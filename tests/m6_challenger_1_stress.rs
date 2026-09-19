@@ -21,6 +21,8 @@
 //!    - SIGKILL / process abortion verification on active running commands.
 //!    - 50-thread concurrent cancellation idempotence on single TaskId.
 
+#![allow(clippy::field_reassign_with_default)]
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -68,9 +70,11 @@ struct ChallengerTestCluster {
 
 impl ChallengerTestCluster {
     pub async fn new() -> Self {
-        let mut sched_cfg = SchedulerConfig::default();
-        sched_cfg.tick_interval = Duration::from_millis(20);
-        sched_cfg.max_host_cpu_pct = 100.0;
+        let sched_cfg = SchedulerConfig {
+            tick_interval: Duration::from_millis(20),
+            max_host_cpu_pct: 100.0,
+            ..Default::default()
+        };
         Self::new_with_config(sched_cfg, ReaperConfig::default()).await
     }
 
@@ -388,11 +392,13 @@ async fn test_adversarial_task_flood_100_tasks_rolling_worker_churn() {
 
 #[tokio::test]
 async fn test_adversarial_priority_flood_preemption_under_churn() {
-    let mut sched_cfg = SchedulerConfig::default();
-    sched_cfg.tick_interval = Duration::from_millis(20);
-    sched_cfg.max_host_cpu_pct = 100.0;
-    // 1 core concurrency cap to force queue serialization
-    sched_cfg.max_tasks_per_worker = Some(1);
+    let sched_cfg = SchedulerConfig {
+        tick_interval: Duration::from_millis(20),
+        max_host_cpu_pct: 100.0,
+        // 1 core concurrency cap to force queue serialization
+        max_tasks_per_worker: Some(1),
+        ..Default::default()
+    };
 
     let mut cluster = ChallengerTestCluster::new_with_config(sched_cfg, ReaperConfig::default()).await;
     let w1 = cluster.spawn_worker("prio-w1", 1, 2048, false).await;
@@ -624,8 +630,10 @@ async fn test_adversarial_client_abrupt_disconnect_with_pending_waiter() {
 
 #[tokio::test]
 async fn test_adversarial_slowloris_handshake_timeout() {
-    let mut sched_cfg = SchedulerConfig::default();
-    sched_cfg.tick_interval = Duration::from_millis(20);
+    let sched_cfg = SchedulerConfig {
+        tick_interval: Duration::from_millis(20),
+        ..Default::default()
+    };
 
     let mut server_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
     // Configure 1-second handshake timeout for fast testing

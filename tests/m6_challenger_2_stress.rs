@@ -23,6 +23,8 @@
 //! 5. End-to-End Heterogeneous Cluster Workload & Constraint Coexistence:
 //!    - Live TCP Master-Worker cluster validating concurrent backpressure and mobile constraints.
 
+#![allow(clippy::cloned_ref_to_slice_refs)]
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -121,7 +123,7 @@ fn test_backpressure_boundary_exact_84_9_vs_85_1() {
     let report_rejected_only = WorkloadScheduler::matchmake(
         &config,
         std::slice::from_ref(&task),
-        &[worker_rejected.clone()],
+        std::slice::from_ref(&worker_rejected),
     );
     assert_eq!(report_rejected_only.assignments.len(), 0);
     assert_eq!(report_rejected_only.skipped.len(), 1);
@@ -134,7 +136,7 @@ fn test_backpressure_boundary_exact_84_9_vs_85_1() {
     let report_accepted_only = WorkloadScheduler::matchmake(
         &config,
         std::slice::from_ref(&task),
-        &[worker_accepted.clone()],
+        std::slice::from_ref(&worker_accepted),
     );
     assert_eq!(report_accepted_only.assignments.len(), 1);
     assert_eq!(report_accepted_only.assignments[0].worker_id, worker_accepted.worker_id);
@@ -146,7 +148,7 @@ fn test_backpressure_boundary_exact_84_9_vs_85_1() {
     let report_exact = WorkloadScheduler::matchmake(
         &config,
         std::slice::from_ref(&task),
-        &[worker_exact.clone()],
+        std::slice::from_ref(&worker_exact),
     );
     assert_eq!(report_exact.assignments.len(), 1);
     assert_eq!(report_exact.assignments[0].worker_id, worker_exact.worker_id);
@@ -217,7 +219,7 @@ async fn test_backpressure_rapid_heartbeat_telemetry_oscillation() {
         let workers_snap = registry.list_active_workers().await;
         assert_eq!(workers_snap[0].cpu_usage_pct, 95.0);
 
-        let report_overloaded = WorkloadScheduler::matchmake(&config, &[task.clone()], &workers_snap);
+        let report_overloaded = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&task), &workers_snap);
         assert_eq!(
             report_overloaded.assignments.len(),
             0,
@@ -237,7 +239,7 @@ async fn test_backpressure_rapid_heartbeat_telemetry_oscillation() {
         let workers_snap_idle = registry.list_active_workers().await;
         assert_eq!(workers_snap_idle[0].cpu_usage_pct, 10.0);
 
-        let report_idle = WorkloadScheduler::matchmake(&config, &[task.clone()], &workers_snap_idle);
+        let report_idle = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&task), &workers_snap_idle);
         assert_eq!(
             report_idle.assignments.len(),
             1,
@@ -287,30 +289,30 @@ fn test_mobile_battery_edge_cases_0_14_15_pct() {
 
     // Case 1: 0% battery, discharging -> compile task skipped, command task permitted
     let w_0 = make_mobile_worker(0, false);
-    let report_0_compile = WorkloadScheduler::matchmake(&config, &[compile_task.clone()], &[w_0.clone()]);
+    let report_0_compile = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&compile_task), std::slice::from_ref(&w_0));
     assert_eq!(report_0_compile.assignments.len(), 0, "0% battery discharging must skip compile tasks");
 
-    let report_0_cmd = WorkloadScheduler::matchmake(&config, &[command_task.clone()], &[w_0.clone()]);
+    let report_0_cmd = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&command_task), std::slice::from_ref(&w_0));
     assert_eq!(report_0_cmd.assignments.len(), 1, "0% battery discharging can run lightweight command tasks");
 
     // Case 2: 14% battery (boundary < 15%), discharging -> compile task skipped
     let w_14 = make_mobile_worker(14, false);
-    let report_14_compile = WorkloadScheduler::matchmake(&config, &[compile_task.clone()], &[w_14.clone()]);
+    let report_14_compile = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&compile_task), std::slice::from_ref(&w_14));
     assert_eq!(report_14_compile.assignments.len(), 0, "14% battery discharging must skip compile tasks");
 
     // Case 3: 15% battery (boundary == 15%), discharging -> compile task ASSIGNED!
     let w_15 = make_mobile_worker(15, false);
-    let report_15_compile = WorkloadScheduler::matchmake(&config, &[compile_task.clone()], &[w_15.clone()]);
+    let report_15_compile = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&compile_task), std::slice::from_ref(&w_15));
     assert_eq!(report_15_compile.assignments.len(), 1, "15% battery discharging must be accepted for compile tasks");
     assert_eq!(report_15_compile.assignments[0].worker_id, w_15.worker_id);
 
     // Case 4: 0% or 14% battery BUT actively charging (is_charging: true) -> compile task ASSIGNED!
     let w_0_charging = make_mobile_worker(0, true);
-    let report_0_charging = WorkloadScheduler::matchmake(&config, &[compile_task.clone()], &[w_0_charging.clone()]);
+    let report_0_charging = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&compile_task), std::slice::from_ref(&w_0_charging));
     assert_eq!(report_0_charging.assignments.len(), 1, "0% battery charging must be accepted for compile tasks");
 
     let w_14_charging = make_mobile_worker(14, true);
-    let report_14_charging = WorkloadScheduler::matchmake(&config, &[compile_task.clone()], &[w_14_charging.clone()]);
+    let report_14_charging = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&compile_task), std::slice::from_ref(&w_14_charging));
     assert_eq!(report_14_charging.assignments.len(), 1, "14% battery charging must be accepted for compile tasks");
 }
 
