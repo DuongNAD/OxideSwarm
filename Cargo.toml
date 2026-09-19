@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/master",
+    "crates/worker",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["RustyGrid Contributors"]
+license = "MIT OR Apache-2.0"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Internal workspace crates
+rusty_grid_core = { path = "crates/core" }
+rusty_grid_master = { path = "crates/master" }
+rusty_grid_worker = { path = "crates/worker" }
+
+# Asynchronous runtime & networking
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1.10"
+futures = "0.3"
+
+# Serialization & wire protocol
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+# Error handling
+thiserror = "2.0"
+
+# Logging & observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI parsing & time utilities
+clap = { version = "4.5", features = ["derive", "env"] }
+chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"
+
+# System monitoring
+sysinfo = "0.30"
+
+# Embedded P2P NAT Traversal
+iroh = { version = "1.2", default-features = false, features = ["tls-ring", "portmapper"] }
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"

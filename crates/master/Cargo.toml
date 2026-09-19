@@ -1,0 +1,56 @@
+[package]
+name = "rusty_grid_master"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+rusty_grid_core = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true, features = ["codec"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+tempfile = "3"
+iroh = { workspace = true, optional = true }
+
+[features]
+default = ["p2p"]
+p2p = ["dep:iroh", "rusty_grid_core/p2p"]
+
+[dev-dependencies]
+rusty_grid_worker = { path = "../worker" }
+futures = { workspace = true }
+
+[[test]]
+name = "m2_lifecycle"
+path = "../../tests/m2_lifecycle.rs"
+
+[[test]]
+name = "m2_stress_challenge"
+path = "../../tests/m2_stress_challenge.rs"
+
+[[test]]
+name = "m2_challenger_2_stress"
+path = "../../tests/m2_challenger_2_stress.rs"
+
+[[test]]
+name = "m4_scheduling"
+path = "../../tests/m4_scheduling.rs"
+
+[[test]]
+name = "m4_challenger_1_stress"
+path = "../../tests/m4_challenger_1_stress.rs"
+
+[[test]]
+name = "m4_challenger_2_stress"
+path = "../../tests/m4_challenger_2_stress.rs"
+
+[[test]]
+name = "m5_challenger_2_stress"
+path = "../../tests/m5_challenger_2_stress.rs"
+

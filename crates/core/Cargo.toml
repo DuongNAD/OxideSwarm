@@ -1,0 +1,28 @@
+[package]
+name = "rusty_grid_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["sync", "io-util", "macros"] }
+tokio-util = { workspace = true, features = ["codec"] }
+bytes = { workspace = true }
+futures = { workspace = true }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+iroh = { workspace = true, optional = true }
+
+[features]
+default = ["p2p"]
+p2p = ["dep:iroh"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

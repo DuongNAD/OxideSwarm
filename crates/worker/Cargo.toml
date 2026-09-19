@@ -1,0 +1,43 @@
+[package]
+name = "rusty_grid_worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+rusty_grid_core = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true, features = ["codec"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+getrandom = "0.4"
+tempfile = "3"
+sysinfo = { workspace = true }
+iroh = { workspace = true, optional = true }
+
+[features]
+default = ["p2p"]
+p2p = ["dep:iroh", "rusty_grid_core/p2p"]
+
+[dev-dependencies]
+
+tempfile = "3"
+
+[[test]]
+name = "m3_execution"
+path = "../../tests/m3_execution.rs"
+
+[[test]]
+name = "m3_challenger_1_stress"
+path = "../../tests/m3_challenger_1_stress.rs"
+
+[[test]]
+name = "m3_challenger_2_stress"
+path = "../../tests/m3_challenger_2_stress.rs"
+
+

@@ -1,0 +1,48 @@
+[package]
+name = "rusty_grid_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rusty-grid"
+path = "src/main.rs"
+
+[dependencies]
+rusty_grid_core = { workspace = true }
+rusty_grid_master = { workspace = true }
+rusty_grid_worker = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+clap = { workspace = true, features = ["derive", "env"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+futures = { workspace = true }
+
+[[test]]
+name = "e2e_cluster"
+path = "../../tests/e2e_cluster.rs"
+
+[[test]]
+name = "m5_challenger_1_stress"
+path = "../../tests/m5_challenger_1_stress.rs"
+
+[[test]]
+name = "m6_challenger_1_stress"
+path = "../../tests/m6_challenger_1_stress.rs"
+
+[[test]]
+name = "m6_challenger_2_stress"
+path = "../../tests/m6_challenger_2_stress.rs"
+
+[[test]]
+name = "windows_cross_compile_test"
+path = "../../tests/windows_cross_compile_test.rs"
+
