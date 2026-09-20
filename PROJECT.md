@@ -57,7 +57,7 @@
 | M3 | Worker Task Execution & Sandboxing | `crates/worker` task runner, sandbox isolation, process execution, stdout/stderr capture, timeout watchdog, simulated GPU executor | M1, M2 | DONE |
 | M4 | Master Scheduling & Workload Routing | `crates/master` task queue, FSM, strict GPU routing constraint, parallel batch spread scheduling across workers | M1, M2, M3 | DONE |
 | M5 | Unified CLI, P2P NAT, Cross-Platform & `test_integration.sh` | `crates/cli` binary `rusty-grid` with full configurability (flags/envs/config, IP/ports, heartbeat timeouts, worker max concurrency, hardware overrides), Android (`build_android_worker.sh`) & Windows (`build_windows_worker.sh`) cross-compilation harnesses, embedded `iroh` P2P NAT traversal, lightweight Map/Reduce, standalone `test_integration.sh`, public `README.md` | M1, M2, M3, M4 | DONE |
-| M6 | E2E Test Pass (100%) & Coverage Hardening | Pass 100% of E2E test suite (Tiers 1–4) and perform Tier 5 adversarial coverage hardening | M5, E2E Track | IN_PROGRESS |
+| M6 | E2E Test Pass (100%) & Coverage Hardening | Pass 100% of E2E test suite (Tiers 1–4) and perform Tier 5 adversarial coverage hardening | M5, E2E Track | DONE |
 
 ---
 

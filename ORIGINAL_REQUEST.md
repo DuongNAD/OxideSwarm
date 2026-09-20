@@ -61,6 +61,36 @@ Note: You do not need to run git commands to push. Just prepare the README and c
 
 USER INSTRUCTION UPDATE: The user has officially selected the project name: `OxideSwarm` (replacing `rusty_grid`). Please ensure the final `README.md`, CLI binary names, and internal project documentation reflect the new brand name `OxideSwarm` before the final project handoff.
 
+## 2026-09-20T04:54:33Z
+
+# Teamwork Project Prompt — Draft
+
+> Status: Launched
+> Requested team: The full agent team
+
+Fix the 40 failing E2E integration tests in the OxideSwarm Rust project. The project currently has networking and registration logic issues that cause `cargo test --workspace` to fail. Use the full agent team to investigate and resolve these issues.
+
+Working directory: d:\teamwork_projects\OxideSwarm
+Integrity mode: benchmark
+
+## Requirements
+
+### R1. Root Cause Resolution
+Analyze and resolve the root causes of the failing integration tests in `tests/e2e_cluster.rs` and the `test_integration.sh` script, particularly focusing on the worker registration, exit code assertions, and output stream truncation issues.
+
+### R2. Preserve Existing Functionality
+Ensure that the 25 currently passing tests continue to pass without regression.
+
+## Verification Resources
+- Test suite: `tests/e2e_cluster.rs` (can be run via `cargo test -p rusty_grid_cli --test e2e_cluster`)
+- Bash acceptance script: `test_integration.sh`
+
+## Acceptance Criteria
+
+### Automated Tests
+- [ ] Running `cargo test --workspace` must complete with 0 test failures.
+- [ ] Running `bash test_integration.sh` must execute successfully without errors.
+
 
 
 

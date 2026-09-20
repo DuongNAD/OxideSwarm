@@ -160,6 +160,12 @@ fi
 
 if [[ -n "$MINGW_GCC" ]]; then
     log_ok "Found mingw-w64 linker toolchain: ${MINGW_GCC}"
+    if [[ "$CHECK_ONLY" == true ]]; then
+        log_info "Reference setup guidance for cross-compilation hosts:"
+        log_info "  - macOS (Homebrew): brew install mingw-w64"
+        log_info "  - Ubuntu/Debian:    sudo apt-get install gcc-mingw-w64-x86-64"
+        log_info "  - Fedora/RHEL:      sudo dnf install mingw64-gcc"
+    fi
 else
     log_warn "mingw-w64 linker toolchain (x86_64-w64-mingw32-gcc) not located in standard paths."
     log_info "Setup guidance to install mingw-w64:"

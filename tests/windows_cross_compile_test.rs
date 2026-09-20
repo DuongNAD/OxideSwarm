@@ -12,7 +12,6 @@
 //! 7. `--help` / `-h` flag execution and usage documentation.
 //! 8. Unknown argument rejection with descriptive error message and exit code 1.
 
-use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -40,6 +39,34 @@ fn get_script_path() -> PathBuf {
     panic!("Could not locate build_windows_worker.sh in candidates: {candidates:?}");
 }
 
+fn script_cmd(script: &std::path::Path) -> Command {
+    #[cfg(windows)]
+    {
+        let bash_candidates = [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+            r"C:\msys64\usr\bin\bash.exe",
+        ];
+        let script_str = script.to_string_lossy();
+        let clean_path = script_str.strip_prefix(r"\\?\").unwrap_or(&script_str).replace('\\', "/");
+        for candidate in &bash_candidates {
+            if std::path::Path::new(candidate).exists() {
+                let mut cmd = Command::new(candidate);
+                cmd.arg(&clean_path);
+                return cmd;
+            }
+        }
+        let mut cmd = Command::new("bash");
+        cmd.arg(&clean_path);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new(script)
+    }
+}
+
 #[test]
 fn test_windows_cross_compile_script_exists_and_is_executable() {
     let script = get_script_path();
@@ -61,7 +88,7 @@ fn test_windows_cross_compile_script_exists_and_is_executable() {
 #[test]
 fn test_windows_cross_compile_check_flag() {
     let script = get_script_path();
-    let output = Command::new(&script)
+    let output = script_cmd(&script)
         .arg("--check")
         .output()
         .expect("failed to execute build_windows_worker.sh --check");
@@ -102,7 +129,7 @@ fn test_windows_cross_compile_check_flag() {
 #[test]
 fn test_windows_cross_compile_dry_run_default_release() {
     let script = get_script_path();
-    let output = Command::new(&script)
+    let output = script_cmd(&script)
         .arg("--dry-run")
         .output()
         .expect("failed to execute build_windows_worker.sh --dry-run");
@@ -147,7 +174,7 @@ fn test_windows_cross_compile_dry_run_default_release() {
 #[test]
 fn test_windows_cross_compile_dry_run_debug_profile() {
     let script = get_script_path();
-    let output = Command::new(&script)
+    let output = script_cmd(&script)
         .args(["--dry-run", "--debug"])
         .output()
         .expect("failed to execute build_windows_worker.sh --dry-run --debug");
@@ -176,7 +203,7 @@ fn test_windows_cross_compile_dry_run_debug_profile() {
 #[test]
 fn test_windows_cross_compile_dry_run_custom_features() {
     let script = get_script_path();
-    let output = Command::new(&script)
+    let output = script_cmd(&script)
         .args(["--dry-run", "--features", "p2p"])
         .output()
         .expect("failed to execute build_windows_worker.sh --dry-run --features p2p");
@@ -200,7 +227,7 @@ fn test_windows_cross_compile_dry_run_custom_env_overrides() {
     let custom_cc = "/opt/custom/x86_64-w64-mingw32-gcc";
     let custom_ld = "/opt/custom/x86_64-w64-mingw32-gcc-ld";
 
-    let output = Command::new(&script)
+    let output = script_cmd(&script)
         .arg("--dry-run")
         .env("CC_x86_64_pc_windows_gnu", custom_cc)
         .env("CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER", custom_ld)
@@ -223,7 +250,7 @@ fn test_windows_cross_compile_dry_run_custom_env_overrides() {
 fn test_windows_cross_compile_help_options() {
     let script = get_script_path();
     for flag in ["--help", "-h"] {
-        let output = Command::new(&script)
+        let output = script_cmd(&script)
             .arg(flag)
             .output()
             .unwrap_or_else(|e| panic!("failed to execute with {flag}: {e}"));
@@ -248,7 +275,7 @@ fn test_windows_cross_compile_help_options() {
 #[test]
 fn test_windows_cross_compile_invalid_argument_fails() {
     let script = get_script_path();
-    let output = Command::new(&script)
+    let output = script_cmd(&script)
         .arg("--invalid-flag-for-testing")
         .output()
         .expect("failed to execute build_windows_worker.sh with invalid argument");
@@ -271,7 +298,7 @@ fn test_windows_cross_compile_invalid_argument_fails() {
 #[test]
 fn test_windows_cross_compile_diagnostic_guidance_present() {
     let script = get_script_path();
-    let output = Command::new(&script)
+    let output = script_cmd(&script)
         .arg("--check")
         .output()
         .expect("failed to execute build_windows_worker.sh --check");

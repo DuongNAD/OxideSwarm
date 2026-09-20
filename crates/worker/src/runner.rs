@@ -82,6 +82,82 @@ pub enum TaskRunnerError {
     Io(#[from] std::io::Error),
 }
 
+#[cfg(windows)]
+fn augment_windows_path(existing_path: &str) -> String {
+    let paths_to_check = [
+        std::path::PathBuf::from(r"C:\Program Files\Git\usr\bin"),
+        std::path::PathBuf::from(r"C:\Program Files\Git\bin"),
+        std::path::PathBuf::from(r"C:\Program Files (x86)\Git\usr\bin"),
+        std::path::PathBuf::from(r"C:\Program Files (x86)\Git\bin"),
+        std::path::PathBuf::from(r"C:\msys64\usr\bin"),
+    ];
+
+    let mut prefix = String::new();
+    for p in &paths_to_check {
+        if p.exists() {
+            let p_str = p.to_string_lossy();
+            if !existing_path.contains(&*p_str) {
+                if !prefix.is_empty() {
+                    prefix.push(';');
+                }
+                prefix.push_str(&p_str);
+            }
+        }
+    }
+    if prefix.is_empty() {
+        existing_path.to_string()
+    } else if existing_path.is_empty() {
+        prefix
+    } else {
+        format!("{prefix};{existing_path}")
+    }
+}
+
+#[cfg(windows)]
+fn resolve_windows_executable(program: &str, effective_path: &str) -> String {
+    let p = Path::new(program);
+    if p.is_file() {
+        return program.to_string();
+    }
+    for ext in &[".exe", ".cmd", ".bat"] {
+        let with_ext = format!("{program}{ext}");
+        if Path::new(&with_ext).is_file() {
+            return with_ext;
+        }
+    }
+
+    let bare_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(program);
+
+    // Fast path: check Git for Windows usr/bin first
+    for base in &[
+        r"C:\Program Files\Git\usr\bin",
+        r"C:\Program Files\Git\bin",
+    ] {
+        let base_path = Path::new(base);
+        for ext in &[".exe", ".cmd", ".bat", ""] {
+            let candidate = base_path.join(format!("{bare_name}{ext}"));
+            if candidate.is_file() {
+                return candidate.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    for dir in std::env::split_paths(effective_path) {
+        let candidate = dir.join(bare_name);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().to_string();
+        }
+        for ext in &[".exe", ".cmd", ".bat"] {
+            let candidate_ext = dir.join(format!("{bare_name}{ext}"));
+            if candidate_ext.is_file() {
+                return candidate_ext.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    program.to_string()
+}
+
 /// Reads an async stream into a bounded memory buffer without pipe deadlocks.
 ///
 /// Continues draining the pipe to EOF even after the buffer is filled, ensuring
@@ -649,19 +725,45 @@ impl TaskRunner {
             }
         };
 
-        let default_sh = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
-        let prog = interpreter.unwrap_or(default_sh);
-        let args = if cfg!(windows) {
-            vec!["/C".to_string(), script_path.to_string_lossy().to_string()]
+        let effective_path = {
+            let base = env
+                .get("PATH")
+                .cloned()
+                .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+            #[cfg(windows)]
+            {
+                augment_windows_path(&base)
+            }
+            #[cfg(not(windows))]
+            {
+                base
+            }
+        };
+
+        #[cfg(windows)]
+        let (prog, args) = if let Some(interp) = interpreter {
+            (interp.to_string(), vec![script_path.to_string_lossy().to_string()])
         } else {
-            vec![script_path.to_string_lossy().to_string()]
+            let sh_resolved = resolve_windows_executable("sh", &effective_path);
+            if Path::new(&sh_resolved).is_file() {
+                (sh_resolved, vec![script_path.to_string_lossy().to_string()])
+            } else {
+                ("cmd.exe".to_string(), vec!["/C".to_string(), script_path.to_string_lossy().to_string()])
+            }
+        };
+
+        #[cfg(not(windows))]
+        let (prog, args) = if let Some(interp) = interpreter {
+            (interp.to_string(), vec![script_path.to_string_lossy().to_string()])
+        } else {
+            ("/bin/sh".to_string(), vec![script_path.to_string_lossy().to_string()])
         };
 
         let result = self
             .execute_process_supervised(
                 task.id,
                 sandbox.path(),
-                prog,
+                &prog,
                 &args,
                 sandbox.path(),
                 env,
@@ -845,19 +947,47 @@ impl TaskRunner {
         mut cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
     ) -> TaskResult {
-        let mut cmd = tokio::process::Command::new(program);
+        let effective_path = match env.get("PATH") {
+            Some(p) => {
+                #[cfg(windows)]
+                {
+                    augment_windows_path(p)
+                }
+                #[cfg(not(windows))]
+                {
+                    p.clone()
+                }
+            }
+            None => {
+                let base = std::env::var("PATH").unwrap_or_default();
+                #[cfg(windows)]
+                {
+                    augment_windows_path(&base)
+                }
+                #[cfg(not(windows))]
+                {
+                    base
+                }
+            }
+        };
+
+        #[cfg(windows)]
+        let resolved_program = resolve_windows_executable(program, &effective_path);
+        #[cfg(not(windows))]
+        let resolved_program = program.to_string();
+
+        let mut cmd = tokio::process::Command::new(&resolved_program);
         cmd.args(args);
         cmd.current_dir(cwd);
 
-        // Inject system PATH if not overridden
-        if !env.contains_key("PATH") {
-            if let Ok(path_val) = std::env::var("PATH") {
-                cmd.env("PATH", path_val);
+        cmd.env("PATH", &effective_path);
+
+        // Inject user environment variables (skipping PATH to preserve effective_path)
+        for (k, v) in env {
+            if k != "PATH" {
+                cmd.env(k, v);
             }
         }
-
-        // Inject user environment variables
-        cmd.envs(env);
 
         // Inject standard framework diagnostics
         cmd.env("RUSTY_GRID_TASK_ID", task_id.to_string());
@@ -942,7 +1072,20 @@ impl TaskRunner {
                 let elapsed = start_time.elapsed().as_millis() as u64;
                 match status_res {
                     Ok(status) => {
-                        let code = status.code().unwrap_or(EXIT_CODE_GENERAL_ERROR);
+                        let code = match status.code() {
+                            Some(c) => c,
+                            None => {
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::process::ExitStatusExt;
+                                    status.signal().map(|s| 128 + s).unwrap_or(EXIT_CODE_GENERAL_ERROR)
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    EXIT_CODE_GENERAL_ERROR
+                                }
+                            }
+                        };
                         if status.success() {
                             let mut res = TaskResult::success(self.worker_id, task_id, stdout_str, elapsed, false);
                             res.stderr = stderr_str;

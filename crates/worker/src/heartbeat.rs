@@ -138,6 +138,43 @@ impl HeartbeatHandle {
     }
 }
 
+static TELEMETRY_CACHE: std::sync::Mutex<(f32, u64)> = std::sync::Mutex::new((0.0, 8192));
+static TELEMETRY_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn ensure_telemetry_sampler_started() {
+    if TELEMETRY_INITIALIZED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        std::thread::spawn(|| {
+            let mut sys = sysinfo::System::new_with_specifics(
+                sysinfo::RefreshKind::new()
+                    .with_cpu(sysinfo::CpuRefreshKind::new().with_cpu_usage())
+                    .with_memory(sysinfo::MemoryRefreshKind::new().with_ram()),
+            );
+            loop {
+                sys.refresh_cpu_specifics(sysinfo::CpuRefreshKind::new().with_cpu_usage());
+                sys.refresh_memory();
+                let cpu_usage_pct = sys.global_cpu_info().cpu_usage();
+                let ram_available_mb = sys.available_memory() / (1024 * 1024);
+                if let Ok(mut cache) = TELEMETRY_CACHE.lock() {
+                    *cache = (cpu_usage_pct, ram_available_mb);
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+    }
+}
+
+fn get_system_telemetry() -> (f32, u64) {
+    ensure_telemetry_sampler_started();
+    if let Ok(cache) = TELEMETRY_CACHE.lock() {
+        *cache
+    } else {
+        (0.0, 8192)
+    }
+}
+
 /// Spawns the background periodic heartbeat sender task.
 pub fn spawn_heartbeat_task(
     worker_id: Uuid,
@@ -149,12 +186,6 @@ pub fn spawn_heartbeat_task(
     let tracker_clone = Arc::clone(&tracker);
 
     let join_handle = tokio::spawn(async move {
-        let mut sys = sysinfo::System::new_with_specifics(
-            sysinfo::RefreshKind::new()
-                .with_cpu(sysinfo::CpuRefreshKind::everything())
-                .with_memory(sysinfo::MemoryRefreshKind::everything()),
-        );
-
         let mut ticker = tokio::time::interval(interval);
         // Skip the immediate initial tick so first heartbeat is sent after interval has elapsed
         ticker.tick().await;
@@ -165,12 +196,8 @@ pub fn spawn_heartbeat_task(
                     let now_sec = current_epoch_secs();
                     let active = tracker_clone.active_tasks.load(Ordering::Relaxed);
 
-                    // Refresh host telemetry
-                    sys.refresh_cpu();
-                    sys.refresh_memory();
-
-                    let cpu_usage_pct = sys.global_cpu_info().cpu_usage();
-                    let ram_available_mb = sys.available_memory() / (1024 * 1024);
+                    // Read current system telemetry from non-blocking background sampler
+                    let (cpu_usage_pct, ram_available_mb) = get_system_telemetry();
 
                     tracker_clone.record_sent(now_sec);
 

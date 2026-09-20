@@ -1,6 +1,6 @@
 //! Wire protocol message types, length-delimited framing codec, and transport helpers.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{split, AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
@@ -298,12 +298,14 @@ impl<T> MessageTransport<T> {
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
-    /// Splits transport into independent read and write halves via `tokio::io::split`.
+    /// Splits transport into independent read and write halves via `tokio::io::split`,
+    /// preserving any unconsumed read buffer or unflushed write buffer.
     pub fn split(self) -> (MessageWriter<WriteHalf<T>>, MessageReader<ReadHalf<T>>) {
-        let (read_half, write_half) = split(self.inner.into_inner());
+        let parts = self.inner.into_parts();
+        let (read_half, write_half) = split(parts.io);
         (
-            MessageWriter::new(write_half),
-            MessageReader::new(read_half),
+            MessageWriter::with_buffer(write_half, parts.write_buf),
+            MessageReader::with_buffer(read_half, parts.read_buf),
         )
     }
 
@@ -405,6 +407,15 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
         }
     }
 
+    /// Creates a new `MessageReader` wrapping an async reader with pre-buffered data.
+    pub fn with_buffer(reader: R, buffer: BytesMut) -> Self {
+        let mut framed = FramedRead::new(reader, default_codec());
+        if !buffer.is_empty() {
+            framed.read_buffer_mut().extend_from_slice(&buffer);
+        }
+        Self { inner: framed }
+    }
+
     /// Reads the next framed message from the reader.
     pub async fn recv_msg<M: DeserializeOwned>(&mut self) -> Result<Option<M>, ProtocolError> {
         match self.inner.next().await {
@@ -460,6 +471,15 @@ impl<W: AsyncWrite + Unpin> MessageWriter<W> {
         Self {
             inner: FramedWrite::new(writer, default_codec()),
         }
+    }
+
+    /// Creates a new `MessageWriter` wrapping an async writer with pre-buffered data.
+    pub fn with_buffer(writer: W, buffer: BytesMut) -> Self {
+        let mut framed = FramedWrite::new(writer, default_codec());
+        if !buffer.is_empty() {
+            framed.write_buffer_mut().extend_from_slice(&buffer);
+        }
+        Self { inner: framed }
     }
 
     /// Serializes and sends a message framed with a 4-byte length prefix.

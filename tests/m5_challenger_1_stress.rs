@@ -850,7 +850,7 @@ async fn test_adversarial_live_cluster_configured_via_toml_and_json_files() {
         r#"
 [master]
 listen = "127.0.0.1:0"
-port_file = "{}"
+port_file = '{}'
 heartbeat_interval_secs = 2
 heartbeat_timeout_secs = 6
 preserve_gpu = true

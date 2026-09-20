@@ -556,6 +556,12 @@ impl TaskQueue {
                 .get_mut(&task_id)
                 .ok_or(GridError::TaskNotFound(task_id.0))?;
 
+            // If task is already terminal (e.g. Cancelled by master directive, Completed, Failed), preserve state
+            if entry.state.is_terminal() {
+                tracing::debug!(task_id = %task_id, state = ?entry.state, "Ignoring result for terminal task");
+                return Ok(entry.state);
+            }
+
             if result.is_success() {
                 if !entry.state.can_transition_to(TaskState::Completed) {
                     return Err(GridError::InvalidTaskState {

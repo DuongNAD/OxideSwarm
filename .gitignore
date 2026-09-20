@@ -1,3 +1,5 @@
 /target/
 /.agents/
 .DS_Store
+
+ticket.txt

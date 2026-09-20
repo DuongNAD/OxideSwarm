@@ -61,7 +61,9 @@ cleanup() {
         fi
     done
 
-    rm -rf "$TEST_DIR"
+    # Allow Windows OS time to release held file handles before directory removal
+    sleep 0.2
+    rm -rf "$TEST_DIR" 2>/dev/null || true
 
     if [[ $exit_code -eq 0 ]]; then
         echo -e "${BOLD}${GREEN}======================================================${NC}"
@@ -80,17 +82,29 @@ trap cleanup EXIT INT TERM
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+log_section "PHASE 0: Cleaning up lingering cluster processes"
+if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || -n "${WINDIR:-}" ]]; then
+    taskkill //F //IM rusty-grid.exe 2>/dev/null || true
+else
+    pkill -9 -f "rusty-grid" 2>/dev/null || true
+fi
+
 log_section "PHASE 1: Building Unified CLI Binary (rusty-grid)"
-if [[ -f "./target/debug/rusty-grid" ]]; then
-    log_info "Binary ./target/debug/rusty-grid already exists, validating..."
+if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || -n "${WINDIR:-}" || -f "./target/debug/rusty-grid.exe" ]]; then
+    BIN="./target/debug/rusty-grid.exe"
+else
+    BIN="./target/debug/rusty-grid"
+fi
+
+if [[ -f "$BIN" ]]; then
+    log_info "Binary $BIN already exists, validating..."
     cargo build --bin rusty-grid --quiet
 else
     log_info "Compiling rusty-grid binary via 'cargo build --bin rusty-grid'..."
     cargo build --bin rusty-grid
 fi
 
-BIN="./target/debug/rusty-grid"
-if [[ ! -x "$BIN" ]]; then
+if [[ ! -x "$BIN" && ! -f "$BIN" ]]; then
     log_fail "Failed to find executable binary at ${BIN}"
     exit 1
 fi
@@ -120,7 +134,7 @@ while [[ ! -s "$PORT_FILE" ]]; do
     fi
 done
 
-MASTER_PORT=$(cat "$PORT_FILE")
+MASTER_PORT=$(tr -d '\r\n' < "$PORT_FILE")
 MASTER_ADDR="127.0.0.1:${MASTER_PORT}"
 log_pass "Master online and listening at ${MASTER_ADDR} (PID: ${MASTER_PID})"
 

@@ -147,16 +147,16 @@ impl TestCluster {
         }
     }
 
-    /// Polls the master until at least `count` workers are in `Connected` status.
+    /// Polls the master until at least `count` workers are in active (non-disconnected) status.
     pub async fn wait_for_workers(&self, count: usize, timeout: Duration) -> bool {
         let start = Instant::now();
         while start.elapsed() < timeout {
             if let Ok(workers) = self.master.list_workers().await {
-                let connected = workers
+                let active = workers
                     .iter()
-                    .filter(|w| w.status == WorkerStatus::Connected)
+                    .filter(|w| w.status != WorkerStatus::Disconnected)
                     .count();
-                if connected >= count {
+                if active >= count {
                     return true;
                 }
             }
