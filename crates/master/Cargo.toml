@@ -17,14 +17,20 @@ tracing = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 tempfile = "3"
 iroh = { workspace = true, optional = true }
+futures = { workspace = true }
+axum = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
 
 [features]
-default = ["p2p"]
+default = ["p2p", "dashboard"]
 p2p = ["dep:iroh", "rusty_grid_core/p2p"]
+dashboard = ["dep:axum", "dep:tower-http"]
 
 [dev-dependencies]
 rusty_grid_worker = { path = "../worker" }
 futures = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
 
 [[test]]
 name = "m2_lifecycle"
@@ -53,4 +59,33 @@ path = "../../tests/m4_challenger_2_stress.rs"
 [[test]]
 name = "m5_challenger_2_stress"
 path = "../../tests/m5_challenger_2_stress.rs"
+
+[[test]]
+name = "m8_challenger_stress"
+path = "../../tests/m8_challenger_stress.rs"
+
+[[test]]
+name = "worker_crash_rescheduling_test"
+path = "../../tests/worker_crash_rescheduling_test.rs"
+
+[[test]]
+name = "m9_stress_challenge_1"
+path = "../../tests/m9_stress_challenge_1.rs"
+
+[[test]]
+name = "m9_stress_challenge_2"
+path = "../../tests/m9_stress_challenge_2.rs"
+
+[[test]]
+name = "dashboard_integration"
+path = "../../tests/dashboard_integration.rs"
+
+[[test]]
+name = "m10_streaming_stress"
+path = "../../tests/m10_streaming_stress.rs"
+
+[[test]]
+name = "m10_challenger_2_stress"
+path = "../../tests/m10_challenger_2_stress.rs"
+
 

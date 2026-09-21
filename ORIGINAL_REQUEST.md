@@ -91,6 +91,84 @@ Ensure that the 25 currently passing tests continue to pass without regression.
 - [ ] Running `cargo test --workspace` must complete with 0 test failures.
 - [ ] Running `bash test_integration.sh` must execute successfully without errors.
 
+## 2026-09-20T15:41:31Z
+
+Modify the OxideSwarm master node to persist its `iroh` P2P Secret Key to a file, ensuring the generated P2P ticket remains constant across server restarts.
+
+Working directory: d:\teamwork_projects\OxideSwarm
+Integrity mode: demo
+
+## Requirements
+
+### R1. Configuration Flag
+Add a new optional CLI argument `--p2p-key-file <PATH>` to the master subcommand in `rusty_grid_cli`. It should map to the corresponding configuration structs down to the master server. If this flag is omitted, the system should continue to generate an ephemeral random key in memory.
+
+### R2. Key Persistence Logic
+In the master server (`crates/master/src/server.rs`), when initializing the `iroh::Endpoint`:
+- If `p2p_key_file` is provided and the file exists, read and deserialize the `iroh::SecretKey` from the file.
+- If the file does not exist, generate a new random `iroh::SecretKey`, serialize it, and save it to the specified path.
+- Build the `iroh::Endpoint` using this `SecretKey`.
+
+### R3. Test Suite Compatibility
+The team must read and understand `test_integration.sh` and existing Rust integration tests. The new feature must be fully backward compatible and must not break any existing tests or workflows that do not specify the new flag.
+
+## Acceptance Criteria
+
+### Verification
+- [ ] A programmatic test script (`tests/verify_p2p_persistence.sh`) is created to run the master node twice with `--p2p-key-file test_key.bin` and `--p2p-ticket-file ticket.txt`.
+- [ ] The script objectively verifies that the `ticket.txt` content from the first run is exactly identical to the `ticket.txt` content from the second run.
+- [ ] Running `./test_integration.sh` fully passes with 0 failures, ensuring no regressions in the core networking logic.
+
+## 2026-09-20T18:01:29Z
+
+Upgrade the OxideSwarm distributed computing framework into a production-grade, fault-tolerant cluster system with high-throughput binary wire protocol communication, automatic worker failure recovery with task rescheduling, and an embedded real-time web observability dashboard.
+
+Working directory: d:\teamwork_projects\OxideSwarm
+Integrity mode: development
+
+## Verification Resources
+- Existing cargo test suites under `tests/` (`tests/e2e_cluster.rs`, lifecycle tests, scheduling tests, stress tests).
+- Automated integration test script `test_integration.sh` verifying end-to-end multi-worker cluster operation.
+
+## Requirements
+
+### R1. High-Performance Binary Wire Protocol
+The communication protocol across Master, Worker, and CLI nodes must support a high-throughput binary serialization format (e.g. bincode or equivalent compact binary codec) to enhance data transmission speed and minimize serialization overhead under high-volume task workloads, while preserving wire protocol safety.
+
+### R2. Fault-Tolerant Worker Lifecycle & Dynamic Task Rescheduling
+The Master scheduling engine must guarantee task execution resilience against worker node failures. If a worker node crashes, experiences network partition, or fails heartbeat health checks while executing tasks, the Master must evict the worker, recover all in-flight tasks, and automatically re-enqueue them to be dispatched to other eligible, healthy workers up to a configurable maximum retry limit.
+
+### R3. Embedded Real-Time Web Observability Dashboard
+The Master node must include an embedded HTTP server (configurable via CLI flag, e.g., `--dashboard-port`) providing a self-contained web dashboard (no external runtime dependencies) that displays real-time cluster status, worker telemetry (CPU, RAM, GPU, OS), and task queues (pending, running, completed, failed) with live data streaming via WebSockets or Server-Sent Events.
+
+### R4. Comprehensive Test Suite & Regression Prevention
+The system must maintain 100% backward compatibility with existing cluster test suites. New automated integration and unit tests must be added to explicitly verify binary wire codec performance, worker crash recovery and task reassignment, and dashboard HTTP/WebSocket telemetry endpoints.
+
+## Acceptance Criteria
+
+### Binary Wire Protocol
+- [ ] Master and Worker nodes successfully exchange handshake, heartbeats, task specifications, and task results over the binary protocol.
+- [ ] Serialization benchmark or programmatic comparison test demonstrates measurable improvement in serialization speed or payload size compared to plain JSON for task specifications and results.
+- [ ] CLI commands (`submit`, `status`, `workers`) interact seamlessly with the Master node.
+
+### Fault Tolerance & Task Rescheduling
+- [ ] When a worker process running a task is killed abruptly (SIGTERM/SIGKILL or simulated drop), the Master detects the failure within the heartbeat timeout window.
+- [ ] All in-flight tasks assigned to the disconnected worker are re-queued and successfully rescheduled to an alternative eligible worker node without manual intervention.
+- [ ] Tasks that exceed the maximum retry count transition to a terminal Failed state with an informative failure reason rather than looping indefinitely.
+- [ ] Graceful worker disconnection triggers immediate task reassignment without waiting for the heartbeat timeout window.
+
+### Embedded Real-Time Web Dashboard
+- [ ] Launching the Master with `--dashboard-port <PORT>` activates the HTTP dashboard server.
+- [ ] Web dashboard renders cluster inventory, worker hardware metrics, and task statuses in real time.
+- [ ] Cluster telemetry and task updates are streamed dynamically via WebSocket or SSE without requiring manual browser refreshes.
+- [ ] Master provides HTTP API endpoints (e.g. `/api/status`, `/api/workers`, `/api/tasks`) returning JSON representations for external monitoring.
+
+### Verification & Test Suite
+- [ ] `cargo test --workspace` executes and passes 100% of unit and integration tests without regression.
+- [ ] Automated end-to-end integration test verifies worker crash recovery by killing an active worker and asserting task completion on a remaining worker.
+- [ ] Automated integration test validates that dashboard HTTP endpoints and WebSocket streams return HTTP 200 and well-formed telemetry data.
+
+
 
 
 

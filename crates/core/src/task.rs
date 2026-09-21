@@ -64,6 +64,9 @@ pub struct TaskRequirements {
     pub gpu_required: bool,
     /// Maximum allowable execution time in seconds before cancellation.
     pub timeout_secs: u64,
+    /// Maximum allowable retries on worker failure. None inherits cluster default.
+    #[serde(default)]
+    pub max_retries: Option<u32>,
 }
 
 impl Default for TaskRequirements {
@@ -73,6 +76,7 @@ impl Default for TaskRequirements {
             ram_mb: 512,
             gpu_required: false,
             timeout_secs: 60,
+            max_retries: None,
         }
     }
 }
@@ -84,6 +88,7 @@ impl TaskRequirements {
             ram_mb,
             gpu_required,
             timeout_secs,
+            max_retries: None,
         }
     }
 
@@ -94,6 +99,7 @@ impl TaskRequirements {
             ram_mb: 512,
             gpu_required: false,
             timeout_secs,
+            max_retries: None,
         }
     }
 
@@ -104,7 +110,14 @@ impl TaskRequirements {
             ram_mb: 1024,
             gpu_required: true,
             timeout_secs,
+            max_retries: None,
         }
+    }
+
+    /// Configures maximum retry attempts on worker failure or crash.
+    pub fn with_max_retries(mut self, retries: u32) -> Self {
+        self.max_retries = Some(retries);
+        self
     }
 
     /// Validates the requirements specification.
@@ -133,10 +146,52 @@ fn default_iterations() -> u32 {
 }
 
 /// Concrete computation payload and execution specification.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskSpec {
     /// Direct command execution (e.g. `echo`, `python3`, CLI tools).
+    Command {
+        program: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        working_dir: Option<PathBuf>,
+        stdin: Option<Vec<u8>>,
+    },
+    /// Shell script execution via system shell.
+    ShellScript {
+        script: String,
+        interpreter: Option<String>,
+        env: HashMap<String, String>,
+    },
+    /// Distributed Rust compilation job.
+    RustCompilation {
+        crate_name: String,
+        /// Relative file paths mapped to file contents (e.g., "Cargo.toml", "src/lib.rs").
+        source_files: HashMap<String, String>,
+        /// Flags passed to compiler / cargo (e.g., ["--crate-type", "lib"]).
+        compiler_flags: Vec<String>,
+        target_dir: Option<PathBuf>,
+    },
+    /// GPU compute workload (matrix multiplication, hash calculations, kernel execution).
+    GpuCompute {
+        kernel_name: String,
+        input_data: Vec<u8>,
+        work_group_size: u32,
+        simulated_matrix_dim: u32,
+        compute_intensity: u32,
+    },
+    /// In-memory built-in test task for rapid verification.
+    BuiltinTest {
+        test_name: String,
+        iterations: u32,
+        duration_ms: u64,
+        should_fail: bool,
+        require_gpu: bool,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum HumanTaskSpec {
     Command {
         #[serde(alias = "command")]
         program: String,
@@ -148,7 +203,6 @@ pub enum TaskSpec {
         #[serde(default)]
         stdin: Option<Vec<u8>>,
     },
-    /// Shell script execution via system shell.
     ShellScript {
         script: String,
         #[serde(default)]
@@ -156,18 +210,14 @@ pub enum TaskSpec {
         #[serde(default)]
         env: HashMap<String, String>,
     },
-    /// Distributed Rust compilation job.
     RustCompilation {
         crate_name: String,
-        /// Relative file paths mapped to file contents (e.g., "Cargo.toml", "src/lib.rs").
         source_files: HashMap<String, String>,
-        /// Flags passed to compiler / cargo (e.g., ["--crate-type", "lib"]).
         #[serde(default, alias = "cargo_args")]
         compiler_flags: Vec<String>,
         #[serde(default)]
         target_dir: Option<PathBuf>,
     },
-    /// GPU compute workload (matrix multiplication, hash calculations, kernel execution).
     GpuCompute {
         kernel_name: String,
         #[serde(default)]
@@ -179,7 +229,6 @@ pub enum TaskSpec {
         #[serde(default)]
         compute_intensity: u32,
     },
-    /// In-memory built-in test task for rapid verification.
     BuiltinTest {
         #[serde(default = "default_test_name")]
         test_name: String,
@@ -192,6 +241,150 @@ pub enum TaskSpec {
         #[serde(default)]
         require_gpu: bool,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+enum BinaryTaskSpec {
+    Command {
+        program: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        working_dir: Option<PathBuf>,
+        stdin: Option<Vec<u8>>,
+    },
+    ShellScript {
+        script: String,
+        interpreter: Option<String>,
+        env: HashMap<String, String>,
+    },
+    RustCompilation {
+        crate_name: String,
+        source_files: HashMap<String, String>,
+        compiler_flags: Vec<String>,
+        target_dir: Option<PathBuf>,
+    },
+    GpuCompute {
+        kernel_name: String,
+        input_data: Vec<u8>,
+        work_group_size: u32,
+        simulated_matrix_dim: u32,
+        compute_intensity: u32,
+    },
+    BuiltinTest {
+        test_name: String,
+        iterations: u32,
+        duration_ms: u64,
+        should_fail: bool,
+        require_gpu: bool,
+    },
+}
+
+impl From<TaskSpec> for HumanTaskSpec {
+    fn from(spec: TaskSpec) -> Self {
+        match spec {
+            TaskSpec::Command { program, args, env, working_dir, stdin } => {
+                HumanTaskSpec::Command { program, args, env, working_dir, stdin }
+            }
+            TaskSpec::ShellScript { script, interpreter, env } => {
+                HumanTaskSpec::ShellScript { script, interpreter, env }
+            }
+            TaskSpec::RustCompilation { crate_name, source_files, compiler_flags, target_dir } => {
+                HumanTaskSpec::RustCompilation { crate_name, source_files, compiler_flags, target_dir }
+            }
+            TaskSpec::GpuCompute { kernel_name, input_data, work_group_size, simulated_matrix_dim, compute_intensity } => {
+                HumanTaskSpec::GpuCompute { kernel_name, input_data, work_group_size, simulated_matrix_dim, compute_intensity }
+            }
+            TaskSpec::BuiltinTest { test_name, iterations, duration_ms, should_fail, require_gpu } => {
+                HumanTaskSpec::BuiltinTest { test_name, iterations, duration_ms, should_fail, require_gpu }
+            }
+        }
+    }
+}
+
+impl From<HumanTaskSpec> for TaskSpec {
+    fn from(spec: HumanTaskSpec) -> Self {
+        match spec {
+            HumanTaskSpec::Command { program, args, env, working_dir, stdin } => {
+                TaskSpec::Command { program, args, env, working_dir, stdin }
+            }
+            HumanTaskSpec::ShellScript { script, interpreter, env } => {
+                TaskSpec::ShellScript { script, interpreter, env }
+            }
+            HumanTaskSpec::RustCompilation { crate_name, source_files, compiler_flags, target_dir } => {
+                TaskSpec::RustCompilation { crate_name, source_files, compiler_flags, target_dir }
+            }
+            HumanTaskSpec::GpuCompute { kernel_name, input_data, work_group_size, simulated_matrix_dim, compute_intensity } => {
+                TaskSpec::GpuCompute { kernel_name, input_data, work_group_size, simulated_matrix_dim, compute_intensity }
+            }
+            HumanTaskSpec::BuiltinTest { test_name, iterations, duration_ms, should_fail, require_gpu } => {
+                TaskSpec::BuiltinTest { test_name, iterations, duration_ms, should_fail, require_gpu }
+            }
+        }
+    }
+}
+
+impl From<TaskSpec> for BinaryTaskSpec {
+    fn from(spec: TaskSpec) -> Self {
+        match spec {
+            TaskSpec::Command { program, args, env, working_dir, stdin } => {
+                BinaryTaskSpec::Command { program, args, env, working_dir, stdin }
+            }
+            TaskSpec::ShellScript { script, interpreter, env } => {
+                BinaryTaskSpec::ShellScript { script, interpreter, env }
+            }
+            TaskSpec::RustCompilation { crate_name, source_files, compiler_flags, target_dir } => {
+                BinaryTaskSpec::RustCompilation { crate_name, source_files, compiler_flags, target_dir }
+            }
+            TaskSpec::GpuCompute { kernel_name, input_data, work_group_size, simulated_matrix_dim, compute_intensity } => {
+                BinaryTaskSpec::GpuCompute { kernel_name, input_data, work_group_size, simulated_matrix_dim, compute_intensity }
+            }
+            TaskSpec::BuiltinTest { test_name, iterations, duration_ms, should_fail, require_gpu } => {
+                BinaryTaskSpec::BuiltinTest { test_name, iterations, duration_ms, should_fail, require_gpu }
+            }
+        }
+    }
+}
+
+impl From<BinaryTaskSpec> for TaskSpec {
+    fn from(spec: BinaryTaskSpec) -> Self {
+        match spec {
+            BinaryTaskSpec::Command { program, args, env, working_dir, stdin } => {
+                TaskSpec::Command { program, args, env, working_dir, stdin }
+            }
+            BinaryTaskSpec::ShellScript { script, interpreter, env } => {
+                TaskSpec::ShellScript { script, interpreter, env }
+            }
+            BinaryTaskSpec::RustCompilation { crate_name, source_files, compiler_flags, target_dir } => {
+                TaskSpec::RustCompilation { crate_name, source_files, compiler_flags, target_dir }
+            }
+            BinaryTaskSpec::GpuCompute { kernel_name, input_data, work_group_size, simulated_matrix_dim, compute_intensity } => {
+                TaskSpec::GpuCompute { kernel_name, input_data, work_group_size, simulated_matrix_dim, compute_intensity }
+            }
+            BinaryTaskSpec::BuiltinTest { test_name, iterations, duration_ms, should_fail, require_gpu } => {
+                TaskSpec::BuiltinTest { test_name, iterations, duration_ms, should_fail, require_gpu }
+            }
+        }
+    }
+}
+
+impl Serialize for TaskSpec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            HumanTaskSpec::from(self.clone()).serialize(serializer)
+        } else {
+            BinaryTaskSpec::from(self.clone()).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            HumanTaskSpec::deserialize(deserializer).map(Into::into)
+        } else {
+            BinaryTaskSpec::deserialize(deserializer).map(Into::into)
+        }
+    }
 }
 
 impl TaskSpec {
@@ -752,4 +945,64 @@ mod tests {
 
         assert_eq!(task, deserialized);
     }
+
+    #[test]
+    fn test_task_bincode_serialization_roundtrip() {
+        let specs = vec![
+            TaskSpec::new_command("cargo", vec!["build".into(), "--release".into()]),
+            TaskSpec::new_shell_script("echo 'testing bincode'"),
+            TaskSpec::RustCompilation {
+                crate_name: "test_crate".into(),
+                source_files: [("src/lib.rs".to_string(), "pub fn f() {}".to_string())]
+                    .into_iter()
+                    .collect(),
+                compiler_flags: vec!["--crate-type".into(), "lib".into()],
+                target_dir: None,
+            },
+            TaskSpec::GpuCompute {
+                kernel_name: "gemm".into(),
+                input_data: vec![1, 2, 3, 4, 5],
+                work_group_size: 32,
+                simulated_matrix_dim: 128,
+                compute_intensity: 50,
+            },
+            TaskSpec::BuiltinTest {
+                test_name: "quick_test".into(),
+                iterations: 500,
+                duration_ms: 10,
+                should_fail: false,
+                require_gpu: true,
+            },
+        ];
+
+        for spec in specs {
+            let req = TaskRequirements::generic(4, 60);
+            let task = Task::new(spec, req).with_tags(vec!["bincode".into()]);
+
+            let encoded = bincode::serialize(&task).expect("bincode serialization failed");
+            let decoded: Task = bincode::deserialize(&encoded).expect("bincode deserialization failed");
+
+            assert_eq!(task, decoded);
+        }
+    }
+
+    #[test]
+    fn test_task_requirements_max_retries() {
+        let req_default = TaskRequirements::default();
+        assert_eq!(req_default.max_retries, None);
+
+        let req_custom = TaskRequirements::generic(2, 30).with_max_retries(5);
+        assert_eq!(req_custom.max_retries, Some(5));
+
+        // Test JSON roundtrip preserves max_retries
+        let json = serde_json::to_string(&req_custom).unwrap();
+        let decoded: TaskRequirements = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.max_retries, Some(5));
+
+        // Test backward compatibility: JSON without max_retries field deserializes to None
+        let legacy_json = r#"{"cpu_cores":1,"ram_mb":512,"gpu_required":false,"timeout_secs":60}"#;
+        let decoded_legacy: TaskRequirements = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(decoded_legacy.max_retries, None);
+    }
 }
+

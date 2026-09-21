@@ -56,6 +56,7 @@ impl TaskState {
                 TaskState::Completed
                     | TaskState::Failed
                     | TaskState::Retrying
+                    | TaskState::Queued
                     | TaskState::Cancelled
             ),
             TaskState::Retrying => matches!(
@@ -625,14 +626,30 @@ impl TaskQueue {
 
     /// Reaps all tasks assigned to a disconnected or timed-out worker.
     ///
-    /// Active tasks (`Scheduled` or `Running`) are transitioned to `Retrying`
-    /// (if retries remain) or `Failed`. Returns the list of affected TaskIds.
-    pub async fn handle_worker_disconnected(&self, worker_id: &Uuid, reason: &str) -> Vec<TaskId> {
+    /// Active tasks (`Scheduled` or `Running`) are transitioned to `Retrying` or `Queued`
+    /// (if retries remain) or `Failed`.
+    /// If `immediate_reschedule` is true (e.g. graceful worker disconnect), tasks are
+    /// re-enqueued directly to `ready_queue` with 0ms delay.
+    /// Otherwise, exponential backoff is scheduled via `delayed_retries`.
+    /// Returns the list of affected TaskIds.
+    pub async fn handle_worker_disconnected(
+        &self,
+        worker_id: &Uuid,
+        reason: &str,
+        immediate_reschedule: bool,
+    ) -> Vec<TaskId> {
         let mut inner = self.inner.write().await;
-        let assigned = inner
+        let mut assigned = inner
             .worker_assignments
             .remove(worker_id)
             .unwrap_or_default();
+
+        // Defense-in-depth: Also capture any active task in inner.tasks assigned to this worker
+        for (id, entry) in &inner.tasks {
+            if entry.assigned_worker_id == Some(*worker_id) && entry.state.is_active() {
+                assigned.insert(*id);
+            }
+        }
 
         let now_instant = Instant::now();
         let now_epoch = Utc::now().timestamp() as u64;
@@ -640,38 +657,66 @@ impl TaskQueue {
 
         let mut affected = Vec::with_capacity(assigned.len());
         let mut delays_to_insert = Vec::new();
+        let mut ready_to_insert = Vec::new();
 
         for task_id in assigned {
             if let Some(entry) = inner.tasks.get_mut(&task_id) {
                 if entry.state.is_active() {
                     affected.push(task_id);
-                    if policy.retry_on_worker_disconnect && entry.retry_count < policy.max_retries {
-                        entry.retry_count += 1;
-                        let delay_ms = policy.calculate_backoff(entry.retry_count);
-                        let retry_after = now_instant + Duration::from_millis(delay_ms);
+                    // Check per-task max_retries override first, falling back to policy.max_retries
+                    let max_retries = entry
+                        .task
+                        .requirements
+                        .max_retries
+                        .unwrap_or(policy.max_retries);
 
-                        entry.state = TaskState::Retrying;
+                    if policy.retry_on_worker_disconnect && entry.retry_count < max_retries {
+                        entry.retry_count += 1;
+                        let delay_ms = if immediate_reschedule {
+                            0
+                        } else {
+                            policy.calculate_backoff(entry.retry_count)
+                        };
+
                         entry.assigned_worker_id = None;
-                        entry.retry_after_instant = Some(retry_after);
                         entry.retry_history.push(RetryAttempt {
                             attempt: entry.retry_count,
                             timestamp_utc: now_epoch,
                             failed_worker_id: Some(*worker_id),
                             reason: reason.to_string(),
                             exit_code: None,
-                            error: Some("Worker connection severed".into()),
+                            error: Some(format!("Worker evicted ({reason})")),
                         });
 
-                        delays_to_insert.push(DelayedRetryKey {
-                            retry_after,
-                            task_id,
-                        });
+                        if delay_ms == 0 {
+                            // Immediate re-enqueue straight to ready_queue
+                            entry.state = TaskState::Queued;
+                            entry.scheduled_instant = None;
+                            entry.started_instant = None;
+                            entry.retry_after_instant = None;
+                            ready_to_insert.push(QueueOrderKey {
+                                priority_rev: Reverse(entry.priority),
+                                sequence: entry.sequence,
+                                task_id,
+                            });
+                        } else {
+                            // Delayed retry with exponential backoff
+                            let retry_after = now_instant + Duration::from_millis(delay_ms);
+                            entry.state = TaskState::Retrying;
+                            entry.retry_after_instant = Some(retry_after);
+                            delays_to_insert.push(DelayedRetryKey {
+                                retry_after,
+                                task_id,
+                            });
+                        }
                     } else {
+                        // Terminal Failed state
                         entry.state = TaskState::Failed;
+                        entry.assigned_worker_id = None;
                         entry.finished_instant = Some(now_instant);
                         let err_msg = format!(
-                            "Worker disconnected and retries exhausted ({}/{})",
-                            entry.retry_count, policy.max_retries
+                            "Task execution failed: maximum retry limit ({max_retries}) reached after worker eviction (Worker disconnected and retries exhausted ({}/{max_retries}), last failure on worker {worker_id}: {reason})",
+                            entry.retry_count
                         );
                         entry.error_message = Some(err_msg.clone());
                         let fail_result = TaskResult::failure(
@@ -691,6 +736,9 @@ impl TaskQueue {
 
         for key in delays_to_insert {
             inner.delayed_retries.insert(key);
+        }
+        for key in ready_to_insert {
+            inner.ready_queue.insert(key);
         }
 
         affected
@@ -990,7 +1038,7 @@ mod tests {
 
         // Worker drops
         let affected = queue
-            .handle_worker_disconnected(&worker_id, "Connection severed")
+            .handle_worker_disconnected(&worker_id, "Connection severed", false)
             .await;
         assert_eq!(affected, vec![task_id]);
         assert_eq!(
@@ -1050,7 +1098,7 @@ mod tests {
         let worker_id = Uuid::new_v4();
         let _ = queue.pop_and_schedule(worker_id, |_| true).await.unwrap();
 
-        let affected = queue.handle_worker_disconnected(&worker_id, "crash").await;
+        let affected = queue.handle_worker_disconnected(&worker_id, "crash", false).await;
         assert_eq!(affected, vec![task_id]);
         assert_eq!(queue.get_state(&task_id).await.unwrap(), TaskState::Failed);
         let res = queue
@@ -1063,5 +1111,59 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("retries exhausted"));
+    }
+
+    #[tokio::test]
+    async fn test_immediate_graceful_disconnect_and_per_task_max_retries() {
+        // Policy allows 5 retries by default
+        let policy = RetryPolicy {
+            max_retries: 5,
+            initial_backoff_ms: 10_000, // Large backoff to verify immediate bypasses it
+            ..Default::default()
+        };
+        let queue = TaskQueue::with_config(policy, None);
+
+        // Task with per-task max_retries = 1 override
+        let task = Task::new(
+            TaskSpec::command("echo", vec!["per_task".into()]),
+            TaskRequirements::generic(1, 10).with_max_retries(1),
+        );
+        let task_id = queue.submit(task).await.unwrap();
+        let worker_1 = Uuid::new_v4();
+        let _ = queue.pop_and_schedule(worker_1, |_| true).await.unwrap();
+        queue.mark_running(&task_id, worker_1).await.unwrap();
+
+        // Graceful disconnect (immediate_reschedule = true)
+        let affected = queue
+            .handle_worker_disconnected(&worker_1, "Graceful shutdown", true)
+            .await;
+        assert_eq!(affected, vec![task_id]);
+
+        // State must immediately be Queued (ready for re-scheduling, 0ms delay)
+        assert_eq!(
+            queue.get_state(&task_id).await.unwrap(),
+            TaskState::Queued,
+            "Immediate reschedule must transition directly to Queued"
+        );
+
+        let info = queue.get_task(&task_id).await.unwrap();
+        assert_eq!(info.retry_count, 1);
+
+        // Schedule to worker 2
+        let worker_2 = Uuid::new_v4();
+        let sched = queue.pop_and_schedule(worker_2, |_| true).await;
+        assert!(sched.is_some(), "Task must be immediately schedulable");
+
+        // Worker 2 disconnects -> should exceed per-task max_retries (1) and fail!
+        let affected2 = queue
+            .handle_worker_disconnected(&worker_2, "Worker 2 crash", false)
+            .await;
+        assert_eq!(affected2, vec![task_id]);
+        assert_eq!(queue.get_state(&task_id).await.unwrap(), TaskState::Failed);
+
+        let res = queue.get_result(&task_id).await.unwrap();
+        assert_eq!(res.exit_code, 1);
+        let err = res.error.unwrap();
+        assert!(err.contains("maximum retry limit (1) reached"), "Must record max retry limit 1: {err}");
     }
 }

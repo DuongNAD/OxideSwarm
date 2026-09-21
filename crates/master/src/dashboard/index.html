@@ -1,0 +1,1233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OxideSwarm Observability Dashboard</title>
+  <style>
+    :root {
+      --bg-space: #070a12;
+      --bg-panel: #0d1322;
+      --bg-card: #131b2e;
+      --bg-card-hover: #19243d;
+      --border-color: rgba(255, 255, 255, 0.08);
+      --border-accent: rgba(6, 182, 212, 0.3);
+      --text-main: #f8fafc;
+      --text-sub: #94a3b8;
+      --text-dim: #64748b;
+      --cyan: #06b6d4;
+      --blue: #3b82f6;
+      --emerald: #10b981;
+      --amber: #f59e0b;
+      --rose: #f43f5e;
+      --purple: #a855f7;
+      --lime: #84cc16;
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Monaco, Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg-space);
+      color: var(--text-main);
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.5;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow-x: hidden;
+    }
+
+    /* Header */
+    header {
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border-color);
+      padding: 12px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .brand-icon {
+      font-size: 22px;
+      color: var(--cyan);
+      filter: drop-shadow(0 0 8px rgba(6, 182, 212, 0.6));
+    }
+    .brand-title {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      color: var(--text-main);
+    }
+    .brand-subtitle {
+      font-size: 11px;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      font-family: var(--font-mono);
+    }
+    .header-meta {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .meta-pill {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 9999px;
+      padding: 4px 12px;
+      font-size: 12px;
+      font-family: var(--font-mono);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-sub);
+    }
+    .status-pill {
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      color: var(--emerald);
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    .status-pill.live .status-dot {
+      box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+      animation: pulse-green 2s infinite;
+    }
+    .status-pill.reconnecting {
+      background: rgba(245, 158, 11, 0.1);
+      border-color: rgba(245, 158, 11, 0.3);
+      color: var(--amber);
+    }
+    .status-pill.reconnecting .status-dot {
+      animation: blink 1s infinite;
+    }
+    .status-pill.disconnected {
+      background: rgba(244, 63, 94, 0.1);
+      border-color: rgba(244, 63, 94, 0.3);
+      color: var(--rose);
+    }
+
+    @keyframes pulse-green {
+      0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+      70% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+    }
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+
+    /* Container */
+    main {
+      flex: 1;
+      max-width: 1440px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 20px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    /* KPI Grid */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+    }
+    .kpi-card {
+      background: var(--bg-panel);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      position: relative;
+      overflow: hidden;
+    }
+    .kpi-card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: var(--cyan);
+      opacity: 0.7;
+    }
+    .kpi-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      color: var(--text-dim);
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .kpi-value {
+      font-size: 28px;
+      font-weight: 700;
+      font-family: var(--font-mono);
+      color: var(--text-main);
+    }
+    .kpi-sub {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 12px;
+      color: var(--text-sub);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-family: var(--font-mono);
+      font-weight: 500;
+    }
+    .badge-emerald { background: rgba(16, 185, 129, 0.15); color: var(--emerald); }
+    .badge-amber { background: rgba(245, 158, 11, 0.15); color: var(--amber); }
+    .badge-rose { background: rgba(244, 63, 94, 0.15); color: var(--rose); }
+    .badge-cyan { background: rgba(6, 182, 212, 0.15); color: var(--cyan); }
+    .badge-purple { background: rgba(168, 85, 247, 0.15); color: var(--purple); }
+    .badge-blue { background: rgba(59, 130, 246, 0.15); color: var(--blue); }
+    .badge-lime { background: rgba(132, 204, 22, 0.15); color: var(--lime); }
+    .badge-dim { background: rgba(255, 255, 255, 0.05); color: var(--text-dim); }
+
+    /* Progress bar */
+    .progress-track {
+      width: 100%;
+      height: 6px;
+      background: var(--bg-card);
+      border-radius: 999px;
+      overflow: hidden;
+      margin-top: 4px;
+    }
+    .progress-fill {
+      height: 100%;
+      border-radius: 999px;
+      transition: width 0.4s ease, background-color 0.4s ease;
+    }
+
+    /* Section Layout */
+    .section-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .section-title .count {
+      color: var(--cyan);
+      font-family: var(--font-mono);
+      font-size: 14px;
+    }
+
+    /* Worker Cards Grid */
+    .workers-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 16px;
+    }
+    .worker-card {
+      background: var(--bg-panel);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      transition: border-color 0.2s, background 0.2s;
+    }
+    .worker-card:hover {
+      border-color: var(--border-accent);
+      background: var(--bg-card);
+    }
+    .worker-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .worker-name {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-main);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .worker-id {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-dim);
+      cursor: pointer;
+    }
+    .worker-id:hover {
+      color: var(--cyan);
+      text-decoration: underline;
+    }
+    .telemetry-row {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .telemetry-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--text-sub);
+    }
+    .worker-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 4px;
+    }
+    .worker-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11px;
+      color: var(--text-dim);
+      font-family: var(--font-mono);
+      border-top: 1px solid var(--border-color);
+      padding-top: 8px;
+    }
+
+    /* Tasks Panel */
+    .tasks-panel {
+      background: var(--bg-panel);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .tasks-toolbar {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      background: rgba(0, 0, 0, 0.2);
+    }
+    .filter-tabs {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .tab-btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-sub);
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+      cursor: pointer;
+      font-family: var(--font-sans);
+      transition: all 0.2s;
+    }
+    .tab-btn:hover {
+      color: var(--text-main);
+      border-color: var(--border-accent);
+    }
+    .tab-btn.active {
+      background: var(--cyan);
+      color: var(--bg-space);
+      border-color: var(--cyan);
+      font-weight: 600;
+    }
+    .search-input {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      border-radius: 4px;
+      padding: 5px 12px;
+      font-size: 12px;
+      outline: none;
+      min-width: 220px;
+    }
+    .search-input:focus {
+      border-color: var(--cyan);
+    }
+    .table-container {
+      overflow-x: auto;
+      max-height: 420px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      text-align: left;
+    }
+    th {
+      background: var(--bg-card);
+      color: var(--text-dim);
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      padding: 10px 14px;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      border-bottom: 1px solid var(--border-color);
+    }
+    td {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border-color);
+      color: var(--text-sub);
+    }
+    tr:hover td {
+      background: rgba(255, 255, 255, 0.02);
+      color: var(--text-main);
+    }
+    .cell-mono {
+      font-family: var(--font-mono);
+      font-size: 12px;
+    }
+
+    /* Live Event Console */
+    .console-panel {
+      background: #040711;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .console-header {
+      background: #090e1d;
+      border-bottom: 1px solid var(--border-color);
+      padding: 8px 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+      font-family: var(--font-mono);
+      color: var(--text-sub);
+    }
+    .console-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .console-btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-sub);
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .console-btn:hover {
+      color: var(--text-main);
+      border-color: var(--border-accent);
+    }
+    .console-body {
+      padding: 12px 16px;
+      max-height: 220px;
+      overflow-y: auto;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .console-line {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+      line-height: 1.4;
+      word-break: break-all;
+    }
+    .log-time { color: var(--text-dim); flex-shrink: 0; }
+    .log-tag { font-weight: 600; flex-shrink: 0; }
+    .log-msg { color: var(--text-sub); }
+
+    /* Utilities */
+    .empty-state {
+      padding: 32px 16px;
+      text-align: center;
+      color: var(--text-dim);
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <!-- Top Cockpit Header -->
+  <header>
+    <div class="brand">
+      <div class="brand-icon">⚡</div>
+      <div>
+        <div class="brand-title">OxideSwarm Cockpit</div>
+        <div class="brand-subtitle">Distributed Cluster Telemetry</div>
+      </div>
+    </div>
+    <div class="header-meta">
+      <div id="statusPill" class="meta-pill status-pill live">
+        <span class="status-dot"></span>
+        <span id="statusText">CONNECTING...</span>
+      </div>
+      <div class="meta-pill">
+        <span>Master:</span>
+        <span id="masterAddr" style="color: var(--cyan);">-</span>
+      </div>
+      <div class="meta-pill">
+        <span>Uptime:</span>
+        <span id="clusterUptime">-</span>
+      </div>
+      <div class="meta-pill">
+        <span>Version:</span>
+        <span id="clusterVersion">-</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- KPI Summary Cards -->
+    <div class="kpi-grid">
+      <!-- Workers Card -->
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span>Worker Nodes</span>
+          <span class="badge badge-cyan" id="kpiWorkersTotalBadge">0 Total</span>
+        </div>
+        <div class="kpi-value" id="kpiWorkersTotal">0</div>
+        <div class="kpi-sub">
+          <span class="badge badge-emerald" id="kpiWorkersConnected">0 Connected</span>
+          <span class="badge badge-amber" id="kpiWorkersBusy">0 Busy</span>
+          <span class="badge badge-rose" id="kpiWorkersDisconnected">0 Disconnected</span>
+        </div>
+      </div>
+
+      <!-- Cluster CPU Card -->
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span>Cluster Compute (CPU)</span>
+          <span class="badge badge-purple" id="kpiCpuCores">0 Cores</span>
+        </div>
+        <div class="kpi-value" id="kpiCpuPct">0.0%</div>
+        <div class="progress-track">
+          <div id="kpiCpuFill" class="progress-fill" style="width: 0%; background: var(--emerald);"></div>
+        </div>
+        <div class="kpi-sub" style="margin-top: 4px;">
+          <span id="kpiAntiStutter" class="badge badge-dim">Anti-Stutter: Nominal (&lt;85%)</span>
+        </div>
+      </div>
+
+      <!-- Cluster RAM Card -->
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span>Cluster Memory (RAM)</span>
+          <span class="badge badge-blue" id="kpiRamAvailable">0 MB Avail</span>
+        </div>
+        <div class="kpi-value" id="kpiRamUsage">0%</div>
+        <div class="progress-track">
+          <div id="kpiRamFill" class="progress-fill" style="width: 0%; background: var(--blue);"></div>
+        </div>
+        <div class="kpi-sub" style="margin-top: 4px;">
+          <span id="kpiRamStats">0 / 0 MB in use</span>
+        </div>
+      </div>
+
+      <!-- Task Pipeline Card -->
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span>Task Pipeline</span>
+          <span class="badge badge-cyan" id="kpiTasksTotalBadge">0 Total</span>
+        </div>
+        <div class="kpi-value" id="kpiTasksTotal">0</div>
+        <div class="kpi-sub">
+          <span class="badge badge-blue" id="kpiTasksQueued">0 Queued</span>
+          <span class="badge badge-amber" id="kpiTasksRunning">0 Running</span>
+          <span class="badge badge-purple" id="kpiTasksRetrying">0 Retrying</span>
+          <span class="badge badge-emerald" id="kpiTasksCompleted">0 Done</span>
+          <span class="badge badge-rose" id="kpiTasksFailed">0 Failed</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Worker Nodes Section -->
+    <section>
+      <div class="section-title">
+        <span>Active Worker Nodes</span>
+        <span class="count" id="workerCountTitle">(0)</span>
+      </div>
+      <div class="workers-grid" id="workersGrid">
+        <div class="empty-state">No workers currently registered. Start a worker with <code>rusty-grid worker</code>.</div>
+      </div>
+    </section>
+
+    <!-- Task Queue Table Section -->
+    <section class="tasks-panel">
+      <div class="tasks-toolbar">
+        <div class="filter-tabs">
+          <button class="tab-btn active" data-filter="all" onclick="setTaskFilter('all')">All (<span id="countFilterAll">0</span>)</button>
+          <button class="tab-btn" data-filter="pending" onclick="setTaskFilter('pending')">Pending (<span id="countFilterPending">0</span>)</button>
+          <button class="tab-btn" data-filter="running" onclick="setTaskFilter('running')">Running (<span id="countFilterRunning">0</span>)</button>
+          <button class="tab-btn" data-filter="completed" onclick="setTaskFilter('completed')">Completed (<span id="countFilterCompleted">0</span>)</button>
+          <button class="tab-btn" data-filter="failed" onclick="setTaskFilter('failed')">Failed / Retried (<span id="countFilterFailed">0</span>)</button>
+        </div>
+        <input type="text" id="taskSearch" class="search-input" placeholder="Filter tasks (ID, worker, error)..." oninput="handleTaskSearch(this.value)">
+      </div>
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Task ID</th>
+              <th>Type</th>
+              <th>Prio</th>
+              <th>GPU Req</th>
+              <th>Assigned Worker</th>
+              <th>Retries</th>
+              <th>State</th>
+              <th>Duration</th>
+              <th>Details</th>
+            </tr>
+          </thead>
+          <tbody id="tasksTableBody">
+            <tr>
+              <td colspan="9" class="empty-state">No tasks recorded in pipeline.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Live Event Console -->
+    <section class="console-panel">
+      <div class="console-header">
+        <span>LIVE TELEMETRY EVENT STREAM</span>
+        <div class="console-actions">
+          <label style="display:flex;align-items:center;gap:4px;cursor:pointer;">
+            <input type="checkbox" id="autoScrollCheck" checked onchange="toggleAutoScroll(this.checked)">
+            <span>Auto-scroll</span>
+          </label>
+          <button class="console-btn" onclick="clearConsole()">Clear</button>
+        </div>
+      </div>
+      <div class="console-body" id="consoleBody"></div>
+    </section>
+  </main>
+
+  <script>
+    // State Store
+    const state = {
+      connected: false,
+      masterAddr: '',
+      uptimeSecs: 0,
+      version: '0.1.0',
+      workers: new Map(), // worker_id -> WorkerInfo
+      tasks: new Map(),   // task_id -> TaskInfo
+      stats: { total: 0, queued: 0, scheduled: 0, running: 0, retrying: 0, completed: 0, failed: 0, cancelled: 0 },
+      taskFilter: 'all',
+      taskSearchQuery: '',
+      autoScroll: true,
+      maxLogLines: 200,
+      uptimeTimer: null,
+    };
+
+    // DOM References
+    const dom = {
+      statusPill: document.getElementById('statusPill'),
+      statusText: document.getElementById('statusText'),
+      masterAddr: document.getElementById('masterAddr'),
+      clusterUptime: document.getElementById('clusterUptime'),
+      clusterVersion: document.getElementById('clusterVersion'),
+      kpiWorkersTotal: document.getElementById('kpiWorkersTotal'),
+      kpiWorkersTotalBadge: document.getElementById('kpiWorkersTotalBadge'),
+      kpiWorkersConnected: document.getElementById('kpiWorkersConnected'),
+      kpiWorkersBusy: document.getElementById('kpiWorkersBusy'),
+      kpiWorkersDisconnected: document.getElementById('kpiWorkersDisconnected'),
+      kpiCpuCores: document.getElementById('kpiCpuCores'),
+      kpiCpuPct: document.getElementById('kpiCpuPct'),
+      kpiCpuFill: document.getElementById('kpiCpuFill'),
+      kpiAntiStutter: document.getElementById('kpiAntiStutter'),
+      kpiRamAvailable: document.getElementById('kpiRamAvailable'),
+      kpiRamUsage: document.getElementById('kpiRamUsage'),
+      kpiRamFill: document.getElementById('kpiRamFill'),
+      kpiRamStats: document.getElementById('kpiRamStats'),
+      kpiTasksTotal: document.getElementById('kpiTasksTotal'),
+      kpiTasksTotalBadge: document.getElementById('kpiTasksTotalBadge'),
+      kpiTasksQueued: document.getElementById('kpiTasksQueued'),
+      kpiTasksRunning: document.getElementById('kpiTasksRunning'),
+      kpiTasksRetrying: document.getElementById('kpiTasksRetrying'),
+      kpiTasksCompleted: document.getElementById('kpiTasksCompleted'),
+      kpiTasksFailed: document.getElementById('kpiTasksFailed'),
+      workerCountTitle: document.getElementById('workerCountTitle'),
+      workersGrid: document.getElementById('workersGrid'),
+      tasksTableBody: document.getElementById('tasksTableBody'),
+      countFilterAll: document.getElementById('countFilterAll'),
+      countFilterPending: document.getElementById('countFilterPending'),
+      countFilterRunning: document.getElementById('countFilterRunning'),
+      countFilterCompleted: document.getElementById('countFilterCompleted'),
+      countFilterFailed: document.getElementById('countFilterFailed'),
+      consoleBody: document.getElementById('consoleBody'),
+      autoScrollCheck: document.getElementById('autoScrollCheck'),
+    };
+
+    // WebSocket Management with Exponential Backoff
+    let ws = null;
+    let reconnectDelay = 500;
+    const maxReconnectDelay = 10000;
+
+    function connectWebSocket() {
+      const loc = window.location;
+      const wsProtocol = loc.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${wsProtocol}//${loc.host}/ws`;
+
+      logConsole('WS_CONNECT', 'blue', `Connecting to telemetry stream at ${wsUrl}...`);
+      setStatus('connecting', 'CONNECTING...');
+
+      try {
+        ws = new WebSocket(wsUrl);
+      } catch (err) {
+        handleWsClose();
+        return;
+      }
+
+      ws.onopen = () => {
+        state.connected = true;
+        reconnectDelay = 500;
+        setStatus('live', 'LIVE WEBSOCKET');
+        logConsole('WS_OPEN', 'emerald', 'WebSocket connection established (HTTP 101)');
+      };
+
+      ws.onclose = () => {
+        handleWsClose();
+      };
+
+      ws.onerror = (e) => {
+        setStatus('reconnecting', 'CONNECTION ERROR');
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          handleStreamMessage(msg);
+        } catch (e) {
+          logConsole('PARSE_ERR', 'rose', `Failed to parse frame: ${e.message}`);
+        }
+      };
+    }
+
+    function handleWsClose() {
+      state.connected = false;
+      setStatus('reconnecting', `RECONNECTING (${Math.round(reconnectDelay/1000)}s)...`);
+      logConsole('WS_CLOSE', 'amber', `Telemetry stream disconnected. Reconnecting in ${reconnectDelay}ms...`);
+      setTimeout(connectWebSocket, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 1.8, maxReconnectDelay);
+    }
+
+    function setStatus(mode, text) {
+      dom.statusPill.className = `meta-pill status-pill ${mode}`;
+      dom.statusText.textContent = text;
+    }
+
+    // Stream Message Dispatcher
+    function handleStreamMessage(msg) {
+      if (!msg || !msg.type) return;
+
+      switch (msg.type) {
+        case 'Snapshot': {
+          const snap = msg.data;
+          state.version = snap.version || state.version;
+          state.uptimeSecs = snap.uptime_secs || 0;
+          state.masterAddr = (snap.status && snap.status.master_addr) || window.location.host;
+          dom.masterAddr.textContent = state.masterAddr;
+          dom.clusterVersion.textContent = state.version;
+
+          state.workers.clear();
+          if (Array.isArray(snap.workers)) {
+            for (const w of snap.workers) {
+              state.workers.set(w.worker_id, w);
+            }
+          }
+
+          state.tasks.clear();
+          if (Array.isArray(snap.tasks)) {
+            for (const t of snap.tasks) {
+              state.tasks.set(t.task_id, t);
+            }
+          }
+
+          if (snap.status && snap.status.tasks) {
+            state.stats = snap.status.tasks;
+          }
+
+          renderAll();
+          logConsole('SNAPSHOT', 'cyan', `Initial snapshot loaded: ${state.workers.size} workers, ${state.tasks.size} tasks`);
+          break;
+        }
+
+        case 'WorkerHeartbeat': {
+          const d = msg.data;
+          const worker = state.workers.get(d.worker_id);
+          if (worker) {
+            worker.cpu_usage_pct = d.cpu_usage_pct;
+            worker.ram_available_mb = d.ram_available_mb;
+            worker.active_tasks = d.active_tasks;
+            worker.last_heartbeat_timestamp = d.timestamp;
+            updateWorkerCardInDom(worker);
+            renderKpis();
+          }
+          break;
+        }
+
+        case 'WorkerRegistered': {
+          const w = msg.data;
+          state.workers.set(w.worker_id, w);
+          renderWorkers();
+          renderKpis();
+          logConsole('WORKER_JOIN', 'emerald', `Worker registered: ${w.capabilities ? w.capabilities.name : w.worker_id} (${w.worker_id.substring(0,8)})`);
+          break;
+        }
+
+        case 'WorkerDisconnected': {
+          const d = msg.data;
+          const w = state.workers.get(d.worker_id);
+          if (w) {
+            w.status = 'Disconnected';
+            w.active_tasks = 0;
+            updateWorkerCardInDom(w);
+            renderKpis();
+          }
+          logConsole('WORKER_LEAVE', 'rose', `Worker disconnected: ${d.worker_id.substring(0,8)} - ${d.reason}`);
+          break;
+        }
+
+        case 'TaskUpdated': {
+          const t = msg.data;
+          state.tasks.set(t.task_id, t);
+          renderTasks();
+          renderKpis();
+          const stateColor = getTaskStateColor(t.state);
+          logConsole('TASK_UPDATE', stateColor, `Task ${t.task_id.substring(0,8)} state -> ${t.state} (retries: ${t.retry_count})`);
+          break;
+        }
+
+        case 'StatsUpdated': {
+          state.stats = msg.data;
+          renderKpis();
+          break;
+        }
+
+        default:
+          break;
+      }
+    }
+
+    // Render Helpers
+    function renderAll() {
+      renderKpis();
+      renderWorkers();
+      renderTasks();
+    }
+
+    function renderKpis() {
+      let totalWorkers = state.workers.size;
+      let connected = 0, busy = 0, disconnected = 0;
+      let totalCores = 0;
+      let weightedCpuSum = 0;
+      let totalRamMb = 0;
+      let availableRamMb = 0;
+      let highestCpu = 0;
+
+      for (const w of state.workers.values()) {
+        const isConn = w.status === 'Connected' || w.status === 'Busy';
+        if (w.status === 'Connected') connected++;
+        else if (w.status === 'Busy') busy++;
+        else disconnected++;
+
+        if (isConn && w.capabilities) {
+          const cores = w.capabilities.cpu_cores || 1;
+          totalCores += cores;
+          const cpu = w.cpu_usage_pct || 0;
+          weightedCpuSum += cpu * cores;
+          if (cpu > highestCpu) highestCpu = cpu;
+
+          const totalRam = w.capabilities.ram_mb || 0;
+          totalRamMb += totalRam;
+          availableRamMb += (w.ram_available_mb || totalRam);
+        }
+      }
+
+      const avgCpu = totalCores > 0 ? (weightedCpuSum / totalCores) : 0;
+      const usedRamMb = Math.max(0, totalRamMb - availableRamMb);
+      const ramUsagePct = totalRamMb > 0 ? Math.round((usedRamMb / totalRamMb) * 100) : 0;
+
+      // Workers KPI
+      dom.kpiWorkersTotal.textContent = totalWorkers;
+      dom.kpiWorkersTotalBadge.textContent = `${totalWorkers} Total`;
+      dom.kpiWorkersConnected.textContent = `${connected} Connected`;
+      dom.kpiWorkersBusy.textContent = `${busy} Busy`;
+      dom.kpiWorkersDisconnected.textContent = `${disconnected} Disconnected`;
+
+      // CPU KPI
+      dom.kpiCpuCores.textContent = `${totalCores} Cores`;
+      dom.kpiCpuPct.textContent = `${avgCpu.toFixed(1)}%`;
+      dom.kpiCpuFill.style.width = `${Math.min(100, avgCpu)}%`;
+      dom.kpiCpuFill.style.backgroundColor = avgCpu > 85 ? 'var(--rose)' : (avgCpu > 60 ? 'var(--amber)' : 'var(--emerald)');
+      if (highestCpu >= 85) {
+        dom.kpiAntiStutter.className = 'badge badge-rose';
+        dom.kpiAntiStutter.textContent = `⚠️ Host Backpressure Active (Max ${highestCpu.toFixed(0)}%)`;
+      } else {
+        dom.kpiAntiStutter.className = 'badge badge-dim';
+        dom.kpiAntiStutter.textContent = `Anti-Stutter: Nominal (<85%)`;
+      }
+
+      // RAM KPI
+      dom.kpiRamAvailable.textContent = `${(availableRamMb / 1024).toFixed(1)} GB Avail`;
+      dom.kpiRamUsage.textContent = `${ramUsagePct}%`;
+      dom.kpiRamFill.style.width = `${ramUsagePct}%`;
+      dom.kpiRamStats.textContent = `${(usedRamMb/1024).toFixed(1)} / ${(totalRamMb/1024).toFixed(1)} GB in use`;
+
+      // Tasks KPI
+      dom.kpiTasksTotal.textContent = state.stats.total || state.tasks.size;
+      dom.kpiTasksTotalBadge.textContent = `${state.stats.total || state.tasks.size} Total`;
+      dom.kpiTasksQueued.textContent = `${state.stats.queued || 0} Queued`;
+      dom.kpiTasksRunning.textContent = `${state.stats.running || 0} Running`;
+      dom.kpiTasksRetrying.textContent = `${state.stats.retrying || 0} Retrying`;
+      dom.kpiTasksCompleted.textContent = `${state.stats.completed || 0} Done`;
+      dom.kpiTasksFailed.textContent = `${state.stats.failed || 0} Failed`;
+
+      // Update Toolbar Filter Counts
+      updateFilterCounts();
+    }
+
+    function renderWorkers() {
+      dom.workerCountTitle.textContent = `(${state.workers.size})`;
+      if (state.workers.size === 0) {
+        dom.workersGrid.innerHTML = `<div class="empty-state">No workers currently registered. Start a worker with <code>rusty-grid worker</code>.</div>`;
+        return;
+      }
+
+      dom.workersGrid.innerHTML = '';
+      for (const w of state.workers.values()) {
+        dom.workersGrid.appendChild(createWorkerCardElement(w));
+      }
+    }
+
+    function createWorkerCardElement(w) {
+      const card = document.createElement('div');
+      card.className = 'worker-card';
+      card.id = `worker-${w.worker_id}`;
+
+      const caps = w.capabilities || {};
+      const statusBadge = getStatusBadge(w.status);
+      const cpuPct = (w.cpu_usage_pct || 0).toFixed(1);
+      const ramAvail = w.ram_available_mb || caps.ram_mb || 0;
+      const ramTotal = caps.ram_mb || 0;
+      const ramPct = ramTotal > 0 ? Math.round(((ramTotal - ramAvail) / ramTotal) * 100) : 0;
+      const cpuColor = w.cpu_usage_pct > 85 ? 'var(--rose)' : (w.cpu_usage_pct > 60 ? 'var(--amber)' : 'var(--emerald)');
+
+      // Badges
+      let gpuHtml = '<span class="badge badge-dim">CPU Only</span>';
+      if (caps.has_gpu) {
+        if (caps.is_simulated_gpu) {
+          gpuHtml = '<span class="badge badge-cyan">🎮 Simulated GPU</span>';
+        } else {
+          gpuHtml = `<span class="badge badge-purple">⚡ ${caps.gpu_device_name || 'GPU Active'}</span>`;
+        }
+      }
+
+      let mobileHtml = '';
+      if (caps.mobile) {
+        const m = caps.mobile;
+        const charging = m.is_charging ? ' ⚡' : '';
+        const throttled = m.thermal_throttled ? ' 🔥 Throttled' : '';
+        mobileHtml = `<span class="badge badge-lime">📱 Android ${m.os_version || ''} (${m.battery_pct}%${charging}${throttled})</span>`;
+      }
+
+      const activeTasks = w.active_tasks || 0;
+
+      card.innerHTML = `
+        <div class="worker-top">
+          <div>
+            <div class="worker-name">${escapeHtml(caps.name || 'Worker Node')}</div>
+            <div class="worker-id" title="Click to copy full UUID" onclick="copyToClipboard('${w.worker_id}')">${w.worker_id.substring(0, 13)}...</div>
+          </div>
+          ${statusBadge}
+        </div>
+        <div class="telemetry-row">
+          <div class="telemetry-label">
+            <span>CPU Load (${caps.cpu_cores || 1} Cores)</span>
+            <span id="w-cpu-val-${w.worker_id}" style="color: ${cpuColor}; font-family: var(--font-mono);">${cpuPct}%</span>
+          </div>
+          <div class="progress-track">
+            <div id="w-cpu-bar-${w.worker_id}" class="progress-fill" style="width: ${Math.min(100, w.cpu_usage_pct || 0)}%; background: ${cpuColor};"></div>
+          </div>
+        </div>
+        <div class="telemetry-row">
+          <div class="telemetry-label">
+            <span>Memory (${ramAvail} / ${ramTotal} MB)</span>
+            <span id="w-ram-val-${w.worker_id}" style="font-family: var(--font-mono);">${ramPct}%</span>
+          </div>
+          <div class="progress-track">
+            <div id="w-ram-bar-${w.worker_id}" class="progress-fill" style="width: ${ramPct}%; background: var(--blue);"></div>
+          </div>
+        </div>
+        <div class="worker-tags">
+          ${gpuHtml}
+          ${mobileHtml}
+          <span class="badge badge-dim" id="w-tasks-${w.worker_id}">${activeTasks} active task${activeTasks === 1 ? '' : 's'}</span>
+        </div>
+        <div class="worker-footer">
+          <span>Addr: ${escapeHtml(w.remote_addr || '127.0.0.1')}</span>
+          <span id="w-fresh-${w.worker_id}">Freshness: < 1s</span>
+        </div>
+      `;
+      return card;
+    }
+
+    function updateWorkerCardInDom(w) {
+      const card = document.getElementById(`worker-${w.worker_id}`);
+      if (!card) {
+        renderWorkers();
+        return;
+      }
+      const caps = w.capabilities || {};
+      const cpuVal = document.getElementById(`w-cpu-val-${w.worker_id}`);
+      const cpuBar = document.getElementById(`w-cpu-bar-${w.worker_id}`);
+      const ramVal = document.getElementById(`w-ram-val-${w.worker_id}`);
+      const ramBar = document.getElementById(`w-ram-bar-${w.worker_id}`);
+      const tasksEl = document.getElementById(`w-tasks-${w.worker_id}`);
+
+      const cpuPct = (w.cpu_usage_pct || 0).toFixed(1);
+      const cpuColor = w.cpu_usage_pct > 85 ? 'var(--rose)' : (w.cpu_usage_pct > 60 ? 'var(--amber)' : 'var(--emerald)');
+      if (cpuVal) {
+        cpuVal.textContent = `${cpuPct}%`;
+        cpuVal.style.color = cpuColor;
+      }
+      if (cpuBar) {
+        cpuBar.style.width = `${Math.min(100, w.cpu_usage_pct || 0)}%`;
+        cpuBar.style.backgroundColor = cpuColor;
+      }
+
+      const ramAvail = w.ram_available_mb || caps.ram_mb || 0;
+      const ramTotal = caps.ram_mb || 0;
+      const ramPct = ramTotal > 0 ? Math.round(((ramTotal - ramAvail) / ramTotal) * 100) : 0;
+      if (ramVal) ramVal.textContent = `${ramPct}%`;
+      if (ramBar) ramBar.style.width = `${ramPct}%`;
+
+      const activeTasks = w.active_tasks || 0;
+      if (tasksEl) tasksEl.textContent = `${activeTasks} active task${activeTasks === 1 ? '' : 's'}`;
+    }
+
+    function renderTasks() {
+      const tbody = dom.tasksTableBody;
+      const tasksArray = Array.from(state.tasks.values());
+
+      let filtered = tasksArray.filter(t => {
+        if (state.taskFilter === 'pending' && !(t.state === 'Queued' || t.state === 'Submitted' || t.state === 'Scheduled')) return false;
+        if (state.taskFilter === 'running' && t.state !== 'Running') return false;
+        if (state.taskFilter === 'completed' && t.state !== 'Completed') return false;
+        if (state.taskFilter === 'failed' && !(t.state === 'Failed' || t.state === 'Retrying')) return false;
+
+        if (state.taskSearchQuery) {
+          const q = state.taskSearchQuery.toLowerCase();
+          const matchId = t.task_id.toLowerCase().includes(q);
+          const matchErr = (t.error_message || '').toLowerCase().includes(q);
+          const matchWorker = (t.assigned_worker_id || '').toLowerCase().includes(q);
+          if (!matchId && !matchErr && !matchWorker) return false;
+        }
+        return true;
+      });
+
+      if (filtered.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="9" class="empty-state">No tasks matching current filter.</td></tr>`;
+        return;
+      }
+
+      // Sort newest tasks first
+      filtered.sort((a, b) => (b.submitted_at_utc || 0) - (a.submitted_at_utc || 0));
+
+      tbody.innerHTML = '';
+      for (const t of filtered) {
+        const tr = document.createElement('tr');
+        const stateBadge = getTaskStateBadge(t.state);
+        const dur = t.execution_time_ms ? `${t.execution_time_ms.toLocaleString()} ms` : '-';
+        const workerSnippet = t.assigned_worker_id ? t.assigned_worker_id.substring(0, 8) : '-';
+        const errSnippet = t.error_message ? escapeHtml(t.error_message) : (t.exit_code !== undefined ? `Exit ${t.exit_code}` : 'OK');
+
+        tr.innerHTML = `
+          <td class="cell-mono"><span title="Click to copy" style="cursor:pointer;" onclick="copyToClipboard('${t.task_id}')">${t.task_id.substring(0, 8)}...</span></td>
+          <td><span class="badge badge-dim">${escapeHtml(t.spec_type || 'Command')}</span></td>
+          <td class="cell-mono">${t.priority || 0}</td>
+          <td>${t.gpu_required ? '<span class="badge badge-purple">Yes</span>' : '<span class="badge badge-dim">No</span>'}</td>
+          <td class="cell-mono">${workerSnippet}</td>
+          <td class="cell-mono">${t.retry_count || 0}</td>
+          <td>${stateBadge}</td>
+          <td class="cell-mono">${dur}</td>
+          <td style="max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${errSnippet}">${errSnippet}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    function updateFilterCounts() {
+      let pending = 0, running = 0, completed = 0, failed = 0;
+      for (const t of state.tasks.values()) {
+        if (t.state === 'Queued' || t.state === 'Submitted' || t.state === 'Scheduled') pending++;
+        else if (t.state === 'Running') running++;
+        else if (t.state === 'Completed') completed++;
+        else if (t.state === 'Failed' || t.state === 'Retrying') failed++;
+      }
+      dom.countFilterAll.textContent = state.tasks.size;
+      dom.countFilterPending.textContent = pending;
+      dom.countFilterRunning.textContent = running;
+      dom.countFilterCompleted.textContent = completed;
+      dom.countFilterFailed.textContent = failed;
+    }
+
+    function setTaskFilter(filter) {
+      state.taskFilter = filter;
+      document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.filter === filter);
+      });
+      renderTasks();
+    }
+
+    function handleTaskSearch(query) {
+      state.taskSearchQuery = query.trim();
+      renderTasks();
+    }
+
+    // Console Logging
+    function logConsole(tag, colorName, text) {
+      const now = new Date();
+      const timeStr = now.toTimeString().split(' ')[0] + '.' + String(now.getMilliseconds()).padStart(3, '0');
+
+      const line = document.createElement('div');
+      line.className = 'console-line';
+      line.innerHTML = `
+        <span class="log-time">[${timeStr}]</span>
+        <span class="log-tag" style="color: var(--${colorName});">[${tag}]</span>
+        <span class="log-msg">${escapeHtml(text)}</span>
+      `;
+
+      dom.consoleBody.appendChild(line);
+
+      // Prune old logs
+      while (dom.consoleBody.children.length > state.maxLogLines) {
+        dom.consoleBody.removeChild(dom.consoleBody.firstChild);
+      }
+
+      if (state.autoScroll) {
+        dom.consoleBody.scrollTop = dom.consoleBody.scrollHeight;
+      }
+    }
+
+    function clearConsole() {
+      dom.consoleBody.innerHTML = '';
+      logConsole('CONSOLE', 'cyan', 'Console logs cleared.');
+    }
+
+    function toggleAutoScroll(enabled) {
+      state.autoScroll = enabled;
+    }
+
+    // Badges & Formatting Helpers
+    function getStatusBadge(status) {
+      switch (status) {
+        case 'Connected': return '<span class="badge badge-emerald">Connected</span>';
+        case 'Busy': return '<span class="badge badge-amber">Busy</span>';
+        case 'Disconnected': return '<span class="badge badge-rose">Disconnected</span>';
+        default: return `<span class="badge badge-dim">${escapeHtml(status || 'Unknown')}</span>`;
+      }
+    }
+
+    function getTaskStateBadge(state) {
+      switch (state) {
+        case 'Queued': return '<span class="badge badge-blue">Queued</span>';
+        case 'Scheduled': return '<span class="badge badge-cyan">Scheduled</span>';
+        case 'Running': return '<span class="badge badge-amber">Running</span>';
+        case 'Completed': return '<span class="badge badge-emerald">Completed</span>';
+        case 'Failed': return '<span class="badge badge-rose">Failed</span>';
+        case 'Retrying': return '<span class="badge badge-purple">Retrying</span>';
+        case 'Cancelled': return '<span class="badge badge-dim">Cancelled</span>';
+        default: return `<span class="badge badge-dim">${escapeHtml(state || 'Unknown')}</span>`;
+      }
+    }
+
+    function getTaskStateColor(state) {
+      switch (state) {
+        case 'Completed': return 'emerald';
+        case 'Failed': return 'rose';
+        case 'Running': return 'amber';
+        case 'Retrying': return 'purple';
+        case 'Queued': return 'blue';
+        default: return 'cyan';
+      }
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function copyToClipboard(text) {
+      navigator.clipboard.writeText(text).then(() => {
+        logConsole('CLIPBOARD', 'cyan', `Copied to clipboard: ${text}`);
+      });
+    }
+
+    // Uptime & Freshness Timer (1 Hz)
+    setInterval(() => {
+      if (state.uptimeSecs > 0) {
+        state.uptimeSecs++;
+        const hrs = String(Math.floor(state.uptimeSecs / 3600)).padStart(2, '0');
+        const mins = String(Math.floor((state.uptimeSecs % 3600) / 60)).padStart(2, '0');
+        const secs = String(state.uptimeSecs % 60).padStart(2, '0');
+        dom.clusterUptime.textContent = `${hrs}:${mins}:${secs}`;
+      }
+
+      // Update worker heartbeat freshness
+      const nowSec = Math.floor(Date.now() / 1000);
+      for (const w of state.workers.values()) {
+        const freshEl = document.getElementById(`w-fresh-${w.worker_id}`);
+        if (freshEl && w.last_heartbeat_timestamp) {
+          const delta = Math.max(0, nowSec - w.last_heartbeat_timestamp);
+          freshEl.textContent = `Freshness: ${delta}s ago`;
+          freshEl.style.color = delta > 10 ? 'var(--rose)' : 'var(--text-dim)';
+        }
+      }
+    }, 1000);
+
+    // Initial Launch
+    window.addEventListener('DOMContentLoaded', () => {
+      connectWebSocket();
+    });
+  </script>
+</body>
+</html>

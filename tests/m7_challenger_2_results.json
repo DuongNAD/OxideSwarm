@@ -1,0 +1,22 @@
+{
+  "c1": {
+    "tickets_match": true,
+    "p2p_registered": true,
+    "has_endpoint_dropped_err": false,
+    "has_handshake_fail_err": false,
+    "worker_log": "\u001b[2m2026-09-20T17:55:36.623909Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mrusty_grid_worker::client\u001b[0m\u001b[2m:\u001b[0m Worker client initialized \u001b[3mworker_id\u001b[0m\u001b[2m=\u001b[0m172513af-89f8-4c35-a8a0-df1aa25996f5 \u001b[3mname\u001b[0m\u001b[2m=\u001b[0mp2p_restart_worker \u001b[3mcpu_cores\u001b[0m\u001b[2m=\u001b[0m20 \u001b[3mram_mb\u001b[0m\u001b[2m=\u001b[0m8192 \u001b[3mhas_gpu\u001b[0m\u001b[2m=\u001b[0mfalse \u001b[3mis_simulated_gpu\u001b[0m\u001b[2m=\u001b[0mfalse\nRustyGrid Worker 172513af-89f8-4c35-a8a0-df1aa25996f5 initializing [Name: p2p_restart_worker, Cores: 20, RAM: 8192MB, GPU: false, Simulated: false]\n\u001b[2m2026-09-20T17:55:36.624615Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mrusty_grid_worker::client\u001b[0m\u001b[2m:\u001b[0m Connecting to Master via P2P NAT Traversal (iroh QUIC)...\n\u001b[2m2026-09-20T17:55:37.211489Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mendpoint\u001b[0m\u001b[1m{\u001b[0m\u001b[3mid\u001b[0m\u001b[2m=\u001b[0m4d17397167\u001b[1m}\u001b[0m\u001b[2m:\u001b[0m\u001b[1mrelay-actor\u001b[0m\u001b[2m:\u001b[0m \u001b[2miroh::socket::transports::relay::actor\u001b[0m\u001b[2m:\u001b[0m home is now relay https://aps1-1.relay.n0.iroh.link./, was None\n\u001b[2m2026-09-20T17:55:39.328750Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mrusty_grid_worker::client\u001b[0m\u001b[2m:\u001b[0m Connected to Master; initiating handshake \u001b[3mmaster\u001b[0m\u001b[2m=\u001b[0miroh://PublicKey(cc587a09413c2356182be3869283a7a7cefe4b3eb692231f0fddee59c08bf8cb) \u001b[3mworker_id\u001b[0m\u001b[2m=\u001b[0m172513af-89f8-4c35-a8a0-df1aa25996f5\n\u001b[2m2026-09-20T17:55:39.439017Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mrusty_grid_worker::client\u001b[0m\u001b[2m:\u001b[0m Worker successfully registered with Master \u001b[3mworker_id\u001b[0m\u001b[2m=\u001b[0m172513af-89f8-4c35-a8a0-df1aa25996f5 \u001b[3mheartbeat_interval_secs\u001b[0m\u001b[2m=\u001b[0m3\n"
+  },
+  "c2": {
+    "2a_alias": true,
+    "2b_env_var": true,
+    "2c_precedence": true,
+    "2d_config": true
+  },
+  "c3": {
+    "key_preserved": true,
+    "port_deleted": false,
+    "ticket_deleted": false,
+    "overall_cleanup_passed": false
+  },
+  "tcp_ctrl": true
+}

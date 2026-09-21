@@ -37,6 +37,10 @@ pub struct MasterFileConfig {
     pub preserve_gpu: Option<bool>,
     pub p2p: Option<bool>,
     pub p2p_ticket_file: Option<String>,
+    pub p2p_key_file: Option<String>,
+    pub wire_codec: Option<String>,
+    pub dashboard_port: Option<u16>,
+    pub dashboard_port_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -64,6 +68,7 @@ pub struct WorkerFileConfig {
     pub no_gpu: Option<bool>,
     pub simulate_gpu: Option<bool>,
     pub gpu_name: Option<String>,
+    pub wire_codec: Option<String>,
     #[serde(default)]
     pub hardware: Option<WorkerHardwareConfig>,
 }
@@ -215,6 +220,23 @@ pub fn resolve_u64(
     resolve_field(cli, env_names, file_val, default, |s| s.trim().parse().ok())
 }
 
+pub fn resolve_u32(
+    cli: Option<u32>,
+    env_names: &[&str],
+    file_val: Option<u32>,
+    default: u32,
+) -> u32 {
+    resolve_field(cli, env_names, file_val, default, |s| s.trim().parse().ok())
+}
+
+pub fn resolve_opt_u32(
+    cli: Option<u32>,
+    env_names: &[&str],
+    file_val: Option<u32>,
+) -> Option<u32> {
+    resolve_opt_field(cli, env_names, file_val, |s| s.trim().parse().ok())
+}
+
 pub fn resolve_usize(
     cli: Option<usize>,
     env_names: &[&str],
@@ -237,6 +259,14 @@ pub fn resolve_opt_u64(
     env_names: &[&str],
     file_val: Option<u64>,
 ) -> Option<u64> {
+    resolve_opt_field(cli, env_names, file_val, |s| s.trim().parse().ok())
+}
+
+pub fn resolve_opt_u16(
+    cli: Option<u16>,
+    env_names: &[&str],
+    file_val: Option<u16>,
+) -> Option<u16> {
     resolve_opt_field(cli, env_names, file_val, |s| s.trim().parse().ok())
 }
 
@@ -327,10 +357,59 @@ gpu_name = "Mock RTX"
         let json_str = r#"{
   "master": {
     "listen": "0.0.0.0:8888",
-    "preserve_gpu": false
+    "preserve_gpu": false,
+    "dashboard_port": 8080,
+    "dashboard_port_file": "dashboard.port"
   }
 }"#;
         let parsed_json: ConfigFile = serde_json::from_str(json_str).expect("parse json");
-        assert_eq!(parsed_json.master.unwrap().preserve_gpu, Some(false));
+        assert_eq!(parsed_json.master.as_ref().unwrap().preserve_gpu, Some(false));
+        assert_eq!(parsed_json.master.as_ref().unwrap().dashboard_port, Some(8080));
+        assert_eq!(parsed_json.master.as_ref().unwrap().dashboard_port_file.as_deref(), Some("dashboard.port"));
+    }
+
+    #[test]
+    fn test_resolve_opt_u16_cli_precedence() {
+        let env_key = "TEST_DASHBOARD_PORT_CLI_PREC";
+        std::env::set_var(env_key, "8081");
+        let res = resolve_opt_u16(Some(8080), &[env_key], Some(8082));
+        std::env::remove_var(env_key);
+        assert_eq!(res, Some(8080));
+    }
+
+    #[test]
+    fn test_resolve_opt_u16_env_precedence() {
+        let env_key = "TEST_DASHBOARD_PORT_ENV_PREC";
+        std::env::set_var(env_key, "8081");
+        let res = resolve_opt_u16(None, &[env_key], Some(8082));
+        std::env::remove_var(env_key);
+        assert_eq!(res, Some(8081));
+    }
+
+    #[test]
+    fn test_resolve_opt_u16_oxide_swarm_env_fallback() {
+        let env_rusty = "RUSTY_GRID_DASH_TEST";
+        let env_oxide = "OXIDE_SWARM_DASH_TEST";
+        std::env::remove_var(env_rusty);
+        std::env::set_var(env_oxide, "8083");
+        let res = resolve_opt_u16(None, &[env_rusty, env_oxide], Some(8082));
+        std::env::remove_var(env_oxide);
+        assert_eq!(res, Some(8083));
+    }
+
+    #[test]
+    fn test_resolve_opt_u16_file_fallback() {
+        let env_key = "TEST_DASHBOARD_PORT_FILE_PREC";
+        std::env::remove_var(env_key);
+        let res = resolve_opt_u16(None, &[env_key], Some(8082));
+        assert_eq!(res, Some(8082));
+    }
+
+    #[test]
+    fn test_resolve_opt_u16_none_default() {
+        let env_key = "TEST_DASHBOARD_PORT_NONE_PREC";
+        std::env::remove_var(env_key);
+        let res = resolve_opt_u16(None, &[env_key], None);
+        assert_eq!(res, None);
     }
 }

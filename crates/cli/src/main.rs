@@ -25,7 +25,7 @@ use rusty_grid_core::mapreduce::{
     MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec,
 };
 use rusty_grid_core::protocol::{
-    ClientMessage, ClientResponse, MessageTransport,
+    ClientMessage, ClientResponse, MessageTransport, WireCodec,
 };
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
 use rusty_grid_master::{
@@ -35,7 +35,7 @@ use rusty_grid_worker::{WorkerClient, WorkerConfig};
 
 use crate::config::{
     load_config_file, resolve_bool, resolve_f32, resolve_opt_field, resolve_opt_string,
-    resolve_opt_u64, resolve_opt_usize, resolve_string, resolve_u64,
+    resolve_opt_u16, resolve_opt_u64, resolve_opt_usize, resolve_string, resolve_u32, resolve_u64,
 };
 
 #[derive(Parser, Debug)]
@@ -116,6 +116,35 @@ pub struct MasterArgs {
 
     #[arg(long, help = "File path where P2P connection ticket string is written")]
     pub p2p_ticket_file: Option<PathBuf>,
+
+    #[arg(
+        long,
+        alias = "key-file",
+        value_name = "PATH",
+        help = "File path to persist/load P2P node secret key for stable ticket generation"
+    )]
+    pub p2p_key_file: Option<PathBuf>,
+
+    #[arg(
+        long,
+        default_value = "bincode",
+        help = "Wire format codec: bincode or json (default: bincode)"
+    )]
+    pub wire_codec: String,
+
+    #[arg(
+        long = "dashboard-port",
+        value_name = "PORT",
+        help = "Enable embedded web observability dashboard HTTP server on specified port (use 0 for ephemeral)"
+    )]
+    pub dashboard_port: Option<u16>,
+
+    #[arg(
+        long = "dashboard-port-file",
+        value_name = "PATH",
+        help = "File path where bound dashboard port number is written (useful for ephemeral port 0)"
+    )]
+    pub dashboard_port_file: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -158,6 +187,13 @@ pub struct WorkerArgs {
 
     #[arg(long, help = "Retain task sandbox directories after execution")]
     pub keep_sandboxes: bool,
+
+    #[arg(
+        long,
+        default_value = "bincode",
+        help = "Wire format codec: bincode or json (default: bincode)"
+    )]
+    pub wire_codec: String,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -182,6 +218,9 @@ pub struct SubmitArgs {
 
     #[arg(long, default_value = "60", help = "Task execution timeout in seconds")]
     pub timeout_secs: u64,
+
+    #[arg(long, help = "Maximum execution retries for this task")]
+    pub max_retries: Option<u32>,
 
     #[arg(long, help = "Wait synchronously for task completion and emit result")]
     pub wait: bool,
@@ -329,18 +368,28 @@ async fn run_master(args: MasterArgs, config_file: Option<config::ConfigFile>) -
         true,
     );
 
-    let enable_p2p = resolve_bool(
+    let p2p_ticket_file = resolve_opt_string(
+        args.p2p_ticket_file.map(|p| p.display().to_string()),
+        &["RUSTY_GRID_P2P_TICKET_FILE"],
+        master_cfg.as_ref().and_then(|m| m.p2p_ticket_file.clone()),
+    );
+
+    let p2p_key_file = resolve_opt_string(
+        args.p2p_key_file.map(|p| p.display().to_string()),
+        &["RUSTY_GRID_P2P_KEY_FILE"],
+        master_cfg.as_ref().and_then(|m| m.p2p_key_file.clone()),
+    );
+
+    let mut enable_p2p = resolve_bool(
         if args.p2p { Some(true) } else { None },
         &["RUSTY_GRID_P2P"],
         master_cfg.as_ref().and_then(|m| m.p2p),
         false,
     );
 
-    let p2p_ticket_file = resolve_opt_string(
-        args.p2p_ticket_file.map(|p| p.display().to_string()),
-        &["RUSTY_GRID_P2P_TICKET_FILE"],
-        master_cfg.as_ref().and_then(|m| m.p2p_ticket_file.clone()),
-    );
+    if p2p_key_file.is_some() || p2p_ticket_file.is_some() {
+        enable_p2p = true;
+    }
 
     let mut server_config = match ServerConfig::from_addr(&listen_addr_str) {
         Ok(c) => c,
@@ -350,15 +399,55 @@ async fn run_master(args: MasterArgs, config_file: Option<config::ConfigFile>) -
         }
     };
 
+    let default_retry_max = resolve_u32(
+        args.default_retry_max,
+        &["RUSTY_GRID_DEFAULT_RETRY_MAX", "RUSTY_GRID_MAX_RETRIES"],
+        master_cfg.as_ref().and_then(|m| m.default_retry_max),
+        3,
+    );
+
     if let Some(pf) = port_file {
         server_config = server_config.with_port_file(pf);
     }
     server_config = server_config
         .with_heartbeat_interval(heartbeat_interval)
-        .with_p2p(enable_p2p);
+        .with_p2p(enable_p2p)
+        .with_max_retries(default_retry_max);
 
     if let Some(ref tf) = p2p_ticket_file {
         server_config = server_config.with_p2p_ticket_file(tf);
+    }
+
+    if let Some(ref kf) = p2p_key_file {
+        server_config = server_config.with_p2p_key_file(kf);
+    }
+
+    let wire_codec_str = resolve_string(
+        Some(args.wire_codec),
+        &["RUSTY_GRID_WIRE_CODEC"],
+        master_cfg.as_ref().and_then(|m| m.wire_codec.clone()),
+        "bincode",
+    );
+    let wire_codec: WireCodec = wire_codec_str.parse().unwrap_or_default();
+    server_config = server_config.with_wire_codec(wire_codec);
+
+    let dashboard_port = resolve_opt_u16(
+        args.dashboard_port,
+        &["RUSTY_GRID_DASHBOARD_PORT", "OXIDE_SWARM_DASHBOARD_PORT"],
+        master_cfg.as_ref().and_then(|m| m.dashboard_port),
+    );
+
+    let dashboard_port_file = resolve_opt_string(
+        args.dashboard_port_file.map(|p| p.display().to_string()),
+        &["RUSTY_GRID_DASHBOARD_PORT_FILE", "OXIDE_SWARM_DASHBOARD_PORT_FILE"],
+        master_cfg.as_ref().and_then(|m| m.dashboard_port_file.clone()),
+    );
+
+    if let Some(dp) = dashboard_port {
+        server_config = server_config.with_dashboard_port(dp);
+    }
+    if let Some(ref dpf) = dashboard_port_file {
+        server_config = server_config.with_dashboard_port_file(dpf);
     }
 
     let sched_config = SchedulerConfig {
@@ -387,6 +476,9 @@ async fn run_master(args: MasterArgs, config_file: Option<config::ConfigFile>) -
     };
 
     println!("RustyGrid Master started on {}", handle.server_addr());
+    if let Some(dash_addr) = handle.dashboard_addr() {
+        println!("Embedded Dashboard available at http://{}", dash_addr);
+    }
 
     if enable_p2p {
         if let Some(ref tf) = p2p_ticket_file {
@@ -544,6 +636,15 @@ async fn run_worker(args: WorkerArgs, config_file: Option<config::ConfigFile>) -
     config = config.with_keep_sandboxes(keep_sandboxes);
     config.default_heartbeat_interval = Duration::from_secs(heartbeat_interval);
 
+    let wire_codec_str = resolve_string(
+        Some(args.wire_codec),
+        &["RUSTY_GRID_WIRE_CODEC"],
+        worker_cfg.as_ref().and_then(|w| w.wire_codec.clone()),
+        "bincode",
+    );
+    let wire_codec: WireCodec = wire_codec_str.parse().unwrap_or_default();
+    config = config.with_wire_codec(wire_codec);
+
     let mut client = WorkerClient::new(config);
     println!(
         "RustyGrid Worker {} initializing [Name: {}, Cores: {}, RAM: {}MB, GPU: {}, Simulated: {}]",
@@ -642,6 +743,7 @@ async fn run_submit(args: SubmitArgs, config_file: Option<config::ConfigFile>) -
         ram_mb: args.ram_mb,
         gpu_required: is_gpu,
         timeout_secs: args.timeout_secs,
+        max_retries: args.max_retries,
     };
 
     let task = Task::new(spec, requirements);

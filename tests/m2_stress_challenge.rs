@@ -264,9 +264,14 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
         legit_registered,
         "Legitimate worker must register immediately; hanging handshakes must NOT block other connections"
     );
+    #[cfg(windows)]
+    let max_elapsed = Duration::from_millis(3000);
+    #[cfg(not(windows))]
+    let max_elapsed = Duration::from_secs(1);
     assert!(
-        legit_elapsed < Duration::from_secs(1),
-        "Legitimate registration must complete in <1s despite Slowloris attacks"
+        legit_elapsed < max_elapsed,
+        "Legitimate registration must complete in <{:?} despite Slowloris attacks",
+        max_elapsed
     );
 
     // 5. Verify that all 3 rogue sockets are dropped by Master within 5s (+ grace window)

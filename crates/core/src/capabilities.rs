@@ -5,21 +5,107 @@ use serde::{Deserialize, Serialize};
 use crate::task::TaskRequirements;
 
 /// Mobile-specific hardware and environmental telemetry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MobileCapabilities {
     /// Operating system version and API level (e.g. "Android 14 (API 34)", "macOS 14.5").
     pub os_version: String,
     /// System-on-Chip descriptor (e.g. "Snapdragon 8 Gen 2", "Apple M2 Max").
     pub soc_model: String,
     /// Battery charge percentage (0-100), or `None` if running on AC power or emulator.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub battery_pct: Option<u8>,
     /// Whether the device is actively drawing external power / charging.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_charging: Option<bool>,
     /// Whether the device is currently experiencing CPU/GPU thermal throttling.
+    pub thermal_throttled: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HumanMobileCapabilities {
+    pub os_version: String,
+    pub soc_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_pct: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_charging: Option<bool>,
     #[serde(default)]
     pub thermal_throttled: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BinaryMobileCapabilities {
+    pub os_version: String,
+    pub soc_model: String,
+    pub battery_pct: Option<u8>,
+    pub is_charging: Option<bool>,
+    pub thermal_throttled: bool,
+}
+
+impl From<MobileCapabilities> for HumanMobileCapabilities {
+    fn from(m: MobileCapabilities) -> Self {
+        Self {
+            os_version: m.os_version,
+            soc_model: m.soc_model,
+            battery_pct: m.battery_pct,
+            is_charging: m.is_charging,
+            thermal_throttled: m.thermal_throttled,
+        }
+    }
+}
+
+impl From<HumanMobileCapabilities> for MobileCapabilities {
+    fn from(h: HumanMobileCapabilities) -> Self {
+        Self {
+            os_version: h.os_version,
+            soc_model: h.soc_model,
+            battery_pct: h.battery_pct,
+            is_charging: h.is_charging,
+            thermal_throttled: h.thermal_throttled,
+        }
+    }
+}
+
+impl From<MobileCapabilities> for BinaryMobileCapabilities {
+    fn from(m: MobileCapabilities) -> Self {
+        Self {
+            os_version: m.os_version,
+            soc_model: m.soc_model,
+            battery_pct: m.battery_pct,
+            is_charging: m.is_charging,
+            thermal_throttled: m.thermal_throttled,
+        }
+    }
+}
+
+impl From<BinaryMobileCapabilities> for MobileCapabilities {
+    fn from(b: BinaryMobileCapabilities) -> Self {
+        Self {
+            os_version: b.os_version,
+            soc_model: b.soc_model,
+            battery_pct: b.battery_pct,
+            is_charging: b.is_charging,
+            thermal_throttled: b.thermal_throttled,
+        }
+    }
+}
+
+impl Serialize for MobileCapabilities {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            HumanMobileCapabilities::from(self.clone()).serialize(serializer)
+        } else {
+            BinaryMobileCapabilities::from(self.clone()).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MobileCapabilities {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            HumanMobileCapabilities::deserialize(deserializer).map(Into::into)
+        } else {
+            BinaryMobileCapabilities::deserialize(deserializer).map(Into::into)
+        }
+    }
 }
 
 /// Hardware capability override inputs.
@@ -35,7 +121,7 @@ pub struct HardwareOverrides {
 }
 
 /// Represents the hardware resources and computational capabilities of a Worker node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerCapabilities {
     /// Human-readable identifier or hostname for the worker.
     pub name: String,
@@ -50,11 +136,115 @@ pub struct WorkerCapabilities {
     /// Human-readable model or descriptor of the GPU.
     pub gpu_device_name: Option<String>,
     /// Optional categorization or affinity tags.
-    #[serde(default)]
     pub tags: Vec<String>,
     /// Optional mobile capabilities (populated automatically on Android, iOS, or battery-powered devices).
+    pub mobile: Option<MobileCapabilities>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HumanWorkerCapabilities {
+    pub name: String,
+    pub cpu_cores: usize,
+    pub ram_mb: u64,
+    pub has_gpu: bool,
+    pub is_simulated_gpu: bool,
+    pub gpu_device_name: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mobile: Option<MobileCapabilities>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BinaryWorkerCapabilities {
+    pub name: String,
+    pub cpu_cores: usize,
+    pub ram_mb: u64,
+    pub has_gpu: bool,
+    pub is_simulated_gpu: bool,
+    pub gpu_device_name: Option<String>,
+    pub tags: Vec<String>,
+    pub mobile: Option<MobileCapabilities>,
+}
+
+impl From<WorkerCapabilities> for HumanWorkerCapabilities {
+    fn from(w: WorkerCapabilities) -> Self {
+        Self {
+            name: w.name,
+            cpu_cores: w.cpu_cores,
+            ram_mb: w.ram_mb,
+            has_gpu: w.has_gpu,
+            is_simulated_gpu: w.is_simulated_gpu,
+            gpu_device_name: w.gpu_device_name,
+            tags: w.tags,
+            mobile: w.mobile,
+        }
+    }
+}
+
+impl From<HumanWorkerCapabilities> for WorkerCapabilities {
+    fn from(h: HumanWorkerCapabilities) -> Self {
+        Self {
+            name: h.name,
+            cpu_cores: h.cpu_cores,
+            ram_mb: h.ram_mb,
+            has_gpu: h.has_gpu,
+            is_simulated_gpu: h.is_simulated_gpu,
+            gpu_device_name: h.gpu_device_name,
+            tags: h.tags,
+            mobile: h.mobile,
+        }
+    }
+}
+
+impl From<WorkerCapabilities> for BinaryWorkerCapabilities {
+    fn from(w: WorkerCapabilities) -> Self {
+        Self {
+            name: w.name,
+            cpu_cores: w.cpu_cores,
+            ram_mb: w.ram_mb,
+            has_gpu: w.has_gpu,
+            is_simulated_gpu: w.is_simulated_gpu,
+            gpu_device_name: w.gpu_device_name,
+            tags: w.tags,
+            mobile: w.mobile,
+        }
+    }
+}
+
+impl From<BinaryWorkerCapabilities> for WorkerCapabilities {
+    fn from(b: BinaryWorkerCapabilities) -> Self {
+        Self {
+            name: b.name,
+            cpu_cores: b.cpu_cores,
+            ram_mb: b.ram_mb,
+            has_gpu: b.has_gpu,
+            is_simulated_gpu: b.is_simulated_gpu,
+            gpu_device_name: b.gpu_device_name,
+            tags: b.tags,
+            mobile: b.mobile,
+        }
+    }
+}
+
+impl Serialize for WorkerCapabilities {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            HumanWorkerCapabilities::from(self.clone()).serialize(serializer)
+        } else {
+            BinaryWorkerCapabilities::from(self.clone()).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkerCapabilities {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            HumanWorkerCapabilities::deserialize(deserializer).map(Into::into)
+        } else {
+            BinaryWorkerCapabilities::deserialize(deserializer).map(Into::into)
+        }
+    }
 }
 
 impl WorkerCapabilities {
