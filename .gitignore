@@ -1,14 +1,99 @@
+# ==============================================================================
+# OxideSwarm Comprehensive .gitignore
+# Production-grade configuration for Rust, Android, Multi-Platform & Toolchains
+# ==============================================================================
+
+# --- Rust & Cargo ---
 /target/
-/.agents/
-.DS_Store
-**/.DS_Store
+target/
+**/*.rs.bk
+*.pdb
+
+# --- OxideSwarm Runtime, Logs & Ephemeral Files ---
 *.log
 **/*.log
-__pycache__/
-*.pyc
+ticket.txt
+*.ticket
+*.port
+master.port
+oxideswarm.port
+/.agents/
+/scratch/
+**/scratch/
+
+# --- macOS System Files ---
+.DS_Store
+**/.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+
+# --- Windows System Files ---
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msm
+*.msp
+
+# --- Linux & Editor Backups ---
+*~
+*.swp
+*.swo
+*.bak
+
+# --- Android, Gradle & NDK ---
 .gradle/
 **/.gradle/
 **/build/
+build/
+local.properties
+*.apk
+*.ap_
+*.aab
+*.dex
+*.class
+captures/
+.externalNativeBuild/
+.cxx/
 
-ticket.txt
+# --- IDEs & Code Editors ---
+# JetBrains / Android Studio
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
 
+# Visual Studio Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# Xcode
+*.moved-aside
+*.xcuserstate
+xcuserdata/
+
+# --- Python & Testing Scratch ---
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.venv/
+venv/
+ENV/
+env/
