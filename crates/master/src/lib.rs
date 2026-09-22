@@ -1,5 +1,7 @@
 //! Master node server, worker registry, task queue, scheduler, and heartbeat reaper for `rusty_grid`.
 
+#[cfg(feature = "dashboard")]
+pub mod dashboard;
 pub mod mapreduce;
 pub mod queue;
 pub mod reaper;

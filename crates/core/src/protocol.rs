@@ -15,6 +15,43 @@ pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 /// Length prefix field width in bytes (4-byte unsigned big-endian integer).
 pub const LENGTH_FIELD_BYTES: usize = 4;
 
+/// Wire protocol format discriminator identifiers.
+pub const WIRE_FORMAT_JSON: u8 = 0x01;
+pub const WIRE_FORMAT_BINCODE: u8 = 0x02;
+
+/// Supported wire serialization formats for framed messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum WireCodec {
+    /// Text-based JSON encoding (discriminator 0x01 or raw '{').
+    Json = WIRE_FORMAT_JSON,
+    /// High-throughput binary encoding via Bincode (discriminator 0x02).
+    #[default]
+    Bincode = WIRE_FORMAT_BINCODE,
+}
+
+impl std::str::FromStr for WireCodec {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "bincode" | "bin" | "binary" => Ok(WireCodec::Bincode),
+            "json" => Ok(WireCodec::Json),
+            other => Err(format!(
+                "Unknown wire codec '{other}', expected 'bincode' or 'json'"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for WireCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WireCodec::Json => write!(f, "json"),
+            WireCodec::Bincode => write!(f, "bincode"),
+        }
+    }
+}
+
 /// Protocol-level error variants encountered during framing and serialization.
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -25,6 +62,14 @@ pub enum ProtocolError {
     /// JSON serialization or deserialization error.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// Bincode serialization or deserialization error.
+    #[error("Bincode error: {0}")]
+    Bincode(#[from] bincode::Error),
+
+    /// Unsupported wire format discriminator byte.
+    #[error("Unsupported wire format discriminator: 0x{0:02x}")]
+    InvalidFormatTag(u8),
 
     /// Frame size exceeds maximum allowed threshold.
     #[error("Frame size {size} bytes exceeds maximum permitted {max} bytes")]
@@ -49,8 +94,7 @@ pub enum ProtocolError {
 }
 
 /// Upstream messages sent from Worker nodes to the Master node.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WorkerMessage {
     /// Initial registration advertising worker identity and capabilities.
     Register {
@@ -62,9 +106,7 @@ pub enum WorkerMessage {
         worker_id: Uuid,
         timestamp: u64,
         active_tasks: usize,
-        #[serde(default)]
         cpu_usage_pct: f32,
-        #[serde(default)]
         ram_available_mb: u64,
     },
     /// Incremental progress update or state change for an active task.
@@ -82,11 +124,184 @@ pub enum WorkerMessage {
         stderr: String,
         execution_time_ms: u64,
         is_gpu_executed: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
     /// Graceful announcement that the worker is disconnecting.
     Disconnecting { worker_id: Uuid, reason: String },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum HumanWorkerMessage {
+    Register {
+        worker_id: Uuid,
+        capabilities: WorkerCapabilities,
+    },
+    Heartbeat {
+        worker_id: Uuid,
+        timestamp: u64,
+        active_tasks: usize,
+        #[serde(default)]
+        cpu_usage_pct: f32,
+        #[serde(default)]
+        ram_available_mb: u64,
+    },
+    TaskProgress {
+        worker_id: Uuid,
+        task_id: TaskId,
+        status: TaskStatus,
+    },
+    TaskResult {
+        worker_id: Uuid,
+        task_id: TaskId,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+        execution_time_ms: u64,
+        is_gpu_executed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    Disconnecting { worker_id: Uuid, reason: String },
+}
+
+#[derive(Serialize, Deserialize)]
+enum BinaryWorkerMessage {
+    Register {
+        worker_id: Uuid,
+        capabilities: WorkerCapabilities,
+    },
+    Heartbeat {
+        worker_id: Uuid,
+        timestamp: u64,
+        active_tasks: usize,
+        cpu_usage_pct: f32,
+        ram_available_mb: u64,
+    },
+    TaskProgress {
+        worker_id: Uuid,
+        task_id: TaskId,
+        status: TaskStatus,
+    },
+    TaskResult {
+        worker_id: Uuid,
+        task_id: TaskId,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+        execution_time_ms: u64,
+        is_gpu_executed: bool,
+        error: Option<String>,
+    },
+    Disconnecting { worker_id: Uuid, reason: String },
+}
+
+impl From<WorkerMessage> for HumanWorkerMessage {
+    fn from(msg: WorkerMessage) -> Self {
+        match msg {
+            WorkerMessage::Register { worker_id, capabilities } => {
+                HumanWorkerMessage::Register { worker_id, capabilities }
+            }
+            WorkerMessage::Heartbeat { worker_id, timestamp, active_tasks, cpu_usage_pct, ram_available_mb } => {
+                HumanWorkerMessage::Heartbeat { worker_id, timestamp, active_tasks, cpu_usage_pct, ram_available_mb }
+            }
+            WorkerMessage::TaskProgress { worker_id, task_id, status } => {
+                HumanWorkerMessage::TaskProgress { worker_id, task_id, status }
+            }
+            WorkerMessage::TaskResult { worker_id, task_id, exit_code, stdout, stderr, execution_time_ms, is_gpu_executed, error } => {
+                HumanWorkerMessage::TaskResult { worker_id, task_id, exit_code, stdout, stderr, execution_time_ms, is_gpu_executed, error }
+            }
+            WorkerMessage::Disconnecting { worker_id, reason } => {
+                HumanWorkerMessage::Disconnecting { worker_id, reason }
+            }
+        }
+    }
+}
+
+impl From<HumanWorkerMessage> for WorkerMessage {
+    fn from(msg: HumanWorkerMessage) -> Self {
+        match msg {
+            HumanWorkerMessage::Register { worker_id, capabilities } => {
+                WorkerMessage::Register { worker_id, capabilities }
+            }
+            HumanWorkerMessage::Heartbeat { worker_id, timestamp, active_tasks, cpu_usage_pct, ram_available_mb } => {
+                WorkerMessage::Heartbeat { worker_id, timestamp, active_tasks, cpu_usage_pct, ram_available_mb }
+            }
+            HumanWorkerMessage::TaskProgress { worker_id, task_id, status } => {
+                WorkerMessage::TaskProgress { worker_id, task_id, status }
+            }
+            HumanWorkerMessage::TaskResult { worker_id, task_id, exit_code, stdout, stderr, execution_time_ms, is_gpu_executed, error } => {
+                WorkerMessage::TaskResult { worker_id, task_id, exit_code, stdout, stderr, execution_time_ms, is_gpu_executed, error }
+            }
+            HumanWorkerMessage::Disconnecting { worker_id, reason } => {
+                WorkerMessage::Disconnecting { worker_id, reason }
+            }
+        }
+    }
+}
+
+impl From<WorkerMessage> for BinaryWorkerMessage {
+    fn from(msg: WorkerMessage) -> Self {
+        match msg {
+            WorkerMessage::Register { worker_id, capabilities } => {
+                BinaryWorkerMessage::Register { worker_id, capabilities }
+            }
+            WorkerMessage::Heartbeat { worker_id, timestamp, active_tasks, cpu_usage_pct, ram_available_mb } => {
+                BinaryWorkerMessage::Heartbeat { worker_id, timestamp, active_tasks, cpu_usage_pct, ram_available_mb }
+            }
+            WorkerMessage::TaskProgress { worker_id, task_id, status } => {
+                BinaryWorkerMessage::TaskProgress { worker_id, task_id, status }
+            }
+            WorkerMessage::TaskResult { worker_id, task_id, exit_code, stdout, stderr, execution_time_ms, is_gpu_executed, error } => {
+                BinaryWorkerMessage::TaskResult { worker_id, task_id, exit_code, stdout, stderr, execution_time_ms, is_gpu_executed, error }
+            }
+            WorkerMessage::Disconnecting { worker_id, reason } => {
+                BinaryWorkerMessage::Disconnecting { worker_id, reason }
+            }
+        }
+    }
+}
+
+impl From<BinaryWorkerMessage> for WorkerMessage {
+    fn from(msg: BinaryWorkerMessage) -> Self {
+        match msg {
+            BinaryWorkerMessage::Register { worker_id, capabilities } => {
+                WorkerMessage::Register { worker_id, capabilities }
+            }
+            BinaryWorkerMessage::Heartbeat { worker_id, timestamp, active_tasks, cpu_usage_pct, ram_available_mb } => {
+                WorkerMessage::Heartbeat { worker_id, timestamp, active_tasks, cpu_usage_pct, ram_available_mb }
+            }
+            BinaryWorkerMessage::TaskProgress { worker_id, task_id, status } => {
+                WorkerMessage::TaskProgress { worker_id, task_id, status }
+            }
+            BinaryWorkerMessage::TaskResult { worker_id, task_id, exit_code, stdout, stderr, execution_time_ms, is_gpu_executed, error } => {
+                WorkerMessage::TaskResult { worker_id, task_id, exit_code, stdout, stderr, execution_time_ms, is_gpu_executed, error }
+            }
+            BinaryWorkerMessage::Disconnecting { worker_id, reason } => {
+                WorkerMessage::Disconnecting { worker_id, reason }
+            }
+        }
+    }
+}
+
+impl Serialize for WorkerMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            HumanWorkerMessage::from(self.clone()).serialize(serializer)
+        } else {
+            BinaryWorkerMessage::from(self.clone()).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkerMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            HumanWorkerMessage::deserialize(deserializer).map(Into::into)
+        } else {
+            BinaryWorkerMessage::deserialize(deserializer).map(Into::into)
+        }
+    }
 }
 
 impl WorkerMessage {
@@ -129,15 +344,13 @@ impl From<TaskResult> for WorkerMessage {
 }
 
 /// Downstream messages sent from the Master node to Worker nodes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MasterMessage {
     /// Acknowledgment of worker registration with operational parameters.
     RegisterAck {
         accepted: bool,
         worker_id: Uuid,
         heartbeat_interval_secs: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
     /// Acknowledgment of heartbeat receipt confirming master liveness.
@@ -147,15 +360,165 @@ pub enum MasterMessage {
     /// Directive to immediately abort and cancel an assigned or running task.
     CancelTask {
         task_id: TaskId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
     /// Directive notifying the worker of master shutdown or cluster evacuation.
     Shutdown {
         reason: String,
+        grace_period_secs: Option<u64>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum HumanMasterMessage {
+    RegisterAck {
+        accepted: bool,
+        worker_id: Uuid,
+        heartbeat_interval_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    HeartbeatAck { timestamp: u64 },
+    AssignTask { task: Task },
+    CancelTask {
+        task_id: TaskId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    Shutdown {
+        reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         grace_period_secs: Option<u64>,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+enum BinaryMasterMessage {
+    RegisterAck {
+        accepted: bool,
+        worker_id: Uuid,
+        heartbeat_interval_secs: u64,
+        message: Option<String>,
+    },
+    HeartbeatAck { timestamp: u64 },
+    AssignTask { task: Task },
+    CancelTask {
+        task_id: TaskId,
+        reason: Option<String>,
+    },
+    Shutdown {
+        reason: String,
+        grace_period_secs: Option<u64>,
+    },
+}
+
+impl From<MasterMessage> for HumanMasterMessage {
+    fn from(msg: MasterMessage) -> Self {
+        match msg {
+            MasterMessage::RegisterAck { accepted, worker_id, heartbeat_interval_secs, message } => {
+                HumanMasterMessage::RegisterAck { accepted, worker_id, heartbeat_interval_secs, message }
+            }
+            MasterMessage::HeartbeatAck { timestamp } => {
+                HumanMasterMessage::HeartbeatAck { timestamp }
+            }
+            MasterMessage::AssignTask { task } => {
+                HumanMasterMessage::AssignTask { task }
+            }
+            MasterMessage::CancelTask { task_id, reason } => {
+                HumanMasterMessage::CancelTask { task_id, reason }
+            }
+            MasterMessage::Shutdown { reason, grace_period_secs } => {
+                HumanMasterMessage::Shutdown { reason, grace_period_secs }
+            }
+        }
+    }
+}
+
+impl From<HumanMasterMessage> for MasterMessage {
+    fn from(msg: HumanMasterMessage) -> Self {
+        match msg {
+            HumanMasterMessage::RegisterAck { accepted, worker_id, heartbeat_interval_secs, message } => {
+                MasterMessage::RegisterAck { accepted, worker_id, heartbeat_interval_secs, message }
+            }
+            HumanMasterMessage::HeartbeatAck { timestamp } => {
+                MasterMessage::HeartbeatAck { timestamp }
+            }
+            HumanMasterMessage::AssignTask { task } => {
+                MasterMessage::AssignTask { task }
+            }
+            HumanMasterMessage::CancelTask { task_id, reason } => {
+                MasterMessage::CancelTask { task_id, reason }
+            }
+            HumanMasterMessage::Shutdown { reason, grace_period_secs } => {
+                MasterMessage::Shutdown { reason, grace_period_secs }
+            }
+        }
+    }
+}
+
+impl From<MasterMessage> for BinaryMasterMessage {
+    fn from(msg: MasterMessage) -> Self {
+        match msg {
+            MasterMessage::RegisterAck { accepted, worker_id, heartbeat_interval_secs, message } => {
+                BinaryMasterMessage::RegisterAck { accepted, worker_id, heartbeat_interval_secs, message }
+            }
+            MasterMessage::HeartbeatAck { timestamp } => {
+                BinaryMasterMessage::HeartbeatAck { timestamp }
+            }
+            MasterMessage::AssignTask { task } => {
+                BinaryMasterMessage::AssignTask { task }
+            }
+            MasterMessage::CancelTask { task_id, reason } => {
+                BinaryMasterMessage::CancelTask { task_id, reason }
+            }
+            MasterMessage::Shutdown { reason, grace_period_secs } => {
+                BinaryMasterMessage::Shutdown { reason, grace_period_secs }
+            }
+        }
+    }
+}
+
+impl From<BinaryMasterMessage> for MasterMessage {
+    fn from(msg: BinaryMasterMessage) -> Self {
+        match msg {
+            BinaryMasterMessage::RegisterAck { accepted, worker_id, heartbeat_interval_secs, message } => {
+                MasterMessage::RegisterAck { accepted, worker_id, heartbeat_interval_secs, message }
+            }
+            BinaryMasterMessage::HeartbeatAck { timestamp } => {
+                MasterMessage::HeartbeatAck { timestamp }
+            }
+            BinaryMasterMessage::AssignTask { task } => {
+                MasterMessage::AssignTask { task }
+            }
+            BinaryMasterMessage::CancelTask { task_id, reason } => {
+                MasterMessage::CancelTask { task_id, reason }
+            }
+            BinaryMasterMessage::Shutdown { reason, grace_period_secs } => {
+                MasterMessage::Shutdown { reason, grace_period_secs }
+            }
+        }
+    }
+}
+
+impl Serialize for MasterMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            HumanMasterMessage::from(self.clone()).serialize(serializer)
+        } else {
+            BinaryMasterMessage::from(self.clone()).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MasterMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            HumanMasterMessage::deserialize(deserializer).map(Into::into)
+        } else {
+            BinaryMasterMessage::deserialize(deserializer).map(Into::into)
+        }
+    }
 }
 
 impl MasterMessage {
@@ -172,13 +535,11 @@ impl MasterMessage {
 }
 
 /// Messages sent from CLI client (or external RPC) to the Master node.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClientMessage {
     /// Submits a task for execution.
     SubmitTask {
         task: Task,
-        #[serde(default)]
         wait: bool,
     },
     /// Queries the status and outcome of a specific task.
@@ -195,9 +556,120 @@ pub enum ClientMessage {
     },
 }
 
-/// Responses sent from the Master node to the CLI client.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
+enum HumanClientMessage {
+    SubmitTask {
+        task: Task,
+        #[serde(default)]
+        wait: bool,
+    },
+    GetTaskStatus {
+        task_id: TaskId,
+    },
+    CancelTask {
+        task_id: TaskId,
+    },
+    ClusterStatus,
+    ListWorkers,
+    SubmitMapReduce {
+        job: crate::mapreduce::MapReduceJobSpec,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+enum BinaryClientMessage {
+    SubmitTask {
+        task: Task,
+        wait: bool,
+    },
+    GetTaskStatus {
+        task_id: TaskId,
+    },
+    CancelTask {
+        task_id: TaskId,
+    },
+    ClusterStatus,
+    ListWorkers,
+    SubmitMapReduce {
+        job: crate::mapreduce::MapReduceJobSpec,
+    },
+}
+
+impl From<ClientMessage> for HumanClientMessage {
+    fn from(msg: ClientMessage) -> Self {
+        match msg {
+            ClientMessage::SubmitTask { task, wait } => HumanClientMessage::SubmitTask { task, wait },
+            ClientMessage::GetTaskStatus { task_id } => HumanClientMessage::GetTaskStatus { task_id },
+            ClientMessage::CancelTask { task_id } => HumanClientMessage::CancelTask { task_id },
+            ClientMessage::ClusterStatus => HumanClientMessage::ClusterStatus,
+            ClientMessage::ListWorkers => HumanClientMessage::ListWorkers,
+            ClientMessage::SubmitMapReduce { job } => HumanClientMessage::SubmitMapReduce { job },
+        }
+    }
+}
+
+impl From<HumanClientMessage> for ClientMessage {
+    fn from(msg: HumanClientMessage) -> Self {
+        match msg {
+            HumanClientMessage::SubmitTask { task, wait } => ClientMessage::SubmitTask { task, wait },
+            HumanClientMessage::GetTaskStatus { task_id } => ClientMessage::GetTaskStatus { task_id },
+            HumanClientMessage::CancelTask { task_id } => ClientMessage::CancelTask { task_id },
+            HumanClientMessage::ClusterStatus => ClientMessage::ClusterStatus,
+            HumanClientMessage::ListWorkers => ClientMessage::ListWorkers,
+            HumanClientMessage::SubmitMapReduce { job } => ClientMessage::SubmitMapReduce { job },
+        }
+    }
+}
+
+impl From<ClientMessage> for BinaryClientMessage {
+    fn from(msg: ClientMessage) -> Self {
+        match msg {
+            ClientMessage::SubmitTask { task, wait } => BinaryClientMessage::SubmitTask { task, wait },
+            ClientMessage::GetTaskStatus { task_id } => BinaryClientMessage::GetTaskStatus { task_id },
+            ClientMessage::CancelTask { task_id } => BinaryClientMessage::CancelTask { task_id },
+            ClientMessage::ClusterStatus => BinaryClientMessage::ClusterStatus,
+            ClientMessage::ListWorkers => BinaryClientMessage::ListWorkers,
+            ClientMessage::SubmitMapReduce { job } => BinaryClientMessage::SubmitMapReduce { job },
+        }
+    }
+}
+
+impl From<BinaryClientMessage> for ClientMessage {
+    fn from(msg: BinaryClientMessage) -> Self {
+        match msg {
+            BinaryClientMessage::SubmitTask { task, wait } => ClientMessage::SubmitTask { task, wait },
+            BinaryClientMessage::GetTaskStatus { task_id } => ClientMessage::GetTaskStatus { task_id },
+            BinaryClientMessage::CancelTask { task_id } => ClientMessage::CancelTask { task_id },
+            BinaryClientMessage::ClusterStatus => ClientMessage::ClusterStatus,
+            BinaryClientMessage::ListWorkers => ClientMessage::ListWorkers,
+            BinaryClientMessage::SubmitMapReduce { job } => ClientMessage::SubmitMapReduce { job },
+        }
+    }
+}
+
+impl Serialize for ClientMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            HumanClientMessage::from(self.clone()).serialize(serializer)
+        } else {
+            BinaryClientMessage::from(self.clone()).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            HumanClientMessage::deserialize(deserializer).map(Into::into)
+        } else {
+            BinaryClientMessage::deserialize(deserializer).map(Into::into)
+        }
+    }
+}
+
+/// Responses sent from the Master node to the CLI client.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClientResponse {
     TaskSubmitted {
         task_id: TaskId,
@@ -239,12 +711,265 @@ pub enum ClientResponse {
     },
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum HumanClientResponse {
+    TaskSubmitted {
+        task_id: TaskId,
+    },
+    TaskCompleted {
+        task_id: TaskId,
+        result: TaskResult,
+    },
+    TaskStatusInfo {
+        task_id: TaskId,
+        status: TaskStatus,
+        state_name: String,
+        assigned_worker: Option<Uuid>,
+        error: Option<String>,
+    },
+    TaskCancelled {
+        task_id: TaskId,
+        success: bool,
+    },
+    ClusterStatus {
+        total_tasks: usize,
+        pending_tasks: usize,
+        running_tasks: usize,
+        completed_tasks: usize,
+        failed_tasks: usize,
+        workers: Vec<WorkerCapabilities>,
+    },
+    WorkerList {
+        workers: Vec<WorkerCapabilities>,
+    },
+    MapReduceSubmitted {
+        job_id: Uuid,
+    },
+    MapReduceCompleted {
+        result: crate::mapreduce::MapReduceResult,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+enum BinaryClientResponse {
+    TaskSubmitted {
+        task_id: TaskId,
+    },
+    TaskCompleted {
+        task_id: TaskId,
+        result: TaskResult,
+    },
+    TaskStatusInfo {
+        task_id: TaskId,
+        status: TaskStatus,
+        state_name: String,
+        assigned_worker: Option<Uuid>,
+        error: Option<String>,
+    },
+    TaskCancelled {
+        task_id: TaskId,
+        success: bool,
+    },
+    ClusterStatus {
+        total_tasks: usize,
+        pending_tasks: usize,
+        running_tasks: usize,
+        completed_tasks: usize,
+        failed_tasks: usize,
+        workers: Vec<WorkerCapabilities>,
+    },
+    WorkerList {
+        workers: Vec<WorkerCapabilities>,
+    },
+    MapReduceSubmitted {
+        job_id: Uuid,
+    },
+    MapReduceCompleted {
+        result: crate::mapreduce::MapReduceResult,
+    },
+    Error {
+        message: String,
+    },
+}
+
+impl From<ClientResponse> for HumanClientResponse {
+    fn from(msg: ClientResponse) -> Self {
+        match msg {
+            ClientResponse::TaskSubmitted { task_id } => HumanClientResponse::TaskSubmitted { task_id },
+            ClientResponse::TaskCompleted { task_id, result } => HumanClientResponse::TaskCompleted { task_id, result },
+            ClientResponse::TaskStatusInfo { task_id, status, state_name, assigned_worker, error } => {
+                HumanClientResponse::TaskStatusInfo { task_id, status, state_name, assigned_worker, error }
+            }
+            ClientResponse::TaskCancelled { task_id, success } => HumanClientResponse::TaskCancelled { task_id, success },
+            ClientResponse::ClusterStatus { total_tasks, pending_tasks, running_tasks, completed_tasks, failed_tasks, workers } => {
+                HumanClientResponse::ClusterStatus { total_tasks, pending_tasks, running_tasks, completed_tasks, failed_tasks, workers }
+            }
+            ClientResponse::WorkerList { workers } => HumanClientResponse::WorkerList { workers },
+            ClientResponse::MapReduceSubmitted { job_id } => HumanClientResponse::MapReduceSubmitted { job_id },
+            ClientResponse::MapReduceCompleted { result } => HumanClientResponse::MapReduceCompleted { result },
+            ClientResponse::Error { message } => HumanClientResponse::Error { message },
+        }
+    }
+}
+
+impl From<HumanClientResponse> for ClientResponse {
+    fn from(msg: HumanClientResponse) -> Self {
+        match msg {
+            HumanClientResponse::TaskSubmitted { task_id } => ClientResponse::TaskSubmitted { task_id },
+            HumanClientResponse::TaskCompleted { task_id, result } => ClientResponse::TaskCompleted { task_id, result },
+            HumanClientResponse::TaskStatusInfo { task_id, status, state_name, assigned_worker, error } => {
+                ClientResponse::TaskStatusInfo { task_id, status, state_name, assigned_worker, error }
+            }
+            HumanClientResponse::TaskCancelled { task_id, success } => ClientResponse::TaskCancelled { task_id, success },
+            HumanClientResponse::ClusterStatus { total_tasks, pending_tasks, running_tasks, completed_tasks, failed_tasks, workers } => {
+                ClientResponse::ClusterStatus { total_tasks, pending_tasks, running_tasks, completed_tasks, failed_tasks, workers }
+            }
+            HumanClientResponse::WorkerList { workers } => ClientResponse::WorkerList { workers },
+            HumanClientResponse::MapReduceSubmitted { job_id } => ClientResponse::MapReduceSubmitted { job_id },
+            HumanClientResponse::MapReduceCompleted { result } => ClientResponse::MapReduceCompleted { result },
+            HumanClientResponse::Error { message } => ClientResponse::Error { message },
+        }
+    }
+}
+
+impl From<ClientResponse> for BinaryClientResponse {
+    fn from(msg: ClientResponse) -> Self {
+        match msg {
+            ClientResponse::TaskSubmitted { task_id } => BinaryClientResponse::TaskSubmitted { task_id },
+            ClientResponse::TaskCompleted { task_id, result } => BinaryClientResponse::TaskCompleted { task_id, result },
+            ClientResponse::TaskStatusInfo { task_id, status, state_name, assigned_worker, error } => {
+                BinaryClientResponse::TaskStatusInfo { task_id, status, state_name, assigned_worker, error }
+            }
+            ClientResponse::TaskCancelled { task_id, success } => BinaryClientResponse::TaskCancelled { task_id, success },
+            ClientResponse::ClusterStatus { total_tasks, pending_tasks, running_tasks, completed_tasks, failed_tasks, workers } => {
+                BinaryClientResponse::ClusterStatus { total_tasks, pending_tasks, running_tasks, completed_tasks, failed_tasks, workers }
+            }
+            ClientResponse::WorkerList { workers } => BinaryClientResponse::WorkerList { workers },
+            ClientResponse::MapReduceSubmitted { job_id } => BinaryClientResponse::MapReduceSubmitted { job_id },
+            ClientResponse::MapReduceCompleted { result } => BinaryClientResponse::MapReduceCompleted { result },
+            ClientResponse::Error { message } => BinaryClientResponse::Error { message },
+        }
+    }
+}
+
+impl From<BinaryClientResponse> for ClientResponse {
+    fn from(msg: BinaryClientResponse) -> Self {
+        match msg {
+            BinaryClientResponse::TaskSubmitted { task_id } => ClientResponse::TaskSubmitted { task_id },
+            BinaryClientResponse::TaskCompleted { task_id, result } => ClientResponse::TaskCompleted { task_id, result },
+            BinaryClientResponse::TaskStatusInfo { task_id, status, state_name, assigned_worker, error } => {
+                ClientResponse::TaskStatusInfo { task_id, status, state_name, assigned_worker, error }
+            }
+            BinaryClientResponse::TaskCancelled { task_id, success } => ClientResponse::TaskCancelled { task_id, success },
+            BinaryClientResponse::ClusterStatus { total_tasks, pending_tasks, running_tasks, completed_tasks, failed_tasks, workers } => {
+                ClientResponse::ClusterStatus { total_tasks, pending_tasks, running_tasks, completed_tasks, failed_tasks, workers }
+            }
+            BinaryClientResponse::WorkerList { workers } => ClientResponse::WorkerList { workers },
+            BinaryClientResponse::MapReduceSubmitted { job_id } => ClientResponse::MapReduceSubmitted { job_id },
+            BinaryClientResponse::MapReduceCompleted { result } => ClientResponse::MapReduceCompleted { result },
+            BinaryClientResponse::Error { message } => ClientResponse::Error { message },
+        }
+    }
+}
+
+impl Serialize for ClientResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            HumanClientResponse::from(self.clone()).serialize(serializer)
+        } else {
+            BinaryClientResponse::from(self.clone()).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientResponse {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            HumanClientResponse::deserialize(deserializer).map(Into::into)
+        } else {
+            BinaryClientResponse::deserialize(deserializer).map(Into::into)
+        }
+    }
+}
+
 /// Unified message discriminator for multiplexed connections on the Master.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum InboundMessage {
     Worker(WorkerMessage),
     Client(ClientMessage),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum HumanInboundMessage {
+    Worker(WorkerMessage),
+    Client(ClientMessage),
+}
+
+#[derive(Serialize, Deserialize)]
+enum BinaryInboundMessage {
+    Worker(WorkerMessage),
+    Client(ClientMessage),
+}
+
+impl From<InboundMessage> for HumanInboundMessage {
+    fn from(msg: InboundMessage) -> Self {
+        match msg {
+            InboundMessage::Worker(w) => HumanInboundMessage::Worker(w),
+            InboundMessage::Client(c) => HumanInboundMessage::Client(c),
+        }
+    }
+}
+
+impl From<HumanInboundMessage> for InboundMessage {
+    fn from(msg: HumanInboundMessage) -> Self {
+        match msg {
+            HumanInboundMessage::Worker(w) => InboundMessage::Worker(w),
+            HumanInboundMessage::Client(c) => InboundMessage::Client(c),
+        }
+    }
+}
+
+impl From<InboundMessage> for BinaryInboundMessage {
+    fn from(msg: InboundMessage) -> Self {
+        match msg {
+            InboundMessage::Worker(w) => BinaryInboundMessage::Worker(w),
+            InboundMessage::Client(c) => BinaryInboundMessage::Client(c),
+        }
+    }
+}
+
+impl From<BinaryInboundMessage> for InboundMessage {
+    fn from(msg: BinaryInboundMessage) -> Self {
+        match msg {
+            BinaryInboundMessage::Worker(w) => InboundMessage::Worker(w),
+            BinaryInboundMessage::Client(c) => InboundMessage::Client(c),
+        }
+    }
+}
+
+impl Serialize for InboundMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            HumanInboundMessage::from(self.clone()).serialize(serializer)
+        } else {
+            BinaryInboundMessage::from(self.clone()).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for InboundMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            HumanInboundMessage::deserialize(deserializer).map(Into::into)
+        } else {
+            BinaryInboundMessage::deserialize(deserializer).map(Into::into)
+        }
+    }
 }
 
 /// Constructs a `LengthDelimitedCodec` configured for rusty_grid:
@@ -263,17 +988,120 @@ pub fn default_codec() -> LengthDelimitedCodec {
         .new_codec()
 }
 
+/// Serializes a message into a byte frame according to the specified wire codec.
+pub fn serialize_message<M: Serialize>(msg: &M, codec: WireCodec) -> Result<Bytes, ProtocolError> {
+    match codec {
+        WireCodec::Bincode => {
+            let mut buf = Vec::with_capacity(128);
+            buf.push(WIRE_FORMAT_BINCODE);
+            bincode::serialize_into(&mut buf, msg)?;
+            if buf.len() > MAX_FRAME_SIZE {
+                return Err(ProtocolError::FrameTooLarge {
+                    size: buf.len(),
+                    max: MAX_FRAME_SIZE,
+                });
+            }
+            Ok(Bytes::from(buf))
+        }
+        WireCodec::Json => {
+            let mut buf = Vec::with_capacity(128);
+            buf.push(WIRE_FORMAT_JSON);
+            serde_json::to_writer(&mut buf, msg)?;
+            if buf.len() > MAX_FRAME_SIZE {
+                return Err(ProtocolError::FrameTooLarge {
+                    size: buf.len(),
+                    max: MAX_FRAME_SIZE,
+                });
+            }
+            Ok(Bytes::from(buf))
+        }
+    }
+}
+
+/// Deserializes a message from a byte frame, automatically identifying the wire format
+/// from the 1-byte discriminator tag or legacy raw JSON format.
+pub fn deserialize_message<M: DeserializeOwned + 'static>(bytes: &[u8]) -> Result<(M, WireCodec), ProtocolError> {
+    if bytes.is_empty() {
+        return serde_json::from_slice::<M>(bytes)
+            .map(|m| (m, WireCodec::Json))
+            .map_err(ProtocolError::Json);
+    }
+
+    match bytes[0] {
+        WIRE_FORMAT_BINCODE => {
+            match bincode::deserialize::<M>(&bytes[1..]) {
+                Ok(msg) => Ok((msg, WireCodec::Bincode)),
+                Err(e) => {
+                    // Fallback for InboundMessage when peer sent raw WorkerMessage or ClientMessage
+                    if std::any::TypeId::of::<M>() == std::any::TypeId::of::<InboundMessage>() {
+                        if let Ok(w) = bincode::deserialize::<WorkerMessage>(&bytes[1..]) {
+                            let inbound = InboundMessage::Worker(w);
+                            let boxed: Box<dyn std::any::Any> = Box::new(inbound);
+                            if let Ok(m) = boxed.downcast::<M>() {
+                                return Ok((*m, WireCodec::Bincode));
+                            }
+                        }
+                        if let Ok(c) = bincode::deserialize::<ClientMessage>(&bytes[1..]) {
+                            let inbound = InboundMessage::Client(c);
+                            let boxed: Box<dyn std::any::Any> = Box::new(inbound);
+                            if let Ok(m) = boxed.downcast::<M>() {
+                                return Ok((*m, WireCodec::Bincode));
+                            }
+                        }
+                    }
+                    Err(ProtocolError::Bincode(e))
+                }
+            }
+        }
+        WIRE_FORMAT_JSON => {
+            let msg: M = serde_json::from_slice(&bytes[1..])?;
+            Ok((msg, WireCodec::Json))
+        }
+        b'{' | b' ' | b'\t' | b'\r' | b'\n' => {
+            let msg: M = serde_json::from_slice(bytes)?;
+            Ok((msg, WireCodec::Json))
+        }
+        tag => Err(ProtocolError::InvalidFormatTag(tag)),
+    }
+}
+
 /// Unified bidirectional framed transport over any `AsyncRead + AsyncWrite + Unpin` stream.
 pub struct MessageTransport<T> {
     inner: Framed<T, LengthDelimitedCodec>,
+    codec: WireCodec,
+    last_detected_codec: Option<WireCodec>,
 }
 
 impl<T> MessageTransport<T> {
-    /// Wraps an I/O stream with the standard 4-byte length-delimited framing codec.
+    /// Wraps an I/O stream with the standard 4-byte length-delimited framing codec
+    /// using the default wire codec (Bincode).
     pub fn new(io: T) -> Self {
+        Self::with_codec(io, WireCodec::default())
+    }
+
+    /// Wraps an I/O stream with the standard 4-byte length-delimited framing codec
+    /// using a specific outbound wire codec.
+    pub fn with_codec(io: T, codec: WireCodec) -> Self {
         Self {
             inner: Framed::new(io, default_codec()),
+            codec,
+            last_detected_codec: None,
         }
+    }
+
+    /// Returns the currently configured outbound wire codec.
+    pub fn codec(&self) -> WireCodec {
+        self.codec
+    }
+
+    /// Sets the outbound wire codec.
+    pub fn set_outbound_codec(&mut self, codec: WireCodec) {
+        self.codec = codec;
+    }
+
+    /// Returns the wire codec detected from the most recently received frame, if any.
+    pub fn last_detected_codec(&self) -> Option<WireCodec> {
+        self.last_detected_codec
     }
 
     /// Consumes this transport, returning the underlying `Framed` stream.
@@ -294,27 +1122,22 @@ impl<T> MessageTransport<T> {
 
 impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
     /// Splits transport into independent read and write halves via `tokio::io::split`,
-    /// preserving any unconsumed read buffer or unflushed write buffer.
+    /// preserving any unconsumed read buffer or unflushed write buffer and propagating
+    /// the configured outbound wire codec to `MessageWriter`.
     pub fn split(self) -> (MessageWriter<WriteHalf<T>>, MessageReader<ReadHalf<T>>) {
         let parts = self.inner.into_parts();
         let (read_half, write_half) = split(parts.io);
         (
-            MessageWriter::with_buffer(write_half, parts.write_buf),
+            MessageWriter::with_codec_and_buffer(write_half, self.codec, parts.write_buf),
             MessageReader::with_buffer(read_half, parts.read_buf),
         )
     }
 
-    /// Serializes and sends a message framed with a 4-byte length prefix.
+    /// Serializes and sends a message framed with a 4-byte length prefix using the configured wire codec.
     pub async fn send_msg<M: Serialize>(&mut self, msg: &M) -> Result<(), ProtocolError> {
-        let serialized = serde_json::to_vec(msg)?;
-        if serialized.len() > MAX_FRAME_SIZE {
-            return Err(ProtocolError::FrameTooLarge {
-                size: serialized.len(),
-                max: MAX_FRAME_SIZE,
-            });
-        }
+        let payload = serialize_message(msg, self.codec)?;
         self.inner
-            .send(Bytes::from(serialized))
+            .send(payload)
             .await
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -328,11 +1151,22 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
 
     /// Reads the next framed message from the stream.
     /// Returns `Ok(Some(msg))` on success, `Ok(None)` on clean EOF, or `Err`.
-    pub async fn recv_msg<M: DeserializeOwned>(&mut self) -> Result<Option<M>, ProtocolError> {
+    pub async fn recv_msg<M: DeserializeOwned + 'static>(&mut self) -> Result<Option<M>, ProtocolError> {
+        match self.recv_msg_with_codec::<M>().await? {
+            Some((msg, _codec)) => Ok(Some(msg)),
+            None => Ok(None),
+        }
+    }
+
+    /// Reads the next framed message and returns it alongside the detected wire codec.
+    pub async fn recv_msg_with_codec<M: DeserializeOwned + 'static>(
+        &mut self,
+    ) -> Result<Option<(M, WireCodec)>, ProtocolError> {
         match self.inner.next().await {
             Some(Ok(bytes)) => {
-                let msg = serde_json::from_slice::<M>(&bytes)?;
-                Ok(Some(msg))
+                let (msg, codec) = deserialize_message::<M>(&bytes)?;
+                self.last_detected_codec = Some(codec);
+                Ok(Some((msg, codec)))
             }
             Some(Err(e)) => {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -392,6 +1226,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
 /// Unidirectional framed reader for receiving messages.
 pub struct MessageReader<R> {
     inner: FramedRead<R, LengthDelimitedCodec>,
+    last_detected_codec: Option<WireCodec>,
 }
 
 impl<R: AsyncRead + Unpin> MessageReader<R> {
@@ -399,6 +1234,7 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
     pub fn new(reader: R) -> Self {
         Self {
             inner: FramedRead::new(reader, default_codec()),
+            last_detected_codec: None,
         }
     }
 
@@ -408,15 +1244,29 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
         if !buffer.is_empty() {
             framed.read_buffer_mut().extend_from_slice(&buffer);
         }
-        Self { inner: framed }
+        Self {
+            inner: framed,
+            last_detected_codec: None,
+        }
     }
 
     /// Reads the next framed message from the reader.
-    pub async fn recv_msg<M: DeserializeOwned>(&mut self) -> Result<Option<M>, ProtocolError> {
+    pub async fn recv_msg<M: DeserializeOwned + 'static>(&mut self) -> Result<Option<M>, ProtocolError> {
+        match self.recv_msg_with_codec::<M>().await? {
+            Some((msg, _codec)) => Ok(Some(msg)),
+            None => Ok(None),
+        }
+    }
+
+    /// Reads the next framed message and returns it alongside the detected wire codec.
+    pub async fn recv_msg_with_codec<M: DeserializeOwned + 'static>(
+        &mut self,
+    ) -> Result<Option<(M, WireCodec)>, ProtocolError> {
         match self.inner.next().await {
             Some(Ok(bytes)) => {
-                let msg = serde_json::from_slice::<M>(&bytes)?;
-                Ok(Some(msg))
+                let (msg, codec) = deserialize_message::<M>(&bytes)?;
+                self.last_detected_codec = Some(codec);
+                Ok(Some((msg, codec)))
             }
             Some(Err(e)) => {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -432,6 +1282,11 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
             }
             None => Ok(None),
         }
+    }
+
+    /// Returns the wire codec detected from the most recently received frame, if any.
+    pub fn last_detected_codec(&self) -> Option<WireCodec> {
+        self.last_detected_codec
     }
 
     /// Reads raw frame bytes without deserializing.
@@ -458,36 +1313,55 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
 /// Unidirectional framed writer for transmitting messages.
 pub struct MessageWriter<W> {
     inner: FramedWrite<W, LengthDelimitedCodec>,
+    codec: WireCodec,
 }
 
 impl<W: AsyncWrite + Unpin> MessageWriter<W> {
-    /// Creates a new `MessageWriter` wrapping an async writer.
+    /// Creates a new `MessageWriter` wrapping an async writer with default wire codec (Bincode).
     pub fn new(writer: W) -> Self {
+        Self::with_codec(writer, WireCodec::default())
+    }
+
+    /// Creates a new `MessageWriter` wrapping an async writer with specific wire codec.
+    pub fn with_codec(writer: W, codec: WireCodec) -> Self {
         Self {
             inner: FramedWrite::new(writer, default_codec()),
+            codec,
         }
     }
 
-    /// Creates a new `MessageWriter` wrapping an async writer with pre-buffered data.
+    /// Creates a new `MessageWriter` wrapping an async writer with pre-buffered data and default codec.
     pub fn with_buffer(writer: W, buffer: BytesMut) -> Self {
+        Self::with_codec_and_buffer(writer, WireCodec::default(), buffer)
+    }
+
+    /// Creates a new `MessageWriter` wrapping an async writer with pre-buffered data and specified codec.
+    pub fn with_codec_and_buffer(writer: W, codec: WireCodec, buffer: BytesMut) -> Self {
         let mut framed = FramedWrite::new(writer, default_codec());
         if !buffer.is_empty() {
             framed.write_buffer_mut().extend_from_slice(&buffer);
         }
-        Self { inner: framed }
+        Self {
+            inner: framed,
+            codec,
+        }
     }
 
-    /// Serializes and sends a message framed with a 4-byte length prefix.
+    /// Returns the currently configured outbound wire codec.
+    pub fn codec(&self) -> WireCodec {
+        self.codec
+    }
+
+    /// Sets the outbound wire codec.
+    pub fn set_codec(&mut self, codec: WireCodec) {
+        self.codec = codec;
+    }
+
+    /// Serializes and sends a message framed with a 4-byte length prefix using the configured wire codec.
     pub async fn send_msg<M: Serialize>(&mut self, msg: &M) -> Result<(), ProtocolError> {
-        let serialized = serde_json::to_vec(msg)?;
-        if serialized.len() > MAX_FRAME_SIZE {
-            return Err(ProtocolError::FrameTooLarge {
-                size: serialized.len(),
-                max: MAX_FRAME_SIZE,
-            });
-        }
+        let payload = serialize_message(msg, self.codec)?;
         self.inner
-            .send(Bytes::from(serialized))
+            .send(payload)
             .await
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -612,6 +1486,7 @@ mod tests {
                         ram_mb: 8192,
                         gpu_required: false,
                         timeout_secs: 60,
+                        max_retries: None,
                     },
                     created_at_utc: 1726747200,
                     tags: vec!["test".into()],
@@ -864,4 +1739,115 @@ mod tests {
             serde_json::from_str(&resp_json).expect("deserialize");
         assert_eq!(response, resp_deserialized);
     }
+
+    #[test]
+    fn test_wire_codec_discriminator_serialization() {
+        let wid = Uuid::new_v4();
+        let msg = WorkerMessage::Heartbeat {
+            worker_id: wid,
+            timestamp: 12345,
+            active_tasks: 2,
+            cpu_usage_pct: 12.5,
+            ram_available_mb: 4096,
+        };
+
+        // Bincode serialized format begins with 0x02
+        let bin_bytes = serialize_message(&msg, WireCodec::Bincode).expect("serialize bincode");
+        assert_eq!(bin_bytes[0], WIRE_FORMAT_BINCODE);
+
+        // JSON serialized format begins with 0x01
+        let json_bytes = serialize_message(&msg, WireCodec::Json).expect("serialize json");
+        assert_eq!(json_bytes[0], WIRE_FORMAT_JSON);
+
+        // Verify deserialization correctly recovers the message and detected codec
+        let (recovered_bin, codec_bin): (WorkerMessage, WireCodec) =
+            deserialize_message(&bin_bytes).expect("deserialize bincode");
+        assert_eq!(recovered_bin, msg);
+        assert_eq!(codec_bin, WireCodec::Bincode);
+
+        let (recovered_json, codec_json): (WorkerMessage, WireCodec) =
+            deserialize_message(&json_bytes).expect("deserialize json");
+        assert_eq!(recovered_json, msg);
+        assert_eq!(codec_json, WireCodec::Json);
+    }
+
+    #[test]
+    fn test_wire_codec_raw_json_fallback() {
+        let wid = Uuid::new_v4();
+        let raw_json = format!(
+            r#"{{"type":"Heartbeat","worker_id":"{}","timestamp":999,"active_tasks":0,"cpu_usage_pct":0.0,"ram_available_mb":1024}}"#,
+            wid
+        );
+        let raw_bytes = Bytes::copy_from_slice(raw_json.as_bytes());
+
+        let (msg, codec): (WorkerMessage, WireCodec) =
+            deserialize_message(&raw_bytes).expect("deserialize raw json");
+        assert_eq!(codec, WireCodec::Json);
+        match msg {
+            WorkerMessage::Heartbeat { worker_id, timestamp, .. } => {
+                assert_eq!(worker_id, wid);
+                assert_eq!(timestamp, 999);
+            }
+            _ => panic!("unexpected message variant"),
+        }
+    }
+
+    #[test]
+    fn test_wire_codec_invalid_discriminator() {
+        let bad_payload = Bytes::from_static(&[0xFF, 0x01, 0x02, 0x03]);
+        let err = deserialize_message::<WorkerMessage>(&bad_payload).unwrap_err();
+        match err {
+            ProtocolError::InvalidFormatTag(0xFF) => {}
+            other => panic!("expected InvalidFormatTag(0xFF), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transport_auto_codec_negotiation() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        // Client uses Json codec
+        let mut client = MessageTransport::with_codec(client_io, WireCodec::Json);
+        // Server defaults to Bincode
+        let mut server = MessageTransport::with_codec(server_io, WireCodec::Bincode);
+
+        let wid = Uuid::new_v4();
+        let reg_msg = WorkerMessage::Register {
+            worker_id: wid,
+            capabilities: crate::capabilities::WorkerCapabilities::new("worker-1", 4, 8192, false, false, None),
+        };
+
+        // Client sends Register message in JSON format
+        client.send_msg(&reg_msg).await.expect("client send");
+
+        // Server receives and auto-detects codec
+        let (inbound, detected_codec) = server
+            .recv_msg_with_codec::<InboundMessage>()
+            .await
+            .expect("server recv")
+            .expect("some message");
+
+        assert_eq!(detected_codec, WireCodec::Json);
+        assert_eq!(inbound, InboundMessage::Worker(reg_msg));
+
+        // Server adjusts outbound codec to match client
+        server.set_outbound_codec(detected_codec);
+
+        let ack = MasterMessage::RegisterAck {
+            accepted: true,
+            worker_id: wid,
+            heartbeat_interval_secs: 3,
+            message: None,
+        };
+        server.send_msg(&ack).await.expect("server send ack");
+
+        // Client receives RegisterAck successfully in JSON
+        let client_ack: MasterMessage = client
+            .recv_msg()
+            .await
+            .expect("client recv")
+            .expect("some ack");
+        assert_eq!(client_ack, ack);
+    }
 }
+

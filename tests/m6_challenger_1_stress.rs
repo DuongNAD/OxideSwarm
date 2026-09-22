@@ -641,10 +641,19 @@ async fn test_adversarial_client_abrupt_disconnect_with_pending_waiter() {
     drop(transport);
 
     // Master finishes task, attempts to notify dead client, handles error gracefully
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    let start = Instant::now();
+    let mut state = TaskState::Submitted;
+    while start.elapsed() < Duration::from_secs(3) {
+        if let Ok(info) = cluster.master.get_task_info(task_id).await {
+            state = info.state;
+            if state == TaskState::Completed {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
-    let info = cluster.master.get_task_info(task_id).await.unwrap();
-    assert_eq!(info.state, TaskState::Completed);
+    assert_eq!(state, TaskState::Completed);
 }
 
 #[tokio::test]

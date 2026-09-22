@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::error::{GridError, GridResult};
-use rusty_grid_core::protocol::{MasterMessage, MessageTransport, WorkerMessage};
+use rusty_grid_core::protocol::{MasterMessage, MessageTransport, WireCodec, WorkerMessage};
 use rusty_grid_core::task::{Task, TaskId, TaskResult, TaskStatus};
 
 use crate::backoff::{BackoffConfig, ExponentialBackoff};
@@ -94,6 +94,8 @@ pub struct WorkerConfig {
     pub enable_redirection_portal: bool,
     /// Port for standby HTTP redirection portal (default: 8080).
     pub redirection_portal_port: u16,
+    /// Wire serialization codec (Bincode or Json, default: Bincode).
+    pub wire_codec: WireCodec,
 }
 
 impl WorkerConfig {
@@ -118,6 +120,7 @@ impl WorkerConfig {
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             enable_redirection_portal: true,
             redirection_portal_port: 8080,
+            wire_codec: WireCodec::default(),
         }
     }
 
@@ -205,6 +208,11 @@ impl WorkerConfig {
         self.max_output_bytes = bytes;
         self
     }
+
+    pub fn with_wire_codec(mut self, codec: WireCodec) -> Self {
+        self.wire_codec = codec;
+        self
+    }
 }
 
 /// Autonomous Worker client managing connection, registration, task execution, and communication with Master.
@@ -219,6 +227,8 @@ pub struct WorkerClient {
     active_task_table: ActiveTaskTable,
     concurrency_semaphore: Arc<Semaphore>,
     master_beacon: Arc<RwLock<Option<rusty_grid_core::discovery::MasterBeacon>>>,
+    #[cfg(feature = "p2p")]
+    p2p_endpoint: Arc<tokio::sync::Mutex<Option<iroh::Endpoint>>>,
 }
 
 impl WorkerClient {
@@ -297,6 +307,8 @@ impl WorkerClient {
             active_task_table,
             concurrency_semaphore,
             master_beacon,
+            #[cfg(feature = "p2p")]
+            p2p_endpoint: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -582,18 +594,32 @@ impl WorkerClient {
             let node_addr = rusty_grid_core::transport::parse_p2p_ticket(ticket_str)
                 .map_err(|e| GridError::Config(format!("Invalid P2P ticket: {e}")))?;
             info!("Connecting to Master via P2P NAT Traversal (iroh QUIC)...");
-            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-                .alpns(vec![rusty_grid_core::transport::GRID_ALPN.to_vec()])
-                .bind()
-                .await
-                .map_err(|e| {
-                    GridError::ConnectionFailed(format!("Failed to bind iroh endpoint: {e}"))
-                })?;
 
-            let conn = endpoint
-                .connect(node_addr, rusty_grid_core::transport::GRID_ALPN)
-                .await
-                .map_err(|e| GridError::ConnectionFailed(format!("P2P connect failed: {e}")))?;
+            let mut ep_guard = self.p2p_endpoint.lock().await;
+            let (endpoint, is_cached) = match ep_guard.as_ref() {
+                Some(ep) => (ep.clone(), true),
+                None => {
+                    let ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                        .alpns(vec![rusty_grid_core::transport::GRID_ALPN.to_vec()])
+                        .bind()
+                        .await
+                        .map_err(|e| GridError::ConnectionFailed(format!("Failed to bind iroh endpoint: {e}")))?;
+                    *ep_guard = Some(ep.clone());
+                    (ep, false)
+                }
+            };
+            drop(ep_guard);
+
+            let conn = match endpoint.connect(node_addr, rusty_grid_core::transport::GRID_ALPN).await {
+                Ok(c) => c,
+                Err(e) => {
+                    if is_cached {
+                        let mut guard = self.p2p_endpoint.lock().await;
+                        *guard = None;
+                    }
+                    return Err(GridError::ConnectionFailed(format!("P2P connect failed: {e}")));
+                }
+            };
 
             let (send, recv) = conn.open_bi().await.map_err(|e| {
                 GridError::ConnectionFailed(format!("Failed to open bidirectional stream: {e}"))
@@ -678,7 +704,7 @@ impl WorkerClient {
         let (stream, remote_desc) = self.establish_stream().await?;
         info!(master = %remote_desc, worker_id = %self.worker_id, "Connected to Master; initiating handshake");
 
-        let mut transport = MessageTransport::new(stream);
+        let mut transport = MessageTransport::with_codec(stream, self.config.wire_codec);
 
         // Perform atomic registration handshake
         let heartbeat_interval = self.perform_handshake(&mut transport).await?;

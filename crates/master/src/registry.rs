@@ -223,7 +223,12 @@ impl WorkerRegistry {
                     return Ok(false);
                 }
             }
+            // IDEMPOTENCY: If already disconnected, do not trigger failover again
+            if entry.status == WorkerStatus::Disconnected {
+                return Ok(false);
+            }
             entry.status = WorkerStatus::Disconnected;
+            entry.active_tasks = 0; // Clear active tasks on eviction
             if let Some(abort) = entry.abort_handle.take() {
                 abort.abort();
             }
@@ -482,6 +487,7 @@ impl WorkerRegistry {
                 // Double check to prevent race condition with concurrent heartbeat
                 if entry.status != WorkerStatus::Disconnected && elapsed > timeout {
                     entry.status = WorkerStatus::Disconnected;
+                    entry.active_tasks = 0;
                     if let Some(abort) = entry.abort_handle.take() {
                         abort.abort();
                     }
@@ -662,5 +668,43 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(active, 2);
         assert_eq!(gpu_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_unregister_idempotency_and_active_tasks_reset() {
+        let registry = WorkerRegistry::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let worker_id = Uuid::new_v4();
+        let caps = WorkerCapabilities::new("w-test", 4, 8192, false, false, None);
+
+        let session_id = registry
+            .register(
+                worker_id,
+                caps,
+                "127.0.0.1:9099".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Increment active tasks
+        registry.increment_active_tasks(&worker_id).await.unwrap();
+        registry.increment_active_tasks(&worker_id).await.unwrap();
+        let entry = registry.get_worker(worker_id).await.unwrap();
+        assert_eq!(entry.active_tasks, 2);
+        assert_eq!(entry.status, WorkerStatus::Busy);
+
+        // First unregister: returns Ok(true), status becomes Disconnected, active_tasks reset to 0
+        let unreg1 = registry.unregister(&worker_id, Some(session_id)).await.unwrap();
+        assert!(unreg1, "First unregister must succeed");
+
+        let entry_disconnected = registry.get_worker(worker_id).await.unwrap();
+        assert_eq!(entry_disconnected.status, WorkerStatus::Disconnected);
+        assert_eq!(entry_disconnected.active_tasks, 0, "active_tasks must be reset to 0 on disconnect");
+
+        // Second unregister: returns Ok(false) due to idempotency
+        let unreg2 = registry.unregister(&worker_id, Some(session_id)).await.unwrap();
+        assert!(!unreg2, "Second unregister must return false (idempotent)");
     }
 }

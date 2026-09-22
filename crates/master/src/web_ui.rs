@@ -278,6 +278,7 @@ async fn api_submit_task(
         ram_mb: 0,
         gpu_required: false,
         timeout_secs: 60,
+        max_retries: None,
     };
     let task = Task::new(spec, reqs);
 

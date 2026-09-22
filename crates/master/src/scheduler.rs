@@ -413,6 +413,7 @@ impl WorkloadScheduler {
                         .handle_worker_disconnected(
                             &assignment.worker_id,
                             "Failed to deliver AssignTask message",
+                            false,
                         )
                         .await;
                     let _ = self.registry.unregister(&assignment.worker_id, None).await;
