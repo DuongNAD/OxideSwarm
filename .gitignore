@@ -25,9 +25,11 @@ oxideswarm.port
 .DS_Store
 **/.DS_Store
 .AppleDouble
+**/.AppleDouble
 .LSOverride
 Icon?
 ._*
+**/._*
 .Spotlight-V100
 .Trashes
 
