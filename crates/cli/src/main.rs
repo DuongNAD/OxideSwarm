@@ -21,16 +21,10 @@ use tokio::sync::watch;
 use tracing::info;
 use uuid::Uuid;
 
-use rusty_grid_core::mapreduce::{
-    MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec,
-};
-use rusty_grid_core::protocol::{
-    ClientMessage, ClientResponse, MessageTransport,
-};
+use rusty_grid_core::mapreduce::{MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec};
+use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
-use rusty_grid_master::{
-    MasterServer, ReaperConfig, SchedulerConfig, ServerConfig,
-};
+use rusty_grid_master::{MasterServer, ReaperConfig, SchedulerConfig, ServerConfig};
 use rusty_grid_worker::{WorkerClient, WorkerConfig};
 
 use crate::config::{
@@ -45,13 +39,27 @@ use crate::config::{
     version
 )]
 pub struct Cli {
-    #[arg(global = true, short = 'v', long = "verbose", help = "Increase logging verbosity")]
+    #[arg(
+        global = true,
+        short = 'v',
+        long = "verbose",
+        help = "Increase logging verbosity"
+    )]
     pub verbose: bool,
 
-    #[arg(global = true, short = 'q', long = "quiet", help = "Suppress non-essential output")]
+    #[arg(
+        global = true,
+        short = 'q',
+        long = "quiet",
+        help = "Suppress non-essential output"
+    )]
     pub quiet: bool,
 
-    #[arg(global = true, long = "config", help = "Path to configuration file (TOML or JSON)")]
+    #[arg(
+        global = true,
+        long = "config",
+        help = "Path to configuration file (TOML or JSON)"
+    )]
     pub config: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -77,23 +85,45 @@ pub enum Commands {
 
     /// Execute a distributed Map/Reduce job
     Mapreduce(MapReduceArgs),
+
+    /// Workflow modes and presets (test, dev, doc, research)
+    Mode(rusty_grid_cli::mode_cli::ModeCliArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
 pub struct MasterArgs {
-    #[arg(long, help = "Socket address to bind TCP listener to (e.g. 127.0.0.1:8080 or 127.0.0.1:0)")]
+    #[arg(
+        long,
+        help = "Socket address to bind TCP listener to (e.g. 127.0.0.1:8080 or 127.0.0.1:0)"
+    )]
     pub listen: Option<String>,
 
-    #[arg(long, alias = "portfile", help = "File path where bound port number is written")]
+    #[arg(
+        long,
+        alias = "portfile",
+        help = "File path where bound port number is written"
+    )]
     pub port_file: Option<PathBuf>,
 
-    #[arg(long, alias = "heartbeat-interval", help = "Heartbeat interval advertised to workers in seconds")]
+    #[arg(
+        long,
+        alias = "heartbeat-interval",
+        help = "Heartbeat interval advertised to workers in seconds"
+    )]
     pub heartbeat_interval_secs: Option<u64>,
 
-    #[arg(long, alias = "heartbeat-timeout", help = "Timeout in seconds before marking unacknowledged worker disconnected")]
+    #[arg(
+        long,
+        alias = "heartbeat-timeout",
+        help = "Timeout in seconds before marking unacknowledged worker disconnected"
+    )]
     pub heartbeat_timeout_secs: Option<u64>,
 
-    #[arg(long, alias = "reaper-interval", help = "Interval in seconds between dead-worker reaper sweeps")]
+    #[arg(
+        long,
+        alias = "reaper-interval",
+        help = "Interval in seconds between dead-worker reaper sweeps"
+    )]
     pub reaper_interval_secs: Option<u64>,
 
     #[arg(long, help = "Maximum queue capacity")]
@@ -105,7 +135,10 @@ pub struct MasterArgs {
     #[arg(long, help = "Scheduler policy (weighted, least-loaded, round-robin)")]
     pub scheduler_policy: Option<String>,
 
-    #[arg(long, help = "Host CPU usage % threshold for worker anti-stuttering backpressure")]
+    #[arg(
+        long,
+        help = "Host CPU usage % threshold for worker anti-stuttering backpressure"
+    )]
     pub max_host_cpu_pct: Option<f32>,
 
     #[arg(long, help = "Preserve GPU-capable workers for GPU-specific workloads")]
@@ -116,11 +149,20 @@ pub struct MasterArgs {
 
     #[arg(long, help = "File path where P2P connection ticket string is written")]
     pub p2p_ticket_file: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "Address to bind HTTP Web UI Dashboard listener (e.g. 127.0.0.1:3000)"
+    )]
+    pub web_ui_addr: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
 pub struct WorkerArgs {
-    #[arg(long, help = "Address of the Master node to connect to (e.g. 127.0.0.1:8080)")]
+    #[arg(
+        long,
+        help = "Address of the Master node to connect to (e.g. 127.0.0.1:8080)"
+    )]
     pub master: Option<String>,
 
     #[arg(long, help = "P2P connection ticket string for NAT traversal")]
@@ -132,7 +174,12 @@ pub struct WorkerArgs {
     #[arg(long, alias = "cpu-cores", help = "Override advertised CPU core count")]
     pub cores: Option<usize>,
 
-    #[arg(long, alias = "override-ram-mb", alias = "ram", help = "Override advertised RAM in Megabytes")]
+    #[arg(
+        long,
+        alias = "override-ram-mb",
+        alias = "ram",
+        help = "Override advertised RAM in Megabytes"
+    )]
     pub ram_mb: Option<u64>,
 
     #[arg(long, help = "Explicitly advertise physical GPU presence")]
@@ -147,10 +194,18 @@ pub struct WorkerArgs {
     #[arg(long, help = "Human-readable GPU device model string")]
     pub gpu_name: Option<String>,
 
-    #[arg(long, alias = "max-concurrent-tasks", help = "Maximum concurrent tasks executing simultaneously")]
+    #[arg(
+        long,
+        alias = "max-concurrent-tasks",
+        help = "Maximum concurrent tasks executing simultaneously"
+    )]
     pub max_concurrency: Option<usize>,
 
-    #[arg(long, alias = "heartbeat-interval", help = "Heartbeat interval in seconds")]
+    #[arg(
+        long,
+        alias = "heartbeat-interval",
+        help = "Heartbeat interval in seconds"
+    )]
     pub heartbeat_interval_secs: Option<u64>,
 
     #[arg(long, help = "Base directory for task scratch sandboxes")]
@@ -165,7 +220,12 @@ pub struct SubmitArgs {
     #[arg(long, help = "Address of Master coordinator")]
     pub master: Option<String>,
 
-    #[arg(long = "type", alias = "task-type", default_value = "generic", help = "Task type: generic, gpu, compile, shell, command")]
+    #[arg(
+        long = "type",
+        alias = "task-type",
+        default_value = "generic",
+        help = "Task type: generic, gpu, compile, shell, command"
+    )]
     pub task_type: String,
 
     #[arg(long, help = "Command executable name to run")]
@@ -174,7 +234,12 @@ pub struct SubmitArgs {
     #[arg(long, default_value = "1", help = "Minimum CPU cores required")]
     pub cores: usize,
 
-    #[arg(long, alias = "ram", default_value = "0", help = "Minimum RAM in MB required")]
+    #[arg(
+        long,
+        alias = "ram",
+        default_value = "0",
+        help = "Minimum RAM in MB required"
+    )]
     pub ram_mb: u64,
 
     #[arg(long, help = "Require GPU worker node")]
@@ -225,16 +290,32 @@ pub struct MapReduceArgs {
     #[arg(long, required = true, help = "Input data files or text datasets")]
     pub input: Vec<String>,
 
-    #[arg(long, default_value = "word_count", help = "Mapper name (e.g. word_count, uppercase) or script path")]
+    #[arg(
+        long,
+        default_value = "word_count",
+        help = "Mapper name (e.g. word_count, uppercase) or script path"
+    )]
     pub mapper: String,
 
-    #[arg(long, default_value = "sum", help = "Reducer name (e.g. sum, count) or script path")]
+    #[arg(
+        long,
+        default_value = "sum",
+        help = "Reducer name (e.g. sum, count) or script path"
+    )]
     pub reducer: String,
 
-    #[arg(long, default_value = "4", help = "Number of input chunks to partition dataset into")]
+    #[arg(
+        long,
+        default_value = "4",
+        help = "Number of input chunks to partition dataset into"
+    )]
     pub chunks: usize,
 
-    #[arg(long, default_value = "60", help = "Timeout in seconds for Map/Reduce execution")]
+    #[arg(
+        long,
+        default_value = "60",
+        help = "Timeout in seconds for Map/Reduce execution"
+    )]
     pub timeout_secs: u64,
 
     #[arg(long, help = "Format output as JSON")]
@@ -275,6 +356,14 @@ async fn main() -> ExitCode {
         Commands::Status(args) => run_status(args, config_file).await,
         Commands::Workers(args) => run_workers(args, config_file).await,
         Commands::Mapreduce(args) => run_mapreduce(args, config_file).await,
+        Commands::Mode(args) => {
+            let code = rusty_grid_cli::mode_cli::run_mode_cli(args).await;
+            if code == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(code as u8)
+            }
+        }
     }
 }
 
@@ -361,6 +450,12 @@ async fn run_master(args: MasterArgs, config_file: Option<config::ConfigFile>) -
         server_config = server_config.with_p2p_ticket_file(tf);
     }
 
+    if let Some(ref w_addr) = args.web_ui_addr {
+        if let Ok(parsed) = w_addr.parse() {
+            server_config = server_config.with_web_ui(true).with_web_ui_addr(parsed);
+        }
+    }
+
     let sched_config = SchedulerConfig {
         preserve_gpu_for_gpu_tasks: preserve_gpu,
         max_host_cpu_pct: max_host_cpu,
@@ -378,13 +473,14 @@ async fn run_master(args: MasterArgs, config_file: Option<config::ConfigFile>) -
         "Starting RustyGrid Master"
     );
 
-    let handle = match MasterServer::spawn_with_config(server_config, sched_config, reaper_config).await {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("Failed to start master server: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let handle =
+        match MasterServer::spawn_with_config(server_config, sched_config, reaper_config).await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("Failed to start master server: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     println!("RustyGrid Master started on {}", handle.server_addr());
 
@@ -486,7 +582,10 @@ async fn run_worker(args: WorkerArgs, config_file: Option<config::ConfigFile>) -
 
     let max_concurrency = resolve_opt_usize(
         args.max_concurrency,
-        &["RUSTY_GRID_MAX_CONCURRENCY", "RUSTY_GRID_MAX_CONCURRENT_TASKS"],
+        &[
+            "RUSTY_GRID_MAX_CONCURRENCY",
+            "RUSTY_GRID_MAX_CONCURRENT_TASKS",
+        ],
         worker_cfg.as_ref().and_then(|w| w.max_concurrency),
     );
 
@@ -504,7 +603,11 @@ async fn run_worker(args: WorkerArgs, config_file: Option<config::ConfigFile>) -
     );
 
     let keep_sandboxes = resolve_bool(
-        if args.keep_sandboxes { Some(true) } else { None },
+        if args.keep_sandboxes {
+            Some(true)
+        } else {
+            None
+        },
         &["RUSTY_GRID_KEEP_SANDBOXES"],
         worker_cfg.as_ref().and_then(|w| w.keep_sandboxes),
         false,
@@ -573,6 +676,38 @@ async fn run_worker(args: WorkerArgs, config_file: Option<config::ConfigFile>) -
     }
 }
 
+async fn resolve_master_addr(addr: String) -> String {
+    if addr.eq_ignore_ascii_case("auto") || addr.starts_with("auto:") {
+        let disc_port = if addr.starts_with("auto:") {
+            addr[5..].parse::<u16>().unwrap_or(rusty_grid_core::DEFAULT_DISCOVERY_PORT)
+        } else {
+            rusty_grid_core::DEFAULT_DISCOVERY_PORT
+        };
+        info!(port = disc_port, "Master address set to 'auto'; performing LAN UDP discovery probe...");
+        match rusty_grid_core::discovery::discover_master(
+            Duration::from_secs(3),
+            disc_port,
+        )
+        .await
+        {
+            Some(beacon) => {
+                info!(
+                    master = %beacon.cluster_addr,
+                    hostname = %beacon.hostname,
+                    "Discovered active Master via UDP LAN beacon"
+                );
+                beacon.cluster_addr
+            }
+            None => {
+                eprintln!("Auto-discovery timed out; falling back to 127.0.0.1:8088");
+                "127.0.0.1:8088".to_string()
+            }
+        }
+    } else {
+        addr
+    }
+}
+
 async fn run_submit(args: SubmitArgs, config_file: Option<config::ConfigFile>) -> ExitCode {
     let submit_cfg = config_file.as_ref().and_then(|c| c.submit.clone());
     let master_addr = resolve_string(
@@ -581,6 +716,7 @@ async fn run_submit(args: SubmitArgs, config_file: Option<config::ConfigFile>) -
         submit_cfg.as_ref().and_then(|s| s.master.clone()),
         "127.0.0.1:8080",
     );
+    let master_addr = resolve_master_addr(master_addr).await;
 
     let stream = match TcpStream::connect(&master_addr).await {
         Ok(s) => s,
@@ -595,14 +731,20 @@ async fn run_submit(args: SubmitArgs, config_file: Option<config::ConfigFile>) -
     let is_gpu = args.gpu || args.task_type.eq_ignore_ascii_case("gpu");
     let spec = match args.task_type.to_lowercase().as_str() {
         "gpu" => TaskSpec::GpuCompute {
-            kernel_name: args.command.clone().unwrap_or_else(|| "matrix_multiply".into()),
+            kernel_name: args
+                .command
+                .clone()
+                .unwrap_or_else(|| "matrix_multiply".into()),
             input_data: vec![1, 2, 3, 4],
             work_group_size: 16,
             simulated_matrix_dim: 64,
             compute_intensity: 10,
         },
         "compile" => TaskSpec::RustCompilation {
-            crate_name: args.command.clone().unwrap_or_else(|| "simulated_crate".into()),
+            crate_name: args
+                .command
+                .clone()
+                .unwrap_or_else(|| "simulated_crate".into()),
             source_files: HashMap::new(),
             compiler_flags: if !args.args.is_empty() {
                 args.args.clone()
@@ -717,6 +859,7 @@ async fn run_status(args: StatusArgs, config_file: Option<config::ConfigFile>) -
         status_cfg.as_ref().and_then(|s| s.master.clone()),
         "127.0.0.1:8080",
     );
+    let master_addr = resolve_master_addr(master_addr).await;
 
     let stream = match TcpStream::connect(&master_addr).await {
         Ok(s) => s,
@@ -790,11 +933,7 @@ async fn run_status(args: StatusArgs, config_file: Option<config::ConfigFile>) -
                     for w in workers {
                         println!(
                             "- Worker [{}] (Cores: {}, RAM: {}MB, GPU: {}, Simulated: {})",
-                            w.name,
-                            w.cpu_cores,
-                            w.ram_mb,
-                            w.has_gpu,
-                            w.is_simulated_gpu,
+                            w.name, w.cpu_cores, w.ram_mb, w.has_gpu, w.is_simulated_gpu,
                         );
                     }
                 }
@@ -879,6 +1018,7 @@ async fn run_mapreduce(args: MapReduceArgs, config_file: Option<config::ConfigFi
         submit_cfg.as_ref().and_then(|s| s.master.clone()),
         "127.0.0.1:8080",
     );
+    let master_addr = resolve_master_addr(master_addr).await;
 
     let stream = match TcpStream::connect(&master_addr).await {
         Ok(s) => s,
@@ -917,7 +1057,10 @@ async fn run_mapreduce(args: MapReduceArgs, config_file: Option<config::ConfigFi
         }
     }
 
-    let mapper_spec = if args.mapper.contains('/') || args.mapper.contains('\\') || Path::new(&args.mapper).exists() {
+    let mapper_spec = if args.mapper.contains('/')
+        || args.mapper.contains('\\')
+        || Path::new(&args.mapper).exists()
+    {
         MapFunctionSpec::ShellScript {
             script: args.mapper,
         }
@@ -927,7 +1070,10 @@ async fn run_mapreduce(args: MapReduceArgs, config_file: Option<config::ConfigFi
         }
     };
 
-    let reducer_spec = if args.reducer.contains('/') || args.reducer.contains('\\') || Path::new(&args.reducer).exists() {
+    let reducer_spec = if args.reducer.contains('/')
+        || args.reducer.contains('\\')
+        || Path::new(&args.reducer).exists()
+    {
         ReduceFunctionSpec::ShellScript {
             script: args.reducer,
         }
@@ -961,10 +1107,19 @@ async fn run_mapreduce(args: MapReduceArgs, config_file: Option<config::ConfigFi
                 println!("=== MapReduce Job Completed ===");
                 println!("Job ID:           {}", result.job_id);
                 println!("Status:           {}", result.status);
-                println!("Map Tasks:        {}/{}", result.map_tasks_completed, result.map_tasks_total);
-                println!("Reduce Tasks:     {}/{}", result.reduce_tasks_completed, result.reduce_tasks_total);
+                println!(
+                    "Map Tasks:        {}/{}",
+                    result.map_tasks_completed, result.map_tasks_total
+                );
+                println!(
+                    "Reduce Tasks:     {}/{}",
+                    result.reduce_tasks_completed, result.reduce_tasks_total
+                );
                 println!("Execution Time:   {}ms", result.execution_time_ms);
-                println!("\nAggregated Results ({} unique keys):", result.output.len());
+                println!(
+                    "\nAggregated Results ({} unique keys):",
+                    result.output.len()
+                );
                 for (key, val) in &result.output {
                     println!("  {key}: {val}");
                 }

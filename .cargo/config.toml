@@ -1,0 +1,3 @@
+[alias]
+xtask = "run --quiet --package rusty_grid_cli --bin ox-mode --"
+mode = "run --quiet --package rusty_grid_cli --bin ox-mode --"

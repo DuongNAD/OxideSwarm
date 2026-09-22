@@ -6,6 +6,7 @@ pub mod reaper;
 pub mod registry;
 pub mod scheduler;
 pub mod server;
+pub mod web_ui;
 
 pub use mapreduce::MapReduceEngine;
 pub use queue::{

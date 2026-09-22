@@ -174,15 +174,37 @@ impl TestCluster {
     /// Convenience setup for standard 1 Master + 3 Workers Acceptance Criteria topology.
     pub async fn setup_ac_cluster() -> (Self, Uuid, Uuid, Uuid) {
         let mut cluster = Self::new().await;
-        let w1 = cluster.spawn_worker("worker-cpu-node-1", 2, 2048, false).await;
-        let w2 = cluster.spawn_worker("worker-cpu-node-2", 4, 4096, false).await;
-        let w3 = cluster.spawn_worker("worker-gpu-node-3", 8, 8192, true).await;
+        let w1 = cluster
+            .spawn_worker("worker-cpu-node-1", 2, 2048, false)
+            .await;
+        let w2 = cluster
+            .spawn_worker("worker-cpu-node-2", 4, 4096, false)
+            .await;
+        let w3 = cluster
+            .spawn_worker("worker-gpu-node-3", 8, 8192, true)
+            .await;
         assert!(
             cluster.wait_for_workers(3, Duration::from_secs(5)).await,
             "Failed to register all 3 AC workers"
         );
         (cluster, w1, w2, w3)
     }
+}
+
+/// Helper polling predicate until condition is met or timeout elapses.
+async fn poll_until<F, Fut>(timeout: Duration, step: Duration, mut predicate: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if predicate().await {
+            return true;
+        }
+        tokio::time::sleep(step).await;
+    }
+    false
 }
 
 impl Drop for TestCluster {
@@ -220,7 +242,10 @@ async fn spawn_mock_wire_worker(
     transport.send_msg(&reg_msg).await.expect("send register");
 
     let ack: Option<MasterMessage> = transport.recv_msg().await.expect("recv ack");
-    assert!(matches!(ack, Some(MasterMessage::RegisterAck { accepted: true, .. })));
+    assert!(matches!(
+        ack,
+        Some(MasterMessage::RegisterAck { accepted: true, .. })
+    ));
 
     let handle = tokio::spawn(async move {
         loop {
@@ -305,7 +330,24 @@ async fn test_tier1_f1_registration_reconnection_same_worker_id() {
 
     // Simulate worker disconnect
     cluster.abort_worker(wid);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let disconnected = poll_until(
+        Duration::from_secs(3),
+        Duration::from_millis(10),
+        || async {
+            if let Ok(workers) = cluster.master.list_workers().await {
+                workers
+                    .iter()
+                    .any(|w| w.worker_id == wid && w.status == WorkerStatus::Disconnected)
+            } else {
+                false
+            }
+        },
+    )
+    .await;
+    assert!(
+        disconnected,
+        "Worker must transition to Disconnected after abort"
+    );
 
     // Reconnect worker with identical UUID
     let temp2 = tempfile::tempdir().unwrap();
@@ -336,7 +378,10 @@ async fn test_tier1_f1_registration_heartbeat_liveness_acknowledged() {
     };
     transport.send_msg(&reg).await.unwrap();
     let ack: Option<MasterMessage> = transport.recv_msg().await.unwrap();
-    assert!(matches!(ack, Some(MasterMessage::RegisterAck { accepted: true, .. })));
+    assert!(matches!(
+        ack,
+        Some(MasterMessage::RegisterAck { accepted: true, .. })
+    ));
 
     let ts = 987654321;
     let hb = WorkerMessage::Heartbeat {
@@ -365,7 +410,10 @@ async fn test_tier1_f1_registration_client_list_workers_wire_protocol() {
     let client_stream = TcpStream::connect(cluster.master_addr).await.unwrap();
     let mut transport = MessageTransport::new(client_stream);
 
-    transport.send_msg(&ClientMessage::ListWorkers).await.unwrap();
+    transport
+        .send_msg(&ClientMessage::ListWorkers)
+        .await
+        .unwrap();
     let resp: Option<ClientResponse> = transport.recv_msg().await.unwrap();
     match resp {
         Some(ClientResponse::WorkerList { workers }) => {
@@ -439,8 +487,7 @@ async fn test_tier1_f2_capabilities_mobile_telemetry_advertising() {
     let caps = WorkerCapabilities::new("android-phone-1", 8, 8192, false, false, None)
         .with_mobile(Some(mobile));
 
-    let (wid, _tx, _rx, _handle) =
-        spawn_mock_wire_worker(cluster.master_addr, caps.clone()).await;
+    let (wid, _tx, _rx, _handle) = spawn_mock_wire_worker(cluster.master_addr, caps.clone()).await;
 
     let workers = cluster.master.list_workers().await.unwrap();
     let w = workers.iter().find(|w| w.worker_id == wid).unwrap();
@@ -486,7 +533,10 @@ async fn test_tier1_f3_generic_command_echo_success() {
         TaskSpec::command("echo", vec!["Hello OxideSwarm Distributed Grid".into()]),
         TaskRequirements::generic(1, 10),
     );
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert_eq!(res.exit_code, 0);
     assert!(res.stdout.contains("Hello OxideSwarm Distributed Grid"));
@@ -506,14 +556,22 @@ async fn test_tier1_f3_generic_command_with_env_and_args() {
     let task = Task::new(
         TaskSpec::Command {
             program: "sh".into(),
-            args: vec!["-c".into(), "echo var=$CUSTOM_GRID_VAR arg=$1".into(), "_".into(), "argval".into()],
+            args: vec![
+                "-c".into(),
+                "echo var=$CUSTOM_GRID_VAR arg=$1".into(),
+                "_".into(),
+                "argval".into(),
+            ],
             env,
             working_dir: None,
             stdin: None,
         },
         TaskRequirements::generic(1, 10),
     );
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert_eq!(res.exit_code, 0);
     assert!(res.stdout.contains("var=DistributedRustWorks"));
@@ -541,7 +599,10 @@ echo "SUM=$total"
         },
         TaskRequirements::generic(1, 10),
     );
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert_eq!(res.exit_code, 0);
     assert!(res.stdout.contains("SUM=10"));
@@ -557,7 +618,10 @@ async fn test_tier1_f3_generic_builtin_test_hash_compute() {
         TaskSpec::builtin_test("hash_compute", 50_000),
         TaskRequirements::generic(1, 10),
     );
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert_eq!(res.exit_code, 0);
     assert!(res.stdout.contains("BuiltinTest hash_compute complete"));
@@ -616,10 +680,16 @@ async fn test_tier1_f4_gpu_task_routes_exclusively_to_simulated_gpu_worker() {
         },
         TaskRequirements::gpu(10),
     );
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert_eq!(res.exit_code, 0);
-    assert_eq!(res.worker_id, w3_gpu, "GPU task must route exclusively to GPU node");
+    assert_eq!(
+        res.worker_id, w3_gpu,
+        "GPU task must route exclusively to GPU node"
+    );
     assert_ne!(res.worker_id, w1);
     assert_ne!(res.worker_id, w2);
     assert!(res.is_gpu_executed);
@@ -648,7 +718,11 @@ async fn test_tier1_f4_gpu_task_blocked_when_no_gpu_workers_connected() {
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let status = cluster.master.get_task_status(task_id).await.unwrap();
-    assert_eq!(status, TaskStatus::Queued, "Task must remain Queued without GPU workers");
+    assert_eq!(
+        status,
+        TaskStatus::Queued,
+        "Task must remain Queued without GPU workers"
+    );
 
     let info = cluster.master.get_task_info(task_id).await.unwrap();
     assert_eq!(info.assigned_worker_id, None);
@@ -683,7 +757,11 @@ async fn test_tier1_f4_gpu_task_dispatches_immediately_when_gpu_worker_joins() {
     assert!(cluster.wait_for_workers(2, Duration::from_secs(3)).await);
 
     // Await task completion
-    let res = cluster.master.wait_task(task_id, Some(Duration::from_secs(5))).await.unwrap();
+    let res = cluster
+        .master
+        .wait_task(task_id, Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
     assert_eq!(res.exit_code, 0);
     assert_eq!(res.worker_id, w_gpu);
     assert!(res.is_gpu_executed);
@@ -692,7 +770,9 @@ async fn test_tier1_f4_gpu_task_dispatches_immediately_when_gpu_worker_joins() {
 #[tokio::test]
 async fn test_tier1_f4_gpu_compute_matrix_multiplication_correctness() {
     let mut cluster = TestCluster::new().await;
-    let w_gpu = cluster.spawn_worker("gpu-matrix-worker", 8, 8192, true).await;
+    let w_gpu = cluster
+        .spawn_worker("gpu-matrix-worker", 8, 8192, true)
+        .await;
     assert!(cluster.wait_for_workers(1, Duration::from_secs(3)).await);
 
     let task = Task::new(
@@ -705,7 +785,10 @@ async fn test_tier1_f4_gpu_compute_matrix_multiplication_correctness() {
         },
         TaskRequirements::gpu(15),
     );
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert_eq!(res.exit_code, 0);
     assert_eq!(res.worker_id, w_gpu);
@@ -725,7 +808,10 @@ async fn test_tier1_f4_cpu_task_prefers_cpu_worker_preserving_gpu() {
         TaskSpec::command("echo", vec!["generic cpu task".into()]),
         TaskRequirements::generic(1, 10),
     );
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert_eq!(res.exit_code, 0);
     assert_eq!(
@@ -751,7 +837,10 @@ async fn test_tier1_f5_batch_5_tasks_spread_across_3_workers() {
         let c = &cluster;
         task_futs.push(async move {
             let id = c.master.submit_task(task).await.unwrap();
-            (i, c.master.wait_task(id, Some(Duration::from_secs(5))).await)
+            (
+                i,
+                c.master.wait_task(id, Some(Duration::from_secs(5))).await,
+            )
         });
     }
 
@@ -835,7 +924,10 @@ async fn test_tier1_f5_batch_compilation_crate_materialization_and_rustc() {
     assert!(cluster.wait_for_workers(2, Duration::from_secs(3)).await);
 
     let crates = vec![
-        ("crate_alpha", "pub fn alpha() -> &'static str { \"alpha\" }"),
+        (
+            "crate_alpha",
+            "pub fn alpha() -> &'static str { \"alpha\" }",
+        ),
         ("crate_beta", "pub fn beta() -> i32 { 100 }"),
         ("crate_gamma", "pub fn gamma() -> bool { true }"),
     ];
@@ -884,7 +976,11 @@ async fn test_tier1_f5_batch_completion_state_consistency() {
     }
 
     for id in task_ids {
-        let res = cluster.master.wait_task(id, Some(Duration::from_secs(5))).await.unwrap();
+        let res = cluster
+            .master
+            .wait_task(id, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
         assert_eq!(res.exit_code, 0);
     }
 
@@ -910,7 +1006,10 @@ async fn test_tier2_bva_timeout_handling_kills_process() {
         TaskSpec::command("sleep", vec!["10".into()]),
         TaskRequirements::new(1, 512, false, 1),
     );
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert_eq!(res.exit_code, 124, "Timed out task must emit exit code 124");
     assert!(
@@ -930,11 +1029,17 @@ async fn test_tier2_bva_zero_duration_builtin_task_instant_completion() {
         TaskRequirements::generic(1, 10),
     );
     let start = Instant::now();
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
     let elapsed = start.elapsed();
 
     assert_eq!(res.exit_code, 0);
-    assert!(elapsed < Duration::from_millis(100), "0-duration task must complete nearly instantly");
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "0-duration task must complete nearly instantly"
+    );
 }
 
 #[tokio::test]
@@ -950,8 +1055,14 @@ async fn test_tier2_bva_max_concurrency_limit_throttles_worker() {
     assert!(cluster.wait_for_workers(1, Duration::from_secs(3)).await);
 
     let start = Instant::now();
-    let t1 = Task::new(TaskSpec::command("sleep", vec!["0.15".into()]), TaskRequirements::generic(1, 10));
-    let t2 = Task::new(TaskSpec::command("sleep", vec!["0.15".into()]), TaskRequirements::generic(1, 10));
+    let t1 = Task::new(
+        TaskSpec::command("sleep", vec!["0.15".into()]),
+        TaskRequirements::generic(1, 10),
+    );
+    let t2 = Task::new(
+        TaskSpec::command("sleep", vec!["0.15".into()]),
+        TaskRequirements::generic(1, 10),
+    );
 
     let id1 = cluster.master.submit_task(t1).await.unwrap();
     let id2 = cluster.master.submit_task(t2).await.unwrap();
@@ -987,16 +1098,26 @@ async fn test_tier2_bva_cancellation_emits_exit_code_130() {
     let mut is_running = false;
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        if matches!(cluster.master.get_task_status(task_id).await, Ok(TaskStatus::Running)) {
+        if matches!(
+            cluster.master.get_task_status(task_id).await,
+            Ok(TaskStatus::Running)
+        ) {
             is_running = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(is_running, "Task must transition to Running before cancellation");
+    assert!(
+        is_running,
+        "Task must transition to Running before cancellation"
+    );
 
     cluster.master.cancel_task(task_id).await.unwrap();
-    let res = cluster.master.wait_task(task_id, Some(Duration::from_secs(5))).await.unwrap();
+    let res = cluster
+        .master
+        .wait_task(task_id, Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
 
     assert_eq!(res.exit_code, 130, "Cancelled task must emit exit code 130");
     let state = cluster.master.get_task_status(task_id).await.unwrap();
@@ -1012,14 +1133,20 @@ async fn test_tier2_bva_non_zero_exit_code_and_stderr_capture() {
     let task = Task::new(
         TaskSpec::Command {
             program: "sh".into(),
-            args: vec!["-c".into(), "echo 'custom error message' >&2; exit 42".into()],
+            args: vec![
+                "-c".into(),
+                "echo 'custom error message' >&2; exit 42".into(),
+            ],
             env: HashMap::new(),
             working_dir: None,
             stdin: None,
         },
         TaskRequirements::generic(1, 10),
     );
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert_eq!(res.exit_code, 42);
     assert!(res.stderr.contains("custom error message"));
@@ -1040,13 +1167,28 @@ async fn test_tier2_bva_worker_socket_drop_triggers_failover() {
     let task_id = cluster.master.submit_task(task).await.unwrap();
 
     // Wait for task to begin running
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    let started = poll_until(
+        Duration::from_secs(3),
+        Duration::from_millis(10),
+        || async {
+            matches!(
+                cluster.master.get_task_status(task_id).await,
+                Ok(TaskStatus::Running)
+            )
+        },
+    )
+    .await;
+    assert!(started, "Task must begin running before aborting worker");
 
     // Abort doomed worker
     cluster.abort_worker(w1);
 
     // Survivor should pick up the orphaned task and complete it
-    let res = cluster.master.wait_task(task_id, Some(Duration::from_secs(5))).await.unwrap();
+    let res = cluster
+        .master
+        .wait_task(task_id, Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
     assert_eq!(res.exit_code, 0);
 }
 
@@ -1064,9 +1206,13 @@ async fn test_tier2_bva_zero_cpu_cores_registration_rejected() {
 
     let ack: Option<MasterMessage> = transport.recv_msg().await.unwrap();
     match ack {
-        Some(MasterMessage::RegisterAck { accepted, message, .. }) => {
+        Some(MasterMessage::RegisterAck {
+            accepted, message, ..
+        }) => {
             assert!(!accepted, "Registration with 0 CPU cores must be rejected");
-            assert!(message.unwrap_or_default().contains("cpu_cores must be > 0"));
+            assert!(message
+                .unwrap_or_default()
+                .contains("cpu_cores must be > 0"));
         }
         other => panic!("Expected RegisterAck, got {other:?}"),
     }
@@ -1087,7 +1233,10 @@ async fn test_tier2_bva_empty_command_fails_gracefully() {
         TaskRequirements::generic(1, 10),
     );
     let err = cluster.master.submit_task(task).await.unwrap_err();
-    assert!(matches!(err, GridError::Config(_)), "Empty program should be rejected by validator");
+    assert!(
+        matches!(err, GridError::Config(_)),
+        "Empty program should be rejected by validator"
+    );
 }
 
 #[tokio::test]
@@ -1113,10 +1262,15 @@ async fn test_tier2_bva_large_output_stream_truncation() {
         },
         TaskRequirements::generic(1, 10),
     );
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert_eq!(res.exit_code, 0);
-    assert!(res.stdout.contains("output truncated after exceeding size limit"));
+    assert!(res
+        .stdout
+        .contains("output truncated after exceeding size limit"));
     assert!(res.stdout.len() <= 1024 * 64 + 1024);
 }
 
@@ -1130,7 +1284,10 @@ async fn test_tier2_bva_nonexistent_command_fails_gracefully() {
         TaskSpec::command("/bin/nonexistent_cmd_xyz_98765", vec![]),
         TaskRequirements::generic(1, 10),
     );
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert_ne!(res.exit_code, 0);
     assert!(res.error.is_some());
@@ -1141,7 +1298,11 @@ async fn test_tier2_bva_task_not_found_query_returns_error() {
     let cluster = TestCluster::new().await;
     let missing_id = TaskId(Uuid::new_v4());
 
-    let err = cluster.master.get_task_status(missing_id).await.unwrap_err();
+    let err = cluster
+        .master
+        .get_task_status(missing_id)
+        .await
+        .unwrap_err();
     assert!(matches!(err, GridError::TaskNotFound(_)));
 }
 
@@ -1170,7 +1331,11 @@ async fn test_tier2_bva_duplicate_registration_replaces_session() {
     let _ack1: Option<MasterMessage> = t1.recv_msg().await.unwrap();
 
     let info1 = cluster.master.list_workers().await.unwrap();
-    let s1 = info1.iter().find(|w| w.worker_id == wid).unwrap().session_id;
+    let s1 = info1
+        .iter()
+        .find(|w| w.worker_id == wid)
+        .unwrap()
+        .session_id;
 
     // Second connection with same UUID
     let stream2 = TcpStream::connect(cluster.master_addr).await.unwrap();
@@ -1182,10 +1347,17 @@ async fn test_tier2_bva_duplicate_registration_replaces_session() {
     .await
     .unwrap();
     let ack2: Option<MasterMessage> = t2.recv_msg().await.unwrap();
-    assert!(matches!(ack2, Some(MasterMessage::RegisterAck { accepted: true, .. })));
+    assert!(matches!(
+        ack2,
+        Some(MasterMessage::RegisterAck { accepted: true, .. })
+    ));
 
     let info2 = cluster.master.list_workers().await.unwrap();
-    let s2 = info2.iter().find(|w| w.worker_id == wid).unwrap().session_id;
+    let s2 = info2
+        .iter()
+        .find(|w| w.worker_id == wid)
+        .unwrap()
+        .session_id;
     assert!(s2 > s1, "Second registration must advance session_id");
 }
 
@@ -1214,10 +1386,24 @@ async fn test_tier2_bva_worker_graceful_disconnect_message() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let workers = cluster.master.list_workers().await.unwrap();
-    let w = workers.iter().find(|w| w.worker_id == wid).unwrap();
-    assert_eq!(w.status, WorkerStatus::Disconnected);
+    let marked_disconnected = poll_until(
+        Duration::from_secs(3),
+        Duration::from_millis(10),
+        || async {
+            if let Ok(workers) = cluster.master.list_workers().await {
+                workers
+                    .iter()
+                    .any(|w| w.worker_id == wid && w.status == WorkerStatus::Disconnected)
+            } else {
+                false
+            }
+        },
+    )
+    .await;
+    assert!(
+        marked_disconnected,
+        "Worker must be marked Disconnected after graceful disconnect message"
+    );
 }
 
 #[tokio::test]
@@ -1231,11 +1417,17 @@ async fn test_tier2_bva_max_retry_exhaustion_marks_failed() {
         TaskSpec::builtin_test("fail", 0),
         TaskRequirements::generic(1, 10),
     );
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert_eq!(res.exit_code, 1);
     assert_eq!(res.worker_id, w1);
-    assert!(res.error.unwrap_or_default().contains("Intentional failure"));
+    assert!(res
+        .error
+        .unwrap_or_default()
+        .contains("Intentional failure"));
 }
 
 #[tokio::test]
@@ -1288,7 +1480,10 @@ async fn test_tier2_bva_empty_stdin_command() {
         },
         TaskRequirements::generic(1, 10),
     );
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert_eq!(res.exit_code, 0);
     assert_eq!(res.stdout, "buffered stdin string");
@@ -1308,7 +1503,10 @@ async fn test_tier2_bva_multi_line_shell_script_syntax_error() {
         },
         TaskRequirements::generic(1, 10),
     );
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert_ne!(res.exit_code, 0);
     assert!(!res.stderr.is_empty() || res.error.is_some());
@@ -1320,7 +1518,10 @@ async fn test_tier2_bva_cluster_status_zero_workers() {
     let client_stream = TcpStream::connect(cluster.master_addr).await.unwrap();
     let mut transport = MessageTransport::new(client_stream);
 
-    transport.send_msg(&ClientMessage::ClusterStatus).await.unwrap();
+    transport
+        .send_msg(&ClientMessage::ClusterStatus)
+        .await
+        .unwrap();
     let resp: Option<ClientResponse> = transport.recv_msg().await.unwrap();
     match resp {
         Some(ClientResponse::ClusterStatus {
@@ -1348,7 +1549,11 @@ async fn test_tier2_bva_rapid_submit_and_cancel_race() {
     let task_id = cluster.master.submit_task(task).await.unwrap();
     let _ = cluster.master.cancel_task(task_id).await;
 
-    let res = cluster.master.wait_task(task_id, Some(Duration::from_secs(5))).await.unwrap();
+    let res = cluster
+        .master
+        .wait_task(task_id, Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
     assert_eq!(res.exit_code, 130);
 }
 
@@ -1363,7 +1568,10 @@ async fn test_tier2_bva_special_characters_in_command_arguments() {
         TaskSpec::command("printf", vec!["%s".into(), special_str.into()]),
         TaskRequirements::generic(1, 10),
     );
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert_eq!(res.exit_code, 0);
     assert_eq!(res.stdout, special_str);
@@ -1385,7 +1593,10 @@ async fn test_tier2_bva_custom_exit_codes_preserved() {
         },
         TaskRequirements::generic(1, 10),
     );
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     assert_eq!(res.exit_code, 77);
 }
@@ -1407,8 +1618,7 @@ async fn test_tier2_bva_port_file_atomic_write_and_cleanup() {
     let temp = tempfile::tempdir().unwrap();
     let port_file = temp.path().join("cluster_master.port");
 
-    let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_port_file(&port_file);
+    let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_port_file(&port_file);
 
     let master = MasterServer::spawn(cfg).await.unwrap();
     assert!(port_file.exists());
@@ -1416,8 +1626,13 @@ async fn test_tier2_bva_port_file_atomic_write_and_cleanup() {
     assert_eq!(content.trim(), master.port().to_string());
 
     master.shutdown().unwrap();
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    assert!(!port_file.exists(), "Port file must be cleaned up on master shutdown");
+    let cleaned = poll_until(
+        Duration::from_secs(3),
+        Duration::from_millis(10),
+        || async { !port_file.exists() },
+    )
+    .await;
+    assert!(cleaned, "Port file must be cleaned up on master shutdown");
 }
 
 // ============================================================================
@@ -1451,7 +1666,10 @@ async fn test_tier3_pairwise_interleaved_gpu_and_cpu_batches() {
         let c = &cluster;
         futs.push(async move {
             let id = c.master.submit_task(task).await.unwrap();
-            (is_gpu, c.master.wait_task(id, Some(Duration::from_secs(5))).await)
+            (
+                is_gpu,
+                c.master.wait_task(id, Some(Duration::from_secs(5))).await,
+            )
         });
     }
 
@@ -1500,7 +1718,32 @@ async fn test_tier3_pairwise_dynamic_load_backpressure_high_cpu() {
     .await
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let hb_recorded = poll_until(
+        Duration::from_secs(3),
+        Duration::from_millis(10),
+        || async {
+            if let Ok(workers) = cluster.master.list_workers().await {
+                let w1_match = workers
+                    .iter()
+                    .find(|w| w.worker_id == w1)
+                    .map(|w| w.cpu_usage_pct >= 90.0)
+                    .unwrap_or(false);
+                let w2_match = workers
+                    .iter()
+                    .find(|w| w.worker_id == w2)
+                    .map(|w| w.cpu_usage_pct <= 20.0)
+                    .unwrap_or(false);
+                w1_match && w2_match
+            } else {
+                false
+            }
+        },
+    )
+    .await;
+    assert!(
+        hb_recorded,
+        "Master must record heartbeat telemetry before task scheduling"
+    );
 
     // Submit task
     let task = Task::new(
@@ -1562,7 +1805,10 @@ async fn test_tier3_pairwise_cancellation_during_batch_spread() {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         for id in &task_ids {
-            if matches!(cluster.master.get_task_status(*id).await, Ok(TaskStatus::Running)) {
+            if matches!(
+                cluster.master.get_task_status(*id).await,
+                Ok(TaskStatus::Running)
+            ) {
                 any_running = true;
                 break;
             }
@@ -1588,7 +1834,10 @@ async fn test_tier3_pairwise_cancellation_during_batch_spread() {
     for (i, res) in results.into_iter().enumerate() {
         let r = res.unwrap();
         if i < 3 {
-            assert_eq!(r.exit_code, 130, "Task {i} was cancelled, expected exit 130");
+            assert_eq!(
+                r.exit_code, 130,
+                "Task {i} was cancelled, expected exit 130"
+            );
         }
     }
 }
@@ -1651,11 +1900,11 @@ async fn test_tier3_pairwise_mobile_worker_thermal_throttling_constraint() {
         is_charging: Some(true),
         thermal_throttled: true,
     };
-    let caps_mobile = WorkerCapabilities::new("mobile-w", 4, 8192, false, false, None)
-        .with_mobile(Some(mobile));
+    let caps_mobile =
+        WorkerCapabilities::new("mobile-w", 4, 8192, false, false, None).with_mobile(Some(mobile));
     let (_w2, _tx2, _rx2, _h2) = spawn_mock_wire_worker(cluster.master_addr, caps_mobile).await;
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(cluster.wait_for_workers(2, Duration::from_secs(3)).await);
 
     // Submit heavy compute task demanding 2 cores
     let task = Task::new(
@@ -1707,11 +1956,11 @@ async fn test_tier3_pairwise_mobile_worker_low_battery_constraint() {
         is_charging: Some(false),
         thermal_throttled: false,
     };
-    let caps_mobile = WorkerCapabilities::new("mobile-w", 4, 8192, false, false, None)
-        .with_mobile(Some(mobile));
+    let caps_mobile =
+        WorkerCapabilities::new("mobile-w", 4, 8192, false, false, None).with_mobile(Some(mobile));
     let (_w2, _tx2, _rx2, _h2) = spawn_mock_wire_worker(cluster.master_addr, caps_mobile).await;
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(cluster.wait_for_workers(2, Duration::from_secs(3)).await);
 
     // Submit compilation task
     let mut files = HashMap::new();
@@ -1739,22 +1988,26 @@ async fn test_tier3_pairwise_mobile_worker_low_battery_constraint() {
         "Master scheduler must route compilation away from low-battery mobile worker"
     );
 
-    let _ = tx1.send(WorkerMessage::TaskResult {
-        worker_id: w1,
-        task_id,
-        exit_code: 0,
-        stdout: "ok".into(),
-        stderr: "".into(),
-        execution_time_ms: 5,
-        is_gpu_executed: false,
-        error: None,
-    }).await;
+    let _ = tx1
+        .send(WorkerMessage::TaskResult {
+            worker_id: w1,
+            task_id,
+            exit_code: 0,
+            stdout: "ok".into(),
+            stderr: "".into(),
+            execution_time_ms: 5,
+            is_gpu_executed: false,
+            error: None,
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn test_tier3_pairwise_priority_task_ordering_with_gpu() {
     let mut cluster = TestCluster::new().await;
-    let _w_gpu = cluster.spawn_worker("gpu-priority-worker", 4, 8192, true).await;
+    let _w_gpu = cluster
+        .spawn_worker("gpu-priority-worker", 4, 8192, true)
+        .await;
     assert!(cluster.wait_for_workers(1, Duration::from_secs(3)).await);
 
     // Submit low priority long GPU task (priority 0)
@@ -1762,27 +2015,61 @@ async fn test_tier3_pairwise_priority_task_ordering_with_gpu() {
         TaskSpec::command("sleep", vec!["0.15".into()]),
         TaskRequirements::gpu(10),
     );
-    let _id_low = cluster.master.submit_task_with_priority(t_low, 0).await.unwrap();
+    let id_low = cluster
+        .master
+        .submit_task_with_priority(t_low, 0)
+        .await
+        .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    let started = poll_until(
+        Duration::from_secs(3),
+        Duration::from_millis(10),
+        || async {
+            matches!(
+                cluster.master.get_task_status(id_low).await,
+                Ok(TaskStatus::Running)
+            )
+        },
+    )
+    .await;
+    assert!(
+        started,
+        "Initial GPU task must start running before queueing pending tasks"
+    );
 
     // Submit low priority pending task (priority 1)
     let t_p1 = Task::new(
         TaskSpec::builtin_test("hash_compute", 100),
         TaskRequirements::gpu(10),
     );
-    let id_p1 = cluster.master.submit_task_with_priority(t_p1, 1).await.unwrap();
+    let id_p1 = cluster
+        .master
+        .submit_task_with_priority(t_p1, 1)
+        .await
+        .unwrap();
 
     // Submit high priority pending task (priority 100)
     let t_p100 = Task::new(
         TaskSpec::builtin_test("hash_compute", 100),
         TaskRequirements::gpu(10),
     );
-    let id_p100 = cluster.master.submit_task_with_priority(t_p100, 100).await.unwrap();
+    let id_p100 = cluster
+        .master
+        .submit_task_with_priority(t_p100, 100)
+        .await
+        .unwrap();
 
     // High priority task should complete before low priority task
-    let res_p100 = cluster.master.wait_task(id_p100, Some(Duration::from_secs(5))).await.unwrap();
-    let res_p1 = cluster.master.wait_task(id_p1, Some(Duration::from_secs(5))).await.unwrap();
+    let res_p100 = cluster
+        .master
+        .wait_task(id_p100, Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    let res_p1 = cluster
+        .master
+        .wait_task(id_p1, Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
 
     assert_eq!(res_p100.exit_code, 0);
     assert_eq!(res_p1.exit_code, 0);
@@ -1793,7 +2080,10 @@ async fn test_tier3_pairwise_worker_disconnect_during_heterogeneous_batch() {
     let (mut cluster, w1, _w2, w3_gpu) = TestCluster::setup_ac_cluster().await;
 
     // Submit 1 CPU task and 1 GPU task
-    let t_cpu = Task::new(TaskSpec::command("sleep", vec!["0.3".into()]), TaskRequirements::generic(1, 10));
+    let t_cpu = Task::new(
+        TaskSpec::command("sleep", vec!["0.3".into()]),
+        TaskRequirements::generic(1, 10),
+    );
     let t_gpu = Task::new(
         TaskSpec::GpuCompute {
             kernel_name: "matmul_tiled".into(),
@@ -1808,15 +2098,30 @@ async fn test_tier3_pairwise_worker_disconnect_during_heterogeneous_batch() {
     let id_cpu = cluster.master.submit_task(t_cpu).await.unwrap();
     let id_gpu = cluster.master.submit_task(t_gpu).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let running = poll_until(
+        Duration::from_secs(3),
+        Duration::from_millis(10),
+        || async {
+            matches!(
+                cluster.master.get_task_status(id_cpu).await,
+                Ok(TaskStatus::Running)
+            )
+        },
+    )
+    .await;
+    assert!(running, "CPU task must begin running before worker abort");
 
     // Abort CPU worker 1
     cluster.abort_worker(w1);
 
     // CPU task should be retried on surviving worker, GPU task finishes on GPU worker
     let (res_cpu, res_gpu) = tokio::join!(
-        cluster.master.wait_task(id_cpu, Some(Duration::from_secs(5))),
-        cluster.master.wait_task(id_gpu, Some(Duration::from_secs(5)))
+        cluster
+            .master
+            .wait_task(id_cpu, Some(Duration::from_secs(5))),
+        cluster
+            .master
+            .wait_task(id_gpu, Some(Duration::from_secs(5)))
     );
 
     assert_eq!(res_cpu.unwrap().exit_code, 0);
@@ -1830,10 +2135,34 @@ async fn test_tier3_pairwise_batch_partial_failures_isolation() {
     let (cluster, _, _, _) = TestCluster::setup_ac_cluster().await;
 
     let tasks = vec![
-        (true, Task::new(TaskSpec::command("echo", vec!["success 1".into()]), TaskRequirements::generic(1, 10))),
-        (false, Task::new(TaskSpec::builtin_test("fail", 0), TaskRequirements::generic(1, 10))),
-        (true, Task::new(TaskSpec::command("echo", vec!["success 2".into()]), TaskRequirements::generic(1, 10))),
-        (false, Task::new(TaskSpec::builtin_test("fail", 0), TaskRequirements::generic(1, 10))),
+        (
+            true,
+            Task::new(
+                TaskSpec::command("echo", vec!["success 1".into()]),
+                TaskRequirements::generic(1, 10),
+            ),
+        ),
+        (
+            false,
+            Task::new(
+                TaskSpec::builtin_test("fail", 0),
+                TaskRequirements::generic(1, 10),
+            ),
+        ),
+        (
+            true,
+            Task::new(
+                TaskSpec::command("echo", vec!["success 2".into()]),
+                TaskRequirements::generic(1, 10),
+            ),
+        ),
+        (
+            false,
+            Task::new(
+                TaskSpec::builtin_test("fail", 0),
+                TaskRequirements::generic(1, 10),
+            ),
+        ),
     ];
 
     let mut futs = Vec::new();
@@ -1841,7 +2170,10 @@ async fn test_tier3_pairwise_batch_partial_failures_isolation() {
         let c = &cluster;
         futs.push(async move {
             let id = c.master.submit_task(task).await.unwrap();
-            (should_succeed, c.master.wait_task(id, Some(Duration::from_secs(5))).await)
+            (
+                should_succeed,
+                c.master.wait_task(id, Some(Duration::from_secs(5))).await,
+            )
         });
     }
 
@@ -1864,16 +2196,26 @@ async fn test_tier3_pairwise_concurrent_mapreduce_and_generic_tasks() {
     let mr_job = MapReduceJobSpec::new(
         "concurrent_mr",
         vec!["hello world".into(), "hello rust".into()],
-        MapFunctionSpec::Builtin { operator: "word_count".into() },
-        ReduceFunctionSpec::Builtin { operator: "sum".into() },
+        MapFunctionSpec::Builtin {
+            operator: "word_count".into(),
+        },
+        ReduceFunctionSpec::Builtin {
+            operator: "sum".into(),
+        },
         2,
         1,
         20,
     );
 
     // Generic tasks
-    let t1 = Task::new(TaskSpec::command("echo", vec!["generic 1".into()]), TaskRequirements::generic(1, 10));
-    let t2 = Task::new(TaskSpec::command("echo", vec!["generic 2".into()]), TaskRequirements::generic(1, 10));
+    let t1 = Task::new(
+        TaskSpec::command("echo", vec!["generic 1".into()]),
+        TaskRequirements::generic(1, 10),
+    );
+    let t2 = Task::new(
+        TaskSpec::command("echo", vec!["generic 2".into()]),
+        TaskRequirements::generic(1, 10),
+    );
 
     let mr_fut = cluster.master.execute_mapreduce(mr_job);
     let id1 = cluster.master.submit_task(t1).await.unwrap();
@@ -1904,9 +2246,15 @@ async fn test_tier4_scenario_full_acceptance_criteria_ac1_to_ac5() {
     // AC1: 1 Master + 3 Workers (W1: 2 CPU, W2: 4 CPU, W3: 8 CPU + Simulated GPU)
     // -------------------------------------------------------------------------
     let mut cluster = TestCluster::new().await;
-    let w1_id = cluster.spawn_worker("worker-cpu-node-1", 2, 2048, false).await;
-    let w2_id = cluster.spawn_worker("worker-cpu-node-2", 4, 4096, false).await;
-    let w3_id = cluster.spawn_worker("worker-gpu-node-3", 8, 8192, true).await;
+    let w1_id = cluster
+        .spawn_worker("worker-cpu-node-1", 2, 2048, false)
+        .await;
+    let w2_id = cluster
+        .spawn_worker("worker-cpu-node-2", 4, 4096, false)
+        .await;
+    let w3_id = cluster
+        .spawn_worker("worker-gpu-node-3", 8, 8192, true)
+        .await;
 
     // -------------------------------------------------------------------------
     // AC2: All 3 Workers register successfully & advertise capabilities
@@ -1938,9 +2286,14 @@ async fn test_tier4_scenario_full_acceptance_criteria_ac1_to_ac5() {
         .await
         .expect("AC3 Failed: Generic task execution error");
 
-    assert_eq!(gen_res.exit_code, 0, "AC3 Failed: Generic task non-zero exit");
+    assert_eq!(
+        gen_res.exit_code, 0,
+        "AC3 Failed: Generic task non-zero exit"
+    );
     assert!(
-        gen_res.stdout.contains("Hello OxideSwarm Distributed Compute"),
+        gen_res
+            .stdout
+            .contains("Hello OxideSwarm Distributed Compute"),
         "AC3 Failed: Generic task stdout mismatch"
     );
 
@@ -1993,7 +2346,9 @@ async fn test_tier4_scenario_full_acceptance_criteria_ac1_to_ac5() {
     for (i, res) in batch_results.into_iter().enumerate() {
         let r = res.expect("AC5 Failed: Task in batch failed");
         assert_eq!(r.exit_code, 0);
-        assert!(r.stdout.contains(&format!("Compiled crate module_{}", i + 1)));
+        assert!(r
+            .stdout
+            .contains(&format!("Compiled crate module_{}", i + 1)));
         workers_in_batch.insert(r.worker_id);
     }
 
@@ -2033,7 +2388,10 @@ async fn test_tier4_scenario_multi_worker_parallel_rust_crate_compilation() {
         let c = &cluster;
         comp_futs.push(async move {
             let id = c.master.submit_task(task).await.unwrap();
-            (crate_name, c.master.wait_task(id, Some(Duration::from_secs(15))).await)
+            (
+                crate_name,
+                c.master.wait_task(id, Some(Duration::from_secs(15))).await,
+            )
         });
     }
 
@@ -2069,7 +2427,10 @@ async fn test_tier4_scenario_heterogeneous_gpu_matrix_and_cpu_data_pipeline() {
         },
         TaskRequirements::gpu(15),
     );
-    let stage1_res = cluster.submit_and_wait(gpu_task, Duration::from_secs(5)).await.unwrap();
+    let stage1_res = cluster
+        .submit_and_wait(gpu_task, Duration::from_secs(5))
+        .await
+        .unwrap();
     assert_eq!(stage1_res.exit_code, 0);
     assert_eq!(stage1_res.worker_id, w3_gpu);
     assert!(stage1_res.is_gpu_executed);
@@ -2095,9 +2456,14 @@ async fn test_tier4_scenario_heterogeneous_gpu_matrix_and_cpu_data_pipeline() {
         },
         TaskRequirements::generic(1, 10),
     );
-    let stage2_res = cluster.submit_and_wait(stage2_task, Duration::from_secs(5)).await.unwrap();
+    let stage2_res = cluster
+        .submit_and_wait(stage2_task, Duration::from_secs(5))
+        .await
+        .unwrap();
     assert_eq!(stage2_res.exit_code, 0);
-    assert!(stage2_res.stdout.contains("Stage 2 received: Verification Digest:"));
+    assert!(stage2_res
+        .stdout
+        .contains("Stage 2 received: Verification Digest:"));
 }
 
 /// Scenario 4: Worker Churn & Cluster Fault-Tolerant Resilience.
@@ -2119,13 +2485,28 @@ async fn test_tier4_scenario_worker_churn_and_cluster_resilience() {
         task_ids.push(id);
     }
 
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    let started = poll_until(
+        Duration::from_secs(3),
+        Duration::from_millis(10),
+        || async {
+            for id in &task_ids {
+                if let Ok(TaskStatus::Running) = cluster.master.get_task_status(*id).await {
+                    return true;
+                }
+            }
+            false
+        },
+    )
+    .await;
+    assert!(started, "Tasks must begin running before worker churn");
 
     // Kill Worker 1 during active execution
     cluster.abort_worker(w1);
 
     // Join Worker 3 to replenish cluster capacity
-    let _w3 = cluster.spawn_worker("churn-w3-replenish", 4, 4096, false).await;
+    let _w3 = cluster
+        .spawn_worker("churn-w3-replenish", 4, 4096, false)
+        .await;
 
     // All 8 tasks must complete successfully without permanent loss
     let mut wait_futs = Vec::new();

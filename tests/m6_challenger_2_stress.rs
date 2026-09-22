@@ -46,9 +46,7 @@ use rusty_grid_master::scheduler::{
 use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 use rusty_grid_worker::runner::{RunnerConfig, TaskRunner, EXIT_CODE_SUCCESS};
-use rusty_grid_worker::sandbox::{
-    sanitize_relative_path, Sandbox, SandboxConfig, SandboxError,
-};
+use rusty_grid_worker::sandbox::{sanitize_relative_path, Sandbox, SandboxConfig, SandboxError};
 
 // ============================================================================
 // HELPER FACTORIES
@@ -117,7 +115,10 @@ fn test_backpressure_boundary_exact_84_9_vs_85_1() {
         &[worker_accepted.clone(), worker_rejected.clone()],
     );
     assert_eq!(report_both.assignments.len(), 1);
-    assert_eq!(report_both.assignments[0].worker_id, worker_accepted.worker_id);
+    assert_eq!(
+        report_both.assignments[0].worker_id,
+        worker_accepted.worker_id
+    );
 
     // Case 2: Only worker at 85.1% CPU present. Task must be skipped with AllEligibleWorkersSaturated.
     let report_rejected_only = WorkloadScheduler::matchmake(
@@ -139,7 +140,10 @@ fn test_backpressure_boundary_exact_84_9_vs_85_1() {
         std::slice::from_ref(&worker_accepted),
     );
     assert_eq!(report_accepted_only.assignments.len(), 1);
-    assert_eq!(report_accepted_only.assignments[0].worker_id, worker_accepted.worker_id);
+    assert_eq!(
+        report_accepted_only.assignments[0].worker_id,
+        worker_accepted.worker_id
+    );
 
     // Case 4: Exactly on the 85.0% boundary.
     // In scheduler.rs: `if worker.cpu_usage_pct > config.max_host_cpu_pct { continue; }`
@@ -151,7 +155,10 @@ fn test_backpressure_boundary_exact_84_9_vs_85_1() {
         std::slice::from_ref(&worker_exact),
     );
     assert_eq!(report_exact.assignments.len(), 1);
-    assert_eq!(report_exact.assignments[0].worker_id, worker_exact.worker_id);
+    assert_eq!(
+        report_exact.assignments[0].worker_id,
+        worker_exact.worker_id
+    );
 }
 
 #[test]
@@ -188,13 +195,7 @@ async fn test_backpressure_rapid_heartbeat_telemetry_oscillation() {
     let caps = WorkerCapabilities::new("oscillating-worker", 4, 8192, false, false, None);
 
     let session_id = registry
-        .register(
-            worker_id,
-            caps,
-            "127.0.0.1:9090".parse().unwrap(),
-            tx,
-            None,
-        )
+        .register(worker_id, caps, "127.0.0.1:9090".parse().unwrap(), tx, None)
         .await
         .expect("registration failed");
 
@@ -219,7 +220,8 @@ async fn test_backpressure_rapid_heartbeat_telemetry_oscillation() {
         let workers_snap = registry.list_active_workers().await;
         assert_eq!(workers_snap[0].cpu_usage_pct, 95.0);
 
-        let report_overloaded = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&task), &workers_snap);
+        let report_overloaded =
+            WorkloadScheduler::matchmake(&config, std::slice::from_ref(&task), &workers_snap);
         assert_eq!(
             report_overloaded.assignments.len(),
             0,
@@ -239,7 +241,8 @@ async fn test_backpressure_rapid_heartbeat_telemetry_oscillation() {
         let workers_snap_idle = registry.list_active_workers().await;
         assert_eq!(workers_snap_idle[0].cpu_usage_pct, 10.0);
 
-        let report_idle = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&task), &workers_snap_idle);
+        let report_idle =
+            WorkloadScheduler::matchmake(&config, std::slice::from_ref(&task), &workers_snap_idle);
         assert_eq!(
             report_idle.assignments.len(),
             1,
@@ -289,31 +292,79 @@ fn test_mobile_battery_edge_cases_0_14_15_pct() {
 
     // Case 1: 0% battery, discharging -> compile task skipped, command task permitted
     let w_0 = make_mobile_worker(0, false);
-    let report_0_compile = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&compile_task), std::slice::from_ref(&w_0));
-    assert_eq!(report_0_compile.assignments.len(), 0, "0% battery discharging must skip compile tasks");
+    let report_0_compile = WorkloadScheduler::matchmake(
+        &config,
+        std::slice::from_ref(&compile_task),
+        std::slice::from_ref(&w_0),
+    );
+    assert_eq!(
+        report_0_compile.assignments.len(),
+        0,
+        "0% battery discharging must skip compile tasks"
+    );
 
-    let report_0_cmd = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&command_task), std::slice::from_ref(&w_0));
-    assert_eq!(report_0_cmd.assignments.len(), 1, "0% battery discharging can run lightweight command tasks");
+    let report_0_cmd = WorkloadScheduler::matchmake(
+        &config,
+        std::slice::from_ref(&command_task),
+        std::slice::from_ref(&w_0),
+    );
+    assert_eq!(
+        report_0_cmd.assignments.len(),
+        1,
+        "0% battery discharging can run lightweight command tasks"
+    );
 
     // Case 2: 14% battery (boundary < 15%), discharging -> compile task skipped
     let w_14 = make_mobile_worker(14, false);
-    let report_14_compile = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&compile_task), std::slice::from_ref(&w_14));
-    assert_eq!(report_14_compile.assignments.len(), 0, "14% battery discharging must skip compile tasks");
+    let report_14_compile = WorkloadScheduler::matchmake(
+        &config,
+        std::slice::from_ref(&compile_task),
+        std::slice::from_ref(&w_14),
+    );
+    assert_eq!(
+        report_14_compile.assignments.len(),
+        0,
+        "14% battery discharging must skip compile tasks"
+    );
 
     // Case 3: 15% battery (boundary == 15%), discharging -> compile task ASSIGNED!
     let w_15 = make_mobile_worker(15, false);
-    let report_15_compile = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&compile_task), std::slice::from_ref(&w_15));
-    assert_eq!(report_15_compile.assignments.len(), 1, "15% battery discharging must be accepted for compile tasks");
+    let report_15_compile = WorkloadScheduler::matchmake(
+        &config,
+        std::slice::from_ref(&compile_task),
+        std::slice::from_ref(&w_15),
+    );
+    assert_eq!(
+        report_15_compile.assignments.len(),
+        1,
+        "15% battery discharging must be accepted for compile tasks"
+    );
     assert_eq!(report_15_compile.assignments[0].worker_id, w_15.worker_id);
 
     // Case 4: 0% or 14% battery BUT actively charging (is_charging: true) -> compile task ASSIGNED!
     let w_0_charging = make_mobile_worker(0, true);
-    let report_0_charging = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&compile_task), std::slice::from_ref(&w_0_charging));
-    assert_eq!(report_0_charging.assignments.len(), 1, "0% battery charging must be accepted for compile tasks");
+    let report_0_charging = WorkloadScheduler::matchmake(
+        &config,
+        std::slice::from_ref(&compile_task),
+        std::slice::from_ref(&w_0_charging),
+    );
+    assert_eq!(
+        report_0_charging.assignments.len(),
+        1,
+        "0% battery charging must be accepted for compile tasks"
+    );
 
     let w_14_charging = make_mobile_worker(14, true);
-    let report_14_charging = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&compile_task), std::slice::from_ref(&w_14_charging));
-    assert_eq!(report_14_charging.assignments.len(), 1, "14% battery charging must be accepted for compile tasks");
+    let report_14_charging = WorkloadScheduler::matchmake(
+        &config,
+        std::slice::from_ref(&compile_task),
+        std::slice::from_ref(&w_14_charging),
+    );
+    assert_eq!(
+        report_14_charging.assignments.len(),
+        1,
+        "14% battery charging must be accepted for compile tasks"
+    );
 }
 
 #[test]
@@ -353,17 +404,30 @@ fn test_mobile_thermal_throttling_dynamic_toggling_under_load() {
     // Phase 1: Unthrottled. All tasks should be assigned.
     let report_p1 = WorkloadScheduler::matchmake(
         &config,
-        &[single_core_task.clone(), multi_core_task.clone(), compile_task.clone()],
+        &[
+            single_core_task.clone(),
+            multi_core_task.clone(),
+            compile_task.clone(),
+        ],
         &[mobile_worker.clone()],
     );
     assert_eq!(report_p1.assignments.len(), 3);
 
     // Phase 2: Toggle to thermal_throttled = true under load
-    mobile_worker.capabilities.mobile.as_mut().unwrap().thermal_throttled = true;
+    mobile_worker
+        .capabilities
+        .mobile
+        .as_mut()
+        .unwrap()
+        .thermal_throttled = true;
 
     let report_p2 = WorkloadScheduler::matchmake(
         &config,
-        &[single_core_task.clone(), multi_core_task.clone(), compile_task.clone()],
+        &[
+            single_core_task.clone(),
+            multi_core_task.clone(),
+            compile_task.clone(),
+        ],
         &[mobile_worker.clone()],
     );
     // Only single_core_task should be assigned; multi-core and compile must be skipped
@@ -372,14 +436,27 @@ fn test_mobile_thermal_throttling_dynamic_toggling_under_load() {
     assert_eq!(report_p2.skipped.len(), 2);
 
     // Phase 3: Toggle back to thermal_throttled = false (cooled down)
-    mobile_worker.capabilities.mobile.as_mut().unwrap().thermal_throttled = false;
+    mobile_worker
+        .capabilities
+        .mobile
+        .as_mut()
+        .unwrap()
+        .thermal_throttled = false;
 
     let report_p3 = WorkloadScheduler::matchmake(
         &config,
-        &[single_core_task.clone(), multi_core_task.clone(), compile_task.clone()],
+        &[
+            single_core_task.clone(),
+            multi_core_task.clone(),
+            compile_task.clone(),
+        ],
         &[mobile_worker.clone()],
     );
-    assert_eq!(report_p3.assignments.len(), 3, "After cooling down, all tasks must be assigned again");
+    assert_eq!(
+        report_p3.assignments.len(),
+        3,
+        "After cooling down, all tasks must be assigned again"
+    );
 }
 
 // ============================================================================
@@ -477,7 +554,9 @@ async fn test_sandbox_security_path_traversal_attacks() {
     ];
 
     for attack in &attacks {
-        let res = sandbox.write_file(Path::new(attack), b"malicious content").await;
+        let res = sandbox
+            .write_file(Path::new(attack), b"malicious content")
+            .await;
         assert!(
             res.is_err(),
             "Path traversal attack '{attack}' must be strictly rejected"
@@ -560,15 +639,34 @@ echo "PIPE:$NUM_PIPELINE"
     );
 
     let res = runner.execute_task(&task, None, None).await;
-    assert!(res.is_success(), "Complex shell script failed: {}", res.stderr);
+    assert!(
+        res.is_success(),
+        "Complex shell script failed: {}",
+        res.stderr
+    );
     assert_eq!(res.exit_code, EXIT_CODE_SUCCESS);
 
     let stdout = res.stdout;
-    assert!(stdout.contains("FUNC:42"), "Expected function result 42, got: {stdout}");
-    assert!(stdout.contains("SUBSHELL:alpha_beta_gamma"), "Subshell encapsulation failed: {stdout}");
-    assert!(stdout.contains("EXP_DEF:fallback_activated"), "Default expansion failed: {stdout}");
-    assert!(stdout.contains("STRIPPED:component_core"), "Prefix strip failed: {stdout}");
-    assert!(stdout.contains("PIPE:ITEM_30 ITEM_3 ITEM_27") || stdout.contains("PIPE:ITEM_3"), "Pipeline output mismatch: {stdout}");
+    assert!(
+        stdout.contains("FUNC:42"),
+        "Expected function result 42, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("SUBSHELL:alpha_beta_gamma"),
+        "Subshell encapsulation failed: {stdout}"
+    );
+    assert!(
+        stdout.contains("EXP_DEF:fallback_activated"),
+        "Default expansion failed: {stdout}"
+    );
+    assert!(
+        stdout.contains("STRIPPED:component_core"),
+        "Prefix strip failed: {stdout}"
+    );
+    assert!(
+        stdout.contains("PIPE:ITEM_30 ITEM_3 ITEM_27") || stdout.contains("PIPE:ITEM_3"),
+        "Pipeline output mismatch: {stdout}"
+    );
 }
 
 #[tokio::test]
@@ -609,7 +707,11 @@ done
     );
 
     let res = runner.execute_task(&task, None, None).await;
-    assert!(res.is_success(), "Multilingual script failed: {}", res.stderr);
+    assert!(
+        res.is_success(),
+        "Multilingual script failed: {}",
+        res.stderr
+    );
 
     let stdout = res.stdout;
     assert!(stdout.contains(vietnamese));
@@ -619,7 +721,10 @@ done
     assert!(stdout.contains(emojis));
     assert!(stdout.contains(math_symbols));
     assert!(stdout.contains("CHUNK_150:"));
-    assert!(stdout.len() > 16384, "Stream should exceed 16KB to verify multi-chunk stream reading");
+    assert!(
+        stdout.len() > 16384,
+        "Stream should exceed 16KB to verify multi-chunk stream reading"
+    );
 }
 
 #[tokio::test]

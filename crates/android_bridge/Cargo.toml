@@ -1,0 +1,19 @@
+[package]
+name = "rusty_grid_android_bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "oxideworker"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+jni = "0.21"
+rusty_grid_worker = { path = "../worker" }
+rusty_grid_core = { path = "../core" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

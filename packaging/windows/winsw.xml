@@ -1,0 +1,39 @@
+<service>
+  <!-- OxideSwarm Windows Service Wrapper Configuration -->
+  <!-- Managed by WinSW (Windows Service Wrapper) -->
+  <id>OxideSwarmWorker</id>
+  <name>OxideSwarm Distributed Grid Worker</name>
+  <description>Automated background compute worker for the OxideSwarm distributed grid, executing general master-worker tasks, distributed compilation, and GPU workloads.</description>
+
+  <!-- Executable Invocation -->
+  <executable>%BASE%\bin\rusty-grid.exe</executable>
+  <arguments>worker --config "%BASE%\config\rusty-grid.toml"</arguments>
+  <workingdirectory>%BASE%</workingdirectory>
+
+  <!-- Process & Session 0 Isolation Settings -->
+  <priority>Normal</priority>
+  <stoptimeout>15 sec</stoptimeout>
+  <stopparentprocessfirst>true</stopparentprocessfirst>
+
+  <!-- Service Startup Configuration -->
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>false</delayedAutoStart>
+
+  <!-- Crash Resilience & Failure Recovery Actions -->
+  <!-- Restart after 5s on first and second failures, 10s on subsequent failures -->
+  <onfailure action="restart" delay="5 sec"/>
+  <onfailure action="restart" delay="5 sec"/>
+  <onfailure action="restart" delay="10 sec"/>
+  <resetfailure>1 day</resetfailure>
+
+  <!-- Log Rolling & Redirection -->
+  <log mode="roll-by-size">
+    <logpath>%BASE%\logs</logpath>
+    <sizeThreshold>10240</sizeThreshold> <!-- 10 MB per log segment -->
+    <keepFiles>5</keepFiles>
+    <autoRollAtTime>00:00:00</autoRollAtTime>
+  </log>
+
+  <!-- Environment Variables -->
+  <env name="RUST_LOG" value="info" />
+</service>

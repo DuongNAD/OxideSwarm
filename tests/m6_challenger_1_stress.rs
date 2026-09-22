@@ -36,12 +36,8 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use rusty_grid_core::error::{GridError, GridResult};
-use rusty_grid_core::mapreduce::{
-    MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec,
-};
-use rusty_grid_core::protocol::{
-    ClientMessage, MessageTransport, MAX_FRAME_SIZE,
-};
+use rusty_grid_core::mapreduce::{MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec};
+use rusty_grid_core::protocol::{ClientMessage, MessageTransport, MAX_FRAME_SIZE};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskResult, TaskSpec, TaskStatus};
 use rusty_grid_master::queue::TaskState;
 use rusty_grid_master::reaper::ReaperConfig;
@@ -169,7 +165,12 @@ impl ChallengerTestCluster {
         false
     }
 
-    pub async fn wait_for_worker_status(&self, id: Uuid, status: WorkerStatus, timeout: Duration) -> bool {
+    pub async fn wait_for_worker_status(
+        &self,
+        id: Uuid,
+        status: WorkerStatus,
+        timeout: Duration,
+    ) -> bool {
         let start = Instant::now();
         while start.elapsed() < timeout {
             if let Ok(workers) = self.master.list_workers().await {
@@ -273,14 +274,20 @@ async fn test_adversarial_task_flood_60_tasks_with_worker_crash_and_recovery() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     cluster.abort_worker(w1);
     assert!(
-        cluster.wait_for_worker_status(w1, WorkerStatus::Disconnected, Duration::from_secs(5)).await,
+        cluster
+            .wait_for_worker_status(w1, WorkerStatus::Disconnected, Duration::from_secs(5))
+            .await,
         "Master must detect w1 disconnect"
     );
 
     // Spawn replacement worker to test dynamic queue rebalancing
-    let w4 = cluster.spawn_worker("flood-w4-replacement", 4, 4096, false).await;
+    let w4 = cluster
+        .spawn_worker("flood-w4-replacement", 4, 4096, false)
+        .await;
     assert!(
-        cluster.wait_for_worker_status(w4, WorkerStatus::Connected, Duration::from_secs(5)).await,
+        cluster
+            .wait_for_worker_status(w4, WorkerStatus::Connected, Duration::from_secs(5))
+            .await,
         "w4 must connect"
     );
     // Allow w4 transport handshake to settle and enter inbound message loop
@@ -400,7 +407,8 @@ async fn test_adversarial_priority_flood_preemption_under_churn() {
         ..Default::default()
     };
 
-    let mut cluster = ChallengerTestCluster::new_with_config(sched_cfg, ReaperConfig::default()).await;
+    let mut cluster =
+        ChallengerTestCluster::new_with_config(sched_cfg, ReaperConfig::default()).await;
     let w1 = cluster.spawn_worker("prio-w1", 1, 2048, false).await;
     let _w2 = cluster.spawn_worker("prio-w2", 1, 2048, false).await;
 
@@ -470,7 +478,10 @@ async fn test_adversarial_garbage_wire_frame_exceeding_max_length() {
 
     // Send 4-byte big-endian prefix specifying length > MAX_FRAME_SIZE (64MB)
     let illegal_len: u32 = (MAX_FRAME_SIZE as u32) + 4096;
-    stream.write_all(&illegal_len.to_be_bytes()).await.expect("write length prefix");
+    stream
+        .write_all(&illegal_len.to_be_bytes())
+        .await
+        .expect("write length prefix");
 
     // Write a dummy payload
     let dummy_payload = vec![0x41u8; 128];
@@ -513,26 +524,37 @@ async fn test_adversarial_garbage_wire_non_json_payload() {
 
     // Valid framing length (24 bytes), but completely invalid non-JSON binary bytes
     let garbage_len: u32 = 24;
-    stream.write_all(&garbage_len.to_be_bytes()).await.expect("write len");
+    stream
+        .write_all(&garbage_len.to_be_bytes())
+        .await
+        .expect("write len");
     let garbage_data = [
-        0xFF, 0xFE, 0x00, 0x12, 0x34, 0x56, 0x78, 0x9A,
-        0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55,
-        0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+        0xFF, 0xFE, 0x00, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44,
+        0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
     ];
-    stream.write_all(&garbage_data).await.expect("write garbage");
+    stream
+        .write_all(&garbage_data)
+        .await
+        .expect("write garbage");
     stream.flush().await.expect("flush");
 
     // Master should close stream on deserialization error
     let mut buf = [0u8; 16];
     let n = stream.read(&mut buf).await.unwrap_or(0);
-    assert_eq!(n, 0, "Master must close connection on non-JSON garbage frame");
+    assert_eq!(
+        n, 0,
+        "Master must close connection on non-JSON garbage frame"
+    );
 
     // Legitimate worker executes work unaffected
     cluster.spawn_worker("legit-w1", 2, 2048, false).await;
     assert!(cluster.wait_for_workers(1, Duration::from_secs(5)).await);
 
     let task = make_echo_task("post_garbage_test");
-    let res = cluster.submit_and_wait(task, Duration::from_secs(5)).await.unwrap();
+    let res = cluster
+        .submit_and_wait(task, Duration::from_secs(5))
+        .await
+        .unwrap();
     assert_eq!(res.exit_code, 0);
 }
 
@@ -612,10 +634,7 @@ async fn test_adversarial_client_abrupt_disconnect_with_pending_waiter() {
     let task_id = task.id;
 
     // Send ClientMessage::SubmitTask with wait = true
-    let submit_msg = ClientMessage::SubmitTask {
-        task,
-        wait: true,
-    };
+    let submit_msg = ClientMessage::SubmitTask { task, wait: true };
     transport.send_msg(&submit_msg).await.unwrap();
 
     // Abruptly drop client transport before receiving response
@@ -639,13 +658,9 @@ async fn test_adversarial_slowloris_handshake_timeout() {
     // Configure 1-second handshake timeout for fast testing
     server_cfg.handshake_timeout_secs = 1;
 
-    let master = MasterServer::spawn_with_config(
-        server_cfg,
-        sched_cfg,
-        ReaperConfig::default(),
-    )
-    .await
-    .unwrap();
+    let master = MasterServer::spawn_with_config(server_cfg, sched_cfg, ReaperConfig::default())
+        .await
+        .unwrap();
 
     let mut stream = TcpStream::connect(master.server_addr()).await.unwrap();
 
@@ -696,9 +711,7 @@ async fn test_adversarial_mapreduce_worker_crash_during_map_phase() {
     );
 
     let master_clone = cluster.master.clone();
-    let mr_handle = tokio::spawn(async move {
-        master_clone.execute_mapreduce(job_spec).await
-    });
+    let mr_handle = tokio::spawn(async move { master_clone.execute_mapreduce(job_spec).await });
 
     // Abruptly kill Worker 1 during the mapping phase
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -709,7 +722,10 @@ async fn test_adversarial_mapreduce_worker_crash_during_map_phase() {
         .expect("join handle")
         .expect("mapreduce execution");
 
-    assert_eq!(result.status, "Completed", "Job should complete despite worker crash");
+    assert_eq!(
+        result.status, "Completed",
+        "Job should complete despite worker crash"
+    );
     assert!(result.error.is_none());
 
     // Verify word counts: "apple" appears 4 times across the 4 lines
@@ -773,9 +789,7 @@ done
     );
 
     let master_clone = cluster.master.clone();
-    let mr_handle = tokio::spawn(async move {
-        master_clone.execute_mapreduce(job_spec).await
-    });
+    let mr_handle = tokio::spawn(async move { master_clone.execute_mapreduce(job_spec).await });
 
     // Wait for map phase to complete and reduce tasks to begin dispatching
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -827,9 +841,7 @@ async fn test_adversarial_mapreduce_worker_drop_during_shuffle_grouping() {
     );
 
     let master_clone = cluster.master.clone();
-    let mr_handle = tokio::spawn(async move {
-        master_clone.execute_mapreduce(job_spec).await
-    });
+    let mr_handle = tokio::spawn(async move { master_clone.execute_mapreduce(job_spec).await });
 
     // Abort Worker 1 right as map tasks finish and shuffle grouping executes
     tokio::time::sleep(Duration::from_millis(35)).await;
@@ -1060,9 +1072,7 @@ async fn test_adversarial_concurrent_cancel_same_task_idempotence() {
     let mut handles = Vec::new();
     for _ in 0..40 {
         let m = master_ref.clone();
-        handles.push(tokio::spawn(async move {
-            m.cancel_task(task_id).await
-        }));
+        handles.push(tokio::spawn(async move { m.cancel_task(task_id).await }));
     }
 
     let results = join_all(handles).await;
@@ -1116,7 +1126,10 @@ async fn test_adversarial_cancel_nonexistent_and_terminal_tasks() {
 
     // 3. Attempt to cancel already Completed task: must not mutate state to Cancelled
     let post_cancel_res = cluster.master.cancel_task(task_id).await;
-    assert!(post_cancel_res.is_ok(), "Cancel on completed task should succeed as no-op");
+    assert!(
+        post_cancel_res.is_ok(),
+        "Cancel on completed task should succeed as no-op"
+    );
 
     let status_after = cluster.master.get_task_status(task_id).await.unwrap();
     assert_eq!(

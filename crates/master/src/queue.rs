@@ -674,15 +674,8 @@ impl TaskQueue {
                             entry.retry_count, policy.max_retries
                         );
                         entry.error_message = Some(err_msg.clone());
-                        let fail_result = TaskResult::failure(
-                            *worker_id,
-                            task_id,
-                            1,
-                            "",
-                            "",
-                            0,
-                            Some(err_msg),
-                        );
+                        let fail_result =
+                            TaskResult::failure(*worker_id, task_id, 1, "", "", 0, Some(err_msg));
                         entry.result = Some(fail_result);
                     }
                 }
@@ -1029,7 +1022,10 @@ mod tests {
             queue.get_state(&task_id).await.unwrap(),
             TaskState::Cancelled
         );
-        let res = queue.get_result(&task_id).await.expect("result must be present");
+        let res = queue
+            .get_result(&task_id)
+            .await
+            .expect("result must be present");
         assert_eq!(res.exit_code, 130);
         assert_eq!(res.task_id, task_id);
         assert_eq!(res.error.as_deref(), Some("user requested"));

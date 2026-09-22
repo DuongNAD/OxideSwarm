@@ -1,5 +1,14 @@
 /target/
 /.agents/
 .DS_Store
+**/.DS_Store
+*.log
+**/*.log
+__pycache__/
+*.pyc
+.gradle/
+**/.gradle/
+**/build/
 
 ticket.txt
+

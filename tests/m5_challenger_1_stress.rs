@@ -48,8 +48,7 @@ mod config;
 
 use config::{
     load_config_file, resolve_bool, resolve_f32, resolve_opt_field, resolve_opt_string,
-    resolve_opt_u64, resolve_opt_usize, resolve_string, resolve_u64, resolve_usize,
-    ConfigFile,
+    resolve_opt_u64, resolve_opt_usize, resolve_string, resolve_u64, resolve_usize, ConfigFile,
 };
 
 static ENV_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -248,10 +247,7 @@ fn test_adversarial_4_tier_float_precedence_thresholds() {
     }
 
     // CLI override
-    assert_eq!(
-        resolve_f32(Some(50.0), &[&env_key], Some(70.5), 85.0),
-        50.0
-    );
+    assert_eq!(resolve_f32(Some(50.0), &[&env_key], Some(70.5), 85.0), 50.0);
 }
 
 #[test]
@@ -429,10 +425,7 @@ master = "127.0.0.1:7777"
         loaded_toml.master.unwrap().listen.as_deref(),
         Some("127.0.0.1:7777")
     );
-    assert_eq!(
-        loaded_json.worker.unwrap().simulate_gpu,
-        Some(true)
-    );
+    assert_eq!(loaded_json.worker.unwrap().simulate_gpu, Some(true));
 }
 
 #[test]
@@ -453,7 +446,11 @@ fn test_adversarial_config_file_syntax_error_rejection() {
 
     // 2. Broken JSON: missing closing bracket and invalid comma
     let bad_json_path = temp_dir.path().join("broken.json");
-    fs::write(&bad_json_path, "{\n  \"master\": {\n    \"listen\": 12345,\n").expect("write bad json");
+    fs::write(
+        &bad_json_path,
+        "{\n  \"master\": {\n    \"listen\": 12345,\n",
+    )
+    .expect("write bad json");
 
     let res_json = load_config_file(Some(&bad_json_path));
     assert!(res_json.is_err(), "Must return Err on malformed JSON");
@@ -502,7 +499,9 @@ master = "127.0.0.1:9090"
     )
     .expect("write partial");
 
-    let res = load_config_file(Some(&partial_path)).expect("load ok").unwrap();
+    let res = load_config_file(Some(&partial_path))
+        .expect("load ok")
+        .unwrap();
     assert!(res.master.is_none());
     assert!(res.worker.is_none());
     assert!(res.status.is_none());
@@ -780,9 +779,7 @@ fn test_adversarial_cli_missing_and_invalid_arguments() {
     let bin_path = env!("CARGO_BIN_EXE_rusty-grid");
 
     // 1. Invoking CLI with zero arguments: missing subcommand
-    let output_no_args = Command::new(bin_path)
-        .output()
-        .expect("invoke CLI");
+    let output_no_args = Command::new(bin_path).output().expect("invoke CLI");
     assert_eq!(
         output_no_args.status.code(),
         Some(2),
@@ -979,8 +976,12 @@ preserve_gpu = true
         TaskRequirements::gpu(30),
     );
 
-    let task_id = master_handle.submit_task(gpu_task).await.expect("submit task");
-    let res = master_handle.wait_task(task_id, Some(Duration::from_secs(5)))
+    let task_id = master_handle
+        .submit_task(gpu_task)
+        .await
+        .expect("submit task");
+    let res = master_handle
+        .wait_task(task_id, Some(Duration::from_secs(5)))
         .await
         .expect("Task executed and waited successfully");
 

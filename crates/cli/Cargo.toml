@@ -5,9 +5,16 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "rusty-grid"
 path = "src/main.rs"
+
+[[bin]]
+name = "ox-mode"
+path = "src/bin/ox_mode.rs"
 
 [dependencies]
 rusty_grid_core = { workspace = true }
@@ -45,4 +52,13 @@ path = "../../tests/m6_challenger_2_stress.rs"
 [[test]]
 name = "windows_cross_compile_test"
 path = "../../tests/windows_cross_compile_test.rs"
+
+[[test]]
+name = "workflow_modes_test"
+path = "../../tests/workflow_modes_test.rs"
+
+[[test]]
+name = "discovery_integration"
+path = "../../tests/discovery_integration.rs"
+
 

@@ -135,6 +135,8 @@ elif [[ -d "$HOME/Android/Sdk/ndk" ]]; then
     if [[ -n "$LATEST_NDK" && -d "$LATEST_NDK" ]]; then
         NDK_DIR="$LATEST_NDK"
     fi
+elif [[ -d "/opt/homebrew/share/android-ndk" ]]; then
+    NDK_DIR="/opt/homebrew/share/android-ndk"
 fi
 
 # Detect host OS tag

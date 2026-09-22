@@ -182,13 +182,9 @@ pub enum ClientMessage {
         wait: bool,
     },
     /// Queries the status and outcome of a specific task.
-    GetTaskStatus {
-        task_id: TaskId,
-    },
+    GetTaskStatus { task_id: TaskId },
     /// Requests cancellation of a task.
-    CancelTask {
-        task_id: TaskId,
-    },
+    CancelTask { task_id: TaskId },
     /// Requests overall cluster metrics.
     ClusterStatus,
     /// Requests list of connected worker nodes.
@@ -250,7 +246,6 @@ pub enum InboundMessage {
     Worker(WorkerMessage),
     Client(ClientMessage),
 }
-
 
 /// Constructs a `LengthDelimitedCodec` configured for rusty_grid:
 /// - 4-byte length prefix
@@ -870,4 +865,3 @@ mod tests {
         assert_eq!(response, resp_deserialized);
     }
 }
-

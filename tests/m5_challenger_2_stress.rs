@@ -36,9 +36,7 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use rusty_grid_core::mapreduce::{
-    MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec,
-};
+use rusty_grid_core::mapreduce::{MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec};
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
 use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
@@ -357,11 +355,36 @@ async fn test_m5_mapreduce_large_multiline_input_stress() {
 
     // Dictionary of 30 deterministic words
     let vocabulary = [
-        "quantum", "entropy", "tensor", "kernel", "matrix", "vector",
-        "cluster", "pipeline", "sharding", "replica", "consensus", "latency",
-        "throughput", "bandwidth", "channel", "semaphore", "mutex", "barrier",
-        "scheduler", "runtime", "compiler", "bytecode", "register", "assembly",
-        "protocol", "framing", "checksum", "payload", "socket", "daemon",
+        "quantum",
+        "entropy",
+        "tensor",
+        "kernel",
+        "matrix",
+        "vector",
+        "cluster",
+        "pipeline",
+        "sharding",
+        "replica",
+        "consensus",
+        "latency",
+        "throughput",
+        "bandwidth",
+        "channel",
+        "semaphore",
+        "mutex",
+        "barrier",
+        "scheduler",
+        "runtime",
+        "compiler",
+        "bytecode",
+        "register",
+        "assembly",
+        "protocol",
+        "framing",
+        "checksum",
+        "payload",
+        "socket",
+        "daemon",
     ];
 
     let mut oracle: HashMap<String, i64> = HashMap::new();
@@ -463,16 +486,17 @@ done"#;
     );
 
     let master_clone = master.clone();
-    let job_fut = tokio::spawn(async move {
-        master_clone.execute_mapreduce(spec).await
-    });
+    let job_fut = tokio::spawn(async move { master_clone.execute_mapreduce(spec).await });
 
     // Wait until a task is actively running on W1, then terminate W1
     let mut aborted = false;
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(4) {
         let tasks = master.list_tasks().await.unwrap_or_default();
-        if let Some(t) = tasks.iter().find(|t| t.assigned_worker_id == Some(w1.worker_id)) {
+        if let Some(t) = tasks
+            .iter()
+            .find(|t| t.assigned_worker_id == Some(w1.worker_id))
+        {
             if t.state == rusty_grid_master::queue::TaskState::Running {
                 w1.abort();
                 aborted = true;
@@ -560,9 +584,7 @@ python3 -c "import sys, json; d=json.load(sys.stdin); print(sum(int(x) for x in 
     );
 
     let master_clone = master.clone();
-    let job_fut = tokio::spawn(async move {
-        master_clone.execute_mapreduce(spec).await
-    });
+    let job_fut = tokio::spawn(async move { master_clone.execute_mapreduce(spec).await });
 
     // Wait until map tasks are completed and a reduce task is running on W1
     let mut aborted = false;
@@ -570,7 +592,10 @@ python3 -c "import sys, json; d=json.load(sys.stdin); print(sum(int(x) for x in 
     while start.elapsed() < Duration::from_secs(6) {
         let tasks = master.list_tasks().await.unwrap_or_default();
         // Check if there are tasks with retry count or running on W1 after map phase
-        if let Some(t) = tasks.iter().find(|t| t.assigned_worker_id == Some(w1.worker_id)) {
+        if let Some(t) = tasks
+            .iter()
+            .find(|t| t.assigned_worker_id == Some(w1.worker_id))
+        {
             if t.state == rusty_grid_master::queue::TaskState::Running {
                 // If there are at least 2 completed tasks, map phase has finished and reduce has started
                 let completed_count = tasks
@@ -755,64 +780,93 @@ async fn test_m5_mapreduce_concurrent_jobs_stress() {
         (
             MapReduceJobSpec::new(
                 "job_fruits",
-                vec![
-                    "apple apple orange".into(),
-                    "banana orange apple".into(),
-                ],
-                MapFunctionSpec::Builtin { operator: "word_count".into() },
-                ReduceFunctionSpec::Builtin { operator: "sum".into() },
-                2, 2, 30,
+                vec!["apple apple orange".into(), "banana orange apple".into()],
+                MapFunctionSpec::Builtin {
+                    operator: "word_count".into(),
+                },
+                ReduceFunctionSpec::Builtin {
+                    operator: "sum".into(),
+                },
+                2,
+                2,
+                30,
             ),
             vec![("apple", 3), ("orange", 2), ("banana", 1)],
         ),
         (
             MapReduceJobSpec::new(
                 "job_langs",
-                vec![
-                    "rust rust python go".into(),
-                    "rust go zig c cpp".into(),
-                ],
-                MapFunctionSpec::Builtin { operator: "word_count".into() },
-                ReduceFunctionSpec::Builtin { operator: "sum".into() },
-                2, 2, 30,
+                vec!["rust rust python go".into(), "rust go zig c cpp".into()],
+                MapFunctionSpec::Builtin {
+                    operator: "word_count".into(),
+                },
+                ReduceFunctionSpec::Builtin {
+                    operator: "sum".into(),
+                },
+                2,
+                2,
+                30,
             ),
-            vec![("rust", 3), ("go", 2), ("python", 1), ("zig", 1), ("c", 1), ("cpp", 1)],
+            vec![
+                ("rust", 3),
+                ("go", 2),
+                ("python", 1),
+                ("zig", 1),
+                ("c", 1),
+                ("cpp", 1),
+            ],
         ),
         (
             MapReduceJobSpec::new(
                 "job_colors",
-                vec![
-                    "red blue green red".into(),
-                    "blue yellow green red".into(),
-                ],
-                MapFunctionSpec::Builtin { operator: "word_count".into() },
-                ReduceFunctionSpec::Builtin { operator: "sum".into() },
-                2, 2, 30,
+                vec!["red blue green red".into(), "blue yellow green red".into()],
+                MapFunctionSpec::Builtin {
+                    operator: "word_count".into(),
+                },
+                ReduceFunctionSpec::Builtin {
+                    operator: "sum".into(),
+                },
+                2,
+                2,
+                30,
             ),
             vec![("red", 3), ("blue", 2), ("green", 2), ("yellow", 1)],
         ),
         (
             MapReduceJobSpec::new(
                 "job_animals",
-                vec![
-                    "cat dog bird cat".into(),
-                    "elephant tiger dog cat".into(),
-                ],
-                MapFunctionSpec::Builtin { operator: "word_count".into() },
-                ReduceFunctionSpec::Builtin { operator: "sum".into() },
-                2, 2, 30,
+                vec!["cat dog bird cat".into(), "elephant tiger dog cat".into()],
+                MapFunctionSpec::Builtin {
+                    operator: "word_count".into(),
+                },
+                ReduceFunctionSpec::Builtin {
+                    operator: "sum".into(),
+                },
+                2,
+                2,
+                30,
             ),
-            vec![("cat", 3), ("dog", 2), ("bird", 1), ("elephant", 1), ("tiger", 1)],
+            vec![
+                ("cat", 3),
+                ("dog", 2),
+                ("bird", 1),
+                ("elephant", 1),
+                ("tiger", 1),
+            ],
         ),
         (
             MapReduceJobSpec::new(
                 "job_single_token",
-                vec![
-                    "unique_token unique_token".into(),
-                ],
-                MapFunctionSpec::Builtin { operator: "word_count".into() },
-                ReduceFunctionSpec::Builtin { operator: "sum".into() },
-                1, 1, 30,
+                vec!["unique_token unique_token".into()],
+                MapFunctionSpec::Builtin {
+                    operator: "word_count".into(),
+                },
+                ReduceFunctionSpec::Builtin {
+                    operator: "sum".into(),
+                },
+                1,
+                1,
+                30,
             ),
             vec![("unique_token", 2)],
         ),

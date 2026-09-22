@@ -12,6 +12,7 @@
 //! 7. `--help` / `-h` flag execution and usage documentation.
 //! 8. Unknown argument rejection with descriptive error message and exit code 1.
 
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -33,7 +34,9 @@ fn get_script_path() -> PathBuf {
     }
     for candidate in &candidates {
         if candidate.exists() {
-            return candidate.canonicalize().unwrap_or_else(|_| candidate.clone());
+            return candidate
+                .canonicalize()
+                .unwrap_or_else(|_| candidate.clone());
         }
     }
     panic!("Could not locate build_windows_worker.sh in candidates: {candidates:?}");
@@ -49,7 +52,10 @@ fn script_cmd(script: &std::path::Path) -> Command {
             r"C:\msys64\usr\bin\bash.exe",
         ];
         let script_str = script.to_string_lossy();
-        let clean_path = script_str.strip_prefix(r"\\?\").unwrap_or(&script_str).replace('\\', "/");
+        let clean_path = script_str
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&script_str)
+            .replace('\\', "/");
         for candidate in &bash_candidates {
             if std::path::Path::new(candidate).exists() {
                 let mut cmd = Command::new(candidate);
@@ -70,7 +76,11 @@ fn script_cmd(script: &std::path::Path) -> Command {
 #[test]
 fn test_windows_cross_compile_script_exists_and_is_executable() {
     let script = get_script_path();
-    assert!(script.exists(), "build_windows_worker.sh must exist at {}", script.display());
+    assert!(
+        script.exists(),
+        "build_windows_worker.sh must exist at {}",
+        script.display()
+    );
 
     #[cfg(unix)]
     {
@@ -166,7 +176,9 @@ fn test_windows_cross_compile_dry_run_default_release() {
         "stdout should default to release profile: {stdout}"
     );
     assert!(
-        stdout.contains("Command: cargo build --target x86_64-pc-windows-gnu --bin rusty-grid --release"),
+        stdout.contains(
+            "Command: cargo build --target x86_64-pc-windows-gnu --bin rusty-grid --release"
+        ),
         "stdout should display the exact release cargo build command: {stdout}"
     );
 }
@@ -241,7 +253,9 @@ fn test_windows_cross_compile_dry_run_custom_env_overrides() {
         "stdout should reflect custom CC override: {stdout}"
     );
     assert!(
-        stdout.contains(&format!("CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER={custom_ld}")),
+        stdout.contains(&format!(
+            "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER={custom_ld}"
+        )),
         "stdout should reflect custom linker override: {stdout}"
     );
 }

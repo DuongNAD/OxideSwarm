@@ -1,0 +1,15 @@
+#!/bin/sh
+
+# Setup standard Gradle environment
+APP_HOME=$(cd "$(dirname "$0")" && pwd)
+CLASSPATH=$APP_HOME/gradle/wrapper/gradle-wrapper.jar
+
+# Fallback to system gradle if wrapper jar is absent
+if [ -f "$CLASSPATH" ]; then
+    exec java -jar "$CLASSPATH" "$@"
+elif command -v gradle >/dev/null 2>&1; then
+    exec gradle "$@"
+else
+    echo "Error: Neither gradle wrapper nor system gradle could be found." >&2
+    exit 1
+fi

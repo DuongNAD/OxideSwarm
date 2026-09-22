@@ -955,4 +955,3 @@ async fn test_adversarial_task_validation_rejects_gpu_spec_without_gpu_requireme
 
     let _ = master.shutdown();
 }
-

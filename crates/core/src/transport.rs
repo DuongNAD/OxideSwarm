@@ -142,15 +142,23 @@ mod tests {
         let mut bi = BiStream::new(r_in, w_in);
 
         // Test writing via BiStream
-        tokio::io::AsyncWriteExt::write_all(&mut bi, b"hello bistream").await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut bi, b"hello bistream")
+            .await
+            .unwrap();
         let mut read_buf = vec![0u8; 14];
-        tokio::io::AsyncReadExt::read_exact(&mut r_out, &mut read_buf).await.unwrap();
+        tokio::io::AsyncReadExt::read_exact(&mut r_out, &mut read_buf)
+            .await
+            .unwrap();
         assert_eq!(&read_buf, b"hello bistream");
 
         // Test reading via BiStream
-        tokio::io::AsyncWriteExt::write_all(&mut w_out, b"world bistream").await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut w_out, b"world bistream")
+            .await
+            .unwrap();
         let mut read_buf2 = vec![0u8; 14];
-        tokio::io::AsyncReadExt::read_exact(&mut bi, &mut read_buf2).await.unwrap();
+        tokio::io::AsyncReadExt::read_exact(&mut bi, &mut read_buf2)
+            .await
+            .unwrap();
         assert_eq!(&read_buf2, b"world bistream");
     }
 
@@ -192,4 +200,3 @@ mod tests {
         });
     }
 }
-

@@ -129,10 +129,7 @@ fn resolve_windows_executable(program: &str, effective_path: &str) -> String {
     let bare_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(program);
 
     // Fast path: check Git for Windows usr/bin first
-    for base in &[
-        r"C:\Program Files\Git\usr\bin",
-        r"C:\Program Files\Git\bin",
-    ] {
+    for base in &[r"C:\Program Files\Git\usr\bin", r"C:\Program Files\Git\bin"] {
         let base_path = Path::new(base);
         for ext in &[".exe", ".cmd", ".bat", ""] {
             let candidate = base_path.join(format!("{bare_name}{ext}"));
@@ -725,38 +722,44 @@ impl TaskRunner {
             }
         };
 
+        #[cfg(windows)]
         let effective_path = {
             let base = env
                 .get("PATH")
                 .cloned()
                 .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
-            #[cfg(windows)]
-            {
-                augment_windows_path(&base)
-            }
-            #[cfg(not(windows))]
-            {
-                base
-            }
+            augment_windows_path(&base)
         };
 
         #[cfg(windows)]
         let (prog, args) = if let Some(interp) = interpreter {
-            (interp.to_string(), vec![script_path.to_string_lossy().to_string()])
+            (
+                interp.to_string(),
+                vec![script_path.to_string_lossy().to_string()],
+            )
         } else {
             let sh_resolved = resolve_windows_executable("sh", &effective_path);
             if Path::new(&sh_resolved).is_file() {
                 (sh_resolved, vec![script_path.to_string_lossy().to_string()])
             } else {
-                ("cmd.exe".to_string(), vec!["/C".to_string(), script_path.to_string_lossy().to_string()])
+                (
+                    "cmd.exe".to_string(),
+                    vec!["/C".to_string(), script_path.to_string_lossy().to_string()],
+                )
             }
         };
 
         #[cfg(not(windows))]
         let (prog, args) = if let Some(interp) = interpreter {
-            (interp.to_string(), vec![script_path.to_string_lossy().to_string()])
+            (
+                interp.to_string(),
+                vec![script_path.to_string_lossy().to_string()],
+            )
         } else {
-            ("/bin/sh".to_string(), vec![script_path.to_string_lossy().to_string()])
+            (
+                "/bin/sh".to_string(),
+                vec![script_path.to_string_lossy().to_string()],
+            )
         };
 
         let result = self

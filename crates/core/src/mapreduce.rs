@@ -46,18 +46,11 @@ impl MapReduceJobSpec {
 #[serde(tag = "type")]
 pub enum MapFunctionSpec {
     /// Command receiving data chunk via stdin, emitting JSON Lines or whitespace-separated key/value to stdout.
-    Command {
-        program: String,
-        args: Vec<String>,
-    },
+    Command { program: String, args: Vec<String> },
     /// Shell script receiving data chunk via stdin/environment, emitting key/value to stdout.
-    ShellScript {
-        script: String,
-    },
+    ShellScript { script: String },
     /// Pre-registered in-memory operator (e.g. "word_count", "line_count", "identity").
-    Builtin {
-        operator: String,
-    },
+    Builtin { operator: String },
 }
 
 /// Reducer execution specification.
@@ -65,18 +58,11 @@ pub enum MapFunctionSpec {
 #[serde(tag = "type")]
 pub enum ReduceFunctionSpec {
     /// Command receiving grouped KV JSON via stdin, emitting reduced KV to stdout.
-    Command {
-        program: String,
-        args: Vec<String>,
-    },
+    Command { program: String, args: Vec<String> },
     /// Shell script receiving grouped KV JSON via stdin/environment, emitting reduced KV to stdout.
-    ShellScript {
-        script: String,
-    },
+    ShellScript { script: String },
     /// Pre-registered in-memory operator (e.g. "sum", "count", "max", "min").
-    Builtin {
-        operator: String,
-    },
+    Builtin { operator: String },
 }
 
 /// Grouped Key-Values passed to a reducer task.

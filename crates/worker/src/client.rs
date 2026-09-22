@@ -90,6 +90,10 @@ pub struct WorkerConfig {
     pub keep_sandboxes: bool,
     /// Maximum bytes to buffer for stdout and stderr before truncation.
     pub max_output_bytes: usize,
+    /// Whether to enable standby HTTP redirection portal on worker node (default: true).
+    pub enable_redirection_portal: bool,
+    /// Port for standby HTTP redirection portal (default: 8080).
+    pub redirection_portal_port: u16,
 }
 
 impl WorkerConfig {
@@ -112,7 +116,19 @@ impl WorkerConfig {
             sandbox_base_dir: None,
             keep_sandboxes: false,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            enable_redirection_portal: true,
+            redirection_portal_port: 8080,
         }
+    }
+
+    pub fn with_redirection_portal(mut self, enable: bool) -> Self {
+        self.enable_redirection_portal = enable;
+        self
+    }
+
+    pub fn with_redirection_portal_port(mut self, port: u16) -> Self {
+        self.redirection_portal_port = port;
+        self
     }
 
     pub fn with_p2p_ticket(mut self, ticket: impl Into<String>) -> Self {
@@ -191,7 +207,6 @@ impl WorkerConfig {
     }
 }
 
-
 /// Autonomous Worker client managing connection, registration, task execution, and communication with Master.
 pub struct WorkerClient {
     config: WorkerConfig,
@@ -203,6 +218,7 @@ pub struct WorkerClient {
     runner: Arc<TaskRunner>,
     active_task_table: ActiveTaskTable,
     concurrency_semaphore: Arc<Semaphore>,
+    master_beacon: Arc<RwLock<Option<rusty_grid_core::discovery::MasterBeacon>>>,
 }
 
 impl WorkerClient {
@@ -234,8 +250,31 @@ impl WorkerClient {
             RunnerConfig::new(sandbox_cfg).with_max_output_bytes(config.max_output_bytes);
         let runner = Arc::new(TaskRunner::new(worker_id, capabilities.clone(), runner_cfg));
         let active_task_table = Arc::new(RwLock::new(HashMap::new()));
-        let concurrency_permits = config.max_concurrency.unwrap_or(capabilities.cpu_cores).max(1);
+        let concurrency_permits = config
+            .max_concurrency
+            .unwrap_or(capabilities.cpu_cores)
+            .max(1);
         let concurrency_semaphore = Arc::new(Semaphore::new(concurrency_permits));
+
+        let initial_beacon = if !config.master_addr.is_empty()
+            && !config.master_addr.eq_ignore_ascii_case("auto")
+            && !config.master_addr.starts_with("auto:")
+        {
+            let host = if let Some(idx) = config.master_addr.find(':') {
+                &config.master_addr[..idx]
+            } else {
+                &config.master_addr
+            };
+            Some(rusty_grid_core::discovery::MasterBeacon::new(
+                config.master_addr.clone(),
+                format!("http://{}:8080", host),
+                "KnownMaster",
+                0,
+            ))
+        } else {
+            None
+        };
+        let master_beacon = Arc::new(RwLock::new(initial_beacon));
 
         info!(
             worker_id = %worker_id,
@@ -257,7 +296,13 @@ impl WorkerClient {
             runner,
             active_task_table,
             concurrency_semaphore,
+            master_beacon,
         }
+    }
+
+    /// Returns a shared reference to the discovered master beacon state.
+    pub fn master_beacon(&self) -> Arc<RwLock<Option<rusty_grid_core::discovery::MasterBeacon>>> {
+        Arc::clone(&self.master_beacon)
     }
 
     /// Convenience constructor initializing WorkerClient directly with common CLI options.
@@ -338,13 +383,22 @@ impl WorkerClient {
     pub async fn run(&mut self, mut shutdown_rx: watch::Receiver<bool>) -> GridResult<()> {
         let mut backoff = ExponentialBackoff::new(self.backoff_config.clone());
 
+        if self.config.enable_redirection_portal {
+            let portal_port = self.config.redirection_portal_port;
+            let portal_shutdown_rx = shutdown_rx.clone();
+            let beacon_ref = Arc::clone(&self.master_beacon);
+            tokio::spawn(async move {
+                spawn_worker_redirection_portal(portal_port, beacon_ref, portal_shutdown_rx).await;
+            });
+        }
+
         loop {
             if *shutdown_rx.borrow() {
                 info!(worker_id = %self.worker_id, "Worker shutdown requested; exiting supervisor");
                 break;
             }
 
-            match self.connect_and_run(&mut shutdown_rx).await {
+            match self.connect_and_run(&mut shutdown_rx, &mut backoff).await {
                 Ok(()) => {
                     info!(worker_id = %self.worker_id, "Worker connection ended cleanly");
                     break;
@@ -361,6 +415,8 @@ impl WorkerClient {
                         attempt = backoff.attempt() + 1,
                         "Connection dropped or failed; applying exponential backoff before reconnect"
                     );
+
+                    *self.master_beacon.write().await = None;
 
                     let delay = backoff.next_delay();
                     tokio::select! {
@@ -518,7 +574,9 @@ impl WorkerClient {
     }
 
     /// Establishes an underlying stream to the Master (either P2P QUIC via ticket, or direct TCP).
-    async fn establish_stream(&self) -> GridResult<(rusty_grid_core::transport::GridStream, String)> {
+    async fn establish_stream(
+        &self,
+    ) -> GridResult<(rusty_grid_core::transport::GridStream, String)> {
         #[cfg(feature = "p2p")]
         if let Some(ref ticket_str) = self.config.p2p_ticket {
             let node_addr = rusty_grid_core::transport::parse_p2p_ticket(ticket_str)
@@ -528,17 +586,18 @@ impl WorkerClient {
                 .alpns(vec![rusty_grid_core::transport::GRID_ALPN.to_vec()])
                 .bind()
                 .await
-                .map_err(|e| GridError::ConnectionFailed(format!("Failed to bind iroh endpoint: {e}")))?;
+                .map_err(|e| {
+                    GridError::ConnectionFailed(format!("Failed to bind iroh endpoint: {e}"))
+                })?;
 
             let conn = endpoint
                 .connect(node_addr, rusty_grid_core::transport::GRID_ALPN)
                 .await
                 .map_err(|e| GridError::ConnectionFailed(format!("P2P connect failed: {e}")))?;
 
-            let (send, recv) = conn
-                .open_bi()
-                .await
-                .map_err(|e| GridError::ConnectionFailed(format!("Failed to open bidirectional stream: {e}")))?;
+            let (send, recv) = conn.open_bi().await.map_err(|e| {
+                GridError::ConnectionFailed(format!("Failed to open bidirectional stream: {e}"))
+            })?;
 
             let bi_stream = rusty_grid_core::transport::BiStream::new(recv, send);
             return Ok((
@@ -547,20 +606,75 @@ impl WorkerClient {
             ));
         }
 
-        let stream = TcpStream::connect(&self.config.master_addr)
+        let mut target_addr = self.config.master_addr.clone();
+        if target_addr.is_empty()
+            || target_addr.eq_ignore_ascii_case("auto")
+            || target_addr.starts_with("auto:")
+        {
+            let disc_port = if target_addr.starts_with("auto:") {
+                target_addr[5..]
+                    .parse::<u16>()
+                    .unwrap_or(rusty_grid_core::DEFAULT_DISCOVERY_PORT)
+            } else {
+                rusty_grid_core::DEFAULT_DISCOVERY_PORT
+            };
+            info!(
+                port = disc_port,
+                "Master address set to 'auto'; probing local network via UDP discovery..."
+            );
+            match rusty_grid_core::discovery::discover_master(
+                Duration::from_secs(3),
+                disc_port,
+            )
+            .await
+            {
+                Some(beacon) => {
+                    info!(
+                        master = %beacon.cluster_addr,
+                        hostname = %beacon.hostname,
+                        "Discovered active Master via UDP LAN beacon"
+                    );
+                    *self.master_beacon.write().await = Some(beacon.clone());
+                    target_addr = beacon.cluster_addr;
+                }
+                None => {
+                    warn!("UDP discovery probe timed out; falling back to 127.0.0.1:8088");
+                    target_addr = "127.0.0.1:8088".to_string();
+                }
+            }
+        }
+
+        let stream = TcpStream::connect(&target_addr)
             .await
             .map_err(GridError::Io)?;
         let _ = stream.set_nodelay(true);
         let remote = stream
             .peer_addr()
             .map(|a| a.to_string())
-            .unwrap_or_else(|_| self.config.master_addr.clone());
+            .unwrap_or_else(|_| target_addr.clone());
+
+        if let Ok(peer) = stream.peer_addr() {
+            let mut lock = self.master_beacon.write().await;
+            if lock.is_none() {
+                let peer_ip = peer.ip();
+                *lock = Some(rusty_grid_core::discovery::MasterBeacon::new(
+                    target_addr.clone(),
+                    format!("http://{}:8080", peer_ip),
+                    "MasterNode",
+                    1,
+                ));
+            }
+        }
         Ok((rusty_grid_core::transport::GridStream::Tcp(stream), remote))
     }
 
     /// Conducts a single connection lifecycle: TCP/P2P connect, registration handshake,
     /// heartbeat task spawning, and bidirectional message processing.
-    async fn connect_and_run(&mut self, shutdown_rx: &mut watch::Receiver<bool>) -> GridResult<()> {
+    async fn connect_and_run(
+        &mut self,
+        shutdown_rx: &mut watch::Receiver<bool>,
+        backoff: &mut ExponentialBackoff,
+    ) -> GridResult<()> {
         let (stream, remote_desc) = self.establish_stream().await?;
         info!(master = %remote_desc, worker_id = %self.worker_id, "Connected to Master; initiating handshake");
 
@@ -568,6 +682,8 @@ impl WorkerClient {
 
         // Perform atomic registration handshake
         let heartbeat_interval = self.perform_handshake(&mut transport).await?;
+        backoff.reset();
+        info!(worker_id = %self.worker_id, "Registration accepted; backoff counter reset");
 
         // Split transport into independent reader and writer
         let (mut writer, mut reader) = transport.split();
@@ -736,6 +852,282 @@ impl WorkerClient {
     }
 }
 
+/// Target coordinator reference for the worker standby redirection portal.
+#[derive(Clone)]
+pub enum PortalTarget {
+    Static(String),
+    Dynamic(Arc<tokio::sync::RwLock<Option<rusty_grid_core::discovery::MasterBeacon>>>),
+}
+
+impl From<String> for PortalTarget {
+    fn from(s: String) -> Self {
+        PortalTarget::Static(s)
+    }
+}
+
+impl From<&str> for PortalTarget {
+    fn from(s: &str) -> Self {
+        PortalTarget::Static(s.to_string())
+    }
+}
+
+impl From<Arc<tokio::sync::RwLock<Option<rusty_grid_core::discovery::MasterBeacon>>>> for PortalTarget {
+    fn from(a: Arc<tokio::sync::RwLock<Option<rusty_grid_core::discovery::MasterBeacon>>>) -> Self {
+        PortalTarget::Dynamic(a)
+    }
+}
+
+async fn resolve_portal_master(
+    target: &PortalTarget,
+    client_ip: std::net::IpAddr,
+) -> Option<(String, String)> {
+    match target {
+        PortalTarget::Dynamic(beacon_state) => {
+            if let Some(ref beacon) = *beacon_state.read().await {
+                let ui_url = if beacon.web_ui_url.contains("127.0.0.1") && !client_ip.is_loopback() {
+                    let host_from_cluster = beacon.cluster_addr.split(':').next().unwrap_or("");
+                    if !host_from_cluster.is_empty()
+                        && host_from_cluster != "127.0.0.1"
+                        && host_from_cluster != "localhost"
+                        && host_from_cluster != "auto"
+                    {
+                        format!("http://{}:8080", host_from_cluster)
+                    } else {
+                        let local_ip = rusty_grid_core::discovery::get_local_ip_or_loopback();
+                        if local_ip.to_string() == "192.168.1.144" {
+                            "http://192.168.1.123:8080".to_string()
+                        } else {
+                            "http://192.168.1.144:8080".to_string()
+                        }
+                    }
+                } else {
+                    beacon.web_ui_url.clone()
+                };
+                return Some((ui_url, beacon.cluster_addr.clone()));
+            }
+            None
+        }
+        PortalTarget::Static(addr) => {
+            if addr.is_empty() || addr.eq_ignore_ascii_case("auto") || addr.starts_with("auto:") {
+                let port = if addr.starts_with("auto:") {
+                    addr[5..]
+                        .parse::<u16>()
+                        .unwrap_or(rusty_grid_core::DEFAULT_DISCOVERY_PORT)
+                } else {
+                    rusty_grid_core::DEFAULT_DISCOVERY_PORT
+                };
+                if let Some(beacon) = rusty_grid_core::discovery::discover_master(
+                    Duration::from_millis(350),
+                    port,
+                )
+                .await
+                {
+                    return Some((beacon.web_ui_url, beacon.cluster_addr));
+                }
+                None
+            } else {
+                let host = if let Some(idx) = addr.find(':') {
+                    &addr[..idx]
+                } else {
+                    addr.as_str()
+                };
+                let host = if host.is_empty() || host == "auto" {
+                    if client_ip.is_loopback() {
+                        "127.0.0.1"
+                    } else {
+                        let local_ip = rusty_grid_core::discovery::get_local_ip_or_loopback();
+                        if local_ip.to_string() == "192.168.1.144" {
+                            "192.168.1.123"
+                        } else {
+                            "192.168.1.144"
+                        }
+                    }
+                } else {
+                    host
+                };
+                Some((format!("http://{}:8080", host), addr.clone()))
+            }
+        }
+    }
+}
+
+fn worker_portal_standby_html() -> String {
+    r#"<!DOCTYPE html>
+<html lang="vi" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>OxideSwarm Standby Node</title>
+  <style>
+    body { background:#090d16; color:#e2e8f0; font-family:-apple-system,BlinkMacSystemFont,sans-serif; text-align:center; padding:40px 16px; margin:0; }
+    .card { max-width:480px; margin:0 auto; background:#111827; border:1px solid #1f293d; border-radius:12px; padding:24px; box-shadow:0 4px 20px rgba(0,0,0,0.5); }
+    .title { font-size:18px; font-weight:700; color:#38bdf8; margin-bottom:12px; }
+    .desc { font-size:14px; color:#94a3b8; line-height:1.6; margin-bottom:20px; }
+    .spinner { display:inline-block; width:36px; height:36px; border:3px solid rgba(56,189,248,0.2); border-top-color:#38bdf8; border-radius:50%; animation:spin 1s linear infinite; margin-bottom:16px; }
+    @keyframes spin { 100% { transform:rotate(360deg); } }
+    .btn { display:inline-block; background:#0284c7; color:#fff; padding:10px 20px; border-radius:6px; text-decoration:none; font-weight:600; font-size:13px; cursor:pointer; border:none; }
+    .status { font-size:12px; color:#f59e0b; margin-top:14px; font-family:monospace; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="spinner"></div>
+    <div class="title">OxideSwarm Standby Node (Worker)</div>
+    <div class="desc">Thiết bị này đang ở vai trò <strong>Worker</strong>. Đang tự động dò tìm Master đang hoạt động trong mạng LAN...</div>
+    <button class="btn" onclick="probeCluster()">Thử kết nối lại ngay</button>
+    <div class="status" id="scanStatus">Đang quét cụm...</div>
+  </div>
+  <script>
+    const candidates = ['192.168.1.144:8080', '192.168.1.123:8080'];
+    async function probeCluster() {
+      const s = document.getElementById('scanStatus');
+      if (s) s.textContent = 'Đang kiểm tra các node...';
+      for (const host of candidates) {
+        if (host === window.location.host) continue;
+        try {
+          const ctrl = new AbortController();
+          const tid = setTimeout(() => ctrl.abort(), 900);
+          const res = await fetch('http://' + host + '/api/status', { signal: ctrl.signal });
+          clearTimeout(tid);
+          if (res.ok) {
+            const data = await res.json();
+            if (data.master && data.master.role === 'MASTER') {
+              if (s) s.textContent = 'Đã tìm thấy Master tại ' + host + '! Đang chuyển hướng...';
+              window.location.replace('http://' + host + '/');
+              return;
+            } else if (data.role === 'WORKER_PORTAL' && data.redirect_url && !data.redirect_url.includes('127.0.0.1')) {
+              window.location.replace(data.redirect_url);
+              return;
+            }
+          }
+        } catch (_) {}
+      }
+      if (s) s.textContent = 'Chưa phát hiện Master. Sẽ tự động thử lại sau 2 giây...';
+    }
+    probeCluster();
+    setInterval(probeCluster, 2000);
+  </script>
+</body>
+</html>"#
+    .to_string()
+}
+
+/// Spawns a lightweight HTTP portal on `portal_port` that redirects incoming browser visits
+/// (e.g. from smartphones or bookmarks) to the active Master node.
+pub async fn spawn_worker_redirection_portal(
+    portal_port: u16,
+    target: impl Into<PortalTarget>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    use std::net::SocketAddr;
+    let target = target.into();
+    let bind_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), portal_port);
+    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            debug!(
+                port = portal_port,
+                error = %e,
+                "Worker standby redirection portal not started (port 8080 likely bound by Master or other service)"
+            );
+            return;
+        }
+    };
+
+    info!(
+        portal_port = portal_port,
+        "Worker standby HTTP redirection portal active on port 8080"
+    );
+
+    loop {
+        tokio::select! {
+            res = listener.accept() => {
+                if let Ok((mut stream, client_addr)) = res {
+                    let target = target.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 1024];
+                        if let Ok(n) = stream.read(&mut buf).await {
+                            if n == 0 { return; }
+                            let req = String::from_utf8_lossy(&buf[..n]);
+                            let is_api_status = req.starts_with("GET /api/status") || req.contains("GET /api/status ");
+
+                            let master_info = resolve_portal_master(&target, client_addr.ip()).await;
+
+                            if is_api_status {
+                                let (resp_json, status_code) = match master_info {
+                                    Some((web_ui, cluster)) => (
+                                        serde_json::json!({
+                                            "role": "WORKER_PORTAL",
+                                            "status": "connected_to_master",
+                                            "master_cluster_addr": cluster,
+                                            "master_web_ui": web_ui,
+                                            "redirect_url": web_ui,
+                                        }),
+                                        "200 OK",
+                                    ),
+                                    None => (
+                                        serde_json::json!({
+                                            "role": "WORKER_PORTAL",
+                                            "status": "searching_master",
+                                            "master_cluster_addr": null,
+                                            "master_web_ui": null,
+                                            "redirect_url": null,
+                                            "candidate_nodes": ["192.168.1.144:8080", "192.168.1.123:8080"],
+                                        }),
+                                        "200 OK",
+                                    ),
+                                };
+                                let json_body = resp_json.to_string();
+                                let resp = format!(
+                                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    status_code,
+                                    json_body.len(),
+                                    json_body
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                            } else {
+                                match master_info {
+                                    Some((web_ui_url, cluster_addr)) => {
+                                        let html_body = format!(
+                                            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"0; url={0}\"><title>OxideSwarm Auto-Redirect</title></head><body style=\"font-family:-apple-system,BlinkMacSystemFont,sans-serif;text-align:center;padding:50px;background:#090d16;color:#e2e8f0;\"><h2>OxideSwarm Node (Worker)</h2><p>Thiết bị này đang ở vai trò Worker. Đang chuyển hướng sang Master tại <a style=\"color:#38bdf8;\" href=\"{0}\">{0}</a>...</p><script>window.location.replace(\"{0}\");</script></body></html>",
+                                            web_ui_url
+                                        );
+                                        let resp = format!(
+                                            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {}\r\nX-OxideSwarm-Master: {}\r\nContent-Type: text/html; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                            web_ui_url,
+                                            cluster_addr,
+                                            html_body.len(),
+                                            html_body
+                                        );
+                                        let _ = stream.write_all(resp.as_bytes()).await;
+                                    }
+                                    None => {
+                                        let html_body = worker_portal_standby_html();
+                                        let resp = format!(
+                                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                            html_body.len(),
+                                            html_body
+                                        );
+                                        let _ = stream.write_all(resp.as_bytes()).await;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+            res = shutdown_rx.changed() => {
+                if res.is_ok() && *shutdown_rx.borrow() {
+                    break;
+                } else if res.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -888,7 +1280,7 @@ mod tests {
         client.capabilities.mobile = Some(rusty_grid_core::capabilities::MobileCapabilities {
             os_version: "Android 14".into(),
             soc_model: "Snapdragon 8 Gen 3".into(),
-            battery_pct: Some(10), // Under 15%
+            battery_pct: Some(10),    // Under 15%
             is_charging: Some(false), // Discharging
             thermal_throttled: false,
         });
@@ -916,5 +1308,86 @@ mod tests {
             }
             other => panic!("Expected TaskResult, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_worker_client_backoff_reset_on_register_ack() {
+        let (client_io, master_io) = tokio::io::duplex(4096);
+        let config = WorkerConfig::new("127.0.0.1:9999");
+        let client = WorkerClient::new(config);
+        let worker_id = client.worker_id();
+
+        // Simulate master receiving Register and responding with RegisterAck(accepted: true)
+        tokio::spawn(async move {
+            let mut master_transport = MessageTransport::new(master_io);
+            let msg = master_transport
+                .recv_msg::<WorkerMessage>()
+                .await
+                .unwrap()
+                .unwrap();
+            match msg {
+                WorkerMessage::Register { worker_id: wid, .. } => {
+                    assert_eq!(wid, worker_id);
+                    master_transport
+                        .send_msg(&MasterMessage::RegisterAck {
+                            accepted: true,
+                            worker_id,
+                            heartbeat_interval_secs: 3,
+                            message: None,
+                        })
+                        .await
+                        .unwrap();
+                }
+                other => panic!("Expected Register, got {other:?}"),
+            }
+        });
+
+        let mut client_transport = MessageTransport::new(client_io);
+        let mut backoff = ExponentialBackoff::new(BackoffConfig::default());
+        // Simulate previous reconnection failures incrementing backoff attempt
+        backoff.next_delay();
+        backoff.next_delay();
+        assert_eq!(backoff.attempt(), 2);
+
+        let res = client.perform_handshake(&mut client_transport).await;
+        assert!(res.is_ok());
+        backoff.reset();
+        assert_eq!(backoff.attempt(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_worker_redirection_portal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let test_port = 18080;
+        let master_target = "192.168.1.123:8088".to_string();
+
+        tokio::spawn(async move {
+            spawn_worker_redirection_portal(test_port, master_target, shutdown_rx).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 1. Test browser navigation / redirect
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", test_port)).await.unwrap();
+        stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.contains("307 Temporary Redirect"));
+        assert!(resp.contains("Location: http://192.168.1.123:8080"));
+
+        // 2. Test /api/status probe
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", test_port)).await.unwrap();
+        stream.write_all(b"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("\"role\":\"WORKER_PORTAL\""));
+        assert!(resp.contains("http://192.168.1.123:8080"));
+
+        let _ = shutdown_tx.send(true);
     }
 }

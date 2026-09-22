@@ -139,7 +139,8 @@ impl HeartbeatHandle {
 }
 
 static TELEMETRY_CACHE: std::sync::Mutex<(f32, u64)> = std::sync::Mutex::new((0.0, 8192));
-static TELEMETRY_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TELEMETRY_INITIALIZED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn ensure_telemetry_sampler_started() {
     if TELEMETRY_INITIALIZED

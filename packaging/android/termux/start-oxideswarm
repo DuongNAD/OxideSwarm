@@ -1,0 +1,72 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# ==============================================================================
+# OxideSwarm Termux:Boot Hook — ~/.termux/boot/start-oxideswarm
+#
+# Executed automatically by the Termux:Boot addon upon Android system boot.
+# Guarantees CPU wakefulness and launches the OxideSwarm grid worker daemon.
+# ==============================================================================
+
+set -euo pipefail
+
+BOOT_LOG_DIR="${HOME}/.local/state/oxideswarm"
+BOOT_LOG="${BOOT_LOG_DIR}/boot.log"
+mkdir -p "${BOOT_LOG_DIR}"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [BOOT] $*" | tee -a "${BOOT_LOG}"
+}
+
+log "=== OxideSwarm Termux:Boot triggered on system boot ==="
+
+# 1. Acquire CPU Wake-Lock immediately to prevent device sleep during boot phase
+if command -v termux-wake-lock >/dev/null 2>&1; then
+    termux-wake-lock
+    log "Acquired termux-wake-lock to prevent CPU suspension."
+else
+    log "WARNING: 'termux-wake-lock' command not found. Install termux-api package."
+fi
+
+# 2. Wait for network connectivity to become operational
+log "Waiting for network connectivity..."
+MAX_WAIT_SECS=60
+ELAPSED=0
+NETWORK_READY=false
+
+while [ $ELAPSED -lt $MAX_WAIT_SECS ]; do
+    # Try pinging standard DNS or coordinator if configured
+    if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 || ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then
+        NETWORK_READY=true
+        log "Network is online and operational (took ${ELAPSED}s)."
+        break
+    fi
+    sleep 3
+    ELAPSED=$((ELAPSED + 3))
+done
+
+if [ "$NETWORK_READY" = false ]; then
+    log "WARNING: Network not detected after ${MAX_WAIT_SECS}s. Attempting worker launch anyway."
+fi
+
+# 3. Locate start_worker.sh script
+RUNNER_SCRIPT="${PREFIX}/bin/start_worker.sh"
+if [ ! -f "$RUNNER_SCRIPT" ]; then
+    RUNNER_SCRIPT="${HOME}/bin/start_worker.sh"
+fi
+
+if [ ! -f "$RUNNER_SCRIPT" ]; then
+    # Search in current directory or script directory
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    RUNNER_SCRIPT="${SCRIPT_DIR}/start_worker.sh"
+fi
+
+if [ -f "$RUNNER_SCRIPT" ] && [ -x "$RUNNER_SCRIPT" ]; then
+    log "Launching OxideSwarm worker daemon via: ${RUNNER_SCRIPT} --daemon"
+    "$RUNNER_SCRIPT" --daemon
+    log "OxideSwarm worker daemon launched successfully."
+else
+    log "ERROR: Worker startup script not found at ${RUNNER_SCRIPT}. Please run install_termux_daemon.sh."
+    exit 1
+fi
+
+log "=== Termux:Boot sequence finished ==="
+exit 0

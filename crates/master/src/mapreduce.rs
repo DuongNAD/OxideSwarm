@@ -280,8 +280,9 @@ done"#
                             )),
                         });
                     }
-                    serde_json::from_str(result.stdout.trim())
-                        .unwrap_or_else(|_| serde_json::Value::String(result.stdout.trim().to_string()))
+                    serde_json::from_str(result.stdout.trim()).unwrap_or_else(|_| {
+                        serde_json::Value::String(result.stdout.trim().to_string())
+                    })
                 }
                 ReduceFunctionSpec::Command { program, args } => {
                     let grouped_kv = GroupedKeyValue {
@@ -317,8 +318,9 @@ done"#
                             )),
                         });
                     }
-                    serde_json::from_str(result.stdout.trim())
-                        .unwrap_or_else(|_| serde_json::Value::String(result.stdout.trim().to_string()))
+                    serde_json::from_str(result.stdout.trim()).unwrap_or_else(|_| {
+                        serde_json::Value::String(result.stdout.trim().to_string())
+                    })
                 }
             };
 
@@ -348,11 +350,7 @@ done"#
         })
     }
 
-    async fn submit_and_await_task(
-        &self,
-        task: Task,
-        timeout_secs: u64,
-    ) -> GridResult<TaskResult> {
+    async fn submit_and_await_task(&self, task: Task, timeout_secs: u64) -> GridResult<TaskResult> {
         let task_id = task.id;
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
@@ -403,7 +401,10 @@ mod tests {
             30,
         );
 
-        let res = engine.execute(spec).await.expect("empty mapreduce succeeds");
+        let res = engine
+            .execute(spec)
+            .await
+            .expect("empty mapreduce succeeds");
         assert_eq!(res.status, "Completed");
         assert_eq!(res.map_tasks_total, 0);
         assert_eq!(res.reduce_tasks_total, 0);
@@ -430,7 +431,10 @@ mod tests {
                     let _ = q_clone.mark_running(&task_id, Uuid::new_v4()).await;
 
                     // Produce simulated output based on task stdin
-                    let stdout = if let TaskSpec::Command { stdin: Some(bytes), .. } = &t.spec {
+                    let stdout = if let TaskSpec::Command {
+                        stdin: Some(bytes), ..
+                    } = &t.spec
+                    {
                         let text = String::from_utf8_lossy(bytes);
                         let mut out = String::new();
                         for word in text.split_whitespace() {
@@ -441,13 +445,7 @@ mod tests {
                         "test\t1\n".into()
                     };
 
-                    let res = TaskResult::success(
-                        Uuid::new_v4(),
-                        task_id,
-                        stdout,
-                        10,
-                        false,
-                    );
+                    let res = TaskResult::success(Uuid::new_v4(), task_id, stdout, 10, false);
                     let _ = q_clone.record_result(res.clone()).await;
                     let mut lock = w_clone.write().await;
                     if let Some(senders) = lock.remove(&task_id) {
@@ -461,10 +459,7 @@ mod tests {
 
         let spec = MapReduceJobSpec::new(
             "test_wc",
-            vec![
-                "apple banana apple".into(),
-                "banana orange apple".into(),
-            ],
+            vec!["apple banana apple".into(), "banana orange apple".into()],
             MapFunctionSpec::Builtin {
                 operator: "word_count".into(),
             },

@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Daemon Identification -->
+    <key>Label</key>
+    <string>com.oxideswarm.worker</string>
+
+    <!-- Executable Invocation -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/rusty-grid</string>
+        <string>worker</string>
+        <string>--master</string>
+        <string>127.0.0.1:8080</string>
+    </array>
+
+    <!-- Automatic Startup on Boot/Load -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Supervision & Crash Recovery -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Crash Loop Throttling (Seconds) -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- Headless Standard I/O Log Redirection -->
+    <key>StandardOutPath</key>
+    <string>/var/log/oxideswarm/worker.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/oxideswarm/worker.err.log</string>
+
+    <!-- Working Directory Context -->
+    <key>WorkingDirectory</key>
+    <string>/var/lib/oxideswarm</string>
+
+    <!-- Runtime Environment -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+
+    <!-- High Performance Grid Resource Limits -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+
+    <!-- Scheduling and Process Tree Management -->
+    <key>ProcessType</key>
+    <string>Standard</string>
+    <key>AbandonProcessGroup</key>
+    <false/>
+</dict>
+</plist>

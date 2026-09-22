@@ -1,0 +1,34 @@
+<resources>
+    <string name="app_name">OxideSwarm Worker</string>
+    <string name="channel_name">OxideSwarm Grid Worker</string>
+    <string name="channel_description">Persistent foreground service maintaining connection to OxideSwarm cluster</string>
+    <string name="notification_title">OxideSwarm Grid Active</string>
+    <string name="notification_content">Worker running in background</string>
+    <string name="action_stop">Stop Worker</string>
+    
+    <!-- UI Strings -->
+    <string name="title_worker_status">Worker Node Status</string>
+    <string name="status_stopped">STOPPED</string>
+    <string name="status_running">RUNNING</string>
+    <string name="status_connecting">CONNECTING</string>
+    <string name="btn_start">Start Worker</string>
+    <string name="btn_stop">Stop Worker</string>
+    
+    <string name="label_master_address">Master Coordinator Address</string>
+    <string name="hint_master_address">e.g. 192.168.1.100:8080</string>
+    <string name="label_worker_name">Worker Identifier</string>
+    <string name="label_cpu_cores">CPU Cores Allocated</string>
+    <string name="label_ram_mb">Memory Limit (MB)</string>
+    <string name="label_simulate_gpu">Simulate GPU Matrix Engine</string>
+    <string name="label_auto_start_boot">Auto-start on System Boot</string>
+    
+    <string name="title_battery_optimization">Background Execution Health</string>
+    <string name="battery_exempt_yes">Battery Optimization: EXEMPT (Safe)</string>
+    <string name="battery_exempt_no">Battery Optimization: ACTIVE (May Sleep!)</string>
+    <string name="btn_request_battery_exemption">Disable Battery Optimization</string>
+    <string name="btn_oem_guide">OEM Standby Settings</string>
+    
+    <string name="title_live_logs">Live Terminal Output</string>
+    <string name="btn_clear_logs">Clear</string>
+    <string name="btn_copy_logs">Copy</string>
+</resources>

@@ -5,6 +5,7 @@ members = [
     "crates/master",
     "crates/worker",
     "crates/cli",
+    "crates/android_bridge",
 ]
 
 [workspace.package]

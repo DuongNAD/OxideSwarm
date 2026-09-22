@@ -545,7 +545,9 @@ async fn test_adversarial_cancel_queued_pre_dispatch() {
     // Register a waiter BEFORE cancel on t1
     let master_c = master.clone();
     let wait_t1_handle = tokio::spawn(async move {
-        master_c.wait_task(t1_id, Some(Duration::from_millis(1500))).await
+        master_c
+            .wait_task(t1_id, Some(Duration::from_millis(1500)))
+            .await
     });
 
     // Small yield to let waiter register in waiters map
@@ -566,7 +568,10 @@ async fn test_adversarial_cancel_queued_pre_dispatch() {
     );
 
     // Active waiter on t1 receives cancellation exit code 130
-    let res1 = wait_t1_handle.await.unwrap().expect("wait t1 must receive cancel result");
+    let res1 = wait_t1_handle
+        .await
+        .unwrap()
+        .expect("wait t1 must receive cancel result");
     assert_eq!(res1.exit_code, 130);
 
     // Calling wait_task on t2 AFTER cancel_task on a queued task returns promptly
@@ -789,7 +794,10 @@ async fn test_adversarial_cancel_mid_execution_and_permit_reuse() {
         Duration::from_millis(30),
         || async {
             let workers = master.list_workers().await.unwrap_or_default();
-            workers.first().map(|w| w.active_tasks == 0).unwrap_or(false)
+            workers
+                .first()
+                .map(|w| w.active_tasks == 0)
+                .unwrap_or(false)
         },
     )
     .await;
@@ -1061,12 +1069,18 @@ async fn test_adversarial_direct_task_queue_retry_policy_exhaustion() {
     let w_a = Uuid::new_v4();
     let scheduled_1 = queue.schedule_task(&task_id, w_a).await;
     assert!(scheduled_1.is_some());
-    assert_eq!(queue.get_state(&task_id).await.unwrap(), TaskState::Scheduled);
+    assert_eq!(
+        queue.get_state(&task_id).await.unwrap(),
+        TaskState::Scheduled
+    );
 
     // Worker A disconnects (Failure 1 -> Retry 1)
     let affected = queue.handle_worker_disconnected(&w_a, "W_A dropped").await;
     assert_eq!(affected, vec![task_id]);
-    assert_eq!(queue.get_state(&task_id).await.unwrap(), TaskState::Retrying);
+    assert_eq!(
+        queue.get_state(&task_id).await.unwrap(),
+        TaskState::Retrying
+    );
     let info = queue.get_task(&task_id).await.unwrap();
     assert_eq!(info.retry_count, 1);
 
@@ -1080,12 +1094,18 @@ async fn test_adversarial_direct_task_queue_retry_policy_exhaustion() {
     let w_b = Uuid::new_v4();
     let scheduled_2 = queue.schedule_task(&task_id, w_b).await;
     assert!(scheduled_2.is_some());
-    assert_eq!(queue.get_state(&task_id).await.unwrap(), TaskState::Scheduled);
+    assert_eq!(
+        queue.get_state(&task_id).await.unwrap(),
+        TaskState::Scheduled
+    );
 
     // Worker B disconnects (Failure 2 -> Retry 2)
     let affected2 = queue.handle_worker_disconnected(&w_b, "W_B dropped").await;
     assert_eq!(affected2, vec![task_id]);
-    assert_eq!(queue.get_state(&task_id).await.unwrap(), TaskState::Retrying);
+    assert_eq!(
+        queue.get_state(&task_id).await.unwrap(),
+        TaskState::Retrying
+    );
     let info2 = queue.get_task(&task_id).await.unwrap();
     assert_eq!(info2.retry_count, 2);
 
@@ -1099,7 +1119,10 @@ async fn test_adversarial_direct_task_queue_retry_policy_exhaustion() {
     let w_c = Uuid::new_v4();
     let scheduled_3 = queue.schedule_task(&task_id, w_c).await;
     assert!(scheduled_3.is_some());
-    assert_eq!(queue.get_state(&task_id).await.unwrap(), TaskState::Scheduled);
+    assert_eq!(
+        queue.get_state(&task_id).await.unwrap(),
+        TaskState::Scheduled
+    );
 
     // Worker C disconnects (Failure 3 -> Exceeds max_retries 2!)
     let affected3 = queue.handle_worker_disconnected(&w_c, "W_C dropped").await;
@@ -1215,7 +1238,12 @@ async fn test_adversarial_bug_wait_task_hangs_after_max_retries_exhaustion() {
 
     // Loop through 4 worker failures to exhaust max_retries
     for attempt in 1..=4 {
-        let worker = spawn_test_worker(master_addr.clone(), &format!("bug-worker-{attempt}"), 2, false);
+        let worker = spawn_test_worker(
+            master_addr.clone(),
+            &format!("bug-worker-{attempt}"),
+            2,
+            false,
+        );
         let running = wait_for(
             Duration::from_secs(6),
             Duration::from_millis(30),

@@ -6,9 +6,9 @@
 //! 3. Configuration File (`--config <path>`, `RUSTY_GRID_CONFIG`, or `./rusty-grid.{toml,json}`)
 //! 4. Hardcoded System Defaults
 
-use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 use rusty_grid_core::error::{GridError, GridResult};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// Top-level configuration file schema supporting TOML and JSON.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -232,11 +232,7 @@ pub fn resolve_opt_usize(
     resolve_opt_field(cli, env_names, file_val, |s| s.trim().parse().ok())
 }
 
-pub fn resolve_opt_u64(
-    cli: Option<u64>,
-    env_names: &[&str],
-    file_val: Option<u64>,
-) -> Option<u64> {
+pub fn resolve_opt_u64(cli: Option<u64>, env_names: &[&str], file_val: Option<u64>) -> Option<u64> {
     resolve_opt_field(cli, env_names, file_val, |s| s.trim().parse().ok())
 }
 
@@ -278,12 +274,22 @@ mod tests {
         assert_eq!(res1, "default_val");
 
         // Tier 3: Config file overrides Default
-        let res2 = resolve_string(None, &[env_key], Some("config_val".to_string()), "default_val");
+        let res2 = resolve_string(
+            None,
+            &[env_key],
+            Some("config_val".to_string()),
+            "default_val",
+        );
         assert_eq!(res2, "config_val");
 
         // Tier 2: Environment variable overrides Config file
         std::env::set_var(env_key, "env_val");
-        let res3 = resolve_string(None, &[env_key], Some("config_val".to_string()), "default_val");
+        let res3 = resolve_string(
+            None,
+            &[env_key],
+            Some("config_val".to_string()),
+            "default_val",
+        );
         assert_eq!(res3, "env_val");
 
         // Tier 1: CLI flag overrides Environment variable
@@ -322,7 +328,10 @@ gpu_name = "Mock RTX"
 
         let worker = parsed_toml.worker.unwrap();
         assert_eq!(worker.simulate_gpu, Some(true));
-        assert_eq!(worker.hardware.unwrap().gpu_name.as_deref(), Some("Mock RTX"));
+        assert_eq!(
+            worker.hardware.unwrap().gpu_name.as_deref(),
+            Some("Mock RTX")
+        );
 
         let json_str = r#"{
   "master": {

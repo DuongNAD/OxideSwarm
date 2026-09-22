@@ -45,10 +45,25 @@ pub struct ServerConfig {
     pub enable_p2p: bool,
     /// Optional path to write P2P ticket for worker connections.
     pub p2p_ticket_file: Option<PathBuf>,
+    /// Address to bind the Web UI dashboard to (e.g. "0.0.0.0:8080").
+    pub web_ui_addr: SocketAddr,
+    /// Whether to enable the Web UI dashboard service (default: false for ephemeral/test configs).
+    pub enable_web_ui: bool,
+    /// Whether to enable UDP Master node discovery service (default: true for non-zero ports).
+    pub enable_discovery: bool,
+    /// UDP discovery port (default: 8089).
+    pub discovery_port: u16,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
+        let enable_web_ui = if std::env::var("RUSTY_GRID_DISABLE_WEB_UI").is_ok() {
+            false
+        } else {
+            std::env::var("RUSTY_GRID_ENABLE_WEB_UI")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        };
         Self {
             bind_addr: "127.0.0.1:0".parse().expect("valid loopback default"),
             port_file: None,
@@ -56,6 +71,10 @@ impl Default for ServerConfig {
             handshake_timeout_secs: 5,
             enable_p2p: false,
             p2p_ticket_file: None,
+            web_ui_addr: "0.0.0.0:8080".parse().expect("valid loopback default"),
+            enable_web_ui,
+            enable_discovery: false,
+            discovery_port: rusty_grid_core::DEFAULT_DISCOVERY_PORT,
         }
     }
 }
@@ -63,10 +82,23 @@ impl Default for ServerConfig {
 impl ServerConfig {
     /// Creates a new ServerConfig binding to the given socket address.
     pub fn new(bind_addr: SocketAddr) -> Self {
-        Self {
+        let enable_discovery = if std::env::var("RUSTY_GRID_DISABLE_DISCOVERY").is_ok() {
+            false
+        } else {
+            bind_addr.port() != 0
+        };
+        let mut cfg = Self {
             bind_addr,
+            enable_discovery,
             ..Default::default()
+        };
+        if bind_addr.port() != 0 && std::env::var("RUSTY_GRID_DISABLE_WEB_UI").is_err() {
+            cfg.enable_web_ui = true;
+            if cfg.web_ui_addr.port() == bind_addr.port() {
+                cfg.web_ui_addr.set_port(bind_addr.port() + 1);
+            }
         }
+        cfg
     }
 
     /// Parses a socket address string (e.g. "127.0.0.1:0") into a ServerConfig.
@@ -104,6 +136,30 @@ impl ServerConfig {
     /// Configures path where P2P ticket string is published.
     pub fn with_p2p_ticket_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.p2p_ticket_file = Some(path.into());
+        self
+    }
+
+    /// Enables or disables the Web UI dashboard service.
+    pub fn with_web_ui(mut self, enable: bool) -> Self {
+        self.enable_web_ui = enable;
+        self
+    }
+
+    /// Sets the socket address to bind the Web UI dashboard to (e.g. "127.0.0.1:0" for ephemeral binding).
+    pub fn with_web_ui_addr(mut self, addr: SocketAddr) -> Self {
+        self.web_ui_addr = addr;
+        self
+    }
+
+    /// Enables or disables UDP Master discovery beacons.
+    pub fn with_discovery(mut self, enable: bool) -> Self {
+        self.enable_discovery = enable;
+        self
+    }
+
+    /// Sets the UDP port for discovery beacons and probes.
+    pub fn with_discovery_port(mut self, port: u16) -> Self {
+        self.discovery_port = port;
         self
     }
 }
@@ -220,6 +276,10 @@ impl MasterServer {
         let waiters = Arc::new(RwLock::new(HashMap::new()));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+        let web_ui_addr = config.web_ui_addr;
+        let enable_web_ui = config.enable_web_ui;
+        let enable_discovery = config.enable_discovery;
+        let discovery_port = config.discovery_port;
         let server = Self::bind_full(
             config,
             registry.clone(),
@@ -255,6 +315,42 @@ impl MasterServer {
             reaper_config,
             reaper_shutdown_rx,
         );
+
+        // 4. Spawn Web UI Dashboard (if enabled)
+        if enable_web_ui {
+            let web_ui_shutdown_rx = shutdown_rx.clone();
+            tokio::spawn(crate::web_ui::start_web_ui(
+                web_ui_addr,
+                registry.clone(),
+                queue.clone(),
+                scheduler_notify.clone(),
+                web_ui_shutdown_rx,
+            ));
+        }
+
+        // 5. Spawn UDP Master Discovery Broadcaster & Active Probe Responder
+        if enable_discovery {
+            let disc_shutdown_rx = shutdown_rx.clone();
+            let listen_ip = server_addr.ip();
+            let cluster_port = server_addr.port();
+            let web_ui_port = if enable_web_ui {
+                web_ui_addr.port()
+            } else {
+                8080
+            };
+            let disc_registry = registry.clone();
+            tokio::spawn(async move {
+                spawn_master_discovery_service(
+                    listen_ip,
+                    cluster_port,
+                    web_ui_port,
+                    discovery_port,
+                    disc_registry,
+                    disc_shutdown_rx,
+                )
+                .await;
+            });
+        }
 
         Ok(MasterHandle {
             server_addr,
@@ -312,7 +408,9 @@ impl MasterServer {
                         let _ = tokio::fs::create_dir_all(parent).await;
                     }
                 }
-                tokio::fs::write(ticket_path, &ticket).await.map_err(GridError::Io)?;
+                tokio::fs::write(ticket_path, &ticket)
+                    .await
+                    .map_err(GridError::Io)?;
                 info!(path = %ticket_path.display(), "Published P2P ticket to file");
             }
 
@@ -575,11 +673,17 @@ async fn handle_worker_disconnect_internal(
                             TaskResult::failure(
                                 info.assigned_worker_id.unwrap_or_else(Uuid::nil),
                                 *task_id,
-                                if info.state == TaskState::Cancelled { 130 } else { 1 },
+                                if info.state == TaskState::Cancelled {
+                                    130
+                                } else {
+                                    1
+                                },
                                 "",
                                 "",
                                 0,
-                                info.error_message.clone().or_else(|| Some("Task terminated".into())),
+                                info.error_message
+                                    .clone()
+                                    .or_else(|| Some("Task terminated".into())),
                             )
                         });
                         let mut lock = waiters.write().await;
@@ -1130,11 +1234,17 @@ impl MasterHandle {
                     return Ok(TaskResult::failure(
                         info.assigned_worker_id.unwrap_or_else(Uuid::nil),
                         task_id,
-                        if info.state == TaskState::Cancelled { 130 } else { 1 },
+                        if info.state == TaskState::Cancelled {
+                            130
+                        } else {
+                            1
+                        },
                         "",
                         "",
                         0,
-                        info.error_message.clone().or_else(|| Some("Task terminated".into())),
+                        info.error_message
+                            .clone()
+                            .or_else(|| Some("Task terminated".into())),
                     ));
                 }
             }
@@ -1155,11 +1265,17 @@ impl MasterHandle {
                         TaskResult::failure(
                             info.assigned_worker_id.unwrap_or_else(Uuid::nil),
                             task_id,
-                            if info.state == TaskState::Cancelled { 130 } else { 1 },
+                            if info.state == TaskState::Cancelled {
+                                130
+                            } else {
+                                1
+                            },
                             "",
                             "",
                             0,
-                            info.error_message.clone().or_else(|| Some("Task terminated".into())),
+                            info.error_message
+                                .clone()
+                                .or_else(|| Some("Task terminated".into())),
                         )
                     }));
                 }
@@ -1234,6 +1350,95 @@ impl MasterHandle {
     }
 }
 
+/// Spawns the Master discovery UDP service that broadcasts periodic beacons
+/// and answers incoming client discovery queries.
+async fn spawn_master_discovery_service(
+    listen_ip: std::net::IpAddr,
+    cluster_port: u16,
+    web_ui_port: u16,
+    discovery_port: u16,
+    registry: WorkerRegistry,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let local_ip = if listen_ip.is_loopback() {
+        listen_ip
+    } else if listen_ip.is_unspecified() {
+        rusty_grid_core::discovery::get_local_ip_or_loopback()
+    } else {
+        listen_ip
+    };
+    let cluster_addr = format!("{}:{}", local_ip, cluster_port);
+    let web_ui_url = format!("http://{}:{}", local_ip, web_ui_port);
+    let hostname = sysinfo::System::host_name().unwrap_or_else(|| "OxideMaster".to_string());
+
+    let bind_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), discovery_port);
+    let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(port = discovery_port, error = %e, "Could not bind Master UDP discovery listener");
+            return;
+        }
+    };
+    let _ = socket.set_broadcast(true);
+
+    info!(
+        discovery_port = discovery_port,
+        cluster_addr = %cluster_addr,
+        web_ui_url = %web_ui_url,
+        "Master UDP Discovery beacon & query responder active"
+    );
+
+    let broadcast_target = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::BROADCAST), discovery_port);
+    let subnet_target = SocketAddr::new(rusty_grid_core::discovery::get_subnet_broadcast_ip(), discovery_port);
+    let loopback_target = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), discovery_port);
+    let mut ticker = tokio::time::interval(Duration::from_millis(1500));
+    let mut buf = [0u8; 1024];
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let workers_count = registry.list_workers().await.len();
+                let beacon = rusty_grid_core::discovery::MasterBeacon::new(
+                    &cluster_addr,
+                    &web_ui_url,
+                    &hostname,
+                    workers_count,
+                );
+                if let Ok(bytes) = beacon.to_bytes() {
+                    let _ = socket.send_to(&bytes, broadcast_target).await;
+                    if subnet_target != broadcast_target {
+                        let _ = socket.send_to(&bytes, subnet_target).await;
+                    }
+                    let _ = socket.send_to(&bytes, loopback_target).await;
+                }
+            }
+            res = socket.recv_from(&mut buf) => {
+                if let Ok((len, from)) = res {
+                    if &buf[..len] == rusty_grid_core::discovery::DISCOVERY_MAGIC_REQUEST {
+                        let workers_count = registry.list_workers().await.len();
+                        let beacon = rusty_grid_core::discovery::MasterBeacon::new(
+                            &cluster_addr,
+                            &web_ui_url,
+                            &hostname,
+                            workers_count,
+                        );
+                        if let Ok(bytes) = beacon.to_bytes() {
+                            let _ = socket.send_to(&bytes, from).await;
+                        }
+                    }
+                }
+            }
+            res = shutdown_rx.changed() => {
+                if res.is_ok() && *shutdown_rx.borrow() {
+                    break;
+                } else if res.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1288,5 +1493,58 @@ mod tests {
         }
 
         let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn test_server_config_web_ui_options() {
+        let default_cfg = ServerConfig::default();
+        assert!(!default_cfg.enable_web_ui);
+
+        let ephemeral_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
+        assert!(!ephemeral_cfg.enable_web_ui);
+
+        let explicit_cfg = ServerConfig::new("127.0.0.1:8088".parse().unwrap());
+        assert!(explicit_cfg.enable_web_ui);
+
+        let custom_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(true)
+            .with_web_ui_addr("127.0.0.1:0".parse().unwrap());
+        assert!(custom_cfg.enable_web_ui);
+        assert_eq!(custom_cfg.web_ui_addr.port(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_master_server_spawn_with_ephemeral_web_ui() {
+        let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(true)
+            .with_web_ui_addr("127.0.0.1:0".parse().unwrap());
+        let handle = MasterServer::spawn(config).await.unwrap();
+        assert!(handle.server_addr().port() > 0);
+        let _ = handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_master_server_discovery_service() {
+        let disc_port = 18089;
+        let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_discovery(true)
+            .with_discovery_port(disc_port);
+
+        let handle = MasterServer::spawn(config).await.unwrap();
+        assert!(handle.server_addr().port() > 0);
+
+        // Discovery probe using the configured discovery port
+        let discovered = rusty_grid_core::discovery::discover_master(
+            Duration::from_millis(1500),
+            disc_port,
+        )
+        .await;
+
+        assert!(discovered.is_some(), "Master discovery service should respond to probe");
+        let beacon = discovered.unwrap();
+        assert_eq!(beacon.service, rusty_grid_core::discovery::DISCOVERY_SERVICE_NAME);
+        assert!(beacon.cluster_addr.ends_with(&format!(":{}", handle.server_addr().port())));
+
+        let _ = handle.shutdown();
     }
 }

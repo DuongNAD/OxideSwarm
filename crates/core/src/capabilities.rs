@@ -166,7 +166,6 @@ impl WorkerCapabilities {
         })
     }
 
-
     /// Returns true if this worker has GPU compute capabilities (either physical or simulated).
     #[inline]
     pub fn can_execute_gpu(&self) -> bool {
@@ -312,7 +311,8 @@ fn detect_battery() -> (Option<u8>, Option<bool>) {
                 let capacity = std::fs::read_to_string(bat_dir.join("capacity"))
                     .ok()
                     .and_then(|s| s.trim().parse::<u8>().ok());
-                let status_str = std::fs::read_to_string(bat_dir.join("status")).unwrap_or_default();
+                let status_str =
+                    std::fs::read_to_string(bat_dir.join("status")).unwrap_or_default();
                 let status_trim = status_str.trim().to_lowercase();
                 let is_charging = if status_trim == "charging" || status_trim == "full" {
                     Some(true)
@@ -331,7 +331,11 @@ fn detect_battery() -> (Option<u8>, Option<bool>) {
     // 2. macOS pmset fallback
     #[cfg(target_os = "macos")]
     {
-        if let Ok(output) = std::process::Command::new("pmset").arg("-g").arg("batt").output() {
+        if let Ok(output) = std::process::Command::new("pmset")
+            .arg("-g")
+            .arg("batt")
+            .output()
+        {
             let text = String::from_utf8_lossy(&output.stdout);
             let mut pct: Option<u8> = None;
             let mut charging: Option<bool> = None;
@@ -355,10 +359,66 @@ fn detect_battery() -> (Option<u8>, Option<bool>) {
         }
     }
 
+    // 3. Android dumpsys battery fallback
+    if is_android_env() {
+        if let Ok(output) = std::process::Command::new("/system/bin/dumpsys")
+            .arg("battery")
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut level: Option<u8> = None;
+            let mut is_charging: Option<bool> = None;
+
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix("level:") {
+                    level = rest.trim().parse::<u8>().ok();
+                } else if let Some(rest) = trimmed.strip_prefix("status:") {
+                    if let Ok(st) = rest.trim().parse::<u32>() {
+                        is_charging = Some(st == 2 || st == 5);
+                    }
+                } else if let Some(rest) = trimmed.strip_prefix("AC powered:") {
+                    if rest.trim() == "true" {
+                        is_charging = Some(true);
+                    }
+                } else if let Some(rest) = trimmed.strip_prefix("USB powered:") {
+                    if rest.trim() == "true" {
+                        is_charging = Some(true);
+                    }
+                } else if let Some(rest) = trimmed.strip_prefix("Wireless powered:") {
+                    if rest.trim() == "true" {
+                        is_charging = Some(true);
+                    }
+                }
+            }
+            if level.is_some() {
+                return (level, is_charging);
+            }
+        }
+    }
+
     (None, None)
 }
 
 fn detect_thermal_throttling() -> bool {
+    // 1. Android dumpsys thermalservice check
+    if is_android_env() {
+        if let Ok(output) = std::process::Command::new("/system/bin/dumpsys")
+            .arg("thermalservice")
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix("Thermal Status:") {
+                    if let Ok(status) = rest.trim().parse::<u32>() {
+                        return status >= 2;
+                    }
+                }
+            }
+        }
+    }
+
     let thermal_base = std::path::Path::new("/sys/class/thermal");
     if !thermal_base.is_dir() {
         return false;
@@ -609,4 +669,3 @@ mod tests {
         }
     }
 }
-

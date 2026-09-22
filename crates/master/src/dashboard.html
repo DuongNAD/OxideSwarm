@@ -1,0 +1,2177 @@
+<!DOCTYPE html>
+<html lang="vi" class="notranslate" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="google" content="notranslate">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>OxideSwarm Mobile Cluster</title>
+    <style>
+        :root[data-theme="dark"] {
+            --bg: #090d16;
+            --surface: #111827;
+            --surface-subtle: #1a2236;
+            --border: #1f293d;
+            --text: #e2e8f0;
+            --text-dim: #94a3b8;
+            --accent: #38bdf8;
+            --accent-glow: rgba(56, 189, 248, 0.15);
+            --tag-master: #f59e0b;
+            --tag-orch: #a855f7;
+            --tag-worker: #06b6d4;
+            --tag-gpu: #06b6d4;
+            --dot-green: #10b981;
+            --dot-red: #ef4444;
+            --dot-busy: #f59e0b;
+            --log-bg: #030712;
+        }
+        :root[data-theme="light"] {
+            --bg: #f8fafc;
+            --surface: #ffffff;
+            --surface-subtle: #f1f5f9;
+            --border: #cbd5e1;
+            --text: #0f172a;
+            --text-dim: #64748b;
+            --accent: #0284c7;
+            --accent-glow: rgba(2, 132, 199, 0.12);
+            --tag-master: #d97706;
+            --tag-orch: #7c3aed;
+            --tag-worker: #0891b2;
+            --tag-gpu: #0891b2;
+            --dot-green: #059669;
+            --dot-red: #dc2626;
+            --dot-busy: #d97706;
+            --log-bg: #ffffff;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        
+        html, body {
+            height: 100dvh;
+            min-height: 100dvh;
+            overflow: hidden;
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, monospace;
+            font-size: 13px;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .layout {
+            height: 100dvh;
+            display: flex;
+            flex-direction: column;
+            max-width: 640px;
+            margin: 0 auto;
+            padding-bottom: max(10px, env(safe-area-inset-bottom));
+        }
+
+        /* Top Header Bar */
+        .topbar {
+            height: 48px;
+            padding: 0 12px;
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-shrink: 0;
+            gap: 8px;
+        }
+        .top-left {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            min-width: 0;
+        }
+        .brand-title {
+            font-weight: 800;
+            font-size: 15px;
+            letter-spacing: -0.3px;
+            color: var(--accent);
+            white-space: nowrap;
+        }
+        .cluster-summary {
+            font-size: 11px;
+            color: var(--dot-green);
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        /* Top Right Actions */
+        .top-actions {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+        }
+        .latency-pill {
+            font-size: 10.5px;
+            font-family: ui-monospace, SFMono-Regular, monospace;
+            color: var(--dot-green);
+            background: var(--surface-subtle);
+            border: 1px solid var(--border);
+            padding: 3px 6px;
+            border-radius: 4px;
+            font-weight: 600;
+        }
+        .wake-pill {
+            font-size: 10px;
+            font-weight: 700;
+            padding: 3px 6px;
+            border-radius: 4px;
+            border: 1px solid var(--border);
+            background: var(--surface-subtle);
+            color: var(--text-dim);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 3px;
+            white-space: nowrap;
+            transition: all 0.15s ease;
+        }
+        .wake-pill.active {
+            background: rgba(245, 158, 11, 0.15);
+            border-color: #f59e0b;
+            color: #f59e0b;
+        }
+        .sync-btn {
+            background: var(--surface-subtle);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 4px 8px;
+            font-size: 11px;
+            font-weight: 600;
+            cursor: pointer;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            min-height: 28px;
+            transition: all 0.15s ease;
+        }
+        .sync-btn:active {
+            border-color: var(--accent);
+            background: var(--accent-glow);
+        }
+        .sync-icon {
+            display: inline-block;
+            transition: transform 0.3s ease;
+            color: var(--accent);
+        }
+        .sync-icon.spinning {
+            animation: spin 0.6s linear infinite;
+        }
+        @keyframes spin {
+            100% { transform: rotate(360deg); }
+        }
+        .sync-text {
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .theme-btn {
+            background: var(--surface-subtle);
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            width: 28px;
+            height: 28px;
+            font-size: 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .theme-btn:active {
+            color: var(--text);
+            border-color: var(--accent);
+        }
+
+        /* 2-Tab Navigation Bar */
+        .tab-nav-bar {
+            display: flex;
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            padding: 4px 10px;
+            gap: 8px;
+            flex-shrink: 0;
+        }
+        .tab-btn {
+            flex: 1;
+            background: var(--surface-subtle);
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            padding: 6px 10px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            transition: all 0.15s ease;
+            min-height: 32px;
+        }
+        .tab-btn.active {
+            background: var(--accent-glow);
+            color: var(--accent);
+            border-color: var(--accent);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .tab-icon { font-size: 13px; }
+        .tab-badge {
+            background: var(--accent);
+            color: #000;
+            font-size: 10px;
+            font-weight: 800;
+            padding: 1px 5px;
+            border-radius: 8px;
+            line-height: 1.2;
+        }
+        .tab-btn:not(.active) .tab-badge {
+            background: var(--border);
+            color: var(--text-dim);
+        }
+
+        /* Tab Pane Viewports */
+        .tab-pane {
+            flex: 1;
+            display: none;
+            overflow: hidden;
+            flex-direction: column;
+        }
+        .tab-pane.active {
+            display: flex;
+        }
+
+        /* ========================================================
+           TAB 1: TERMINAL / CHAT FEED
+           ======================================================== */
+        .terminal-wrapper {
+            flex: 1 1 auto;
+            min-height: 160px;
+            display: flex;
+            flex-direction: column;
+            background: var(--log-bg);
+            overflow: hidden;
+        }
+        .terminal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: var(--surface);
+            padding: 6px 12px;
+            border-bottom: 1px solid var(--border);
+            font-size: 11px;
+            flex-shrink: 0;
+        }
+        .term-title-group {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .term-title {
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            color: var(--text-dim);
+        }
+        .term-status {
+            font-size: 10.5px;
+            color: var(--dot-green);
+            font-weight: 600;
+        }
+        .term-controls {
+            display: flex;
+            gap: 5px;
+        }
+        .btn-term {
+            background: var(--surface-subtle);
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            padding: 3px 8px;
+            font-size: 11px;
+            font-weight: 600;
+            border-radius: 3px;
+            cursor: pointer;
+            transition: all 0.12s ease;
+        }
+        .btn-term:active {
+            color: var(--text);
+            border-color: var(--accent);
+        }
+
+        .chat-feed {
+            flex: 1 1 auto;
+            min-height: 160px;
+            overflow-y: auto;
+            padding: 10px 12px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            line-height: 1.45;
+            -webkit-overflow-scrolling: touch;
+        }
+        .term-welcome {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            padding: 4px 0;
+            color: var(--text-dim);
+        }
+        .w-accent { color: var(--accent); font-weight: 600; }
+        .welcome-hint { font-size: 11px; opacity: 0.85; }
+
+        .prompt-line {
+            color: var(--accent);
+            font-weight: 600;
+        }
+        .prompt-line::before {
+            content: "> ";
+            color: var(--text-dim);
+        }
+        .report-box {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-left: 3px solid var(--accent);
+            padding: 8px 10px;
+            border-radius: 4px;
+            white-space: pre-wrap;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+        }
+        .report-meta {
+            font-size: 10.5px;
+            color: var(--text-dim);
+            margin-bottom: 5px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px dashed var(--border);
+            padding-bottom: 4px;
+        }
+        .res-content {
+            white-space: pre-wrap;
+            font-size: 11.5px;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+        }
+
+        /* Maximized Terminal View Mode */
+        .layout.term-maximized .topbar { display: none; }
+        .layout.term-maximized .tab-nav-bar { display: none; }
+        .layout.term-maximized .quick-chips { display: none; }
+
+        /* Terminal Bottom Controls */
+        .chat-bottom {
+            padding: 8px 12px;
+            background: var(--surface);
+            border-top: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            flex-shrink: 0;
+        }
+        .quick-chips {
+            display: flex;
+            gap: 6px;
+            overflow-x: auto;
+            scrollbar-width: none;
+            -webkit-overflow-scrolling: touch;
+            padding-bottom: 2px;
+        }
+        .quick-chips::-webkit-scrollbar { display: none; }
+        .chip {
+            background: var(--surface-subtle);
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            padding: 4px 8px;
+            font-size: 11px;
+            border-radius: 3px;
+            cursor: pointer;
+            white-space: nowrap;
+            font-family: ui-monospace, monospace;
+            min-height: 28px;
+        }
+        .chip:active {
+            border-color: var(--accent);
+            color: var(--text);
+        }
+        .chip-mode {
+            font-weight: 700;
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+        .chip-mode.active {
+            background: var(--accent);
+            color: #000;
+        }
+        .input-row {
+            display: flex;
+            gap: 6px;
+        }
+        .cmd-input {
+            flex: 1;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 9px 12px;
+            font-family: ui-monospace, monospace;
+            font-size: 13px;
+            border-radius: 4px;
+            outline: none;
+            min-height: 40px;
+        }
+        .cmd-input:focus { border-color: var(--accent); }
+        .btn-run {
+            background: var(--accent);
+            color: #000;
+            font-weight: 700;
+            border: none;
+            padding: 0 16px;
+            border-radius: 4px;
+            font-size: 13px;
+            cursor: pointer;
+            min-height: 40px;
+            min-width: 60px;
+        }
+        .btn-run:active { opacity: 0.85; }
+
+        /* ========================================================
+           TAB 2: CONNECTED DEVICES (Clean, Even Alignment)
+           ======================================================== */
+        .devices-view {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            -webkit-overflow-scrolling: touch;
+        }
+        .cluster-banner {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            padding: 10px 12px;
+            border-radius: 5px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 12px;
+            color: var(--text-dim);
+            flex-shrink: 0;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+        .cluster-banner strong { color: var(--text); }
+        .banner-stat { display: flex; align-items: center; gap: 4px; }
+
+        .devices-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        /* Interactive / Clean Cluster Topology Card */
+        .topology-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 9px 11px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .topology-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 11px;
+            font-weight: 700;
+            color: var(--text-dim);
+            letter-spacing: 0.3px;
+        }
+        .topo-badge {
+            font-size: 9px;
+            padding: 1px 6px;
+            border-radius: 3px;
+            background: rgba(16, 185, 129, 0.15);
+            color: var(--dot-green);
+            font-weight: 600;
+        }
+        .topology-diagram {
+            font-family: 'SF Mono', Menlo, Consolas, Monaco, monospace;
+            font-size: 10px;
+            line-height: 1.35;
+            background: #0f172a;
+            border: 1px solid #1e293b;
+            border-radius: 6px;
+            padding: 9px 12px;
+            overflow-x: auto;
+            white-space: pre;
+            color: #38bdf8;
+            box-shadow: inset 0 1px 3px rgba(0,0,0,0.3);
+        }
+
+        /* High-Density 2-Row Micro-Cards */
+        .device-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 9px 11px;
+            display: flex;
+            flex-direction: column;
+            gap: 7px;
+            transition: border-color 0.15s ease;
+        }
+        .device-card:hover {
+            border-color: var(--accent);
+        }
+
+        /* Row 1: Identity, Status Dot, Name, Tasks */
+        .card-row-1 {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            min-width: 0;
+            gap: 8px;
+        }
+        .card-id-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+            flex: 1;
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .dot-online {
+            background: var(--dot-green);
+            box-shadow: 0 0 6px var(--dot-green);
+        }
+        .dot-offline {
+            background: var(--dot-red);
+            box-shadow: 0 0 6px var(--dot-red);
+        }
+        .dot-busy {
+            background: var(--dot-busy);
+            box-shadow: 0 0 6px var(--dot-busy);
+        }
+
+        .role-badge {
+            font-size: 10px;
+            font-weight: 700;
+            padding: 2px 6px;
+            border-radius: 3px;
+            text-align: center;
+            min-width: 58px;
+            flex-shrink: 0;
+            letter-spacing: 0.3px;
+            border: 1px solid currentColor;
+        }
+        .tag-master {
+            color: var(--tag-master);
+            background: rgba(245, 158, 11, 0.12);
+        }
+        .tag-orch {
+            color: var(--tag-orch);
+            background: rgba(168, 85, 247, 0.12);
+        }
+        .tag-worker {
+            color: var(--tag-worker);
+            background: rgba(6, 182, 212, 0.12);
+        }
+        .tag-gpu {
+            color: var(--tag-gpu);
+            background: rgba(6, 182, 212, 0.18);
+        }
+
+        .node-name {
+            font-weight: 600;
+            font-size: 13px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            min-width: 0;
+            flex: 1;
+        }
+
+        .card-top-right {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+        }
+        .task-pill {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 3px;
+            background: rgba(56, 189, 248, 0.12);
+            color: var(--accent);
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .ping-pill {
+            font-size: 10px;
+            color: var(--text-dim);
+            font-family: ui-monospace, monospace;
+            white-space: nowrap;
+        }
+
+        /* Row 2: Telemetry Gauges, GPU, Battery, Throttling */
+        .card-row-2 {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            font-family: ui-monospace, SFMono-Regular, monospace;
+            flex-wrap: wrap;
+        }
+        .metric-pill {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            background: var(--surface-subtle);
+            border: 1px solid var(--border);
+            padding: 2px 6px;
+            border-radius: 3px;
+            white-space: nowrap;
+        }
+        .m-label { color: var(--text-dim); font-size: 10.5px; }
+        .meter-blocks {
+            letter-spacing: 1px;
+            font-size: 9.5px;
+            color: var(--accent);
+        }
+        .meter-track {
+            width: 28px;
+            height: 4px;
+            background: var(--border);
+            border-radius: 2px;
+            overflow: hidden;
+            display: inline-block;
+            vertical-align: middle;
+        }
+        .meter-fill {
+            height: 100%;
+            border-radius: 2px;
+            transition: width 0.3s ease;
+        }
+        .bar-green { background: var(--dot-green); }
+        .bar-yellow { background: var(--dot-busy); }
+        .bar-red { background: var(--dot-red); }
+
+        .badge-gpu {
+            font-size: 9.5px;
+            color: var(--tag-gpu);
+            background: rgba(6, 182, 212, 0.12);
+            border: 1px solid rgba(6, 182, 212, 0.3);
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+        .badge-battery {
+            font-size: 9.5px;
+            color: var(--tag-orch);
+            background: rgba(168, 85, 247, 0.12);
+            border: 1px solid rgba(168, 85, 247, 0.3);
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .badge-throttle {
+            font-size: 9.5px;
+            color: var(--dot-red);
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+
+        /* ========================================================
+           TAB 3: WORKFLOW MODES & AUTOMATION PRESETS
+           ======================================================== */
+        .modes-view {
+            flex: 1 1 auto;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .modes-banner {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px 12px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .modes-title {
+            font-weight: 800;
+            font-size: 13px;
+            color: var(--accent);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .modes-status-tag {
+            font-size: 11px;
+            font-weight: 700;
+            padding: 2px 8px;
+            border-radius: 4px;
+            background: var(--surface-subtle);
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+        }
+        .modes-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+        @media (max-width: 480px) {
+            .modes-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        .mode-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .mode-card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-weight: 700;
+            font-size: 12px;
+        }
+        .mode-card-desc {
+            font-size: 11px;
+            color: var(--text-dim);
+            line-height: 1.35;
+        }
+        .mode-actions-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+            margin-top: 4px;
+        }
+        .btn-mode-act {
+            background: var(--surface-subtle);
+            border: 1px solid var(--border);
+            color: var(--text);
+            border-radius: 4px;
+            padding: 4px 8px;
+            font-size: 11px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .btn-mode-act:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+            background: var(--accent-glow);
+        }
+        .btn-mode-act:active {
+            transform: scale(0.96);
+        }
+        .mode-console {
+            background: var(--log-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            min-height: 180px;
+            max-height: 280px;
+        }
+        .mode-console-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 11px;
+            font-weight: 700;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 5px;
+        }
+        .mode-log-content {
+            font-family: monospace;
+            font-size: 11px;
+            white-space: pre-wrap;
+            word-break: break-all;
+            overflow-y: auto;
+            flex: 1;
+            color: var(--text);
+            line-height: 1.45;
+        }
+
+        /* Ultra-Narrow Screens (<380px) */
+        @media (max-width: 380px) {
+            .topbar { padding: 0 8px; }
+            .brand-title { font-size: 14px; }
+            .tab-btn { font-size: 11px; padding: 5px 6px; }
+            .node-name { max-width: 100px; }
+            .meter-track { width: 20px; }
+        }
+
+        /* Device Detail Modal Bottom Sheet */
+        .modal-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0, 0, 0, 0.75);
+            backdrop-filter: blur(4px);
+            z-index: 1000;
+            display: none;
+            align-items: flex-end;
+            justify-content: center;
+        }
+        .modal-overlay.active {
+            display: flex;
+        }
+        .modal-sheet {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-bottom: none;
+            border-radius: 16px 16px 0 0;
+            width: 100%;
+            max-width: 500px;
+            max-height: 85dvh;
+            overflow-y: auto;
+            padding: 20px;
+            padding-bottom: max(20px, env(safe-area-inset-bottom));
+            animation: slideUp 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+            box-shadow: 0 -4px 24px rgba(0,0,0,0.6);
+        }
+        @keyframes slideUp {
+            from { transform: translateY(100%); }
+            to { transform: translateY(0); }
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 14px;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 10px;
+        }
+        .modal-title {
+            font-size: 15px;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .modal-close {
+            background: var(--surface-subtle);
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            font-size: 16px;
+            border-radius: 50%;
+            width: 30px; height: 30px;
+            display: flex; align-items: center; justify-content: center;
+            cursor: pointer;
+        }
+        .detail-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-bottom: 14px;
+        }
+        .detail-item {
+            background: var(--surface-subtle);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px 10px;
+        }
+        .detail-label {
+            font-size: 10px;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 3px;
+        }
+        .detail-val {
+            font-size: 13px;
+            font-weight: 600;
+            font-family: ui-monospace, SFMono-Regular, monospace;
+            color: var(--text);
+            word-break: break-word;
+        }
+        .modal-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 14px;
+        }
+        .modal-btn {
+            flex: 1;
+            padding: 10px 12px;
+            border-radius: 6px;
+            font-weight: 700;
+            font-size: 12px;
+            cursor: pointer;
+            text-align: center;
+            border: 1px solid var(--border);
+        }
+        .modal-btn-primary {
+            background: var(--accent);
+            color: #000;
+            border-color: var(--accent);
+        }
+        .modal-btn-secondary {
+            background: var(--surface-subtle);
+            color: var(--text);
+        }
+        .device-card {
+            cursor: pointer;
+            transition: transform 0.1s ease, border-color 0.15s ease;
+        }
+        .device-card:active {
+            transform: scale(0.98);
+            border-color: var(--accent);
+        }
+    </style>
+</head>
+<body>
+    <div class="layout" id="mainLayout">
+        <!-- Top Header Bar with Status Summary, Latency Pill, and SVG Reload Button -->
+        <header class="topbar">
+            <div class="top-left">
+                <div class="brand-title">OxideSwarm</div>
+                <div class="cluster-summary" id="clusterSummary">● Connecting...</div>
+            </div>
+
+            <div class="top-actions">
+                <button class="wake-pill" id="radarBtn" onclick="manualMasterScan()" title="Quét tìm Master trong LAN">📡 Quét Master</button>
+                <button class="wake-pill active" id="wakePill" onclick="toggleWakeLock()" title="Giữ màn hình luôn sáng">☀️ Luôn thức</button>
+                <div class="latency-pill" id="latencyPill" title="API Roundtrip Latency">-- ms</div>
+                <button class="sync-btn" id="syncBtn" onclick="triggerReload()" title="Instant Cluster Sync">
+                    <svg class="sync-icon" id="syncIcon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="23 4 23 10 17 10"></polyline>
+                        <polyline points="1 20 1 14 7 14"></polyline>
+                        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                    </svg>
+                </button>
+                <button class="theme-btn" onclick="toggleTheme()" id="btnTheme" title="Toggle Light/Dark Theme">🌓</button>
+            </div>
+        </header>
+
+        <!-- Dynamic Master Auto-Discovery Toast Notification -->
+        <div id="discoveryToast" style="display:none; position:fixed; top:54px; left:50%; transform:translateX(-50%); z-index:9999; background:rgba(17,24,39,0.95); border:1px solid var(--accent); color:var(--text); padding:8px 14px; border-radius:6px; font-size:12px; font-weight:600; box-shadow:0 4px 12px rgba(0,0,0,0.5); text-align:center; max-width:90%; pointer-events:none; transition:all 0.2s ease;"></div>
+
+        <!-- 3-Tab Navigation Bar -->
+        <nav class="tab-nav-bar" id="tabNavBar">
+            <button class="tab-btn active" id="btnTabChat" onclick="switchTab('chat')">Chat</button>
+            <button class="tab-btn" id="btnTabModes" onclick="switchTab('modes')">Modes</button>
+            <button class="tab-btn" id="btnTabDevices" onclick="switchTab('devices')">Devices (<span id="tabDevicesBadge">0</span>)</button>
+        </nav>
+
+        <!-- TAB 1: TERMINAL & CHAT FEED -->
+        <div class="tab-pane active" id="tabChat">
+            <div class="terminal-wrapper" id="terminalWrapper">
+                <div class="terminal-header">
+                    <div class="term-title-group">
+                        <span class="term-title">SWARM CONSOLE</span>
+                        <span class="term-status" id="termStatus">● READY</span>
+                    </div>
+                    <div class="term-controls">
+                        <button class="btn-term" onclick="clearTerminal()" title="Clear terminal logs">Clear</button>
+                        <button class="btn-term" onclick="toggleTerminalMax()" id="btnMax" title="Toggle full-screen view">⛶ Expand</button>
+                    </div>
+                </div>
+
+                <div class="chat-feed" id="chatFeed">
+                    <div class="term-welcome">
+                        <div class="welcome-line"><span class="w-accent">OxideSwarm Mobile Cluster Console</span> ready.</div>
+                        <div class="welcome-hint">Tap a preset chip below or enter a shell command to dispatch across cluster.</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="chat-bottom">
+                <div class="quick-chips">
+                    <button class="chip chip-mode active" id="btnModeAI" onclick="setChatMode('ai')">🤖 AI Model</button>
+                    <button class="chip chip-mode" id="btnModeShell" onclick="setChatMode('shell')">💻 Shell</button>
+                    <button class="chip" onclick="quickAI('Vẽ sơ đồ cụm hiện tại dạng khối ASCII kèm bảng tóm tắt và biểu tượng trực quan')">🗺️ Sơ đồ cụm</button>
+                    <button class="chip" onclick="quickShell('uname -sm')">uname</button>
+                    <button class="chip" onclick="quickShell('python3 -c &quot;print(1+1)&quot;')">python</button>
+                    <button class="chip" onclick="quickShell('df -h | head -n 3')">disk</button>
+                    <button class="chip" onclick="quickShell('uptime')">uptime</button>
+                </div>
+                <div class="input-row">
+                    <input type="text" id="inputCmd" class="cmd-input" placeholder="Hỏi trợ lý AI (Gemini)..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" onkeydown="if(event.key==='Enter') sendCmd()">
+                    <button class="btn-run" id="btnRun" onclick="sendCmd()">GỬI</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- TAB 2: CONNECTED DEVICES -->
+        <div class="tab-pane" id="tabDevices">
+            <div class="devices-view">
+                <div class="cluster-banner">
+                    <div class="banner-stat">Cluster Cores: <strong id="sumCores">0 Cores</strong></div>
+                    <div class="banner-stat">Total RAM: <strong id="sumRam">0 GB</strong></div>
+                    <div class="banner-stat">Status: <strong id="clusterHealth">Healthy</strong></div>
+                    <div class="banner-stat" id="masterStatus">Master: <strong class="tag-master">OxideSwarm</strong></div>
+                </div>
+
+                <!-- TOPOLOGY DIAGRAM CARD -->
+                <div class="topology-card">
+                    <div class="topology-header">
+                        <span>🗺️ SƠ ĐỒ TOPOLOGY PHÂN TÁN (P2P MESH)</span>
+                        <span class="topo-badge" id="topoBadge">🟢 20 Cores Live</span>
+                    </div>
+                    <div class="topology-diagram" id="topologyDiagram">Đang dựng sơ đồ topology...</div>
+                </div>
+
+                <div class="devices-list" id="deviceList">
+                </div>
+            </div>
+        </div>
+
+        <!-- TAB 3: WORKFLOW MODES -->
+        <div class="tab-pane" id="tabModes">
+            <div class="modes-view">
+                <div class="modes-banner">
+                    <div class="modes-title">
+                        <span>🚀 WORKFLOW MODES & PRESETS</span>
+                    </div>
+                    <div class="modes-status-tag" id="modeStatusTag">IDLE</div>
+                </div>
+
+                <div class="modes-grid">
+                    <!-- MODE 1: TESTING -->
+                    <div class="mode-card">
+                        <div class="mode-card-header">
+                            <span>🧪 Testing & Quality</span>
+                            <span style="color:var(--accent);">Test</span>
+                        </div>
+                        <div class="mode-card-desc">Chạy kiểm thử đơn vị, kiểm tra chất lượng mã nguồn (clippy/fmt), phát hiện lỗi flaky test.</div>
+                        <div class="mode-actions-row">
+                            <button class="btn-mode-act" onclick="runWorkflowMode('test', 'quick')">⚡ Quick Test</button>
+                            <button class="btn-mode-act" onclick="runWorkflowMode('test', 'lint')">🔍 Lint & Format</button>
+                            <button class="btn-mode-act" onclick="runWorkflowMode('test', 'flaky')">🎲 Flaky Check</button>
+                            <button class="btn-mode-act" onclick="runWorkflowMode('test', 'full')">📦 Full Suite</button>
+                        </div>
+                    </div>
+
+                    <!-- MODE 2: DEVELOPMENT -->
+                    <div class="mode-card">
+                        <div class="mode-card-header">
+                            <span>⚡ Development</span>
+                            <span style="color:var(--tag-master);">Dev</span>
+                        </div>
+                        <div class="mode-card-desc">Build nhanh, quản lý cụm dev local (Master + 2 Workers), theo dõi trạng thái sống.</div>
+                        <div class="mode-actions-row">
+                            <button class="btn-mode-act" onclick="runWorkflowMode('dev', 'fast')">⚡ Fast Check</button>
+                            <button class="btn-mode-act" onclick="runWorkflowMode('dev', 'watch')">🔄 Live-Reload</button>
+                            <button class="btn-mode-act" onclick="runWorkflowMode('dev', 'cluster')">🚀 Launch Cluster</button>
+                            <button class="btn-mode-act" onclick="runWorkflowMode('dev', 'status')">💓 Health Ping</button>
+                            <button class="btn-mode-act" onclick="runWorkflowMode('dev', 'stop')">🛑 Stop Cluster</button>
+                        </div>
+                    </div>
+
+                    <!-- MODE 3: DOCUMENTATION -->
+                    <div class="mode-card">
+                        <div class="mode-card-header">
+                            <span>📚 Doc & Specification</span>
+                            <span style="color:var(--tag-orch);">Doc</span>
+                        </div>
+                        <div class="mode-card-desc">Xác minh tính toàn vẹn markdown, xuất tài liệu đặc tả kiến trúc thống nhất, sinh rustdoc.</div>
+                        <div class="mode-actions-row">
+                            <button class="btn-mode-act" onclick="runWorkflowMode('doc', 'verify')">🔍 Verify Docs</button>
+                            <button class="btn-mode-act" onclick="runWorkflowMode('doc', 'export')">📄 Update Spec</button>
+                            <button class="btn-mode-act" onclick="runWorkflowMode('doc', 'build')">📖 Build Rustdoc</button>
+                        </div>
+                    </div>
+
+                    <!-- MODE 4: RESEARCH & BENCHMARKS -->
+                    <div class="mode-card">
+                        <div class="mode-card-header">
+                            <span>🔬 Research & Benchmarks</span>
+                            <span style="color:var(--dot-green);">Research</span>
+                        </div>
+                        <div class="mode-card-desc">Phân tích tài nguyên CPU/RAM, đo kiểm tốc độ serialization & codec, xuất báo cáo nghiên cứu JSON.</div>
+                        <div class="mode-actions-row">
+                            <button class="btn-mode-act" onclick="runWorkflowMode('research', 'profile')">📊 CPU/RAM Profile</button>
+                            <button class="btn-mode-act" onclick="runWorkflowMode('research', 'bench')">⏱️ Micro-Bench</button>
+                            <button class="btn-mode-act" onclick="runWorkflowMode('research', 'distributed')">🌐 Distributed</button>
+                            <button class="btn-mode-act" onclick="runWorkflowMode('research', 'report')">📑 Full Report</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- MODE EXECUTION CONSOLE -->
+                <div class="mode-console">
+                    <div class="mode-console-header">
+                        <span>📋 MODE EXECUTION CONSOLE</span>
+                        <div style="display:flex;gap:6px;align-items:center;">
+                            <span id="modeConsoleStatus" style="color:var(--dot-green);">● READY</span>
+                            <button class="btn-mode-act" onclick="clearModeConsole()" style="padding:2px 6px;">Clear</button>
+                        </div>
+                    </div>
+                    <div class="mode-log-content" id="modeLogContent">Sẵn sàng thực thi. Bấm một trong các nút thao tác phía trên để kích hoạt chế độ...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Device Detail Modal Bottom Sheet -->
+    <div class="modal-overlay" id="deviceModal" onclick="if(event.target===this) closeDeviceModal()">
+        <div class="modal-sheet">
+            <div class="modal-header">
+                <div class="modal-title">
+                    <span class="status-dot dot-online" id="mDot"></span>
+                    <span id="mName">Device</span>
+                    <span class="role-badge tag-worker" id="mRole">WORKER</span>
+                </div>
+                <button class="modal-close" onclick="closeDeviceModal()">✕</button>
+            </div>
+            <div class="detail-grid">
+                <div class="detail-item">
+                    <div class="detail-label">CPU Cores (Vật lý)</div>
+                    <div class="detail-val" id="mCores">--</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">CPU Đang dùng</div>
+                    <div class="detail-val" id="mCpu">--%</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Tổng RAM Vật lý</div>
+                    <div class="detail-val" id="mRamTotal">-- GB</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">RAM Khả dụng / Đang dùng</div>
+                    <div class="detail-val" id="mRamAvail">--</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Trạng thái Pin</div>
+                    <div class="detail-val" id="mBattery">--</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Nhiệt độ / Throttling</div>
+                    <div class="detail-val" id="mThermal">Bình thường</div>
+                </div>
+                <div class="detail-item" style="grid-column: span 2;">
+                    <div class="detail-label">GPU & Tính toán</div>
+                    <div class="detail-val" id="mGpu">--</div>
+                </div>
+                <div class="detail-item" style="grid-column: span 2;">
+                    <div class="detail-label">Node ID & P2P Heartbeat</div>
+                    <div class="detail-val" id="mId" style="font-size: 11px; word-break: break-all;">--</div>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="modal-btn modal-btn-primary" onclick="runDeviceDiagnostic()">Kiểm tra phần cứng</button>
+                <button class="modal-btn modal-btn-secondary" onclick="closeDeviceModal()">Đóng</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 1. Tab Switching (Preserves active terminal buffer)
+        function switchTab(name) {
+            const isChat = name === 'chat';
+            const isDevices = name === 'devices';
+            const isModes = name === 'modes';
+
+            const tabChat = document.getElementById('tabChat');
+            const tabDevices = document.getElementById('tabDevices');
+            const tabModes = document.getElementById('tabModes');
+            const btnChat = document.getElementById('btnTabChat');
+            const btnDevices = document.getElementById('btnTabDevices');
+            const btnModes = document.getElementById('btnTabModes');
+
+            if (tabChat) tabChat.classList.toggle('active', isChat);
+            if (tabDevices) tabDevices.classList.toggle('active', isDevices);
+            if (tabModes) tabModes.classList.toggle('active', isModes);
+            if (btnChat) btnChat.classList.toggle('active', isChat);
+            if (btnDevices) btnDevices.classList.toggle('active', isDevices);
+            if (btnModes) btnModes.classList.toggle('active', isModes);
+
+            if (isDevices) {
+                syncData();
+            } else if (isModes) {
+                syncModes();
+            }
+        }
+
+        // Workflow Modes State and Runner
+        let modePollingInterval = null;
+
+        async function syncModes() {
+            try {
+                const res = await fetch('/api/modes');
+                if (!res.ok) return;
+                const data = await res.json();
+                if (data.current_state) {
+                    updateModesStatusUi(data.current_state);
+                }
+            } catch (e) {
+                console.warn('syncModes error:', e);
+            }
+        }
+
+        function updateModesStatusUi(state) {
+            const tag = document.getElementById('modeStatusTag');
+            const consoleStatus = document.getElementById('modeConsoleStatus');
+            const logEl = document.getElementById('modeLogContent');
+
+            if (tag) {
+                tag.textContent = state.status ? state.status.toUpperCase() : 'IDLE';
+                if (state.status === 'running') {
+                    tag.style.color = 'var(--dot-busy)';
+                } else if (state.status === 'success') {
+                    tag.style.color = 'var(--dot-green)';
+                } else if (state.status === 'failed') {
+                    tag.style.color = 'var(--dot-red)';
+                } else {
+                    tag.style.color = 'var(--text-dim)';
+                }
+            }
+
+            if (consoleStatus) {
+                consoleStatus.textContent = state.is_running 
+                    ? `● RUNNING (${state.current_mode || ''}/${state.current_action || ''})`
+                    : (state.status === 'success' ? '● SUCCESS' : (state.status === 'failed' ? '● FAILED' : '● READY'));
+            }
+
+            if (logEl && state.logs && state.logs.length > 0) {
+                logEl.textContent = state.logs.join('\n\n');
+                logEl.scrollTop = logEl.scrollHeight;
+            }
+        }
+
+        async function runWorkflowMode(mode, action) {
+            const logEl = document.getElementById('modeLogContent');
+            const consoleStatus = document.getElementById('modeConsoleStatus');
+            if (consoleStatus) consoleStatus.textContent = `● DISPATCHING (${mode}/${action})...`;
+            if (logEl) logEl.textContent = `[${new Date().toLocaleTimeString()}] Submitting request to run mode='${mode}', action='${action}'...\n`;
+
+            try {
+                const res = await fetch('/api/modes/run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode, action })
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    if (logEl) logEl.textContent += `\n[ERROR] ${data.message || 'Failed to dispatch mode'}\n`;
+                    if (consoleStatus) consoleStatus.textContent = '● ERROR';
+                    return;
+                }
+
+                if (modePollingInterval) clearInterval(modePollingInterval);
+                modePollingInterval = setInterval(async () => {
+                    try {
+                        const statusRes = await fetch('/api/modes/status');
+                        if (!statusRes.ok) return;
+                        const statusData = await statusRes.json();
+                        updateModesStatusUi(statusData);
+
+                        if (!statusData.is_running) {
+                            clearInterval(modePollingInterval);
+                            modePollingInterval = null;
+                        }
+                    } catch (err) {
+                        console.error('Mode polling error:', err);
+                    }
+                }, 500);
+            } catch (e) {
+                if (logEl) logEl.textContent += `\n[NETWORK ERROR] ${e.message}\n`;
+            }
+        }
+
+        function clearModeConsole() {
+            const logEl = document.getElementById('modeLogContent');
+            if (logEl) logEl.textContent = 'Console cleared. Select an action above to execute.';
+            const consoleStatus = document.getElementById('modeConsoleStatus');
+            if (consoleStatus) consoleStatus.textContent = '● READY';
+        }
+
+        // 2. Light / Dark Mode Toggle with Persistence
+        function initTheme() {
+            const saved = localStorage.getItem('ox_theme') || 'dark';
+            document.documentElement.setAttribute('data-theme', saved);
+        }
+        function toggleTheme() {
+            const cur = document.documentElement.getAttribute('data-theme');
+            const next = cur === 'dark' ? 'light' : 'dark';
+            document.documentElement.setAttribute('data-theme', next);
+            localStorage.setItem('ox_theme', next);
+        }
+        initTheme();
+
+        // 3. Terminal Maximization & Clear Controls
+        function toggleTerminalMax() {
+            const layout = document.getElementById('mainLayout');
+            const btn = document.getElementById('btnMax');
+            const isMax = layout.classList.toggle('term-maximized');
+            if (isMax) {
+                btn.textContent = '🗗 Restore';
+                btn.title = 'Restore standard layout';
+            } else {
+                btn.textContent = '⛶ Expand';
+                btn.title = 'Expand to full screen';
+            }
+        }
+
+        function clearTerminal() {
+            const feed = document.getElementById('chatFeed');
+            feed.innerHTML = `
+                <div class="term-welcome">
+                    <div class="welcome-hint">// Terminal cleared. Console ready for commands.</div>
+                </div>
+            `;
+        }
+
+        // 4. Progress Meter Block Generator (■■□□)
+        function renderBlocks(pct) {
+            const filled = Math.min(4, Math.max(0, Math.round((pct / 100) * 4)));
+            return '■'.repeat(filled) + '□'.repeat(4 - filled);
+        }
+
+        function getFillClass(pct) {
+            if (pct < 60) return 'bar-green';
+            if (pct < 85) return 'bar-yellow';
+            return 'bar-red';
+        }
+
+        // 5. On-Demand Sync with SVG Spin Animation and Ping Latency
+        let isSyncing = false;
+        async function triggerReload() {
+            if (isSyncing) return;
+            const icon = document.getElementById('syncIcon');
+            const pill = document.getElementById('latencyPill');
+            icon.classList.add('spinning');
+            isSyncing = true;
+            const t0 = performance.now();
+            try {
+                await syncData();
+                const latency = Math.round(performance.now() - t0);
+                pill.textContent = `${latency}ms`;
+                pill.style.color = latency < 120 ? 'var(--dot-green)' : (latency < 300 ? 'var(--dot-busy)' : 'var(--dot-red)');
+            } catch (e) {
+                pill.textContent = 'Err';
+                pill.style.color = 'var(--dot-red)';
+                const summaryEl = document.getElementById('clusterSummary');
+                if (summaryEl) {
+                    summaryEl.innerHTML = '<span style="color:var(--dot-red)">● Disconnected</span>';
+                }
+            } finally {
+                isSyncing = false;
+                setTimeout(() => icon.classList.remove('spinning'), 350);
+            }
+        }
+        window.manualSync = triggerReload;
+
+        function showDiscoveryToast(msg, duration = 3000) {
+            const t = document.getElementById('discoveryToast');
+            if (!t) return;
+            t.innerHTML = msg;
+            t.style.display = 'block';
+            t.style.opacity = '1';
+            clearTimeout(window._discoveryToastTimer);
+            window._discoveryToastTimer = setTimeout(() => {
+                t.style.opacity = '0';
+                setTimeout(() => t.style.display = 'none', 200);
+            }, duration);
+        }
+
+        let consecutiveDisconnects = 0;
+        let isProbing = false;
+
+        async function probeClusterForActiveMaster() {
+            if (isProbing) return null;
+            isProbing = true;
+            try {
+                const candidateHosts = [
+                    '192.168.1.144:8080',
+                    '192.168.1.123:8080'
+                ];
+                if (window.location.host && !candidateHosts.includes(window.location.host)) {
+                    candidateHosts.push(window.location.host);
+                }
+                const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+                if (isLocal) {
+                    candidateHosts.push('127.0.0.1:8080');
+                    candidateHosts.push('localhost:8080');
+                }
+                try {
+                    const saved = JSON.parse(localStorage.getItem('ox_known_hosts') || '[]');
+                    saved.forEach(h => { if (!candidateHosts.includes(h)) candidateHosts.push(h); });
+                } catch (_) {}
+
+                const probePromises = candidateHosts.map(async (host) => {
+                    const controller = new AbortController();
+                    const timer = setTimeout(() => controller.abort(), 1200);
+                    try {
+                        const res = await fetch(`http://${host}/api/status`, { signal: controller.signal });
+                        clearTimeout(timer);
+                        if (!res.ok) return { host, ok: false, error: 'HTTP ' + res.status };
+                        const json = await res.json();
+                        if (json.master && json.master.role === 'MASTER') {
+                            return { host, ok: true, role: 'MASTER', data: json };
+                        } else if (json.role === 'WORKER_PORTAL') {
+                            let redirectUrl = json.redirect_url;
+                            if (redirectUrl && redirectUrl.includes('127.0.0.1') && !isLocal) {
+                                redirectUrl = host.startsWith('192.168.1.144') ? 'http://192.168.1.123:8080/' : 'http://192.168.1.144:8080/';
+                            }
+                            return { host, ok: true, role: 'PORTAL', redirect_url: redirectUrl, data: json };
+                        }
+                        return { host, ok: false, data: json };
+                    } catch (err) {
+                        return { host, ok: false, error: err.message };
+                    }
+                });
+
+                return await Promise.all(probePromises);
+            } finally {
+                isProbing = false;
+            }
+        }
+
+        async function manualMasterScan() {
+            showDiscoveryToast("📡 Đang quét các thiết bị trong mạng LAN...");
+            const results = await probeClusterForActiveMaster();
+            if (!results) return;
+
+            const masterNode = results.find(r => r.ok && r.role === 'MASTER');
+            const portalNode = results.find(r => r.ok && r.role === 'PORTAL' && r.redirect_url);
+
+            if (masterNode) {
+                if (masterNode.host === window.location.host) {
+                    showDiscoveryToast(`✅ Node hiện tại (${masterNode.host}) ĐANG LÀ MASTER hoạt động tốt.`);
+                } else {
+                    showDiscoveryToast(`🚀 Đã tìm thấy MASTER tại ${masterNode.host} (${masterNode.data.master.host}). Đang chuyển hướng trong 1s...`);
+                    setTimeout(() => {
+                        window.location.href = `http://${masterNode.host}/`;
+                    }, 1000);
+                }
+            } else if (portalNode) {
+                showDiscoveryToast(`🚀 Worker Portal tại ${portalNode.host} chuyển hướng sang Master. Đang chuyển hướng...`);
+                setTimeout(() => {
+                    window.location.href = portalNode.redirect_url;
+                }, 1000);
+            } else {
+                showDiscoveryToast("⚠️ Không tìm thấy Master nào đang bật. Vui lòng bật Master trên Mac hoặc máy Case.", 4000);
+            }
+        }
+
+        async function handleDisconnectFailover() {
+            consecutiveDisconnects++;
+            if (consecutiveDisconnects >= 1) {
+                const results = await probeClusterForActiveMaster();
+                if (!results) return;
+                const masterTarget = results.find(r => r.ok && r.role === 'MASTER' && r.host !== window.location.host);
+                const portalTarget = results.find(r => r.ok && r.role === 'PORTAL' && r.redirect_url && r.host !== window.location.host);
+                const target = masterTarget || portalTarget;
+                if (target) {
+                    const destUrl = target.role === 'PORTAL' ? target.redirect_url : `http://${target.host}/`;
+                    showDiscoveryToast(`⚡ Master đã đổi sang node khác! Tự động chuyển hướng sang: ${destUrl}`, 2500);
+                    setTimeout(() => {
+                        window.location.href = destUrl;
+                    }, 1000);
+                }
+            }
+        }
+
+        // 6. Synchronize Cluster Data (Uniform Columns, Micro Progress Meters, Rich Telemetry)
+        let workers = [];
+        async function syncData() {
+            try {
+                const res = await fetch('/api/status');
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const data = await res.json();
+
+                if (data.role === 'WORKER_PORTAL' && data.redirect_url) {
+                    let dest = data.redirect_url;
+                    const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+                    if (dest.includes('127.0.0.1') && !isLocal) {
+                        dest = window.location.host.startsWith('192.168.1.144') ? 'http://192.168.1.123:8080/' : 'http://192.168.1.144:8080/';
+                    }
+                    showDiscoveryToast(`Thiết bị này đang là Worker. Đang chuyển hướng sang Master tại ${dest}...`);
+                    setTimeout(() => {
+                        window.location.replace(dest);
+                    }, 500);
+                    return;
+                }
+
+                consecutiveDisconnects = 0;
+                try {
+                    const known = JSON.parse(localStorage.getItem('ox_known_hosts') || '[]');
+                    if (!known.includes(window.location.host)) {
+                        known.push(window.location.host);
+                        localStorage.setItem('ox_known_hosts', JSON.stringify(known));
+                    }
+                } catch (_) {}
+
+                let totalCores = 0;
+                let totalRamMb = 0;
+                workers = data.workers || [];
+
+                workers.forEach(w => {
+                    totalCores += w.cpu_cores || 0;
+                    totalRamMb += w.ram_mb || 0;
+                });
+
+                const totalNodes = workers.length + (data.master ? 1 : 0);
+                const hasDegraded = workers.some(w => w.status === 'Disconnected');
+                const clusterHealth = hasDegraded ? 'Degraded' : 'Healthy';
+                const healthColor = hasDegraded ? 'var(--dot-busy)' : 'var(--dot-green)';
+
+                // Update Topbar and Banner Summaries
+                const summaryEl = document.getElementById('clusterSummary');
+                if (summaryEl) {
+                    summaryEl.innerHTML = `<span style="color:${healthColor}">●</span> ${totalNodes} devices (${totalCores}c) • ${clusterHealth}`;
+                }
+                const sumCoresEl = document.getElementById('sumCores');
+                if (sumCoresEl) sumCoresEl.textContent = `${totalCores} Cores`;
+                const sumRamEl = document.getElementById('sumRam');
+                if (sumRamEl) sumRamEl.textContent = `${(totalRamMb / 1024).toFixed(1)} GB`;
+                const healthEl = document.getElementById('clusterHealth');
+                if (healthEl) {
+                    healthEl.textContent = clusterHealth;
+                    healthEl.style.color = healthColor;
+                }
+                const badgeEl = document.getElementById('tabDevicesBadge');
+                if (badgeEl) badgeEl.textContent = totalNodes;
+
+                if (data.master) {
+                    const masterEl = document.getElementById('masterStatus');
+                    if (masterEl) {
+                        masterEl.innerHTML = `Master: <strong class="tag-master">${escapeHtml(data.master.host || 'OxideSwarm')} (Coordinator)</strong>`;
+                    }
+                }
+
+                // Render Live Topology Diagram
+                const topoEl = document.getElementById('topologyDiagram');
+                if (topoEl) {
+                    const phoneW = workers.find(w => w.name && (w.name.includes('phone') || w.name.includes('android'))) || workers[0];
+                    const macW = workers.find(w => w.name && (w.name.includes('mac') || w.name.includes('pc'))) || workers[1];
+
+                    const pCores = phoneW ? phoneW.cpu_cores : 10;
+                    const pRam = phoneW ? (phoneW.ram_mb / 1024).toFixed(1) : '10.9';
+                    const pCpu = phoneW ? parseFloat(phoneW.cpu_usage_pct || 0).toFixed(1) : '0.0';
+                    const pStatus = (phoneW && (phoneW.status === 'Connected' || phoneW.status === 'Busy')) ? '🟢 ONLINE' : '⚪ CONNECTING';
+
+                    const mCores = macW ? macW.cpu_cores : 10;
+                    const mRam = macW ? (macW.ram_mb / 1024).toFixed(1) : '32.0';
+                    const mCpu = macW ? parseFloat(macW.cpu_usage_pct || 0).toFixed(1) : '0.0';
+                    const mStatus = (macW && (macW.status === 'Connected' || macW.status === 'Busy')) ? '🟢 ONLINE' : '⚪ CONNECTING';
+
+                    topoEl.innerHTML = `
+                    <svg viewBox="0 0 350 155" style="width:100%; height:auto; display:block; border-radius:6px; background:#0b1120;" xmlns="http://www.w3.org/2000/svg">
+                        <defs>
+                            <linearGradient id="gLineL" x1="0%" y1="0%" x2="0%" y2="100%">
+                                <stop offset="0%" stop-color="#38bdf8"/>
+                                <stop offset="100%" stop-color="#06b6d4"/>
+                            </linearGradient>
+                            <linearGradient id="gLineR" x1="0%" y1="0%" x2="0%" y2="100%">
+                                <stop offset="0%" stop-color="#38bdf8"/>
+                                <stop offset="100%" stop-color="#a855f7"/>
+                            </linearGradient>
+                        </defs>
+
+                        <!-- Connector Lines -->
+                        <path d="M 175 40 C 175 72, 85 72, 85 96" fill="none" stroke="url(#gLineL)" stroke-width="1.8" stroke-dasharray="3,3"/>
+                        <path d="M 175 40 C 175 72, 265 72, 265 96" fill="none" stroke="url(#gLineR)" stroke-width="1.8" stroke-dasharray="3,3"/>
+
+                        <!-- Tags on Lines -->
+                        <rect x="96" y="58" width="46" height="14" rx="3" fill="#1e293b" stroke="#334155"/>
+                        <text x="119" y="68" fill="#94a3b8" font-size="7.5" font-family="-apple-system, sans-serif" text-anchor="middle">Wi-Fi LAN</text>
+
+                        <rect x="208" y="58" width="46" height="14" rx="3" fill="#1e293b" stroke="#334155"/>
+                        <text x="231" y="68" fill="#94a3b8" font-size="7.5" font-family="-apple-system, sans-serif" text-anchor="middle">Local IPC</text>
+
+                        <!-- TOP NODE: MASTER -->
+                        <g transform="translate(85, 6)">
+                            <rect width="180" height="34" rx="6" fill="#1e293b" stroke="#475569" stroke-width="1"/>
+                            <circle cx="14" cy="17" r="3.5" fill="#10b981"/>
+                            <text x="25" y="15" fill="#f8fafc" font-size="10" font-weight="700" font-family="-apple-system, sans-serif">Master Coordinator</text>
+                            <text x="25" y="26" fill="#94a3b8" font-size="8" font-family="monospace">192.168.1.144 :8088</text>
+                            <rect x="135" y="9" width="37" height="16" rx="3" fill="rgba(245,158,11,0.2)"/>
+                            <text x="153" y="20" fill="#fbbf24" font-size="7.5" font-weight="700" text-anchor="middle">MASTER</text>
+                        </g>
+
+                        <!-- LEFT NODE: PHONE -->
+                        <g transform="translate(8, 96)">
+                            <rect width="154" height="50" rx="6" fill="#1e293b" stroke="${phoneW ? '#0891b2' : '#334155'}" stroke-width="1"/>
+                            <circle cx="14" cy="15" r="3" fill="${phoneW ? '#10b981' : '#64748b'}"/>
+                            <text x="23" y="15" fill="#f8fafc" font-size="9.5" font-weight="600" font-family="-apple-system, sans-serif">Galaxy S24 (Phone)</text>
+                            <rect x="110" y="7" width="36" height="13" rx="2.5" fill="rgba(6,182,212,0.2)"/>
+                            <text x="128" y="16.5" fill="#22d3ee" font-size="7" font-weight="700" text-anchor="middle">WORKER</text>
+                            <text x="12" y="30" fill="#94a3b8" font-size="8.5" font-family="-apple-system, sans-serif">10 Cores • ${pRam} GB RAM</text>
+                            <text x="12" y="42" fill="#64748b" font-size="8" font-family="-apple-system, sans-serif">Phần cứng thật • CPU ${pCpu}%</text>
+                        </g>
+
+                        <!-- RIGHT NODE: MACBOOK -->
+                        <g transform="translate(188, 96)">
+                            <rect width="154" height="50" rx="6" fill="#1e293b" stroke="${macW ? '#7c3aed' : '#334155'}" stroke-width="1"/>
+                            <circle cx="14" cy="15" r="3" fill="${macW ? '#10b981' : '#64748b'}"/>
+                            <text x="23" y="15" fill="#f8fafc" font-size="9.5" font-weight="600" font-family="-apple-system, sans-serif">MacBook Pro</text>
+                            <rect x="114" y="7" width="32" height="13" rx="2.5" fill="rgba(168,85,247,0.2)"/>
+                            <text x="130" y="16.5" fill="#c084fc" font-size="7" font-weight="700" text-anchor="middle">ORCH</text>
+                            <text x="12" y="30" fill="#94a3b8" font-size="8.5" font-family="-apple-system, sans-serif">10 Cores • ${mRam} GB RAM</text>
+                            <text x="12" y="42" fill="#64748b" font-size="8" font-family="-apple-system, sans-serif">Matrix Engine • CPU ${mCpu}%</text>
+                        </g>
+                    </svg>
+                    `;
+                }
+
+                // Render Device Cards (Coordinator + Connected Workers)
+                let html = '';
+
+                // 1. Render MASTER Node Card at the top of Devices tab
+                if (data.master) {
+                    const masterRunning = (data.tasks && data.tasks.running !== undefined) ? data.tasks.running : 0;
+                    const masterQueued = (data.tasks && data.tasks.queued !== undefined) ? data.tasks.queued : 0;
+                    html += `
+                        <div class="device-card">
+                            <div class="card-row-1">
+                                <div class="card-id-group">
+                                    <span class="status-dot dot-online" title="Status: Online"></span>
+                                    <span class="role-badge tag-master">${escapeHtml(data.master.role || 'MASTER')}</span>
+                                    <span class="node-name" title="${escapeHtml(data.master.host)}">${escapeHtml(data.master.host)} (Coordinator)</span>
+                                </div>
+                                <div class="card-top-right">
+                                    <span class="task-pill">${masterRunning} running</span>
+                                    <span class="ping-pill">local</span>
+                                </div>
+                            </div>
+                            <div class="card-row-2">
+                                <div class="metric-pill">
+                                    <span class="m-label">Role:</span>
+                                    <span>${escapeHtml(data.master.description || 'P2P Coordinator')}</span>
+                                </div>
+                                <div class="metric-pill">
+                                    <span class="m-label">Queue:</span>
+                                    <span>${masterQueued} pending</span>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }
+
+                // 2. Render Worker Node Cards with High-Density Telemetry
+                workers.forEach(w => {
+                    const role = w.role || 'WORKER';
+                    const tagClass = role === 'ORCH' ? 'tag-orch' : (role === 'GPU' ? 'tag-gpu' : 'tag-worker');
+                    const isOnline = w.status === 'Connected' || w.status === 'Busy';
+                    const isBusy = w.status === 'Busy';
+                    const dotClass = isOnline ? (isBusy ? 'dot-busy' : 'dot-online') : 'dot-offline';
+
+                    // Telemetry: CPU
+                    const cpuPct = Math.min(100, Math.max(0, Math.round(w.cpu_usage_pct || 0)));
+                    const cpuBlocks = renderBlocks(cpuPct);
+                    const cpuCls = getFillClass(cpuPct);
+
+                    // Telemetry: RAM
+                    const ramTotalGb = (w.ram_mb / 1024).toFixed(1);
+                    const ramAvailMb = w.ram_available_mb !== undefined ? w.ram_available_mb : w.ram_mb;
+                    const ramUsedMb = w.ram_mb > ramAvailMb ? (w.ram_mb - ramAvailMb) : 0;
+                    const ramUsedGb = (ramUsedMb / 1024).toFixed(1);
+                    const ramPct = w.ram_mb > 0 ? Math.min(100, Math.max(0, Math.round((ramUsedMb / w.ram_mb) * 100))) : 0;
+                    const ramBlocks = renderBlocks(ramPct);
+                    const ramCls = getFillClass(ramPct);
+
+                    // Telemetry: GPU Badge
+                    let gpuBadge = '';
+                    if (w.has_gpu) {
+                        let gName = w.gpu_device_name ? w.gpu_device_name.replace(/NVIDIA|GeForce|Graphics/gi, '').trim() : 'GPU';
+                        gpuBadge = `<span class="badge-gpu" title="${escapeHtml(w.gpu_device_name || 'GPU')}">⚡ ${escapeHtml(gName)}</span>`;
+                    }
+
+                    // Telemetry: Mobile Battery & Thermal
+                    let mobileBadge = '';
+                    if (w.battery_pct !== null && w.battery_pct !== undefined) {
+                        const icon = w.is_charging ? '⚡' : '🔋';
+                        mobileBadge = `<span class="badge-battery">${icon} ${w.battery_pct}%</span>`;
+                    }
+                    if (w.thermal_throttled) {
+                        mobileBadge += `<span class="badge-throttle">🔥 Throttled</span>`;
+                    }
+
+                    const lastHb = w.last_heartbeat_secs_ago !== undefined ? `${w.last_heartbeat_secs_ago}s ago` : 'active';
+
+                    html += `
+                        <div class="device-card" onclick="openDeviceDetail('${escapeHtml(w.id)}')">
+                            <div class="card-row-1">
+                                <div class="card-id-group">
+                                    <span class="status-dot ${dotClass}" title="Status: ${escapeHtml(w.status)}"></span>
+                                    <span class="role-badge ${tagClass}">${role}</span>
+                                    <span class="node-name" title="${escapeHtml(w.name)}">${escapeHtml(w.name)}</span>
+                                </div>
+                                <div class="card-top-right">
+                                    <span class="task-pill">${w.active_tasks || 0} active</span>
+                                    <span class="ping-pill" title="Heartbeat">${lastHb}</span>
+                                </div>
+                            </div>
+                            <div class="card-row-2">
+                                <div class="metric-pill">
+                                    <span class="m-label">CPU:</span>
+                                    <span class="meter-blocks">[${cpuBlocks}]</span>
+                                    <span class="meter-track"><span class="meter-fill ${cpuCls}" style="width: ${cpuPct}%"></span></span>
+                                    <span>${cpuPct}%</span>
+                                </div>
+                                <div class="metric-pill">
+                                    <span class="m-label">RAM:</span>
+                                    <span class="meter-blocks">[${ramBlocks}]</span>
+                                    <span class="meter-track"><span class="meter-fill ${ramCls}" style="width: ${ramPct}%"></span></span>
+                                    <span>${ramUsedGb}/${ramTotalGb}GB</span>
+                                </div>
+                                ${gpuBadge}
+                                ${mobileBadge}
+                            </div>
+                        </div>
+                    `;
+                });
+
+                document.getElementById('deviceList').innerHTML = html;
+            } catch (e) {
+                console.error("Sync error:", e);
+                const pill = document.getElementById('latencyPill');
+                if (pill) {
+                    pill.textContent = 'Err';
+                    pill.style.color = 'var(--dot-red)';
+                }
+                const summaryEl = document.getElementById('clusterSummary');
+                if (summaryEl) {
+                    summaryEl.innerHTML = '<span style="color:var(--dot-red)">● Disconnected</span>';
+                }
+                handleDisconnectFailover().catch(() => {});
+                throw e;
+            }
+        }
+        syncData().catch(() => {});
+        setInterval(() => syncData().catch(() => {}), 3000);
+
+        // 7. Device Detail Modal Controls
+        let activeModalWorker = null;
+
+        function openDeviceDetail(workerId) {
+            const w = (workers || []).find(item => item.id === workerId);
+            if (!w) return;
+            activeModalWorker = w;
+
+            const isOnline = w.status === 'Connected' || w.status === 'Busy';
+            const dotEl = document.getElementById('mDot');
+            if (dotEl) dotEl.className = 'status-dot ' + (isOnline ? 'dot-online' : 'dot-offline');
+
+            const nameEl = document.getElementById('mName');
+            if (nameEl) nameEl.textContent = w.name;
+
+            const roleEl = document.getElementById('mRole');
+            if (roleEl) {
+                roleEl.textContent = w.role || 'WORKER';
+                roleEl.className = 'role-badge ' + (w.role === 'ORCH' ? 'tag-orch' : (w.role === 'GPU' ? 'tag-gpu' : 'tag-worker'));
+            }
+
+            const coresEl = document.getElementById('mCores');
+            if (coresEl) coresEl.textContent = `${w.cpu_cores || 10} Cores (Phần cứng thật)`;
+
+            const cpuEl = document.getElementById('mCpu');
+            if (cpuEl) cpuEl.textContent = `${Math.round(w.cpu_usage_pct || 0)}%`;
+
+            const totalGb = (w.ram_mb / 1024).toFixed(1);
+            const ramTotalEl = document.getElementById('mRamTotal');
+            if (ramTotalEl) ramTotalEl.textContent = `${totalGb} GB (${w.ram_mb} MB RAM vật lý)`;
+
+            const availMb = w.ram_available_mb !== undefined ? w.ram_available_mb : w.ram_mb;
+            const usedMb = w.ram_mb > availMb ? (w.ram_mb - availMb) : 0;
+            const ramAvailEl = document.getElementById('mRamAvail');
+            if (ramAvailEl) ramAvailEl.textContent = `${(availMb/1024).toFixed(1)}GB trống / ${(usedMb/1024).toFixed(1)}GB dùng`;
+
+            const batEl = document.getElementById('mBattery');
+            if (batEl) {
+                if (w.battery_pct !== null && w.battery_pct !== undefined) {
+                    const charging = w.is_charging ? ' (Đang sạc USB)' : ' (Dùng pin)';
+                    batEl.textContent = `${w.battery_pct}%${charging}`;
+                } else {
+                    batEl.textContent = 'Nguồn trực tiếp (AC)';
+                }
+            }
+
+            const thermEl = document.getElementById('mThermal');
+            if (thermEl) thermEl.textContent = w.thermal_throttled ? 'Bị nghẽn nhiệt (Throttled)' : 'Bình thường (Mát)';
+
+            const gpuEl = document.getElementById('mGpu');
+            if (gpuEl) {
+                gpuEl.textContent = w.has_gpu ? (w.gpu_device_name || 'GPU Compute Enabled') : 'Không có (CPU Compute)';
+            }
+
+            const idEl = document.getElementById('mId');
+            if (idEl) idEl.textContent = `${w.id} (Heartbeat: ${w.last_heartbeat_secs_ago || 0}s trước)`;
+
+            const modal = document.getElementById('deviceModal');
+            if (modal) modal.classList.add('active');
+        }
+
+        function closeDeviceModal() {
+            const modal = document.getElementById('deviceModal');
+            if (modal) modal.classList.remove('active');
+            activeModalWorker = null;
+        }
+
+        function runDeviceDiagnostic() {
+            if (!activeModalWorker) return;
+            const targetName = activeModalWorker.name;
+            closeDeviceModal();
+            switchTab('chat');
+            const isMac = targetName.includes('mac');
+            const cmd = isMac ? 'uname -a && sysctl -n hw.model hw.ncpu' : 'uname -a && head -n 4 /proc/meminfo';
+            quick(cmd);
+        }
+
+        // 8. Chat & Command Execution (AI Model by default, Shell mode on demand)
+        let currentMode = 'ai'; // 'ai' or 'shell'
+
+        function setChatMode(mode) {
+            currentMode = mode;
+            const btnAI = document.getElementById('btnModeAI');
+            const btnShell = document.getElementById('btnModeShell');
+            if (btnAI) btnAI.classList.toggle('active', mode === 'ai');
+            if (btnShell) btnShell.classList.toggle('active', mode === 'shell');
+            const input = document.getElementById('inputCmd');
+            if (input) {
+                input.placeholder = mode === 'ai' ? 'Hỏi trợ lý AI (Gemini)...' : 'Nhập lệnh shell cluster ($ cmd)...';
+            }
+        }
+
+        function quick(cmd) {
+            const input = document.getElementById('inputCmd') || document.getElementById('cmdInput');
+            if (input) input.value = cmd;
+            sendCmd();
+        }
+        window.quickRun = quick;
+
+        function quickShell(cmd) {
+            setChatMode('shell');
+            quick(cmd);
+        }
+
+        function quickAI(prompt) {
+            setChatMode('ai');
+            quick(prompt);
+        }
+        window.quickShell = quickShell;
+        window.quickAI = quickAI;
+
+        async function sendCmd() {
+            const input = document.getElementById('inputCmd') || document.getElementById('cmdInput');
+            if (!input) return;
+            const raw = input.value.trim();
+            if (!raw) return;
+            input.value = '';
+
+            const feed = document.getElementById('chatFeed');
+            const status = document.getElementById('termStatus');
+
+            // Detect whether this should be executed as a shell command
+            let isShell = currentMode === 'shell';
+            let cmd = raw;
+            if (raw.startsWith('$ ') || raw.startsWith('! ')) {
+                isShell = true;
+                cmd = raw.slice(2).trim();
+            } else if (raw.startsWith('$') || raw.startsWith('!')) {
+                isShell = true;
+                cmd = raw.slice(1).trim();
+            }
+
+            // Append Prompt Line
+            const p = document.createElement('div');
+            p.className = 'prompt-line';
+            p.textContent = (isShell ? '$ ' : '💬 ') + raw;
+            feed.appendChild(p);
+
+            // ==========================================
+            // BRANCH 1: SEND TO REAL AI MODEL (/api/chat)
+            // ==========================================
+            if (!isShell) {
+                if (status) {
+                    status.textContent = '🧠 AI THINKING';
+                    status.style.color = 'var(--tag-orch)';
+                }
+                const report = document.createElement('div');
+                report.className = 'report-box';
+                report.innerHTML = `
+                    <div class="report-meta">
+                        <span style="color: var(--tag-orch); font-weight:700;">[Antigravity AI]</span>
+                        <span style="color: var(--accent);">Đang kết nối model...</span>
+                    </div>
+                    <div class="res-content" style="color: var(--text-dim); font-style: italic;">Đang xử lý câu hỏi của bạn...</div>
+                `;
+                feed.appendChild(report);
+                feed.scrollTop = feed.scrollHeight;
+
+                try {
+                    const post = await fetch('/api/chat', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ message: raw })
+                    });
+                    if (!post.ok) {
+                        const errText = await post.text();
+                        throw new Error(`HTTP ${post.status}: ${errText}`);
+                    }
+                    const data = await post.json();
+                    if (status) {
+                        status.textContent = '● READY';
+                        status.style.color = 'var(--dot-green)';
+                    }
+                    report.innerHTML = `
+                        <div class="report-meta">
+                            <span style="color: var(--accent); font-weight: 700;">[${escapeHtml(data.model || 'Antigravity AI')}] • ${data.execution_time_ms || 0}ms</span>
+                            <span style="color: var(--dot-green); font-weight: 700;">Trả lời</span>
+                        </div>
+                        <div class="res-content" style="white-space: pre-wrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.5; font-size: 13.5px;">${escapeHtml(data.reply)}</div>
+                    `;
+                    feed.scrollTop = feed.scrollHeight;
+                } catch (err) {
+                    if (status) {
+                        status.textContent = '● LỖI AI';
+                        status.style.color = 'var(--dot-red)';
+                    }
+                    report.innerHTML = `
+                        <div class="report-meta" style="color: var(--dot-red); font-weight: 700;">[Lỗi phản hồi AI]</div>
+                        <div class="res-content" style="color: var(--dot-red);">Không thể nhận phản hồi từ model: ${escapeHtml(err.message)}</div>
+                    `;
+                    feed.scrollTop = feed.scrollHeight;
+                }
+                return;
+            }
+
+            // ==========================================
+            // BRANCH 2: DISTRIBUTED SHELL EXECUTION (/api/tasks)
+            // ==========================================
+            if (status) {
+                status.textContent = '⚡ RUNNING';
+                status.style.color = 'var(--accent)';
+            }
+            const report = document.createElement('div');
+            report.className = 'report-box';
+            report.innerHTML = `<div class="report-meta"><span>Phân phối cụm...</span><span>Đang chạy...</span></div><div class="res-content">Working...</div>`;
+            feed.appendChild(report);
+            feed.scrollTop = feed.scrollHeight;
+
+            try {
+                const post = await fetch('/api/tasks', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command: cmd })
+                });
+                if (!post.ok) throw new Error(await post.text());
+                const { task_id } = await post.json();
+
+                let checks = 0;
+                const maxChecks = 150;
+                const timer = setInterval(async () => {
+                    checks++;
+                    try {
+                        const get = await fetch(`/api/tasks/${task_id}`);
+                        if (get.ok) {
+                            const detail = await get.json();
+                            if (detail.state === 'Completed' || detail.state === 'Failed' || detail.state === 'Cancelled') {
+                                clearInterval(timer);
+                                if (status) {
+                                    status.textContent = '● READY';
+                                    status.style.color = 'var(--dot-green)';
+                                }
+                                const isOk = detail.state === 'Completed' && detail.exit_code === 0;
+                                const matched = (workers || []).find(w => w.id === detail.worker_id);
+                                const executor = matched ? matched.name : (detail.worker_id ? detail.worker_id.slice(0, 8) : 'cluster-node');
+                                const out = detail.stdout || detail.stderr || detail.error || (detail.state === 'Cancelled' ? 'Task was cancelled' : '(Done, 0 output)');
+                                const exitColor = isOk ? 'var(--dot-green)' : 'var(--dot-red)';
+                                const exitLabel = detail.state === 'Cancelled' ? 'Cancelled' : `Exit ${detail.exit_code !== undefined && detail.exit_code !== null ? detail.exit_code : (detail.state === 'Completed' ? 0 : 1)}`;
+
+                                report.innerHTML = `
+                                    <div class="report-meta">
+                                        <span>[${escapeHtml(executor)}] • ${detail.execution_time_ms || 0}ms</span>
+                                        <span style="color: ${exitColor}; font-weight: 700;">${exitLabel}</span>
+                                    </div>
+                                    <div class="res-content">${escapeHtml(out.trim())}</div>
+                                `;
+                                feed.scrollTop = feed.scrollHeight;
+                            }
+                        }
+                    } catch (e) {}
+
+                    if (checks > maxChecks) {
+                        clearInterval(timer);
+                        if (status) {
+                            status.textContent = '● READY';
+                            status.style.color = 'var(--dot-green)';
+                        }
+                        report.innerHTML = `
+                            <div class="report-meta" style="color: var(--dot-red);">Timeout</div>
+                            <div class="res-content">Lệnh vượt quá thời gian chờ (60s).</div>
+                        `;
+                    }
+                }, 400);
+
+            } catch (err) {
+                if (status) {
+                    status.textContent = '● LỖI KẾT NỐI';
+                    status.style.color = 'var(--dot-red)';
+                }
+                report.innerHTML = `
+                    <div class="report-meta" style="color: var(--dot-red);">Lỗi kết nối</div>
+                    <div class="res-content">Không thể kết nối đến Master node (192.168.1.144:8080). Đang tự động kết nối lại...</div>
+                `;
+            }
+        }
+        window.runCmd = sendCmd;
+
+        function escapeHtml(s) {
+            if (!s) return '';
+            return String(s)
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+        // 9. Screen Wake Lock API (Keep mobile phone screen always awake)
+        let wakeLock = null;
+        let wakeLockActive = false;
+
+        async function requestWakeLock() {
+            try {
+                if ('wakeLock' in navigator) {
+                    wakeLock = await navigator.wakeLock.request('screen');
+                    wakeLockActive = true;
+                    updateWakeUI(true);
+                    wakeLock.addEventListener('release', () => {
+                        wakeLockActive = false;
+                        updateWakeUI(false);
+                    });
+                    console.log('Native Screen Wake Lock acquired');
+                    return;
+                }
+            } catch (err) {
+                console.warn('Native Wake Lock not available, falling back to video loop');
+            }
+
+            // Fallback for non-HTTPS/LAN: Loop invisible canvas stream video
+            try {
+                startCanvasWakeLock();
+            } catch (e) {
+                console.warn('Canvas wake lock fallback failed:', e);
+            }
+        }
+
+        function startCanvasWakeLock() {
+            if (!wakeVideo) {
+                const canvas = document.createElement('canvas');
+                canvas.width = 4;
+                canvas.height = 4;
+                const ctx = canvas.getContext('2d');
+                if (canvas.captureStream) {
+                    const stream = canvas.captureStream(1);
+                    wakeVideo = document.createElement('video');
+                    wakeVideo.setAttribute('playsinline', '');
+                    wakeVideo.setAttribute('muted', '');
+                    wakeVideo.muted = true;
+                    wakeVideo.srcObject = stream;
+                    wakeVideo.style.position = 'fixed';
+                    wakeVideo.style.top = '-9999px';
+                    wakeVideo.style.left = '-9999px';
+                    wakeVideo.style.width = '1px';
+                    wakeVideo.style.height = '1px';
+                    wakeVideo.style.opacity = '0.001';
+                    document.body.appendChild(wakeVideo);
+                    setInterval(() => {
+                        ctx.fillStyle = ctx.fillStyle === '#000000' ? '#000001' : '#000000';
+                        ctx.fillRect(0, 0, 4, 4);
+                    }, 2000);
+                }
+            }
+            if (wakeVideo) {
+                wakeVideo.play().then(() => {
+                    wakeLockActive = true;
+                    updateWakeUI(true);
+                }).catch(() => {
+                    // Waiting for next user tap to start video play
+                    wakeLockActive = true;
+                    updateWakeUI(true);
+                });
+            } else {
+                wakeLockActive = true;
+                updateWakeUI(true);
+            }
+        }
+
+        function updateWakeUI(active, text) {
+            const pill = document.getElementById('wakePill');
+            if (!pill) return;
+            if (active) {
+                pill.className = 'wake-pill active';
+                pill.innerHTML = '☀️ Luôn thức';
+                pill.title = 'Màn hình điện thoại đang được giữ luôn sáng';
+            } else {
+                pill.className = 'wake-pill';
+                pill.innerHTML = text || '🌙 Nghỉ';
+                pill.title = 'Bấm để bật chế độ giữ màn hình luôn sáng';
+            }
+        }
+
+        async function toggleWakeLock() {
+            if (wakeLockActive) {
+                if (wakeLock) {
+                    await wakeLock.release();
+                    wakeLock = null;
+                }
+                if (wakeVideo) {
+                    wakeVideo.pause();
+                }
+                wakeLockActive = false;
+                updateWakeUI(false);
+            } else {
+                wakeLockActive = true;
+                updateWakeUI(true);
+                await requestWakeLock();
+            }
+        }
+
+        // Re-acquire wake lock when switching back to tab
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible' && wakeLockActive) {
+                requestWakeLock();
+            }
+        });
+
+        // Request on any initial user touch/click/key
+        ['click', 'touchstart', 'touchend', 'keydown'].forEach(evt => {
+            document.addEventListener(evt, () => {
+                if (wakeLockActive) {
+                    requestWakeLock();
+                }
+            }, { once: true });
+        });
+
+        // Initial default state is ALWAYS ON
+        wakeLockActive = true;
+        updateWakeUI(true);
+        requestWakeLock();
+    </script>
+</body>
+</html>
