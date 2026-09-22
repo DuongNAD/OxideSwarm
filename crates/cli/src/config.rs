@@ -84,6 +84,25 @@ pub struct StatusFileConfig {
     pub master: Option<String>,
 }
 
+/// Returns the platform-specific default OxideSwarm directory:
+/// Unix / macOS: ~/.oxideswarm
+/// Windows: %USERPROFILE%\.oxideswarm
+pub fn default_oxideswarm_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+            .map(|h| h.join(".oxideswarm"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|h| h.join(".oxideswarm"))
+    }
+}
+
 /// Attempts to load configuration file from explicit path, environment variable, or standard locations.
 pub fn load_config_file(explicit_path: Option<&Path>) -> GridResult<Option<ConfigFile>> {
     let path_to_load = if let Some(p) = explicit_path {
@@ -95,7 +114,9 @@ pub fn load_config_file(explicit_path: Option<&Path>) -> GridResult<Option<Confi
     } else if Path::new("rusty-grid.json").exists() {
         Some(PathBuf::from("rusty-grid.json"))
     } else {
-        None
+        default_oxideswarm_dir()
+            .map(|d| d.join("rusty-grid.toml"))
+            .filter(|user_config| user_config.exists())
     };
 
     let path = match path_to_load {

@@ -229,6 +229,8 @@ pub struct WorkerClient {
     master_beacon: Arc<RwLock<Option<rusty_grid_core::discovery::MasterBeacon>>>,
     #[cfg(feature = "p2p")]
     p2p_endpoint: Arc<tokio::sync::Mutex<Option<iroh::Endpoint>>>,
+    #[cfg(feature = "p2p")]
+    p2p_conn: Arc<tokio::sync::RwLock<Option<iroh::endpoint::Connection>>>,
 }
 
 impl WorkerClient {
@@ -309,8 +311,35 @@ impl WorkerClient {
             master_beacon,
             #[cfg(feature = "p2p")]
             p2p_endpoint: Arc::new(tokio::sync::Mutex::new(None)),
+            #[cfg(feature = "p2p")]
+            p2p_conn: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
+
+    /// Returns the active P2P path information, if connected via P2P.
+    #[cfg(feature = "p2p")]
+    pub async fn active_p2p_path_info(&self) -> Option<rusty_grid_core::transport::P2pPathInfo> {
+        let guard = self.p2p_conn.read().await;
+        guard
+            .as_ref()
+            .and_then(rusty_grid_core::transport::inspect_connection_paths)
+    }
+
+    /// Returns a shared reference to the active P2P connection handle.
+    #[cfg(feature = "p2p")]
+    pub fn p2p_connection(&self) -> Arc<tokio::sync::RwLock<Option<iroh::endpoint::Connection>>> {
+        Arc::clone(&self.p2p_conn)
+    }
+
+    /// Sets an explicit pre-configured P2P endpoint (e.g. for testing relay fallback or specific network constraints).
+    #[cfg(feature = "p2p")]
+    pub fn with_p2p_endpoint(self, endpoint: iroh::Endpoint) -> Self {
+        if let Ok(mut guard) = self.p2p_endpoint.try_lock() {
+            *guard = Some(endpoint);
+        }
+        self
+    }
+
 
     /// Returns a shared reference to the discovered master beacon state.
     pub fn master_beacon(&self) -> Arc<RwLock<Option<rusty_grid_core::discovery::MasterBeacon>>> {
@@ -635,6 +664,22 @@ impl WorkerClient {
             })?;
 
             let bi_stream = rusty_grid_core::transport::BiStream::new(recv, send);
+            let path_info = rusty_grid_core::transport::inspect_connection_paths(&conn);
+            if let Some(ref info) = path_info {
+                info!(
+                    connection_type = %info.connection_type,
+                    is_relay = info.is_relay,
+                    is_ip = info.is_ip,
+                    rtt_ms = info.rtt_ms,
+                    remote = %info.remote_addr,
+                    "P2P transport path active"
+                );
+            }
+            {
+                let mut conn_guard = self.p2p_conn.write().await;
+                *conn_guard = Some(conn.clone());
+            }
+
             return Ok((
                 rusty_grid_core::transport::GridStream::P2p(bi_stream),
                 format!("iroh://{:?}", conn.remote_id()),
@@ -808,6 +853,11 @@ impl WorkerClient {
 
         // Cleanly terminate heartbeat task
         heartbeat_handle.stop().await;
+        #[cfg(feature = "p2p")]
+        {
+            let mut conn_guard = self.p2p_conn.write().await;
+            *conn_guard = None;
+        }
         exit_result
     }
 

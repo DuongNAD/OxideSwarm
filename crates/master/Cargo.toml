@@ -92,3 +92,7 @@ path = "../../tests/m10_streaming_stress.rs"
 [[test]]
 name = "m10_challenger_2_stress"
 path = "../../tests/m10_challenger_2_stress.rs"
+
+[[test]]
+name = "test_m4_dashboard_telemetry"
+path = "../../tests/test_m4_dashboard_telemetry.rs"

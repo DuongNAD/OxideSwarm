@@ -36,15 +36,18 @@ pub struct WebUiState {
     pub queue: TaskQueue,
     pub scheduler_notify: Arc<tokio::sync::Notify>,
     pub modes_state: Arc<tokio::sync::Mutex<ModesRunState>>,
+    pub master_handle: Option<crate::server::MasterHandle>,
+    pub p2p_ticket: Option<String>,
 }
 
-pub async fn start_web_ui(
-    addr: SocketAddr,
+/// Creates a fresh `WebUiState` instance with initialized run state.
+pub fn create_web_ui_state(
     registry: WorkerRegistry,
     queue: TaskQueue,
     scheduler_notify: Arc<tokio::sync::Notify>,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
+    master_handle: Option<crate::server::MasterHandle>,
+    p2p_ticket: Option<String>,
+) -> WebUiState {
     let modes_state = Arc::new(tokio::sync::Mutex::new(ModesRunState {
         current_mode: None,
         current_action: None,
@@ -53,14 +56,32 @@ pub async fn start_web_ui(
         logs: Vec::new(),
         last_result: None,
     }));
-    let state = WebUiState {
+    WebUiState {
         registry,
         queue,
         scheduler_notify,
         modes_state,
-    };
+        master_handle,
+        p2p_ticket,
+    }
+}
 
-    let app = Router::new()
+/// Creates the full Axum router for the Web UI dashboard and REST API.
+pub fn create_web_ui_router(
+    registry: WorkerRegistry,
+    queue: TaskQueue,
+    scheduler_notify: Arc<tokio::sync::Notify>,
+    master_handle: Option<crate::server::MasterHandle>,
+    p2p_ticket: Option<String>,
+) -> Router {
+    let state = create_web_ui_state(
+        registry,
+        queue,
+        scheduler_notify,
+        master_handle,
+        p2p_ticket,
+    );
+    Router::new()
         .route("/", get(index_html))
         .route("/api/status", get(api_status))
         .route("/api/tasks", post(api_submit_task))
@@ -70,7 +91,25 @@ pub async fn start_web_ui(
         .route("/api/modes/run", post(api_run_mode))
         .route("/api/modes/status", get(api_mode_status))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state)
+}
+
+pub async fn start_web_ui(
+    addr: SocketAddr,
+    registry: WorkerRegistry,
+    queue: TaskQueue,
+    scheduler_notify: Arc<tokio::sync::Notify>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    master_handle: Option<crate::server::MasterHandle>,
+    p2p_ticket: Option<String>,
+) {
+    let app = create_web_ui_router(
+        registry,
+        queue,
+        scheduler_notify,
+        master_handle,
+        p2p_ticket,
+    );
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -103,21 +142,25 @@ async fn index_html() -> Html<&'static str> {
     Html(include_str!("dashboard.html"))
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MasterUiInfo {
     pub host: String,
     pub role: String,
     pub description: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardStatus {
     pub master: MasterUiInfo,
     pub workers: Vec<WorkerUiInfo>,
     pub tasks: DashboardTasks,
+    #[serde(default)]
+    pub p2p_ticket: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+pub type ClusterStatusDto = crate::dashboard::dto::ClusterStatusDto;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerUiInfo {
     pub id: String,
     pub name: String,
@@ -135,9 +178,12 @@ pub struct WorkerUiInfo {
     pub is_charging: Option<bool>,
     pub thermal_throttled: bool,
     pub last_heartbeat_secs_ago: u64,
+    pub interconnect_type: String,
+    pub is_relayed: bool,
+    pub rtt_ms: Option<f32>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardTasks {
     pub total: usize,
     pub queued: usize,
@@ -147,7 +193,7 @@ pub struct DashboardTasks {
     pub active_list: Vec<TaskUiInfo>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskUiInfo {
     pub id: String,
     pub state: String,
@@ -166,56 +212,86 @@ async fn api_status(State(state): State<WebUiState>) -> impl IntoResponse {
         .unwrap_or(0);
 
     let mut orchestrator_assigned = false;
-    let workers: Vec<WorkerUiInfo> = workers_info
-        .into_iter()
-        .map(|w| {
-            let has_gpu = w.capabilities.has_gpu || w.capabilities.is_simulated_gpu;
-            let gpu_device_name = w.capabilities.gpu_device_name.clone();
+    let mut workers = Vec::with_capacity(workers_info.len());
+    for w in workers_info {
+        let has_gpu = w.capabilities.has_gpu || w.capabilities.is_simulated_gpu;
+        let gpu_device_name = w.capabilities.gpu_device_name.clone();
 
-            let is_orchestrator = !orchestrator_assigned
-                && (w.capabilities.name.to_lowercase().contains("mac")
-                    || (w.capabilities.cpu_cores == max_cores && w.capabilities.ram_mb >= 16384));
+        let is_orchestrator = !orchestrator_assigned
+            && (w.capabilities.name.to_lowercase().contains("mac")
+                || (w.capabilities.cpu_cores == max_cores && w.capabilities.ram_mb >= 16384));
 
-            let (role, role_description) = if is_orchestrator {
-                orchestrator_assigned = true;
-                ("ORCH".to_string(), "Coordination & Build".to_string())
-            } else if has_gpu {
-                ("GPU".to_string(), "GPU Acceleration".to_string())
-            } else {
-                ("WORKER".to_string(), "Compute Node".to_string())
-            };
+        let (role, role_description) = if is_orchestrator {
+            orchestrator_assigned = true;
+            ("ORCH".to_string(), "Coordination & Build".to_string())
+        } else if has_gpu {
+            ("GPU".to_string(), "GPU Acceleration".to_string())
+        } else {
+            ("WORKER".to_string(), "Compute Node".to_string())
+        };
 
-            let (battery_pct, is_charging, thermal_throttled) = match &w.capabilities.mobile {
-                Some(m) => (m.battery_pct, m.is_charging, m.thermal_throttled),
-                None => (None, None, false),
-            };
+        let (battery_pct, is_charging, thermal_throttled) = match &w.capabilities.mobile {
+            Some(m) => (m.battery_pct, m.is_charging, m.thermal_throttled),
+            None => (None, None, false),
+        };
 
-            let last_heartbeat_secs_ago = if w.last_heartbeat_timestamp > 0 {
-                now_epoch.saturating_sub(w.last_heartbeat_timestamp)
-            } else {
-                0
-            };
+        let last_heartbeat_secs_ago = if w.last_heartbeat_timestamp > 0 {
+            now_epoch.saturating_sub(w.last_heartbeat_timestamp)
+        } else {
+            0
+        };
 
-            WorkerUiInfo {
-                id: w.worker_id.to_string(),
-                name: w.capabilities.name,
-                status: format!("{:?}", w.status),
-                role,
-                role_description,
-                active_tasks: w.active_tasks,
-                cpu_cores: w.capabilities.cpu_cores,
-                ram_mb: w.capabilities.ram_mb,
-                cpu_usage_pct: w.cpu_usage_pct,
-                ram_available_mb: w.ram_available_mb,
-                has_gpu,
-                gpu_device_name,
-                battery_pct,
-                is_charging,
-                thermal_throttled,
-                last_heartbeat_secs_ago,
+        let (interconnect_type, is_relayed, rtt_ms) = {
+            #[cfg(feature = "p2p")]
+            {
+                if let Some(ref handle) = state.master_handle {
+                    if let Some(p2p_info) = handle.get_worker_p2p_info(&w.worker_id).await {
+                        let conn_type = if p2p_info.is_relay {
+                            "Relay (DERP)".to_string()
+                        } else {
+                            "Direct P2P (QUIC)".to_string()
+                        };
+                        let rtt = if p2p_info.rtt_ms.is_finite() && p2p_info.rtt_ms >= 0.0 {
+                            Some(p2p_info.rtt_ms as f32)
+                        } else {
+                            None
+                        };
+                        (conn_type, p2p_info.is_relay, rtt)
+                    } else {
+                        parse_link_from_tags(&w.capabilities.tags)
+                    }
+                } else {
+                    parse_link_from_tags(&w.capabilities.tags)
+                }
             }
-        })
-        .collect();
+            #[cfg(not(feature = "p2p"))]
+            {
+                parse_link_from_tags(&w.capabilities.tags)
+            }
+        };
+
+        workers.push(WorkerUiInfo {
+            id: w.worker_id.to_string(),
+            name: w.capabilities.name,
+            status: format!("{:?}", w.status),
+            role,
+            role_description,
+            active_tasks: w.active_tasks,
+            cpu_cores: w.capabilities.cpu_cores,
+            ram_mb: w.capabilities.ram_mb,
+            cpu_usage_pct: w.cpu_usage_pct,
+            ram_available_mb: w.ram_available_mb,
+            has_gpu,
+            gpu_device_name,
+            battery_pct,
+            is_charging,
+            thermal_throttled,
+            last_heartbeat_secs_ago,
+            interconnect_type,
+            is_relayed,
+            rtt_ms,
+        });
+    }
 
     let host_name = sysinfo::System::host_name().unwrap_or_else(|| "OxideSwarm Host".to_string());
     let master = MasterUiInfo {
@@ -250,7 +326,24 @@ async fn api_status(State(state): State<WebUiState>) -> impl IntoResponse {
         master,
         workers,
         tasks,
+        p2p_ticket: state.p2p_ticket.clone(),
     })
+}
+
+fn parse_link_from_tags(tags: &[String]) -> (String, bool, Option<f32>) {
+    for tag in tags {
+        if let Some(rest) = tag.strip_prefix("link:") {
+            if let Some((kind, rtt_str)) = rest.split_once(':') {
+                let rtt = rtt_str.trim_end_matches("ms").parse::<f32>().ok();
+                let is_relayed = kind.contains("Relay") || kind.contains("DERP");
+                return (kind.to_string(), is_relayed, rtt);
+            } else {
+                let is_relayed = rest.contains("Relay") || rest.contains("DERP");
+                return (rest.to_string(), is_relayed, None);
+            }
+        }
+    }
+    ("TCP/LAN".to_string(), false, None)
 }
 
 #[derive(Deserialize)]
@@ -638,6 +731,9 @@ mod tests {
             is_charging: Some(true),
             thermal_throttled: false,
             last_heartbeat_secs_ago: 3,
+            interconnect_type: "Direct P2P (QUIC)".to_string(),
+            is_relayed: false,
+            rtt_ms: Some(18.5),
         };
 
         let json = serde_json::to_string(&info).expect("WorkerUiInfo should serialize to json");
@@ -649,6 +745,9 @@ mod tests {
         assert!(json.contains("\"is_charging\":true"));
         assert!(json.contains("\"thermal_throttled\":false"));
         assert!(json.contains("\"last_heartbeat_secs_ago\":3"));
+        assert!(json.contains("\"interconnect_type\":\"Direct P2P (QUIC)\""));
+        assert!(json.contains("\"is_relayed\":false"));
+        assert!(json.contains("\"rtt_ms\":18.5"));
     }
 
     #[test]
@@ -739,6 +838,8 @@ mod tests {
             queue,
             scheduler_notify,
             modes_state,
+            master_handle: None,
+            p2p_ticket: None,
         };
 
         // 1. Test get modes list
@@ -788,6 +889,8 @@ mod tests {
             queue,
             scheduler_notify,
             modes_state,
+            master_handle: None,
+            p2p_ticket: None,
         };
 
         let payload = RunModePayload {

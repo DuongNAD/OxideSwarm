@@ -127,6 +127,18 @@ Open the `windows/` folder on your Windows machine:
 * On the Windows PC: Run `windows\switch_role.cmd master` (or choose option `1` in the menu).
 * On the Mac: Run `./switch_role.sh worker 192.168.1.123:8088` (or choose option `2` in the menu).
 
+#### D. Remote WAN Connection (Khác Mạng LAN / Qua Internet — 1-Click 0-Config)
+Khi 2 máy không cùng mạng Wi-Fi (ví dụ: MacBook ở quán cafe/công ty, Máy Case Windows ở nhà):
+1. **Lấy mã Ticket từ Master**:
+   - Mở Web Dashboard của Master, bấm nút **"📋 Copy P2P Ticket"** (mã ticket được cố định qua `~/.oxideswarm/master_key.bin`, không bao giờ đổi khi reboot).
+2. **Kết nối trên Máy Phụ (Worker)**:
+   - **Trên macOS**: Chạy `./connect_remote.sh` rồi dán Ticket (hoặc `./connect_remote.sh "<TICKET>"`).
+   - **Trên Windows**: Double-click vào [`connect_remote.cmd`](file:///Users/duongnad/Documents/project/OxideSwarm/connect_remote.cmd), dán Ticket và nhấn Enter. Script tự lưu cấu hình và chạy ngầm tàng hình.
+3. **Tự động nhận diện đường truyền**:
+   - Hai máy tự động đục lỗ tường lửa (UDP Hole Punching) để bắt tay trực tiếp (`🟢 Direct P2P | <RTT>ms`).
+   - Nếu bị tường lửa công ty chặn UDP, tự động chuyển tiếp qua HTTPS Relay (`🟣 DERP Relay | <RTT>ms`) an toàn 100%.
+   - Xem báo cáo phân tích đối chuẩn chi tiết tại [Báo cáo Đối chuẩn Kỹ thuật (Benchmark Whitepaper)](file:///Users/duongnad/teamwork_projects/remote_cluster_interconnect/COMPARATIVE_INTERCONNECT_BENCHMARK.md).
+
 ---
 
 ## 5. CLI Reference & Workflow Modes (`ox-mode`)

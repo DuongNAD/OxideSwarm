@@ -49,6 +49,8 @@ pub struct DashboardState {
     pub started_at: Instant,
     /// Non-blocking broadcast channel for streaming telemetry to WebSocket/SSE clients.
     pub broadcast_tx: broadcast::Sender<DashboardStreamMessage>,
+    /// Master's active P2P ticket, if enabled.
+    pub p2p_ticket: Option<String>,
 }
 
 impl DashboardState {
@@ -82,6 +84,7 @@ impl DashboardState {
                 disconnected,
             },
             tasks: stats,
+            p2p_ticket: self.p2p_ticket.clone(),
         };
 
         ClusterSnapshotDto {

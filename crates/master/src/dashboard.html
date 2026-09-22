@@ -699,6 +699,56 @@
             white-space: nowrap;
         }
 
+        /* Link Badges: Direct P2P, DERP Relay, TCP/LAN */
+        .link-badge {
+            font-size: 9.5px;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-weight: 700;
+            white-space: nowrap;
+            display: inline-flex;
+            align-items: center;
+            gap: 3px;
+        }
+        .link-direct {
+            color: #10b981;
+            background: rgba(16, 185, 129, 0.15);
+            border: 1px solid rgba(16, 185, 129, 0.35);
+        }
+        .link-relay {
+            color: #f59e0b;
+            background: rgba(245, 158, 11, 0.15);
+            border: 1px solid rgba(245, 158, 11, 0.35);
+        }
+        .link-tcp {
+            color: #94a3b8;
+            background: rgba(148, 163, 184, 0.12);
+            border: 1px solid rgba(148, 163, 184, 0.25);
+        }
+
+        /* Degradation Alert Banner */
+        .degradation-banner {
+            background: rgba(245, 158, 11, 0.15);
+            border: 1px solid #f59e0b;
+            color: #fbbf24;
+            padding: 8px 14px;
+            margin: 6px 12px 0 12px;
+            border-radius: 6px;
+            font-size: 11.5px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            box-shadow: 0 2px 8px rgba(245, 158, 11, 0.1);
+        }
+        .degradation-banner .alert-icon {
+            font-size: 14px;
+            flex-shrink: 0;
+        }
+        .degradation-banner .alert-text {
+            flex: 1;
+        }
+
         /* ========================================================
            TAB 3: WORKFLOW MODES & AUTOMATION PRESETS
            ======================================================== */
@@ -961,6 +1011,7 @@
 
             <div class="top-actions">
                 <button class="wake-pill" id="radarBtn" onclick="manualMasterScan()" title="Quét tìm Master trong LAN">📡 Quét Master</button>
+                <button class="wake-pill" id="copyTicketBtn" onclick="copyP2pTicket()" title="Copy Master P2P Ticket to Clipboard">📋 Copy Ticket</button>
                 <button class="wake-pill active" id="wakePill" onclick="toggleWakeLock()" title="Giữ màn hình luôn sáng">☀️ Luôn thức</button>
                 <div class="latency-pill" id="latencyPill" title="API Roundtrip Latency">-- ms</div>
                 <button class="sync-btn" id="syncBtn" onclick="triggerReload()" title="Instant Cluster Sync">
@@ -973,6 +1024,9 @@
                 <button class="theme-btn" onclick="toggleTheme()" id="btnTheme" title="Toggle Light/Dark Theme">🌓</button>
             </div>
         </header>
+
+        <!-- Visual Degradation Alert Banner -->
+        <div id="degradationAlertBanner" class="degradation-banner" style="display:none;"></div>
 
         <!-- Dynamic Master Auto-Discovery Toast Notification -->
         <div id="discoveryToast" style="display:none; position:fixed; top:54px; left:50%; transform:translateX(-50%); z-index:9999; background:rgba(17,24,39,0.95); border:1px solid var(--accent); color:var(--text); padding:8px 14px; border-radius:6px; font-size:12px; font-weight:600; box-shadow:0 4px 12px rgba(0,0,0,0.5); text-align:center; max-width:90%; pointer-events:none; transition:all 0.2s ease;"></div>
@@ -1173,6 +1227,14 @@
                 <div class="detail-item" style="grid-column: span 2;">
                     <div class="detail-label">GPU & Tính toán</div>
                     <div class="detail-val" id="mGpu">--</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Loại kết nối (Interconnect)</div>
+                    <div class="detail-val" id="mLink">--</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Độ trễ (RTT)</div>
+                    <div class="detail-val" id="mRtt">--</div>
                 </div>
                 <div class="detail-item" style="grid-column: span 2;">
                     <div class="detail-label">Node ID & P2P Heartbeat</div>
@@ -1396,6 +1458,33 @@
             }, duration);
         }
 
+        async function copyP2pTicket() {
+            const ticket = window.currentP2pTicket;
+            if (!ticket) {
+                showDiscoveryToast("⚠️ P2P Ticket chưa khả dụng (Master chưa bật P2P hoặc chưa có vé)", 3000);
+                return;
+            }
+            try {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    await navigator.clipboard.writeText(ticket);
+                } else {
+                    const ta = document.createElement('textarea');
+                    ta.value = ticket;
+                    ta.style.position = 'fixed';
+                    ta.style.opacity = '0';
+                    document.body.appendChild(ta);
+                    ta.focus();
+                    ta.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(ta);
+                }
+                showDiscoveryToast("✅ Đã sao chép P2P Ticket vào bộ nhớ tạm!", 3000);
+            } catch (err) {
+                console.warn("Clipboard API failed:", err);
+                prompt("P2P Ticket (nhấn Ctrl+C để copy):", ticket);
+            }
+        }
+
         let consecutiveDisconnects = 0;
         let isProbing = false;
 
@@ -1562,6 +1651,81 @@
                     }
                 }
 
+                // Store P2P ticket for 1-Click Copy
+                window.currentP2pTicket = data.p2p_ticket || null;
+                const copyBtn = document.getElementById('copyTicketBtn');
+                if (copyBtn) {
+                    if (data.p2p_ticket) {
+                        copyBtn.title = `Sao chép vé P2P kết nối Master: ${data.p2p_ticket.substring(0, 16)}...`;
+                    } else {
+                        copyBtn.title = "Master chưa cấu hình P2P Ticket";
+                    }
+                }
+
+                // Visual Degradation Alert Banner: DERP Relay or RTT > 150ms
+                const degradedWorkers = workers.filter(w => (w.status === 'Connected' || w.status === 'Busy') && (w.is_relayed || (w.rtt_ms !== null && w.rtt_ms !== undefined && w.rtt_ms > 150)));
+                const degBanner = document.getElementById('degradationAlertBanner');
+                if (degBanner) {
+                    if (degradedWorkers.length > 0) {
+                        const issues = degradedWorkers.map(w => {
+                            const reasons = [];
+                            if (w.is_relayed) reasons.push('DERP Relay');
+                            if (w.rtt_ms !== null && w.rtt_ms !== undefined && w.rtt_ms > 150) reasons.push(`Độ trễ cao ${Math.round(w.rtt_ms)}ms`);
+                            return `<strong>${escapeHtml(w.name || w.id)}</strong> (${reasons.join(', ')})`;
+                        });
+                        degBanner.innerHTML = `<span class="alert-icon">⚠️</span><span class="alert-text"><strong>Cảnh báo chất lượng kết nối:</strong> ${issues.join(' • ')}</span>`;
+                        degBanner.style.display = 'flex';
+                    } else {
+                        degBanner.style.display = 'none';
+                    }
+                }
+
+                // Dynamic Transport Styling for SVG Topology
+                function getTransportStyle(worker) {
+                    if (!worker) {
+                        return {
+                            stroke: '#475569',
+                            dash: '3,3',
+                            width: '1.8',
+                            filter: '',
+                            label: 'Offline',
+                            color: '#64748b'
+                        };
+                    }
+                    const isRelayed = !!worker.is_relayed || (worker.interconnect_type && worker.interconnect_type.includes('Relay'));
+                    const isDirect = !isRelayed && (worker.interconnect_type && (worker.interconnect_type.includes('Direct') || worker.interconnect_type.includes('P2P')));
+                    const rtt = (worker.rtt_ms !== null && worker.rtt_ms !== undefined) ? `${Math.round(worker.rtt_ms)}ms` : null;
+
+                    if (isDirect) {
+                        return {
+                            stroke: '#10b981', // solid glowing green
+                            dash: 'none',
+                            width: '2.2',
+                            filter: 'url(#glowGreen)',
+                            label: rtt ? `Direct P2P • ${rtt}` : 'Direct P2P',
+                            color: '#10b981'
+                        };
+                    } else if (isRelayed) {
+                        return {
+                            stroke: '#f59e0b', // dashed amber
+                            dash: '4,4',
+                            width: '1.8',
+                            filter: '',
+                            label: rtt ? `DERP Relay • ${rtt}` : 'DERP Relay',
+                            color: '#fbbf24'
+                        };
+                    } else {
+                        return {
+                            stroke: '#06b6d4', // dashed cyan
+                            dash: '3,3',
+                            width: '1.8',
+                            filter: '',
+                            label: rtt ? `TCP/LAN • ${rtt}` : 'TCP/LAN',
+                            color: '#38bdf8'
+                        };
+                    }
+                }
+
                 // Render Live Topology Diagram
                 const topoEl = document.getElementById('topologyDiagram');
                 if (topoEl) {
@@ -1571,12 +1735,13 @@
                     const pCores = phoneW ? phoneW.cpu_cores : 10;
                     const pRam = phoneW ? (phoneW.ram_mb / 1024).toFixed(1) : '10.9';
                     const pCpu = phoneW ? parseFloat(phoneW.cpu_usage_pct || 0).toFixed(1) : '0.0';
-                    const pStatus = (phoneW && (phoneW.status === 'Connected' || phoneW.status === 'Busy')) ? '🟢 ONLINE' : '⚪ CONNECTING';
 
                     const mCores = macW ? macW.cpu_cores : 10;
                     const mRam = macW ? (macW.ram_mb / 1024).toFixed(1) : '32.0';
                     const mCpu = macW ? parseFloat(macW.cpu_usage_pct || 0).toFixed(1) : '0.0';
-                    const mStatus = (macW && (macW.status === 'Connected' || macW.status === 'Busy')) ? '🟢 ONLINE' : '⚪ CONNECTING';
+
+                    const pTransport = getTransportStyle(phoneW);
+                    const mTransport = getTransportStyle(macW);
 
                     topoEl.innerHTML = `
                     <svg viewBox="0 0 350 155" style="width:100%; height:auto; display:block; border-radius:6px; background:#0b1120;" xmlns="http://www.w3.org/2000/svg">
@@ -1589,18 +1754,25 @@
                                 <stop offset="0%" stop-color="#38bdf8"/>
                                 <stop offset="100%" stop-color="#a855f7"/>
                             </linearGradient>
+                            <filter id="glowGreen" x="-20%" y="-20%" width="140%" height="140%">
+                                <feGaussianBlur stdDeviation="2" result="blur" />
+                                <feMerge>
+                                    <feMergeNode in="blur" />
+                                    <feMergeNode in="SourceGraphic" />
+                                </feMerge>
+                            </filter>
                         </defs>
 
                         <!-- Connector Lines -->
-                        <path d="M 175 40 C 175 72, 85 72, 85 96" fill="none" stroke="url(#gLineL)" stroke-width="1.8" stroke-dasharray="3,3"/>
-                        <path d="M 175 40 C 175 72, 265 72, 265 96" fill="none" stroke="url(#gLineR)" stroke-width="1.8" stroke-dasharray="3,3"/>
+                        <path d="M 175 40 C 175 72, 85 72, 85 96" fill="none" stroke="${pTransport.stroke}" stroke-width="${pTransport.width}" stroke-dasharray="${pTransport.dash}" ${pTransport.filter ? `filter="${pTransport.filter}"` : ''}/>
+                        <path d="M 175 40 C 175 72, 265 72, 265 96" fill="none" stroke="${mTransport.stroke}" stroke-width="${mTransport.width}" stroke-dasharray="${mTransport.dash}" ${mTransport.filter ? `filter="${mTransport.filter}"` : ''}/>
 
                         <!-- Tags on Lines -->
-                        <rect x="96" y="58" width="46" height="14" rx="3" fill="#1e293b" stroke="#334155"/>
-                        <text x="119" y="68" fill="#94a3b8" font-size="7.5" font-family="-apple-system, sans-serif" text-anchor="middle">Wi-Fi LAN</text>
+                        <rect x="62" y="58" width="82" height="14" rx="3" fill="#1e293b" stroke="${pTransport.stroke}"/>
+                        <text x="103" y="68" fill="${pTransport.color}" font-size="7.5" font-family="-apple-system, sans-serif" font-weight="600" text-anchor="middle">${pTransport.label}</text>
 
-                        <rect x="208" y="58" width="46" height="14" rx="3" fill="#1e293b" stroke="#334155"/>
-                        <text x="231" y="68" fill="#94a3b8" font-size="7.5" font-family="-apple-system, sans-serif" text-anchor="middle">Local IPC</text>
+                        <rect x="206" y="58" width="82" height="14" rx="3" fill="#1e293b" stroke="${mTransport.stroke}"/>
+                        <text x="247" y="68" fill="${mTransport.color}" font-size="7.5" font-family="-apple-system, sans-serif" font-weight="600" text-anchor="middle">${mTransport.label}</text>
 
                         <!-- TOP NODE: MASTER -->
                         <g transform="translate(85, 6)">
@@ -1614,24 +1786,24 @@
 
                         <!-- LEFT NODE: PHONE -->
                         <g transform="translate(8, 96)">
-                            <rect width="154" height="50" rx="6" fill="#1e293b" stroke="${phoneW ? '#0891b2' : '#334155'}" stroke-width="1"/>
-                            <circle cx="14" cy="15" r="3" fill="${phoneW ? '#10b981' : '#64748b'}"/>
-                            <text x="23" y="15" fill="#f8fafc" font-size="9.5" font-weight="600" font-family="-apple-system, sans-serif">Galaxy S24 (Phone)</text>
+                            <rect width="154" height="50" rx="6" fill="#1e293b" stroke="${phoneW ? pTransport.stroke : '#334155'}" stroke-width="1"/>
+                            <circle cx="14" cy="15" r="3" fill="${phoneW ? (phoneW.status === 'Connected' || phoneW.status === 'Busy' ? '#10b981' : '#64748b') : '#64748b'}"/>
+                            <text x="23" y="15" fill="#f8fafc" font-size="9.5" font-weight="600" font-family="-apple-system, sans-serif">${escapeHtml(phoneW ? phoneW.name : 'Galaxy S24 (Phone)')}</text>
                             <rect x="110" y="7" width="36" height="13" rx="2.5" fill="rgba(6,182,212,0.2)"/>
-                            <text x="128" y="16.5" fill="#22d3ee" font-size="7" font-weight="700" text-anchor="middle">WORKER</text>
-                            <text x="12" y="30" fill="#94a3b8" font-size="8.5" font-family="-apple-system, sans-serif">10 Cores • ${pRam} GB RAM</text>
-                            <text x="12" y="42" fill="#64748b" font-size="8" font-family="-apple-system, sans-serif">Phần cứng thật • CPU ${pCpu}%</text>
+                            <text x="128" y="16.5" fill="#22d3ee" font-size="7" font-weight="700" text-anchor="middle">${escapeHtml(phoneW ? (phoneW.role || 'WORKER') : 'WORKER')}</text>
+                            <text x="12" y="30" fill="#94a3b8" font-size="8.5" font-family="-apple-system, sans-serif">${pCores} Cores • ${pRam} GB RAM</text>
+                            <text x="12" y="42" fill="#64748b" font-size="8" font-family="-apple-system, sans-serif">${pTransport.label} • CPU ${pCpu}%</text>
                         </g>
 
                         <!-- RIGHT NODE: MACBOOK -->
                         <g transform="translate(188, 96)">
-                            <rect width="154" height="50" rx="6" fill="#1e293b" stroke="${macW ? '#7c3aed' : '#334155'}" stroke-width="1"/>
-                            <circle cx="14" cy="15" r="3" fill="${macW ? '#10b981' : '#64748b'}"/>
-                            <text x="23" y="15" fill="#f8fafc" font-size="9.5" font-weight="600" font-family="-apple-system, sans-serif">MacBook Pro</text>
+                            <rect width="154" height="50" rx="6" fill="#1e293b" stroke="${macW ? mTransport.stroke : '#334155'}" stroke-width="1"/>
+                            <circle cx="14" cy="15" r="3" fill="${macW ? (macW.status === 'Connected' || macW.status === 'Busy' ? '#10b981' : '#64748b') : '#64748b'}"/>
+                            <text x="23" y="15" fill="#f8fafc" font-size="9.5" font-weight="600" font-family="-apple-system, sans-serif">${escapeHtml(macW ? macW.name : 'MacBook Pro')}</text>
                             <rect x="114" y="7" width="32" height="13" rx="2.5" fill="rgba(168,85,247,0.2)"/>
-                            <text x="130" y="16.5" fill="#c084fc" font-size="7" font-weight="700" text-anchor="middle">ORCH</text>
-                            <text x="12" y="30" fill="#94a3b8" font-size="8.5" font-family="-apple-system, sans-serif">10 Cores • ${mRam} GB RAM</text>
-                            <text x="12" y="42" fill="#64748b" font-size="8" font-family="-apple-system, sans-serif">Matrix Engine • CPU ${mCpu}%</text>
+                            <text x="130" y="16.5" fill="#c084fc" font-size="7" font-weight="700" text-anchor="middle">${escapeHtml(macW ? (macW.role || 'ORCH') : 'ORCH')}</text>
+                            <text x="12" y="30" fill="#94a3b8" font-size="8.5" font-family="-apple-system, sans-serif">${mCores} Cores • ${mRam} GB RAM</text>
+                            <text x="12" y="42" fill="#64748b" font-size="8" font-family="-apple-system, sans-serif">${mTransport.label} • CPU ${mCpu}%</text>
                         </g>
                     </svg>
                     `;
@@ -1710,6 +1882,23 @@
                         mobileBadge += `<span class="badge-throttle">🔥 Throttled</span>`;
                     }
 
+                    // Telemetry: Interconnect Link Badge
+                    const isRelayed = !!w.is_relayed || (w.interconnect_type && w.interconnect_type.includes('Relay'));
+                    const isDirect = !isRelayed && (w.interconnect_type && (w.interconnect_type.includes('Direct') || w.interconnect_type.includes('P2P')));
+                    const rttStr = (w.rtt_ms !== null && w.rtt_ms !== undefined) ? `${Math.round(w.rtt_ms)}ms` : null;
+
+                    let linkBadge = '';
+                    if (isDirect) {
+                        const lbl = rttStr ? `● Direct P2P | ${rttStr}` : `● Direct P2P`;
+                        linkBadge = `<span class="link-badge link-direct" title="Direct P2P Link (QUIC)">${lbl}</span>`;
+                    } else if (isRelayed) {
+                        const lbl = rttStr ? `▲ DERP Relay | ${rttStr}` : `▲ DERP Relay`;
+                        linkBadge = `<span class="link-badge link-relay" title="Relay (DERP)">${lbl}</span>`;
+                    } else {
+                        const lbl = rttStr ? `TCP/LAN | ${rttStr}` : `TCP/LAN`;
+                        linkBadge = `<span class="link-badge link-tcp" title="Standard TCP/LAN Link">${lbl}</span>`;
+                    }
+
                     const lastHb = w.last_heartbeat_secs_ago !== undefined ? `${w.last_heartbeat_secs_ago}s ago` : 'active';
 
                     html += `
@@ -1726,6 +1915,7 @@
                                 </div>
                             </div>
                             <div class="card-row-2">
+                                ${linkBadge}
                                 <div class="metric-pill">
                                     <span class="m-label">CPU:</span>
                                     <span class="meter-blocks">[${cpuBlocks}]</span>
@@ -1816,6 +2006,24 @@
             const gpuEl = document.getElementById('mGpu');
             if (gpuEl) {
                 gpuEl.textContent = w.has_gpu ? (w.gpu_device_name || 'GPU Compute Enabled') : 'Không có (CPU Compute)';
+            }
+
+            const linkEl = document.getElementById('mLink');
+            if (linkEl) {
+                const isRelayed = !!w.is_relayed || (w.interconnect_type && w.interconnect_type.includes('Relay'));
+                const isDirect = !isRelayed && (w.interconnect_type && (w.interconnect_type.includes('Direct') || w.interconnect_type.includes('P2P')));
+                if (isDirect) {
+                    linkEl.innerHTML = `<span style="color:#10b981; font-weight:700;">● Direct P2P (QUIC)</span>`;
+                } else if (isRelayed) {
+                    linkEl.innerHTML = `<span style="color:#f59e0b; font-weight:700;">▲ Relay (DERP)</span>`;
+                } else {
+                    linkEl.innerHTML = `<span style="color:#94a3b8; font-weight:700;">TCP/LAN</span>`;
+                }
+            }
+
+            const rttEl = document.getElementById('mRtt');
+            if (rttEl) {
+                rttEl.textContent = (w.rtt_ms !== null && w.rtt_ms !== undefined) ? `${Math.round(w.rtt_ms)} ms` : '--';
             }
 
             const idEl = document.getElementById('mId');

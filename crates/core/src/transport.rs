@@ -9,6 +9,10 @@ use tokio::net::TcpStream;
 /// ALPN token identifying rusty-grid peer-to-peer connections over QUIC.
 pub const GRID_ALPN: &[u8] = b"rusty-grid/v1";
 
+#[cfg(feature = "p2p")]
+pub use iroh;
+
+
 /// A bidirectional stream adapter combining separate `AsyncRead` and `AsyncWrite` handles.
 pub struct BiStream<R, W> {
     reader: R,
@@ -126,6 +130,48 @@ pub fn serialize_p2p_ticket(addr: &iroh::EndpointAddr) -> Result<String, serde_j
 pub fn parse_p2p_ticket(ticket: &str) -> Result<iroh::EndpointAddr, serde_json::Error> {
     serde_json::from_str(ticket)
 }
+
+/// Runtime path information for an active P2P (iroh QUIC) connection.
+#[cfg(feature = "p2p")]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct P2pPathInfo {
+    pub is_selected: bool,
+    pub is_relay: bool,
+    pub is_ip: bool,
+    pub remote_addr: String,
+    pub rtt_ms: f64,
+    pub connection_type: String,
+}
+
+/// Inspects active paths of an iroh QUIC connection and extracts current selected/active path info.
+#[cfg(feature = "p2p")]
+pub fn inspect_connection_paths(conn: &iroh::endpoint::Connection) -> Option<P2pPathInfo> {
+    let paths = conn.paths();
+    let selected = paths.iter().find(|p| p.is_selected()).or_else(|| paths.iter().next());
+    selected.map(|p| {
+        let rtt_ms = p.rtt().as_secs_f64() * 1000.0;
+        let is_relay = p.is_relay();
+        let is_ip = p.is_ip();
+        let remote_addr = p.remote_addr().to_string();
+        let connection_type = if is_relay {
+            format!("Relay (DERP: {remote_addr})")
+        } else if is_ip {
+            format!("Direct P2P (QUIC: {remote_addr})")
+        } else {
+            format!("P2P ({remote_addr})")
+        };
+        P2pPathInfo {
+            is_selected: p.is_selected(),
+            is_relay,
+            is_ip,
+            remote_addr,
+            rtt_ms,
+            connection_type,
+        }
+    })
+}
+
+
 
 #[cfg(test)]
 mod tests {

@@ -69,6 +69,8 @@ pub struct ServerConfig {
     pub dashboard_bind_ip: Option<std::net::IpAddr>,
     /// Optional filesystem path to write the dynamic bound dashboard port for zero-collision testing.
     pub dashboard_port_file: Option<PathBuf>,
+    /// Whether to force ephemeral in-memory secret key generation instead of default persistence.
+    pub ephemeral_key: bool,
 }
 
 impl Default for ServerConfig {
@@ -97,6 +99,7 @@ impl Default for ServerConfig {
             dashboard_port: None,
             dashboard_bind_ip: None,
             dashboard_port_file: None,
+            ephemeral_key: false,
         }
     }
 }
@@ -220,6 +223,12 @@ impl ServerConfig {
         self.dashboard_port_file = Some(path.into());
         self
     }
+
+    /// Disables default secret key persistence to ~/.oxideswarm/master_key.bin when P2P is enabled.
+    pub fn with_ephemeral_key(mut self, ephemeral: bool) -> Self {
+        self.ephemeral_key = ephemeral;
+        self
+    }
 }
 
 /// Atomically writes the bound port number to `path` using a sibling temporary file.
@@ -271,9 +280,13 @@ pub struct MasterServer {
     waiters: WaiterMap,
     #[cfg(feature = "p2p")]
     p2p_endpoint: Option<iroh::Endpoint>,
+    #[cfg(feature = "p2p")]
+    p2p_active_conns: Arc<tokio::sync::RwLock<HashMap<Uuid, iroh::endpoint::Connection>>>,
     #[cfg(feature = "dashboard")]
     pub broadcast_tx:
         Option<tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>>,
+    /// Master's active P2P ticket, if enabled.
+    pub p2p_ticket: Option<String>,
 }
 
 impl MasterServer {
@@ -294,21 +307,53 @@ impl MasterServer {
         waiters: WaiterMap,
     ) -> GridResult<Self> {
         #[cfg(feature = "p2p")]
-        let p2p_endpoint = if config.enable_p2p || config.p2p_key_file.is_some() {
-            let secret_key = resolve_p2p_secret_key(config.p2p_key_file.as_deref()).await?;
+        let p2p_active_conns = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        #[cfg(feature = "p2p")]
+        let (p2p_endpoint, p2p_ticket) = if config.enable_p2p || config.p2p_key_file.is_some() {
+            let resolved_key_file = if config.ephemeral_key {
+                config.p2p_key_file.clone()
+            } else {
+                config
+                    .p2p_key_file
+                    .clone()
+                    .or_else(default_master_key_file)
+            };
+            let secret_key = resolve_p2p_secret_key(resolved_key_file.as_deref()).await?;
             let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
                 .secret_key(secret_key)
                 .alpns(vec![GRID_ALPN.to_vec()])
                 .bind()
                 .await
                 .map_err(|e| GridError::Config(format!("Failed to bind iroh endpoint: {e}")))?;
+
+            // Await home DERP relay connection and STUN discovery before serializing ticket.
+            // Timeout gracefully so offline/air-gapped environments don't hang indefinitely.
+            match tokio::time::timeout(Duration::from_secs(3), endpoint.online()).await {
+                Ok(_) => {
+                    info!("Master connected to home DERP relay and discovered public network paths");
+                }
+                Err(_) => {
+                    warn!("Timed out awaiting DERP relay readiness; proceeding with initial discovered addresses");
+                }
+            }
+
             let mut addr = endpoint.addr();
-            if config.p2p_key_file.is_some() {
-                // Filter ephemeral direct UDP socket addresses allocated by the OS on ephemeral bind (:0).
-                // Retaining ephemeral direct socket ports would break ticket determinism across restarts
-                // (Ticket 1 != Ticket 2) and point to dead ports. In iroh with presets::N0, workers
-                // resolve the persistent NodeId (PublicKey) via N0 DNS/Pkarr discovery.
-                addr.addrs.retain(|a| a.is_relay());
+            if resolved_key_file.is_some() {
+                // If relay address was discovered, retain relay addresses for stable WAN connectivity
+                // across restarts without pinning dead ephemeral ports (:0).
+                let has_relay = addr.addrs.iter().any(|a| a.is_relay());
+                if has_relay {
+                    addr.addrs.retain(|a| a.is_relay());
+                    info!(
+                        relay_count = addr.addrs.len(),
+                        "Preserved home DERP relay addresses in persistent P2P ticket"
+                    );
+                } else {
+                    warn!(
+                        "No DERP relay discovered before ticket generation; retaining {} direct address(es)",
+                        addr.addrs.len()
+                    );
+                }
             }
             let ticket = rusty_grid_core::transport::serialize_p2p_ticket(&addr)?;
             info!(ticket = %ticket, "Master P2P endpoint established");
@@ -325,10 +370,12 @@ impl MasterServer {
                 info!(path = %ticket_path.display(), "Published P2P ticket to file");
             }
 
-            Some(endpoint)
+            (Some(endpoint), Some(ticket))
         } else {
-            None
+            (None, None)
         };
+        #[cfg(not(feature = "p2p"))]
+        let p2p_ticket: Option<String> = None;
 
         let listener = match TcpListener::bind(config.bind_addr).await {
             Ok(l) => l,
@@ -372,8 +419,11 @@ impl MasterServer {
             waiters,
             #[cfg(feature = "p2p")]
             p2p_endpoint,
+            #[cfg(feature = "p2p")]
+            p2p_active_conns,
             #[cfg(feature = "dashboard")]
             broadcast_tx: None,
+            p2p_ticket,
         })
     }
 
@@ -419,6 +469,11 @@ impl MasterServer {
         )
         .await?;
         let server_addr = server.local_addr();
+        #[cfg(feature = "p2p")]
+        let p2p_endpoint = server.p2p_endpoint.clone();
+        #[cfg(feature = "p2p")]
+        let p2p_active_conns = Arc::clone(&server.p2p_active_conns);
+        let p2p_ticket = server.p2p_ticket.clone();
 
         #[cfg(feature = "dashboard")]
         let (dashboard_addr, broadcast_tx) = if let Some(dash_port) = config.dashboard_port {
@@ -450,6 +505,7 @@ impl MasterServer {
                 dashboard_addr: Some(bound_dash_addr),
                 started_at: std::time::Instant::now(),
                 broadcast_tx: b_tx.clone(),
+                p2p_ticket: p2p_ticket.clone(),
             };
 
             let router = crate::dashboard::create_dashboard_router(state);
@@ -582,15 +638,34 @@ impl MasterServer {
             reaper_shutdown_rx,
         );
 
+        let handle = MasterHandle {
+            server_addr,
+            dashboard_addr,
+            registry,
+            queue,
+            scheduler_notify,
+            waiters,
+            shutdown_tx,
+            #[cfg(feature = "dashboard")]
+            broadcast_tx,
+            #[cfg(feature = "p2p")]
+            p2p_endpoint,
+            #[cfg(feature = "p2p")]
+            p2p_active_conns,
+            p2p_ticket: p2p_ticket.clone(),
+        };
+
         // 4. Spawn Web UI Dashboard (if enabled)
         if enable_web_ui {
             let web_ui_shutdown_rx = shutdown_rx.clone();
             tokio::spawn(crate::web_ui::start_web_ui(
                 web_ui_addr,
-                registry.clone(),
-                queue.clone(),
-                scheduler_notify.clone(),
+                handle.registry().clone(),
+                handle.queue().clone(),
+                handle.scheduler_notify().clone(),
                 web_ui_shutdown_rx,
+                Some(handle.clone()),
+                p2p_ticket.clone(),
             ));
         }
 
@@ -604,7 +679,7 @@ impl MasterServer {
             } else {
                 8080
             };
-            let disc_registry = registry.clone();
+            let disc_registry = handle.registry().clone();
             tokio::spawn(async move {
                 spawn_master_discovery_service(
                     listen_ip,
@@ -618,18 +693,9 @@ impl MasterServer {
             });
         }
 
-        Ok(MasterHandle {
-            server_addr,
-            dashboard_addr,
-            registry,
-            queue,
-            scheduler_notify,
-            waiters,
-            shutdown_tx,
-            #[cfg(feature = "dashboard")]
-            broadcast_tx,
-        })
+        Ok(handle)
     }
+
 
     /// Returns the local socket address this server is listening on.
     pub fn local_addr(&self) -> SocketAddr {
@@ -654,6 +720,56 @@ impl MasterServer {
     /// Returns a reference to the scheduler notification trigger.
     pub fn scheduler_notify(&self) -> &Arc<tokio::sync::Notify> {
         &self.scheduler_notify
+    }
+
+    /// Returns a reference to the active P2P endpoint, if enabled.
+    #[cfg(feature = "p2p")]
+    pub fn p2p_endpoint(&self) -> Option<&iroh::Endpoint> {
+        self.p2p_endpoint.as_ref()
+    }
+
+    /// Returns the active P2P connection registry mapping worker IDs to connections.
+    #[cfg(feature = "p2p")]
+    pub fn p2p_connection_map(
+        &self,
+    ) -> Arc<tokio::sync::RwLock<HashMap<Uuid, iroh::endpoint::Connection>>> {
+        Arc::clone(&self.p2p_active_conns)
+    }
+
+    /// Queries live P2P path and latency telemetry for a connected worker.
+    #[cfg(feature = "p2p")]
+    pub async fn get_worker_p2p_info(
+        &self,
+        worker_id: &Uuid,
+    ) -> Option<rusty_grid_core::transport::P2pPathInfo> {
+        let guard = self.p2p_active_conns.read().await;
+        guard
+            .get(worker_id)
+            .and_then(rusty_grid_core::transport::inspect_connection_paths)
+    }
+
+    /// Returns the active P2P ticket for this master instance, if P2P is enabled.
+    pub fn p2p_ticket(&self) -> Option<&str> {
+        self.p2p_ticket.as_deref()
+    }
+}
+
+/// Returns the platform-specific default master P2P secret key file path.
+/// Unix / macOS: ~/.oxideswarm/master_key.bin
+/// Windows: %USERPROFILE%\.oxideswarm\master_key.bin
+pub fn default_master_key_file() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+            .map(|h| h.join(".oxideswarm").join("master_key.bin"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|h| h.join(".oxideswarm").join("master_key.bin"))
     }
 }
 
@@ -728,6 +844,7 @@ impl MasterServer {
             let p2p_hb = self.config.heartbeat_interval_secs;
             let p2p_to = Duration::from_secs(self.config.handshake_timeout_secs);
             let p2p_codec = self.config.wire_codec;
+            let p2p_conns = Arc::clone(&self.p2p_active_conns);
 
             tokio::spawn(async move {
                 let mut p2p_shutdown = p2p_shutdown_rx;
@@ -740,13 +857,24 @@ impl MasterServer {
                                         match conn.accept_bi().await {
                                             Ok((send, recv)) => {
                                                 let grid_stream = GridStream::P2p(BiStream::new(recv, send));
-                                                let remote_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+                                                let path_info = rusty_grid_core::transport::inspect_connection_paths(&conn);
+                                                let remote_addr: SocketAddr = if let Some(ref info) = path_info {
+                                                    if info.is_ip {
+                                                        info.remote_addr.parse().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap())
+                                                    } else {
+                                                        "127.0.0.1:0".parse().unwrap()
+                                                    }
+                                                } else {
+                                                    "127.0.0.1:0".parse().unwrap()
+                                                };
                                                 let c_reg = p2p_reg.clone();
                                                 let c_q = p2p_queue.clone();
                                                 let c_sched = p2p_sched.clone();
                                                 let c_wait = Arc::clone(&p2p_waiters);
                                                 let c_shut = p2p_shutdown.clone();
                                                 let c_codec = p2p_codec;
+                                                let c_conns = Arc::clone(&p2p_conns);
+                                                let c_conn = conn.clone();
                                                 #[cfg(feature = "dashboard")]
                                                 let c_bcast = p2p_broadcast_tx.clone();
                                                 tokio::spawn(async move {
@@ -764,6 +892,10 @@ impl MasterServer {
                                                          c_codec,
                                                          #[cfg(feature = "dashboard")]
                                                          c_bcast,
+                                                         #[cfg(feature = "p2p")]
+                                                         Some(c_conn),
+                                                         #[cfg(feature = "p2p")]
+                                                         Some(c_conns),
                                                     ).await;
                                                 });
                                             }
@@ -803,6 +935,8 @@ impl MasterServer {
                             let conn_wire_codec = self.config.wire_codec;
                             #[cfg(feature = "dashboard")]
                             let conn_broadcast_tx = self.broadcast_tx.clone();
+                            #[cfg(feature = "p2p")]
+                            let conn_p2p_active = Arc::clone(&self.p2p_active_conns);
 
                             let (abort_tx, abort_rx) = oneshot::channel::<AbortHandle>();
                             let conn_handle = tokio::spawn(async move {
@@ -821,6 +955,10 @@ impl MasterServer {
                                     conn_wire_codec,
                                     #[cfg(feature = "dashboard")]
                                     conn_broadcast_tx,
+                                    #[cfg(feature = "p2p")]
+                                    None,
+                                    #[cfg(feature = "p2p")]
+                                    Some(conn_p2p_active),
                                 ).await {
                                     debug!(remote_addr = %remote_addr, error = %e, "Worker connection ended");
                                 }
@@ -855,9 +993,11 @@ impl MasterServer {
             info!(path = %dp_path.display(), "Dashboard port file removed on shutdown");
         }
 
-        // Clean up P2P ticket file on shutdown
-        if let Some(ref ticket_path) = self.config.p2p_ticket_file {
-            let _ = tokio::fs::remove_file(ticket_path).await;
+        // Clean up P2P ticket file on shutdown only if running in ephemeral mode
+        if self.config.ephemeral_key {
+            if let Some(ref ticket_path) = self.config.p2p_ticket_file {
+                let _ = tokio::fs::remove_file(ticket_path).await;
+            }
         }
 
         Ok(())
@@ -1195,6 +1335,7 @@ async fn handle_worker_disconnect_internal(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     first_msg: ClientMessage,
     mut transport: MessageTransport<S>,
@@ -1204,6 +1345,9 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     waiters: WaiterMap,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<
         tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
+    #[cfg(feature = "p2p")] p2p_conns: Option<
+        Arc<tokio::sync::RwLock<HashMap<Uuid, iroh::endpoint::Connection>>>,
     >,
 ) -> GridResult<()> {
     let mut next_msg = Some(first_msg);
@@ -1329,7 +1473,33 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
             }
             ClientMessage::ClusterStatus => {
                 let workers_info = registry.list_all_workers().await;
-                let workers = workers_info.into_iter().map(|w| w.capabilities).collect();
+                let mut workers = Vec::with_capacity(workers_info.len());
+                for w in workers_info {
+                    let mut caps = w.capabilities;
+                    #[cfg(feature = "p2p")]
+                    if let Some(ref conns) = p2p_conns {
+                        let guard = conns.read().await;
+                        if let Some(conn) = guard.get(&w.worker_id) {
+                            if let Some(info) = rusty_grid_core::transport::inspect_connection_paths(conn) {
+                                let tag = if info.is_relay {
+                                    format!("link:Relay (DERP):{:.1}ms", info.rtt_ms)
+                                } else {
+                                    format!("link:Direct P2P (QUIC):{:.1}ms", info.rtt_ms)
+                                };
+                                caps.tags.push(tag);
+                            } else {
+                                caps.tags.push("link:Direct P2P (QUIC)".to_string());
+                            }
+                        } else {
+                            caps.tags.push("link:TCP/LAN".to_string());
+                        }
+                    } else {
+                        caps.tags.push("link:TCP/LAN".to_string());
+                    }
+                    #[cfg(not(feature = "p2p"))]
+                    caps.tags.push("link:TCP/LAN".to_string());
+                    workers.push(caps);
+                }
                 let stats = queue.stats().await;
                 let resp = ClientResponse::ClusterStatus {
                     total_tasks: stats.total,
@@ -1343,7 +1513,33 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
             }
             ClientMessage::ListWorkers => {
                 let workers_info = registry.list_all_workers().await;
-                let workers = workers_info.into_iter().map(|w| w.capabilities).collect();
+                let mut workers = Vec::with_capacity(workers_info.len());
+                for w in workers_info {
+                    let mut caps = w.capabilities;
+                    #[cfg(feature = "p2p")]
+                    if let Some(ref conns) = p2p_conns {
+                        let guard = conns.read().await;
+                        if let Some(conn) = guard.get(&w.worker_id) {
+                            if let Some(info) = rusty_grid_core::transport::inspect_connection_paths(conn) {
+                                let tag = if info.is_relay {
+                                    format!("link:Relay (DERP):{:.1}ms", info.rtt_ms)
+                                } else {
+                                    format!("link:Direct P2P (QUIC):{:.1}ms", info.rtt_ms)
+                                };
+                                caps.tags.push(tag);
+                            } else {
+                                caps.tags.push("link:Direct P2P (QUIC)".to_string());
+                            }
+                        } else {
+                            caps.tags.push("link:TCP/LAN".to_string());
+                        }
+                    } else {
+                        caps.tags.push("link:TCP/LAN".to_string());
+                    }
+                    #[cfg(not(feature = "p2p"))]
+                    caps.tags.push("link:TCP/LAN".to_string());
+                    workers.push(caps);
+                }
                 let resp = ClientResponse::WorkerList { workers };
                 transport.send_msg(&resp).await?;
             }
@@ -1380,6 +1576,10 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     wire_codec: WireCodec,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<
         tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
+    #[cfg(feature = "p2p")] p2p_conn: Option<iroh::endpoint::Connection>,
+    #[cfg(feature = "p2p")] p2p_conns: Option<
+        Arc<tokio::sync::RwLock<HashMap<Uuid, iroh::endpoint::Connection>>>,
     >,
 ) -> GridResult<()> {
     let mut transport = MessageTransport::with_codec(stream, wire_codec);
@@ -1422,6 +1622,8 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 waiters,
                 #[cfg(feature = "dashboard")]
                 broadcast_tx,
+                #[cfg(feature = "p2p")]
+                p2p_conns,
             )
             .await;
         }
@@ -1477,6 +1679,17 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             abort_handle,
         )
         .await?;
+
+    #[cfg(feature = "p2p")]
+    if let (Some(ref conn), Some(ref conns)) = (&p2p_conn, &p2p_conns) {
+        conns.write().await.insert(worker_id, conn.clone());
+        let path_info = rusty_grid_core::transport::inspect_connection_paths(conn);
+        info!(
+            worker_id = %worker_id,
+            path_info = ?path_info,
+            "Tracked P2P connection path for registered worker"
+        );
+    }
 
     // 4. Send RegisterAck
     let ack = MasterMessage::RegisterAck {
@@ -1704,6 +1917,10 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         broadcast_tx.as_ref(),
     )
     .await;
+    #[cfg(feature = "p2p")]
+    if let Some(ref conns) = p2p_conns {
+        conns.write().await.remove(&worker_id);
+    }
     writer_task.abort();
     Ok(())
 }
@@ -1721,9 +1938,19 @@ pub struct MasterHandle {
     #[cfg(feature = "dashboard")]
     pub broadcast_tx:
         Option<tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>>,
+    #[cfg(feature = "p2p")]
+    p2p_endpoint: Option<iroh::Endpoint>,
+    #[cfg(feature = "p2p")]
+    p2p_active_conns: Arc<tokio::sync::RwLock<HashMap<Uuid, iroh::endpoint::Connection>>>,
+    /// Master's active P2P ticket, if enabled.
+    pub p2p_ticket: Option<String>,
 }
 
 impl MasterHandle {
+    /// Returns the active P2P ticket for this master instance, if P2P is enabled.
+    pub fn p2p_ticket(&self) -> Option<&str> {
+        self.p2p_ticket.as_deref()
+    }
     /// Returns the bound dashboard socket address, if the dashboard is enabled.
     pub fn dashboard_addr(&self) -> Option<SocketAddr> {
         self.dashboard_addr
@@ -1741,6 +1968,33 @@ impl MasterHandle {
     ) -> Option<tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>> {
         self.broadcast_tx.clone()
     }
+
+    /// Returns a reference to the active P2P endpoint, if enabled.
+    #[cfg(feature = "p2p")]
+    pub fn p2p_endpoint(&self) -> Option<&iroh::Endpoint> {
+        self.p2p_endpoint.as_ref()
+    }
+
+    /// Returns the active P2P connection registry mapping worker IDs to connections.
+    #[cfg(feature = "p2p")]
+    pub fn p2p_connection_map(
+        &self,
+    ) -> Arc<tokio::sync::RwLock<HashMap<Uuid, iroh::endpoint::Connection>>> {
+        Arc::clone(&self.p2p_active_conns)
+    }
+
+    /// Queries live P2P path and latency telemetry for a connected worker.
+    #[cfg(feature = "p2p")]
+    pub async fn get_worker_p2p_info(
+        &self,
+        worker_id: &Uuid,
+    ) -> Option<rusty_grid_core::transport::P2pPathInfo> {
+        let guard = self.p2p_active_conns.read().await;
+        guard
+            .get(worker_id)
+            .and_then(rusty_grid_core::transport::inspect_connection_paths)
+    }
+
 
     /// Submits a task with default priority (0).
     pub async fn submit_task(&self, task: Task) -> GridResult<TaskId> {

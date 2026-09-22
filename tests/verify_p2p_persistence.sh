@@ -249,11 +249,11 @@ else
 fi
 
 log_section "PHASE 7: Verifying Ephemeral Behavior (Negative Control)"
-log_info "Starting two runs without --p2p-key-file to prove tickets differ without persistence..."
+log_info "Starting two runs with --ephemeral-key to prove tickets differ without persistence..."
 rm -f "$TICKET_FILE" "$PORT_FILE"
 
 # Ephemeral Run A
-$BIN master --listen "127.0.0.1:0" --port-file "$PORT_FILE" --p2p --p2p-ticket-file "$TICKET_FILE" > "${TEST_DIR}/eph_a.log" 2>&1 &
+$BIN master --listen "127.0.0.1:0" --port-file "$PORT_FILE" --p2p --ephemeral-key --p2p-ticket-file "$TICKET_FILE" > "${TEST_DIR}/eph_a.log" 2>&1 &
 EPH_A_PID=$!
 wait_for_file_and_content "$TICKET_FILE" "$EPH_A_PID" "${TEST_DIR}/eph_a.log" 100
 TICKET_EPH_A=$(tr -d '\r\n' < "$TICKET_FILE")
@@ -262,7 +262,7 @@ stop_master_process "$EPH_A_PID"
 rm -f "$TICKET_FILE" "$PORT_FILE"
 
 # Ephemeral Run B
-$BIN master --listen "127.0.0.1:0" --port-file "$PORT_FILE" --p2p --p2p-ticket-file "$TICKET_FILE" > "${TEST_DIR}/eph_b.log" 2>&1 &
+$BIN master --listen "127.0.0.1:0" --port-file "$PORT_FILE" --p2p --ephemeral-key --p2p-ticket-file "$TICKET_FILE" > "${TEST_DIR}/eph_b.log" 2>&1 &
 EPH_B_PID=$!
 wait_for_file_and_content "$TICKET_FILE" "$EPH_B_PID" "${TEST_DIR}/eph_b.log" 100
 TICKET_EPH_B=$(tr -d '\r\n' < "$TICKET_FILE")
@@ -271,7 +271,56 @@ stop_master_process "$EPH_B_PID"
 if [[ "$TICKET_EPH_A" != "$TICKET_EPH_B" ]]; then
     log_pass "Verified negative control: ephemeral runs generated different tickets as expected."
 else
-    log_warn "Ephemeral tickets were identical (unexpected for random keys)."
+    log_fail "Ephemeral tickets were identical (unexpected for random keys)."
+    exit 1
 fi
 
-log_pass "All persistence checks passed with 100% success!"
+log_section "PHASE 8: Verifying 0-Config Default Key Persistence (~/.oxideswarm/master_key.bin)"
+log_info "Starting two master runs with --p2p and NO key file flags, verifying auto-persistence..."
+MOCK_HOME="${TEST_DIR}/mock_home"
+mkdir -p "$MOCK_HOME"
+rm -f "$TICKET_FILE" "$PORT_FILE"
+
+# 0-Config Run 1
+HOME="$MOCK_HOME" USERPROFILE="$MOCK_HOME" $BIN master \
+    --listen "127.0.0.1:0" \
+    --port-file "$PORT_FILE" \
+    --p2p \
+    --p2p-ticket-file "$TICKET_FILE" > "${TEST_DIR}/auto_run1.log" 2>&1 &
+AUTO_1_PID=$!
+wait_for_file_and_content "$TICKET_FILE" "$AUTO_1_PID" "${TEST_DIR}/auto_run1.log" 100
+TICKET_AUTO_1=$(tr -d '\r\n' < "$TICKET_FILE")
+stop_master_process "$AUTO_1_PID"
+
+DEFAULT_KEY_FILE="${MOCK_HOME}/.oxideswarm/master_key.bin"
+if [[ ! -f "$DEFAULT_KEY_FILE" || ! -s "$DEFAULT_KEY_FILE" ]]; then
+    log_fail "Default master key file was not created at ${DEFAULT_KEY_FILE}!"
+    cat "${TEST_DIR}/auto_run1.log" >&2
+    exit 1
+fi
+AUTO_KEY_SIZE=$(wc -c < "$DEFAULT_KEY_FILE" | tr -d '[:space:]')
+log_pass "Verified default master key file automatically created at ${DEFAULT_KEY_FILE} (${AUTO_KEY_SIZE} bytes)."
+
+rm -f "$TICKET_FILE" "$PORT_FILE"
+
+# 0-Config Run 2
+HOME="$MOCK_HOME" USERPROFILE="$MOCK_HOME" $BIN master \
+    --listen "127.0.0.1:0" \
+    --port-file "$PORT_FILE" \
+    --p2p \
+    --p2p-ticket-file "$TICKET_FILE" > "${TEST_DIR}/auto_run2.log" 2>&1 &
+AUTO_2_PID=$!
+wait_for_file_and_content "$TICKET_FILE" "$AUTO_2_PID" "${TEST_DIR}/auto_run2.log" 100
+TICKET_AUTO_2=$(tr -d '\r\n' < "$TICKET_FILE")
+stop_master_process "$AUTO_2_PID"
+
+if [[ "$TICKET_AUTO_1" == "$TICKET_AUTO_2" ]]; then
+    log_pass "0-Config default key persistence verified! Ticket 1 == Ticket 2 across restarts."
+else
+    log_fail "0-Config ticket mismatch! Default key persistence failed."
+    log_fail "Ticket 1: ${TICKET_AUTO_1}"
+    log_fail "Ticket 2: ${TICKET_AUTO_2}"
+    exit 1
+fi
+
+log_pass "All persistence checks (explicit key, negative control, 0-config default) passed with 100% success!"

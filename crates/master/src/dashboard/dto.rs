@@ -21,6 +21,9 @@ pub struct ClusterStatusDto {
     pub workers: WorkerSummaryDto,
     /// Summary counts of tasks by lifecycle state.
     pub tasks: QueueStats,
+    /// Master's active P2P ticket for 1-click worker pairing.
+    #[serde(default)]
+    pub p2p_ticket: Option<String>,
 }
 
 /// Summary counts of connected and active worker nodes.

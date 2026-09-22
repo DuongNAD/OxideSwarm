@@ -166,6 +166,12 @@ pub struct MasterArgs {
 
     #[arg(
         long,
+        help = "Do not persist P2P secret key to default ~/.oxideswarm/master_key.bin; generate ephemeral key"
+    )]
+    pub ephemeral_key: bool,
+
+    #[arg(
+        long,
         default_value = "bincode",
         help = "Wire format codec: bincode or json (default: bincode)"
     )]
@@ -463,7 +469,14 @@ async fn run_master(args: MasterArgs, config_file: Option<config::ConfigFile>) -
         master_cfg.as_ref().and_then(|m| m.p2p_ticket_file.clone()),
     );
 
-    let p2p_key_file = resolve_opt_string(
+    let ephemeral_key = resolve_bool(
+        if args.ephemeral_key { Some(true) } else { None },
+        &["RUSTY_GRID_EPHEMERAL_KEY"],
+        None,
+        false,
+    );
+
+    let mut p2p_key_file = resolve_opt_string(
         args.p2p_key_file.map(|p| p.display().to_string()),
         &["RUSTY_GRID_P2P_KEY_FILE"],
         master_cfg.as_ref().and_then(|m| m.p2p_key_file.clone()),
@@ -478,6 +491,12 @@ async fn run_master(args: MasterArgs, config_file: Option<config::ConfigFile>) -
 
     if p2p_key_file.is_some() || p2p_ticket_file.is_some() {
         enable_p2p = true;
+    }
+
+    if enable_p2p && p2p_key_file.is_none() && !ephemeral_key {
+        if let Some(def_key) = rusty_grid_master::server::default_master_key_file() {
+            p2p_key_file = Some(def_key.display().to_string());
+        }
     }
 
     let mut server_config = match ServerConfig::from_addr(&listen_addr_str) {
@@ -501,6 +520,7 @@ async fn run_master(args: MasterArgs, config_file: Option<config::ConfigFile>) -
     server_config = server_config
         .with_heartbeat_interval(heartbeat_interval)
         .with_p2p(enable_p2p)
+        .with_ephemeral_key(ephemeral_key)
         .with_max_retries(default_retry_max);
 
     if let Some(ref tf) = p2p_ticket_file {
@@ -1034,14 +1054,30 @@ async fn run_status(args: StatusArgs, config_file: Option<config::ConfigFile>) -
         match transport.recv_msg::<ClientResponse>().await {
             Ok(Some(ClientResponse::WorkerList { workers })) => {
                 if args.json {
-                    println!("{}", serde_json::to_string_pretty(&workers).unwrap());
+                    let enriched_workers: Vec<serde_json::Value> = workers
+                        .iter()
+                        .map(|w| {
+                            let link = parse_worker_link(w);
+                            let mut val = serde_json::to_value(w).unwrap_or_default();
+                            if let Some(l) = link {
+                                if let Some(obj) = val.as_object_mut() {
+                                    obj.insert("link".to_string(), serde_json::Value::String(l));
+                                }
+                            }
+                            val
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&enriched_workers).unwrap());
                 } else {
                     println!("Connected Workers ({}):", workers.len());
-                    for w in workers {
+                    for w in &workers {
                         println!(
                             "- Worker [{}] (Cores: {}, RAM: {}MB, GPU: {}, Simulated: {})",
                             w.name, w.cpu_cores, w.ram_mb, w.has_gpu, w.is_simulated_gpu,
                         );
+                        if let Some(link) = parse_worker_link(w) {
+                            println!("  └─ {}", link);
+                        }
                     }
                 }
                 ExitCode::SUCCESS
@@ -1067,6 +1103,19 @@ async fn run_status(args: StatusArgs, config_file: Option<config::ConfigFile>) -
                 workers,
             })) => {
                 if args.json {
+                    let enriched_workers: Vec<serde_json::Value> = workers
+                        .iter()
+                        .map(|w| {
+                            let link = parse_worker_link(w);
+                            let mut val = serde_json::to_value(w).unwrap_or_default();
+                            if let Some(l) = link {
+                                if let Some(obj) = val.as_object_mut() {
+                                    obj.insert("link".to_string(), serde_json::Value::String(l));
+                                }
+                            }
+                            val
+                        })
+                        .collect();
                     println!(
                         "{}",
                         serde_json::json!({
@@ -1076,7 +1125,7 @@ async fn run_status(args: StatusArgs, config_file: Option<config::ConfigFile>) -
                             "completed_tasks": completed_tasks,
                             "failed_tasks": failed_tasks,
                             "worker_count": workers.len(),
-                            "workers": workers
+                            "workers": enriched_workers
                         })
                     );
                 } else {
@@ -1089,11 +1138,14 @@ async fn run_status(args: StatusArgs, config_file: Option<config::ConfigFile>) -
                     println!("Failed Tasks:     {}", failed_tasks);
                     if !workers.is_empty() {
                         println!("\nWorkers:");
-                        for w in workers {
+                        for w in &workers {
                             println!(
                                 "  • [{}] (Cores: {}, RAM: {}MB, GPU: {})",
                                 w.name, w.cpu_cores, w.ram_mb, w.has_gpu
                             );
+                            if let Some(link) = parse_worker_link(w) {
+                                println!("    └─ {}", link);
+                            }
                         }
                     }
                 }
@@ -1105,6 +1157,19 @@ async fn run_status(args: StatusArgs, config_file: Option<config::ConfigFile>) -
             }
         }
     }
+}
+
+fn parse_worker_link(w: &rusty_grid_core::WorkerCapabilities) -> Option<String> {
+    for tag in &w.tags {
+        if let Some(rest) = tag.strip_prefix("link:") {
+            if let Some((kind, rtt)) = rest.split_once(':') {
+                return Some(format!("Link: {} | RTT: {}", kind, rtt));
+            } else {
+                return Some(format!("Link: {}", rest));
+            }
+        }
+    }
+    Some("Link: TCP/LAN".to_string())
 }
 
 async fn run_workers(args: WorkersArgs, config_file: Option<config::ConfigFile>) -> ExitCode {
@@ -1243,3 +1308,33 @@ async fn run_mapreduce(args: MapReduceArgs, config_file: Option<config::ConfigFi
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusty_grid_core::WorkerCapabilities;
+
+    #[test]
+    fn test_parse_worker_link_direct_p2p() {
+        let caps = WorkerCapabilities::new("worker-1", 4, 4096, false, false, None)
+            .with_tags(vec!["link:Direct P2P (QUIC):18ms".to_string()]);
+        let link = parse_worker_link(&caps);
+        assert_eq!(link.as_deref(), Some("Link: Direct P2P (QUIC) | RTT: 18ms"));
+    }
+
+    #[test]
+    fn test_parse_worker_link_relay_derp() {
+        let caps = WorkerCapabilities::new("worker-2", 4, 4096, false, false, None)
+            .with_tags(vec!["link:Relay (DERP):120ms".to_string()]);
+        let link = parse_worker_link(&caps);
+        assert_eq!(link.as_deref(), Some("Link: Relay (DERP) | RTT: 120ms"));
+    }
+
+    #[test]
+    fn test_parse_worker_link_default_tcp() {
+        let caps = WorkerCapabilities::new("worker-3", 4, 4096, false, false, None);
+        let link = parse_worker_link(&caps);
+        assert_eq!(link.as_deref(), Some("Link: TCP/LAN"));
+    }
+}
+

@@ -19,6 +19,9 @@
 .PARAMETER Master
     Address of the Master coordinator node. Default: "127.0.0.1:8080"
 
+.PARAMETER P2pTicket
+    P2P connection ticket string from Master for NAT traversal.
+
 .PARAMETER WorkerBin
     Path to compiled rusty-grid.exe binary.
 
@@ -87,6 +90,9 @@ param (
 
     [Parameter()]
     [string]$Master = "127.0.0.1:8080",
+
+    [Parameter()]
+    [string]$P2pTicket = "",
 
     [Parameter()]
     [string]$WorkerBin = "",
@@ -313,6 +319,10 @@ if ($WorkerName) {
     $tomlLines += "name = `"$WorkerName`""
 }
 
+if ($P2pTicket) {
+    $tomlLines += "p2p_ticket = '$P2pTicket'"
+}
+
 if ($MaxConcurrency -gt 0) {
     $tomlLines += "max_concurrency = $MaxConcurrency"
 }
@@ -408,13 +418,18 @@ if ($ServiceMethod -eq "WinSW") {
             $templateXml = Join-Path $configDir "winsw.xml"
         }
 
+        $serviceArguments = "worker --config `"$ConfigPath`""
+        if ($P2pTicket) {
+            $serviceArguments += " --p2p-ticket `"$P2pTicket`""
+        }
+
         if (Test-Path $templateXml) {
             [xml]$xmlDoc = Get-Content $templateXml
             $xmlDoc.service.id = $ServiceName
             $xmlDoc.service.name = $DisplayName
             $xmlDoc.service.description = $Description
             $xmlDoc.service.executable = $destWorkerBin
-            $xmlDoc.service.arguments = "worker --config `"$ConfigPath`""
+            $xmlDoc.service.arguments = $serviceArguments
             $xmlDoc.service.workingdirectory = $InstallDir
             if ($xmlDoc.service.log) {
                 $xmlDoc.service.log.logpath = $LogDir
@@ -428,7 +443,7 @@ if ($ServiceMethod -eq "WinSW") {
   <name>$DisplayName</name>
   <description>$Description</description>
   <executable>$destWorkerBin</executable>
-  <arguments>worker --config "$ConfigPath"</arguments>
+  <arguments>$serviceArguments</arguments>
   <workingdirectory>$InstallDir</workingdirectory>
   <priority>Normal</priority>
   <stoptimeout>15 sec</stoptimeout>
@@ -559,6 +574,9 @@ Write-Host "[OK] SCM Failure Recovery configured successfully." -ForegroundColor
 [Environment]::SetEnvironmentVariable("OXIDESWARM_BIN", $destWorkerBin, [EnvironmentVariableTarget]::Machine)
 [Environment]::SetEnvironmentVariable("OXIDESWARM_CONFIG", $ConfigPath, [EnvironmentVariableTarget]::Machine)
 [Environment]::SetEnvironmentVariable("OXIDESWARM_LOG_DIR", $LogDir, [EnvironmentVariableTarget]::Machine)
+if ($P2pTicket) {
+    [Environment]::SetEnvironmentVariable("OXIDESWARM_P2P_TICKET", $P2pTicket, [EnvironmentVariableTarget]::Machine)
+}
 Write-Host "[OK] Configured system environment variables for worker." -ForegroundColor Green
 
 # ==============================================================================

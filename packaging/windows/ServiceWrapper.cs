@@ -115,6 +115,11 @@ namespace OxideSwarm.Packaging.Windows
         private void StartWorkerProcess()
         {
             string arguments = string.Format("worker --config \"{0}\"", _resolvedConfigPath);
+            string p2pTicketEnv = Environment.GetEnvironmentVariable("OXIDESWARM_P2P_TICKET");
+            if (!string.IsNullOrEmpty(p2pTicketEnv))
+            {
+                arguments += string.Format(" --p2p-ticket \"{0}\"", p2pTicketEnv);
+            }
 
             ProcessStartInfo psi = new ProcessStartInfo
             {

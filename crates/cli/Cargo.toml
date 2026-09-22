@@ -61,4 +61,13 @@ path = "../../tests/workflow_modes_test.rs"
 name = "discovery_integration"
 path = "../../tests/discovery_integration.rs"
 
+[[test]]
+name = "test_p2p_wan_fallback"
+path = "../../tests/test_p2p_wan_fallback.rs"
+
+[[test]]
+name = "test_m2_identity_scripts"
+path = "../../tests/test_m2_identity_scripts.rs"
+
+
 
