@@ -7,10 +7,10 @@
 #[cfg(feature = "p2p")]
 #[tokio::test]
 async fn benchmark_iroh_quic_stream_rtt() {
-    use std::time::Instant;
     use iroh::endpoint::RelayMode;
     use rusty_grid_core::protocol::{MasterMessage, MessageTransport, WorkerMessage};
     use rusty_grid_core::transport::{BiStream, GridStream, GRID_ALPN};
+    use std::time::Instant;
     use uuid::Uuid;
 
     let endpoint1 = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
@@ -32,7 +32,12 @@ async fn benchmark_iroh_quic_stream_rtt() {
     // Server accept task spawned in background
     let ep1 = endpoint1.clone();
     let server_task = tokio::spawn(async move {
-        let incoming = ep1.accept().await.expect("accept incoming").await.expect("handshake");
+        let incoming = ep1
+            .accept()
+            .await
+            .expect("accept incoming")
+            .await
+            .expect("handshake");
         let (send1, recv1) = incoming.accept_bi().await.expect("accept_bi on server");
         let stream1 = GridStream::P2p(BiStream::new(recv1, send1));
         let mut server_transport = MessageTransport::new(stream1);
@@ -72,7 +77,11 @@ async fn benchmark_iroh_quic_stream_rtt() {
             ram_available_mb: 4096,
         };
         client_transport.send_msg(&hb).await.expect("warmup send");
-        let _ack: MasterMessage = client_transport.recv_msg().await.expect("recv").expect("ack");
+        let _ack: MasterMessage = client_transport
+            .recv_msg()
+            .await
+            .expect("recv")
+            .expect("ack");
     }
 
     // Benchmark (100 iterations)
@@ -89,7 +98,11 @@ async fn benchmark_iroh_quic_stream_rtt() {
         };
         let t0 = Instant::now();
         client_transport.send_msg(&hb).await.expect("bench send");
-        let _ack: MasterMessage = client_transport.recv_msg().await.expect("recv").expect("ack");
+        let _ack: MasterMessage = client_transport
+            .recv_msg()
+            .await
+            .expect("recv")
+            .expect("ack");
         let elapsed = t0.elapsed();
         latencies_us.push(elapsed.as_micros() as f64);
     }
@@ -121,7 +134,10 @@ async fn benchmark_iroh_quic_stream_rtt() {
     println!("p99 RTT: {:.3} ms ({:.1} µs)", p99_us / 1000.0, p99_us);
     println!("Max RTT: {:.3} ms ({:.1} µs)", max_us / 1000.0, max_us);
     if let Some(rtt) = quic_rtt {
-        println!("QUIC Internal Smoothed RTT: {:.3} ms", rtt.as_secs_f64() * 1000.0);
+        println!(
+            "QUIC Internal Smoothed RTT: {:.3} ms",
+            rtt.as_secs_f64() * 1000.0
+        );
     }
     println!("======================================================\n");
 

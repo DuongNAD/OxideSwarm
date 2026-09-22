@@ -28,11 +28,11 @@ use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 
-pub use dto::*;
-use rusty_grid_core::task::TaskId;
 use crate::queue::TaskInfo;
 use crate::registry::{WorkerInfo, WorkerRegistry, WorkerStatus};
 use crate::TaskQueue;
+pub use dto::*;
+use rusty_grid_core::task::TaskId;
 
 /// Shared application state injected into Axum route handlers.
 #[derive(Clone)]
@@ -291,7 +291,11 @@ async fn sse_handler(
         let snapshot = state_clone.build_snapshot().await;
         let snapshot_msg = DashboardStreamMessage::Snapshot(snapshot);
         if let Ok(json) = serde_json::to_string(&snapshot_msg) {
-            if tx.send(Ok(Event::default().event("snapshot").data(json))).await.is_err() {
+            if tx
+                .send(Ok(Event::default().event("snapshot").data(json)))
+                .await
+                .is_err()
+            {
                 return;
             }
         }
@@ -303,7 +307,11 @@ async fn sse_handler(
                 Ok(msg) => {
                     let event_type = msg.event_name();
                     if let Ok(json) = serde_json::to_string(&msg) {
-                        if tx.send(Ok(Event::default().event(event_type).data(json))).await.is_err() {
+                        if tx
+                            .send(Ok(Event::default().event(event_type).data(json)))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -313,7 +321,11 @@ async fn sse_handler(
                     let fresh_snapshot = state_clone.build_snapshot().await;
                     let msg = DashboardStreamMessage::Snapshot(fresh_snapshot);
                     if let Ok(json) = serde_json::to_string(&msg) {
-                        if tx.send(Ok(Event::default().event("snapshot").data(json))).await.is_err() {
+                        if tx
+                            .send(Ok(Event::default().event("snapshot").data(json)))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }

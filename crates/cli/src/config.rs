@@ -229,11 +229,7 @@ pub fn resolve_u32(
     resolve_field(cli, env_names, file_val, default, |s| s.trim().parse().ok())
 }
 
-pub fn resolve_opt_u32(
-    cli: Option<u32>,
-    env_names: &[&str],
-    file_val: Option<u32>,
-) -> Option<u32> {
+pub fn resolve_opt_u32(cli: Option<u32>, env_names: &[&str], file_val: Option<u32>) -> Option<u32> {
     resolve_opt_field(cli, env_names, file_val, |s| s.trim().parse().ok())
 }
 
@@ -258,11 +254,7 @@ pub fn resolve_opt_u64(cli: Option<u64>, env_names: &[&str], file_val: Option<u6
     resolve_opt_field(cli, env_names, file_val, |s| s.trim().parse().ok())
 }
 
-pub fn resolve_opt_u16(
-    cli: Option<u16>,
-    env_names: &[&str],
-    file_val: Option<u16>,
-) -> Option<u16> {
+pub fn resolve_opt_u16(cli: Option<u16>, env_names: &[&str], file_val: Option<u16>) -> Option<u16> {
     resolve_opt_field(cli, env_names, file_val, |s| s.trim().parse().ok())
 }
 
@@ -372,9 +364,23 @@ gpu_name = "Mock RTX"
   }
 }"#;
         let parsed_json: ConfigFile = serde_json::from_str(json_str).expect("parse json");
-        assert_eq!(parsed_json.master.as_ref().unwrap().preserve_gpu, Some(false));
-        assert_eq!(parsed_json.master.as_ref().unwrap().dashboard_port, Some(8080));
-        assert_eq!(parsed_json.master.as_ref().unwrap().dashboard_port_file.as_deref(), Some("dashboard.port"));
+        assert_eq!(
+            parsed_json.master.as_ref().unwrap().preserve_gpu,
+            Some(false)
+        );
+        assert_eq!(
+            parsed_json.master.as_ref().unwrap().dashboard_port,
+            Some(8080)
+        );
+        assert_eq!(
+            parsed_json
+                .master
+                .as_ref()
+                .unwrap()
+                .dashboard_port_file
+                .as_deref(),
+            Some("dashboard.port")
+        );
     }
 
     #[test]

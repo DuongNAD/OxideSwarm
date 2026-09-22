@@ -66,11 +66,26 @@ pub fn spawn_reaper_with_queue(
 ) -> tokio::task::JoinHandle<()> {
     #[cfg(feature = "dashboard")]
     {
-        spawn_reaper_with_broadcast(registry, queue, scheduler_notify, waiters, config, shutdown_rx, None)
+        spawn_reaper_with_broadcast(
+            registry,
+            queue,
+            scheduler_notify,
+            waiters,
+            config,
+            shutdown_rx,
+            None,
+        )
     }
     #[cfg(not(feature = "dashboard"))]
     {
-        spawn_reaper_internal(registry, queue, scheduler_notify, waiters, config, shutdown_rx)
+        spawn_reaper_internal(
+            registry,
+            queue,
+            scheduler_notify,
+            waiters,
+            config,
+            shutdown_rx,
+        )
     }
 }
 
@@ -83,7 +98,9 @@ pub fn spawn_reaper_with_broadcast(
     waiters: Option<crate::server::WaiterMap>,
     config: ReaperConfig,
     mut shutdown_rx: watch::Receiver<bool>,
-    broadcast_tx: Option<tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>>,
+    broadcast_tx: Option<
+        tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         info!(
@@ -278,7 +295,14 @@ pub fn spawn_reaper(
 ) -> tokio::task::JoinHandle<()> {
     let dummy_queue = TaskQueue::new();
     let dummy_notify = Arc::new(tokio::sync::Notify::new());
-    spawn_reaper_with_queue(registry, dummy_queue, dummy_notify, None, config, shutdown_rx)
+    spawn_reaper_with_queue(
+        registry,
+        dummy_queue,
+        dummy_notify,
+        None,
+        config,
+        shutdown_rx,
+    )
 }
 
 #[cfg(test)]

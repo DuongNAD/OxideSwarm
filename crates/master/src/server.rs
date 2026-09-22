@@ -19,7 +19,9 @@ use rusty_grid_core::protocol::{ClientMessage, ClientResponse, InboundMessage};
 use rusty_grid_core::task::{Task, TaskId, TaskResult, TaskStatus};
 #[cfg(feature = "p2p")]
 use rusty_grid_core::transport::{BiStream, GridStream, GRID_ALPN};
-use rusty_grid_core::{GridError, GridResult, MasterMessage, MessageTransport, WireCodec, WorkerMessage};
+use rusty_grid_core::{
+    GridError, GridResult, MasterMessage, MessageTransport, WireCodec, WorkerMessage,
+};
 
 use crate::mapreduce::MapReduceEngine;
 use crate::queue::{QueueStats, TaskInfo, TaskQueue, TaskState};
@@ -270,7 +272,8 @@ pub struct MasterServer {
     #[cfg(feature = "p2p")]
     p2p_endpoint: Option<iroh::Endpoint>,
     #[cfg(feature = "dashboard")]
-    pub broadcast_tx: Option<tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>>,
+    pub broadcast_tx:
+        Option<tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>>,
 }
 
 impl MasterServer {
@@ -316,7 +319,9 @@ impl MasterServer {
                         let _ = tokio::fs::create_dir_all(parent).await;
                     }
                 }
-                tokio::fs::write(ticket_path, &ticket).await.map_err(GridError::Io)?;
+                tokio::fs::write(ticket_path, &ticket)
+                    .await
+                    .map_err(GridError::Io)?;
                 info!(path = %ticket_path.display(), "Published P2P ticket to file");
             }
 
@@ -685,7 +690,9 @@ async fn resolve_p2p_secret_key(key_path_opt: Option<&Path>) -> GridResult<iroh:
                 let secret_key = iroh::SecretKey::generate();
                 if let Some(parent) = path.parent() {
                     if !parent.as_os_str().is_empty() {
-                        tokio::fs::create_dir_all(parent).await.map_err(GridError::Io)?;
+                        tokio::fs::create_dir_all(parent)
+                            .await
+                            .map_err(GridError::Io)?;
                     }
                 }
                 tokio::fs::write(path, secret_key.to_bytes())
@@ -704,7 +711,6 @@ async fn resolve_p2p_secret_key(key_path_opt: Option<&Path>) -> GridResult<iroh:
 }
 
 impl MasterServer {
-
     /// Runs the master server accept loop until `shutdown_rx` signals termination.
     pub async fn run(self, mut shutdown_rx: watch::Receiver<bool>) -> GridResult<()> {
         info!(listen_addr = %self.local_addr, "Master server accept loop started");
@@ -868,7 +874,8 @@ pub async fn handle_task_result(
 ) {
     #[cfg(feature = "dashboard")]
     {
-        handle_task_result_with_broadcast(registry, queue, scheduler_notify, waiters, result, None).await;
+        handle_task_result_with_broadcast(registry, queue, scheduler_notify, waiters, result, None)
+            .await;
     }
     #[cfg(not(feature = "dashboard"))]
     {
@@ -884,7 +891,9 @@ pub async fn handle_task_result_with_broadcast(
     scheduler_notify: &tokio::sync::Notify,
     waiters: &WaiterMap,
     result: TaskResult,
-    broadcast_tx: Option<&tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>>,
+    broadcast_tx: Option<
+        &tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
 ) {
     let task_id = result.task_id;
     let worker_id = result.worker_id;
@@ -903,9 +912,13 @@ pub async fn handle_task_result_with_broadcast(
 
     if let Some(b_tx) = broadcast_tx {
         if let Some(info) = queue.get_task(&task_id).await {
-            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
+            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                info,
+            ));
         }
-        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(queue.stats().await));
+        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+            queue.stats().await,
+        ));
     }
 
     // 2. Decrement worker active tasks in registry immediately
@@ -984,16 +997,22 @@ pub async fn handle_task_progress_with_broadcast(
     worker_id: Uuid,
     task_id: TaskId,
     status: TaskStatus,
-    broadcast_tx: Option<&tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>>,
+    broadcast_tx: Option<
+        &tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
 ) {
     debug!(worker_id = %worker_id, task_id = %task_id, ?status, "Task progress update");
     if status == TaskStatus::Running {
         let _ = queue.mark_running(&task_id, worker_id).await;
         if let Some(b_tx) = broadcast_tx {
             if let Some(info) = queue.get_task(&task_id).await {
-                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
+                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                    info,
+                ));
             }
-            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(queue.stats().await));
+            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                queue.stats().await,
+            ));
         }
     }
 }
@@ -1057,8 +1076,9 @@ pub async fn handle_worker_disconnect_with_broadcast(
     session_id: Option<u64>,
     reason: &str,
     immediate_reschedule: bool,
-    #[cfg(feature = "dashboard")]
-    broadcast_tx: Option<&tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>>,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<
+        &tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
 ) {
     let unregistered = registry
         .unregister(worker_id, session_id)
@@ -1078,10 +1098,12 @@ pub async fn handle_worker_disconnect_with_broadcast(
 
     #[cfg(feature = "dashboard")]
     if let Some(b_tx) = broadcast_tx {
-        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::WorkerDisconnected {
-            worker_id: *worker_id,
-            reason: reason.to_string(),
-        });
+        let _ = b_tx.send(
+            crate::dashboard::dto::DashboardStreamMessage::WorkerDisconnected {
+                worker_id: *worker_id,
+                reason: reason.to_string(),
+            },
+        );
     }
 
     // Failover all orphaned tasks assigned to this worker
@@ -1100,10 +1122,14 @@ pub async fn handle_worker_disconnect_with_broadcast(
         if let Some(b_tx) = broadcast_tx {
             for task_id in &affected_tasks {
                 if let Some(info) = queue.get_task(task_id).await {
-                    let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
+                    let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                        info,
+                    ));
                 }
             }
-            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(queue.stats().await));
+            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                queue.stats().await,
+            ));
         }
 
         // Resolve waiters for any tasks that reached terminal state (e.g. retries exhausted)
@@ -1165,7 +1191,8 @@ async fn handle_worker_disconnect_internal(
         immediate_reschedule,
         #[cfg(feature = "dashboard")]
         None,
-    ).await;
+    )
+    .await;
 }
 
 async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
@@ -1175,8 +1202,9 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     queue: TaskQueue,
     scheduler_notify: Arc<tokio::sync::Notify>,
     waiters: WaiterMap,
-    #[cfg(feature = "dashboard")]
-    broadcast_tx: Option<tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>>,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<
+        tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
 ) -> GridResult<()> {
     let mut next_msg = Some(first_msg);
     let mapreduce = MapReduceEngine::new(queue.clone(), scheduler_notify.clone(), waiters.clone());
@@ -1208,9 +1236,13 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 #[cfg(feature = "dashboard")]
                 if let Some(ref b_tx) = broadcast_tx {
                     if let Some(info) = queue.get_task(&task_id).await {
-                        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
+                        let _ = b_tx.send(
+                            crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info),
+                        );
                     }
-                    let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(queue.stats().await));
+                    let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                        queue.stats().await,
+                    ));
                 }
 
                 if let Some(rx) = rx {
@@ -1282,9 +1314,14 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 if success {
                     if let Some(ref b_tx) = broadcast_tx {
                         if let Some(info) = queue.get_task(&task_id).await {
-                            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
+                            let _ = b_tx.send(
+                                crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info),
+                            );
                         }
-                        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(queue.stats().await));
+                        let _ =
+                            b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                                queue.stats().await,
+                            ));
                     }
                 }
                 let resp = ClientResponse::TaskCancelled { task_id, success };
@@ -1341,8 +1378,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut shutdown_rx: watch::Receiver<bool>,
     abort_handle: Option<AbortHandle>,
     wire_codec: WireCodec,
-    #[cfg(feature = "dashboard")]
-    broadcast_tx: Option<tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>>,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<
+        tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
 ) -> GridResult<()> {
     let mut transport = MessageTransport::with_codec(stream, wire_codec);
 
@@ -1455,7 +1493,8 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     #[cfg(feature = "dashboard")]
     if let Some(ref b_tx) = broadcast_tx {
         if let Some(info) = registry.get_worker(worker_id).await {
-            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::WorkerRegistered(info));
+            let _ =
+                b_tx.send(crate::dashboard::dto::DashboardStreamMessage::WorkerRegistered(info));
         }
     }
 
@@ -1680,7 +1719,8 @@ pub struct MasterHandle {
     waiters: WaiterMap,
     shutdown_tx: watch::Sender<bool>,
     #[cfg(feature = "dashboard")]
-    pub broadcast_tx: Option<tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>>,
+    pub broadcast_tx:
+        Option<tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>>,
 }
 
 impl MasterHandle {
@@ -1696,7 +1736,9 @@ impl MasterHandle {
 
     /// Returns a clone of the broadcast sender for telemetry events, if available.
     #[cfg(feature = "dashboard")]
-    pub fn broadcast_tx(&self) -> Option<tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>> {
+    pub fn broadcast_tx(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>> {
         self.broadcast_tx.clone()
     }
 
@@ -1707,9 +1749,13 @@ impl MasterHandle {
         #[cfg(feature = "dashboard")]
         if let Some(ref b_tx) = self.broadcast_tx {
             if let Some(info) = self.queue.get_task(&id).await {
-                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
+                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                    info,
+                ));
             }
-            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(self.queue.stats().await));
+            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                self.queue.stats().await,
+            ));
         }
         Ok(id)
     }
@@ -1721,9 +1767,13 @@ impl MasterHandle {
         #[cfg(feature = "dashboard")]
         if let Some(ref b_tx) = self.broadcast_tx {
             if let Some(info) = self.queue.get_task(&id).await {
-                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
+                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                    info,
+                ));
             }
-            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(self.queue.stats().await));
+            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                self.queue.stats().await,
+            ));
         }
         Ok(id)
     }
@@ -1787,9 +1837,13 @@ impl MasterHandle {
         #[cfg(feature = "dashboard")]
         if let Some(ref b_tx) = self.broadcast_tx {
             if let Some(info) = self.queue.get_task(&task_id).await {
-                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
+                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                    info,
+                ));
             }
-            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(self.queue.stats().await));
+            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                self.queue.stats().await,
+            ));
         }
         Ok(())
     }
@@ -1946,7 +2000,10 @@ async fn spawn_master_discovery_service(
     let web_ui_url = format!("http://{}:{}", local_ip, web_ui_port);
     let hostname = sysinfo::System::host_name().unwrap_or_else(|| "OxideMaster".to_string());
 
-    let bind_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), discovery_port);
+    let bind_addr = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        discovery_port,
+    );
     let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
         Ok(s) => s,
         Err(e) => {
@@ -1963,9 +2020,18 @@ async fn spawn_master_discovery_service(
         "Master UDP Discovery beacon & query responder active"
     );
 
-    let broadcast_target = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::BROADCAST), discovery_port);
-    let subnet_target = SocketAddr::new(rusty_grid_core::discovery::get_subnet_broadcast_ip(), discovery_port);
-    let loopback_target = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), discovery_port);
+    let broadcast_target = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::BROADCAST),
+        discovery_port,
+    );
+    let subnet_target = SocketAddr::new(
+        rusty_grid_core::discovery::get_subnet_broadcast_ip(),
+        discovery_port,
+    );
+    let loopback_target = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        discovery_port,
+    );
     let mut ticker = tokio::time::interval(Duration::from_millis(1500));
     let mut buf = [0u8; 1024];
 
@@ -2004,9 +2070,7 @@ async fn spawn_master_discovery_service(
                 }
             }
             res = shutdown_rx.changed() => {
-                if res.is_ok() && *shutdown_rx.borrow() {
-                    break;
-                } else if res.is_err() {
+                if (res.is_ok() && *shutdown_rx.borrow()) || res.is_err() {
                     break;
                 }
             }
@@ -2109,16 +2173,22 @@ mod tests {
         assert!(handle.server_addr().port() > 0);
 
         // Discovery probe using the configured discovery port
-        let discovered = rusty_grid_core::discovery::discover_master(
-            Duration::from_millis(1500),
-            disc_port,
-        )
-        .await;
+        let discovered =
+            rusty_grid_core::discovery::discover_master(Duration::from_millis(1500), disc_port)
+                .await;
 
-        assert!(discovered.is_some(), "Master discovery service should respond to probe");
+        assert!(
+            discovered.is_some(),
+            "Master discovery service should respond to probe"
+        );
         let beacon = discovered.unwrap();
-        assert_eq!(beacon.service, rusty_grid_core::discovery::DISCOVERY_SERVICE_NAME);
-        assert!(beacon.cluster_addr.ends_with(&format!(":{}", handle.server_addr().port())));
+        assert_eq!(
+            beacon.service,
+            rusty_grid_core::discovery::DISCOVERY_SERVICE_NAME
+        );
+        assert!(beacon
+            .cluster_addr
+            .ends_with(&format!(":{}", handle.server_addr().port())));
 
         let _ = handle.shutdown();
     }

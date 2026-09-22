@@ -25,7 +25,13 @@ CLR_YELLOW='\033[1;33m'
 CLR_RED='\033[0;31m'
 CLR_MAGENTA='\033[0;35m'
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 

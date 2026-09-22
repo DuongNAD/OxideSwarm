@@ -55,8 +55,7 @@ use rusty_grid_worker::client::WorkerClient;
 /// Test 1: Rapid connection and abrupt disconnection bursts across /ws, /api/stream, and /api/stream/sse.
 #[tokio::test]
 async fn test_stress_rapid_connection_and_abrupt_disconnection_bursts() {
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_dashboard_port(0);
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(0);
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
@@ -104,7 +103,8 @@ async fn test_stress_rapid_connection_and_abrupt_disconnection_bursts() {
                     // Abrupt drop on /api/stream after receiving 0 or 1 frame
                     let url = format!("ws://{}/api/stream", dash_addr);
                     if let Ok((mut ws_stream, _)) = connect_async(&url).await {
-                        let _ = tokio::time::timeout(Duration::from_millis(5), ws_stream.next()).await;
+                        let _ =
+                            tokio::time::timeout(Duration::from_millis(5), ws_stream.next()).await;
                         drop(ws_stream);
                     }
                 }
@@ -185,7 +185,11 @@ async fn test_stress_rapid_connection_and_abrupt_disconnection_bursts() {
         .await
         .expect("fresh SSE connection must succeed post-burst");
     assert_eq!(sse_resp.status(), StatusCode::OK);
-    let first_chunk = sse_resp.chunk().await.expect("read sse chunk").expect("non-empty chunk");
+    let first_chunk = sse_resp
+        .chunk()
+        .await
+        .expect("read sse chunk")
+        .expect("non-empty chunk");
     let chunk_text = String::from_utf8_lossy(&first_chunk);
     assert!(chunk_text.contains("data:"));
 
@@ -200,17 +204,14 @@ async fn test_stress_rapid_connection_and_abrupt_disconnection_bursts() {
 /// (`RecvError::Lagged`) and snapshot resynchronization without server crash.
 #[tokio::test]
 async fn test_stress_slow_lagging_consumer_ring_buffer_overflow() {
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_dashboard_port(0);
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(0);
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
 
     // 1. Connect Client A (Slow/Lagging Consumer) on /ws
     let ws_url_a = format!("ws://{}/ws", dash_addr);
-    let (ws_stream_a, _) = connect_async(&ws_url_a)
-        .await
-        .expect("connect client A");
+    let (ws_stream_a, _) = connect_async(&ws_url_a).await.expect("connect client A");
     let (mut write_a, mut read_a) = ws_stream_a.split();
 
     // Consume Client A initial snapshot
@@ -223,9 +224,7 @@ async fn test_stress_slow_lagging_consumer_ring_buffer_overflow() {
 
     // 2. Connect Client B (Fast Consumer) on /api/stream
     let ws_url_b = format!("ws://{}/api/stream", dash_addr);
-    let (ws_stream_b, _) = connect_async(&ws_url_b)
-        .await
-        .expect("connect client B");
+    let (ws_stream_b, _) = connect_async(&ws_url_b).await.expect("connect client B");
     let (mut write_b, mut read_b) = ws_stream_b.split();
 
     // Consume Client B initial snapshot
@@ -250,9 +249,13 @@ async fn test_stress_slow_lagging_consumer_ring_buffer_overflow() {
     // 3. Client A stops reading entirely!
     // Master generates a rapid burst of >256 events directly through broadcast_tx without yielding,
     // guaranteeing the 256-slot broadcast ring buffer overflows.
-    let b_tx = master.broadcast_tx().expect("broadcast_tx must be available");
+    let b_tx = master
+        .broadcast_tx()
+        .expect("broadcast_tx must be available");
     for _ in 0..400 {
-        let _ = b_tx.send(DashboardStreamMessage::StatsUpdated(rusty_grid_master::queue::QueueStats::default()));
+        let _ = b_tx.send(DashboardStreamMessage::StatsUpdated(
+            rusty_grid_master::queue::QueueStats::default(),
+        ));
     }
 
     // Give server event processing a moment to process the lag event and transmit snapshot
@@ -271,9 +274,13 @@ async fn test_stress_slow_lagging_consumer_ring_buffer_overflow() {
     let read_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
 
     while tokio::time::Instant::now() < read_deadline {
-        if let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_millis(200), read_a.next()).await {
+        if let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(Duration::from_millis(200), read_a.next()).await
+        {
             if let Ok(text) = msg.to_text() {
-                if let Ok(DashboardStreamMessage::Snapshot(_)) = serde_json::from_str::<DashboardStreamMessage>(text) {
+                if let Ok(DashboardStreamMessage::Snapshot(_)) =
+                    serde_json::from_str::<DashboardStreamMessage>(text)
+                {
                     found_resync_snapshot = true;
                     break;
                 }
@@ -296,8 +303,7 @@ async fn test_stress_slow_lagging_consumer_ring_buffer_overflow() {
 /// Test 3: Server-Sent Events (/api/stream/sse) slow consumer and snapshot resynchronization.
 #[tokio::test]
 async fn test_stress_sse_lagging_consumer_and_resync() {
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_dashboard_port(0);
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(0);
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
@@ -317,14 +323,25 @@ async fn test_stress_sse_lagging_consumer_and_resync() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // 1. Read initial snapshot chunk
-    let first_chunk = resp.chunk().await.expect("read chunk").expect("initial chunk");
+    let first_chunk = resp
+        .chunk()
+        .await
+        .expect("read chunk")
+        .expect("initial chunk");
     let initial_text = String::from_utf8_lossy(&first_chunk);
-    assert!(initial_text.contains("snapshot"), "First SSE event must be snapshot");
+    assert!(
+        initial_text.contains("snapshot"),
+        "First SSE event must be snapshot"
+    );
 
     // 2. Pause reading SSE chunks while generating 400 broadcast events synchronously
-    let b_tx = master.broadcast_tx().expect("broadcast_tx must be available");
+    let b_tx = master
+        .broadcast_tx()
+        .expect("broadcast_tx must be available");
     for _ in 0..400 {
-        let _ = b_tx.send(DashboardStreamMessage::StatsUpdated(rusty_grid_master::queue::QueueStats::default()));
+        let _ = b_tx.send(DashboardStreamMessage::StatsUpdated(
+            rusty_grid_master::queue::QueueStats::default(),
+        ));
     }
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -334,9 +351,13 @@ async fn test_stress_sse_lagging_consumer_and_resync() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
 
     while tokio::time::Instant::now() < deadline {
-        if let Ok(Ok(Some(chunk))) = tokio::time::timeout(Duration::from_millis(300), resp.chunk()).await {
+        if let Ok(Ok(Some(chunk))) =
+            tokio::time::timeout(Duration::from_millis(300), resp.chunk()).await
+        {
             let text = String::from_utf8_lossy(&chunk);
-            if text.contains("event: snapshot") || (text.contains("Snapshot") && text.contains("status")) {
+            if text.contains("event: snapshot")
+                || (text.contains("Snapshot") && text.contains("status"))
+            {
                 received_resync_snapshot = true;
                 break;
             }
@@ -355,8 +376,7 @@ async fn test_stress_sse_lagging_consumer_and_resync() {
 /// while workers register, send heartbeats, and complete batch tasks.
 #[tokio::test]
 async fn test_stress_high_throughput_concurrency() {
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_dashboard_port(0);
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(0);
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
@@ -496,16 +516,13 @@ async fn test_stress_high_throughput_concurrency() {
 /// Test 5: Keepalive ping/pong verification under load, on-demand snapshot, and frame corruption resilience.
 #[tokio::test]
 async fn test_stress_keepalive_ping_pong_under_heavy_load() {
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_dashboard_port(0);
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(0);
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
 
     let ws_url = format!("ws://{}/ws", dash_addr);
-    let (ws_stream, _) = connect_async(&ws_url)
-        .await
-        .expect("connect to websocket");
+    let (ws_stream, _) = connect_async(&ws_url).await.expect("connect to websocket");
     let (mut write, mut read) = ws_stream.split();
 
     // Consume initial snapshot
@@ -550,7 +567,9 @@ async fn test_stress_keepalive_ping_pong_under_heavy_load() {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
 
         while tokio::time::Instant::now() < deadline {
-            if let Ok(Some(Ok(Message::Pong(pong_payload)))) = tokio::time::timeout(Duration::from_millis(250), read.next()).await {
+            if let Ok(Some(Ok(Message::Pong(pong_payload)))) =
+                tokio::time::timeout(Duration::from_millis(250), read.next()).await
+            {
                 if pong_payload == payload {
                     matched_pong = true;
                     break;
@@ -572,20 +591,29 @@ async fn test_stress_keepalive_ping_pong_under_heavy_load() {
     let mut received_snapshot = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_millis(250), read.next()).await {
+        if let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(Duration::from_millis(250), read.next()).await
+        {
             if let Ok(text) = msg.to_text() {
-                if let Ok(DashboardStreamMessage::Snapshot(_)) = serde_json::from_str::<DashboardStreamMessage>(text) {
+                if let Ok(DashboardStreamMessage::Snapshot(_)) =
+                    serde_json::from_str::<DashboardStreamMessage>(text)
+                {
                     received_snapshot = true;
                     break;
                 }
             }
         }
     }
-    assert!(received_snapshot, "Must receive Snapshot response to on-demand snapshot action");
+    assert!(
+        received_snapshot,
+        "Must receive Snapshot response to on-demand snapshot action"
+    );
 
     // Test resilience: send unexpected/unknown frame and verify stream remains operational
     write
-        .send(Message::Text(r#"{"action":"completely_unknown_action"}"#.into()))
+        .send(Message::Text(
+            r#"{"action":"completely_unknown_action"}"#.into(),
+        ))
         .await
         .expect("send unknown action");
     write
@@ -603,14 +631,19 @@ async fn test_stress_keepalive_ping_pong_under_heavy_load() {
     let mut canary_received = false;
     let canary_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < canary_deadline {
-        if let Ok(Some(Ok(Message::Pong(pong_payload)))) = tokio::time::timeout(Duration::from_millis(250), read.next()).await {
+        if let Ok(Some(Ok(Message::Pong(pong_payload)))) =
+            tokio::time::timeout(Duration::from_millis(250), read.next()).await
+        {
             if pong_payload == canary_payload {
                 canary_received = true;
                 break;
             }
         }
     }
-    assert!(canary_received, "Canary Ping must receive Pong after unknown frames");
+    assert!(
+        canary_received,
+        "Canary Ping must receive Pong after unknown frames"
+    );
 
     // Stop load and teardown
     let _ = stop_load_tx.send(true);
@@ -626,8 +659,7 @@ async fn test_stress_keepalive_ping_pong_under_heavy_load() {
 /// Test 6: Master graceful shutdown cleanly drains active WebSocket and SSE telemetry streams.
 #[tokio::test]
 async fn test_stress_master_graceful_shutdown_drains_telemetry_streams() {
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_dashboard_port(0);
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(0);
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
@@ -685,7 +717,10 @@ async fn test_stress_master_graceful_shutdown_drains_telemetry_streams() {
             true
         })
         .await;
-        assert!(stream_res.is_ok(), "WebSocket reader must terminate cleanly on close");
+        assert!(
+            stream_res.is_ok(),
+            "WebSocket reader must terminate cleanly on close"
+        );
     }
 
     // 3. Drop SSE responses to release underlying channels

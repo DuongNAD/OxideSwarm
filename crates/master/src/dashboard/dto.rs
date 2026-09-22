@@ -70,10 +70,7 @@ pub enum DashboardStreamMessage {
     /// Notification that a new worker registered or an existing worker reconnected.
     WorkerRegistered(WorkerInfo),
     /// Notification that a worker disconnected or was reaped.
-    WorkerDisconnected {
-        worker_id: Uuid,
-        reason: String,
-    },
+    WorkerDisconnected { worker_id: Uuid, reason: String },
     /// Notification that a task changed state, was assigned, or finished.
     TaskUpdated(TaskInfo),
     /// Periodic or event-driven update of queue statistics.

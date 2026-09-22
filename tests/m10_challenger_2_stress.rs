@@ -135,15 +135,19 @@ async fn test_malformed_queries_to_api_tasks() {
         "NONEXISTENT_STATE",
         "12345",
         "unknown_state_foobar",
-        "%00",                            // null byte
-        "%27%20OR%201=1%20--",           // SQL injection attempt: ' OR 1=1 --
+        "%00",                               // null byte
+        "%27%20OR%201=1%20--",               // SQL injection attempt: ' OR 1=1 --
         "%3Cscript%3Ealert(1)%3C/script%3E", // XSS attempt: <script>alert(1)</script>
-        "%F0%9F%A6%80%F0%9F%94%A5",      // Unicode: 🦀🔥
+        "%F0%9F%A6%80%F0%9F%94%A5",          // Unicode: 🦀🔥
     ];
 
     for st in invalid_states {
         let url = format!("{}/api/tasks?state={}", base_url, st);
-        let resp = client.get(&url).send().await.expect("send invalid state query");
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .expect("send invalid state query");
         assert_eq!(
             resp.status(),
             StatusCode::OK,
@@ -161,7 +165,11 @@ async fn test_malformed_queries_to_api_tasks() {
     let whitespace_states = ["", "%20", "%20%20%20", "%09"];
     for ws in whitespace_states {
         let url = format!("{}/api/tasks?state={}", base_url, ws);
-        let resp = client.get(&url).send().await.expect("send whitespace query");
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .expect("send whitespace query");
         assert_eq!(resp.status(), StatusCode::OK);
         let tasks: Vec<TaskInfo> = resp.json().await.expect("parse tasks");
         assert_eq!(
@@ -174,7 +182,11 @@ async fn test_malformed_queries_to_api_tasks() {
     // Case C: Oversized query string (>4KB) -> handled gracefully without 500 crash
     let long_state = "A".repeat(4096);
     let url = format!("{}/api/tasks?state={}", base_url, long_state);
-    let resp = client.get(&url).send().await.expect("send long state query");
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .expect("send long state query");
     assert_ne!(
         resp.status(),
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -264,13 +276,20 @@ async fn test_malformed_queries_to_api_tasks() {
 
     // Case F: Extra / unknown parameters
     let resp = client
-        .get(format!("{}/api/tasks?foo=bar&state=completed&extra_param=123", base_url))
+        .get(format!(
+            "{}/api/tasks?foo=bar&state=completed&extra_param=123",
+            base_url
+        ))
         .send()
         .await
         .expect("extra params");
     assert_eq!(resp.status(), StatusCode::OK);
     let tasks: Vec<TaskInfo> = resp.json().await.expect("parse json");
-    assert_eq!(tasks.len(), 2, "Extra query parameters must be safely ignored");
+    assert_eq!(
+        tasks.len(),
+        2,
+        "Extra query parameters must be safely ignored"
+    );
 
     // Case G: Combined filter + limit
     let resp = client
@@ -356,10 +375,10 @@ async fn test_non_uuid_and_nonexistent_task_ids() {
         "true",
         "NaN",
         "task_12345",
-        "..%2F..%2Fetc%2Fpasswd",     // Path traversal
-        "%20%20",                     // Spaces
-        "%3Cscript%3E",               // Script tag
-        "%27%20OR%201=1",             // SQL injection
+        "..%2F..%2Fetc%2Fpasswd", // Path traversal
+        "%20%20",                 // Spaces
+        "%3Cscript%3E",           // Script tag
+        "%27%20OR%201=1",         // SQL injection
         "invalid.json",
         "0",
     ];
@@ -377,14 +396,14 @@ async fn test_non_uuid_and_nonexistent_task_ids() {
 
     // 3. Malformed UUID strings -> Strict HTTP 404 (NOT_FOUND)
     let malformed_uuids = [
-        "00000000-0000-0000-0000-00000000000g",                     // Invalid hex character 'g'
-        "12345678-1234-1234-1234-1234567890a",                      // Too short (11 digits at end)
-        "12345678-1234-1234-1234-1234567890abcdef",                  // Too long (14 digits at end)
-        "12345678_1234_1234_1234_1234567890ab",                      // Underscores instead of hyphens
-        "%7B12345678-1234-1234-1234-1234567890ab%7D",              // Braced UUID {1234...}
-        "12345678-1234-1234-1234-1234567890ab-extra",               // Extra suffix
-        "prefix-12345678-1234-1234-1234-1234567890ab",               // Extra prefix
-        "12345678-1234-1234-1234",                                   // Truncated segments
+        "00000000-0000-0000-0000-00000000000g", // Invalid hex character 'g'
+        "12345678-1234-1234-1234-1234567890a",  // Too short (11 digits at end)
+        "12345678-1234-1234-1234-1234567890abcdef", // Too long (14 digits at end)
+        "12345678_1234_1234_1234_1234567890ab", // Underscores instead of hyphens
+        "%7B12345678-1234-1234-1234-1234567890ab%7D", // Braced UUID {1234...}
+        "12345678-1234-1234-1234-1234567890ab-extra", // Extra suffix
+        "prefix-12345678-1234-1234-1234-1234567890ab", // Extra prefix
+        "12345678-1234-1234-1234",              // Truncated segments
     ];
 
     for mu in malformed_uuids {
@@ -409,7 +428,11 @@ async fn test_non_uuid_and_nonexistent_task_ids() {
 
     for nu in nonexistent_uuids {
         let url = format!("{}/api/tasks/{}", base_url, nu);
-        let resp = client.get(&url).send().await.expect("send nonexistent uuid");
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .expect("send nonexistent uuid");
         assert_eq!(
             resp.status(),
             StatusCode::NOT_FOUND,
@@ -419,7 +442,11 @@ async fn test_non_uuid_and_nonexistent_task_ids() {
     }
 
     // 5. Re-verify the valid task still returns 200 OK after barrage of 404s
-    let resp = client.get(&valid_url).send().await.expect("re-verify valid task");
+    let resp = client
+        .get(&valid_url)
+        .send()
+        .await
+        .expect("re-verify valid task");
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Teardown
@@ -451,8 +478,12 @@ async fn test_ephemeral_port_0_lifecycle_and_port_file_stress() {
             .with_dashboard_port(0)
             .with_dashboard_port_file(&port_file);
 
-        let master = MasterServer::spawn(config).await.expect("spawn master on port 0");
-        let dash_addr = master.dashboard_addr().expect("dashboard addr must be present");
+        let master = MasterServer::spawn(config)
+            .await
+            .expect("spawn master on port 0");
+        let dash_addr = master
+            .dashboard_addr()
+            .expect("dashboard addr must be present");
         let bound_port = dash_addr.port();
 
         assert_ne!(
@@ -476,7 +507,11 @@ async fn test_ephemeral_port_0_lifecycle_and_port_file_stress() {
 
         // Verify HTTP endpoint responds
         let status_url = format!("http://127.0.0.1:{bound_port}/api/status");
-        let resp = client.get(&status_url).send().await.expect("GET /api/status");
+        let resp = client
+            .get(&status_url)
+            .send()
+            .await
+            .expect("GET /api/status");
         assert_eq!(resp.status(), StatusCode::OK);
         let status: ClusterStatusDto = resp.json().await.expect("parse status");
         assert_eq!(status.dashboard_addr, Some(dash_addr.to_string()));
@@ -507,7 +542,9 @@ async fn test_ephemeral_port_0_lifecycle_and_port_file_stress() {
             .with_dashboard_port(0)
             .with_dashboard_port_file(&port_file);
 
-        let master = MasterServer::spawn(config).await.expect("spawn concurrent master");
+        let master = MasterServer::spawn(config)
+            .await
+            .expect("spawn concurrent master");
         let dash_addr = master.dashboard_addr().expect("dashboard addr");
         let port = dash_addr.port();
 
@@ -527,7 +564,9 @@ async fn test_ephemeral_port_0_lifecycle_and_port_file_stress() {
     for (idx, (p_file, port)) in port_files.iter().enumerate() {
         let exists = wait_file_exists(p_file, Duration::from_millis(500)).await;
         assert!(exists, "Concurrent instance {idx}: Port file must exist");
-        let content = tokio::fs::read_to_string(p_file).await.expect("read port file");
+        let content = tokio::fs::read_to_string(p_file)
+            .await
+            .expect("read port file");
         let p: u16 = content.trim().parse().expect("parse u16");
         assert_eq!(p, *port);
 
@@ -629,7 +668,10 @@ async fn test_concurrent_rest_bombardment_under_load() {
         },
         TaskRequirements::generic(1, 10),
     );
-    let initial_task_id = master.submit_task(initial_task).await.expect("submit initial");
+    let initial_task_id = master
+        .submit_task(initial_task)
+        .await
+        .expect("submit initial");
 
     // Shared counters for bombardment assertions
     let total_200_requests = Arc::new(AtomicUsize::new(0));
@@ -661,10 +703,19 @@ async fn test_concurrent_rest_bombardment_under_load() {
                     0 => (format!("{}/api/status", base_url), StatusCode::OK),
                     1 => (format!("{}/api/workers", base_url), StatusCode::OK),
                     2 => (format!("{}/api/tasks", base_url), StatusCode::OK),
-                    3 => (format!("{}/api/tasks?state=running", base_url), StatusCode::OK),
-                    4 => (format!("{}/api/tasks?state=completed", base_url), StatusCode::OK),
+                    3 => (
+                        format!("{}/api/tasks?state=running", base_url),
+                        StatusCode::OK,
+                    ),
+                    4 => (
+                        format!("{}/api/tasks?state=completed", base_url),
+                        StatusCode::OK,
+                    ),
                     5 => (format!("{}/api/tasks?limit=3", base_url), StatusCode::OK),
-                    6 => (format!("{}/api/tasks/{}", base_url, valid_id), StatusCode::OK),
+                    6 => (
+                        format!("{}/api/tasks/{}", base_url, valid_id),
+                        StatusCode::OK,
+                    ),
                     7 => (
                         format!("{}/api/tasks/{}", base_url, Uuid::new_v4()),
                         StatusCode::NOT_FOUND,
@@ -717,7 +768,10 @@ async fn test_concurrent_rest_bombardment_under_load() {
             .wait_task(tid, Some(Duration::from_secs(10)))
             .await
             .expect("wait task");
-        assert_eq!(res.exit_code, 0, "Task {tid} should complete with exit code 0");
+        assert_eq!(
+            res.exit_code, 0,
+            "Task {tid} should complete with exit code 0"
+        );
     }
 
     // Wait for all bombardment tasks to finish

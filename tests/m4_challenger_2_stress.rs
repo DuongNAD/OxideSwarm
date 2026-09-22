@@ -1075,7 +1075,9 @@ async fn test_adversarial_direct_task_queue_retry_policy_exhaustion() {
     );
 
     // Worker A disconnects (Failure 1 -> Retry 1)
-    let affected = queue.handle_worker_disconnected(&w_a, "W_A dropped", false).await;
+    let affected = queue
+        .handle_worker_disconnected(&w_a, "W_A dropped", false)
+        .await;
     assert_eq!(affected, vec![task_id]);
     assert_eq!(
         queue.get_state(&task_id).await.unwrap(),
@@ -1100,7 +1102,9 @@ async fn test_adversarial_direct_task_queue_retry_policy_exhaustion() {
     );
 
     // Worker B disconnects (Failure 2 -> Retry 2)
-    let affected2 = queue.handle_worker_disconnected(&w_b, "W_B dropped", false).await;
+    let affected2 = queue
+        .handle_worker_disconnected(&w_b, "W_B dropped", false)
+        .await;
     assert_eq!(affected2, vec![task_id]);
     assert_eq!(
         queue.get_state(&task_id).await.unwrap(),
@@ -1125,7 +1129,9 @@ async fn test_adversarial_direct_task_queue_retry_policy_exhaustion() {
     );
 
     // Worker C disconnects (Failure 3 -> Exceeds max_retries 2!)
-    let affected3 = queue.handle_worker_disconnected(&w_c, "W_C dropped", false).await;
+    let affected3 = queue
+        .handle_worker_disconnected(&w_c, "W_C dropped", false)
+        .await;
     assert_eq!(affected3, vec![task_id]);
     assert_eq!(queue.get_state(&task_id).await.unwrap(), TaskState::Failed);
 

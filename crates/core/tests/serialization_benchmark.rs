@@ -8,9 +8,7 @@
 use std::time::Instant;
 use uuid::Uuid;
 
-use rusty_grid_core::protocol::{
-    deserialize_message, serialize_message, MasterMessage, WireCodec,
-};
+use rusty_grid_core::protocol::{deserialize_message, serialize_message, MasterMessage, WireCodec};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskResult, TaskSpec};
 
 const BENCH_ITERATIONS: usize = 5_000;
@@ -30,13 +28,7 @@ fn test_task_spec_and_result_benchmark() {
     };
 
     // 2. TaskResult with 32 KB stdout logs
-    let task_result = TaskResult::success(
-        worker_id,
-        task_id,
-        "x".repeat(32768),
-        150,
-        true,
-    );
+    let task_result = TaskResult::success(worker_id, task_id, "x".repeat(32768), 150, true);
 
     // =========================================================================
     // Part 1: TaskSpec::GpuCompute (Binary Buffer) Benchmark
@@ -46,11 +38,13 @@ fn test_task_spec_and_result_benchmark() {
 
     // Lossless roundtrip verification
     let json_deser: TaskSpec = serde_json::from_slice(&json_gpu_bytes).expect("JSON deserialize");
-    let bincode_deser: TaskSpec = bincode::deserialize(&bincode_gpu_bytes).expect("Bincode deserialize");
+    let bincode_deser: TaskSpec =
+        bincode::deserialize(&bincode_gpu_bytes).expect("Bincode deserialize");
     assert_eq!(json_deser, gpu_spec);
     assert_eq!(bincode_deser, gpu_spec);
 
-    let size_savings_pct = 100.0 * (1.0 - (bincode_gpu_bytes.len() as f64 / json_gpu_bytes.len() as f64));
+    let size_savings_pct =
+        100.0 * (1.0 - (bincode_gpu_bytes.len() as f64 / json_gpu_bytes.len() as f64));
     println!("\n=== Benchmark: TaskSpec::GpuCompute (16 KB buffer) ===");
     println!("JSON Size:        {} bytes", json_gpu_bytes.len());
     println!("Bincode Size:     {} bytes", bincode_gpu_bytes.len());
@@ -88,8 +82,14 @@ fn test_task_spec_and_result_benchmark() {
     let json_ser_time = start.elapsed();
 
     let ser_speedup = json_ser_time.as_nanos() as f64 / bincode_ser_time.as_nanos().max(1) as f64;
-    println!("Bincode Ser Time: {:?} ({} iters)", bincode_ser_time, BENCH_ITERATIONS);
-    println!("JSON Ser Time:    {:?} ({} iters)", json_ser_time, BENCH_ITERATIONS);
+    println!(
+        "Bincode Ser Time: {:?} ({} iters)",
+        bincode_ser_time, BENCH_ITERATIONS
+    );
+    println!(
+        "JSON Ser Time:    {:?} ({} iters)",
+        json_ser_time, BENCH_ITERATIONS
+    );
     println!("Ser Speedup:      {:.2}x", ser_speedup);
     assert!(
         bincode_ser_time <= json_ser_time,
@@ -110,18 +110,27 @@ fn test_task_spec_and_result_benchmark() {
     let json_de_time = start.elapsed();
 
     let de_speedup = json_de_time.as_nanos() as f64 / bincode_de_time.as_nanos().max(1) as f64;
-    println!("Bincode De Time:  {:?} ({} iters)", bincode_de_time, BENCH_ITERATIONS);
-    println!("JSON De Time:     {:?} ({} iters)", json_de_time, BENCH_ITERATIONS);
+    println!(
+        "Bincode De Time:  {:?} ({} iters)",
+        bincode_de_time, BENCH_ITERATIONS
+    );
+    println!(
+        "JSON De Time:     {:?} ({} iters)",
+        json_de_time, BENCH_ITERATIONS
+    );
     println!("De Speedup:       {:.2}x", de_speedup);
 
     // =========================================================================
     // Part 2: TaskResult (Heavy Log Output) Benchmark
     // =========================================================================
     let json_res_bytes = serde_json::to_vec(&task_result).expect("JSON serialize task_result");
-    let bincode_res_bytes = bincode::serialize(&task_result).expect("Bincode serialize task_result");
+    let bincode_res_bytes =
+        bincode::serialize(&task_result).expect("Bincode serialize task_result");
 
-    let json_res_deser: TaskResult = serde_json::from_slice(&json_res_bytes).expect("JSON deserialize");
-    let bincode_res_deser: TaskResult = bincode::deserialize(&bincode_res_bytes).expect("Bincode deserialize");
+    let json_res_deser: TaskResult =
+        serde_json::from_slice(&json_res_bytes).expect("JSON deserialize");
+    let bincode_res_deser: TaskResult =
+        bincode::deserialize(&bincode_res_bytes).expect("Bincode deserialize");
     assert_eq!(json_res_deser, task_result);
     assert_eq!(bincode_res_deser, task_result);
 
@@ -148,7 +157,8 @@ fn test_task_spec_and_result_benchmark() {
     }
     let json_res_ser_time = start.elapsed();
 
-    let res_ser_speedup = json_res_ser_time.as_nanos() as f64 / bincode_res_ser_time.as_nanos().max(1) as f64;
+    let res_ser_speedup =
+        json_res_ser_time.as_nanos() as f64 / bincode_res_ser_time.as_nanos().max(1) as f64;
     println!("Bincode Res Ser:  {:?}", bincode_res_ser_time);
     println!("JSON Res Ser:     {:?}", json_res_ser_time);
     println!("Res Ser Speedup:  {:.2}x", res_ser_speedup);
@@ -168,11 +178,15 @@ fn test_task_spec_and_result_benchmark() {
     );
     let assign_msg = MasterMessage::AssignTask { task };
 
-    let framed_bincode = serialize_message(&assign_msg, WireCodec::Bincode).expect("serialize bincode");
+    let framed_bincode =
+        serialize_message(&assign_msg, WireCodec::Bincode).expect("serialize bincode");
     let framed_json = serialize_message(&assign_msg, WireCodec::Json).expect("serialize json");
 
     // Format discriminator assertions
-    assert_eq!(framed_bincode[0], 0x02, "Bincode frame must start with 0x02");
+    assert_eq!(
+        framed_bincode[0], 0x02,
+        "Bincode frame must start with 0x02"
+    );
     assert_eq!(framed_json[0], 0x01, "JSON frame must start with 0x01");
 
     let (decoded_bin_msg, detected_bin_codec): (MasterMessage, WireCodec) =

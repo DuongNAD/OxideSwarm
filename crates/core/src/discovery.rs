@@ -3,9 +3,9 @@
 //! Provides zero-configuration LAN discovery for OxideSwarm Master nodes
 //! using UDP broadcast beacons and active discovery probes.
 
+use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
-use serde::{Deserialize, Serialize};
 
 /// Default UDP port for OxideSwarm discovery beacons and queries.
 pub const DEFAULT_DISCOVERY_PORT: u16 = 8089;
@@ -77,7 +77,13 @@ impl MasterBeacon {
 /// using OS routing table resolution without generating network traffic.
 pub fn get_local_ip() -> Option<IpAddr> {
     if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        for target in &["8.8.8.8:80", "192.168.1.1:80", "192.168.1.254:80", "10.0.0.1:80", "172.16.0.1:80"] {
+        for target in &[
+            "8.8.8.8:80",
+            "192.168.1.1:80",
+            "192.168.1.254:80",
+            "10.0.0.1:80",
+            "172.16.0.1:80",
+        ] {
             if socket.connect(target).is_ok() {
                 if let Ok(local_addr) = socket.local_addr() {
                     let ip = local_addr.ip();
@@ -111,28 +117,42 @@ pub fn get_subnet_broadcast_ip() -> IpAddr {
 pub const KNOWN_CLUSTER_CANDIDATE_IPS: &[&str] = &["192.168.1.144", "192.168.1.123"];
 
 /// Probes an individual candidate node via HTTP GET /api/status.
-pub async fn probe_http_candidate(host: &str, port: u16, timeout: Duration) -> Option<MasterBeacon> {
+pub async fn probe_http_candidate(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Option<MasterBeacon> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
     let addr_str = format!("{}:{}", host, port);
     let connect_future = TcpStream::connect(&addr_str);
-    let mut stream = tokio::time::timeout(timeout, connect_future).await.ok()?.ok()?;
+    let mut stream = tokio::time::timeout(timeout, connect_future)
+        .await
+        .ok()?
+        .ok()?;
     let _ = stream.set_nodelay(true);
 
     let req = format!(
         "GET /api/status HTTP/1.1\r\nHost: {}\r\nUser-Agent: OxideSwarm-Discovery/1.0\r\nConnection: close\r\n\r\n",
         host
     );
-    let _ = tokio::time::timeout(timeout, stream.write_all(req.as_bytes())).await.ok()?.ok()?;
+    tokio::time::timeout(timeout, stream.write_all(req.as_bytes()))
+        .await
+        .ok()?
+        .ok()?;
 
     let mut buf = Vec::with_capacity(2048);
     let mut temp = [0u8; 1024];
     let read_future = async {
         while let Ok(n) = stream.read(&mut temp).await {
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             buf.extend_from_slice(&temp[..n]);
-            if buf.len() > 16384 { break; }
+            if buf.len() > 16384 {
+                break;
+            }
             if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                 if serde_json::from_slice::<serde_json::Value>(&buf[idx + 4..]).is_ok() {
                     break;
@@ -170,7 +190,10 @@ pub async fn probe_http_candidate(host: &str, port: u16, timeout: Duration) -> O
     // Case 2: Node is a Worker Redirection Portal pointing to Master
     if json.get("role").and_then(|r| r.as_str()) == Some("WORKER_PORTAL") {
         if let Some(redirect_url) = json.get("redirect_url").and_then(|u| u.as_str()) {
-            if !redirect_url.is_empty() && !redirect_url.contains("127.0.0.1") && !redirect_url.contains("localhost") {
+            if !redirect_url.is_empty()
+                && !redirect_url.contains("127.0.0.1")
+                && !redirect_url.contains("localhost")
+            {
                 if let Some(stripped) = redirect_url.strip_prefix("http://") {
                     let target_host = stripped.split(':').next().unwrap_or(stripped);
                     let cluster_addr = json
@@ -206,9 +229,7 @@ pub async fn probe_http_candidates(timeout: Duration, web_ui_port: u16) -> Optio
     for host in candidates {
         let t = timeout;
         let p = web_ui_port;
-        set.spawn(async move {
-            probe_http_candidate(&host, p, t).await
-        });
+        set.spawn(async move { probe_http_candidate(&host, p, t).await });
     }
 
     while let Some(res) = set.join_next().await {
@@ -275,7 +296,9 @@ pub async fn discover_master(timeout: Duration, port: u16) -> Option<MasterBeaco
         return Some(beacon);
     }
 
-    let http_timeout = timeout.saturating_sub(udp_timeout).max(Duration::from_millis(600));
+    let http_timeout = timeout
+        .saturating_sub(udp_timeout)
+        .max(Duration::from_millis(600));
     probe_http_candidates(http_timeout, 8080).await
 }
 
@@ -375,7 +398,8 @@ mod tests {
                         "description": "P2P Coordinator"
                     },
                     "workers": []
-                }).to_string();
+                })
+                .to_string();
 
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -394,4 +418,3 @@ mod tests {
         assert_eq!(b.web_ui_url, format!("http://127.0.0.1:{}", port));
     }
 }
-

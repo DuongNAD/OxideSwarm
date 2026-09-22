@@ -25,7 +25,9 @@ async fn test_master_beacon_broadcast_and_unicast_query() {
         .with_discovery(true)
         .with_discovery_port(discovery_port);
 
-    let master_handle = MasterServer::spawn(config).await.expect("Failed to spawn master");
+    let master_handle = MasterServer::spawn(config)
+        .await
+        .expect("Failed to spawn master");
     let master_tcp_port = master_handle.server_addr().port();
 
     // 1. Probe via core discover_master function
@@ -37,26 +39,35 @@ async fn test_master_beacon_broadcast_and_unicast_query() {
     );
     let beacon = discovered.unwrap();
     assert_eq!(beacon.service, DISCOVERY_SERVICE_NAME);
-    assert!(beacon.cluster_addr.ends_with(&format!(":{}", master_tcp_port)));
+    assert!(beacon
+        .cluster_addr
+        .ends_with(&format!(":{}", master_tcp_port)));
     assert!(!beacon.hostname.is_empty());
 
     // 2. Direct Unicast UDP probe with DISCOVERY_MAGIC_REQUEST
-    let client_socket = UdpSocket::bind("127.0.0.1:0").await.expect("Bind client udp");
-    let target_discovery_addr: SocketAddr = format!("127.0.0.1:{}", discovery_port).parse().unwrap();
+    let client_socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("Bind client udp");
+    let target_discovery_addr: SocketAddr =
+        format!("127.0.0.1:{}", discovery_port).parse().unwrap();
     client_socket
         .send_to(DISCOVERY_MAGIC_REQUEST, target_discovery_addr)
         .await
         .expect("Send magic request");
 
     let mut buf = [0u8; 1024];
-    let (len, _from) = tokio::time::timeout(Duration::from_secs(1), client_socket.recv_from(&mut buf))
-        .await
-        .expect("Timeout receiving unicast discovery response")
-        .expect("Recv error");
+    let (len, _from) =
+        tokio::time::timeout(Duration::from_secs(1), client_socket.recv_from(&mut buf))
+            .await
+            .expect("Timeout receiving unicast discovery response")
+            .expect("Recv error");
 
-    let unicast_beacon: MasterBeacon = serde_json::from_slice(&buf[..len]).expect("Deserialize beacon");
+    let unicast_beacon: MasterBeacon =
+        serde_json::from_slice(&buf[..len]).expect("Deserialize beacon");
     assert_eq!(unicast_beacon.service, DISCOVERY_SERVICE_NAME);
-    assert!(unicast_beacon.cluster_addr.ends_with(&format!(":{}", master_tcp_port)));
+    assert!(unicast_beacon
+        .cluster_addr
+        .ends_with(&format!(":{}", master_tcp_port)));
 
     // 3. Negative test: Send invalid magic bytes - master should ignore
     client_socket
@@ -64,7 +75,11 @@ async fn test_master_beacon_broadcast_and_unicast_query() {
         .await
         .expect("Send invalid query");
 
-    let timeout_res = tokio::time::timeout(Duration::from_millis(200), client_socket.recv_from(&mut buf)).await;
+    let timeout_res = tokio::time::timeout(
+        Duration::from_millis(200),
+        client_socket.recv_from(&mut buf),
+    )
+    .await;
     assert!(
         timeout_res.is_err(),
         "Master discovery must ignore unrecognized UDP packets"
@@ -81,7 +96,9 @@ async fn test_worker_e2e_connection_via_auto_discovery() {
         .with_discovery(true)
         .with_discovery_port(discovery_port);
 
-    let master_handle = MasterServer::spawn(config).await.expect("Failed to spawn master");
+    let master_handle = MasterServer::spawn(config)
+        .await
+        .expect("Failed to spawn master");
     let master_registry = master_handle.registry();
 
     // Configure worker with auto-discovery specifying port
@@ -260,7 +277,9 @@ async fn test_worker_redirection_portal_with_auto_master() {
         .with_discovery(true)
         .with_discovery_port(discovery_port);
 
-    let master_handle = MasterServer::spawn(config).await.expect("Failed to spawn master");
+    let master_handle = MasterServer::spawn(config)
+        .await
+        .expect("Failed to spawn master");
     let master_tcp_port = master_handle.server_addr().port();
     let master_registry = master_handle.registry();
 
@@ -312,7 +331,10 @@ async fn test_worker_redirection_portal_with_auto_master() {
     assert!(resp.contains("200 OK"));
     assert!(resp.contains("\"role\":\"WORKER_PORTAL\""));
     assert!(resp.contains("\"status\":\"connected_to_master\""));
-    assert!(resp.contains(&format!(":{}", master_tcp_port)), "Must contain master TCP port");
+    assert!(
+        resp.contains(&format!(":{}", master_tcp_port)),
+        "Must contain master TCP port"
+    );
 
     // 2. Query worker portal / (root navigation) - must return 307 redirecting to master
     let mut stream2 = TcpStream::connect(format!("127.0.0.1:{}", portal_port))
@@ -336,9 +358,9 @@ async fn test_worker_redirection_portal_with_auto_master() {
 
 #[tokio::test]
 async fn test_redirection_portal_standby_page_when_no_master() {
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::RwLock;
-    use std::sync::Arc;
 
     let portal_port = 29013;
     let beacon_state: Arc<RwLock<Option<MasterBeacon>>> = Arc::new(RwLock::new(None));
@@ -402,7 +424,8 @@ async fn test_http_candidate_probing_fallback() {
                     "description": "P2P Coordinator"
                 },
                 "workers": [{"name": "worker-1"}]
-            }).to_string();
+            })
+            .to_string();
 
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -420,10 +443,12 @@ async fn test_http_candidate_probing_fallback() {
     )
     .await;
 
-    assert!(beacon.is_some(), "HTTP probing must discover simulated master");
+    assert!(
+        beacon.is_some(),
+        "HTTP probing must discover simulated master"
+    );
     let b = beacon.unwrap();
     assert_eq!(b.hostname, "FallBackMaster");
     assert_eq!(b.cluster_addr, "127.0.0.1:8088");
     assert_eq!(b.worker_count, 1);
 }
-

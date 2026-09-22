@@ -51,8 +51,8 @@ use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::{MasterMessage, MessageTransport, WorkerMessage};
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_master::queue::TaskState;
-use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::server::{MasterServer, ServerConfig};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 
@@ -154,9 +154,17 @@ async fn test_stress_multi_worker_concurrent_crashes() {
 
     // Wait for all 5 workers to register
     assert!(
-        wait_for(Duration::from_secs(5), Duration::from_millis(50), || async {
-            master.list_workers().await.map(|w| w.len() == 5).unwrap_or(false)
-        })
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|w| w.len() == 5)
+                    .unwrap_or(false)
+            }
+        )
         .await,
         "All 5 workers must register"
     );
@@ -171,17 +179,21 @@ async fn test_stress_multi_worker_concurrent_crashes() {
 
     // Wait until all 15 tasks are Running across the cluster
     assert!(
-        wait_for(Duration::from_secs(6), Duration::from_millis(30), || async {
-            let mut running = 0;
-            for id in &task_ids {
-                if let Ok(info) = master.get_task_info(*id).await {
-                    if info.state == TaskState::Running {
-                        running += 1;
+        wait_for(
+            Duration::from_secs(6),
+            Duration::from_millis(30),
+            || async {
+                let mut running = 0;
+                for id in &task_ids {
+                    if let Ok(info) = master.get_task_info(*id).await {
+                        if info.state == TaskState::Running {
+                            running += 1;
+                        }
                     }
                 }
+                running == 15
             }
-            running == 15
-        })
+        )
         .await,
         "All 15 tasks must enter Running state across the 5 workers"
     );
@@ -207,17 +219,21 @@ async fn test_stress_multi_worker_concurrent_crashes() {
     workers[2].abort();
 
     // Await all 15 tasks to reach Completed state on the 2 surviving workers
-    let completed_all = wait_for(Duration::from_secs(15), Duration::from_millis(50), || async {
-        let mut completed = 0;
-        for id in &task_ids {
-            if let Ok(info) = master.get_task_info(*id).await {
-                if info.state == TaskState::Completed {
-                    completed += 1;
+    let completed_all = wait_for(
+        Duration::from_secs(15),
+        Duration::from_millis(50),
+        || async {
+            let mut completed = 0;
+            for id in &task_ids {
+                if let Ok(info) = master.get_task_info(*id).await {
+                    if info.state == TaskState::Completed {
+                        completed += 1;
+                    }
                 }
             }
-        }
-        completed == 15
-    })
+            completed == 15
+        },
+    )
     .await;
     assert!(
         completed_all,
@@ -274,74 +290,179 @@ async fn test_stress_tcp_rst_vs_graceful_disconnect() {
 
     // 1. Worker 1: Graceful worker (starts first)
     let (w1_tx, w1_rx) = watch::channel(false);
-    let mut w1 = WorkerClient::from_options(master_addr.to_string(), Some("w-graceful".into()), Some(1), false);
+    let mut w1 = WorkerClient::from_options(
+        master_addr.to_string(),
+        Some("w-graceful".into()),
+        Some(1),
+        false,
+    );
     let w1_id = w1.worker_id();
-    let _h1 = tokio::spawn(async move { let _ = w1.run(w1_rx).await; });
+    let _h1 = tokio::spawn(async move {
+        let _ = w1.run(w1_rx).await;
+    });
 
     // Wait for W1 to register
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(30), || async {
-        master.list_workers().await.map(|w| w.len() == 1).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(30),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|w| w.len() == 1)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     // Submit Task A (must land on W1 because W1 is the only worker)
     let task_a = make_builtin_task("task_graceful", 2500, None);
     let id_a = master.submit_task(task_a).await.unwrap();
 
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(20), || async {
-        master.get_task_info(id_a).await.map(|i| i.state == TaskState::Running && i.assigned_worker_id == Some(w1_id)).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(id_a)
+                    .await
+                    .map(|i| i.state == TaskState::Running && i.assigned_worker_id == Some(w1_id))
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     // 2. Spawn Worker 3: Survivor worker
     let (_w3_tx, w3_rx) = watch::channel(false);
-    let mut w3 = WorkerClient::from_options(master_addr.to_string(), Some("w-survivor".into()), Some(4), false);
+    let mut w3 = WorkerClient::from_options(
+        master_addr.to_string(),
+        Some("w-survivor".into()),
+        Some(4),
+        false,
+    );
     let w3_id = w3.worker_id();
-    let _h3 = tokio::spawn(async move { let _ = w3.run(w3_rx).await; });
+    let _h3 = tokio::spawn(async move {
+        let _ = w3.run(w3_rx).await;
+    });
 
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(30), || async {
-        master.list_workers().await.map(|w| w.iter().any(|x| x.worker_id == w3_id && x.status == WorkerStatus::Connected)).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(30),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|w| {
+                        w.iter()
+                            .any(|x| x.worker_id == w3_id && x.status == WorkerStatus::Connected)
+                    })
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     // Graceful disconnect on Worker 1
     let t_graceful = Instant::now();
     let _ = w1_tx.send(true);
 
     // Task A must reassign to W3 immediately (<100ms) with 0ms delay!
-    let w1_reallocated = wait_for(Duration::from_millis(200), Duration::from_millis(10), || async {
-        if let Ok(info) = master.get_task_info(id_a).await {
-            info.assigned_worker_id == Some(w3_id)
-                && (info.state == TaskState::Scheduled || info.state == TaskState::Running)
-        } else {
-            false
-        }
-    }).await;
+    let w1_reallocated = wait_for(
+        Duration::from_millis(200),
+        Duration::from_millis(10),
+        || async {
+            if let Ok(info) = master.get_task_info(id_a).await {
+                info.assigned_worker_id == Some(w3_id)
+                    && (info.state == TaskState::Scheduled || info.state == TaskState::Running)
+            } else {
+                false
+            }
+        },
+    )
+    .await;
     let failover_lat = t_graceful.elapsed();
-    assert!(w1_reallocated, "Gracefully disconnected task must reassign to survivor immediately");
-    assert!(failover_lat < Duration::from_millis(100), "Graceful failover latency must be <100ms; measured: {:?}", failover_lat);
+    assert!(
+        w1_reallocated,
+        "Gracefully disconnected task must reassign to survivor immediately"
+    );
+    assert!(
+        failover_lat < Duration::from_millis(100),
+        "Graceful failover latency must be <100ms; measured: {:?}",
+        failover_lat
+    );
 
     // Wait for Task A to complete on W3
-    assert!(wait_for(Duration::from_secs(6), Duration::from_millis(30), || async {
-        master.get_task_info(id_a).await.map(|i| i.state == TaskState::Completed).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(6),
+            Duration::from_millis(30),
+            || async {
+                master
+                    .get_task_info(id_a)
+                    .await
+                    .map(|i| i.state == TaskState::Completed)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     // 3. Now test abrupt TCP drop / crash:
     // Spawn Worker 2 (abrupt crash worker)
     let (_w2_tx, w2_rx) = watch::channel(false);
-    let mut w2 = WorkerClient::from_options(master_addr.to_string(), Some("w-abrupt".into()), Some(1), false);
+    let mut w2 = WorkerClient::from_options(
+        master_addr.to_string(),
+        Some("w-abrupt".into()),
+        Some(1),
+        false,
+    );
     let w2_id = w2.worker_id();
-    let h2 = tokio::spawn(async move { let _ = w2.run(w2_rx).await; });
+    let h2 = tokio::spawn(async move {
+        let _ = w2.run(w2_rx).await;
+    });
 
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(30), || async {
-        master.list_workers().await.map(|w| w.iter().any(|x| x.worker_id == w2_id && x.status == WorkerStatus::Connected)).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(30),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|w| {
+                        w.iter()
+                            .any(|x| x.worker_id == w2_id && x.status == WorkerStatus::Connected)
+                    })
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     // Submit Task B
     let task_b = make_builtin_task("task_abrupt", 2500, None);
     let id_b = master.submit_task(task_b).await.unwrap();
 
     // Wait until Task B is Running
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(20), || async {
-        master.get_task_info(id_b).await.map(|i| i.state == TaskState::Running).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(id_b)
+                    .await
+                    .map(|i| i.state == TaskState::Running)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     let info_b = master.get_task_info(id_b).await.unwrap();
     let assigned = info_b.assigned_worker_id.unwrap();
@@ -356,18 +477,38 @@ async fn test_stress_tcp_rst_vs_graceful_disconnect() {
     target_handle.abort(); // TCP drop without Disconnecting!
 
     // Verify Task B transitions to Retrying (exponential backoff)
-    assert!(wait_for(Duration::from_secs(3), Duration::from_millis(15), || async {
-        if let Ok(info) = master.get_task_info(id_b).await {
-            info.state == TaskState::Retrying || (info.state == TaskState::Scheduled && info.assigned_worker_id == Some(survivor_for_b))
-        } else {
-            false
-        }
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(3),
+            Duration::from_millis(15),
+            || async {
+                if let Ok(info) = master.get_task_info(id_b).await {
+                    info.state == TaskState::Retrying
+                        || (info.state == TaskState::Scheduled
+                            && info.assigned_worker_id == Some(survivor_for_b))
+                } else {
+                    false
+                }
+            }
+        )
+        .await
+    );
 
     // Task B completes on survivor
-    assert!(wait_for(Duration::from_secs(6), Duration::from_millis(30), || async {
-        master.get_task_info(id_b).await.map(|i| i.state == TaskState::Completed).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(6),
+            Duration::from_millis(30),
+            || async {
+                master
+                    .get_task_info(id_b)
+                    .await
+                    .map(|i| i.state == TaskState::Completed)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     let final_a = master.get_task_info(id_a).await.unwrap();
     let final_b = master.get_task_info(id_b).await.unwrap();
@@ -394,18 +535,32 @@ async fn test_stress_immediate_failover_latency_under_load() {
     let (w1_tx, w1_rx) = watch::channel(false);
     let (_w2_tx, w2_rx) = watch::channel(false);
 
-    let mut w1 = WorkerClient::from_options(master_addr.clone(), Some("load-w1".into()), Some(8), false);
+    let mut w1 =
+        WorkerClient::from_options(master_addr.clone(), Some("load-w1".into()), Some(8), false);
     let w1_id = w1.worker_id();
-    let mut w2 = WorkerClient::from_options(master_addr.clone(), Some("load-w2".into()), Some(8), false);
+    let mut w2 =
+        WorkerClient::from_options(master_addr.clone(), Some("load-w2".into()), Some(8), false);
     let w2_id = w2.worker_id();
 
-    tokio::spawn(async move { let _ = w1.run(w1_rx).await; });
-    tokio::spawn(async move { let _ = w2.run(w2_rx).await; });
+    tokio::spawn(async move {
+        let _ = w1.run(w1_rx).await;
+    });
+    tokio::spawn(async move {
+        let _ = w2.run(w2_rx).await;
+    });
 
     assert!(
-        wait_for(Duration::from_secs(5), Duration::from_millis(50), || async {
-            master.list_workers().await.map(|w| w.len() == 2).unwrap_or(false)
-        })
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|w| w.len() == 2)
+                    .unwrap_or(false)
+            }
+        )
         .await
     );
 
@@ -418,15 +573,21 @@ async fn test_stress_immediate_failover_latency_under_load() {
 
     // Wait until all tasks are Running
     assert!(
-        wait_for(Duration::from_secs(5), Duration::from_millis(20), || async {
-            let mut count = 0;
-            for id in &tasks {
-                if let Ok(info) = master.get_task_info(*id).await {
-                    if info.state == TaskState::Running { count += 1; }
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                let mut count = 0;
+                for id in &tasks {
+                    if let Ok(info) = master.get_task_info(*id).await {
+                        if info.state == TaskState::Running {
+                            count += 1;
+                        }
+                    }
                 }
+                count == 4
             }
-            count == 4
-        })
+        )
         .await
     );
 
@@ -447,18 +608,25 @@ async fn test_stress_immediate_failover_latency_under_load() {
 
         // Measure latency until evicted tasks from W1 are reassigned to W2
         let first_task = w1_tasks[0];
-        let reassigned = wait_for(Duration::from_millis(200), Duration::from_millis(5), || async {
-            if let Ok(info) = master.get_task_info(first_task).await {
-                info.assigned_worker_id == Some(w2_id)
-                    && (info.state == TaskState::Scheduled || info.state == TaskState::Running)
-            } else {
-                false
-            }
-        })
+        let reassigned = wait_for(
+            Duration::from_millis(200),
+            Duration::from_millis(5),
+            || async {
+                if let Ok(info) = master.get_task_info(first_task).await {
+                    info.assigned_worker_id == Some(w2_id)
+                        && (info.state == TaskState::Scheduled || info.state == TaskState::Running)
+                } else {
+                    false
+                }
+            },
+        )
         .await;
 
         let elapsed = t0.elapsed();
-        assert!(reassigned, "First evicted task must be reassigned to survivor W2");
+        assert!(
+            reassigned,
+            "First evicted task must be reassigned to survivor W2"
+        );
         assert!(
             elapsed < Duration::from_millis(100),
             "Graceful failover latency must be strictly <100ms; measured: {elapsed:?}"
@@ -467,15 +635,21 @@ async fn test_stress_immediate_failover_latency_under_load() {
 
     // All 4 tasks must complete on W2
     assert!(
-        wait_for(Duration::from_secs(8), Duration::from_millis(50), || async {
-            let mut done = 0;
-            for id in &tasks {
-                if let Ok(info) = master.get_task_info(*id).await {
-                    if info.state == TaskState::Completed { done += 1; }
+        wait_for(
+            Duration::from_secs(8),
+            Duration::from_millis(50),
+            || async {
+                let mut done = 0;
+                for id in &tasks {
+                    if let Ok(info) = master.get_task_info(*id).await {
+                        if info.state == TaskState::Completed {
+                            done += 1;
+                        }
+                    }
                 }
+                done == 4
             }
-            done == 4
-        })
+        )
         .await
     );
 
@@ -504,9 +678,17 @@ async fn test_stress_high_volume_worker_churn() {
     }
 
     assert!(
-        wait_for(Duration::from_secs(5), Duration::from_millis(50), || async {
-            master.list_workers().await.map(|w| w.len() == 4).unwrap_or(false)
-        })
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|w| w.len() == 4)
+                    .unwrap_or(false)
+            }
+        )
         .await
     );
 
@@ -541,23 +723,40 @@ async fn test_stress_high_volume_worker_churn() {
     }
 
     // Stop churning, spawn 2 extra workers to guarantee swift draining of the remaining queue
-    workers.push(ManagedWorker::spawn(master_addr.clone(), "drain-w1", 4, false));
-    workers.push(ManagedWorker::spawn(master_addr.clone(), "drain-w2", 4, false));
+    workers.push(ManagedWorker::spawn(
+        master_addr.clone(),
+        "drain-w1",
+        4,
+        false,
+    ));
+    workers.push(ManagedWorker::spawn(
+        master_addr.clone(),
+        "drain-w2",
+        4,
+        false,
+    ));
 
     // Wait for all 30 tasks to reach Completed
-    let all_done = wait_for(Duration::from_secs(20), Duration::from_millis(50), || async {
-        let mut completed = 0;
-        for id in &task_ids {
-            if let Ok(info) = master.get_task_info(*id).await {
-                if info.state == TaskState::Completed {
-                    completed += 1;
+    let all_done = wait_for(
+        Duration::from_secs(20),
+        Duration::from_millis(50),
+        || async {
+            let mut completed = 0;
+            for id in &task_ids {
+                if let Ok(info) = master.get_task_info(*id).await {
+                    if info.state == TaskState::Completed {
+                        completed += 1;
+                    }
                 }
             }
-        }
-        completed == 30
-    })
+            completed == 30
+        },
+    )
     .await;
-    assert!(all_done, "All 30 tasks must complete despite rapid worker churn");
+    assert!(
+        all_done,
+        "All 30 tasks must complete despite rapid worker churn"
+    );
 
     // Assert zero task failures, zero orphaned tasks
     let stats = master.queue_stats().await.unwrap();
@@ -582,17 +781,37 @@ async fn test_stress_high_volume_worker_churn() {
 #[tokio::test]
 async fn test_stress_concurrent_max_retries_and_waiters_resolution() {
     let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(2);
-    let master = MasterServer::spawn(server_config).await.expect("spawn master");
+    let master = MasterServer::spawn(server_config)
+        .await
+        .expect("spawn master");
     let master_addr = master.server_addr().to_string();
 
     // Spawn Worker 1
     let (_w1_tx, w1_rx) = watch::channel(false);
-    let mut w1 = WorkerClient::from_options(master_addr.clone(), Some("w-retry-1".into()), Some(4), false);
-    let h1 = tokio::spawn(async move { let _ = w1.run(w1_rx).await; });
+    let mut w1 = WorkerClient::from_options(
+        master_addr.clone(),
+        Some("w-retry-1".into()),
+        Some(4),
+        false,
+    );
+    let h1 = tokio::spawn(async move {
+        let _ = w1.run(w1_rx).await;
+    });
 
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(50), || async {
-        master.list_workers().await.map(|w| w.len() == 1).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|w| w.len() == 1)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     // Submit 3 tasks concurrently and attach wait_task listeners
     let mut task_ids = Vec::new();
@@ -610,78 +829,137 @@ async fn test_stress_concurrent_max_retries_and_waiters_resolution() {
     }
 
     // Wait until all 3 tasks are running on W1
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(20), || async {
-        let mut running = 0;
-        for id in &task_ids {
-            if let Ok(info) = master.get_task_info(*id).await {
-                if info.state == TaskState::Running { running += 1; }
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                let mut running = 0;
+                for id in &task_ids {
+                    if let Ok(info) = master.get_task_info(*id).await {
+                        if info.state == TaskState::Running {
+                            running += 1;
+                        }
+                    }
+                }
+                running == 3
             }
-        }
-        running == 3
-    }).await);
+        )
+        .await
+    );
 
     // Abort Worker 1 (Attempt 1)
     h1.abort();
 
     // Wait for retry_count to become 1
-    assert!(wait_for(Duration::from_secs(4), Duration::from_millis(20), || async {
-        let mut count1 = 0;
-        for id in &task_ids {
-            if let Ok(info) = master.get_task_info(*id).await {
-                if info.retry_count == 1 { count1 += 1; }
+    assert!(
+        wait_for(
+            Duration::from_secs(4),
+            Duration::from_millis(20),
+            || async {
+                let mut count1 = 0;
+                for id in &task_ids {
+                    if let Ok(info) = master.get_task_info(*id).await {
+                        if info.retry_count == 1 {
+                            count1 += 1;
+                        }
+                    }
+                }
+                count1 == 3
             }
-        }
-        count1 == 3
-    }).await);
+        )
+        .await
+    );
 
     // Spawn Worker 2 (Attempt 2)
     let (_w2_tx, w2_rx) = watch::channel(false);
-    let mut w2 = WorkerClient::from_options(master_addr.clone(), Some("w-retry-2".into()), Some(4), false);
+    let mut w2 = WorkerClient::from_options(
+        master_addr.clone(),
+        Some("w-retry-2".into()),
+        Some(4),
+        false,
+    );
     let w2_id = w2.worker_id();
-    let h2 = tokio::spawn(async move { let _ = w2.run(w2_rx).await; });
+    let h2 = tokio::spawn(async move {
+        let _ = w2.run(w2_rx).await;
+    });
 
     // Wait until tasks run on W2
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(20), || async {
-        let mut running = 0;
-        for id in &task_ids {
-            if let Ok(info) = master.get_task_info(*id).await {
-                if info.state == TaskState::Running && info.assigned_worker_id == Some(w2_id) {
-                    running += 1;
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                let mut running = 0;
+                for id in &task_ids {
+                    if let Ok(info) = master.get_task_info(*id).await {
+                        if info.state == TaskState::Running
+                            && info.assigned_worker_id == Some(w2_id)
+                        {
+                            running += 1;
+                        }
+                    }
                 }
+                running == 3
             }
-        }
-        running == 3
-    }).await);
+        )
+        .await
+    );
 
     // Abort Worker 2 (Attempt 2)
     h2.abort();
 
     // Wait for retry_count to become 2
-    assert!(wait_for(Duration::from_secs(4), Duration::from_millis(20), || async {
-        let mut count2 = 0;
-        for id in &task_ids {
-            if let Ok(info) = master.get_task_info(*id).await {
-                if info.retry_count == 2 { count2 += 1; }
+    assert!(
+        wait_for(
+            Duration::from_secs(4),
+            Duration::from_millis(20),
+            || async {
+                let mut count2 = 0;
+                for id in &task_ids {
+                    if let Ok(info) = master.get_task_info(*id).await {
+                        if info.retry_count == 2 {
+                            count2 += 1;
+                        }
+                    }
+                }
+                count2 == 3
             }
-        }
-        count2 == 3
-    }).await);
+        )
+        .await
+    );
 
     // Spawn Worker 3 (Attempt 3 -> will exceed max_retries = 2!)
     let (_w3_tx, w3_rx) = watch::channel(false);
-    let mut w3 = WorkerClient::from_options(master_addr.clone(), Some("w-retry-3".into()), Some(4), false);
-    let h3 = tokio::spawn(async move { let _ = w3.run(w3_rx).await; });
+    let mut w3 = WorkerClient::from_options(
+        master_addr.clone(),
+        Some("w-retry-3".into()),
+        Some(4),
+        false,
+    );
+    let h3 = tokio::spawn(async move {
+        let _ = w3.run(w3_rx).await;
+    });
 
     // Wait until running on W3
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(20), || async {
-        let mut running = 0;
-        for id in &task_ids {
-            if let Ok(info) = master.get_task_info(*id).await {
-                if info.state == TaskState::Running { running += 1; }
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                let mut running = 0;
+                for id in &task_ids {
+                    if let Ok(info) = master.get_task_info(*id).await {
+                        if info.state == TaskState::Running {
+                            running += 1;
+                        }
+                    }
+                }
+                running == 3
             }
-        }
-        running == 3
-    }).await);
+        )
+        .await
+    );
 
     // Abort Worker 3 -> Retries (2) exceeded!
     h3.abort();
@@ -692,7 +970,10 @@ async fn test_stress_concurrent_max_retries_and_waiters_resolution() {
 
     for (i, res) in results.into_iter().enumerate() {
         let task_res = res.expect("join handle").expect("wait_task result");
-        assert_eq!(task_res.exit_code, 1, "Task {i} exit code must be 1 on failure");
+        assert_eq!(
+            task_res.exit_code, 1,
+            "Task {i} exit code must be 1 on failure"
+        );
         let err = task_res.error.unwrap_or_default();
         assert!(
             err.contains("maximum retry limit (2) reached"),
@@ -723,17 +1004,15 @@ async fn test_stress_reaper_detection_and_failover() {
     // Fast reaper: scans every 25ms, timeout 80ms
     let reaper_config = ReaperConfig::new(Duration::from_millis(25), Duration::from_millis(80));
     let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3);
-    let master = MasterServer::spawn_with_config(
-        server_config,
-        Default::default(),
-        reaper_config,
-    )
-    .await
-    .expect("master spawn");
+    let master = MasterServer::spawn_with_config(server_config, Default::default(), reaper_config)
+        .await
+        .expect("master spawn");
     let master_addr = master.server_addr();
 
     // 1. Worker 1: Raw TCP connection that registers then HALTS all heartbeats (simulating silent freeze)
-    let stream = tokio::net::TcpStream::connect(master_addr).await.expect("tcp connect");
+    let stream = tokio::net::TcpStream::connect(master_addr)
+        .await
+        .expect("tcp connect");
     let mut transport = MessageTransport::new(stream);
     let w1_id = Uuid::new_v4();
     transport
@@ -744,32 +1023,50 @@ async fn test_stress_reaper_detection_and_failover() {
         .await
         .expect("send register");
     let ack: Option<MasterMessage> = transport.recv_msg().await.expect("recv ack");
-    assert!(matches!(ack, Some(MasterMessage::RegisterAck { accepted: true, .. })));
+    assert!(matches!(
+        ack,
+        Some(MasterMessage::RegisterAck { accepted: true, .. })
+    ));
 
     // Submit task while Worker 1 is the ONLY registered worker
     let task = make_builtin_task("silent_reap_task", 100, None);
     let task_id = master.submit_task(task).await.unwrap();
 
     // Receive AssignTask on Worker 1 transport
-    let assign = transport.recv_msg::<MasterMessage>().await.expect("recv assign");
+    let assign = transport
+        .recv_msg::<MasterMessage>()
+        .await
+        .expect("recv assign");
     assert!(matches!(assign, Some(MasterMessage::AssignTask { .. })));
 
     // Worker 1 holds TCP socket open but sends NOTHING (no heartbeats, no results).
     // The Master Reaper must detect silence >80ms and mark Worker 1 as Disconnected!
-    let w1_reaped = wait_for(Duration::from_secs(3), Duration::from_millis(20), || async {
-        if let Ok(workers) = master.list_workers().await {
-            workers.iter().any(|w| w.worker_id == w1_id && w.status == WorkerStatus::Disconnected)
-        } else {
-            false
-        }
-    }).await;
-    assert!(w1_reaped, "Master reaper must detect silent worker and mark as Disconnected");
+    let w1_reaped = wait_for(
+        Duration::from_secs(3),
+        Duration::from_millis(20),
+        || async {
+            if let Ok(workers) = master.list_workers().await {
+                workers
+                    .iter()
+                    .any(|w| w.worker_id == w1_id && w.status == WorkerStatus::Disconnected)
+            } else {
+                false
+            }
+        },
+    )
+    .await;
+    assert!(
+        w1_reaped,
+        "Master reaper must detect silent worker and mark as Disconnected"
+    );
 
     // Allow the 500ms crash exponential backoff delay to elapse so task re-enters ready_queue
     tokio::time::sleep(Duration::from_millis(600)).await;
 
     // 2. NOW connect Worker 2 (raw TCP) to accept and complete the failed-over task
-    let stream2 = tokio::net::TcpStream::connect(master_addr).await.expect("tcp connect w2");
+    let stream2 = tokio::net::TcpStream::connect(master_addr)
+        .await
+        .expect("tcp connect w2");
     let mut transport2 = MessageTransport::new(stream2);
     let w2_id = Uuid::new_v4();
     transport2
@@ -780,10 +1077,16 @@ async fn test_stress_reaper_detection_and_failover() {
         .await
         .expect("send register w2");
     let ack2: Option<MasterMessage> = transport2.recv_msg().await.expect("recv ack w2");
-    assert!(matches!(ack2, Some(MasterMessage::RegisterAck { accepted: true, .. })));
+    assert!(matches!(
+        ack2,
+        Some(MasterMessage::RegisterAck { accepted: true, .. })
+    ));
 
     // Worker 2 receives AssignTask for the reaped task
-    let assign2 = transport2.recv_msg::<MasterMessage>().await.expect("recv assign w2");
+    let assign2 = transport2
+        .recv_msg::<MasterMessage>()
+        .await
+        .expect("recv assign w2");
     assert!(matches!(assign2, Some(MasterMessage::AssignTask { .. })));
 
     // Worker 2 sends successful TaskResult
@@ -797,13 +1100,24 @@ async fn test_stress_reaper_detection_and_failover() {
         is_gpu_executed: false,
         error: None,
     };
-    transport2.send_msg(&result_msg).await.expect("send result from w2");
+    transport2
+        .send_msg(&result_msg)
+        .await
+        .expect("send result from w2");
 
     // The reaped task must be marked Completed on Master!
     assert!(
-        wait_for(Duration::from_secs(3), Duration::from_millis(20), || async {
-            master.get_task_info(task_id).await.map(|i| i.state == TaskState::Completed).unwrap_or(false)
-        })
+        wait_for(
+            Duration::from_secs(3),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(task_id)
+                    .await
+                    .map(|i| i.state == TaskState::Completed)
+                    .unwrap_or(false)
+            }
+        )
         .await,
         "Task must complete on Worker 2 after Worker 1 is reaped"
     );
@@ -816,7 +1130,10 @@ async fn test_stress_reaper_detection_and_failover() {
 
     // Verify Worker 1 status in registry is Disconnected
     let workers = master.list_workers().await.unwrap();
-    let w1_entry = workers.iter().find(|w| w.worker_id == w1_id).expect("find w1");
+    let w1_entry = workers
+        .iter()
+        .find(|w| w.worker_id == w1_id)
+        .expect("find w1");
     assert_eq!(w1_entry.status, WorkerStatus::Disconnected);
     assert_eq!(w1_entry.active_tasks, 0);
 

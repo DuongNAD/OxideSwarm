@@ -603,21 +603,30 @@ impl WorkerClient {
                         .alpns(vec![rusty_grid_core::transport::GRID_ALPN.to_vec()])
                         .bind()
                         .await
-                        .map_err(|e| GridError::ConnectionFailed(format!("Failed to bind iroh endpoint: {e}")))?;
+                        .map_err(|e| {
+                            GridError::ConnectionFailed(format!(
+                                "Failed to bind iroh endpoint: {e}"
+                            ))
+                        })?;
                     *ep_guard = Some(ep.clone());
                     (ep, false)
                 }
             };
             drop(ep_guard);
 
-            let conn = match endpoint.connect(node_addr, rusty_grid_core::transport::GRID_ALPN).await {
+            let conn = match endpoint
+                .connect(node_addr, rusty_grid_core::transport::GRID_ALPN)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     if is_cached {
                         let mut guard = self.p2p_endpoint.lock().await;
                         *guard = None;
                     }
-                    return Err(GridError::ConnectionFailed(format!("P2P connect failed: {e}")));
+                    return Err(GridError::ConnectionFailed(format!(
+                        "P2P connect failed: {e}"
+                    )));
                 }
             };
 
@@ -637,8 +646,8 @@ impl WorkerClient {
             || target_addr.eq_ignore_ascii_case("auto")
             || target_addr.starts_with("auto:")
         {
-            let disc_port = if target_addr.starts_with("auto:") {
-                target_addr[5..]
+            let disc_port = if let Some(port_str) = target_addr.strip_prefix("auto:") {
+                port_str
                     .parse::<u16>()
                     .unwrap_or(rusty_grid_core::DEFAULT_DISCOVERY_PORT)
             } else {
@@ -648,11 +657,8 @@ impl WorkerClient {
                 port = disc_port,
                 "Master address set to 'auto'; probing local network via UDP discovery..."
             );
-            match rusty_grid_core::discovery::discover_master(
-                Duration::from_secs(3),
-                disc_port,
-            )
-            .await
+            match rusty_grid_core::discovery::discover_master(Duration::from_secs(3), disc_port)
+                .await
             {
                 Some(beacon) => {
                     info!(
@@ -897,7 +903,9 @@ impl From<&str> for PortalTarget {
     }
 }
 
-impl From<Arc<tokio::sync::RwLock<Option<rusty_grid_core::discovery::MasterBeacon>>>> for PortalTarget {
+impl From<Arc<tokio::sync::RwLock<Option<rusty_grid_core::discovery::MasterBeacon>>>>
+    for PortalTarget
+{
     fn from(a: Arc<tokio::sync::RwLock<Option<rusty_grid_core::discovery::MasterBeacon>>>) -> Self {
         PortalTarget::Dynamic(a)
     }
@@ -910,7 +918,8 @@ async fn resolve_portal_master(
     match target {
         PortalTarget::Dynamic(beacon_state) => {
             if let Some(ref beacon) = *beacon_state.read().await {
-                let ui_url = if beacon.web_ui_url.contains("127.0.0.1") && !client_ip.is_loopback() {
+                let ui_url = if beacon.web_ui_url.contains("127.0.0.1") && !client_ip.is_loopback()
+                {
                     let host_from_cluster = beacon.cluster_addr.split(':').next().unwrap_or("");
                     if !host_from_cluster.is_empty()
                         && host_from_cluster != "127.0.0.1"
@@ -935,18 +944,16 @@ async fn resolve_portal_master(
         }
         PortalTarget::Static(addr) => {
             if addr.is_empty() || addr.eq_ignore_ascii_case("auto") || addr.starts_with("auto:") {
-                let port = if addr.starts_with("auto:") {
-                    addr[5..]
+                let port = if let Some(port_str) = addr.strip_prefix("auto:") {
+                    port_str
                         .parse::<u16>()
                         .unwrap_or(rusty_grid_core::DEFAULT_DISCOVERY_PORT)
                 } else {
                     rusty_grid_core::DEFAULT_DISCOVERY_PORT
                 };
-                if let Some(beacon) = rusty_grid_core::discovery::discover_master(
-                    Duration::from_millis(350),
-                    port,
-                )
-                .await
+                if let Some(beacon) =
+                    rusty_grid_core::discovery::discover_master(Duration::from_millis(350), port)
+                        .await
                 {
                     return Some((beacon.web_ui_url, beacon.cluster_addr));
                 }
@@ -1047,7 +1054,10 @@ pub async fn spawn_worker_redirection_portal(
 ) {
     use std::net::SocketAddr;
     let target = target.into();
-    let bind_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), portal_port);
+    let bind_addr = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        portal_port,
+    );
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -1144,9 +1154,7 @@ pub async fn spawn_worker_redirection_portal(
                 }
             }
             res = shutdown_rx.changed() => {
-                if res.is_ok() && *shutdown_rx.borrow() {
-                    break;
-                } else if res.is_err() {
+                if (res.is_ok() && *shutdown_rx.borrow()) || res.is_err() {
                     break;
                 }
             }
@@ -1396,8 +1404,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // 1. Test browser navigation / redirect
-        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", test_port)).await.unwrap();
-        stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", test_port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
         let mut buf = vec![0u8; 1024];
         let n = stream.read(&mut buf).await.unwrap();
         let resp = String::from_utf8_lossy(&buf[..n]);
@@ -1405,8 +1418,13 @@ mod tests {
         assert!(resp.contains("Location: http://192.168.1.123:8080"));
 
         // 2. Test /api/status probe
-        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", test_port)).await.unwrap();
-        stream.write_all(b"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", test_port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
         let mut buf = vec![0u8; 1024];
         let n = stream.read(&mut buf).await.unwrap();
         let resp = String::from_utf8_lossy(&buf[..n]);

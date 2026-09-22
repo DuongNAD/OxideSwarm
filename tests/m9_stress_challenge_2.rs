@@ -134,28 +134,44 @@ fn find_rusty_grid_bin() -> Option<PathBuf> {
 #[tokio::test]
 async fn test_boundary_max_retries_0_immediate_failure_on_crash() {
     // Server configured with generous default retries (5)
-    let master = MasterServer::spawn(
-        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(5),
-    )
-    .await
-    .expect("master spawn");
+    let master =
+        MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(5))
+            .await
+            .expect("master spawn");
     let master_addr = master.server_addr().to_string();
 
     let (_w1_tx, w1_rx) = watch::channel(false);
     let (_w2_tx, w2_rx) = watch::channel(false);
 
-    let mut w1 = WorkerClient::from_options(master_addr.clone(), Some("b0-w1".into()), Some(2), false);
+    let mut w1 =
+        WorkerClient::from_options(master_addr.clone(), Some("b0-w1".into()), Some(2), false);
     let w1_id = w1.worker_id();
-    let mut w2 = WorkerClient::from_options(master_addr.clone(), Some("b0-w2".into()), Some(2), false);
+    let mut w2 =
+        WorkerClient::from_options(master_addr.clone(), Some("b0-w2".into()), Some(2), false);
     let w2_id = w2.worker_id();
 
-    let h1 = tokio::spawn(async move { let _ = w1.run(w1_rx).await; });
-    let _h2 = tokio::spawn(async move { let _ = w2.run(w2_rx).await; });
+    let h1 = tokio::spawn(async move {
+        let _ = w1.run(w1_rx).await;
+    });
+    let _h2 = tokio::spawn(async move {
+        let _ = w2.run(w2_rx).await;
+    });
 
     // Wait for both workers to register
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(30), || async {
-        master.list_workers().await.map(|w| w.len() == 2).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(30),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|w| w.len() == 2)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     // Submit task with max_retries explicitly overridden to 0
     let task = Task::new(
@@ -171,9 +187,20 @@ async fn test_boundary_max_retries_0_immediate_failure_on_crash() {
     let task_id = master.submit_task(task).await.expect("submit task");
 
     // Wait until running
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(20), || async {
-        master.get_task_info(task_id).await.map(|i| i.state == TaskState::Running).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(task_id)
+                    .await
+                    .map(|i| i.state == TaskState::Running)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     let initial_info = master.get_task_info(task_id).await.unwrap();
     let assigned_worker = initial_info.assigned_worker_id.unwrap();
@@ -186,16 +213,36 @@ async fn test_boundary_max_retries_0_immediate_failure_on_crash() {
     }
 
     // Task MUST transition directly to Failed without any retries
-    assert!(wait_for(Duration::from_secs(4), Duration::from_millis(20), || async {
-        master.get_task_info(task_id).await.map(|i| i.state == TaskState::Failed).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(4),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(task_id)
+                    .await
+                    .map(|i| i.state == TaskState::Failed)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     let final_info = master.get_task_info(task_id).await.unwrap();
     assert_eq!(final_info.state, TaskState::Failed);
-    assert_eq!(final_info.retry_count, 0, "retry_count must remain 0 when max_retries is 0");
-    assert_eq!(final_info.exit_code, Some(1), "Synthetic failure exit code must be 1");
+    assert_eq!(
+        final_info.retry_count, 0,
+        "retry_count must remain 0 when max_retries is 0"
+    );
+    assert_eq!(
+        final_info.exit_code,
+        Some(1),
+        "Synthetic failure exit code must be 1"
+    );
 
-    let err = final_info.error_message.expect("error message must be populated");
+    let err = final_info
+        .error_message
+        .expect("error message must be populated");
     assert!(
         err.contains("maximum retry limit (0) reached after worker eviction"),
         "Error message must specify limit 0 reached: {err}"
@@ -206,10 +253,17 @@ async fn test_boundary_max_retries_0_immediate_failure_on_crash() {
     );
 
     // The surviving worker must remain completely untouched (active_tasks == 0)
-    let survivor_id = if assigned_worker == w1_id { w2_id } else { w1_id };
+    let survivor_id = if assigned_worker == w1_id {
+        w2_id
+    } else {
+        w1_id
+    };
     let workers = master.list_workers().await.unwrap();
     let survivor = workers.iter().find(|w| w.worker_id == survivor_id).unwrap();
-    assert_eq!(survivor.active_tasks, 0, "Surviving worker must never have received the task");
+    assert_eq!(
+        survivor.active_tasks, 0,
+        "Surviving worker must never have received the task"
+    );
 
     let _ = master.shutdown();
 }
@@ -220,21 +274,34 @@ async fn test_boundary_max_retries_0_immediate_failure_on_crash() {
 
 #[tokio::test]
 async fn test_boundary_max_retries_1_single_retry_then_failure() {
-    let master = MasterServer::spawn(
-        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3),
-    )
-    .await
-    .expect("master spawn");
+    let master =
+        MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3))
+            .await
+            .expect("master spawn");
     let master_addr = master.server_addr().to_string();
 
     let (_w1_tx, w1_rx) = watch::channel(false);
-    let mut w1 = WorkerClient::from_options(master_addr.clone(), Some("b1-w1".into()), Some(1), false);
+    let mut w1 =
+        WorkerClient::from_options(master_addr.clone(), Some("b1-w1".into()), Some(1), false);
     let w1_id = w1.worker_id();
-    let h1 = tokio::spawn(async move { let _ = w1.run(w1_rx).await; });
+    let h1 = tokio::spawn(async move {
+        let _ = w1.run(w1_rx).await;
+    });
 
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(30), || async {
-        master.list_workers().await.map(|w| w.len() == 1).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(30),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|w| w.len() == 1)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     // Task with max_retries: Some(1)
     let task = Task::new(
@@ -250,32 +317,79 @@ async fn test_boundary_max_retries_1_single_retry_then_failure() {
     let task_id = master.submit_task(task).await.expect("submit");
 
     // 1. Task enters Running on w1 -> kill w1
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(20), || async {
-        master.get_task_info(task_id).await.map(|i| i.state == TaskState::Running).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(task_id)
+                    .await
+                    .map(|i| i.state == TaskState::Running)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
     h1.abort();
 
     // 2. Task reschedules, retry_count increments to 1
-    assert!(wait_for(Duration::from_secs(4), Duration::from_millis(20), || async {
-        master.get_task_info(task_id).await.map(|i| i.retry_count == 1).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(4),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(task_id)
+                    .await
+                    .map(|i| i.retry_count == 1)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     // 3. Spawn w2 -> takes task
     let (_w2_tx, w2_rx) = watch::channel(false);
-    let mut w2 = WorkerClient::from_options(master_addr.clone(), Some("b1-w2".into()), Some(1), false);
-    let h2 = tokio::spawn(async move { let _ = w2.run(w2_rx).await; });
+    let mut w2 =
+        WorkerClient::from_options(master_addr.clone(), Some("b1-w2".into()), Some(1), false);
+    let h2 = tokio::spawn(async move {
+        let _ = w2.run(w2_rx).await;
+    });
 
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(20), || async {
-        master.get_task_info(task_id).await.map(|i| i.state == TaskState::Running && i.assigned_worker_id != Some(w1_id)).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(task_id)
+                    .await
+                    .map(|i| i.state == TaskState::Running && i.assigned_worker_id != Some(w1_id))
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     // 4. Kill w2 -> max_retries (1) is now exhausted!
     h2.abort();
 
     // Must transition cleanly to Failed
-    assert!(wait_for(Duration::from_secs(4), Duration::from_millis(20), || async {
-        master.get_task_info(task_id).await.map(|i| i.state == TaskState::Failed).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(4),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(task_id)
+                    .await
+                    .map(|i| i.state == TaskState::Failed)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     let final_info = master.get_task_info(task_id).await.unwrap();
     assert_eq!(final_info.state, TaskState::Failed);
@@ -288,13 +402,25 @@ async fn test_boundary_max_retries_1_single_retry_then_failure() {
 
     // Spawn a 3rd worker to verify it is NEVER given this task
     let (_w3_tx, w3_rx) = watch::channel(false);
-    let mut w3 = WorkerClient::from_options(master_addr.clone(), Some("b1-w3".into()), Some(1), false);
+    let mut w3 =
+        WorkerClient::from_options(master_addr.clone(), Some("b1-w3".into()), Some(1), false);
     let w3_id = w3.worker_id();
-    let _h3 = tokio::spawn(async move { let _ = w3.run(w3_rx).await; });
+    let _h3 = tokio::spawn(async move {
+        let _ = w3.run(w3_rx).await;
+    });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let w3_info = master.list_workers().await.unwrap().into_iter().find(|w| w.worker_id == w3_id).unwrap();
-    assert_eq!(w3_info.active_tasks, 0, "Failed task must never be dispatched to new workers");
+    let w3_info = master
+        .list_workers()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|w| w.worker_id == w3_id)
+        .unwrap();
+    assert_eq!(
+        w3_info.active_tasks, 0,
+        "Failed task must never be dispatched to new workers"
+    );
 
     let _ = master.shutdown();
 }
@@ -306,11 +432,10 @@ async fn test_boundary_max_retries_1_single_retry_then_failure() {
 #[tokio::test]
 async fn test_boundary_max_retries_5_overrides_lower_server_default() {
     // Master server configured with default_retry_max = 1 (very restrictive!)
-    let master = MasterServer::spawn(
-        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(1),
-    )
-    .await
-    .expect("master spawn");
+    let master =
+        MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(1))
+            .await
+            .expect("master spawn");
     let master_addr = master.server_addr().to_string();
 
     // Submit task requesting max_retries = Some(5)
@@ -336,13 +461,24 @@ async fn test_boundary_max_retries_5_overrides_lower_server_default() {
             Some(1),
             false,
         );
-        let _h = tokio::spawn(async move { let _ = worker.run(shutdown_rx).await; });
+        let _h = tokio::spawn(async move {
+            let _ = worker.run(shutdown_rx).await;
+        });
 
         // Wait until task is running on this worker
         assert!(
-            wait_for(Duration::from_secs(5), Duration::from_millis(20), || async {
-                master.get_task_info(task_id).await.map(|i| i.state == TaskState::Running).unwrap_or(false)
-            }).await,
+            wait_for(
+                Duration::from_secs(5),
+                Duration::from_millis(20),
+                || async {
+                    master
+                        .get_task_info(task_id)
+                        .await
+                        .map(|i| i.state == TaskState::Running)
+                        .unwrap_or(false)
+                }
+            )
+            .await,
             "Task must become Running in cycle {cycle}"
         );
 
@@ -351,9 +487,18 @@ async fn test_boundary_max_retries_5_overrides_lower_server_default() {
 
         // Wait for retry_count to increment to cycle
         assert!(
-            wait_for(Duration::from_secs(3), Duration::from_millis(15), || async {
-                master.get_task_info(task_id).await.map(|i| i.retry_count == cycle as u32).unwrap_or(false)
-            }).await,
+            wait_for(
+                Duration::from_secs(3),
+                Duration::from_millis(15),
+                || async {
+                    master
+                        .get_task_info(task_id)
+                        .await
+                        .map(|i| i.retry_count == cycle as u32)
+                        .unwrap_or(false)
+                }
+            )
+            .await,
             "retry_count must increment to {cycle}"
         );
 
@@ -370,19 +515,48 @@ async fn test_boundary_max_retries_5_overrides_lower_server_default() {
 
     // Now spawn the 6th worker: accepts task, then disconnects -> exhausts max_retries (5)
     let (shutdown_tx6, shutdown_rx6) = watch::channel(false);
-    let mut w6 = WorkerClient::from_options(master_addr.clone(), Some("w-cycle-6".into()), Some(1), false);
-    let _h6 = tokio::spawn(async move { let _ = w6.run(shutdown_rx6).await; });
+    let mut w6 = WorkerClient::from_options(
+        master_addr.clone(),
+        Some("w-cycle-6".into()),
+        Some(1),
+        false,
+    );
+    let _h6 = tokio::spawn(async move {
+        let _ = w6.run(shutdown_rx6).await;
+    });
 
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(20), || async {
-        master.get_task_info(task_id).await.map(|i| i.state == TaskState::Running).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(task_id)
+                    .await
+                    .map(|i| i.state == TaskState::Running)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     let _ = shutdown_tx6.send(true);
 
     // Now it MUST transition to Failed!
-    assert!(wait_for(Duration::from_secs(4), Duration::from_millis(20), || async {
-        master.get_task_info(task_id).await.map(|i| i.state == TaskState::Failed).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(4),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(task_id)
+                    .await
+                    .map(|i| i.state == TaskState::Failed)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     let final_info = master.get_task_info(task_id).await.unwrap();
     assert_eq!(final_info.state, TaskState::Failed);
@@ -456,14 +630,19 @@ async fn test_direct_queue_boundary_crash_cycles_and_audit() {
     queue.mark_running(&id_c, wid1).await.unwrap();
 
     // Crash wid1
-    let affected = queue.handle_worker_disconnected(&wid1, "Crash wid1", true).await;
+    let affected = queue
+        .handle_worker_disconnected(&wid1, "Crash wid1", true)
+        .await;
     assert_eq!(affected.len(), 3);
 
     // Task B had max_retries = 0 -> MUST BE FAILED IMMEDIATELY
     let info_b = queue.get_task(&id_b).await.unwrap();
     assert_eq!(info_b.state, TaskState::Failed);
     assert_eq!(info_b.retry_count, 0);
-    assert!(info_b.error_message.unwrap().contains("maximum retry limit (0) reached"));
+    assert!(info_b
+        .error_message
+        .unwrap()
+        .contains("maximum retry limit (0) reached"));
     let res_b = queue.get_result(&id_b).await.unwrap();
     assert_eq!(res_b.exit_code, 1);
 
@@ -483,14 +662,19 @@ async fn test_direct_queue_boundary_crash_cycles_and_audit() {
     queue.mark_running(&id_c, wid2).await.unwrap();
 
     // Crash wid2
-    let affected2 = queue.handle_worker_disconnected(&wid2, "Crash wid2", true).await;
+    let affected2 = queue
+        .handle_worker_disconnected(&wid2, "Crash wid2", true)
+        .await;
     assert_eq!(affected2.len(), 2);
 
     // Task C had max_retries = 1 -> MUST BE FAILED NOW
     let info_c2 = queue.get_task(&id_c).await.unwrap();
     assert_eq!(info_c2.state, TaskState::Failed);
     assert_eq!(info_c2.retry_count, 1);
-    assert!(info_c2.error_message.unwrap().contains("maximum retry limit (1) reached"));
+    assert!(info_c2
+        .error_message
+        .unwrap()
+        .contains("maximum retry limit (1) reached"));
     let res_c = queue.get_result(&id_c).await.unwrap();
     assert_eq!(res_c.exit_code, 1);
 
@@ -504,13 +688,18 @@ async fn test_direct_queue_boundary_crash_cycles_and_audit() {
     queue.mark_running(&id_a, wid3).await.unwrap();
 
     // Crash wid3 -> exhausts Task A max_retries (2)
-    let affected3 = queue.handle_worker_disconnected(&wid3, "Crash wid3", true).await;
+    let affected3 = queue
+        .handle_worker_disconnected(&wid3, "Crash wid3", true)
+        .await;
     assert_eq!(affected3.len(), 1);
 
     let info_a3 = queue.get_task(&id_a).await.unwrap();
     assert_eq!(info_a3.state, TaskState::Failed);
     assert_eq!(info_a3.retry_count, 2);
-    assert!(info_a3.error_message.unwrap().contains("maximum retry limit (2) reached"));
+    assert!(info_a3
+        .error_message
+        .unwrap()
+        .contains("maximum retry limit (2) reached"));
     let res_a = queue.get_result(&id_a).await.unwrap();
     assert_eq!(res_a.exit_code, 1);
 }
@@ -521,20 +710,33 @@ async fn test_direct_queue_boundary_crash_cycles_and_audit() {
 
 #[tokio::test]
 async fn test_client_wait_task_unblocks_promptly_on_crash() {
-    let master = MasterServer::spawn(
-        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0),
-    )
-    .await
-    .expect("master spawn");
+    let master =
+        MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0))
+            .await
+            .expect("master spawn");
     let master_addr = master.server_addr().to_string();
 
     let (_w1_tx, w1_rx) = watch::channel(false);
-    let mut w1 = WorkerClient::from_options(master_addr.clone(), Some("wait-w1".into()), Some(1), false);
-    let h1 = tokio::spawn(async move { let _ = w1.run(w1_rx).await; });
+    let mut w1 =
+        WorkerClient::from_options(master_addr.clone(), Some("wait-w1".into()), Some(1), false);
+    let h1 = tokio::spawn(async move {
+        let _ = w1.run(w1_rx).await;
+    });
 
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(30), || async {
-        master.list_workers().await.map(|w| w.len() == 1).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(30),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|w| w.len() == 1)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     let task = Task::new(
         TaskSpec::BuiltinTest {
@@ -551,19 +753,35 @@ async fn test_client_wait_task_unblocks_promptly_on_crash() {
     // Spawn client calling wait_task with 5 second timeout
     let master_clone = master.clone();
     let wait_handle = tokio::spawn(async move {
-        master_clone.wait_task(task_id, Some(Duration::from_secs(5))).await
+        master_clone
+            .wait_task(task_id, Some(Duration::from_secs(5)))
+            .await
     });
 
     // Wait until running
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(20), || async {
-        master.get_task_info(task_id).await.map(|i| i.state == TaskState::Running).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(task_id)
+                    .await
+                    .map(|i| i.state == TaskState::Running)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     // Kill worker and measure latency until wait_task unblocks
     let kill_time = Instant::now();
     h1.abort();
 
-    let result = wait_handle.await.expect("join wait handle").expect("wait_task result");
+    let result = wait_handle
+        .await
+        .expect("join wait handle")
+        .expect("wait_task result");
     let unblock_latency = kill_time.elapsed();
 
     // Must unblock in less than 300ms (far less than 5s timeout!)
@@ -588,13 +806,9 @@ async fn test_client_wait_task_unblocks_on_reaper_eviction_latency() {
     // Fast reaper: 20ms scan interval, 60ms timeout threshold
     let reaper_config = ReaperConfig::new(Duration::from_millis(20), Duration::from_millis(60));
     let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0);
-    let master = MasterServer::spawn_with_config(
-        server_config,
-        Default::default(),
-        reaper_config,
-    )
-    .await
-    .expect("master spawn");
+    let master = MasterServer::spawn_with_config(server_config, Default::default(), reaper_config)
+        .await
+        .expect("master spawn");
     let master_addr = master.server_addr();
 
     // Raw TCP connection simulating a silent/frozen worker (no heartbeats sent)
@@ -609,7 +823,10 @@ async fn test_client_wait_task_unblocks_on_reaper_eviction_latency() {
     transport.send_msg(&reg_msg).await.expect("send reg");
 
     let ack: Option<MasterMessage> = transport.recv_msg().await.expect("recv ack");
-    assert!(matches!(ack, Some(MasterMessage::RegisterAck { accepted: true, .. })));
+    assert!(matches!(
+        ack,
+        Some(MasterMessage::RegisterAck { accepted: true, .. })
+    ));
 
     let task = Task::new(
         TaskSpec::BuiltinTest {
@@ -630,14 +847,19 @@ async fn test_client_wait_task_unblocks_on_reaper_eviction_latency() {
     // Spawn client calling wait_task
     let master_clone = master.clone();
     let wait_handle = tokio::spawn(async move {
-        master_clone.wait_task(task_id, Some(Duration::from_secs(5))).await
+        master_clone
+            .wait_task(task_id, Some(Duration::from_secs(5)))
+            .await
     });
 
     // Mark start of freeze. The worker sends NO heartbeats.
     let freeze_start = Instant::now();
 
     // Waiter MUST unblock once reaper detects inactivity > 60ms
-    let result = wait_handle.await.expect("join wait handle").expect("wait_task result");
+    let result = wait_handle
+        .await
+        .expect("join wait handle")
+        .expect("wait_task result");
     let elapsed = freeze_start.elapsed();
 
     // Reaper threshold is 60ms, scan interval 20ms. Total resolution must be < 600ms
@@ -661,27 +883,43 @@ async fn test_client_wait_task_unblocks_on_reaper_eviction_latency() {
 
 #[tokio::test]
 async fn test_client_wait_task_preserves_resolution_across_mid_flight_failover() {
-    let master = MasterServer::spawn(
-        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3),
-    )
-    .await
-    .expect("master spawn");
+    let master =
+        MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3))
+            .await
+            .expect("master spawn");
     let master_addr = master.server_addr().to_string();
 
     let (_w1_tx, w1_rx) = watch::channel(false);
     let (_w2_tx, w2_rx) = watch::channel(false);
 
-    let mut w1 = WorkerClient::from_options(master_addr.clone(), Some("mid-w1".into()), Some(2), false);
+    let mut w1 =
+        WorkerClient::from_options(master_addr.clone(), Some("mid-w1".into()), Some(2), false);
     let w1_id = w1.worker_id();
-    let mut w2 = WorkerClient::from_options(master_addr.clone(), Some("mid-w2".into()), Some(2), false);
+    let mut w2 =
+        WorkerClient::from_options(master_addr.clone(), Some("mid-w2".into()), Some(2), false);
     let _w2_id = w2.worker_id();
 
-    let h1 = tokio::spawn(async move { let _ = w1.run(w1_rx).await; });
-    let _h2 = tokio::spawn(async move { let _ = w2.run(w2_rx).await; });
+    let h1 = tokio::spawn(async move {
+        let _ = w1.run(w1_rx).await;
+    });
+    let _h2 = tokio::spawn(async move {
+        let _ = w2.run(w2_rx).await;
+    });
 
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(30), || async {
-        master.list_workers().await.map(|w| w.len() == 2).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(30),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|w| w.len() == 2)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     // Task that runs for 1.2s
     let task = Task::new(
@@ -699,13 +937,26 @@ async fn test_client_wait_task_preserves_resolution_across_mid_flight_failover()
     // Client starts wait_task BEFORE any crash occurs
     let master_clone = master.clone();
     let wait_handle = tokio::spawn(async move {
-        master_clone.wait_task(task_id, Some(Duration::from_secs(8))).await
+        master_clone
+            .wait_task(task_id, Some(Duration::from_secs(8)))
+            .await
     });
 
     // Wait until task is running
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(20), || async {
-        master.get_task_info(task_id).await.map(|i| i.state == TaskState::Running).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(task_id)
+                    .await
+                    .map(|i| i.state == TaskState::Running)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     let info = master.get_task_info(task_id).await.unwrap();
     let initial_worker = info.assigned_worker_id.unwrap();
@@ -718,8 +969,14 @@ async fn test_client_wait_task_preserves_resolution_across_mid_flight_failover()
     }
 
     // The client's wait_task MUST NOT crash, error, or drop; it must wait and succeed on survivor!
-    let result = wait_handle.await.expect("wait handle join").expect("wait_task result");
-    assert_eq!(result.exit_code, 0, "Task must complete with exit code 0 on survivor");
+    let result = wait_handle
+        .await
+        .expect("wait handle join")
+        .expect("wait_task result");
+    assert_eq!(
+        result.exit_code, 0,
+        "Task must complete with exit code 0 on survivor"
+    );
     assert!(result.is_success());
 
     let final_info = master.get_task_info(task_id).await.unwrap();
@@ -735,20 +992,37 @@ async fn test_client_wait_task_preserves_resolution_across_mid_flight_failover()
 
 #[tokio::test]
 async fn test_multiple_concurrent_client_waiters_fanout() {
-    let master = MasterServer::spawn(
-        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0),
-    )
-    .await
-    .expect("master spawn");
+    let master =
+        MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0))
+            .await
+            .expect("master spawn");
     let master_addr = master.server_addr().to_string();
 
     let (_w1_tx, w1_rx) = watch::channel(false);
-    let mut w1 = WorkerClient::from_options(master_addr.clone(), Some("fanout-w1".into()), Some(1), false);
-    let h1 = tokio::spawn(async move { let _ = w1.run(w1_rx).await; });
+    let mut w1 = WorkerClient::from_options(
+        master_addr.clone(),
+        Some("fanout-w1".into()),
+        Some(1),
+        false,
+    );
+    let h1 = tokio::spawn(async move {
+        let _ = w1.run(w1_rx).await;
+    });
 
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(30), || async {
-        master.list_workers().await.map(|w| w.len() == 1).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(30),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|w| w.len() == 1)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     let task = Task::new(
         TaskSpec::BuiltinTest {
@@ -772,9 +1046,20 @@ async fn test_multiple_concurrent_client_waiters_fanout() {
     }
 
     // Wait until running
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(20), || async {
-        master.get_task_info(task_id).await.map(|i| i.state == TaskState::Running).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(task_id)
+                    .await
+                    .map(|i| i.state == TaskState::Running)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     let kill_time = Instant::now();
     h1.abort();
@@ -793,7 +1078,10 @@ async fn test_multiple_concurrent_client_waiters_fanout() {
         let task_res = res.expect("join").expect("task result");
         assert_eq!(task_res.exit_code, 1);
         assert!(!task_res.is_success());
-        assert!(task_res.error.unwrap().contains("maximum retry limit (0) reached"));
+        assert!(task_res
+            .error
+            .unwrap()
+            .contains("maximum retry limit (0) reached"));
     }
 
     let _ = master.shutdown();
@@ -805,24 +1093,43 @@ async fn test_multiple_concurrent_client_waiters_fanout() {
 
 #[tokio::test]
 async fn test_tcp_wire_client_submit_wait_resolution() {
-    let master = MasterServer::spawn(
-        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0),
-    )
-    .await
-    .expect("master spawn");
+    let master =
+        MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(0))
+            .await
+            .expect("master spawn");
     let master_addr = master.server_addr();
 
     // Spawn worker
     let (_w1_tx, w1_rx) = watch::channel(false);
-    let mut w1 = WorkerClient::from_options(master_addr.to_string(), Some("wire-w1".into()), Some(1), false);
-    let h1 = tokio::spawn(async move { let _ = w1.run(w1_rx).await; });
+    let mut w1 = WorkerClient::from_options(
+        master_addr.to_string(),
+        Some("wire-w1".into()),
+        Some(1),
+        false,
+    );
+    let h1 = tokio::spawn(async move {
+        let _ = w1.run(w1_rx).await;
+    });
 
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(30), || async {
-        master.list_workers().await.map(|w| w.len() == 1).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(30),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|w| w.len() == 1)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     // Connect raw TCP client
-    let stream = TcpStream::connect(master_addr).await.expect("client connect");
+    let stream = TcpStream::connect(master_addr)
+        .await
+        .expect("client connect");
     let mut client_transport = MessageTransport::new(stream);
 
     let task = Task::new(
@@ -839,12 +1146,26 @@ async fn test_tcp_wire_client_submit_wait_resolution() {
         task: task.clone(),
         wait: true,
     };
-    client_transport.send_msg(&submit_msg).await.expect("send submit");
+    client_transport
+        .send_msg(&submit_msg)
+        .await
+        .expect("send submit");
 
     // Wait until task is running
-    assert!(wait_for(Duration::from_secs(5), Duration::from_millis(20), || async {
-        master.get_task_info(task.id).await.map(|i| i.state == TaskState::Running).unwrap_or(false)
-    }).await);
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(task.id)
+                    .await
+                    .map(|i| i.state == TaskState::Running)
+                    .unwrap_or(false)
+            }
+        )
+        .await
+    );
 
     // Kill worker
     h1.abort();
@@ -881,11 +1202,17 @@ fn test_cli_flags_configuration_and_precedence() {
     std::env::set_var(&env_key, "10");
     let file_cfg = Some(5);
     let resolved = resolve_u32(Some(20), &env_slice, file_cfg, 3);
-    assert_eq!(resolved, 20, "CLI argument must override env, file, and default");
+    assert_eq!(
+        resolved, 20,
+        "CLI argument must override env, file, and default"
+    );
 
     // 2. Env variable takes second precedence
     let resolved_env = resolve_u32(None, &env_slice, file_cfg, 3);
-    assert_eq!(resolved_env, 10, "Env variable must override file and default");
+    assert_eq!(
+        resolved_env, 10,
+        "Env variable must override file and default"
+    );
 
     // 3. File config takes third precedence
     std::env::remove_var(&env_key);

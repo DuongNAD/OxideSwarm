@@ -678,13 +678,7 @@ mod tests {
         let caps = WorkerCapabilities::new("w-test", 4, 8192, false, false, None);
 
         let session_id = registry
-            .register(
-                worker_id,
-                caps,
-                "127.0.0.1:9099".parse().unwrap(),
-                tx,
-                None,
-            )
+            .register(worker_id, caps, "127.0.0.1:9099".parse().unwrap(), tx, None)
             .await
             .unwrap();
 
@@ -696,15 +690,24 @@ mod tests {
         assert_eq!(entry.status, WorkerStatus::Busy);
 
         // First unregister: returns Ok(true), status becomes Disconnected, active_tasks reset to 0
-        let unreg1 = registry.unregister(&worker_id, Some(session_id)).await.unwrap();
+        let unreg1 = registry
+            .unregister(&worker_id, Some(session_id))
+            .await
+            .unwrap();
         assert!(unreg1, "First unregister must succeed");
 
         let entry_disconnected = registry.get_worker(worker_id).await.unwrap();
         assert_eq!(entry_disconnected.status, WorkerStatus::Disconnected);
-        assert_eq!(entry_disconnected.active_tasks, 0, "active_tasks must be reset to 0 on disconnect");
+        assert_eq!(
+            entry_disconnected.active_tasks, 0,
+            "active_tasks must be reset to 0 on disconnect"
+        );
 
         // Second unregister: returns Ok(false) due to idempotency
-        let unreg2 = registry.unregister(&worker_id, Some(session_id)).await.unwrap();
+        let unreg2 = registry
+            .unregister(&worker_id, Some(session_id))
+            .await
+            .unwrap();
         assert!(!unreg2, "Second unregister must return false (idempotent)");
     }
 }

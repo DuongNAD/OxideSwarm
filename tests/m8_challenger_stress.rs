@@ -20,9 +20,9 @@ use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::{
-    deserialize_message, serialize_message, ClientMessage, ClientResponse,
-    MasterMessage, MessageTransport, ProtocolError, WireCodec, WorkerMessage,
-    WIRE_FORMAT_BINCODE, WIRE_FORMAT_JSON,
+    deserialize_message, serialize_message, ClientMessage, ClientResponse, MasterMessage,
+    MessageTransport, ProtocolError, WireCodec, WorkerMessage, WIRE_FORMAT_BINCODE,
+    WIRE_FORMAT_JSON,
 };
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
 use rusty_grid_master::registry::WorkerStatus;
@@ -275,7 +275,10 @@ async fn test_m8_post_handshake_malformed_discriminator_disconnects_worker() {
     let (ack_msg, ack_codec): (MasterMessage, WireCodec) =
         deserialize_message(&ack_frame).expect("deserialize RegisterAck");
     assert_eq!(ack_codec, WireCodec::Bincode);
-    assert!(matches!(ack_msg, MasterMessage::RegisterAck { accepted: true, .. }));
+    assert!(matches!(
+        ack_msg,
+        MasterMessage::RegisterAck { accepted: true, .. }
+    ));
 
     // Now send a post-handshake message with invalid discriminator 0x03
     let malformed_post = vec![0x03, 0xDE, 0xAD, 0xBE, 0xEF];
@@ -296,7 +299,10 @@ async fn test_m8_post_handshake_malformed_discriminator_disconnects_worker() {
     let active_w = workers
         .iter()
         .find(|w| w.worker_id == worker_id && w.status == WorkerStatus::Connected);
-    assert!(active_w.is_none(), "Worker was not evicted after sending malformed discriminator");
+    assert!(
+        active_w.is_none(),
+        "Worker was not evicted after sending malformed discriminator"
+    );
 
     let _ = master.shutdown();
 }
@@ -315,7 +321,10 @@ async fn test_m8_truncated_and_empty_frames() {
     // 1. Zero-length payload frame (length prefix = 0)
     {
         let mut stream = TcpStream::connect(&master_addr).await.expect("connect");
-        stream.write_all(&0u32.to_be_bytes()).await.expect("write 0 len");
+        stream
+            .write_all(&0u32.to_be_bytes())
+            .await
+            .expect("write 0 len");
         stream.flush().await.expect("flush");
 
         let mut buf = [0u8; 16];
@@ -326,11 +335,16 @@ async fn test_m8_truncated_and_empty_frames() {
     // 2. Discriminator-only frame (length = 1, payload = [0x02])
     {
         let mut stream = TcpStream::connect(&master_addr).await.expect("connect");
-        send_raw_frame(&mut stream, &[WIRE_FORMAT_BINCODE]).await.expect("send tag only");
+        send_raw_frame(&mut stream, &[WIRE_FORMAT_BINCODE])
+            .await
+            .expect("send tag only");
 
         let mut buf = [0u8; 16];
         let n = stream.read(&mut buf).await.unwrap_or(0);
-        assert_eq!(n, 0, "Master must close on tag-only truncated bincode frame");
+        assert_eq!(
+            n, 0,
+            "Master must close on tag-only truncated bincode frame"
+        );
     }
 
     // 3. Partial Bincode message (cut in half)
@@ -343,7 +357,9 @@ async fn test_m8_truncated_and_empty_frames() {
         let full_frame = serialize_message(&reg_msg, WireCodec::Bincode).expect("serialize");
         // Truncate to first 12 bytes of a 40+ byte message
         let truncated = &full_frame[..12];
-        send_raw_frame(&mut stream, truncated).await.expect("send truncated");
+        send_raw_frame(&mut stream, truncated)
+            .await
+            .expect("send truncated");
 
         let mut buf = [0u8; 16];
         let n = stream.read(&mut buf).await.unwrap_or(0);
@@ -353,8 +369,14 @@ async fn test_m8_truncated_and_empty_frames() {
     // 4. Abrupt TCP EOF mid-frame (header promises 1000 bytes, sends 10 then closes)
     {
         let mut stream = TcpStream::connect(&master_addr).await.expect("connect");
-        stream.write_all(&1000u32.to_be_bytes()).await.expect("write len 1000");
-        stream.write_all(&[WIRE_FORMAT_BINCODE, 0x01, 0x02, 0x03]).await.expect("write 4 bytes");
+        stream
+            .write_all(&1000u32.to_be_bytes())
+            .await
+            .expect("write len 1000");
+        stream
+            .write_all(&[WIRE_FORMAT_BINCODE, 0x01, 0x02, 0x03])
+            .await
+            .expect("write 4 bytes");
         stream.shutdown().await.expect("abrupt shutdown");
     }
 
@@ -364,7 +386,9 @@ async fn test_m8_truncated_and_empty_frames() {
         let mut corrupt_payload = vec![WIRE_FORMAT_BINCODE];
         corrupt_payload.extend_from_slice(&999999u32.to_le_bytes()); // invalid enum discriminant
         corrupt_payload.extend_from_slice(&[0x00; 32]);
-        send_raw_frame(&mut stream, &corrupt_payload).await.expect("send corrupt");
+        send_raw_frame(&mut stream, &corrupt_payload)
+            .await
+            .expect("send corrupt");
 
         let mut buf = [0u8; 16];
         let n = stream.read(&mut buf).await.unwrap_or(0);
@@ -401,12 +425,12 @@ fn test_m8_large_binary_payload_wire_comparison() {
         };
 
         // Serialize via Bincode
-        let bincode_frame = serialize_message(&task_spec, WireCodec::Bincode)
-            .expect("serialize_message Bincode");
+        let bincode_frame =
+            serialize_message(&task_spec, WireCodec::Bincode).expect("serialize_message Bincode");
 
         // Serialize via JSON
-        let json_frame = serialize_message(&task_spec, WireCodec::Json)
-            .expect("serialize_message JSON");
+        let json_frame =
+            serialize_message(&task_spec, WireCodec::Json).expect("serialize_message JSON");
 
         // Verify Bincode payload size is very close to raw binary size (1 byte tag + enum + length + data)
         // Overhead should be less than 100 bytes!
@@ -498,7 +522,10 @@ async fn test_m8_large_binary_payload_gpu_compute_5mb_e2e() {
     match response {
         ClientResponse::TaskCompleted { result, .. } => {
             assert_eq!(result.exit_code, 0, "Task failed: {:?}", result.error);
-            assert!(result.is_gpu_executed, "Expected is_gpu_executed to be true");
+            assert!(
+                result.is_gpu_executed,
+                "Expected is_gpu_executed to be true"
+            );
         }
         other => panic!("Unexpected client response: {other:?}"),
     }
@@ -556,7 +583,9 @@ async fn test_m8_rapid_mixed_stream_clients() {
             match i % 4 {
                 0 => {
                     // Bincode Client
-                    let stream = TcpStream::connect(&addr).await.expect("connect bincode client");
+                    let stream = TcpStream::connect(&addr)
+                        .await
+                        .expect("connect bincode client");
                     let mut transport = MessageTransport::with_codec(stream, WireCodec::Bincode);
 
                     let task = Task::new(
@@ -574,7 +603,11 @@ async fn test_m8_rapid_mixed_stream_clients() {
                         .expect("recv Bincode response")
                         .expect("premature close");
 
-                    assert_eq!(codec, WireCodec::Bincode, "Expected symmetrical Bincode response");
+                    assert_eq!(
+                        codec,
+                        WireCodec::Bincode,
+                        "Expected symmetrical Bincode response"
+                    );
                     if let ClientResponse::TaskCompleted { result, .. } = resp {
                         assert_eq!(result.exit_code, 0);
                         counter.fetch_add(1, Ordering::SeqCst);
@@ -584,7 +617,9 @@ async fn test_m8_rapid_mixed_stream_clients() {
                 }
                 1 => {
                     // Tagged JSON Client
-                    let stream = TcpStream::connect(&addr).await.expect("connect json client");
+                    let stream = TcpStream::connect(&addr)
+                        .await
+                        .expect("connect json client");
                     let mut transport = MessageTransport::with_codec(stream, WireCodec::Json);
 
                     let task = Task::new(
@@ -612,7 +647,9 @@ async fn test_m8_rapid_mixed_stream_clients() {
                 }
                 2 => {
                     // Raw Legacy JSON Client ('{')
-                    let mut stream = TcpStream::connect(&addr).await.expect("connect raw json client");
+                    let mut stream = TcpStream::connect(&addr)
+                        .await
+                        .expect("connect raw json client");
                     let task = Task::new(
                         TaskSpec::builtin_test(format!("test_legacy_{i}"), 10),
                         TaskRequirements::generic(1, 15),
@@ -740,7 +777,10 @@ async fn test_m8_frame_boundary_and_streaming_integrity() {
         assert_eq!(codec3, WireCodec::Bincode);
         match resp3 {
             ClientResponse::Error { message } => {
-                assert!(message.contains("not found"), "Unexpected error message: {message}");
+                assert!(
+                    message.contains("not found"),
+                    "Unexpected error message: {message}"
+                );
             }
             other => panic!("Iteration {i}: Expected Error for missing task, got {other:?}"),
         }

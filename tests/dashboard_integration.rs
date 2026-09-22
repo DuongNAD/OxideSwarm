@@ -15,9 +15,9 @@
 //! 3. `test_dashboard_sse_stream`:
 //!    - SSE endpoint /api/stream/sse returns text/event-stream and streams initial snapshot.
 
-use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use reqwest::StatusCode;
+use std::time::Duration;
 use tokio::sync::watch;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -42,8 +42,14 @@ async fn test_dashboard_http_rest_endpoints() {
         .with_dashboard_port_file(&dash_port_file);
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
-    let dash_addr = master.dashboard_addr().expect("dashboard addr must be assigned");
-    assert_ne!(dash_addr.port(), 0, "Ephemeral port must resolve to non-zero port");
+    let dash_addr = master
+        .dashboard_addr()
+        .expect("dashboard addr must be assigned");
+    assert_ne!(
+        dash_addr.port(),
+        0,
+        "Ephemeral port must resolve to non-zero port"
+    );
 
     // Verify port file was written with the exact bound port
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -73,7 +79,10 @@ async fn test_dashboard_http_rest_endpoints() {
         "Expected text/html, got {content_type}"
     );
     let html = resp.text().await.expect("read html body");
-    assert!(html.contains("<!DOCTYPE html>"), "Must be valid HTML5 document");
+    assert!(
+        html.contains("<!DOCTYPE html>"),
+        "Must be valid HTML5 document"
+    );
     assert!(html.contains("OxideSwarm"), "Must contain OxideSwarm brand");
     assert!(html.contains("Cockpit"), "Must contain Cockpit title");
 
@@ -199,17 +208,14 @@ async fn test_dashboard_http_rest_endpoints() {
 #[tokio::test]
 async fn test_dashboard_websocket_telemetry_stream() {
     // 1. Launch Master with ephemeral dashboard port (0)
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_dashboard_port(0);
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(0);
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
 
     // 2. Connect WebSocket client to /ws
     let ws_url = format!("ws://{}/ws", dash_addr);
-    let (ws_stream, response) = connect_async(&ws_url)
-        .await
-        .expect("connect to websocket");
+    let (ws_stream, response) = connect_async(&ws_url).await.expect("connect to websocket");
 
     assert_eq!(
         response.status(),
@@ -227,8 +233,8 @@ async fn test_dashboard_websocket_telemetry_stream() {
         .expect("valid websocket frame");
 
     let first_text = first_msg.to_text().expect("must be text frame");
-    let initial_stream_msg: DashboardStreamMessage = serde_json::from_str(first_text)
-        .expect("parse initial DashboardStreamMessage");
+    let initial_stream_msg: DashboardStreamMessage =
+        serde_json::from_str(first_text).expect("parse initial DashboardStreamMessage");
 
     match initial_stream_msg {
         DashboardStreamMessage::Snapshot(snapshot) => {
@@ -257,7 +263,9 @@ async fn test_dashboard_websocket_telemetry_stream() {
     let event_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
 
     while tokio::time::Instant::now() < event_deadline {
-        if let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_millis(500), read.next()).await {
+        if let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(Duration::from_millis(500), read.next()).await
+        {
             if let Ok(text) = msg.to_text() {
                 if let Ok(event) = serde_json::from_str::<DashboardStreamMessage>(text) {
                     match event {
@@ -275,7 +283,10 @@ async fn test_dashboard_websocket_telemetry_stream() {
             }
         }
     }
-    assert!(received_event, "Must receive dynamic event frame over WebSocket");
+    assert!(
+        received_event,
+        "Must receive dynamic event frame over WebSocket"
+    );
 
     // 5. Verify Ping/Pong frame handling
     let ping_payload = b"oxide_ping".to_vec();
@@ -287,7 +298,9 @@ async fn test_dashboard_websocket_telemetry_stream() {
     let mut received_pong = false;
     let pong_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < pong_deadline {
-        if let Ok(Some(Ok(Message::Pong(payload)))) = tokio::time::timeout(Duration::from_millis(500), read.next()).await {
+        if let Ok(Some(Ok(Message::Pong(payload)))) =
+            tokio::time::timeout(Duration::from_millis(500), read.next()).await
+        {
             if payload == ping_payload {
                 received_pong = true;
                 break;
@@ -304,8 +317,7 @@ async fn test_dashboard_websocket_telemetry_stream() {
 /// Test 3: Server-Sent Events (SSE) telemetry stream validation.
 #[tokio::test]
 async fn test_dashboard_sse_stream() {
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_dashboard_port(0);
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(0);
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");

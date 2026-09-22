@@ -262,9 +262,9 @@ impl From<ProtocolError> for GridError {
             ProtocolError::Io(e) => GridError::Io(e),
             ProtocolError::Json(e) => GridError::Serialization(e),
             ProtocolError::Bincode(e) => GridError::Framing(format!("Bincode error: {e}")),
-            ProtocolError::InvalidFormatTag(tag) => {
-                GridError::Framing(format!("Unsupported wire format discriminator: 0x{tag:02x}"))
-            }
+            ProtocolError::InvalidFormatTag(tag) => GridError::Framing(format!(
+                "Unsupported wire format discriminator: 0x{tag:02x}"
+            )),
             ProtocolError::FrameTooLarge { size, max } => GridError::FrameTooLarge { size, max },
             ProtocolError::UnexpectedEof => GridError::ConnectionClosed,
             ProtocolError::ConnectionClosed => GridError::ConnectionClosed,

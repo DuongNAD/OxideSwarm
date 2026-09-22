@@ -383,7 +383,9 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
     class: JClass<'local>,
     timeout_ms: jlong,
 ) -> jstring {
-    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeDiscoverMaster(env, class, timeout_ms)
+    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeDiscoverMaster(
+        env, class, timeout_ms,
+    )
 }
 
 #[cfg(test)]

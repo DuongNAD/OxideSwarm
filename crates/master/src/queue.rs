@@ -1094,7 +1094,9 @@ mod tests {
         let worker_id = Uuid::new_v4();
         let _ = queue.pop_and_schedule(worker_id, |_| true).await.unwrap();
 
-        let affected = queue.handle_worker_disconnected(&worker_id, "crash", false).await;
+        let affected = queue
+            .handle_worker_disconnected(&worker_id, "crash", false)
+            .await;
         assert_eq!(affected, vec![task_id]);
         assert_eq!(queue.get_state(&task_id).await.unwrap(), TaskState::Failed);
         let res = queue
@@ -1160,6 +1162,9 @@ mod tests {
         let res = queue.get_result(&task_id).await.unwrap();
         assert_eq!(res.exit_code, 1);
         let err = res.error.unwrap();
-        assert!(err.contains("maximum retry limit (1) reached"), "Must record max retry limit 1: {err}");
+        assert!(
+            err.contains("maximum retry limit (1) reached"),
+            "Must record max retry limit 1: {err}"
+        );
     }
 }

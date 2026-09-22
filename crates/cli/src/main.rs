@@ -534,8 +534,13 @@ async fn run_master(args: MasterArgs, config_file: Option<config::ConfigFile>) -
 
     let dashboard_port_file = resolve_opt_string(
         args.dashboard_port_file.map(|p| p.display().to_string()),
-        &["RUSTY_GRID_DASHBOARD_PORT_FILE", "OXIDE_SWARM_DASHBOARD_PORT_FILE"],
-        master_cfg.as_ref().and_then(|m| m.dashboard_port_file.clone()),
+        &[
+            "RUSTY_GRID_DASHBOARD_PORT_FILE",
+            "OXIDE_SWARM_DASHBOARD_PORT_FILE",
+        ],
+        master_cfg
+            .as_ref()
+            .and_then(|m| m.dashboard_port_file.clone()),
     );
 
     if let Some(dp) = dashboard_port {
@@ -779,18 +784,18 @@ async fn run_worker(args: WorkerArgs, config_file: Option<config::ConfigFile>) -
 
 async fn resolve_master_addr(addr: String) -> String {
     if addr.eq_ignore_ascii_case("auto") || addr.starts_with("auto:") {
-        let disc_port = if addr.starts_with("auto:") {
-            addr[5..].parse::<u16>().unwrap_or(rusty_grid_core::DEFAULT_DISCOVERY_PORT)
+        let disc_port = if let Some(port_str) = addr.strip_prefix("auto:") {
+            port_str
+                .parse::<u16>()
+                .unwrap_or(rusty_grid_core::DEFAULT_DISCOVERY_PORT)
         } else {
             rusty_grid_core::DEFAULT_DISCOVERY_PORT
         };
-        info!(port = disc_port, "Master address set to 'auto'; performing LAN UDP discovery probe...");
-        match rusty_grid_core::discovery::discover_master(
-            Duration::from_secs(3),
-            disc_port,
-        )
-        .await
-        {
+        info!(
+            port = disc_port,
+            "Master address set to 'auto'; performing LAN UDP discovery probe..."
+        );
+        match rusty_grid_core::discovery::discover_master(Duration::from_secs(3), disc_port).await {
             Some(beacon) => {
                 info!(
                     master = %beacon.cluster_addr,

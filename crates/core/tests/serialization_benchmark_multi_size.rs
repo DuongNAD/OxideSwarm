@@ -10,9 +10,7 @@
 use std::time::Instant;
 use uuid::Uuid;
 
-use rusty_grid_core::protocol::{
-    deserialize_message, serialize_message, MasterMessage, WireCodec,
-};
+use rusty_grid_core::protocol::{deserialize_message, serialize_message, MasterMessage, WireCodec};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskResult, TaskSpec};
 
 #[allow(dead_code)]
@@ -46,7 +44,8 @@ fn bench_gpu_compute(size: usize, iters: usize) -> BenchmarkResult {
     let bincode_bytes = bincode::serialize(&spec).expect("Bincode serialize");
 
     let json_deser: TaskSpec = serde_json::from_slice(&json_bytes).expect("JSON deserialize");
-    let bincode_deser: TaskSpec = bincode::deserialize(&bincode_bytes).expect("Bincode deserialize");
+    let bincode_deser: TaskSpec =
+        bincode::deserialize(&bincode_bytes).expect("Bincode deserialize");
 
     let roundtrip_ok = (json_deser == spec) && (bincode_deser == spec);
     assert!(roundtrip_ok, "Lossless roundtrip must match original spec");
@@ -122,10 +121,14 @@ fn bench_task_result(size: usize, iters: usize) -> BenchmarkResult {
     let bincode_bytes = bincode::serialize(&result).expect("Bincode serialize");
 
     let json_deser: TaskResult = serde_json::from_slice(&json_bytes).expect("JSON deserialize");
-    let bincode_deser: TaskResult = bincode::deserialize(&bincode_bytes).expect("Bincode deserialize");
+    let bincode_deser: TaskResult =
+        bincode::deserialize(&bincode_bytes).expect("Bincode deserialize");
 
     let roundtrip_ok = (json_deser == result) && (bincode_deser == result);
-    assert!(roundtrip_ok, "Lossless roundtrip must match original result");
+    assert!(
+        roundtrip_ok,
+        "Lossless roundtrip must match original result"
+    );
 
     let size_reduction_pct = 100.0 * (1.0 - (bincode_bytes.len() as f64 / json_bytes.len() as f64));
 
@@ -197,13 +200,24 @@ fn test_multi_payload_size_benchmark_matrix() {
     ];
 
     println!("\n==========================================================================================");
-    println!("EMPIRICAL SERIALIZATION BENCHMARK MATRIX: JSON VS BINCODE ACROSS MULTIPLE PAYLOAD SIZES");
+    println!(
+        "EMPIRICAL SERIALIZATION BENCHMARK MATRIX: JSON VS BINCODE ACROSS MULTIPLE PAYLOAD SIZES"
+    );
     println!("==========================================================================================");
 
     println!("\n--- Part 1: TaskSpec::GpuCompute (Raw Binary Payload) ---");
     println!(
         "{:<8} | {:<10} | {:<10} | {:<10} | {:<12} | {:<12} | {:<10} | {:<12} | {:<12} | {:<10}",
-        "Size", "JSON (B)", "Bin (B)", "Reduction", "JSON Ser (us)", "Bin Ser (us)", "Ser Speed", "JSON De (us)", "Bin De (us)", "De Speed"
+        "Size",
+        "JSON (B)",
+        "Bin (B)",
+        "Reduction",
+        "JSON Ser (us)",
+        "Bin Ser (us)",
+        "Ser Speed",
+        "JSON De (us)",
+        "Bin De (us)",
+        "De Speed"
     );
     println!("{}", "-".repeat(118));
 
@@ -246,7 +260,16 @@ fn test_multi_payload_size_benchmark_matrix() {
     println!("\n--- Part 2: TaskResult (String Log Output Payload) ---");
     println!(
         "{:<8} | {:<10} | {:<10} | {:<10} | {:<12} | {:<12} | {:<10} | {:<12} | {:<12} | {:<10}",
-        "Size", "JSON (B)", "Bin (B)", "Reduction", "JSON Ser (us)", "Bin Ser (us)", "Ser Speed", "JSON De (us)", "Bin De (us)", "De Speed"
+        "Size",
+        "JSON (B)",
+        "Bin (B)",
+        "Reduction",
+        "JSON Ser (us)",
+        "Bin Ser (us)",
+        "Ser Speed",
+        "JSON De (us)",
+        "Bin De (us)",
+        "De Speed"
     );
     println!("{}", "-".repeat(118));
 

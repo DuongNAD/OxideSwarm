@@ -10,7 +10,9 @@ pub mod task;
 pub mod transport;
 
 pub use capabilities::WorkerCapabilities;
-pub use discovery::{discover_master, MasterBeacon, DEFAULT_DISCOVERY_PORT, DISCOVERY_MAGIC_REQUEST};
+pub use discovery::{
+    discover_master, MasterBeacon, DEFAULT_DISCOVERY_PORT, DISCOVERY_MAGIC_REQUEST,
+};
 pub use error::{GridError, GridResult};
 pub use mode::{ModeExecutionResult, WorkflowMode};
 pub use protocol::{

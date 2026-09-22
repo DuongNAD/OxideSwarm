@@ -162,7 +162,10 @@ enum HumanWorkerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
-    Disconnecting { worker_id: Uuid, reason: String },
+    Disconnecting {
+        worker_id: Uuid,
+        reason: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -193,24 +196,63 @@ enum BinaryWorkerMessage {
         is_gpu_executed: bool,
         error: Option<String>,
     },
-    Disconnecting { worker_id: Uuid, reason: String },
+    Disconnecting {
+        worker_id: Uuid,
+        reason: String,
+    },
 }
 
 impl From<WorkerMessage> for HumanWorkerMessage {
     fn from(msg: WorkerMessage) -> Self {
         match msg {
-            WorkerMessage::Register { worker_id, capabilities } => {
-                HumanWorkerMessage::Register { worker_id, capabilities }
-            }
-            WorkerMessage::Heartbeat { worker_id, timestamp, active_tasks, cpu_usage_pct, ram_available_mb } => {
-                HumanWorkerMessage::Heartbeat { worker_id, timestamp, active_tasks, cpu_usage_pct, ram_available_mb }
-            }
-            WorkerMessage::TaskProgress { worker_id, task_id, status } => {
-                HumanWorkerMessage::TaskProgress { worker_id, task_id, status }
-            }
-            WorkerMessage::TaskResult { worker_id, task_id, exit_code, stdout, stderr, execution_time_ms, is_gpu_executed, error } => {
-                HumanWorkerMessage::TaskResult { worker_id, task_id, exit_code, stdout, stderr, execution_time_ms, is_gpu_executed, error }
-            }
+            WorkerMessage::Register {
+                worker_id,
+                capabilities,
+            } => HumanWorkerMessage::Register {
+                worker_id,
+                capabilities,
+            },
+            WorkerMessage::Heartbeat {
+                worker_id,
+                timestamp,
+                active_tasks,
+                cpu_usage_pct,
+                ram_available_mb,
+            } => HumanWorkerMessage::Heartbeat {
+                worker_id,
+                timestamp,
+                active_tasks,
+                cpu_usage_pct,
+                ram_available_mb,
+            },
+            WorkerMessage::TaskProgress {
+                worker_id,
+                task_id,
+                status,
+            } => HumanWorkerMessage::TaskProgress {
+                worker_id,
+                task_id,
+                status,
+            },
+            WorkerMessage::TaskResult {
+                worker_id,
+                task_id,
+                exit_code,
+                stdout,
+                stderr,
+                execution_time_ms,
+                is_gpu_executed,
+                error,
+            } => HumanWorkerMessage::TaskResult {
+                worker_id,
+                task_id,
+                exit_code,
+                stdout,
+                stderr,
+                execution_time_ms,
+                is_gpu_executed,
+                error,
+            },
             WorkerMessage::Disconnecting { worker_id, reason } => {
                 HumanWorkerMessage::Disconnecting { worker_id, reason }
             }
@@ -221,18 +263,54 @@ impl From<WorkerMessage> for HumanWorkerMessage {
 impl From<HumanWorkerMessage> for WorkerMessage {
     fn from(msg: HumanWorkerMessage) -> Self {
         match msg {
-            HumanWorkerMessage::Register { worker_id, capabilities } => {
-                WorkerMessage::Register { worker_id, capabilities }
-            }
-            HumanWorkerMessage::Heartbeat { worker_id, timestamp, active_tasks, cpu_usage_pct, ram_available_mb } => {
-                WorkerMessage::Heartbeat { worker_id, timestamp, active_tasks, cpu_usage_pct, ram_available_mb }
-            }
-            HumanWorkerMessage::TaskProgress { worker_id, task_id, status } => {
-                WorkerMessage::TaskProgress { worker_id, task_id, status }
-            }
-            HumanWorkerMessage::TaskResult { worker_id, task_id, exit_code, stdout, stderr, execution_time_ms, is_gpu_executed, error } => {
-                WorkerMessage::TaskResult { worker_id, task_id, exit_code, stdout, stderr, execution_time_ms, is_gpu_executed, error }
-            }
+            HumanWorkerMessage::Register {
+                worker_id,
+                capabilities,
+            } => WorkerMessage::Register {
+                worker_id,
+                capabilities,
+            },
+            HumanWorkerMessage::Heartbeat {
+                worker_id,
+                timestamp,
+                active_tasks,
+                cpu_usage_pct,
+                ram_available_mb,
+            } => WorkerMessage::Heartbeat {
+                worker_id,
+                timestamp,
+                active_tasks,
+                cpu_usage_pct,
+                ram_available_mb,
+            },
+            HumanWorkerMessage::TaskProgress {
+                worker_id,
+                task_id,
+                status,
+            } => WorkerMessage::TaskProgress {
+                worker_id,
+                task_id,
+                status,
+            },
+            HumanWorkerMessage::TaskResult {
+                worker_id,
+                task_id,
+                exit_code,
+                stdout,
+                stderr,
+                execution_time_ms,
+                is_gpu_executed,
+                error,
+            } => WorkerMessage::TaskResult {
+                worker_id,
+                task_id,
+                exit_code,
+                stdout,
+                stderr,
+                execution_time_ms,
+                is_gpu_executed,
+                error,
+            },
             HumanWorkerMessage::Disconnecting { worker_id, reason } => {
                 WorkerMessage::Disconnecting { worker_id, reason }
             }
@@ -243,18 +321,54 @@ impl From<HumanWorkerMessage> for WorkerMessage {
 impl From<WorkerMessage> for BinaryWorkerMessage {
     fn from(msg: WorkerMessage) -> Self {
         match msg {
-            WorkerMessage::Register { worker_id, capabilities } => {
-                BinaryWorkerMessage::Register { worker_id, capabilities }
-            }
-            WorkerMessage::Heartbeat { worker_id, timestamp, active_tasks, cpu_usage_pct, ram_available_mb } => {
-                BinaryWorkerMessage::Heartbeat { worker_id, timestamp, active_tasks, cpu_usage_pct, ram_available_mb }
-            }
-            WorkerMessage::TaskProgress { worker_id, task_id, status } => {
-                BinaryWorkerMessage::TaskProgress { worker_id, task_id, status }
-            }
-            WorkerMessage::TaskResult { worker_id, task_id, exit_code, stdout, stderr, execution_time_ms, is_gpu_executed, error } => {
-                BinaryWorkerMessage::TaskResult { worker_id, task_id, exit_code, stdout, stderr, execution_time_ms, is_gpu_executed, error }
-            }
+            WorkerMessage::Register {
+                worker_id,
+                capabilities,
+            } => BinaryWorkerMessage::Register {
+                worker_id,
+                capabilities,
+            },
+            WorkerMessage::Heartbeat {
+                worker_id,
+                timestamp,
+                active_tasks,
+                cpu_usage_pct,
+                ram_available_mb,
+            } => BinaryWorkerMessage::Heartbeat {
+                worker_id,
+                timestamp,
+                active_tasks,
+                cpu_usage_pct,
+                ram_available_mb,
+            },
+            WorkerMessage::TaskProgress {
+                worker_id,
+                task_id,
+                status,
+            } => BinaryWorkerMessage::TaskProgress {
+                worker_id,
+                task_id,
+                status,
+            },
+            WorkerMessage::TaskResult {
+                worker_id,
+                task_id,
+                exit_code,
+                stdout,
+                stderr,
+                execution_time_ms,
+                is_gpu_executed,
+                error,
+            } => BinaryWorkerMessage::TaskResult {
+                worker_id,
+                task_id,
+                exit_code,
+                stdout,
+                stderr,
+                execution_time_ms,
+                is_gpu_executed,
+                error,
+            },
             WorkerMessage::Disconnecting { worker_id, reason } => {
                 BinaryWorkerMessage::Disconnecting { worker_id, reason }
             }
@@ -265,18 +379,54 @@ impl From<WorkerMessage> for BinaryWorkerMessage {
 impl From<BinaryWorkerMessage> for WorkerMessage {
     fn from(msg: BinaryWorkerMessage) -> Self {
         match msg {
-            BinaryWorkerMessage::Register { worker_id, capabilities } => {
-                WorkerMessage::Register { worker_id, capabilities }
-            }
-            BinaryWorkerMessage::Heartbeat { worker_id, timestamp, active_tasks, cpu_usage_pct, ram_available_mb } => {
-                WorkerMessage::Heartbeat { worker_id, timestamp, active_tasks, cpu_usage_pct, ram_available_mb }
-            }
-            BinaryWorkerMessage::TaskProgress { worker_id, task_id, status } => {
-                WorkerMessage::TaskProgress { worker_id, task_id, status }
-            }
-            BinaryWorkerMessage::TaskResult { worker_id, task_id, exit_code, stdout, stderr, execution_time_ms, is_gpu_executed, error } => {
-                WorkerMessage::TaskResult { worker_id, task_id, exit_code, stdout, stderr, execution_time_ms, is_gpu_executed, error }
-            }
+            BinaryWorkerMessage::Register {
+                worker_id,
+                capabilities,
+            } => WorkerMessage::Register {
+                worker_id,
+                capabilities,
+            },
+            BinaryWorkerMessage::Heartbeat {
+                worker_id,
+                timestamp,
+                active_tasks,
+                cpu_usage_pct,
+                ram_available_mb,
+            } => WorkerMessage::Heartbeat {
+                worker_id,
+                timestamp,
+                active_tasks,
+                cpu_usage_pct,
+                ram_available_mb,
+            },
+            BinaryWorkerMessage::TaskProgress {
+                worker_id,
+                task_id,
+                status,
+            } => WorkerMessage::TaskProgress {
+                worker_id,
+                task_id,
+                status,
+            },
+            BinaryWorkerMessage::TaskResult {
+                worker_id,
+                task_id,
+                exit_code,
+                stdout,
+                stderr,
+                execution_time_ms,
+                is_gpu_executed,
+                error,
+            } => WorkerMessage::TaskResult {
+                worker_id,
+                task_id,
+                exit_code,
+                stdout,
+                stderr,
+                execution_time_ms,
+                is_gpu_executed,
+                error,
+            },
             BinaryWorkerMessage::Disconnecting { worker_id, reason } => {
                 WorkerMessage::Disconnecting { worker_id, reason }
             }
@@ -379,8 +529,12 @@ enum HumanMasterMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
-    HeartbeatAck { timestamp: u64 },
-    AssignTask { task: Task },
+    HeartbeatAck {
+        timestamp: u64,
+    },
+    AssignTask {
+        task: Task,
+    },
     CancelTask {
         task_id: TaskId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -401,8 +555,12 @@ enum BinaryMasterMessage {
         heartbeat_interval_secs: u64,
         message: Option<String>,
     },
-    HeartbeatAck { timestamp: u64 },
-    AssignTask { task: Task },
+    HeartbeatAck {
+        timestamp: u64,
+    },
+    AssignTask {
+        task: Task,
+    },
     CancelTask {
         task_id: TaskId,
         reason: Option<String>,
@@ -416,21 +574,31 @@ enum BinaryMasterMessage {
 impl From<MasterMessage> for HumanMasterMessage {
     fn from(msg: MasterMessage) -> Self {
         match msg {
-            MasterMessage::RegisterAck { accepted, worker_id, heartbeat_interval_secs, message } => {
-                HumanMasterMessage::RegisterAck { accepted, worker_id, heartbeat_interval_secs, message }
-            }
+            MasterMessage::RegisterAck {
+                accepted,
+                worker_id,
+                heartbeat_interval_secs,
+                message,
+            } => HumanMasterMessage::RegisterAck {
+                accepted,
+                worker_id,
+                heartbeat_interval_secs,
+                message,
+            },
             MasterMessage::HeartbeatAck { timestamp } => {
                 HumanMasterMessage::HeartbeatAck { timestamp }
             }
-            MasterMessage::AssignTask { task } => {
-                HumanMasterMessage::AssignTask { task }
-            }
+            MasterMessage::AssignTask { task } => HumanMasterMessage::AssignTask { task },
             MasterMessage::CancelTask { task_id, reason } => {
                 HumanMasterMessage::CancelTask { task_id, reason }
             }
-            MasterMessage::Shutdown { reason, grace_period_secs } => {
-                HumanMasterMessage::Shutdown { reason, grace_period_secs }
-            }
+            MasterMessage::Shutdown {
+                reason,
+                grace_period_secs,
+            } => HumanMasterMessage::Shutdown {
+                reason,
+                grace_period_secs,
+            },
         }
     }
 }
@@ -438,21 +606,31 @@ impl From<MasterMessage> for HumanMasterMessage {
 impl From<HumanMasterMessage> for MasterMessage {
     fn from(msg: HumanMasterMessage) -> Self {
         match msg {
-            HumanMasterMessage::RegisterAck { accepted, worker_id, heartbeat_interval_secs, message } => {
-                MasterMessage::RegisterAck { accepted, worker_id, heartbeat_interval_secs, message }
-            }
+            HumanMasterMessage::RegisterAck {
+                accepted,
+                worker_id,
+                heartbeat_interval_secs,
+                message,
+            } => MasterMessage::RegisterAck {
+                accepted,
+                worker_id,
+                heartbeat_interval_secs,
+                message,
+            },
             HumanMasterMessage::HeartbeatAck { timestamp } => {
                 MasterMessage::HeartbeatAck { timestamp }
             }
-            HumanMasterMessage::AssignTask { task } => {
-                MasterMessage::AssignTask { task }
-            }
+            HumanMasterMessage::AssignTask { task } => MasterMessage::AssignTask { task },
             HumanMasterMessage::CancelTask { task_id, reason } => {
                 MasterMessage::CancelTask { task_id, reason }
             }
-            HumanMasterMessage::Shutdown { reason, grace_period_secs } => {
-                MasterMessage::Shutdown { reason, grace_period_secs }
-            }
+            HumanMasterMessage::Shutdown {
+                reason,
+                grace_period_secs,
+            } => MasterMessage::Shutdown {
+                reason,
+                grace_period_secs,
+            },
         }
     }
 }
@@ -460,21 +638,31 @@ impl From<HumanMasterMessage> for MasterMessage {
 impl From<MasterMessage> for BinaryMasterMessage {
     fn from(msg: MasterMessage) -> Self {
         match msg {
-            MasterMessage::RegisterAck { accepted, worker_id, heartbeat_interval_secs, message } => {
-                BinaryMasterMessage::RegisterAck { accepted, worker_id, heartbeat_interval_secs, message }
-            }
+            MasterMessage::RegisterAck {
+                accepted,
+                worker_id,
+                heartbeat_interval_secs,
+                message,
+            } => BinaryMasterMessage::RegisterAck {
+                accepted,
+                worker_id,
+                heartbeat_interval_secs,
+                message,
+            },
             MasterMessage::HeartbeatAck { timestamp } => {
                 BinaryMasterMessage::HeartbeatAck { timestamp }
             }
-            MasterMessage::AssignTask { task } => {
-                BinaryMasterMessage::AssignTask { task }
-            }
+            MasterMessage::AssignTask { task } => BinaryMasterMessage::AssignTask { task },
             MasterMessage::CancelTask { task_id, reason } => {
                 BinaryMasterMessage::CancelTask { task_id, reason }
             }
-            MasterMessage::Shutdown { reason, grace_period_secs } => {
-                BinaryMasterMessage::Shutdown { reason, grace_period_secs }
-            }
+            MasterMessage::Shutdown {
+                reason,
+                grace_period_secs,
+            } => BinaryMasterMessage::Shutdown {
+                reason,
+                grace_period_secs,
+            },
         }
     }
 }
@@ -482,21 +670,31 @@ impl From<MasterMessage> for BinaryMasterMessage {
 impl From<BinaryMasterMessage> for MasterMessage {
     fn from(msg: BinaryMasterMessage) -> Self {
         match msg {
-            BinaryMasterMessage::RegisterAck { accepted, worker_id, heartbeat_interval_secs, message } => {
-                MasterMessage::RegisterAck { accepted, worker_id, heartbeat_interval_secs, message }
-            }
+            BinaryMasterMessage::RegisterAck {
+                accepted,
+                worker_id,
+                heartbeat_interval_secs,
+                message,
+            } => MasterMessage::RegisterAck {
+                accepted,
+                worker_id,
+                heartbeat_interval_secs,
+                message,
+            },
             BinaryMasterMessage::HeartbeatAck { timestamp } => {
                 MasterMessage::HeartbeatAck { timestamp }
             }
-            BinaryMasterMessage::AssignTask { task } => {
-                MasterMessage::AssignTask { task }
-            }
+            BinaryMasterMessage::AssignTask { task } => MasterMessage::AssignTask { task },
             BinaryMasterMessage::CancelTask { task_id, reason } => {
                 MasterMessage::CancelTask { task_id, reason }
             }
-            BinaryMasterMessage::Shutdown { reason, grace_period_secs } => {
-                MasterMessage::Shutdown { reason, grace_period_secs }
-            }
+            BinaryMasterMessage::Shutdown {
+                reason,
+                grace_period_secs,
+            } => MasterMessage::Shutdown {
+                reason,
+                grace_period_secs,
+            },
         }
     }
 }
@@ -538,10 +736,7 @@ impl MasterMessage {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientMessage {
     /// Submits a task for execution.
-    SubmitTask {
-        task: Task,
-        wait: bool,
-    },
+    SubmitTask { task: Task, wait: bool },
     /// Queries the status and outcome of a specific task.
     GetTaskStatus { task_id: TaskId },
     /// Requests cancellation of a task.
@@ -599,8 +794,12 @@ enum BinaryClientMessage {
 impl From<ClientMessage> for HumanClientMessage {
     fn from(msg: ClientMessage) -> Self {
         match msg {
-            ClientMessage::SubmitTask { task, wait } => HumanClientMessage::SubmitTask { task, wait },
-            ClientMessage::GetTaskStatus { task_id } => HumanClientMessage::GetTaskStatus { task_id },
+            ClientMessage::SubmitTask { task, wait } => {
+                HumanClientMessage::SubmitTask { task, wait }
+            }
+            ClientMessage::GetTaskStatus { task_id } => {
+                HumanClientMessage::GetTaskStatus { task_id }
+            }
             ClientMessage::CancelTask { task_id } => HumanClientMessage::CancelTask { task_id },
             ClientMessage::ClusterStatus => HumanClientMessage::ClusterStatus,
             ClientMessage::ListWorkers => HumanClientMessage::ListWorkers,
@@ -612,8 +811,12 @@ impl From<ClientMessage> for HumanClientMessage {
 impl From<HumanClientMessage> for ClientMessage {
     fn from(msg: HumanClientMessage) -> Self {
         match msg {
-            HumanClientMessage::SubmitTask { task, wait } => ClientMessage::SubmitTask { task, wait },
-            HumanClientMessage::GetTaskStatus { task_id } => ClientMessage::GetTaskStatus { task_id },
+            HumanClientMessage::SubmitTask { task, wait } => {
+                ClientMessage::SubmitTask { task, wait }
+            }
+            HumanClientMessage::GetTaskStatus { task_id } => {
+                ClientMessage::GetTaskStatus { task_id }
+            }
             HumanClientMessage::CancelTask { task_id } => ClientMessage::CancelTask { task_id },
             HumanClientMessage::ClusterStatus => ClientMessage::ClusterStatus,
             HumanClientMessage::ListWorkers => ClientMessage::ListWorkers,
@@ -625,8 +828,12 @@ impl From<HumanClientMessage> for ClientMessage {
 impl From<ClientMessage> for BinaryClientMessage {
     fn from(msg: ClientMessage) -> Self {
         match msg {
-            ClientMessage::SubmitTask { task, wait } => BinaryClientMessage::SubmitTask { task, wait },
-            ClientMessage::GetTaskStatus { task_id } => BinaryClientMessage::GetTaskStatus { task_id },
+            ClientMessage::SubmitTask { task, wait } => {
+                BinaryClientMessage::SubmitTask { task, wait }
+            }
+            ClientMessage::GetTaskStatus { task_id } => {
+                BinaryClientMessage::GetTaskStatus { task_id }
+            }
             ClientMessage::CancelTask { task_id } => BinaryClientMessage::CancelTask { task_id },
             ClientMessage::ClusterStatus => BinaryClientMessage::ClusterStatus,
             ClientMessage::ListWorkers => BinaryClientMessage::ListWorkers,
@@ -638,8 +845,12 @@ impl From<ClientMessage> for BinaryClientMessage {
 impl From<BinaryClientMessage> for ClientMessage {
     fn from(msg: BinaryClientMessage) -> Self {
         match msg {
-            BinaryClientMessage::SubmitTask { task, wait } => ClientMessage::SubmitTask { task, wait },
-            BinaryClientMessage::GetTaskStatus { task_id } => ClientMessage::GetTaskStatus { task_id },
+            BinaryClientMessage::SubmitTask { task, wait } => {
+                ClientMessage::SubmitTask { task, wait }
+            }
+            BinaryClientMessage::GetTaskStatus { task_id } => {
+                ClientMessage::GetTaskStatus { task_id }
+            }
             BinaryClientMessage::CancelTask { task_id } => ClientMessage::CancelTask { task_id },
             BinaryClientMessage::ClusterStatus => ClientMessage::ClusterStatus,
             BinaryClientMessage::ListWorkers => ClientMessage::ListWorkers,
@@ -799,18 +1010,50 @@ enum BinaryClientResponse {
 impl From<ClientResponse> for HumanClientResponse {
     fn from(msg: ClientResponse) -> Self {
         match msg {
-            ClientResponse::TaskSubmitted { task_id } => HumanClientResponse::TaskSubmitted { task_id },
-            ClientResponse::TaskCompleted { task_id, result } => HumanClientResponse::TaskCompleted { task_id, result },
-            ClientResponse::TaskStatusInfo { task_id, status, state_name, assigned_worker, error } => {
-                HumanClientResponse::TaskStatusInfo { task_id, status, state_name, assigned_worker, error }
+            ClientResponse::TaskSubmitted { task_id } => {
+                HumanClientResponse::TaskSubmitted { task_id }
             }
-            ClientResponse::TaskCancelled { task_id, success } => HumanClientResponse::TaskCancelled { task_id, success },
-            ClientResponse::ClusterStatus { total_tasks, pending_tasks, running_tasks, completed_tasks, failed_tasks, workers } => {
-                HumanClientResponse::ClusterStatus { total_tasks, pending_tasks, running_tasks, completed_tasks, failed_tasks, workers }
+            ClientResponse::TaskCompleted { task_id, result } => {
+                HumanClientResponse::TaskCompleted { task_id, result }
             }
+            ClientResponse::TaskStatusInfo {
+                task_id,
+                status,
+                state_name,
+                assigned_worker,
+                error,
+            } => HumanClientResponse::TaskStatusInfo {
+                task_id,
+                status,
+                state_name,
+                assigned_worker,
+                error,
+            },
+            ClientResponse::TaskCancelled { task_id, success } => {
+                HumanClientResponse::TaskCancelled { task_id, success }
+            }
+            ClientResponse::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+            } => HumanClientResponse::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+            },
             ClientResponse::WorkerList { workers } => HumanClientResponse::WorkerList { workers },
-            ClientResponse::MapReduceSubmitted { job_id } => HumanClientResponse::MapReduceSubmitted { job_id },
-            ClientResponse::MapReduceCompleted { result } => HumanClientResponse::MapReduceCompleted { result },
+            ClientResponse::MapReduceSubmitted { job_id } => {
+                HumanClientResponse::MapReduceSubmitted { job_id }
+            }
+            ClientResponse::MapReduceCompleted { result } => {
+                HumanClientResponse::MapReduceCompleted { result }
+            }
             ClientResponse::Error { message } => HumanClientResponse::Error { message },
         }
     }
@@ -819,18 +1062,50 @@ impl From<ClientResponse> for HumanClientResponse {
 impl From<HumanClientResponse> for ClientResponse {
     fn from(msg: HumanClientResponse) -> Self {
         match msg {
-            HumanClientResponse::TaskSubmitted { task_id } => ClientResponse::TaskSubmitted { task_id },
-            HumanClientResponse::TaskCompleted { task_id, result } => ClientResponse::TaskCompleted { task_id, result },
-            HumanClientResponse::TaskStatusInfo { task_id, status, state_name, assigned_worker, error } => {
-                ClientResponse::TaskStatusInfo { task_id, status, state_name, assigned_worker, error }
+            HumanClientResponse::TaskSubmitted { task_id } => {
+                ClientResponse::TaskSubmitted { task_id }
             }
-            HumanClientResponse::TaskCancelled { task_id, success } => ClientResponse::TaskCancelled { task_id, success },
-            HumanClientResponse::ClusterStatus { total_tasks, pending_tasks, running_tasks, completed_tasks, failed_tasks, workers } => {
-                ClientResponse::ClusterStatus { total_tasks, pending_tasks, running_tasks, completed_tasks, failed_tasks, workers }
+            HumanClientResponse::TaskCompleted { task_id, result } => {
+                ClientResponse::TaskCompleted { task_id, result }
             }
+            HumanClientResponse::TaskStatusInfo {
+                task_id,
+                status,
+                state_name,
+                assigned_worker,
+                error,
+            } => ClientResponse::TaskStatusInfo {
+                task_id,
+                status,
+                state_name,
+                assigned_worker,
+                error,
+            },
+            HumanClientResponse::TaskCancelled { task_id, success } => {
+                ClientResponse::TaskCancelled { task_id, success }
+            }
+            HumanClientResponse::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+            } => ClientResponse::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+            },
             HumanClientResponse::WorkerList { workers } => ClientResponse::WorkerList { workers },
-            HumanClientResponse::MapReduceSubmitted { job_id } => ClientResponse::MapReduceSubmitted { job_id },
-            HumanClientResponse::MapReduceCompleted { result } => ClientResponse::MapReduceCompleted { result },
+            HumanClientResponse::MapReduceSubmitted { job_id } => {
+                ClientResponse::MapReduceSubmitted { job_id }
+            }
+            HumanClientResponse::MapReduceCompleted { result } => {
+                ClientResponse::MapReduceCompleted { result }
+            }
             HumanClientResponse::Error { message } => ClientResponse::Error { message },
         }
     }
@@ -839,18 +1114,50 @@ impl From<HumanClientResponse> for ClientResponse {
 impl From<ClientResponse> for BinaryClientResponse {
     fn from(msg: ClientResponse) -> Self {
         match msg {
-            ClientResponse::TaskSubmitted { task_id } => BinaryClientResponse::TaskSubmitted { task_id },
-            ClientResponse::TaskCompleted { task_id, result } => BinaryClientResponse::TaskCompleted { task_id, result },
-            ClientResponse::TaskStatusInfo { task_id, status, state_name, assigned_worker, error } => {
-                BinaryClientResponse::TaskStatusInfo { task_id, status, state_name, assigned_worker, error }
+            ClientResponse::TaskSubmitted { task_id } => {
+                BinaryClientResponse::TaskSubmitted { task_id }
             }
-            ClientResponse::TaskCancelled { task_id, success } => BinaryClientResponse::TaskCancelled { task_id, success },
-            ClientResponse::ClusterStatus { total_tasks, pending_tasks, running_tasks, completed_tasks, failed_tasks, workers } => {
-                BinaryClientResponse::ClusterStatus { total_tasks, pending_tasks, running_tasks, completed_tasks, failed_tasks, workers }
+            ClientResponse::TaskCompleted { task_id, result } => {
+                BinaryClientResponse::TaskCompleted { task_id, result }
             }
+            ClientResponse::TaskStatusInfo {
+                task_id,
+                status,
+                state_name,
+                assigned_worker,
+                error,
+            } => BinaryClientResponse::TaskStatusInfo {
+                task_id,
+                status,
+                state_name,
+                assigned_worker,
+                error,
+            },
+            ClientResponse::TaskCancelled { task_id, success } => {
+                BinaryClientResponse::TaskCancelled { task_id, success }
+            }
+            ClientResponse::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+            } => BinaryClientResponse::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+            },
             ClientResponse::WorkerList { workers } => BinaryClientResponse::WorkerList { workers },
-            ClientResponse::MapReduceSubmitted { job_id } => BinaryClientResponse::MapReduceSubmitted { job_id },
-            ClientResponse::MapReduceCompleted { result } => BinaryClientResponse::MapReduceCompleted { result },
+            ClientResponse::MapReduceSubmitted { job_id } => {
+                BinaryClientResponse::MapReduceSubmitted { job_id }
+            }
+            ClientResponse::MapReduceCompleted { result } => {
+                BinaryClientResponse::MapReduceCompleted { result }
+            }
             ClientResponse::Error { message } => BinaryClientResponse::Error { message },
         }
     }
@@ -859,18 +1166,50 @@ impl From<ClientResponse> for BinaryClientResponse {
 impl From<BinaryClientResponse> for ClientResponse {
     fn from(msg: BinaryClientResponse) -> Self {
         match msg {
-            BinaryClientResponse::TaskSubmitted { task_id } => ClientResponse::TaskSubmitted { task_id },
-            BinaryClientResponse::TaskCompleted { task_id, result } => ClientResponse::TaskCompleted { task_id, result },
-            BinaryClientResponse::TaskStatusInfo { task_id, status, state_name, assigned_worker, error } => {
-                ClientResponse::TaskStatusInfo { task_id, status, state_name, assigned_worker, error }
+            BinaryClientResponse::TaskSubmitted { task_id } => {
+                ClientResponse::TaskSubmitted { task_id }
             }
-            BinaryClientResponse::TaskCancelled { task_id, success } => ClientResponse::TaskCancelled { task_id, success },
-            BinaryClientResponse::ClusterStatus { total_tasks, pending_tasks, running_tasks, completed_tasks, failed_tasks, workers } => {
-                ClientResponse::ClusterStatus { total_tasks, pending_tasks, running_tasks, completed_tasks, failed_tasks, workers }
+            BinaryClientResponse::TaskCompleted { task_id, result } => {
+                ClientResponse::TaskCompleted { task_id, result }
             }
+            BinaryClientResponse::TaskStatusInfo {
+                task_id,
+                status,
+                state_name,
+                assigned_worker,
+                error,
+            } => ClientResponse::TaskStatusInfo {
+                task_id,
+                status,
+                state_name,
+                assigned_worker,
+                error,
+            },
+            BinaryClientResponse::TaskCancelled { task_id, success } => {
+                ClientResponse::TaskCancelled { task_id, success }
+            }
+            BinaryClientResponse::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+            } => ClientResponse::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+            },
             BinaryClientResponse::WorkerList { workers } => ClientResponse::WorkerList { workers },
-            BinaryClientResponse::MapReduceSubmitted { job_id } => ClientResponse::MapReduceSubmitted { job_id },
-            BinaryClientResponse::MapReduceCompleted { result } => ClientResponse::MapReduceCompleted { result },
+            BinaryClientResponse::MapReduceSubmitted { job_id } => {
+                ClientResponse::MapReduceSubmitted { job_id }
+            }
+            BinaryClientResponse::MapReduceCompleted { result } => {
+                ClientResponse::MapReduceCompleted { result }
+            }
             BinaryClientResponse::Error { message } => ClientResponse::Error { message },
         }
     }
@@ -1020,7 +1359,9 @@ pub fn serialize_message<M: Serialize>(msg: &M, codec: WireCodec) -> Result<Byte
 
 /// Deserializes a message from a byte frame, automatically identifying the wire format
 /// from the 1-byte discriminator tag or legacy raw JSON format.
-pub fn deserialize_message<M: DeserializeOwned + 'static>(bytes: &[u8]) -> Result<(M, WireCodec), ProtocolError> {
+pub fn deserialize_message<M: DeserializeOwned + 'static>(
+    bytes: &[u8],
+) -> Result<(M, WireCodec), ProtocolError> {
     if bytes.is_empty() {
         return serde_json::from_slice::<M>(bytes)
             .map(|m| (m, WireCodec::Json))
@@ -1136,22 +1477,21 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
     /// Serializes and sends a message framed with a 4-byte length prefix using the configured wire codec.
     pub async fn send_msg<M: Serialize>(&mut self, msg: &M) -> Result<(), ProtocolError> {
         let payload = serialize_message(msg, self.codec)?;
-        self.inner
-            .send(payload)
-            .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    ProtocolError::UnexpectedEof
-                } else {
-                    ProtocolError::Io(e)
-                }
-            })?;
+        self.inner.send(payload).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                ProtocolError::UnexpectedEof
+            } else {
+                ProtocolError::Io(e)
+            }
+        })?;
         Ok(())
     }
 
     /// Reads the next framed message from the stream.
     /// Returns `Ok(Some(msg))` on success, `Ok(None)` on clean EOF, or `Err`.
-    pub async fn recv_msg<M: DeserializeOwned + 'static>(&mut self) -> Result<Option<M>, ProtocolError> {
+    pub async fn recv_msg<M: DeserializeOwned + 'static>(
+        &mut self,
+    ) -> Result<Option<M>, ProtocolError> {
         match self.recv_msg_with_codec::<M>().await? {
             Some((msg, _codec)) => Ok(Some(msg)),
             None => Ok(None),
@@ -1251,7 +1591,9 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
     }
 
     /// Reads the next framed message from the reader.
-    pub async fn recv_msg<M: DeserializeOwned + 'static>(&mut self) -> Result<Option<M>, ProtocolError> {
+    pub async fn recv_msg<M: DeserializeOwned + 'static>(
+        &mut self,
+    ) -> Result<Option<M>, ProtocolError> {
         match self.recv_msg_with_codec::<M>().await? {
             Some((msg, _codec)) => Ok(Some(msg)),
             None => Ok(None),
@@ -1360,16 +1702,13 @@ impl<W: AsyncWrite + Unpin> MessageWriter<W> {
     /// Serializes and sends a message framed with a 4-byte length prefix using the configured wire codec.
     pub async fn send_msg<M: Serialize>(&mut self, msg: &M) -> Result<(), ProtocolError> {
         let payload = serialize_message(msg, self.codec)?;
-        self.inner
-            .send(payload)
-            .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    ProtocolError::UnexpectedEof
-                } else {
-                    ProtocolError::Io(e)
-                }
-            })?;
+        self.inner.send(payload).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                ProtocolError::UnexpectedEof
+            } else {
+                ProtocolError::Io(e)
+            }
+        })?;
         Ok(())
     }
 
@@ -1784,7 +2123,11 @@ mod tests {
             deserialize_message(&raw_bytes).expect("deserialize raw json");
         assert_eq!(codec, WireCodec::Json);
         match msg {
-            WorkerMessage::Heartbeat { worker_id, timestamp, .. } => {
+            WorkerMessage::Heartbeat {
+                worker_id,
+                timestamp,
+                ..
+            } => {
                 assert_eq!(worker_id, wid);
                 assert_eq!(timestamp, 999);
             }
@@ -1814,7 +2157,9 @@ mod tests {
         let wid = Uuid::new_v4();
         let reg_msg = WorkerMessage::Register {
             worker_id: wid,
-            capabilities: crate::capabilities::WorkerCapabilities::new("worker-1", 4, 8192, false, false, None),
+            capabilities: crate::capabilities::WorkerCapabilities::new(
+                "worker-1", 4, 8192, false, false, None,
+            ),
         };
 
         // Client sends Register message in JSON format
@@ -1850,4 +2195,3 @@ mod tests {
         assert_eq!(client_ack, ack);
     }
 }
-

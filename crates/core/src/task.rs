@@ -282,21 +282,65 @@ enum BinaryTaskSpec {
 impl From<TaskSpec> for HumanTaskSpec {
     fn from(spec: TaskSpec) -> Self {
         match spec {
-            TaskSpec::Command { program, args, env, working_dir, stdin } => {
-                HumanTaskSpec::Command { program, args, env, working_dir, stdin }
-            }
-            TaskSpec::ShellScript { script, interpreter, env } => {
-                HumanTaskSpec::ShellScript { script, interpreter, env }
-            }
-            TaskSpec::RustCompilation { crate_name, source_files, compiler_flags, target_dir } => {
-                HumanTaskSpec::RustCompilation { crate_name, source_files, compiler_flags, target_dir }
-            }
-            TaskSpec::GpuCompute { kernel_name, input_data, work_group_size, simulated_matrix_dim, compute_intensity } => {
-                HumanTaskSpec::GpuCompute { kernel_name, input_data, work_group_size, simulated_matrix_dim, compute_intensity }
-            }
-            TaskSpec::BuiltinTest { test_name, iterations, duration_ms, should_fail, require_gpu } => {
-                HumanTaskSpec::BuiltinTest { test_name, iterations, duration_ms, should_fail, require_gpu }
-            }
+            TaskSpec::Command {
+                program,
+                args,
+                env,
+                working_dir,
+                stdin,
+            } => HumanTaskSpec::Command {
+                program,
+                args,
+                env,
+                working_dir,
+                stdin,
+            },
+            TaskSpec::ShellScript {
+                script,
+                interpreter,
+                env,
+            } => HumanTaskSpec::ShellScript {
+                script,
+                interpreter,
+                env,
+            },
+            TaskSpec::RustCompilation {
+                crate_name,
+                source_files,
+                compiler_flags,
+                target_dir,
+            } => HumanTaskSpec::RustCompilation {
+                crate_name,
+                source_files,
+                compiler_flags,
+                target_dir,
+            },
+            TaskSpec::GpuCompute {
+                kernel_name,
+                input_data,
+                work_group_size,
+                simulated_matrix_dim,
+                compute_intensity,
+            } => HumanTaskSpec::GpuCompute {
+                kernel_name,
+                input_data,
+                work_group_size,
+                simulated_matrix_dim,
+                compute_intensity,
+            },
+            TaskSpec::BuiltinTest {
+                test_name,
+                iterations,
+                duration_ms,
+                should_fail,
+                require_gpu,
+            } => HumanTaskSpec::BuiltinTest {
+                test_name,
+                iterations,
+                duration_ms,
+                should_fail,
+                require_gpu,
+            },
         }
     }
 }
@@ -304,21 +348,65 @@ impl From<TaskSpec> for HumanTaskSpec {
 impl From<HumanTaskSpec> for TaskSpec {
     fn from(spec: HumanTaskSpec) -> Self {
         match spec {
-            HumanTaskSpec::Command { program, args, env, working_dir, stdin } => {
-                TaskSpec::Command { program, args, env, working_dir, stdin }
-            }
-            HumanTaskSpec::ShellScript { script, interpreter, env } => {
-                TaskSpec::ShellScript { script, interpreter, env }
-            }
-            HumanTaskSpec::RustCompilation { crate_name, source_files, compiler_flags, target_dir } => {
-                TaskSpec::RustCompilation { crate_name, source_files, compiler_flags, target_dir }
-            }
-            HumanTaskSpec::GpuCompute { kernel_name, input_data, work_group_size, simulated_matrix_dim, compute_intensity } => {
-                TaskSpec::GpuCompute { kernel_name, input_data, work_group_size, simulated_matrix_dim, compute_intensity }
-            }
-            HumanTaskSpec::BuiltinTest { test_name, iterations, duration_ms, should_fail, require_gpu } => {
-                TaskSpec::BuiltinTest { test_name, iterations, duration_ms, should_fail, require_gpu }
-            }
+            HumanTaskSpec::Command {
+                program,
+                args,
+                env,
+                working_dir,
+                stdin,
+            } => TaskSpec::Command {
+                program,
+                args,
+                env,
+                working_dir,
+                stdin,
+            },
+            HumanTaskSpec::ShellScript {
+                script,
+                interpreter,
+                env,
+            } => TaskSpec::ShellScript {
+                script,
+                interpreter,
+                env,
+            },
+            HumanTaskSpec::RustCompilation {
+                crate_name,
+                source_files,
+                compiler_flags,
+                target_dir,
+            } => TaskSpec::RustCompilation {
+                crate_name,
+                source_files,
+                compiler_flags,
+                target_dir,
+            },
+            HumanTaskSpec::GpuCompute {
+                kernel_name,
+                input_data,
+                work_group_size,
+                simulated_matrix_dim,
+                compute_intensity,
+            } => TaskSpec::GpuCompute {
+                kernel_name,
+                input_data,
+                work_group_size,
+                simulated_matrix_dim,
+                compute_intensity,
+            },
+            HumanTaskSpec::BuiltinTest {
+                test_name,
+                iterations,
+                duration_ms,
+                should_fail,
+                require_gpu,
+            } => TaskSpec::BuiltinTest {
+                test_name,
+                iterations,
+                duration_ms,
+                should_fail,
+                require_gpu,
+            },
         }
     }
 }
@@ -326,21 +414,65 @@ impl From<HumanTaskSpec> for TaskSpec {
 impl From<TaskSpec> for BinaryTaskSpec {
     fn from(spec: TaskSpec) -> Self {
         match spec {
-            TaskSpec::Command { program, args, env, working_dir, stdin } => {
-                BinaryTaskSpec::Command { program, args, env, working_dir, stdin }
-            }
-            TaskSpec::ShellScript { script, interpreter, env } => {
-                BinaryTaskSpec::ShellScript { script, interpreter, env }
-            }
-            TaskSpec::RustCompilation { crate_name, source_files, compiler_flags, target_dir } => {
-                BinaryTaskSpec::RustCompilation { crate_name, source_files, compiler_flags, target_dir }
-            }
-            TaskSpec::GpuCompute { kernel_name, input_data, work_group_size, simulated_matrix_dim, compute_intensity } => {
-                BinaryTaskSpec::GpuCompute { kernel_name, input_data, work_group_size, simulated_matrix_dim, compute_intensity }
-            }
-            TaskSpec::BuiltinTest { test_name, iterations, duration_ms, should_fail, require_gpu } => {
-                BinaryTaskSpec::BuiltinTest { test_name, iterations, duration_ms, should_fail, require_gpu }
-            }
+            TaskSpec::Command {
+                program,
+                args,
+                env,
+                working_dir,
+                stdin,
+            } => BinaryTaskSpec::Command {
+                program,
+                args,
+                env,
+                working_dir,
+                stdin,
+            },
+            TaskSpec::ShellScript {
+                script,
+                interpreter,
+                env,
+            } => BinaryTaskSpec::ShellScript {
+                script,
+                interpreter,
+                env,
+            },
+            TaskSpec::RustCompilation {
+                crate_name,
+                source_files,
+                compiler_flags,
+                target_dir,
+            } => BinaryTaskSpec::RustCompilation {
+                crate_name,
+                source_files,
+                compiler_flags,
+                target_dir,
+            },
+            TaskSpec::GpuCompute {
+                kernel_name,
+                input_data,
+                work_group_size,
+                simulated_matrix_dim,
+                compute_intensity,
+            } => BinaryTaskSpec::GpuCompute {
+                kernel_name,
+                input_data,
+                work_group_size,
+                simulated_matrix_dim,
+                compute_intensity,
+            },
+            TaskSpec::BuiltinTest {
+                test_name,
+                iterations,
+                duration_ms,
+                should_fail,
+                require_gpu,
+            } => BinaryTaskSpec::BuiltinTest {
+                test_name,
+                iterations,
+                duration_ms,
+                should_fail,
+                require_gpu,
+            },
         }
     }
 }
@@ -348,21 +480,65 @@ impl From<TaskSpec> for BinaryTaskSpec {
 impl From<BinaryTaskSpec> for TaskSpec {
     fn from(spec: BinaryTaskSpec) -> Self {
         match spec {
-            BinaryTaskSpec::Command { program, args, env, working_dir, stdin } => {
-                TaskSpec::Command { program, args, env, working_dir, stdin }
-            }
-            BinaryTaskSpec::ShellScript { script, interpreter, env } => {
-                TaskSpec::ShellScript { script, interpreter, env }
-            }
-            BinaryTaskSpec::RustCompilation { crate_name, source_files, compiler_flags, target_dir } => {
-                TaskSpec::RustCompilation { crate_name, source_files, compiler_flags, target_dir }
-            }
-            BinaryTaskSpec::GpuCompute { kernel_name, input_data, work_group_size, simulated_matrix_dim, compute_intensity } => {
-                TaskSpec::GpuCompute { kernel_name, input_data, work_group_size, simulated_matrix_dim, compute_intensity }
-            }
-            BinaryTaskSpec::BuiltinTest { test_name, iterations, duration_ms, should_fail, require_gpu } => {
-                TaskSpec::BuiltinTest { test_name, iterations, duration_ms, should_fail, require_gpu }
-            }
+            BinaryTaskSpec::Command {
+                program,
+                args,
+                env,
+                working_dir,
+                stdin,
+            } => TaskSpec::Command {
+                program,
+                args,
+                env,
+                working_dir,
+                stdin,
+            },
+            BinaryTaskSpec::ShellScript {
+                script,
+                interpreter,
+                env,
+            } => TaskSpec::ShellScript {
+                script,
+                interpreter,
+                env,
+            },
+            BinaryTaskSpec::RustCompilation {
+                crate_name,
+                source_files,
+                compiler_flags,
+                target_dir,
+            } => TaskSpec::RustCompilation {
+                crate_name,
+                source_files,
+                compiler_flags,
+                target_dir,
+            },
+            BinaryTaskSpec::GpuCompute {
+                kernel_name,
+                input_data,
+                work_group_size,
+                simulated_matrix_dim,
+                compute_intensity,
+            } => TaskSpec::GpuCompute {
+                kernel_name,
+                input_data,
+                work_group_size,
+                simulated_matrix_dim,
+                compute_intensity,
+            },
+            BinaryTaskSpec::BuiltinTest {
+                test_name,
+                iterations,
+                duration_ms,
+                should_fail,
+                require_gpu,
+            } => TaskSpec::BuiltinTest {
+                test_name,
+                iterations,
+                duration_ms,
+                should_fail,
+                require_gpu,
+            },
         }
     }
 }
@@ -980,7 +1156,8 @@ mod tests {
             let task = Task::new(spec, req).with_tags(vec!["bincode".into()]);
 
             let encoded = bincode::serialize(&task).expect("bincode serialization failed");
-            let decoded: Task = bincode::deserialize(&encoded).expect("bincode deserialization failed");
+            let decoded: Task =
+                bincode::deserialize(&encoded).expect("bincode deserialization failed");
 
             assert_eq!(task, decoded);
         }
@@ -1005,4 +1182,3 @@ mod tests {
         assert_eq!(decoded_legacy.max_retries, None);
     }
 }
-
