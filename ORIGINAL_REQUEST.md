@@ -301,3 +301,49 @@ Kiểm thử các tình huống lỗi mạng và ngắt node đột ngột:
 - Thiết bị Worker 1: `macbook-worker` (chạy trên localhost).
 - Thiết bị Worker 2: Samsung Galaxy S24 kết nối qua ADB (`R5CWC3QQ52H` tại `192.168.1.147`).
 - Cấu trúc dự án nguồn tại `/Users/duongnad/Documents/project/OxideSwarm`.
+
+## 2026-09-22T17:20:41Z
+
+# Teamwork Project Prompt — Draft
+
+> Status: Launched
+> Goal: Craft prompt → get user approval → delegate to teamwork_preview
+> Requested team: [none — teamwork routes from the description]
+
+Xây dựng và tối ưu hóa giải pháp kết nối từ xa hoàn toàn tự động giữa 2 máy tính (MacBook và Máy Case Windows) không cần chung mạng LAN, tận dụng kiến trúc Native P2P NAT Traversal (Iroh QUIC / DERP Relay) tích hợp sẵn trong OxideSwarm để đạt được trải nghiệm 0-config, không cần cài đặt phần mềm bên thứ ba.
+
+Working directory: ~/teamwork_projects/remote_cluster_interconnect
+Integrity mode: development
+
+## Requirements
+
+### R1. Native P2P Remote WAN Interconnect (Zero Third-Party Dependency)
+Tối ưu hóa tầng giao vận P2P có sẵn trong OxideSwarm (`iroh` QUIC + N0 Relay / DERP) để đảm bảo 2 máy tính nằm ở 2 mạng Internet hoàn toàn khác nhau (ví dụ: máy tính ở nhà và laptop ở công ty/quán cafe, hoặc qua mạng 4G di động) có thể tự động đục lỗ NAT (UDP Hole Punching) và bắt tay trực tiếp. Nếu gặp NAT đối xứng (Symmetric NAT) không thể đục lỗ, hệ thống phải tự động chuyển tiếp qua Relay tốc độ cao một cách hoàn toàn trong suốt.
+
+### R2. Thiết Lập 1-Click & Đồng Bộ Khóa Định Danh Cố Định (Stable Identity Pairing)
+Thiết lập cơ chế ghép nối (pairing) cực kỳ đơn giản và an toàn giữa 2 máy:
+- Máy Master cố định `SecretKey` (thông qua file cấu hình key) để P2P ticket/URL không bị thay đổi mỗi khi khởi động lại.
+- Cung cấp script 1-click hoặc giao diện Web QR/Ticket Code để Worker trên máy phụ chỉ cần nhập mã một lần là tự động kết nối vĩnh viễn.
+- Hỗ trợ cơ chế tự động kết nối lại (Exponential Backoff Auto-Reconnect) ngay khi đường truyền mạng hồi phục mà không cần can thiệp thủ công.
+
+### R3. Bảng Đánh Giá Kỹ Thuật & So Sánh Định Lượng Đa Phương Án
+Thực hiện nghiên cứu độc lập và lập báo cáo so sánh định lượng giữa:
+1. **OxideSwarm Native Iroh P2P** (Giải pháp cốt lõi)
+2. **Tailscale / WireGuard Mesh VPN**
+3. **Cloudflare Tunnel / Reverse Proxy**
+So sánh chi tiết dựa trên: Độ trễ round-trip (RTT ms), Băng thông truyền tải (Throughput MB/s), Mức tiêu thụ RAM/CPU khi chạy ngầm, Khả năng vượt tường lửa gắt gao (Corporate Firewall), và Mức độ phức tạp khi người dùng cài đặt ("Nhẹ mà tốt").
+
+### R4. Trực Quan Hóa Trạng Thái Đường Truyền Trên Dashboard
+Hiển thị rõ ràng trạng thái kết nối trên Web UI Dashboard và CLI:
+- Chỉ báo loại kết nối thực tế: `Direct P2P (QUIC)` hay `Relay (DERP)`.
+- Đo lường ping viễn trình thời gian thực giữa 2 máy (RTT in ms).
+- Cảnh báo trực quan nếu mạng bị suy giảm chất lượng hoặc chuyển mạng.
+
+## Acceptance Criteria
+
+### Automated Verification & Network Emulation
+- [ ] **Cross-Network Simulation**: Chạy kịch bản kiểm thử tự động giả lập 2 node nằm trên 2 subnet mạng khác nhau (non-routable private subnets) chứng minh chúng tự động đục lỗ NAT và hoàn thành bắt tay P2P.
+- [ ] **Relay Fallback**: Mô phỏng tường lửa chặn hoàn toàn UDP trực tiếp, chứng minh kết nối tự động fallback sang DERP Relay trong suốt với tỷ lệ thành công 100%.
+- [ ] **Ticket Determinism**: Kiểm chứng rằng sau khi Master khởi động lại nhiều lần, ticket kết nối không đổi và Worker tự động kết nối lại thành công trong < 3 giây.
+- [ ] **Comparative Benchmark Report**: Cung cấp file tài liệu báo cáo phân tích chi tiết với bảng so sánh số liệu thực nghiệm giữa 3 phương án (Iroh, Tailscale, Cloudflare).
+- [ ] **1-Click Automation**: Cung cấp file script chạy 1-click cho cả macOS (`connect_remote.sh`) và Windows (`connect_remote.cmd`).
