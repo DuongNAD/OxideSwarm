@@ -347,3 +347,60 @@ Hiển thị rõ ràng trạng thái kết nối trên Web UI Dashboard và CLI:
 - [ ] **Ticket Determinism**: Kiểm chứng rằng sau khi Master khởi động lại nhiều lần, ticket kết nối không đổi và Worker tự động kết nối lại thành công trong < 3 giây.
 - [ ] **Comparative Benchmark Report**: Cung cấp file tài liệu báo cáo phân tích chi tiết với bảng so sánh số liệu thực nghiệm giữa 3 phương án (Iroh, Tailscale, Cloudflare).
 - [ ] **1-Click Automation**: Cung cấp file script chạy 1-click cho cả macOS (`connect_remote.sh`) và Windows (`connect_remote.cmd`).
+
+
+## 2026-09-23T05:05:19Z
+
+Phối hợp với một AI khác qua thư mục chung để tự động phân vai (Server/Client), trao đổi IP LAN, tự động viết code kết nối mạng cho dự án OxideSwarm, chạy thử và debug chéo qua file log cho đến khi ping thành công. Môi trường hiện tại là macOS, nhưng sẽ đồng bộ với một máy tính (máy case) khác qua Google Drive.
+
+Working directory: ~/teamwork_projects/oxideswarm_sync
+Integrity mode: benchmark
+
+## Requirements
+
+### R1. Điều phối qua file (File-based Coordination)
+Nhóm AI phải giao tiếp, phân vai (Server/Client) và trao đổi địa chỉ IP LAN hoàn toàn thông qua việc đọc/ghi file trong thư mục đồng bộ chung. Không được giao tiếp trực tiếp ngoài luồng.
+
+### R2. Tự động viết và chạy code mạng
+Dựa vào vai trò đã nhận, nhóm AI tự động viết script mạng (có thể tự chọn ngôn ngữ/thư viện), chạy thử nghiệm kết nối (ping/pong) tới IP của đầu kia.
+
+### R3. Debug chéo qua file log
+Nếu kết nối thất bại, Agent phải xuất log lỗi vào thư mục chung để Agent ở đầu kia (trên máy khác) có thể đọc được, phân tích và tự sửa code tương ứng. Lặp lại cho đến khi kết nối thành công.
+
+## Acceptance Criteria
+
+### Điều phối và Khởi tạo
+- [ ] Có file xác nhận vai trò (vd: server_ready.txt hoặc client_ready.txt) được tạo trong thư mục chung.
+- [ ] Có file chứa địa chỉ IP LAN hợp lệ của ít nhất một bên trong thư mục chung.
+
+### Kết nối mạng
+- [ ] Script kết nối thực thi thành công mà không có lỗi (exit code 0).
+- [ ] Có file log báo cáo trạng thái PING SUCCESS (hoặc tương đương) trong thư mục chung, chứng minh gói tin đã được gửi và nhận thành công giữa hai môi trường.
+
+## 2026-09-23T05:23:20Z
+
+Phối hợp với một AI khác đang chạy trên một máy tính Windows để setup và test mạng dự án OxideSwarm. AI bên kia đang đọc/ghi vào thư mục chung Google Drive. Nhóm AI trên máy Mac này phải tự giao tiếp với AI bên kia qua thư mục đồng bộ để phân vai (Server/Client), trao đổi IP LAN hoặc P2P Ticket, tự động viết script kết nối và chạy thử. Nếu thất bại, ghi log vào thư mục chung để bên kia đọc và sửa code, lặp lại tới khi ping thành công.
+
+Working directory: ~/Google Drive/Drive của tôi/OxideSwarm_Sync
+Integrity mode: benchmark
+
+## Requirements
+
+### R1. Điều phối hoàn toàn qua file (Cross-Machine File Coordination)
+Nhóm AI KHÔNG được hỏi người dùng. Mọi giao tiếp với AI bên máy tính Windows phải diễn ra thông qua thư mục đồng bộ `~/Google Drive/Drive của tôi/OxideSwarm_Sync`. Tạo thư mục này nếu nó chưa tồn tại. Phải đọc các file trong này để biết AI bên kia đã chọn vai trò gì (Server hay Client) và lấy IP LAN/P2P Ticket của bên kia, đồng thời ghi vai trò và IP/Ticket của mình vào đó.
+
+### R2. Tự động thiết lập kết nối mạng
+Dựa vào vai trò đã thống nhất, nhóm AI tự viết script mạng (dùng ngôn ngữ/thư viện tuỳ chọn), biên dịch/chạy script để kết nối tới AI bên kia.
+
+### R3. Debug chéo tự động
+Nếu kết nối hoặc ping thất bại, nhóm AI phải xuất log lỗi chi tiết ra một file (vd: `mac_error_log.txt`) trong thư mục chung để AI bên Windows đọc được, đồng thời theo dõi các file log lỗi từ AI bên Windows để tự điều chỉnh code của mình. Liên tục lặp lại quá trình này cho đến khi kết nối thành công.
+
+## Acceptance Criteria
+
+### Giao tiếp ban đầu
+- [ ] File xác nhận vai trò và IP/P2P Ticket của máy Mac được ghi thành công vào thư mục chung.
+- [ ] Đọc và parse thành công file chứa IP/P2P Ticket của máy Windows từ thư mục chung.
+
+### Kết nối mạng
+- [ ] Script mạng trên máy Mac thực thi thành công (exit code 0) hoặc duy trì trạng thái kết nối ổn định.
+- [ ] Ghi nhận một file log chung (vd: `ping_success.txt`) xác nhận gói tin ping/pong đã được gửi và nhận thành công giữa 2 máy.

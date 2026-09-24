@@ -137,7 +137,14 @@ Khi 2 máy không cùng mạng Wi-Fi (ví dụ: MacBook ở quán cafe/công ty,
 3. **Tự động nhận diện đường truyền**:
    - Hai máy tự động đục lỗ tường lửa (UDP Hole Punching) để bắt tay trực tiếp (`🟢 Direct P2P | <RTT>ms`).
    - Nếu bị tường lửa công ty chặn UDP, tự động chuyển tiếp qua HTTPS Relay (`🟣 DERP Relay | <RTT>ms`) an toàn 100%.
-   - Xem báo cáo phân tích đối chuẩn chi tiết tại [Báo cáo Đối chuẩn Kỹ thuật (Benchmark Whitepaper)](file:///Users/duongnad/teamwork_projects/remote_cluster_interconnect/COMPARATIVE_INTERCONNECT_BENCHMARK.md).
+   - Xem báo cáo phân tích đối chuẩn chi tiết tại [Báo cáo Đối chuẩn Kỹ thuật (Benchmark Whitepaper)](benchmarks/interconnect/COMPARATIVE_INTERCONNECT_BENCHMARK.md).
+
+#### E. Cross-Machine File-Based Autonomous Sync (`scripts/sync_network`)
+Bộ công cụ điều phối tự động giữa 2 máy tính độc lập (macOS và Windows 11) qua thư mục chia sẻ cloud (Google Drive, OneDrive, hoặc LAN mount):
+- **Tự động phân vai & đàm phán**: Tự đề xuất `SERVER` (Master) hoặc `CLIENT` (Worker) dựa trên priority và tie-breaker.
+- **Trao đổi IP & Ticket tự động**: Ghi nhận nguyên tử IP LAN và P2P Ticket vào thư mục đồng bộ.
+- **Tự động dò tìm & debug chéo**: Chạy kiểm thử mạng 5 tầng, nếu lỗi xuất log kèm gợi ý xử lý để máy bên kia tự chẩn đoán.
+- Xem chi tiết tại [Tài liệu Sync Network](scripts/sync_network/README.md) và [Báo cáo Tổng Hợp Thành Quả](docs/WHAT_WAS_DONE.md).
 
 ---
 

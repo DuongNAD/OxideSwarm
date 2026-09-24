@@ -1,0 +1,27 @@
+﻿{
+    "directories":  {
+                        "verifications":  "verifications/\u003cnode_id\u003e_result.json",
+                        "logs":  "logs/\u003cnode_id\u003e.log",
+                        "nodes":  "nodes/\u003cnode_id\u003e/"
+                    },
+    "name":  "OxideSwarm Cross-Machine Coordination Protocol",
+    "description":  "Partitioned mailbox protocol for zero-conflict inter-machine role negotiation, P2P ticket exchange, and reachability ping verification via Google Drive.",
+    "protocol_version":  "1.0.0",
+    "schemas":  {
+                    "verification":  "verifications/\u003cnode_id\u003e_result.json: { node_id, status, transport_used, target_endpoint, rtt_ms, test_command, exit_code, details }",
+                    "heartbeat":  "heartbeat.json: { node_id, timestamp_utc, status }",
+                    "ticket":  "ticket.json: { server_node_id, timestamp_utc, lan_endpoints, p2p_ticket, web_dashboard_url }",
+                    "announce":  "announce.json: { protocol_version, node_id, hostname, platform, timestamp_utc, preferred_role, priority, tie_breaker, lan_ipv4, advertised_port, dashboard_port, capabilities }",
+                    "state":  "state.json: { node_id, current_state, role, updated_utc }"
+                },
+    "created_at_utc":  "2026-09-23T05:43:50Z",
+    "states":  [
+                   "UNKNOWN",
+                   "ROLE_PROPOSED",
+                   "ROLE_CONFIRMED",
+                   "READY",
+                   "CONNECTING",
+                   "CONNECTED",
+                   "SUCCESS"
+               ]
+}
