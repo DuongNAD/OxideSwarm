@@ -43,6 +43,7 @@ object OxideWorkerBridge : WorkerEngine {
         return try {
             val started = nativeStartWorker(
                 masterAddr = config.masterAddress,
+                p2pTicket = config.p2pTicket ?: "",
                 workerName = config.workerName,
                 cores = config.cores,
                 ramMb = config.ramMb,
@@ -76,6 +77,71 @@ object OxideWorkerBridge : WorkerEngine {
         }
     }
 
+    fun updateTelemetry(
+        batteryPct: Int,
+        isCharging: Boolean,
+        thermalThrottled: Boolean,
+        batteryTemperature: Float = -1.0f,
+        networkType: String = "unknown"
+    ): Boolean {
+        if (!isLibraryAvailable) return false
+        return try {
+            nativeUpdateTelemetryDetailed(
+                batteryPct,
+                isCharging,
+                thermalThrottled,
+                batteryTemperature,
+                networkType
+            )
+        } catch (e: Throwable) {
+            try {
+                nativeUpdateTelemetry(batteryPct, isCharging, thermalThrottled)
+            } catch (e2: Throwable) {
+                Log.w(TAG, "Exception in nativeUpdateTelemetry", e2)
+                false
+            }
+        }
+    }
+
+    fun startMaster(bindPort: Int = 8088, dashboardPort: Int = 8080, enableP2p: Boolean = true): String {
+        if (!isLibraryAvailable) return "{\"error\":\"Native library unavailable\"}"
+        return try {
+            nativeStartMaster(bindPort, dashboardPort, enableP2p)
+        } catch (e: Throwable) {
+            Log.e(TAG, "Exception in nativeStartMaster", e)
+            "{\"error\":\"${e.message}\"}"
+        }
+    }
+
+    fun stopMaster(): Boolean {
+        if (!isLibraryAvailable) return false
+        return try {
+            nativeStopMaster()
+        } catch (e: Throwable) {
+            Log.e(TAG, "Exception in nativeStopMaster", e)
+            false
+        }
+    }
+
+    fun getWorkerStatus(): String {
+        if (!isLibraryAvailable) return "{}"
+        return try {
+            nativeGetWorkerStatus()
+        } catch (e: Throwable) {
+            "{}"
+        }
+    }
+
+    fun discoverMaster(timeoutMs: Long = 2500): String {
+        if (!isLibraryAvailable) return "{}"
+        return try {
+            nativeDiscoverMaster(timeoutMs)
+        } catch (e: Throwable) {
+            Log.w(TAG, "Exception in nativeDiscoverMaster", e)
+            "{}"
+        }
+    }
+
     // Callbacks invoked from native C/Rust thread via JNI
     @JvmStatic
     fun onNativeLog(level: String, message: String) {
@@ -92,6 +158,7 @@ object OxideWorkerBridge : WorkerEngine {
     // Native declarations matching C-ABI exports
     private external fun nativeStartWorker(
         masterAddr: String,
+        p2pTicket: String,
         workerName: String,
         cores: Int,
         ramMb: Long,
@@ -99,19 +166,33 @@ object OxideWorkerBridge : WorkerEngine {
         heartbeatIntervalSecs: Long
     ): Boolean
 
-    fun discoverMaster(timeoutMs: Long = 2500): String {
-        if (!isLibraryAvailable) return "{}"
-        return try {
-            nativeDiscoverMaster(timeoutMs)
-        } catch (e: Throwable) {
-            Log.w(TAG, "Exception in nativeDiscoverMaster", e)
-            "{}"
-        }
-    }
-
     private external fun nativeStopWorker(): Boolean
 
     private external fun nativeIsRunning(): Boolean
 
+    private external fun nativeGetWorkerStatus(): String
+
     private external fun nativeDiscoverMaster(timeoutMs: Long): String
+
+    private external fun nativeUpdateTelemetry(
+        batteryPct: Int,
+        isCharging: Boolean,
+        thermalThrottled: Boolean
+    ): Boolean
+
+    private external fun nativeUpdateTelemetryDetailed(
+        batteryPct: Int,
+        isCharging: Boolean,
+        thermalThrottled: Boolean,
+        batteryTemperature: Float,
+        networkType: String
+    ): Boolean
+
+    private external fun nativeStartMaster(
+        bindPort: Int,
+        dashboardPort: Int,
+        enableP2p: Boolean
+    ): String
+
+    private external fun nativeStopMaster(): Boolean
 }

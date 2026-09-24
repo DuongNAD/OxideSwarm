@@ -179,26 +179,80 @@ OxideSwarm includes a unified CLI management tool:
 
 ---
 
-## 6. Workspace Crate Architecture
+## 6. Cross-Platform Coding Agent Mesh (`agent-mesh`)
+
+OxideSwarm includes a dedicated, resilient agent-to-agent communication framework (`crates/agent_mesh`) enabling autonomous coding agents to discover peers, transmit binary data payloads, and route structured commands across **Windows, macOS, Ubuntu Linux, and Android (Termux / ADB)**.
+
+```text
+                      ┌─────────────────────────────────┐
+                      │         OxideRelay Hub          │
+                      │    (axum / tokio-tungstenite)   │
+                      │      Active Node Catalog        │
+                      └───────▲───────▲────────▲────────┘
+                              │       │        │
+                Persistent WS │       │ WS     │ Persistent WS
+                    (outbound)│       │        │ (outbound)
+                              ▼       ▼        ▼
+            ┌─────────────────┐ ┌───────────┐ ┌───────────────────┐
+            │ Node 1: Windows │ │Node 2: Mac│ │ Node 3: Android   │
+            │ Coding Agent    │ │Coding Agt │ │ Coding Agent      │
+            └─────────────────┘ └───────────┘ └───────────────────┘
+```
+
+### Key Capabilities:
+- **Universal Outbound Connectivity:** All nodes connect outbound to the Hub via WebSockets (`ws://` or `wss://`), bypassing Carrier-Grade NAT (**CGNAT**) on cellular networks and restrictive home firewalls with zero port forwarding.
+- **Explicit Point-to-Point Addressing:** Nodes route commands directly to specific peers (`from: "node-1"`, `to: "node-3"`) without broadcast storming.
+- **Dual Runtime Support:** Pure Rust binary (`agent-mesh`) for maximum throughput and zero-compilation Python client (`scripts/agent_node.py`) for instant mobile/Termux deployment.
+- **Delivery Guarantees & Integrity:** Application-level correlation tracking (`uuid::Uuid`), immediate delivery acknowledgments (`DeliveryAck`, `DeliveryNack`), and bit-for-bit SHA-256 data payload validation.
+
+### Quickstart Commands:
+```bash
+# 1. Build the Agent Mesh CLI:
+cargo build --release -p agent_mesh
+
+# 2. Start the WebSocket Relay Hub on port 8088:
+./target/release/agent-mesh hub --listen 0.0.0.0:8088
+
+# 3. Connect an Agent Node (Windows / Mac / Linux / Android):
+./target/release/agent-mesh node --hub ws://127.0.0.1:8088/ws --id node-mac-1 --platform macos
+# Or via Python client:
+python scripts/agent_node.py --hub ws://127.0.0.1:8088/ws --id node-android-3 --platform android
+
+# 4. Route a command from any node or terminal:
+./target/release/agent-mesh send --hub ws://127.0.0.1:8088/ws --to node-android-3 --command shell_exec --args '{"cmd": "uname -m"}'
+
+# 5. Query online nodes catalog:
+./target/release/agent-mesh list --hub ws://127.0.0.1:8088/ws
+```
+
+*For comprehensive turnkey deployment guides on Android, Windows, macOS, and Ubuntu, see [DEPLOYMENT.md](DEPLOYMENT.md).*
+
+---
+
+## 7. Workspace Crate Architecture
 
 ```text
 OxideSwarm/
 ├── Cargo.toml                     # Workspace root manifest
 ├── README.md                      # Primary documentation & cluster specifications
+├── DEPLOYMENT.md                  # Turnkey multi-platform agent deployment guide
 ├── switch_role.sh                 # 1-click role switcher for macOS (Master <-> Worker)
 ├── ox-mode -> scripts/mode.sh     # Unified CLI & TUI workflow automation runner
 ├── assets/                        # Vector branding assets (logo.svg, icon.svg)
-├── windows/                       # 1-click silent background tooling for Windows
-│   ├── switch_role.cmd            # Interactive role switcher for Windows
-│   ├── run_worker_silent.vbs      # Headless runner (WindowStyle 0, zero console popup)
-│   ├── start_worker.cmd           # Worker launcher with automated Master discovery
-│   ├── status_worker.cmd          # Process inspector (PID, RAM, CPU, live logs)
-│   └── stop_worker.cmd            # 1-click graceful worker shutdown
-├── packaging/                     # Headless system service definitions
+├── scripts/
+│   ├── agent_node.py              # Lightweight Python agent node client (Termux/Win/Mac/Linux)
+│   └── mode.sh                    # Workflow mode automation script
+├── packaging/
+│   ├── agent_mesh/                # Turnkey multi-platform agent deployment suite
+│   │   ├── windows/               # Windows PowerShell & CMD agent node runners
+│   │   ├── macos/                 # macOS agent node runner with launchd guidance
+│   │   ├── ubuntu/                # Ubuntu/Debian agent node runner with systemd unit
+│   │   └── android/               # Termux wake-lock runner & ADB binary deployer
 │   ├── windows/                   # Windows Service wrapper via ServiceWrapper.cs (csc.exe)
 │   ├── android/                   # Android APK project & persistent foreground service daemon
 │   └── macos/                     # LaunchDaemon configuration for macOS
 ├── crates/
+│   ├── agent_mesh/                # Cross-platform coding agent communication framework (hub, node, protocol)
 │   ├── core/                      # Wire protocol, framing codec, LAN discovery, workflow modes
 │   ├── master/                    # Scheduler, GPU routing, FSM, Axum dashboard, WebSocket telemetry
 │   ├── worker/                    # Task runner, sandbox isolation, GPU matrix, Standby Portal
@@ -209,7 +263,7 @@ OxideSwarm/
 
 ---
 
-## 7. Verification & Benchmarks
+## 8. Verification & Benchmarks
 
 OxideSwarm contains a comprehensive, multi-tiered test and benchmark suite:
 
