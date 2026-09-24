@@ -1,10 +1,15 @@
 package com.oxideswarm.worker.service
 
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
+import android.os.BatteryManager
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -32,6 +37,15 @@ class OxideWorkerService : Service(), WorkerEngineListener {
     private var activeTasks: Int = 0
     private var totalExecutedTasks: Int = 0
 
+    // Mobile telemetry cache and listeners
+    private var batteryReceiver: BroadcastReceiver? = null
+    private var thermalListener: PowerManager.OnThermalStatusChangedListener? = null
+    private var currentBatteryPct: Int = -1
+    private var currentBatteryTemp: Float = -1.0f
+    private var currentIsCharging: Boolean = false
+    private var currentThermalThrottled: Boolean = false
+    private var currentNetworkType: String = "unknown"
+
     // Callback listeners registered by UI (MainActivity)
     private val uiListeners = mutableListOf<WorkerServiceListener>()
 
@@ -54,8 +68,89 @@ class OxideWorkerService : Service(), WorkerEngineListener {
         // Acquire hardware locks to keep CPU and high-performance Wi-Fi alive
         acquireWakeLocks()
 
+        // Setup real-time battery and thermal monitoring for Rust JNI injection
+        setupTelemetryMonitoring()
+
         // Start Foreground immediately with initial notification to guarantee oom_score_adj <= 200
         startInForeground("Worker Initializing...", "Holding CPU wake-lock and high-performance Wi-Fi")
+    }
+
+    private fun getActiveNetworkType(): String {
+        return try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val network = cm?.activeNetwork
+            val caps = cm?.getNetworkCapabilities(network) ?: return "unknown"
+            when {
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+                else -> "unknown"
+            }
+        } catch (e: Exception) {
+            "unknown"
+        }
+    }
+
+    private fun setupTelemetryMonitoring() {
+        // 1. Battery State Monitoring
+        batteryReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent == null) return
+                val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+                val pct = if (level >= 0 && scale > 0) (level * 100) / scale else -1
+                val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+                val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
+                val tempInt = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1)
+                val batteryTemp = if (tempInt > 0) tempInt / 10.0f else -1.0f
+                val netType = getActiveNetworkType()
+
+                currentBatteryPct = pct
+                currentIsCharging = isCharging
+                currentBatteryTemp = batteryTemp
+                currentNetworkType = netType
+                OxideWorkerBridge.updateTelemetry(pct, isCharging, currentThermalThrottled, batteryTemp, netType)
+            }
+        }
+        val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        val stickyIntent = registerReceiver(batteryReceiver, filter)
+        if (stickyIntent != null) {
+            val level = stickyIntent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+            val scale = stickyIntent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+            val pct = if (level >= 0 && scale > 0) (level * 100) / scale else -1
+            val status = stickyIntent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+            val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
+            val tempInt = stickyIntent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1)
+            val batteryTemp = if (tempInt > 0) tempInt / 10.0f else -1.0f
+            val netType = getActiveNetworkType()
+
+            currentBatteryPct = pct
+            currentIsCharging = isCharging
+            currentBatteryTemp = batteryTemp
+            currentNetworkType = netType
+            OxideWorkerBridge.updateTelemetry(pct, isCharging, currentThermalThrottled, batteryTemp, netType)
+        }
+
+        // 2. Thermal Throttling Monitoring (API 29+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                thermalListener = PowerManager.OnThermalStatusChangedListener { status ->
+                    val isThrottled = status >= PowerManager.THERMAL_STATUS_MODERATE
+                    currentThermalThrottled = isThrottled
+                    OxideWorkerBridge.updateTelemetry(
+                        currentBatteryPct,
+                        currentIsCharging,
+                        isThrottled,
+                        currentBatteryTemp,
+                        currentNetworkType
+                    )
+                }
+                pm.addThermalStatusListener(thermalListener!!)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to register thermal status listener", e)
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -70,6 +165,7 @@ class OxideWorkerService : Service(), WorkerEngineListener {
             }
             ACTION_START -> {
                 val master = intent?.getStringExtra(EXTRA_MASTER) ?: "127.0.0.1:8080"
+                val p2pTicket = intent?.getStringExtra(EXTRA_P2P_TICKET)
                 val name = intent?.getStringExtra(EXTRA_NAME) ?: SystemInfoHelper.getDefaultWorkerName()
                 val cores = intent?.getIntExtra(EXTRA_CORES, SystemInfoHelper.getAvailableCores())
                     ?: SystemInfoHelper.getAvailableCores()
@@ -79,6 +175,7 @@ class OxideWorkerService : Service(), WorkerEngineListener {
 
                 val config = WorkerConfig(
                     masterAddress = master,
+                    p2pTicket = p2pTicket,
                     workerName = name,
                     cores = cores,
                     ramMb = ramMb,
@@ -311,6 +408,26 @@ class OxideWorkerService : Service(), WorkerEngineListener {
     override fun onDestroy() {
         Log.i(TAG, "OxideWorkerService onDestroy")
         stopWorkerService()
+
+        batteryReceiver?.let {
+            try {
+                unregisterReceiver(it)
+            } catch (e: Exception) {
+                Log.w(TAG, "Error unregistering battery receiver", e)
+            }
+            batteryReceiver = null
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && thermalListener != null) {
+            try {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                pm.removeThermalStatusListener(thermalListener!!)
+            } catch (e: Exception) {
+                Log.w(TAG, "Error removing thermal listener", e)
+            }
+            thermalListener = null
+        }
+
         super.onDestroy()
     }
 
@@ -321,6 +438,7 @@ class OxideWorkerService : Service(), WorkerEngineListener {
         const val ACTION_STOP = "com.oxideswarm.worker.action.STOP"
 
         const val EXTRA_MASTER = "EXTRA_MASTER"
+        const val EXTRA_P2P_TICKET = "EXTRA_P2P_TICKET"
         const val EXTRA_NAME = "EXTRA_NAME"
         const val EXTRA_CORES = "EXTRA_CORES"
         const val EXTRA_RAM_MB = "EXTRA_RAM_MB"
@@ -330,6 +448,7 @@ class OxideWorkerService : Service(), WorkerEngineListener {
             val intent = Intent(context, OxideWorkerService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_MASTER, config.masterAddress)
+                putExtra(EXTRA_P2P_TICKET, config.p2pTicket)
                 putExtra(EXTRA_NAME, config.workerName)
                 putExtra(EXTRA_CORES, config.cores)
                 putExtra(EXTRA_RAM_MB, config.ramMb)

@@ -1,99 +1,82 @@
-# Project: Remote Cluster Interconnect (OxideSwarm)
+# Project: OxideSwarm Cross-Machine Coordination & Network Ping
 
 ## Architecture
-OxideSwarm's remote interconnect enables zero-configuration, secure, high-performance inter-machine communication across arbitrary WAN and NAT boundaries without third-party VPNs or port forwarding.
+Cross-machine autonomous coordination and network testing between two AI nodes communicating exclusively through a shared Google Drive synchronization folder (`G:\Google Drive\OxideSwarm_Sync` / `G:\My Drive\OxideSwarm_Sync`).
 
 ```
-+-----------------------------------------------------------------------------------+
-|                                 MASTER NODE                                       |
-|  - Persistent SecretKey (~/.oxideswarm/master_key.bin) -> Deterministic Ticket    |
-|  - Iroh QUIC Endpoint + N0 DERP Relay (https://*.relay.n0.iroh.link)               |
-|  - Awaits endpoint.online().await before publishing ticket                        |
-|  - Tracks conn.paths(): selected path, is_ip / is_relay, smoothed RTT             |
-|  - Exposes connection_type, is_relayed, rtt_ms on /api/status & Web Dashboard    |
-+----------------------------------------+------------------------------------------+
-                                         |
-                       +-----------------+-----------------+
-                       |                                   |
-         Direct UDP Hole Punching                  DERP Relay Fallback
-         (QUIC, sub-millisecond LAN,              (HTTPS/TLS Encapsulation,
-          lowest WAN RTT)                          100% Symmetric NAT bypass)
-                       |                                   |
-                       +-----------------+-----------------+
-                                         |
-+----------------------------------------v------------------------------------------+
-|                                 WORKER NODE                                       |
-|  - 1-Click Connect (connect_remote.sh on macOS / connect_remote.cmd on Windows)  |
-|  - Parses deterministic ticket, binds Iroh endpoint                               |
-|  - Exponential Backoff Auto-Reconnect (<3s recovery on restart)                   |
-|  - Reports telemetry & responds to millisecond RTT heartbeats                     |
-+-----------------------------------------------------------------------------------+
++-------------------------------------------------------------------------------------------------+
+|                       SHARED GOOGLE DRIVE SYNCHRONIZATION DIRECTORY                             |
+|                           (G:\My Drive\OxideSwarm_Sync\)                                        |
+|  - Single-Writer Partitioned Mailbox Architecture (prevents Google Drive sync conflict copies)   |
+|  - 7-Stage State Machine: UNKNOWN -> ROLE_PROPOSED -> ROLE_CONFIRMED -> READY -> CONNECTING     |
+|                           -> CONNECTED -> SUCCESS                                               |
+|  - Deterministic Role Tie-Breaking: Priority score + lexicographic hash comparison             |
++-----------------------------------------------+-------------------------------------------------+
+                                                |
+                       +------------------------+------------------------+
+                       |                                                 |
+         Node A Mailbox (nodes/win_case_/)                 Node B Mailbox (nodes/peer_/)
+         - announce.json (IPs, role bid)                   - announce.json (IPs, role bid)
+         - state.json (state machine)                      - state.json (state machine)
+         - ticket.json (P2P ticket / LAN port)             - ticket.json (if Server)
+         - heartbeat.json (liveness pulse)                 - heartbeat.json (liveness pulse)
+                       |                                                 |
+                       +------------------------+------------------------+
+                                                |
++-----------------------------------------------v-------------------------------------------------+
+|                           NETWORK REACHABILITY & PING EXECUTION                                 |
+|  - Tier 1: Fast TCP Socket Reachability (Port 8088 / Test-NetConnection)                        |
+|  - Tier 2: HTTP Cluster Status & Telemetry Ping (Port 8081 / /api/status)                       |
+|  - Tier 3: OxideSwarm Native Worker Registration & Status (rusty-grid worker / status)          |
+|  - Tier 4: Native P2P NAT Traversal (Iroh QUIC / DERP Relay ticket fallback)                    |
+|  - Tier 5: End-to-End Distributed Compute Verification (rusty-grid submit ping-pong)            |
++-----------------------------------------------+-------------------------------------------------+
+                                                |
+                                                v
++-------------------------------------------------------------------------------------------------+
+|                         VERIFICATION & SHARED SUCCESS CONFIRMATION                              |
+|  - verifications/<node_id>_result.json: Programmatic test results with exit code 0              |
+|  - SUCCESS_CONFIRMED.md: Mutual success confirmation report in shared sync folder               |
++-------------------------------------------------------------------------------------------------+
 ```
 
 ## Feature Inventory
 | # | Feature | Description | Milestone | Source |
 |---|---------|-------------|-----------|--------|
-| F1 | `endpoint.online()` Timing Fix | Await `endpoint.online().await` with timeout before publishing ticket to ensure home relay and STUN WAN IPs are populated | M1 | Survey (spec miner) [DONE] |
-| F2 | Seamless DERP Relay Fallback | Guarantee 100% transparent fallback to N0 DERP relay if direct UDP hole-punching is blocked | M1 | R1, Survey [DONE] |
-| F3 | Runtime Connection Introspection | Query `conn.paths()` on accepted/dialed connections to detect `is_selected()`, `is_ip()`, `is_relay()`, and `rtt()` | M1 | R1, R4, Survey [DONE] |
-| F4 | Persistent SecretKey & Deterministic Ticket | Auto-default Master SecretKey storage (`~/.oxideswarm/master_key.bin`) and retain deterministic ticket across restarts | M2 | R2, Survey [DONE] |
-| F5 | Exponential Backoff Auto-Reconnect | Worker self-healing reconnection loop with jitter and cached endpoint invalidation reconnecting in < 3s | M2 | R2, Survey [DONE] |
-| F6 | 1-Click macOS Automation Script | `connect_remote.sh` with interactive pairing, config persistence, and LaunchDaemon integration | M2 | R2, Survey [DONE] |
-| F7 | 1-Click Windows Automation Script | `connect_remote.cmd` with UAC auto-elevation, service registration, and PowerShell bypass | M2 | R2, Survey [DONE] |
-| F8 | Comparative Technical Benchmark | Quantitative empirical study comparing OxideSwarm Native Iroh vs Tailscale vs Cloudflare Tunnel across RTT, throughput, RAM/CPU, firewall penetration, and complexity | M3 | R3, Survey [DONE] |
-| F9 | Benchmark Deliverables Publishing | Generate `COMPARATIVE_INTERCONNECT_BENCHMARK.md`, `benchmark_data.json`, and `benchmark_matrix.csv` in `~/teamwork_projects/remote_cluster_interconnect` | M3 | R3, Survey [DONE] |
-| F10 | Telemetry Model Extension | Add `interconnect_type`, `is_relayed`, and `rtt_ms` to `WorkerUiInfo` and `/api/status` DTOs | M4 | R4, Survey [DONE] |
-| F11 | Dashboard Visual Indicators & Badges | Web UI Link Badges (`[● Direct P2P | 12ms]`, `[▲ DERP Relay | 68ms]`), dynamic SVG topology path styling, and copy ticket UI | M4 | R4, Survey [DONE] |
-| F12 | Degradation & Switch Alerts | Real-time visual alert banner/toast on network failover or high latency degradation | M4 | R4, Survey [DONE] |
-| F13 | CLI Telemetry Visualization | Display link mode (`Direct P2P` vs `DERP Relay`) and live RTT in `rusty-grid status` CLI output | M4 | R4, Survey [DONE] |
-| F14 | Cross-Network NAT Simulation Test | Automated scenario simulating 2 nodes on separate subnets proving direct hole punching | M5 | Acceptance Criteria [DONE] |
-| F15 | Relay Fallback Simulation Test | Automated scenario simulating UDP block proving transparent DERP relay fallback | M5 | Acceptance Criteria [DONE] |
-| F16 | Ticket Determinism & Reconnect Test | Automated test verifying ticket stability across Master restarts and < 3s reconnection | M5 | Acceptance Criteria [DONE] |
-| F17 | Forensic Integrity Audit | Independent forensic audit ensuring clean, non-fabricated, 100% authentic implementations | M5 | Protocol [DONE] |
+| F1 | Sync Folder & Path Normalization | Manage `G:\My Drive\OxideSwarm_Sync` (with fallback to `G:\Google Drive\OxideSwarm_Sync`), ensure directory hierarchy | M1 | R1, Survey |
+| F2 | Partitioned Mailbox Architecture | Single-writer directory structure (`nodes/<node_id>/`) avoiding Google Drive conflicted copies | M1 | R1, Survey |
+| F3 | Autonomous Role Negotiation & Tie-Breaking | Bidding protocol with priority and deterministic tie-breaker hash resolving Server/Client | M1 | R1, Survey |
+| F4 | Connection Parameter Exchange | Exchange local IPv4 (`192.168.1.166`), ports (8088, 8081), and Iroh P2P tickets via `announce.json` & `ticket.json` | M1 | R1, Survey |
+| F5 | Server / Master Node Execution | Launch OxideSwarm Master on TCP 8088, Web UI 8081 with `--p2p`, and publish ticket | M2 | R2, Survey |
+| F6 | Client / Worker Connection Execution | Execute connection tests and worker join using exchanged parameters (LAN TCP & P2P ticket) | M2 | R2, Survey |
+| F7 | Iterative Debugging & Shared Logging | Capture execution logs to `logs/<node_id>.log` in shared folder, inspect peer logs, auto-adjust on failure | M2 | R3, Survey |
+| F8 | Programmatic Network Ping Verification | Scripted multi-tier reachability tests (TCP, HTTP status, worker registration, compute ping) | M3 | Acceptance Criteria |
+| F9 | Mutual Success Confirmation Report | Write `verifications/<node_id>_result.json` and `SUCCESS_CONFIRMED.md` in shared sync folder | M3 | Acceptance Criteria |
+| F10 | Multi-Agent Review, Challenge & Forensic Audit Gate | Independent review, adversarial challenge, and zero-tolerance forensic integrity audit | M3 | System Constraints |
 
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|-------------|--------|
-| M1 | Native P2P Remote WAN Interconnect (R1) | Fix `endpoint.online()` timing, DERP relay fallback, and runtime connection path inspection | None | DONE |
-| M2 | Stable Identity Pairing & 1-Click Automation (R2) | Persistent SecretKey, deterministic ticket, auto-reconnect backoff, `connect_remote.sh` & `connect_remote.cmd` | M1 | DONE |
-| M3 | Quantitative Benchmark & Comparative Report (R3) | Empirical benchmarking report & data comparing Iroh, Tailscale, Cloudflare | None | DONE |
-| M4 | Dashboard & CLI Telemetry Visualization (R4) | Web UI Link Badges, SVG topology, latency alerts, and CLI link status | M1, M2 | DONE |
-| M5 | Integrated Verification, Hardening & Forensic Audit | Cross-network simulation, relay fallback test, ticket test, full workspace test, forensic audit | M1, M2, M3, M4 | DONE |
+| M1 | Coordination Protocol & Role Negotiation | Partitioned sync folder setup, announce.json publishing, role negotiation tie-breaker, ticket exchange protocol | None | DONE |
+| M2 | Connection Testing & Iterative Debugging | Master/Server execution with P2P, connection test scripts, iterative log capture, bidirectional debugging | M1 | DONE |
+| M3 | Verification, Mutual Success & Forensic Audit | Programmatic test execution with exit code 0, SUCCESS_CONFIRMED.md publishing, multi-agent review, challenge & forensic audit | M2 | DONE |
 
 ## Interface Contracts
-### Master ↔ Worker P2P Transport (`crates/core/src/transport.rs`)
-- `serialize_p2p_ticket(addr: &iroh::EndpointAddr) -> Result<String, serde_json::Error>`
-- `parse_p2p_ticket(ticket: &str) -> Result<iroh::EndpointAddr, serde_json::Error>`
-- `P2pPathInfo`: `is_relay: bool`, `is_ip: bool`, `remote_addr: Option<String>`, `rtt_ms: Option<f32>`
-- `inspect_connection_paths(conn: &iroh::endpoint::Connection) -> Option<P2pPathInfo>`
-- ALPN: `b"rusty-grid/v1"`
-
-### Runtime Telemetry Contract (`crates/master/src/web_ui.rs`, `crates/core/src/protocol.rs`)
-- `WorkerUiInfo`:
-  - `interconnect_type: String` ("Direct P2P (QUIC)", "Relay (DERP)", "TCP/LAN")
-  - `is_relayed: bool`
-  - `rtt_ms: Option<f32>`
-- `ClusterStatusDto`:
-  - `p2p_ticket: Option<String>`
-- Heartbeat:
-  - `timestamp_ms: u64` (millisecond timestamp for sub-millisecond precision RTT calculation)
-
-### 1-Click Script Contract (`connect_remote.sh`, `connect_remote.cmd`)
-- Syntax: `connect_remote.sh [P2P_TICKET]` or interactive prompt
-- Syntax: `connect_remote.cmd [P2P_TICKET]` or double-click interactive prompt
-- Config Target: `~/.oxideswarm/rusty-grid.toml` (macOS/Linux) or `%USERPROFILE%\.oxideswarm\rusty-grid.toml` (Windows)
-- Execution: Launches background daemon or service with automatic restart on reboot.
+### Coordination State Machine & File Schema
+- Protocol Version: `1.0.0`
+- Base Directory: `G:\My Drive\OxideSwarm_Sync` (fallback `G:\Google Drive\OxideSwarm_Sync`)
+- Node Mailbox: `nodes/<node_id>/`
+- Files:
+  - `announce.json`: `{ protocol_version, node_id, hostname, platform, timestamp_utc, preferred_role, priority, tie_breaker, lan_ipv4, advertised_port, dashboard_port, capabilities }`
+  - `state.json`: `{ node_id, current_state, role, updated_utc }`
+  - `ticket.json`: `{ server_node_id, timestamp_utc, lan_endpoints, p2p_ticket, web_dashboard_url }`
+  - `heartbeat.json`: `{ node_id, timestamp_utc, status }`
+  - `logs/<node_id>.log`: Real-time execution and error diagnostics
+  - `verifications/<node_id>_result.json`: `{ node_id, status: "SUCCESS", transport_used, target_endpoint, rtt_ms, test_command, exit_code: 0, details }`
+  - `SUCCESS_CONFIRMED.md`: Final mutual report confirming two-way communication
 
 ## Code Layout
-- `crates/core/src/transport.rs`: P2P transport primitives, ticket serialization/deserialization.
-- `crates/core/src/protocol.rs`: Master-worker wire protocol and heartbeat structures.
-- `crates/master/src/server.rs`: Master server, P2P endpoint binding, SecretKey resolution, connection handling.
-- `crates/master/src/web_ui.rs`: Axum web server and API status handlers.
-- `crates/master/src/dashboard.html`: Web UI Dashboard single-page application.
-- `crates/worker/src/client.rs`: Worker client loop, connection management, exponential backoff.
-- `crates/worker/src/heartbeat.rs`: Worker heartbeat sender and RTT calculator.
-- `crates/cli/src/main.rs`: CLI command parser and formatted output.
-- `connect_remote.sh`: 1-click connection script for macOS/Linux.
-- `connect_remote.cmd`: 1-click connection script for Windows.
-- `packaging/windows/install_windows_service.ps1`: Windows SCM service installer.
-- `/Users/duongnad/teamwork_projects/remote_cluster_interconnect/`: Deliverables directory containing reports and benchmark data.
+- `target\debug\rusty-grid.exe`: OxideSwarm core executable (Master & Worker).
+- `G:\My Drive\OxideSwarm_Sync\`: Shared cloud synchronization folder for inter-AI coordination.
+- `e:\teamwork_projects\OxideSwarm\scripts\`: Coordination and connection test automation scripts.
+- `e:\teamwork_projects\OxideSwarm\.agents\`: Agent metadata, plans, progress, and handoffs.

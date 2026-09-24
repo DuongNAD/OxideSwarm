@@ -241,12 +241,17 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
         val autoStart = switchAutoStart.isChecked
 
         if (master.isEmpty()) {
-            etMasterAddress.error = "Master address required (e.g. 192.168.1.100:8080)"
+            etMasterAddress.error = "Master address or P2P ticket required (e.g. 192.168.1.100:8080 or {\"id\":...})"
             return
         }
 
+        val isTicket = master.trim().startsWith("{") && (master.contains("\"id\"") || master.contains("relay"))
+        val p2pTicket = if (isTicket) master.trim() else null
+        val resolvedMaster = if (isTicket) "iroh-p2p" else master
+
         val config = WorkerConfig(
-            masterAddress = master,
+            masterAddress = resolvedMaster,
+            p2pTicket = p2pTicket,
             workerName = if (name.isEmpty()) SystemInfoHelper.getDefaultWorkerName() else name,
             cores = cores,
             ramMb = ramMb,

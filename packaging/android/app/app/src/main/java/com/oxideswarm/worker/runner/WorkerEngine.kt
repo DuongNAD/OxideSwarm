@@ -9,6 +9,7 @@ enum class WorkerState {
 
 data class WorkerConfig(
     val masterAddress: String,
+    val p2pTicket: String? = null,
     val workerName: String,
     val cores: Int,
     val ramMb: Long,

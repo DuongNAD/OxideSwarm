@@ -348,6 +348,38 @@ Hiển thị rõ ràng trạng thái kết nối trên Web UI Dashboard và CLI:
 - [ ] **Comparative Benchmark Report**: Cung cấp file tài liệu báo cáo phân tích chi tiết với bảng so sánh số liệu thực nghiệm giữa 3 phương án (Iroh, Tailscale, Cloudflare).
 - [ ] **1-Click Automation**: Cung cấp file script chạy 1-click cho cả macOS (`connect_remote.sh`) và Windows (`connect_remote.cmd`).
 
+## 2026-09-23T05:04:34Z
+
+# Teamwork Project Prompt — Draft
+
+> Status: Launched
+> Goal: Craft prompt → get user approval → delegate to teamwork_preview
+> Requested team: [none — teamwork routes from the description]
+
+Coordinate with another AI via a shared folder (`G:\Google Drive\OxideSwarm_Sync`) to test the OxideSwarm network. Autonomously assign Server/Client roles, exchange IPs, write connection scripts, test the connection, and iteratively debug using shared log files until a successful ping is achieved.
+
+Working directory: e:\teamwork_projects\OxideSwarm
+Integrity mode: benchmark
+
+## Requirements
+
+### R1. Autonomous Coordination
+Communicate exclusively via `G:\Google Drive\OxideSwarm_Sync` to negotiate roles (Server/Client) and exchange connection parameters (e.g., LAN IPs, ports, or OxideSwarm tickets). You must design your own file naming and protocol to avoid race conditions.
+
+### R2. Connection Testing
+Write and execute a script or command to test the connection to the peer machine. You may use OxideSwarm's built-in tools or write a custom test, as long as it verifies network reachability.
+
+### R3. Iterative Debugging
+If the connection fails, capture the error logs, write them to the shared Google Drive folder, read the peer's logs, and autonomously adjust your approach or scripts until a successful connection is established.
+
+## Acceptance Criteria
+
+### Coordination
+- [ ] The shared folder contains files documenting the agreed-upon roles and connection details.
+
+### Successful Connection
+- [ ] A programmatic test (script or command) exits with a success code indicating the connection is established.
+- [ ] A final "success" log or file is written to the shared folder, confirming that both sides have successfully communicated over the network.
 
 ## 2026-09-23T05:05:19Z
 
@@ -404,3 +436,121 @@ Nếu kết nối hoặc ping thất bại, nhóm AI phải xuất log lỗi chi
 ### Kết nối mạng
 - [ ] Script mạng trên máy Mac thực thi thành công (exit code 0) hoặc duy trì trạng thái kết nối ổn định.
 - [ ] Ghi nhận một file log chung (vd: `ping_success.txt`) xác nhận gói tin ping/pong đã được gửi và nhận thành công giữa 2 máy.
+
+## 2026-09-23T07:37:48Z
+
+# Teamwork Project Prompt — Draft
+
+> Status: Launched
+> Goal: Craft prompt → get user approval → delegate to teamwork_preview
+> Requested team: [none — teamwork routes from the description]
+
+Research and develop an architectural upgrade for OxideSwarm to optimally run compute nodes on Android devices from anywhere. The upgrade should feature advanced node coordination, NAT traversal, dynamic role assignment, and robust management, leveraging and taking inspiration from existing open-source projects.
+
+Working directory: e:\teamwork_projects\OxideSwarm
+Integrity mode: benchmark
+
+## Requirements
+
+### R1. Android Native Architecture Research
+Research and design a high-performance Android native architecture for OxideSwarm. The solution must allow Android smartphones to act as compute nodes over any network while optimizing for battery life and resisting Android's background execution limits (e.g., Doze mode, Phantom Process Killer). 
+
+### R2. Advanced Coordination and P2P Management
+Design a resilient mechanism for dynamic role assignment and cluster management that seamlessly accommodates mobile nodes roaming across different IP networks. Evaluate and adapt NAT traversal or P2P routing techniques from leading open-source projects.
+
+### R3. Deliverables Generation
+Produce a comprehensive architectural specification document based on your research. If feasible within the time budget, write a proof-of-concept (PoC) code integration extending the current `crates/android_bridge` or `packaging/android` modules to demonstrate the concepts.
+
+## Acceptance Criteria
+
+### Research & Architecture Document
+- [ ] An `ANDROID_ARCHITECTURE.md` artifact is created in the workspace containing the proposed architecture.
+- [ ] The document explicitly cites and analyzes at least two existing open-source projects as reference models.
+- [ ] The document includes specific technical solutions for: (1) battery-optimized background execution on Android, and (2) mobile NAT traversal.
+
+### Code Quality (If PoC is built)
+- [ ] Any PoC code or script added to the workspace must successfully compile or pass basic lints (e.g., `cargo check` exits with code 0).
+
+## 2026-09-23T09:50:43Z
+
+A cross-platform communication framework that enables coding agents to connect, transmit information, and send commands using diverse connection methods (LAN/Internet). The focus is a Proof-of-Concept to demonstrate successful command routing across macOS, Windows, Android, and Ubuntu.
+
+Working directory: e:\teamwork_projects\OxideSwarm
+Integrity mode: development
+
+## Requirements
+
+### R1. Cross-Platform Communication Core
+The system must establish a communication mesh or hub that allows nodes to connect. The agent team is free to choose the optimal underlying frameworks or libraries (e.g., ZeroMQ, MQTT, WebSockets, gRPC) to support both local and internet-based routing.
+
+### R2. Command Routing and Execution
+Nodes must be able to send structured commands to other specific nodes and receive execution results or data payloads. The client/node implementation must be compatible with Windows, macOS, Ubuntu, and Android.
+
+## Acceptance Criteria
+
+### Verification & Testing
+- [ ] A programmatic test script (e.g., Python/Node.js) can spawn at least 3 simulated nodes locally and verify that a command sent from Node 1 is successfully received and responded to by Node 3.
+- [ ] The system includes clear build/run instructions or scripts to deploy the node client on Android, Windows, macOS, and Ubuntu.
+- [ ] Automated tests pass, proving bidirectional data transmission between nodes without data loss.
+
+## 2026-09-24T05:40:53Z
+
+Merge the remote Git branch `feat/cross-machine-network-sync` into `master` alongside existing local uncommitted changes, refactor and restructure the OxideSwarm repository for high maintainability and extensibility, optimize cross-platform performance (Rust core, Agent Mesh, Android worker, Sync Network), execute comprehensive multi-layer verification tests, and push the consolidated codebase to `origin/master`.
+
+Working directory: e:\teamwork_projects\OxideSwarm
+Integrity mode: development
+
+## Requirements
+
+### R1. Git Branch Consolidation & Conflict Resolution
+Merge remote branch `origin/feat/cross-machine-network-sync` into `master`, reconciling all modifications with existing local additions (including `crates/agent_mesh`, `crates/android_bridge`, and test suites) with zero data loss or functional regression.
+
+### R2. Architectural Reorganization & Modular Decoupling
+Streamline the repository structure so that each layer has clean, well-defined boundaries:
+- Rust Core Engine & Networking (P2P, WAN interconnect, Iroh/QUIC).
+- JNI / Android Bridge (`crates/android_bridge` and `packaging/android`).
+- Agent Mesh Coordination layer (`crates/agent_mesh` and `packaging/agent_mesh`).
+- Cross-machine Synchronization & Benchmarks (`scripts/sync_network` and `benchmarks/interconnect`).
+Eliminate redundant artifacts, unreferenced scratch files, or duplicate utilities to maximize clarity for future maintenance and feature development.
+
+### R3. Performance Optimization & Modernization
+Profile and optimize critical paths:
+- Reduce memory overhead and resource leaks in background coordination workers.
+- Optimize I/O and latency for cross-machine packet synchronization and P2P routing.
+- Standardize robust error handling, graceful shutdown, and cross-platform path handling (Windows / Linux / macOS / Android).
+
+### R4. Comprehensive Verification & Testing
+Execute automated multi-tiered test suites across all integrated modules:
+- Cargo workspace verification: `cargo check --workspace` and `cargo test --workspace`.
+- Agent Mesh test suite: `python tests/run_all_mesh_tests.py` and challenger integration tests.
+- Cross-machine sync validation: verify integrity and protocol compliance of `scripts/sync_network`.
+
+### R5. Git Delivery & Documentation Synchronization
+Synchronize documentation (`README.md`, `PROJECT.md`, architecture specs) to accurately reflect the unified system design, generate clean conventional commits, and push the verified `master` branch to `origin/master`.
+
+## Verification Resources
+- Rust build & test tools: `cargo check --workspace`, `cargo test --workspace`
+- Agent Mesh test runner: `tests/run_all_mesh_tests.py`
+- Test challenger scripts in `tests/test_challenger_*.py`
+- Network sync protocol verification in `scripts/sync_network/`
+
+## Acceptance Criteria
+
+### Git & Workspace Integration
+- [ ] `origin/feat/cross-machine-network-sync` is merged cleanly into local `master` without dropped files or unresolved conflict markers.
+- [ ] All existing local files (`crates/agent_mesh`, Android bridge updates, test suites) are properly incorporated and tracked.
+- [ ] `git status` reports a clean working tree after all commits are created.
+
+### Build & Test Pass
+- [ ] `cargo check --workspace` finishes with exit code 0 and zero compilation errors.
+- [ ] `cargo test --workspace` passes all tests cleanly.
+- [ ] Python agent mesh test suite (`python tests/run_all_mesh_tests.py`) runs and reports 100% passed.
+- [ ] No regression detected in `scripts/sync_network/sync_network.py` or P2P interconnect logic.
+
+### Architectural Health
+- [ ] The workspace structure is cleanly categorized into clear functional crates and directories.
+- [ ] Obsolete temporary files or accidental build artifacts are pruned from Git tracking.
+- [ ] `README.md` and architecture documentation are updated with the unified project layout and usage instructions.
+
+### Remote Delivery
+- [ ] Final commits are successfully pushed to `origin/master`.

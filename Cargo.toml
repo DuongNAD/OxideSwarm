@@ -6,6 +6,7 @@ members = [
     "crates/worker",
     "crates/cli",
     "crates/android_bridge",
+    "crates/agent_mesh",
 ]
 
 [workspace.package]
@@ -17,6 +18,7 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 # Internal workspace crates
+agent_mesh = { path = "crates/agent_mesh" }
 rusty_grid_core = { path = "crates/core" }
 rusty_grid_master = { path = "crates/master" }
 rusty_grid_worker = { path = "crates/worker" }
