@@ -1,9 +1,24 @@
+# ==============================================================================
+# DEPRECATION NOTICE:
+# This script (scripts/run_milestones_1_and_2.ps1) is DEPRECATED and retained
+# only for historical reference.
+#
+# SUPERSEDED BY:
+#   - scripts/sync_network/sync_network.cmd (Windows)
+#   - scripts/sync_network/sync_network.py  (Cross-platform Python)
+#   - scripts/sync_network/sync_network.sh  (macOS / Linux)
+#
+# Please use scripts/sync_network/sync_network.cmd or sync_network.py for all
+# cross-machine synchronization, autonomous role negotiation, and network testing.
+# ==============================================================================
+
 # OxideSwarm Coordination and Network Ping Automation
 # Milestones 1 & 2 Execution Script
 # Author: Worker 1 (node_win_case_166)
 
 $ErrorActionPreference = "Stop"
 
+Write-Warning "DEPRECATED: scripts/run_milestones_1_and_2.ps1 is superseded by scripts/sync_network/sync_network.cmd and sync_network.py."
 Write-Host "=== Starting OxideSwarm Milestones 1 & 2 Execution ===" -ForegroundColor Cyan
 
 # 1. Resolve Shared Sync Directory

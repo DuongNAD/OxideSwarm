@@ -99,3 +99,9 @@ htmlcov/
 venv/
 ENV/
 env/
+
+# --- Test Empirical Results & Dumps ---
+tests/empirical_results.json
+tests/m7_challenger_2_results.json
+tests/*_results.json
+windows/*.log
