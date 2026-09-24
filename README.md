@@ -133,7 +133,7 @@ Khi 2 máy không cùng mạng Wi-Fi (ví dụ: MacBook ở quán cafe/công ty,
    - Mở Web Dashboard của Master, bấm nút **"📋 Copy P2P Ticket"** (mã ticket được cố định qua `~/.oxideswarm/master_key.bin`, không bao giờ đổi khi reboot).
 2. **Kết nối trên Máy Phụ (Worker)**:
    - **Trên macOS**: Chạy `./connect_remote.sh` rồi dán Ticket (hoặc `./connect_remote.sh "<TICKET>"`).
-   - **Trên Windows**: Double-click vào [`connect_remote.cmd`](file:///Users/duongnad/Documents/project/OxideSwarm/connect_remote.cmd), dán Ticket và nhấn Enter. Script tự lưu cấu hình và chạy ngầm tàng hình.
+   - **Trên Windows**: Double-click vào [`connect_remote.cmd`](connect_remote.cmd), dán Ticket và nhấn Enter. Script tự lưu cấu hình và chạy ngầm tàng hình.
 3. **Tự động nhận diện đường truyền**:
    - Hai máy tự động đục lỗ tường lửa (UDP Hole Punching) để bắt tay trực tiếp (`🟢 Direct P2P | <RTT>ms`).
    - Nếu bị tường lửa công ty chặn UDP, tự động chuyển tiếp qua HTTPS Relay (`🟣 DERP Relay | <RTT>ms`) an toàn 100%.
@@ -243,10 +243,16 @@ OxideSwarm/
 ├── Cargo.toml                     # Workspace root manifest
 ├── README.md                      # Primary documentation & cluster specifications
 ├── DEPLOYMENT.md                  # Turnkey multi-platform agent deployment guide
+├── ANDROID_ARCHITECTURE.md        # Comprehensive Android native architecture specification
 ├── switch_role.sh                 # 1-click role switcher for macOS (Master <-> Worker)
+├── connect_remote.sh              # 1-click P2P WAN interconnect launcher for macOS
+├── connect_remote.cmd             # 1-click P2P WAN interconnect launcher for Windows
 ├── ox-mode -> scripts/mode.sh     # Unified CLI & TUI workflow automation runner
 ├── assets/                        # Vector branding assets (logo.svg, icon.svg)
+├── benchmarks/
+│   └── interconnect/              # Comparative empirical benchmarks (Iroh P2P vs Tailscale vs Cloudflare)
 ├── scripts/
+│   ├── sync_network/              # Cross-machine file-based autonomous network sync suite
 │   ├── agent_node.py              # Lightweight Python agent node client (Termux/Win/Mac/Linux)
 │   └── mode.sh                    # Workflow mode automation script
 ├── packaging/
@@ -278,6 +284,12 @@ OxideSwarm contains a comprehensive, multi-tiered test and benchmark suite:
 # Run the entire workspace unit and integration test suite:
 cargo test --workspace
 
+# Run cross-platform Agent Mesh test suite:
+python tests/run_all_mesh_tests.py
+
+# Run comparative interconnect empirical benchmarks:
+./benchmarks/interconnect/run_comparative_benchmark.sh
+
 # Run the end-to-end integration test (1 Master + 3 Workers with simulated GPU):
 ./test_integration.sh
 
@@ -290,7 +302,7 @@ cargo test --workspace
 
 ---
 
-## 8. License
+## 9. License
 
 OxideSwarm is dual-licensed under:
 * Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
