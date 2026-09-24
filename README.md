@@ -27,6 +27,8 @@
 * **Autonomous P2P NAT Traversal (`iroh`)**: Built-in QUIC and DERP hole-punching protocol connects remote machines across the public Internet and restrictive home firewalls without opening router ports or establishing complex VPNs.
 * **Ultra-Lightweight & Stealth ("Lean & Mean")**: Background workers operate with a minimal memory footprint of **~12 MB RAM** and **0.0% idle CPU**. A 1-click silent runner on Windows executes completely headless without intrusive console popups, preserving system responsiveness for gaming and rendering.
 * **Instant Role Swapping & Autonomous Discovery**: Promote or demote nodes between **Master <-> Worker** in under 1 second. Mobile and edge devices auto-discover active coordinators via a resilient 3-tier fallback discovery protocol.
+* **Modular 4-Layer Decoupled Architecture**: Cleanly partitioned into Rust Core Engine, Android Native JNI Bridge, Agent Mesh Coordination Hub, and Cross-Machine Sync Network.
+* **Process Tree Lifecycle & Bounded Memory**: Automated OS-level process tree termination (`taskkill` / `pkill` / `sysinfo`) prevents orphaned child leaks, paired with LRU task eviction and stale worker pruning on the Master node.
 
 ---
 
@@ -168,20 +170,25 @@ OxideSwarm includes a unified CLI management tool:
 ./ox-mode research distributed
 ```
 
-### Direct CLI Commands (`rusty-grid`)
+### Direct CLI Commands (`oxideswarm` / `rusty-grid`)
+
+The CLI is available under both `oxideswarm` and `rusty-grid` binary aliases:
 
 ```bash
+# Start Master coordinator:
+./target/release/oxideswarm master --listen 0.0.0.0:8088 --web-ui-addr 0.0.0.0:8080
+
 # Submit an arbitrary command task to the cluster:
-./target/release/rusty-grid submit --master 127.0.0.1:8088 --command "sha256sum large_file.bin"
+./target/release/oxideswarm submit --master 127.0.0.1:8088 --command "sha256sum large_file.bin"
 
 # Submit a GPU-only workload:
-./target/release/rusty-grid submit --master 127.0.0.1:8088 --command "python3 train.py" --require-gpu
+./target/release/oxideswarm submit --master 127.0.0.1:8088 --command "python3 train.py" --require-gpu
 
 # Inspect real-time worker node inventory:
-./target/release/rusty-grid workers --master 127.0.0.1:8088
+./target/release/oxideswarm workers --master 127.0.0.1:8088
 
 # Check cluster status and task queue:
-./target/release/rusty-grid status --master 127.0.0.1:8088
+./target/release/oxideswarm status --master 127.0.0.1:8088
 ```
 
 ---
@@ -265,13 +272,13 @@ OxideSwarm/
 │   ├── android/                   # Android APK project & persistent foreground service daemon
 │   └── macos/                     # LaunchDaemon configuration for macOS
 ├── crates/
-│   ├── agent_mesh/                # Cross-platform coding agent communication framework (hub, node, protocol)
-│   ├── core/                      # Wire protocol, framing codec, LAN discovery, workflow modes
-│   ├── master/                    # Scheduler, GPU routing, FSM, Axum dashboard, WebSocket telemetry
-│   ├── worker/                    # Task runner, sandbox isolation, GPU matrix, Standby Portal
-│   ├── android_bridge/            # Native C/Rust JNI bridge for Android foreground service
-│   └── cli/                       # Unified CLI binary (rusty-grid) with 7 subcommands
-└── tests/                         # E2E integration test suite, chaos stress tests, and benchmarks
+│   ├── core/                      # [Layer 1] Wire protocol, framing codec, LAN discovery, workflow modes
+│   ├── master/                    # [Layer 1] Scheduler, GPU routing, FSM, LRU memory bounding, Axum dashboard
+│   ├── worker/                    # [Layer 1] Task runner, process tree kill sandbox, GPU matrix, Standby Portal
+│   ├── cli/                       # [Layer 1] Unified CLI binary (oxideswarm & rusty-grid aliases)
+│   ├── android_bridge/            # [Layer 2] Native C/Rust JNI bridge (liboxideworker.so) for Android
+│   └── agent_mesh/                # [Layer 3] Axum WebSocket Relay Hub & Agent Client
+└── tests/                         # Multi-tier E2E integration test suite, chaos stress tests, and benchmarks
 ```
 
 ---
