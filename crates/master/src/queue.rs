@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use rusty_grid_core::error::{GridError, GridResult};
-use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskResult, TaskStatus};
+use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskRequirements, TaskResult, TaskStatus};
 
 /// 8-State Task Lifecycle Finite State Machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -552,6 +552,56 @@ impl TaskQueue {
         Some(task)
     }
 
+    /// Atomically transitions a batch of tasks to Scheduled state under a single write lock.
+    ///
+    /// Accepts a slice of `(TaskId, Uuid)` pairs and returns `Vec<(TaskId, Uuid, Task)>`
+    /// containing all tasks that were successfully transitioned from `Queued` to `Scheduled`.
+    /// Any task that is no longer in `Queued` state (e.g. cancelled concurrently) is skipped.
+    pub async fn schedule_tasks_batch(
+        &self,
+        assignments: &[(TaskId, Uuid)],
+    ) -> Vec<(TaskId, Uuid, Task)> {
+        if assignments.is_empty() {
+            return Vec::new();
+        }
+
+        let mut inner = self.inner.write().await;
+        let now = Instant::now();
+        let mut scheduled = Vec::with_capacity(assignments.len());
+
+        for &(task_id, worker_id) in assignments {
+            let priority_info = match inner.tasks.get(&task_id) {
+                Some(entry) if entry.state == TaskState::Queued => {
+                    (entry.priority, entry.sequence)
+                }
+                _ => continue,
+            };
+
+            inner.ready_queue.remove(&QueueOrderKey {
+                priority_rev: Reverse(priority_info.0),
+                sequence: priority_info.1,
+                task_id,
+            });
+
+            if let Some(entry) = inner.tasks.get_mut(&task_id) {
+                entry.state = TaskState::Scheduled;
+                entry.assigned_worker_id = Some(worker_id);
+                entry.scheduled_instant = Some(now);
+                let task = entry.task.clone();
+
+                inner
+                    .worker_assignments
+                    .entry(worker_id)
+                    .or_default()
+                    .insert(task_id);
+
+                scheduled.push((task_id, worker_id, task));
+            }
+        }
+
+        scheduled
+    }
+
     /// Re-enqueues a task back to `Queued` status if dispatch to the worker failed.
     pub async fn requeue_task(&self, task_id: &TaskId) -> GridResult<()> {
         let mut inner = self.inner.write().await;
@@ -610,6 +660,46 @@ impl TaskQueue {
         entry.assigned_worker_id = Some(worker_id);
         entry.started_instant = Some(Instant::now());
         Ok(())
+    }
+
+    /// Records a mid-task computation checkpoint for an in-flight task.
+    ///
+    /// Monotonically enforces checkpoint ordering by sequence number.
+    /// Outdated out-of-order checkpoint snapshots are safely ignored.
+    pub async fn record_checkpoint(
+        &self,
+        task_id: TaskId,
+        checkpoint: CheckpointData,
+    ) -> Result<(), GridError> {
+        let mut inner = self.inner.write().await;
+        let entry = inner
+            .tasks
+            .get_mut(&task_id)
+            .ok_or(GridError::TaskNotFound(task_id.0))?;
+
+        if entry.state.is_terminal() {
+            return Ok(());
+        }
+
+        let is_newer = match &entry.task.latest_checkpoint {
+            Some(existing) => checkpoint.sequence > existing.sequence,
+            None => true,
+        };
+
+        if is_newer {
+            entry.task.update_checkpoint(checkpoint);
+        }
+
+        Ok(())
+    }
+
+    /// Retrieves the latest verified mid-task checkpoint for a task, if available.
+    pub async fn get_checkpoint(&self, task_id: &TaskId) -> Option<CheckpointData> {
+        let inner = self.inner.read().await;
+        inner
+            .tasks
+            .get(task_id)
+            .and_then(|e| e.task.latest_checkpoint.clone())
     }
 
     /// Records execution outcome returned by a worker and transitions state.

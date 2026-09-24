@@ -27,7 +27,7 @@ pub struct ClusterStatusDto {
 }
 
 /// Summary counts of connected and active worker nodes.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct WorkerSummaryDto {
     /// Total registered workers across all states.
     pub total: usize,
@@ -38,6 +38,88 @@ pub struct WorkerSummaryDto {
     /// Workers currently disconnected or reaped.
     pub disconnected: usize,
 }
+
+impl<'de> Deserialize<'de> for WorkerSummaryDto {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct WorkerSummaryVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for WorkerSummaryVisitor {
+            type Value = WorkerSummaryDto;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a worker summary object or a list of worker items")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut total = 0;
+                let mut connected = 0;
+                let mut busy = 0;
+                let mut disconnected = 0;
+
+                while let Some(val) = seq.next_element::<serde_json::Value>()? {
+                    total += 1;
+                    if let Some(status_str) = val.get("status").and_then(|s| s.as_str()) {
+                        let lower = status_str.to_lowercase();
+                        if lower.contains("busy") {
+                            busy += 1;
+                        } else if lower.contains("disconnect") || lower.contains("reap") {
+                            disconnected += 1;
+                        } else {
+                            connected += 1;
+                        }
+                    } else {
+                        connected += 1;
+                    }
+                }
+
+                Ok(WorkerSummaryDto {
+                    total,
+                    connected,
+                    busy,
+                    disconnected,
+                })
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                let mut total = None;
+                let mut connected = None;
+                let mut busy = None;
+                let mut disconnected = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "total" => total = Some(map.next_value()?),
+                        "connected" => connected = Some(map.next_value()?),
+                        "busy" => busy = Some(map.next_value()?),
+                        "disconnected" => disconnected = Some(map.next_value()?),
+                        _ => {
+                            let _ = map.next_value::<serde_json::Value>()?;
+                        }
+                    }
+                }
+
+                Ok(WorkerSummaryDto {
+                    total: total.unwrap_or(0),
+                    connected: connected.unwrap_or(0),
+                    busy: busy.unwrap_or(0),
+                    disconnected: disconnected.unwrap_or(0),
+                })
+            }
+        }
+
+        deserializer.deserialize_any(WorkerSummaryVisitor)
+    }
+}
+
 
 /// Full point-in-time state snapshot of the cluster, delivered upon WebSocket handshake.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

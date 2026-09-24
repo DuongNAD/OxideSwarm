@@ -1,10 +1,391 @@
 //! Task definitions, specifications, requirements, results, and state machine transitions.
 
+pub use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use uuid::Uuid;
+
+/// Zero-copy, high-performance byte buffer wrapping `bytes::Bytes` with transparent UTF-8 inspection.
+#[derive(Clone, Default, Eq)]
+#[repr(transparent)]
+pub struct Bytes(pub bytes::Bytes);
+
+impl Bytes {
+    #[inline]
+    pub const fn new() -> Self {
+        Bytes(bytes::Bytes::new())
+    }
+
+    #[inline]
+    pub fn copy_from_slice(data: &[u8]) -> Self {
+        Bytes(bytes::Bytes::copy_from_slice(data))
+    }
+
+    #[inline]
+    pub fn from_static(bytes: &'static [u8]) -> Self {
+        Bytes(bytes::Bytes::from_static(bytes))
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).unwrap_or("")
+    }
+
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[inline]
+    pub fn slice(&self, range: impl std::ops::RangeBounds<usize>) -> Self {
+        Bytes(self.0.slice(range))
+    }
+
+    #[inline]
+    pub fn into_bytes(self) -> bytes::Bytes {
+        self.0
+    }
+
+    #[inline]
+    pub fn inner(&self) -> &bytes::Bytes {
+        &self.0
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl std::ops::Deref for Bytes {
+    type Target = str;
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<[u8]> for Bytes {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<str> for Bytes {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::borrow::Borrow<str> for Bytes {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::borrow::Borrow<[u8]> for Bytes {
+    #[inline]
+    fn borrow(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Bytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Ok(s) = std::str::from_utf8(&self.0) {
+            write!(f, "{:?}", s)
+        } else {
+            write!(f, "{:?}", &self.0)
+        }
+    }
+}
+
+impl fmt::Display for Bytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl From<bytes::Bytes> for Bytes {
+    #[inline]
+    fn from(b: bytes::Bytes) -> Self {
+        Bytes(b)
+    }
+}
+
+impl From<Bytes> for bytes::Bytes {
+    #[inline]
+    fn from(b: Bytes) -> Self {
+        b.0
+    }
+}
+
+impl From<Vec<u8>> for Bytes {
+    #[inline]
+    fn from(v: Vec<u8>) -> Self {
+        Bytes(bytes::Bytes::from(v))
+    }
+}
+
+impl From<String> for Bytes {
+    #[inline]
+    fn from(s: String) -> Self {
+        Bytes(bytes::Bytes::from(s))
+    }
+}
+
+impl From<&str> for Bytes {
+    #[inline]
+    fn from(s: &str) -> Self {
+        Bytes(bytes::Bytes::copy_from_slice(s.as_bytes()))
+    }
+}
+
+impl From<&[u8]> for Bytes {
+    #[inline]
+    fn from(s: &[u8]) -> Self {
+        Bytes(bytes::Bytes::copy_from_slice(s))
+    }
+}
+
+impl PartialEq for Bytes {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl PartialEq<str> for Bytes {
+    #[inline]
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for Bytes {
+    #[inline]
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for Bytes {
+    #[inline]
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl PartialEq<Bytes> for str {
+    #[inline]
+    fn eq(&self, other: &Bytes) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl PartialEq<Bytes> for &str {
+    #[inline]
+    fn eq(&self, other: &Bytes) -> bool {
+        *self == other.as_str()
+    }
+}
+
+impl PartialEq<Bytes> for String {
+    #[inline]
+    fn eq(&self, other: &Bytes) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl std::ops::Index<usize> for Bytes {
+    type Output = u8;
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.0[index]
+    }
+}
+
+impl FromIterator<u8> for Bytes {
+    fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
+        let vec: Vec<u8> = iter.into_iter().collect();
+        Bytes(bytes::Bytes::from(vec))
+    }
+}
+
+impl<'a> FromIterator<&'a u8> for Bytes {
+    fn from_iter<T: IntoIterator<Item = &'a u8>>(iter: T) -> Self {
+        let vec: Vec<u8> = iter.into_iter().copied().collect();
+        Bytes(bytes::Bytes::from(vec))
+    }
+}
+
+impl FromIterator<i32> for Bytes {
+    fn from_iter<T: IntoIterator<Item = i32>>(iter: T) -> Self {
+        let vec: Vec<u8> = iter.into_iter().map(|x| x as u8).collect();
+        Bytes(bytes::Bytes::from(vec))
+    }
+}
+
+impl std::hash::Hash for Bytes {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+pub mod bytes_serde {
+    use super::Bytes;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &Bytes, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if serializer.is_human_readable() {
+            if let Ok(s) = std::str::from_utf8(bytes.as_bytes()) {
+                serializer.serialize_str(s)
+            } else {
+                serializer.serialize_bytes(bytes.as_bytes())
+            }
+        } else {
+            serializer.serialize_bytes(bytes.as_bytes())
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Bytes, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BytesVisitor;
+        impl<'de> serde::de::Visitor<'de> for BytesVisitor {
+            type Value = Bytes;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a byte array, slice, or string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Bytes::copy_from_slice(v.as_bytes()))
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Bytes::copy_from_slice(v))
+            }
+
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Bytes::from(v))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut v = Vec::new();
+                while let Some(b) = seq.next_element()? {
+                    v.push(b);
+                }
+                Ok(Bytes::from(v))
+            }
+        }
+
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_any(BytesVisitor)
+        } else {
+            deserializer.deserialize_byte_buf(BytesVisitor)
+        }
+    }
+}
+
+impl serde::Serialize for Bytes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        bytes_serde::serialize(self, serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Bytes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        bytes_serde::deserialize(deserializer)
+    }
+}
+
+pub mod opt_bytes_serde {
+    use super::Bytes;
+    use serde::{Deserializer, Serializer};
+
+    struct BytesRefWrapper<'a>(&'a Bytes);
+    impl<'a> serde::Serialize for BytesRefWrapper<'a> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            super::bytes_serde::serialize(self.0, serializer)
+        }
+    }
+
+    pub fn serialize<S>(opt: &Option<Bytes>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match opt {
+            Some(b) => serializer.serialize_some(&BytesRefWrapper(b)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Bytes>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OptBytesVisitor;
+        impl<'de> serde::de::Visitor<'de> for OptBytesVisitor {
+            type Value = Option<Bytes>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an optional byte sequence, string, or array")
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                super::bytes_serde::deserialize(deserializer).map(Some)
+            }
+        }
+
+        deserializer.deserialize_option(OptBytesVisitor)
+    }
+}
 
 /// Strongly-typed unique identifier for a task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -250,6 +631,7 @@ enum BinaryTaskSpec {
         args: Vec<String>,
         env: HashMap<String, String>,
         working_dir: Option<PathBuf>,
+        #[serde(default)]
         stdin: Option<Vec<u8>>,
     },
     ShellScript {
@@ -265,6 +647,7 @@ enum BinaryTaskSpec {
     },
     GpuCompute {
         kernel_name: String,
+        #[serde(default)]
         input_data: Vec<u8>,
         work_group_size: u32,
         simulated_matrix_dim: u32,
@@ -684,6 +1067,29 @@ impl TaskSpec {
     }
 }
 
+/// Incremental computational snapshot emitted by a Worker during execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointData {
+    pub sequence: u64,
+    pub delta_state: Bytes,
+    pub timestamp: u64,
+}
+
+impl CheckpointData {
+    /// Creates a new CheckpointData with sequence, delta state, and current UNIX epoch timestamp.
+    pub fn new(sequence: u64, delta_state: impl Into<Bytes>) -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self {
+            sequence,
+            delta_state: delta_state.into(),
+            timestamp,
+        }
+    }
+}
+
 /// The top-level task representation submitted to Master and dispatched to Workers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
@@ -698,6 +1104,9 @@ pub struct Task {
     /// User-defined tags or labels.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Latest checkpoint data for delta resumption.
+    #[serde(default)]
+    pub latest_checkpoint: Option<CheckpointData>,
 }
 
 impl Task {
@@ -714,6 +1123,7 @@ impl Task {
             requirements,
             created_at_utc,
             tags: Vec::new(),
+            latest_checkpoint: None,
         }
     }
 
@@ -722,6 +1132,18 @@ impl Task {
         self.tags = tags;
         self
     }
+
+    /// Builder method to attach latest checkpoint data.
+    pub fn with_checkpoint(mut self, checkpoint: CheckpointData) -> Self {
+        self.latest_checkpoint = Some(checkpoint);
+        self
+    }
+
+    /// Mutates the task to record an updated checkpoint snapshot.
+    pub fn update_checkpoint(&mut self, checkpoint: CheckpointData) {
+        self.latest_checkpoint = Some(checkpoint);
+    }
+
 
     /// Validates the task and checks for specification/requirement mismatches.
     pub fn validate(&self) -> Result<(), String> {
@@ -739,7 +1161,7 @@ impl Task {
 }
 
 /// Execution outcome returned by a Worker upon task completion or termination.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskResult {
     /// Worker UUID that executed the task.
     pub worker_id: Uuid,
@@ -748,15 +1170,133 @@ pub struct TaskResult {
     /// Process exit code (0 indicates success).
     pub exit_code: i32,
     /// Captured standard output.
-    pub stdout: String,
+    pub stdout: Bytes,
     /// Captured standard error.
-    pub stderr: String,
+    pub stderr: Bytes,
     /// Execution duration in milliseconds.
     pub execution_time_ms: u64,
     /// Whether the task was executed on a physical or simulated GPU.
     pub is_gpu_executed: bool,
+    /// Hardware device name or compute engine descriptor (Requirement R4).
+    pub device_name: Option<String>,
     /// Optional error message if execution or sandboxing encountered an error.
     pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HumanTaskResult {
+    pub worker_id: Uuid,
+    pub task_id: TaskId,
+    pub exit_code: i32,
+    #[serde(with = "bytes_serde")]
+    pub stdout: Bytes,
+    #[serde(with = "bytes_serde")]
+    pub stderr: Bytes,
+    pub execution_time_ms: u64,
+    pub is_gpu_executed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BinaryTaskResult {
+    pub worker_id: Uuid,
+    pub task_id: TaskId,
+    pub exit_code: i32,
+    #[serde(with = "bytes_serde")]
+    pub stdout: Bytes,
+    #[serde(with = "bytes_serde")]
+    pub stderr: Bytes,
+    pub execution_time_ms: u64,
+    pub is_gpu_executed: bool,
+    pub device_name: Option<String>,
+    pub error: Option<String>,
+}
+
+impl From<&TaskResult> for HumanTaskResult {
+    fn from(r: &TaskResult) -> Self {
+        Self {
+            worker_id: r.worker_id,
+            task_id: r.task_id,
+            exit_code: r.exit_code,
+            stdout: r.stdout.clone(),
+            stderr: r.stderr.clone(),
+            execution_time_ms: r.execution_time_ms,
+            is_gpu_executed: r.is_gpu_executed,
+            device_name: r.device_name.clone(),
+            error: r.error.clone(),
+        }
+    }
+}
+
+impl From<HumanTaskResult> for TaskResult {
+    fn from(h: HumanTaskResult) -> Self {
+        Self {
+            worker_id: h.worker_id,
+            task_id: h.task_id,
+            exit_code: h.exit_code,
+            stdout: h.stdout,
+            stderr: h.stderr,
+            execution_time_ms: h.execution_time_ms,
+            is_gpu_executed: h.is_gpu_executed,
+            device_name: h.device_name,
+            error: h.error,
+        }
+    }
+}
+
+impl From<&TaskResult> for BinaryTaskResult {
+    fn from(r: &TaskResult) -> Self {
+        Self {
+            worker_id: r.worker_id,
+            task_id: r.task_id,
+            exit_code: r.exit_code,
+            stdout: r.stdout.clone(),
+            stderr: r.stderr.clone(),
+            execution_time_ms: r.execution_time_ms,
+            is_gpu_executed: r.is_gpu_executed,
+            device_name: r.device_name.clone(),
+            error: r.error.clone(),
+        }
+    }
+}
+
+impl From<BinaryTaskResult> for TaskResult {
+    fn from(b: BinaryTaskResult) -> Self {
+        Self {
+            worker_id: b.worker_id,
+            task_id: b.task_id,
+            exit_code: b.exit_code,
+            stdout: b.stdout,
+            stderr: b.stderr,
+            execution_time_ms: b.execution_time_ms,
+            is_gpu_executed: b.is_gpu_executed,
+            device_name: b.device_name,
+            error: b.error,
+        }
+    }
+}
+
+impl Serialize for TaskResult {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            HumanTaskResult::from(self).serialize(serializer)
+        } else {
+            BinaryTaskResult::from(self).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskResult {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            HumanTaskResult::deserialize(deserializer).map(Into::into)
+        } else {
+            BinaryTaskResult::deserialize(deserializer).map(Into::into)
+        }
+    }
 }
 
 impl TaskResult {
@@ -766,11 +1306,37 @@ impl TaskResult {
         self.exit_code == 0 && self.error.is_none()
     }
 
+    /// Sets the hardware device name or compute engine descriptor.
+    pub fn with_device_name(mut self, device_name: impl Into<String>) -> Self {
+        self.device_name = Some(device_name.into());
+        self
+    }
+
+    /// Returns stdout rendered as a string slice (lossy UTF-8 conversion if necessary).
+    #[inline]
+    pub fn stdout_str(&self) -> std::borrow::Cow<'_, str> {
+        if let Ok(s) = std::str::from_utf8(self.stdout.as_bytes()) {
+            std::borrow::Cow::Borrowed(s)
+        } else {
+            String::from_utf8_lossy(self.stdout.as_bytes())
+        }
+    }
+
+    /// Returns stderr rendered as a string slice (lossy UTF-8 conversion if necessary).
+    #[inline]
+    pub fn stderr_str(&self) -> std::borrow::Cow<'_, str> {
+        if let Ok(s) = std::str::from_utf8(self.stderr.as_bytes()) {
+            std::borrow::Cow::Borrowed(s)
+        } else {
+            String::from_utf8_lossy(self.stderr.as_bytes())
+        }
+    }
+
     /// Convenience constructor for successful execution.
     pub fn success(
         worker_id: Uuid,
         task_id: TaskId,
-        stdout: impl Into<String>,
+        stdout: impl Into<Bytes>,
         execution_time_ms: u64,
         is_gpu_executed: bool,
     ) -> Self {
@@ -779,9 +1345,10 @@ impl TaskResult {
             task_id,
             exit_code: 0,
             stdout: stdout.into(),
-            stderr: String::new(),
+            stderr: Bytes::new(),
             execution_time_ms,
             is_gpu_executed,
+            device_name: None,
             error: None,
         }
     }
@@ -791,8 +1358,8 @@ impl TaskResult {
         worker_id: Uuid,
         task_id: TaskId,
         exit_code: i32,
-        stdout: impl Into<String>,
-        stderr: impl Into<String>,
+        stdout: impl Into<Bytes>,
+        stderr: impl Into<Bytes>,
         execution_time_ms: u64,
         error: Option<String>,
     ) -> Self {
@@ -804,6 +1371,7 @@ impl TaskResult {
             stderr: stderr.into(),
             execution_time_ms,
             is_gpu_executed: false,
+            device_name: None,
             error,
         }
     }
@@ -960,7 +1528,7 @@ mod tests {
         // Spec requires GPU, but requirements state gpu_required = false
         let gpu_spec = TaskSpec::GpuCompute {
             kernel_name: "matrix_mult".into(),
-            input_data: vec![1, 2, 3],
+            input_data: vec![1, 2, 3].into(),
             work_group_size: 16,
             simulated_matrix_dim: 64,
             compute_intensity: 10,
@@ -1137,7 +1705,7 @@ mod tests {
             },
             TaskSpec::GpuCompute {
                 kernel_name: "gemm".into(),
-                input_data: vec![1, 2, 3, 4, 5],
+                input_data: vec![1, 2, 3, 4, 5].into(),
                 work_group_size: 32,
                 simulated_matrix_dim: 128,
                 compute_intensity: 50,
@@ -1181,4 +1749,38 @@ mod tests {
         let decoded_legacy: TaskRequirements = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(decoded_legacy.max_retries, None);
     }
+
+    #[test]
+    fn test_task_checkpoint_serialization_roundtrip() {
+        let checkpoint = CheckpointData::new(42, Bytes::copy_from_slice(b"delta_state_payload"));
+        assert_eq!(checkpoint.sequence, 42);
+        assert_eq!(checkpoint.delta_state.as_bytes(), b"delta_state_payload");
+
+        let task = Task::new(
+            TaskSpec::BuiltinTest {
+                test_name: "test".into(),
+                iterations: 100,
+                duration_ms: 0,
+                should_fail: false,
+                require_gpu: false,
+            },
+            TaskRequirements::generic(1, 10),
+        )
+        .with_checkpoint(checkpoint.clone());
+
+        assert_eq!(task.latest_checkpoint, Some(checkpoint.clone()));
+
+        // JSON roundtrip
+        let json = serde_json::to_string(&task).unwrap();
+        let decoded_json: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(task, decoded_json);
+        assert_eq!(decoded_json.latest_checkpoint, Some(checkpoint.clone()));
+
+        // Bincode roundtrip
+        let bin = bincode::serialize(&task).unwrap();
+        let decoded_bin: Task = bincode::deserialize(&bin).unwrap();
+        assert_eq!(task, decoded_bin);
+        assert_eq!(decoded_bin.latest_checkpoint, Some(checkpoint));
+    }
 }
+

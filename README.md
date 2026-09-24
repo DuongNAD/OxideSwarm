@@ -76,6 +76,11 @@
 | **10. Real-Time Web Observability Dashboard** | Embedded Axum HTTP server at `http://<MASTER_IP>:8080`. Single Page Application embedded via `include_str!` with zero external CDN/npm dependencies. Displays real-time SVG topology, battery, thermal status, CPU/RAM charts, and a built-in AI assistant. | **VERIFIED** (Tested across 5 mobile viewport sizes) |
 | **11. 4 Operational Modes (`ox-mode`)** | Unified TUI and CLI automation tooling: `test` (quick / lint / flaky / full), `dev` (fast check / local cluster / live-reload watch), `doc` (verify / export specs), and `research` (profile / bench / report). | **VERIFIED** |
 | **12. Benchmarked Performance & Chaos Resilience** | • **20-Core Heterogeneous Cluster (Mac + S24)**: Parallel SHA-256 compute throughput reached **341.3 MB/s** (**1.55x speedup** over single-machine).<br>• **Mid-Execution Worker Crash**: Master detects unexpected node drop in **319 ms**, reschedules task to Mac with **100% success** and **0.0% data loss**. | **VERIFIED** (Independently verified in CI/CD) |
+| **13. High-Performance Zero-Copy I/O & QUIC Multiplexing** | Payload buffers upgraded to zero-copy `bytes::Bytes`. Dedicated 2-lane Iroh QUIC multiplexing (`STREAM_CONTROL = 0x01` vs `STREAM_DATA = 0x02`) bypasses head-of-line blocking under backpressure. Master scheduler micro-batching debounces burst dispatches. | **VERIFIED** (100% PASS) |
+| **14. Fault-Tolerant Mid-Task Checkpointing** | Incremental computation snapshots via `WorkerMessage::Checkpoint` and `MasterMessage::AssignTaskWithCheckpoint`. Master preserves monotonic checkpoint delta in `TaskQueue`; reassigned workers resume computation from last known delta rather than restarting from 0%. | **VERIFIED** (100% PASS) |
+| **15. Hardware-Accelerated WGSL Shaders (`wgpu`)** | Feature-gated `gpu-wgpu` compiles and executes portable WGSL compute shaders (tiled GEMM, parallel reduction hashing) directly on physical GPUs (NVIDIA RTX, Apple Silicon Metal, Vulkan), paired with deterministic 8-wide CPU SIMD fallback. | **VERIFIED** (100% PASS) |
+| **16. Zero-Trust RBAC Security Middleware** | Bearer token and API key authentication in `crates/master/src/auth.rs` supporting `Admin`, `Worker`, `Submitter`, and `Observer` scopes with automatic `--dev` loopback bypass. Single consolidated Web UI on port `:8080`. | **VERIFIED** (100% PASS) |
+| **17. Coding Agent Mesh & Master Grid Convergence** | In-process `AgentGridBridge` connects Layer 3 Coding Agent Mesh (`agent_mesh`) directly to Layer 1 Master Grid (`MasterHandle`), enabling seamless native job execution and cluster orchestration from autonomous agents. | **VERIFIED** (100% PASS) |
 
 ---
 
@@ -83,13 +88,13 @@
 
 To provide complete clarity on current boundaries and future engineering goals:
 
-| # | Limitation | Current Behavior | Target Solution (Roadmap) |
+| # | Limitation / Goal | Status | Technical Details |
 |---|---|---|---|
-| **1** | **Mid-Task Checkpointing** | If a worker fails at minute 9 of a 10-minute compute task, the Master detects the dead node and reschedules the task from scratch (**0%**) on another worker. | Integrate state snapshotting to binary delta checkpoints, allowing replacement workers to resume execution from the latest checkpoint. |
-| **2** | **Distributed Shared File System (DFS)** | Data payloads are currently passed via length-delimited network streams or in-memory chunks. There is no shared virtual file system spanning physical hard drives. | Develop a `rusty_grid_fs` module supporting virtual distributed file system mounts via FUSE and P2P content-addressed block stores. |
-| **3** | **UDP Discovery on Isolated Subnets** | UDP Broadcast beacons (`:8089`) work on standard LANs, but are filtered when routers enable *AP Client Isolation* (common in enterprise or public Wi-Fi). *(Note: HTTP candidate probing and Standby Portal mitigate this).* | Provide an automated fallback relay through a public Rendezvous Server whenever L2 broadcast isolation is detected. |
-| **4** | **Cross-Platform WebGPU / Vulkan Compute Shaders** | GPU support currently consists of high-speed SIMD matrix simulation and NVIDIA CUDA via external executables. It lacks an out-of-the-box cross-vendor shader runner for AMD, Intel Iris, and Apple Metal. | Integrate `wgpu` directly into `crates/worker` to compile and execute portable compute shaders across all GPU hardware without separate driver toolkits. |
-| **5** | **Dashboard RBAC & Production Authentication** | The Web UI and control APIs are optimized for trusted private LAN and P2P environments. Anyone on the local subnet can view cluster metrics and submit tasks. | Introduce JWT authentication, per-worker API keys, and mutual TLS (mTLS) for zero-trust public cloud deployments. |
+| **1** | **Mid-Task Checkpointing** | **COMPLETED & VERIFIED** | Implemented in `WorkerMessage::Checkpoint` and `MasterMessage::AssignTaskWithCheckpoint` with delta resumption. |
+| **2** | **Distributed Shared File System (DFS)** | Planned (Roadmap) | Develop a `rusty_grid_fs` module supporting virtual distributed file system mounts via FUSE and P2P content-addressed block stores. |
+| **3** | **UDP Discovery on Isolated Subnets** | Planned (Roadmap) | Provide an automated fallback relay through a public Rendezvous Server whenever L2 broadcast isolation is detected. |
+| **4** | **Cross-Platform WebGPU / Vulkan Compute Shaders** | **COMPLETED & VERIFIED** | Implemented via `wgpu` (`gpu-wgpu` feature) with portable WGSL shaders and deterministic CPU SIMD fallback. |
+| **5** | **Dashboard RBAC & Production Authentication** | **COMPLETED & VERIFIED** | Implemented Zero-Trust RBAC middleware (`crates/master/src/auth.rs`) with granular roles and `--dev` bypass. |
 
 ---
 

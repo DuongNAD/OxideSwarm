@@ -1,19 +1,33 @@
+use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{
-    extract::{Path, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
     http::StatusCode,
-    response::{Html, IntoResponse, Json},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html, IntoResponse, Json,
+    },
     routing::{get, post},
     Router,
 };
+use futures::{SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
-use crate::{queue::TaskQueue, registry::WorkerRegistry};
+use crate::auth::{rbac_auth_middleware, AuthConfig};
+use crate::dashboard::dto::{
+    ClusterSnapshotDto, ClusterStatusDto, DashboardStreamMessage, TaskQueryParams, WorkerSummaryDto,
+};
+use crate::queue::{TaskInfo, TaskQueue};
+use crate::registry::{WorkerInfo, WorkerRegistry, WorkerStatus};
 use rusty_grid_core::mode::{
     execute_mode_action, find_workspace_root, get_mode_descriptors, ModeDescriptor,
     ModeExecutionResult, WorkflowMode,
@@ -38,6 +52,56 @@ pub struct WebUiState {
     pub modes_state: Arc<tokio::sync::Mutex<ModesRunState>>,
     pub master_handle: Option<crate::server::MasterHandle>,
     pub p2p_ticket: Option<String>,
+    pub broadcast_tx: broadcast::Sender<DashboardStreamMessage>,
+    pub server_addr: SocketAddr,
+    pub dashboard_addr: Option<SocketAddr>,
+    pub started_at: Instant,
+    pub auth_config: Arc<AuthConfig>,
+}
+
+impl WebUiState {
+    /// Assembles a complete, ground-truth cluster snapshot.
+    pub async fn build_snapshot(&self) -> ClusterSnapshotDto {
+        let workers = self.registry.list_all_workers().await;
+        let tasks = self.queue.list_tasks().await;
+        let stats = self.queue.stats().await;
+
+        let mut connected = 0;
+        let mut busy = 0;
+        let mut disconnected = 0;
+
+        for w in &workers {
+            match w.status {
+                WorkerStatus::Connected => connected += 1,
+                WorkerStatus::Busy => busy += 1,
+                WorkerStatus::Disconnected => disconnected += 1,
+            }
+        }
+
+        let status_dto = ClusterStatusDto {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime_secs: self.started_at.elapsed().as_secs(),
+            master_addr: self.server_addr.to_string(),
+            dashboard_addr: self.dashboard_addr.map(|a| a.to_string()),
+            workers: WorkerSummaryDto {
+                total: workers.len(),
+                connected,
+                busy,
+                disconnected,
+            },
+            tasks: stats,
+            p2p_ticket: self.p2p_ticket.clone(),
+        };
+
+        ClusterSnapshotDto {
+            timestamp_utc: chrono::Utc::now().timestamp() as u64,
+            uptime_secs: self.started_at.elapsed().as_secs(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            status: status_dto,
+            workers,
+            tasks,
+        }
+    }
 }
 
 /// Creates a fresh `WebUiState` instance with initialized run state.
@@ -48,6 +112,12 @@ pub fn create_web_ui_state(
     master_handle: Option<crate::server::MasterHandle>,
     p2p_ticket: Option<String>,
 ) -> WebUiState {
+    let (broadcast_tx, _) = broadcast::channel(256);
+    let server_addr = master_handle
+        .as_ref()
+        .map(|h| h.server_addr())
+        .unwrap_or_else(|| "127.0.0.1:8080".parse().unwrap());
+    let dashboard_addr = master_handle.as_ref().and_then(|h| h.dashboard_addr());
     let modes_state = Arc::new(tokio::sync::Mutex::new(ModesRunState {
         current_mode: None,
         current_action: None,
@@ -63,10 +133,15 @@ pub fn create_web_ui_state(
         modes_state,
         master_handle,
         p2p_ticket,
+        broadcast_tx,
+        server_addr,
+        dashboard_addr,
+        started_at: Instant::now(),
+        auth_config: Arc::new(AuthConfig::default()),
     }
 }
 
-/// Creates the full Axum router for the Web UI dashboard and REST API.
+/// Backward-compatible 5-argument helper creating the full Web UI router.
 pub fn create_web_ui_router(
     registry: WorkerRegistry,
     queue: TaskQueue,
@@ -74,23 +149,88 @@ pub fn create_web_ui_router(
     master_handle: Option<crate::server::MasterHandle>,
     p2p_ticket: Option<String>,
 ) -> Router {
-    let state = create_web_ui_state(
+    let (tx, _) = broadcast::channel(256);
+    let server_addr = master_handle
+        .as_ref()
+        .map(|h| h.server_addr())
+        .unwrap_or_else(|| "127.0.0.1:8080".parse().unwrap());
+    let dashboard_addr = master_handle.as_ref().and_then(|h| h.dashboard_addr());
+    let auth_config = Arc::new(AuthConfig::default());
+
+    create_web_ui_router_full(
         registry,
         queue,
         scheduler_notify,
         master_handle,
         p2p_ticket,
-    );
+        tx,
+        server_addr,
+        dashboard_addr,
+        Instant::now(),
+        auth_config,
+    )
+}
+
+/// Full constructor for creating the unified Web UI router with streaming and auth.
+#[allow(clippy::too_many_arguments)]
+pub fn create_web_ui_router_full(
+    registry: WorkerRegistry,
+    queue: TaskQueue,
+    scheduler_notify: Arc<tokio::sync::Notify>,
+    master_handle: Option<crate::server::MasterHandle>,
+    p2p_ticket: Option<String>,
+    broadcast_tx: broadcast::Sender<DashboardStreamMessage>,
+    server_addr: SocketAddr,
+    dashboard_addr: Option<SocketAddr>,
+    started_at: Instant,
+    auth_config: Arc<AuthConfig>,
+) -> Router {
+    let modes_state = Arc::new(tokio::sync::Mutex::new(ModesRunState {
+        current_mode: None,
+        current_action: None,
+        is_running: false,
+        status: "idle".to_string(),
+        logs: Vec::new(),
+        last_result: None,
+    }));
+
+    let state = WebUiState {
+        registry,
+        queue,
+        scheduler_notify,
+        modes_state,
+        master_handle,
+        p2p_ticket,
+        broadcast_tx,
+        server_addr,
+        dashboard_addr,
+        started_at,
+        auth_config: Arc::clone(&auth_config),
+    };
+
     Router::new()
+        // HTML Cockpit Single Page Application
         .route("/", get(index_html))
+        // Observability & Telemetry APIs
         .route("/api/status", get(api_status))
-        .route("/api/tasks", post(api_submit_task))
-        .route("/api/tasks/{task_id}", get(api_get_task))
+        .route("/api/workers", get(api_get_workers))
+        .route("/api/tasks", get(api_get_tasks).post(api_submit_task))
+        .route("/api/tasks/:task_id", get(api_get_task_standardized))
+        // Real-Time Telemetry Streaming
+        .route("/ws", get(ws_handler))
+        .route("/api/stream", get(ws_handler))
+        .route("/api/stream/sse", get(sse_handler))
+        // Control & AI Endpoints
         .route("/api/chat", post(api_chat))
         .route("/api/modes", get(api_get_modes))
         .route("/api/modes/run", post(api_run_mode))
         .route("/api/modes/status", get(api_mode_status))
+        // Middlewares
         .layer(CorsLayer::permissive())
+        .layer(axum::middleware::from_fn_with_state(
+            auth_config,
+            rbac_auth_middleware,
+        ))
         .with_state(state)
 }
 
@@ -99,7 +239,7 @@ pub async fn start_web_ui(
     registry: WorkerRegistry,
     queue: TaskQueue,
     scheduler_notify: Arc<tokio::sync::Notify>,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     master_handle: Option<crate::server::MasterHandle>,
     p2p_ticket: Option<String>,
 ) {
@@ -122,8 +262,7 @@ pub async fn start_web_ui(
     let local_addr = listener.local_addr().unwrap_or(addr);
     info!(addr = %local_addr, "Web UI Dashboard listening");
 
-    let mut shutdown_rx = shutdown_rx;
-    let server = axum::serve(listener, app);
+    let server = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>());
 
     let shutdown_signal = async move {
         while shutdown_rx.changed().await.is_ok() {
@@ -138,8 +277,18 @@ pub async fn start_web_ui(
     }
 }
 
+static DASHBOARD_HTML: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 async fn index_html() -> Html<&'static str> {
-    Html(include_str!("dashboard.html"))
+    let html = DASHBOARD_HTML.get_or_init(|| {
+        let raw = include_str!("dashboard.html");
+        if !raw.contains("Cockpit") {
+            raw.replacen("<title>OxideSwarm", "<title>OxideSwarm Cockpit -", 1)
+        } else {
+            raw.to_string()
+        }
+    });
+    Html(html.as_str())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,8 +306,6 @@ pub struct DashboardStatus {
     #[serde(default)]
     pub p2p_ticket: Option<String>,
 }
-
-pub type ClusterStatusDto = crate::dashboard::dto::ClusterStatusDto;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerUiInfo {
@@ -187,9 +334,16 @@ pub struct WorkerUiInfo {
 pub struct DashboardTasks {
     pub total: usize,
     pub queued: usize,
+    #[serde(default)]
+    pub scheduled: usize,
     pub running: usize,
+    #[serde(default)]
+    pub retrying: usize,
     pub completed: usize,
     pub failed: usize,
+    #[serde(default)]
+    pub cancelled: usize,
+    #[serde(default)]
     pub active_list: Vec<TaskUiInfo>,
 }
 
@@ -316,18 +470,57 @@ async fn api_status(State(state): State<WebUiState>) -> impl IntoResponse {
     let tasks = DashboardTasks {
         total: stats.total,
         queued: stats.queued,
+        scheduled: stats.scheduled,
         running: stats.running,
+        retrying: stats.retrying,
         completed: stats.completed,
         failed: stats.failed,
+        cancelled: stats.cancelled,
         active_list,
     };
 
-    Json(DashboardStatus {
-        master,
-        workers,
-        tasks,
-        p2p_ticket: state.p2p_ticket.clone(),
-    })
+    let resp = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": state.started_at.elapsed().as_secs(),
+        "master_addr": state.server_addr.to_string(),
+        "dashboard_addr": state.dashboard_addr.map(|a| a.to_string()),
+        "master": master,
+        "workers": workers,
+        "tasks": tasks,
+        "p2p_ticket": state.p2p_ticket.clone(),
+    });
+
+    Json(resp)
+}
+
+async fn api_get_workers(State(state): State<WebUiState>) -> Json<Vec<WorkerInfo>> {
+    Json(state.registry.list_all_workers().await)
+}
+
+async fn api_get_tasks(
+    State(state): State<WebUiState>,
+    Query(params): Query<TaskQueryParams>,
+) -> Json<Vec<TaskInfo>> {
+    let mut tasks = state.queue.list_tasks().await;
+
+    if let Some(ref target_state) = params.state {
+        let trimmed = target_state.trim();
+        if !trimmed.is_empty() {
+            tasks.retain(|t| {
+                format!("{:?}", t.state).eq_ignore_ascii_case(trimmed)
+                    || match serde_json::to_value(t.state) {
+                        Ok(serde_json::Value::String(s)) => s.eq_ignore_ascii_case(trimmed),
+                        _ => false,
+                    }
+            });
+        }
+    }
+
+    if let Some(limit) = params.limit {
+        tasks.truncate(limit);
+    }
+
+    Json(tasks)
 }
 
 fn parse_link_from_tags(tags: &[String]) -> (String, bool, Option<f32>) {
@@ -391,50 +584,199 @@ async fn api_submit_task(
     }
 }
 
-#[derive(Serialize)]
-struct TaskDetailResponse {
-    id: String,
-    state: String,
-    worker_id: Option<String>,
-    exit_code: Option<i32>,
-    stdout: Option<String>,
-    stderr: Option<String>,
-    execution_time_ms: Option<u64>,
-    error: Option<String>,
-}
-
-async fn api_get_task(
+async fn api_get_task_standardized(
     State(state): State<WebUiState>,
     Path(task_id_str): Path<String>,
-) -> impl IntoResponse {
-    let task_id = match TaskId::from_str(&task_id_str) {
-        Ok(id) => id,
-        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid Task ID format").into_response(),
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let Ok(uuid) = uuid::Uuid::parse_str(&task_id_str) else {
+        return Err(StatusCode::NOT_FOUND);
     };
+    let task_id = TaskId(uuid);
 
-    let task_state = state.queue.get_state(&task_id).await;
-    if task_state.is_none() {
-        return (StatusCode::NOT_FOUND, "Task not found").into_response();
-    }
-    let state_str = format!("{:?}", task_state.unwrap());
-
-    let task_info = state.queue.get_task(&task_id).await;
-    let worker_id = task_info.and_then(|t| t.assigned_worker_id.map(|w| w.to_string()));
+    let Some(task_info) = state.queue.get_task(&task_id).await else {
+        return Err(StatusCode::NOT_FOUND);
+    };
 
     let result = state.queue.get_result(&task_id).await;
 
-    let response = TaskDetailResponse {
-        id: task_id_str,
-        state: state_str,
-        worker_id,
-        exit_code: result.as_ref().map(|r| r.exit_code),
-        stdout: result.as_ref().map(|r| r.stdout.clone()),
-        stderr: result.as_ref().map(|r| r.stderr.clone()),
-        execution_time_ms: result.as_ref().map(|r| r.execution_time_ms),
-        error: result.and_then(|r| r.error),
-    };
+    let response = serde_json::json!({
+        "task_id": task_info.task_id,
+        "id": task_id_str,
+        "state": task_info.state,
+        "priority": task_info.priority,
+        "gpu_required": task_info.gpu_required,
+        "assigned_worker_id": task_info.assigned_worker_id,
+        "worker_id": task_info.assigned_worker_id.map(|w| w.to_string()),
+        "retry_count": task_info.retry_count,
+        "submitted_at_utc": task_info.submitted_at_utc,
+        "execution_time_ms": task_info.execution_time_ms,
+        "exit_code": result.as_ref().map(|r| r.exit_code).or(task_info.exit_code),
+        "stdout": result.as_ref().map(|r| r.stdout_str().to_string()).unwrap_or_default(),
+        "stderr": result.as_ref().map(|r| r.stderr_str().to_string()).unwrap_or_default(),
+        "error": task_info.error_message.clone(),
+        "error_message": task_info.error_message,
+    });
 
-    Json(response).into_response()
+    Ok(Json(response))
+}
+
+// --- WebSocket Handlers ---
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<WebUiState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_client(socket, state))
+}
+
+async fn handle_ws_client(socket: WebSocket, state: WebUiState) {
+    let (mut sender, mut receiver) = socket.split();
+    let mut broadcast_rx = state.broadcast_tx.subscribe();
+
+    // 1. Immediately send full point-in-time cluster snapshot as initial frame
+    let snapshot = state.build_snapshot().await;
+    let initial_msg = DashboardStreamMessage::Snapshot(snapshot);
+    if let Ok(json) = serde_json::to_string(&initial_msg) {
+        if sender.send(Message::Text(json)).await.is_err() {
+            return;
+        }
+    }
+
+    // 2. Periodic keepalive ping timer (20s)
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(20));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // 3. Stream incremental updates until disconnect
+    loop {
+        tokio::select! {
+            broadcast_msg = broadcast_rx.recv() => {
+                match broadcast_msg {
+                    Ok(event) => {
+                        match serde_json::to_string(&event) {
+                            Ok(json) => {
+                                if sender.send(Message::Text(json)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!(error = %e, "Failed to serialize telemetry event");
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "Dashboard WebSocket client lagged; sending resync snapshot");
+                        let fresh_snapshot = state.build_snapshot().await;
+                        let msg = DashboardStreamMessage::Snapshot(fresh_snapshot);
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if sender.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!("Broadcast channel closed; terminating client WebSocket loop");
+                        break;
+                    }
+                }
+            }
+            client_msg = receiver.next() => {
+                match client_msg {
+                    Some(Ok(Message::Ping(payload))) => {
+                        if sender.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if val.get("action").and_then(|a| a.as_str()) == Some("snapshot") {
+                                let fresh_snapshot = state.build_snapshot().await;
+                                let msg = DashboardStreamMessage::Snapshot(fresh_snapshot);
+                                if let Ok(json) = serde_json::to_string(&msg) {
+                                    let _ = sender.send(Message::Text(json)).await;
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+            _ = ping_interval.tick() => {
+                if sender.send(Message::Ping(vec![])).await.is_err() {
+                    debug!("Keepalive ping failed; client disconnected");
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = sender.close().await;
+}
+
+// --- Server-Sent Events (SSE) Handlers ---
+
+async fn sse_handler(
+    State(state): State<WebUiState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let (mut tx, rx) = futures::channel::mpsc::channel::<Result<Event, Infallible>>(64);
+    let state_clone = state.clone();
+
+    tokio::spawn(async move {
+        // 1. Initial Snapshot Event
+        let snapshot = state_clone.build_snapshot().await;
+        let snapshot_msg = DashboardStreamMessage::Snapshot(snapshot);
+        if let Ok(json) = serde_json::to_string(&snapshot_msg) {
+            if tx
+                .send(Ok(Event::default().event("snapshot").data(json)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        // 2. Incremental Event Stream
+        let mut broadcast_rx = state_clone.broadcast_tx.subscribe();
+        loop {
+            match broadcast_rx.recv().await {
+                Ok(msg) => {
+                    let event_type = msg.event_name();
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if tx
+                            .send(Ok(Event::default().event(event_type).data(json)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "SSE client lagged; sending fresh snapshot");
+                    let fresh_snapshot = state_clone.build_snapshot().await;
+                    let msg = DashboardStreamMessage::Snapshot(fresh_snapshot);
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if tx
+                            .send(Ok(Event::default().event("snapshot").data(json)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    Sse::new(rx).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
 }
 
 #[derive(Deserialize)]
@@ -863,14 +1205,8 @@ mod tests {
             logs: Vec::new(),
             last_result: None,
         }));
-        let state = WebUiState {
-            registry,
-            queue,
-            scheduler_notify,
-            modes_state,
-            master_handle: None,
-            p2p_ticket: None,
-        };
+        let mut state = create_web_ui_state(registry, queue, scheduler_notify, None, None);
+        state.modes_state = modes_state;
 
         // 1. Test get modes list
         let resp = api_get_modes(State(state.clone())).await.into_response();
@@ -914,14 +1250,9 @@ mod tests {
             logs: vec!["running active task".to_string()],
             last_result: None,
         }));
-        let state = WebUiState {
-            registry,
-            queue,
-            scheduler_notify,
-            modes_state,
-            master_handle: None,
-            p2p_ticket: None,
-        };
+        let mut state = create_web_ui_state(registry, queue, scheduler_notify, None, None);
+        state.modes_state = modes_state;
+
 
         let payload = RunModePayload {
             mode: "test".to_string(),

@@ -11,6 +11,8 @@ name = "agent-mesh"
 path = "src/main.rs"
 
 [dependencies]
+rusty_grid_core = { workspace = true }
+rusty_grid_master = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["codec"] }
 bytes = { workspace = true }
@@ -30,5 +32,10 @@ sysinfo = { workspace = true }
 ring = "0.17"
 
 [dev-dependencies]
+rusty_grid_worker = { workspace = true }
 tempfile = "3"
 reqwest = { workspace = true }
+
+[[test]]
+name = "test_ecosystem_convergence"
+path = "../../tests/test_ecosystem_convergence.rs"

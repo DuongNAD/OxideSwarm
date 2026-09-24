@@ -32,6 +32,7 @@ rusty_grid_worker = { path = "../worker" }
 futures = { workspace = true }
 reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }
+bincode = { workspace = true }
 
 [[test]]
 name = "m2_lifecycle"
@@ -96,3 +97,28 @@ path = "../../tests/m10_challenger_2_stress.rs"
 [[test]]
 name = "test_m4_dashboard_telemetry"
 path = "../../tests/test_m4_dashboard_telemetry.rs"
+
+[[test]]
+name = "rbac_security_test"
+path = "../../tests/rbac_security_test.rs"
+
+[[test]]
+name = "zero_copy_quic_test"
+path = "../../tests/zero_copy_quic_test.rs"
+
+[[test]]
+name = "m2_challenger_1_stress"
+path = "../../tests/m2_challenger_1_stress.rs"
+
+[[test]]
+name = "checkpoint_resumption_test"
+path = "../../tests/checkpoint_resumption_test.rs"
+
+[[test]]
+name = "m3_challenger_1_checkpoint_stress"
+path = "../../tests/m3_challenger_1_checkpoint_stress.rs"
+
+[[test]]
+name = "m3_challenger_2_checkpoint_stress"
+path = "../../tests/m3_challenger_2_checkpoint_stress.rs"
+

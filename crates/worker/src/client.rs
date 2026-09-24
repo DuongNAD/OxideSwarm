@@ -14,7 +14,7 @@ use uuid::Uuid;
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::error::{GridError, GridResult};
 use rusty_grid_core::protocol::{MasterMessage, MessageTransport, WireCodec, WorkerMessage};
-use rusty_grid_core::task::{Task, TaskId, TaskResult, TaskStatus};
+use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus};
 
 use crate::backoff::{BackoffConfig, ExponentialBackoff};
 use crate::heartbeat::{current_epoch_secs, spawn_heartbeat_task, HeartbeatTracker};
@@ -231,6 +231,16 @@ pub struct WorkerClient {
     p2p_endpoint: Arc<tokio::sync::Mutex<Option<iroh::Endpoint>>>,
     #[cfg(feature = "p2p")]
     p2p_conn: Arc<tokio::sync::RwLock<Option<iroh::endpoint::Connection>>>,
+}
+
+/// Connection stream mode to Master: single stream (direct TCP) or 2-lane QUIC multiplexed streams (iroh P2P).
+pub enum WorkerStreamMode {
+    Single(rusty_grid_core::transport::GridStream),
+    #[cfg(feature = "p2p")]
+    Multiplexed {
+        control: rusty_grid_core::transport::GridStream,
+        data: rusty_grid_core::transport::GridStream,
+    },
 }
 
 impl WorkerClient {
@@ -480,6 +490,18 @@ impl WorkerClient {
 
     /// Dispatches an assigned task asynchronously, managing permits, telemetry, and results.
     pub async fn handle_assign_task(&self, task: Task, outbound_tx: mpsc::Sender<WorkerMessage>) {
+        let checkpoint = task.latest_checkpoint.clone();
+        self.handle_assign_task_with_checkpoint(task, checkpoint, outbound_tx)
+            .await;
+    }
+
+    /// Dispatches an assigned task asynchronously with checkpoint delta resumption.
+    pub async fn handle_assign_task_with_checkpoint(
+        &self,
+        task: Task,
+        checkpoint: Option<CheckpointData>,
+        outbound_tx: mpsc::Sender<WorkerMessage>,
+    ) {
         let task_id = task.id;
         let worker_id = self.worker_id;
 
@@ -574,8 +596,15 @@ impl WorkerClient {
                 return;
             }
 
+            let effective_checkpoint = checkpoint.or_else(|| task.latest_checkpoint.clone());
             let result = runner
-                .execute_task(&task, Some(child_pid_clone), Some(cancel_rx))
+                .execute_task_with_checkpoint(
+                    &task,
+                    effective_checkpoint.as_ref(),
+                    Some(outbound_tx.clone()),
+                    Some(child_pid_clone),
+                    Some(cancel_rx),
+                )
                 .await;
 
             let _ = outbound_tx.send(WorkerMessage::from(result)).await;
@@ -617,7 +646,7 @@ impl WorkerClient {
     /// Establishes an underlying stream to the Master (either P2P QUIC via ticket, or direct TCP).
     async fn establish_stream(
         &self,
-    ) -> GridResult<(rusty_grid_core::transport::GridStream, String)> {
+    ) -> GridResult<(WorkerStreamMode, String)> {
         #[cfg(feature = "p2p")]
         if let Some(ref ticket_str) = self.config.p2p_ticket {
             let node_addr = rusty_grid_core::transport::parse_p2p_ticket(ticket_str)
@@ -659,11 +688,36 @@ impl WorkerClient {
                 }
             };
 
-            let (send, recv) = conn.open_bi().await.map_err(|e| {
-                GridError::ConnectionFailed(format!("Failed to open bidirectional stream: {e}"))
+            // 1. Open dedicated Control / Telemetry Stream (Tag 0x01)
+            let (mut ctrl_send, ctrl_recv) = conn.open_bi().await.map_err(|e| {
+                GridError::ConnectionFailed(format!("Failed to open bidirectional control stream: {e}"))
             })?;
+            tokio::io::AsyncWriteExt::write_all(
+                &mut ctrl_send,
+                &[rusty_grid_core::transport::STREAM_CONTROL],
+            )
+            .await
+            .map_err(GridError::Io)?;
+            tokio::io::AsyncWriteExt::flush(&mut ctrl_send)
+                .await
+                .map_err(GridError::Io)?;
 
-            let bi_stream = rusty_grid_core::transport::BiStream::new(recv, send);
+            // 2. Open dedicated Data / Workload Stream (Tag 0x02)
+            let (mut data_send, data_recv) = conn.open_bi().await.map_err(|e| {
+                GridError::ConnectionFailed(format!("Failed to open bidirectional data stream: {e}"))
+            })?;
+            tokio::io::AsyncWriteExt::write_all(
+                &mut data_send,
+                &[rusty_grid_core::transport::STREAM_DATA],
+            )
+            .await
+            .map_err(GridError::Io)?;
+            tokio::io::AsyncWriteExt::flush(&mut data_send)
+                .await
+                .map_err(GridError::Io)?;
+
+            let ctrl_bi = rusty_grid_core::transport::BiStream::new(ctrl_recv, ctrl_send);
+            let data_bi = rusty_grid_core::transport::BiStream::new(data_recv, data_send);
             let path_info = rusty_grid_core::transport::inspect_connection_paths(&conn);
             if let Some(ref info) = path_info {
                 info!(
@@ -672,7 +726,7 @@ impl WorkerClient {
                     is_ip = info.is_ip,
                     rtt_ms = info.rtt_ms,
                     remote = %info.remote_addr,
-                    "P2P transport path active"
+                    "P2P transport path active (QUIC 2-lane multiplexed)"
                 );
             }
             {
@@ -681,7 +735,10 @@ impl WorkerClient {
             }
 
             return Ok((
-                rusty_grid_core::transport::GridStream::P2p(bi_stream),
+                WorkerStreamMode::Multiplexed {
+                    control: rusty_grid_core::transport::GridStream::P2p(ctrl_bi),
+                    data: rusty_grid_core::transport::GridStream::P2p(data_bi),
+                },
                 format!("iroh://{:?}", conn.remote_id()),
             ));
         }
@@ -742,7 +799,10 @@ impl WorkerClient {
                 ));
             }
         }
-        Ok((rusty_grid_core::transport::GridStream::Tcp(stream), remote))
+        Ok((
+            WorkerStreamMode::Single(rusty_grid_core::transport::GridStream::Tcp(stream)),
+            remote,
+        ))
     }
 
     /// Conducts a single connection lifecycle: TCP/P2P connect, registration handshake,
@@ -752,113 +812,261 @@ impl WorkerClient {
         shutdown_rx: &mut watch::Receiver<bool>,
         backoff: &mut ExponentialBackoff,
     ) -> GridResult<()> {
-        let (stream, remote_desc) = self.establish_stream().await?;
+        let (stream_mode, remote_desc) = self.establish_stream().await?;
         info!(master = %remote_desc, worker_id = %self.worker_id, "Connected to Master; initiating handshake");
 
-        let mut transport = MessageTransport::with_codec(stream, self.config.wire_codec);
+        match stream_mode {
+            WorkerStreamMode::Single(stream) => {
+                let mut transport = MessageTransport::with_codec(stream, self.config.wire_codec);
 
-        // Perform atomic registration handshake
-        let heartbeat_interval = self.perform_handshake(&mut transport).await?;
-        backoff.reset();
-        info!(worker_id = %self.worker_id, "Registration accepted; backoff counter reset");
+                // Perform atomic registration handshake
+                let heartbeat_interval = self.perform_handshake(&mut transport).await?;
+                backoff.reset();
+                info!(worker_id = %self.worker_id, "Registration accepted; backoff counter reset");
 
-        // Split transport into independent reader and writer
-        let (mut writer, mut reader) = transport.split();
+                // Split transport into independent reader and writer
+                let (mut writer, mut reader) = transport.split();
 
-        // Setup outbound channel and spawn heartbeat task
-        let (outbound_tx, mut outbound_rx) = mpsc::channel::<WorkerMessage>(64);
-        let heartbeat_handle = spawn_heartbeat_task(
-            self.worker_id,
-            heartbeat_interval,
-            outbound_tx.clone(),
-            Arc::clone(&self.heartbeat_tracker),
-        );
+                // Setup outbound channel and spawn heartbeat task
+                let (outbound_tx, mut outbound_rx) = mpsc::channel::<WorkerMessage>(64);
+                let heartbeat_handle = spawn_heartbeat_task(
+                    self.worker_id,
+                    heartbeat_interval,
+                    outbound_tx.clone(),
+                    Arc::clone(&self.heartbeat_tracker),
+                );
 
-        let mut exit_result: GridResult<()> = Ok(());
+                let mut exit_result: GridResult<()> = Ok(());
 
-        loop {
-            tokio::select! {
-                // Outbound messages to Master
-                Some(worker_msg) = outbound_rx.recv() => {
-                    if let Err(e) = writer.send_msg(&worker_msg).await {
-                        error!(error = %e, "Failed to send message to Master");
-                        exit_result = Err(GridError::from(e));
-                        break;
-                    }
-                }
+                loop {
+                    tokio::select! {
+                        // Outbound messages to Master
+                        Some(worker_msg) = outbound_rx.recv() => {
+                            if let Err(e) = writer.send_msg(&worker_msg).await {
+                                error!(error = %e, "Failed to send message to Master");
+                                exit_result = Err(GridError::from(e));
+                                break;
+                            }
+                        }
 
-                // Inbound messages from Master
-                incoming = reader.recv_msg::<MasterMessage>() => {
-                    match incoming {
-                        Ok(Some(msg)) => {
-                            match msg {
-                                MasterMessage::HeartbeatAck { timestamp } => {
-                                    self.heartbeat_tracker.record_ack(timestamp, current_epoch_secs());
+                        // Inbound messages from Master
+                        incoming = reader.recv_msg::<MasterMessage>() => {
+                            match incoming {
+                                Ok(Some(msg)) => {
+                                    match msg {
+                                        MasterMessage::HeartbeatAck { timestamp } => {
+                                            self.heartbeat_tracker.record_ack(timestamp, current_epoch_secs());
+                                        }
+                                        MasterMessage::Shutdown { reason, .. } => {
+                                            warn!(reason = %reason, "Master ordered cluster shutdown; disconnecting");
+                                            let disc_msg = WorkerMessage::Disconnecting {
+                                                worker_id: self.worker_id,
+                                                reason: "Master ordered shutdown".into(),
+                                            };
+                                            let _ = writer.send_msg(&disc_msg).await;
+                                            exit_result = Ok(());
+                                            break;
+                                        }
+                                        MasterMessage::AssignTask { task } => {
+                                            debug!(task_id = %task.id, "AssignTask received; dispatching runner");
+                                            let checkpoint = task.latest_checkpoint.clone();
+                                            self.handle_assign_task_with_checkpoint(task, checkpoint, outbound_tx.clone()).await;
+                                        }
+                                        MasterMessage::AssignTaskWithCheckpoint { task, latest_checkpoint } => {
+                                            debug!(task_id = %task.id, "AssignTaskWithCheckpoint received; dispatching runner");
+                                            let checkpoint = latest_checkpoint.or_else(|| task.latest_checkpoint.clone());
+                                            self.handle_assign_task_with_checkpoint(task, checkpoint, outbound_tx.clone()).await;
+                                        }
+                                        MasterMessage::CancelTask { task_id, reason } => {
+                                            debug!(task_id = %task_id, reason = ?reason, "CancelTask received; aborting task");
+                                            self.handle_cancel_task(task_id, reason).await;
+                                        }
+                                        MasterMessage::RegisterAck { .. } => {
+                                            warn!("Unexpected RegisterAck during active connection");
+                                        }
+                                    }
                                 }
-                                MasterMessage::Shutdown { reason, .. } => {
-                                    warn!(reason = %reason, "Master ordered cluster shutdown; disconnecting");
-                                    let disc_msg = WorkerMessage::Disconnecting {
-                                        worker_id: self.worker_id,
-                                        reason: "Master ordered shutdown".into(),
-                                    };
-                                    let _ = writer.send_msg(&disc_msg).await;
-                                    exit_result = Ok(());
+                                Ok(None) => {
+                                    info!("Master closed TCP connection (EOF)");
+                                    exit_result = Err(GridError::ConnectionClosed);
                                     break;
                                 }
-                                MasterMessage::AssignTask { task } => {
-                                    debug!(task_id = %task.id, "AssignTask received; dispatching runner");
-                                    self.handle_assign_task(task, outbound_tx.clone()).await;
-                                }
-                                MasterMessage::CancelTask { task_id, reason } => {
-                                    debug!(task_id = %task_id, reason = ?reason, "CancelTask received; aborting task");
-                                    self.handle_cancel_task(task_id, reason).await;
-                                }
-                                MasterMessage::RegisterAck { .. } => {
-                                    warn!("Unexpected RegisterAck during active connection");
+                                Err(e) => {
+                                    warn!(error = %e, "Inbound message receive error");
+                                    exit_result = Err(e.into());
+                                    break;
                                 }
                             }
                         }
-                        Ok(None) => {
-                            info!("Master closed TCP connection (EOF)");
-                            exit_result = Err(GridError::ConnectionClosed);
-                            break;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Inbound message receive error");
-                            exit_result = Err(e.into());
-                            break;
+
+                        // External shutdown signal
+                        res = shutdown_rx.changed() => {
+                            if res.is_ok() && *shutdown_rx.borrow() {
+                                info!(worker_id = %self.worker_id, "Graceful worker shutdown initiated; notifying Master");
+                                let disc_msg = WorkerMessage::Disconnecting {
+                                    worker_id: self.worker_id,
+                                    reason: "Graceful worker shutdown".into(),
+                                };
+                                let _ = writer.send_msg(&disc_msg).await;
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                exit_result = Ok(());
+                                break;
+                            } else if res.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
 
-                // External shutdown signal
-                res = shutdown_rx.changed() => {
-                    if res.is_ok() && *shutdown_rx.borrow() {
-                        info!(worker_id = %self.worker_id, "Graceful worker shutdown initiated; notifying Master");
-                        let disc_msg = WorkerMessage::Disconnecting {
-                            worker_id: self.worker_id,
-                            reason: "Graceful worker shutdown".into(),
-                        };
-                        let _ = writer.send_msg(&disc_msg).await;
-                        // Brief pause to allow message to flush
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        exit_result = Ok(());
-                        break;
-                    } else if res.is_err() {
-                        break;
+                // Cleanly terminate heartbeat task
+                heartbeat_handle.stop().await;
+                #[cfg(feature = "p2p")]
+                {
+                    let mut conn_guard = self.p2p_conn.write().await;
+                    *conn_guard = None;
+                }
+
+                exit_result
+            }
+            #[cfg(feature = "p2p")]
+            WorkerStreamMode::Multiplexed { control, data } => {
+                let mut ctrl_transport = MessageTransport::with_codec(control, self.config.wire_codec);
+                let data_transport = MessageTransport::with_codec(data, self.config.wire_codec);
+
+                // Handshake over dedicated control stream (Tag 0x01)
+                let heartbeat_interval = self.perform_handshake(&mut ctrl_transport).await?;
+                backoff.reset();
+                info!(worker_id = %self.worker_id, "Registration accepted over QUIC control stream; backoff counter reset");
+
+                let (mut ctrl_writer, mut ctrl_reader) = ctrl_transport.split();
+                let (mut data_writer, mut data_reader) = data_transport.split();
+
+                let (ctrl_outbound_tx, mut ctrl_outbound_rx) = mpsc::channel::<WorkerMessage>(64);
+                let (data_outbound_tx, mut data_outbound_rx) = mpsc::channel::<WorkerMessage>(64);
+
+                let heartbeat_handle = spawn_heartbeat_task(
+                    self.worker_id,
+                    heartbeat_interval,
+                    ctrl_outbound_tx.clone(),
+                    Arc::clone(&self.heartbeat_tracker),
+                );
+
+                let mut exit_result: GridResult<()> = Ok(());
+
+                loop {
+                    tokio::select! {
+                        // Outbound Control Stream (Heartbeats, Disconnect)
+                        Some(worker_msg) = ctrl_outbound_rx.recv() => {
+                            if let Err(e) = ctrl_writer.send_msg(&worker_msg).await {
+                                error!(error = %e, "Failed to send message over control stream");
+                                exit_result = Err(GridError::from(e));
+                                break;
+                            }
+                        }
+
+                        // Outbound Data Stream (TaskProgress, TaskResult)
+                        Some(worker_msg) = data_outbound_rx.recv() => {
+                            if let Err(e) = data_writer.send_msg(&worker_msg).await {
+                                error!(error = %e, "Failed to send message over data stream");
+                                exit_result = Err(GridError::from(e));
+                                break;
+                            }
+                        }
+
+                        // Inbound Control Stream (HeartbeatAck, Shutdown)
+                        incoming = ctrl_reader.recv_msg::<MasterMessage>() => {
+                            match incoming {
+                                Ok(Some(msg)) => match msg {
+                                    MasterMessage::HeartbeatAck { timestamp } => {
+                                        self.heartbeat_tracker.record_ack(timestamp, current_epoch_secs());
+                                    }
+                                    MasterMessage::Shutdown { reason, .. } => {
+                                        warn!(reason = %reason, "Master ordered cluster shutdown on control stream; disconnecting");
+                                        let disc_msg = WorkerMessage::Disconnecting {
+                                            worker_id: self.worker_id,
+                                            reason: "Master ordered shutdown".into(),
+                                        };
+                                        let _ = ctrl_writer.send_msg(&disc_msg).await;
+                                        exit_result = Ok(());
+                                        break;
+                                    }
+                                    _ => {}
+                                },
+                                Ok(None) => {
+                                    info!("Master closed control stream (EOF)");
+                                    exit_result = Err(GridError::ConnectionClosed);
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Inbound control stream error");
+                                    exit_result = Err(e.into());
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Inbound Data Stream (AssignTask, CancelTask)
+                        incoming = data_reader.recv_msg::<MasterMessage>() => {
+                            match incoming {
+                                Ok(Some(msg)) => match msg {
+                                    MasterMessage::AssignTask { task } => {
+                                        debug!(task_id = %task.id, "AssignTask received on data stream; dispatching runner");
+                                        let checkpoint = task.latest_checkpoint.clone();
+                                        self.handle_assign_task_with_checkpoint(task, checkpoint, data_outbound_tx.clone()).await;
+                                    }
+                                    MasterMessage::AssignTaskWithCheckpoint { task, latest_checkpoint } => {
+                                        debug!(task_id = %task.id, "AssignTaskWithCheckpoint received on data stream; dispatching runner");
+                                        let checkpoint = latest_checkpoint.or_else(|| task.latest_checkpoint.clone());
+                                        self.handle_assign_task_with_checkpoint(task, checkpoint, data_outbound_tx.clone()).await;
+                                    }
+                                    MasterMessage::CancelTask { task_id, reason } => {
+                                        debug!(task_id = %task_id, reason = ?reason, "CancelTask received on data stream; aborting task");
+                                        self.handle_cancel_task(task_id, reason).await;
+                                    }
+                                    _ => {}
+                                },
+                                Ok(None) => {
+                                    info!("Master closed data stream (EOF)");
+                                    exit_result = Err(GridError::ConnectionClosed);
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Inbound data stream error");
+                                    exit_result = Err(e.into());
+                                    break;
+                                }
+                            }
+                        }
+
+                        // External shutdown signal
+                        res = shutdown_rx.changed() => {
+                            if res.is_ok() && *shutdown_rx.borrow() {
+                                info!(worker_id = %self.worker_id, "Graceful worker shutdown initiated; notifying Master on control stream");
+                                let disc_msg = WorkerMessage::Disconnecting {
+                                    worker_id: self.worker_id,
+                                    reason: "Graceful worker shutdown".into(),
+                                };
+                                let _ = ctrl_writer.send_msg(&disc_msg).await;
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                exit_result = Ok(());
+                                break;
+                            } else if res.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
+
+                heartbeat_handle.stop().await;
+                #[cfg(feature = "p2p")]
+                {
+                    let mut conn_guard = self.p2p_conn.write().await;
+                    *conn_guard = None;
+                }
+
+                exit_result
             }
         }
-
-        // Cleanly terminate heartbeat task
-        heartbeat_handle.stop().await;
-        #[cfg(feature = "p2p")]
-        {
-            let mut conn_guard = self.p2p_conn.write().await;
-            *conn_guard = None;
-        }
-        exit_result
     }
 
     /// Executes the atomic registration handshake over the transport.

@@ -511,9 +511,42 @@ pub fn start_master_impl(
                                                         let conn_shutdown = p2p_shutdown_rx.clone();
                                                         tokio::spawn(async move {
                                                             if let Ok(conn) = incoming.await {
-                                                                if let Ok((send, recv)) = conn.accept_bi().await {
-                                                                    let grid_stream = GridStream::P2p(BiStream::new(recv, send));
-                                                                    handle_coordinator_stream(grid_stream, conn_state, conn_shutdown).await;
+                                                                if let Ok((send, mut recv)) = conn.accept_bi().await {
+                                                                    let mut tag = [0u8; 1];
+                                                                    let p2p_to = Duration::from_millis(500);
+                                                                    let is_m2_multiplexed = match tokio::time::timeout(
+                                                                        p2p_to,
+                                                                        tokio::io::AsyncReadExt::read_exact(&mut recv, &mut tag),
+                                                                    ).await {
+                                                                        Ok(Ok(_)) => tag[0] == rusty_grid_core::transport::STREAM_CONTROL || tag[0] == rusty_grid_core::transport::STREAM_DATA,
+                                                                        _ => false,
+                                                                    };
+
+                                                                    if is_m2_multiplexed {
+                                                                        let (ctrl_send, ctrl_recv) = if tag[0] == rusty_grid_core::transport::STREAM_CONTROL {
+                                                                            let conn_clone = conn.clone();
+                                                                            tokio::spawn(async move {
+                                                                                if let Ok(Ok((_s2, mut r2))) = tokio::time::timeout(p2p_to, conn_clone.accept_bi()).await {
+                                                                                    let mut t2 = [0u8; 1];
+                                                                                    let _ = tokio::io::AsyncReadExt::read_exact(&mut r2, &mut t2).await;
+                                                                                }
+                                                                            });
+                                                                            (send, recv)
+                                                                        } else {
+                                                                            if let Ok(Ok((s2, mut r2))) = tokio::time::timeout(p2p_to, conn.accept_bi()).await {
+                                                                                let mut t2 = [0u8; 1];
+                                                                                let _ = tokio::io::AsyncReadExt::read_exact(&mut r2, &mut t2).await;
+                                                                                (s2, r2)
+                                                                            } else {
+                                                                                (send, recv)
+                                                                            }
+                                                                        };
+                                                                        let grid_stream = GridStream::P2p(BiStream::new(ctrl_recv, ctrl_send));
+                                                                        handle_coordinator_stream(grid_stream, conn_state, conn_shutdown).await;
+                                                                    } else {
+                                                                        let grid_stream = GridStream::P2p(BiStream::new(recv, send));
+                                                                        handle_coordinator_stream(grid_stream, conn_state, conn_shutdown).await;
+                                                                    }
                                                                 }
                                                             }
                                                         });

@@ -1,5 +1,6 @@
 //! Master node server, worker registry, task queue, scheduler, and heartbeat reaper for `rusty_grid`.
 
+pub mod auth;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
 pub mod mapreduce;
@@ -8,7 +9,10 @@ pub mod reaper;
 pub mod registry;
 pub mod scheduler;
 pub mod server;
+#[cfg(feature = "dashboard")]
 pub mod web_ui;
+
+pub use auth::{AuthConfig, AuthIdentity, ApiToken, AuthScope};
 
 pub use mapreduce::MapReduceEngine;
 pub use queue::{

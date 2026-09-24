@@ -4,6 +4,7 @@
 //! node registry, point-to-point command routing, delivery ACKs/NACKs,
 //! and HTTP observability endpoints.
 
+use crate::bridge::AgentGridBridge;
 use crate::protocol::{
     AgentMeshEnvelope, NodeDescriptor,
 };
@@ -50,6 +51,7 @@ pub struct HubState {
     pub nodes: RwLock<HashMap<String, NodeSession>>,
     pub stats: RwLock<HubStats>,
     pub start_time: Instant,
+    pub bridge: RwLock<Option<Arc<AgentGridBridge>>>,
 }
 
 impl HubState {
@@ -58,22 +60,51 @@ impl HubState {
             nodes: RwLock::new(HashMap::new()),
             stats: RwLock::new(HubStats::default()),
             start_time: Instant::now(),
+            bridge: RwLock::new(None),
         }
     }
 
     pub async fn get_catalog(&self) -> Vec<NodeDescriptor> {
-        let nodes = self.nodes.read().await;
-        nodes
-            .values()
-            .map(|s| NodeDescriptor {
-                node_id: s.node_id.clone(),
-                platform: s.platform.clone(),
-                hostname: s.hostname.clone(),
+        let mut catalog: Vec<NodeDescriptor> = {
+            let nodes = self.nodes.read().await;
+            nodes
+                .values()
+                .map(|s| NodeDescriptor {
+                    node_id: s.node_id.clone(),
+                    platform: s.platform.clone(),
+                    hostname: s.hostname.clone(),
+                    status: "online".to_string(),
+                    capabilities: s.capabilities.clone(),
+                    connected_at: s.connected_at,
+                })
+                .collect()
+        };
+
+        if self.bridge.read().await.is_some() {
+            catalog.push(NodeDescriptor {
+                node_id: "grid".to_string(),
+                platform: "grid-supercomputer".to_string(),
+                hostname: "rusty-grid-master".to_string(),
                 status: "online".to_string(),
-                capabilities: s.capabilities.clone(),
-                connected_at: s.connected_at,
-            })
-            .collect()
+                capabilities: serde_json::json!({
+                    "supported_commands": [
+                        "grid_compute",
+                        "grid_compile",
+                        "grid_submit",
+                        "grid_status",
+                        "compute",
+                        "compile",
+                        "status",
+                        "submit"
+                    ],
+                    "engine": "OxideSwarm Supercomputing Grid",
+                    "layer": 1,
+                }),
+                connected_at: self.start_time.elapsed().as_secs(),
+            });
+        }
+
+        catalog
     }
 
     pub async fn remove_node(&self, node_id: &str) {
@@ -95,6 +126,24 @@ impl AgentMeshHub {
             state: Arc::new(HubState::new()),
             shutdown_tx: RwLock::new(None),
         }
+    }
+
+    pub fn new_with_bridge(bridge: Arc<AgentGridBridge>) -> Self {
+        let hub = Self::new();
+        if let Ok(mut b) = hub.state.bridge.try_write() {
+            *b = Some(bridge);
+        }
+        hub
+    }
+
+    pub async fn attach_bridge(&self, bridge: Arc<AgentGridBridge>) {
+        let mut b = self.state.bridge.write().await;
+        *b = Some(bridge);
+        info!("AgentGridBridge attached to AgentMeshHub");
+    }
+
+    pub fn create_router(state: Arc<HubState>) -> Router {
+        Self::build_router(state)
     }
 
     pub fn state(&self) -> Arc<HubState> {
@@ -287,8 +336,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<HubState>) {
                     }
 
                     AgentMeshEnvelope::CommandRequest {
-                        ref from,
-                        ref to,
+                        from,
+                        to,
+                        command,
+                        args,
+                        payload,
+                        timeout_ms,
                         require_ack,
                         ..
                     } => {
@@ -297,46 +350,123 @@ async fn handle_socket(socket: WebSocket, state: Arc<HubState>) {
                             stats.routed_commands += 1;
                         }
 
-                        let target_tx = {
-                            let nodes = state.nodes.read().await;
-                            nodes.get(to).map(|s| s.tx.clone())
-                        };
+                        let is_grid_targeted = to == "grid"
+                            || to == "grid-master"
+                            || command.starts_with("grid_")
+                            || (to == "hub" && (command == "grid_status" || command.starts_with("grid_")));
 
-                        if let Some(dest_tx) = target_tx {
-                            // Forward command request to target node
-                            let _ = dest_tx.send(Message::Text(raw_text.clone()));
+                        if is_grid_targeted {
+                            let bridge_opt = {
+                                let b = state.bridge.read().await;
+                                b.clone()
+                            };
 
-                            // Emit DeliveryAck back to sender if requested
-                            if require_ack {
+                            if let Some(bridge) = bridge_opt {
+                                if require_ack {
+                                    {
+                                        let mut stats = state.stats.write().await;
+                                        stats.delivered_acks += 1;
+                                    }
+                                    let ack = AgentMeshEnvelope::new_delivery_ack(
+                                        "hub",
+                                        &from,
+                                        &corr_id,
+                                        "target_forwarded",
+                                    );
+                                    if let Ok(ack_json) = ack.to_json_string() {
+                                        let _ = tx.send(Message::Text(ack_json));
+                                    }
+                                }
+
+                                let tx_clone = tx.clone();
+                                let state_clone = state.clone();
+                                let from_node = from.clone();
+                                let req_envelope = AgentMeshEnvelope::CommandRequest {
+                                    version: "1.0".to_string(),
+                                    correlation_id: corr_id.clone(),
+                                    from: from.clone(),
+                                    to: to.clone(),
+                                    command: command.clone(),
+                                    args,
+                                    payload,
+                                    timeout_ms,
+                                    require_ack,
+                                    timestamp: SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as u64,
+                                };
+
+                                tokio::spawn(async move {
+                                    let resp = bridge.handle_command(&req_envelope).await;
+                                    if let Ok(resp_json) = resp.to_json_string() {
+                                        if tx_clone.send(Message::Text(resp_json.clone())).is_err() {
+                                            let nodes = state_clone.nodes.read().await;
+                                            if let Some(session) = nodes.get(&from_node) {
+                                                let _ = session.tx.send(Message::Text(resp_json));
+                                            }
+                                        }
+                                    }
+                                });
+                            } else {
+                                warn!("Hub: Grid command received but AgentGridBridge is not configured: '{}'", command);
                                 {
                                     let mut stats = state.stats.write().await;
-                                    stats.delivered_acks += 1;
+                                    stats.delivered_nacks += 1;
                                 }
-                                let ack = AgentMeshEnvelope::new_delivery_ack(
+                                let nack = AgentMeshEnvelope::new_delivery_nack(
                                     "hub",
-                                    from,
-                                    corr_id,
-                                    "target_forwarded",
+                                    &from,
+                                    &corr_id,
+                                    "ERR_BRIDGE_NOT_CONFIGURED",
+                                    "AgentGridBridge is not attached to this hub",
                                 );
-                                if let Ok(ack_json) = ack.to_json_string() {
-                                    let _ = tx.send(Message::Text(ack_json));
+                                if let Ok(nack_json) = nack.to_json_string() {
+                                    let _ = tx.send(Message::Text(nack_json));
                                 }
                             }
                         } else {
-                            warn!("Hub: Routing failed - target '{}' not found!", to);
-                            {
-                                let mut stats = state.stats.write().await;
-                                stats.delivered_nacks += 1;
-                            }
-                            let nack = AgentMeshEnvelope::new_delivery_nack(
-                                "hub",
-                                from,
-                                corr_id,
-                                "ERR_NODE_NOT_FOUND",
-                                format!("Target node '{}' is not registered with the hub.", to),
-                            );
-                            if let Ok(nack_json) = nack.to_json_string() {
-                                let _ = tx.send(Message::Text(nack_json));
+                            let target_tx = {
+                                let nodes = state.nodes.read().await;
+                                nodes.get(&to).map(|s| s.tx.clone())
+                            };
+
+                            if let Some(dest_tx) = target_tx {
+                                // Forward command request to target node
+                                let _ = dest_tx.send(Message::Text(raw_text.clone()));
+
+                                // Emit DeliveryAck back to sender if requested
+                                if require_ack {
+                                    {
+                                        let mut stats = state.stats.write().await;
+                                        stats.delivered_acks += 1;
+                                    }
+                                    let ack = AgentMeshEnvelope::new_delivery_ack(
+                                        "hub",
+                                        &from,
+                                        &corr_id,
+                                        "target_forwarded",
+                                    );
+                                    if let Ok(ack_json) = ack.to_json_string() {
+                                        let _ = tx.send(Message::Text(ack_json));
+                                    }
+                                }
+                            } else {
+                                warn!("Hub: Routing failed - target '{}' not found!", to);
+                                {
+                                    let mut stats = state.stats.write().await;
+                                    stats.delivered_nacks += 1;
+                                }
+                                let nack = AgentMeshEnvelope::new_delivery_nack(
+                                    "hub",
+                                    &from,
+                                    &corr_id,
+                                    "ERR_NODE_NOT_FOUND",
+                                    format!("Target node '{}' is not registered with the hub.", to),
+                                );
+                                if let Ok(nack_json) = nack.to_json_string() {
+                                    let _ = tx.send(Message::Text(nack_json));
+                                }
                             }
                         }
                     }

@@ -53,6 +53,10 @@ pub struct SchedulerConfig {
     pub max_host_cpu_pct: f32,
     /// Fallback periodic tick interval for the scheduling loop (default: 100ms).
     pub tick_interval: Duration,
+    /// Micro-batch accumulation debounce window during burst submissions (default: 5ms).
+    pub micro_batch_window: Duration,
+    /// Maximum number of tasks to schedule in a single batch (default: 128).
+    pub max_batch_size: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -66,6 +70,8 @@ impl Default for SchedulerConfig {
             mobile_min_battery_pct: 15,
             max_host_cpu_pct: 85.0,
             tick_interval: Duration::from_millis(100),
+            micro_batch_window: Duration::from_millis(5),
+            max_batch_size: 128,
         }
     }
 }
@@ -80,6 +86,18 @@ impl SchedulerConfig {
             Some(cap) => limit.min(cap),
             None => limit,
         }
+    }
+
+    /// Sets the debounce micro-batch window.
+    pub fn with_micro_batch_window(mut self, window: Duration) -> Self {
+        self.micro_batch_window = window;
+        self
+    }
+
+    /// Sets the maximum batch size for scheduling.
+    pub fn with_max_batch_size(mut self, size: usize) -> Self {
+        self.max_batch_size = size;
+        self
     }
 }
 
@@ -342,12 +360,13 @@ impl WorkloadScheduler {
         report
     }
 
-    /// Performs a single scheduling pass:
+    /// Performs an atomic batch scheduling pass for up to `max_batch_size` tasks:
     /// 1. Processes expired delayed retries in the queue.
-    /// 2. Fetches ready tasks and active workers.
-    /// 3. Executes `matchmake`.
-    /// 4. Atomically transitions assigned tasks to `Scheduled` and dispatches `AssignTask`.
-    pub async fn schedule_once(&self) -> GridResult<ScheduleReport> {
+    /// 2. Fetches ready tasks (bounded by `max_batch_size`) and active workers.
+    /// 3. Executes pure `matchmake`.
+    /// 4. Atomically transitions all assigned tasks to `Scheduled` under a single write lock.
+    /// 5. Dispatches `AssignTask` messages to the matched workers.
+    pub async fn schedule_batch(&self, max_batch_size: usize) -> GridResult<ScheduleReport> {
         // Step 1: Advance any delayed retries whose backoff has passed
         let advanced_retries = self.queue.process_delayed_retries().await;
         if advanced_retries > 0 {
@@ -358,9 +377,12 @@ impl WorkloadScheduler {
         }
 
         // Step 2: Fetch schedulable tasks and active workers
-        let tasks = self.queue.get_schedulable_tasks().await;
+        let mut tasks = self.queue.get_schedulable_tasks().await;
         if tasks.is_empty() {
             return Ok(ScheduleReport::default());
+        }
+        if tasks.len() > max_batch_size {
+            tasks.truncate(max_batch_size);
         }
 
         let workers = self.registry.list_active_workers().await;
@@ -375,24 +397,42 @@ impl WorkloadScheduler {
         }
 
         // Step 3: Run pure matchmaking algorithm
-        let report = Self::matchmake(&self.config, &tasks, &workers);
+        let mut report = Self::matchmake(&self.config, &tasks, &workers);
 
-        // Step 4: Dispatch assignments
+        // Step 4: Atomically transition batch in TaskQueue
+        let assignment_pairs: Vec<(TaskId, Uuid)> = report
+            .assignments
+            .iter()
+            .map(|a| (a.task_id, a.worker_id))
+            .collect();
+
+        let scheduled_batch = self.queue.schedule_tasks_batch(&assignment_pairs).await;
+
+        let scheduled_map: HashMap<TaskId, (Uuid, Task)> = scheduled_batch
+            .into_iter()
+            .map(|(tid, wid, task)| (tid, (wid, task)))
+            .collect();
+
+        report
+            .assignments
+            .retain(|a| scheduled_map.contains_key(&a.task_id));
+
+        // Step 5: Dispatch AssignTask frames to workers
         for assignment in &report.assignments {
-            // Atomically mark task Scheduled in queue
-            if let Some(task) = self
-                .queue
-                .schedule_task(&assignment.task_id, assignment.worker_id)
-                .await
-            {
-                // Increment active tasks in registry
+            if let Some((_, ref task)) = scheduled_map.get(&assignment.task_id) {
                 let _ = self
                     .registry
                     .increment_active_tasks(&assignment.worker_id)
                     .await;
 
-                // Dispatch AssignTask frame to worker outbound channel
-                let msg = MasterMessage::AssignTask { task: task.clone() };
+                let msg = if task.latest_checkpoint.is_some() {
+                    MasterMessage::AssignTaskWithCheckpoint {
+                        task: task.clone(),
+                        latest_checkpoint: task.latest_checkpoint.clone(),
+                    }
+                } else {
+                    MasterMessage::AssignTask { task: task.clone() }
+                };
                 if let Err(e) = self
                     .registry
                     .send_to_worker(&assignment.worker_id, msg)
@@ -430,6 +470,11 @@ impl WorkloadScheduler {
         Ok(report)
     }
 
+    /// Performs a single scheduling pass, delegating to `schedule_batch` with configured `max_batch_size`.
+    pub async fn schedule_once(&self) -> GridResult<ScheduleReport> {
+        self.schedule_batch(self.config.max_batch_size).await
+    }
+
     /// Spawns the autonomous event-driven scheduling loop.
     pub fn spawn(
         self: Arc<Self>,
@@ -449,6 +494,9 @@ impl WorkloadScheduler {
                 tokio::select! {
                     _ = self.trigger.notified() => {
                         debug!("Scheduler loop woken by event notification");
+                        if self.config.micro_batch_window > Duration::ZERO {
+                            tokio::time::sleep(self.config.micro_batch_window).await;
+                        }
                         let _ = self.schedule_once().await;
                     }
                     _ = ticker.tick() => {

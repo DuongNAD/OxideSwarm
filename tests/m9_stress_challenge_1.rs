@@ -1098,6 +1098,7 @@ async fn test_stress_reaper_detection_and_failover() {
         stderr: "".into(),
         execution_time_ms: 10,
         is_gpu_executed: false,
+        device_name: None,
         error: None,
     };
     transport2

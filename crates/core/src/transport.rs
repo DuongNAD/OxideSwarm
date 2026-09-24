@@ -9,6 +9,11 @@ use tokio::net::TcpStream;
 /// ALPN token identifying rusty-grid peer-to-peer connections over QUIC.
 pub const GRID_ALPN: &[u8] = b"rusty-grid/v1";
 
+/// Dedicated Control / Telemetry Stream discriminator tag (high priority).
+pub const STREAM_CONTROL: u8 = 0x01;
+/// Dedicated Task Data / Result Stream discriminator tag (bulk priority).
+pub const STREAM_DATA: u8 = 0x02;
+
 #[cfg(feature = "p2p")]
 pub use iroh;
 

@@ -466,10 +466,11 @@ fn test_serde_worker_message_all_variants_and_edge_cases() {
             worker_id,
             task_id,
             exit_code: code,
-            stdout: "Output\0with\0nulls\n🔥".to_string(),
-            stderr: "Error\t\r\n".to_string(),
+            stdout: "Output\0with\0nulls\n🔥".to_string().into(),
+            stderr: "Error\t\r\n".to_string().into(),
             execution_time_ms: u64::MAX,
             is_gpu_executed: true,
+            device_name: None,
             error: Some("Failed with error \0".into()),
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -578,7 +579,9 @@ fn test_serde_master_message_all_variants_and_edge_cases() {
             },
             created_at_utc: u64::MAX,
             tags: vec!["tag1".into(), "unicode_🏷️".into(), "".into()],
+            latest_checkpoint: None,
         };
+
         let assign = MasterMessage::AssignTask { task };
         let json = serde_json::to_string(&assign).unwrap();
         let de: MasterMessage = serde_json::from_str(&json).unwrap();

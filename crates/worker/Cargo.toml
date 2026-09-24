@@ -19,13 +19,17 @@ getrandom = "0.4"
 tempfile = "3"
 sysinfo = { workspace = true }
 iroh = { workspace = true, optional = true }
+wgpu = { version = "22", optional = true }
+pollster = { version = "0.3", optional = true }
+bytemuck = { version = "1.25", features = ["derive"], optional = true }
 
 [features]
 default = ["p2p"]
 p2p = ["dep:iroh", "rusty_grid_core/p2p"]
+gpu-wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dev-dependencies]
-
+rusty_grid_master = { path = "../master" }
 tempfile = "3"
 
 [[test]]
@@ -39,5 +43,13 @@ path = "../../tests/m3_challenger_1_stress.rs"
 [[test]]
 name = "m3_challenger_2_stress"
 path = "../../tests/m3_challenger_2_stress.rs"
+
+[[test]]
+name = "gpu_wgpu_compute_test"
+path = "../../tests/gpu_wgpu_compute_test.rs"
+
+[[test]]
+name = "gpu_wgpu_adversarial_test"
+path = "../../tests/gpu_wgpu_adversarial_test.rs"
 
 

@@ -189,7 +189,21 @@ pub struct MasterArgs {
         help = "File path where bound dashboard port number is written (useful for ephemeral port 0)"
     )]
     pub dashboard_port_file: Option<PathBuf>,
+
+    #[arg(
+        long = "dev",
+        help = "Enable local development mode (bypasses auth for loopback requests)"
+    )]
+    pub dev: bool,
+
+    #[arg(
+        long = "auth-token",
+        value_name = "TOKEN:NAME:SCOPES",
+        help = "Register an API token with name and comma-separated scopes (e.g. secret123:admin:admin or obs123:monitor:observer)"
+    )]
+    pub auth_tokens: Vec<String>,
 }
+
 
 #[derive(Parser, Debug, Clone)]
 pub struct WorkerArgs {
@@ -567,6 +581,22 @@ async fn run_master(args: MasterArgs, config_file: Option<config::ConfigFile>) -
     if let Some(ref dpf) = dashboard_port_file {
         server_config = server_config.with_dashboard_port_file(dpf);
     }
+    if args.dev {
+        server_config = server_config.with_dev_mode(true);
+    }
+    for token_spec in &args.auth_tokens {
+        let parts: Vec<&str> = token_spec.split(':').collect();
+        if parts.len() >= 3 {
+            let token = parts[0];
+            let name = parts[1];
+            let scopes: Vec<rusty_grid_master::auth::AuthScope> = parts[2]
+                .split(',')
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            server_config.auth_config.add_token(token, name, &scopes);
+        }
+    }
+
 
     let sched_config = SchedulerConfig {
         preserve_gpu_for_gpu_tasks: preserve_gpu,
@@ -859,7 +889,7 @@ async fn run_submit(args: SubmitArgs, config_file: Option<config::ConfigFile>) -
                 .command
                 .clone()
                 .unwrap_or_else(|| "matrix_multiply".into()),
-            input_data: vec![1, 2, 3, 4],
+            input_data: vec![1, 2, 3, 4].into(),
             work_group_size: 16,
             simulated_matrix_dim: 64,
             compute_intensity: 10,
@@ -945,10 +975,10 @@ async fn run_submit(args: SubmitArgs, config_file: Option<config::ConfigFile>) -
                 println!("Exit Code: {}", result.exit_code);
                 println!("Execution Time: {}ms", result.execution_time_ms);
                 if !result.stdout.is_empty() {
-                    println!("Stdout:\n{}", result.stdout.trim());
+                    println!("Stdout:\n{}", result.stdout_str().trim());
                 }
                 if !result.stderr.is_empty() {
-                    eprintln!("Stderr:\n{}", result.stderr.trim());
+                    eprintln!("Stderr:\n{}", result.stderr_str().trim());
                 }
             }
             if result.exit_code == 0 {

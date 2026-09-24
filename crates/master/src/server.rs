@@ -16,9 +16,9 @@ use uuid::Uuid;
 
 use rusty_grid_core::mapreduce::{MapReduceJobSpec, MapReduceResult};
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, InboundMessage};
-use rusty_grid_core::task::{Task, TaskId, TaskResult, TaskStatus};
+use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus};
 #[cfg(feature = "p2p")]
-use rusty_grid_core::transport::{BiStream, GridStream, GRID_ALPN};
+use rusty_grid_core::transport::{BiStream, GridStream, GRID_ALPN, STREAM_CONTROL, STREAM_DATA};
 use rusty_grid_core::{
     GridError, GridResult, MasterMessage, MessageTransport, WireCodec, WorkerMessage,
 };
@@ -71,6 +71,8 @@ pub struct ServerConfig {
     pub dashboard_port_file: Option<PathBuf>,
     /// Whether to force ephemeral in-memory secret key generation instead of default persistence.
     pub ephemeral_key: bool,
+    /// Authentication and RBAC configuration for web observability and REST endpoints.
+    pub auth_config: crate::auth::AuthConfig,
 }
 
 impl Default for ServerConfig {
@@ -100,9 +102,11 @@ impl Default for ServerConfig {
             dashboard_bind_ip: None,
             dashboard_port_file: None,
             ephemeral_key: false,
+            auth_config: crate::auth::AuthConfig::default(),
         }
     }
 }
+
 
 impl ServerConfig {
     /// Creates a new ServerConfig binding to the given socket address.
@@ -229,7 +233,20 @@ impl ServerConfig {
         self.ephemeral_key = ephemeral;
         self
     }
+
+    /// Configures the auth config for web UI and REST endpoints.
+    pub fn with_auth_config(mut self, auth_config: crate::auth::AuthConfig) -> Self {
+        self.auth_config = auth_config;
+        self
+    }
+
+    /// Sets development mode on auth config.
+    pub fn with_dev_mode(mut self, dev_mode: bool) -> Self {
+        self.auth_config.dev_mode = dev_mode;
+        self
+    }
 }
+
 
 /// Atomically writes the bound port number to `path` using a sibling temporary file.
 pub async fn write_port_file(path: &Path, port: u16) -> GridResult<()> {
@@ -460,6 +477,7 @@ impl MasterServer {
         let enable_web_ui = config.enable_web_ui;
         let enable_discovery = config.enable_discovery;
         let discovery_port = config.discovery_port;
+        #[allow(unused_mut)]
         let mut server = Self::bind_full(
             config.clone(),
             registry.clone(),
@@ -476,61 +494,50 @@ impl MasterServer {
         let p2p_ticket = server.p2p_ticket.clone();
 
         #[cfg(feature = "dashboard")]
-        let (dashboard_addr, broadcast_tx) = if let Some(dash_port) = config.dashboard_port {
-            let bind_ip = config.dashboard_bind_ip.unwrap_or_else(|| {
-                let ip = server_addr.ip();
-                if ip.is_unspecified() {
-                    "127.0.0.1".parse().unwrap()
-                } else {
-                    ip
-                }
-            });
-            let dash_bind_addr = SocketAddr::new(bind_ip, dash_port);
-            let dash_listener = TcpListener::bind(dash_bind_addr)
-                .await
-                .map_err(GridError::Io)?;
-            let bound_dash_addr = dash_listener.local_addr().map_err(GridError::Io)?;
-            info!(addr = %bound_dash_addr, "Embedded Web Observability Dashboard listening");
-
-            if let Some(ref dp_file) = config.dashboard_port_file {
-                write_port_file(dp_file, bound_dash_addr.port()).await?;
-                info!(port = bound_dash_addr.port(), path = %dp_file.display(), "Dashboard port file published");
-            }
-
-            let (b_tx, _) = tokio::sync::broadcast::channel(256);
-            let state = crate::dashboard::DashboardState {
-                registry: registry.clone(),
-                queue: queue.clone(),
-                server_addr,
-                dashboard_addr: Some(bound_dash_addr),
-                started_at: std::time::Instant::now(),
-                broadcast_tx: b_tx.clone(),
-                p2p_ticket: p2p_ticket.clone(),
-            };
-
-            let router = crate::dashboard::create_dashboard_router(state);
-            let mut dash_shutdown_rx = shutdown_rx.clone();
-            let shutdown_signal = async move {
-                while !*dash_shutdown_rx.borrow_and_update() {
-                    if dash_shutdown_rx.changed().await.is_err() {
-                        break;
+        let (dashboard_server_opt, broadcast_tx) = if enable_web_ui || config.dashboard_port.is_some() {
+            let bind_addr = if let Some(dash_port) = config.dashboard_port {
+                let bind_ip = config.dashboard_bind_ip.unwrap_or_else(|| {
+                    let ip = server_addr.ip();
+                    if ip.is_unspecified() {
+                        "127.0.0.1".parse().unwrap()
+                    } else {
+                        ip
                     }
-                }
+                });
+                SocketAddr::new(bind_ip, dash_port)
+            } else {
+                web_ui_addr
             };
 
-            tokio::spawn(async move {
-                if let Err(e) = axum::serve(dash_listener, router)
-                    .with_graceful_shutdown(shutdown_signal)
-                    .await
-                {
-                    warn!(error = %e, "Dashboard HTTP server terminated with error");
-                }
-            });
+            match TcpListener::bind(bind_addr).await {
+                Ok(dash_listener) => {
+                    let bound_dash_addr = dash_listener.local_addr().map_err(GridError::Io)?;
+                    info!(addr = %bound_dash_addr, "Unified Web Observability & Control Dashboard listening");
 
-            (Some(bound_dash_addr), Some(b_tx))
+                    if let Some(ref dp_file) = config.dashboard_port_file {
+                        write_port_file(dp_file, bound_dash_addr.port()).await?;
+                        info!(port = bound_dash_addr.port(), path = %dp_file.display(), "Dashboard port file published");
+                    }
+
+                    let (b_tx, _) = tokio::sync::broadcast::channel(256);
+                    (Some((dash_listener, bound_dash_addr)), Some(b_tx))
+                }
+                Err(e) if config.dashboard_port.is_none() => {
+                    warn!(
+                        error = %e,
+                        addr = %bind_addr,
+                        "Web UI port binding failed; continuing master RPC without Web UI"
+                    );
+                    (None, None)
+                }
+                Err(e) => return Err(GridError::Io(e)),
+            }
         } else {
             (None, None)
         };
+
+        #[cfg(feature = "dashboard")]
+        let dashboard_addr = dashboard_server_opt.as_ref().map(|(_, addr)| *addr);
 
         #[cfg(not(feature = "dashboard"))]
         let dashboard_addr: Option<SocketAddr> = None;
@@ -539,6 +546,7 @@ impl MasterServer {
         if let Some(ref b_tx) = broadcast_tx {
             server.broadcast_tx = Some(b_tx.clone());
         }
+
 
         // 1. Spawn TCP server accept loop
         let srv_shutdown_rx = shutdown_rx.clone();
@@ -558,6 +566,7 @@ impl MasterServer {
         let mut sched_shutdown_rx = shutdown_rx.clone();
         #[cfg(feature = "dashboard")]
         let sched_broadcast_tx = broadcast_tx.clone();
+        #[cfg(feature = "dashboard")]
         let sched_queue = queue.clone();
         let sched_trigger = scheduler_notify.clone();
 
@@ -575,7 +584,11 @@ impl MasterServer {
                 tokio::select! {
                     _ = sched_trigger.notified() => {
                         debug!("Scheduler loop woken by event notification");
+                        if sched.config().micro_batch_window > Duration::ZERO {
+                            tokio::time::sleep(sched.config().micro_batch_window).await;
+                        }
                         if let Ok(report) = sched.schedule_once().await {
+                            let _ = &report;
                             #[cfg(feature = "dashboard")]
                             if let Some(ref b_tx) = sched_broadcast_tx {
                                 if !report.assignments.is_empty() {
@@ -591,6 +604,7 @@ impl MasterServer {
                     }
                     _ = ticker.tick() => {
                         if let Ok(report) = sched.schedule_once().await {
+                            let _ = &report;
                             #[cfg(feature = "dashboard")]
                             if let Some(ref b_tx) = sched_broadcast_tx {
                                 if !report.assignments.is_empty() {
@@ -604,6 +618,7 @@ impl MasterServer {
                             }
                         }
                     }
+
                     res = sched_shutdown_rx.changed() => {
                         if res.is_ok() && *sched_shutdown_rx.borrow() {
                             info!("WorkloadScheduler received shutdown signal; terminating");
@@ -647,7 +662,7 @@ impl MasterServer {
             waiters,
             shutdown_tx,
             #[cfg(feature = "dashboard")]
-            broadcast_tx,
+            broadcast_tx: broadcast_tx.clone(),
             #[cfg(feature = "p2p")]
             p2p_endpoint,
             #[cfg(feature = "p2p")]
@@ -655,18 +670,42 @@ impl MasterServer {
             p2p_ticket: p2p_ticket.clone(),
         };
 
-        // 4. Spawn Web UI Dashboard (if enabled)
-        if enable_web_ui {
-            let web_ui_shutdown_rx = shutdown_rx.clone();
-            tokio::spawn(crate::web_ui::start_web_ui(
-                web_ui_addr,
+        // 4. Spawn Unified Web Observability & Control Dashboard (if enabled)
+        #[cfg(feature = "dashboard")]
+        if let Some((dash_listener, bound_dash_addr)) = dashboard_server_opt {
+            let b_tx = broadcast_tx.as_ref().unwrap().clone();
+            let auth_config = Arc::new(config.auth_config.clone());
+            let router = crate::web_ui::create_web_ui_router_full(
                 handle.registry().clone(),
                 handle.queue().clone(),
                 handle.scheduler_notify().clone(),
-                web_ui_shutdown_rx,
                 Some(handle.clone()),
                 p2p_ticket.clone(),
-            ));
+                b_tx,
+                server_addr,
+                Some(bound_dash_addr),
+                std::time::Instant::now(),
+                auth_config,
+            );
+
+            let mut dash_shutdown_rx = shutdown_rx.clone();
+            let shutdown_signal = async move {
+                while !*dash_shutdown_rx.borrow_and_update() {
+                    if dash_shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            };
+
+            tokio::spawn(async move {
+                let app = router.into_make_service_with_connect_info::<SocketAddr>();
+                if let Err(e) = axum::serve(dash_listener, app)
+                    .with_graceful_shutdown(shutdown_signal)
+                    .await
+                {
+                    warn!(error = %e, "Unified Web UI HTTP server terminated with error");
+                }
+            });
         }
 
         // 5. Spawn UDP Master Discovery Broadcaster & Active Probe Responder
@@ -674,11 +713,14 @@ impl MasterServer {
             let disc_shutdown_rx = shutdown_rx.clone();
             let listen_ip = server_addr.ip();
             let cluster_port = server_addr.port();
-            let web_ui_port = if enable_web_ui {
+            let web_ui_port = if let Some(addr) = dashboard_addr {
+                addr.port()
+            } else if enable_web_ui {
                 web_ui_addr.port()
             } else {
                 8080
             };
+
             let disc_registry = handle.registry().clone();
             tokio::spawn(async move {
                 spawn_master_discovery_service(
@@ -854,55 +896,103 @@ impl MasterServer {
                             if let Some(incoming) = incoming {
                                 match incoming.await {
                                     Ok(conn) => {
-                                        match conn.accept_bi().await {
-                                            Ok((send, recv)) => {
-                                                let grid_stream = GridStream::P2p(BiStream::new(recv, send));
-                                                let path_info = rusty_grid_core::transport::inspect_connection_paths(&conn);
-                                                let remote_addr: SocketAddr = if let Some(ref info) = path_info {
-                                                    if info.is_ip {
-                                                        info.remote_addr.parse().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap())
-                                                    } else {
-                                                        "127.0.0.1:0".parse().unwrap()
-                                                    }
+                                        let c_reg = p2p_reg.clone();
+                                        let c_q = p2p_queue.clone();
+                                        let c_sched = p2p_sched.clone();
+                                        let c_wait = Arc::clone(&p2p_waiters);
+                                        let c_shut = p2p_shutdown.clone();
+                                        let c_codec = p2p_codec;
+                                        let c_conns = Arc::clone(&p2p_conns);
+                                        let c_conn = conn.clone();
+                                        #[cfg(feature = "dashboard")]
+                                        let c_bcast = p2p_broadcast_tx.clone();
+
+                                        tokio::spawn(async move {
+                                            let path_info = rusty_grid_core::transport::inspect_connection_paths(&conn);
+                                            let remote_addr: SocketAddr = if let Some(ref info) = path_info {
+                                                if info.is_ip {
+                                                    info.remote_addr.parse().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap())
                                                 } else {
                                                     "127.0.0.1:0".parse().unwrap()
-                                                };
-                                                let c_reg = p2p_reg.clone();
-                                                let c_q = p2p_queue.clone();
-                                                let c_sched = p2p_sched.clone();
-                                                let c_wait = Arc::clone(&p2p_waiters);
-                                                let c_shut = p2p_shutdown.clone();
-                                                let c_codec = p2p_codec;
-                                                let c_conns = Arc::clone(&p2p_conns);
-                                                let c_conn = conn.clone();
-                                                #[cfg(feature = "dashboard")]
-                                                let c_bcast = p2p_broadcast_tx.clone();
-                                                tokio::spawn(async move {
-                                                    let _ = handle_connection(
-                                                         grid_stream,
-                                                         remote_addr,
-                                                         c_reg,
-                                                         c_q,
-                                                         c_sched,
-                                                         c_wait,
-                                                         p2p_hb,
-                                                         p2p_to,
-                                                         c_shut,
-                                                         None,
-                                                         c_codec,
-                                                         #[cfg(feature = "dashboard")]
-                                                         c_bcast,
-                                                         #[cfg(feature = "p2p")]
-                                                         Some(c_conn),
-                                                         #[cfg(feature = "p2p")]
-                                                         Some(c_conns),
+                                                }
+                                            } else {
+                                                "127.0.0.1:0".parse().unwrap()
+                                            };
+
+                                            let (send1, mut recv1) = match conn.accept_bi().await {
+                                                Ok(s) => s,
+                                                Err(e) => {
+                                                    warn!(error = %e, "Failed to accept bidirectional P2P stream");
+                                                    return;
+                                                }
+                                            };
+
+                                            let mut tag1 = [0u8; 1];
+                                            let tag_read_res = tokio::time::timeout(
+                                                p2p_to,
+                                                tokio::io::AsyncReadExt::read_exact(&mut recv1, &mut tag1),
+                                            )
+                                            .await;
+
+                                            match tag_read_res {
+                                                Ok(Ok(_))
+                                                    if tag1[0] == STREAM_CONTROL
+                                                        || tag1[0] == STREAM_DATA =>
+                                                {
+                                                    let (send2, mut recv2) = match tokio::time::timeout(p2p_to, conn.accept_bi()).await {
+                                                        Ok(Ok(s)) => s,
+                                                        _ => {
+                                                            warn!("Failed to accept second P2P stream for multiplexed connection");
+                                                            return;
+                                                        }
+                                                    };
+                                                    let mut tag2 = [0u8; 1];
+                                                    if tokio::time::timeout(p2p_to, tokio::io::AsyncReadExt::read_exact(&mut recv2, &mut tag2)).await.is_err() {
+                                                        warn!("Failed to read tag on second P2P stream");
+                                                        return;
+                                                    }
+
+                                                    let (ctrl_stream, data_stream) = if tag1[0] == STREAM_CONTROL && tag2[0] == STREAM_DATA {
+                                                        (
+                                                            GridStream::P2p(BiStream::new(recv1, send1)),
+                                                            GridStream::P2p(BiStream::new(recv2, send2)),
+                                                        )
+                                                    } else if tag1[0] == STREAM_DATA && tag2[0] == STREAM_CONTROL {
+                                                        (
+                                                            GridStream::P2p(BiStream::new(recv2, send2)),
+                                                            GridStream::P2p(BiStream::new(recv1, send1)),
+                                                        )
+                                                    } else {
+                                                        warn!("Invalid stream tags for multiplexed connection: tag1={}, tag2={}", tag1[0], tag2[0]);
+                                                        return;
+                                                    };
+
+                                                    let _ = handle_multiplexed_connection(
+                                                        ctrl_stream,
+                                                        data_stream,
+                                                        remote_addr,
+                                                        c_reg,
+                                                        c_q,
+                                                        c_sched,
+                                                        c_wait,
+                                                        p2p_hb,
+                                                        p2p_to,
+                                                        c_shut,
+                                                        None,
+                                                        c_codec,
+                                                        #[cfg(feature = "dashboard")]
+                                                        c_bcast,
+                                                        #[cfg(feature = "p2p")]
+                                                        Some(c_conn),
+                                                        #[cfg(feature = "p2p")]
+                                                        Some(c_conns),
                                                     ).await;
-                                                });
+                                                }
+                                                _ => {
+                                                    warn!("Failed or untagged P2P stream; closing connection");
+                                                }
                                             }
-                                            Err(e) => {
-                                                warn!(error = %e, "Failed to accept bidirectional P2P stream");
-                                            }
-                                        }
+                                        });
                                     }
                                     Err(e) => {
                                         warn!(error = %e, "P2P connection accept failed");
@@ -1819,6 +1909,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                 stderr,
                                 execution_time_ms,
                                 is_gpu_executed,
+                                device_name,
                                 error,
                             } => {
                                 let result = TaskResult {
@@ -1829,6 +1920,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                     stderr,
                                     execution_time_ms,
                                     is_gpu_executed,
+                                    device_name,
                                     error,
                                 };
                                 #[cfg(feature = "dashboard")]
@@ -1849,9 +1941,18 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                     result,
                                 ).await;
                             }
+                            WorkerMessage::Checkpoint { task_id, sequence, delta_state } => {
+                                let checkpoint = CheckpointData::new(sequence, delta_state.into_bytes());
+                                if let Err(e) = queue.record_checkpoint(task_id, checkpoint).await {
+                                    warn!(worker_id = %worker_id, task_id = %task_id, error = %e, "Failed to record mid-task checkpoint");
+                                } else {
+                                    debug!(worker_id = %worker_id, task_id = %task_id, sequence = sequence, "Recorded mid-task checkpoint");
+                                }
+                            }
                             WorkerMessage::Register { .. } => {
                                 warn!(worker_id = %worker_id, "Ignoring unexpected Register message on active connection");
                             }
+
                         }
                     }
                     Ok(None) => {
@@ -1922,6 +2023,501 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         conns.write().await.remove(&worker_id);
     }
     writer_task.abort();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_multiplexed_connection<
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+>(
+    ctrl_stream: C,
+    data_stream: D,
+    remote_addr: SocketAddr,
+    registry: WorkerRegistry,
+    queue: TaskQueue,
+    scheduler_notify: Arc<tokio::sync::Notify>,
+    waiters: WaiterMap,
+    heartbeat_interval_secs: u64,
+    handshake_timeout: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+    abort_handle: Option<AbortHandle>,
+    wire_codec: WireCodec,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<
+        tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
+    #[cfg(feature = "p2p")] p2p_conn: Option<iroh::endpoint::Connection>,
+    #[cfg(feature = "p2p")] p2p_conns: Option<
+        Arc<tokio::sync::RwLock<HashMap<Uuid, iroh::endpoint::Connection>>>,
+    >,
+) -> GridResult<()> {
+    let mut ctrl_transport = MessageTransport::with_codec(ctrl_stream, wire_codec);
+    let data_transport = MessageTransport::with_codec(data_stream, wire_codec);
+
+    // 1. Handshake on control stream (Slowloris defense)
+    let (first_msg, detected_codec) = match tokio::time::timeout(
+        handshake_timeout,
+        ctrl_transport.recv_msg_with_codec::<InboundMessage>(),
+    )
+    .await
+    {
+        Ok(Ok(Some((msg, codec)))) => (msg, codec),
+        Ok(Ok(None)) => {
+            debug!(remote = %remote_addr, "Peer closed control stream before handshake");
+            return Err(GridError::ConnectionClosed);
+        }
+        Ok(Err(e)) => {
+            warn!(remote = %remote_addr, error = %e, "Protocol error during handshake on control stream");
+            return Err(e.into());
+        }
+        Err(_) => {
+            warn!(remote = %remote_addr, timeout_secs = handshake_timeout.as_secs(), "Handshake watchdog timed out on control stream");
+            return Err(GridError::Timeout {
+                operation: "handshake".into(),
+                duration_secs: handshake_timeout.as_secs(),
+            });
+        }
+    };
+
+    ctrl_transport.set_outbound_codec(detected_codec);
+
+    let worker_msg = match first_msg {
+        InboundMessage::Worker(wm) => wm,
+        InboundMessage::Client(_) => {
+            return Err(GridError::HandshakeFailed(
+                "Client connection not supported over multiplexed P2P worker transport".into(),
+            ));
+        }
+    };
+
+    // 2. Validate Register message
+    let (worker_id, capabilities) = match worker_msg {
+        WorkerMessage::Register {
+            worker_id,
+            capabilities,
+        } => {
+            if capabilities.cpu_cores == 0 {
+                let reject_ack = MasterMessage::RegisterAck {
+                    accepted: false,
+                    worker_id,
+                    heartbeat_interval_secs: 0,
+                    message: Some("Invalid capability: cpu_cores must be > 0".into()),
+                };
+                let _ = ctrl_transport.send_msg(&reject_ack).await;
+                return Err(GridError::RegistrationRejected(
+                    "cpu_cores must be > 0".into(),
+                ));
+            }
+            (worker_id, capabilities)
+        }
+        other => {
+            let reject_ack = MasterMessage::RegisterAck {
+                accepted: false,
+                worker_id: Uuid::nil(),
+                heartbeat_interval_secs: 0,
+                message: Some(format!(
+                    "Expected Register message, received {}",
+                    other.variant_name()
+                )),
+            };
+            let _ = ctrl_transport.send_msg(&reject_ack).await;
+            return Err(GridError::HandshakeFailed(format!(
+                "Expected Register message, received {}",
+                other.variant_name()
+            )));
+        }
+    };
+
+    // 3. Register in WorkerRegistry
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<MasterMessage>(128);
+    let session_id = registry
+        .register(
+            worker_id,
+            capabilities,
+            remote_addr,
+            outbound_tx.clone(),
+            abort_handle,
+        )
+        .await?;
+
+    #[cfg(feature = "p2p")]
+    if let (Some(ref conn), Some(ref conns)) = (&p2p_conn, &p2p_conns) {
+        conns.write().await.insert(worker_id, conn.clone());
+        let path_info = rusty_grid_core::transport::inspect_connection_paths(conn);
+        info!(
+            worker_id = %worker_id,
+            path_info = ?path_info,
+            "Tracked P2P connection path for registered worker"
+        );
+    }
+
+    // 4. Send RegisterAck over control stream
+    let ack = MasterMessage::RegisterAck {
+        accepted: true,
+        worker_id,
+        heartbeat_interval_secs,
+        message: None,
+    };
+    if let Err(e) = ctrl_transport.send_msg(&ack).await {
+        let _ = registry.unregister(&worker_id, Some(session_id)).await;
+        return Err(e.into());
+    }
+
+    #[cfg(feature = "dashboard")]
+    if let Some(ref b_tx) = broadcast_tx {
+        if let Some(info) = registry.get_worker(worker_id).await {
+            let _ =
+                b_tx.send(crate::dashboard::dto::DashboardStreamMessage::WorkerRegistered(info));
+        }
+    }
+
+    info!(
+        worker_id = %worker_id,
+        session_id = session_id,
+        remote = %remote_addr,
+        "Worker successfully registered with master (QUIC 2-lane multiplexed)"
+    );
+
+    // 5. Split transports into independent writers and readers
+    let (mut ctrl_writer, mut ctrl_reader) = ctrl_transport.split();
+    let (mut data_writer, mut data_reader) = data_transport.split();
+
+    // 6. Spawn 2-lane outbound writers: Control Lane and Data Lane
+    let (ctrl_out_tx, mut ctrl_out_rx) = mpsc::channel::<MasterMessage>(64);
+    let (data_out_tx, mut data_out_rx) = mpsc::channel::<MasterMessage>(64);
+    let ctrl_sender = ctrl_out_tx.clone();
+
+    // router_task decouples data and control lane routing from outbound_rx.
+    // When data_out_tx experiences backpressure, pending data frames are queued
+    // locally in pending_data, while outbound_rx continues to be drained so that
+    // control messages are dispatched immediately to ctrl_out_tx without head-of-line blocking.
+    let router_task = tokio::spawn(async move {
+        let mut pending_data: std::collections::VecDeque<MasterMessage> =
+            std::collections::VecDeque::new();
+
+        loop {
+            if pending_data.is_empty() {
+                match outbound_rx.recv().await {
+                    Some(msg) => match msg {
+                        MasterMessage::AssignTask { .. }
+                        | MasterMessage::AssignTaskWithCheckpoint { .. }
+                        | MasterMessage::CancelTask { .. } => {
+                            match data_out_tx.try_send(msg) {
+                                Ok(()) => {}
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(data_msg)) => {
+                                    pending_data.push_back(data_msg);
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                            }
+                        }
+                        ctrl_msg => {
+                            if ctrl_out_tx.send(ctrl_msg).await.is_err() {
+                                break;
+                            }
+                        }
+                    },
+                    None => break,
+                }
+            } else {
+                tokio::select! {
+                    send_permit = data_out_tx.reserve() => {
+                        match send_permit {
+                            Ok(permit) => {
+                                if let Some(msg) = pending_data.pop_front() {
+                                    permit.send(msg);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    msg_opt = outbound_rx.recv() => {
+                        match msg_opt {
+                            Some(msg) => match msg {
+                                MasterMessage::AssignTask { .. }
+                                | MasterMessage::AssignTaskWithCheckpoint { .. }
+                                | MasterMessage::CancelTask { .. } => {
+                                    pending_data.push_back(msg);
+                                }
+
+                                ctrl_msg => {
+                                    // Control frames bypass pending data frames immediately
+                                    if ctrl_out_tx.send(ctrl_msg).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            },
+                            None => {
+                                // outbound_rx closed; drain remaining pending data then exit
+                                while let Some(msg) = pending_data.pop_front() {
+                                    if data_out_tx.send(msg).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let ctrl_writer_task = tokio::spawn(async move {
+        while let Some(msg) = ctrl_out_rx.recv().await {
+            if let Err(e) = ctrl_writer.send_msg(&msg).await {
+                debug!(error = %e, "Control writer send error; terminating");
+                break;
+            }
+        }
+    });
+
+    let data_writer_task = tokio::spawn(async move {
+        while let Some(msg) = data_out_rx.recv().await {
+            if let Err(e) = data_writer.send_msg(&msg).await {
+                debug!(error = %e, "Data writer send error; terminating");
+                break;
+            }
+        }
+    });
+
+    let sched_notify = scheduler_notify.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sched_notify.notify_one();
+    });
+
+    // 7. Multiplexed inbound reader loop
+    loop {
+        tokio::select! {
+            ctrl_res = ctrl_reader.recv_msg::<WorkerMessage>() => {
+                match ctrl_res {
+                    Ok(Some(msg)) => {
+                        match msg {
+                            WorkerMessage::Heartbeat {
+                                worker_id: id,
+                                timestamp,
+                                active_tasks,
+                                cpu_usage_pct,
+                                ram_available_mb,
+                            } => {
+                                if id == worker_id {
+                                    let _ = registry
+                                        .record_heartbeat(
+                                            &worker_id,
+                                            active_tasks,
+                                            timestamp,
+                                            cpu_usage_pct,
+                                            ram_available_mb,
+                                            Some(session_id),
+                                        )
+                                        .await;
+                                    let _ = ctrl_sender
+                                        .send(MasterMessage::HeartbeatAck { timestamp })
+                                        .await;
+                                    #[cfg(feature = "dashboard")]
+                                    if let Some(ref b_tx) = broadcast_tx {
+                                        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::WorkerHeartbeat {
+                                            worker_id: id,
+                                            cpu_usage_pct,
+                                            ram_available_mb,
+                                            active_tasks,
+                                            timestamp,
+                                        });
+                                    }
+                                } else {
+                                    warn!(expected = %worker_id, got = %id, "Heartbeat worker_id mismatch on control stream");
+                                }
+                            }
+                            WorkerMessage::Disconnecting { worker_id: id, reason } => {
+                                info!(worker_id = %id, reason = %reason, "Worker announced graceful disconnection on control stream");
+                                handle_worker_disconnect_with_broadcast(
+                                    &registry,
+                                    &queue,
+                                    &scheduler_notify,
+                                    Some(&waiters),
+                                    &worker_id,
+                                    Some(session_id),
+                                    &format!("Worker graceful disconnect: {reason}"),
+                                    true,
+                                    #[cfg(feature = "dashboard")]
+                                    broadcast_tx.as_ref(),
+                                ).await;
+                                break;
+                            }
+                            other => {
+                                warn!(worker_id = %worker_id, message = %other.variant_name(), "Unexpected message on control stream");
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        info!(worker_id = %worker_id, "Worker control stream closed by peer (EOF)");
+                        handle_worker_disconnect_with_broadcast(
+                            &registry,
+                            &queue,
+                            &scheduler_notify,
+                            Some(&waiters),
+                            &worker_id,
+                            Some(session_id),
+                            "Control stream EOF",
+                            false,
+                            #[cfg(feature = "dashboard")]
+                            broadcast_tx.as_ref(),
+                        ).await;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(worker_id = %worker_id, error = %e, "Control stream read error");
+                        handle_worker_disconnect_with_broadcast(
+                            &registry,
+                            &queue,
+                            &scheduler_notify,
+                            Some(&waiters),
+                            &worker_id,
+                            Some(session_id),
+                            &format!("Control stream socket error: {e}"),
+                            false,
+                            #[cfg(feature = "dashboard")]
+                            broadcast_tx.as_ref(),
+                        ).await;
+                        break;
+                    }
+                }
+            }
+            data_res = data_reader.recv_msg::<WorkerMessage>() => {
+                match data_res {
+                    Ok(Some(msg)) => {
+                        match msg {
+                            WorkerMessage::TaskProgress { worker_id: id, task_id, status } => {
+                                #[cfg(feature = "dashboard")]
+                                handle_task_progress_with_broadcast(&queue, id, task_id, status, broadcast_tx.as_ref()).await;
+                                #[cfg(not(feature = "dashboard"))]
+                                handle_task_progress(&queue, id, task_id, status).await;
+                            }
+                            WorkerMessage::TaskResult {
+                                worker_id: id,
+                                task_id,
+                                exit_code,
+                                stdout,
+                                stderr,
+                                execution_time_ms,
+                                is_gpu_executed,
+                                device_name,
+                                error,
+                            } => {
+                                let result = TaskResult {
+                                    worker_id: id,
+                                    task_id,
+                                    exit_code,
+                                    stdout,
+                                    stderr,
+                                    execution_time_ms,
+                                    is_gpu_executed,
+                                    device_name,
+                                    error,
+                                };
+                                #[cfg(feature = "dashboard")]
+                                handle_task_result_with_broadcast(
+                                    &registry,
+                                    &queue,
+                                    &scheduler_notify,
+                                    &waiters,
+                                    result,
+                                    broadcast_tx.as_ref(),
+                                ).await;
+                                #[cfg(not(feature = "dashboard"))]
+                                handle_task_result(
+                                    &registry,
+                                    &queue,
+                                    &scheduler_notify,
+                                    &waiters,
+                                    result,
+                                ).await;
+                            }
+                            WorkerMessage::Checkpoint { task_id, sequence, delta_state } => {
+                                let checkpoint = CheckpointData::new(sequence, delta_state.into_bytes());
+                                if let Err(e) = queue.record_checkpoint(task_id, checkpoint).await {
+                                    warn!(worker_id = %worker_id, task_id = %task_id, error = %e, "Failed to record mid-task checkpoint");
+                                } else {
+                                    debug!(worker_id = %worker_id, task_id = %task_id, sequence = sequence, "Recorded mid-task checkpoint");
+                                }
+                            }
+                            other => {
+                                warn!(worker_id = %worker_id, message = %other.variant_name(), "Unexpected message on data stream");
+                            }
+
+                        }
+                    }
+                    Ok(None) => {
+                        info!(worker_id = %worker_id, "Worker data stream closed by peer (EOF)");
+                        handle_worker_disconnect_with_broadcast(
+                            &registry,
+                            &queue,
+                            &scheduler_notify,
+                            Some(&waiters),
+                            &worker_id,
+                            Some(session_id),
+                            "Data stream EOF",
+                            false,
+                            #[cfg(feature = "dashboard")]
+                            broadcast_tx.as_ref(),
+                        ).await;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(worker_id = %worker_id, error = %e, "Data stream read error");
+                        handle_worker_disconnect_with_broadcast(
+                            &registry,
+                            &queue,
+                            &scheduler_notify,
+                            Some(&waiters),
+                            &worker_id,
+                            Some(session_id),
+                            &format!("Data stream socket error: {e}"),
+                            false,
+                            #[cfg(feature = "dashboard")]
+                            broadcast_tx.as_ref(),
+                        ).await;
+                        break;
+                    }
+                }
+            }
+            res = shutdown_rx.changed() => {
+                if res.is_ok() && *shutdown_rx.borrow() {
+                    info!(worker_id = %worker_id, "Master shutting down; notifying worker on control stream");
+                    let _ = ctrl_sender.send(MasterMessage::Shutdown {
+                        reason: "Master server shutting down".into(),
+                        grace_period_secs: Some(5),
+                    }).await;
+                    break;
+                } else if res.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    // 8. Cleanup upon disconnect
+    handle_worker_disconnect_with_broadcast(
+        &registry,
+        &queue,
+        &scheduler_notify,
+        Some(&waiters),
+        &worker_id,
+        Some(session_id),
+        "Multiplexed connection terminated",
+        false,
+        #[cfg(feature = "dashboard")]
+        broadcast_tx.as_ref(),
+    )
+    .await;
+
+    #[cfg(feature = "p2p")]
+    if let Some(ref conns) = p2p_conns {
+        conns.write().await.remove(&worker_id);
+    }
+    ctrl_writer_task.abort();
+    data_writer_task.abort();
+    router_task.abort();
     Ok(())
 }
 
@@ -2049,6 +2645,12 @@ impl MasterHandle {
             .await
             .ok_or(GridError::TaskNotFound(task_id.0))
     }
+
+    /// Retrieves the latest verified mid-task checkpoint for a task, if available.
+    pub async fn get_checkpoint(&self, task_id: &TaskId) -> Option<CheckpointData> {
+        self.queue.get_checkpoint(task_id).await
+    }
+
 
     /// Lists all tasks currently managed by the Master.
     pub async fn list_tasks(&self) -> GridResult<Vec<TaskInfo>> {

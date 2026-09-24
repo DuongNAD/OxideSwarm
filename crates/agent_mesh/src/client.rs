@@ -340,6 +340,74 @@ impl AgentMeshClient {
         }
     }
 
+    /// Submits a GPU/matrix compute job to the OxideSwarm Grid via the Agent-Grid Bridge.
+    pub async fn submit_grid_compute(
+        &self,
+        kernel_name: &str,
+        matrix_dim: u32,
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentMeshEnvelope, Box<dyn std::error::Error + Send + Sync>> {
+        let args = serde_json::json!({
+            "kernel_name": kernel_name,
+            "kernel": kernel_name,
+            "matrix_dim": matrix_dim,
+            "simulated_matrix_dim": matrix_dim,
+        });
+        self.send_command("grid", "grid_compute", args, timeout_ms).await
+    }
+
+    /// Submits a distributed Rust compilation job to the OxideSwarm Grid via the Agent-Grid Bridge.
+    pub async fn submit_grid_compilation<I>(
+        &self,
+        crate_name: &str,
+        source_files: I,
+        compiler_flags: Vec<String>,
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentMeshEnvelope, Box<dyn std::error::Error + Send + Sync>>
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let files: HashMap<String, String> = source_files.into_iter().collect();
+        let args = serde_json::json!({
+            "crate_name": crate_name,
+            "source_files": files,
+            "compiler_flags": compiler_flags,
+        });
+        self.send_command("grid", "grid_compile", args, timeout_ms.or(Some(30000))).await
+    }
+
+    /// Convenience alias for `submit_grid_compilation`.
+    pub async fn submit_grid_compile(
+        &self,
+        crate_name: &str,
+        files: HashMap<String, String>,
+        flags: Vec<String>,
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentMeshEnvelope, Box<dyn std::error::Error + Send + Sync>> {
+        self.submit_grid_compilation(crate_name, files, flags, timeout_ms).await
+    }
+
+    /// Queries cluster status and scheduler queue metrics from the Master Grid scheduler.
+    pub async fn query_grid_status(
+        &self,
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentMeshEnvelope, Box<dyn std::error::Error + Send + Sync>> {
+        self.send_command("grid", "grid_status", serde_json::json!({}), timeout_ms.or(Some(5000))).await
+    }
+
+    /// Queries grid status or specific task info.
+    pub async fn submit_grid_status(
+        &self,
+        task_id: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentMeshEnvelope, Box<dyn std::error::Error + Send + Sync>> {
+        let mut args = serde_json::json!({});
+        if let Some(id) = task_id {
+            args["task_id"] = serde_json::json!(id);
+        }
+        self.send_command("grid", "grid_status", args, timeout_ms.or(Some(5000))).await
+    }
+
     pub async fn send_envelope(
         &self,
         envelope: AgentMeshEnvelope,

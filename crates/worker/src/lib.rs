@@ -5,9 +5,12 @@
 
 pub mod backoff;
 pub mod client;
+pub mod cpu_simd;
 pub mod heartbeat;
 pub mod runner;
 pub mod sandbox;
+#[cfg(feature = "gpu-wgpu")]
+pub mod wgpu_engine;
 
 pub use backoff::{BackoffConfig, ExponentialBackoff};
 pub use client::{WorkerClient, WorkerConfig};

@@ -5,13 +5,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
-use rusty_grid_core::task::{Task, TaskId, TaskResult, TaskSpec};
+use rusty_grid_core::protocol::WorkerMessage;
+use rusty_grid_core::task::{Bytes, BytesMut, CheckpointData, Task, TaskId, TaskResult, TaskSpec};
 
+use crate::cpu_simd;
 use crate::sandbox::{sanitize_relative_path, Sandbox, SandboxConfig, SandboxError};
 
 /// Exit code emitted on successful completion.
@@ -162,10 +164,10 @@ fn resolve_windows_executable(program: &str, effective_path: &str) -> String {
 pub async fn read_bounded_stream<R: tokio::io::AsyncRead + Unpin>(
     mut reader: R,
     max_bytes: usize,
-) -> (String, bool) {
+) -> (Bytes, bool) {
     use tokio::io::AsyncReadExt;
 
-    let mut captured = Vec::with_capacity(std::cmp::min(max_bytes, 64 * 1024));
+    let mut captured = BytesMut::with_capacity(std::cmp::min(max_bytes, 64 * 1024));
     let mut scratch = [0u8; 8192];
     let mut truncated = false;
 
@@ -189,12 +191,11 @@ pub async fn read_bounded_stream<R: tokio::io::AsyncRead + Unpin>(
         }
     }
 
-    let mut output = String::from_utf8_lossy(&captured).into_owned();
     if truncated {
-        output.push_str("\n[rusty_grid: output truncated after exceeding size limit]\n");
+        captured.extend_from_slice(b"\n[rusty_grid: output truncated after exceeding size limit]\n");
     }
 
-    (output, truncated)
+    (captured.freeze().into(), truncated)
 }
 
 /// Core computational workload execution engine for Worker nodes.
@@ -202,6 +203,8 @@ pub struct TaskRunner {
     worker_id: Uuid,
     capabilities: WorkerCapabilities,
     config: RunnerConfig,
+    #[cfg(feature = "gpu-wgpu")]
+    gpu_engine: std::sync::OnceLock<Option<Arc<crate::wgpu_engine::WgpuEngine>>>,
 }
 
 impl TaskRunner {
@@ -210,7 +213,22 @@ impl TaskRunner {
             worker_id,
             capabilities,
             config,
+            #[cfg(feature = "gpu-wgpu")]
+            gpu_engine: std::sync::OnceLock::new(),
         }
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    fn get_gpu_engine(&self) -> Option<Arc<crate::wgpu_engine::WgpuEngine>> {
+        self.gpu_engine
+            .get_or_init(|| match crate::wgpu_engine::WgpuEngine::try_init() {
+                Ok(engine) => engine.map(Arc::new),
+                Err(err) => {
+                    warn!("WGPU engine initialization failed: {err}");
+                    None
+                }
+            })
+            .clone()
     }
 
     pub fn worker_id(&self) -> Uuid {
@@ -225,11 +243,12 @@ impl TaskRunner {
         &self.config
     }
 
-    /// Primary execution dispatcher: validates capabilities, establishes isolation,
-    /// runs workload, supervises timeouts, handles cancellation, and emits TaskResult.
-    pub async fn execute_task(
+    /// Primary execution dispatcher with checkpoint resumption and mid-task checkpoint emission.
+    pub async fn execute_task_with_checkpoint(
         &self,
         task: &Task,
+        checkpoint: Option<&CheckpointData>,
+        checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
         child_pid: Option<Arc<AtomicU32>>,
         cancel_rx: Option<oneshot::Receiver<String>>,
     ) -> TaskResult {
@@ -253,10 +272,11 @@ impl TaskRunner {
                     worker_id: self.worker_id,
                     task_id: task.id,
                     exit_code: EXIT_CODE_GENERAL_ERROR,
-                    stdout: String::new(),
-                    stderr: "Execution Error: Task requires GPU capability, but this worker has no GPU (Worker lacks GPU capability).".to_string(),
+                    stdout: Bytes::new(),
+                    stderr: Bytes::from_static(b"Execution Error: Task requires GPU capability, but this worker has no GPU (Worker lacks GPU capability)."),
                     execution_time_ms: 0,
                     is_gpu_executed: false,
+                    device_name: None,
                     error: Some("Worker lacks GPU capability".to_string()),
                 };
             }
@@ -265,7 +285,7 @@ impl TaskRunner {
         // 2. Dispatch in-memory workloads (BuiltinTest, GpuCompute) or process-based workloads
         match &task.spec {
             TaskSpec::BuiltinTest { .. } => {
-                self.execute_builtin_test(task, timeout_duration, cancel_rx, start_time)
+                self.execute_builtin_test(task, checkpoint, checkpoint_tx, timeout_duration, cancel_rx, start_time)
                     .await
             }
 
@@ -287,7 +307,7 @@ impl TaskRunner {
                     args,
                     env,
                     working_dir.as_ref(),
-                    stdin.as_ref(),
+                    stdin.as_deref(),
                     timeout_duration,
                     child_pid,
                     cancel_rx,
@@ -336,10 +356,25 @@ impl TaskRunner {
         }
     }
 
-    /// Executes in-memory BuiltinTest tasks with optional sleep, arithmetic stress, or hash computation.
+    /// Primary execution dispatcher: validates capabilities, establishes isolation,
+    /// runs workload, supervises timeouts, handles cancellation, and emits TaskResult.
+    pub async fn execute_task(
+        &self,
+        task: &Task,
+        child_pid: Option<Arc<AtomicU32>>,
+        cancel_rx: Option<oneshot::Receiver<String>>,
+    ) -> TaskResult {
+        self.execute_task_with_checkpoint(task, task.latest_checkpoint.as_ref(), None, child_pid, cancel_rx)
+            .await
+    }
+
+    /// Executes in-memory BuiltinTest tasks with optional sleep, arithmetic stress, or hash computation,
+    /// supporting mid-task checkpoint emission and delta resumption.
     async fn execute_builtin_test(
         &self,
         task: &Task,
+        checkpoint: Option<&CheckpointData>,
+        checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
         timeout: Duration,
         mut cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
@@ -387,7 +422,13 @@ impl TaskRunner {
         }
 
         let compute_fut = async {
-            if duration_ms > 0 || test_name == "sleep" || test_name == "duration" {
+            if test_name == "sleep"
+                || test_name == "duration"
+                || (duration_ms > 0
+                    && test_name != "checkpoint"
+                    && test_name != "checkpoint_iterative"
+                    && test_name != "hash_compute")
+            {
                 tokio::time::sleep(Duration::from_millis(duration_ms)).await;
                 format!("BuiltinTest sleep complete: {duration_ms} ms\n")
             } else if test_name == "arithmetic_stress" || test_name == "arithmetic" {
@@ -400,19 +441,76 @@ impl TaskRunner {
                 let pi_est = acc * 4.0;
                 format!("BuiltinTest arithmetic_stress complete: {iters} iterations, pi_estimate = {pi_est:.10}\n")
             } else {
-                // Default: deterministic hash computation
+                // Default: deterministic hash computation with checkpoint resumption & emission
                 let iters = if iterations == 0 { 100_000 } else { iterations };
+                let mut start_iter: u32 = 0;
                 let mut state: u64 = 0xcbf29ce484222325;
-                for b in task_id.as_uuid().as_bytes() {
-                    state ^= *b as u64;
-                    state = state.wrapping_mul(0x100000001b3);
+
+                // 1. Restore delta state from checkpoint if available
+                if let Some(cp) = checkpoint {
+                    let slice = cp.delta_state.as_slice();
+                    if slice.len() >= 16 {
+                        let iter_bytes: [u8; 8] = slice[0..8].try_into().unwrap_or([0; 8]);
+                        let state_bytes: [u8; 8] = slice[8..16].try_into().unwrap_or([0; 8]);
+                        start_iter = u64::from_le_bytes(iter_bytes) as u32;
+                        state = u64::from_le_bytes(state_bytes);
+                    } else if let Ok(val) = serde_json::from_slice::<serde_json::Value>(slice) {
+                        if let (Some(iter), Some(st)) = (
+                            val.get("iteration").and_then(|v| v.as_u64()),
+                            val.get("state").and_then(|v| v.as_u64()),
+                        ) {
+                            start_iter = iter as u32;
+                            state = st;
+                        }
+                    }
                 }
-                for i in 0..iters {
+
+                // If not resuming from a checkpoint, initialize state from task_id bytes
+                if start_iter == 0 {
+                    for b in task_id.as_uuid().as_bytes() {
+                        state ^= *b as u64;
+                        state = state.wrapping_mul(0x100000001b3);
+                    }
+                }
+
+                let mut sequence: u64 = checkpoint.map(|c| c.sequence).unwrap_or(0);
+                let checkpoint_interval = if iters >= 2 { iters / 2 } else { 1 };
+
+                for i in start_iter..iters {
                     state ^= i as u64;
                     state = state.wrapping_mul(0x100000001b3);
                     state = state.rotate_left(13);
+
+                    // Mid-task checkpoint emission (at halfway point or periodic interval)
+                    let current_count = i + 1;
+                    if let Some(ref tx) = checkpoint_tx {
+                        if current_count < iters
+                            && (current_count % checkpoint_interval == 0 || (iters >= 100 && current_count == 50))
+                        {
+                            sequence += 1;
+                            let mut delta = Vec::with_capacity(16);
+                            delta.extend_from_slice(&(current_count as u64).to_le_bytes());
+                            delta.extend_from_slice(&state.to_le_bytes());
+
+                            let cp_msg = WorkerMessage::Checkpoint {
+                                task_id,
+                                sequence,
+                                delta_state: Bytes::from(delta),
+                            };
+                            let _ = tx.send(cp_msg).await;
+
+                            if duration_ms > 0 && start_iter == 0 {
+                                tokio::time::sleep(Duration::from_millis(duration_ms)).await;
+                            }
+                        }
+                    }
                 }
-                format!("BuiltinTest hash_compute complete: {iters} iterations, digest = {state:016x}\n")
+
+                if start_iter > 0 {
+                    format!("BuiltinTest hash_compute complete: {iters} iterations (resumed from {start_iter}), digest = {state:016x}\n")
+                } else {
+                    format!("BuiltinTest hash_compute complete: {iters} iterations, digest = {state:016x}\n")
+                }
             }
         };
 
@@ -476,7 +574,7 @@ impl TaskRunner {
                 ..
             } => (
                 kernel_name.as_str(),
-                input_data.as_slice(),
+                input_data.as_ref(),
                 *work_group_size,
                 *simulated_matrix_dim,
             ),
@@ -486,85 +584,76 @@ impl TaskRunner {
         let tile = work_group_size.clamp(4, 32) as usize;
 
         let compute_fut = async {
-            let seed = if !input_data.is_empty() {
-                input_data
-                    .iter()
-                    .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64))
+            if self.capabilities.is_simulated_gpu {
+                let (stdout, elapsed) = cpu_simd::execute_simd_compute(
+                    kernel_name,
+                    input_data,
+                    *task_id.as_uuid(),
+                    dim,
+                    tile,
+                    start_time,
+                );
+                (
+                    stdout,
+                    elapsed,
+                    "Simulated Virtual GPU (Matrix Engine)".to_string(),
+                )
             } else {
-                let bytes: [u8; 8] = task_id.as_uuid().as_bytes()[0..8].try_into().unwrap();
-                u64::from_le_bytes(bytes)
-            };
-
-            let mut a = vec![0.0f32; dim * dim];
-            let mut b = vec![0.0f32; dim * dim];
-            let mut c = vec![0.0f32; dim * dim];
-
-            for i in 0..dim {
-                for j in 0..dim {
-                    let idx = i * dim + j;
-                    a[idx] = (((i as u64 * 37 + j as u64 * 17 + seed) % 1000) as f32) / 100.0;
-                    b[idx] = (((i as u64 * 19 + j as u64 * 43 + seed) % 1000) as f32) / 100.0;
-                }
-            }
-
-            // Tiled matrix multiplication C = A x B simulating GPU thread-block tiles
-            for i0 in (0..dim).step_by(tile) {
-                let i_end = (i0 + tile).min(dim);
-                for k0 in (0..dim).step_by(tile) {
-                    let k_end = (k0 + tile).min(dim);
-                    for j0 in (0..dim).step_by(tile) {
-                        let j_end = (j0 + tile).min(dim);
-                        for i in i0..i_end {
-                            for k in k0..k_end {
-                                let a_val = a[i * dim + k];
-                                for j in j0..j_end {
-                                    c[i * dim + j] += a_val * b[k * dim + j];
-                                }
-                            }
+                #[cfg(feature = "gpu-wgpu")]
+                let wgpu_res = if let Some(engine) = self.get_gpu_engine() {
+                    match engine.execute_gemm(
+                        kernel_name,
+                        input_data,
+                        *task_id.as_uuid(),
+                        dim,
+                        tile,
+                        start_time,
+                    ) {
+                        Ok(outcome) => {
+                            Some((outcome.stdout, outcome.elapsed_ms, outcome.device_name))
                         }
+                        Err(err) => {
+                            warn!("WGPU execution failed, falling back to CPU SIMD: {err}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                #[cfg(not(feature = "gpu-wgpu"))]
+                let wgpu_res: Option<(String, u64, String)> = None;
+
+                match wgpu_res {
+                    Some(res) => res,
+                    None => {
+                        let (stdout, elapsed) = cpu_simd::execute_simd_compute_with_device(
+                            kernel_name,
+                            input_data,
+                            *task_id.as_uuid(),
+                            dim,
+                            tile,
+                            start_time,
+                            "CPU SIMD Fallback",
+                            "[GPU COMPUTE SIMULATOR]",
+                        );
+                        (stdout, elapsed, "CPU SIMD Fallback".to_string())
                     }
                 }
             }
-
-            // Invariant checksums: Trace, Frobenius Norm, IEEE-754 bit hash
-            let mut trace = 0.0f64;
-            let mut f_norm_sq = 0.0f64;
-            let mut bit_hash: u64 = 0xcbf29ce484222325;
-
-            for i in 0..dim {
-                trace += c[i * dim + i] as f64;
-            }
-            for &val in &c {
-                let v = val as f64;
-                f_norm_sq += v * v;
-                bit_hash ^= val.to_bits() as u64;
-                bit_hash = bit_hash.wrapping_mul(0x100000001b3);
-            }
-            let f_norm = f_norm_sq.sqrt();
-            let elapsed = std::cmp::max(1, start_time.elapsed().as_millis() as u64);
-
-            let stdout = format!(
-                "[GPU COMPUTE SIMULATOR]\nDevice: Simulated Virtual GPU (Matrix Engine)\nKernel: {}\nMatrix Dimension: {dim}x{dim} (FLOPs: {})\nWork Group Size: {tile}x{tile}\nExecution Time: {elapsed} ms\nMatrix Trace: {:.4}\nFrobenius Norm: {:.4}\nVerification Digest: 0x{:016x}\nStatus: VERIFIED_OK\n",
-                kernel_name,
-                2 * dim * dim * dim,
-                trace,
-                f_norm,
-                bit_hash,
-            );
-
-            (stdout, elapsed)
         };
 
         tokio::select! {
-            (stdout, elapsed) = compute_fut => {
+            (stdout, elapsed, device_name) = compute_fut => {
                 TaskResult {
                     worker_id: self.worker_id,
                     task_id,
                     exit_code: EXIT_CODE_SUCCESS,
-                    stdout,
-                    stderr: String::new(),
+                    stdout: stdout.into(),
+                    stderr: Bytes::new(),
                     execution_time_ms: elapsed,
                     is_gpu_executed: true,
+                    device_name: Some(device_name),
                     error: None,
                 }
             }
@@ -614,7 +703,7 @@ impl TaskRunner {
         args: &[String],
         env: &HashMap<String, String>,
         working_dir: Option<&PathBuf>,
-        stdin: Option<&Vec<u8>>,
+        stdin: Option<&[u8]>,
         timeout: Duration,
         child_pid: Option<Arc<AtomicU32>>,
         cancel_rx: Option<oneshot::Receiver<String>>,
@@ -666,7 +755,7 @@ impl TaskRunner {
                 args,
                 &effective_cwd,
                 env,
-                stdin.cloned(),
+                stdin.map(|s| s.to_vec()),
                 timeout,
                 child_pid,
                 cancel_rx,
@@ -923,10 +1012,13 @@ impl TaskRunner {
                 }
             }
             if !found_artifacts.is_empty() {
-                res.stdout.push_str(&format!(
+                let notice = format!(
                     "\n[rusty_grid: compilation artifacts generated in target/: {}]\n",
                     found_artifacts.join(", ")
-                ));
+                );
+                let mut combined = BytesMut::from(res.stdout.as_bytes());
+                combined.extend_from_slice(notice.as_bytes());
+                res.stdout = combined.freeze().into();
             }
         }
 
@@ -1051,7 +1143,7 @@ impl TaskRunner {
             if let Some(pipe) = child_stdout {
                 read_bounded_stream(pipe, max_output).await
             } else {
-                (String::new(), false)
+                (Bytes::new(), false)
             }
         };
 
@@ -1060,18 +1152,18 @@ impl TaskRunner {
             if let Some(pipe) = child_stderr {
                 read_bounded_stream(pipe, max_output).await
             } else {
-                (String::new(), false)
+                (Bytes::new(), false)
             }
         };
 
         let execution_fut = async {
-            let (_, (stdout_str, _), (stderr_str, _), status_res) =
+            let (_, (stdout_bytes, _), (stderr_bytes, _), status_res) =
                 tokio::join!(stdin_fut, stdout_fut, stderr_fut, child.wait());
-            (stdout_str, stderr_str, status_res)
+            (stdout_bytes, stderr_bytes, status_res)
         };
 
         tokio::select! {
-            (stdout_str, stderr_str, status_res) = execution_fut => {
+            (stdout_bytes, stderr_bytes, status_res) = execution_fut => {
                 let elapsed = start_time.elapsed().as_millis() as u64;
                 match status_res {
                     Ok(status) => {
@@ -1090,16 +1182,16 @@ impl TaskRunner {
                             }
                         };
                         if status.success() {
-                            let mut res = TaskResult::success(self.worker_id, task_id, stdout_str, elapsed, false);
-                            res.stderr = stderr_str;
+                            let mut res = TaskResult::success(self.worker_id, task_id, stdout_bytes, elapsed, false);
+                            res.stderr = stderr_bytes;
                             res
                         } else {
                             TaskResult::failure(
                                 self.worker_id,
                                 task_id,
                                 code,
-                                stdout_str,
-                                stderr_str,
+                                stdout_bytes,
+                                stderr_bytes,
                                 elapsed,
                                 None,
                             )
@@ -1110,8 +1202,8 @@ impl TaskRunner {
                             self.worker_id,
                             task_id,
                             EXIT_CODE_GENERAL_ERROR,
-                            stdout_str,
-                            stderr_str,
+                            stdout_bytes,
+                            stderr_bytes,
                             elapsed,
                             Some(format!("Process wait error: {e}")),
                         )
@@ -1257,7 +1349,7 @@ mod tests {
         let res = runner.execute_task(&task, None, None).await;
         assert!(res.is_success());
         assert_eq!(res.exit_code, 0);
-        assert!(res.stdout.contains("hello rusty_grid"));
+        assert!(res.stdout_str().contains("hello rusty_grid"));
         assert!(!res.is_gpu_executed);
     }
 
@@ -1282,13 +1374,13 @@ mod tests {
             args: vec![],
             env: HashMap::new(),
             working_dir: None,
-            stdin: Some(b"piped input data\n".to_vec()),
+            stdin: Some(b"piped input data\n".to_vec().into()),
         };
         let task = Task::new(spec, TaskRequirements::generic(1, 10));
 
         let res = runner.execute_task(&task, None, None).await;
         assert!(res.is_success());
-        assert_eq!(res.stdout, "piped input data\n");
+        assert_eq!(res.stdout_str(), "piped input data\n");
     }
 
     #[tokio::test]
@@ -1311,8 +1403,8 @@ mod tests {
 
         let res = runner.execute_task(&task, None, None).await;
         assert!(res.is_success());
-        assert!(res.stdout.contains("MY_CUSTOM_VAL"));
-        assert!(res.stdout.contains(&task.id.to_string()));
+        assert!(res.stdout_str().contains("MY_CUSTOM_VAL"));
+        assert!(res.stdout_str().contains(&task.id.to_string()));
     }
 
     #[tokio::test]
@@ -1326,7 +1418,7 @@ mod tests {
 
         let res = runner.execute_task(&task, None, None).await;
         assert!(res.is_success());
-        assert_eq!(res.stdout.trim(), "15");
+        assert_eq!(res.stdout_str().trim(), "15");
     }
 
     #[tokio::test]
@@ -1341,8 +1433,8 @@ mod tests {
         let res = runner.execute_task(&task, None, None).await;
         assert_eq!(res.exit_code, EXIT_CODE_TIMEOUT);
         assert!(!res.is_success());
-        assert!(res.error.unwrap().contains("timed out after 1s"));
-        assert!(res.stderr.contains("Task timed out after 1s"));
+        assert!(res.error.as_ref().unwrap().contains("timed out after 1s"));
+        assert!(res.stderr_str().contains("Task timed out after 1s"));
     }
 
     #[tokio::test]
@@ -1395,9 +1487,9 @@ mod tests {
         assert_eq!(res.exit_code, 0);
         assert!(res.is_gpu_executed);
         assert!(res.execution_time_ms >= 1);
-        assert!(res.stdout.contains("VERIFIED_OK"));
-        assert!(res.stdout.contains("Matrix Trace:"));
-        assert!(res.stdout.contains("Frobenius Norm:"));
+        assert!(res.stdout_str().contains("VERIFIED_OK"));
+        assert!(res.stdout_str().contains("Matrix Trace:"));
+        assert!(res.stdout_str().contains("Frobenius Norm:"));
     }
 
     #[tokio::test]
@@ -1422,6 +1514,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_runner_checkpoint_emission_and_resumption() {
+        let runner = test_runner(false);
+        let task = Task::new(
+            TaskSpec::builtin_test("hash_compute", 100),
+            TaskRequirements::generic(1, 10),
+        );
+
+        // 1. Run full 100 iterations uninterrupted
+        let full_res = runner.execute_task(&task, None, None).await;
+        assert!(full_res.is_success());
+        let full_output = full_res.stdout_str();
+        assert!(full_output.contains("100 iterations"));
+
+        let digest_pos = full_output.find("digest = ").expect("digest must exist");
+        let full_digest = &full_output[digest_pos..];
+
+        // 2. Run with checkpoint emission channel
+        let (cp_tx, mut cp_rx) = mpsc::channel(10);
+        let task_clone = task.clone();
+        let runner_clone = test_runner(false);
+        let run_handle = tokio::spawn(async move {
+            runner_clone
+                .execute_task_with_checkpoint(&task_clone, None, Some(cp_tx), None, None)
+                .await
+        });
+
+        // Receive emitted checkpoint at iteration 50
+        let received_cp = cp_rx.recv().await.expect("must emit checkpoint");
+        let (cp_seq, cp_delta) = match received_cp {
+            WorkerMessage::Checkpoint { sequence, delta_state, .. } => (sequence, delta_state),
+            other => panic!("Unexpected message: {:?}", other),
+        };
+        assert_eq!(cp_seq, 1);
+        assert_eq!(cp_delta.len(), 16);
+
+        let _ = run_handle.await;
+
+        // 3. Resume another worker from iteration 50 checkpoint
+        let cp_data = CheckpointData {
+            sequence: cp_seq,
+            delta_state: cp_delta,
+            timestamp: 12345,
+        };
+        let resumed_res = runner
+            .execute_task_with_checkpoint(&task, Some(&cp_data), None, None, None)
+            .await;
+        assert!(resumed_res.is_success());
+        let resumed_output = resumed_res.stdout_str();
+        assert!(resumed_output.contains("resumed from 50"));
+        let resumed_digest_pos = resumed_output.find("digest = ").expect("digest must exist");
+        let resumed_digest = &resumed_output[resumed_digest_pos..];
+
+        assert_eq!(full_digest, resumed_digest);
+    }
+
+    #[tokio::test]
     async fn test_runner_rust_compilation_workflow() {
         let runner = test_runner(false);
         let mut sources = HashMap::new();
@@ -1438,6 +1586,6 @@ mod tests {
         let res = runner.execute_task(&task, None, None).await;
         assert!(res.is_success());
         assert_eq!(res.exit_code, 0);
-        assert!(res.stdout.contains("compilation artifacts generated"));
+        assert!(res.stdout_str().contains("compilation artifacts generated"));
     }
 }

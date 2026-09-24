@@ -1775,6 +1775,7 @@ async fn test_tier3_pairwise_dynamic_load_backpressure_high_cpu() {
                     stderr: "".into(),
                     execution_time_ms: 10,
                     is_gpu_executed: false,
+                    device_name: None,
                     error: None,
                 })
                 .await
@@ -1938,6 +1939,7 @@ async fn test_tier3_pairwise_mobile_worker_thermal_throttling_constraint() {
         stderr: "".into(),
         execution_time_ms: 10,
         is_gpu_executed: false,
+        device_name: None,
         error: None,
     })
     .await
@@ -2001,6 +2003,7 @@ async fn test_tier3_pairwise_mobile_worker_low_battery_constraint() {
             stderr: "".into(),
             execution_time_ms: 5,
             is_gpu_executed: false,
+            device_name: None,
             error: None,
         })
         .await;

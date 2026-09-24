@@ -129,6 +129,15 @@ class OxideAgentNode:
         }
         await self.ws.send(json.dumps(reg_msg))
 
+    async def listen(self):
+        """Processes incoming messages from the WebSocket."""
+        async for raw_msg in self.ws:
+            try:
+                msg = json.loads(raw_msg)
+                asyncio.create_task(self._dispatch_incoming(msg))
+            except Exception as e:
+                logger.error(f"Error handling incoming message: {e}")
+
     async def run(self):
         """Main client loop with automatic reconnection."""
         backoff = 1.0
@@ -141,12 +150,7 @@ class OxideAgentNode:
                 hb_task = asyncio.create_task(self._heartbeat_loop())
 
                 # Message pump
-                async for raw_msg in self.ws:
-                    try:
-                        msg = json.loads(raw_msg)
-                        asyncio.create_task(self._dispatch_incoming(msg))
-                    except Exception as e:
-                        logger.error(f"Error handling incoming message: {e}")
+                await self.listen()
 
                 hb_task.cancel()
 
@@ -422,6 +426,50 @@ class OxideAgentNode:
         await self.ws.send(json.dumps(payload_msg))
         return corr_id, sha256_hash
 
+    async def submit_grid_compute(
+        self,
+        kernel: str = "matrix_multiply",
+        matrix_dim: int = 128,
+        timeout_s: float = 30.0,
+    ) -> dict:
+        """
+        Submits a GPU/matrix compute job to the OxideSwarm Grid via the Agent-Grid Bridge.
+        Awaits and returns the CommandResponse envelope dictionary.
+        """
+        args = {
+            "kernel_name": kernel,
+            "kernel": kernel,
+            "matrix_dim": matrix_dim,
+            "simulated_matrix_dim": matrix_dim,
+        }
+        return await self.send_command("grid", "grid_compute", args, timeout=timeout_s)
+
+    async def submit_grid_compile(
+        self,
+        crate_name: str,
+        files: dict = None,
+        flags: list = None,
+        timeout_s: float = 60.0,
+    ) -> dict:
+        """
+        Submits a distributed Rust compilation job to the OxideSwarm Grid via the Agent-Grid Bridge.
+        Awaits and returns the CommandResponse envelope dictionary.
+        """
+        args = {
+            "crate_name": crate_name,
+            "source_files": files if files is not None else {
+                "src/main.rs": 'fn main() { println!("Hello from compiled agent grid binary!"); }'
+            },
+            "compiler_flags": flags or ["build"],
+        }
+        return await self.send_command("grid", "grid_compile", args, timeout=timeout_s)
+
+    async def query_grid_status(self, timeout_s: float = 10.0) -> dict:
+        """
+        Queries cluster status from the Master Grid scheduler via the Agent-Grid Bridge.
+        """
+        return await self.send_command("grid", "grid_status", {}, timeout=timeout_s)
+
     async def close(self):
         self.running = False
         if self.ws:
@@ -437,11 +485,132 @@ def main():
     parser.add_argument("--id", default=default_id, help="Node ID")
     parser.add_argument("--platform", default=detected_plat, help="Platform tag (windows, macos, ubuntu, android)")
     parser.add_argument("--hostname", default=None, help="Hostname override")
+
+    # Command submission options (flags & subcommands supported)
+    parser.add_argument(
+        "--submit-grid-compute",
+        nargs="?",
+        const="matrix_multiply",
+        default=None,
+        help="Submit compute job to grid and exit",
+    )
+    parser.add_argument(
+        "--submit-grid-compile",
+        nargs="?",
+        const="sample_crate",
+        default=None,
+        help="Submit compilation job to grid and exit",
+    )
+    parser.add_argument(
+        "--query-grid-status",
+        "--grid-status",
+        dest="query_grid_status",
+        action="store_true",
+        help="Query grid status and exit",
+    )
+    parser.add_argument("--kernel", default=None, help="Compute kernel name")
+    parser.add_argument("--matrix-dim", type=int, default=128, help="Matrix dimension")
+    parser.add_argument("--crate-name", default="sample_crate", help="Crate name for compilation")
+    parser.add_argument("--flags", nargs="*", default=["build"], help="Compiler flags")
+    parser.add_argument("--timeout", type=float, default=30.0, help="Operation timeout in seconds")
+
+    subparsers = parser.add_subparsers(dest="subcommand", help="Optional subcommand")
+    compute_sub = subparsers.add_parser("grid-compute", help="Submit compute job")
+    compute_sub.add_argument("kernel", nargs="?", default="matrix_multiply")
+    compute_sub.add_argument("--matrix-dim", type=int, default=128)
+    compute_sub.add_argument("--timeout", type=float, default=30.0)
+
+    compile_sub = subparsers.add_parser("grid-compile", help="Submit compilation job")
+    compile_sub.add_argument("--crate-name", default="sample_crate")
+    compile_sub.add_argument("--flags", nargs="*", default=["build"])
+    compile_sub.add_argument("--timeout", type=float, default=60.0)
+
+    status_sub = subparsers.add_parser("grid-status", help="Query grid status")
+    status_sub.add_argument("--timeout", type=float, default=10.0)
+
     args = parser.parse_args()
 
     node = OxideAgentNode(args.hub, args.id, args.platform, args.hostname)
+
+    async def execute():
+        is_compute = (
+            args.submit_grid_compute is not None
+            or args.subcommand in ("grid-compute", "submit-grid-compute")
+        )
+        is_compile = (
+            args.submit_grid_compile is not None
+            or args.subcommand in ("grid-compile", "submit-grid-compile")
+        )
+        is_status = (
+            getattr(args, "query_grid_status", False)
+            or args.subcommand in ("grid-status", "query-grid-status")
+        )
+
+        if is_compute:
+            kernel = args.kernel or (
+                args.submit_grid_compute
+                if isinstance(args.submit_grid_compute, str) and args.submit_grid_compute != "matrix_multiply"
+                else "matrix_multiply"
+            )
+            if not kernel:
+                kernel = "matrix_multiply"
+            await node.connect()
+            listener_task = asyncio.create_task(node.listen())
+            try:
+                res = await node.submit_grid_compute(
+                    kernel=kernel,
+                    matrix_dim=args.matrix_dim,
+                    timeout_s=args.timeout,
+                )
+                print(json.dumps(res, indent=2))
+                is_ok = res.get("status") == "success" and res.get("exit_code") == 0
+                sys.exit(0 if is_ok else 1)
+            finally:
+                listener_task.cancel()
+                await node.close()
+
+        elif is_compile:
+            crate_name = args.crate_name or (
+                args.submit_grid_compile
+                if isinstance(args.submit_grid_compile, str)
+                else "sample_crate"
+            )
+            files = {
+                "src/main.rs": 'fn main() { println!("Hello from compiled agent grid binary!"); }'
+            }
+            await node.connect()
+            listener_task = asyncio.create_task(node.listen())
+            try:
+                res = await node.submit_grid_compile(
+                    crate_name=crate_name,
+                    files=files,
+                    flags=args.flags,
+                    timeout_s=args.timeout,
+                )
+                print(json.dumps(res, indent=2))
+                is_ok = res.get("status") == "success" and res.get("exit_code") == 0
+                sys.exit(0 if is_ok else 1)
+            finally:
+                listener_task.cancel()
+                await node.close()
+
+        elif is_status:
+            await node.connect()
+            listener_task = asyncio.create_task(node.listen())
+            try:
+                res = await node.query_grid_status(timeout_s=args.timeout)
+                print(json.dumps(res, indent=2))
+                is_ok = res.get("status") == "success" and res.get("exit_code") == 0
+                sys.exit(0 if is_ok else 1)
+            finally:
+                listener_task.cancel()
+                await node.close()
+
+        else:
+            await node.run()
+
     try:
-        asyncio.run(node.run())
+        asyncio.run(execute())
     except KeyboardInterrupt:
         logger.info("Agent node stopped by user.")
 

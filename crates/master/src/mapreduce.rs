@@ -103,7 +103,7 @@ done"#
                         args: vec!["-c".into(), script.into()],
                         env: HashMap::new(),
                         working_dir: None,
-                        stdin: Some(chunk_input.into_bytes()),
+                        stdin: Some(chunk_input.into_bytes().into()),
                     }
                 }
                 MapFunctionSpec::ShellScript { script } => TaskSpec::Command {
@@ -111,14 +111,14 @@ done"#
                     args: vec!["-c".into(), script.clone()],
                     env: HashMap::new(),
                     working_dir: None,
-                    stdin: Some(chunk_input.into_bytes()),
+                    stdin: Some(chunk_input.into_bytes().into()),
                 },
                 MapFunctionSpec::Command { program, args } => TaskSpec::Command {
                     program: program.clone(),
                     args: args.clone(),
                     env: HashMap::new(),
                     working_dir: None,
-                    stdin: Some(chunk_input.into_bytes()),
+                    stdin: Some(chunk_input.into_bytes().into()),
                 },
             };
 
@@ -141,7 +141,7 @@ done"#
                     execution_time_ms: start_time.elapsed().as_millis() as u64,
                     error: Some(format!(
                         "Map partition {} failed with exit code {}: {}",
-                        idx, result.exit_code, result.stderr
+                        idx, result.exit_code, result.stderr_str()
                     )),
                 });
             }
@@ -149,7 +149,7 @@ done"#
             map_tasks_completed += 1;
 
             // Parse output lines into key-value pairs
-            for line in result.stdout.lines() {
+            for line in result.stdout_str().lines() {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -257,7 +257,7 @@ done"#
                         args: vec!["-c".into(), script.clone()],
                         env: HashMap::new(),
                         working_dir: None,
-                        stdin: Some(stdin_bytes),
+                        stdin: Some(stdin_bytes.into()),
                     };
                     let task = Task::new(
                         task_spec,
@@ -276,12 +276,12 @@ done"#
                             execution_time_ms: start_time.elapsed().as_millis() as u64,
                             error: Some(format!(
                                 "Reducer for key '{key}' failed: {}",
-                                result.stderr
+                                result.stderr_str()
                             )),
                         });
                     }
-                    serde_json::from_str(result.stdout.trim()).unwrap_or_else(|_| {
-                        serde_json::Value::String(result.stdout.trim().to_string())
+                    serde_json::from_str(result.stdout_str().trim()).unwrap_or_else(|_| {
+                        serde_json::Value::String(result.stdout_str().trim().to_string())
                     })
                 }
                 ReduceFunctionSpec::Command { program, args } => {
@@ -295,7 +295,7 @@ done"#
                         args: args.clone(),
                         env: HashMap::new(),
                         working_dir: None,
-                        stdin: Some(stdin_bytes),
+                        stdin: Some(stdin_bytes.into()),
                     };
                     let task = Task::new(
                         task_spec,
@@ -314,12 +314,12 @@ done"#
                             execution_time_ms: start_time.elapsed().as_millis() as u64,
                             error: Some(format!(
                                 "Reducer for key '{key}' failed: {}",
-                                result.stderr
+                                result.stderr_str()
                             )),
                         });
                     }
-                    serde_json::from_str(result.stdout.trim()).unwrap_or_else(|_| {
-                        serde_json::Value::String(result.stdout.trim().to_string())
+                    serde_json::from_str(result.stdout_str().trim()).unwrap_or_else(|_| {
+                        serde_json::Value::String(result.stdout_str().trim().to_string())
                     })
                 }
             };

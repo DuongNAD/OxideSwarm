@@ -222,6 +222,50 @@ async fn test_master_server_rpc_resilience_on_web_ui_port_conflict() {
 }
 
 #[tokio::test]
+async fn test_master_server_explicit_dashboard_port_conflict_returns_io_error() {
+    // 1. Bind a TCP listener to a dedicated port to simulate a port conflict
+    let blocker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let occupied_port = blocker.local_addr().unwrap().port();
+
+    // 2. Case A: Explicit dashboard_port with default web_ui setting -> MUST return Err(GridError::Io)
+    let config_a = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_dashboard_port(occupied_port);
+
+    let res_a = MasterServer::spawn(config_a).await;
+    match res_a {
+        Err(rusty_grid_core::GridError::Io(err)) => {
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::AddrInUse,
+                "Explicit dashboard_port collision must fail with AddrInUse"
+            );
+        }
+        Ok(_) => panic!("MasterServer::spawn must NOT succeed when explicit dashboard_port is conflicted"),
+        Err(other) => panic!("Expected GridError::Io, got: {other:?}"),
+    }
+
+    // 3. Case B: Explicit dashboard_port with with_web_ui(true) -> MUST ALSO return Err(GridError::Io)
+    let config_b = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_web_ui(true)
+        .with_dashboard_port(occupied_port);
+
+    let res_b = MasterServer::spawn(config_b).await;
+    match res_b {
+        Err(rusty_grid_core::GridError::Io(err)) => {
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::AddrInUse,
+                "Explicit dashboard_port collision with web_ui=true must fail with AddrInUse"
+            );
+        }
+        Ok(_) => panic!("MasterServer::spawn must NOT succeed when explicit dashboard_port is conflicted"),
+        Err(other) => panic!("Expected GridError::Io, got: {other:?}"),
+    }
+
+    drop(blocker);
+}
+
+#[tokio::test]
 async fn test_web_ui_port_release_and_reuse_after_shutdown() {
     // Find an available port by binding and immediately dropping
     let test_port = {

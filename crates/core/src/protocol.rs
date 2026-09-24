@@ -8,7 +8,7 @@ use tokio_util::codec::{Framed, FramedRead, FramedWrite, LengthDelimitedCodec};
 use uuid::Uuid;
 
 use crate::capabilities::WorkerCapabilities;
-use crate::task::{Task, TaskId, TaskResult, TaskStatus};
+use crate::task::{Bytes as TaskBytes, CheckpointData, Task, TaskId, TaskResult, TaskStatus};
 
 /// Maximum allowable frame size in bytes (64 MB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -120,11 +120,18 @@ pub enum WorkerMessage {
         worker_id: Uuid,
         task_id: TaskId,
         exit_code: i32,
-        stdout: String,
-        stderr: String,
+        stdout: TaskBytes,
+        stderr: TaskBytes,
         execution_time_ms: u64,
         is_gpu_executed: bool,
+        device_name: Option<String>,
         error: Option<String>,
+    },
+    /// Incremental computational snapshot checkpoint emitted during task execution.
+    Checkpoint {
+        task_id: TaskId,
+        sequence: u64,
+        delta_state: TaskBytes,
     },
     /// Graceful announcement that the worker is disconnecting.
     Disconnecting { worker_id: Uuid, reason: String },
@@ -155,12 +162,19 @@ enum HumanWorkerMessage {
         worker_id: Uuid,
         task_id: TaskId,
         exit_code: i32,
-        stdout: String,
-        stderr: String,
+        stdout: TaskBytes,
+        stderr: TaskBytes,
         execution_time_ms: u64,
         is_gpu_executed: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+    Checkpoint {
+        task_id: TaskId,
+        sequence: u64,
+        delta_state: TaskBytes,
     },
     Disconnecting {
         worker_id: Uuid,
@@ -190,17 +204,24 @@ enum BinaryWorkerMessage {
         worker_id: Uuid,
         task_id: TaskId,
         exit_code: i32,
-        stdout: String,
-        stderr: String,
+        stdout: TaskBytes,
+        stderr: TaskBytes,
         execution_time_ms: u64,
         is_gpu_executed: bool,
+        device_name: Option<String>,
         error: Option<String>,
+    },
+    Checkpoint {
+        task_id: TaskId,
+        sequence: u64,
+        delta_state: TaskBytes,
     },
     Disconnecting {
         worker_id: Uuid,
         reason: String,
     },
 }
+
 
 impl From<WorkerMessage> for HumanWorkerMessage {
     fn from(msg: WorkerMessage) -> Self {
@@ -242,6 +263,7 @@ impl From<WorkerMessage> for HumanWorkerMessage {
                 stderr,
                 execution_time_ms,
                 is_gpu_executed,
+                device_name,
                 error,
             } => HumanWorkerMessage::TaskResult {
                 worker_id,
@@ -251,7 +273,17 @@ impl From<WorkerMessage> for HumanWorkerMessage {
                 stderr,
                 execution_time_ms,
                 is_gpu_executed,
+                device_name,
                 error,
+            },
+            WorkerMessage::Checkpoint {
+                task_id,
+                sequence,
+                delta_state,
+            } => HumanWorkerMessage::Checkpoint {
+                task_id,
+                sequence,
+                delta_state,
             },
             WorkerMessage::Disconnecting { worker_id, reason } => {
                 HumanWorkerMessage::Disconnecting { worker_id, reason }
@@ -300,6 +332,7 @@ impl From<HumanWorkerMessage> for WorkerMessage {
                 stderr,
                 execution_time_ms,
                 is_gpu_executed,
+                device_name,
                 error,
             } => WorkerMessage::TaskResult {
                 worker_id,
@@ -309,7 +342,17 @@ impl From<HumanWorkerMessage> for WorkerMessage {
                 stderr,
                 execution_time_ms,
                 is_gpu_executed,
+                device_name,
                 error,
+            },
+            HumanWorkerMessage::Checkpoint {
+                task_id,
+                sequence,
+                delta_state,
+            } => WorkerMessage::Checkpoint {
+                task_id,
+                sequence,
+                delta_state,
             },
             HumanWorkerMessage::Disconnecting { worker_id, reason } => {
                 WorkerMessage::Disconnecting { worker_id, reason }
@@ -358,6 +401,7 @@ impl From<WorkerMessage> for BinaryWorkerMessage {
                 stderr,
                 execution_time_ms,
                 is_gpu_executed,
+                device_name,
                 error,
             } => BinaryWorkerMessage::TaskResult {
                 worker_id,
@@ -367,7 +411,17 @@ impl From<WorkerMessage> for BinaryWorkerMessage {
                 stderr,
                 execution_time_ms,
                 is_gpu_executed,
+                device_name,
                 error,
+            },
+            WorkerMessage::Checkpoint {
+                task_id,
+                sequence,
+                delta_state,
+            } => BinaryWorkerMessage::Checkpoint {
+                task_id,
+                sequence,
+                delta_state,
             },
             WorkerMessage::Disconnecting { worker_id, reason } => {
                 BinaryWorkerMessage::Disconnecting { worker_id, reason }
@@ -416,6 +470,7 @@ impl From<BinaryWorkerMessage> for WorkerMessage {
                 stderr,
                 execution_time_ms,
                 is_gpu_executed,
+                device_name,
                 error,
             } => WorkerMessage::TaskResult {
                 worker_id,
@@ -425,7 +480,17 @@ impl From<BinaryWorkerMessage> for WorkerMessage {
                 stderr,
                 execution_time_ms,
                 is_gpu_executed,
+                device_name,
                 error,
+            },
+            BinaryWorkerMessage::Checkpoint {
+                task_id,
+                sequence,
+                delta_state,
+            } => WorkerMessage::Checkpoint {
+                task_id,
+                sequence,
+                delta_state,
             },
             BinaryWorkerMessage::Disconnecting { worker_id, reason } => {
                 WorkerMessage::Disconnecting { worker_id, reason }
@@ -433,6 +498,7 @@ impl From<BinaryWorkerMessage> for WorkerMessage {
         }
     }
 }
+
 
 impl Serialize for WorkerMessage {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -462,6 +528,7 @@ impl WorkerMessage {
             Self::Heartbeat { .. } => "Heartbeat",
             Self::TaskProgress { .. } => "TaskProgress",
             Self::TaskResult { .. } => "TaskResult",
+            Self::Checkpoint { .. } => "Checkpoint",
             Self::Disconnecting { .. } => "Disconnecting",
         }
     }
@@ -473,10 +540,12 @@ impl WorkerMessage {
             Self::Heartbeat { worker_id, .. } => *worker_id,
             Self::TaskProgress { worker_id, .. } => *worker_id,
             Self::TaskResult { worker_id, .. } => *worker_id,
+            Self::Checkpoint { .. } => Uuid::nil(),
             Self::Disconnecting { worker_id, .. } => *worker_id,
         }
     }
 }
+
 
 impl From<TaskResult> for WorkerMessage {
     fn from(r: TaskResult) -> Self {
@@ -488,6 +557,7 @@ impl From<TaskResult> for WorkerMessage {
             stderr: r.stderr,
             execution_time_ms: r.execution_time_ms,
             is_gpu_executed: r.is_gpu_executed,
+            device_name: r.device_name,
             error: r.error,
         }
     }
@@ -507,6 +577,11 @@ pub enum MasterMessage {
     HeartbeatAck { timestamp: u64 },
     /// Assignment of a task payload for execution.
     AssignTask { task: Task },
+    /// Assignment of a task payload with checkpoint data for delta resumption.
+    AssignTaskWithCheckpoint {
+        task: Task,
+        latest_checkpoint: Option<CheckpointData>,
+    },
     /// Directive to immediately abort and cancel an assigned or running task.
     CancelTask {
         task_id: TaskId,
@@ -535,6 +610,11 @@ enum HumanMasterMessage {
     AssignTask {
         task: Task,
     },
+    AssignTaskWithCheckpoint {
+        task: Task,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        latest_checkpoint: Option<CheckpointData>,
+    },
     CancelTask {
         task_id: TaskId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -561,6 +641,10 @@ enum BinaryMasterMessage {
     AssignTask {
         task: Task,
     },
+    AssignTaskWithCheckpoint {
+        task: Task,
+        latest_checkpoint: Option<CheckpointData>,
+    },
     CancelTask {
         task_id: TaskId,
         reason: Option<String>,
@@ -570,6 +654,7 @@ enum BinaryMasterMessage {
         grace_period_secs: Option<u64>,
     },
 }
+
 
 impl From<MasterMessage> for HumanMasterMessage {
     fn from(msg: MasterMessage) -> Self {
@@ -589,6 +674,13 @@ impl From<MasterMessage> for HumanMasterMessage {
                 HumanMasterMessage::HeartbeatAck { timestamp }
             }
             MasterMessage::AssignTask { task } => HumanMasterMessage::AssignTask { task },
+            MasterMessage::AssignTaskWithCheckpoint {
+                task,
+                latest_checkpoint,
+            } => HumanMasterMessage::AssignTaskWithCheckpoint {
+                task,
+                latest_checkpoint,
+            },
             MasterMessage::CancelTask { task_id, reason } => {
                 HumanMasterMessage::CancelTask { task_id, reason }
             }
@@ -621,6 +713,13 @@ impl From<HumanMasterMessage> for MasterMessage {
                 MasterMessage::HeartbeatAck { timestamp }
             }
             HumanMasterMessage::AssignTask { task } => MasterMessage::AssignTask { task },
+            HumanMasterMessage::AssignTaskWithCheckpoint {
+                task,
+                latest_checkpoint,
+            } => MasterMessage::AssignTaskWithCheckpoint {
+                task,
+                latest_checkpoint,
+            },
             HumanMasterMessage::CancelTask { task_id, reason } => {
                 MasterMessage::CancelTask { task_id, reason }
             }
@@ -653,6 +752,13 @@ impl From<MasterMessage> for BinaryMasterMessage {
                 BinaryMasterMessage::HeartbeatAck { timestamp }
             }
             MasterMessage::AssignTask { task } => BinaryMasterMessage::AssignTask { task },
+            MasterMessage::AssignTaskWithCheckpoint {
+                task,
+                latest_checkpoint,
+            } => BinaryMasterMessage::AssignTaskWithCheckpoint {
+                task,
+                latest_checkpoint,
+            },
             MasterMessage::CancelTask { task_id, reason } => {
                 BinaryMasterMessage::CancelTask { task_id, reason }
             }
@@ -685,6 +791,13 @@ impl From<BinaryMasterMessage> for MasterMessage {
                 MasterMessage::HeartbeatAck { timestamp }
             }
             BinaryMasterMessage::AssignTask { task } => MasterMessage::AssignTask { task },
+            BinaryMasterMessage::AssignTaskWithCheckpoint {
+                task,
+                latest_checkpoint,
+            } => MasterMessage::AssignTaskWithCheckpoint {
+                task,
+                latest_checkpoint,
+            },
             BinaryMasterMessage::CancelTask { task_id, reason } => {
                 MasterMessage::CancelTask { task_id, reason }
             }
@@ -726,11 +839,13 @@ impl MasterMessage {
             Self::RegisterAck { .. } => "RegisterAck",
             Self::HeartbeatAck { .. } => "HeartbeatAck",
             Self::AssignTask { .. } => "AssignTask",
+            Self::AssignTaskWithCheckpoint { .. } => "AssignTaskWithCheckpoint",
             Self::CancelTask { .. } => "CancelTask",
             Self::Shutdown { .. } => "Shutdown",
         }
     }
 }
+
 
 /// Messages sent from CLI client (or external RPC) to the Master node.
 #[derive(Debug, Clone, PartialEq)]
@@ -1375,14 +1490,50 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
                 Err(e) => {
                     // Fallback for InboundMessage when peer sent raw WorkerMessage or ClientMessage
                     if std::any::TypeId::of::<M>() == std::any::TypeId::of::<InboundMessage>() {
-                        if let Ok(w) = bincode::deserialize::<WorkerMessage>(&bytes[1..]) {
-                            let inbound = InboundMessage::Worker(w);
-                            let boxed: Box<dyn std::any::Any> = Box::new(inbound);
-                            if let Ok(m) = boxed.downcast::<M>() {
-                                return Ok((*m, WireCodec::Bincode));
+                        use bincode::Options;
+                        let slice = &bytes[1..];
+                        let slice_opts = bincode::DefaultOptions::new()
+                            .with_fixint_encoding()
+                            .allow_trailing_bytes()
+                            .with_limit(slice.len() as u64);
+
+                        // 1. Try WorkerMessage: verify exact byte consumption AND worker registration invariant
+                        let mut cursor_w = std::io::Cursor::new(slice);
+                        if let Ok(w) = slice_opts.deserialize_from::<_, WorkerMessage>(&mut cursor_w) {
+                            let matches_size = cursor_w.position() as usize == slice.len();
+                            let is_initial_worker_msg = matches!(w, WorkerMessage::Register { .. });
+                            if matches_size && is_initial_worker_msg {
+                                let inbound = InboundMessage::Worker(w);
+                                let boxed: Box<dyn std::any::Any> = Box::new(inbound);
+                                if let Ok(m) = boxed.downcast::<M>() {
+                                    return Ok((*m, WireCodec::Bincode));
+                                }
                             }
                         }
-                        if let Ok(c) = bincode::deserialize::<ClientMessage>(&bytes[1..]) {
+                        // 2. Try ClientMessage: verify exact byte consumption
+                        let mut cursor_c = std::io::Cursor::new(slice);
+                        if let Ok(c) = slice_opts.deserialize_from::<_, ClientMessage>(&mut cursor_c) {
+                            if cursor_c.position() as usize == slice.len() {
+                                let inbound = InboundMessage::Client(c);
+                                let boxed: Box<dyn std::any::Any> = Box::new(inbound);
+                                if let Ok(m) = boxed.downcast::<M>() {
+                                    return Ok((*m, WireCodec::Bincode));
+                                }
+                            }
+                        }
+                        // 3. Fallback: if WorkerMessage consumed all bytes without Register requirement
+                        let mut cursor_w2 = std::io::Cursor::new(slice);
+                        if let Ok(w) = slice_opts.deserialize_from::<_, WorkerMessage>(&mut cursor_w2) {
+                            if cursor_w2.position() as usize == slice.len() {
+                                let inbound = InboundMessage::Worker(w);
+                                let boxed: Box<dyn std::any::Any> = Box::new(inbound);
+                                if let Ok(m) = boxed.downcast::<M>() {
+                                    return Ok((*m, WireCodec::Bincode));
+                                }
+                            }
+                        }
+                        // 4. Fallback: if ClientMessage was sent without exact size check
+                        if let Ok(c) = slice_opts.deserialize::<ClientMessage>(slice) {
                             let inbound = InboundMessage::Client(c);
                             let boxed: Box<dyn std::any::Any> = Box::new(inbound);
                             if let Ok(m) = boxed.downcast::<M>() {
@@ -1777,7 +1928,13 @@ mod tests {
                 stderr: "".into(),
                 execution_time_ms: 120,
                 is_gpu_executed: true,
+                device_name: Some("Simulated M1 GPU".into()),
                 error: None,
+            },
+            WorkerMessage::Checkpoint {
+                task_id,
+                sequence: 1,
+                delta_state: TaskBytes::copy_from_slice(b"checkpoint-50"),
             },
             WorkerMessage::Disconnecting {
                 worker_id,
@@ -1790,7 +1947,11 @@ mod tests {
             let deserialized: WorkerMessage =
                 serde_json::from_str(&json).expect("deserialization failed");
             assert_eq!(msg, deserialized);
-            assert_eq!(msg.worker_id(), worker_id);
+            if let WorkerMessage::Checkpoint { .. } = msg {
+                assert_eq!(msg.worker_id(), Uuid::nil());
+            } else {
+                assert_eq!(msg.worker_id(), worker_id);
+            }
             assert!(!msg.variant_name().is_empty());
         }
     }
@@ -1829,7 +1990,31 @@ mod tests {
                     },
                     created_at_utc: 1726747200,
                     tags: vec!["test".into()],
+                    latest_checkpoint: None,
                 },
+            },
+            MasterMessage::AssignTaskWithCheckpoint {
+                task: Task {
+                    id: task_id,
+                    spec: TaskSpec::Command {
+                        program: "cargo".into(),
+                        args: vec!["test".into()],
+                        env: HashMap::new(),
+                        working_dir: None,
+                        stdin: None,
+                    },
+                    requirements: TaskRequirements {
+                        cpu_cores: 4,
+                        ram_mb: 8192,
+                        gpu_required: false,
+                        timeout_secs: 60,
+                        max_retries: None,
+                    },
+                    created_at_utc: 1726747200,
+                    tags: vec!["test".into()],
+                    latest_checkpoint: None,
+                },
+                latest_checkpoint: Some(CheckpointData::new(5, TaskBytes::copy_from_slice(b"checkpoint-state"))),
             },
             MasterMessage::CancelTask {
                 task_id,
@@ -1846,6 +2031,7 @@ mod tests {
             let deserialized: MasterMessage =
                 serde_json::from_str(&json).expect("deserialization failed");
             assert_eq!(msg, deserialized);
+
             assert!(!msg.variant_name().is_empty());
         }
     }

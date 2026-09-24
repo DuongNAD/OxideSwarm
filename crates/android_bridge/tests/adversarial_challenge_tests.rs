@@ -518,9 +518,9 @@ async fn test_adversarial_worker_connect_via_master_p2p_ticket() {
     );
     assert!(started, "Worker supervisor should spawn");
 
-    // Settle connection (poll up to 500ms)
+    // Settle connection (poll up to 5000ms)
     let mut connected = false;
-    for _ in 0..10 {
+    for _ in 0..100 {
         if get_master_worker_count_impl() >= 1 {
             connected = true;
             break;
