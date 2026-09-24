@@ -54,7 +54,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MASTER_ADDR="127.0.0.1:8088"
 WEB_UI_URL="http://127.0.0.1:8080"
 ADB_DEVICE_ID="R5CWC3QQ52H"
-OUTPUT_DIR="/Users/duongnad/teamwork_projects/oxideswarm_testing_hardening"
+OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/test_reports}"
 TASKS_COUNT=6
 WORKLOAD_DURATION=4
 CLI_BIN="${SCRIPT_DIR}/target/release/rusty-grid"
@@ -108,8 +108,9 @@ mkdir -p "${OUTPUT_DIR}"
 # ------------------------------------------------------------------------------
 ADB_BIN=""
 for candidate in \
-    "/Users/duongnad/Library/Android/sdk/platform-tools/adb" \
     "${ANDROID_HOME:-}/platform-tools/adb" \
+    "${ANDROID_SDK_ROOT:-}/platform-tools/adb" \
+    "${HOME}/Library/Android/sdk/platform-tools/adb" \
     "$(command -v adb 2>/dev/null || true)"; do
     if [[ -n "$candidate" && -x "$candidate" ]]; then
         ADB_BIN="$candidate"

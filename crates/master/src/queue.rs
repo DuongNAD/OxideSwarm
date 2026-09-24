@@ -279,6 +279,8 @@ pub struct QueueStats {
     pub cancelled: usize,
 }
 
+pub const DEFAULT_MAX_TERMINAL_TASKS: usize = 10_000;
+
 struct TaskQueueInner {
     tasks: HashMap<TaskId, TaskEntry>,
     ready_queue: BTreeSet<QueueOrderKey>,
@@ -287,6 +289,72 @@ struct TaskQueueInner {
     next_sequence: u64,
     retry_policy: RetryPolicy,
     capacity: Option<usize>,
+    max_terminal_tasks: usize,
+    terminal_order: std::collections::VecDeque<TaskId>,
+}
+
+impl TaskQueueInner {
+    fn track_terminal_task(&mut self, task_id: TaskId) {
+        self.terminal_order.push_back(task_id);
+        while self.terminal_order.len() > self.max_terminal_tasks {
+            if let Some(oldest) = self.terminal_order.pop_front() {
+                if let Some(entry) = self.tasks.get(&oldest) {
+                    if entry.state.is_terminal() {
+                        self.tasks.remove(&oldest);
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn evict_terminal_tasks(&mut self, max_retained: usize) -> usize {
+        let mut evicted = 0;
+        while self.terminal_order.len() > max_retained {
+            if let Some(oldest) = self.terminal_order.pop_front() {
+                if let Some(entry) = self.tasks.get(&oldest) {
+                    if entry.state.is_terminal() {
+                        self.tasks.remove(&oldest);
+                        evicted += 1;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        evicted
+    }
+
+    fn prune_terminal_older_than(&mut self, ttl: Duration) -> usize {
+        let now = Instant::now();
+        let mut evicted = 0;
+        let mut remaining = std::collections::VecDeque::new();
+        while let Some(task_id) = self.terminal_order.pop_front() {
+            let should_evict = if let Some(entry) = self.tasks.get(&task_id) {
+                if entry.state.is_terminal() {
+                    if let Some(finished) = entry.finished_instant {
+                        now.duration_since(finished) >= ttl
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if should_evict {
+                self.tasks.remove(&task_id);
+                evicted += 1;
+            } else if self.tasks.contains_key(&task_id) {
+                remaining.push_back(task_id);
+            }
+        }
+        self.terminal_order = remaining;
+        evicted
+    }
 }
 
 /// Thread-safe in-memory Task Queue and lifecycle coordinator.
@@ -309,6 +377,15 @@ impl TaskQueue {
 
     /// Creates a new TaskQueue with custom retry policy and optional capacity limit.
     pub fn with_config(retry_policy: RetryPolicy, capacity: Option<usize>) -> Self {
+        Self::with_retention(retry_policy, capacity, DEFAULT_MAX_TERMINAL_TASKS)
+    }
+
+    /// Creates a new TaskQueue with custom retry policy, capacity limit, and terminal retention limit.
+    pub fn with_retention(
+        retry_policy: RetryPolicy,
+        capacity: Option<usize>,
+        max_terminal_tasks: usize,
+    ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(TaskQueueInner {
                 tasks: HashMap::new(),
@@ -318,6 +395,8 @@ impl TaskQueue {
                 next_sequence: 1,
                 retry_policy,
                 capacity,
+                max_terminal_tasks,
+                terminal_order: std::collections::VecDeque::new(),
             })),
         }
     }
@@ -619,6 +698,10 @@ impl TaskQueue {
             inner.delayed_retries.insert(key);
         }
 
+        if res_state.is_terminal() {
+            inner.track_terminal_task(task_id);
+        }
+
         Ok(res_state)
     }
 
@@ -658,6 +741,7 @@ impl TaskQueue {
         let mut affected = Vec::with_capacity(assigned.len());
         let mut delays_to_insert = Vec::new();
         let mut ready_to_insert = Vec::new();
+        let mut terminal_to_track = Vec::new();
 
         for task_id in assigned {
             if let Some(entry) = inner.tasks.get_mut(&task_id) {
@@ -722,6 +806,7 @@ impl TaskQueue {
                         let fail_result =
                             TaskResult::failure(*worker_id, task_id, 1, "", "", 0, Some(err_msg));
                         entry.result = Some(fail_result);
+                        terminal_to_track.push(task_id);
                     }
                 }
             }
@@ -732,6 +817,9 @@ impl TaskQueue {
         }
         for key in ready_to_insert {
             inner.ready_queue.insert(key);
+        }
+        for tid in terminal_to_track {
+            inner.track_terminal_task(tid);
         }
 
         affected
@@ -860,6 +948,7 @@ impl TaskQueue {
                 entry.result = Some(cancel_result);
             }
         }
+        inner.track_terminal_task(*task_id);
 
         Ok(worker_to_notify)
     }
@@ -918,6 +1007,29 @@ impl TaskQueue {
         }
 
         stats
+    }
+
+    /// Dynamically adjusts the retention limit for terminal tasks and evicts oldest tasks exceeding this limit.
+    pub async fn set_max_terminal_tasks(&self, limit: usize) {
+        let mut inner = self.inner.write().await;
+        inner.max_terminal_tasks = limit;
+        inner.evict_terminal_tasks(limit);
+    }
+
+    /// Evicts oldest terminal tasks until at most `max_retained` terminal tasks remain.
+    ///
+    /// Returns the number of evicted tasks.
+    pub async fn evict_terminal_tasks(&self, max_retained: usize) -> usize {
+        let mut inner = self.inner.write().await;
+        inner.evict_terminal_tasks(max_retained)
+    }
+
+    /// Evicts terminal tasks (Completed, Failed, Cancelled) whose execution completed older than `ttl`.
+    ///
+    /// Returns the number of evicted tasks.
+    pub async fn prune_terminal_older_than(&self, ttl: Duration) -> usize {
+        let mut inner = self.inner.write().await;
+        inner.prune_terminal_older_than(ttl)
     }
 }
 
@@ -1166,5 +1278,50 @@ mod tests {
             err.contains("maximum retry limit (1) reached"),
             "Must record max retry limit 1: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_terminal_task_lru_retention_and_eviction() {
+        let queue = TaskQueue::with_retention(RetryPolicy::default(), None, 3);
+        let worker_id = Uuid::new_v4();
+
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let task = Task::new(
+                TaskSpec::command("echo", vec![format!("{i}")]),
+                TaskRequirements::generic(1, 10),
+            );
+            let tid = queue.submit(task).await.unwrap();
+            ids.push(tid);
+            let _ = queue.pop_and_schedule(worker_id, |_| true).await;
+            queue.mark_running(&tid, worker_id).await.unwrap();
+            let res = TaskResult::success(worker_id, tid, "ok", 10, false);
+            queue.record_result(res).await.unwrap();
+        }
+
+        // We submitted and completed 5 tasks with retention limit = 3.
+        // Oldest 2 tasks (ids[0] and ids[1]) should have been evicted.
+        assert!(queue.get_task(&ids[0]).await.is_none());
+        assert!(queue.get_result(&ids[0]).await.is_none());
+        assert!(queue.get_task(&ids[1]).await.is_none());
+        assert!(queue.get_result(&ids[1]).await.is_none());
+
+        // Newest 3 tasks (ids[2], ids[3], ids[4]) must be retained.
+        assert!(queue.get_task(&ids[2]).await.is_some());
+        assert!(queue.get_task(&ids[3]).await.is_some());
+        assert!(queue.get_task(&ids[4]).await.is_some());
+
+        // Dynamic eviction down to 1
+        let evicted = queue.evict_terminal_tasks(1).await;
+        assert_eq!(evicted, 2);
+        assert!(queue.get_task(&ids[2]).await.is_none());
+        assert!(queue.get_task(&ids[3]).await.is_none());
+        assert!(queue.get_task(&ids[4]).await.is_some());
+
+        // TTL pruning
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let pruned = queue.prune_terminal_older_than(Duration::from_millis(10)).await;
+        assert_eq!(pruned, 1);
+        assert!(queue.get_task(&ids[4]).await.is_none());
     }
 }

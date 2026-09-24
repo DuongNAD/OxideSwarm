@@ -216,8 +216,42 @@ fn test_cli_binary_mode_subcommand() {
     assert_eq!(json["success"], true);
 }
 
+fn resolve_functional_bash() -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+
+    #[cfg(windows)]
+    {
+        candidates.push(std::path::PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"));
+        candidates.push(std::path::PathBuf::from(r"C:\Program Files\Git\usr\bin\bash.exe"));
+        candidates.push(std::path::PathBuf::from(r"C:\Program Files (x86)\Git\bin\bash.exe"));
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            candidates.push(std::path::PathBuf::from(local_app_data).join(r"Programs\Git\bin\bash.exe"));
+        }
+    }
+
+    candidates.push(std::path::PathBuf::from("bash"));
+
+    for cand in candidates {
+        if let Ok(output) = std::process::Command::new(&cand).args(["-c", "exit 0"]).output() {
+            if output.status.success() {
+                return Some(cand);
+            }
+        }
+    }
+
+    None
+}
+
 #[test]
 fn test_bash_script_invocation() {
+    let bash_bin = match resolve_functional_bash() {
+        Some(bin) => bin,
+        None => {
+            eprintln!("Skipping test_bash_script_invocation: No functional bash interpreter found on host");
+            return;
+        }
+    };
+
     let root = find_workspace_root();
     let script = root.join("scripts/mode.sh");
     if !script.exists() {
@@ -225,7 +259,7 @@ fn test_bash_script_invocation() {
     }
 
     // Run bash script doc verify --json
-    let output = std::process::Command::new("bash")
+    let output = std::process::Command::new(&bash_bin)
         .arg(&script)
         .args(["doc", "verify", "--json"])
         .current_dir(&root)

@@ -39,11 +39,7 @@ if (-not $BinaryPath) {
         ".\target\release\agent-mesh.exe",
         ".\target\debug\agent-mesh.exe",
         "..\..\target\release\agent-mesh.exe",
-        "..\..\target\debug\agent-mesh.exe",
-        ".\target\release\rusty-grid.exe",
-        ".\target\debug\rusty-grid.exe",
-        "..\..\target\release\rusty-grid.exe",
-        "..\..\target\debug\rusty-grid.exe"
+        "..\..\target\debug\agent-mesh.exe"
     )
 
     foreach ($Cand in $Candidates) {

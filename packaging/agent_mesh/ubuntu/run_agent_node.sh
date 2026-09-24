@@ -26,10 +26,6 @@ if [[ -f "./target/release/agent-mesh" ]]; then
     BINARY="./target/release/agent-mesh"
 elif [[ -f "./target/debug/agent-mesh" ]]; then
     BINARY="./target/debug/agent-mesh"
-elif [[ -f "./target/release/rusty-grid" ]]; then
-    BINARY="./target/release/rusty-grid"
-elif [[ -f "./target/debug/rusty-grid" ]]; then
-    BINARY="./target/debug/rusty-grid"
 fi
 
 while true; do

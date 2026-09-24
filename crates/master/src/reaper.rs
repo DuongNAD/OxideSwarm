@@ -21,6 +21,10 @@ pub struct ReaperConfig {
     pub scan_interval: Duration,
     /// Inactivity threshold after which an uncommunicative worker is declared Disconnected (default: 10.0 seconds).
     pub timeout: Duration,
+    /// Inactivity threshold after which a disconnected worker is pruned from memory (default: 1 hour).
+    pub stale_worker_timeout: Option<Duration>,
+    /// Threshold after which terminal tasks are pruned from memory (default: None).
+    pub terminal_task_ttl: Option<Duration>,
 }
 
 impl Default for ReaperConfig {
@@ -28,6 +32,8 @@ impl Default for ReaperConfig {
         Self {
             scan_interval: Duration::from_secs(1),
             timeout: Duration::from_secs(10),
+            stale_worker_timeout: Some(Duration::from_secs(3600)),
+            terminal_task_ttl: None,
         }
     }
 }
@@ -37,6 +43,8 @@ impl ReaperConfig {
         Self {
             scan_interval,
             timeout,
+            stale_worker_timeout: Some(Duration::from_secs(3600)),
+            terminal_task_ttl: None,
         }
     }
 
@@ -47,6 +55,16 @@ impl ReaperConfig {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_stale_worker_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.stale_worker_timeout = timeout;
+        self
+    }
+
+    pub fn with_terminal_task_ttl(mut self, ttl: Option<Duration>) -> Self {
+        self.terminal_task_ttl = ttl;
         self
     }
 }
@@ -116,6 +134,18 @@ pub fn spawn_reaper_with_broadcast(
             tokio::select! {
                 _ = ticker.tick() => {
                     let reaped = registry.reap_stale_workers(config.timeout).await;
+                    if let Some(stale_timeout) = config.stale_worker_timeout {
+                        let pruned_workers = registry.prune_stale_workers(stale_timeout).await;
+                        if pruned_workers > 0 {
+                            debug!(count = pruned_workers, "Reaper pruned stale disconnected workers");
+                        }
+                    }
+                    if let Some(ttl) = config.terminal_task_ttl {
+                        let pruned_tasks = queue.prune_terminal_older_than(ttl).await;
+                        if pruned_tasks > 0 {
+                            debug!(count = pruned_tasks, "Reaper pruned old terminal tasks");
+                        }
+                    }
                     if !reaped.is_empty() {
                         warn!(
                             count = reaped.len(),
@@ -222,6 +252,18 @@ fn spawn_reaper_internal(
             tokio::select! {
                 _ = ticker.tick() => {
                     let reaped = registry.reap_stale_workers(config.timeout).await;
+                    if let Some(stale_timeout) = config.stale_worker_timeout {
+                        let pruned_workers = registry.prune_stale_workers(stale_timeout).await;
+                        if pruned_workers > 0 {
+                            debug!(count = pruned_workers, "Reaper pruned stale disconnected workers");
+                        }
+                    }
+                    if let Some(ttl) = config.terminal_task_ttl {
+                        let pruned_tasks = queue.prune_terminal_older_than(ttl).await;
+                        if pruned_tasks > 0 {
+                            debug!(count = pruned_tasks, "Reaper pruned old terminal tasks");
+                        }
+                    }
                     if !reaped.is_empty() {
                         warn!(
                             count = reaped.len(),
@@ -326,10 +368,7 @@ mod tests {
             .unwrap();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let config = ReaperConfig {
-            scan_interval: Duration::from_millis(20),
-            timeout: Duration::from_millis(50),
-        };
+        let config = ReaperConfig::new(Duration::from_millis(20), Duration::from_millis(50));
 
         let handle = spawn_reaper(registry.clone(), config, shutdown_rx);
 

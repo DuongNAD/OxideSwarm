@@ -512,19 +512,8 @@ async fn api_chat(
         cluster_context, message
     );
 
-    // Locate agy CLI binary
-    let agy_candidates = [
-        "/Users/duongnad/.local/bin/agy",
-        "/usr/local/bin/agy",
-        "agy",
-    ];
-    let mut agy_bin = "agy";
-    for cand in agy_candidates {
-        if std::path::Path::new(cand).exists() {
-            agy_bin = cand;
-            break;
-        }
-    }
+    // Locate agy CLI binary dynamically
+    let agy_bin = resolve_agy_binary();
 
     let cmd_result = tokio::time::timeout(
         std::time::Duration::from_secs(60),
@@ -575,6 +564,47 @@ async fn api_chat(
             }),
         ),
     }
+}
+
+fn resolve_agy_binary() -> std::path::PathBuf {
+    let mut candidates = Vec::new();
+
+    // Check user home dir: $HOME/.local/bin or %USERPROFILE%\.local\bin
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        let home_path = std::path::PathBuf::from(home);
+        candidates.push(home_path.join(".local").join("bin").join("agy"));
+        #[cfg(windows)]
+        {
+            candidates.push(home_path.join(".local").join("bin").join("agy.exe"));
+            candidates.push(home_path.join(".local").join("bin").join("agy.bat"));
+            candidates.push(home_path.join(".local").join("bin").join("agy.cmd"));
+        }
+    }
+
+    // Common unix paths
+    candidates.push(std::path::PathBuf::from("/usr/local/bin/agy"));
+    candidates.push(std::path::PathBuf::from("/usr/bin/agy"));
+
+    // Check system PATH
+    if let Some(paths) = std::env::var_os("PATH") {
+        for p in std::env::split_paths(&paths) {
+            candidates.push(p.join("agy"));
+            #[cfg(windows)]
+            {
+                candidates.push(p.join("agy.exe"));
+                candidates.push(p.join("agy.bat"));
+                candidates.push(p.join("agy.cmd"));
+            }
+        }
+    }
+
+    for cand in candidates {
+        if cand.is_file() {
+            return cand;
+        }
+    }
+
+    std::path::PathBuf::from("agy")
 }
 
 #[derive(Serialize)]

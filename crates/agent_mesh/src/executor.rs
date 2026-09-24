@@ -260,8 +260,20 @@ impl CommandExecutor {
                 .output();
         }
 
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        #[cfg(unix)]
+        {
+            // On Unix, kill the process group (-pgid) and direct child processes via pkill
+            let pgid = pid as i32;
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &format!("-{pgid}")])
+                .output();
+            let _ = std::process::Command::new("pkill")
+                .args(["-9", "-P", &pid.to_string()])
+                .output();
+        }
+
+        let mut sys = System::new();
+        sys.refresh_processes();
         let target_pid = sysinfo::Pid::from(pid as usize);
 
         // Collect all descendant PIDs

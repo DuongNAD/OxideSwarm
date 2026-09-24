@@ -33,7 +33,7 @@ log_section() { echo -e "\n${CYAN}${BOLD}=======================================
 # ------------------------------------------------------------------------------
 MASTER_ADDR="127.0.0.1:8088"
 ADB_ID="R5CWC3QQ52H"
-OUTPUT_DIR="/Users/duongnad/teamwork_projects/oxideswarm_testing_hardening"
+OUTPUT_DIR="${OUTPUT_DIR:-./test_reports}"
 WORKLOAD="all"              # "hash", "matrix", or "all"
 HASH_CHUNKS=10              # 10 chunks
 HASH_CHUNK_SIZE_MB=10       # 10 MB per chunk -> 100 MB total
@@ -49,7 +49,7 @@ Automated heterogeneous distributed cluster benchmark for OxideSwarm.
 Options:
   --master <ADDR>       Master TCP socket address (default: 127.0.0.1:8088)
   --adb-id <ID>         Samsung Galaxy S24 ADB serial ID (default: R5CWC3QQ52H)
-  --output-dir <DIR>    Directory for emitted reports & logs (default: /Users/duongnad/teamwork_projects/oxideswarm_testing_hardening)
+  --output-dir <DIR>    Directory for emitted reports & logs (default: ./test_reports)
   --workload <TYPE>     Workload to benchmark: 'hash', 'matrix', or 'all' (default: all)
   --chunks <N>          Number of hash chunks to execute (default: 10)
   --chunk-size <MB>     Megabytes per hash chunk (default: 10)
@@ -113,8 +113,10 @@ log_section "Phase 1: Environment & Toolchain Resolution"
 # Auto-detect ADB
 if [[ -n "${ADB_PATH:-}" && -x "${ADB_PATH}" ]]; then
     ADB="${ADB_PATH}"
-elif [[ -x "/Users/duongnad/Library/Android/sdk/platform-tools/adb" ]]; then
-    ADB="/Users/duongnad/Library/Android/sdk/platform-tools/adb"
+elif [[ -n "${ANDROID_HOME:-}" && -x "${ANDROID_HOME}/platform-tools/adb" ]]; then
+    ADB="${ANDROID_HOME}/platform-tools/adb"
+elif [[ -n "${ANDROID_SDK_ROOT:-}" && -x "${ANDROID_SDK_ROOT}/platform-tools/adb" ]]; then
+    ADB="${ANDROID_SDK_ROOT}/platform-tools/adb"
 elif [[ -x "$HOME/Library/Android/sdk/platform-tools/adb" ]]; then
     ADB="$HOME/Library/Android/sdk/platform-tools/adb"
 elif command -v adb &>/dev/null; then
@@ -617,7 +619,7 @@ log_section "Phase 6: Emitting Verified Benchmark Reports (Markdown & JSON)"
 python3 - << 'PYEOF'
 import sys, os, csv, json, datetime
 
-output_dir = os.environ.get("OUTPUT_DIR") or "/Users/duongnad/teamwork_projects/oxideswarm_testing_hardening"
+output_dir = os.environ.get("OUTPUT_DIR") or "./test_reports"
 os.makedirs(output_dir, exist_ok=True)
 report_md_path = os.environ.get("REPORT_MD") or os.path.join(output_dir, "benchmark_report.md")
 report_json_path = os.environ.get("REPORT_JSON") or os.path.join(output_dir, "benchmark_data.json")

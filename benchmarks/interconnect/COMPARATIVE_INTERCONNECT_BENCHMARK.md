@@ -448,7 +448,7 @@ cargo test -p rusty_grid_core --test memory_bench -- --nocapture
 **Expected Outcome**: Confirms memory drift $< 10\text{ MB}$ after 20 cycles of 2 MB frames and validates exact 64 MB maximum frame rejection.
 
 ### 9.4 Verifying Deliverable Artifacts
-The accompanying structured data files are located in `/Users/duongnad/teamwork_projects/remote_cluster_interconnect/`:
+The accompanying structured data files are located in `benchmarks/interconnect/`:
 - `benchmark_data.json`: Valid JSON schema containing raw percentiles, latency models, and hardware telemetry.
 - `benchmark_matrix.csv`: Standard comma-separated tabular dataset ready for Excel, Google Sheets, or dashboard import.
 - `run_comparative_benchmark.sh`: Automated executable test harness.

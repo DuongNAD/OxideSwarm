@@ -89,10 +89,10 @@ fi
 
 log_section "Phase 4: Comparative Scoring Summary"
 
-python3 - << 'EOF'
-import json, os
+python3 - "${SCRIPT_DIR}/benchmark_data.json" << 'EOF'
+import json, os, sys
 
-data_path = "/Users/duongnad/teamwork_projects/remote_cluster_interconnect/benchmark_data.json"
+data_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_data.json")
 with open(data_path, "r") as f:
     d = json.load(f)
 

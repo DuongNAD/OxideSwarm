@@ -86,6 +86,11 @@ while [[ $# -gt 0 ]]; do
             if [[ -z "$TICKET" && ! "$1" =~ ^-- ]]; then
                 TICKET="$1"
                 shift
+                # If ticket is JSON and was split across arguments by Windows shell/quotes, reassemble
+                while [[ $# -gt 0 && ! "$1" =~ ^-- && "$TICKET" =~ ^\{ && ! "$TICKET" =~ \}$ ]]; do
+                    TICKET="${TICKET} $1"
+                    shift
+                done
             else
                 echo -e "${RED}[ERROR] Unknown option or extra argument: $1${NC}" >&2
                 show_help

@@ -383,7 +383,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_probe_http_candidate_active_master() {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -391,6 +391,9 @@ mod tests {
 
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
+                let mut req_buf = [0u8; 1024];
+                let _ = stream.read(&mut req_buf).await;
+
                 let json = serde_json::json!({
                     "master": {
                         "host": "MockMasterNode",
@@ -402,11 +405,13 @@ mod tests {
                 .to_string();
 
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                     json.len(),
                     json
                 );
                 let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+                let _ = stream.shutdown().await;
             }
         });
 

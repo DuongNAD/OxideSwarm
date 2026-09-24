@@ -243,6 +243,42 @@ impl WorkerRegistry {
         self.unregister(worker_id, None).await
     }
 
+    /// Unconditionally removes a worker from the registry (closing any active abort handle).
+    pub async fn remove_worker(&self, worker_id: &Uuid) -> Option<WorkerInfo> {
+        let mut inner = self.inner.write().await;
+        if let Some(entry) = inner.workers.remove(worker_id) {
+            if let Some(ref abort) = entry.abort_handle {
+                abort.abort();
+            }
+            Some(entry.to_info())
+        } else {
+            None
+        }
+    }
+
+    /// Evicts disconnected workers whose last heartbeat or registration occurred longer ago than `stale_timeout`.
+    pub async fn prune_stale_workers(&self, stale_timeout: Duration) -> usize {
+        let mut inner = self.inner.write().await;
+        let now = Instant::now();
+        let mut to_remove = Vec::new();
+        for (id, entry) in &inner.workers {
+            if entry.status == WorkerStatus::Disconnected {
+                if now.duration_since(entry.last_heartbeat_instant) >= stale_timeout {
+                    to_remove.push(*id);
+                }
+            }
+        }
+        let count = to_remove.len();
+        for id in to_remove {
+            if let Some(entry) = inner.workers.remove(&id) {
+                if let Some(abort) = entry.abort_handle {
+                    abort.abort();
+                }
+            }
+        }
+        count
+    }
+
     /// Updates worker status with session validation.
     pub async fn set_status(
         &self,
@@ -709,5 +745,42 @@ mod tests {
             .await
             .unwrap();
         assert!(!unreg2, "Second unregister must return false (idempotent)");
+    }
+
+    #[tokio::test]
+    async fn test_remove_worker_and_prune_stale_workers() {
+        let registry = WorkerRegistry::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let worker_1 = Uuid::new_v4();
+        let worker_2 = Uuid::new_v4();
+        let caps = WorkerCapabilities::new("w-prune", 2, 4096, false, false, None);
+
+        registry
+            .register(worker_1, caps.clone(), "127.0.0.1:9101".parse().unwrap(), tx.clone(), None)
+            .await
+            .unwrap();
+        registry
+            .register(worker_2, caps, "127.0.0.1:9102".parse().unwrap(), tx, None)
+            .await
+            .unwrap();
+
+        // Remove worker 1 explicitly
+        let removed = registry.remove_worker(&worker_1).await;
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().worker_id, worker_1);
+        assert!(registry.get_worker(worker_1).await.is_none());
+
+        // Disconnect worker 2
+        registry.mark_disconnected(&worker_2).await.unwrap();
+
+        // Prune with large timeout should not remove worker 2 yet
+        let pruned = registry.prune_stale_workers(Duration::from_secs(60)).await;
+        assert_eq!(pruned, 0);
+        assert!(registry.get_worker(worker_2).await.is_some());
+
+        // Prune with 0 timeout removes disconnected worker 2
+        let pruned = registry.prune_stale_workers(Duration::from_millis(0)).await;
+        assert_eq!(pruned, 1);
+        assert!(registry.get_worker(worker_2).await.is_none());
     }
 }

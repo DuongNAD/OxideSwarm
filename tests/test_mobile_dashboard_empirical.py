@@ -22,6 +22,7 @@ import os
 import sys
 import threading
 import time
+import shutil
 from playwright.sync_api import sync_playwright
 
 DASHBOARD_PATH = os.path.abspath("crates/master/src/dashboard.html")
@@ -139,10 +140,16 @@ def run_suite():
     ]
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            executable_path="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        chrome_bin = (
+            shutil.which("chrome")
+            or shutil.which("google-chrome")
+            or shutil.which("chromium")
+            or shutil.which("msedge")
         )
+        launch_kwargs = {"headless": True}
+        if chrome_bin:
+            launch_kwargs["executable_path"] = chrome_bin
+        browser = p.chromium.launch(**launch_kwargs)
 
         print("\n=================================================================")
         print("  1. VIEWPORT & EMPTY VOID STRESS TESTS")

@@ -409,7 +409,7 @@ async fn test_redirection_portal_standby_page_when_no_master() {
 
 #[tokio::test]
 async fn test_http_candidate_probing_fallback() {
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     let test_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -417,6 +417,9 @@ async fn test_http_candidate_probing_fallback() {
 
     tokio::spawn(async move {
         if let Ok((mut stream, _)) = test_listener.accept().await {
+            let mut req_buf = [0u8; 1024];
+            let _ = stream.read(&mut req_buf).await;
+
             let json = serde_json::json!({
                 "master": {
                     "host": "FallBackMaster",
@@ -428,11 +431,13 @@ async fn test_http_candidate_probing_fallback() {
             .to_string();
 
             let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 json.len(),
                 json
             );
             let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.flush().await;
+            let _ = stream.shutdown().await;
         }
     });
 

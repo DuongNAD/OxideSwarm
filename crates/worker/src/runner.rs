@@ -1127,6 +1127,9 @@ impl TaskRunner {
                 }
             } => {
                 info!(task_id = %task_id, "Aborting child process per cancellation signal");
+                if let Some(pid) = child.id() {
+                    Self::terminate_process_tree(pid);
+                }
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 let elapsed = start_time.elapsed().as_millis() as u64;
@@ -1144,6 +1147,9 @@ impl TaskRunner {
 
             _ = tokio::time::sleep(timeout) => {
                 warn!(task_id = %task_id, timeout_secs = timeout.as_secs(), "Killing runaway process after watchdog timeout");
+                if let Some(pid) = child.id() {
+                    Self::terminate_process_tree(pid);
+                }
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 let elapsed = start_time.elapsed().as_millis() as u64;
@@ -1158,6 +1164,56 @@ impl TaskRunner {
                     Some(msg),
                 )
             }
+        }
+    }
+
+    /// Cross-platform process tree terminator to eliminate orphaned grandchild processes.
+    pub fn terminate_process_tree(pid: u32) {
+        #[cfg(target_os = "windows")]
+        {
+            // taskkill /F /T forcefully terminates the specified process and all its child processes
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .output();
+        }
+
+        #[cfg(unix)]
+        {
+            // On Unix, kill the process group (-pgid) and direct child processes via pkill
+            let pgid = pid as i32;
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &format!("-{pgid}")])
+                .output();
+            let _ = std::process::Command::new("pkill")
+                .args(["-9", "-P", &pid.to_string()])
+                .output();
+        }
+
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes();
+        let target_pid = sysinfo::Pid::from(pid as usize);
+
+        // Collect all descendant PIDs
+        let mut to_kill = Vec::new();
+        let mut queue = vec![target_pid];
+
+        while let Some(parent) = queue.pop() {
+            for (&p, proc) in sys.processes() {
+                if proc.parent() == Some(parent) {
+                    to_kill.push(p);
+                    queue.push(p);
+                }
+            }
+        }
+
+        for p in to_kill {
+            if let Some(proc) = sys.process(p) {
+                let _ = proc.kill();
+            }
+        }
+
+        if let Some(proc) = sys.process(target_pid) {
+            let _ = proc.kill();
         }
     }
 }

@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 OXIDE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 BIN_PATH = os.path.join(OXIDE_ROOT, "target", "debug", "rusty-grid")
-BENCH_DIR = "/Users/duongnad/teamwork_projects/remote_cluster_interconnect"
+BENCH_DIR = os.path.join(OXIDE_ROOT, "benchmarks", "interconnect")
 
 def print_header(title):
     print(f"\n\033[1;36m=== {title} ===\033[0m")

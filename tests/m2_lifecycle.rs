@@ -330,10 +330,7 @@ async fn test_m2_heartbeat_reaper_silent_timeout() {
     let master_addr = master.local_addr();
 
     // Start Reaper with fast interval and timeout for deterministic test execution
-    let reaper_config = ReaperConfig {
-        scan_interval: Duration::from_millis(30),
-        timeout: Duration::from_millis(150),
-    };
+    let reaper_config = ReaperConfig::new(Duration::from_millis(30), Duration::from_millis(150));
     let reaper_handle = spawn_reaper(registry.clone(), reaper_config, master_shutdown_rx.clone());
 
     tokio::spawn(async move { master.run(master_shutdown_rx).await });

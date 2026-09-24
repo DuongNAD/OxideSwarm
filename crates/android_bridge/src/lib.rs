@@ -577,6 +577,11 @@ pub fn start_master_impl(
                     }
                 }
 
+                // Cleanly close and release active Iroh P2P endpoint inside background Tokio runtime
+                if let Some(ep) = state_clone.p2p_endpoint.lock().unwrap().take() {
+                    ep.close().await;
+                }
+
                 *state_clone.status.lock().unwrap() = "STOPPED".to_string();
                 state_clone.running.store(false, Ordering::SeqCst);
             });
@@ -683,14 +688,8 @@ pub fn stop_master_impl() -> bool {
     state.running.store(false, Ordering::SeqCst);
     *state.status.lock().unwrap() = "STOPPED".to_string();
 
-    // Close and release active Iroh P2P endpoint
-    if let Some(ep) = state.p2p_endpoint.lock().unwrap().take() {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                ep.close().await;
-            });
-        }
-    }
+    // Ensure endpoint reference is cleared if not already taken
+    let _ = state.p2p_endpoint.lock().unwrap().take();
 
     if let Some(h) = state.thread_handle.lock().unwrap().take() {
         let _ = h.join();
