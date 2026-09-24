@@ -9,12 +9,12 @@ authors.workspace = true
 path = "src/lib.rs"
 
 [[bin]]
-name = "rusty-grid"
+name = "oxideswarm"
 path = "src/main.rs"
 
 [[bin]]
-name = "oxideswarm"
-path = "src/main.rs"
+name = "rusty-grid"
+path = "src/bin/rusty_grid.rs"
 
 [[bin]]
 name = "ox-mode"

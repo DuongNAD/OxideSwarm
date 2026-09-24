@@ -12,7 +12,6 @@
 //! 7. `--help` / `-h` flag execution and usage documentation.
 //! 8. Unknown argument rejection with descriptive error message and exit code 1.
 
-use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
