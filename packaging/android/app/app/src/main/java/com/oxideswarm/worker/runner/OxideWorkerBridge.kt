@@ -32,6 +32,31 @@ object OxideWorkerBridge : WorkerEngine {
         }
     }
 
+    /**
+     * Tells the native worker where to create task sandboxes (use a directory inside the app's
+     * cache dir). Call it before [start]: without it the worker falls back to /data/local/tmp,
+     * which an app cannot write, and refuses to start.
+     */
+    fun setSandboxDir(path: String): Boolean {
+        if (!isLibraryAvailable) return false
+        return try {
+            nativeSetSandboxDir(path)
+        } catch (e: Throwable) {
+            Log.w(TAG, "Exception in nativeSetSandboxDir (older liboxideworker.so?)", e)
+            false
+        }
+    }
+
+    /** The reason the native worker gave for not starting, from its status JSON ("ERROR: ..."). */
+    private fun startFailureReason(): String {
+        return try {
+            val status = org.json.JSONObject(nativeGetWorkerStatus()).optString("status", "")
+            if (status.startsWith("ERROR")) status else "JNI nativeStartWorker failed"
+        } catch (e: Throwable) {
+            "JNI nativeStartWorker failed"
+        }
+    }
+
     override fun start(config: WorkerConfig, listener: WorkerEngineListener): Boolean {
         if (!isLibraryAvailable) {
             listener.onStateChanged(WorkerState.ERROR, "Native JNI library not loaded")
@@ -54,7 +79,7 @@ object OxideWorkerBridge : WorkerEngine {
                 running = true
                 listener.onStateChanged(WorkerState.RUNNING, "Worker running in-process (PID ${android.os.Process.myPid()})")
             } else {
-                listener.onStateChanged(WorkerState.ERROR, "JNI nativeStartWorker failed")
+                listener.onStateChanged(WorkerState.ERROR, startFailureReason())
             }
             started
         } catch (e: Throwable) {
@@ -165,6 +190,8 @@ object OxideWorkerBridge : WorkerEngine {
         simulateGpu: Boolean,
         heartbeatIntervalSecs: Long
     ): Boolean
+
+    private external fun nativeSetSandboxDir(sandboxDir: String): Boolean
 
     private external fun nativeStopWorker(): Boolean
 

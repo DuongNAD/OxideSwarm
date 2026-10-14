@@ -73,9 +73,11 @@ async fn test_malformed_queries_to_api_tasks() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let dash_port_file = temp_dir.path().join("dash.port");
 
+    // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_dashboard_port(0)
-        .with_dashboard_port_file(&dash_port_file);
+        .with_dashboard_port_file(&dash_port_file)
+        .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr");
@@ -315,9 +317,11 @@ async fn test_non_uuid_and_nonexistent_task_ids() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let dash_port_file = temp_dir.path().join("dash.port");
 
+    // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_dashboard_port(0)
-        .with_dashboard_port_file(&dash_port_file);
+        .with_dashboard_port_file(&dash_port_file)
+        .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr");
@@ -474,9 +478,11 @@ async fn test_ephemeral_port_0_lifecycle_and_port_file_stress() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let port_file = temp_dir.path().join(format!("dash_{i}.port"));
 
+        // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
         let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
             .with_dashboard_port(0)
-            .with_dashboard_port_file(&port_file);
+            .with_dashboard_port_file(&port_file)
+            .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
         let master = MasterServer::spawn(config)
             .await
@@ -538,9 +544,11 @@ async fn test_ephemeral_port_0_lifecycle_and_port_file_stress() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let port_file = temp_dir.path().join(format!("dash_concurrent_{i}.port"));
 
+        // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
         let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
             .with_dashboard_port(0)
-            .with_dashboard_port_file(&port_file);
+            .with_dashboard_port_file(&port_file)
+            .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
         let master = MasterServer::spawn(config)
             .await
@@ -600,9 +608,11 @@ async fn test_concurrent_rest_bombardment_under_load() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let dash_port_file = temp_dir.path().join("dash.port");
 
+    // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_dashboard_port(0)
-        .with_dashboard_port_file(&dash_port_file);
+        .with_dashboard_port_file(&dash_port_file)
+        .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr");

@@ -12,6 +12,7 @@ Authoritative reference:
 
 import sys
 import os
+import glob
 import json
 import time
 import socket
@@ -47,9 +48,7 @@ def find_sync_dir(cli_dir=None):
         os.path.join(user_home, "Google Drive", "Drive của tôi", "OxideSwarm_Sync"),
         os.path.join(user_home, "Google Drive", "Drive của tôi", "OxideSwarm_Sync"),
         os.path.join(user_home, "Google Drive", "My Drive", "OxideSwarm_Sync"),
-        os.path.join(user_home, "Library", "CloudStorage", "GoogleDrive-duonganhdn2000@gmail.com", "Drive của tôi", "OxideSwarm_Sync"),
-        os.path.join(user_home, "Library", "CloudStorage", "GoogleDrive-duonganhdn2000@gmail.com", "Drive của tôi", "OxideSwarm_Sync"),
-        os.path.join(user_home, "Library", "CloudStorage", "GoogleDrive-duonganhdn2000@gmail.com", "My Drive", "OxideSwarm_Sync"),
+        # (Library/CloudStorage/GoogleDrive-<account> for any signed-in account is added below)
         # Windows mounted drive letters
         "G:\\Drive của tôi\\OxideSwarm_Sync",
         "G:\\Drive của tôi\\OxideSwarm_Sync",
@@ -61,6 +60,10 @@ def find_sync_dir(cli_dir=None):
         os.path.join(user_home, "teamwork_projects", "oxideswarm_sync"),
         os.path.join(user_home, "teamwork_projects", "OxideSwarm_Sync"),
     ]
+
+    for account_dir in sorted(glob.glob(os.path.join(user_home, "Library", "CloudStorage", "GoogleDrive-*"))):
+        for drive_name in (unicodedata.normalize("NFC", "Drive của tôi"), "My Drive"):
+            candidates.insert(0, os.path.join(account_dir, drive_name, "OxideSwarm_Sync"))
 
     for cand in candidates:
         if os.path.exists(cand):
@@ -494,7 +497,7 @@ EPOCH_MS={int(time.time() * 1000)}
     emit_error_log(sync_dir, "CLIENT_CONNECT", url, last_err)
     return False
 
-def arbitrate_roles(sync_dir, port=DEFAULT_PORT, observe_seconds=3.0):
+def arbitrate_roles(sync_dir, port=DEFAULT_PORT, observe_seconds=15.0):
     """Execute race-condition-free role negotiation."""
     server_ready_file = os.path.join(sync_dir, "server_ready.txt")
     local_ip = get_local_lan_ip()
@@ -553,8 +556,16 @@ def arbitrate_roles(sync_dir, port=DEFAULT_PORT, observe_seconds=3.0):
                         except Exception:
                             pass
 
+    # Claim files are never deleted, so a claim left over from an earlier session must not count
+    # as "the senior peer": ignore claims older than the session TTL.
+    if peer_claim:
+        age_s = (time.time() * 1000 - peer_claim.get("epoch_ms", 0)) / 1000.0
+        if age_s > SESSION_TTL:
+            print(f"[AUTO] Ignoring stale {PEER_PLATFORM} claim ({int(age_s)}s old, TTL {int(SESSION_TTL)}s).")
+            peer_claim = None
+
     if not peer_claim:
-        print(f"[AUTO] No peer claim detected from {PEER_PLATFORM}. Electing role: SERVER")
+        print(f"[AUTO] No fresh peer claim detected from {PEER_PLATFORM}. Electing role: SERVER")
         return "server", "0.0.0.0", port
 
     # Rule 3: Temporal Seniority (|T_local - T_peer| >= 1000ms)
@@ -662,7 +673,9 @@ if __name__ == "__main__":
     parser.add_argument("--sync-dir", default="", help="Custom Google Drive sync directory")
     parser.add_argument("--max-pings", type=int, default=None, help="Server mode: exit after N pings")
     parser.add_argument("--timeout", type=float, default=None, help="Server mode timeout in seconds")
-    parser.add_argument("--observe-time", type=float, default=3.0, help="Auto mode: seconds to observe peer claim")
+    parser.add_argument("--observe-time", type=float, default=15.0,
+                        help="Auto mode: seconds to wait for the peer's claim to appear in the shared folder "
+                             "(cloud sync can take longer than the old 3 s; a shorter window lets both machines elect SERVER)")
     args = parser.parse_args()
 
     sync_path = find_sync_dir(args.sync_dir)

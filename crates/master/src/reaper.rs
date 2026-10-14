@@ -9,8 +9,6 @@ use tokio::sync::watch;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
-use rusty_grid_core::task::TaskResult;
-
 use crate::queue::TaskQueue;
 use crate::registry::WorkerRegistry;
 
@@ -133,7 +131,7 @@ pub fn spawn_reaper_with_broadcast(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let reaped = registry.reap_stale_workers(config.timeout).await;
+                    let reaped = registry.reap_stale_sessions(config.timeout).await;
                     if let Some(stale_timeout) = config.stale_worker_timeout {
                         let pruned_workers = registry.prune_stale_workers(stale_timeout).await;
                         if pruned_workers > 0 {
@@ -154,7 +152,7 @@ pub fn spawn_reaper_with_broadcast(
                         );
 
                         let mut total_failed_over = 0;
-                        for worker_id in &reaped {
+                        for (worker_id, session_id) in &reaped {
                             if let Some(ref b_tx) = broadcast_tx {
                                 let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::WorkerDisconnected {
                                     worker_id: *worker_id,
@@ -162,8 +160,11 @@ pub fn spawn_reaper_with_broadcast(
                                 });
                             }
 
-                            let tasks = queue.handle_worker_disconnected(
+                            // Only the reaped session's tasks: if the worker has already
+                            // re-registered, its new session keeps what it was given.
+                            let tasks = queue.handle_session_disconnected(
                                 worker_id,
+                                Some(*session_id),
                                 "Heartbeat timeout (reaper detected)",
                                 false,
                             ).await;
@@ -179,29 +180,7 @@ pub fn spawn_reaper_with_broadcast(
 
                             // Resolve waiters for any tasks that reached terminal state
                             if let Some(ref w_map) = waiters {
-                                for task_id in &tasks {
-                                    if let Some(info) = queue.get_task(task_id).await {
-                                        if info.state.is_terminal() {
-                                            let res = queue.get_result(task_id).await.unwrap_or_else(|| {
-                                                TaskResult::failure(
-                                                    *worker_id,
-                                                    *task_id,
-                                                    1,
-                                                    "",
-                                                    "",
-                                                    0,
-                                                    info.error_message.clone().or_else(|| Some("Heartbeat timeout".into())),
-                                                )
-                                            });
-                                            let mut lock = w_map.write().await;
-                                            if let Some(senders) = lock.remove(task_id) {
-                                                for tx in senders {
-                                                    let _ = tx.send(res.clone());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                                crate::server::resolve_terminal_waiters(&queue, w_map, &tasks, Some(*worker_id)).await;
                             }
                         }
 
@@ -251,7 +230,7 @@ fn spawn_reaper_internal(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let reaped = registry.reap_stale_workers(config.timeout).await;
+                    let reaped = registry.reap_stale_sessions(config.timeout).await;
                     if let Some(stale_timeout) = config.stale_worker_timeout {
                         let pruned_workers = registry.prune_stale_workers(stale_timeout).await;
                         if pruned_workers > 0 {
@@ -272,9 +251,11 @@ fn spawn_reaper_internal(
                         );
 
                         let mut total_failed_over = 0;
-                        for worker_id in &reaped {
-                            let tasks = queue.handle_worker_disconnected(
+                        for (worker_id, session_id) in &reaped {
+                            // Only the reaped session's tasks (see the dashboard variant above).
+                            let tasks = queue.handle_session_disconnected(
                                 worker_id,
+                                Some(*session_id),
                                 "Heartbeat timeout (reaper detected)",
                                 false,
                             ).await;
@@ -282,29 +263,7 @@ fn spawn_reaper_internal(
 
                             // Resolve waiters for any tasks that reached terminal state
                             if let Some(ref w_map) = waiters {
-                                for task_id in &tasks {
-                                    if let Some(info) = queue.get_task(task_id).await {
-                                        if info.state.is_terminal() {
-                                            let res = queue.get_result(task_id).await.unwrap_or_else(|| {
-                                                TaskResult::failure(
-                                                    *worker_id,
-                                                    *task_id,
-                                                    1,
-                                                    "",
-                                                    "",
-                                                    0,
-                                                    info.error_message.clone().or_else(|| Some("Heartbeat timeout".into())),
-                                                )
-                                            });
-                                            let mut lock = w_map.write().await;
-                                            if let Some(senders) = lock.remove(task_id) {
-                                                for tx in senders {
-                                                    let _ = tx.send(res.clone());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                                crate::server::resolve_terminal_waiters(&queue, w_map, &tasks, Some(*worker_id)).await;
                             }
                         }
 

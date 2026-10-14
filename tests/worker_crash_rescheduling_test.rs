@@ -298,11 +298,14 @@ async fn test_immediate_graceful_disconnect() {
 /// TaskResult::failure.
 #[tokio::test]
 async fn test_max_retries_exhaustion() {
-    // Master with max_retries = 2
-    let master =
-        MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(2))
-            .await
-            .expect("master spawn");
+    // Master with max_retries = 2 (failovers have their own budget; pin it to the same limit)
+    let master = MasterServer::spawn(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_max_retries(2)
+            .with_max_failovers(2),
+    )
+    .await
+    .expect("master spawn");
     let master_addr = master.server_addr().to_string();
 
     let (_w1_tx, w1_rx) = watch::channel(false);

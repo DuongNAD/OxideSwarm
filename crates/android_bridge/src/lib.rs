@@ -8,6 +8,7 @@
 //! Running in-process produces 0 child processes, ensuring complete immunity
 //! against the Android 12+ Phantom Process Killer (PPK) and W^X execution restrictions.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -18,11 +19,14 @@ use uuid::Uuid;
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
+use rusty_grid_core::capabilities::MobileLiveStatus;
 use rusty_grid_core::protocol::{MasterMessage, MessageTransport, WorkerMessage};
 use rusty_grid_core::transport::{
     iroh, serialize_p2p_ticket, BiStream, GridStream, GRID_ALPN,
 };
-use rusty_grid_worker::{WorkerClient, WorkerConfig};
+use rusty_grid_worker::{
+    MobileTelemetryHandle, SandboxConfig, SandboxError, WorkerClient, WorkerConfig,
+};
 
 // ==============================================================================
 // Mobile Telemetry Model
@@ -56,6 +60,12 @@ struct WorkerState {
     p2p_ticket: Mutex<Option<String>>,
     status: Mutex<String>,
     telemetry: Mutex<MobileTelemetry>,
+    /// The same readings, shared with the running `WorkerClient`: it reports every change to the
+    /// Master (`WorkerMessage::MobileTelemetry`) and refuses tasks on a critically low battery.
+    mobile: MobileTelemetryHandle,
+    /// Writable directory for task sandboxes, handed over by the app (its cache directory) before
+    /// the worker starts. The default, `/data/local/tmp`, is closed to apps.
+    sandbox_dir: Mutex<Option<PathBuf>>,
     shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
     thread_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -68,6 +78,8 @@ impl WorkerState {
             p2p_ticket: Mutex::new(None),
             status: Mutex::new("STOPPED".to_string()),
             telemetry: Mutex::new(MobileTelemetry::default()),
+            mobile: MobileTelemetryHandle::default(),
+            sandbox_dir: Mutex::new(None),
             shutdown_tx: Mutex::new(None),
             thread_handle: Mutex::new(None),
         }
@@ -82,8 +94,38 @@ fn get_worker_state() -> Arc<WorkerState> {
         .clone()
 }
 
+/// Names the directory task sandboxes are created in (the app's cache directory, for example
+/// `<cacheDir>/sandboxes`). Call it before [`start_worker_impl`]; without it the worker falls back
+/// to `RUSTY_GRID_SANDBOX_BASE_DIR`, `TMPDIR` and the platform temp dir, and on Android that last
+/// one (`/data/local/tmp`) is not writable for an app. An empty string clears the setting.
+pub fn set_sandbox_dir_impl(dir: String) -> bool {
+    let dir = dir.trim();
+    *get_worker_state().sandbox_dir.lock().unwrap() =
+        (!dir.is_empty()).then(|| PathBuf::from(dir));
+    true
+}
+
+/// Same check as the worker's own start-up check (`SandboxConfig::ensure_usable`), without a
+/// runtime: `start_worker_impl` has to answer the app synchronously, and may itself be called
+/// from inside one.
+fn check_sandbox_usable(base_dir: &Path) -> Result<(), SandboxError> {
+    let unusable = |source: std::io::Error| SandboxError::BaseDirUnusable {
+        path: base_dir.to_path_buf(),
+        source,
+    };
+    std::fs::create_dir_all(base_dir).map_err(unusable)?;
+    let probe = base_dir.join(format!(".write_probe_{}", std::process::id()));
+    std::fs::write(&probe, b"probe").map_err(unusable)?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
 /// Core implementation for starting the native worker client in a background Tokio runtime.
 /// Accepts an optional `p2p_ticket` for connecting across WAN/CGNAT via Iroh QUIC/DERP relays.
+///
+/// Returns `false`, with the reason in the status (`ERROR: ...`, see [`get_worker_status_impl`]),
+/// when the worker cannot start at all: no writable sandbox directory, or the thread cannot be
+/// spawned. A failure after that point (an invalid P2P ticket) is reported through the status.
 pub fn start_worker_impl(
     master_addr: String,
     p2p_ticket: Option<String>,
@@ -113,8 +155,27 @@ pub fn start_worker_impl(
         config = config.with_ram_mb(ram_mb as u64);
     }
     config = config.with_simulate_gpu(simulate_gpu);
+    if let Some(dir) = state.sandbox_dir.lock().unwrap().clone() {
+        config = config.with_sandbox_base_dir(dir);
+    }
+    // Battery / thermal readings pushed by the Android app (`update_telemetry_*`) flow into the
+    // worker through this handle for as long as it runs.
+    config = config.with_mobile_telemetry(state.mobile.clone());
     if heartbeat_interval_secs > 0 {
         config.default_heartbeat_interval = Duration::from_secs(heartbeat_interval_secs as u64);
+    }
+
+    // The worker refuses to run without a writable sandbox directory (every process task would
+    // fail otherwise); say so here, where the app can show it, instead of from a thread that
+    // exits unnoticed.
+    let sandbox_base = config
+        .sandbox_base_dir
+        .clone()
+        .unwrap_or_else(|| SandboxConfig::default().base_dir);
+    if let Err(e) = check_sandbox_usable(&sandbox_base) {
+        error!(error = %e, "Android worker cannot start: task sandboxes cannot be created");
+        *state.status.lock().unwrap() = format!("ERROR: {e}");
+        return false;
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -148,10 +209,14 @@ pub fn start_worker_impl(
                 *state_clone.status.lock().unwrap() = "RUNNING".to_string();
                 let mut client = WorkerClient::new(config);
                 info!(worker_id = %worker_id, "In-process Android worker starting run loop");
-                if let Err(e) = client.run(shutdown_rx).await {
-                    error!(worker_id = %worker_id, error = %e, "Worker supervisor exited with error");
-                }
-                *state_clone.status.lock().unwrap() = "STOPPED".to_string();
+                let outcome = client.run(shutdown_rx).await;
+                *state_clone.status.lock().unwrap() = match outcome {
+                    Ok(()) => "STOPPED".to_string(),
+                    Err(e) => {
+                        error!(worker_id = %worker_id, error = %e, "Worker supervisor exited with error");
+                        format!("ERROR: {e}")
+                    }
+                };
                 state_clone.running.store(false, Ordering::SeqCst);
             });
         });
@@ -278,6 +343,13 @@ pub fn update_telemetry_detailed_impl(
     telem.is_charging = Some(is_charging);
     telem.thermal_throttled = thermal_throttled;
     telem.network_type = net;
+    // The worker's scheduling view of this device: without this the Master would keep the
+    // registration-time snapshot for the whole run.
+    state.mobile.update(MobileLiveStatus {
+        battery_pct: pct,
+        is_charging: Some(is_charging),
+        thermal_throttled,
+    });
     true
 }
 
@@ -856,6 +928,26 @@ pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nati
     }
 }
 
+/// Hands the app's writable sandbox directory to the worker; call it before `nativeStartWorker`.
+#[no_mangle]
+pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeSetSandboxDir<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    sandbox_dir: JString<'local>,
+) -> jboolean {
+    let dir: String = match env.get_string(&sandbox_dir) {
+        Ok(s) => s.into(),
+        Err(_) => return JNI_FALSE,
+    };
+    if set_sandbox_dir_impl(dir) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeUpdateTelemetry<
     'local,
@@ -1038,6 +1130,17 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeSetSandboxDir<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    class: JClass<'local>,
+    sandbox_dir: JString<'local>,
+) -> jboolean {
+    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeSetSandboxDir(env, class, sandbox_dir)
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeStartWorkerLegacy<
     'local,
 >(
@@ -1191,8 +1294,10 @@ mod tests {
         stop_master_impl();
         let ws = get_worker_state();
         *ws.telemetry.lock().unwrap() = MobileTelemetry::default();
+        ws.mobile.set(None);
         *ws.worker_id.lock().unwrap() = None;
         *ws.p2p_ticket.lock().unwrap() = None;
+        *ws.sandbox_dir.lock().unwrap() = None;
         *ws.status.lock().unwrap() = "STOPPED".to_string();
         ws.running.store(false, Ordering::SeqCst);
 
@@ -1203,6 +1308,111 @@ mod tests {
         *ms.dashboard_port.lock().unwrap() = 0;
         *ms.status.lock().unwrap() = "STOPPED".to_string();
         ms.running.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn test_jni_telemetry_reaches_the_handle_shared_with_the_worker() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        reset_test_state();
+        let state = get_worker_state();
+        assert!(state.mobile.live_status().is_none(), "nothing known before the app reports");
+
+        assert!(update_telemetry_detailed_impl(23, false, true, Some(41.5), None));
+        let live = state.mobile.live_status().expect("the report must reach the worker's handle");
+        assert_eq!(live.battery_pct, Some(23));
+        assert_eq!(live.is_charging, Some(false));
+        assert!(live.thermal_throttled);
+
+        // Later reports replace it; an out-of-range percentage becomes "unknown", not a wrong number.
+        assert!(update_telemetry_impl(150, true, false));
+        let live = state.mobile.live_status().unwrap();
+        assert_eq!(live.battery_pct, None);
+        assert_eq!(live.is_charging, Some(true));
+        assert!(!live.thermal_throttled);
+        reset_test_state();
+    }
+
+    /// A fresh, empty directory under the platform temp dir (removed again by the caller).
+    fn scratch_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oxide-bridge-{label}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn status_text() -> String {
+        let status: serde_json::Value = serde_json::from_str(&get_worker_status_impl()).unwrap();
+        status["status"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn test_worker_start_refuses_an_unwritable_sandbox_dir_and_says_why() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        reset_test_state();
+        // What an app sees when nobody handed it a writable directory: the base cannot be created.
+        let dir = scratch_dir("blocked");
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        assert!(set_sandbox_dir_impl(blocker.join("sandboxes").display().to_string()));
+
+        assert!(
+            !start_worker_impl("127.0.0.1:59990".into(), None, "NoSandbox".into(), 2, 1024, false, 5),
+            "a worker that cannot create task sandboxes must not pretend to have started"
+        );
+        assert!(!is_running_impl());
+        let status = status_text();
+        assert!(status.starts_with("ERROR: "), "{status}");
+        assert!(status.contains("sandbox base directory"), "{status}");
+        assert!(status.contains("not-a-directory"), "{status}");
+        reset_test_state();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_worker_start_uses_the_sandbox_dir_the_app_handed_over() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        reset_test_state();
+        let dir = scratch_dir("handed-over");
+        let sandboxes = dir.join("cache").join("sandboxes");
+        assert!(set_sandbox_dir_impl(sandboxes.display().to_string()));
+
+        assert!(start_worker_impl("127.0.0.1:59991".into(), None, "WithSandbox".into(), 2, 1024, false, 5));
+        assert!(sandboxes.is_dir(), "the worker must have prepared the directory it was given");
+        assert!(stop_worker_impl());
+        reset_test_state();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_worker_that_fails_after_starting_reports_the_reason_in_its_status() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        reset_test_state();
+        let dir = scratch_dir("bad-ticket");
+        assert!(set_sandbox_dir_impl(dir.join("sandboxes").display().to_string()));
+
+        // `run()` refuses an unusable P2P ticket right away, on the worker's own thread.
+        assert!(start_worker_impl(
+            "127.0.0.1:59992".into(),
+            Some("INVALID_P2P_TICKET_PAYLOAD_NOT_JSON".into()),
+            "BadTicket".into(),
+            2,
+            1024,
+            false,
+            5,
+        ));
+        let mut status = status_text();
+        for _ in 0..100 {
+            if status.starts_with("ERROR: ") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            status = status_text();
+        }
+        assert!(status.starts_with("ERROR: "), "{status}");
+        assert!(status.contains("P2P ticket"), "{status}");
+        assert!(!is_running_impl());
+        assert!(stop_worker_impl());
+        reset_test_state();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

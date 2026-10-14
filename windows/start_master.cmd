@@ -1,33 +1,48 @@
 @echo off
-setlocal enabledelayedexpansion
+setlocal EnableExtensions
 
-:: ==============================================================================
-:: OxideSwarm Windows Background MASTER Launcher
-:: Binds Cluster on 0.0.0.0:8088 | Web UI on 0.0.0.0:8080
-:: ==============================================================================
+rem ==============================================================================
+rem  OxideSwarm Windows Background MASTER Launcher
+rem
+rem    start_master.cmd [--lan-dashboard] [--p2p] [--no-worker]
+rem
+rem  Cluster port : 0.0.0.0:8088 (workers connect here; authenticated by the
+rem                 cluster secret, created on first start in
+rem                 %USERPROFILE%\.oxideswarm\cluster.secret - copy it to every worker)
+rem  Dashboard    : http://127.0.0.1:8080, this PC only. --lan-dashboard opens it to
+rem                 phones / other PCs; the login token is printed by
+rem                 "rusty-grid secret show --dashboard-token".
+rem  --p2p        : also publish a P2P ticket for machines on other networks.
+rem  Process id and logs live in %USERPROFILE%\.oxideswarm\run (see oxctl.ps1).
+rem ==============================================================================
 
 set "SCRIPT_DIR=%~dp0"
-cd /d "%SCRIPT_DIR%"
+set "OX_FLAGS="
 
-set "BIN="
-if exist "%SCRIPT_DIR%rusty-grid.exe" (
-    set "BIN=%SCRIPT_DIR%rusty-grid.exe"
-) else if exist "%SCRIPT_DIR%..\target\release\rusty-grid.exe" (
-    set "BIN=%SCRIPT_DIR%..\target\release\rusty-grid.exe"
-) else if exist "%SCRIPT_DIR%target\release\rusty-grid.exe" (
-    set "BIN=%SCRIPT_DIR%target\release\rusty-grid.exe"
-)
+:parse
+if "%~1"=="" goto run
+if /i "%~1"=="--lan-dashboard" goto flag_lan
+if /i "%~1"=="--p2p" goto flag_p2p
+if /i "%~1"=="--no-worker" goto flag_noworker
+echo [ERROR] Unknown option: %~1
+echo Usage: start_master.cmd [--lan-dashboard] [--p2p] [--no-worker]
+exit /b 1
 
-if not defined BIN (
-    echo [INFO] Compiling rusty-grid master via cargo...
-    cargo build --release --bin rusty-grid
-    set "BIN=%SCRIPT_DIR%..\target\release\rusty-grid.exe"
-)
+:flag_lan
+set "OX_FLAGS=%OX_FLAGS% -DashboardLan"
+shift
+goto parse
 
-set "LOG_FILE=%SCRIPT_DIR%master.log"
+:flag_p2p
+set "OX_FLAGS=%OX_FLAGS% -P2p"
+shift
+goto parse
 
-echo [OK] Starting OxideSwarm Master silently in background...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%BIN%' -ArgumentList 'master --listen 0.0.0.0:8088 --web-ui-addr 0.0.0.0:8080' -WindowStyle Hidden -RedirectStandardOutput '%LOG_FILE%' -RedirectStandardError '%SCRIPT_DIR%master_error.log'"
+:flag_noworker
+set "OX_FLAGS=%OX_FLAGS% -NoWorker"
+shift
+goto parse
 
-timeout /t 2 /nobreak >nul
-echo [SUCCESS] OxideSwarm Master is running! Open http://localhost:8080
+:run
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%oxctl.ps1" start master%OX_FLAGS%
+exit /b %errorlevel%

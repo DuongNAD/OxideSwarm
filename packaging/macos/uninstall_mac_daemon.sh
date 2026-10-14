@@ -187,6 +187,7 @@ else
         log_info "Logs preserved at ${LOG_DIR} (use --remove-logs or --purge to delete)."
     fi
     log_info "Working directory preserved at ${WORK_DIR} (use --purge to delete)."
+    log_info "${CONFIG_DIR} (worker.toml and the copied cluster.secret, both mode 600) is also preserved; --purge removes it."
 fi
 
 echo -e "\n${BOLD}${GREEN}=== Uninstallation Completed Successfully ===${NC}\n"

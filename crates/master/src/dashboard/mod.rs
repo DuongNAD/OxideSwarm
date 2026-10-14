@@ -35,7 +35,10 @@ impl DashboardState {
     /// Assembles a complete, ground-truth cluster snapshot.
     pub async fn build_snapshot(&self) -> ClusterSnapshotDto {
         let workers = self.registry.list_all_workers().await;
-        let tasks = self.queue.list_tasks().await;
+        let tasks = self
+            .queue
+            .recent_tasks(|_| true, 0, SNAPSHOT_MAX_TASKS)
+            .await;
         let stats = self.queue.stats().await;
 
         let mut connected = 0;
@@ -77,7 +80,18 @@ impl DashboardState {
 }
 
 /// Builds and configures the complete Axum Router for the embedded dashboard, delegating to the unified Web UI router.
+///
+/// Uses [`crate::auth::AuthConfig::default`], i.e. every API route demands a token; use
+/// [`create_dashboard_router_with_auth`] to register tokens or opt in to dev mode.
 pub fn create_dashboard_router(state: DashboardState) -> Router {
+    create_dashboard_router_with_auth(state, crate::auth::AuthConfig::default())
+}
+
+/// Like [`create_dashboard_router`] with an explicit authentication configuration.
+pub fn create_dashboard_router_with_auth(
+    state: DashboardState,
+    auth_config: crate::auth::AuthConfig,
+) -> Router {
     crate::web_ui::create_web_ui_router_full(
         state.registry,
         state.queue,
@@ -88,6 +102,6 @@ pub fn create_dashboard_router(state: DashboardState) -> Router {
         state.server_addr,
         state.dashboard_addr,
         state.started_at,
-        std::sync::Arc::new(crate::auth::AuthConfig::default()),
+        std::sync::Arc::new(auth_config),
     )
 }

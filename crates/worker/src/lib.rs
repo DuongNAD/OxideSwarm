@@ -6,7 +6,10 @@
 pub mod backoff;
 pub mod client;
 pub mod cpu_simd;
+pub mod gpu;
 pub mod heartbeat;
+pub mod identity;
+pub mod process_tree;
 pub mod runner;
 pub mod sandbox;
 #[cfg(feature = "gpu-wgpu")]
@@ -14,10 +17,13 @@ pub mod wgpu_engine;
 
 pub use backoff::{BackoffConfig, ExponentialBackoff};
 pub use client::{WorkerClient, WorkerConfig};
-pub use heartbeat::{HeartbeatHandle, HeartbeatTracker};
+pub use gpu::{GpuError, GpuNotice, NoticeLevel, WGPU_COMPILED};
+pub use heartbeat::{HeartbeatHandle, HeartbeatTracker, MobileTelemetryHandle};
+pub use process_tree::{terminate_all_task_process_trees, ProcessPriority};
 pub use runner::{
     read_bounded_stream, RunnerConfig, TaskRunner, TaskRunnerError, DEFAULT_MAX_OUTPUT_BYTES,
-    EXIT_CODE_CANCELLED, EXIT_CODE_GENERAL_ERROR, EXIT_CODE_SUCCESS, EXIT_CODE_TIMEOUT,
+    EXIT_CODE_CANCELLED, EXIT_CODE_GENERAL_ERROR, EXIT_CODE_INTERRUPTED, EXIT_CODE_SUCCESS,
+    EXIT_CODE_TIMEOUT,
 };
 pub use sandbox::{sanitize_relative_path, Sandbox, SandboxConfig, SandboxError};
 

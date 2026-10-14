@@ -2,18 +2,27 @@
 # ==============================================================================
 # run_cluster_benchmark.sh
 #
-# Automated Heterogeneous Distributed Cluster Benchmark
-# Hardware: Apple MacBook (Apple M5, 10 Cores) + Samsung Galaxy S24 (Exynos 2400, 10 Cores)
-# Total Compute Capacity: 20 Physical CPU Cores across LAN
+# Two-node distributed benchmark: parallel chunk hashing and dense matrix
+# multiplication, each run on node A alone, node B alone, and on both together.
 #
-# Requirements Addressed:
-# - R2: Heterogeneous Distributed Benchmark (Chunk Hashing & Matrix Multiplication)
-# - R4: Telemetry Latency Hardening & Mobile Resource Monitoring (< 100ms API response)
+#   node A : a worker process on this machine
+#   node B : either a second worker process on this machine (default, hardware free)
+#            or an Android phone reached through adb (--adb-id SERIAL)
+#
+# The script starts its OWN master and workers (private HOME, tracked PIDs) and never
+# signals anything it did not start. All figures in the reports are computed from the
+# raw per-task results saved in <output-dir>/raw_logs; a run exits non-zero and the
+# report says FAIL when any task result is missing or wrong (wrong digest, wrong
+# matrix element, non-zero exit). Speedups are measurements on this host and network,
+# not a claim about any other setup, and they are NOT reproduced in CI.
+#
+# Phone mode needs: adb, a USB-debugging phone on the same network as this machine,
+# an aarch64-linux-android rusty-grid binary (--phone-bin), and this machine's LAN IP
+# (--lan-ip, auto-detected when possible). The cluster secret is pushed to the phone.
 # ==============================================================================
 
 set -euo pipefail
 
-# ANSI color codes
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -29,31 +38,36 @@ log_err()     { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 log_section() { echo -e "\n${CYAN}${BOLD}======================================================================${NC}\n${CYAN}${BOLD} $*${NC}\n${CYAN}${BOLD}======================================================================${NC}\n"; }
 
 # ------------------------------------------------------------------------------
-# 1. CLI Options & Defaults
+# 1. CLI options & defaults (no device serials or addresses are baked in)
 # ------------------------------------------------------------------------------
-MASTER_ADDR="127.0.0.1:8088"
-ADB_ID="R5CWC3QQ52H"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ADB_ID="${ADB_ID:-}"
+LAN_IP=""
+PHONE_BIN=""
+CLI_BIN=""
 OUTPUT_DIR="${OUTPUT_DIR:-./test_reports}"
 WORKLOAD="all"              # "hash", "matrix", or "all"
-HASH_CHUNKS=10              # 10 chunks
-HASH_CHUNK_SIZE_MB=10       # 10 MB per chunk -> 100 MB total
-MATRIX_TILES=10             # 10 matrix blocks
-MATRIX_DIM=60               # 60x60 matrix per tile
+HASH_CHUNKS=10
+HASH_CHUNK_SIZE_MB=10
+MATRIX_TILES=10
+MATRIX_DIM=60
 
 print_help() {
     cat << EOF
 Usage: $(basename "$0") [OPTIONS]
 
-Automated heterogeneous distributed cluster benchmark for OxideSwarm.
+Two-node distributed benchmark for OxideSwarm (hash + matrix workloads).
 
 Options:
-  --master <ADDR>       Master TCP socket address (default: 127.0.0.1:8088)
-  --adb-id <ID>         Samsung Galaxy S24 ADB serial ID (default: R5CWC3QQ52H)
+  --adb-id <SERIAL>     Use this adb device as node B (default: a second local worker; also ADB_ID)
+  --phone-bin <PATH>    aarch64-linux-android rusty-grid to push (default: target/aarch64-linux-android/release/rusty-grid)
+  --lan-ip <IP>         This machine's LAN IP as seen by the phone (default: auto-detect; required if detection fails)
+  --cli-bin <PATH>      rusty-grid binary (default: target/release/rusty-grid, else target/debug/rusty-grid)
   --output-dir <DIR>    Directory for emitted reports & logs (default: ./test_reports)
-  --workload <TYPE>     Workload to benchmark: 'hash', 'matrix', or 'all' (default: all)
-  --chunks <N>          Number of hash chunks to execute (default: 10)
+  --workload <TYPE>     'hash', 'matrix', or 'all' (default: all)
+  --chunks <N>          Number of hash chunks (default: 10)
   --chunk-size <MB>     Megabytes per hash chunk (default: 10)
-  --matrix-tiles <N>    Number of matrix tiles to execute (default: 10)
+  --matrix-tiles <N>    Number of matrix tiles (default: 10)
   --matrix-dim <N>      Matrix dimension N for NxN tiles (default: 60)
   -h, --help            Print this help message and exit
 EOF
@@ -61,408 +75,332 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --master)
-            MASTER_ADDR="$2"
-            shift 2
-            ;;
-        --adb-id)
-            ADB_ID="$2"
-            shift 2
-            ;;
-        --output-dir)
-            OUTPUT_DIR="$2"
-            shift 2
-            ;;
-        --workload)
-            WORKLOAD="$2"
-            shift 2
-            ;;
-        --chunks)
-            HASH_CHUNKS="$2"
-            shift 2
-            ;;
-        --chunk-size)
-            HASH_CHUNK_SIZE_MB="$2"
-            shift 2
-            ;;
-        --matrix-tiles)
-            MATRIX_TILES="$2"
-            shift 2
-            ;;
-        --matrix-dim)
-            MATRIX_DIM="$2"
-            shift 2
-            ;;
-        -h|--help)
-            print_help
-            exit 0
-            ;;
-        *)
-            log_err "Unknown option: $1"
-            print_help
-            exit 1
-            ;;
+        --adb-id)       ADB_ID="$2"; shift 2 ;;
+        --phone-bin)    PHONE_BIN="$2"; shift 2 ;;
+        --lan-ip)       LAN_IP="$2"; shift 2 ;;
+        --cli-bin)      CLI_BIN="$2"; shift 2 ;;
+        --output-dir)   OUTPUT_DIR="$2"; shift 2 ;;
+        --workload)     WORKLOAD="$2"; shift 2 ;;
+        --chunks)       HASH_CHUNKS="$2"; shift 2 ;;
+        --chunk-size)   HASH_CHUNK_SIZE_MB="$2"; shift 2 ;;
+        --matrix-tiles) MATRIX_TILES="$2"; shift 2 ;;
+        --matrix-dim)   MATRIX_DIM="$2"; shift 2 ;;
+        -h|--help)      print_help; exit 0 ;;
+        *) log_err "Unknown option: $1"; print_help; exit 1 ;;
     esac
 done
 
-# ------------------------------------------------------------------------------
-# 2. Toolchain Resolution (ADB, Paths, & Binaries)
-# ------------------------------------------------------------------------------
-log_section "Phase 1: Environment & Toolchain Resolution"
+case "$WORKLOAD" in hash|matrix|all) ;; *) log_err "--workload must be hash, matrix or all"; exit 1 ;; esac
+command -v python3 >/dev/null 2>&1 || { log_err "python3 is required (analysis and report generation)."; exit 1; }
 
-# Auto-detect ADB
-if [[ -n "${ADB_PATH:-}" && -x "${ADB_PATH}" ]]; then
-    ADB="${ADB_PATH}"
-elif [[ -n "${ANDROID_HOME:-}" && -x "${ANDROID_HOME}/platform-tools/adb" ]]; then
-    ADB="${ANDROID_HOME}/platform-tools/adb"
-elif [[ -n "${ANDROID_SDK_ROOT:-}" && -x "${ANDROID_SDK_ROOT}/platform-tools/adb" ]]; then
-    ADB="${ANDROID_SDK_ROOT}/platform-tools/adb"
-elif [[ -x "$HOME/Library/Android/sdk/platform-tools/adb" ]]; then
-    ADB="$HOME/Library/Android/sdk/platform-tools/adb"
-elif command -v adb &>/dev/null; then
-    ADB="$(command -v adb)"
-else
-    log_err "ADB executable could not be found in PATH or standard Android SDK directories."
-    exit 1
+if [[ -z "$CLI_BIN" ]]; then
+    for cand in "${SCRIPT_DIR}/target/release/rusty-grid" "${SCRIPT_DIR}/target/debug/rusty-grid"; do
+        if [[ -x "$cand" ]]; then CLI_BIN="$cand"; break; fi
+    done
 fi
-export PATH="$(dirname "$ADB"):$PATH"
-log_ok "Resolved ADB: ${ADB}"
+[[ -n "$CLI_BIN" && -x "$CLI_BIN" ]] || { log_err "rusty-grid binary not found. Run 'cargo build --release --bin rusty-grid' or pass --cli-bin."; exit 1; }
+CLI_BIN="$(cd "$(dirname "$CLI_BIN")" && pwd)/$(basename "$CLI_BIN")"
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_MAC="${PROJECT_ROOT}/target/release/rusty-grid"
-BIN_ANDROID_LOCAL="${PROJECT_ROOT}/target/aarch64-linux-android/release/rusty-grid"
-BIN_ANDROID_REMOTE="/data/local/tmp/rusty-grid"
+PHONE_MODE=false
+ADB=""
+if [[ -n "$ADB_ID" ]]; then
+    PHONE_MODE=true
+    for cand in "${ADB_PATH:-}" "${ANDROID_HOME:-}/platform-tools/adb" "${ANDROID_SDK_ROOT:-}/platform-tools/adb" "$HOME/Library/Android/sdk/platform-tools/adb" "$(command -v adb 2>/dev/null || true)"; do
+        if [[ -n "$cand" && -x "$cand" ]]; then ADB="$cand"; break; fi
+    done
+    [[ -n "$ADB" ]] || { log_err "adb not found in PATH or the standard Android SDK directories."; exit 1; }
+    [[ -n "$PHONE_BIN" ]] || PHONE_BIN="${SCRIPT_DIR}/target/aarch64-linux-android/release/rusty-grid"
+    [[ -f "$PHONE_BIN" ]] || { log_err "Phone binary not found at ${PHONE_BIN} (build it with build_android_worker.sh, or pass --phone-bin)."; exit 1; }
+    if [[ -z "$LAN_IP" ]]; then
+        LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    fi
+    [[ -n "$LAN_IP" ]] || { log_err "Could not detect this machine's LAN IP; pass --lan-ip."; exit 1; }
+fi
 
-export OUTPUT_DIR
+# ------------------------------------------------------------------------------
+# 2. Workspace, isolated environment and process bookkeeping
+# ------------------------------------------------------------------------------
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/oxideswarm_bench_XXXXXX")"
+WORK="$(cd "$WORK" && pwd -P)"
+TEST_HOME="${WORK}/home"
+mkdir -p "$TEST_HOME" "$OUTPUT_DIR"
+OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 RAW_LOG_DIR="${OUTPUT_DIR}/raw_logs"
-mkdir -p "${RAW_LOG_DIR}"
+rm -rf "$RAW_LOG_DIR"
+mkdir -p "$RAW_LOG_DIR"
+EMPTY_CONFIG="${WORK}/empty.toml"
+: > "$EMPTY_CONFIG"
+
+GRID_ENV=(env)
+for var in $(env | sed -n 's/^\(RUSTY_GRID_[A-Za-z0-9_]*\)=.*/\1/p') OXIDESWARM_SECRET OXIDESWARM_SECRET_FILE OXIDE_DEV_MODE; do
+    GRID_ENV+=(-u "$var")
+done
+GRID_ENV+=(HOME="$TEST_HOME" USERPROFILE="$TEST_HOME" RUSTY_GRID_CONFIG="$EMPTY_CONFIG")
+grid() { "${GRID_ENV[@]}" "$CLI_BIN" "$@"; }
 
 export TELEMETRY_CSV="${OUTPUT_DIR}/telemetry_samples.csv"
 export REPORT_MD="${OUTPUT_DIR}/benchmark_report.md"
 export REPORT_JSON="${OUTPUT_DIR}/benchmark_data.json"
-export REPORT_METRICS_JSON="${OUTPUT_DIR}/benchmark_metrics.json"
 
-# Resolve local LAN IP and S24 Wi-Fi IP
-MAC_LAN_IP=$(ipconfig getifaddr en0 2>/dev/null || ifconfig en0 2>/dev/null | grep "inet " | awk '{print $2}' || echo "192.168.1.144")
-S24_WLAN_IP=$($ADB -s "${ADB_ID}" shell "ip addr show wlan0 2>/dev/null | grep 'inet ' | awk '{print \$2}' | cut -d/ -f1" 2>/dev/null || echo "192.168.1.147")
-if [[ -z "${S24_WLAN_IP}" ]]; then
-    S24_WLAN_IP="192.168.1.147"
-fi
-WEB_API_URL="http://127.0.0.1:8080"
-
-export MASTER_ADDR ADB_ID MAC_LAN_IP S24_WLAN_IP WEB_API_URL
-export HASH_CHUNKS HASH_CHUNK_SIZE_MB MATRIX_TILES MATRIX_DIM
-
-log_info "Master Address : ${MASTER_ADDR}"
-log_info "Web UI URL     : ${WEB_API_URL}"
-log_info "Mac LAN IP     : ${MAC_LAN_IP}"
-log_info "S24 Wi-Fi IP   : ${S24_WLAN_IP} (ADB ID: ${ADB_ID})"
-log_info "Output Dir     : ${OUTPUT_DIR}"
-
-# ------------------------------------------------------------------------------
-# 3. Cleanup & Restoration Traps
-# ------------------------------------------------------------------------------
+MASTER_PID=""
+NODE_A_PID=""
+NODE_B_PID=""
+PHONE_WORKER_PID=""
 TELEMETRY_PID=""
+
+stop_pid() {  # TERM, brief wait, KILL; only for PIDs this script started
+    local pid="$1" i
+    [[ -n "$pid" ]] || return 0
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.2
+        done
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+}
+
+phone_sh() { "$ADB" -s "$ADB_ID" shell "$@"; }
+
+stop_phone_worker() {
+    if [[ "$PHONE_MODE" == true && -n "$PHONE_WORKER_PID" ]]; then
+        phone_sh "kill $PHONE_WORKER_PID" >/dev/null 2>&1 || true
+        PHONE_WORKER_PID=""
+    fi
+}
 
 cleanup() {
     local exit_code=$?
-    log_info "Executing benchmark cleanup routine..."
-    if [[ -n "${TELEMETRY_PID}" ]] && kill -0 "${TELEMETRY_PID}" 2>/dev/null; then
-        log_info "Terminating background telemetry daemon (PID: ${TELEMETRY_PID})..."
-        kill -TERM "${TELEMETRY_PID}" 2>/dev/null || kill -9 "${TELEMETRY_PID}" 2>/dev/null || true
-        wait "${TELEMETRY_PID}" 2>/dev/null || true
-    fi
-
-    # Ensure local Mac worker is running
-    if ! pgrep -f "rusty-grid worker.*macbook-worker" &>/dev/null; then
-        log_info "Restoring local macbook-worker..."
-        nohup "${BIN_MAC}" worker --master "${MASTER_ADDR}" --name macbook-worker --simulate-gpu > "${RAW_LOG_DIR}/mac_worker_restore.log" 2>&1 &
-        sleep 1
-    fi
-
-    # Ensure remote S24 worker is running
-    if ! $ADB -s "${ADB_ID}" shell "ps -A | grep -w rusty-grid" &>/dev/null; then
-        log_info "Restoring remote S24 worker..."
-        $ADB -s "${ADB_ID}" shell "nohup ${BIN_ANDROID_REMOTE} worker --master ${MAC_LAN_IP}:8088 --name android-s24-phone > /data/local/tmp/worker.log 2>&1 &"
-        sleep 1
-    fi
-
+    log_info "Stopping the processes this script started..."
+    stop_pid "$TELEMETRY_PID"
+    stop_phone_worker
+    stop_pid "$NODE_B_PID"
+    stop_pid "$NODE_A_PID"
+    stop_pid "$MASTER_PID"
     if [[ $exit_code -eq 0 ]]; then
-        log_ok "Cluster state fully restored. Benchmark finished cleanly."
+        rm -rf "$WORK"
     else
-        log_warn "Cluster state restored after premature termination (exit code: ${exit_code})."
+        log_warn "Benchmark did not complete (exit ${exit_code}); scratch files kept in ${WORK}"
     fi
 }
 trap cleanup EXIT INT TERM
 
+now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+
 # ------------------------------------------------------------------------------
-# 4. Pre-Flight Verification & Cluster Initialization
+# 3. Master (own instance; auth/dashboard policy as the CLI enforces it)
 # ------------------------------------------------------------------------------
-log_section "Phase 2: Pre-Flight Cluster Verification"
-
-# Verify local macOS binary
-if [[ ! -x "${BIN_MAC}" ]]; then
-    log_err "Master/Worker binary missing at ${BIN_MAC}. Run 'cargo build --release' first."
-    exit 1
-fi
-log_ok "Mac binary verified: ${BIN_MAC}"
-
-# Verify ADB connectivity to S24
-log_info "Probing Samsung Galaxy S24 ADB device state..."
-ADB_STATE=$($ADB -s "${ADB_ID}" get-state 2>/dev/null || echo "offline")
-if [[ "${ADB_STATE}" != "device" ]]; then
-    log_err "Samsung Galaxy S24 (${ADB_ID}) is not ready. ADB state: ${ADB_STATE}."
-    exit 1
-fi
-S24_MODEL=$($ADB -s "${ADB_ID}" shell "getprop ro.product.model" 2>/dev/null | tr -d '\r\n')
-log_ok "Samsung Galaxy S24 authenticated via ADB (${S24_MODEL}, state: ${ADB_STATE})"
-
-# Verify Wi-Fi network reachability
-log_info "Pinging Galaxy S24 at ${S24_WLAN_IP}..."
-if ping -c 2 -W 2 "${S24_WLAN_IP}" &>/dev/null; then
-    log_ok "S24 Wi-Fi interface ${S24_WLAN_IP} is reachable (0.0% packet loss)."
+log_section "Phase 1: Starting master and workers"
+PORT_FILE="${WORK}/master.port"
+DASH_PORT_FILE="${WORK}/dashboard.port"
+if [[ "$PHONE_MODE" == true ]]; then
+    # Reachable by the phone => the master creates a cluster secret in the private HOME and
+    # requires it; the dashboard is read with the token derived from that secret.
+    MASTER_ARGS=(master --listen 0.0.0.0:0 --port-file "$PORT_FILE" --dashboard-port 0 --dashboard-port-file "$DASH_PORT_FILE")
 else
-    log_warn "Direct ICMP ping to ${S24_WLAN_IP} failed; continuing TCP probe."
+    # Everything on loopback: no secret needed; --dev gives the harness loopback-only dashboard access.
+    MASTER_ARGS=(master --listen 127.0.0.1:0 --port-file "$PORT_FILE" --dashboard-port 0 --dashboard-port-file "$DASH_PORT_FILE" --dev)
 fi
+"${GRID_ENV[@]}" "$CLI_BIN" "${MASTER_ARGS[@]}" > "${RAW_LOG_DIR}/master.log" 2>&1 &
+MASTER_PID=$!
+for _ in $(seq 1 100); do
+    [[ -s "$PORT_FILE" && -s "$DASH_PORT_FILE" ]] && break
+    kill -0 "$MASTER_PID" 2>/dev/null || { cat "${RAW_LOG_DIR}/master.log" >&2; log_err "master exited during startup"; exit 1; }
+    sleep 0.1
+done
+[[ -s "$PORT_FILE" && -s "$DASH_PORT_FILE" ]] || { log_err "master did not publish its ports"; exit 1; }
+MASTER_PORT="$(tr -d '\r\n' < "$PORT_FILE")"
+DASH_PORT="$(tr -d '\r\n' < "$DASH_PORT_FILE")"
+LOCAL_MASTER="127.0.0.1:${MASTER_PORT}"
+WEB_API_URL="http://127.0.0.1:${DASH_PORT}"
+export MASTER_ADDR="$LOCAL_MASTER" WEB_API_URL
 
-# Ensure Master Coordinator is running
-log_info "Checking Master Coordinator availability on ${MASTER_ADDR}..."
-if ! curl -s --max-time 2 "${WEB_API_URL}/api/status" &>/dev/null; then
-    log_warn "Master coordinator not responding at ${WEB_API_URL}/api/status. Launching master..."
-    nohup "${BIN_MAC}" master --listen 0.0.0.0:8088 > "${RAW_LOG_DIR}/master.log" 2>&1 &
-    sleep 2
-    if ! curl -s --max-time 3 "${WEB_API_URL}/api/status" &>/dev/null; then
-        log_err "Failed to launch Master Coordinator on 0.0.0.0:8088."
-        exit 1
+CURL_AUTH=()
+if [[ "$PHONE_MODE" == true ]]; then
+    DASH_TOKEN="$(grid secret show --dashboard-token)"
+    CURL_AUTH=(-H "Authorization: Bearer ${DASH_TOKEN}")
+fi
+api_status() {
+    if [[ ${#CURL_AUTH[@]} -gt 0 ]]; then
+        curl -s --max-time 3 "${CURL_AUTH[@]}" "${WEB_API_URL}/api/status"
+    else
+        curl -s --max-time 3 "${WEB_API_URL}/api/status"
     fi
-fi
-log_ok "Master Coordinator active and listening on ${MASTER_ADDR} / ${WEB_API_URL}."
+}
+log_ok "Master up: cluster ${LOCAL_MASTER}, dashboard ${WEB_API_URL} (PID ${MASTER_PID})"
 
-# Ensure remote S24 binary is present and up to date
-log_info "Verifying S24 binary at ${BIN_ANDROID_REMOTE}..."
-if ! $ADB -s "${ADB_ID}" shell "test -x ${BIN_ANDROID_REMOTE}" 2>/dev/null; then
-    log_warn "S24 binary missing or not executable. Deploying ${BIN_ANDROID_LOCAL}..."
-    if [[ ! -f "${BIN_ANDROID_LOCAL}" ]]; then
-        log_err "Local Android binary not found at ${BIN_ANDROID_LOCAL}."
-        exit 1
+# ------------------------------------------------------------------------------
+# 4. Worker helpers: node A is always local; node B is a phone or a second local worker
+# ------------------------------------------------------------------------------
+NODE_A_NAME="bench-node-a"
+NODE_B_NAME="bench-node-b"
+mkdir -p "${WORK}/sandbox_a" "${WORK}/sandbox_b"
+
+start_local_worker() {  # name sandbox logfile -> STARTED_PID
+    "${GRID_ENV[@]}" "$CLI_BIN" worker --master "$LOCAL_MASTER" --name "$1" --no-gpu \
+        --sandbox-base-dir "$2" > "$3" 2>&1 &
+    STARTED_PID=$!
+}
+
+start_node_a() { start_local_worker "$NODE_A_NAME" "${WORK}/sandbox_a" "${RAW_LOG_DIR}/node_a_worker.log"; NODE_A_PID=$STARTED_PID; }
+stop_node_a()  { stop_pid "$NODE_A_PID"; NODE_A_PID=""; }
+
+PHONE_SECRET_REMOTE="/data/local/tmp/oxideswarm_bench.secret"
+PHONE_BIN_REMOTE="/data/local/tmp/rusty-grid-bench"
+prepare_phone() {
+    local state
+    state="$("$ADB" -s "$ADB_ID" get-state 2>/dev/null || echo offline)"
+    [[ "$state" == "device" ]] || { log_err "adb device ${ADB_ID} is not ready (state: ${state})."; exit 1; }
+    PHONE_MODEL="$(phone_sh getprop ro.product.model 2>/dev/null | tr -d '\r\n')"
+    PHONE_OS="Android $(phone_sh getprop ro.build.version.release 2>/dev/null | tr -d '\r\n')"
+    PHONE_SOC="$(phone_sh getprop ro.soc.model 2>/dev/null | tr -d '\r\n')"
+    "$ADB" -s "$ADB_ID" push "$PHONE_BIN" "$PHONE_BIN_REMOTE" >/dev/null
+    phone_sh "chmod 755 $PHONE_BIN_REMOTE"
+    "$ADB" -s "$ADB_ID" push "${TEST_HOME}/.oxideswarm/cluster.secret" "$PHONE_SECRET_REMOTE" >/dev/null
+    phone_sh "chmod 600 $PHONE_SECRET_REMOTE"
+    log_ok "Phone ready: ${PHONE_MODEL} (${PHONE_OS})"
+}
+start_node_b() {
+    if [[ "$PHONE_MODE" == true ]]; then
+        PHONE_WORKER_PID="$(phone_sh "nohup $PHONE_BIN_REMOTE worker --master ${LAN_IP}:${MASTER_PORT} --name $NODE_B_NAME --secret-file $PHONE_SECRET_REMOTE > /data/local/tmp/oxideswarm_bench_worker.log 2>&1 & echo \$!" | tr -d '\r\n')"
+        [[ "$PHONE_WORKER_PID" =~ ^[0-9]+$ ]] || { log_err "could not start the phone worker"; exit 1; }
+    else
+        start_local_worker "$NODE_B_NAME" "${WORK}/sandbox_b" "${RAW_LOG_DIR}/node_b_worker.log"
+        NODE_B_PID=$STARTED_PID
     fi
-    $ADB -s "${ADB_ID}" push "${BIN_ANDROID_LOCAL}" "${BIN_ANDROID_REMOTE}"
-    $ADB -s "${ADB_ID}" shell "chmod +x ${BIN_ANDROID_REMOTE}"
-fi
-log_ok "S24 binary deployed and executable at ${BIN_ANDROID_REMOTE}."
+}
+stop_node_b() {
+    if [[ "$PHONE_MODE" == true ]]; then stop_phone_worker; else stop_pid "$NODE_B_PID"; NODE_B_PID=""; fi
+}
 
-# Ensure S24 Worker process is running
-log_info "Verifying S24 Worker process status..."
-if ! $ADB -s "${ADB_ID}" shell "ps -A | grep -w rusty-grid" &>/dev/null; then
-    log_warn "S24 Worker process not detected. Spawning worker on S24..."
-    $ADB -s "${ADB_ID}" shell "nohup ${BIN_ANDROID_REMOTE} worker --master ${MAC_LAN_IP}:8088 --name android-s24-phone > /data/local/tmp/worker.log 2>&1 &"
-    sleep 2
-fi
-log_ok "S24 Worker process confirmed active."
-
-# Ensure Mac Worker process is running
-log_info "Verifying Mac Worker process status..."
-if ! pgrep -f "rusty-grid worker.*macbook-worker" &>/dev/null; then
-    log_warn "Mac Worker process not detected. Spawning macbook-worker..."
-    nohup "${BIN_MAC}" worker --master "${MASTER_ADDR}" --name macbook-worker --simulate-gpu > "${RAW_LOG_DIR}/mac_worker.log" 2>&1 &
-    sleep 2
-fi
-log_ok "Mac Worker process confirmed active."
-
-# Await cluster registration of both workers
-log_info "Confirming dual-worker cluster registration (20 CPU cores total)..."
-READY=false
-for attempt in $(seq 1 15); do
-    STATUS_JSON=$(curl -s --max-time 2 "${WEB_API_URL}/api/status" || echo "{}")
-    CONNECTED_WORKERS=$(echo "${STATUS_JSON}" | python3 -c '
+# Waits until exactly the wanted node names are Connected on the master (dashboard API).
+wait_for_nodes() {  # names...
+    local want="$*" i
+    for i in $(seq 1 120); do
+        if api_status | python3 -c '
 import sys, json
+want = set(sys.argv[1:])
 try:
     d = json.load(sys.stdin)
-    workers = d.get("workers", [])
-    connected = [w for w in workers if w.get("status") == "Connected"]
-    names = [w.get("name") for w in connected]
-    cores = sum(w.get("cpu_cores", 0) for w in connected)
-    has_mac = "macbook-worker" in names
-    has_s24 = "android-s24-phone" in names
-    print(f"{len(connected)} {cores} {1 if has_mac and has_s24 else 0}")
 except Exception:
-    print("0 0 0")
-' || echo "0 0 0")
-    
-    read -r CNT CORES SYMMETRIC <<< "${CONNECTED_WORKERS}"
-    if [[ "${CNT}" -ge 2 && "${SYMMETRIC}" -eq 1 ]]; then
-        READY=true
-        log_ok "Cluster fully synchronized: ${CNT} workers connected (${CORES} total CPU cores)."
-        break
-    fi
-    sleep 1
-done
+    sys.exit(1)
+have = {w.get("name") for w in d.get("workers", []) if w.get("status") == "Connected"}
+sys.exit(0 if have == want else 1)' $want 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    log_err "timed out waiting for connected workers: ${want}"
+    api_status | python3 -m json.tool >&2 || true
+    return 1
+}
 
-if [[ "${READY}" != "true" ]]; then
-    log_err "Timeout waiting for both macbook-worker and android-s24-phone to connect."
-    curl -s "${WEB_API_URL}/api/status" | jq . || true
-    exit 1
-fi
+if [[ "$PHONE_MODE" == true ]]; then prepare_phone; else PHONE_MODEL="local worker process"; PHONE_OS="$(uname -sr)"; PHONE_SOC="n/a"; fi
+
+# Node inventory for the report: connect both once, record what the master saw, then isolate.
+start_node_a
+start_node_b
+wait_for_nodes "$NODE_A_NAME" "$NODE_B_NAME"
+api_status > "${RAW_LOG_DIR}/cluster_inventory.json"
+log_ok "Both nodes registered; inventory saved."
 
 # ------------------------------------------------------------------------------
-# 5. Launch 1Hz Mobile Telemetry & Stability Monitor
+# 5. Telemetry sampler: 1 Hz API latency (+ phone temperature/battery in phone mode)
 # ------------------------------------------------------------------------------
-log_section "Phase 3: Launching 1Hz Mobile Hardware & Telemetry Monitor"
-
+log_section "Phase 2: Telemetry sampler"
 echo "timestamp,epoch_s,s24_ap_temp_c,s24_skin_temp_c,s24_bat_temp_hal_c,s24_bat_temp_sys_c,s24_bat_pct,s24_bat_voltage_mv,s24_thermal_status,api_latency_ms" > "${TELEMETRY_CSV}"
 
 start_telemetry_daemon() {
     (
         while true; do
-            local NOW_EPOCH=$(python3 -c 'import time; print(int(time.time()))')
-            local NOW_ISO=$(python3 -c 'import datetime; print(datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))')
-
-            # Query S24 thermalservice and battery via ADB in a single command
-            local TEL_RAW=$($ADB -s "${ADB_ID}" shell "dumpsys thermalservice 2>/dev/null | grep -E 'mValue=|Thermal Status:'; dumpsys battery | head -n 25 2>/dev/null" 2>/dev/null || echo "")
-
-            local AP_T=$(echo "$TEL_RAW" | grep "mName=AP" | head -n1 | sed -n 's/.*mValue=\([0-9.]*\).*/\1/p' || echo "0.0")
-            local SKIN_T=$(echo "$TEL_RAW" | grep "mName=SKIN" | head -n1 | sed -n 's/.*mValue=\([0-9.]*\).*/\1/p' || echo "0.0")
-            local BAT_T_HAL=$(echo "$TEL_RAW" | grep "mName=BAT" | head -n1 | sed -n 's/.*mValue=\([0-9.]*\).*/\1/p' || echo "0.0")
-            local TH_STAT=$(echo "$TEL_RAW" | grep "Thermal Status:" | head -n1 | awk '{print $3}' || echo "0")
-
-            local BAT_P=$(echo "$TEL_RAW" | grep -m1 "level:" | awk '{print $2}' || echo "0")
-            local BAT_V=$(echo "$TEL_RAW" | awk '/^[[:space:]]*voltage:[[:space:]]*[0-9]+/ {print $2}' | head -n1 || echo "0")
-            local BAT_T_SYS=$(echo "$TEL_RAW" | grep -m1 "temperature:" | awk '{printf "%.1f", $2/10}' || echo "0.0")
-
-            # Measure /api/status HTTP round-trip latency
-            local LAT_S=$(curl -o /dev/null -s -w '%{time_total}' "${WEB_API_URL}/api/status" 2>/dev/null || echo "0")
-            local LAT_MS=$(python3 -c "print(f'{float(\"${LAT_S}\") * 1000:.2f}')" 2>/dev/null || echo "0.0")
-
+            NOW_EPOCH=$(python3 -c 'import time; print(int(time.time()))')
+            NOW_ISO=$(python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))')
+            AP_T=""; SKIN_T=""; BAT_T_HAL=""; BAT_T_SYS=""; BAT_P=""; BAT_V=""; TH_STAT=""
+            if [[ "$PHONE_MODE" == true ]]; then
+                TEL_RAW=$("$ADB" -s "$ADB_ID" shell "dumpsys thermalservice 2>/dev/null | grep -E 'mValue=|Thermal Status:'; dumpsys battery | head -n 25 2>/dev/null" 2>/dev/null || echo "")
+                AP_T=$(echo "$TEL_RAW" | grep "mName=AP" | head -n1 | sed -n 's/.*mValue=\([0-9.]*\).*/\1/p' || true)
+                SKIN_T=$(echo "$TEL_RAW" | grep "mName=SKIN" | head -n1 | sed -n 's/.*mValue=\([0-9.]*\).*/\1/p' || true)
+                BAT_T_HAL=$(echo "$TEL_RAW" | grep "mName=BAT" | head -n1 | sed -n 's/.*mValue=\([0-9.]*\).*/\1/p' || true)
+                TH_STAT=$(echo "$TEL_RAW" | grep "Thermal Status:" | head -n1 | awk '{print $3}' || true)
+                BAT_P=$(echo "$TEL_RAW" | grep -m1 "level:" | awk '{print $2}' || true)
+                BAT_V=$(echo "$TEL_RAW" | awk '/^[[:space:]]*voltage:[[:space:]]*[0-9]+/ {print $2}' | head -n1 || true)
+                BAT_T_SYS=$(echo "$TEL_RAW" | grep -m1 "temperature:" | awk '{printf "%.1f", $2/10}' || true)
+            fi
+            if [[ ${#CURL_AUTH[@]} -gt 0 ]]; then
+                LAT_S=$(curl -o /dev/null -s -w '%{time_total}' "${CURL_AUTH[@]}" "${WEB_API_URL}/api/status" 2>/dev/null || echo "")
+            else
+                LAT_S=$(curl -o /dev/null -s -w '%{time_total}' "${WEB_API_URL}/api/status" 2>/dev/null || echo "")
+            fi
+            LAT_MS=""
+            if [[ -n "$LAT_S" ]]; then LAT_MS=$(python3 -c "print(f'{float(\"${LAT_S}\") * 1000:.2f}')" 2>/dev/null || echo ""); fi
             echo "${NOW_ISO},${NOW_EPOCH},${AP_T},${SKIN_T},${BAT_T_HAL},${BAT_T_SYS},${BAT_P},${BAT_V},${TH_STAT},${LAT_MS}" >> "${TELEMETRY_CSV}"
             sleep 1
         done
     ) &
     TELEMETRY_PID=$!
 }
-
 start_telemetry_daemon
-log_ok "1Hz Telemetry collector active (Daemon PID: ${TELEMETRY_PID})."
-sleep 2
+log_ok "1 Hz sampler running (PID ${TELEMETRY_PID})."
 
 # ------------------------------------------------------------------------------
-# 6. Benchmark Workload 1: Parallel Chunk Hashing (I/O & Cryptography)
+# 6. Workloads. Each phase saves one JSON result per task; nothing is counted here.
 # ------------------------------------------------------------------------------
-TOTAL_HASH_MB=$(( HASH_CHUNKS * HASH_CHUNK_SIZE_MB ))
-HASH_REF="e5b844cc57f57094ea4585e235f36c78c1cd222262bb89d53c94dcb4d6b3e55d"
+TIMINGS="${RAW_LOG_DIR}/timings.env"
+: > "$TIMINGS"
 
-run_hash_workload() {
-    log_section "Phase 4: Workload 1 — Parallel Chunk Hashing (${TOTAL_HASH_MB} MB across ${HASH_CHUNKS} chunks)"
-    
-    local HASH_PAYLOAD='
-HOST_OS=$(uname -s)
-HASH=$(dd if=/dev/zero bs=1048576 count='${HASH_CHUNK_SIZE_MB}' 2>/dev/null | sha256sum | awk "{print \$1}")
-printf "HASH_RESULT host=%s hash=%s\n" "$HOST_OS" "$HASH"
-'
-
-    # --- 1A. MacBook Standalone Baseline ---
-    log_info "Executing 1A: MacBook Standalone (${HASH_CHUNKS} concurrent chunks)..."
-    local PIDS=()
-    local T0=$(python3 -c 'import time; print(int(time.time()*1000))')
-    for i in $(seq 1 "${HASH_CHUNKS}"); do
-        "${BIN_MAC}" submit --master "${MASTER_ADDR}" --type shell --gpu --wait -- "$HASH_PAYLOAD" > "${RAW_LOG_DIR}/mac_hash_${i}.log" 2>&1 &
-        PIDS+=($!)
+run_batch() {  # phase_name count payload
+    local phase="$1" count="$2" payload="$3" i t0 t1
+    local pids=()
+    t0=$(now_ms)
+    for i in $(seq 1 "$count"); do
+        grid submit --master "$LOCAL_MASTER" --type shell --wait --json -- "$payload" \
+            > "${RAW_LOG_DIR}/${phase}_${i}.json" 2> "${RAW_LOG_DIR}/${phase}_${i}.err" &
+        pids+=($!)
     done
-    for p in "${PIDS[@]}"; do wait "$p"; done
-    local T1=$(python3 -c 'import time; print(int(time.time()*1000))')
-    MAC_HASH_TIME_MS=$(( T1 - T0 ))
-    MAC_HASH_THROUGHPUT=$(python3 -c "print(f'{(${TOTAL_HASH_MB} / (${MAC_HASH_TIME_MS} / 1000.0)):.2f}')")
-    
-    local MAC_HASH_VERIFIED=0
-    for i in $(seq 1 "${HASH_CHUNKS}"); do
-        if grep -q "${HASH_REF}" "${RAW_LOG_DIR}/mac_hash_${i}.log"; then
-            ((MAC_HASH_VERIFIED++)) || true
-        fi
-    done
-    log_ok "MacBook Standalone Hashing: ${MAC_HASH_TIME_MS} ms (${MAC_HASH_THROUGHPUT} MB/s) [Verified: ${MAC_HASH_VERIFIED}/${HASH_CHUNKS}]"
-
-    # --- 1B. Samsung Galaxy S24 Standalone Baseline ---
-    log_info "Executing 1B: Samsung Galaxy S24 Standalone (${HASH_CHUNKS} concurrent chunks over Wi-Fi)..."
-    local MAC_WORKER_PID=$(pgrep -f "rusty-grid worker.*macbook-worker" || true)
-    if [[ -n "${MAC_WORKER_PID}" ]]; then
-        kill -9 ${MAC_WORKER_PID} 2>/dev/null || true
-        wait ${MAC_WORKER_PID} 2>/dev/null || true
-        sleep 1
-    fi
-    
-    PIDS=()
-    T0=$(python3 -c 'import time; print(int(time.time()*1000))')
-    for i in $(seq 1 "${HASH_CHUNKS}"); do
-        "${BIN_MAC}" submit --master "${MASTER_ADDR}" --type shell --wait -- "$HASH_PAYLOAD" > "${RAW_LOG_DIR}/s24_hash_${i}.log" 2>&1 &
-        PIDS+=($!)
-    done
-    for p in "${PIDS[@]}"; do wait "$p"; done
-    T1=$(python3 -c 'import time; print(int(time.time()*1000))')
-    S24_HASH_TIME_MS=$(( T1 - T0 ))
-    S24_HASH_THROUGHPUT=$(python3 -c "print(f'{(${TOTAL_HASH_MB} / (${S24_HASH_TIME_MS} / 1000.0)):.2f}')")
-
-    local S24_HASH_VERIFIED=0
-    for i in $(seq 1 "${HASH_CHUNKS}"); do
-        if grep -q "${HASH_REF}" "${RAW_LOG_DIR}/s24_hash_${i}.log"; then
-            ((S24_HASH_VERIFIED++)) || true
-        fi
-    done
-    log_ok "Galaxy S24 Standalone Hashing: ${S24_HASH_TIME_MS} ms (${S24_HASH_THROUGHPUT} MB/s) [Verified: ${S24_HASH_VERIFIED}/${HASH_CHUNKS}]"
-
-    # Reconnect Mac Worker for Cluster Run
-    log_info "Re-joining MacBook Worker into cluster..."
-    nohup "${BIN_MAC}" worker --master "${MASTER_ADDR}" --name macbook-worker --simulate-gpu > "${RAW_LOG_DIR}/mac_worker.log" 2>&1 &
-    sleep 2
-
-    # --- 1C. 20-Core Heterogeneous Cluster Run ---
-    log_info "Executing 1C: 20-Core Cluster Distributed (${HASH_CHUNKS} chunks across Mac + S24)..."
-    PIDS=()
-    T0=$(python3 -c 'import time; print(int(time.time()*1000))')
-    for i in $(seq 1 "${HASH_CHUNKS}"); do
-        "${BIN_MAC}" submit --master "${MASTER_ADDR}" --type shell --wait -- "$HASH_PAYLOAD" > "${RAW_LOG_DIR}/cluster_hash_${i}.log" 2>&1 &
-        PIDS+=($!)
-    done
-    for p in "${PIDS[@]}"; do wait "$p"; done
-    T1=$(python3 -c 'import time; print(int(time.time()*1000))')
-    CLUSTER_HASH_TIME_MS=$(( T1 - T0 ))
-    CLUSTER_HASH_THROUGHPUT=$(python3 -c "print(f'{(${TOTAL_HASH_MB} / (${CLUSTER_HASH_TIME_MS} / 1000.0)):.2f}')")
-
-    local CLUSTER_HASH_VERIFIED=0
-    local CLUSTER_DARWIN_COUNT=0
-    local CLUSTER_LINUX_COUNT=0
-    for i in $(seq 1 "${HASH_CHUNKS}"); do
-        if grep -q "${HASH_REF}" "${RAW_LOG_DIR}/cluster_hash_${i}.log"; then
-            ((CLUSTER_HASH_VERIFIED++)) || true
-        fi
-        if grep -q "host=Darwin" "${RAW_LOG_DIR}/cluster_hash_${i}.log"; then
-            ((CLUSTER_DARWIN_COUNT++)) || true
-        fi
-        if grep -q "host=Linux" "${RAW_LOG_DIR}/cluster_hash_${i}.log"; then
-            ((CLUSTER_LINUX_COUNT++)) || true
-        fi
-    done
-
-    # Mathematical speedup calculations
-    HASH_SPEEDUP_VS_S24=$(python3 -c "print(f'{(${S24_HASH_TIME_MS} / ${CLUSTER_HASH_TIME_MS}):.2f}')")
-    HASH_SPEEDUP_VS_MAC=$(python3 -c "print(f'{(${MAC_HASH_TIME_MS} / ${CLUSTER_HASH_TIME_MS}):.2f}')")
-    HASH_IDEAL_TIME_MS=$(python3 -c "print(f'{(${MAC_HASH_TIME_MS} * ${S24_HASH_TIME_MS}) / (${MAC_HASH_TIME_MS} + ${S24_HASH_TIME_MS}):.2f}')")
-    HASH_EFFICIENCY=$(python3 -c "print(f'{(float(\"${HASH_IDEAL_TIME_MS}\") / ${CLUSTER_HASH_TIME_MS}):.2f}')")
-
-    log_ok "Cluster Hashing: ${CLUSTER_HASH_TIME_MS} ms (${CLUSTER_HASH_THROUGHPUT} MB/s). Distribution: Mac=${CLUSTER_DARWIN_COUNT}, S24=${CLUSTER_LINUX_COUNT} [Verified: ${CLUSTER_HASH_VERIFIED}/${HASH_CHUNKS}]"
-    log_ok "Hashing Speedup vs Galaxy S24: ${HASH_SPEEDUP_VS_S24}x | Speedup vs Mac: ${HASH_SPEEDUP_VS_MAC}x"
+    for i in "${pids[@]}"; do wait "$i" || true; done
+    t1=$(now_ms)
+    echo "${phase}_ms=$(( t1 - t0 ))" >> "$TIMINGS"
+    log_ok "${phase}: ${count} tasks finished in $(( t1 - t0 )) ms"
 }
 
-# ------------------------------------------------------------------------------
-# 7. Benchmark Workload 2: Distributed Dense Matrix Multiplication
-# ------------------------------------------------------------------------------
-FLOPS_PER_TILE=$(( 2 * MATRIX_DIM * MATRIX_DIM * MATRIX_DIM ))
-TOTAL_FLOPS=$(( MATRIX_TILES * FLOPS_PER_TILE ))
-TOTAL_MFLOPS=$(python3 -c "print(f'{${TOTAL_FLOPS} / 1000000.0:.2f}')")
-EXPECTED_C00=$(python3 -c "print(f'{2.0 * ${MATRIX_DIM}:.1f}')")
+# Phases: <prefix>_a (node A only), <prefix>_b (node B only), <prefix>_cluster (both).
+run_three_modes() {  # prefix count payload
+    local prefix="$1" count="$2" payload="$3"
+    stop_node_b; sleep 1
+    wait_for_nodes "$NODE_A_NAME"
+    run_batch "${prefix}_a" "$count" "$payload"
 
-run_matrix_workload() {
-    log_section "Phase 5: Workload 2 — Distributed Dense Matrix Multiplication (${TOTAL_MFLOPS} MFLOPs across ${MATRIX_TILES} tiles of ${MATRIX_DIM}x${MATRIX_DIM})"
+    stop_node_a; start_node_b; sleep 1
+    wait_for_nodes "$NODE_B_NAME"
+    run_batch "${prefix}_b" "$count" "$payload"
 
-    local MATRIX_PAYLOAD='
+    start_node_a
+    wait_for_nodes "$NODE_A_NAME" "$NODE_B_NAME"
+    # A restarted worker gets a new id: record which id belongs to which node for this phase.
+    api_status > "${RAW_LOG_DIR}/${prefix}_cluster_workers.json"
+    run_batch "${prefix}_cluster" "$count" "$payload"
+}
+
+TOTAL_HASH_MB=$(( HASH_CHUNKS * HASH_CHUNK_SIZE_MB ))
+HASH_REF="$(python3 -c "import hashlib; print(hashlib.sha256(bytes(${HASH_CHUNK_SIZE_MB} * 1048576)).hexdigest())")"
+
+if [[ "$WORKLOAD" == "hash" || "$WORKLOAD" == "all" ]]; then
+    log_section "Phase 3: Parallel chunk hashing (${TOTAL_HASH_MB} MB in ${HASH_CHUNKS} chunks)"
+    HASH_PAYLOAD='
+HOST_OS=$(uname -s)
+if command -v sha256sum >/dev/null 2>&1; then S=sha256sum; else S="shasum -a 256"; fi
+HASH=$(dd if=/dev/zero bs=1048576 count='${HASH_CHUNK_SIZE_MB}' 2>/dev/null | $S | awk "{print \$1}")
+printf "HASH_RESULT host=%s hash=%s\n" "$HOST_OS" "$HASH"
+'
+    run_three_modes hash "$HASH_CHUNKS" "$HASH_PAYLOAD"
+fi
+
+EXPECTED_C00="$(python3 -c "print(f'{2.0 * ${MATRIX_DIM}:.1f}')")"
+if [[ "$WORKLOAD" == "matrix" || "$WORKLOAD" == "all" ]]; then
+    log_section "Phase 4: Dense matrix multiplication (${MATRIX_TILES} tiles of ${MATRIX_DIM}x${MATRIX_DIM})"
+    MATRIX_PAYLOAD='
 HOST_OS=$(uname -s)
 awk -v host="$HOST_OS" '\''BEGIN {
   N = '${MATRIX_DIM}';
@@ -474,469 +412,235 @@ awk -v host="$HOST_OS" '\''BEGIN {
   }
   printf "MATRIX_RESULT host=%s flops=%d c00=%.1f\n", host, 2*N*N*N, c[0,0];
 }'\'''
-
-    # --- 2A. MacBook Standalone Baseline ---
-    log_info "Executing 2A: MacBook Standalone (${MATRIX_TILES} concurrent tiles)..."
-    local PIDS=()
-    local T0=$(python3 -c 'import time; print(int(time.time()*1000))')
-    for i in $(seq 1 "${MATRIX_TILES}"); do
-        "${BIN_MAC}" submit --master "${MASTER_ADDR}" --type shell --gpu --wait -- "$MATRIX_PAYLOAD" > "${RAW_LOG_DIR}/mac_mat_${i}.log" 2>&1 &
-        PIDS+=($!)
-    done
-    for p in "${PIDS[@]}"; do wait "$p"; done
-    local T1=$(python3 -c 'import time; print(int(time.time()*1000))')
-    MAC_MAT_TIME_MS=$(( T1 - T0 ))
-    MAC_MAT_MFLOPS=$(python3 -c "print(f'{(float(\"${TOTAL_MFLOPS}\") / (${MAC_MAT_TIME_MS} / 1000.0)):.2f}')")
-
-    local MAC_MAT_VERIFIED=0
-    for i in $(seq 1 "${MATRIX_TILES}"); do
-        if grep -q "c00=${EXPECTED_C00}" "${RAW_LOG_DIR}/mac_mat_${i}.log"; then
-            ((MAC_MAT_VERIFIED++)) || true
-        fi
-    done
-    log_ok "MacBook Standalone Matrix: ${MAC_MAT_TIME_MS} ms (${MAC_MAT_MFLOPS} MFLOPS) [Verified: ${MAC_MAT_VERIFIED}/${MATRIX_TILES}]"
-
-    # --- 2B. Samsung Galaxy S24 Standalone Baseline ---
-    log_info "Executing 2B: Samsung Galaxy S24 Standalone (${MATRIX_TILES} concurrent tiles over Wi-Fi)..."
-    local MAC_WORKER_PID=$(pgrep -f "rusty-grid worker.*macbook-worker" || true)
-    if [[ -n "${MAC_WORKER_PID}" ]]; then
-        kill -9 ${MAC_WORKER_PID} 2>/dev/null || true
-        wait ${MAC_WORKER_PID} 2>/dev/null || true
-        sleep 1
-    fi
-
-    PIDS=()
-    T0=$(python3 -c 'import time; print(int(time.time()*1000))')
-    for i in $(seq 1 "${MATRIX_TILES}"); do
-        "${BIN_MAC}" submit --master "${MASTER_ADDR}" --type shell --wait -- "$MATRIX_PAYLOAD" > "${RAW_LOG_DIR}/s24_mat_${i}.log" 2>&1 &
-        PIDS+=($!)
-    done
-    for p in "${PIDS[@]}"; do wait "$p"; done
-    T1=$(python3 -c 'import time; print(int(time.time()*1000))')
-    S24_MAT_TIME_MS=$(( T1 - T0 ))
-    S24_MAT_MFLOPS=$(python3 -c "print(f'{(float(\"${TOTAL_MFLOPS}\") / (${S24_MAT_TIME_MS} / 1000.0)):.2f}')")
-
-    local S24_MAT_VERIFIED=0
-    for i in $(seq 1 "${MATRIX_TILES}"); do
-        if grep -q "c00=${EXPECTED_C00}" "${RAW_LOG_DIR}/s24_mat_${i}.log"; then
-            ((S24_MAT_VERIFIED++)) || true
-        fi
-    done
-    log_ok "Galaxy S24 Standalone Matrix: ${S24_MAT_TIME_MS} ms (${S24_MAT_MFLOPS} MFLOPS) [Verified: ${S24_MAT_VERIFIED}/${MATRIX_TILES}]"
-
-    # Reconnect Mac Worker for Cluster Run
-    log_info "Re-joining MacBook Worker into cluster..."
-    nohup "${BIN_MAC}" worker --master "${MASTER_ADDR}" --name macbook-worker --simulate-gpu > "${RAW_LOG_DIR}/mac_worker.log" 2>&1 &
-    sleep 2
-
-    # --- 2C. 20-Core Heterogeneous Cluster Run ---
-    log_info "Executing 2C: 20-Core Cluster Distributed (${MATRIX_TILES} tiles across Mac + S24)..."
-    PIDS=()
-    T0=$(python3 -c 'import time; print(int(time.time()*1000))')
-    for i in $(seq 1 "${MATRIX_TILES}"); do
-        "${BIN_MAC}" submit --master "${MASTER_ADDR}" --type shell --wait -- "$MATRIX_PAYLOAD" > "${RAW_LOG_DIR}/cluster_mat_${i}.log" 2>&1 &
-        PIDS+=($!)
-    done
-    for p in "${PIDS[@]}"; do wait "$p"; done
-    T1=$(python3 -c 'import time; print(int(time.time()*1000))')
-    CLUSTER_MAT_TIME_MS=$(( T1 - T0 ))
-    CLUSTER_MAT_MFLOPS=$(python3 -c "print(f'{(float(\"${TOTAL_MFLOPS}\") / (${CLUSTER_MAT_TIME_MS} / 1000.0)):.2f}')")
-
-    local CLUSTER_MAT_VERIFIED=0
-    local CLUSTER_DARWIN_COUNT=0
-    local CLUSTER_LINUX_COUNT=0
-    for i in $(seq 1 "${MATRIX_TILES}"); do
-        if grep -q "c00=${EXPECTED_C00}" "${RAW_LOG_DIR}/cluster_mat_${i}.log"; then
-            ((CLUSTER_MAT_VERIFIED++)) || true
-        fi
-        if grep -q "host=Darwin" "${RAW_LOG_DIR}/cluster_mat_${i}.log"; then
-            ((CLUSTER_DARWIN_COUNT++)) || true
-        fi
-        if grep -q "host=Linux" "${RAW_LOG_DIR}/cluster_mat_${i}.log"; then
-            ((CLUSTER_LINUX_COUNT++)) || true
-        fi
-    done
-
-    # Mathematical speedup calculations
-    MAT_SPEEDUP_VS_S24=$(python3 -c "print(f'{(${S24_MAT_TIME_MS} / ${CLUSTER_MAT_TIME_MS}):.2f}')")
-    MAT_SPEEDUP_VS_MAC=$(python3 -c "print(f'{(${MAC_MAT_TIME_MS} / ${CLUSTER_MAT_TIME_MS}):.2f}')")
-    MAT_IDEAL_TIME_MS=$(python3 -c "print(f'{(${MAC_MAT_TIME_MS} * ${S24_MAT_TIME_MS}) / (${MAC_MAT_TIME_MS} + ${S24_MAT_TIME_MS}):.2f}')")
-    MAT_EFFICIENCY=$(python3 -c "print(f'{(float(\"${MAT_IDEAL_TIME_MS}\") / ${CLUSTER_MAT_TIME_MS}):.2f}')")
-
-    log_ok "Cluster Matrix: ${CLUSTER_MAT_TIME_MS} ms (${CLUSTER_MAT_MFLOPS} MFLOPS). Distribution: Mac=${CLUSTER_DARWIN_COUNT}, S24=${CLUSTER_LINUX_COUNT} [Verified: ${CLUSTER_MAT_VERIFIED}/${MATRIX_TILES}]"
-    log_ok "Matrix Speedup vs Galaxy S24: ${MAT_SPEEDUP_VS_S24}x | Speedup vs Mac: ${MAT_SPEEDUP_VS_MAC}x"
-}
-
-# Run selected workloads
-if [[ "${WORKLOAD}" == "hash" || "${WORKLOAD}" == "all" ]]; then
-    run_hash_workload
+    run_three_modes matrix "$MATRIX_TILES" "$MATRIX_PAYLOAD"
 fi
 
-if [[ "${WORKLOAD}" == "matrix" || "${WORKLOAD}" == "all" ]]; then
-    run_matrix_workload
-fi
-
-# Allow telemetry collector to record post-benchmark cooldown sample
-sleep 2
-
-# Stop telemetry daemon
-if [[ -n "${TELEMETRY_PID}" ]] && kill -0 "${TELEMETRY_PID}" 2>/dev/null; then
-    kill -TERM "${TELEMETRY_PID}" 2>/dev/null || kill -9 "${TELEMETRY_PID}" 2>/dev/null || true
-    wait "${TELEMETRY_PID}" 2>/dev/null || true
-    TELEMETRY_PID=""
-fi
-
-# Export all workload metrics for Python report generator
-export HASH_CHUNKS TOTAL_HASH_MB HASH_CHUNK_SIZE_MB HASH_REF
-export MAC_HASH_TIME_MS="${MAC_HASH_TIME_MS:-0}"
-export MAC_HASH_THROUGHPUT="${MAC_HASH_THROUGHPUT:-0.0}"
-export S24_HASH_TIME_MS="${S24_HASH_TIME_MS:-0}"
-export S24_HASH_THROUGHPUT="${S24_HASH_THROUGHPUT:-0.0}"
-export CLUSTER_HASH_TIME_MS="${CLUSTER_HASH_TIME_MS:-0}"
-export CLUSTER_HASH_THROUGHPUT="${CLUSTER_HASH_THROUGHPUT:-0.0}"
-export HASH_SPEEDUP_VS_S24="${HASH_SPEEDUP_VS_S24:-1.0}"
-export HASH_SPEEDUP_VS_MAC="${HASH_SPEEDUP_VS_MAC:-1.0}"
-export HASH_IDEAL_TIME_MS="${HASH_IDEAL_TIME_MS:-0.0}"
-export HASH_EFFICIENCY="${HASH_EFFICIENCY:-0.0}"
-
-export MATRIX_TILES MATRIX_DIM FLOPS_PER_TILE TOTAL_MFLOPS EXPECTED_C00
-export MAC_MAT_TIME_MS="${MAC_MAT_TIME_MS:-0}"
-export MAC_MAT_MFLOPS="${MAC_MAT_MFLOPS:-0.0}"
-export S24_MAT_TIME_MS="${S24_MAT_TIME_MS:-0}"
-export S24_MAT_MFLOPS="${S24_MAT_MFLOPS:-0.0}"
-export CLUSTER_MAT_TIME_MS="${CLUSTER_MAT_TIME_MS:-0}"
-export CLUSTER_MAT_MFLOPS="${CLUSTER_MAT_MFLOPS:-0.0}"
-export MAT_SPEEDUP_VS_S24="${MAT_SPEEDUP_VS_S24:-1.0}"
-export MAT_SPEEDUP_VS_MAC="${MAT_SPEEDUP_VS_MAC:-1.0}"
-export MAT_IDEAL_TIME_MS="${MAT_IDEAL_TIME_MS:-0.0}"
-export MAT_EFFICIENCY="${MAT_EFFICIENCY:-0.0}"
+stop_pid "$TELEMETRY_PID"; TELEMETRY_PID=""
 
 # ------------------------------------------------------------------------------
-# 8. Report Generation & JSON Emission
+# 7. Analysis and reports: everything below is computed from the raw results
 # ------------------------------------------------------------------------------
-log_section "Phase 6: Emitting Verified Benchmark Reports (Markdown & JSON)"
+log_section "Phase 5: Verifying results and writing reports"
+export WORKLOAD HASH_CHUNKS HASH_CHUNK_SIZE_MB TOTAL_HASH_MB HASH_REF MATRIX_TILES MATRIX_DIM EXPECTED_C00
+export RAW_LOG_DIR OUTPUT_DIR NODE_A_NAME NODE_B_NAME PHONE_MODE PHONE_MODEL PHONE_OS PHONE_SOC
+export HOST_DESC="$(uname -srm)"
+export HOST_CPU="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//' || echo unknown)"
 
+set +e
 python3 - << 'PYEOF'
-import sys, os, csv, json, datetime
+import csv, datetime, glob, json, os, sys
 
-output_dir = os.environ.get("OUTPUT_DIR") or "./test_reports"
-os.makedirs(output_dir, exist_ok=True)
-report_md_path = os.environ.get("REPORT_MD") or os.path.join(output_dir, "benchmark_report.md")
-report_json_path = os.environ.get("REPORT_JSON") or os.path.join(output_dir, "benchmark_data.json")
-metrics_json_path = os.environ.get("REPORT_METRICS_JSON") or os.path.join(output_dir, "benchmark_metrics.json")
-csv_path = os.environ.get("TELEMETRY_CSV") or os.path.join(output_dir, "telemetry_samples.csv")
+env = os.environ
+raw = env["RAW_LOG_DIR"]
+out = env["OUTPUT_DIR"]
+workload = env["WORKLOAD"]
+phone_mode = env["PHONE_MODE"] == "true"
 
-# Load telemetry CSV
-rows = []
-if os.path.exists(csv_path):
-    with open(csv_path, 'r') as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            rows.append(r)
+def fnum(v, default=None):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
 
-def safe_float(v, default=0.0):
-    try: return float(v)
-    except: return default
+timings = {}
+with open(os.path.join(raw, "timings.env")) as f:
+    for line in f:
+        if "=" in line:
+            k, v = line.strip().split("=", 1)
+            timings[k] = int(v)
 
-def safe_int(v, default=0):
-    try: return int(v)
-    except: return default
+def load_phase(phase, expected_count):
+    results = []
+    for i in range(1, expected_count + 1):
+        p = os.path.join(raw, f"{phase}_{i}.json")
+        try:
+            with open(p) as f:
+                results.append(json.load(f))
+        except Exception:
+            results.append(None)
+    return results
 
-ap_temps = [safe_float(r.get('s24_ap_temp_c')) for r in rows if safe_float(r.get('s24_ap_temp_c')) > 0]
-skin_temps = [safe_float(r.get('s24_skin_temp_c')) for r in rows if safe_float(r.get('s24_skin_temp_c')) > 0]
-bat_temps = [safe_float(r.get('s24_bat_temp_sys_c')) for r in rows if safe_float(r.get('s24_bat_temp_sys_c')) > 0]
-bat_pcts = [safe_int(r.get('s24_bat_pct')) for r in rows if safe_int(r.get('s24_bat_pct')) > 0]
-bat_volts = [safe_int(r.get('s24_bat_voltage_mv')) for r in rows if safe_int(r.get('s24_bat_voltage_mv')) > 0]
-thermal_statuses = [safe_int(r.get('s24_thermal_status')) for r in rows]
-api_lats = [safe_float(r.get('api_latency_ms')) for r in rows if safe_float(r.get('api_latency_ms')) > 0]
+def check(results, token):
+    """Returns (verified_count, worker_id counter, host counter)."""
+    verified = 0
+    workers, hosts = {}, {}
+    for r in results:
+        if not r:
+            continue
+        wid = r.get("worker_id", "unknown")
+        stdout = r.get("stdout", "")
+        ok = r.get("exit_code") == 0 and token(stdout)
+        if ok:
+            verified += 1
+            workers[wid] = workers.get(wid, 0) + 1
+            for part in stdout.split():
+                if part.startswith("host="):
+                    hosts[part[5:]] = hosts.get(part[5:], 0) + 1
+    return verified, workers, hosts
 
-start_ap = ap_temps[0] if ap_temps else 30.0
-final_ap = ap_temps[-1] if ap_temps else 30.0
-max_ap = max(ap_temps) if ap_temps else 30.0
-
-start_skin = skin_temps[0] if skin_temps else 30.0
-final_skin = skin_temps[-1] if skin_temps else 30.0
-max_skin = max(skin_temps) if skin_temps else 30.0
-
-start_bat_t = bat_temps[0] if bat_temps else 29.5
-final_bat_t = bat_temps[-1] if bat_temps else 29.5
-max_bat_t = max(bat_temps) if bat_temps else 29.5
-
-start_bat_p = bat_pcts[0] if bat_pcts else 100
-final_bat_p = bat_pcts[-1] if bat_pcts else 100
-bat_v = bat_volts[-1] if bat_volts else 4307
-
-th_max = max(thermal_statuses) if thermal_statuses else 0
-
-lat_min = min(api_lats) if api_lats else 0.3
-lat_max = max(api_lats) if api_lats else 0.8
-lat_avg = sum(api_lats)/len(api_lats) if api_lats else 0.4
-sorted_lat = sorted(api_lats)
-p95_idx = int(len(sorted_lat)*0.95) if sorted_lat else 0
-lat_p95 = sorted_lat[p95_idx] if sorted_lat else 0.5
-
-# Extract bash workload metrics
-hash_chunks = safe_int(os.environ.get("HASH_CHUNKS", 10))
-hash_mb = safe_int(os.environ.get("TOTAL_HASH_MB", 100))
-mac_hash_t = safe_int(os.environ.get("MAC_HASH_TIME_MS", 0))
-mac_hash_r = safe_float(os.environ.get("MAC_HASH_THROUGHPUT", 0.0))
-s24_hash_t = safe_int(os.environ.get("S24_HASH_TIME_MS", 0))
-s24_hash_r = safe_float(os.environ.get("S24_HASH_THROUGHPUT", 0.0))
-cl_hash_t = safe_int(os.environ.get("CLUSTER_HASH_TIME_MS", 0))
-cl_hash_r = safe_float(os.environ.get("CLUSTER_HASH_THROUGHPUT", 0.0))
-h_sp_s24 = safe_float(os.environ.get("HASH_SPEEDUP_VS_S24", 1.0))
-h_sp_mac = safe_float(os.environ.get("HASH_SPEEDUP_VS_MAC", 1.0))
-h_ideal = safe_float(os.environ.get("HASH_IDEAL_TIME_MS", 0.0))
-h_eff = safe_float(os.environ.get("HASH_EFFICIENCY", 0.0))
-
-mat_tiles = safe_int(os.environ.get("MATRIX_TILES", 10))
-mat_dim = safe_int(os.environ.get("MATRIX_DIM", 60))
-total_mflops = safe_float(os.environ.get("TOTAL_MFLOPS", 4.32))
-mac_mat_t = safe_int(os.environ.get("MAC_MAT_TIME_MS", 0))
-mac_mat_r = safe_float(os.environ.get("MAC_MAT_MFLOPS", 0.0))
-s24_mat_t = safe_int(os.environ.get("S24_MAT_TIME_MS", 0))
-s24_mat_r = safe_float(os.environ.get("S24_MAT_MFLOPS", 0.0))
-cl_mat_t = safe_int(os.environ.get("CLUSTER_MAT_TIME_MS", 0))
-cl_mat_r = safe_float(os.environ.get("CLUSTER_MAT_MFLOPS", 0.0))
-m_sp_s24 = safe_float(os.environ.get("MAT_SPEEDUP_VS_S24", 1.0))
-m_sp_mac = safe_float(os.environ.get("MAT_SPEEDUP_VS_MAC", 1.0))
-m_ideal = safe_float(os.environ.get("MAT_IDEAL_TIME_MS", 0.0))
-m_eff = safe_float(os.environ.get("MAT_EFFICIENCY", 0.0))
-
-timestamp_str = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-
+failures = []
 data = {
-    "timestamp": timestamp_str,
-    "benchmark_version": "1.0.0",
-    "cluster": {
-        "master_address": os.environ.get("MASTER_ADDR", "127.0.0.1:8088"),
-        "total_cores": 20,
-        "nodes": [
-            {
-                "name": "macbook-worker",
-                "role": "Orchestrator & Worker",
-                "model": "Apple M5",
-                "os": "macOS 27.0 (Darwin)",
-                "cpu_cores": 10,
-                "ram_mb": 32768,
-                "ip": os.environ.get("MAC_LAN_IP", "192.168.1.144"),
-                "has_gpu": True,
-                "simulated_gpu": True
-            },
-            {
-                "name": "android-s24-phone",
-                "role": "Compute Worker Node",
-                "model": "Samsung Galaxy S24 (SM-S926B)",
-                "soc": "Samsung Exynos 2400",
-                "os": "Android 16 (API 36, Linux 6.1.157)",
-                "cpu_cores": 10,
-                "ram_mb": 11203,
-                "serial": os.environ.get("ADB_ID", "R5CWC3QQ52H"),
-                "ip": os.environ.get("S24_WLAN_IP", "192.168.1.147"),
-                "has_gpu": False
-            }
-        ]
-    },
-    "workloads": {
-        "parallel_chunk_hashing": {
-            "total_volume_mb": hash_mb,
-            "chunk_count": hash_chunks,
-            "chunk_size_mb": safe_int(os.environ.get("HASH_CHUNK_SIZE_MB", 10)),
-            "algorithm": "SHA-256",
-            "expected_digest": os.environ.get("HASH_REF", ""),
-            "macbook_standalone": {
-                "execution_time_ms": mac_hash_t,
-                "throughput_mb_s": mac_hash_r,
-                "tasks_completed": hash_chunks,
-                "digests_verified": hash_chunks
-            },
-            "s24_standalone": {
-                "execution_time_ms": s24_hash_t,
-                "throughput_mb_s": s24_hash_r,
-                "tasks_completed": hash_chunks,
-                "digests_verified": hash_chunks
-            },
-            "cluster_distributed": {
-                "execution_time_ms": cl_hash_t,
-                "throughput_mb_s": cl_hash_r,
-                "tasks_completed": hash_chunks,
-                "macbook_tasks": hash_chunks // 2,
-                "s24_tasks": hash_chunks - (hash_chunks // 2),
-                "digests_verified": hash_chunks
-            },
-            "speedup_vs_s24": h_sp_s24,
-            "speedup_vs_macbook": h_sp_mac,
-            "harmonic_ideal_time_ms": h_ideal,
-            "parallel_efficiency": h_eff
-        },
-        "distributed_dense_matrix_multiplication": {
-            "tiles": mat_tiles,
-            "matrix_dimension": mat_dim,
-            "flops_per_tile": safe_int(os.environ.get("FLOPS_PER_TILE", 432000)),
-            "total_mflops": total_mflops,
-            "expected_c00": safe_float(os.environ.get("EXPECTED_C00", 120.0)),
-            "macbook_standalone": {
-                "execution_time_ms": mac_mat_t,
-                "compute_rate_mflops": mac_mat_r,
-                "tiles_completed": mat_tiles,
-                "results_verified": mat_tiles
-            },
-            "s24_standalone": {
-                "execution_time_ms": s24_mat_t,
-                "compute_rate_mflops": s24_mat_r,
-                "tiles_completed": mat_tiles,
-                "results_verified": mat_tiles
-            },
-            "cluster_distributed": {
-                "execution_time_ms": cl_mat_t,
-                "compute_rate_mflops": cl_mat_r,
-                "tiles_completed": mat_tiles,
-                "macbook_tiles": mat_tiles // 2,
-                "s24_tiles": mat_tiles - (mat_tiles // 2),
-                "results_verified": mat_tiles
-            },
-            "speedup_vs_s24": m_sp_s24,
-            "speedup_vs_macbook": m_sp_mac,
-            "harmonic_ideal_time_ms": m_ideal,
-            "parallel_efficiency": m_eff
-        }
-    },
-    "telemetry": {
-        "sample_count": len(rows),
-        "sampling_rate_hz": 1.0,
-        "s24_battery": {
-            "initial_pct": start_bat_p,
-            "final_pct": final_bat_p,
-            "delta_pct": final_bat_p - start_bat_p,
-            "voltage_mv": bat_v,
-            "initial_temp_c": start_bat_t,
-            "final_temp_c": final_bat_t,
-            "max_temp_c": max_bat_t
-        },
-        "s24_thermal": {
-            "initial_ap_temp_c": start_ap,
-            "final_ap_temp_c": final_ap,
-            "max_ap_temp_c": max_ap,
-            "initial_skin_temp_c": start_skin,
-            "final_skin_temp_c": final_skin,
-            "max_skin_temp_c": max_skin,
-            "max_thermal_status": th_max,
-            "throttling_detected": th_max > 0
-        },
-        "api_latency_ms": {
-            "min": round(lat_min, 2),
-            "avg": round(lat_avg, 2),
-            "max": round(lat_max, 2),
-            "p95": round(lat_p95, 2),
-            "threshold_ms": 100.0,
-            "target_met": lat_max < 100.0
-        }
-    },
-    "integrity_attestation": {
-        "live_cluster_execution": True,
-        "physical_hardware_verified": True,
-        "total_cores_engaged": 20,
-        "synthetic_results": False
-    }
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "host": env["HOST_DESC"],
+    "host_cpu": env["HOST_CPU"],
+    "mode": "phone" if phone_mode else "two local worker processes",
+    "node_b": {"model": env["PHONE_MODEL"], "os": env["PHONE_OS"], "soc": env["PHONE_SOC"]},
+    "note": "Single run on the host above; not reproduced in CI. Speedups are measurements, not guarantees.",
+    "workloads": {},
 }
 
-# Write JSON reports
-with open(report_json_path, 'w') as f:
+# Inventory (cores/RAM as the master saw them)
+inv = {}
+try:
+    with open(os.path.join(raw, "cluster_inventory.json")) as f:
+        for w in json.load(f).get("workers", []):
+            inv[w.get("name")] = {"cpu_cores": w.get("cpu_cores"), "ram_mb": w.get("ram_mb")}
+except Exception:
+    pass
+data["nodes"] = {"node_a": inv.get(env["NODE_A_NAME"], {}), "node_b": inv.get(env["NODE_B_NAME"], {})}
+total_cores = sum((v.get("cpu_cores") or 0) for v in data["nodes"].values())
+data["total_cores_reported"] = total_cores
+
+def run_workload(key, prefix, count, token, unit_label, work_units):
+    section = {"tasks_per_mode": count}
+    for mode in ("a", "b", "cluster"):
+        phase = f"{prefix}_{mode}"
+        results = load_phase(phase, count)
+        verified, workers, hosts = check(results, token)
+        ms = timings.get(f"{phase}_ms")
+        section[mode] = {
+            "execution_time_ms": ms,
+            "tasks_verified": verified,
+            "tasks_expected": count,
+            "rate": round(work_units / (ms / 1000.0), 2) if ms else None,
+            "worker_task_counts": workers,
+            "host_task_counts": hosts,
+        }
+        if verified != count:
+            failures.append(f"{key}/{mode}: {verified}/{count} results verified")
+    ta, tb, tc = (section[m]["execution_time_ms"] for m in ("a", "b", "cluster"))
+    cluster_workers = section["cluster"]["worker_task_counts"]
+    # Worker ids change on every restart, so the node of each id comes from the master's own
+    # worker list captured right before the cluster run.
+    ids_by_name = {}
+    try:
+        with open(os.path.join(raw, f"{prefix}_cluster_workers.json")) as f:
+            for w in json.load(f).get("workers", []):
+                ids_by_name[w.get("name")] = w.get("id")
+    except Exception:
+        pass
+    section["cluster_distribution"] = {
+        "node_a_tasks": cluster_workers.get(ids_by_name.get(env["NODE_A_NAME"]), 0),
+        "node_b_tasks": cluster_workers.get(ids_by_name.get(env["NODE_B_NAME"]), 0),
+    }
+    if ta and tb and tc:
+        section["speedup_vs_node_b"] = round(tb / tc, 2)
+        section["speedup_vs_node_a"] = round(ta / tc, 2)
+        ideal = (ta * tb) / (ta + tb)
+        section["harmonic_ideal_time_ms"] = round(ideal, 2)
+        section["parallel_efficiency"] = round(ideal / tc, 2)
+    section["rate_unit"] = unit_label
+    data["workloads"][key] = section
+
+if workload in ("hash", "all"):
+    ref = env["HASH_REF"]
+    run_workload("parallel_chunk_hashing", "hash", int(env["HASH_CHUNKS"]),
+                 lambda s: f"hash={ref}" in s, "MB/s", int(env["TOTAL_HASH_MB"]))
+    data["workloads"]["parallel_chunk_hashing"]["expected_sha256_per_chunk"] = ref
+    data["workloads"]["parallel_chunk_hashing"]["chunk_size_mb"] = int(env["HASH_CHUNK_SIZE_MB"])
+
+if workload in ("matrix", "all"):
+    dim = int(env["MATRIX_DIM"])
+    c00 = env["EXPECTED_C00"]
+    flops_tile = 2 * dim ** 3
+    tiles = int(env["MATRIX_TILES"])
+    run_workload("distributed_dense_matrix_multiplication", "matrix", tiles,
+                 lambda s: f"c00={c00}" in s, "MFLOPS", (flops_tile * tiles) / 1e6)
+    data["workloads"]["distributed_dense_matrix_multiplication"]["matrix_dimension"] = dim
+    data["workloads"]["distributed_dense_matrix_multiplication"]["expected_c00"] = float(c00)
+
+# Telemetry
+rows = []
+csv_path = env["TELEMETRY_CSV"]
+if os.path.exists(csv_path):
+    with open(csv_path) as f:
+        rows = list(csv.DictReader(f))
+lat = [fnum(r.get("api_latency_ms")) for r in rows]
+lat = [x for x in lat if x is not None and x > 0]
+th = [fnum(r.get("s24_thermal_status")) for r in rows]
+th = [x for x in th if x is not None]
+bat = [fnum(r.get("s24_bat_pct")) for r in rows]
+bat = [x for x in bat if x is not None and x > 0]
+telemetry = {"sample_count": len(rows), "api_latency_samples": len(lat)}
+if lat:
+    s = sorted(lat)
+    telemetry["api_latency_ms"] = {
+        "min": round(min(lat), 2), "avg": round(sum(lat) / len(lat), 2),
+        "p95": round(s[min(len(s) - 1, int(len(s) * 0.95))], 2), "max": round(max(lat), 2),
+        "threshold_ms": 100.0, "within_threshold": max(lat) < 100.0,
+    }
+if phone_mode:
+    telemetry["phone_thermal_samples_above_normal"] = sum(1 for x in th if x > 0)
+    if bat:
+        telemetry["phone_battery_pct_first_last"] = [bat[0], bat[-1]]
+data["telemetry"] = telemetry
+
+data["verdict"] = "PASS" if not failures else "FAIL"
+data["failures"] = failures
+
+with open(env["REPORT_JSON"], "w") as f:
     json.dump(data, f, indent=2)
 
-with open(metrics_json_path, 'w') as f:
-    json.dump(data, f, indent=2)
+def row(label, sec, mode):
+    s = sec[mode]
+    status = "PASS" if s["tasks_verified"] == s["tasks_expected"] else "FAIL"
+    return f"| {label} | {s['execution_time_ms']} ms | {s['rate']} {sec['rate_unit']} | {s['tasks_verified']}/{s['tasks_expected']} {status} |"
 
-# Write Markdown report
-md_content = f"""# Heterogeneous Distributed Cluster Benchmark Report
+lines = [
+    "# Two-node distributed benchmark report",
+    "",
+    f"- Generated: `{data['timestamp']}` on `{data['host']}` ({data['host_cpu']})",
+    f"- Mode: {data['mode']}; node B: {env['PHONE_MODEL']} ({env['PHONE_OS']})",
+    f"- Cores reported by the master: {total_cores}",
+    f"- **Verdict: {data['verdict']}**" + ("" if not failures else " - " + "; ".join(failures)),
+    f"- {data['note']}",
+    "",
+]
+for key, sec in data["workloads"].items():
+    lines += [f"## {key}", "", "| Mode | Wall clock | Rate | Verified results |", "| :--- | ---: | ---: | :--- |",
+              row("Node A alone", sec, "a"), row("Node B alone", sec, "b"), row("Both nodes", sec, "cluster"), ""]
+    d = sec["cluster_distribution"]
+    lines.append(f"Cluster run placement: node A {d['node_a_tasks']} task(s), node B {d['node_b_tasks']} task(s).")
+    if "speedup_vs_node_b" in sec:
+        lines.append(f"Speedup of the cluster run: {sec['speedup_vs_node_a']}x vs node A alone, {sec['speedup_vs_node_b']}x vs node B alone; "
+                     f"parallel efficiency {sec['parallel_efficiency']} (1.0 = harmonic ideal).")
+    lines.append("")
+lat_info = telemetry.get("api_latency_ms")
+lines += ["## Telemetry", "", f"- Samples: {telemetry['sample_count']} (1 Hz)"]
+if lat_info:
+    lines.append(f"- Dashboard `/api/status` latency (ms): min {lat_info['min']}, avg {lat_info['avg']}, p95 {lat_info['p95']}, max {lat_info['max']}"
+                 f" - {'within' if lat_info['within_threshold'] else 'ABOVE'} the {lat_info['threshold_ms']} ms threshold")
+if phone_mode:
+    lines.append(f"- Phone samples with thermal status above normal: {telemetry['phone_thermal_samples_above_normal']}")
+with open(env["REPORT_MD"], "w") as f:
+    f.write("\n".join(lines) + "\n")
 
-**OxideSwarm High-Performance Grid Engine**  
-**Execution Timestamp**: `{timestamp_str}`  
-**Cluster Architecture**: 20 CPU Cores across LAN (`{data['cluster']['nodes'][0]['ip']}` <-> `{data['cluster']['nodes'][1]['ip']}`)
-
----
-
-## 1. Physical Hardware & Cluster Topology
-
-| Node Name | Device & Architecture | Cores / Cache | Memory | Operating System | Network Role |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **macbook-worker** | Apple M5 (4P + 6E Cores) | 10 Cores, 6MB L2 | 32 GB Unified | macOS 27.0 (Darwin) | Master / Compute (`{data['cluster']['nodes'][0]['ip']}:8088`) |
-| **android-s24-phone** | Samsung Exynos 2400 (1X4 + 5A720 + 4A520) | 10 Cores, Tri-cluster | 12 GB LPDDR5X | Android 16 (Linux 6.1) | Compute Worker (`{data['cluster']['nodes'][1]['ip']}`) |
-| **Total Cluster** | **Heterogeneous ARM64 Dual-Node** | **20 Physical Cores** | **44 GB RAM** | **Cross-Platform Grid** | **Symmetric 50/50 Load Balance** |
-
----
-
-## 2. Workload 1: Parallel Chunk Hashing (I/O & Cryptographic Throughput)
-- **Workload Scale**: {hash_mb} MB total across {hash_chunks} parallel chunks ({hash_chunks} x {data['workloads']['parallel_chunk_hashing']['chunk_size_mb']} MB).
-- **Algorithm**: Deterministic Cryptographic SHA-256 (`sha256sum`).
-- **Target Hash**: `{data['workloads']['parallel_chunk_hashing']['expected_digest']}`.
-
-| Execution Mode | Wall-Clock Time (ms) | Throughput (MB/s) | Speedup vs. S24 | Speedup vs. Mac | Cryptographic Verification |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **MacBook Standalone** | {mac_hash_t} ms | {mac_hash_r} MB/s | - | 1.00x | 100% PASS ({hash_chunks}/{hash_chunks} digests verified) |
-| **Galaxy S24 Standalone** | {s24_hash_t} ms | {s24_hash_r} MB/s | 1.00x | - | 100% PASS ({hash_chunks}/{hash_chunks} digests verified) |
-| **20-Core Cluster Distributed** | **{cl_hash_t} ms** | **{cl_hash_r} MB/s** | **{h_sp_s24}x** | **{h_sp_mac}x** | **100% PASS ({hash_chunks}/{hash_chunks} digests verified)** |
-
-> **Load Distribution**: {data['workloads']['parallel_chunk_hashing']['cluster_distributed']['macbook_tasks']} tasks scheduled on MacBook (Darwin), {data['workloads']['parallel_chunk_hashing']['cluster_distributed']['s24_tasks']} tasks scheduled on Galaxy S24 (Linux).  
-> **Theoretical Harmonic Ideal Time**: {h_ideal} ms (Parallel Efficiency: {h_eff * 100:.1f}%).
-
----
-
-## 3. Workload 2: Distributed Dense Matrix Multiplication (Compute-Bound FLOPs)
-- **Workload Scale**: {mat_tiles} parallel submatrix tiles of dimension {mat_dim}x{mat_dim}.
-- **Arithmetic Complexity**: $2 \\times N^3$ FLOPs per tile ($2 \\times {mat_dim}^3 = {data['workloads']['distributed_dense_matrix_multiplication']['flops_per_tile']} \\text{{ FLOPs}}$) = **{total_mflops} MFLOPs Total**.
-- **Numerical Invariant**: Result element $C[0,0] = {data['workloads']['distributed_dense_matrix_multiplication']['expected_c00']}$.
-
-| Execution Mode | Wall-Clock Time (ms) | Compute Rate (MFLOPS) | Speedup vs. S24 | Speedup vs. Mac | Numerical Integrity |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **MacBook Standalone** | {mac_mat_t} ms | {mac_mat_r} MFLOPS | - | 1.00x | 100% PASS ({mat_tiles}/{mat_tiles} tiles verified) |
-| **Galaxy S24 Standalone** | {s24_mat_t} ms | {s24_mat_r} MFLOPS | 1.00x | - | 100% PASS ({mat_tiles}/{mat_tiles} tiles verified) |
-| **20-Core Cluster Distributed** | **{cl_mat_t} ms** | **{cl_mat_r} MFLOPS** | **{m_sp_s24}x** | **{m_sp_mac}x** | **100% PASS ({mat_tiles}/{mat_tiles} tiles verified)** |
-
-> **Load Distribution**: {data['workloads']['distributed_dense_matrix_multiplication']['cluster_distributed']['macbook_tiles']} tiles scheduled on MacBook (Darwin), {data['workloads']['distributed_dense_matrix_multiplication']['cluster_distributed']['s24_tiles']} tiles scheduled on Galaxy S24 (Linux).  
-> **Theoretical Harmonic Ideal Time**: {m_ideal} ms (Parallel Efficiency: {m_eff * 100:.1f}%).
-
----
-
-## 4. Mobile Hardware Stability & Telemetry Sampling (Requirement R4)
-Continuously monitored at 1.0 Hz sampling rate during distributed computation:
-
-- **Battery State**:
-  - Initial Level: `{start_bat_p}%` -> Final Level: `{final_bat_p}%` ($\Delta = {final_bat_p - start_bat_p}\%$)
-  - Terminal Voltage: `{bat_v} mV`
-  - Battery Cell Temp: Initial `{start_bat_t} °C` -> Final `{final_bat_t} °C` (Peak: `{max_bat_t} °C`)
-- **Thermal & Throttling Status**:
-  - Application Processor (AP) SoC Temp: Initial `{start_ap} °C` -> Final `{final_ap} °C` (Peak: `{max_ap} °C`)
-  - Device Chassis (Skin) Temp: Initial `{start_skin} °C` -> Final `{final_skin} °C` (Peak: `{max_skin} °C`)
-  - Thermal Throttling Status: `Status {th_max}` (**0 Throttling Events**, full unthrottled performance throughout)
-- **Master Telemetry Latency (`/api/status`) Under Load**:
-  - Min Latency: `{lat_min:.2f} ms`
-  - Average Latency: `{lat_avg:.2f} ms`
-  - 95th Percentile (P95): `{lat_p95:.2f} ms`
-  - Max Peak Latency: `{lat_max:.2f} ms`
-  - **Acceptance Threshold**: `< 100.0 ms` -> **PASSED ({lat_max:.2f} ms << 100 ms)**
-
----
-
-## 5. Summary & Verification Conclusion
-1. **Cluster Execution**: Successfully proved live concurrent compute across all 20 cores of the heterogeneous cluster (MacBook M5 + Samsung Galaxy S24).
-2. **Speedup Confirmed**: Demonstrates true speedup over mobile standalone execution ({h_sp_s24}x for hashing, {m_sp_s24}x for matrix multiplication) with 50/50 task split.
-3. **Data Integrity**: 100% deterministic SHA-256 hash match and exact floating-point matrix result validation across all nodes.
-4. **P2P Telemetry Resilience**: Status API response time remained well under 1 ms under full cluster load, vastly exceeding Requirement R4.
-"""
-
-with open(report_md_path, 'w') as f:
-    f.write(md_content.strip() + "\n")
-
-print(f"[OK] Report generated: {report_md_path}")
-print(f"[OK] Metrics JSON generated: {report_json_path}")
+print(f"[{'OK' if not failures else 'FAIL'}] verdict {data['verdict']}: {env['REPORT_MD']}")
+for fl in failures:
+    print(f"  - {fl}", file=sys.stderr)
+sys.exit(0 if not failures else 2)
 PYEOF
+ANALYSIS_EXIT=$?
+set -e
 
-log_ok "Benchmark suite complete! Summary reports generated:"
-log_ok "  - Markdown Report : ${REPORT_MD}"
-log_ok "  - JSON Metrics    : ${REPORT_JSON}"
-log_ok "  - Telemetry CSV   : ${TELEMETRY_CSV}"
+if [[ $ANALYSIS_EXIT -ne 0 ]]; then
+    log_err "Benchmark FAILED verification (see ${REPORT_MD} and ${RAW_LOG_DIR})."
+    exit "$ANALYSIS_EXIT"
+fi
 
-echo -e "\n${BOLD}======================================================================${NC}"
+log_ok "Benchmark complete. Reports:"
+log_ok "  - Markdown : ${REPORT_MD}"
+log_ok "  - JSON     : ${REPORT_JSON}"
+log_ok "  - Telemetry: ${TELEMETRY_CSV}"
+echo
 cat "${REPORT_MD}"
-echo -e "${BOLD}======================================================================${NC}\n"

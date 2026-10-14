@@ -5,6 +5,12 @@
 //! 2. Environment Variables (`RUSTY_GRID_*`)
 //! 3. Configuration File (`--config <path>`, `RUSTY_GRID_CONFIG`, or `./rusty-grid.{toml,json}`)
 //! 4. Hardcoded System Defaults
+//!
+//! The cluster secret is the one exception to the `RUSTY_GRID_*` prefix: it follows
+//! `ClusterSecret::resolve` (`--secret`, `--secret-file`, `OXIDESWARM_SECRET`,
+//! `OXIDESWARM_SECRET_FILE`), then the `secret_file` / `secret` config keys (top level, or inside
+//! the `[master]`, `[worker]`, `[submit]`, `[status]` section of the command, which wins), then
+//! the default file `~/.oxideswarm/cluster.secret`. See `crate::secret_cmd`.
 
 use rusty_grid_core::error::{GridError, GridResult};
 use serde::{Deserialize, Serialize};
@@ -13,6 +19,13 @@ use std::path::{Path, PathBuf};
 /// Top-level configuration file schema supporting TOML and JSON.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ConfigFile {
+    /// Path of the cluster secret file used by every command (a section's own key wins).
+    #[serde(default)]
+    pub secret_file: Option<String>,
+    /// Cluster secret as hex. Prefer `secret_file`: a secret inline in a config file is easy to
+    /// leak through backups and version control.
+    #[serde(default)]
+    pub secret: Option<SecretText>,
     #[serde(default)]
     pub master: Option<MasterFileConfig>,
     #[serde(default)]
@@ -41,6 +54,20 @@ pub struct MasterFileConfig {
     pub wire_codec: Option<String>,
     pub dashboard_port: Option<u16>,
     pub dashboard_port_file: Option<String>,
+    /// Finished tasks (with payload and output) the master keeps before evicting the oldest.
+    pub max_retained_tasks: Option<usize>,
+    /// Megabytes of finished-task payload and output the master keeps (default 256).
+    pub max_retained_mb: Option<u64>,
+    /// Tasks of one `mapreduce` job in flight at once.
+    pub mapreduce_parallelism: Option<usize>,
+    /// Open connections the grid port accepts at once.
+    pub max_connections: Option<usize>,
+    /// Connections allowed to sit in the pre-authentication handshake at once.
+    pub max_pending_handshakes: Option<usize>,
+    /// Allow a master that is reachable beyond this machine to run without a cluster secret.
+    pub insecure: Option<bool>,
+    pub secret_file: Option<String>,
+    pub secret: Option<SecretText>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -71,17 +98,99 @@ pub struct WorkerFileConfig {
     pub wire_codec: Option<String>,
     #[serde(default)]
     pub hardware: Option<WorkerHardwareConfig>,
+    pub secret_file: Option<String>,
+    pub secret: Option<SecretText>,
+    /// Allow connecting to a remote / `auto` / P2P master without a cluster secret.
+    pub insecure: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SubmitFileConfig {
     pub master: Option<String>,
     pub timeout_secs: Option<u64>,
+    pub secret_file: Option<String>,
+    pub secret: Option<SecretText>,
+    /// Allow talking to a remote / `auto` master without a cluster secret.
+    pub insecure: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct StatusFileConfig {
     pub master: Option<String>,
+    pub secret_file: Option<String>,
+    pub secret: Option<SecretText>,
+    /// Allow talking to a remote / `auto` master without a cluster secret.
+    pub insecure: Option<bool>,
+}
+
+/// A secret as typed by a human (`--secret`, the `secret` config key). It is a plain string, but
+/// `Debug` never shows it, so the derived `Debug` of the argument and config structs that hold it
+/// cannot leak it into logs.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretText(pub String);
+
+impl SecretText {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretText(<redacted>)")
+    }
+}
+
+impl std::str::FromStr for SecretText {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
+}
+
+/// The config-file section whose `secret` / `secret_file` keys apply to a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretSection {
+    Master,
+    Worker,
+    /// `submit` and `mapreduce` (both read the `[submit]` section).
+    Submit,
+    /// `status` and `workers` (both read the `[status]` section).
+    Status,
+}
+
+impl ConfigFile {
+    /// The `(secret, secret_file)` config keys that apply to `section`: the section's own keys
+    /// win over the top-level ones, per key. Empty strings count as unset.
+    pub fn secret_keys(&self, section: SecretSection) -> (Option<String>, Option<String>) {
+        let (sec_value, sec_file) = match section {
+            SecretSection::Master => self
+                .master
+                .as_ref()
+                .map(|m| (m.secret.clone(), m.secret_file.clone())),
+            SecretSection::Worker => self
+                .worker
+                .as_ref()
+                .map(|w| (w.secret.clone(), w.secret_file.clone())),
+            SecretSection::Submit => self
+                .submit
+                .as_ref()
+                .map(|s| (s.secret.clone(), s.secret_file.clone())),
+            SecretSection::Status => self
+                .status
+                .as_ref()
+                .map(|s| (s.secret.clone(), s.secret_file.clone())),
+        }
+        .unwrap_or_default();
+        let non_empty = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+        let text = |v: Option<SecretText>| v.map(|t| t.0);
+        (
+            non_empty(text(sec_value)).or_else(|| non_empty(text(self.secret.clone()))),
+            non_empty(sec_file).or_else(|| non_empty(self.secret_file.clone())),
+        )
+    }
 }
 
 /// Returns the platform-specific default OxideSwarm directory:
@@ -402,6 +511,69 @@ gpu_name = "Mock RTX"
                 .as_deref(),
             Some("dashboard.port")
         );
+    }
+
+    #[test]
+    fn test_secret_keys_parse_from_toml_and_sections_override_top_level() {
+        let parsed: ConfigFile = toml::from_str(
+            r#"
+secret_file = "/etc/oxideswarm/cluster.secret"
+secret = "00000000000000000000000000000000"
+
+[master]
+insecure = true
+secret_file = "/srv/master.secret"
+
+[worker]
+secret = "11111111111111111111111111111111"
+
+[status]
+master = "10.0.0.5:8088"
+"#,
+        )
+        .expect("parse toml");
+        assert_eq!(parsed.master.as_ref().unwrap().insecure, Some(true));
+
+        let value = |v: &str| Some(v.to_string());
+        // Per key: the section's own entry wins, otherwise the top-level one applies.
+        assert_eq!(
+            parsed.secret_keys(SecretSection::Master),
+            (
+                value("00000000000000000000000000000000"),
+                value("/srv/master.secret")
+            )
+        );
+        assert_eq!(
+            parsed.secret_keys(SecretSection::Worker),
+            (
+                value("11111111111111111111111111111111"),
+                value("/etc/oxideswarm/cluster.secret")
+            )
+        );
+        // Sections without secret keys, or missing entirely, fall back to the top level.
+        for section in [SecretSection::Status, SecretSection::Submit] {
+            assert_eq!(
+                parsed.secret_keys(section),
+                (
+                    value("00000000000000000000000000000000"),
+                    value("/etc/oxideswarm/cluster.secret")
+                )
+            );
+        }
+        assert_eq!(
+            ConfigFile::default().secret_keys(SecretSection::Master),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn test_empty_secret_keys_count_as_unset() {
+        let config = ConfigFile {
+            secret: Some(SecretText("  ".into())),
+            secret_file: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(config.secret_keys(SecretSection::Worker), (None, None));
     }
 
     #[test]

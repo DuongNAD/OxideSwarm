@@ -23,9 +23,14 @@ Android's power-management architecture is designed to restrict and suspend back
 
 Without specialized packaging, a background worker process will be frozen or terminated within **3 to 15 minutes** of turning off the phone screen.
 
-OxideSwarm solves these challenges through two robust deployment paths:
-* **Path A (Production Recommended):** Native Android Foreground Service App (`packaging/android/app/`).
-* **Path B (Developer / Automation):** Termux Background Daemon (`packaging/android/termux/`).
+OxideSwarm offers two deployment paths:
+* **Path A:** Native Android Foreground Service App (`packaging/android/app/`). It needs a native library you must build first (section 2.3) and cannot hold the cluster secret yet (see below).
+* **Path B:** Termux Background Daemon (`packaging/android/termux/`). Works with the cluster secret today and is the path to use against a master that requires one.
+
+> **What the phone needs to join a grid.** The master's *cluster* address, `HOST:8088` (8080 is the dashboard and
+> never works), and a copy of the master's `cluster.secret` (a master reachable beyond loopback creates
+> `~/.oxideswarm/cluster.secret` on its first start; copy it with `scp` or a USB stick, never chat or e-mail).
+> Without the secret the worker refuses to follow a remote master. Model and caveats: [../../docs/SECURITY.md](../../docs/SECURITY.md).
 
 ---
 
@@ -66,7 +71,7 @@ Located in `packaging/android/app/`, this is a production-grade, turnkey Android
 │  │  [Primary] OxideWorkerBridge (In-Process JNI)                      │  │
 │  │  - Loads 'liboxideworker.so' via dlopen                            │  │
 │  │  - Executes Tokio Multi-Thread Runtime on native POSIX pthread     │  │
-│  │  - Zero child processes -> 100% IMMUNE to Phantom Process Killer   │  │
+│  │  - The worker loop is not a child process (see 2.2 for tasks)      │  │
 │  │  - Full SELinux W^X (Write XOR Execute) compliance                 │  │
 │  │                                                                    │  │
 │  │  [Fallback] ManagedProcessRunner (Binary Process Supervision)      │  │
@@ -81,22 +86,30 @@ Located in `packaging/android/app/`, this is a production-grade, turnkey Android
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 Why In-Process JNI Wins
-1. **Zero Phantom Child Processes:** When an Android app spawns a child process using `ProcessBuilder` or `fork()`, Android 12+ monitors its CPU usage. If it consumes heavy CPU in the background, `ActivityManagerService` terminates it with `SIGKILL` (Phantom Process Killer). With In-Process JNI, the Rust runtime lives entirely on a native thread within the JVM process. There are **no child processes**, completely bypassing PPK.
+### 2.2 Why In-Process JNI
+1. **The worker is not a phantom child process:** When an Android app spawns a child process using `ProcessBuilder` or `fork()`, Android 12+ monitors its CPU usage. If it consumes heavy CPU in the background, `ActivityManagerService` terminates it with `SIGKILL` (Phantom Process Killer). With In-Process JNI the Rust runtime and the worker loop live on native threads within the app process, so the worker itself is not subject to PPK. **Caveat:** the task runner still launches a child process for every `command`, `shell` and `compile` task (`tokio::process::Command`), and those children *are* exposed to PPK; only the built-in in-process task types are not. Raise the limit as described in 3.4 if you run command tasks on the phone.
 2. **SELinux W^X Compliance:** Android 10+ strictly prohibits executing binaries from writable app directories (`/data/data/...`). JNI libraries (`liboxideworker.so`) reside in the OS-managed read-only `nativeLibraryDir`, adhering to SELinux security rules.
 3. **Elevated Priority Inheritance:** The Rust Tokio runtime inherits the Foreground Service's `oom_score_adj <= 200`.
 
 ### 2.3 Compiling & Installing the APK
 
-#### Building from CLI:
+#### Step 1 - build the native worker library (mandatory):
+The Gradle project does not compile Rust. Without `liboxideworker.so` in `app/app/src/main/jniLibs/arm64-v8a/` the app reports "Native JNI library not loaded" or "Worker binary not found" and never joins the grid.
+```bash
+# From the repository root (needs the Android NDK and the aarch64-linux-android Rust target; --check verifies them)
+packaging/android/build_android_jni.sh --check
+packaging/android/build_android_jni.sh --release
+# -> packaging/android/app/app/src/main/jniLibs/arm64-v8a/liboxideworker.so
+```
+
+#### Step 2 - build the APK from CLI:
 ```bash
 cd packaging/android/app
 
-# Clean and assemble release APK
-./gradlew assembleRelease
-
-# The generated APK will be at:
-# app/build/outputs/apk/release/app-release-unsigned.apk
+# Debug APK (signed with the debug key, installable directly)
+./gradlew assembleDebug
+# -> app/build/outputs/apk/debug/app-debug.apk
+# `assembleRelease` produces app-release-unsigned.apk, which Android refuses to install until you sign it.
 ```
 
 #### Installing via ADB:
@@ -109,8 +122,16 @@ adb shell am start -n com.oxideswarm.worker/.MainActivity
 ### 2.4 First-Time Configuration Walkthrough
 1. **Grant Notification Permission:** On Android 13+, tap "Allow" when prompted for notification permissions (required for foreground service visibility).
 2. **Exempt from Battery Optimizations:** Tap the **"Disable Battery Optimization"** button. Android will display a system dialog asking to let the app always run in the background. Tap **"Allow"**.
-3. **Configure Coordinator Address:** Enter the IP address and port of your OxideSwarm Master node (e.g. `192.168.1.100:8080`).
-4. **Tap "Start Worker":** The worker connects immediately, displays an ongoing status notification, and begins heartbeating every 3 seconds.
+3. **Configure Coordinator Address:** Enter the master's *cluster* address, IP and port **8088** (e.g. `192.168.1.100:8088`), or a P2P ticket. Not 8080: that is the dashboard.
+4. **Tap "Start Worker":** The worker connects, displays an ongoing status notification, and begins heartbeating every 3 seconds.
+
+> **Known gap:** the app has no field for the cluster secret and its JNI start path builds the worker without one, so it
+> cannot join a master that requires the secret (any master with a non-loopback `--listen`). Until that is added use
+> the Termux worker (Path B). Tracked in the top-level README under Known Limitations.
+>
+> The in-process worker keeps its task sandboxes in `<app cache dir>/sandboxes` (the service hands that path to the
+> native library before starting it). If the directory cannot be created the worker does not start and the app shows
+> the reason (`ERROR: The sandbox base directory ... is not writable`).
 
 ---
 
@@ -149,10 +170,18 @@ For automated test environments, headless mobile clusters, or power users, Oxide
    bash ~/install_termux_daemon.sh
    ```
 
-3. **Managing the Termux Worker:**
+3. **Tell the worker where the master is and give it the secret** (the installer writes a config with these lines
+   commented out; `start_worker.sh` refuses to start without a master):
    ```bash
-   # Start worker in background
-   start_worker.sh --daemon --master 192.168.1.100:8080
+   nano ~/.config/oxideswarm/rusty-grid.toml        # master = "192.168.1.100:8088"   (or p2p_ticket = '...')
+   pkg install -y openssh && mkdir -p ~/.oxideswarm
+   scp user@master:~/.oxideswarm/cluster.secret ~/.oxideswarm/cluster.secret && chmod 600 ~/.oxideswarm/cluster.secret
+   ```
+
+4. **Managing the Termux Worker:**
+   ```bash
+   # Start worker in background (the config file decides the master; --master HOST:8088 overrides it for one run)
+   start_worker.sh --daemon
 
    # Check worker status, PID, and battery/temperature
    start_worker.sh --status
@@ -160,9 +189,10 @@ For automated test environments, headless mobile clusters, or power users, Oxide
    # Tail live daemon logs
    start_worker.sh --logs
 
-   # Stop background worker and release wake-lock
+   # Stop the supervisor AND its worker process, and release the wake-lock
    start_worker.sh --stop
    ```
+   The worker advertises no GPU (a phone has none the grid can use). `--simulate-gpu` exists for tests only: a simulated GPU makes the phone eligible for GPU tasks, which then run on the CPU.
 
 ### 3.4 Crucial Notice: Android 12+ Phantom Process Killer
 If running `rusty-grid` under Termux on Android 12, 13, 14, or 15, Android's `ActivityManagerService` limits background child processes and may send `SIGKILL` after sustained CPU utilization.

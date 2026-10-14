@@ -1,13 +1,20 @@
-//! Comprehensive Integration Test Suite: Hardware-Accelerated Compute Shaders & CPU SIMD Fallback (Requirement R4).
+//! Comprehensive Integration Test Suite: Hardware-Accelerated Compute Shaders & CPU SIMD Simulator (Requirement R4).
 //!
 //! Validates:
 //! 1. Mathematical equivalence between 8-wide CPU SIMD engine and triple-loop reference oracle.
 //! 2. Deterministic pseudo-random matrix generation and seed derivation.
 //! 3. Backward compatibility for simulated GPU execution (`simulate_gpu: true`).
 //! 4. Strict negative capability gating for CPU-only workers.
-//! 5. Graceful CPU fallback when physical GPU execution is requested without hardware adapters.
-//! 6. Physical WGSL shader compilation and execution on real GPU hardware (NVIDIA RTX 5060 Ti).
+//! 5. A worker that advertises a REAL GPU never fakes GPU work on the CPU: it computes on the GPU
+//!    or fails the task with the reason.
+//! 6. Physical WGSL shader compilation and execution on real GPU hardware (feature `gpu-wgpu`).
 //! 7. End-to-end distributed cluster task scheduling to GPU-capable workers.
+//! 8. Honest failure paths: parameters are honoured or rejected (never clamped), device loss and
+//!    wgpu errors become failed results, the runtime is never blocked, timeouts and cancellation work.
+//!
+//! Tests that need a GPU skip (with a message) on a machine without one, unless
+//! `RUSTY_GRID_REQUIRE_GPU=1` is set (the GPU-machine lane: `RUSTY_GRID_REQUIRE_GPU=1 cargo test
+//! -p rusty_grid_worker --features gpu-wgpu`), in which case a missing GPU engine fails them.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,10 +26,11 @@ use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_master::{MasterServer, ServerConfig, WorkerStatus};
 use rusty_grid_worker::cpu_simd;
-use rusty_grid_worker::runner::{RunnerConfig, TaskRunner, EXIT_CODE_GENERAL_ERROR};
+use rusty_grid_worker::runner::{
+    RunnerConfig, TaskRunner, EXIT_CODE_CANCELLED, EXIT_CODE_GENERAL_ERROR, EXIT_CODE_TIMEOUT,
+};
 use rusty_grid_worker::sandbox::SandboxConfig;
 use rusty_grid_worker::WorkerClient;
-
 
 fn make_capabilities(name: &str, cores: usize, has_gpu: bool, is_simulated: bool) -> WorkerCapabilities {
     WorkerCapabilities {
@@ -49,6 +57,55 @@ fn make_runner(has_gpu: bool, is_simulated: bool) -> (TaskRunner, tempfile::Temp
     let cfg = RunnerConfig::new(SandboxConfig::new(tmp.path()));
     let runner = TaskRunner::new(Uuid::new_v4(), caps, cfg);
     (runner, tmp)
+}
+
+/// A GpuCompute task with explicit parameters.
+fn gpu_task(dim: u32, tile: u32, timeout_secs: u64) -> Task {
+    Task::new(
+        TaskSpec::GpuCompute {
+            kernel_name: "param_test_kernel".into(),
+            input_data: b"param_test_payload".to_vec(),
+            work_group_size: tile,
+            simulated_matrix_dim: dim,
+            compute_intensity: 1,
+        },
+        TaskRequirements::gpu(timeout_secs),
+    )
+}
+
+/// True if this build can compute on a real GPU here (feature compiled in AND an adapter starts).
+fn real_gpu_engine_available() -> bool {
+    #[cfg(feature = "gpu-wgpu")]
+    {
+        rusty_grid_worker::wgpu_engine::EngineProvider::shared().get().is_ok()
+    }
+    #[cfg(not(feature = "gpu-wgpu"))]
+    {
+        false
+    }
+}
+
+/// On the GPU lane (`RUSTY_GRID_REQUIRE_GPU=1`) a missing GPU engine is a failure, not a skip.
+fn require_gpu_lane_to_have_a_gpu(test: &str) {
+    if std::env::var("RUSTY_GRID_REQUIRE_GPU").as_deref() == Ok("1") && !real_gpu_engine_available() {
+        panic!(
+            "RUSTY_GRID_REQUIRE_GPU=1 but {test} found no GPU engine (built with gpu-wgpu: {})",
+            rusty_grid_worker::WGPU_COMPILED
+        );
+    }
+}
+
+/// The shared engine, or None (after saying so) on a machine / build without a GPU.
+#[cfg(feature = "gpu-wgpu")]
+fn gpu_engine_or_skip(test: &str) -> Option<Arc<rusty_grid_worker::wgpu_engine::WgpuEngine>> {
+    require_gpu_lane_to_have_a_gpu(test);
+    match rusty_grid_worker::wgpu_engine::EngineProvider::shared().get() {
+        Ok(lease) => Some(lease.engine),
+        Err(err) => {
+            println!("{test}: skipped, no GPU engine on this host ({err})");
+            None
+        }
+    }
 }
 
 async fn wait_for<F, Fut>(timeout: Duration, interval: Duration, mut predicate: F) -> bool
@@ -235,11 +292,11 @@ async fn test_negative_capability_gating() {
 }
 
 // ============================================================================
-// Scenario 5: Graceful CPU Fallback on Hardware Absence
+// Scenario 5: A Real-GPU Worker Never Fakes GPU Work On The CPU
 // ============================================================================
-#[tokio::test]
-async fn test_graceful_cpu_fallback_on_simulated_absence() {
-    // 1. Direct validation of CPU SIMD fallback formatting
+#[test]
+fn test_cpu_simd_report_format() {
+    // Direct validation of the CPU SIMD engine's report (the engine behind the simulator).
     let task_id = Uuid::new_v4();
     let (stdout, elapsed) = cpu_simd::execute_simd_compute_with_device(
         "fallback_kernel",
@@ -247,7 +304,6 @@ async fn test_graceful_cpu_fallback_on_simulated_absence() {
         task_id,
         32,
         16,
-        Instant::now(),
         "CPU SIMD Fallback",
         "[GPU COMPUTE SIMULATOR]",
     );
@@ -258,9 +314,14 @@ async fn test_graceful_cpu_fallback_on_simulated_absence() {
     assert!(stdout.contains("Backend: CPU_SIMD_FALLBACK"));
     assert!(stdout.contains("Kernel: fallback_kernel"));
     assert!(stdout.contains("Matrix Dimension: 32x32"));
+    // VERIFIED_OK is earned: 1024 of 1024 entries were recomputed with an independent dot product.
+    assert!(stdout.contains("Verification: 1024 of 1024 entries"), "{stdout}");
     assert!(stdout.contains("Status: VERIFIED_OK"));
+}
 
-    // 2. Validate runner execution for hardware-configured worker falling back gracefully
+#[tokio::test]
+async fn test_real_gpu_worker_computes_on_the_gpu_or_fails_it_never_fakes_it() {
+    // has_gpu = true, is_simulated = false: what a worker advertises when it really has a GPU.
     let (runner, _tmp) = make_runner(true, false);
     let task = Task::new(
         TaskSpec::gpu_compute("fallback_runner_test", 32),
@@ -268,10 +329,33 @@ async fn test_graceful_cpu_fallback_on_simulated_absence() {
     );
 
     let res = runner.execute_task(&task, None, None).await;
-    assert_eq!(res.exit_code, 0);
-    assert!(res.is_gpu_executed);
-    assert!(res.stdout.contains("Status: VERIFIED_OK"));
-    assert!(res.device_name.is_some());
+
+    if real_gpu_engine_available() {
+        assert_eq!(res.exit_code, 0, "{:?}", res.error);
+        assert!(res.is_gpu_executed);
+        assert!(res.stdout.contains("[GPU COMPUTE WGPU]"), "{}", res.stdout);
+        assert!(!res.stdout.contains("SIMULATOR"));
+        assert!(!res.stdout.contains("CPU_SIMD"));
+        assert!(res.stdout.contains("Status: VERIFIED_OK"));
+        assert_ne!(res.device_name.as_deref(), Some("CPU SIMD Fallback"));
+    } else {
+        require_gpu_lane_to_have_a_gpu("test_real_gpu_worker_computes_on_the_gpu_or_fails_it_never_fakes_it");
+        // No engine: the task FAILS with the reason. It must not succeed on the CPU while
+        // claiming GPU execution (the old behaviour: exit 0, is_gpu_executed, VERIFIED_OK).
+        assert_eq!(res.exit_code, EXIT_CODE_GENERAL_ERROR);
+        assert!(!res.is_success());
+        assert!(!res.is_gpu_executed);
+        assert!(res.device_name.is_none());
+        assert!(res.stdout.is_empty(), "no report for work that did not run: {}", res.stdout);
+        let error = res.error.expect("failure must carry a message");
+        if rusty_grid_worker::WGPU_COMPILED {
+            assert!(error.contains("GPU unavailable"), "{error}");
+        } else {
+            assert!(error.contains("gpu-wgpu"), "{error}");
+            assert!(error.contains("--features gpu-wgpu"), "{error}");
+        }
+        assert!(res.stderr.contains("Execution Error"));
+    }
 }
 
 // ============================================================================
@@ -281,61 +365,53 @@ async fn test_graceful_cpu_fallback_on_simulated_absence() {
 fn test_physical_wgpu_execution_when_available() {
     #[cfg(feature = "gpu-wgpu")]
     {
-        if let Some(adapter_info) = rusty_grid_worker::wgpu_engine::probe_physical_adapter() {
-            println!(
-                "Discovered physical GPU adapter: '{}' (backend: {:?}, type: {:?})",
-                adapter_info.name, adapter_info.backend, adapter_info.device_type
+        let Some(engine) = gpu_engine_or_skip("test_physical_wgpu_execution_when_available") else {
+            return;
+        };
+        let adapter_info = &engine.adapter_info;
+        println!(
+            "Discovered physical GPU adapter: '{}' (backend: {:?}, type: {:?})",
+            adapter_info.name, adapter_info.backend, adapter_info.device_type
+        );
+
+        let dim = 32;
+        let input_data = b"hardware_wgpu_test_tensor";
+        let task_id = Uuid::new_v4();
+        let seed = cpu_simd::derive_seed(input_data, task_id);
+        let (a, b) = cpu_simd::generate_deterministic_matrices(dim, seed);
+        let mut c_expected = vec![0.0f32; dim * dim];
+        cpu_simd::matmul_simd(&a, &b, &mut c_expected, dim);
+
+        let outcome = engine
+            .execute_gemm("wgsl_gemm_hardware_test", input_data, task_id, dim, 16)
+            .expect("execute_gemm failed on physical GPU");
+
+        println!("Physical GPU execution elapsed: {} ms", outcome.elapsed_ms);
+        assert!(!outcome.device_name.is_empty());
+        assert_eq!(outcome.device_name, adapter_info.name);
+        assert!(outcome.stdout.contains("[GPU COMPUTE WGPU]"));
+        assert!(outcome.verification.passed());
+        assert!(outcome.stdout.contains("Status: VERIFIED_OK"));
+        assert_eq!(outcome.matrix_c.len(), dim * dim);
+
+        // Verify numerical convergence between GPU shader and CPU reference oracle
+        for i in 0..dim * dim {
+            let diff = (outcome.matrix_c[i] - c_expected[i]).abs();
+            assert!(
+                diff < 1e-2,
+                "GPU vs CPU mismatch at index {i}: gpu={}, cpu={}, diff={}",
+                outcome.matrix_c[i],
+                c_expected[i],
+                diff
             );
-
-            let engine = rusty_grid_worker::wgpu_engine::WgpuEngine::try_init()
-                .expect("WgpuEngine::try_init returned error")
-                .expect("Physical adapter probed but initialization returned None");
-
-            let dim = 32;
-            let input_data = b"hardware_wgpu_test_tensor";
-            let task_id = Uuid::new_v4();
-            let seed = cpu_simd::derive_seed(input_data, task_id);
-            let (a, b) = cpu_simd::generate_deterministic_matrices(dim, seed);
-            let mut c_expected = vec![0.0f32; dim * dim];
-            cpu_simd::matmul_simd(&a, &b, &mut c_expected, dim);
-
-            let outcome = engine
-                .execute_gemm(
-                    "wgsl_gemm_hardware_test",
-                    input_data,
-                    task_id,
-                    dim,
-                    16,
-                    Instant::now(),
-                )
-                .expect("execute_gemm failed on physical GPU");
-
-            println!("Physical GPU execution elapsed: {} ms", outcome.elapsed_ms);
-            assert!(!outcome.device_name.is_empty());
-            assert_eq!(outcome.device_name, adapter_info.name);
-            assert!(outcome.stdout.contains("[GPU COMPUTE WGPU]"));
-            assert!(outcome.stdout.contains("Status: VERIFIED_OK"));
-            assert_eq!(outcome.matrix_c.len(), dim * dim);
-
-            // Verify numerical convergence between GPU shader and CPU reference oracle
-            for i in 0..dim * dim {
-                let diff = (outcome.matrix_c[i] - c_expected[i]).abs();
-                assert!(
-                    diff < 1e-2,
-                    "GPU vs CPU mismatch at index {i}: gpu={}, cpu={}, diff={}",
-                    outcome.matrix_c[i],
-                    c_expected[i],
-                    diff
-                );
-            }
-            println!("Physical GPU GEMM mathematical validation passed successfully!");
-        } else {
-            println!("No physical GPU adapter available on host; hardware execution gracefully skipped.");
         }
+        println!("Physical GPU GEMM mathematical validation passed successfully!");
     }
 
     #[cfg(not(feature = "gpu-wgpu"))]
     {
+        // Without the feature there is no GPU engine: say so, refuse on the GPU lane.
+        require_gpu_lane_to_have_a_gpu("test_physical_wgpu_execution_when_available");
         println!("Feature 'gpu-wgpu' not enabled in current build; physical shader execution skipped.");
     }
 }
@@ -442,32 +518,19 @@ async fn test_e2e_cluster_gpu_task_distribution() {
 async fn test_adversarial_concurrent_gpu_compute_invocations() {
     #[cfg(feature = "gpu-wgpu")]
     {
-        if let Some(_) = rusty_grid_worker::wgpu_engine::probe_physical_adapter() {
-            let engine = Arc::new(
-                rusty_grid_worker::wgpu_engine::WgpuEngine::try_init()
-                    .expect("try_init failed")
-                    .expect("No physical engine"),
-            );
-
+        if let Some(engine) = gpu_engine_or_skip("test_adversarial_concurrent_gpu_compute_invocations") {
             // 1. Direct concurrent execute_gemm invocations across 12 threads
             const NUM_TASKS: usize = 12;
             let mut handles = Vec::with_capacity(NUM_TASKS);
 
             for i in 0..NUM_TASKS {
                 let eng = Arc::clone(&engine);
-                handles.push(tokio::spawn(async move {
+                handles.push(tokio::task::spawn_blocking(move || {
                     let task_id = Uuid::new_v4();
                     let payload = format!("concurrent_tensor_batch_{i}").into_bytes();
                     let dim = 32;
                     let outcome = eng
-                        .execute_gemm(
-                            &format!("concurrent_gemm_{i}"),
-                            &payload,
-                            task_id,
-                            dim,
-                            16,
-                            Instant::now(),
-                        )
+                        .execute_gemm(&format!("concurrent_gemm_{i}"), &payload, task_id, dim, 16)
                         .expect("Concurrent execute_gemm must not fail");
                     (i, outcome)
                 }));
@@ -484,7 +547,8 @@ async fn test_adversarial_concurrent_gpu_compute_invocations() {
         }
     }
 
-    // 2. High-concurrency execution via TaskRunner (works for physical or simulated)
+    // 2. High-concurrency execution via TaskRunner on a worker that advertises a real GPU:
+    // every task runs on the GPU (when there is one) or fails with a message, none panics.
     let (runner, _tmp) = make_runner(true, false);
     let runner = Arc::new(runner);
 
@@ -504,148 +568,330 @@ async fn test_adversarial_concurrent_gpu_compute_invocations() {
 
     for (idx, h) in task_handles.into_iter().enumerate() {
         let res = h.await.expect("Runner task panicked");
-        assert_eq!(res.exit_code, 0, "Task {idx} must succeed with exit code 0");
-        assert!(res.is_gpu_executed, "Task {idx} must be GPU executed");
-        assert!(res.device_name.is_some(), "Task {idx} must report device name");
-        assert!(
-            res.stdout.contains("Status: VERIFIED_OK"),
-            "Task {idx} must contain VERIFIED_OK in stdout"
-        );
+        if real_gpu_engine_available() {
+            assert_eq!(res.exit_code, 0, "Task {idx} must succeed: {:?}", res.error);
+            assert!(res.is_gpu_executed, "Task {idx} must be GPU executed");
+            assert!(res.device_name.is_some(), "Task {idx} must report device name");
+            assert!(
+                res.stdout.contains("Status: VERIFIED_OK"),
+                "Task {idx} must contain VERIFIED_OK in stdout"
+            );
+        } else {
+            require_gpu_lane_to_have_a_gpu("test_adversarial_concurrent_gpu_compute_invocations");
+            assert_eq!(res.exit_code, EXIT_CODE_GENERAL_ERROR, "Task {idx}");
+            assert!(!res.is_gpu_executed, "Task {idx} must not claim GPU execution");
+            assert!(res.error.is_some(), "Task {idx} must say why it failed");
+        }
     }
 }
 
 // ============================================================================
-// Scenario 9: Memory Bounds, Clamping, and Irregular Matrix Dimensions
+// Scenario 9: Parameters Are Honoured Or Rejected, Never Silently Clamped
 // ============================================================================
-#[test]
-fn test_adversarial_gpu_memory_bounds_and_matrix_dimensions() {
-    #[cfg(feature = "gpu-wgpu")]
-    {
-        if let Some(_) = rusty_grid_worker::wgpu_engine::probe_physical_adapter() {
-            let engine = rusty_grid_worker::wgpu_engine::WgpuEngine::try_init()
-                .expect("try_init failed")
-                .expect("physical adapter unavailable");
+#[tokio::test]
+async fn test_gpu_task_parameters_are_honoured_or_rejected_never_clamped() {
+    // The simulated GPU claims 1 <= dim <= 2048 and work groups up to 32x32.
+    let (runner, _tmp) = make_runner(true, true);
 
-            // Test irregular non-power-of-two dimensions and workgroup edge conditions
-            let test_dims = [16, 17, 33, 48, 65, 128, 256];
-
-            for &dim in &test_dims {
-                let task_id = Uuid::new_v4();
-                let input = format!("dim_test_{dim}").into_bytes();
-                let seed = cpu_simd::derive_seed(&input, task_id);
-                let (a, b) = cpu_simd::generate_deterministic_matrices(dim, seed);
-                let mut c_expected = vec![0.0f32; dim * dim];
-                cpu_simd::matmul_simd(&a, &b, &mut c_expected, dim);
-
-                let outcome = engine
-                    .execute_gemm("irregular_dim_kernel", &input, task_id, dim, 16, Instant::now())
-                    .unwrap_or_else(|e| panic!("execute_gemm failed for dim {dim}x{dim}: {e}"));
-
-                assert_eq!(outcome.matrix_c.len(), dim * dim);
-                assert!(outcome.stdout.contains("Status: VERIFIED_OK"));
-
-                // Verify numerical convergence for every dimension
-                for i in 0..dim * dim {
-                    let diff = (outcome.matrix_c[i] - c_expected[i]).abs();
-                    assert!(
-                        diff < 1e-2,
-                        "Mismatch for dim {dim} at index {i}: gpu={}, cpu={}, diff={}",
-                        outcome.matrix_c[i],
-                        c_expected[i],
-                        diff
-                    );
-                }
-            }
-        }
+    // Out of range: a clear error naming the parameter and the limit, and no report at all.
+    for (dim, tile, needle) in [
+        (0, 16, "simulated_matrix_dim must be at least 1"),
+        (16, 0, "work_group_size must be at least 1"),
+        (100_000, 16, "simulated_matrix_dim 100000 is above what this device accepts (at most 2048"),
+        (2049, 16, "at most 2048"),
+        (64, 1000, "work_group_size 1000 is above"),
+        (64, 33, "work_group_size 33 is above"),
+    ] {
+        let res = runner.execute_task(&gpu_task(dim, tile, 10), None, None).await;
+        assert_eq!(res.exit_code, EXIT_CODE_GENERAL_ERROR, "dim {dim} tile {tile}");
+        assert!(!res.is_gpu_executed, "dim {dim} tile {tile}");
+        assert!(res.stdout.is_empty(), "dim {dim} tile {tile}: {}", res.stdout);
+        let error = res.error.expect("error message");
+        assert!(error.contains(needle), "dim {dim} tile {tile}: {error}");
     }
 
-    // Test extreme boundary clamping at the TaskRunner level
+    // In range: used exactly as asked. 513 is one above the old silent clamp of 512, 4 below its
+    // old minimum work group edge.
+    let res = runner.execute_task(&gpu_task(513, 4, 120), None, None).await;
+    assert_eq!(res.exit_code, 0, "{:?}", res.error);
+    assert!(res.stdout.contains("Matrix Dimension: 513x513"), "{}", res.stdout);
+    assert!(res.stdout.contains("Work Group Size: 4x4"), "{}", res.stdout);
+    let res = runner.execute_task(&gpu_task(5, 1, 10), None, None).await;
+    assert_eq!(res.exit_code, 0, "{:?}", res.error);
+    assert!(res.stdout.contains("Matrix Dimension: 5x5"), "{}", res.stdout);
+    assert!(res.stdout.contains("Status: VERIFIED_OK"));
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn test_wgpu_engine_honours_dim_and_work_group_or_rejects_with_a_clear_error() {
+    use rusty_grid_worker::gpu::GpuError;
+    let Some(engine) = gpu_engine_or_skip("test_wgpu_engine_honours_dim_and_work_group") else {
+        return;
+    };
+    let limits = engine.device_limits();
+    println!("device limits: {limits:?}");
+
+    // Irregular dimensions and several work group edges produce correct products, and the report
+    // prints the edge that was really dispatched.
+    for (dim, tile) in [(1usize, 1usize), (7, 4), (17, 8), (33, 16), (100, 12), (129, 16)] {
+        let outcome = engine
+            .execute_gemm("tile_test", b"tile_payload", Uuid::new_v4(), dim, tile)
+            .unwrap_or_else(|e| panic!("dim {dim} tile {tile}: {e}"));
+        assert!(outcome.verification.passed(), "dim {dim} tile {tile}");
+        assert!(
+            outcome.stdout.contains(&format!("Work Group Size: {tile}x{tile}\n")),
+            "{}",
+            outcome.stdout
+        );
+        assert!(outcome.stdout.contains(&format!("Matrix Dimension: {dim}x{dim} ")));
+    }
+
+    // A work group of 32x32 = 1024 threads only on devices that allow it.
+    let big_tile = engine.execute_gemm("tile_test", b"", Uuid::new_v4(), 64, 32);
+    if limits.max_workgroup_invocations >= 1024 && limits.max_workgroup_edge >= 32 {
+        assert!(big_tile.expect("32x32 allowed on this device").verification.passed());
+    } else {
+        assert!(matches!(big_tile, Err(GpuError::InvalidRequest(_))), "{big_tile:?}");
+    }
+
+    // Out of range: InvalidRequest before anything touches the device, naming the limit.
+    for (dim, tile) in [(0usize, 16usize), (16, 0)] {
+        let err = engine.execute_gemm("k", b"", Uuid::new_v4(), dim, tile).unwrap_err();
+        assert!(matches!(err, GpuError::InvalidRequest(_)), "{err:?}");
+    }
+    let too_big = limits.max_supported_dim() as usize + 1;
+    let err = engine.execute_gemm("k", b"", Uuid::new_v4(), too_big, 16).unwrap_err();
+    let GpuError::InvalidRequest(message) = &err else {
+        panic!("{err:?}");
+    };
+    assert!(message.contains(&format!("simulated_matrix_dim {too_big} is above")), "{message}");
+    // The same holds for a size that does not even fit 32 bits.
+    let err = engine.execute_gemm("k", b"", Uuid::new_v4(), usize::MAX, 16).unwrap_err();
+    assert!(matches!(err, GpuError::InvalidRequest(_)), "{err:?}");
+    // None of that harmed the engine.
+    assert!(!engine.is_lost());
+    assert!(engine.execute_gemm("k", b"", Uuid::new_v4(), 16, 16).is_ok());
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn gpu_output_matches_cpu_oracle_for_dims_1_15_16_17_255_512() {
+    let Some(engine) = gpu_engine_or_skip("gpu_output_matches_cpu_oracle") else {
+        return;
+    };
+    for dim in [1usize, 15, 16, 17, 255, 512] {
+        let input = format!("oracle_dim_{dim}").into_bytes();
+        let task_id = Uuid::new_v4();
+        let seed = cpu_simd::derive_seed(&input, task_id);
+        let (a, b) = cpu_simd::generate_deterministic_matrices(dim, seed);
+        let mut expected = vec![0.0f32; dim * dim];
+        cpu_simd::matmul_simd(&a, &b, &mut expected, dim);
+
+        let outcome = engine
+            .execute_gemm("oracle_kernel", &input, task_id, dim, 16)
+            .unwrap_or_else(|e| panic!("dim {dim}: {e}"));
+
+        assert_eq!(outcome.matrix_c.len(), dim * dim);
+        // Every element within the rigorous f32 dot-product bound of the CPU result.
+        let bound = dim as f32 * f32::EPSILON;
+        for (i, (&gpu, &cpu)) in outcome.matrix_c.iter().zip(&expected).enumerate() {
+            let tolerance = bound * cpu.abs().max(1e-3) * 2.0;
+            assert!((gpu - cpu).abs() <= tolerance, "dim {dim} index {i}: gpu={gpu} cpu={cpu}");
+        }
+        // The two engines' traces agree to far better than a unit in the last place of a sum.
+        let cpu_metrics = cpu_simd::compute_matrix_metrics(&expected, dim);
+        let relative = (outcome.metrics.trace - cpu_metrics.trace).abs() / cpu_metrics.trace.abs().max(1e-9);
+        assert!(relative < 1e-4, "dim {dim}: trace {} vs {}", outcome.metrics.trace, cpu_metrics.trace);
+    }
+}
+
+// ============================================================================
+// Scenario 10: GPU Device Loss / Errors Become Failed Results, Never Panics Or Hangs
+// ============================================================================
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn device_loss_returns_failure_result_not_panic() {
+    use rusty_grid_worker::gpu::GpuError;
+    // An engine of our own: destroying the shared one would hurt the other tests.
+    require_gpu_lane_to_have_a_gpu("device_loss_returns_failure_result_not_panic");
+    let engine = match rusty_grid_worker::wgpu_engine::WgpuEngine::try_init() {
+        Ok(Some(engine)) => engine,
+        other => {
+            println!("device_loss_returns_failure_result_not_panic: skipped, no GPU engine ({other:?})");
+            return;
+        }
+    };
+    assert!(engine.execute_gemm("before", b"x", Uuid::new_v4(), 32, 16).is_ok());
+
+    // Destroy the underlying wgpu Device to simulate physical device loss / driver reset.
+    engine.device.destroy();
+
+    // wgpu's default handler panics here ("uncaptured error handler is not set"); the engine
+    // must turn that into an Err, and keep turning it into one.
+    for attempt in 0..3 {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.execute_gemm("post_device_loss_kernel", b"lost_device_tensor", Uuid::new_v4(), 32, 16)
+        }));
+        let outcome = result.unwrap_or_else(|_| panic!("attempt {attempt}: execute_gemm panicked on a lost device"));
+        let err = outcome.expect_err("a destroyed device cannot compute");
+        assert!(matches!(err, GpuError::Device(_)), "attempt {attempt}: {err:?}");
+        assert!(!err.to_string().is_empty());
+        println!("attempt {attempt}: {err}");
+    }
+    assert!(engine.is_lost(), "an engine that failed on the device is marked lost");
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[tokio::test]
+async fn lost_engine_is_rebuilt_and_the_next_task_runs() {
+    use rusty_grid_worker::wgpu_engine::EngineProvider;
+    require_gpu_lane_to_have_a_gpu("lost_engine_is_rebuilt_and_the_next_task_runs");
+    let provider = Arc::new(EngineProvider::new());
+    let first = match provider.get() {
+        Ok(lease) => lease,
+        Err(err) => {
+            println!("lost_engine_is_rebuilt_and_the_next_task_runs: skipped, no GPU engine ({err})");
+            return;
+        }
+    };
+    assert!(first.init_ms.is_some(), "the first lease built the engine");
+    let again = provider.get().expect("engine still there");
+    assert!(Arc::ptr_eq(&first.engine, &again.engine));
+    assert!(again.init_ms.is_none(), "a running engine is handed out without a rebuild");
+
+    let tmp = tempdir().unwrap();
+    let runner = TaskRunner::new(
+        Uuid::new_v4(),
+        make_capabilities("rebuild-worker", 4, true, false),
+        RunnerConfig::new(SandboxConfig::new(tmp.path())),
+    )
+    .with_gpu_engine_provider(Arc::clone(&provider));
+
+    let ok = runner.execute_task(&gpu_task(32, 16, 30), None, None).await;
+    assert_eq!(ok.exit_code, 0, "{:?}", ok.error);
+
+    // The GPU dies under the worker: that task fails with a message (it does not hang or kill
+    // the runner task) ...
+    first.engine.device.destroy();
+    let failed = runner.execute_task(&gpu_task(32, 16, 30), None, None).await;
+    assert_eq!(failed.exit_code, EXIT_CODE_GENERAL_ERROR, "{:?}", failed.stdout);
+    assert!(!failed.is_gpu_executed);
+    assert!(failed.error.as_deref().is_some_and(|e| e.contains("GPU device error")), "{:?}", failed.error);
+
+    // ... and the next task gets a fresh engine instead of the dead one cached for ever.
+    let recovered = runner.execute_task(&gpu_task(32, 16, 30), None, None).await;
+    assert_eq!(recovered.exit_code, 0, "{:?}", recovered.error);
+    assert!(recovered.is_gpu_executed);
+    assert!(recovered.stdout.contains("Engine Init Time:"), "{}", recovered.stdout);
+    let rebuilt = provider.get().expect("engine");
+    assert!(!Arc::ptr_eq(&first.engine, &rebuilt.engine), "a new engine replaced the lost one");
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn cancelled_or_expired_gemm_returns_interrupted_without_touching_the_gpu() {
+    use rusty_grid_worker::gpu::GpuError;
+    use rusty_grid_worker::wgpu_engine::GemmControl;
+    use std::sync::atomic::AtomicBool;
+    let Some(engine) = gpu_engine_or_skip("cancelled_or_expired_gemm") else {
+        return;
+    };
+    let cancel = Arc::new(AtomicBool::new(true));
+    let control = GemmControl {
+        cancel: Some(cancel),
+        ..Default::default()
+    };
+    let err = engine
+        .execute_gemm_controlled("k", b"", Uuid::new_v4(), 64, 16, &control)
+        .unwrap_err();
+    assert!(matches!(err, GpuError::Interrupted(_)), "{err:?}");
+
+    let expired = GemmControl {
+        deadline: Some(Instant::now()),
+        ..Default::default()
+    };
+    let err = engine
+        .execute_gemm_controlled("k", b"", Uuid::new_v4(), 64, 16, &expired)
+        .unwrap_err();
+    assert!(matches!(err, GpuError::Interrupted(_)), "{err:?}");
+    assert!(!engine.is_lost(), "an interruption is not a device failure");
+}
+
+// ============================================================================
+// Scenario 10b: The Runtime Is Never Blocked; Timeout And Cancel Work On GPU-Class Tasks
+// ============================================================================
+#[tokio::test(flavor = "current_thread")]
+async fn gpu_class_compute_does_not_block_the_async_runtime() {
+    // One runtime thread, a CPU multiplication that takes a while in a debug build, and a ticker
+    // that stands for the heartbeat. With the multiplication run inline the ticker stalls for the
+    // whole multiplication; on a blocking thread it keeps ticking.
     let (runner, _tmp) = make_runner(true, true);
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let ticker = tokio::spawn(async {
+        let mut worst = Duration::ZERO;
+        let mut last = Instant::now();
+        for _ in 0..600 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let now = Instant::now();
+            worst = worst.max(now - last);
+            last = now;
+        }
+        worst
+    });
+
+    let started = Instant::now();
+    let res = runner.execute_task(&gpu_task(1000, 16, 120), None, None).await;
+    let compute_wall = started.elapsed();
+    assert_eq!(res.exit_code, 0, "{:?}", res.error);
+
+    let worst_gap = ticker.await.unwrap();
+    println!("multiplication took {compute_wall:?}, worst ticker gap {worst_gap:?}");
+    assert!(
+        worst_gap < Duration::from_millis(400),
+        "the runtime stalled for {worst_gap:?} while a GPU-class task ran ({compute_wall:?})"
+    );
+}
+
+#[test]
+fn gpu_class_timeout_fires_and_stops_the_multiplication() {
+    // A manual runtime, because dropping a runtime waits for its blocking threads: if the
+    // multiplication were not told to stop, the drop would sit through the rest of it.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
+    let (runner, _tmp) = make_runner(true, true);
+    let started = Instant::now();
+    // 1500^3 * 2 = 6.75 GFLOP: many seconds in a debug build, so only the timeout can end this.
+    let res = runtime.block_on(runner.execute_task(&gpu_task(1500, 16, 1), None, None));
+    assert_eq!(res.exit_code, EXIT_CODE_TIMEOUT, "{:?}", res.error);
+    assert!(res.error.unwrap().contains("timed out"));
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
 
-    rt.block_on(async {
-        // Under-bounds: dim = 0, work_group_size = 0 (should clamp to 16 and 4)
-        let under_task = Task::new(
-            TaskSpec::GpuCompute {
-                kernel_name: "under_bounds_kernel".into(),
-                input_data: vec![],
-                work_group_size: 0,
-                simulated_matrix_dim: 0,
-                compute_intensity: 1,
-            },
-            TaskRequirements::gpu(10),
-        );
-        let res_under = runner.execute_task(&under_task, None, None).await;
-        assert_eq!(res_under.exit_code, 0);
-        assert!(res_under.stdout.contains("Matrix Dimension: 16x16"));
-        assert!(res_under.stdout.contains("Work Group Size: 4x4"));
-
-        // Over-bounds: dim = 100_000, work_group_size = 1000 (should clamp to 512 and 32)
-        let over_task = Task::new(
-            TaskSpec::GpuCompute {
-                kernel_name: "over_bounds_kernel".into(),
-                input_data: vec![],
-                work_group_size: 1000,
-                simulated_matrix_dim: 100_000,
-                compute_intensity: 1,
-            },
-            TaskRequirements::gpu(10),
-        );
-        let res_over = runner.execute_task(&over_task, None, None).await;
-        assert_eq!(res_over.exit_code, 0);
-        assert!(res_over.stdout.contains("Matrix Dimension: 512x512"));
-        assert!(res_over.stdout.contains("Work Group Size: 32x32"));
-    });
+    let shutdown_started = Instant::now();
+    drop(runtime);
+    assert!(
+        shutdown_started.elapsed() < Duration::from_millis(2500),
+        "the timed-out multiplication kept running on its blocking thread for {:?}",
+        shutdown_started.elapsed()
+    );
 }
 
-// ============================================================================
-// Scenario 10: GPU Device Loss / Corruption & Graceful Fallback
-// ============================================================================
 #[tokio::test]
-async fn test_adversarial_gpu_device_loss_recovery() {
-    // 1. Validate that TaskRunner with physical GPU configuration (has_gpu = true, is_simulated = false)
-    // cleanly falls back to CPU SIMD if physical GPU execution fails or is unavailable.
-    let (runner, _tmp) = make_runner(true, false);
-
-    let task = Task::new(
-        TaskSpec::gpu_compute("device_loss_test_kernel", 32),
-        TaskRequirements::gpu(15),
-    );
-
-    let res = runner.execute_task(&task, None, None).await;
-    assert_eq!(res.exit_code, 0);
-    assert!(res.is_gpu_executed);
-    assert!(res.stdout.contains("Status: VERIFIED_OK"));
-    assert!(res.device_name.is_some());
-
-    #[cfg(feature = "gpu-wgpu")]
-    {
-        if let Some(engine) = rusty_grid_worker::wgpu_engine::WgpuEngine::try_init().ok().flatten() {
-            // Explicitly destroy the underlying wgpu Device to simulate physical device loss / driver reset
-            engine.device.destroy();
-
-            // Calling execute_gemm directly: does it panic or return Err?
-            let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                engine.execute_gemm(
-                    "post_device_loss_kernel",
-                    b"lost_device_tensor",
-                    Uuid::new_v4(),
-                    32,
-                    16,
-                    Instant::now(),
-                )
-            }));
-
-            println!("Device loss empirical test: execute_gemm panicked = {}", panic_res.is_err());
-            assert!(
-                panic_res.is_err(),
-                "Expected wgpu to panic on invalid device in create_buffer because uncaptured error handler is not set"
-            );
-        }
-    }
+async fn gpu_class_cancel_is_honoured_promptly() {
+    let (runner, _tmp) = make_runner(true, true);
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let _ = cancel_tx.send("user requested cancel".to_string());
+    });
+    let started = Instant::now();
+    let res = runner
+        .execute_task(&gpu_task(1500, 16, 120), None, Some(cancel_rx))
+        .await;
+    assert_eq!(res.exit_code, EXIT_CODE_CANCELLED, "{:?}", res.error);
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
 }
 
 // ============================================================================

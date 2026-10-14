@@ -19,6 +19,41 @@ pub struct MobileCapabilities {
     pub thermal_throttled: bool,
 }
 
+impl MobileCapabilities {
+    /// Returns a copy with the fast-changing readings replaced by `status`; the OS version and SoC
+    /// descriptor, which never change while the process runs, are kept.
+    pub fn with_live_status(&self, status: MobileLiveStatus) -> Self {
+        Self {
+            os_version: self.os_version.clone(),
+            soc_model: self.soc_model.clone(),
+            battery_pct: status.battery_pct,
+            is_charging: status.is_charging,
+            thermal_throttled: status.thermal_throttled,
+        }
+    }
+
+    /// The fast-changing readings of this snapshot.
+    pub fn live_status(&self) -> MobileLiveStatus {
+        MobileLiveStatus {
+            battery_pct: self.battery_pct,
+            is_charging: self.is_charging,
+            thermal_throttled: self.thermal_throttled,
+        }
+    }
+}
+
+/// The part of [`MobileCapabilities`] that changes while a worker runs: what has to be re-read
+/// (or pushed by the platform, e.g. Android's `BatteryManager`) to keep scheduling decisions fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MobileLiveStatus {
+    /// Battery charge percentage (0-100), `None` when unknown or on AC power.
+    pub battery_pct: Option<u8>,
+    /// Whether the device is drawing external power, `None` when unknown.
+    pub is_charging: Option<bool>,
+    /// Whether the device is currently thermally throttled.
+    pub thermal_throttled: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 struct HumanMobileCapabilities {
     pub os_version: String,
@@ -384,23 +419,56 @@ impl WorkerCapabilities {
 }
 
 /// Discovers a reasonable hostname or fallback worker name.
+///
+/// The OS hostname (`gethostname`, via sysinfo) comes first because `HOSTNAME` is a shell
+/// variable that is normally *not* exported to child processes on macOS/Linux and does not exist
+/// under launchd, Termux services or Android. The environment variables remain as fallbacks,
+/// then `worker-<pid>`.
 fn detect_worker_name() -> String {
-    if let Ok(host) = std::env::var("HOSTNAME") {
-        if !host.trim().is_empty() {
-            return host.trim().to_string();
-        }
-    }
-    if let Ok(host) = std::env::var("COMPUTERNAME") {
-        if !host.trim().is_empty() {
-            return host.trim().to_string();
-        }
-    }
-    format!("worker-{}", std::process::id())
+    pick_worker_name(
+        sysinfo::System::host_name(),
+        std::env::var("HOSTNAME").ok(),
+        std::env::var("COMPUTERNAME").ok(),
+        std::process::id(),
+    )
+}
+
+/// Chooses the first usable name: OS hostname, `HOSTNAME`, `COMPUTERNAME`, `worker-<pid>`.
+/// Blank values and a bare "localhost" (Android's default, identical on every device) are skipped.
+fn pick_worker_name(
+    os_hostname: Option<String>,
+    env_hostname: Option<String>,
+    env_computername: Option<String>,
+    pid: u32,
+) -> String {
+    [os_hostname, env_hostname, env_computername]
+        .into_iter()
+        .flatten()
+        .map(|h| h.trim().to_string())
+        .find(|h| !h.is_empty() && !h.eq_ignore_ascii_case("localhost"))
+        .unwrap_or_else(|| format!("worker-{pid}"))
+}
+
+/// Converts a byte count to whole MiB, or `None` if it is below 1 MiB (i.e. not a real reading).
+fn bytes_to_mb(bytes: u64) -> Option<u64> {
+    let mb = bytes / (1024 * 1024);
+    (mb > 0).then_some(mb)
 }
 
 /// Inspects host OS total memory in Megabytes.
+///
+/// `sysinfo` is the primary source on every OS (Linux, macOS, Windows, Android); Windows has
+/// neither `/proc/meminfo` nor `sysctl`, which used to leave it at the hard-coded 8192 MB. The
+/// older probes stay as fallbacks, and the final 8 GB guess is logged because it is only a guess.
 fn detect_system_ram_mb() -> u64 {
-    // 1. Linux /proc/meminfo inspection
+    // 1. sysinfo (cross-platform total physical memory, reported in bytes)
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    if let Some(mb) = bytes_to_mb(sys.total_memory()) {
+        return mb;
+    }
+
+    // 2. Linux /proc/meminfo inspection
     if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
         for line in meminfo.lines() {
             if line.starts_with("MemTotal:") {
@@ -414,7 +482,7 @@ fn detect_system_ram_mb() -> u64 {
         }
     }
 
-    // 2. macOS / Darwin sysctl hw.memsize inspection
+    // 3. macOS / Darwin sysctl hw.memsize inspection
     #[cfg(unix)]
     {
         if let Ok(output) = std::process::Command::new("sysctl")
@@ -432,7 +500,8 @@ fn detect_system_ram_mb() -> u64 {
         }
     }
 
-    // 3. Sensible fallback (8 GB)
+    // 4. Sensible fallback (8 GB)
+    tracing::warn!("could not detect system RAM; assuming 8192 MB (override with --ram-mb)");
     8192
 }
 
@@ -482,6 +551,22 @@ pub fn detect_mobile_capabilities() -> Option<MobileCapabilities> {
         battery_pct,
         is_charging,
         thermal_throttled,
+    })
+}
+
+/// Re-reads only the battery and thermal state (no SoC / OS probing), cheap enough to run every
+/// few seconds. Returns `None` on a machine without a readable battery that is not Android, i.e.
+/// exactly when [`detect_mobile_capabilities`] would. Blocking (sysfs reads, `pmset`/`dumpsys`
+/// child processes): call it from `spawn_blocking`.
+pub fn detect_live_mobile_status() -> Option<MobileLiveStatus> {
+    let (battery_pct, is_charging) = detect_battery();
+    if !is_android_env() && battery_pct.is_none() {
+        return None;
+    }
+    Some(MobileLiveStatus {
+        battery_pct,
+        is_charging,
+        thermal_throttled: detect_thermal_throttling(),
     })
 }
 
@@ -617,9 +702,10 @@ fn detect_thermal_throttling() -> bool {
         for entry in entries.flatten() {
             let file_name = entry.file_name().to_string_lossy().to_string();
             if file_name.starts_with("cooling_device") {
+                let kind = std::fs::read_to_string(entry.path().join("type")).unwrap_or_default();
                 if let Ok(cur_state_str) = std::fs::read_to_string(entry.path().join("cur_state")) {
                     if let Ok(state) = cur_state_str.trim().parse::<u32>() {
-                        if state > 0 {
+                        if cooling_device_indicates_throttling(&kind, state) {
                             return true;
                         }
                     }
@@ -637,6 +723,25 @@ fn detect_thermal_throttling() -> bool {
         }
     }
     false
+}
+
+/// True when a sysfs cooling device in a non-zero state means the CPU/GPU is being throttled.
+///
+/// A fan running (`Fan`, `pwm-fan`, ...) is a machine doing its job, not throttling: counting it
+/// flagged every laptop with an active fan as `thermal_throttled`, which made the scheduler skip
+/// it for multi-core, compile and GPU work. Only processor / frequency / idle-injection devices
+/// count; an unknown or unreadable `type` does not.
+fn cooling_device_indicates_throttling(kind: &str, cur_state: u32) -> bool {
+    if cur_state == 0 {
+        return false;
+    }
+    let kind = kind.trim().to_ascii_lowercase();
+    if kind.contains("fan") || kind.contains("pwm") {
+        return false;
+    }
+    ["cpu", "gpu", "processor", "devfreq", "powerclamp"]
+        .iter()
+        .any(|marker| kind.contains(marker))
 }
 
 fn detect_soc_model(is_android: bool) -> String {
@@ -722,6 +827,68 @@ mod tests {
             !caps.is_simulated_gpu,
             "Simulated GPU must be false by default"
         );
+    }
+
+    #[test]
+    fn test_pick_worker_name_prefers_os_hostname_and_skips_useless_values() {
+        let some = |s: &str| Some(s.to_string());
+        // The OS hostname wins even when the env vars are set.
+        assert_eq!(
+            pick_worker_name(some("mac-mini"), some("from-env"), some("WINBOX"), 7),
+            "mac-mini"
+        );
+        // Env fallbacks keep their old order.
+        assert_eq!(
+            pick_worker_name(None, some("from-env"), some("WINBOX"), 7),
+            "from-env"
+        );
+        assert_eq!(pick_worker_name(None, None, some("WINBOX"), 7), "WINBOX");
+        // Blank and "localhost" (Android default) are not names.
+        assert_eq!(
+            pick_worker_name(some("  "), some(""), some("Localhost"), 7),
+            "worker-7"
+        );
+        assert_eq!(
+            pick_worker_name(some("localhost"), None, some("WINBOX"), 7),
+            "WINBOX"
+        );
+        // Whitespace is trimmed; nothing at all falls back to the pid.
+        assert_eq!(pick_worker_name(some(" box \n"), None, None, 7), "box");
+        assert_eq!(pick_worker_name(None, None, None, 4242), "worker-4242");
+    }
+
+    #[test]
+    fn test_detect_worker_name_uses_real_hostname_not_pid() {
+        let name = detect_worker_name();
+        assert!(!name.is_empty());
+        if let Some(host) = sysinfo::System::host_name() {
+            let host = host.trim();
+            if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
+                assert_eq!(name, host, "worker name must come from the OS hostname");
+            }
+        }
+    }
+
+    #[test]
+    fn test_bytes_to_mb_rounds_down_and_rejects_noise() {
+        assert_eq!(bytes_to_mb(0), None);
+        assert_eq!(bytes_to_mb(1024 * 1024 - 1), None);
+        assert_eq!(bytes_to_mb(1024 * 1024), Some(1));
+        assert_eq!(bytes_to_mb(64 * 1024 * 1024 * 1024), Some(65536));
+        assert_eq!(bytes_to_mb(u64::MAX), Some(u64::MAX / (1024 * 1024)));
+    }
+
+    #[test]
+    fn test_detect_system_ram_matches_sysinfo_total_memory() {
+        // This is the code path Windows relies on (no /proc, no sysctl): the figure must be the
+        // OS-reported total, not the old hard-coded 8192 MB fallback.
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let expected = sys.total_memory() / (1024 * 1024);
+        if expected > 0 {
+            assert_eq!(detect_system_ram_mb(), expected);
+        }
+        assert!(detect_system_ram_mb() > 0);
     }
 
     #[test]
@@ -857,5 +1024,51 @@ mod tests {
             assert!(!m.os_version.is_empty());
             assert!(!m.soc_model.is_empty());
         }
+        // The live re-read must agree with the full probe about whether this is a mobile device.
+        assert_eq!(
+            detect_live_mobile_status().is_some(),
+            detect_mobile_capabilities().is_some()
+        );
+    }
+
+    #[test]
+    fn test_live_status_replaces_only_the_fast_changing_fields() {
+        let snapshot = MobileCapabilities {
+            os_version: "Android 14".into(),
+            soc_model: "Snapdragon 8 Gen 2".into(),
+            battery_pct: Some(90),
+            is_charging: Some(true),
+            thermal_throttled: false,
+        };
+        let live = snapshot.with_live_status(MobileLiveStatus {
+            battery_pct: Some(4),
+            is_charging: Some(false),
+            thermal_throttled: true,
+        });
+        assert_eq!(live.os_version, "Android 14");
+        assert_eq!(live.soc_model, "Snapdragon 8 Gen 2");
+        assert_eq!(live.battery_pct, Some(4));
+        assert_eq!(live.is_charging, Some(false));
+        assert!(live.thermal_throttled);
+        assert_eq!(live.live_status().battery_pct, Some(4));
+        // The original snapshot is untouched.
+        assert_eq!(snapshot.battery_pct, Some(90));
+    }
+
+    #[test]
+    fn test_running_fan_is_not_thermal_throttling() {
+        // Fans and unknown devices never count, whatever their state.
+        assert!(!cooling_device_indicates_throttling("Fan", 3));
+        assert!(!cooling_device_indicates_throttling("pwm-fan", 1));
+        assert!(!cooling_device_indicates_throttling("", 5));
+        assert!(!cooling_device_indicates_throttling("Battery", 2));
+        // An idle processor device is not throttling either.
+        assert!(!cooling_device_indicates_throttling("Processor", 0));
+        // CPU/GPU frequency capping and idle injection are.
+        assert!(cooling_device_indicates_throttling("Processor\n", 1));
+        assert!(cooling_device_indicates_throttling("thermal-cpufreq-0", 2));
+        assert!(cooling_device_indicates_throttling("cpu-isolate0", 1));
+        assert!(cooling_device_indicates_throttling("devfreq-gpu", 1));
+        assert!(cooling_device_indicates_throttling("intel_powerclamp", 10));
     }
 }

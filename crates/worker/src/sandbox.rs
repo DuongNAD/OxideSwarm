@@ -5,6 +5,10 @@ use tracing::{debug, warn};
 
 use rusty_grid_core::task::{TaskId, TaskSpec};
 
+/// Environment variable that names the sandbox base directory itself (task sandboxes are created
+/// directly inside it).
+pub const SANDBOX_BASE_DIR_ENV: &str = "RUSTY_GRID_SANDBOX_BASE_DIR";
+
 /// Configuration options for worker sandbox environment.
 #[derive(Debug, Clone)]
 pub struct SandboxConfig {
@@ -14,10 +18,32 @@ pub struct SandboxConfig {
     pub keep_sandboxes: bool,
 }
 
+/// Where task sandboxes go when nothing names a directory explicitly, in order of precedence:
+///
+/// 1. `RUSTY_GRID_SANDBOX_BASE_DIR` (used as the base directory itself),
+/// 2. `<TMPDIR>/rusty_grid/sandboxes`,
+/// 3. `<platform temp dir>/rusty_grid/sandboxes`.
+///
+/// An explicit directory (`SandboxConfig::new`, `WorkerConfig::with_sandbox_base_dir`, the
+/// `--sandbox-base-dir` flag) outranks all three. `env` looks a variable up and `platform_temp` is
+/// the platform's temp dir; both are parameters so the order can be tested without touching the
+/// process environment. Empty variables count as unset.
+pub fn resolve_default_base_dir(
+    env: impl Fn(&str) -> Option<String>,
+    platform_temp: PathBuf,
+) -> PathBuf {
+    let non_empty = |name: &str| env(name).filter(|v| !v.trim().is_empty());
+    if let Some(dir) = non_empty(SANDBOX_BASE_DIR_ENV) {
+        return PathBuf::from(dir);
+    }
+    let temp = non_empty("TMPDIR").map(PathBuf::from).unwrap_or(platform_temp);
+    temp.join("rusty_grid").join("sandboxes")
+}
+
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            base_dir: std::env::temp_dir().join("rusty_grid").join("sandboxes"),
+            base_dir: resolve_default_base_dir(|name| std::env::var(name).ok(), std::env::temp_dir()),
             keep_sandboxes: false,
         }
     }
@@ -34,6 +60,22 @@ impl SandboxConfig {
     pub fn with_keep_sandboxes(mut self, keep: bool) -> Self {
         self.keep_sandboxes = keep;
         self
+    }
+
+    /// Checks that task sandboxes can actually be created: creates the base directory if needed
+    /// and writes (then removes) a probe file in it. Call it when the worker starts, so a base
+    /// directory the process may not write to (on Android the default `/data/local/tmp` is closed
+    /// to apps) is one clear error instead of a failure of every process task.
+    pub async fn ensure_usable(&self) -> Result<(), SandboxError> {
+        let unusable = |source: std::io::Error| SandboxError::BaseDirUnusable {
+            path: self.base_dir.clone(),
+            source,
+        };
+        tokio::fs::create_dir_all(&self.base_dir).await.map_err(unusable)?;
+        let probe = self.base_dir.join(format!(".write_probe_{}", std::process::id()));
+        tokio::fs::write(&probe, b"probe").await.map_err(unusable)?;
+        let _ = tokio::fs::remove_file(&probe).await;
+        Ok(())
     }
 }
 
@@ -66,6 +108,18 @@ pub enum SandboxError {
 
     #[error("Sandbox directory already exists for task {task_id}: {path}")]
     AlreadyExists { task_id: TaskId, path: PathBuf },
+
+    #[error(
+        "The sandbox base directory '{}' is not writable: {source}. Task sandboxes cannot be \
+         created there; point the worker at a writable directory with --sandbox-base-dir, \
+         RUSTY_GRID_SANDBOX_BASE_DIR or TMPDIR (on Android: the app's cache directory)",
+        path.display()
+    )]
+    BaseDirUnusable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Validates that a requested path does not escape the sandbox root directory.
@@ -389,6 +443,81 @@ mod tests {
 
         assert!(!sb_path.exists(), "RAII Drop should clean up sandbox dir");
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    fn lookup<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn test_default_base_dir_resolution_order() {
+        let platform = PathBuf::from("/platform/tmp");
+        let nested = |root: &str| PathBuf::from(root).join("rusty_grid").join("sandboxes");
+
+        // 3. nothing set: the platform temp dir
+        assert_eq!(
+            resolve_default_base_dir(lookup(&[]), platform.clone()),
+            nested("/platform/tmp")
+        );
+        // 2. TMPDIR beats the platform temp dir
+        assert_eq!(
+            resolve_default_base_dir(lookup(&[("TMPDIR", "/data/user/0/app/cache")]), platform.clone()),
+            nested("/data/user/0/app/cache")
+        );
+        // 1. RUSTY_GRID_SANDBOX_BASE_DIR beats both and is used as the base itself
+        assert_eq!(
+            resolve_default_base_dir(
+                lookup(&[("TMPDIR", "/tmp/x"), (SANDBOX_BASE_DIR_ENV, "/big/disk/sb")]),
+                platform.clone()
+            ),
+            PathBuf::from("/big/disk/sb")
+        );
+        // empty values do not count
+        assert_eq!(
+            resolve_default_base_dir(
+                lookup(&[("TMPDIR", "  "), (SANDBOX_BASE_DIR_ENV, "")]),
+                platform
+            ),
+            nested("/platform/tmp")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_usable_creates_the_base_dir_and_leaves_no_probe_behind() {
+        let root = std::env::temp_dir().join(format!("test_sb_{}", TaskId::new()));
+        let base = root.join("deep").join("base");
+        let config = SandboxConfig::new(&base);
+
+        config.ensure_usable().await.expect("a creatable directory is usable");
+        assert!(base.is_dir());
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0, "the probe file must be removed");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_usable_gives_a_clear_error_for_an_unwritable_base_dir() {
+        let root = std::env::temp_dir().join(format!("test_sb_{}", TaskId::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        // A regular file in the way: nothing can be created below it, whoever runs the test.
+        let blocker = root.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let config = SandboxConfig::new(blocker.join("sandboxes"));
+
+        let err = config.ensure_usable().await.expect_err("must not be usable");
+        assert!(matches!(err, SandboxError::BaseDirUnusable { .. }), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("blocker"), "the message must name the directory: {text}");
+        assert!(
+            text.contains("--sandbox-base-dir") && text.contains("RUSTY_GRID_SANDBOX_BASE_DIR"),
+            "the message must say how to fix it: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

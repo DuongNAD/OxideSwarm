@@ -81,8 +81,7 @@ fn test_checkpoint_serialization_roundtrip() {
     };
 
     // JSON wire codec
-    let json_bytes =
-        serialize_message(&cp_msg, WireCodec::Json).expect("serialize cp_msg to json");
+    let json_bytes = serialize_message(&cp_msg, WireCodec::Json).expect("serialize cp_msg to json");
     let (deser_json, codec_json): (WorkerMessage, WireCodec) =
         deserialize_message(&json_bytes).expect("deserialize cp_msg from json");
     assert_eq!(codec_json, WireCodec::Json);
@@ -329,8 +328,12 @@ async fn test_end_to_end_mid_task_checkpoint_and_resumption_on_worker_disconnect
 
     // 2. Connect Worker 1
     let (w1_shutdown_tx, w1_shutdown_rx) = watch::channel(false);
-    let mut w1 =
-        WorkerClient::from_options(master_addr.clone(), Some("checkpoint-w1".into()), Some(1), false);
+    let mut w1 = WorkerClient::from_options(
+        master_addr.clone(),
+        Some("checkpoint-w1".into()),
+        Some(1),
+        false,
+    );
     let w1_id = w1.worker_id();
 
     let w1_handle = tokio::spawn(async move {
@@ -338,13 +341,17 @@ async fn test_end_to_end_mid_task_checkpoint_and_resumption_on_worker_disconnect
     });
 
     // Wait for Worker 1 to register
-    let w1_registered = wait_for(Duration::from_secs(5), Duration::from_millis(50), || async {
-        if let Ok(workers) = master.list_workers().await {
-            workers.iter().any(|w| w.worker_id == w1_id)
-        } else {
-            false
-        }
-    })
+    let w1_registered = wait_for(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        || async {
+            if let Ok(workers) = master.list_workers().await {
+                workers.iter().any(|w| w.worker_id == w1_id)
+            } else {
+                false
+            }
+        },
+    )
     .await;
     assert!(w1_registered, "Worker 1 must be registered");
 
@@ -390,21 +397,31 @@ async fn test_end_to_end_mid_task_checkpoint_and_resumption_on_worker_disconnect
     let slice = cp_before_kill.delta_state.as_slice();
     let iter_bytes: [u8; 8] = slice[0..8].try_into().unwrap();
     let start_iter = u64::from_le_bytes(iter_bytes) as u32;
-    assert_eq!(start_iter, 50, "Checkpoint delta state must record 50 iterations");
+    assert_eq!(
+        start_iter, 50,
+        "Checkpoint delta state must record 50 iterations"
+    );
 
     // 5. Abruptly kill Worker 1 (abort tokio task, abruptly dropping the TCP connection mid-computation)
     w1_handle.abort();
 
     // 6. Master detects disconnect and returns task to queue with checkpoint intact
-    let task_requeued = wait_for(Duration::from_secs(6), Duration::from_millis(50), || async {
-        if let Ok(info) = master.get_task_info(task_id).await {
-            info.state == TaskState::Queued || info.state == TaskState::Retrying
-        } else {
-            false
-        }
-    })
+    let task_requeued = wait_for(
+        Duration::from_secs(6),
+        Duration::from_millis(50),
+        || async {
+            if let Ok(info) = master.get_task_info(task_id).await {
+                info.state == TaskState::Queued || info.state == TaskState::Retrying
+            } else {
+                false
+            }
+        },
+    )
     .await;
-    assert!(task_requeued, "Task must return to Queued/Retrying state after Worker 1 termination");
+    assert!(
+        task_requeued,
+        "Task must return to Queued/Retrying state after Worker 1 termination"
+    );
 
     let cp_after_kill = master.get_checkpoint(&task_id).await;
     assert_eq!(
@@ -415,8 +432,12 @@ async fn test_end_to_end_mid_task_checkpoint_and_resumption_on_worker_disconnect
 
     // 7. Spawn Worker 2 to resume execution
     let (_w2_shutdown_tx, w2_shutdown_rx) = watch::channel(false);
-    let mut w2 =
-        WorkerClient::from_options(master_addr.clone(), Some("checkpoint-w2".into()), Some(1), false);
+    let mut w2 = WorkerClient::from_options(
+        master_addr.clone(),
+        Some("checkpoint-w2".into()),
+        Some(1),
+        false,
+    );
     let w2_id = w2.worker_id();
 
     let _w2_handle = tokio::spawn(async move {
@@ -444,7 +465,10 @@ async fn test_end_to_end_mid_task_checkpoint_and_resumption_on_worker_disconnect
     // 9. Verify task execution outcome and data integrity
     let final_info = master.get_task_info(task_id).await.unwrap();
     assert_eq!(final_info.state, TaskState::Completed);
-    assert_eq!(final_info.retry_count, 1, "Task must record exactly 1 retry due to failover");
+    assert_eq!(
+        final_info.retry_count, 1,
+        "Task must record exactly 1 retry due to failover"
+    );
     assert_eq!(final_info.exit_code, Some(0));
     assert_eq!(final_info.assigned_worker_id, Some(w2_id));
 

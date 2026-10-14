@@ -5,11 +5,13 @@
 
 use crate::executor::CommandExecutor;
 use crate::protocol::{
-    verify_sha256, AgentMeshEnvelope, CorrelationId, NodeDescriptor,
+    verify_sha256, AgentMeshEnvelope, CorrelationId, NodeDescriptor, ERR_DUPLICATE_NODE_ID,
+    ERR_INVALID_NODE_ID, ERR_UNAUTHORIZED,
 };
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,11 +19,34 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
 use tracing::{info, warn};
 
+/// How long `connect` waits for the hub to accept or reject the registration before it carries on
+/// (a hub that never answers is treated like the pre-token hubs, which did not wait either).
+const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Pause between reconnect attempts after the hub rejected the credentials or the node id: such a
+/// rejection cannot succeed on its own, so do not hammer the hub.
+const REJECTED_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// The hub answered the registration with a NACK (bad or missing token, duplicate node id, ...).
+#[derive(Debug, Clone)]
+pub struct RegistrationRejected {
+    pub error_code: String,
+    pub reason: String,
+}
+
+impl fmt::Display for RegistrationRejected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "hub rejected the registration: {} - {}", self.error_code, self.reason)
+    }
+}
+
+impl std::error::Error for RegistrationRejected {}
+
 pub struct AgentMeshClient {
     hub_url: String,
     node_id: String,
     platform: String,
     hostname: String,
+    token: Option<String>,
     tx: Arc<RwLock<Option<mpsc::UnboundedSender<WsMessage>>>>,
     pending: Arc<RwLock<HashMap<CorrelationId, oneshot::Sender<AgentMeshEnvelope>>>>,
     received_payloads: Arc<RwLock<Vec<AgentMeshEnvelope>>>,
@@ -41,12 +66,20 @@ impl AgentMeshClient {
             node_id: node_id.into(),
             platform: platform.into(),
             hostname,
+            token: None,
             tx: Arc::new(RwLock::new(None)),
             pending: Arc::new(RwLock::new(HashMap::new())),
             received_payloads: Arc::new(RwLock::new(Vec::new())),
             executed_count: Arc::new(AtomicUsize::new(0)),
             running: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Sets the hub token sent with the registration (the CLI feeds `--token` / `OXIDE_MESH_TOKEN`
+    /// here). Needed for any hub started with a token.
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
     }
 
     pub fn node_id(&self) -> &str {
@@ -87,9 +120,11 @@ impl AgentMeshClient {
         });
 
         // Send registration message
+        let reg_corr_id = uuid::Uuid::new_v4().to_string();
+        let (reg_tx, reg_rx) = oneshot::channel::<AgentMeshEnvelope>();
         let reg = AgentMeshEnvelope::NodeRegistration {
             version: "1.0".to_string(),
-            correlation_id: uuid::Uuid::new_v4().to_string(),
+            correlation_id: reg_corr_id.clone(),
             from: self.node_id.clone(),
             to: "hub".to_string(),
             platform: self.platform.clone(),
@@ -99,6 +134,7 @@ impl AgentMeshClient {
                 "arch": std::env::consts::ARCH,
                 "supported_commands": ["echo", "ping", "system_info", "shell_exec", "sha256_verify"],
             }),
+            token: self.token.clone(),
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -116,6 +152,7 @@ impl AgentMeshClient {
         let exec_counter = self.executed_count.clone();
         let out_tx = outbound_tx.clone();
         let running_flag = self.running.clone();
+        let mut reg_waiter = Some(reg_tx);
 
         tokio::spawn(async move {
             while let Some(msg_res) = ws_read.next().await {
@@ -144,6 +181,20 @@ impl AgentMeshClient {
                         }
 
                         let corr_id = envelope.correlation_id().to_string();
+
+                        // The hub's verdict on our registration is handed to `connect` directly.
+                        if corr_id == reg_corr_id
+                            && matches!(
+                                envelope,
+                                AgentMeshEnvelope::NodeRegistrationAck { .. }
+                                    | AgentMeshEnvelope::DeliveryNack { .. }
+                            )
+                        {
+                            if let Some(waiter) = reg_waiter.take() {
+                                let _ = waiter.send(envelope);
+                            }
+                            continue;
+                        }
 
                         match envelope {
                             AgentMeshEnvelope::CommandRequest {
@@ -256,7 +307,21 @@ impl AgentMeshClient {
             running_flag.store(false, Ordering::SeqCst);
         });
 
-        Ok(())
+        match tokio::time::timeout(REGISTRATION_TIMEOUT, reg_rx).await {
+            Ok(Ok(AgentMeshEnvelope::DeliveryNack { error_code, reason, .. })) => {
+                self.close().await;
+                Err(Box::new(RegistrationRejected { error_code, reason }))
+            }
+            Ok(Ok(_accepted)) => Ok(()),
+            Ok(Err(_)) => {
+                self.close().await;
+                Err("hub closed the connection before accepting the registration".into())
+            }
+            Err(_) => {
+                warn!("Hub did not answer the registration within {:?}; continuing", REGISTRATION_TIMEOUT);
+                Ok(())
+            }
+        }
     }
 
     /// Sends a structured command to a target node and awaits the result.
@@ -439,8 +504,29 @@ impl AgentMeshClient {
     pub async fn run_daemon(&self) {
         while self.running.load(Ordering::SeqCst) || true {
             if let Err(e) = self.connect().await {
-                warn!("Connection to hub failed: {}. Reconnecting in 3s...", e);
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                let delay = match e.downcast_ref::<RegistrationRejected>() {
+                    Some(rej)
+                        if rej.error_code == ERR_UNAUTHORIZED
+                            || rej.error_code == ERR_INVALID_NODE_ID =>
+                    {
+                        tracing::error!(
+                            "{}. Fix the token / node id; retrying in {}s.",
+                            rej,
+                            REJECTED_RETRY_DELAY.as_secs()
+                        );
+                        REJECTED_RETRY_DELAY
+                    }
+                    Some(rej) if rej.error_code == ERR_DUPLICATE_NODE_ID => {
+                        // The previous session of this node may simply not have timed out yet.
+                        warn!("{}. Retrying in 10s...", rej);
+                        Duration::from_secs(10)
+                    }
+                    _ => {
+                        warn!("Connection to hub failed: {}. Reconnecting in 3s...", e);
+                        Duration::from_secs(3)
+                    }
+                };
+                tokio::time::sleep(delay).await;
                 continue;
             }
 

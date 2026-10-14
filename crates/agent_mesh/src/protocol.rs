@@ -13,6 +13,39 @@ use uuid::Uuid;
 pub type NodeId = String;
 pub type CorrelationId = String;
 
+/// `DeliveryNack` error codes the hub emits for access-control decisions. Clients match on these
+/// (e.g. to stop retrying a registration that can never succeed), so keep them stable.
+pub const ERR_UNAUTHORIZED: &str = "ERR_UNAUTHORIZED";
+pub const ERR_NOT_REGISTERED: &str = "ERR_NOT_REGISTERED";
+pub const ERR_DUPLICATE_NODE_ID: &str = "ERR_DUPLICATE_NODE_ID";
+pub const ERR_INVALID_NODE_ID: &str = "ERR_INVALID_NODE_ID";
+pub const ERR_SENDER_MISMATCH: &str = "ERR_SENDER_MISMATCH";
+pub const ERR_NODE_UNAVAILABLE: &str = "ERR_NODE_UNAVAILABLE";
+
+/// Node ids the hub reserves for itself and for routing targets; no peer may register them.
+pub const RESERVED_NODE_IDS: [&str; 4] = ["hub", "grid", "grid-master", "all"];
+
+/// Longest node id (in bytes) the hub accepts.
+pub const MAX_NODE_ID_LEN: usize = 128;
+
+/// Checks that `id` is something a peer may register: 1..=128 bytes, no control characters and
+/// not one of the ids the hub reserves for routing (`hub`, `grid`, `grid-master`, `all`).
+pub fn validate_node_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("node id must not be empty".to_string());
+    }
+    if id.len() > MAX_NODE_ID_LEN {
+        return Err(format!("node id is longer than {MAX_NODE_ID_LEN} bytes"));
+    }
+    if id.chars().any(|c| c.is_control()) {
+        return Err("node id must not contain control characters".to_string());
+    }
+    if RESERVED_NODE_IDS.iter().any(|r| r.eq_ignore_ascii_case(id)) {
+        return Err("node id is reserved by the hub".to_string());
+    }
+    Ok(())
+}
+
 fn current_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -89,6 +122,10 @@ pub enum AgentMeshEnvelope {
         hostname: String,
         #[serde(default)]
         capabilities: Value,
+        /// Shared hub token (`--token` / `OXIDE_MESH_TOKEN`). Absent from older clients, so it
+        /// defaults to `None`; a hub started without a token ignores it. Never log this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
         #[serde(default = "current_time_ms")]
         timestamp: u64,
     },
@@ -540,6 +577,52 @@ mod tests {
         } else {
             panic!("Expected DataPayload variant");
         }
+    }
+
+    #[test]
+    fn test_registration_token_is_optional_on_the_wire() {
+        // Pre-token clients send no `token` field; it must still parse (and stay unset).
+        let legacy = r#"{"type":"NodeRegistration","from":"old-node","platform":"linux"}"#;
+        match AgentMeshEnvelope::from_json_str(legacy).unwrap() {
+            AgentMeshEnvelope::NodeRegistration { from, token, .. } => {
+                assert_eq!(from, "old-node");
+                assert_eq!(token, None);
+            }
+            other => panic!("expected NodeRegistration, got {other:?}"),
+        }
+
+        let with_token = r#"{"type":"NodeRegistration","from":"n","token":"s3cret"}"#;
+        match AgentMeshEnvelope::from_json_str(with_token).unwrap() {
+            AgentMeshEnvelope::NodeRegistration { token, .. } => {
+                assert_eq!(token.as_deref(), Some("s3cret"));
+            }
+            other => panic!("expected NodeRegistration, got {other:?}"),
+        }
+
+        // A token-less registration must not serialise a `token: null` that old hubs choke on.
+        let reg = AgentMeshEnvelope::NodeRegistration {
+            version: "1.0".into(),
+            correlation_id: "c".into(),
+            from: "n".into(),
+            to: "hub".into(),
+            platform: "linux".into(),
+            hostname: "h".into(),
+            capabilities: Value::Null,
+            token: None,
+            timestamp: 0,
+        };
+        assert!(!reg.to_json_string().unwrap().contains("token"));
+    }
+
+    #[test]
+    fn test_validate_node_id_rules() {
+        assert!(validate_node_id("node-linux-box").is_ok());
+        assert!(validate_node_id("nodé-🚀").is_ok());
+        for bad in ["", "hub", "HUB", "grid", "grid-master", "all", "has\nnewline", "nul\0byte"] {
+            assert!(validate_node_id(bad).is_err(), "{bad:?} must be rejected");
+        }
+        assert!(validate_node_id(&"x".repeat(MAX_NODE_ID_LEN)).is_ok());
+        assert!(validate_node_id(&"x".repeat(MAX_NODE_ID_LEN + 1)).is_err());
     }
 
     #[test]

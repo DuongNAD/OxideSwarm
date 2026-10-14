@@ -37,9 +37,11 @@ async fn test_dashboard_http_rest_endpoints() {
     let dash_port_file = temp_dir.path().join("dashboard.port");
 
     // 1. Launch Master with ephemeral dashboard port (0) and dashboard port file
+    // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_dashboard_port(0)
-        .with_dashboard_port_file(&dash_port_file);
+        .with_dashboard_port_file(&dash_port_file)
+        .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master
@@ -208,7 +210,10 @@ async fn test_dashboard_http_rest_endpoints() {
 #[tokio::test]
 async fn test_dashboard_websocket_telemetry_stream() {
     // 1. Launch Master with ephemeral dashboard port (0)
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(0);
+    // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_dashboard_port(0)
+        .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
@@ -317,7 +322,10 @@ async fn test_dashboard_websocket_telemetry_stream() {
 /// Test 3: Server-Sent Events (SSE) telemetry stream validation.
 #[tokio::test]
 async fn test_dashboard_sse_stream() {
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(0);
+    // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_dashboard_port(0)
+        .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");

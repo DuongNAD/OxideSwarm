@@ -55,7 +55,10 @@ use rusty_grid_worker::client::WorkerClient;
 /// Test 1: Rapid connection and abrupt disconnection bursts across /ws, /api/stream, and /api/stream/sse.
 #[tokio::test]
 async fn test_stress_rapid_connection_and_abrupt_disconnection_bursts() {
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(0);
+    // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_dashboard_port(0)
+        .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
@@ -204,7 +207,10 @@ async fn test_stress_rapid_connection_and_abrupt_disconnection_bursts() {
 /// (`RecvError::Lagged`) and snapshot resynchronization without server crash.
 #[tokio::test]
 async fn test_stress_slow_lagging_consumer_ring_buffer_overflow() {
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(0);
+    // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_dashboard_port(0)
+        .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
@@ -303,7 +309,10 @@ async fn test_stress_slow_lagging_consumer_ring_buffer_overflow() {
 /// Test 3: Server-Sent Events (/api/stream/sse) slow consumer and snapshot resynchronization.
 #[tokio::test]
 async fn test_stress_sse_lagging_consumer_and_resync() {
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(0);
+    // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_dashboard_port(0)
+        .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
@@ -376,7 +385,10 @@ async fn test_stress_sse_lagging_consumer_and_resync() {
 /// while workers register, send heartbeats, and complete batch tasks.
 #[tokio::test]
 async fn test_stress_high_throughput_concurrency() {
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(0);
+    // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_dashboard_port(0)
+        .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
@@ -516,7 +528,10 @@ async fn test_stress_high_throughput_concurrency() {
 /// Test 5: Keepalive ping/pong verification under load, on-demand snapshot, and frame corruption resilience.
 #[tokio::test]
 async fn test_stress_keepalive_ping_pong_under_heavy_load() {
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(0);
+    // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_dashboard_port(0)
+        .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");
@@ -659,7 +674,10 @@ async fn test_stress_keepalive_ping_pong_under_heavy_load() {
 /// Test 6: Master graceful shutdown cleanly drains active WebSocket and SSE telemetry streams.
 #[tokio::test]
 async fn test_stress_master_graceful_shutdown_drains_telemetry_streams() {
-    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(0);
+    // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_dashboard_port(0)
+        .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
 
     let master = MasterServer::spawn(config).await.expect("spawn master");
     let dash_addr = master.dashboard_addr().expect("dashboard addr present");

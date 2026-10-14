@@ -21,6 +21,8 @@ iroh = { workspace = true, optional = true }
 futures = { workspace = true }
 axum = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
+# Constant-time dashboard token comparison (already in Cargo.lock via rusty_grid_core).
+ring = "0.17"
 
 [features]
 default = ["p2p", "dashboard"]
@@ -122,3 +124,29 @@ path = "../../tests/m3_challenger_1_checkpoint_stress.rs"
 name = "m3_challenger_2_checkpoint_stress"
 path = "../../tests/m3_challenger_2_checkpoint_stress.rs"
 
+[[test]]
+name = "dashboard_security_test"
+path = "../../tests/dashboard_security_test.rs"
+required-features = ["dashboard"]
+
+[[test]]
+name = "cluster_auth_e2e"
+path = "../../tests/cluster_auth_e2e.rs"
+
+[[test]]
+name = "master_failover_cancel_liveness"
+path = "../../tests/master_failover_cancel_liveness.rs"
+
+[[test]]
+name = "dashboard_api_test"
+path = "../../tests/dashboard_api_test.rs"
+required-features = ["dashboard"]
+
+[[test]]
+name = "master_limits_and_scheduling"
+path = "../../tests/master_limits_and_scheduling.rs"
+
+[[test]]
+name = "master_quic_limits"
+path = "../../tests/master_quic_limits.rs"
+required-features = ["p2p"]

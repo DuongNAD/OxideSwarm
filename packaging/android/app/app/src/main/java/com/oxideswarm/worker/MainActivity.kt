@@ -52,6 +52,9 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
 
     private val logBuffer = StringBuilder()
     private var lastDiscoveredWebUi: String? = null
+    // True when the last scan found a master whose beacon advertises no dashboard URL: its
+    // dashboard listens on the master machine only (the default), so there is nothing to open.
+    private var lastDiscoveryHasNoDashboard = false
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -130,11 +133,19 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
         btnScanMaster.setOnClickListener { scanForMaster(showToast = true) }
         
         btnOpenDashboard.setOnClickListener {
+            if (lastDiscoveryHasNoDashboard) {
+                Toast.makeText(this, "This master's dashboard listens on the master machine only; start the master with --web-ui-addr to open it from here", Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
             val targetUrl = lastDiscoveredWebUi ?: run {
                 val master = etMasterAddress.text?.toString()?.trim().orEmpty()
                 val host = if (master.contains(":")) master.split(":")[0] else master
-                val ip = if (host.isEmpty() || host.equals("auto", ignoreCase = true)) "192.168.1.144" else host
-                "http://$ip:8080"
+                if (host.isEmpty() || host.equals("auto", ignoreCase = true) || host.startsWith("{")) {
+                    // No address of this owner's network is baked in: ask for one instead of guessing.
+                    Toast.makeText(this, "Enter the master address or tap Scan Master first", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                "http://$host:8080"
             }
             val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(targetUrl))
             try {
@@ -180,7 +191,7 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
         }
         val prefs = storageContext.getSharedPreferences(BootCompletedReceiver.PREFS_NAME, Context.MODE_PRIVATE)
 
-        val defaultMaster = prefs.getString(BootCompletedReceiver.KEY_MASTER, "127.0.0.1:8080")
+        val defaultMaster = prefs.getString(BootCompletedReceiver.KEY_MASTER, "127.0.0.1:8088")
         val defaultName = prefs.getString(BootCompletedReceiver.KEY_WORKER_NAME, SystemInfoHelper.getDefaultWorkerName())
         val defaultCores = prefs.getInt(BootCompletedReceiver.KEY_CORES, SystemInfoHelper.getAvailableCores())
         val defaultRam = prefs.getLong(BootCompletedReceiver.KEY_RAM_MB, SystemInfoHelper.getTotalRamMb(this))
@@ -241,7 +252,7 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
         val autoStart = switchAutoStart.isChecked
 
         if (master.isEmpty()) {
-            etMasterAddress.error = "Master address or P2P ticket required (e.g. 192.168.1.100:8080 or {\"id\":...})"
+            etMasterAddress.error = "Master address or P2P ticket required (cluster port, e.g. 192.168.1.100:8088 - not the dashboard port 8080 - or {\"id\":...})"
             return
         }
 
@@ -284,6 +295,11 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
         }
         appendLog("[DISCOVERY] Bắt đầu quét tìm Master trong mạng LAN...")
 
+        // The HTTP fallback below only probes the host typed in the address field (if any): there is
+        // no built-in list of addresses, and no subnet is scanned.
+        val typedMaster = etMasterAddress.text?.toString()?.trim().orEmpty()
+        val typedHost = if (typedMaster.contains(":")) typedMaster.split(":")[0] else typedMaster
+
         Thread {
             var discoveredMasterCluster: String? = null
             var discoveredHostName: String? = null
@@ -315,9 +331,11 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
                 } catch (_: Exception) {}
             }
 
-            // Method 2: Fast Parallel HTTP Fallback to Cluster Candidate Nodes
-            if (discoveredMasterCluster == null) {
-                val candidateIps = listOf("192.168.1.144", "192.168.1.123")
+            // Method 2: HTTP probe of the host typed in the address field (dashboard / standby portal on :8080)
+            val candidateIps = listOf(typedHost).filter {
+                it.isNotEmpty() && !it.equals("auto", ignoreCase = true) && !it.startsWith("{")
+            }
+            if (discoveredMasterCluster == null && candidateIps.isNotEmpty()) {
                 val executor = java.util.concurrent.Executors.newFixedThreadPool(candidateIps.size)
                 val completionService = java.util.concurrent.ExecutorCompletionService<org.json.JSONObject?>(executor)
 
@@ -350,7 +368,7 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
                         remaining--
                         val json = future?.get()
                         if (json != null) {
-                            val probedIp = json.optString("_probed_ip", "192.168.1.144")
+                            val probedIp = json.optString("_probed_ip", "")
                             if (json.has("master") && json.getJSONObject("master").optString("role") == "MASTER") {
                                 discoveredMasterCluster = "$probedIp:8088"
                                 discoveredHostName = json.getJSONObject("master").optString("host", "OxideMaster")
@@ -361,7 +379,9 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
                                 val masterCluster = json.optString("master_cluster_addr")
                                 if (masterCluster.isNotEmpty() && !masterCluster.equals("auto", ignoreCase = true)) {
                                     discoveredMasterCluster = masterCluster
-                                    discoveredWebUi = json.optString("master_web_ui", redirectUrl)
+                                    // JSON null = the master it follows has no dashboard to open (org.json
+                                    // would turn that null into the text "null").
+                                    discoveredWebUi = if (json.isNull("master_web_ui")) "" else json.optString("master_web_ui", redirectUrl)
                                     discoveredHostName = "PortalRedirect"
                                     break
                                 } else if (redirectUrl.isNotEmpty() && !redirectUrl.contains("127.0.0.1")) {
@@ -381,7 +401,9 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
 
             runOnUiThread {
                 if (discoveredMasterCluster != null) {
-                    lastDiscoveredWebUi = discoveredWebUi
+                    val advertisedWebUi = discoveredWebUi
+                    lastDiscoveredWebUi = advertisedWebUi?.takeIf { it.isNotBlank() }
+                    lastDiscoveryHasNoDashboard = advertisedWebUi != null && advertisedWebUi.isBlank()
                     etMasterAddress.setText(discoveredMasterCluster)
                     val hostDisplay = discoveredHostName ?: "OxideMaster"
                     appendLog("[DISCOVERY] ✅ Đã tìm thấy Master: $hostDisplay ($discoveredMasterCluster)")

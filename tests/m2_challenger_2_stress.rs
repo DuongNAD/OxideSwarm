@@ -774,7 +774,9 @@ async fn test_reaper_monotonic_clock_immune_to_worker_reported_epoch_skew() {
 async fn test_adversarial_quic_stream_multiplexing_heavy_saturation_anti_hol() {
     use iroh::endpoint::presets::N0;
     use iroh::endpoint::RelayMode;
-    use rusty_grid_core::transport::{BiStream, GridStream, GRID_ALPN, STREAM_CONTROL, STREAM_DATA};
+    use rusty_grid_core::transport::{
+        BiStream, GridStream, GRID_ALPN, STREAM_CONTROL, STREAM_DATA,
+    };
     use tokio::io::AsyncWriteExt;
 
     // 1. Setup loopback QUIC endpoints
@@ -796,7 +798,12 @@ async fn test_adversarial_quic_stream_multiplexing_heavy_saturation_anti_hol() {
 
     // 2. Server accepts connection and the two bi-directional streams
     let server_handle = tokio::spawn(async move {
-        let incoming = ep_server.accept().await.expect("accept").await.expect("handshake");
+        let incoming = ep_server
+            .accept()
+            .await
+            .expect("accept")
+            .await
+            .expect("handshake");
 
         let (send_a, mut recv_a) = incoming.accept_bi().await.expect("accept stream A");
         let mut tag_a = [0u8; 1];
@@ -836,7 +843,10 @@ async fn test_adversarial_quic_stream_multiplexing_heavy_saturation_anti_hol() {
             match msg {
                 WorkerMessage::Heartbeat { timestamp, .. } => {
                     let ack = MasterMessage::HeartbeatAck { timestamp };
-                    ctrl_transport.send_msg(&ack).await.expect("send heartbeat ack");
+                    ctrl_transport
+                        .send_msg(&ack)
+                        .await
+                        .expect("send heartbeat ack");
                 }
                 WorkerMessage::Disconnecting { .. } => {
                     break;
@@ -850,16 +860,25 @@ async fn test_adversarial_quic_stream_multiplexing_heavy_saturation_anti_hol() {
     });
 
     // 3. Client connects
-    let conn = ep_client.connect(server_addr, GRID_ALPN).await.expect("connect");
+    let conn = ep_client
+        .connect(server_addr, GRID_ALPN)
+        .await
+        .expect("connect");
 
     let (mut ctrl_send, ctrl_recv) = conn.open_bi().await.expect("open ctrl bi");
-    ctrl_send.write_all(&[STREAM_CONTROL]).await.expect("write ctrl tag");
+    ctrl_send
+        .write_all(&[STREAM_CONTROL])
+        .await
+        .expect("write ctrl tag");
     ctrl_send.flush().await.expect("flush ctrl tag");
     let ctrl_stream = GridStream::P2p(BiStream::new(ctrl_recv, ctrl_send));
     let mut ctrl_transport = MessageTransport::new(ctrl_stream);
 
     let (mut data_send, _data_recv) = conn.open_bi().await.expect("open data bi");
-    data_send.write_all(&[STREAM_DATA]).await.expect("write data tag");
+    data_send
+        .write_all(&[STREAM_DATA])
+        .await
+        .expect("write data tag");
     data_send.flush().await.expect("flush data tag");
 
     // 4. Heavy Data Saturation: Stream 5MB of data concurrently
@@ -868,7 +887,10 @@ async fn test_adversarial_quic_stream_multiplexing_heavy_saturation_anti_hol() {
         let chunk = vec![0xA5u8; 64 * 1024];
         let mut sent = 0;
         while sent < heavy_payload_size {
-            data_send.write_all(&chunk).await.expect("write heavy chunk");
+            data_send
+                .write_all(&chunk)
+                .await
+                .expect("write heavy chunk");
             sent += chunk.len();
         }
         data_send.flush().await.expect("flush data");
@@ -907,15 +929,22 @@ async fn test_adversarial_quic_stream_multiplexing_heavy_saturation_anti_hol() {
         worker_id,
         reason: "Adversarial test complete".into(),
     };
-    ctrl_transport.send_msg(&disc).await.expect("send disconnecting");
+    ctrl_transport
+        .send_msg(&disc)
+        .await
+        .expect("send disconnecting");
 
     data_producer_task.await.expect("data producer finish");
     let total_server_read = server_handle.await.expect("server finish");
 
-    assert_eq!(total_server_read, heavy_payload_size, "Server must receive all 5MB of streamed data");
+    assert_eq!(
+        total_server_read, heavy_payload_size,
+        "Server must receive all 5MB of streamed data"
+    );
 
     let max_latency = heartbeat_latencies.iter().max().cloned().unwrap();
-    let avg_latency: Duration = heartbeat_latencies.iter().sum::<Duration>() / heartbeat_latencies.len() as u32;
+    let avg_latency: Duration =
+        heartbeat_latencies.iter().sum::<Duration>() / heartbeat_latencies.len() as u32;
 
     println!(
         "[QUIC HOL ISOLATION] Heartbeats: {}, Avg Latency: {:?}, Max Latency: {:?}",
@@ -947,8 +976,10 @@ async fn test_adversarial_quic_stream_multiplexing_heavy_saturation_anti_hol() {
 async fn test_adversarial_master_multiplexed_heartbeat_under_backpressured_data_lane() {
     use iroh::endpoint::presets::N0;
     use iroh::endpoint::RelayMode;
-    use rusty_grid_core::transport::{BiStream, GridStream, GRID_ALPN, STREAM_CONTROL, STREAM_DATA};
     use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
+    use rusty_grid_core::transport::{
+        BiStream, GridStream, GRID_ALPN, STREAM_CONTROL, STREAM_DATA,
+    };
     use rusty_grid_master::queue::TaskQueue;
     use rusty_grid_master::scheduler::{SchedulerConfig, WorkloadScheduler};
     use std::collections::HashMap;
@@ -976,7 +1007,10 @@ async fn test_adversarial_master_multiplexed_heartbeat_under_backpressured_data_
     .await
     .expect("master bind");
 
-    let p2p_endpoint = master.p2p_endpoint().expect("p2p endpoint must exist").clone();
+    let p2p_endpoint = master
+        .p2p_endpoint()
+        .expect("p2p endpoint must exist")
+        .clone();
     let server_addr = p2p_endpoint.addr();
 
     let master_handle = tokio::spawn(async move { master.run(master_shutdown_rx).await });
@@ -989,27 +1023,46 @@ async fn test_adversarial_master_multiplexed_heartbeat_under_backpressured_data_
         .await
         .expect("bind client endpoint");
 
-    let conn = ep_client.connect(server_addr, GRID_ALPN).await.expect("connect");
+    let conn = ep_client
+        .connect(server_addr, GRID_ALPN)
+        .await
+        .expect("connect");
 
     // Open control stream (0x01)
     let (mut ctrl_send, ctrl_recv) = conn.open_bi().await.expect("open ctrl bi");
-    ctrl_send.write_all(&[STREAM_CONTROL]).await.expect("write ctrl tag");
+    ctrl_send
+        .write_all(&[STREAM_CONTROL])
+        .await
+        .expect("write ctrl tag");
     ctrl_send.flush().await.expect("flush ctrl tag");
     let ctrl_stream = GridStream::P2p(BiStream::new(ctrl_recv, ctrl_send));
     let mut ctrl_transport = MessageTransport::new(ctrl_stream);
 
     // Open data stream (0x02)
     let (mut data_send, _data_recv) = conn.open_bi().await.expect("open data bi");
-    data_send.write_all(&[STREAM_DATA]).await.expect("write data tag");
+    data_send
+        .write_all(&[STREAM_DATA])
+        .await
+        .expect("write data tag");
     data_send.flush().await.expect("flush data tag");
 
     // Register worker with 200 cores
     let worker_id = Uuid::new_v4();
     let reg_msg = WorkerMessage::Register {
         worker_id,
-        capabilities: WorkerCapabilities::new("backpressure-test-node", 200, 131072, false, false, None),
+        capabilities: WorkerCapabilities::new(
+            "backpressure-test-node",
+            200,
+            131072,
+            false,
+            false,
+            None,
+        ),
     };
-    ctrl_transport.send_msg(&reg_msg).await.expect("send register");
+    ctrl_transport
+        .send_msg(&reg_msg)
+        .await
+        .expect("send register");
 
     let ack: Option<MasterMessage> = ctrl_transport.recv_msg().await.expect("recv register ack");
     match ack {
@@ -1041,7 +1094,11 @@ async fn test_adversarial_master_multiplexed_heartbeat_under_backpressured_data_
         sched_trigger.clone(),
     );
     let sched_report = scheduler.schedule_batch(200).await.expect("schedule batch");
-    assert_eq!(sched_report.assignments.len(), 150, "All 150 tasks should be scheduled to worker");
+    assert_eq!(
+        sched_report.assignments.len(),
+        150,
+        "All 150 tasks should be scheduled to worker"
+    );
 
     // Notice: The client deliberately DOES NOT READ from `data_recv`!
     // This creates complete backpressure on the data lane.
@@ -1060,9 +1117,16 @@ async fn test_adversarial_master_multiplexed_heartbeat_under_backpressured_data_
     ctrl_transport.send_msg(&hb).await.expect("send heartbeat");
 
     // We expect HeartbeatAck within 2 seconds
-    let ack_res = tokio::time::timeout(Duration::from_secs(2), ctrl_transport.recv_msg::<MasterMessage>()).await;
+    let ack_res = tokio::time::timeout(
+        Duration::from_secs(2),
+        ctrl_transport.recv_msg::<MasterMessage>(),
+    )
+    .await;
 
-    println!("[BACKPRESSURE TEST RESULT] HeartbeatAck recv result: {:?}", ack_res);
+    println!(
+        "[BACKPRESSURE TEST RESULT] HeartbeatAck recv result: {:?}",
+        ack_res
+    );
 
     let _ = master_shutdown_tx.send(true);
     let _ = master_handle.await;
@@ -1086,7 +1150,7 @@ async fn test_adversarial_master_multiplexed_heartbeat_under_backpressured_data_
 
 #[test]
 fn test_adversarial_zero_copy_huge_payload_slicing_and_cow() {
-    use rusty_grid_core::task::{Bytes, TaskResult, TaskId};
+    use rusty_grid_core::task::{Bytes, TaskId, TaskResult};
     use std::borrow::Cow;
 
     let task_id = TaskId::new();
@@ -1151,9 +1215,22 @@ async fn test_adversarial_scheduler_micro_batch_massive_burst() {
         let wid = Uuid::new_v4();
         let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let caps = WorkerCapabilities::new(format!("bulk-worker-{}", i), 100, 131072, false, false, None);
+        let caps = WorkerCapabilities::new(
+            format!("bulk-worker-{}", i),
+            100,
+            131072,
+            false,
+            false,
+            None,
+        );
         registry
-            .register(wid, caps, format!("127.0.0.1:{}", 9100 + i).parse().unwrap(), tx, None)
+            .register(
+                wid,
+                caps,
+                format!("127.0.0.1:{}", 9100 + i).parse().unwrap(),
+                tx,
+                None,
+            )
             .await
             .unwrap();
     }
@@ -1188,12 +1265,18 @@ async fn test_adversarial_scheduler_micro_batch_massive_burst() {
         total_scheduled += report.assignments.len();
     }
 
-    assert_eq!(total_scheduled, 250, "All 250 burst tasks must be scheduled");
-    assert_eq!(queue.get_schedulable_tasks().await.len(), 0, "No schedulable tasks remain");
+    assert_eq!(
+        total_scheduled, 250,
+        "All 250 burst tasks must be scheduled"
+    );
+    assert_eq!(
+        queue.get_schedulable_tasks().await.len(),
+        0,
+        "No schedulable tasks remain"
+    );
 
     // Verify all 250 tasks are in Scheduled state
     for tid in task_ids {
         assert_eq!(queue.get_state(&tid).await, Some(TaskState::Scheduled));
     }
 }
-

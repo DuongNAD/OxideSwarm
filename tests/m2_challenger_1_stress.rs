@@ -21,7 +21,8 @@ use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::{
-    deserialize_message, serialize_message, MasterMessage, MessageTransport, WireCodec, WorkerMessage,
+    deserialize_message, serialize_message, MasterMessage, MessageTransport, WireCodec,
+    WorkerMessage,
 };
 use rusty_grid_core::task::{Bytes, Task, TaskId, TaskRequirements, TaskResult, TaskSpec};
 use rusty_grid_core::transport::{BiStream, GridStream, STREAM_CONTROL, STREAM_DATA};
@@ -46,7 +47,11 @@ fn test_zero_copy_slicing_and_pointer_invariants() {
     let raw_ptr = raw.as_ptr();
 
     let b = Bytes::from(raw.clone());
-    assert_eq!(b.as_bytes().as_ptr(), raw_ptr, "Bytes wrapper must share identical base pointer");
+    assert_eq!(
+        b.as_bytes().as_ptr(),
+        raw_ptr,
+        "Bytes wrapper must share identical base pointer"
+    );
 
     // Multiple slices across disparate offsets
     let s1 = b.slice(100..200);
@@ -80,8 +85,8 @@ fn test_binary_non_utf8_stdout_stderr_slicing_and_cow() {
 
     // Adversarial byte pattern: invalid UTF-8 sequences (0xFF, 0xFE, lone continuation bytes, null bytes)
     let non_utf8_stdout = vec![
-        0xFF, 0xFE, 0xFD, 0x00, 0x80, 0x81, 0xC0, 0xAF, b'H', b'e', b'l', b'l', b'o', 0x00,
-        0xF0, 0x28, 0x8C, 0x28, 0xFF,
+        0xFF, 0xFE, 0xFD, 0x00, 0x80, 0x81, 0xC0, 0xAF, b'H', b'e', b'l', b'l', b'o', 0x00, 0xF0,
+        0x28, 0x8C, 0x28, 0xFF,
     ];
     let non_utf8_stderr = vec![0x80, 0xBF, 0xC2, 0x00, 0xFF];
 
@@ -90,11 +95,16 @@ fn test_binary_non_utf8_stdout_stderr_slicing_and_cow() {
 
     // 1. Deref to str should NOT panic, should return empty or valid slice
     let deref_str: &str = &b_stdout;
-    assert_eq!(deref_str, "", "Deref on invalid UTF-8 should fallback gracefully without panicking");
+    assert_eq!(
+        deref_str, "",
+        "Deref on invalid UTF-8 should fallback gracefully without panicking"
+    );
 
     // 2. Display and Debug formatting should NOT panic
+    // Display is lossy (U+FFFD for bad bytes); it used to blank the whole buffer to "".
     let display_output = format!("{}", b_stdout);
-    assert_eq!(display_output, "");
+    assert_eq!(display_output, String::from_utf8_lossy(&non_utf8_stdout));
+    assert!(display_output.contains("Hello"));
 
     let debug_output = format!("{:?}", b_stdout);
     assert!(
@@ -124,8 +134,14 @@ fn test_binary_non_utf8_stdout_stderr_slicing_and_cow() {
     let cow_stdout = result.stdout_str();
     match cow_stdout {
         Cow::Owned(ref s) => {
-            assert!(s.contains('\u{FFFD}'), "Lossy UTF-8 conversion should contain replacement character");
-            assert!(s.contains("Hello"), "Lossy UTF-8 conversion should preserve ASCII segments");
+            assert!(
+                s.contains('\u{FFFD}'),
+                "Lossy UTF-8 conversion should contain replacement character"
+            );
+            assert!(
+                s.contains("Hello"),
+                "Lossy UTF-8 conversion should preserve ASCII segments"
+            );
         }
         Cow::Borrowed(_) => panic!("Expected Cow::Owned for non-UTF8 stdout"),
     }
@@ -241,13 +257,17 @@ async fn test_read_bounded_stream_binary_overflow_and_drain() {
 
     // Reader task captures bounded stream
     let (captured, truncated) = read_bounded_stream(reader, max_capture).await;
-    writer_task.await.expect("writer task must finish without deadlock");
+    writer_task
+        .await
+        .expect("writer task must finish without deadlock");
 
     assert!(truncated, "Stream should be flagged as truncated");
     // Max captured bytes + truncation message
     assert!(captured.len() >= max_capture);
     assert!(
-        captured.as_bytes().ends_with(b"[rusty_grid: output truncated after exceeding size limit]\n"),
+        captured
+            .as_bytes()
+            .ends_with(b"[rusty_grid: output truncated after exceeding size limit]\n"),
         "Must contain truncation footer"
     );
     // Verify initial data chunk was captured correctly
@@ -285,7 +305,12 @@ async fn test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation() 
 
     // Server accepts connection and demuxes Control vs Data streams
     let server_handle = tokio::spawn(async move {
-        let incoming = ep_server.accept().await.expect("accept").await.expect("handshake");
+        let incoming = ep_server
+            .accept()
+            .await
+            .expect("accept")
+            .await
+            .expect("handshake");
 
         let (send_a, mut recv_a) = incoming.accept_bi().await.expect("stream a");
         let mut tag_a = [0u8; 1];
@@ -339,18 +364,27 @@ async fn test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation() 
     });
 
     // Client connects
-    let conn = ep_client.connect(server_addr, GRID_ALPN).await.expect("connect");
+    let conn = ep_client
+        .connect(server_addr, GRID_ALPN)
+        .await
+        .expect("connect");
 
     // Open Control Lane
     let (mut ctrl_send, ctrl_recv) = conn.open_bi().await.expect("open ctrl");
-    ctrl_send.write_all(&[STREAM_CONTROL]).await.expect("write ctrl tag");
+    ctrl_send
+        .write_all(&[STREAM_CONTROL])
+        .await
+        .expect("write ctrl tag");
     ctrl_send.flush().await.expect("flush ctrl tag");
     let ctrl_stream = GridStream::P2p(BiStream::new(ctrl_recv, ctrl_send));
     let mut ctrl_transport = MessageTransport::new(ctrl_stream);
 
     // Open Data Lane
     let (mut data_send, _data_recv) = conn.open_bi().await.expect("open data");
-    data_send.write_all(&[STREAM_DATA]).await.expect("write data tag");
+    data_send
+        .write_all(&[STREAM_DATA])
+        .await
+        .expect("write data tag");
     data_send.flush().await.expect("flush data tag");
 
     // Concurrently saturate Data Lane with 5MB
@@ -380,7 +414,8 @@ async fn test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation() 
             ram_available_mb: 4096,
         };
         ctrl_transport.send_msg(&hb).await.expect("send heartbeat");
-        let ack: Option<MasterMessage> = ctrl_transport.recv_msg().await.expect("recv heartbeat ack");
+        let ack: Option<MasterMessage> =
+            ctrl_transport.recv_msg().await.expect("recv heartbeat ack");
         let rtt = t0.elapsed();
         latencies.push(rtt);
 
@@ -435,7 +470,8 @@ async fn test_scheduler_micro_batch_burst_concurrency_race() {
         .with_micro_batch_window(Duration::from_millis(5))
         .with_max_batch_size(64);
 
-    let scheduler = WorkloadScheduler::new(config, registry.clone(), queue.clone(), trigger.clone());
+    let scheduler =
+        WorkloadScheduler::new(config, registry.clone(), queue.clone(), trigger.clone());
 
     // Register 4 workers: 2 GPU workers (32 cores each) and 2 CPU-only workers (32 cores each)
     let mut workers = Vec::new();
@@ -450,10 +486,20 @@ async fn test_scheduler_micro_batch_burst_concurrency_race() {
             32768,
             is_gpu,
             is_gpu,
-            if is_gpu { Some("Virtual GPU".into()) } else { None },
+            if is_gpu {
+                Some("Virtual GPU".into())
+            } else {
+                None
+            },
         );
         registry
-            .register(wid, caps, format!("127.0.0.1:910{}", i).parse().unwrap(), tx, None)
+            .register(
+                wid,
+                caps,
+                format!("127.0.0.1:910{}", i).parse().unwrap(),
+                tx,
+                None,
+            )
             .await
             .expect("register worker");
         workers.push(wid);
@@ -502,7 +548,9 @@ async fn test_scheduler_micro_batch_burst_concurrency_race() {
     // Concurrently cancel 30 tasks from the submitted set
     let cancel_set: HashSet<TaskId> = submitted_tids.iter().take(30).copied().collect();
     for tid in &cancel_set {
-        let _ = queue.cancel_task(tid, Some("Concurrent cancellation stress".to_string())).await;
+        let _ = queue
+            .cancel_task(tid, Some("Concurrent cancellation stress".to_string()))
+            .await;
     }
 
     // Concurrently run schedule_batch in multiple scheduling passes
@@ -552,7 +600,10 @@ async fn test_scheduler_micro_batch_burst_concurrency_race() {
     }
 
     for a in &scheduled_tasks {
-        let state = queue.get_state(&a.task_id).await.expect("scheduled state exists");
+        let state = queue
+            .get_state(&a.task_id)
+            .await
+            .expect("scheduled state exists");
         assert_eq!(state, TaskState::Scheduled);
     }
 }
@@ -573,7 +624,10 @@ async fn test_scheduler_batch_atomicity_and_edge_cases() {
     // 2. Non-existent task IDs
     let fake_id = TaskId::new();
     let fake_res = queue.schedule_tasks_batch(&[(fake_id, worker_id)]).await;
-    assert!(fake_res.is_empty(), "Non-existent task IDs must be skipped gracefully");
+    assert!(
+        fake_res.is_empty(),
+        "Non-existent task IDs must be skipped gracefully"
+    );
 
     // 3. Batch rescheduling idempotency
     let task = Task::new(

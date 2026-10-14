@@ -84,7 +84,7 @@ fn test_windows_cross_compile_script_exists_and_is_executable() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let metadata = fs::metadata(&script).expect("failed to read script metadata");
+        let metadata = std::fs::metadata(&script).expect("failed to read script metadata");
         let permissions = metadata.permissions();
         assert!(
             permissions.mode() & 0o111 != 0,
@@ -229,6 +229,37 @@ fn test_windows_cross_compile_dry_run_custom_features() {
     assert!(
         stdout.contains("Command: cargo build --target x86_64-pc-windows-gnu --bin rusty-grid --release --features p2p"),
         "stdout should include custom features in the cargo command: {stdout}"
+    );
+}
+
+/// `--gpu` is the one switch that yields a Windows worker able to use the GPU: it must reach cargo
+/// as the CLI's `gpu-wgpu` feature (the CLI forwards it to `rusty_grid_worker/gpu-wgpu`).
+#[test]
+fn test_windows_cross_compile_dry_run_gpu_flag_enables_the_wgpu_feature() {
+    let script = get_script_path();
+    let output = script_cmd(&script)
+        .args(["--dry-run", "--gpu"])
+        .output()
+        .expect("failed to execute build_windows_worker.sh --dry-run --gpu");
+
+    assert!(
+        output.status.success(),
+        "build_windows_worker.sh --dry-run --gpu should exit with code 0, got status: {:?}",
+        output.status
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Command: cargo build --target x86_64-pc-windows-gnu --bin rusty-grid --release --features gpu-wgpu"),
+        "--gpu must add the gpu-wgpu feature to the cargo command: {stdout}"
+    );
+
+    let plain = script_cmd(&script)
+        .arg("--dry-run")
+        .output()
+        .expect("failed to execute build_windows_worker.sh --dry-run");
+    assert!(
+        !String::from_utf8_lossy(&plain.stdout).contains("gpu-wgpu"),
+        "without --gpu the build has no wgpu engine"
     );
 }
 

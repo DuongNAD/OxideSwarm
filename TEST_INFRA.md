@@ -1,5 +1,10 @@
 # TEST_INFRA: Cross-Platform Coding Agent Communication Framework PoC
 
+> **HISTORICAL design note.** It describes the test plan of the September 2026 Agent Mesh proof of concept. The
+> tests it names run against a Python reference hub (`tests/run_all_mesh_tests.py`); the current Rust-hub tests are listed
+> in `README.md` section 8. "Zero cheating" and "100%" statements in this file describe intent, not a current result.
+
+
 ## 1. Test Philosophy & Methodology
 - **Opaque-Box & Requirement-Driven**: The test infrastructure validates system behavior strictly against the interface contracts and requirements specified in `ORIGINAL_REQUEST.md` (`## 2026-09-23T09:50:43Z`) and `PROJECT.md`. Tests interact solely through network transport boundaries (RFC 6455 WebSockets over TCP) and wire protocol frames (`AgentMeshEnvelope`), treating the Hub and Agent Nodes as opaque systems.
 - **Genuine Verification (Zero Cheating / No Facades)**: Every test establishes real TCP/WebSocket connections, transmits live serialized JSON envelopes, executes genuine subprocess commands or echo operations, calculates cryptographic SHA-256 hashes from raw byte arrays, and asserts exact match criteria. No mock shortcuts, artificial delays, or pre-canned responses are tolerated.

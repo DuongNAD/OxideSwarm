@@ -558,8 +558,10 @@ fn map_task_result_to_response(
     command: &str,
 ) -> AgentMeshEnvelope {
     let status = if res.exit_code == 0 { "success" } else { "failed" };
-    let mut stdout = res.stdout.as_str().to_string();
-    let stderr = res.stderr.as_str().to_string();
+    // Lossy, not `as_str()`: non-UTF-8 console output (e.g. an OEM code page on Windows) must
+    // reach the agent as text with replacement characters, not as an empty string.
+    let mut stdout = res.stdout_str().into_owned();
+    let stderr = res.stderr_str().into_owned();
 
     // If compilation succeeded, ensure stdout contains informative completion banner
     if command.contains("compile")
@@ -631,4 +633,38 @@ fn make_error_response(
         *error = Some(err_msg.to_string());
     }
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusty_grid_core::task::Bytes;
+    use uuid::Uuid;
+
+    #[test]
+    fn test_response_keeps_non_utf8_output_instead_of_blanking_it() {
+        // Windows console output in an OEM code page: 0x82 is e-acute and invalid as UTF-8.
+        let mut raw = b"Volume in drive C is Syst".to_vec();
+        raw.push(0x82);
+        raw.extend_from_slice(b"me\r\n");
+        let mut res =
+            TaskResult::success(Uuid::new_v4(), TaskId::new(), Bytes::from(raw), 5, false);
+        res.stderr = Bytes::from(vec![b'w', 0xFF, b'n']);
+
+        match map_task_result_to_response(res, "agent-1", "corr-1", "grid_submit") {
+            AgentMeshEnvelope::CommandResponse {
+                status,
+                exit_code,
+                stdout,
+                stderr,
+                ..
+            } => {
+                assert_eq!(status, "success");
+                assert_eq!(exit_code, 0);
+                assert_eq!(stdout, "Volume in drive C is Syst\u{fffd}me\r\n");
+                assert_eq!(stderr, "w\u{fffd}n");
+            }
+            other => panic!("expected CommandResponse, got {other:?}"),
+        }
+    }
 }

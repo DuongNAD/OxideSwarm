@@ -1,5 +1,15 @@
 # TEST_READY: OxideSwarm Agent Mesh E2E Acceptance Test Suite
 
+> **HISTORICAL document (September 2026).** The "READY (100% Passing)" status, the test counts and the timings below
+> describe one session on the author's machine and are not produced by any current check.
+> * `python tests/run_all_mesh_tests.py` runs the protocol against a **Python reference hub** (`OxideRelayHub` inside
+>   `tests/test_agent_mesh_simulation.py`); it never starts the Rust `agent-mesh` hub, so "verified against the live
+>   WebSocket mesh protocol" does not apply to the Rust code.
+> * Tests of the Rust hub: `cargo test -p agent_mesh`, `python3 tests/test_agent_mesh_token_auth.py` and
+>   `python3 tests/test_agent_mesh_rust_hub_cross_interop.py` (build `agent-mesh` first).
+> * The hub now requires a token off loopback (`OXIDE_MESH_TOKEN`); see `DEPLOYMENT.md` and `docs/SECURITY.md`.
+
+
 ## Test Suite Status: READY (100% Passing)
 
 All end-to-end integration and simulation tests specified across Tiers 1–4 have been implemented and verified against the live WebSocket mesh protocol with **0 failures**, **0 dropped packets**, **0.00% data loss**, and **complete node isolation**.

@@ -12,15 +12,43 @@
         b) WinSW: Industry-standard XML-configured service wrapper (winsw.xml).
     - Deploys rusty-grid.exe and creates an oxideswarm.exe alias for brand identity.
     - Generates TOML configuration and initializes log directories in ProgramData.
+    - Runs the service as a low-privilege account (virtual service account by default),
+      NOT as LocalSystem: every task the master sends executes with this identity.
+    - Keeps the cluster secret and any P2P ticket in ACL-restricted files, never on the
+      command line, in the registry or in the SCM definition.
+    - Re-running the installer with -Force upgrades or re-pairs an installed service.
 
 .PARAMETER InstallDir
     Target installation directory. Default: "C:\Program Files\OxideSwarm"
 
 .PARAMETER Master
-    Address of the Master coordinator node. Default: "127.0.0.1:8080"
+    Address of the Master's CLUSTER port, e.g. "192.168.1.100:8088" (8088, never the
+    dashboard port 8080). Required unless a P2P ticket is given.
 
 .PARAMETER P2pTicket
-    P2P connection ticket string from Master for NAT traversal.
+    P2P connection ticket string from Master for NAT traversal. Prefer -P2pTicketFile.
+
+.PARAMETER P2pTicketFile
+    File containing the P2P ticket (read once; the file is not modified or deleted).
+
+.PARAMETER SecretFile
+    Cluster secret file copied from the master (default: $env:OXIDESWARM_SECRET_FILE, then
+    %USERPROFILE%\.oxideswarm\cluster.secret). Required for any remote/P2P master unless
+    -Insecure. Installed as <ConfigPath dir>\cluster.secret with an ACL limited to
+    Administrators, SYSTEM and the service account.
+
+.PARAMETER Insecure
+    Allow a remote master WITHOUT a cluster secret (the worker then obeys any host that
+    answers as the master). Not recommended.
+
+.PARAMETER ServiceAccount
+    Identity of the service and therefore of every task it runs:
+      VirtualAccount (default)  NT SERVICE\<ServiceName>, no password, minimal rights
+      LocalService              NT AUTHORITY\LocalService
+      LocalSystem               full control of the machine; needs -AcceptSystemRisk
+
+.PARAMETER AcceptSystemRisk
+    Required together with -ServiceAccount LocalSystem.
 
 .PARAMETER WorkerBin
     Path to compiled rusty-grid.exe binary.
@@ -74,13 +102,15 @@
     Start the service immediately after registration. Default: $true
 
 .PARAMETER Force
-    Overwrite existing installation and stop any conflicting service.
+    Stop and replace an existing service of the same name (upgrade / re-pair).
 
 .PARAMETER NoElevate
     Do not attempt automatic elevation if running without Administrator privileges.
 
 .EXAMPLE
-    .\install_windows_service.ps1 -Master "192.168.1.100:8080" -WorkerBin ".\rusty-grid.exe"
+    .\install_windows_service.ps1 -Master "192.168.1.100:8088" -SecretFile "C:\path\cluster.secret" -WorkerBin ".\rusty-grid.exe"
+.EXAMPLE
+    .\install_windows_service.ps1 -P2pTicketFile "C:\path\ticket.txt" -SecretFile "C:\path\cluster.secret" -Force
 #>
 
 [CmdletBinding()]
@@ -89,10 +119,26 @@ param (
     [string]$InstallDir = "C:\Program Files\OxideSwarm",
 
     [Parameter()]
-    [string]$Master = "127.0.0.1:8080",
+    [string]$Master = "",
 
     [Parameter()]
     [string]$P2pTicket = "",
+
+    [Parameter()]
+    [string]$P2pTicketFile = "",
+
+    [Parameter()]
+    [string]$SecretFile = "",
+
+    [Parameter()]
+    [switch]$Insecure,
+
+    [Parameter()]
+    [ValidateSet("VirtualAccount", "LocalService", "LocalSystem")]
+    [string]$ServiceAccount = "VirtualAccount",
+
+    [Parameter()]
+    [switch]$AcceptSystemRisk,
 
     [Parameter()]
     [string]$WorkerBin = "",
@@ -168,6 +214,8 @@ if ($LogDir) { $LogDir = $LogDir.TrimEnd('\') }
 if ($DataDir) { $DataDir = $DataDir.TrimEnd('\') }
 if ($ConfigPath) { $ConfigPath = $ConfigPath.TrimEnd('\') }
 if ($WinSWBin) { $WinSWBin = $WinSWBin.TrimEnd('\') }
+if ($SecretFile) { $SecretFile = $SecretFile.TrimEnd('\') }
+if ($P2pTicketFile) { $P2pTicketFile = $P2pTicketFile.TrimEnd('\') }
 
 # ==============================================================================
 # 1. Administrator Elevation Check
@@ -194,7 +242,9 @@ function Assert-Administrator {
                 } elseif ($val -is [bool]) {
                     $argList += " -$key `$$val"
                 } else {
-                    $valStr = if ($val -is [string]) { $val.TrimEnd('\') } else { $val }
+                    $valStr = if ($val -is [string]) { $val.TrimEnd('\') } else { [string]$val }
+                    # Embedded double quotes (a JSON ticket given via -P2pTicket) must survive CommandLineToArgvW.
+                    $valStr = $valStr.Replace('"', '\"')
                     $argList += " -$key `"$valStr`""
                 }
             }
@@ -220,7 +270,113 @@ Write-Host "  OxideSwarm Windows Background Service Installer" -ForegroundColor 
 Write-Host "========================================================`n" -ForegroundColor Cyan
 
 # ==============================================================================
-# 2. Resolve Worker Executable Binary
+# 2. Resolve Pairing Inputs (ticket, master, cluster secret, service identity)
+# ==============================================================================
+
+# Whether a worker must hold the cluster secret to follow this master (mirrors the CLI rule):
+# everything except a master on this very machine needs one, because without it any host that
+# answers at that address could become the master and run commands on this PC.
+function Test-MasterNeedsSecret {
+    param (
+        [string]$Address,
+        [bool]$ViaTicket
+    )
+    if ($ViaTicket) { return $true }
+    if (-not $Address) { return $true }
+    $hostPart = $Address.Trim()
+    if ($hostPart -match '^\[(.*)\](:\d+)?$') {
+        $hostPart = $Matches[1]
+    } elseif ($hostPart -match '^(.*):\d+$') {
+        $hostPart = $Matches[1]
+    }
+    $hostPart = $hostPart.TrimEnd('.').ToLowerInvariant()
+    if ($hostPart -eq 'localhost' -or $hostPart.EndsWith('.localhost') -or $hostPart -eq '::1' -or $hostPart -match '^127\.') {
+        return $false
+    }
+    return $true
+}
+
+if ($P2pTicketFile) {
+    if (-not (Test-Path -LiteralPath $P2pTicketFile)) {
+        Write-Error "P2P ticket file not found: $P2pTicketFile"
+        exit 1
+    }
+    $P2pTicket = (Get-Content -LiteralPath $P2pTicketFile -Raw).Trim().TrimStart([char]0xFEFF).Trim()
+}
+$P2pTicket = $P2pTicket.Trim()
+
+if ($P2pTicket) {
+    if ($P2pTicket.Contains("'")) {
+        Write-Error "The P2P ticket contains a single quote and cannot be stored in the TOML configuration."
+        exit 1
+    }
+    $ticketObject = $null
+    try { $ticketObject = $P2pTicket | ConvertFrom-Json } catch { $ticketObject = $null }
+    if (-not $ticketObject -or -not $ticketObject.id) {
+        Write-Error "Invalid P2P ticket: expected a JSON object with an 'id' field, e.g. {`"id`":`"...`",`"addrs`":[...]}."
+        exit 1
+    }
+}
+
+if (-not $Master -and -not $P2pTicket) {
+    Write-Error "Nothing to connect to: pass -Master HOST:8088 (the master's CLUSTER port) or a P2P ticket (-P2pTicketFile)."
+    exit 1
+}
+if ($Master -match ':8080$') {
+    Write-Warning "Port 8080 is the master's DASHBOARD, not its cluster port. Workers must connect to port 8088, e.g. -Master 192.168.1.100:8088."
+}
+
+$resolvedSecret = ""
+$secretCandidate = $SecretFile
+if (-not $secretCandidate) { $secretCandidate = $env:OXIDESWARM_SECRET_FILE }
+if (-not $secretCandidate -and $env:USERPROFILE) { $secretCandidate = Join-Path $env:USERPROFILE ".oxideswarm\cluster.secret" }
+if ($secretCandidate -and (Test-Path -LiteralPath $secretCandidate)) {
+    $resolvedSecret = (Resolve-Path -LiteralPath $secretCandidate).Path
+} elseif ($SecretFile) {
+    Write-Error "Cluster secret file not found: $SecretFile"
+    exit 1
+}
+
+$needsSecret = Test-MasterNeedsSecret -Address $Master -ViaTicket ([bool]$P2pTicket)
+if ($needsSecret -and -not $resolvedSecret -and -not $Insecure) {
+    $secretMsg = @"
+No cluster secret found. A master address or P2P ticket only says WHERE the master is; the secret is what proves it is the real one.
+Copy the master's secret to this PC over a trusted channel (scp, USB stick; never chat or email), for example:
+  scp user@master:~/.oxideswarm/cluster.secret "$env:USERPROFILE\.oxideswarm\cluster.secret"
+then re-run with -SecretFile "<path>". To continue WITHOUT authenticating the master, pass -Insecure (not recommended).
+"@
+    Write-Error $secretMsg
+    exit 1
+}
+if ($Insecure) {
+    Write-Warning "-Insecure: this worker will NOT authenticate its master and will obey any host that answers as the master."
+}
+
+# Identity of the service == identity of every task process it spawns.
+$serviceStartName = ""
+$aclPrincipal = ""
+switch ($ServiceAccount) {
+    "VirtualAccount" {
+        $serviceStartName = "NT SERVICE\$ServiceName"
+        $aclPrincipal = "NT SERVICE\$ServiceName"
+    }
+    "LocalService" {
+        $serviceStartName = "NT AUTHORITY\LocalService"
+        $aclPrincipal = "*S-1-5-19"
+    }
+    "LocalSystem" {
+        if (-not $AcceptSystemRisk) {
+            Write-Error "Running as LocalSystem gives every task the master dispatches full control of this PC. Re-run with -AcceptSystemRisk to confirm, or keep the default low-privilege -ServiceAccount VirtualAccount."
+            exit 1
+        }
+        Write-Warning "Service will run as LocalSystem: every task the master sends executes with full control of this machine."
+        $aclPrincipal = "*S-1-5-18"
+    }
+}
+Write-Host "[INFO] Service identity: $(if ($serviceStartName) { $serviceStartName } else { 'LocalSystem' })" -ForegroundColor Cyan
+
+# ==============================================================================
+# 3. Resolve Worker Executable Binary
 # ==============================================================================
 $resolvedWorkerBin = ""
 
@@ -259,13 +415,44 @@ if (-not $resolvedWorkerBin -or -not (Test-Path $resolvedWorkerBin)) {
 }
 
 # ==============================================================================
-# 3. Create Filesystem Directory Hierarchy
+# 4. Stop and Remove an Existing Service BEFORE touching any file
+#    (a running service locks rusty-grid.exe, so copying over it first would abort the script
+#    halfway and leave a new config next to an old service)
+# ==============================================================================
+$existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+if ($existingService) {
+    if (-not $Force) {
+        Write-Error "Service '$ServiceName' already exists (Status: $($existingService.Status)). Nothing was changed. Re-run with -Force to stop and replace it (upgrade or re-pair)."
+        exit 1
+    }
+    Write-Host "[INFO] Existing service '$ServiceName' detected (Status: $($existingService.Status)). -Force specified, replacing it..." -ForegroundColor Yellow
+    if ($existingService.Status -ne 'Stopped') {
+        Write-Host "[INFO] Stopping existing service '$ServiceName'..." -ForegroundColor Yellow
+        Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+        try {
+            $existingService.WaitForStatus('Stopped', (New-TimeSpan -Seconds 20))
+        } catch {
+            Write-Warning "Service '$ServiceName' did not report Stopped within 20 s; continuing."
+        }
+    }
+    Write-Host "[INFO] Removing existing service from SCM..." -ForegroundColor Yellow
+    sc.exe delete $ServiceName | Out-Null
+    for ($i = 0; $i -lt 15; $i++) {
+        if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Seconds 1
+    }
+    if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+        Write-Warning "Service '$ServiceName' is still marked for deletion (open handles). If creating it fails below, close Services/Event Viewer windows and re-run."
+    }
+}
+
+# ==============================================================================
+# 5. Create Filesystem Directory Hierarchy
 # ==============================================================================
 $binDir = Join-Path $InstallDir "bin"
-$configDir = Join-Path $InstallDir "config"
 $configParent = Split-Path -Path $ConfigPath -Parent
 
-$requiredDirs = @($InstallDir, $binDir, $configDir, $LogDir, $DataDir, $configParent) | Select-Object -Unique
+$requiredDirs = @($InstallDir, $binDir, $LogDir, $DataDir, $configParent) | Select-Object -Unique
 
 foreach ($dir in $requiredDirs) {
     if (-not (Test-Path $dir)) {
@@ -275,22 +462,39 @@ foreach ($dir in $requiredDirs) {
 }
 
 # ==============================================================================
-# 4. Deploy Executable Binaries
+# 6. Deploy Executable Binaries
 # ==============================================================================
 $destWorkerBin = Join-Path $binDir "rusty-grid.exe"
 $destAliasBin  = Join-Path $binDir "oxideswarm.exe"
 
+function Copy-FileWithRetry {
+    param (
+        [string]$Source,
+        [string]$Destination,
+        [int]$Attempts = 10
+    )
+    for ($i = 1; $i -le $Attempts; $i++) {
+        try {
+            Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($i -eq $Attempts) { throw }
+            Start-Sleep -Seconds 1
+        }
+    }
+}
+
 # Copy primary binary
 if ((Test-Path $resolvedWorkerBin) -and ($resolvedWorkerBin -ne $destWorkerBin)) {
     Write-Host "[INFO] Deploying $resolvedWorkerBin -> $destWorkerBin..."
-    Copy-Item -Path $resolvedWorkerBin -Destination $destWorkerBin -Force
+    Copy-FileWithRetry -Source $resolvedWorkerBin -Destination $destWorkerBin
 }
 Write-Host "[OK] Primary worker binary: $destWorkerBin" -ForegroundColor Green
 
 # Create brand alias (oxideswarm.exe)
 if (Test-Path $destWorkerBin) {
     try {
-        Copy-Item -Path $destWorkerBin -Destination $destAliasBin -Force
+        Copy-FileWithRetry -Source $destWorkerBin -Destination $destAliasBin
         Write-Host "[OK] Deployed brand alias: $destAliasBin" -ForegroundColor Green
     } catch {
         Write-Warning "Could not create oxideswarm.exe alias: $($_.Exception.Message)"
@@ -298,29 +502,58 @@ if (Test-Path $destWorkerBin) {
 }
 
 # ==============================================================================
-# 5. Generate Configuration File (rusty-grid.toml)
+# 7. Generate Configuration File (rusty-grid.toml) and install the cluster secret
 # ==============================================================================
 Write-Host "[INFO] Generating configuration at $ConfigPath..."
 
 $escapedDataDir = $DataDir.Replace('\', '/')
 
+$secretTarget = ""
+if ($resolvedSecret) {
+    $secretTarget = Join-Path $configParent "cluster.secret"
+    if ($resolvedSecret -ne $secretTarget) {
+        Copy-Item -LiteralPath $resolvedSecret -Destination $secretTarget -Force
+    }
+    Write-Host "[OK] Cluster secret installed at: $secretTarget" -ForegroundColor Green
+}
+
 $tomlLines = @(
     "# OxideSwarm Distributed Grid Worker Configuration",
-    "# Auto-generated by install_windows_service.ps1",
+    "# Auto-generated by install_windows_service.ps1 (contains the P2P ticket: keep the ACL restricted)",
     "",
-    "[worker]",
-    "master = `"$Master`"",
+    "[worker]"
+)
+
+if ($Master) {
+    $tomlLines += "master = `"$Master`""
+}
+
+$tomlLines += @(
     "heartbeat_interval_secs = $HeartbeatInterval",
     "sandbox_base_dir = `"$escapedDataDir`"",
     "keep_sandboxes = false"
 )
 
+# A worker keeps the same worker id across restarts only when it has a name; a service the SCM
+# respawns must not show up as a new machine each time.
+if (-not $WorkerName) { $WorkerName = $env:COMPUTERNAME }
 if ($WorkerName) {
     $tomlLines += "name = `"$WorkerName`""
 }
 
+# The ticket lives only in this ACL-restricted file. It is deliberately NOT passed to the
+# service as a --p2p-ticket command-line argument or stored in the registry: the command line is
+# visible to every local user, and CommandLineToArgvW strips the quotes of a JSON ticket.
 if ($P2pTicket) {
     $tomlLines += "p2p_ticket = '$P2pTicket'"
+}
+
+if ($secretTarget) {
+    $tomlLines += "secret_file = '$secretTarget'"
+}
+
+if ($Insecure) {
+    $tomlLines += "insecure = true"
 }
 
 if ($MaxConcurrency -gt 0) {
@@ -344,40 +577,12 @@ if ($hasHardware) {
 }
 
 $tomlContent = ($tomlLines -join "`r`n") + "`r`n"
-Set-Content -Path $ConfigPath -Value $tomlContent -Encoding UTF8 -Force
+# UTF-8 without BOM: Set-Content -Encoding UTF8 would prepend one on Windows PowerShell 5.1.
+[System.IO.File]::WriteAllText($ConfigPath, $tomlContent, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "[OK] Configuration written to: $ConfigPath" -ForegroundColor Green
 
-# Also mirror configuration in $InstallDir\config\rusty-grid.toml for redundancy
-$mirrorConfig = Join-Path $configDir "rusty-grid.toml"
-if ($mirrorConfig -ne $ConfigPath) {
-    Copy-Item -Path $ConfigPath -Destination $mirrorConfig -Force
-    Write-Host "[OK] Mirrored configuration at: $mirrorConfig" -ForegroundColor Green
-}
-
 # ==============================================================================
-# 6. Stop and Remove Existing Service if Present
-# ==============================================================================
-$existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-if ($existingService) {
-    if ($Force) {
-        Write-Host "[INFO] Existing service '$ServiceName' detected (Status: $($existingService.Status)). -Force specified, removing..." -ForegroundColor Yellow
-        if ($existingService.Status -eq 'Running') {
-            Write-Host "[INFO] Stopping existing service '$ServiceName'..." -ForegroundColor Yellow
-            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
-        }
-
-        Write-Host "[INFO] Removing existing service from SCM..." -ForegroundColor Yellow
-        sc.exe delete $ServiceName | Out-Null
-        Start-Sleep -Seconds 1
-    } else {
-        Write-Error "Service '$ServiceName' already exists (Status: $($existingService.Status)). Specify -Force to stop and overwrite the existing service."
-        exit 1
-    }
-}
-
-# ==============================================================================
-# 7. Service Wrapper Setup (NativeWrapper or WinSW)
+# 8. Service Wrapper Setup (NativeWrapper or WinSW)
 # ==============================================================================
 $serviceExePath = ""
 
@@ -410,18 +615,15 @@ if ($ServiceMethod -eq "WinSW") {
         $ServiceMethod = "NativeWrapper"
     } else {
         Write-Host "[INFO] Copying WinSW binary to $serviceExePath..."
-        Copy-Item -Path $resolvedWinSW -Destination $serviceExePath -Force
+        if ($resolvedWinSW -ne $serviceExePath) {
+            Copy-FileWithRetry -Source $resolvedWinSW -Destination $serviceExePath
+        }
 
         # Prepare WinSW XML config
         $templateXml = Join-Path $PSScriptRoot "winsw.xml"
-        if (-not (Test-Path $templateXml)) {
-            $templateXml = Join-Path $configDir "winsw.xml"
-        }
 
+        # Configuration only: the ticket and the secret path come from $ConfigPath.
         $serviceArguments = "worker --config `"$ConfigPath`""
-        if ($P2pTicket) {
-            $serviceArguments += " --p2p-ticket `"$P2pTicket`""
-        }
 
         if (Test-Path $templateXml) {
             [xml]$xmlDoc = Get-Content $templateXml
@@ -462,7 +664,7 @@ if ($ServiceMethod -eq "WinSW") {
   <env name="RUST_LOG" value="info" />
 </service>
 "@
-            Set-Content -Path $serviceXmlPath -Value $xmlContent -Encoding UTF8
+            [System.IO.File]::WriteAllText($serviceXmlPath, $xmlContent, (New-Object System.Text.UTF8Encoding($false)))
         }
         Write-Host "[OK] Configured WinSW XML: $serviceXmlPath" -ForegroundColor Green
 
@@ -561,7 +763,63 @@ if ($ServiceMethod -eq "NativeWrapper") {
 }
 
 # ==============================================================================
-# 8. Configure SCM Recovery Actions & Auto-Start
+# 9. Service Identity and Access Control
+#    (after registration: the NT SERVICE\<name> account only resolves once the service exists)
+# ==============================================================================
+if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) {
+    Write-Error "Service '$ServiceName' is not registered in the SCM after installation; see the output above."
+    exit 1
+}
+
+if ($serviceStartName) {
+    Write-Host "[INFO] Configuring service identity: $serviceStartName" -ForegroundColor Cyan
+    $identityResult = sc.exe config $ServiceName obj= $serviceStartName 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "sc.exe config obj= failed with exit code $LASTEXITCODE. Output: $identityResult"
+        exit 1
+    }
+    Write-Host "[OK] Service runs as $serviceStartName (tasks inherit this low-privilege identity)." -ForegroundColor Green
+}
+
+# Config and secret: readable by SYSTEM, Administrators and the service account only.
+function Set-PrivateFileAcl {
+    param (
+        [string]$Path,
+        [string]$Principal
+    )
+    $grants = @("*S-1-5-18:(F)", "*S-1-5-32-544:(F)")
+    if ($Principal -and $Principal -ne "*S-1-5-18") {
+        $grants += ($Principal + ":(R)")
+    }
+    & icacls.exe $Path /inheritance:r /grant:r $grants | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Could not restrict the ACL of $Path (icacls exit code $LASTEXITCODE). Restrict it manually: it holds the cluster secret / P2P ticket."
+    }
+}
+
+# Log and sandbox directories: the service account must be able to write there.
+function Grant-ServiceModify {
+    param (
+        [string]$Path,
+        [string]$Principal
+    )
+    if (-not $Principal -or $Principal -eq "*S-1-5-18") { return }
+    & icacls.exe $Path /grant ($Principal + ":(OI)(CI)M") | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Could not grant the service account write access to $Path (icacls exit code $LASTEXITCODE)."
+    }
+}
+
+Set-PrivateFileAcl -Path $ConfigPath -Principal $aclPrincipal
+if ($secretTarget) {
+    Set-PrivateFileAcl -Path $secretTarget -Principal $aclPrincipal
+}
+Grant-ServiceModify -Path $LogDir -Principal $aclPrincipal
+Grant-ServiceModify -Path $DataDir -Principal $aclPrincipal
+Write-Host "[OK] Applied ACLs (config/secret private; log and sandbox directories writable by the service account)." -ForegroundColor Green
+
+# ==============================================================================
+# 10. Configure SCM Recovery Actions & Auto-Start
 # ==============================================================================
 Write-Host "[INFO] Configuring SCM failure recovery (auto-restart after 5000ms)..."
 # Reset failure counter after 86400 seconds (1 day)
@@ -570,19 +828,48 @@ sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/rest
 sc.exe failureflag $ServiceName 1 | Out-Null
 Write-Host "[OK] SCM Failure Recovery configured successfully." -ForegroundColor Green
 
-# Set Windows Environment Variables for wrapper discovery if needed
+# Set Windows Environment Variables for wrapper discovery if needed (paths only: no secrets here).
 [Environment]::SetEnvironmentVariable("OXIDESWARM_BIN", $destWorkerBin, [EnvironmentVariableTarget]::Machine)
 [Environment]::SetEnvironmentVariable("OXIDESWARM_CONFIG", $ConfigPath, [EnvironmentVariableTarget]::Machine)
 [Environment]::SetEnvironmentVariable("OXIDESWARM_LOG_DIR", $LogDir, [EnvironmentVariableTarget]::Machine)
-if ($P2pTicket) {
-    [Environment]::SetEnvironmentVariable("OXIDESWARM_P2P_TICKET", $P2pTicket, [EnvironmentVariableTarget]::Machine)
-}
+# Older installers stored the ticket machine-wide, where it overrode every later configuration.
+[Environment]::SetEnvironmentVariable("OXIDESWARM_P2P_TICKET", $null, [EnvironmentVariableTarget]::Machine)
 Write-Host "[OK] Configured system environment variables for worker." -ForegroundColor Green
 
 # ==============================================================================
-# 9. Start Service and Verify Health
+# 11. Start Service and Verify Health
 # ==============================================================================
 $overallPassed = $true
+$registered = $false
+
+# Only log output written after this point counts as evidence from this start.
+$workerOutLog = Join-Path $LogDir "worker.out.log"
+$logOffset = 0
+if (Test-Path -LiteralPath $workerOutLog) {
+    $logOffset = (Get-Item -LiteralPath $workerOutLog).Length
+}
+
+function Test-LogContainsSince {
+    param (
+        [string]$Path,
+        [long]$Offset,
+        [string]$Pattern
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        if ($stream.Length -le $Offset) { return $false }
+        $null = $stream.Seek($Offset, [System.IO.SeekOrigin]::Begin)
+        $reader = New-Object System.IO.StreamReader($stream)
+        $text = $reader.ReadToEnd()
+        return ($text -match $Pattern)
+    } catch {
+        return $false
+    } finally {
+        if ($stream) { $stream.Dispose() }
+    }
+}
 
 if ($StartImmediately) {
     Write-Host "`n[INFO] Starting service '$ServiceName'..." -ForegroundColor Cyan
@@ -607,6 +894,22 @@ if ($StartImmediately) {
 
     if ($svc -and $svc.Status -eq 'Running') {
         Write-Host "[OK] Service '$ServiceName' is active and RUNNING in Session 0." -ForegroundColor Green
+
+        # A running service is not a connected worker: wait for the master to accept the registration.
+        Write-Host "[INFO] Waiting up to 20 s for the master to accept this worker..." -ForegroundColor Cyan
+        for ($i = 0; $i -lt 20; $i++) {
+            if (Test-LogContainsSince -Path $workerOutLog -Offset $logOffset -Pattern "Registration accepted") {
+                $registered = $true
+                break
+            }
+            Start-Sleep -Seconds 1
+        }
+        if ($registered) {
+            Write-Host "[OK] Worker registered with the master ('Registration accepted' in $workerOutLog)." -ForegroundColor Green
+        } else {
+            Write-Warning "The service is running but no 'Registration accepted' appeared in $workerOutLog yet."
+            Write-Warning "Check the log for 'Invalid P2P ticket', 'Authentication' or connection errors; confirm the master address/port (8088), the cluster secret and that the master is reachable."
+        }
     } else {
         $overallPassed = $false
         Write-Error "Service status after $elapsed seconds: $($svc.Status). Failed to start service '$ServiceName'."
@@ -615,7 +918,7 @@ if ($StartImmediately) {
 }
 
 # ==============================================================================
-# 10. Summary Banner
+# 12. Summary Banner
 # ==============================================================================
 if ($overallPassed) {
     Write-Host "`n========================================================" -ForegroundColor Green
@@ -624,12 +927,15 @@ if ($overallPassed) {
     Write-Host "  Service Name:    $ServiceName"
     Write-Host "  Display Name:    $DisplayName"
     Write-Host "  Startup Type:    Automatic (Boot-time Session 0)"
+    Write-Host "  Runs As:         $(if ($serviceStartName) { $serviceStartName } else { 'LocalSystem' })"
     Write-Host "  Binary Path:     $destWorkerBin"
     Write-Host "  Service Wrapper: $serviceExePath"
     Write-Host "  Configuration:   $ConfigPath"
     Write-Host "  Logs Directory:  $LogDir"
     Write-Host "  Data Sandbox:    $DataDir"
-    Write-Host "  Master Node:     $Master"
+    Write-Host "  Master:          $(if ($P2pTicket) { 'P2P ticket (see configuration)' } else { $Master })"
+    Write-Host "  Cluster secret:  $(if ($secretTarget) { $secretTarget } else { 'none (-Insecure or loopback master)' })"
+    Write-Host "  Registered:      $(if ($registered) { 'yes' } else { 'not confirmed yet' })"
     Write-Host "========================================================`n" -ForegroundColor Green
     Write-Host "To verify installation, run:"
     Write-Host "  powershell -ExecutionPolicy Bypass -File .\verify_windows_service.ps1`n" -ForegroundColor Cyan

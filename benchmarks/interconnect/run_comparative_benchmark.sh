@@ -2,16 +2,17 @@
 # ==============================================================================
 # run_comparative_benchmark.sh
 #
-# Automated Empirical Benchmark Verification Harness for Remote Interconnect
-# Compares:
-# 1. OxideSwarm Native Iroh P2P
-# 2. Tailscale / WireGuard Mesh VPN
-# 3. Cloudflare Tunnel (cloudflared)
+# Validator for the committed interconnect comparison data. What this script does:
+#   1. checks that the three deliverables exist and parse
+#      (COMPARATIVE_INTERCONNECT_BENCHMARK.md, benchmark_data.json, benchmark_matrix.csv);
+#   2. runs the two local Rust benches (QUIC stream latency, memory bound) on THIS machine;
+#   3. prints the scores that are stored in benchmark_data.json.
 #
-# Emits and validates:
-# - COMPARATIVE_INTERCONNECT_BENCHMARK.md
-# - benchmark_data.json
-# - benchmark_matrix.csv
+# What it does NOT do: it never starts Tailscale, WireGuard or cloudflared, and it measures
+# nothing about them. Their figures, and the iroh WAN/relay figures, are a hand-recorded
+# dataset from one set of machines (Mac + Android phone on the author's networks), not
+# reproduced in CI and not re-measured here. The "composite score" is a weighted sum of
+# those recorded numbers, not a measurement.
 # ==============================================================================
 
 set -euo pipefail
@@ -34,11 +35,11 @@ log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_err()     { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 log_section() { echo -e "\n${CYAN}${BOLD}=== $* ===${NC}\n"; }
 
-log_section "Phase 1: Validating Deliverable Artifacts in ${SCRIPT_DIR}"
+log_section "Phase 1: Validating the committed data files in ${SCRIPT_DIR} (structure only, no re-measurement)"
 
 for req_file in "COMPARATIVE_INTERCONNECT_BENCHMARK.md" "benchmark_data.json" "benchmark_matrix.csv"; do
     if [[ -f "${SCRIPT_DIR}/${req_file}" ]]; then
-        log_ok "Found verified deliverable: ${req_file} ($(wc -c < "${SCRIPT_DIR}/${req_file}") bytes)"
+        log_ok "Found deliverable: ${req_file} ($(wc -c < "${SCRIPT_DIR}/${req_file}") bytes)"
     else
         log_err "Missing required deliverable: ${req_file}"
         exit 1
@@ -64,7 +65,7 @@ with open('${SCRIPT_DIR}/benchmark_matrix.csv', mode='r') as f:
 "
 log_ok "benchmark_matrix.csv parsed successfully."
 
-log_section "Phase 2: Executing Live Rust Empirical Benchmark Tests"
+log_section "Phase 2: Local Rust benches (measured on this machine, loopback only)"
 
 if [[ -d "${OXIDE_ROOT}" ]]; then
     cd "${OXIDE_ROOT}"
@@ -77,17 +78,17 @@ else
     log_warn "OxideSwarm root directory not found at ${OXIDE_ROOT}. Skipping live cargo tests."
 fi
 
-log_section "Phase 3: Inspecting Live System Resource Footprint (RAM & CPU)"
+log_section "Phase 3: Resource footprint of OxideSwarm processes currently running (read-only)"
 
 RUNNING_PROCS=$(ps aux | grep -E "rusty-grid (master|worker)" | grep -v grep || true)
 if [[ -n "${RUNNING_PROCS}" ]]; then
-    log_ok "Active OxideSwarm cluster processes detected on host:"
-    echo "${RUNNING_PROCS}" | awk '{printf "  • PID %-6s CPU: %-5s MEM: %-5s RSS: %-7s KB  CMD: %s\n", $2, $3"%", $4"%", $6, $11" "$12" "$13}'
+    log_ok "OxideSwarm processes found on this host (nothing is started or stopped here):"
+    echo "${RUNNING_PROCS}" | awk '{printf "  - PID %-6s CPU: %-5s MEM: %-5s RSS: %-7s KB  CMD: %s\n", $2, $3"%", $4"%", $6, $11" "$12" "$13}'
 else
-    log_info "No live background cluster processes currently running. Spawning sample probe..."
+    log_info "No OxideSwarm master/worker process is running, so there is no footprint to report."
 fi
 
-log_section "Phase 4: Comparative Scoring Summary"
+log_section "Phase 4: Scores recorded in benchmark_data.json (static data, not measured by this run)"
 
 python3 - "${SCRIPT_DIR}/benchmark_data.json" << 'EOF'
 import json, os, sys
@@ -107,7 +108,9 @@ for k in ["latency_responsiveness", "throughput_bandwidth", "system_resource_lig
     name = k.replace("_", " ").title()
     print(f"{name:<35} | {iroh.get(k, 0):>14.1f} | {ts.get(k, 0):>13.1f} | {cf.get(k, 0):>15.1f}")
 print("=" * 92)
-print("Conclusion: OxideSwarm Native Iroh P2P outperforms alternative solutions across all major axes.")
+best = max(("OxideSwarm Iroh", iroh), ("Tailscale VPN", ts), ("Cloudflare Tunnel", cf), key=lambda kv: kv[1].get("composite_score", 0))
+print(f"Highest composite score in the recorded dataset: {best[0]} ({best[1].get('composite_score', 0):.1f}).")
+print("These numbers were recorded once on the author's hardware and networks; Tailscale and Cloudflare were not run by this script.")
 EOF
 
-log_ok "Automated benchmark verification harness completed successfully!"
+log_ok "Data files validated and local benches ran. Nothing here re-measured Tailscale, WireGuard or Cloudflare."

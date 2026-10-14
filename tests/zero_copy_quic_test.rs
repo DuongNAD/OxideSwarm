@@ -27,7 +27,8 @@ use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::{
-    deserialize_message, serialize_message, MasterMessage, MessageTransport, WireCodec, WorkerMessage,
+    deserialize_message, serialize_message, MasterMessage, MessageTransport, WireCodec,
+    WorkerMessage,
 };
 use rusty_grid_core::task::{Bytes, Task, TaskId, TaskRequirements, TaskResult, TaskSpec};
 use rusty_grid_core::transport::{BiStream, GridStream, STREAM_CONTROL, STREAM_DATA};
@@ -177,7 +178,8 @@ fn test_zero_copy_large_payload_serialization_roundtrip() {
         error: None,
     };
 
-    let msg_bincode = serialize_message(&worker_msg, WireCodec::Bincode).expect("bincode wire encode");
+    let msg_bincode =
+        serialize_message(&worker_msg, WireCodec::Bincode).expect("bincode wire encode");
     let (msg_decoded, codec_bincode): (WorkerMessage, WireCodec) =
         deserialize_message(&msg_bincode).expect("bincode wire decode");
     assert_eq!(codec_bincode, WireCodec::Bincode);
@@ -227,7 +229,12 @@ async fn test_quic_stream_multiplexing_isolation_and_anti_hol_blocking() {
 
     // 2. Server task accepts connection and incoming bi-directional streams
     let server_handle = tokio::spawn(async move {
-        let incoming = ep_server.accept().await.expect("accept").await.expect("handshake");
+        let incoming = ep_server
+            .accept()
+            .await
+            .expect("accept")
+            .await
+            .expect("handshake");
 
         // Accept first stream
         let (send_a, mut recv_a) = incoming.accept_bi().await.expect("accept stream A");
@@ -271,7 +278,10 @@ async fn test_quic_stream_multiplexing_isolation_and_anti_hol_blocking() {
             match msg {
                 WorkerMessage::Heartbeat { timestamp, .. } => {
                     let ack = MasterMessage::HeartbeatAck { timestamp };
-                    ctrl_transport.send_msg(&ack).await.expect("send heartbeat ack");
+                    ctrl_transport
+                        .send_msg(&ack)
+                        .await
+                        .expect("send heartbeat ack");
                 }
                 WorkerMessage::Disconnecting { .. } => {
                     break;
@@ -285,18 +295,27 @@ async fn test_quic_stream_multiplexing_isolation_and_anti_hol_blocking() {
     });
 
     // 3. Client connects to server
-    let conn = ep_client.connect(server_addr, GRID_ALPN).await.expect("connect");
+    let conn = ep_client
+        .connect(server_addr, GRID_ALPN)
+        .await
+        .expect("connect");
 
     // Open Lane 1: Control Stream (tag 0x01)
     let (mut ctrl_send, ctrl_recv) = conn.open_bi().await.expect("open ctrl bi");
-    ctrl_send.write_all(&[STREAM_CONTROL]).await.expect("write ctrl tag");
+    ctrl_send
+        .write_all(&[STREAM_CONTROL])
+        .await
+        .expect("write ctrl tag");
     ctrl_send.flush().await.expect("flush ctrl tag");
     let ctrl_stream = GridStream::P2p(BiStream::new(ctrl_recv, ctrl_send));
     let mut ctrl_transport = MessageTransport::new(ctrl_stream);
 
     // Open Lane 2: Data Stream (tag 0x02)
     let (mut data_send, _data_recv) = conn.open_bi().await.expect("open data bi");
-    data_send.write_all(&[STREAM_DATA]).await.expect("write data tag");
+    data_send
+        .write_all(&[STREAM_DATA])
+        .await
+        .expect("write data tag");
     data_send.flush().await.expect("flush data tag");
 
     // 4. Anti-Head-of-Line Blocking Simulation:
@@ -306,7 +325,10 @@ async fn test_quic_stream_multiplexing_isolation_and_anti_hol_blocking() {
         let chunk = vec![0xAAu8; 16 * 1024];
         let mut sent = 0;
         while sent < heavy_payload_size {
-            data_send.write_all(&chunk).await.expect("write heavy chunk");
+            data_send
+                .write_all(&chunk)
+                .await
+                .expect("write heavy chunk");
             data_send.flush().await.expect("flush heavy chunk");
             sent += chunk.len();
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -346,16 +368,26 @@ async fn test_quic_stream_multiplexing_isolation_and_anti_hol_blocking() {
         worker_id,
         reason: "Test complete".into(),
     };
-    ctrl_transport.send_msg(&disc).await.expect("send disconnecting");
+    ctrl_transport
+        .send_msg(&disc)
+        .await
+        .expect("send disconnecting");
 
     data_producer_task.await.expect("data producer finish");
     let total_server_read = server_handle.await.expect("server finish");
 
-    assert_eq!(total_server_read, heavy_payload_size, "Server must receive all streamed data");
+    assert_eq!(
+        total_server_read, heavy_payload_size,
+        "Server must receive all streamed data"
+    );
 
     // Assert that average heartbeat latency is under 50ms despite concurrent data streaming
-    let avg_latency: Duration = heartbeat_latencies.iter().sum::<Duration>() / heartbeat_latencies.len() as u32;
-    println!("Control Lane Avg Heartbeat Latency under Heavy Data Stream: {:?}", avg_latency);
+    let avg_latency: Duration =
+        heartbeat_latencies.iter().sum::<Duration>() / heartbeat_latencies.len() as u32;
+    println!(
+        "Control Lane Avg Heartbeat Latency under Heavy Data Stream: {:?}",
+        avg_latency
+    );
     assert!(
         avg_latency < Duration::from_millis(50),
         "Heartbeat latency over multiplexed control stream must remain sub-50ms (got: {:?})",
@@ -426,7 +458,11 @@ async fn test_task_queue_atomic_batch_scheduling() {
 
     // 3. Execute atomic batch transition under a single lock acquisition
     let scheduled = queue.schedule_tasks_batch(&assignments).await;
-    assert_eq!(scheduled.len(), 50, "All 50 tasks should be successfully scheduled");
+    assert_eq!(
+        scheduled.len(),
+        50,
+        "All 50 tasks should be successfully scheduled"
+    );
 
     // 4. Verify all tasks are in Scheduled state and assigned correctly
     for (tid, assigned_worker, _task) in scheduled {
@@ -439,7 +475,11 @@ async fn test_task_queue_atomic_batch_scheduling() {
 
     // 5. Subsequent attempt to reschedule already Scheduled tasks should yield empty
     let duplicate_scheduled = queue.schedule_tasks_batch(&assignments).await;
-    assert_eq!(duplicate_scheduled.len(), 0, "Already scheduled tasks cannot be rescheduled");
+    assert_eq!(
+        duplicate_scheduled.len(),
+        0,
+        "Already scheduled tasks cannot be rescheduled"
+    );
 }
 
 #[tokio::test]
@@ -461,7 +501,13 @@ async fn test_workload_scheduler_micro_batch_burst_accumulation() {
     tokio::spawn(async move { while rx_a.recv().await.is_some() {} });
     let caps_a = WorkerCapabilities::new("worker-a", 40, 65536, false, false, None);
     registry
-        .register(worker_a, caps_a, "127.0.0.1:9001".parse().unwrap(), tx_a, None)
+        .register(
+            worker_a,
+            caps_a,
+            "127.0.0.1:9001".parse().unwrap(),
+            tx_a,
+            None,
+        )
         .await
         .expect("register worker a");
 
@@ -469,7 +515,13 @@ async fn test_workload_scheduler_micro_batch_burst_accumulation() {
     tokio::spawn(async move { while rx_b.recv().await.is_some() {} });
     let caps_b = WorkerCapabilities::new("worker-b", 40, 65536, false, false, None);
     registry
-        .register(worker_b, caps_b, "127.0.0.1:9002".parse().unwrap(), tx_b, None)
+        .register(
+            worker_b,
+            caps_b,
+            "127.0.0.1:9002".parse().unwrap(),
+            tx_b,
+            None,
+        )
         .await
         .expect("register worker b");
 
@@ -508,5 +560,9 @@ async fn test_workload_scheduler_micro_batch_burst_accumulation() {
 
     // No more queued tasks to schedule
     let empty_batch = scheduler.schedule_batch(32).await.expect("empty batch");
-    assert_eq!(empty_batch.assignments.len(), 0, "No remaining tasks should be scheduled");
+    assert_eq!(
+        empty_batch.assignments.len(),
+        0,
+        "No remaining tasks should be scheduled"
+    );
 }

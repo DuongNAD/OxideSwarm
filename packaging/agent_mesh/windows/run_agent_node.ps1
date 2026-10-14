@@ -31,6 +31,10 @@ Write-Host "========================================================" -Foregroun
 Write-Host "Node ID:  $NodeId" -ForegroundColor Yellow
 Write-Host "Hub URL:  $Hub" -ForegroundColor Yellow
 Write-Host "Platform: Windows ($([System.Environment]::OSVersion.VersionString))" -ForegroundColor Gray
+if (-not $env:OXIDE_MESH_TOKEN) {
+    Write-Host "[INFO] OXIDE_MESH_TOKEN is not set: a hub bound beyond localhost will reject this node (`$env:OXIDE_MESH_TOKEN = '<hub token>')." -ForegroundColor Yellow
+}
+Write-Host "[INFO] ws:// is not encrypted; do not use it across untrusted networks or the Internet." -ForegroundColor Yellow
 Write-Host ""
 
 # 1. Resolve Native Binary

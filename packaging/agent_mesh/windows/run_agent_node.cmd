@@ -21,6 +21,9 @@ echo Target Hub: %HUB_URL%
 echo Node ID:    %NODE_ID%
 echo Platform:   windows
 echo.
+if not defined OXIDE_MESH_TOKEN echo [INFO] OXIDE_MESH_TOKEN is not set: a hub bound beyond localhost will reject this node. Run "set OXIDE_MESH_TOKEN=your-hub-token" first.
+echo [INFO] ws:// is not encrypted. Do not use it across untrusted networks or the Internet.
+echo.
 
 :LOOP
 if exist "target\release\agent-mesh.exe" (

@@ -37,7 +37,10 @@ Options:
   --release             Build in release mode (optimized, default)
   --debug               Build in debug mode (unoptimized, faster compile)
   --target <TRIPLE>     Cross-compilation target (default: x86_64-pc-windows-gnu)
-  --features <LIST>     Cargo feature flags to pass
+  --gpu                 Build the worker with the wgpu GPU engine (same as --features gpu-wgpu). Without it
+                        the worker cannot use the GPU: it advertises none, also when started with --gpu.
+                        Cross-compiled for DirectX 12 / Vulkan; not run by any test on this host
+  --features <LIST>     Cargo feature flags to pass (must be features of package rusty_grid_cli, e.g. gpu-wgpu)
   -h, --help            Show this help message
 
 Environment Variables:
@@ -70,6 +73,10 @@ while [[ $# -gt 0 ]]; do
         --target)
             TARGET="$2"
             shift 2
+            ;;
+        --gpu)
+            CARGO_FLAGS="${CARGO_FLAGS} --features gpu-wgpu"
+            shift
             ;;
         --features)
             CARGO_FLAGS="${CARGO_FLAGS} --features $2"
@@ -245,8 +252,14 @@ if [[ -f "$OUTPUT_BIN" ]]; then
     echo "Deployment to Windows machine:"
     echo "  1. Transfer binary to Windows host (e.g. scp, network share, USB):"
     echo "     scp ${OUTPUT_BIN} <USER>@<WINDOWS_HOST>:C:/rusty-grid/rusty-grid.exe"
-    echo "  2. Run worker on Windows (PowerShell or cmd.exe):"
-    echo "     .\\rusty-grid.exe worker --master <MASTER_IP>"
+    echo "  2. Copy the master's cluster secret to the Windows PC (scp or USB, never chat/email):"
+    echo "     scp <USER>@<MASTER_HOST>:~/.oxideswarm/cluster.secret C:/Users/<YOU>/.oxideswarm/cluster.secret"
+    echo "  3. Run worker on Windows (PowerShell or cmd.exe). Use the master's CLUSTER port 8088,"
+    echo "     never the dashboard port 8080. A binary built with --gpu finds the graphics card itself"
+    echo "     and prints 'GPU compute enabled on <adapter>' at start-up; one built without it"
+    echo "     advertises no GPU (add --no-gpu to keep the card out of the grid):"
+    echo "     .\\rusty-grid.exe worker --master <MASTER_IP>:8088"
+    echo "     (or windows\\switch_role.cmd worker <MASTER_IP>:8088, or windows\\install_service.cmd for a service)"
     echo "=================================================================="
 else
     log_err "Expected output binary not found at ${OUTPUT_BIN}"

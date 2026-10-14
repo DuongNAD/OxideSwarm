@@ -34,7 +34,7 @@ class BootCompletedReceiver : BroadcastReceiver() {
                 return
             }
 
-            val master = prefs.getString(KEY_MASTER, "127.0.0.1:8080") ?: "127.0.0.1:8080"
+            val master = prefs.getString(KEY_MASTER, "127.0.0.1:8088") ?: "127.0.0.1:8088"
             val name = prefs.getString(KEY_WORKER_NAME, SystemInfoHelper.getDefaultWorkerName())
                 ?: SystemInfoHelper.getDefaultWorkerName()
             val cores = prefs.getInt(KEY_CORES, SystemInfoHelper.getAvailableCores())

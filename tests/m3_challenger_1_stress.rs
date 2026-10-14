@@ -83,9 +83,41 @@ fn create_test_runner_with_cap(
 // 1. Path Traversal & Isolation Attack Tests
 // =========================================================================
 
+/// Every file and directory below `root`, as sorted relative paths (symlinks are not followed).
+fn tree_listing(root: &Path) -> Vec<String> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            out.push(path.strip_prefix(root).unwrap_or(&path).display().to_string());
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                walk(&path, root, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
 #[tokio::test]
 async fn test_adversarial_path_traversal_rust_compilation_source_files() {
-    let (runner, _tmp) = create_test_runner(2, false);
+    // The sandbox base sits four levels below a private root, so every relative escape below lands
+    // inside `root`, where a before/after listing sees it. (The old oracle joined the hostile path
+    // onto the base dir and asked `exists()`: the wrong directory, and on Linux a real system file
+    // such as /etc/passwd, so it failed spuriously there and proved nothing on macOS.)
+    let root = tempfile::tempdir().expect("create private root");
+    let base = root.path().join("l1").join("l2").join("l3").join("base");
+    std::fs::create_dir_all(&base).unwrap();
+    let runner = TaskRunner::new(
+        Uuid::new_v4(),
+        create_test_capabilities(2, false),
+        RunnerConfig::new(SandboxConfig::new(&base)),
+    );
+    let before = tree_listing(root.path());
 
     // Hostile relative and absolute path attempts
     let hostile_paths = vec![
@@ -100,6 +132,13 @@ async fn test_adversarial_path_traversal_rust_compilation_source_files() {
     ];
 
     for hostile_path in hostile_paths {
+        // An absolute target outside the root cannot be seen in the listing: remember whether it
+        // existed (it may, legitimately, on the host) and require that nothing changed.
+        let absolute_target = Path::new(hostile_path).is_absolute().then(|| {
+            let target = Path::new(hostile_path);
+            (target, target.exists(), std::fs::metadata(target).ok().map(|m| m.len()))
+        });
+
         let mut sources = HashMap::new();
         sources.insert(
             hostile_path.to_string(),
@@ -123,19 +162,48 @@ async fn test_adversarial_path_traversal_rust_compilation_source_files() {
             "Hostile path '{}' must emit EXIT_CODE_GENERAL_ERROR",
             hostile_path
         );
+        let error = res.error.clone().expect("hostile path must have an error message");
+
+        // It must have been refused when the source was materialized: not by rustc, not by an
+        // unrelated failure (missing compiler, ...) that would also make the task fail.
         assert!(
-            res.error.is_some(),
-            "Hostile path '{}' must have an error message",
+            error.contains("Source materialization error"),
+            "Hostile path '{}' must be rejected before any compiler runs, got: {}",
+            hostile_path,
+            error
+        );
+        assert!(
+            res.stderr_str().contains("Failed to write source file"),
+            "Hostile path '{}': {}",
+            hostile_path,
+            res.stderr_str()
+        );
+        if !hostile_path.contains('\0') {
+            assert!(
+                error.contains("Path traversal security violation"),
+                "Hostile path '{}' must be flagged as path traversal, got: {}",
+                hostile_path,
+                error
+            );
+        }
+
+        // Nothing may have been created anywhere below the root (the task's own sandbox included:
+        // it is removed again), and a hostile absolute target must be exactly as it was.
+        assert_eq!(
+            tree_listing(root.path()),
+            before,
+            "Hostile path '{}' left files behind",
             hostile_path
         );
-
-        // Verify sandbox base directory is clean of escaped files
-        let leaked_file = runner.config().sandbox_config.base_dir.join(hostile_path);
-        assert!(
-            !leaked_file.exists(),
-            "Leaked file must not exist at {}",
-            leaked_file.display()
-        );
+        if let Some((target, existed, len)) = absolute_target {
+            assert_eq!(target.exists(), existed, "'{}' was created or removed", hostile_path);
+            assert_eq!(
+                std::fs::metadata(target).ok().map(|m| m.len()),
+                len,
+                "'{}' was modified",
+                hostile_path
+            );
+        }
     }
 }
 
@@ -859,4 +927,167 @@ async fn test_cancellation_of_queued_task_behind_saturated_worker() {
         "Queued task cancellation must occur immediately (<500ms) without waiting for saturated permit release, took {:?}",
         elapsed
     );
+}
+
+// =========================================================================
+// 7. Process-tree termination: real grandchildren, killed with their task
+// =========================================================================
+
+/// The PID a task script recorded in `file` (waits for the script to get that far).
+#[cfg(unix)]
+async fn recorded_pid(file: &Path) -> u32 {
+    for _ in 0..200 {
+        if let Some(pid) = std::fs::read_to_string(file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        {
+            return pid;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("{} was never written", file.display());
+}
+
+/// Waits for `pid` to disappear; a survivor is killed (so a failing test does not leave it
+/// running for five minutes) and reported.
+#[cfg(unix)]
+async fn assert_process_dies(what: &str, pid: u32) {
+    for _ in 0..100 {
+        if !is_process_alive(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    unsafe { kill(pid as i32, 9) };
+    panic!("{what} (pid {pid}) outlived its task");
+}
+
+/// A script with a background child, and a nested shell with a grandchild of its own.
+#[cfg(unix)]
+fn tree_script(pids: &Path) -> String {
+    format!(
+        "sleep 300 &\necho $! > '{child}'\nsh -c 'sleep 300 & echo $! > \"$0\"; wait' '{grandchild}' &\nwait\n",
+        child = pids.join("child.pid").display(),
+        grandchild = pids.join("grandchild.pid").display(),
+    )
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_timeout_kills_grandchild_process() {
+    let (runner, _tmp) = create_test_runner(2, false);
+    let pids = tempfile::tempdir().unwrap();
+    let task = Task::new(
+        TaskSpec::shell_script(tree_script(pids.path())),
+        TaskRequirements::generic(1, 2),
+    );
+
+    let res = runner.execute_task(&task, None, None).await;
+
+    assert_eq!(res.exit_code, EXIT_CODE_TIMEOUT);
+    assert_process_dies("background child", recorded_pid(&pids.path().join("child.pid")).await).await;
+    assert_process_dies("nested grandchild", recorded_pid(&pids.path().join("grandchild.pid")).await).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_cancel_kills_three_level_tree() {
+    let temp_dir = tempfile::tempdir().expect("temp dir for client");
+    let client = WorkerClient::new(
+        WorkerConfig::new("127.0.0.1:9999")
+            .with_cores(2)
+            .with_sandbox_base_dir(temp_dir.path()),
+    );
+    let pids = tempfile::tempdir().unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    let task = Task::new(
+        TaskSpec::shell_script(tree_script(pids.path())),
+        TaskRequirements::generic(1, 60),
+    );
+    let task_id = task.id;
+    client.handle_assign_task(task, tx).await;
+
+    let child = recorded_pid(&pids.path().join("child.pid")).await;
+    let grandchild = recorded_pid(&pids.path().join("grandchild.pid")).await;
+    assert!(is_process_alive(child) && is_process_alive(grandchild));
+
+    client
+        .handle_cancel_task(task_id, Some("tree cancel".into()))
+        .await;
+
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("a result after the cancel")
+            .expect("channel open")
+        {
+            WorkerMessage::TaskResult { task_id: rid, exit_code, .. } if rid == task_id => {
+                assert_eq!(exit_code, EXIT_CODE_CANCELLED);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_process_dies("background child", child).await;
+    assert_process_dies("nested grandchild", grandchild).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_daemonizing_double_fork_grandchild_is_killed() {
+    let (runner, _tmp) = create_test_runner(2, false);
+    let pids = tempfile::tempdir().unwrap();
+    let pid_file = pids.path().join("daemon.pid");
+    // The subshell exits right after forking `sleep`, which is re-parented to init: the classic
+    // double fork. The task ends normally; the daemon must not survive it.
+    let task = Task::new(
+        TaskSpec::shell_script(format!(
+            "( sleep 300 >/dev/null 2>&1 </dev/null & echo $! > '{}' )\necho done\n",
+            pid_file.display()
+        )),
+        TaskRequirements::generic(1, 30),
+    );
+
+    let res = runner.execute_task(&task, None, None).await;
+
+    assert!(res.is_success(), "{res:?}");
+    assert_process_dies("double-forked daemon", recorded_pid(&pid_file).await).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_worker_shutdown_kills_all_running_trees() {
+    let temp_dir = tempfile::tempdir().expect("temp dir for client");
+    let client = WorkerClient::new(
+        WorkerConfig::new("127.0.0.1:9999")
+            .with_cores(4)
+            .with_sandbox_base_dir(temp_dir.path()),
+    );
+    let (tx, _rx) = mpsc::channel(64);
+
+    let mut pid_dirs = Vec::new();
+    for _ in 0..3 {
+        let pids = tempfile::tempdir().unwrap();
+        let task = Task::new(
+            TaskSpec::shell_script(tree_script(pids.path())),
+            TaskRequirements::generic(1, 120),
+        );
+        client.handle_assign_task(task, tx.clone()).await;
+        pid_dirs.push(pids);
+    }
+    let mut all = Vec::new();
+    for dir in &pid_dirs {
+        all.push(recorded_pid(&dir.path().join("child.pid")).await);
+        all.push(recorded_pid(&dir.path().join("grandchild.pid")).await);
+    }
+
+    // What a session end / worker shutdown does.
+    assert_eq!(client.cancel_all_active_tasks("worker shutting down").await, 3);
+
+    for pid in all {
+        assert_process_dies("task descendant", pid).await;
+    }
 }

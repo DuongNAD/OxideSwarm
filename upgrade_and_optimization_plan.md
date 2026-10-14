@@ -1,5 +1,10 @@
 # Technical Blueprint: OxideSwarm Architectural Upgrade & Optimization
 
+> **HISTORICAL plan (2026-09-24).** It was written before the security hardening and refers to
+> `.agents/teamwork/ORIGINAL_REQUEST.md`, which is git-ignored and not part of a clone (see the root `ORIGINAL_REQUEST.md`
+> for the tracked copy). Items described as future work may be done, dropped or changed since; check `README.md`.
+
+
 **Status**: Consolidated Architectural Plan  
 **Governing Document**: `.agents/teamwork/ORIGINAL_REQUEST.md` (Requirements R1–R6)  
 **Authors**: Survey Team (Explorer 1, Explorer 2, Explorer 3) & Project Orchestrator  
@@ -88,13 +93,13 @@ OxideSwarm Architecture
 1. **Modular Feature Gating**:
    - In `crates/worker/Cargo.toml`, declare feature `gpu-wgpu = ["dep:wgpu", "dep:pollster"]` with cached `wgpu = "22"` and `pollster = "0.3"`.
 2. **WGSL Compute Shaders**:
-   - Tiled matrix multiplication kernel (`gemm.wgsl`) with 16x16 workgroups.
-   - Verification hashing / parallel reduction kernel (`hash.wgsl`).
+   - Tiled matrix multiplication kernel (`gemm.wgsl`); the workgroup edge is the task's `work_group_size` (a `const` the host substitutes, one pipeline per edge; 16 by default).
+   - Verification hashing / parallel reduction kernel (`hash.wgsl`): **not delivered**. The file is an experimental sketch that no task dispatches and that cannot reproduce the CPU digest; results are verified by a sampled `f64` CPU recomputation (`cpu_simd::verify_gemm`) instead.
 3. **Cross-Platform Hardware Adapter Negotiation**:
    - Support Metal (macOS), DirectX 12 / Vulkan (Windows), and Vulkan (Linux/Android).
 4. **Deterministic CPU SIMD Fallback (`cpu_simd.rs`)**:
    - Unrolled 8-wide chunked matrix multiplication ensuring exact mathematical equivalence with reference oracle.
-   - Automatic fallback when GPU adapter is unavailable or in `--simulate-gpu` mode.
+   - The CPU engine backs the explicit `--simulate-gpu` test mode and is the oracle the GPU result is checked against. It is **not** a silent fallback: a worker that advertises a real GPU and cannot use it fails the task (a worker advertises one only if built with `--features gpu-wgpu` and an adapter started).
 5. **Structured Device Telemetry in `TaskResult`**:
    - Add `device_name: Option<String>` to `TaskResult` and stdout formatting (`Device: ...`, `Execution Time: ... ms`, `Status: VERIFIED_OK`).
 

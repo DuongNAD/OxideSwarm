@@ -2,6 +2,14 @@
 
 Production-grade deployment and automation tooling for running the **OxideSwarm** distributed grid worker (`rusty-grid.exe` / `oxideswarm.exe`) as a genuine, headless Windows Service managed by the Windows Service Control Manager (SCM).
 
+> **Before you install.** A worker needs (1) the master's **cluster address `HOST:8088`** (8080 is the dashboard and
+> never works), or a P2P ticket from a master started with `--p2p`, and (2) a copy of the master's **`cluster.secret`**
+> (on the master: `~/.oxideswarm/cluster.secret`; copy it with `scp` or a USB stick, never chat/e-mail). The installer
+> refuses to continue without the secret unless you pass `-Insecure`. The service runs as a low-privilege virtual
+> account, **not SYSTEM**, because every task the master sends runs with the service's identity. See
+> [../../docs/SECURITY.md](../../docs/SECURITY.md). The scripts in this folder were written for Windows PowerShell 5.1
+> and have not been run by any automated test.
+
 ---
 
 ## 1. Architectural Overview
@@ -38,6 +46,11 @@ Windows Services execute exclusively in **Session 0**, which has been completely
 
 The worker operates completely silently in the background from system boot, surviving user logins, logouts, and lock screens without displaying any console or command prompt windows.
 
+### 1.4 Service identity and where secrets live
+* **Account.** `-ServiceAccount VirtualAccount` (default) registers the service as `NT SERVICE\OxideSwarmWorker`: no password, no network identity, only the rights granted to it. Tasks run with the same identity, so they cannot touch other users' profiles or system files by default. `-ServiceAccount LocalService` is the alternative; `LocalSystem` (full control of the PC for every task) needs `-ServiceAccount LocalSystem -AcceptSystemRisk`.
+* **Config and secret.** The installer writes `rusty-grid.toml` (master address or P2P ticket, secret path) and a copy of `cluster.secret` into `C:\ProgramData\OxideSwarm\` and restricts both to SYSTEM, Administrators and the service account. The ticket is **not** put on the service command line or in the registry (older installers did both, and the JSON quotes did not survive Windows argument parsing, so the worker never accepted the ticket); the wrapper only runs `worker --config <that file>`. Log and sandbox directories are granted modify rights to the service account.
+* **Re-pairing / upgrading.** Run the installer again with `-Force`: it stops and deletes the old service *before* it replaces any file, then rewrites the config. A leftover machine-wide `OXIDESWARM_P2P_TICKET` from older installs is cleared by both the installer and the uninstaller.
+
 ---
 
 ## 2. File Manifest
@@ -72,14 +85,19 @@ bash build_windows_worker.sh --release
 ```
 Or build natively on Windows:
 ```cmd
-cargo build --release --bin rusty-grid
+cargo build --release --bin rusty-grid --features gpu-wgpu
 ```
+(`--features gpu-wgpu` / `build_windows_worker.sh --gpu` is what lets the worker use the graphics card; without it no GPU is advertised. The cross-build for it is not tested here.)
 
 ### Step 2: Install as a Windows Service
 Open an **Elevated (Administrator) PowerShell** terminal, navigate to `packaging\windows\`, and run:
 ```powershell
-.\install_windows_service.ps1 -Master "192.168.1.100:8080" -WorkerBin ".\rusty-grid.exe"
+.\install_windows_service.ps1 -Master "192.168.1.100:8088" -SecretFile "C:\path\to\cluster.secret" -WorkerBin ".\rusty-grid.exe"
 ```
+For a master on another network (started with `--p2p`), save its ticket JSON to a file and use
+`-P2pTicketFile C:\path\ticket.txt` instead of `-Master` (or run `connect_remote.cmd` from the repository root, which does
+this for you). Add `-Force` to replace an installed service. The installer waits up to 20 s for `Registration accepted`
+in `worker.out.log` and warns if it does not appear: a *Running* service is not necessarily a connected worker.
 *Note: If launched from a non-elevated PowerShell console, the script will automatically prompt for UAC elevation.*
 
 ### Step 3: Verify the Service
@@ -111,7 +129,13 @@ To also purge all log files and data sandboxes:
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `-InstallDir` | String | `C:\Program Files\OxideSwarm` | Destination directory for application binaries and service wrapper. |
-| `-Master` | String | `127.0.0.1:8080` | IP and port of the Master coordinator node. |
+| `-Master` | String | `""` (required unless a ticket is given) | The Master's **cluster** address `HOST:8088`. Port 8080 is the dashboard; the installer warns if you give it. |
+| `-P2pTicketFile` | String | `""` | File with the P2P ticket JSON of a master started with `--p2p` (read once, never put on a command line). |
+| `-P2pTicket` | String | `""` | Ticket given inline (visible in the process list of the installer; prefer `-P2pTicketFile`). |
+| `-SecretFile` | String | `""` | Cluster secret copied from the master. Default lookup: `$env:OXIDESWARM_SECRET_FILE`, then `%USERPROFILE%\.oxideswarm\cluster.secret`. Required for any remote or P2P master. |
+| `-Insecure` | Switch | `False` | Install without a secret: the worker obeys any host that answers as the master. Not recommended. |
+| `-ServiceAccount` | String | `VirtualAccount` | `VirtualAccount` (`NT SERVICE\<ServiceName>`), `LocalService`, or `LocalSystem` (needs `-AcceptSystemRisk`). |
+| `-AcceptSystemRisk` | Switch | `False` | Confirms that every task may run with full control of this PC (only with `-ServiceAccount LocalSystem`). |
 | `-WorkerBin` | String | `""` (auto-detected) | Explicit path to source `rusty-grid.exe`. Auto-detects in target build folders if omitted. |
 | `-ServiceMethod` | String | `NativeWrapper` | Service wrapping engine: `NativeWrapper` (zero external dependencies) or `WinSW`. |
 | `-ServiceName` | String | `OxideSwarmWorker` | Service name registered in SCM. |
@@ -119,9 +143,9 @@ To also purge all log files and data sandboxes:
 | `-WorkerName` | String | `""` (uses hostname) | Custom worker node identifier advertised to the grid. |
 | `-Cores` | Int32 | `0` (auto-detect) | Hardware core count override. |
 | `-RamMb` | Int64 | `0` (auto-detect) | Host RAM in Megabytes override. |
-| `-Gpu` | Switch | `False` | Explicitly advertise physical GPU presence. |
-| `-NoGpu` | Switch | `False` | Explicitly disable GPU advertising. |
-| `-SimulateGpu` | Switch | `False` | Advertise simulated GPU matrix compute capability. |
+| `-Gpu` | Switch | `False` | Insist on a real GPU. It is advertised only if the binary was built with `--features gpu-wgpu` and an adapter starts; otherwise the worker advertises none and logs a warning (the stock binary has no wgpu engine). The worker also looks for a GPU without this switch. |
+| `-NoGpu` | Switch | `False` | Never advertise a GPU (also skips looking for one). |
+| `-SimulateGpu` | Switch | `False` | Test mode: advertise a simulated GPU whose tasks run on the CPU and are labelled as simulated. |
 | `-GpuName` | String | `""` | Custom GPU model string (e.g. `"NVIDIA RTX 4090"`). |
 | `-MaxConcurrency` | Int32 | `0` (core count) | Maximum concurrent task executions permitted. |
 | `-HeartbeatInterval` | Int32 | `3` | Heartbeat interval in seconds advertised to Master. |
@@ -130,7 +154,7 @@ To also purge all log files and data sandboxes:
 | `-ConfigPath` | String | `C:\ProgramData\OxideSwarm\rusty-grid.toml` | Path for generated TOML configuration. |
 | `-WinSWBin` | String | `""` | Path to WinSW executable if `WinSW` method is selected. |
 | `-StartImmediately` | Boolean | `$true` | Immediately start the service upon successful registration. |
-| `-Force` | Switch | `False` | Overwrite existing installation files and stop any running service. |
+| `-Force` | Switch | `False` | Stop and delete an existing service of the same name before replacing files (upgrade / re-pair). Without it an existing service makes the installer stop with nothing changed. |
 | `-NoElevate` | Switch | `False` | Suppress automatic UAC prompt; fail if not elevated. |
 
 ### 4.2 `uninstall_windows_service.ps1`
@@ -167,14 +191,13 @@ C:\Program Files\OxideSwarm\               <-- Read/Execute for Users, Full for 
 ├── bin\
 │   ├── rusty-grid.exe                     <-- Primary compiled worker executable
 │   └── oxideswarm.exe                     <-- Brand alias (copy/link of rusty-grid.exe)
-├── config\
-│   └── rusty-grid.toml                    <-- Mirrored configuration backup
 ├── OxideSwarmService.exe                  <-- Compiled native SCM wrapper
 ├── ServiceWrapper.cs                      <-- Retained C# wrapper source
 └── OxideSwarmWorker.xml                   <-- WinSW configuration (if using WinSW)
 
 C:\ProgramData\OxideSwarm\                 <-- Writable by SYSTEM & Administrators
-├── rusty-grid.toml                        <-- Active runtime configuration
+├── rusty-grid.toml                        <-- Active runtime configuration (may hold a P2P ticket; ACL-restricted)
+├── cluster.secret                         <-- Copy of the cluster secret (ACL-restricted)
 ├── logs\
 │   ├── worker.out.log                     <-- Standard output log stream
 │   ├── worker.err.log                     <-- Standard error log stream
@@ -260,3 +283,5 @@ The verification script (`verify_windows_service.ps1`) systematically executes t
 | `SCM-06` | SCM Crash Recovery | `sc.exe qfailure` | Confirms restart actions are configured. |
 | `ISO-01` | Session 0 Headless Execution | `Get-Process` | Asserts `SessionId == 0` and `MainWindowHandle == 0`. |
 | `LOG-01` | Log Output Streams | Filesystem | Confirms log directory exists and log files are generated. |
+| `SEC-01` | Service Identity | `Win32_Service` | Warns when the service runs as LocalSystem (every task would inherit it). |
+| `NET-01` | Worker Registered | `worker.out.log` | Looks for `Registration accepted` after the most recent connection/authentication error. A Running service alone proves nothing. |

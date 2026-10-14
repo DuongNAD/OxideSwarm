@@ -228,8 +228,8 @@ async fn test_master_server_explicit_dashboard_port_conflict_returns_io_error() 
     let occupied_port = blocker.local_addr().unwrap().port();
 
     // 2. Case A: Explicit dashboard_port with default web_ui setting -> MUST return Err(GridError::Io)
-    let config_a = ServerConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_dashboard_port(occupied_port);
+    let config_a =
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_dashboard_port(occupied_port);
 
     let res_a = MasterServer::spawn(config_a).await;
     match res_a {
@@ -240,7 +240,9 @@ async fn test_master_server_explicit_dashboard_port_conflict_returns_io_error() 
                 "Explicit dashboard_port collision must fail with AddrInUse"
             );
         }
-        Ok(_) => panic!("MasterServer::spawn must NOT succeed when explicit dashboard_port is conflicted"),
+        Ok(_) => panic!(
+            "MasterServer::spawn must NOT succeed when explicit dashboard_port is conflicted"
+        ),
         Err(other) => panic!("Expected GridError::Io, got: {other:?}"),
     }
 
@@ -258,7 +260,9 @@ async fn test_master_server_explicit_dashboard_port_conflict_returns_io_error() 
                 "Explicit dashboard_port collision with web_ui=true must fail with AddrInUse"
             );
         }
-        Ok(_) => panic!("MasterServer::spawn must NOT succeed when explicit dashboard_port is conflicted"),
+        Ok(_) => panic!(
+            "MasterServer::spawn must NOT succeed when explicit dashboard_port is conflicted"
+        ),
         Err(other) => panic!("Expected GridError::Io, got: {other:?}"),
     }
 
@@ -572,9 +576,11 @@ async fn test_web_ui_http_api_endpoints_under_ephemeral_multi_master() {
     };
     let web_addr: SocketAddr = format!("127.0.0.1:{web_port}").parse().unwrap();
 
+    // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_web_ui(true)
-        .with_web_ui_addr(web_addr);
+        .with_web_ui_addr(web_addr)
+        .with_auth_config(rusty_grid_master::auth::AuthConfig::dev());
     let master = MasterServer::spawn(config).await.unwrap();
 
     // Register a worker to the master so /api/status has data

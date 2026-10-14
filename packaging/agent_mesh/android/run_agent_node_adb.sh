@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-HUB_URL="${1:-ws://192.168.1.100:8088/ws}"
+HUB_URL="${1:?Usage: run_agent_node_adb.sh <ws://HUB_HOST:PORT/ws> [NODE_ID]  (token: export OXIDE_MESH_TOKEN=...)}"
 DEFAULT_NODE_ID="node-android-adb"
 NODE_ID="${2:-$DEFAULT_NODE_ID}"
 
@@ -51,4 +51,6 @@ adb shell "chmod +x $REMOTE_PATH"
 
 # 4. Launch on Android device
 echo "[INFO] Starting OxideSwarm Agent on Android device..."
-adb shell "$REMOTE_PATH node --hub '$HUB_URL' --id '$NODE_ID' --platform android"
+# The hub token (if any) is handed over as an environment variable of the remote command only;
+# it is briefly visible in the process list of this host and of the phone while the session runs.
+adb shell "${OXIDE_MESH_TOKEN:+OXIDE_MESH_TOKEN='$OXIDE_MESH_TOKEN' }$REMOTE_PATH node --hub '$HUB_URL' --id '$NODE_ID' --platform android"

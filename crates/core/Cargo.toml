@@ -22,9 +22,14 @@ chrono = { workspace = true, features = ["serde"] }
 sysinfo = { workspace = true }
 iroh = { workspace = true, optional = true }
 
+# Cluster authentication (HMAC-SHA256, CSPRNG) and TCP socket options; both already in Cargo.lock.
+ring = "0.17"
+socket2 = { version = "0.6", features = ["all"] }
+
 [features]
 default = ["p2p"]
 p2p = ["dep:iroh"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"

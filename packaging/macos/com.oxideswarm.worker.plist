@@ -6,13 +6,20 @@
     <key>Label</key>
     <string>com.oxideswarm.worker</string>
 
-    <!-- Executable Invocation -->
+    <!-- Account the worker (and every task the master sends it) runs as. NEVER leave this out
+         or set it to root: install_mac_daemon.sh fills in the invoking user or --user NAME.
+         Replace the placeholder yourself when installing this template by hand. -->
+    <key>UserName</key>
+    <string>REPLACE_WITH_SERVICE_ACCOUNT</string>
+
+    <!-- Executable Invocation. The master address / P2P ticket / secret path live in the 0600
+         config file (see install_mac_daemon.sh), never on the command line or in this plist. -->
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/rusty-grid</string>
         <string>worker</string>
-        <string>--master</string>
-        <string>127.0.0.1:8080</string>
+        <string>--config</string>
+        <string>/etc/oxideswarm/worker.toml</string>
     </array>
 
     <!-- Automatic Startup on Boot/Load -->

@@ -936,9 +936,12 @@ async fn test_adversarial_rapid_concurrent_cancellations_storm() {
 /// and descriptive error history message.
 #[tokio::test]
 async fn test_adversarial_max_retries_exhaustion_via_worker_disconnects() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    // Failovers are budgeted separately from max_retries; pin the failover cap to the old limit (3).
+    let master = MasterServer::spawn(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_failovers(3),
+    )
+    .await
+    .expect("MasterServer::spawn failed");
     let master_addr = master.server_addr().to_string();
 
     let task = Task::new(
@@ -1051,6 +1054,7 @@ async fn test_adversarial_max_retries_exhaustion_via_worker_disconnects() {
 async fn test_adversarial_direct_task_queue_retry_policy_exhaustion() {
     let policy = RetryPolicy {
         max_retries: 2,
+        max_failovers: 2, // failover budget is separate from max_retries; equal here so the exhaustion path is still exercised
         initial_backoff_ms: 10,
         max_backoff_ms: 50,
         backoff_multiplier: 1.5,
@@ -1153,6 +1157,7 @@ async fn test_adversarial_direct_task_queue_retry_policy_exhaustion() {
 async fn test_adversarial_retry_exhaustion_on_execution_failure() {
     let policy = RetryPolicy {
         max_retries: 2,
+        max_failovers: 2, // failover budget is separate from max_retries; equal here so the exhaustion path is still exercised
         initial_backoff_ms: 10,
         max_backoff_ms: 50,
         backoff_multiplier: 1.0,
@@ -1231,9 +1236,12 @@ async fn test_adversarial_retry_exhaustion_on_execution_failure() {
 /// the terminal Failed result without hanging or timing out.
 #[tokio::test]
 async fn test_adversarial_bug_wait_task_hangs_after_max_retries_exhaustion() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("spawn failed");
+    // Failovers are budgeted separately from max_retries; pin the failover cap to the old limit (3).
+    let master = MasterServer::spawn(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_failovers(3),
+    )
+    .await
+    .expect("spawn failed");
     let master_addr = master.server_addr().to_string();
 
     let task = Task::new(

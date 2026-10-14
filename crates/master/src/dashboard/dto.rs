@@ -120,7 +120,6 @@ impl<'de> Deserialize<'de> for WorkerSummaryDto {
     }
 }
 
-
 /// Full point-in-time state snapshot of the cluster, delivered upon WebSocket handshake.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClusterSnapshotDto {
@@ -134,7 +133,8 @@ pub struct ClusterSnapshotDto {
     pub status: ClusterStatusDto,
     /// Snapshot of all registered worker nodes and their telemetry.
     pub workers: Vec<WorkerInfo>,
-    /// Snapshot of all tasks currently in the master queue.
+    /// Snapshot of the newest tasks in the master queue, newest first (at most
+    /// [`SNAPSHOT_MAX_TASKS`]; `status.tasks` carries the true counts).
     pub tasks: Vec<TaskInfo>,
 }
 
@@ -176,11 +176,24 @@ impl DashboardStreamMessage {
     }
 }
 
+/// Tasks returned by `GET /api/tasks` when no `limit` is given.
+pub const DEFAULT_TASK_LIST_LIMIT: usize = 100;
+
+/// Largest `limit` honoured by `GET /api/tasks`; a bigger one is clamped to this.
+pub const MAX_TASK_LIST_LIMIT: usize = 1000;
+
+/// Tasks (newest first) carried by a dashboard snapshot. A master that retains tens of thousands
+/// of finished tasks must not serialise all of them into every WebSocket/SSE (re)sync.
+pub const SNAPSHOT_MAX_TASKS: usize = 1000;
+
 /// URL query parameters for filtering `GET /api/tasks`.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct TaskQueryParams {
     /// Optional filter by task state (e.g. "queued", "running", "completed", "failed").
     pub state: Option<String>,
-    /// Optional maximum number of tasks to return.
+    /// Optional maximum number of tasks to return (default [`DEFAULT_TASK_LIST_LIMIT`], at most
+    /// [`MAX_TASK_LIST_LIMIT`]). Tasks are listed newest submission first.
     pub limit: Option<usize>,
+    /// Optional number of (newest) matching tasks to skip, for paging.
+    pub offset: Option<usize>,
 }

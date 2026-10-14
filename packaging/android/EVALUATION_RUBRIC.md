@@ -29,7 +29,8 @@ The 10 evaluation test cases below mathematically and empirically verify immunit
 ### Hardware & Software Prerequisites
 - **Android Device or Emulator**: Android 10+ (Android 14/15 recommended for full FGS validation).
 - **Host Machine**: macOS, Linux, or Windows with Android Debug Bridge (`adb`) installed and configured in `PATH`.
-- **Master Node**: An active OxideSwarm Master coordinator reachable from the device (e.g., `192.168.1.100:8080` on local Wi-Fi, or via ADB reverse proxy `adb reverse tcp:8080 tcp:8080`).
+- **Master Node**: An active OxideSwarm Master coordinator reachable from the device on its **cluster port 8088** (e.g., `192.168.1.100:8088` on local Wi-Fi, or via ADB reverse proxy `adb reverse tcp:8088 tcp:8088` to a master bound to loopback). Port 8080 is the dashboard and is never a worker target.
+- **Cluster secret**: a master that listens beyond loopback requires the worker to hold its `cluster.secret` (see `docs/SECURITY.md`). The Android app cannot hold it yet, so run these tests against a loopback master through `adb reverse`, or use the Termux worker with `--secret-file`. The `rusty-grid submit` commands below run on the host that runs the master (`--secret-file` if needed).
 
 ### Quick ADB Pre-Flight Command:
 ```bash
@@ -230,7 +231,7 @@ adb shell getprop ro.build.version.release
   1. While the device remains in Deep Doze (`IDLE`) with the display turned off (from TC-06):
   2. Dispatch a task from the Master CLI:
      ```bash
-     rusty-grid submit --master 127.0.0.1:8080 \
+     rusty-grid submit --master 127.0.0.1:8088 \
        --type generic \
        --command "echo 'DOZE_EXECUTION_VERIFIED'" \
        --wait
@@ -282,6 +283,7 @@ adb shell getprop ro.build.version.release
 ---
 
 ### TC-09: Android 12+ Phantom Process Killer (PPK) Immunity Test
+* **Note:** the in-process JNI worker loop is not a child process, but the `sh -c` workload used below IS one (the task runner spawns a child for every command task), so this test measures whether PPK kills that child. On Android 12+ with the default `max_phantom_processes` limit it may fail; it is expected to pass after the override in `packaging/android/README.md` section 3.4. Record which of the two you tested.
 * **Objective:** Verify that intensive, multi-core computational tasks executed by the worker do NOT trigger `SIGKILL` (signal 9) from `ActivityManagerService`'s Phantom Process Killer.
 * **Mechanism Under Test:** Android 12–15+ `PhantomProcessList` in `ActivityManagerService`.
 * **Execution Procedure:**
@@ -296,7 +298,7 @@ adb shell getprop ro.build.version.release
      ```
   3. Submit a high-CPU task that executes for 30 seconds using a universal POSIX shell compute loop that runs on stock Android without requiring python:
      ```bash
-     rusty-grid submit --master 127.0.0.1:8080 --type generic --command "sh -c 'end=\$((\$(date +%s)+30)); while [ \$(date +%s) -lt \$end ]; do :; done'" --wait
+     rusty-grid submit --master 127.0.0.1:8088 --type generic --command "sh -c 'end=\$((\$(date +%s)+30)); while [ \$(date +%s) -lt \$end ]; do :; done'" --wait
      ```
   4. Inspect logcat for PPK termination notices:
      ```bash
@@ -353,7 +355,7 @@ adb shell getprop ro.build.version.release
      ```
   7. Verify on Master coordinator:
      ```bash
-     rusty-grid status --master 127.0.0.1:8080 --workers
+     rusty-grid status --master 127.0.0.1:8088 --workers
      ```
 * **Expected Output Snippet:**
   ```text

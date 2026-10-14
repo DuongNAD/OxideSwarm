@@ -8,17 +8,20 @@
 //!    and dynamic SVG topology connector line styling.
 //! 5. Full MasterServer spawn with Web UI and P2P ticket exposure.
 
+use reqwest::StatusCode;
 use std::sync::Arc;
 use std::time::Duration;
-use reqwest::StatusCode;
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
+use rusty_grid_master::auth::AuthConfig;
 use rusty_grid_master::dashboard::dto::ClusterStatusDto;
 use rusty_grid_master::queue::TaskQueue;
 use rusty_grid_master::registry::WorkerRegistry;
 use rusty_grid_master::server::{MasterServer, ServerConfig};
-use rusty_grid_master::web_ui::{create_web_ui_router, DashboardStatus, WorkerUiInfo};
+use rusty_grid_master::web_ui::{
+    create_web_ui_router, create_web_ui_router_with_auth, DashboardStatus, WorkerUiInfo,
+};
 
 /// 1. Verifies that WorkerUiInfo includes and correctly serializes/deserializes
 ///    interconnect_type, is_relayed, and rtt_ms.
@@ -51,7 +54,8 @@ fn test_m4_worker_ui_info_schema_and_serialization() {
     assert!(json_direct.contains("\"is_relayed\":false"));
     assert!(json_direct.contains("\"rtt_ms\":14.8"));
 
-    let de_direct: WorkerUiInfo = serde_json::from_str(&json_direct).expect("deserialize direct worker");
+    let de_direct: WorkerUiInfo =
+        serde_json::from_str(&json_direct).expect("deserialize direct worker");
     assert_eq!(de_direct.interconnect_type, "Direct P2P (QUIC)");
     assert!(!de_direct.is_relayed);
     assert_eq!(de_direct.rtt_ms, Some(14.8));
@@ -83,7 +87,8 @@ fn test_m4_worker_ui_info_schema_and_serialization() {
     assert!(json_relay.contains("\"is_relayed\":true"));
     assert!(json_relay.contains("\"rtt_ms\":182.5"));
 
-    let de_relay: WorkerUiInfo = serde_json::from_str(&json_relay).expect("deserialize relay worker");
+    let de_relay: WorkerUiInfo =
+        serde_json::from_str(&json_relay).expect("deserialize relay worker");
     assert_eq!(de_relay.interconnect_type, "Relay (DERP)");
     assert!(de_relay.is_relayed);
     assert_eq!(de_relay.rtt_ms, Some(182.5));
@@ -111,7 +116,8 @@ fn test_m4_cluster_status_dto_p2p_ticket() {
         "p2p_ticket": "ticket-master-test-sec12345"
     }"#;
 
-    let parsed_with: DashboardStatus = serde_json::from_str(raw_with_ticket).expect("parse with ticket");
+    let parsed_with: DashboardStatus =
+        serde_json::from_str(raw_with_ticket).expect("parse with ticket");
     assert_eq!(
         parsed_with.p2p_ticket.as_deref(),
         Some("ticket-master-test-sec12345")
@@ -135,7 +141,8 @@ fn test_m4_cluster_status_dto_p2p_ticket() {
         "workers": []
     }"#;
 
-    let parsed_without: DashboardStatus = serde_json::from_str(raw_without_ticket).expect("parse without ticket");
+    let parsed_without: DashboardStatus =
+        serde_json::from_str(raw_without_ticket).expect("parse without ticket");
     assert_eq!(parsed_without.p2p_ticket, None);
 
     let dto: ClusterStatusDto = serde_json::from_str(r#"{
@@ -205,12 +212,14 @@ async fn test_m4_api_status_endpoint_returns_telemetry() {
         .unwrap();
 
     let ticket = Some("iroh-p2p-test-ticket-987654321".to_string());
-    let router = create_web_ui_router(
+    // The dashboard denies unauthenticated requests by default; opt in to local dev mode for this test.
+    let router = create_web_ui_router_with_auth(
         registry.clone(),
         queue.clone(),
         scheduler_notify.clone(),
         None,
         ticket.clone(),
+        AuthConfig::dev(),
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -220,7 +229,11 @@ async fn test_m4_api_status_endpoint_returns_telemetry() {
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
-        let server = axum::serve(listener, router);
+        // The dev bypass needs the peer address, so serve with connect info.
+        let server = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        );
         let _ = server
             .with_graceful_shutdown(async move {
                 while shutdown_rx.changed().await.is_ok() {
@@ -338,11 +351,20 @@ async fn test_m4_dashboard_html_visual_elements() {
 
     // 1. Link Badges styling & elements
     assert!(html.contains(".link-badge"), "CSS must contain .link-badge");
-    assert!(html.contains(".link-direct"), "CSS must contain .link-direct");
+    assert!(
+        html.contains(".link-direct"),
+        "CSS must contain .link-direct"
+    );
     assert!(html.contains(".link-relay"), "CSS must contain .link-relay");
     assert!(html.contains(".link-tcp"), "CSS must contain .link-tcp");
-    assert!(html.contains("Direct P2P"), "Must contain Direct P2P badge text");
-    assert!(html.contains("DERP Relay"), "Must contain DERP Relay badge text");
+    assert!(
+        html.contains("Direct P2P"),
+        "Must contain Direct P2P badge text"
+    );
+    assert!(
+        html.contains("DERP Relay"),
+        "Must contain DERP Relay badge text"
+    );
 
     // 2. 1-Click Copy Ticket button
     assert!(
@@ -403,14 +425,19 @@ async fn test_m4_master_server_full_spawn_with_p2p_and_web_ui() {
         .with_web_ui(true)
         .with_web_ui_addr("127.0.0.1:0".parse().unwrap());
 
-    let master = MasterServer::spawn(config).await.expect("spawn MasterServer");
+    let master = MasterServer::spawn(config)
+        .await
+        .expect("spawn MasterServer");
     assert!(master.server_addr().port() > 0);
 
     // Ensure MasterHandle p2p_ticket is populated
     #[cfg(feature = "p2p")]
     {
         let ticket = master.p2p_ticket();
-        assert!(ticket.is_some(), "MasterHandle must expose active p2p_ticket");
+        assert!(
+            ticket.is_some(),
+            "MasterHandle must expose active p2p_ticket"
+        );
         assert!(!ticket.unwrap().is_empty(), "p2p_ticket must not be empty");
     }
 

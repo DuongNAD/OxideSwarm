@@ -3,6 +3,7 @@
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
@@ -17,6 +18,47 @@ pub const STREAM_DATA: u8 = 0x02;
 #[cfg(feature = "p2p")]
 pub use iroh;
 
+/// Idle time before the first TCP keepalive probe is sent.
+pub const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(20);
+/// Interval between TCP keepalive probes.
+pub const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// Unanswered probes after which the kernel drops the connection.
+pub const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// Applies the grid's standard socket options to a connected TCP stream:
+/// `TCP_NODELAY` (small control frames must not wait for Nagle) and TCP keepalive
+/// (idle 20 s, probe every 10 s, 3 retries), so a peer that vanished without a FIN
+/// (Wi-Fi drop, suspended phone, pulled cable) is detected in roughly 50 s instead of
+/// the OS default of hours. Both options are always attempted; the first error is returned.
+///
+/// Platform notes: idle time, probe interval and retry count are requested on Linux, Android,
+/// macOS/iOS and their siblings, the BSDs and Windows (socket2 maps them to the closest option
+/// each OS offers). On any other target only the idle time is configured.
+pub fn configure_tcp_stream(stream: &TcpStream) -> io::Result<()> {
+    let nodelay = stream.set_nodelay(true);
+
+    let keepalive = socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE_IDLE);
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+        target_os = "windows",
+    ))]
+    let keepalive = keepalive
+        .with_interval(TCP_KEEPALIVE_INTERVAL)
+        .with_retries(TCP_KEEPALIVE_RETRIES);
+
+    let keepalive = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive);
+    nodelay.and(keepalive)
+}
 
 /// A bidirectional stream adapter combining separate `AsyncRead` and `AsyncWrite` handles.
 pub struct BiStream<R, W> {
@@ -211,6 +253,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&read_buf2, b"world bistream");
+    }
+
+    #[tokio::test]
+    async fn test_configure_tcp_stream_sets_nodelay_and_keepalive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let client = client.unwrap();
+        let (server, _) = accepted.unwrap();
+
+        for stream in [&client, &server] {
+            assert!(
+                !stream.nodelay().unwrap(),
+                "precondition: Nagle is on by default"
+            );
+            configure_tcp_stream(stream).unwrap();
+            assert!(stream.nodelay().unwrap(), "TCP_NODELAY must be enabled");
+            let sock = socket2::SockRef::from(stream);
+            assert!(sock.keepalive().unwrap(), "SO_KEEPALIVE must be enabled");
+            // The read-back getters exist on these targets only (the setters cover more).
+            #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+            assert_eq!(sock.tcp_keepalive_time().unwrap(), TCP_KEEPALIVE_IDLE);
+            #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+            assert_eq!(
+                sock.tcp_keepalive_interval().unwrap(),
+                TCP_KEEPALIVE_INTERVAL
+            );
+            #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+            assert_eq!(sock.tcp_keepalive_retries().unwrap(), TCP_KEEPALIVE_RETRIES);
+        }
+        // Idempotent: applying it twice is fine.
+        configure_tcp_stream(&client).unwrap();
     }
 
     #[tokio::test]

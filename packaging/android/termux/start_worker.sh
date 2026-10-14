@@ -4,6 +4,16 @@
 #
 # Holds CPU wake-lock, supervises the rusty-grid worker process, restarts on
 # transient failures, and manages logging.
+#
+# Where the worker connects is decided by the config file
+# (~/.config/oxideswarm/rusty-grid.toml: master = "HOST:8088" or p2p_ticket = '...').
+# --master overrides it for one run. The master's CLUSTER port is 8088; 8080 is
+# its dashboard and never a valid worker target.
+#
+# The worker also needs the master's cluster secret (default
+# ~/.oxideswarm/cluster.secret, or --secret-file). Copy it from the master:
+#   scp user@master:~/.oxideswarm/cluster.secret ~/.oxideswarm/cluster.secret
+#   chmod 600 ~/.oxideswarm/cluster.secret
 # ==============================================================================
 
 set -uo pipefail
@@ -21,7 +31,8 @@ NC="$(printf '\033[0m')"
 CONFIG_DIR="${HOME}/.config/oxideswarm"
 CONFIG_FILE="${CONFIG_DIR}/rusty-grid.toml"
 STATE_DIR="${HOME}/.local/state/oxideswarm"
-PID_FILE="${STATE_DIR}/worker.pid"
+PID_FILE="${STATE_DIR}/worker.pid"            # the supervisor (this script)
+CHILD_PID_FILE="${STATE_DIR}/worker.child.pid" # the rusty-grid worker it supervises
 LOG_FILE="${STATE_DIR}/worker.log"
 SANDBOX_DIR="${HOME}/.cache/oxideswarm/sandboxes"
 
@@ -32,12 +43,14 @@ log_ok()   { echo -e "${GREEN}[OK]${NC}   $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 log_err()  { echo -e "${RED}[ERR]${NC}  $(date '+%Y-%m-%d %H:%M:%S') $*" >&2; }
 
-# Default parameters
-MASTER_ADDR="127.0.0.1:8080"
+# Default parameters (empty = let the config file decide)
+MASTER_ADDR=""
 WORKER_NAME=""
 CORES=""
 RAM_MB=""
+SECRET_FILE=""
 SIMULATE_GPU=false
+INSECURE=false
 MODE="foreground"
 
 usage() {
@@ -50,17 +63,21 @@ ${BOLD}Commands:${NC}
   --daemon              Run worker silently in background with auto-restart
   --foreground          Run worker in foreground with live console logs (default)
   --status              Check worker daemon status, PID, and resource telemetry
-  --stop                Gracefully terminate background worker and release wake-lock
+  --stop                Gracefully terminate the supervisor AND its worker process, release wake-lock
   --restart             Restart background worker daemon
   --logs                Stream live daemon logs (tail -f)
   -h, --help            Show this help message
 
 ${BOLD}Options:${NC}
-  --master <ADDR>       Master coordinator address (default: 127.0.0.1:8080 or config file)
+  --master <ADDR>       Master CLUSTER address HOST:8088 (default: from ${CONFIG_FILE};
+                        8080 is the dashboard, not a valid target)
+  --secret-file <PATH>  Cluster secret copied from the master (default: ~/.oxideswarm/cluster.secret)
+  --insecure            Follow a remote master WITHOUT a cluster secret (not recommended)
   --name <NAME>         Worker node identifier advertised to Master
   --cores <N>           Limit CPU cores allocated
   --ram-mb <MB>         Override advertised RAM in Megabytes
-  --simulate-gpu        Advertise simulated GPU capabilities
+  --simulate-gpu        Advertise simulated GPU capabilities (testing only: GPU tasks will then
+                        be routed to this phone and run on the CPU)
 EOF
     exit 0
 }
@@ -111,40 +128,76 @@ rotate_logs_if_needed() {
     fi
 }
 
-get_status() {
-    if [ -f "$PID_FILE" ]; then
-        local pid
-        pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            echo -e "${GREEN}${BOLD}● OxideSwarm Worker is ACTIVE${NC} (PID: ${pid})"
-            
-            # Print process memory & CPU if ps/proc available
-            if [ -d "/proc/${pid}" ]; then
-                local oom_score
-                oom_score=$(cat "/proc/${pid}/oom_score_adj" 2>/dev/null || echo "unknown")
-                echo -e "  - OOM Score Adjustment: ${oom_score}"
-            fi
-            
-            # Battery info if termux-battery-status available
-            if command -v termux-battery-status >/dev/null 2>&1; then
-                local battery_info
-                battery_info=$(termux-battery-status 2>/dev/null || echo "")
-                if [ -n "$battery_info" ]; then
-                    local percentage temp
-                    percentage=$(echo "$battery_info" | grep -o '"percentage": [0-9]*' | awk '{print $2}' || echo "?")
-                    temp=$(echo "$battery_info" | grep -o '"temperature": [0-9.]*' | awk '{print $2}' || echo "?")
-                    echo -e "  - Device Battery: ${percentage}% | Temperature: ${temp}°C"
-                fi
-            fi
+read_pid_file() {
+    if [ -f "$1" ]; then
+        tr -d '[:space:]' < "$1" 2>/dev/null || true
+    fi
+}
 
-            echo -e "  - Log File: ${LOG_FILE}"
-            echo -e "  - Config:   ${CONFIG_FILE}"
-            return 0
-        else
-            echo -e "${YELLOW}${BOLD}● OxideSwarm Worker is NOT running${NC} (Stale PID file found: ${pid})"
-            rm -f "$PID_FILE"
-            return 1
+# True when PID is alive and (where /proc allows the check) still one of our processes,
+# so a recycled PID is never signalled.
+pid_alive() {
+    local pid="$1" cmdline
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [ -r "/proc/${pid}/cmdline" ]; then
+        cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+        case "$cmdline" in
+            *rusty-grid*|*oxideswarm*|*start_worker*) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+    return 0
+}
+
+wait_for_exit() {
+    # wait_for_exit PID SECONDS
+    local pid="$1" tenths=$(( $2 * 10 )) i=0
+    while [ "$i" -lt "$tenths" ]; do
+        pid_alive "$pid" || return 0
+        sleep 0.1
+        i=$((i + 1))
+    done
+    pid_alive "$pid" && return 1
+    return 0
+}
+
+get_status() {
+    local pid child
+    pid="$(read_pid_file "$PID_FILE")"
+    child="$(read_pid_file "$CHILD_PID_FILE")"
+    if [ -n "$pid" ] && pid_alive "$pid"; then
+        echo -e "${GREEN}${BOLD}● OxideSwarm Worker is ACTIVE${NC} (supervisor PID: ${pid}, worker PID: ${child:-starting})"
+
+        # Print process memory & CPU if ps/proc available
+        if [ -d "/proc/${pid}" ]; then
+            local oom_score
+            oom_score=$(cat "/proc/${pid}/oom_score_adj" 2>/dev/null || echo "unknown")
+            echo -e "  - OOM Score Adjustment: ${oom_score}"
         fi
+
+        # Battery info if termux-battery-status available
+        if command -v termux-battery-status >/dev/null 2>&1; then
+            local battery_info
+            battery_info=$(termux-battery-status 2>/dev/null || echo "")
+            if [ -n "$battery_info" ]; then
+                local percentage temp
+                percentage=$(echo "$battery_info" | grep -o '"percentage": [0-9]*' | awk '{print $2}' || echo "?")
+                temp=$(echo "$battery_info" | grep -o '"temperature": [0-9.]*' | awk '{print $2}' || echo "?")
+                echo -e "  - Device Battery: ${percentage}% | Temperature: ${temp}°C"
+            fi
+        fi
+
+        echo -e "  - Log File: ${LOG_FILE}"
+        echo -e "  - Config:   ${CONFIG_FILE}"
+        return 0
+    elif [ -n "$pid" ]; then
+        echo -e "${YELLOW}${BOLD}● OxideSwarm Worker is NOT running${NC} (Stale PID file found: ${pid})"
+        rm -f "$PID_FILE"
+        if [ -n "$child" ] && pid_alive "$child"; then
+            echo -e "${RED}  ! An orphaned worker process (PID ${child}) is still alive; run '$(basename "$0") --stop' to remove it.${NC}"
+        fi
+        return 1
     else
         echo -e "${RED}${BOLD}● OxideSwarm Worker is STOPPED${NC}"
         return 3
@@ -152,31 +205,35 @@ get_status() {
 }
 
 stop_worker() {
-    if [ -f "$PID_FILE" ]; then
-        local pid
-        pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            log_info "Stopping worker process (PID $pid)..."
-            kill -TERM "$pid" 2>/dev/null || true
-            
-            # Wait up to 5 seconds for graceful shutdown
-            for _ in $(seq 1 10); do
-                if ! kill -0 "$pid" 2>/dev/null; then
-                    break
-                fi
-                sleep 0.5
-            done
+    local pid child
+    pid="$(read_pid_file "$PID_FILE")"
+    child="$(read_pid_file "$CHILD_PID_FILE")"
 
-            if kill -0 "$pid" 2>/dev/null; then
-                log_warn "Process $pid did not exit in 5s; sending SIGKILL..."
-                kill -KILL "$pid" 2>/dev/null || true
-            fi
-            rm -f "$PID_FILE"
-            log_ok "OxideSwarm worker stopped successfully."
-        else
-            log_warn "Stale PID file found ($pid). Removing."
-            rm -f "$PID_FILE"
+    if [ -n "$pid" ] && pid_alive "$pid"; then
+        log_info "Stopping supervisor (PID $pid); it forwards the stop to the worker (PID ${child:-?})..."
+        kill -TERM "$pid" 2>/dev/null || true
+        if ! wait_for_exit "$pid" 10; then
+            log_warn "Supervisor $pid did not exit in 10s; sending SIGKILL."
+            kill -KILL "$pid" 2>/dev/null || true
         fi
+    elif [ -n "$pid" ]; then
+        log_warn "Stale supervisor PID file found ($pid). Removing."
+    fi
+
+    # Whatever happened to the supervisor, the worker process must not outlive it
+    # (a SIGKILLed supervisor cannot clean up after itself).
+    if [ -n "$child" ] && pid_alive "$child"; then
+        log_info "Stopping worker process (PID $child)..."
+        kill -TERM "$child" 2>/dev/null || true
+        if ! wait_for_exit "$child" 5; then
+            log_warn "Worker $child did not exit in 5s; sending SIGKILL."
+            kill -KILL "$child" 2>/dev/null || true
+        fi
+    fi
+
+    if [ -n "$pid" ] || [ -n "$child" ]; then
+        rm -f "$PID_FILE" "$CHILD_PID_FILE"
+        log_ok "OxideSwarm worker stopped."
     else
         log_info "No active worker PID file found."
     fi
@@ -218,19 +275,27 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         --master)
-            MASTER_ADDR="$2"
+            MASTER_ADDR="${2:?--master needs HOST:8088}"
             shift 2
             ;;
+        --secret-file)
+            SECRET_FILE="${2:?--secret-file needs a PATH}"
+            shift 2
+            ;;
+        --insecure)
+            INSECURE=true
+            shift
+            ;;
         --name)
-            WORKER_NAME="$2"
+            WORKER_NAME="${2:?--name needs a value}"
             shift 2
             ;;
         --cores)
-            CORES="$2"
+            CORES="${2:?--cores needs a value}"
             shift 2
             ;;
         --ram-mb)
-            RAM_MB="$2"
+            RAM_MB="${2:?--ram-mb needs a value}"
             shift 2
             ;;
         --simulate-gpu)
@@ -249,6 +314,21 @@ done
 
 BINARY=$(locate_binary)
 
+# The config file decides the target unless --master was given.
+config_has_target() {
+    [ -f "$CONFIG_FILE" ] && grep -Eq '^[[:space:]]*(master|p2p_ticket)[[:space:]]*=' "$CONFIG_FILE"
+}
+if [ -z "$MASTER_ADDR" ] && ! config_has_target; then
+    log_err "No master configured. Set master = \"HOST:8088\" (or p2p_ticket) in ${CONFIG_FILE},"
+    log_err "or pass --master HOST:8088. Use the master's CLUSTER port 8088, not the dashboard port 8080."
+    exit 1
+fi
+case "$MASTER_ADDR" in
+    *:8080)
+        log_warn "Port 8080 is the master's DASHBOARD. Workers connect to the cluster port (normally 8088)."
+        ;;
+esac
+
 # If default name not supplied, build one from Android device model
 if [ -z "$WORKER_NAME" ]; then
     DEVICE_MODEL=""
@@ -261,8 +341,13 @@ if [ -z "$WORKER_NAME" ]; then
     WORKER_NAME="android-${DEVICE_MODEL}"
 fi
 
-# Assemble worker command arguments
-WORKER_ARGS=("worker" "--master" "${MASTER_ADDR}" "--name" "${WORKER_NAME}" "--sandbox-base-dir" "${SANDBOX_DIR}")
+# Assemble worker command arguments. Nothing is passed unless it was asked for, so the config
+# file keeps control (command-line flags would override it).
+WORKER_ARGS=("worker" "--name" "${WORKER_NAME}" "--sandbox-base-dir" "${SANDBOX_DIR}")
+
+if [ -n "$MASTER_ADDR" ]; then
+    WORKER_ARGS+=("--master" "${MASTER_ADDR}")
+fi
 
 if [ -n "$CORES" ]; then
     WORKER_ARGS+=("--cores" "${CORES}")
@@ -276,6 +361,14 @@ if [ "$SIMULATE_GPU" = true ]; then
     WORKER_ARGS+=("--simulate-gpu")
 fi
 
+if [ -n "$SECRET_FILE" ]; then
+    WORKER_ARGS+=("--secret-file" "${SECRET_FILE}")
+fi
+
+if [ "$INSECURE" = true ]; then
+    WORKER_ARGS+=("--insecure")
+fi
+
 if [ -f "$CONFIG_FILE" ]; then
     WORKER_ARGS+=("--config" "${CONFIG_FILE}")
 fi
@@ -284,15 +377,31 @@ fi
 run_supervision_loop() {
     acquire_wake_lock
 
-    # Setup trap to clean up wake-lock and child on termination
-    trap 'log_info "Interrupted; terminating worker loop..."; release_wake_lock; exit 0' SIGINT SIGTERM SIGHUP
+    CHILD_PID=""
+    SHUTTING_DOWN=false
+
+    # Forward the stop to the worker: a plain `exit` would leave the child running, and bash only
+    # runs a trap after a foreground child ends, so the worker runs in the background and is
+    # `wait`ed for (wait is interrupted by a trapped signal).
+    on_stop_signal() {
+        SHUTTING_DOWN=true
+        log_info "Stop requested; terminating worker loop..."
+        if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+            kill -TERM "$CHILD_PID" 2>/dev/null || true
+            wait_for_exit "$CHILD_PID" 5 || kill -KILL "$CHILD_PID" 2>/dev/null || true
+        fi
+        rm -f "$CHILD_PID_FILE"
+        release_wake_lock
+        exit 0
+    }
+    trap on_stop_signal INT TERM HUP
 
     local consecutive_failures=0
     local max_backoff=30
 
     log_info "Starting OxideSwarm Worker Supervision Loop"
     log_info "Binary:       ${BINARY}"
-    log_info "Master:       ${MASTER_ADDR}"
+    log_info "Master:       ${MASTER_ADDR:-<from ${CONFIG_FILE}>}"
     log_info "Worker Name:  ${WORKER_NAME}"
     log_info "Command:      ${BINARY} ${WORKER_ARGS[*]}"
 
@@ -302,10 +411,13 @@ run_supervision_loop() {
         start_ts=$(date +%s)
 
         log_ok "Spawning worker engine process..."
-        set +e
-        "$BINARY" "${WORKER_ARGS[@]}"
+        "$BINARY" "${WORKER_ARGS[@]}" &
+        CHILD_PID=$!
+        echo "$CHILD_PID" > "$CHILD_PID_FILE"
+        wait "$CHILD_PID"
         local exit_code=$?
-        set -e
+        CHILD_PID=""
+        rm -f "$CHILD_PID_FILE"
 
         local end_ts
         end_ts=$(date +%s)
@@ -330,28 +442,32 @@ run_supervision_loop() {
         fi
 
         log_info "Restarting worker in ${backoff} seconds (failure count: ${consecutive_failures})..."
-        sleep "$backoff"
+        sleep "$backoff" &
+        wait $!
     done
 }
 
 if [ "$MODE" = "daemon" ]; then
     # Check if already running
-    if [ -f "$PID_FILE" ]; then
-        EXISTING_PID=$(cat "$PID_FILE" 2>/dev/null || echo "")
-        if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
-            log_warn "Worker is already running (PID ${EXISTING_PID})."
-            exit 0
-        fi
+    EXISTING_PID="$(read_pid_file "$PID_FILE")"
+    if [ -n "$EXISTING_PID" ] && pid_alive "$EXISTING_PID"; then
+        log_warn "Worker is already running (PID ${EXISTING_PID})."
+        exit 0
     fi
 
     log_info "Launching worker in background daemon mode..."
     rotate_logs_if_needed
 
-    # Run supervision loop under nohup
-    nohup "$0" --foreground --master "${MASTER_ADDR}" --name "${WORKER_NAME}" \
-        ${CORES:+--cores "$CORES"} ${RAM_MB:+--ram-mb "$RAM_MB"} \
-        ${SIMULATE_GPU:+--simulate-gpu} \
-        >> "${LOG_FILE}" 2>&1 &
+    # Re-run this script as the supervisor, forwarding exactly the options that were given.
+    DAEMON_ARGS=("--foreground" "--name" "${WORKER_NAME}")
+    if [ -n "$MASTER_ADDR" ]; then DAEMON_ARGS+=("--master" "${MASTER_ADDR}"); fi
+    if [ -n "$CORES" ]; then DAEMON_ARGS+=("--cores" "${CORES}"); fi
+    if [ -n "$RAM_MB" ]; then DAEMON_ARGS+=("--ram-mb" "${RAM_MB}"); fi
+    if [ -n "$SECRET_FILE" ]; then DAEMON_ARGS+=("--secret-file" "${SECRET_FILE}"); fi
+    if [ "$SIMULATE_GPU" = true ]; then DAEMON_ARGS+=("--simulate-gpu"); fi
+    if [ "$INSECURE" = true ]; then DAEMON_ARGS+=("--insecure"); fi
+
+    nohup "$0" "${DAEMON_ARGS[@]}" >> "${LOG_FILE}" 2>&1 &
 
     DAEMON_PID=$!
     echo "$DAEMON_PID" > "$PID_FILE"

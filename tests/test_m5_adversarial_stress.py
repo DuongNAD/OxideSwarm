@@ -28,6 +28,22 @@ OXIDE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 BIN_PATH = os.path.join(OXIDE_ROOT, "target", "debug", "rusty-grid")
 BENCH_DIR = os.path.join(OXIDE_ROOT, "benchmarks", "interconnect")
 
+
+def isolated_env(home_dir):
+    """Environment for child processes that must not touch the developer's real ~/.oxideswarm.
+
+    A master started with --p2p creates cluster.secret (and, without a key file, master_key.bin)
+    under HOME, and connect_remote.sh keeps its state under OXIDESWARM_HOME, so both point at
+    a private directory here.
+    """
+    env = os.environ.copy()
+    env["HOME"] = home_dir
+    env["USERPROFILE"] = home_dir
+    env["OXIDESWARM_HOME"] = os.path.join(home_dir, ".oxideswarm")
+    for name in ("OXIDESWARM_SECRET", "OXIDESWARM_SECRET_FILE", "RUSTY_GRID_CONFIG"):
+        env.pop(name, None)
+    return env
+
 def print_header(title):
     print(f"\n\033[1;36m=== {title} ===\033[0m")
 
@@ -40,6 +56,8 @@ def print_fail(msg):
 def test_p2p_ticket_fuzzing():
     print_header("CHALLENGE 1: Adversarial P2P Ticket Validation & Fuzzing")
     script = os.path.join(OXIDE_ROOT, "connect_remote.sh")
+    fuzz_tmp = tempfile.TemporaryDirectory(prefix="oxide_fuzz_home_")  # removed when the function returns
+    fuzz_env = isolated_env(fuzz_tmp.name)
     
     # Structural invalid cases that MUST be rejected by connect_remote.sh upfront
     shell_rejected_cases = [
@@ -57,6 +75,7 @@ def test_p2p_ticket_fuzzing():
             res = subprocess.run(
                 ["bash", script, case, "--dry-run"],
                 cwd=OXIDE_ROOT,
+                env=fuzz_env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -84,6 +103,7 @@ def test_p2p_ticket_fuzzing():
         res = subprocess.run(
             ["bash", script, case, "--dry-run"],
             cwd=OXIDE_ROOT,
+            env=fuzz_env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -107,6 +127,7 @@ def test_multi_restart_ticket_determinism():
 
     tickets = []
     key_hashes = []
+    master_env = isolated_env(tmp_dir)
 
     try:
         for cycle in range(1, 6):
@@ -121,7 +142,7 @@ def test_multi_restart_ticket_determinism():
                 "--p2p-key-file", key_file,
                 "--p2p-ticket-file", ticket_file
             ]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            proc = subprocess.Popen(cmd, env=master_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
             # Wait for ticket file
             start = time.time()
@@ -178,6 +199,7 @@ def test_negative_control_ephemeral_key():
     port_file = os.path.join(tmp_dir, "master.port")
 
     tickets = []
+    master_env = isolated_env(tmp_dir)
     try:
         for run in range(3):
             if os.path.exists(ticket_file): os.remove(ticket_file)
@@ -191,7 +213,7 @@ def test_negative_control_ephemeral_key():
                 "--ephemeral-key",
                 "--p2p-ticket-file", ticket_file
             ]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            proc = subprocess.Popen(cmd, env=master_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
             start = time.time()
             while time.time() - start < 10:

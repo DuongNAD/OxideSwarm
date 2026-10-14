@@ -33,6 +33,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 toml = { workspace = true }
 
+[features]
+# Workers of this binary can compute on the GPU (Metal, Vulkan, DirectX 12) and advertise it:
+#   cargo build --release --bin oxideswarm --features gpu-wgpu
+# Without it `--gpu` is refused (no GPU is advertised) and only `--simulate-gpu` is available.
+gpu-wgpu = ["rusty_grid_worker/gpu-wgpu"]
+
 [dev-dependencies]
 tempfile = "3"
 futures = { workspace = true }
@@ -75,3 +81,18 @@ path = "../../tests/test_m2_identity_scripts.rs"
 
 
 
+[[test]]
+name = "cli_secret_e2e"
+path = "../../tests/cli_secret_e2e.rs"
+
+[[test]]
+name = "cli_worker_signals_e2e"
+path = "../../tests/cli_worker_signals_e2e.rs"
+
+[[test]]
+name = "cli_dashboard_policy_e2e"
+path = "../../tests/cli_dashboard_policy_e2e.rs"
+
+[[test]]
+name = "cli_worker_identity_e2e"
+path = "../../tests/cli_worker_identity_e2e.rs"

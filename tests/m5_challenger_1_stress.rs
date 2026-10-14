@@ -736,7 +736,11 @@ fn test_adversarial_master_listen_address_validation() {
 
     // 2. Verify CLI binary exits with failure (code 1) when given an invalid listen address
     let bin_path = env!("CARGO_BIN_EXE_rusty-grid");
+    // The CLI resolves ~/.oxideswarm/cluster.secret; keep this test off the developer's real home.
+    let home = TempDir::new().expect("create temp home");
     let output = Command::new(bin_path)
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .arg("master")
         .arg("--listen")
         .arg("invalid_socket_address:abc")
@@ -777,6 +781,8 @@ fn test_adversarial_p2p_ticket_malformed_rejection() {
 #[test]
 fn test_adversarial_cli_missing_and_invalid_arguments() {
     let bin_path = env!("CARGO_BIN_EXE_rusty-grid");
+    // The client commands resolve ~/.oxideswarm/cluster.secret; keep this test off the real home.
+    let home = TempDir::new().expect("create temp home");
 
     // 1. Invoking CLI with zero arguments: missing subcommand
     let output_no_args = Command::new(bin_path).output().expect("invoke CLI");
@@ -812,6 +818,8 @@ fn test_adversarial_cli_missing_and_invalid_arguments() {
 
     // 4. Submitting task to closed/non-listening port
     let output_submit_closed = Command::new(bin_path)
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .arg("submit")
         .arg("--master")
         .arg("127.0.0.1:1") // Closed port

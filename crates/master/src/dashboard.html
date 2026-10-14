@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="google" content="notranslate">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <!-- Defence in depth: no external scripts/frames/objects, no <base>/form hijack. connect-src stays open to http(s) for the LAN master probe. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http: https:; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
     <title>OxideSwarm Mobile Cluster</title>
     <style>
         :root[data-theme="dark"] {
@@ -67,20 +69,22 @@
 
         /* Top Header Bar */
         .topbar {
-            height: 48px;
-            padding: 0 12px;
+            min-height: 48px;
+            padding: 6px 12px;
             background: var(--surface);
             border-bottom: 1px solid var(--border);
             display: flex;
             justify-content: space-between;
             align-items: center;
             flex-shrink: 0;
-            gap: 8px;
+            gap: 6px 8px;
+            flex-wrap: wrap;
         }
         .top-left {
             display: flex;
             flex-direction: column;
             gap: 2px;
+            flex: 1 1 120px;
             min-width: 0;
         }
         .brand-title {
@@ -103,8 +107,20 @@
         .top-actions {
             display: flex;
             align-items: center;
+            justify-content: flex-end;
+            flex-wrap: wrap;
             gap: 6px;
             flex-shrink: 0;
+        }
+        /* Phones: row 1 = brand + cluster summary + latency/sync/theme, row 2 = the three text pills.
+           .top-actions dissolves (display: contents) so its children can be ordered into those rows. */
+        @media (max-width: 600px) {
+            .top-actions { display: contents; }
+            .top-left { order: 0; flex: 1 1 140px; }
+            .latency-pill { order: 1; }
+            .sync-btn { order: 2; }
+            .theme-btn { order: 3; }
+            .wake-pill { order: 4; flex: 1 1 auto; justify-content: center; min-height: 28px; }
         }
         .latency-pill {
             font-size: 10.5px;
@@ -876,7 +892,7 @@
 
         /* Ultra-Narrow Screens (<380px) */
         @media (max-width: 380px) {
-            .topbar { padding: 0 8px; }
+            .topbar { padding: 6px 8px; }
             .brand-title { font-size: 14px; }
             .tab-btn { font-size: 11px; padding: 5px 6px; }
             .node-name { max-width: 100px; }
@@ -998,6 +1014,23 @@
             transform: scale(0.98);
             border-color: var(--accent);
         }
+
+        /* Token prompt shown on any 401 (sits above the device modal and toasts' backdrop) */
+        .login-overlay { z-index: 2000; }
+        .login-text {
+            font-size: 12px;
+            color: var(--text-dim);
+            line-height: 1.5;
+            margin-bottom: 10px;
+        }
+        .login-input { width: 100%; }
+        .login-error {
+            min-height: 16px;
+            margin-top: 6px;
+            font-size: 11.5px;
+            font-weight: 600;
+            color: var(--dot-red);
+        }
     </style>
 </head>
 <body>
@@ -1091,7 +1124,7 @@
                 <div class="topology-card">
                     <div class="topology-header">
                         <span>🗺️ SƠ ĐỒ TOPOLOGY PHÂN TÁN (P2P MESH)</span>
-                        <span class="topo-badge" id="topoBadge">🟢 20 Cores Live</span>
+                        <span class="topo-badge" id="topoBadge">⚪ Đang đồng bộ...</span>
                     </div>
                     <div class="topology-diagram" id="topologyDiagram">Đang dựng sơ đồ topology...</div>
                 </div>
@@ -1248,7 +1281,255 @@
         </div>
     </div>
 
+    <!-- Token prompt (opened by any 401 response; token is kept in sessionStorage only) -->
+    <div class="modal-overlay login-overlay" id="loginOverlay" role="dialog" aria-modal="true" aria-labelledby="loginTitle">
+        <form class="modal-sheet" id="loginForm" autocomplete="off">
+            <div class="modal-header">
+                <div class="modal-title" id="loginTitle">🔒 Cần token truy cập</div>
+            </div>
+            <div class="login-text">Master yêu cầu xác thực. Nhập token của cụm (Observer cho chế độ xem, Submitter/Admin để chạy lệnh). Token chỉ được giữ trong phiên trình duyệt này.</div>
+            <input type="password" id="tokenInput" class="cmd-input login-input" placeholder="Token" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" maxlength="256">
+            <div class="login-error" id="loginError" role="alert"></div>
+            <div class="modal-actions">
+                <button type="submit" class="modal-btn modal-btn-primary">Đăng nhập</button>
+            </div>
+        </form>
+    </div>
+
     <script>
+        // ===================================================================
+        // 0. Safety foundations
+        //   * Every server-provided string reaches the DOM through textContent or the
+        //     html`` tag below, which HTML-escapes every interpolation unless it is
+        //     itself html``/raw() output. setHtml() holds the ONLY innerHTML assignment.
+        //   * Auth: the token lives in sessionStorage and goes out as "Authorization:
+        //     Bearer" via apiFetch(). Any 401 opens the token prompt (see showLogin()).
+        //   * Remote URLs (redirect_url, probed hosts) are never assigned to location
+        //     unless parseSafeUrl() accepts them (http/https, host[:port], no credentials).
+        // ===================================================================
+        function escapeHtml(s) {
+            if (s === null || s === undefined) return '';
+            return String(s)
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+        class SafeHtml {
+            constructor(s) { this.s = s; }
+            toString() { return this.s; }
+        }
+        function raw(s) { return new SafeHtml(String(s)); }
+        function joinHtml(parts, sep) {
+            return raw(parts.map(p => (p instanceof SafeHtml ? p.s : escapeHtml(p))).join(sep || ''));
+        }
+        // Tagged template: interpolations are escaped unless they are SafeHtml (or arrays of it).
+        // Only the author-written static parts are tidied (indentation between tags would otherwise
+        // show up as blank lines inside the white-space: pre-wrap report boxes).
+        function html(strings, ...vals) {
+            const last = strings.length - 1;
+            const tidy = (s, i) => {
+                let t = s.replace(/>\s+</g, '><');
+                if (i === 0) t = t.replace(/^\s+/, '');
+                if (i === last) t = t.replace(/\s+$/, '');
+                return t;
+            };
+            let out = tidy(strings[0], 0);
+            for (let i = 0; i < vals.length; i++) {
+                const v = vals[i];
+                const piece = v instanceof SafeHtml ? v.s : (Array.isArray(v) ? joinHtml(v).s : escapeHtml(v));
+                out += piece + tidy(strings[i + 1], i + 1);
+            }
+            return new SafeHtml(out);
+        }
+        function setHtml(el, safe) {
+            if (!el) return;
+            // Only SafeHtml (built by html``/raw()) may be parsed as markup; anything else is shown as text.
+            if (safe instanceof SafeHtml) el.innerHTML = safe.s;
+            else el.textContent = (safe === null || safe === undefined) ? '' : String(safe);
+        }
+
+        function num(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
+        function fmtGb(mb) { return (num(mb) / 1024).toFixed(1); }
+        function shortText(s, max) {
+            const t = (s === null || s === undefined) ? '' : String(s);
+            return t.length > max ? t.slice(0, max - 1) + '…' : t;
+        }
+        const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+        function isOnlineStatus(status) { return status === 'Connected' || status === 'Busy'; }
+
+        // ---- Token storage (sessionStorage, with an in-memory fallback for blocked storage) ----
+        const TOKEN_KEY = 'ox_token';
+        let memToken = '';
+        function validToken(t) { return typeof t === 'string' && /^[\x21-\x7e]{1,256}$/.test(t); }
+        function getToken() {
+            try { return sessionStorage.getItem(TOKEN_KEY) || memToken; } catch (_) { return memToken; }
+        }
+        function saveToken(t) {
+            memToken = t;
+            try { sessionStorage.setItem(TOKEN_KEY, t); } catch (_) {}
+        }
+        function clearToken() {
+            memToken = '';
+            try { sessionStorage.removeItem(TOKEN_KEY); } catch (_) {}
+        }
+        // A token may be handed over once via "#token=..." (never sent to the server or logged);
+        // "?token=" is accepted too. Both are stripped from the address bar right away.
+        (function bootstrapToken() {
+            try {
+                const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+                const query = new URLSearchParams(window.location.search);
+                const found = (fragment.get('token') || query.get('token') || '').trim();
+                if (!fragment.has('token') && !query.has('token')) return;
+                if (validToken(found)) saveToken(found);
+                fragment.delete('token');
+                query.delete('token');
+                const search = query.toString();
+                const hash = fragment.toString();
+                history.replaceState(null, '', window.location.pathname + (search ? '?' + search : '') + (hash ? '#' + hash : ''));
+            } catch (_) {}
+        })();
+
+        class AuthError extends Error {
+            constructor(message) {
+                super(message || 'Authentication required');
+                this.name = 'AuthError';
+                this.isAuth = true;
+            }
+        }
+        let authBlocked = false; // true while the token prompt is open: no API traffic until a token is entered
+
+        // Every call to this master goes through here so the Bearer token is attached and a 401 opens the prompt.
+        async function apiFetch(path, opts) {
+            if (authBlocked) throw new AuthError('Token prompt is open');
+            const o = Object.assign({ cache: 'no-store' }, opts || {});
+            o.headers = Object.assign({}, o.headers || {});
+            const token = getToken();
+            if (token) o.headers['Authorization'] = 'Bearer ' + token;
+            const res = await fetch(path, o);
+            if (res.status === 401) {
+                if (token) clearToken(); // the stored token was rejected
+                showLogin(token ? 'Token không hợp lệ hoặc đã hết hạn.' : '');
+                throw new AuthError();
+            }
+            return res;
+        }
+
+        function showLogin(message) {
+            authBlocked = true;
+            const overlay = document.getElementById('loginOverlay');
+            if (overlay) overlay.classList.add('active');
+            const err = document.getElementById('loginError');
+            if (err) err.textContent = message || '';
+            const input = document.getElementById('tokenInput');
+            if (input) {
+                input.value = '';
+                setTimeout(() => { try { input.focus(); } catch (_) {} }, 50);
+            }
+            renderAuthRequired();
+        }
+
+        function submitLogin(ev) {
+            if (ev) ev.preventDefault();
+            const input = document.getElementById('tokenInput');
+            const err = document.getElementById('loginError');
+            const token = input ? input.value.trim() : '';
+            if (!validToken(token)) {
+                if (err) err.textContent = 'Token không hợp lệ (chỉ ký tự ASCII, không có khoảng trắng).';
+                return;
+            }
+            saveToken(token);
+            if (input) input.value = '';
+            if (err) err.textContent = '';
+            authBlocked = false;
+            const overlay = document.getElementById('loginOverlay');
+            if (overlay) overlay.classList.remove('active');
+            syncData().catch(() => {});
+        }
+        (function wireLoginForm() {
+            const form = document.getElementById('loginForm');
+            if (form) form.addEventListener('submit', submitLogin);
+        })();
+
+        function renderAuthRequired() {
+            const pill = document.getElementById('latencyPill');
+            if (pill) {
+                pill.textContent = 'Auth';
+                pill.style.color = 'var(--dot-busy)';
+            }
+            setSummary(html`<span style="color:var(--dot-busy)">🔒 Cần token</span>`);
+        }
+        function setSummary(safe) { setHtml(document.getElementById('clusterSummary'), safe); }
+
+        async function errorText(res) {
+            let t = '';
+            try { t = await res.text(); } catch (_) {}
+            try {
+                const j = JSON.parse(t);
+                if (j && (j.message || j.error)) t = String(j.message || j.error);
+            } catch (_) {}
+            return 'HTTP ' + res.status + (t ? ': ' + t.slice(0, 300) : '');
+        }
+
+        // ---- Hosts / URLs ----
+        // host or host:port, DNS name / IPv4 / bracketed IPv6 only
+        function isHostPort(h) {
+            return typeof h === 'string' && h.length <= 260 &&
+                /^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]{2,45}\])(?::\d{1,5})?$/.test(h);
+        }
+        // Private / loopback / link-local / CGNAT addresses and dotless or mDNS-style names.
+        function isLanHost(hostname) {
+            const h = String(hostname).toLowerCase();
+            if (h.startsWith('[')) {
+                const v6 = h.slice(1, -1);
+                return v6 === '::1' || /^fe[89ab]/.test(v6) || /^f[cd]/.test(v6);
+            }
+            const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+            if (m) {
+                const a = Number(m[1]);
+                const b = Number(m[2]);
+                return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) ||
+                    (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127);
+            }
+            return !h.includes('.') || /\.(local|lan|home\.arpa|internal)$/.test(h);
+        }
+        // Accepts only http(s) URLs with a host[:port] and no credentials; everything else (javascript:, data:, relative...) is null.
+        function parseSafeUrl(rawUrl) {
+            if (typeof rawUrl !== 'string' || rawUrl.length > 300) return null;
+            let u;
+            try { u = new URL(rawUrl); } catch (_) { return null; }
+            if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+            if (!u.hostname || u.username || u.password) return null;
+            if (!isHostPort(u.host)) return null;
+            return u;
+        }
+
+        const KNOWN_HOSTS_KEY = 'ox_known_hosts';
+        function loadKnownHosts() {
+            try {
+                const saved = JSON.parse(localStorage.getItem(KNOWN_HOSTS_KEY) || '[]');
+                return Array.isArray(saved) ? saved.filter(isHostPort).slice(-8) : [];
+            } catch (_) { return []; }
+        }
+        function rememberHost(host) {
+            if (!isHostPort(host)) return;
+            try {
+                const known = loadKnownHosts();
+                if (known.includes(host)) return;
+                known.push(host);
+                localStorage.setItem(KNOWN_HOSTS_KEY, JSON.stringify(known.slice(-8)));
+            } catch (_) {}
+        }
+        function isKnownHost(host) { return host === window.location.host || loadKnownHosts().includes(host); }
+        // Dashboard hosts the master itself advertises in /api/status ("discovery_hosts": ["host:port", ...]).
+        let discoveryHosts = [];
+        function isTrustedTarget(u) {
+            return isLanHost(u.hostname) || isKnownHost(u.host) || discoveryHosts.includes(u.host);
+        }
+        function navigateTo(u) { window.location.assign(u.origin + '/'); }
+
         // 1. Tab Switching (Preserves active terminal buffer)
         function switchTab(name) {
             const isChat = name === 'chat';
@@ -1270,7 +1551,7 @@
             if (btnModes) btnModes.classList.toggle('active', isModes);
 
             if (isDevices) {
-                syncData();
+                syncData().catch(() => {});
             } else if (isModes) {
                 syncModes();
             }
@@ -1281,14 +1562,14 @@
 
         async function syncModes() {
             try {
-                const res = await fetch('/api/modes');
+                const res = await apiFetch('/api/modes');
                 if (!res.ok) return;
                 const data = await res.json();
                 if (data.current_state) {
                     updateModesStatusUi(data.current_state);
                 }
             } catch (e) {
-                console.warn('syncModes error:', e);
+                if (!e.isAuth) console.warn('syncModes error:', e);
             }
         }
 
@@ -1298,7 +1579,7 @@
             const logEl = document.getElementById('modeLogContent');
 
             if (tag) {
-                tag.textContent = state.status ? state.status.toUpperCase() : 'IDLE';
+                tag.textContent = state.status ? String(state.status).toUpperCase() : 'IDLE';
                 if (state.status === 'running') {
                     tag.style.color = 'var(--dot-busy)';
                 } else if (state.status === 'success') {
@@ -1311,12 +1592,12 @@
             }
 
             if (consoleStatus) {
-                consoleStatus.textContent = state.is_running 
+                consoleStatus.textContent = state.is_running
                     ? `● RUNNING (${state.current_mode || ''}/${state.current_action || ''})`
                     : (state.status === 'success' ? '● SUCCESS' : (state.status === 'failed' ? '● FAILED' : '● READY'));
             }
 
-            if (logEl && state.logs && state.logs.length > 0) {
+            if (logEl && Array.isArray(state.logs) && state.logs.length > 0) {
                 logEl.textContent = state.logs.join('\n\n');
                 logEl.scrollTop = logEl.scrollHeight;
             }
@@ -1329,7 +1610,7 @@
             if (logEl) logEl.textContent = `[${new Date().toLocaleTimeString()}] Submitting request to run mode='${mode}', action='${action}'...\n`;
 
             try {
-                const res = await fetch('/api/modes/run', {
+                const res = await apiFetch('/api/modes/run', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ mode, action })
@@ -1344,7 +1625,7 @@
                 if (modePollingInterval) clearInterval(modePollingInterval);
                 modePollingInterval = setInterval(async () => {
                     try {
-                        const statusRes = await fetch('/api/modes/status');
+                        const statusRes = await apiFetch('/api/modes/status');
                         if (!statusRes.ok) return;
                         const statusData = await statusRes.json();
                         updateModesStatusUi(statusData);
@@ -1354,11 +1635,21 @@
                             modePollingInterval = null;
                         }
                     } catch (err) {
-                        console.error('Mode polling error:', err);
+                        if (err.isAuth) {
+                            clearInterval(modePollingInterval);
+                            modePollingInterval = null;
+                        } else {
+                            console.error('Mode polling error:', err);
+                        }
                     }
                 }, 500);
             } catch (e) {
-                if (logEl) logEl.textContent += `\n[NETWORK ERROR] ${e.message}\n`;
+                if (e.isAuth) {
+                    if (logEl) logEl.textContent += `\n[AUTH] Cần token để chạy chế độ này.\n`;
+                    if (consoleStatus) consoleStatus.textContent = '● CẦN TOKEN';
+                } else if (logEl) {
+                    logEl.textContent += `\n[NETWORK ERROR] ${e.message}\n`;
+                }
             }
         }
 
@@ -1371,14 +1662,15 @@
 
         // 2. Light / Dark Mode Toggle with Persistence
         function initTheme() {
-            const saved = localStorage.getItem('ox_theme') || 'dark';
+            let saved = 'dark';
+            try { saved = localStorage.getItem('ox_theme') === 'light' ? 'light' : 'dark'; } catch (_) {}
             document.documentElement.setAttribute('data-theme', saved);
         }
         function toggleTheme() {
             const cur = document.documentElement.getAttribute('data-theme');
             const next = cur === 'dark' ? 'light' : 'dark';
             document.documentElement.setAttribute('data-theme', next);
-            localStorage.setItem('ox_theme', next);
+            try { localStorage.setItem('ox_theme', next); } catch (_) {}
         }
         initTheme();
 
@@ -1398,11 +1690,11 @@
 
         function clearTerminal() {
             const feed = document.getElementById('chatFeed');
-            feed.innerHTML = `
+            setHtml(feed, html`
                 <div class="term-welcome">
                     <div class="welcome-hint">// Terminal cleared. Console ready for commands.</div>
                 </div>
-            `;
+            `);
         }
 
         // 4. Progress Meter Block Generator (■■□□)
@@ -1428,15 +1720,12 @@
             const t0 = performance.now();
             try {
                 await syncData();
-                const latency = Math.round(performance.now() - t0);
-                pill.textContent = `${latency}ms`;
-                pill.style.color = latency < 120 ? 'var(--dot-green)' : (latency < 300 ? 'var(--dot-busy)' : 'var(--dot-red)');
+                paintLatency(Math.round(performance.now() - t0));
             } catch (e) {
-                pill.textContent = 'Err';
-                pill.style.color = 'var(--dot-red)';
-                const summaryEl = document.getElementById('clusterSummary');
-                if (summaryEl) {
-                    summaryEl.innerHTML = '<span style="color:var(--dot-red)">● Disconnected</span>';
+                // syncData() has already painted the matching state (Disconnected / token required).
+                if (!e.isAuth) {
+                    pill.textContent = 'Err';
+                    pill.style.color = 'var(--dot-red)';
                 }
             } finally {
                 isSyncing = false;
@@ -1445,10 +1734,11 @@
         }
         window.manualSync = triggerReload;
 
+        // Toast text is always set as text: nothing in it is ever parsed as markup.
         function showDiscoveryToast(msg, duration = 3000) {
             const t = document.getElementById('discoveryToast');
             if (!t) return;
-            t.innerHTML = msg;
+            t.textContent = msg;
             t.style.display = 'block';
             t.style.opacity = '1';
             clearTimeout(window._discoveryToastTimer);
@@ -1485,275 +1775,257 @@
             }
         }
 
+        // ---- Master discovery / failover ----
+        // Candidates: the page's own host, hosts this browser has used before, and the list the master
+        // publishes in /api/status ("discovery_hosts"). No addresses are baked into the page.
+        const FAILOVER_AFTER_FAILURES = 3;      // consecutive failed polls (~9 s) before any probing/navigation
+        const FAILOVER_PROBE_COOLDOWN_MS = 15000;
         let consecutiveDisconnects = 0;
         let isProbing = false;
+        let lastProbeAt = 0;
+        const declinedTargets = new Set();
+
+        function candidateHosts() {
+            const list = [];
+            const add = (h) => { if (isHostPort(h) && !list.includes(h) && list.length < 16) list.push(h); };
+            add(window.location.host);
+            loadKnownHosts().forEach(add);
+            discoveryHosts.forEach(add);
+            return list;
+        }
+
+        async function probeHost(host) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 1500);
+            try {
+                let res;
+                if (host === window.location.host) {
+                    res = await apiFetch('/api/status', { signal: controller.signal }); // same origin: token attached
+                } else {
+                    const base = `${window.location.protocol}//${host}`;
+                    try {
+                        res = await fetch(`${base}/api/status`, { signal: controller.signal, cache: 'no-store', credentials: 'omit' });
+                    } catch (_) {
+                        // Other masters serve no CORS headers; an opaque response still proves something listens there.
+                        await fetch(`${base}/api/status`, { signal: controller.signal, mode: 'no-cors', cache: 'no-store', credentials: 'omit' });
+                        return { host, ok: true, role: 'REACHABLE' };
+                    }
+                }
+                if (res.status === 401) return { host, ok: true, role: 'REACHABLE' };
+                if (!res.ok) return { host, ok: false, error: 'HTTP ' + res.status };
+                const json = await res.json();
+                if (json && json.master && json.master.role === 'MASTER') {
+                    return { host, ok: true, role: 'MASTER', name: shortText(json.master.host, 64) };
+                }
+                if (json && json.role === 'WORKER_PORTAL') {
+                    const u = parseSafeUrl(json.redirect_url);
+                    if (u && isTrustedTarget(u)) return { host, ok: true, role: 'PORTAL', url: u };
+                    return { host, ok: false, error: 'portal without a usable redirect' };
+                }
+                return { host, ok: false };
+            } catch (err) {
+                return { host, ok: false, error: String(err && err.message) };
+            } finally {
+                clearTimeout(timer);
+            }
+        }
 
         async function probeClusterForActiveMaster() {
             if (isProbing) return null;
             isProbing = true;
             try {
-                const candidateHosts = [
-                    '192.168.1.144:8080',
-                    '192.168.1.123:8080'
-                ];
-                if (window.location.host && !candidateHosts.includes(window.location.host)) {
-                    candidateHosts.push(window.location.host);
-                }
-                const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-                if (isLocal) {
-                    candidateHosts.push('127.0.0.1:8080');
-                    candidateHosts.push('localhost:8080');
-                }
-                try {
-                    const saved = JSON.parse(localStorage.getItem('ox_known_hosts') || '[]');
-                    saved.forEach(h => { if (!candidateHosts.includes(h)) candidateHosts.push(h); });
-                } catch (_) {}
-
-                const probePromises = candidateHosts.map(async (host) => {
-                    const controller = new AbortController();
-                    const timer = setTimeout(() => controller.abort(), 1200);
-                    try {
-                        const res = await fetch(`http://${host}/api/status`, { signal: controller.signal });
-                        clearTimeout(timer);
-                        if (!res.ok) return { host, ok: false, error: 'HTTP ' + res.status };
-                        const json = await res.json();
-                        if (json.master && json.master.role === 'MASTER') {
-                            return { host, ok: true, role: 'MASTER', data: json };
-                        } else if (json.role === 'WORKER_PORTAL') {
-                            let redirectUrl = json.redirect_url;
-                            if (redirectUrl && redirectUrl.includes('127.0.0.1') && !isLocal) {
-                                redirectUrl = host.startsWith('192.168.1.144') ? 'http://192.168.1.123:8080/' : 'http://192.168.1.144:8080/';
-                            }
-                            return { host, ok: true, role: 'PORTAL', redirect_url: redirectUrl, data: json };
-                        }
-                        return { host, ok: false, data: json };
-                    } catch (err) {
-                        return { host, ok: false, error: err.message };
-                    }
-                });
-
-                return await Promise.all(probePromises);
+                return await Promise.all(candidateHosts().map(probeHost));
             } finally {
                 isProbing = false;
             }
         }
 
+        function hostUrl(host) { return new URL(`${window.location.protocol}//${host}/`); }
+
         async function manualMasterScan() {
-            showDiscoveryToast("📡 Đang quét các thiết bị trong mạng LAN...");
+            showDiscoveryToast("📡 Đang quét các thiết bị đã biết...", 4000);
             const results = await probeClusterForActiveMaster();
             if (!results) return;
 
+            const here = window.location.host;
             const masterNode = results.find(r => r.ok && r.role === 'MASTER');
-            const portalNode = results.find(r => r.ok && r.role === 'PORTAL' && r.redirect_url);
+            const portalNode = results.find(r => r.ok && r.role === 'PORTAL' && r.host !== here);
+            const reachableNode = results.find(r => r.ok && r.role === 'REACHABLE' && r.host !== here);
 
             if (masterNode) {
-                if (masterNode.host === window.location.host) {
+                if (masterNode.host === here) {
                     showDiscoveryToast(`✅ Node hiện tại (${masterNode.host}) ĐANG LÀ MASTER hoạt động tốt.`);
                 } else {
-                    showDiscoveryToast(`🚀 Đã tìm thấy MASTER tại ${masterNode.host} (${masterNode.data.master.host}). Đang chuyển hướng trong 1s...`);
-                    setTimeout(() => {
-                        window.location.href = `http://${masterNode.host}/`;
-                    }, 1000);
+                    showDiscoveryToast(`🚀 Đã tìm thấy MASTER tại ${masterNode.host} (${masterNode.name}). Đang chuyển hướng trong 1s...`);
+                    setTimeout(() => navigateTo(hostUrl(masterNode.host)), 1000);
                 }
             } else if (portalNode) {
                 showDiscoveryToast(`🚀 Worker Portal tại ${portalNode.host} chuyển hướng sang Master. Đang chuyển hướng...`);
-                setTimeout(() => {
-                    window.location.href = portalNode.redirect_url;
-                }, 1000);
+                setTimeout(() => navigateTo(portalNode.url), 1000);
+            } else if (reachableNode) {
+                showDiscoveryToast(`🚀 Có dashboard đang chạy tại ${reachableNode.host}. Đang chuyển hướng trong 1s...`);
+                setTimeout(() => navigateTo(hostUrl(reachableNode.host)), 1000);
             } else {
-                showDiscoveryToast("⚠️ Không tìm thấy Master nào đang bật. Vui lòng bật Master trên Mac hoặc máy Case.", 4000);
+                showDiscoveryToast("⚠️ Không tìm thấy Master nào đang bật. Vui lòng bật Master hoặc mở lại từ địa chỉ Master.", 4000);
             }
+        }
+
+        function pickFailoverTarget(results) {
+            const here = window.location.host;
+            const others = results.filter(r => r.ok && r.host !== here);
+            const master = others.find(r => r.role === 'MASTER');
+            if (master) return hostUrl(master.host);
+            const portal = others.find(r => r.role === 'PORTAL');
+            if (portal) return portal.url;
+            const reachable = others.find(r => r.role === 'REACHABLE' && isKnownHost(r.host));
+            return reachable ? hostUrl(reachable.host) : null;
         }
 
         async function handleDisconnectFailover() {
             consecutiveDisconnects++;
-            if (consecutiveDisconnects >= 1) {
-                const results = await probeClusterForActiveMaster();
-                if (!results) return;
-                const masterTarget = results.find(r => r.ok && r.role === 'MASTER' && r.host !== window.location.host);
-                const portalTarget = results.find(r => r.ok && r.role === 'PORTAL' && r.redirect_url && r.host !== window.location.host);
-                const target = masterTarget || portalTarget;
-                if (target) {
-                    const destUrl = target.role === 'PORTAL' ? target.redirect_url : `http://${target.host}/`;
-                    showDiscoveryToast(`⚡ Master đã đổi sang node khác! Tự động chuyển hướng sang: ${destUrl}`, 2500);
-                    setTimeout(() => {
-                        window.location.href = destUrl;
-                    }, 1000);
-                }
+            if (consecutiveDisconnects < FAILOVER_AFTER_FAILURES) return;
+            if (Date.now() - lastProbeAt < FAILOVER_PROBE_COOLDOWN_MS) return;
+            lastProbeAt = Date.now();
+            const results = await probeClusterForActiveMaster();
+            if (!results) return;
+            const target = pickFailoverTarget(results);
+            if (!target || declinedTargets.has(target.host)) return;
+            // Auto-follow only hosts this browser has already used as a dashboard; anything else needs a tap.
+            if (!isKnownHost(target.host) && !confirm(`Master hiện tại không phản hồi. Chuyển sang ${target.host}?`)) {
+                declinedTargets.add(target.host);
+                return;
             }
+            showDiscoveryToast(`⚡ Master đã đổi sang node khác! Tự động chuyển hướng sang: ${target.host}`, 2500);
+            setTimeout(() => navigateTo(target), 1000);
         }
 
         // 6. Synchronize Cluster Data (Uniform Columns, Micro Progress Meters, Rich Telemetry)
         let workers = [];
-        async function syncData() {
-            try {
-                const res = await fetch('/api/status');
-                if (!res.ok) throw new Error('HTTP ' + res.status);
-                const data = await res.json();
 
-                if (data.role === 'WORKER_PORTAL' && data.redirect_url) {
-                    let dest = data.redirect_url;
-                    const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-                    if (dest.includes('127.0.0.1') && !isLocal) {
-                        dest = window.location.host.startsWith('192.168.1.144') ? 'http://192.168.1.123:8080/' : 'http://192.168.1.144:8080/';
-                    }
-                    showDiscoveryToast(`Thiết bị này đang là Worker. Đang chuyển hướng sang Master tại ${dest}...`);
-                    setTimeout(() => {
-                        window.location.replace(dest);
-                    }, 500);
-                    return;
+        // Shared link classification used by the topology, the cards and the modal.
+        function linkKind(w) {
+            const type = String(w.interconnect_type || '');
+            const isRelayed = !!w.is_relayed || type.includes('Relay');
+            const isDirect = !isRelayed && (type.includes('Direct') || type.includes('P2P'));
+            const rtt = (w.rtt_ms !== null && w.rtt_ms !== undefined && Number.isFinite(Number(w.rtt_ms))) ? `${Math.round(Number(w.rtt_ms))}ms` : null;
+            return { isRelayed, isDirect, rtt };
+        }
+
+        // Dynamic Transport Styling for SVG Topology
+        function getTransportStyle(worker) {
+            if (!worker || !isOnlineStatus(worker.status)) {
+                return {
+                    stroke: '#475569',
+                    dash: '3,3',
+                    width: '1.8',
+                    filter: '',
+                    label: 'Offline',
+                    color: '#64748b'
+                };
+            }
+            const { isRelayed, isDirect, rtt } = linkKind(worker);
+
+            if (isDirect) {
+                return {
+                    stroke: '#10b981', // solid glowing green
+                    dash: 'none',
+                    width: '2.2',
+                    filter: 'url(#glowGreen)',
+                    label: rtt ? `Direct P2P • ${rtt}` : 'Direct P2P',
+                    color: '#10b981'
+                };
+            } else if (isRelayed) {
+                return {
+                    stroke: '#f59e0b', // dashed amber
+                    dash: '4,4',
+                    width: '1.8',
+                    filter: '',
+                    label: rtt ? `DERP Relay • ${rtt}` : 'DERP Relay',
+                    color: '#fbbf24'
+                };
+            } else {
+                return {
+                    stroke: '#06b6d4', // dashed cyan
+                    dash: '3,3',
+                    width: '1.8',
+                    filter: '',
+                    label: rtt ? `TCP/LAN • ${rtt}` : 'TCP/LAN',
+                    color: '#38bdf8'
+                };
+            }
+        }
+
+        // "0.0.0.0:8088" (or a loopback address seen from another device) is useless to a phone:
+        // show the host the page was loaded from instead.
+        function masterAddrLabel(addr) {
+            const m = typeof addr === 'string' ? addr.match(/^(\[[^\]]+\]|[^:]+):(\d{1,5})$/) : null;
+            if (!m) return window.location.host;
+            const pageHost = window.location.hostname;
+            const unspecified = m[1] === '0.0.0.0' || m[1] === '[::]';
+            const loopback = m[1] === '127.0.0.1' || m[1] === '[::1]' || m[1] === 'localhost';
+            const pageIsLoopback = pageHost === '127.0.0.1' || pageHost === '[::1]' || pageHost === 'localhost';
+            const host = (unspecified || (loopback && !pageIsLoopback)) ? pageHost : m[1];
+            return `${host}:${m[2]}`;
+        }
+
+        // One SVG node box per real worker (154x50 user units).
+        function topoNode(w, x, y) {
+            const online = isOnlineStatus(w.status);
+            const t = getTransportStyle(w);
+            const role = String(w.role || 'WORKER');
+            const rc = role === 'ORCH' ? { bg: 'rgba(168,85,247,0.2)', fg: '#c084fc' } : { bg: 'rgba(6,182,212,0.2)', fg: '#22d3ee' };
+            return html`
+                        <g transform="translate(${x}, ${y})">
+                            <title>${w.name} (${w.id})</title>
+                            <rect width="154" height="50" rx="6" fill="#1e293b" stroke="${online ? t.stroke : '#334155'}" stroke-width="1"/>
+                            <circle cx="14" cy="15" r="3" fill="${online ? '#10b981' : '#64748b'}"/>
+                            <text x="23" y="15" fill="#f8fafc" font-size="9.5" font-weight="600" font-family="-apple-system, sans-serif">${shortText(w.name, 15)}</text>
+                            <rect x="110" y="7" width="36" height="13" rx="2.5" fill="${rc.bg}"/>
+                            <text x="128" y="16.5" fill="${rc.fg}" font-size="7" font-weight="700" text-anchor="middle">${shortText(role, 6)}</text>
+                            <text x="12" y="30" fill="#94a3b8" font-size="8.5" font-family="-apple-system, sans-serif">${num(w.cpu_cores)} Cores • ${fmtGb(w.ram_mb)} GB RAM</text>
+                            <text x="12" y="42" fill="#64748b" font-size="8" font-family="-apple-system, sans-serif">${t.label} • CPU ${num(w.cpu_usage_pct).toFixed(1)}%</text>
+                        </g>`;
+        }
+
+        // Render Live Topology Diagram: master on top, one node per registered worker, nothing invented.
+        function renderTopology(list, data) {
+            const topoEl = document.getElementById('topologyDiagram');
+            if (!topoEl) return;
+
+            const ROW_H = 62;       // node height 50 + gap 12
+            const FIRST_ROW_Y = 58;
+            const rows = Math.ceil(list.length / 2);
+            const height = list.length ? FIRST_ROW_Y - 6 + rows * ROW_H : 86;
+
+            const branches = [];
+            const nodes = [];
+            let spineEnd = 40;
+            list.forEach((w, i) => {
+                const top = FIRST_ROW_Y + Math.floor(i / 2) * ROW_H;
+                const cy = top + 25;
+                const t = getTransportStyle(w);
+                const filterAttr = t.filter ? html`filter="${t.filter}"` : '';
+                const lone = i === list.length - 1 && list.length % 2 === 1;
+                if (lone) {
+                    // Last odd node sits centred under the master, joined by a short vertical stub.
+                    nodes.push(topoNode(w, 98, top));
+                    branches.push(html`<path d="M 175 ${top - 18} V ${top}" fill="none" stroke="${t.stroke}" stroke-width="${t.width}" stroke-dasharray="${t.dash}" ${filterAttr}/>`);
+                    spineEnd = Math.max(spineEnd, top - 18);
+                } else {
+                    const left = i % 2 === 0;
+                    nodes.push(topoNode(w, left ? 8 : 188, top));
+                    branches.push(html`<path d="M 175 ${cy} H ${left ? 162 : 188}" fill="none" stroke="${t.stroke}" stroke-width="${t.width}" stroke-dasharray="${t.dash}" ${filterAttr}/>`);
+                    spineEnd = Math.max(spineEnd, cy);
                 }
+            });
 
-                consecutiveDisconnects = 0;
-                try {
-                    const known = JSON.parse(localStorage.getItem('ox_known_hosts') || '[]');
-                    if (!known.includes(window.location.host)) {
-                        known.push(window.location.host);
-                        localStorage.setItem('ox_known_hosts', JSON.stringify(known));
-                    }
-                } catch (_) {}
+            const empty = list.length === 0
+                ? html`<text x="175" y="66" fill="#94a3b8" font-size="9" font-family="-apple-system, sans-serif" text-anchor="middle">Chưa có worker nào kết nối</text>`
+                : '';
 
-                let totalCores = 0;
-                let totalRamMb = 0;
-                workers = data.workers || [];
-
-                workers.forEach(w => {
-                    totalCores += w.cpu_cores || 0;
-                    totalRamMb += w.ram_mb || 0;
-                });
-
-                const totalNodes = workers.length + (data.master ? 1 : 0);
-                const hasDegraded = workers.some(w => w.status === 'Disconnected');
-                const clusterHealth = hasDegraded ? 'Degraded' : 'Healthy';
-                const healthColor = hasDegraded ? 'var(--dot-busy)' : 'var(--dot-green)';
-
-                // Update Topbar and Banner Summaries
-                const summaryEl = document.getElementById('clusterSummary');
-                if (summaryEl) {
-                    summaryEl.innerHTML = `<span style="color:${healthColor}">●</span> ${totalNodes} devices (${totalCores}c) • ${clusterHealth}`;
-                }
-                const sumCoresEl = document.getElementById('sumCores');
-                if (sumCoresEl) sumCoresEl.textContent = `${totalCores} Cores`;
-                const sumRamEl = document.getElementById('sumRam');
-                if (sumRamEl) sumRamEl.textContent = `${(totalRamMb / 1024).toFixed(1)} GB`;
-                const healthEl = document.getElementById('clusterHealth');
-                if (healthEl) {
-                    healthEl.textContent = clusterHealth;
-                    healthEl.style.color = healthColor;
-                }
-                const badgeEl = document.getElementById('tabDevicesBadge');
-                if (badgeEl) badgeEl.textContent = totalNodes;
-
-                if (data.master) {
-                    const masterEl = document.getElementById('masterStatus');
-                    if (masterEl) {
-                        masterEl.innerHTML = `Master: <strong class="tag-master">${escapeHtml(data.master.host || 'OxideSwarm')} (Coordinator)</strong>`;
-                    }
-                }
-
-                // Store P2P ticket for 1-Click Copy
-                window.currentP2pTicket = data.p2p_ticket || null;
-                const copyBtn = document.getElementById('copyTicketBtn');
-                if (copyBtn) {
-                    if (data.p2p_ticket) {
-                        copyBtn.title = `Sao chép vé P2P kết nối Master: ${data.p2p_ticket.substring(0, 16)}...`;
-                    } else {
-                        copyBtn.title = "Master chưa cấu hình P2P Ticket";
-                    }
-                }
-
-                // Visual Degradation Alert Banner: DERP Relay or RTT > 150ms
-                const degradedWorkers = workers.filter(w => (w.status === 'Connected' || w.status === 'Busy') && (w.is_relayed || (w.rtt_ms !== null && w.rtt_ms !== undefined && w.rtt_ms > 150)));
-                const degBanner = document.getElementById('degradationAlertBanner');
-                if (degBanner) {
-                    if (degradedWorkers.length > 0) {
-                        const issues = degradedWorkers.map(w => {
-                            const reasons = [];
-                            if (w.is_relayed) reasons.push('DERP Relay');
-                            if (w.rtt_ms !== null && w.rtt_ms !== undefined && w.rtt_ms > 150) reasons.push(`Độ trễ cao ${Math.round(w.rtt_ms)}ms`);
-                            return `<strong>${escapeHtml(w.name || w.id)}</strong> (${reasons.join(', ')})`;
-                        });
-                        degBanner.innerHTML = `<span class="alert-icon">⚠️</span><span class="alert-text"><strong>Cảnh báo chất lượng kết nối:</strong> ${issues.join(' • ')}</span>`;
-                        degBanner.style.display = 'flex';
-                    } else {
-                        degBanner.style.display = 'none';
-                    }
-                }
-
-                // Dynamic Transport Styling for SVG Topology
-                function getTransportStyle(worker) {
-                    if (!worker) {
-                        return {
-                            stroke: '#475569',
-                            dash: '3,3',
-                            width: '1.8',
-                            filter: '',
-                            label: 'Offline',
-                            color: '#64748b'
-                        };
-                    }
-                    const isRelayed = !!worker.is_relayed || (worker.interconnect_type && worker.interconnect_type.includes('Relay'));
-                    const isDirect = !isRelayed && (worker.interconnect_type && (worker.interconnect_type.includes('Direct') || worker.interconnect_type.includes('P2P')));
-                    const rtt = (worker.rtt_ms !== null && worker.rtt_ms !== undefined) ? `${Math.round(worker.rtt_ms)}ms` : null;
-
-                    if (isDirect) {
-                        return {
-                            stroke: '#10b981', // solid glowing green
-                            dash: 'none',
-                            width: '2.2',
-                            filter: 'url(#glowGreen)',
-                            label: rtt ? `Direct P2P • ${rtt}` : 'Direct P2P',
-                            color: '#10b981'
-                        };
-                    } else if (isRelayed) {
-                        return {
-                            stroke: '#f59e0b', // dashed amber
-                            dash: '4,4',
-                            width: '1.8',
-                            filter: '',
-                            label: rtt ? `DERP Relay • ${rtt}` : 'DERP Relay',
-                            color: '#fbbf24'
-                        };
-                    } else {
-                        return {
-                            stroke: '#06b6d4', // dashed cyan
-                            dash: '3,3',
-                            width: '1.8',
-                            filter: '',
-                            label: rtt ? `TCP/LAN • ${rtt}` : 'TCP/LAN',
-                            color: '#38bdf8'
-                        };
-                    }
-                }
-
-                // Render Live Topology Diagram
-                const topoEl = document.getElementById('topologyDiagram');
-                if (topoEl) {
-                    const phoneW = workers.find(w => w.name && (w.name.includes('phone') || w.name.includes('android'))) || workers[0];
-                    const macW = workers.find(w => w.name && (w.name.includes('mac') || w.name.includes('pc'))) || workers[1];
-
-                    const pCores = phoneW ? phoneW.cpu_cores : 10;
-                    const pRam = phoneW ? (phoneW.ram_mb / 1024).toFixed(1) : '10.9';
-                    const pCpu = phoneW ? parseFloat(phoneW.cpu_usage_pct || 0).toFixed(1) : '0.0';
-
-                    const mCores = macW ? macW.cpu_cores : 10;
-                    const mRam = macW ? (macW.ram_mb / 1024).toFixed(1) : '32.0';
-                    const mCpu = macW ? parseFloat(macW.cpu_usage_pct || 0).toFixed(1) : '0.0';
-
-                    const pTransport = getTransportStyle(phoneW);
-                    const mTransport = getTransportStyle(macW);
-
-                    topoEl.innerHTML = `
-                    <svg viewBox="0 0 350 155" style="width:100%; height:auto; display:block; border-radius:6px; background:#0b1120;" xmlns="http://www.w3.org/2000/svg">
+            setHtml(topoEl, html`
+                    <svg viewBox="0 0 350 ${height}" style="width:100%; height:auto; display:block; border-radius:6px; background:#0b1120;" xmlns="http://www.w3.org/2000/svg">
                         <defs>
-                            <linearGradient id="gLineL" x1="0%" y1="0%" x2="0%" y2="100%">
-                                <stop offset="0%" stop-color="#38bdf8"/>
-                                <stop offset="100%" stop-color="#06b6d4"/>
-                            </linearGradient>
-                            <linearGradient id="gLineR" x1="0%" y1="0%" x2="0%" y2="100%">
-                                <stop offset="0%" stop-color="#38bdf8"/>
-                                <stop offset="100%" stop-color="#a855f7"/>
-                            </linearGradient>
                             <filter id="glowGreen" x="-20%" y="-20%" width="140%" height="140%">
                                 <feGaussianBlur stdDeviation="2" result="blur" />
                                 <feMerge>
@@ -1763,66 +2035,110 @@
                             </filter>
                         </defs>
 
-                        <!-- Connector Lines -->
-                        <path d="M 175 40 C 175 72, 85 72, 85 96" fill="none" stroke="${pTransport.stroke}" stroke-width="${pTransport.width}" stroke-dasharray="${pTransport.dash}" ${pTransport.filter ? `filter="${pTransport.filter}"` : ''}/>
-                        <path d="M 175 40 C 175 72, 265 72, 265 96" fill="none" stroke="${mTransport.stroke}" stroke-width="${mTransport.width}" stroke-dasharray="${mTransport.dash}" ${mTransport.filter ? `filter="${mTransport.filter}"` : ''}/>
-
-                        <!-- Tags on Lines -->
-                        <rect x="62" y="58" width="82" height="14" rx="3" fill="#1e293b" stroke="${pTransport.stroke}"/>
-                        <text x="103" y="68" fill="${pTransport.color}" font-size="7.5" font-family="-apple-system, sans-serif" font-weight="600" text-anchor="middle">${pTransport.label}</text>
-
-                        <rect x="206" y="58" width="82" height="14" rx="3" fill="#1e293b" stroke="${mTransport.stroke}"/>
-                        <text x="247" y="68" fill="${mTransport.color}" font-size="7.5" font-family="-apple-system, sans-serif" font-weight="600" text-anchor="middle">${mTransport.label}</text>
+                        <!-- Connector lines: a spine below the master and one branch per worker -->
+                        <path d="M 175 40 V ${spineEnd}" fill="none" stroke="#475569" stroke-width="1.8"/>
+                        ${branches}
 
                         <!-- TOP NODE: MASTER -->
                         <g transform="translate(85, 6)">
                             <rect width="180" height="34" rx="6" fill="#1e293b" stroke="#475569" stroke-width="1"/>
                             <circle cx="14" cy="17" r="3.5" fill="#10b981"/>
                             <text x="25" y="15" fill="#f8fafc" font-size="10" font-weight="700" font-family="-apple-system, sans-serif">Master Coordinator</text>
-                            <text x="25" y="26" fill="#94a3b8" font-size="8" font-family="monospace">192.168.1.144 :8088</text>
+                            <text x="25" y="26" fill="#94a3b8" font-size="8" font-family="monospace">${shortText(masterAddrLabel(data && data.master_addr), 22)}</text>
                             <rect x="135" y="9" width="37" height="16" rx="3" fill="rgba(245,158,11,0.2)"/>
                             <text x="153" y="20" fill="#fbbf24" font-size="7.5" font-weight="700" text-anchor="middle">MASTER</text>
                         </g>
 
-                        <!-- LEFT NODE: PHONE -->
-                        <g transform="translate(8, 96)">
-                            <rect width="154" height="50" rx="6" fill="#1e293b" stroke="${phoneW ? pTransport.stroke : '#334155'}" stroke-width="1"/>
-                            <circle cx="14" cy="15" r="3" fill="${phoneW ? (phoneW.status === 'Connected' || phoneW.status === 'Busy' ? '#10b981' : '#64748b') : '#64748b'}"/>
-                            <text x="23" y="15" fill="#f8fafc" font-size="9.5" font-weight="600" font-family="-apple-system, sans-serif">${escapeHtml(phoneW ? phoneW.name : 'Galaxy S24 (Phone)')}</text>
-                            <rect x="110" y="7" width="36" height="13" rx="2.5" fill="rgba(6,182,212,0.2)"/>
-                            <text x="128" y="16.5" fill="#22d3ee" font-size="7" font-weight="700" text-anchor="middle">${escapeHtml(phoneW ? (phoneW.role || 'WORKER') : 'WORKER')}</text>
-                            <text x="12" y="30" fill="#94a3b8" font-size="8.5" font-family="-apple-system, sans-serif">${pCores} Cores • ${pRam} GB RAM</text>
-                            <text x="12" y="42" fill="#64748b" font-size="8" font-family="-apple-system, sans-serif">${pTransport.label} • CPU ${pCpu}%</text>
-                        </g>
-
-                        <!-- RIGHT NODE: MACBOOK -->
-                        <g transform="translate(188, 96)">
-                            <rect width="154" height="50" rx="6" fill="#1e293b" stroke="${macW ? mTransport.stroke : '#334155'}" stroke-width="1"/>
-                            <circle cx="14" cy="15" r="3" fill="${macW ? (macW.status === 'Connected' || macW.status === 'Busy' ? '#10b981' : '#64748b') : '#64748b'}"/>
-                            <text x="23" y="15" fill="#f8fafc" font-size="9.5" font-weight="600" font-family="-apple-system, sans-serif">${escapeHtml(macW ? macW.name : 'MacBook Pro')}</text>
-                            <rect x="114" y="7" width="32" height="13" rx="2.5" fill="rgba(168,85,247,0.2)"/>
-                            <text x="130" y="16.5" fill="#c084fc" font-size="7" font-weight="700" text-anchor="middle">${escapeHtml(macW ? (macW.role || 'ORCH') : 'ORCH')}</text>
-                            <text x="12" y="30" fill="#94a3b8" font-size="8.5" font-family="-apple-system, sans-serif">${mCores} Cores • ${mRam} GB RAM</text>
-                            <text x="12" y="42" fill="#64748b" font-size="8" font-family="-apple-system, sans-serif">${mTransport.label} • CPU ${mCpu}%</text>
-                        </g>
+                        ${empty}
+                        ${nodes}
                     </svg>
-                    `;
+                    `);
+        }
+
+        function renderStatus(data) {
+            let totalCores = 0;
+            let liveCores = 0;
+            let totalRamMb = 0;
+            workers.forEach(w => {
+                totalCores += num(w.cpu_cores);
+                totalRamMb += num(w.ram_mb);
+                if (isOnlineStatus(w.status)) liveCores += num(w.cpu_cores);
+            });
+
+            const totalNodes = workers.length + (data.master ? 1 : 0);
+            const hasDegraded = workers.some(w => w.status === 'Disconnected');
+            const clusterHealth = hasDegraded ? 'Degraded' : 'Healthy';
+            const healthColor = hasDegraded ? 'var(--dot-busy)' : 'var(--dot-green)';
+
+            // Update Topbar and Banner Summaries
+            setSummary(html`<span style="color:${healthColor}">●</span> ${totalNodes} devices (${totalCores}c) • ${clusterHealth}`);
+            const sumCoresEl = document.getElementById('sumCores');
+            if (sumCoresEl) sumCoresEl.textContent = `${totalCores} Cores`;
+            const sumRamEl = document.getElementById('sumRam');
+            if (sumRamEl) sumRamEl.textContent = `${fmtGb(totalRamMb)} GB`;
+            const healthEl = document.getElementById('clusterHealth');
+            if (healthEl) {
+                healthEl.textContent = clusterHealth;
+                healthEl.style.color = healthColor;
+            }
+            const badgeEl = document.getElementById('tabDevicesBadge');
+            if (badgeEl) badgeEl.textContent = totalNodes;
+            const topoBadgeEl = document.getElementById('topoBadge');
+            if (topoBadgeEl) {
+                topoBadgeEl.textContent = liveCores > 0 ? `🟢 ${liveCores} Cores Live` : '⚪ Không có worker online';
+            }
+
+            if (data.master) {
+                setHtml(document.getElementById('masterStatus'),
+                    html`Master: <strong class="tag-master">${data.master.host || 'OxideSwarm'} (Coordinator)</strong>`);
+            }
+
+            // Store P2P ticket for 1-Click Copy
+            window.currentP2pTicket = (typeof data.p2p_ticket === 'string' && data.p2p_ticket) ? data.p2p_ticket : null;
+            const copyBtn = document.getElementById('copyTicketBtn');
+            if (copyBtn) {
+                if (window.currentP2pTicket) {
+                    copyBtn.title = `Sao chép vé P2P kết nối Master: ${window.currentP2pTicket.substring(0, 16)}...`;
+                } else {
+                    copyBtn.title = "Master chưa cấu hình P2P Ticket";
                 }
+            }
 
-                // Render Device Cards (Coordinator + Connected Workers)
-                let html = '';
+            // Visual Degradation Alert Banner: DERP Relay or RTT > 150ms
+            const degradedWorkers = workers.filter(w => isOnlineStatus(w.status) && (w.is_relayed || (w.rtt_ms !== null && w.rtt_ms !== undefined && num(w.rtt_ms) > 150)));
+            const degBanner = document.getElementById('degradationAlertBanner');
+            if (degBanner) {
+                if (degradedWorkers.length > 0) {
+                    const issues = degradedWorkers.map(w => {
+                        const reasons = [];
+                        if (w.is_relayed) reasons.push('DERP Relay');
+                        if (w.rtt_ms !== null && w.rtt_ms !== undefined && num(w.rtt_ms) > 150) reasons.push(`Độ trễ cao ${Math.round(num(w.rtt_ms))}ms`);
+                        return html`<strong>${w.name || w.id}</strong> (${reasons.join(', ')})`;
+                    });
+                    setHtml(degBanner, html`<span class="alert-icon">⚠️</span><span class="alert-text"><strong>Cảnh báo chất lượng kết nối:</strong> ${joinHtml(issues, ' • ')}</span>`);
+                    degBanner.style.display = 'flex';
+                } else {
+                    degBanner.style.display = 'none';
+                }
+            }
 
-                // 1. Render MASTER Node Card at the top of Devices tab
-                if (data.master) {
-                    const masterRunning = (data.tasks && data.tasks.running !== undefined) ? data.tasks.running : 0;
-                    const masterQueued = (data.tasks && data.tasks.queued !== undefined) ? data.tasks.queued : 0;
-                    html += `
+            renderTopology(workers, data);
+
+            // Render Device Cards (Coordinator + Connected Workers)
+            const cards = [];
+
+            // 1. Render MASTER Node Card at the top of Devices tab
+            if (data.master) {
+                const tasks = data.tasks || {};
+                const masterRunning = num(tasks.running);
+                const masterQueued = num(tasks.queued);
+                cards.push(html`
                         <div class="device-card">
                             <div class="card-row-1">
                                 <div class="card-id-group">
                                     <span class="status-dot dot-online" title="Status: Online"></span>
-                                    <span class="role-badge tag-master">${escapeHtml(data.master.role || 'MASTER')}</span>
-                                    <span class="node-name" title="${escapeHtml(data.master.host)}">${escapeHtml(data.master.host)} (Coordinator)</span>
+                                    <span class="role-badge tag-master">${data.master.role || 'MASTER'}</span>
+                                    <span class="node-name" title="${data.master.host}">${data.master.host} (Coordinator)</span>
                                 </div>
                                 <div class="card-top-right">
                                     <span class="task-pill">${masterRunning} running</span>
@@ -1832,7 +2148,7 @@
                             <div class="card-row-2">
                                 <div class="metric-pill">
                                     <span class="m-label">Role:</span>
-                                    <span>${escapeHtml(data.master.description || 'P2P Coordinator')}</span>
+                                    <span>${data.master.description || 'P2P Coordinator'}</span>
                                 </div>
                                 <div class="metric-pill">
                                     <span class="m-label">Queue:</span>
@@ -1840,77 +2156,77 @@
                                 </div>
                             </div>
                         </div>
-                    `;
+                    `);
+            }
+
+            // 2. Render Worker Node Cards with High-Density Telemetry
+            workers.forEach(w => {
+                const role = w.role || 'WORKER';
+                const tagClass = role === 'ORCH' ? 'tag-orch' : (role === 'GPU' ? 'tag-gpu' : 'tag-worker');
+                const isOnline = isOnlineStatus(w.status);
+                const isBusy = w.status === 'Busy';
+                const dotClass = isOnline ? (isBusy ? 'dot-busy' : 'dot-online') : 'dot-offline';
+
+                // Telemetry: CPU
+                const cpuPct = Math.min(100, Math.max(0, Math.round(num(w.cpu_usage_pct))));
+                const cpuBlocks = renderBlocks(cpuPct);
+                const cpuCls = getFillClass(cpuPct);
+
+                // Telemetry: RAM
+                const ramMb = num(w.ram_mb);
+                const ramTotalGb = fmtGb(ramMb);
+                const ramAvailMb = w.ram_available_mb !== undefined ? num(w.ram_available_mb) : ramMb;
+                const ramUsedMb = ramMb > ramAvailMb ? (ramMb - ramAvailMb) : 0;
+                const ramUsedGb = fmtGb(ramUsedMb);
+                const ramPct = ramMb > 0 ? Math.min(100, Math.max(0, Math.round((ramUsedMb / ramMb) * 100))) : 0;
+                const ramBlocks = renderBlocks(ramPct);
+                const ramCls = getFillClass(ramPct);
+
+                // Telemetry: GPU Badge
+                let gpuBadge = '';
+                if (w.has_gpu) {
+                    const gName = w.gpu_device_name ? String(w.gpu_device_name).replace(/NVIDIA|GeForce|Graphics/gi, '').trim() : 'GPU';
+                    gpuBadge = html`<span class="badge-gpu" title="${w.gpu_device_name || 'GPU'}">⚡ ${gName}</span>`;
                 }
 
-                // 2. Render Worker Node Cards with High-Density Telemetry
-                workers.forEach(w => {
-                    const role = w.role || 'WORKER';
-                    const tagClass = role === 'ORCH' ? 'tag-orch' : (role === 'GPU' ? 'tag-gpu' : 'tag-worker');
-                    const isOnline = w.status === 'Connected' || w.status === 'Busy';
-                    const isBusy = w.status === 'Busy';
-                    const dotClass = isOnline ? (isBusy ? 'dot-busy' : 'dot-online') : 'dot-offline';
+                // Telemetry: Mobile Battery & Thermal
+                const mobileParts = [];
+                if (w.battery_pct !== null && w.battery_pct !== undefined) {
+                    const icon = w.is_charging ? '⚡' : '🔋';
+                    mobileParts.push(html`<span class="badge-battery">${icon} ${num(w.battery_pct)}%</span>`);
+                }
+                if (w.thermal_throttled) {
+                    mobileParts.push(html`<span class="badge-throttle">🔥 Throttled</span>`);
+                }
 
-                    // Telemetry: CPU
-                    const cpuPct = Math.min(100, Math.max(0, Math.round(w.cpu_usage_pct || 0)));
-                    const cpuBlocks = renderBlocks(cpuPct);
-                    const cpuCls = getFillClass(cpuPct);
+                // Telemetry: Interconnect Link Badge
+                const { isRelayed, isDirect, rtt: rttStr } = linkKind(w);
 
-                    // Telemetry: RAM
-                    const ramTotalGb = (w.ram_mb / 1024).toFixed(1);
-                    const ramAvailMb = w.ram_available_mb !== undefined ? w.ram_available_mb : w.ram_mb;
-                    const ramUsedMb = w.ram_mb > ramAvailMb ? (w.ram_mb - ramAvailMb) : 0;
-                    const ramUsedGb = (ramUsedMb / 1024).toFixed(1);
-                    const ramPct = w.ram_mb > 0 ? Math.min(100, Math.max(0, Math.round((ramUsedMb / w.ram_mb) * 100))) : 0;
-                    const ramBlocks = renderBlocks(ramPct);
-                    const ramCls = getFillClass(ramPct);
+                let linkBadge;
+                if (isDirect) {
+                    const lbl = rttStr ? `● Direct P2P | ${rttStr}` : `● Direct P2P`;
+                    linkBadge = html`<span class="link-badge link-direct" title="Direct P2P Link (QUIC)">${lbl}</span>`;
+                } else if (isRelayed) {
+                    const lbl = rttStr ? `▲ DERP Relay | ${rttStr}` : `▲ DERP Relay`;
+                    linkBadge = html`<span class="link-badge link-relay" title="Relay (DERP)">${lbl}</span>`;
+                } else {
+                    const lbl = rttStr ? `TCP/LAN | ${rttStr}` : `TCP/LAN`;
+                    linkBadge = html`<span class="link-badge link-tcp" title="Standard TCP/LAN Link">${lbl}</span>`;
+                }
 
-                    // Telemetry: GPU Badge
-                    let gpuBadge = '';
-                    if (w.has_gpu) {
-                        let gName = w.gpu_device_name ? w.gpu_device_name.replace(/NVIDIA|GeForce|Graphics/gi, '').trim() : 'GPU';
-                        gpuBadge = `<span class="badge-gpu" title="${escapeHtml(w.gpu_device_name || 'GPU')}">⚡ ${escapeHtml(gName)}</span>`;
-                    }
+                const lastHb = w.last_heartbeat_secs_ago !== undefined ? `${num(w.last_heartbeat_secs_ago)}s ago` : 'active';
 
-                    // Telemetry: Mobile Battery & Thermal
-                    let mobileBadge = '';
-                    if (w.battery_pct !== null && w.battery_pct !== undefined) {
-                        const icon = w.is_charging ? '⚡' : '🔋';
-                        mobileBadge = `<span class="badge-battery">${icon} ${w.battery_pct}%</span>`;
-                    }
-                    if (w.thermal_throttled) {
-                        mobileBadge += `<span class="badge-throttle">🔥 Throttled</span>`;
-                    }
-
-                    // Telemetry: Interconnect Link Badge
-                    const isRelayed = !!w.is_relayed || (w.interconnect_type && w.interconnect_type.includes('Relay'));
-                    const isDirect = !isRelayed && (w.interconnect_type && (w.interconnect_type.includes('Direct') || w.interconnect_type.includes('P2P')));
-                    const rttStr = (w.rtt_ms !== null && w.rtt_ms !== undefined) ? `${Math.round(w.rtt_ms)}ms` : null;
-
-                    let linkBadge = '';
-                    if (isDirect) {
-                        const lbl = rttStr ? `● Direct P2P | ${rttStr}` : `● Direct P2P`;
-                        linkBadge = `<span class="link-badge link-direct" title="Direct P2P Link (QUIC)">${lbl}</span>`;
-                    } else if (isRelayed) {
-                        const lbl = rttStr ? `▲ DERP Relay | ${rttStr}` : `▲ DERP Relay`;
-                        linkBadge = `<span class="link-badge link-relay" title="Relay (DERP)">${lbl}</span>`;
-                    } else {
-                        const lbl = rttStr ? `TCP/LAN | ${rttStr}` : `TCP/LAN`;
-                        linkBadge = `<span class="link-badge link-tcp" title="Standard TCP/LAN Link">${lbl}</span>`;
-                    }
-
-                    const lastHb = w.last_heartbeat_secs_ago !== undefined ? `${w.last_heartbeat_secs_ago}s ago` : 'active';
-
-                    html += `
-                        <div class="device-card" onclick="openDeviceDetail('${escapeHtml(w.id)}')">
+                // The worker id travels in a data attribute (click handled by delegation), never inside inline JS.
+                cards.push(html`
+                        <div class="device-card" data-wid="${w.id}">
                             <div class="card-row-1">
                                 <div class="card-id-group">
-                                    <span class="status-dot ${dotClass}" title="Status: ${escapeHtml(w.status)}"></span>
+                                    <span class="status-dot ${dotClass}" title="Status: ${w.status}"></span>
                                     <span class="role-badge ${tagClass}">${role}</span>
-                                    <span class="node-name" title="${escapeHtml(w.name)}">${escapeHtml(w.name)}</span>
+                                    <span class="node-name" title="${w.name}">${w.name}</span>
                                 </div>
                                 <div class="card-top-right">
-                                    <span class="task-pill">${w.active_tasks || 0} active</span>
+                                    <span class="task-pill">${num(w.active_tasks)} active</span>
                                     <span class="ping-pill" title="Heartbeat">${lastHb}</span>
                                 </div>
                             </div>
@@ -1929,25 +2245,91 @@
                                     <span>${ramUsedGb}/${ramTotalGb}GB</span>
                                 </div>
                                 ${gpuBadge}
-                                ${mobileBadge}
+                                ${mobileParts}
                             </div>
                         </div>
-                    `;
-                });
+                    `);
+            });
 
-                document.getElementById('deviceList').innerHTML = html;
+            setHtml(document.getElementById('deviceList'), joinHtml(cards));
+        }
+
+        function paintLatency(ms) {
+            const pill = document.getElementById('latencyPill');
+            if (!pill) return;
+            pill.textContent = `${ms}ms`;
+            pill.style.color = ms < 120 ? 'var(--dot-green)' : (ms < 300 ? 'var(--dot-busy)' : 'var(--dot-red)');
+        }
+
+        // Single-flight: overlapping callers (3 s poll, Sync button, tab switch) share one request.
+        let syncPromise = null;
+        function syncData() {
+            if (!syncPromise) {
+                syncPromise = doSyncData().finally(() => { syncPromise = null; });
+            }
+            return syncPromise;
+        }
+
+        function noteSyncFailure(e) {
+            if (e && e.isAuth) {
+                renderAuthRequired(); // a 401 is "login required", not "disconnected": no failover
+                return;
+            }
+            const pill = document.getElementById('latencyPill');
+            if (pill) {
+                pill.textContent = 'Err';
+                pill.style.color = 'var(--dot-red)';
+            }
+            setSummary(html`<span style="color:var(--dot-red)">● Disconnected</span>`);
+            handleDisconnectFailover().catch(() => {});
+        }
+
+        async function doSyncData() {
+            let data;
+            const t0 = performance.now();
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 8000);
+            try {
+                const res = await apiFetch('/api/status', { signal: controller.signal });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                data = await res.json();
+                if (!data || typeof data !== 'object') throw new Error('Malformed /api/status payload');
+                paintLatency(Math.round(performance.now() - t0));
             } catch (e) {
-                console.error("Sync error:", e);
-                const pill = document.getElementById('latencyPill');
-                if (pill) {
-                    pill.textContent = 'Err';
-                    pill.style.color = 'var(--dot-red)';
+                if (!e.isAuth) console.error("Sync error:", e);
+                noteSyncFailure(e);
+                throw e;
+            } finally {
+                clearTimeout(timer);
+            }
+
+            // This node is a standby Worker portal: follow its redirect only if it is a safe, trusted http(s) URL.
+            if (data.role === 'WORKER_PORTAL') {
+                const dest = parseSafeUrl(data.redirect_url);
+                if (dest && isTrustedTarget(dest)) {
+                    showDiscoveryToast(`Thiết bị này đang là Worker. Đang chuyển hướng sang Master tại ${dest.origin}...`);
+                    setTimeout(() => window.location.replace(dest.origin + '/'), 500);
+                } else {
+                    showDiscoveryToast("Thiết bị này đang là Worker và chưa tìm thấy Master.", 4000);
+                    setSummary(html`<span style="color:var(--dot-busy)">● Worker portal (chưa có Master)</span>`);
                 }
-                const summaryEl = document.getElementById('clusterSummary');
-                if (summaryEl) {
-                    summaryEl.innerHTML = '<span style="color:var(--dot-red)">● Disconnected</span>';
-                }
-                handleDisconnectFailover().catch(() => {});
+                return;
+            }
+
+            consecutiveDisconnects = 0;
+            rememberHost(window.location.host);
+            discoveryHosts = Array.isArray(data.discovery_hosts) ? data.discovery_hosts.filter(isHostPort).slice(0, 16) : [];
+
+            // Registry order is a HashMap order: sort so cards/topology do not shuffle between polls.
+            workers = (Array.isArray(data.workers) ? data.workers : [])
+                .filter(w => w && typeof w === 'object')
+                .sort((a, b) => String(a.name || '').toLowerCase().localeCompare(String(b.name || '').toLowerCase()) ||
+                    String(a.id || '').localeCompare(String(b.id || '')));
+
+            try {
+                renderStatus(data);
+            } catch (e) {
+                console.error("Render error:", e);
                 throw e;
             }
         }
@@ -1957,12 +2339,22 @@
         // 7. Device Detail Modal Controls
         let activeModalWorker = null;
 
+        // Cards carry the worker id in data-wid; one delegated listener opens the detail sheet.
+        (function wireDeviceList() {
+            const list = document.getElementById('deviceList');
+            if (!list) return;
+            list.addEventListener('click', (ev) => {
+                const card = ev.target && ev.target.closest ? ev.target.closest('.device-card[data-wid]') : null;
+                if (card) openDeviceDetail(card.getAttribute('data-wid'));
+            });
+        })();
+
         function openDeviceDetail(workerId) {
             const w = (workers || []).find(item => item.id === workerId);
             if (!w) return;
             activeModalWorker = w;
 
-            const isOnline = w.status === 'Connected' || w.status === 'Busy';
+            const isOnline = isOnlineStatus(w.status);
             const dotEl = document.getElementById('mDot');
             if (dotEl) dotEl.className = 'status-dot ' + (isOnline ? 'dot-online' : 'dot-offline');
 
@@ -1976,25 +2368,25 @@
             }
 
             const coresEl = document.getElementById('mCores');
-            if (coresEl) coresEl.textContent = `${w.cpu_cores || 10} Cores (Phần cứng thật)`;
+            if (coresEl) coresEl.textContent = `${num(w.cpu_cores)} Cores (Phần cứng thật)`;
 
             const cpuEl = document.getElementById('mCpu');
-            if (cpuEl) cpuEl.textContent = `${Math.round(w.cpu_usage_pct || 0)}%`;
+            if (cpuEl) cpuEl.textContent = `${Math.round(num(w.cpu_usage_pct))}%`;
 
-            const totalGb = (w.ram_mb / 1024).toFixed(1);
+            const ramMb = num(w.ram_mb);
             const ramTotalEl = document.getElementById('mRamTotal');
-            if (ramTotalEl) ramTotalEl.textContent = `${totalGb} GB (${w.ram_mb} MB RAM vật lý)`;
+            if (ramTotalEl) ramTotalEl.textContent = `${fmtGb(ramMb)} GB (${ramMb} MB RAM vật lý)`;
 
-            const availMb = w.ram_available_mb !== undefined ? w.ram_available_mb : w.ram_mb;
-            const usedMb = w.ram_mb > availMb ? (w.ram_mb - availMb) : 0;
+            const availMb = w.ram_available_mb !== undefined ? num(w.ram_available_mb) : ramMb;
+            const usedMb = ramMb > availMb ? (ramMb - availMb) : 0;
             const ramAvailEl = document.getElementById('mRamAvail');
-            if (ramAvailEl) ramAvailEl.textContent = `${(availMb/1024).toFixed(1)}GB trống / ${(usedMb/1024).toFixed(1)}GB dùng`;
+            if (ramAvailEl) ramAvailEl.textContent = `${fmtGb(availMb)}GB trống / ${fmtGb(usedMb)}GB dùng`;
 
             const batEl = document.getElementById('mBattery');
             if (batEl) {
                 if (w.battery_pct !== null && w.battery_pct !== undefined) {
                     const charging = w.is_charging ? ' (Đang sạc USB)' : ' (Dùng pin)';
-                    batEl.textContent = `${w.battery_pct}%${charging}`;
+                    batEl.textContent = `${num(w.battery_pct)}%${charging}`;
                 } else {
                     batEl.textContent = 'Nguồn trực tiếp (AC)';
                 }
@@ -2010,24 +2402,23 @@
 
             const linkEl = document.getElementById('mLink');
             if (linkEl) {
-                const isRelayed = !!w.is_relayed || (w.interconnect_type && w.interconnect_type.includes('Relay'));
-                const isDirect = !isRelayed && (w.interconnect_type && (w.interconnect_type.includes('Direct') || w.interconnect_type.includes('P2P')));
+                const { isRelayed, isDirect } = linkKind(w);
                 if (isDirect) {
-                    linkEl.innerHTML = `<span style="color:#10b981; font-weight:700;">● Direct P2P (QUIC)</span>`;
+                    setHtml(linkEl, html`<span style="color:#10b981; font-weight:700;">● Direct P2P (QUIC)</span>`);
                 } else if (isRelayed) {
-                    linkEl.innerHTML = `<span style="color:#f59e0b; font-weight:700;">▲ Relay (DERP)</span>`;
+                    setHtml(linkEl, html`<span style="color:#f59e0b; font-weight:700;">▲ Relay (DERP)</span>`);
                 } else {
-                    linkEl.innerHTML = `<span style="color:#94a3b8; font-weight:700;">TCP/LAN</span>`;
+                    setHtml(linkEl, html`<span style="color:#94a3b8; font-weight:700;">TCP/LAN</span>`);
                 }
             }
 
             const rttEl = document.getElementById('mRtt');
             if (rttEl) {
-                rttEl.textContent = (w.rtt_ms !== null && w.rtt_ms !== undefined) ? `${Math.round(w.rtt_ms)} ms` : '--';
+                rttEl.textContent = (w.rtt_ms !== null && w.rtt_ms !== undefined) ? `${Math.round(num(w.rtt_ms))} ms` : '--';
             }
 
             const idEl = document.getElementById('mId');
-            if (idEl) idEl.textContent = `${w.id} (Heartbeat: ${w.last_heartbeat_secs_ago || 0}s trước)`;
+            if (idEl) idEl.textContent = `${w.id} (Heartbeat: ${num(w.last_heartbeat_secs_ago)}s trước)`;
 
             const modal = document.getElementById('deviceModal');
             if (modal) modal.classList.add('active');
@@ -2039,14 +2430,16 @@
             activeModalWorker = null;
         }
 
+        // Runs a small inspection command through the shell path. The API cannot pin a task to a worker
+        // yet, so the scheduler picks the executor; the result header names the worker that actually ran it.
         function runDeviceDiagnostic() {
             if (!activeModalWorker) return;
-            const targetName = activeModalWorker.name;
+            const targetName = String(activeModalWorker.name || '').toLowerCase();
             closeDeviceModal();
             switchTab('chat');
             const isMac = targetName.includes('mac');
             const cmd = isMac ? 'uname -a && sysctl -n hw.model hw.ncpu' : 'uname -a && head -n 4 /proc/meminfo';
-            quick(cmd);
+            quickShell(cmd);
         }
 
         // 8. Chat & Command Execution (AI Model by default, Shell mode on demand)
@@ -2082,6 +2475,42 @@
         }
         window.quickShell = quickShell;
         window.quickAI = quickAI;
+
+        // GET /api/tasks/:id reports the state in snake_case ("completed") while /api/status uses
+        // PascalCase ("Completed"): fold both into one canonical spelling before comparing.
+        function canonState(s) {
+            const t = String(s === null || s === undefined ? '' : s).toLowerCase();
+            if (t === 'canceled') return 'Cancelled';
+            return t.charAt(0).toUpperCase() + t.slice(1);
+        }
+        const TASK_WAIT_MS = 180000; // task timeout is 60 s server-side; leave room for queueing and one retry
+
+        // Polls until the server reports a terminal state. Resolves null when TASK_WAIT_MS elapses first.
+        async function waitForTask(taskId) {
+            const deadline = Date.now() + TASK_WAIT_MS;
+            while (Date.now() < deadline) {
+                try {
+                    const get = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`);
+                    if (get.status === 404) {
+                        const gone = new Error('Task không còn tồn tại trên Master (đã bị dọn).');
+                        gone.fatal = true;
+                        throw gone;
+                    }
+                    if (get.ok) {
+                        const detail = await get.json();
+                        detail.state = canonState(detail.state);
+                        if (detail.state === 'Completed' || detail.state === 'Failed' || detail.state === 'Cancelled') {
+                            return detail;
+                        }
+                    }
+                } catch (e) {
+                    if (e.isAuth || e.fatal) throw e;
+                    // transient network error: keep polling
+                }
+                await sleep(400);
+            }
+            return null;
+        }
 
         async function sendCmd() {
             const input = document.getElementById('inputCmd') || document.getElementById('cmdInput');
@@ -2120,48 +2549,45 @@
                 }
                 const report = document.createElement('div');
                 report.className = 'report-box';
-                report.innerHTML = `
+                setHtml(report, html`
                     <div class="report-meta">
                         <span style="color: var(--tag-orch); font-weight:700;">[Antigravity AI]</span>
                         <span style="color: var(--accent);">Đang kết nối model...</span>
                     </div>
                     <div class="res-content" style="color: var(--text-dim); font-style: italic;">Đang xử lý câu hỏi của bạn...</div>
-                `;
+                `);
                 feed.appendChild(report);
                 feed.scrollTop = feed.scrollHeight;
 
                 try {
-                    const post = await fetch('/api/chat', {
+                    const post = await apiFetch('/api/chat', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ message: raw })
                     });
-                    if (!post.ok) {
-                        const errText = await post.text();
-                        throw new Error(`HTTP ${post.status}: ${errText}`);
-                    }
+                    if (!post.ok) throw new Error(await errorText(post));
                     const data = await post.json();
                     if (status) {
                         status.textContent = '● READY';
                         status.style.color = 'var(--dot-green)';
                     }
-                    report.innerHTML = `
+                    setHtml(report, html`
                         <div class="report-meta">
-                            <span style="color: var(--accent); font-weight: 700;">[${escapeHtml(data.model || 'Antigravity AI')}] • ${data.execution_time_ms || 0}ms</span>
+                            <span style="color: var(--accent); font-weight: 700;">[${data.model || 'Antigravity AI'}] • ${num(data.execution_time_ms)}ms</span>
                             <span style="color: var(--dot-green); font-weight: 700;">Trả lời</span>
                         </div>
-                        <div class="res-content" style="white-space: pre-wrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.5; font-size: 13.5px;">${escapeHtml(data.reply)}</div>
-                    `;
+                        <div class="res-content" style="white-space: pre-wrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.5; font-size: 13.5px;">${data.reply}</div>
+                    `);
                     feed.scrollTop = feed.scrollHeight;
                 } catch (err) {
                     if (status) {
-                        status.textContent = '● LỖI AI';
-                        status.style.color = 'var(--dot-red)';
+                        status.textContent = err.isAuth ? '🔒 CẦN TOKEN' : '● LỖI AI';
+                        status.style.color = err.isAuth ? 'var(--dot-busy)' : 'var(--dot-red)';
                     }
-                    report.innerHTML = `
+                    setHtml(report, html`
                         <div class="report-meta" style="color: var(--dot-red); font-weight: 700;">[Lỗi phản hồi AI]</div>
-                        <div class="res-content" style="color: var(--dot-red);">Không thể nhận phản hồi từ model: ${escapeHtml(err.message)}</div>
-                    `;
+                        <div class="res-content" style="color: var(--dot-red);">Không thể nhận phản hồi từ model: ${err.isAuth ? 'cần nhập token truy cập.' : err.message}</div>
+                    `);
                     feed.scrollTop = feed.scrollHeight;
                 }
                 return;
@@ -2176,91 +2602,71 @@
             }
             const report = document.createElement('div');
             report.className = 'report-box';
-            report.innerHTML = `<div class="report-meta"><span>Phân phối cụm...</span><span>Đang chạy...</span></div><div class="res-content">Working...</div>`;
+            setHtml(report, html`<div class="report-meta"><span>Phân phối cụm...</span><span>Đang chạy...</span></div><div class="res-content">Working...</div>`);
             feed.appendChild(report);
             feed.scrollTop = feed.scrollHeight;
 
+            const setReady = () => {
+                if (status) {
+                    status.textContent = '● READY';
+                    status.style.color = 'var(--dot-green)';
+                }
+            };
+
             try {
-                const post = await fetch('/api/tasks', {
+                const post = await apiFetch('/api/tasks', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ command: cmd })
                 });
-                if (!post.ok) throw new Error(await post.text());
+                if (!post.ok) throw new Error(await errorText(post));
                 const { task_id } = await post.json();
 
-                let checks = 0;
-                const maxChecks = 150;
-                const timer = setInterval(async () => {
-                    checks++;
-                    try {
-                        const get = await fetch(`/api/tasks/${task_id}`);
-                        if (get.ok) {
-                            const detail = await get.json();
-                            if (detail.state === 'Completed' || detail.state === 'Failed' || detail.state === 'Cancelled') {
-                                clearInterval(timer);
-                                if (status) {
-                                    status.textContent = '● READY';
-                                    status.style.color = 'var(--dot-green)';
-                                }
-                                const isOk = detail.state === 'Completed' && detail.exit_code === 0;
-                                const matched = (workers || []).find(w => w.id === detail.worker_id);
-                                const executor = matched ? matched.name : (detail.worker_id ? detail.worker_id.slice(0, 8) : 'cluster-node');
-                                const out = detail.stdout || detail.stderr || detail.error || (detail.state === 'Cancelled' ? 'Task was cancelled' : '(Done, 0 output)');
-                                const exitColor = isOk ? 'var(--dot-green)' : 'var(--dot-red)';
-                                const exitLabel = detail.state === 'Cancelled' ? 'Cancelled' : `Exit ${detail.exit_code !== undefined && detail.exit_code !== null ? detail.exit_code : (detail.state === 'Completed' ? 0 : 1)}`;
+                const detail = await waitForTask(task_id);
+                setReady();
+                if (!detail) {
+                    setHtml(report, html`
+                        <div class="report-meta" style="color: var(--dot-red);">Timeout</div>
+                        <div class="res-content">Lệnh vượt quá thời gian chờ (${TASK_WAIT_MS / 1000}s). Task ${task_id} vẫn có thể đang chạy trên cụm.</div>
+                    `);
+                    return;
+                }
 
-                                report.innerHTML = `
-                                    <div class="report-meta">
-                                        <span>[${escapeHtml(executor)}] • ${detail.execution_time_ms || 0}ms</span>
-                                        <span style="color: ${exitColor}; font-weight: 700;">${exitLabel}</span>
-                                    </div>
-                                    <div class="res-content">${escapeHtml(out.trim())}</div>
-                                `;
-                                feed.scrollTop = feed.scrollHeight;
-                            }
-                        }
-                    } catch (e) {}
+                const isOk = detail.state === 'Completed' && detail.exit_code === 0;
+                const matched = (workers || []).find(w => w.id === detail.worker_id);
+                const executor = matched ? matched.name : (detail.worker_id ? String(detail.worker_id).slice(0, 8) : 'cluster-node');
+                const out = String(detail.stdout || detail.stderr || detail.error || (detail.state === 'Cancelled' ? 'Task was cancelled' : '(Done, 0 output)'));
+                const exitColor = isOk ? 'var(--dot-green)' : 'var(--dot-red)';
+                const exitLabel = detail.state === 'Cancelled' ? 'Cancelled' : `Exit ${detail.exit_code !== undefined && detail.exit_code !== null ? num(detail.exit_code) : (detail.state === 'Completed' ? 0 : 1)}`;
 
-                    if (checks > maxChecks) {
-                        clearInterval(timer);
-                        if (status) {
-                            status.textContent = '● READY';
-                            status.style.color = 'var(--dot-green)';
-                        }
-                        report.innerHTML = `
-                            <div class="report-meta" style="color: var(--dot-red);">Timeout</div>
-                            <div class="res-content">Lệnh vượt quá thời gian chờ (60s).</div>
-                        `;
-                    }
-                }, 400);
-
+                setHtml(report, html`
+                    <div class="report-meta">
+                        <span>[${executor}] • ${num(detail.execution_time_ms)}ms</span>
+                        <span style="color: ${exitColor}; font-weight: 700;">${exitLabel}</span>
+                    </div>
+                    <div class="res-content">${out.trim()}</div>
+                `);
+                feed.scrollTop = feed.scrollHeight;
             } catch (err) {
                 if (status) {
-                    status.textContent = '● LỖI KẾT NỐI';
-                    status.style.color = 'var(--dot-red)';
+                    status.textContent = err.isAuth ? '🔒 CẦN TOKEN' : '● LỖI KẾT NỐI';
+                    status.style.color = err.isAuth ? 'var(--dot-busy)' : 'var(--dot-red)';
                 }
-                report.innerHTML = `
-                    <div class="report-meta" style="color: var(--dot-red);">Lỗi kết nối</div>
-                    <div class="res-content">Không thể kết nối đến Master node (192.168.1.144:8080). Đang tự động kết nối lại...</div>
-                `;
+                const reason = err.isAuth
+                    ? 'Cần nhập token truy cập để gửi lệnh.'
+                    : (err instanceof TypeError ? `Không thể kết nối đến Master node (${window.location.host}).` : err.message);
+                setHtml(report, html`
+                    <div class="report-meta" style="color: var(--dot-red);">${err.isAuth ? 'Cần xác thực' : 'Lỗi'}</div>
+                    <div class="res-content">${reason}</div>
+                `);
             }
         }
         window.runCmd = sendCmd;
 
-        function escapeHtml(s) {
-            if (!s) return '';
-            return String(s)
-                .replace(/&/g, "&amp;")
-                .replace(/</g, "&lt;")
-                .replace(/>/g, "&gt;")
-                .replace(/"/g, "&quot;")
-                .replace(/'/g, "&#039;");
-        }
-
         // 9. Screen Wake Lock API (Keep mobile phone screen always awake)
         let wakeLock = null;
         let wakeLockActive = false;
+        let wakeVideo = null;
 
         async function requestWakeLock() {
             try {
@@ -2333,11 +2739,11 @@
             if (!pill) return;
             if (active) {
                 pill.className = 'wake-pill active';
-                pill.innerHTML = '☀️ Luôn thức';
+                pill.textContent = '☀️ Luôn thức';
                 pill.title = 'Màn hình điện thoại đang được giữ luôn sáng';
             } else {
                 pill.className = 'wake-pill';
-                pill.innerHTML = text || '🌙 Nghỉ';
+                pill.textContent = text || '🌙 Nghỉ';
                 pill.title = 'Bấm để bật chế độ giữ màn hình luôn sáng';
             }
         }

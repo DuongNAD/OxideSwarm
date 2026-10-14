@@ -371,9 +371,10 @@ fn test_mobile_battery_edge_cases_0_14_15_pct() {
 fn test_mobile_thermal_throttling_dynamic_toggling_under_load() {
     let config = SchedulerConfig::default();
 
+    // 8 cores: the 4-core `make -j4` task now occupies 4 slots, so the batch below (1 + 4 + 1) needs 6.
     let mut mobile_worker = create_mock_worker_info(
         "android-throttle-test",
-        4,
+        8,
         8192,
         false,
         20.0,

@@ -114,12 +114,10 @@ namespace OxideSwarm.Packaging.Windows
 
         private void StartWorkerProcess()
         {
+            // Everything (master address, P2P ticket, cluster secret path) comes from the config file,
+            // which the installer protects with an ACL. A ticket on the command line would be visible
+            // to every local user, and CommandLineToArgvW would strip the quotes of its JSON.
             string arguments = string.Format("worker --config \"{0}\"", _resolvedConfigPath);
-            string p2pTicketEnv = Environment.GetEnvironmentVariable("OXIDESWARM_P2P_TICKET");
-            if (!string.IsNullOrEmpty(p2pTicketEnv))
-            {
-                arguments += string.Format(" --p2p-ticket \"{0}\"", p2pTicketEnv);
-            }
 
             ProcessStartInfo psi = new ProcessStartInfo
             {

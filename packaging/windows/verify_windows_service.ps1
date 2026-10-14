@@ -12,6 +12,9 @@
       5. Failure recovery actions are configured to restart the service on crash.
       6. Process executes headlessly in Session 0 without an interactive desktop window.
       7. Log files are generated in the specified log directory.
+      8. The service does not run as LocalSystem (every task inherits the service identity).
+      9. The worker log shows the master accepted the registration (a Running service alone
+         does not prove the worker joined the grid).
 
     Returns exit code 0 if all critical checks pass, non-zero if any check fails.
     Supports both human-readable console output and structured JSON output for CI/CD automation.
@@ -250,6 +253,61 @@ $logsValid = ($logDirExists -and ($logFilesFound -gt 0 -or -not $RequireRunning)
 Add-CheckResult -TestId "LOG-01" -Name "Log Directory and Output Streams" -Passed $logsValid -Severity "Warning" `
     -Details "Log directory '$LogDir' (Exists: $logDirExists, Log files found: $logFilesFound). $([string]::Join('; ', $logFileDetails))" `
     -Metadata @{ LogDirExists = $logDirExists; LogFilesFound = $logFilesFound }
+
+# ==============================================================================
+# Test 6: Service Identity (every task runs as the service account)
+# ==============================================================================
+if ($cim) {
+    $startName = "$($cim.StartName)"
+    $runsAsSystem = ($startName -eq "LocalSystem" -or $startName -eq "NT AUTHORITY\SYSTEM")
+    $identityDetails = if ($runsAsSystem) {
+        "Service runs as '$startName': every task the master dispatches executes with full control of this PC. Reinstall with -ServiceAccount VirtualAccount."
+    } else {
+        "Service runs as '$startName' (tasks inherit this identity)."
+    }
+    Add-CheckResult -TestId "SEC-01" -Name "Service Runs Without SYSTEM Privileges" -Passed (-not $runsAsSystem) -Severity "Warning" `
+        -Details $identityDetails `
+        -Metadata @{ StartName = $startName }
+}
+
+# ==============================================================================
+# Test 7: Did the worker actually register with the master?
+#   A Running service is not a connected worker: a bad ticket, wrong port or missing cluster
+#   secret keeps the service Running while the worker retries forever.
+# ==============================================================================
+# The worker logs through tracing to stdout (worker.out.log); a refusal to start (missing cluster
+# secret) is printed to stderr (worker.err.log). Line numbers are only compared within one file.
+$regPattern = "Registration accepted"
+$errPattern = "Invalid P2P ticket|Authentication required|Authentication failed|authentication with the Master failed|refusing to connect|Connection dropped or failed"
+$fatalPattern = "Authentication required|Authentication failed|refusing to connect"
+$outLogPath = Join-Path $LogDir "worker.out.log"
+$errLogPath = Join-Path $LogDir "worker.err.log"
+$lastReg = 0
+$lastErr = 0
+$stderrFatal = $false
+if (Test-Path -LiteralPath $outLogPath) {
+    $regHits = @(Select-String -LiteralPath $outLogPath -Pattern $regPattern -ErrorAction SilentlyContinue)
+    $errHits = @(Select-String -LiteralPath $outLogPath -Pattern $errPattern -ErrorAction SilentlyContinue)
+    if ($regHits.Count -gt 0) { $lastReg = $regHits[-1].LineNumber }
+    if ($errHits.Count -gt 0) { $lastErr = $errHits[-1].LineNumber }
+}
+if (Test-Path -LiteralPath $errLogPath) {
+    $stderrFatal = (@(Select-String -LiteralPath $errLogPath -Pattern $fatalPattern -ErrorAction SilentlyContinue).Count -gt 0)
+}
+$registrationSeverity = if ($RequireRunning) { "Error" } else { "Warning" }
+if (-not (Test-Path -LiteralPath $outLogPath) -and -not (Test-Path -LiteralPath $errLogPath)) {
+    Add-CheckResult -TestId "NET-01" -Name "Worker Registered With Master" -Passed $false -Severity "Warning" `
+        -Details "No worker log in '$LogDir' yet, so registration cannot be confirmed."
+} elseif ($lastReg -gt 0 -and $lastReg -ge $lastErr) {
+    Add-CheckResult -TestId "NET-01" -Name "Worker Registered With Master" -Passed $true -Severity $registrationSeverity `
+        -Details "'$regPattern' found in worker.out.log after the most recent connection error."
+} elseif ($lastErr -gt 0 -or $stderrFatal) {
+    Add-CheckResult -TestId "NET-01" -Name "Worker Registered With Master" -Passed $false -Severity $registrationSeverity `
+        -Details "The worker log shows connection/authentication errors and no later '$regPattern'. Check the master address (cluster port 8088, not 8080), the P2P ticket and the cluster secret."
+} else {
+    Add-CheckResult -TestId "NET-01" -Name "Worker Registered With Master" -Passed $false -Severity "Warning" `
+        -Details "Neither a registration nor an error was found in the worker log yet."
+}
 
 # ==============================================================================
 # Output Formatting

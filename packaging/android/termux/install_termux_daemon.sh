@@ -132,7 +132,13 @@ if [ ! -f "${CONFIG_FILE}" ]; then
     cat > "${CONFIG_FILE}" <<EOF
 # OxideSwarm Worker Configuration for Android Termux
 [worker]
-master = "127.0.0.1:8080"
+# Where this phone connects. Set ONE of the following (start_worker.sh refuses to run without it):
+#   - a master on the same Wi-Fi: its CLUSTER address, port 8088 (8080 is the dashboard, never use it)
+# master = "192.168.1.100:8088"
+#   - a master on another network (started with --p2p): its P2P ticket
+# p2p_ticket = '{"id":"...","addrs":[...]}'
+# Cluster secret copied from the master (default: ~/.oxideswarm/cluster.secret)
+# secret_file = "${HOME}/.oxideswarm/cluster.secret"
 name = "android-termux-$(getprop ro.product.model 2>/dev/null | tr ' ' '_' | tr -cd '[:alnum:]_-' || echo node)"
 heartbeat_interval_secs = 3
 max_concurrency = 4
@@ -142,8 +148,10 @@ keep_sandboxes = false
 # Leave commented out to auto-detect hardware CPU and RAM
 # cores = 8
 # ram_mb = 6144
+# A phone has no GPU the grid can use: never advertise one (a simulated GPU would attract GPU tasks).
 simulate_gpu = false
 EOF
+    chmod 600 "${CONFIG_FILE}"
     log_ok "Generated configuration file: ${CONFIG_FILE}"
 else
     log_ok "Existing configuration preserved: ${CONFIG_FILE}"
@@ -218,6 +226,14 @@ echo "=================================================================="
 echo "          Installation & Setup Completed Successfully!            "
 echo "=================================================================="
 echo -e "${NC}"
+echo "BEFORE THE FIRST START you must:"
+echo "  1. Put the master's address in ${CONFIG_FILE}  (master = \"HOST:8088\", or a p2p_ticket)"
+echo "  2. Copy the master's cluster secret (proof that the master is genuine):"
+echo "       pkg install -y openssh"
+echo "       mkdir -p ~/.oxideswarm && scp user@master:~/.oxideswarm/cluster.secret ~/.oxideswarm/cluster.secret"
+echo "       chmod 600 ~/.oxideswarm/cluster.secret"
+echo "     (or put the file on the phone over USB; never send it through chat or email)"
+echo ""
 echo "Management Commands:"
 echo "  Start worker in foreground:  start_worker.sh --foreground"
 echo "  Start worker in background:  start_worker.sh --daemon"

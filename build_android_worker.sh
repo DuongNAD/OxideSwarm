@@ -38,7 +38,7 @@ ${BOLD}Options:${NC}
   --release             Build in release mode (optimized, smaller binary)
   --target <TRIPLE>     Cross-compilation target (default: aarch64-linux-android)
   --api-level <N>       Android API level (default: 24)
-  --features <LIST>     Cargo feature flags to pass
+  --features <LIST>     Cargo feature flags to pass (must be features of package rusty_grid_cli)
   -h, --help            Show this help message
 
 ${BOLD}Environment Variables:${NC}
@@ -205,7 +205,10 @@ if [[ -f "$OUTPUT_BIN" ]]; then
     echo "Deployment to Android device:"
     echo "  1. Push binary: adb push ${OUTPUT_BIN} /data/local/tmp/rusty-grid"
     echo "  2. Make executable: adb shell chmod +x /data/local/tmp/rusty-grid"
-    echo "  3. Run worker: adb shell /data/local/tmp/rusty-grid worker --master <MASTER_IP>"
+    echo "  3. Push the master's cluster secret (copied from ~/.oxideswarm/cluster.secret on the master):"
+    echo "     adb push cluster.secret /data/local/tmp/cluster.secret && adb shell chmod 600 /data/local/tmp/cluster.secret"
+    echo "  4. Run worker against the master's CLUSTER port 8088 (never the dashboard port 8080):"
+    echo "     adb shell /data/local/tmp/rusty-grid worker --master <MASTER_IP>:8088 --secret-file /data/local/tmp/cluster.secret"
     echo "=================================================================="
 else
     log_err "Expected output binary not found at ${OUTPUT_BIN}"

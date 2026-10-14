@@ -348,8 +348,11 @@ async fn test_worker_redirection_portal_with_auto_master() {
     let n2 = stream2.read(&mut buf).await.expect("Read response");
     let resp2 = String::from_utf8_lossy(&buf[..n2]);
 
-    assert!(resp2.contains("307 Temporary Redirect"));
-    assert!(resp2.contains(&format!(":{}", master_tcp_port)));
+    // This master has no dashboard (it is not enabled here, and a loopback one is advertised as
+    // none), so there is nothing to redirect to: the visitor keeps the standby page. (The beacon
+    // used to name a dashboard URL that nothing served, and the portal redirected to it.)
+    assert!(resp2.contains("200 OK"), "{resp2}");
+    assert!(!resp2.contains("Location:"), "{resp2}");
 
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;

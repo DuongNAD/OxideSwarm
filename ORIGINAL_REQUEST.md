@@ -1,5 +1,12 @@
 # Original User Request
 
+> **HISTORICAL request log, not a current specification.** It records the requests made while the project was built
+> (September 2026), in chronological order, including requirements that were later dropped or only partly delivered
+> (for example the MCP server in R1 of the 2026-09-23 update does **not** exist in this repository). It also contains the
+> author's personal paths, LAN addresses and a phone serial number as they were at the time; do not treat them as
+> defaults. For what exists today see `README.md` (Capabilities & Status, Known Limitations) and `docs/SECURITY.md`.
+
+
 ## 2026-09-19T13:28:05+07:00
 
 An open-source distributed computing framework written in Rust, designed to handle general master-worker tasks, distributed Rust compilation, and GPU workloads across multiple connected machines.

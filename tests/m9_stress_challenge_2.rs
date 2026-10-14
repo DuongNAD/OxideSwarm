@@ -588,6 +588,7 @@ async fn test_boundary_max_retries_5_overrides_lower_server_default() {
 async fn test_direct_queue_boundary_crash_cycles_and_audit() {
     let policy = RetryPolicy {
         max_retries: 2,
+        max_failovers: 2, // failover budget is separate from max_retries; equal here so the exhaustion path is still exercised
         initial_backoff_ms: 10,
         max_backoff_ms: 100,
         backoff_multiplier: 1.5,

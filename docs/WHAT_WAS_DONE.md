@@ -1,4 +1,11 @@
 # Báo Cáo Tổng Hợp Thành Quả Phát Triển OxideSwarm
+
+> **TÀI LIỆU LỊCH SỬ / HISTORICAL (09/2026).** Đây là bản ghi của một giai đoạn làm việc, không phải kết quả kiểm tra hiện hành.
+> The figures (LAN 1.2 ms, 14.2 MB RAM, 38.5 / 32.1 MB for Tailscale / Cloudflare, "probe 5 tầng", ticket exchange through
+> the shared folder) come from one set of the author's machines, are inconsistent with
+> `benchmarks/interconnect/benchmark_data.json` (0.190 ms, 6.8 MB) and were never reproduced in CI. `scripts/sync_network`
+> only performs an HTTP ping probe on port 8085 (see its README) and must not be used to exchange tickets or the cluster secret.
+
 # (OxideSwarm Comprehensive Accomplishment Report)
 
 **Nhánh (Branch)**: `feat/cross-machine-network-sync`  

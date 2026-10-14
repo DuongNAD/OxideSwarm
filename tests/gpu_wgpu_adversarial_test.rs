@@ -8,20 +8,21 @@
 //! 3. Bitwise Deterministic Equivalence:
 //!    - Extensive fuzzing across random seeds and hostile float matrices ensuring bitwise identity
 //!      (simd[idx].to_bits() == oracle[idx].to_bits(), trace, frobenius norm, FNV-1a 64-bit digest).
-//! 4. Hardware WGPU Physical GPU Execution (RTX 5060 Ti):
+//! 4. Hardware WGPU Physical GPU Execution (needs feature `gpu-wgpu` and an adapter; a host
+//!    without one skips these unless `RUSTY_GRID_REQUIRE_GPU=1`):
 //!    - Irregular tile boundary stress (1x1, 17x17, 33x33, 65x65, 127x127, 512x512) on physical GPU.
 //!    - Rapid back-to-back GPU execution stress (buffer allocation/deallocation, memory leaks).
-//! 5. Runner Clamping & Fallback Invariants:
-//!    - Hostile task specification parameter boundary tests (0-dim, max-dim, out-of-range tiles).
+//! 5. Runner Parameter Invariants:
+//!    - Hostile task specification parameters (0-dim, max-dim, out-of-range tiles) are rejected with a
+//!      message naming the limit, never silently clamped.
 
-use std::time::Instant;
 use tempfile::tempdir;
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_worker::cpu_simd;
-use rusty_grid_worker::runner::{RunnerConfig, TaskRunner, EXIT_CODE_SUCCESS};
+use rusty_grid_worker::runner::{RunnerConfig, TaskRunner, EXIT_CODE_GENERAL_ERROR, EXIT_CODE_SUCCESS};
 use rusty_grid_worker::sandbox::SandboxConfig;
 
 fn make_test_runner(has_gpu: bool, is_simulated: bool) -> (TaskRunner, tempfile::TempDir) {
@@ -45,6 +46,23 @@ fn make_test_runner(has_gpu: bool, is_simulated: bool) -> (TaskRunner, tempfile:
     let cfg = RunnerConfig::new(SandboxConfig::new(tmp.path()));
     let runner = TaskRunner::new(Uuid::new_v4(), caps, cfg);
     (runner, tmp)
+}
+
+/// The shared GPU engine, or None (after saying so) on a host/build without one. With
+/// `RUSTY_GRID_REQUIRE_GPU=1` a missing engine fails the test instead.
+#[cfg(feature = "gpu-wgpu")]
+fn gpu_engine_or_skip(test: &str) -> Option<std::sync::Arc<rusty_grid_worker::wgpu_engine::WgpuEngine>> {
+    match rusty_grid_worker::wgpu_engine::EngineProvider::shared().get() {
+        Ok(lease) => Some(lease.engine),
+        Err(err) => {
+            assert!(
+                std::env::var("RUSTY_GRID_REQUIRE_GPU").as_deref() != Ok("1"),
+                "RUSTY_GRID_REQUIRE_GPU=1 but {test} found no GPU engine: {err}"
+            );
+            println!("{test}: skipped, no GPU engine on this host ({err})");
+            None
+        }
+    }
 }
 
 // ============================================================================
@@ -275,7 +293,6 @@ fn test_deterministic_digest_invariance_across_iterations() {
         task_id,
         dim,
         tile,
-        Instant::now(),
     );
 
     // Extract the digest line from stdout
@@ -292,7 +309,6 @@ fn test_deterministic_digest_invariance_across_iterations() {
             task_id,
             dim,
             tile,
-            Instant::now(),
         );
 
         let repeat_digest = stdout_repeat
@@ -314,66 +330,55 @@ fn test_deterministic_digest_invariance_across_iterations() {
 fn test_wgpu_hardware_irregular_dimensions() {
     #[cfg(feature = "gpu-wgpu")]
     {
-        if let Some(adapter_info) = rusty_grid_worker::wgpu_engine::probe_physical_adapter() {
-            println!(
-                "Adversarial WGPU Testing on Physical Adapter: '{}' ({:?})",
-                adapter_info.name, adapter_info.backend
-            );
+        let Some(engine) = gpu_engine_or_skip("test_wgpu_hardware_irregular_dimensions") else {
+            return;
+        };
+        let adapter_info = &engine.adapter_info;
+        println!(
+            "Adversarial WGPU Testing on Physical Adapter: '{}' ({:?})",
+            adapter_info.name, adapter_info.backend
+        );
 
-            let engine = rusty_grid_worker::wgpu_engine::WgpuEngine::try_init()
-                .expect("WgpuEngine::try_init failed")
-                .expect("Physical adapter probed but initialization returned None");
+        // Dimensions: 1x1, 17x17, 33x33, 65x65, 127x127, 512x512
+        let stress_dims = [1, 17, 33, 65, 127, 512];
+        let payload = b"adversarial_test_payload";
 
-            // Dimensions: 1x1, 17x17, 33x33, 65x65, 127x127, 512x512
-            let stress_dims = [1, 17, 33, 65, 127, 512];
-            let payload = b"adversarial_test_payload";
+        for &dim in &stress_dims {
+            let task_id = Uuid::new_v4();
+            let seed = cpu_simd::derive_seed(payload, task_id);
+            let (a, b) = cpu_simd::generate_deterministic_matrices(dim, seed);
+            let mut c_expected = vec![0.0f32; dim * dim];
+            cpu_simd::matmul_simd(&a, &b, &mut c_expected, dim);
 
-            for &dim in &stress_dims {
-                let task_id = Uuid::new_v4();
-                let seed = cpu_simd::derive_seed(payload, task_id);
-                let (a, b) = cpu_simd::generate_deterministic_matrices(dim, seed);
-                let mut c_expected = vec![0.0f32; dim * dim];
-                cpu_simd::matmul_simd(&a, &b, &mut c_expected, dim);
+            let outcome = engine
+                .execute_gemm(&format!("adversarial_gemm_{dim}"), payload, task_id, dim, 16)
+                .unwrap_or_else(|e| panic!("execute_gemm failed for dim {dim}x{dim}: {e}"));
 
-                let start = Instant::now();
-                let outcome = engine
-                    .execute_gemm(
-                        &format!("adversarial_gemm_{dim}"),
-                        payload,
-                        task_id,
-                        dim,
-                        16,
-                        start,
-                    )
-                    .unwrap_or_else(|e| panic!("execute_gemm failed for dim {dim}x{dim}: {e}"));
+            assert_eq!(outcome.matrix_c.len(), dim * dim);
+            assert!(outcome.verification.passed(), "dim {dim}: {}", outcome.verification.summary());
+            assert!(outcome.stdout.contains("Status: VERIFIED_OK"));
+            assert_eq!(outcome.device_name, adapter_info.name);
 
-                assert_eq!(outcome.matrix_c.len(), dim * dim);
-                assert!(outcome.stdout.contains("Status: VERIFIED_OK"));
-                assert_eq!(outcome.device_name, adapter_info.name);
-
-                // Check maximum absolute and relative error against CPU reference
-                let mut max_abs_diff = 0.0f32;
-                for i in 0..dim * dim {
-                    let diff = (outcome.matrix_c[i] - c_expected[i]).abs();
-                    if diff > max_abs_diff {
-                        max_abs_diff = diff;
-                    }
-                    assert!(
-                        diff < 1e-1,
-                        "Excessive GPU vs CPU error at index {i} for dim {dim}x{dim}: gpu={}, cpu={}, diff={}",
-                        outcome.matrix_c[i],
-                        c_expected[i],
-                        diff
-                    );
+            // Check maximum absolute and relative error against CPU reference
+            let mut max_abs_diff = 0.0f32;
+            for i in 0..dim * dim {
+                let diff = (outcome.matrix_c[i] - c_expected[i]).abs();
+                if diff > max_abs_diff {
+                    max_abs_diff = diff;
                 }
-
-                println!(
-                    "  [PASS] Physical GPU Dim {dim:>3}x{dim:<3} | Max Abs Diff: {:.6e} | Time: {} ms",
-                    max_abs_diff, outcome.elapsed_ms
+                assert!(
+                    diff < 1e-1,
+                    "Excessive GPU vs CPU error at index {i} for dim {dim}x{dim}: gpu={}, cpu={}, diff={}",
+                    outcome.matrix_c[i],
+                    c_expected[i],
+                    diff
                 );
             }
-        } else {
-            println!("No physical GPU adapter available; skipping physical WGPU irregular dimension test.");
+
+            println!(
+                "  [PASS] Physical GPU Dim {dim:>3}x{dim:<3} | Max Abs Diff: {:.6e} | Time: {} ms",
+                max_abs_diff, outcome.elapsed_ms
+            );
         }
     }
 }
@@ -385,43 +390,36 @@ fn test_wgpu_hardware_irregular_dimensions() {
 fn test_wgpu_hardware_rapid_burst_stress() {
     #[cfg(feature = "gpu-wgpu")]
     {
-        if let Some(adapter_info) = rusty_grid_worker::wgpu_engine::probe_physical_adapter() {
-            let engine = rusty_grid_worker::wgpu_engine::WgpuEngine::try_init()
-                .expect("WgpuEngine::try_init failed")
-                .expect("Engine init returned None");
+        let Some(engine) = gpu_engine_or_skip("test_wgpu_hardware_rapid_burst_stress") else {
+            return;
+        };
+        println!(
+            "Executing 20 rapid back-to-back GEMM dispatches on '{}'...",
+            engine.adapter_info.name
+        );
+        let dim = 48;
 
-            println!("Executing 20 rapid back-to-back GEMM dispatches on '{}'...", adapter_info.name);
-            let dim = 48;
+        for iter in 1..=20 {
+            let outcome = engine
+                .execute_gemm(&format!("burst_kernel_{iter}"), b"burst_test_payload", Uuid::new_v4(), dim, 16)
+                .unwrap_or_else(|e| panic!("Burst iteration {iter} failed: {e}"));
 
-            for iter in 1..=20 {
-                let start = Instant::now();
-                let outcome = engine
-                    .execute_gemm(
-                        &format!("burst_kernel_{iter}"),
-                        b"burst_test_payload",
-                        Uuid::new_v4(),
-                        dim,
-                        16,
-                        start,
-                    )
-                    .unwrap_or_else(|e| panic!("Burst iteration {iter} failed: {e}"));
-
-                assert_eq!(outcome.matrix_c.len(), dim * dim);
-                assert!(outcome.stdout.contains("Status: VERIFIED_OK"));
-            }
-            println!("  [PASS] Completed 20 rapid back-to-back GPU GEMM dispatches successfully.");
+            assert_eq!(outcome.matrix_c.len(), dim * dim);
+            assert!(outcome.stdout.contains("Status: VERIFIED_OK"));
         }
+        println!("  [PASS] Completed 20 rapid back-to-back GPU GEMM dispatches successfully.");
     }
 }
 
 // ============================================================================
-// Scenario 8: Runner Task Specification Hostile Parameter Clamping
+// Scenario 8: Runner Task Specification Hostile Parameters: Rejected, Not Clamped
 // ============================================================================
 #[tokio::test]
 async fn test_runner_hostile_parameter_clamping() {
     let (runner, _tmp) = make_test_runner(true, true);
 
-    // 1. Hostile underflow: dim = 0, work_group_size = 0
+    // 1. Hostile underflow: dim = 0, work_group_size = 0. These used to be silently raised to
+    // 16 and 4; now the task fails and says which parameter is wrong.
     let task_underflow = Task::new(
         TaskSpec::GpuCompute {
             kernel_name: "underflow_clamp_kernel".into(),
@@ -434,19 +432,14 @@ async fn test_runner_hostile_parameter_clamping() {
     );
 
     let res_underflow = runner.execute_task(&task_underflow, None, None).await;
-    assert_eq!(res_underflow.exit_code, EXIT_CODE_SUCCESS);
-    assert!(res_underflow.is_gpu_executed);
-    // Dim must be clamped to 16, tile to 4
-    assert!(
-        res_underflow.stdout.contains("Matrix Dimension: 16x16"),
-        "Matrix dimension was not clamped to minimum 16"
-    );
-    assert!(
-        res_underflow.stdout.contains("Work Group Size: 4x4"),
-        "Work group size was not clamped to minimum 4"
-    );
+    assert_eq!(res_underflow.exit_code, EXIT_CODE_GENERAL_ERROR);
+    assert!(!res_underflow.is_gpu_executed);
+    assert!(res_underflow.stdout.is_empty(), "no result for a rejected request");
+    let error = res_underflow.error.expect("error message");
+    assert!(error.contains("simulated_matrix_dim must be at least 1"), "{error}");
 
-    // 2. Hostile overflow: dim = 100000, work_group_size = 999
+    // 2. Hostile overflow: dim = 100000, work_group_size = 999. These used to be silently
+    // lowered to 512 and 32 (so a caller asking for 100000 got a 512 benchmark and exit 0).
     let task_overflow = Task::new(
         TaskSpec::GpuCompute {
             kernel_name: "overflow_clamp_kernel".into(),
@@ -459,16 +452,12 @@ async fn test_runner_hostile_parameter_clamping() {
     );
 
     let res_overflow = runner.execute_task(&task_overflow, None, None).await;
-    assert_eq!(res_overflow.exit_code, EXIT_CODE_SUCCESS);
-    assert!(res_overflow.is_gpu_executed);
-    // Dim must be clamped to 512, tile to 32
+    assert_eq!(res_overflow.exit_code, EXIT_CODE_GENERAL_ERROR);
+    assert!(!res_overflow.is_gpu_executed);
+    let error = res_overflow.error.expect("error message");
     assert!(
-        res_overflow.stdout.contains("Matrix Dimension: 512x512"),
-        "Matrix dimension was not clamped to maximum 512"
-    );
-    assert!(
-        res_overflow.stdout.contains("Work Group Size: 32x32"),
-        "Work group size was not clamped to maximum 32"
+        error.contains("simulated_matrix_dim 100000 is above what this device accepts"),
+        "{error}"
     );
 
     // 3. Huge input payload (100 KB) for seed derivation
@@ -487,25 +476,34 @@ async fn test_runner_hostile_parameter_clamping() {
     let res_huge = runner.execute_task(&task_huge, None, None).await;
     assert_eq!(res_huge.exit_code, EXIT_CODE_SUCCESS);
     assert!(res_huge.stdout.contains("Status: VERIFIED_OK"));
+
+    // 4. Input whose hash is the largest possible seed: the seed addition must wrap, not panic
+    // (debug) or silently differ (release). 0xff.. folded with *31 is some u64; use the
+    // unit-tested generator to prove the extreme seeds directly as well.
+    let (a, _) = cpu_simd::generate_deterministic_matrices(16, u64::MAX);
+    assert!(a.iter().all(|v| v.is_finite()));
 }
 
 // ============================================================================
 // Scenario 9: Hash WGSL Compute Shader Compilation & Validation
+// (hash.wgsl is EXPERIMENTAL and not dispatched by any task: this only checks that it still
+// compiles. It does not produce the CPU digest, see the header of the file.)
 // ============================================================================
 #[test]
 fn test_hash_wgsl_shader_compilation() {
     #[cfg(feature = "gpu-wgpu")]
     {
-        if let Some(_info) = rusty_grid_worker::wgpu_engine::probe_physical_adapter() {
-            let engine = rusty_grid_worker::wgpu_engine::WgpuEngine::try_init()
-                .expect("WgpuEngine::try_init failed")
-                .expect("Physical adapter probed but initialization returned None");
-
+        if let Some(engine) = gpu_engine_or_skip("test_hash_wgsl_shader_compilation") {
             let hash_wgsl = include_str!("../crates/worker/src/shaders/hash.wgsl");
+            // The engine's device reports errors to a logging handler instead of panicking, so
+            // the compilation result has to be read from an error scope.
+            engine.device.push_error_scope(wgpu::ErrorFilter::Validation);
             let shader = engine.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("adversarial_hash_shader_module"),
                 source: wgpu::ShaderSource::Wgsl(hash_wgsl.into()),
             });
+            let error = pollster::block_on(engine.device.pop_error_scope());
+            assert!(error.is_none(), "hash.wgsl no longer compiles: {error:?}");
 
             // Verify shader module compilation succeeds
             println!("  [PASS] WGSL validation of hash.wgsl succeeded: {:?}", shader);
@@ -520,26 +518,19 @@ fn test_hash_wgsl_shader_compilation() {
 fn test_direct_wgpu_zero_dimension_behavior() {
     #[cfg(feature = "gpu-wgpu")]
     {
-        if let Some(_info) = rusty_grid_worker::wgpu_engine::probe_physical_adapter() {
-            let engine = rusty_grid_worker::wgpu_engine::WgpuEngine::try_init()
-                .expect("WgpuEngine::try_init failed")
-                .expect("Engine init returned None");
-
-            // Calling execute_gemm directly with dim = 0 creates 0-byte buffers
+        if let Some(engine) = gpu_engine_or_skip("test_direct_wgpu_zero_dimension_behavior") {
+            // dim = 0 would create 0-byte buffers, which wgpu rejects. The engine refuses the
+            // request up front instead of panicking or leaving it to the driver.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                engine.execute_gemm(
-                    "zero_dim_kernel",
-                    b"payload",
-                    Uuid::new_v4(),
-                    0,
-                    16,
-                    Instant::now(),
-                )
+                engine.execute_gemm("zero_dim_kernel", b"payload", Uuid::new_v4(), 0, 16)
             }));
-
-            // In wgpu, creating a buffer with size 0 causes a panic or error
-            println!("  [OBSERVED] Direct execute_gemm(dim=0) result: {:?}", result.is_ok());
-            // Note: TaskRunner clamps dim to min 16, so tasks submitted via scheduler/runner never hit dim=0.
+            let outcome = result.expect("execute_gemm(dim=0) must not panic");
+            let err = outcome.expect_err("dim = 0 is not a matrix");
+            assert!(
+                matches!(err, rusty_grid_worker::gpu::GpuError::InvalidRequest(_)),
+                "{err:?}"
+            );
+            assert!(!engine.is_lost());
         }
     }
 }

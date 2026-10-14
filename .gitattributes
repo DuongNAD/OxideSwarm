@@ -1,0 +1,17 @@
+# Line endings are part of the contract for launcher scripts:
+#  - anything bash (or another Unix interpreter) runs must be LF, or Git Bash on a Windows
+#    checkout with core.autocrlf=true fails with `$'\r': command not found`;
+#  - anything cmd.exe / PowerShell / WSH runs must be CRLF, or batch labels (`goto :X`,
+#    `call :X`) can fail with "cannot find the batch label" when the file is copied around raw.
+
+# Unix shell scripts and shebang scripts
+*.sh                                       text eol=lf
+*.py                                       text eol=lf
+packaging/android/termux/start-oxideswarm  text eol=lf
+packaging/android/app/gradlew              text eol=lf
+
+# Windows scripts
+*.cmd                                      text eol=crlf
+*.bat                                      text eol=crlf
+*.ps1                                      text eol=crlf
+*.vbs                                      text eol=crlf

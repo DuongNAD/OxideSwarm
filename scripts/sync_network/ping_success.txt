@@ -1,5 +1,7 @@
 ================================================================================
 OXIDESWARM CROSS-MACHINE PING SUCCESS CONFIRMATION
+(HISTORICAL sample written on 2026-09-23 for two of the author's machines; sync_network.py writes this file
+ after a successful HTTP /ping on port 8085 only. It says nothing about the grid ports 8088/8080/8089.)
 ================================================================================
 STATUS: PING SUCCESS
 RESULT: SUCCESS

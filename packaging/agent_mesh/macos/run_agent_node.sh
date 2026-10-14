@@ -20,6 +20,20 @@ echo "Node ID:  $NODE_ID"
 echo "Platform: macOS ($(uname -m))"
 echo ""
 
+# A hub that is reachable beyond this machine requires its token (OXIDE_MESH_TOKEN, or --token).
+case "$HUB_URL" in
+    ws://127.0.0.1:*|ws://localhost:*|ws://\[::1\]:*) ;;
+    *)
+        if [[ -z "${OXIDE_MESH_TOKEN:-}" ]]; then
+            echo "[WARN] OXIDE_MESH_TOKEN is not set; a hub bound beyond localhost will reject this node (export OXIDE_MESH_TOKEN=<hub token>)."
+        fi
+        if [[ "$HUB_URL" == ws://* ]]; then
+            echo "[WARN] ws:// is not encrypted: the token and every command cross the network in clear text."
+            echo "       Use wss:// behind a TLS proxy, or a VPN / SSH tunnel; never expose the hub to the Internet."
+        fi
+        ;;
+esac
+
 # Find binary
 BINARY=""
 if [[ -f "./target/release/agent-mesh" ]]; then

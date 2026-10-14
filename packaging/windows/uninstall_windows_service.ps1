@@ -208,6 +208,8 @@ try {
     [Environment]::SetEnvironmentVariable("OXIDESWARM_BIN", $null, [EnvironmentVariableTarget]::Machine)
     [Environment]::SetEnvironmentVariable("OXIDESWARM_CONFIG", $null, [EnvironmentVariableTarget]::Machine)
     [Environment]::SetEnvironmentVariable("OXIDESWARM_LOG_DIR", $null, [EnvironmentVariableTarget]::Machine)
+    # Set by older installers; a leftover value would override the configuration of any later install.
+    [Environment]::SetEnvironmentVariable("OXIDESWARM_P2P_TICKET", $null, [EnvironmentVariableTarget]::Machine)
     Write-Host "[OK] Environment variables cleaned." -ForegroundColor Green
 } catch {
     Write-Warning "Could not clear environment variables: $($_.Exception.Message)"
@@ -239,8 +241,8 @@ if (Test-Path $InstallDir) {
         Remove-Item -Path (Join-Path $InstallDir "ServiceWrapper.cs") -Force -ErrorAction SilentlyContinue
 
         Write-Host "[OK] Binaries removed from $InstallDir." -ForegroundColor Green
-        Write-Host "[INFO] Preserved config ($ConfigPath) and logs ($LogDir)." -ForegroundColor Cyan
-        Write-Host "       Pass -PurgeData to permanently remove all log files and data sandboxes." -ForegroundColor Cyan
+        Write-Host "[INFO] Preserved config ($ConfigPath, which may hold a P2P ticket), the cluster secret next to it, and logs ($LogDir)." -ForegroundColor Cyan
+        Write-Host "       Pass -PurgeData to permanently remove all log files, data sandboxes, the config and the secret copy." -ForegroundColor Cyan
     }
 }
 

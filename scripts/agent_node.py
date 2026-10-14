@@ -12,6 +12,8 @@ Features:
 - Subprocess command execution with timeout watchdog
 - Bit-for-bit SHA-256 verified data payload streaming
 - Cross-talk isolation (ignores messages not targeted to this node)
+- Hub token authentication: pass --token or set OXIDE_MESH_TOKEN when the hub requires one
+  (the token is sent in clear text inside the WebSocket; use wss:// on untrusted networks)
 """
 
 import argparse
@@ -21,6 +23,7 @@ import json
 import logging
 import os
 import platform
+import signal
 import subprocess
 import sys
 import time
@@ -38,6 +41,12 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("OxideAgent")
+
+# DeliveryNack error codes the hub answers a NodeRegistration with when it refuses the node.
+REGISTRATION_ERROR_CODES = ("ERR_UNAUTHORIZED", "ERR_DUPLICATE_NODE_ID", "ERR_INVALID_NODE_ID")
+# Rejections that cannot fix themselves: do not hammer the hub, retry rarely.
+REGISTRATION_FATAL_CODES = ("ERR_UNAUTHORIZED", "ERR_INVALID_NODE_ID")
+REJECTED_RETRY_DELAY_S = 30.0
 
 
 def detect_platform_tag() -> str:
@@ -65,6 +74,26 @@ def detect_platform_tag() -> str:
     return sys_plat
 
 
+def kill_process_tree(proc) -> None:
+    """Kills a command started by `shell_exec` together with everything it spawned.
+
+    On POSIX the command runs in its own session (see `start_new_session` below), so its process
+    group id is its PID and one `killpg` reaches the grandchildren too. Without that, a grandchild
+    that inherited the output pipes keeps them open and even `proc.wait()` blocks until it exits.
+    """
+    try:
+        if platform.system().lower() == "windows":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
 def collect_telemetry(platform_tag: str) -> dict:
     """Collects system hardware and OS capabilities."""
     return {
@@ -79,11 +108,15 @@ def collect_telemetry(platform_tag: str) -> dict:
 
 
 class OxideAgentNode:
-    def __init__(self, hub_url: str, node_id: str, platform_name: str, hostname: str = None):
+    def __init__(self, hub_url: str, node_id: str, platform_name: str, hostname: str = None, token: str = None):
         self.hub_url = hub_url
         self.node_id = node_id
         self.platform_name = platform_name
         self.hostname = hostname or platform.node() or "unknown-host"
+        # Hub token (OXIDE_MESH_TOKEN / --token); an empty string means "no token".
+        self.token = token or None
+        # (error_code, reason) when the hub answered the last registration with a NACK.
+        self.registration_error = None
         self.ws = None
         self.running = False
         self.active_commands = 0
@@ -104,6 +137,7 @@ class OxideAgentNode:
             max_size=16 * 1024 * 1024,
         )
         self.running = True
+        self.registration_error = None
         logger.info(f"Connected! Registering as '{self.node_id}' ({self.platform_name})...")
 
         # Send NodeRegistration
@@ -127,14 +161,34 @@ class OxideAgentNode:
             },
             "timestamp": int(time.time() * 1000),
         }
+        if self.token:
+            reg_msg["token"] = self.token
         await self.ws.send(json.dumps(reg_msg))
+
+    def _fail_pending(self, msg: dict):
+        """Resolves every outstanding request with `msg` (the hub's refusal), so callers fail fast."""
+        for futures in (self.pending_commands, self.pending_acks):
+            for corr_id in list(futures):
+                fut = futures.pop(corr_id)
+                if not fut.done():
+                    fut.set_result(msg)
+
+    def _rejection_delay(self) -> float:
+        """How long to wait before registering again after a hub NACK."""
+        code = self.registration_error[0] if self.registration_error else None
+        return REJECTED_RETRY_DELAY_S if code in REGISTRATION_FATAL_CODES else 10.0
 
     async def listen(self):
         """Processes incoming messages from the WebSocket."""
         async for raw_msg in self.ws:
             try:
                 msg = json.loads(raw_msg)
-                asyncio.create_task(self._dispatch_incoming(msg))
+                if msg.get("type") == "DeliveryNack" and msg.get("error_code") in REGISTRATION_ERROR_CODES:
+                    # Handled inline: the hub closes the socket right behind this frame, and the
+                    # reconnect logic must already know why by the time the close is noticed.
+                    await self._dispatch_incoming(msg)
+                else:
+                    asyncio.create_task(self._dispatch_incoming(msg))
             except Exception as e:
                 logger.error(f"Error handling incoming message: {e}")
 
@@ -150,14 +204,31 @@ class OxideAgentNode:
                 hb_task = asyncio.create_task(self._heartbeat_loop())
 
                 # Message pump
-                await self.listen()
+                try:
+                    await self.listen()
+                finally:
+                    hb_task.cancel()
 
-                hb_task.cancel()
+                # The hub closed the connection. Pace the reconnect instead of spinning, and back
+                # off hard when it refused us for a reason that will not go away by itself.
+                if self.registration_error:
+                    delay = self._rejection_delay()
+                    logger.error(f"Retrying the registration in {delay:.0f}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.warning(f"Connection closed by hub. Reconnecting in {backoff:.1f}s...")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 1.5, 15.0)
 
             except (websockets.exceptions.ConnectionClosed, ConnectionRefusedError, OSError) as e:
-                logger.warning(f"Connection error: {e}. Reconnecting in {backoff:.1f}s...")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 1.5, 15.0)
+                if self.registration_error:
+                    delay = self._rejection_delay()
+                    logger.error(f"Connection closed after the hub rejected the registration. Retrying in {delay:.0f}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.warning(f"Connection error: {e}. Reconnecting in {backoff:.1f}s...")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 1.5, 15.0)
             except Exception as e:
                 logger.error(f"Unexpected client error: {e}. Retrying in 3s...")
                 await asyncio.sleep(3.0)
@@ -212,6 +283,11 @@ class OxideAgentNode:
                     fut = self.pending_acks.pop(corr_id)
                     if not fut.done():
                         fut.set_result(msg)
+        elif msg_type == "DeliveryNack" and msg.get("error_code") in REGISTRATION_ERROR_CODES:
+            # The hub refused this node (bad token, duplicate id, ...): it closes the socket next.
+            self.registration_error = (msg.get("error_code"), msg.get("reason", ""))
+            logger.error(f"Hub rejected the registration: {msg.get('error_code')} - {msg.get('reason', '')}")
+            self._fail_pending(msg)
         elif msg_type == "DeliveryNack":
             # DeliveryNack represents a routing failure (e.g. node not found); fail fast on both queues
             if corr_id in self.pending_commands:
@@ -284,6 +360,7 @@ class OxideAgentNode:
                     cmd_str,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    start_new_session=(os.name == "posix"),
                 )
                 out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
                 stdout = out.decode("utf-8", errors="replace")
@@ -298,11 +375,9 @@ class OxideAgentNode:
 
         except asyncio.TimeoutError:
             if proc is not None:
+                kill_process_tree(proc)
                 try:
-                    if platform.system().lower() == "windows":
-                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
-                    proc.kill()
-                    await proc.wait()
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
                 except Exception:
                     pass
             status = "timeout"
@@ -397,8 +472,22 @@ class OxideAgentNode:
             "timeout_ms": int(timeout * 1000),
             "timestamp": int(time.time() * 1000),
         }
-        await self.ws.send(json.dumps(req))
         try:
+            try:
+                await self.ws.send(json.dumps(req))
+            except websockets.exceptions.ConnectionClosed:
+                if self.registration_error:
+                    # The hub already hung up on us after refusing the registration.
+                    code, reason = self.registration_error
+                    return {
+                        "type": "DeliveryNack",
+                        "correlation_id": corr_id,
+                        "from": "hub",
+                        "to": self.node_id,
+                        "error_code": code,
+                        "reason": reason,
+                    }
+                raise
             return await asyncio.wait_for(fut, timeout=timeout + 2.0)
         finally:
             self.pending_commands.pop(corr_id, None)
@@ -485,6 +574,12 @@ def main():
     parser.add_argument("--id", default=default_id, help="Node ID")
     parser.add_argument("--platform", default=detected_plat, help="Platform tag (windows, macos, ubuntu, android)")
     parser.add_argument("--hostname", default=None, help="Hostname override")
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("OXIDE_MESH_TOKEN") or None,
+        help="Hub token (default: $OXIDE_MESH_TOKEN). Needed when the hub was started with --token; "
+        "visible in the process list, so prefer the environment variable",
+    )
 
     # Command submission options (flags & subcommands supported)
     parser.add_argument(
@@ -530,7 +625,7 @@ def main():
 
     args = parser.parse_args()
 
-    node = OxideAgentNode(args.hub, args.id, args.platform, args.hostname)
+    node = OxideAgentNode(args.hub, args.id, args.platform, args.hostname, token=args.token)
 
     async def execute():
         is_compute = (

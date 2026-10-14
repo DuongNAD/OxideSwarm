@@ -2,6 +2,14 @@
 
 Welcome to the unified packaging and background execution suite for **OxideSwarm** (`rusty-grid` / `oxideswarm`). This directory contains production-ready installation scripts, daemon configurations, wrappers, and validation tools designed to run the OxideSwarm distributed grid worker as an automated, persistent, silent background service across **macOS**, **Windows**, and **Android**.
 
+> **Read first: three things every worker needs.** (1) The master's **cluster port, 8088**, as its address
+> (`HOST:8088`; port 8080 is the dashboard and never works as a worker target). (2) A copy of the master's
+> **`cluster.secret`** (on the master: `~/.oxideswarm/cluster.secret`, created on its first start), moved over a
+> channel you trust, e.g. `scp user@master:~/.oxideswarm/cluster.secret ./cluster.secret` or a USB stick. A worker
+> refuses to follow a remote master without it unless you pass `--insecure`/`-Insecure`. (3) The account that runs
+> the service: every task the master sends runs with that account's rights, so the installers use an unprivileged one
+> (not root/SYSTEM) by default. Details and threat model: [../docs/SECURITY.md](../docs/SECURITY.md).
+
 ---
 
 ## 1. Overview of OxideSwarm Background Packaging
@@ -32,8 +40,9 @@ An OxideSwarm compute grid relies on persistent worker nodes capable of receivin
 1. **Silent & Headless Execution**: Zero command windows, terminal popups, or user-session dependencies. Services run in background system domains or foreground service notifications.
 2. **Auto-Start on Boot**: Workers automatically register and begin processing immediately when the operating system boots, surviving user logoffs or lock screens.
 3. **Crash Resilience & Supervision**: Process supervisors automatically restart the worker upon unexpected exit or network failure, incorporating exponential or throttled backoff to prevent restart storms.
-4. **Observable Logging**: Standard I/O streams are systematically captured into structured, rotating log files with configurable log levels (`RUST_LOG=info`).
-5. **Zero Friction Deployment**: Every target OS includes self-contained installation scripts with automatic privilege detection and comprehensive verification suites.
+4. **Observable Logging**: Standard I/O streams are captured into log files (`RUST_LOG=info`); rotation depends on the platform wrapper (see each guide).
+5. **Least Privilege**: no installer runs the worker as root or SYSTEM unless you ask for it explicitly (`--run-as-root`, `-ServiceAccount LocalSystem -AcceptSystemRisk`).
+6. **Honest Verification**: the verify scripts check the installed definition, and the Windows/macOS installers also look for the `Registration accepted` log line, because a running service is not necessarily a connected worker.
 
 ---
 
@@ -87,17 +96,19 @@ Deployed as an Apple System LaunchDaemon in `/Library/LaunchDaemons/` managed by
 #### Quickstart Commands
 
 ```bash
-# 1. Build the release binary (if not already compiled)
-cargo build --release --bin rusty-grid
+# 1. Build the release binary (if not already compiled). --features gpu-wgpu lets the worker use this
+#    Mac's GPU (Metal); without it the worker advertises no GPU.
+cargo build --release --bin rusty-grid --features gpu-wgpu
 
-# 2. Install and launch the System LaunchDaemon (connects to Master coordinator)
-sudo bash packaging/macos/install_mac_daemon.sh --master 192.168.1.100:8080
+# 2. Install and launch the System LaunchDaemon (connects to the master's CLUSTER port 8088).
+#    The worker runs as the user who ran sudo (or --user NAME), never as root; see packaging/macos/README.md
+sudo bash packaging/macos/install_mac_daemon.sh --master 192.168.1.100:8088 --secret-file ~/cluster.secret
 
-# Or connect over the internet using an Iroh P2P NAT Traversal ticket:
-sudo bash packaging/macos/install_mac_daemon.sh --p2p-ticket "iroh-ticket-string..."
+# Or connect over the internet using an Iroh P2P ticket from a master started with --p2p (ticket in a file, not on argv):
+sudo bash packaging/macos/install_mac_daemon.sh --p2p-ticket-file ticket.txt --secret-file ~/cluster.secret
 
-# 3. Dry-run installation (safe preview without root)
-bash packaging/macos/install_mac_daemon.sh --dry-run --master 127.0.0.1:8080
+# 3. Dry-run installation (safe preview, no root, writes nothing)
+bash packaging/macos/install_mac_daemon.sh --dry-run --master 192.168.1.100:8088 --secret-file ~/cluster.secret
 
 # 4. Inspect daemon status in launchd
 sudo launchctl print system/com.oxideswarm.worker
@@ -135,11 +146,15 @@ Windows Services run in **Session 0** under the Windows Service Control Manager 
 # 1. Navigate to the Windows packaging directory
 cd packaging\windows
 
-# 2. Install using NativeWrapper (Default, zero external downloads)
-.\install_windows_service.ps1 -Master "192.168.1.100:8080" -WorkerBin "..\..\target\x86_64-pc-windows-gnu\release\rusty-grid.exe"
+# 2. Install using NativeWrapper (Default, zero external downloads). -Master is the CLUSTER port 8088, and the
+#    secret file is the one copied from the master. The service runs as NT SERVICE\OxideSwarmWorker, not SYSTEM.
+.\install_windows_service.ps1 -Master "192.168.1.100:8088" -SecretFile "C:\path\cluster.secret" -WorkerBin "..\..\target\x86_64-pc-windows-gnu\release\rusty-grid.exe"
 
 # Or install using WinSW:
-.\install_windows_service.ps1 -Master "192.168.1.100:8080" -WorkerBin ".\rusty-grid.exe" -ServiceMethod "WinSW"
+.\install_windows_service.ps1 -Master "192.168.1.100:8088" -SecretFile "C:\path\cluster.secret" -WorkerBin ".\rusty-grid.exe" -ServiceMethod "WinSW"
+
+# Re-pair or upgrade an installed service (stops and replaces it) / connect through a P2P ticket file:
+.\install_windows_service.ps1 -P2pTicketFile "C:\path\ticket.txt" -SecretFile "C:\path\cluster.secret" -Force
 
 # 3. Verify service registration, auto-start, and Session 0 headless execution
 .\verify_windows_service.ps1
@@ -152,8 +167,8 @@ Get-Service OxideSwarmWorker
 Start-Service OxideSwarmWorker
 Stop-Service OxideSwarmWorker
 
-# 5. Tail service logs
-Get-Content C:\ProgramData\OxideSwarm\logs\worker.log -Wait -Tail 30
+# 5. Tail service logs (look for "Registration accepted"; the installer waits for it and warns if it does not appear)
+Get-Content C:\ProgramData\OxideSwarm\logs\worker.out.log -Wait -Tail 30
 
 # 6. Uninstall service
 .\uninstall_windows_service.ps1
@@ -170,8 +185,9 @@ Android's aggressive battery optimizations (Doze Mode, App Standby, Low Memory K
 #### Path A: Native Android Foreground Service App (`packaging/android/app/`) — Production Recommended
 A production-grade Kotlin app targeting API 24+ (Android 7.0 through Android 15+).
 - **Dual-Engine Execution**:
-  - **In-Process JNI (`liboxideworker.so`)**: Executes Tokio runtime within the app's native POSIX thread. Produces **zero child processes**, rendering it **100% immune to the Android 12+ Phantom Process Killer (PPK)** and SELinux W^X execution restrictions.
-  - **Managed Process Runner**: Standalone ELF supervision fallback.
+  - **In-Process JNI (`liboxideworker.so`)**: runs the Tokio runtime and the worker loop inside the app process, so the worker itself is not a child process that the Android 12+ Phantom Process Killer (PPK) can reap. Tasks of type command / shell / compile are still spawned as child processes of the app and are exposed to PPK; only the built-in in-process task types are not. **You must build the library first**: `packaging/android/build_android_jni.sh --release` writes it to `packaging/android/app/app/src/main/jniLibs/arm64-v8a/`; an APK built without it has no worker.
+  - **Managed Process Runner**: fallback that looks for a standalone `rusty-grid` binary (`/data/local/tmp/rusty-grid` or the app's files); it is not bundled.
+  - **Known gap**: the app cannot hold the cluster secret yet, so it cannot join a master that requires one. Use Path B (Termux) until that is added.
 - **Power Management Immunity**:
   - `foregroundServiceType="specialUse|dataSync"` with mandatory Android 14+ subtype justification property.
   - `PowerManager.PARTIAL_WAKE_LOCK` (`OxideSwarm::CpuWakeLock`) keeps the CPU awake during screen-off.
@@ -181,13 +197,16 @@ A production-grade Kotlin app targeting API 24+ (Android 7.0 through Android 15+
 
 ##### Build & Install Path A:
 ```bash
+# 0. Build the native worker library (needs the Android NDK and the aarch64-linux-android Rust target; see packaging/android/README.md)
+packaging/android/build_android_jni.sh --release
+
 cd packaging/android/app
 
-# Compile Release APK using Gradle wrapper
-./gradlew assembleRelease
+# Compile a debug APK (the release APK is unsigned and cannot be installed as is)
+./gradlew assembleDebug
 
 # Install onto connected Android device via ADB
-adb install -r app/build/outputs/apk/release/app-release-unsigned.apk
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 # Launch Worker UI to configure coordinator address and start service
 adb shell am start -n com.oxideswarm.worker/.MainActivity
@@ -204,8 +223,10 @@ A lightweight script-based setup for developer workstations and headless Android
 # 1. Run the one-click installer
 bash packaging/android/termux/install_termux_daemon.sh
 
-# 2. Start the worker daemon in the background
-bash packaging/android/termux/start_worker.sh --daemon --master 192.168.1.100:8080
+# 2. Put the master's CLUSTER address (HOST:8088) in ~/.config/oxideswarm/rusty-grid.toml (master = "...")
+#    and the copied secret in ~/.oxideswarm/cluster.secret (chmod 600), then start the worker daemon:
+bash packaging/android/termux/start_worker.sh --daemon
+#    (--master HOST:8088 overrides the config for one run; nothing is passed unless you give it)
 
 # 3. Check daemon status and resource telemetry
 bash packaging/android/termux/start_worker.sh --status
@@ -221,18 +242,20 @@ bash packaging/android/termux/start_worker.sh --stop
 
 ## 4. Verification Scripts & Validation Commands
 
-All packaging scripts have been subjected to rigorous syntax, schema, and execution checks.
+The scripts below check syntax, structure and (where possible) the installed definition. Some checks only run on
+the target OS: the Windows scripts cannot run on macOS/Linux, so the Windows output further down is an illustration of
+the format, not a recorded run.
 
 ### 4.1 Verification Commands Reference
 
 | Platform | Verification Target | Command | Validation Scope |
 |---|---|---|---|
 | **macOS** | Property List Syntax | `plutil -lint packaging/macos/com.oxideswarm.worker.plist` | Apple XML DTD compliance, key-value typing |
-| **macOS** | Daemon Test Suite | `bash packaging/macos/verify_mac_daemon.sh --non-root` | 10 automated checks: keys, limits, paths |
+| **macOS** | Daemon Test Suite | `bash packaging/macos/verify_mac_daemon.sh --non-root` | 11 automated checks: keys, limits, paths, service account (not root) |
 | **macOS** | Shell Scripts | `bash -n packaging/macos/*.sh` | POSIX/Bash syntax, absence of parse errors |
 | **Windows**| XML Configuration | Python ET / `xmllint packaging/windows/winsw.xml` | XML structure, well-formedness |
 | **Windows**| PowerShell Integrity | Structural parser (`validate_ps1.py`) | Bracket/quote balance, cmdlet parameters |
-| **Windows**| Live SCM Test | `.\packaging\windows\verify_windows_service.ps1` | SCM query, Auto startup, Session 0, recovery |
+| **Windows**| Live SCM Test | `.\packaging\windows\verify_windows_service.ps1` | SCM query, Auto startup, Session 0, recovery, not-SYSTEM identity, `Registration accepted` in the log |
 | **Android**| Manifest XML | Python ET / `xmllint AndroidManifest.xml` | Android schema, permissions, FGS properties |
 | **Android**| Termux Shell Scripts| `bash -n packaging/android/termux/*.sh` | Bash syntax validation, no parse errors |
 | **Android**| Execution Rubric | Audit per `packaging/android/EVALUATION_RUBRIC.md` | 10-point empirical power-saving immunity |
@@ -257,10 +280,12 @@ $ bash packaging/macos/verify_mac_daemon.sh --non-root
 [CHECK 8] Validating I/O log redirection keys... [PASS] StandardOutPath, StandardErrorPath
 [CHECK 9] Validating ResourceLimits... [PASS] NumberOfFiles Soft: 65536, Hard: 65536
 [CHECK 10] Validating execution environment... [PASS] WorkingDirectory = /var/lib/oxideswarm
-VERIFICATION RESULT: ALL CHECKS PASSED [OK] (Score: 10/10)
+[CHECK 10b] Validating service account (UserName, not root)... [PASS] UserName is the template placeholder
+VERIFICATION RESULT: ALL CHECKS PASSED [OK] (Score: 11/11)
 ```
+(Abbreviated from a run on macOS against the template plist.)
 
-#### Windows Verification
+#### Windows Verification (illustrative output; not produced on this repository's macOS host)
 ```powershell
 # SCM Verification Suite
 PS > .\packaging\windows\verify_windows_service.ps1
@@ -271,7 +296,9 @@ PS > .\packaging\windows\verify_windows_service.ps1
 [CHECK 5] SCM Failure Recovery Actions              [PASS] Service restart actions configured
 [CHECK 6] Session 0 Headless Execution              [PASS] Process runs in Session 0 (Headless)
 [CHECK 7] Log Directory and File Creation           [PASS] Active logs located in ProgramData
-VERIFICATION RESULT: ALL 7 CHECKS PASSED [OK]
+[SEC-01]  Service Runs Without SYSTEM Privileges    [PASS] Service runs as 'NT SERVICE\OxideSwarmWorker'
+[NET-01]  Worker Registered With Master             [PASS] 'Registration accepted' found in worker.out.log
+VERIFICATION RESULT: ALL CHECKS PASSED [OK]
 ```
 
 ---
@@ -291,7 +318,7 @@ To ensure an independent auditor can confirm technical compliance against Doze m
 6. **TC-06: Simulated Deep Doze Mode Endurance Test** — Uses `dumpsys deviceidle force-idle` to place the device into Deep Doze; confirms TCP socket and heartbeat stay active for 15+ minutes.
 7. **TC-07: In-Doze Computational Task Dispatch & Execution** — Dispatches compute tasks while device is locked in Deep Doze; verifies instant execution without waiting for maintenance windows.
 8. **TC-08: Linux Cgroups Freezer (`CachedAppOptimizer`) Exemption Verification** — Queries cgroup v1/v2 freeze states (`cgroup.freeze`) to confirm the worker process is never frozen by Android's `CachedAppOptimizer`.
-9. **TC-09: Android 12+ Phantom Process Killer (PPK) Immunity Test** — Confirms that In-Process JNI execution produces zero child processes (`pgrep -P $PID` returns empty), guaranteeing complete PPK immunity without `SIGKILL`.
+9. **TC-09: Android 12+ Phantom Process Killer (PPK) Test** — Confirms that the in-process JNI worker loop has no child process while idle or running built-in tasks (`pgrep -P $PID` returns empty). It does not hold while command / shell / compile tasks are running, because those spawn child processes that PPK may kill.
 10. **TC-10: Cold Device Reboot Auto-Start & Auto-Reconnect Verification** — Verifies direct boot / boot broadcast resurrection (`LOCKED_BOOT_COMPLETED` in BFU and `BOOT_COMPLETED` in AFU) without requiring manual app launch.
 
 ---

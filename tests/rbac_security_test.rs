@@ -14,9 +14,9 @@
 //! 5. `test_rbac_multi_channel_credential_extraction`:
 //!    - Token extraction works interchangeably via Authorization Bearer, X-API-Key, and ?token= query parameter.
 
-use std::time::Duration;
 use futures::StreamExt;
 use reqwest::{header, StatusCode};
+use std::time::Duration;
 use tokio_tungstenite::connect_async;
 
 use rusty_grid_master::auth::{AuthConfig, AuthScope};
@@ -30,6 +30,7 @@ async fn test_rbac_loopback_dev_bypass() {
         dev_mode: true,
         loopback_bypass: true,
         tokens: Default::default(),
+        allowed_origins: Vec::new(),
     };
 
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
@@ -83,6 +84,7 @@ async fn test_rbac_strict_mode_unauthorized() {
         dev_mode: false,
         loopback_bypass: false,
         tokens: Default::default(),
+        allowed_origins: Vec::new(),
     }
     .with_token("valid-admin-token", "root-admin", &[AuthScope::Admin]);
 
@@ -152,6 +154,7 @@ async fn test_rbac_invalid_token() {
         dev_mode: false,
         loopback_bypass: false,
         tokens: Default::default(),
+        allowed_origins: Vec::new(),
     }
     .with_token("real-token", "real-admin", &[AuthScope::Admin]);
 
@@ -188,7 +191,10 @@ async fn test_rbac_invalid_token() {
 
     // Case C: Invalid URL Query Token
     let resp = client
-        .get(format!("{}/api/status?token=bogus-query-token-789", base_url))
+        .get(format!(
+            "{}/api/status?token=bogus-query-token-789",
+            base_url
+        ))
         .send()
         .await
         .expect("GET with bad query token");
@@ -205,6 +211,7 @@ async fn test_rbac_scope_enforcement() {
         dev_mode: false,
         loopback_bypass: false,
         tokens: Default::default(),
+        allowed_origins: Vec::new(),
     }
     .with_token("token-obs", "observer-client", &[AuthScope::Observer])
     .with_token("token-sub", "submitter-client", &[AuthScope::Submitter])
@@ -340,8 +347,13 @@ async fn test_rbac_multi_channel_credential_extraction() {
         dev_mode: false,
         loopback_bypass: false,
         tokens: Default::default(),
+        allowed_origins: Vec::new(),
     }
-    .with_token("shared-secret-key", "integration-client", &[AuthScope::Submitter]);
+    .with_token(
+        "shared-secret-key",
+        "integration-client",
+        &[AuthScope::Submitter],
+    );
 
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_dashboard_port(0)
@@ -401,6 +413,7 @@ async fn test_adversarial_malformed_tokens_and_empty_prefixes() {
         dev_mode: false,
         loopback_bypass: false,
         tokens: Default::default(),
+        allowed_origins: Vec::new(),
     }
     .with_token("valid-admin-token", "root-admin", &[AuthScope::Admin]);
 
@@ -515,7 +528,10 @@ async fn test_adversarial_malformed_tokens_and_empty_prefixes() {
 
     // 12. Valid token in multi-param query string
     let resp = client
-        .get(format!("{}/api/status?foo=1&token=valid-admin-token&bar=2", base_url))
+        .get(format!(
+            "{}/api/status?foo=1&token=valid-admin-token&bar=2",
+            base_url
+        ))
         .send()
         .await
         .expect("send");
@@ -523,7 +539,10 @@ async fn test_adversarial_malformed_tokens_and_empty_prefixes() {
 
     // 13. Valid api_key in multi-param query string
     let resp = client
-        .get(format!("{}/api/status?alpha=beta&api_key=valid-admin-token", base_url))
+        .get(format!(
+            "{}/api/status?alpha=beta&api_key=valid-admin-token",
+            base_url
+        ))
         .send()
         .await
         .expect("send");
@@ -540,6 +559,7 @@ async fn test_adversarial_non_uuid_task_routes_strict_404() {
         dev_mode: false,
         loopback_bypass: false,
         tokens: Default::default(),
+        allowed_origins: Vec::new(),
     }
     .with_token("admin-key", "admin", &[AuthScope::Admin]);
 
@@ -605,7 +625,10 @@ async fn test_adversarial_non_uuid_task_routes_strict_404() {
 
     // 6. Non-hex characters inside UUID-like format
     let resp = client
-        .get(format!("{}/api/tasks/g0000000-0000-0000-0000-000000000000", base_url))
+        .get(format!(
+            "{}/api/tasks/g0000000-0000-0000-0000-000000000000",
+            base_url
+        ))
         .header(header::AUTHORIZATION, "Bearer admin-key")
         .send()
         .await
@@ -648,6 +671,7 @@ async fn test_adversarial_scope_escalation_matrix() {
         dev_mode: false,
         loopback_bypass: false,
         tokens: Default::default(),
+        allowed_origins: Vec::new(),
     }
     .with_token("token-obs", "obs-user", &[AuthScope::Observer])
     .with_token("token-wrk", "wrk-user", &[AuthScope::Worker])
@@ -752,11 +776,19 @@ async fn test_adversarial_scope_escalation_matrix() {
 
     // Matrix check: SSE /api/stream/sse requires Observer
     // Unauthenticated -> 401
-    let res = client.get(format!("{}/api/stream/sse", base_url)).send().await.unwrap();
+    let res = client
+        .get(format!("{}/api/stream/sse", base_url))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
     // Observer -> 200 OK
-    let res = client.get(format!("{}/api/stream/sse?token=token-obs", base_url)).send().await.unwrap();
+    let res = client
+        .get(format!("{}/api/stream/sse?token=token-obs", base_url))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
     let _ = master.shutdown();
@@ -779,11 +811,20 @@ async fn test_adversarial_loopback_bypass_dev_toggle_permutations() {
                 dev_mode: false,
                 loopback_bypass: true,
                 tokens: Default::default(),
+                allowed_origins: Vec::new(),
             });
         let master = MasterServer::spawn(config).await.expect("spawn");
         let base_url = format!("http://{}", master.dashboard_addr().unwrap());
-        let res = client.get(format!("{}/api/status", base_url)).send().await.unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "dev_mode=false must reject unauth loopback");
+        let res = client
+            .get(format!("{}/api/status", base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "dev_mode=false must reject unauth loopback"
+        );
         let _ = master.shutdown();
     }
 
@@ -796,11 +837,20 @@ async fn test_adversarial_loopback_bypass_dev_toggle_permutations() {
                 dev_mode: true,
                 loopback_bypass: false,
                 tokens: Default::default(),
+                allowed_origins: Vec::new(),
             });
         let master = MasterServer::spawn(config).await.expect("spawn");
         let base_url = format!("http://{}", master.dashboard_addr().unwrap());
-        let res = client.get(format!("{}/api/status", base_url)).send().await.unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "loopback_bypass=false must reject unauth loopback");
+        let res = client
+            .get(format!("{}/api/status", base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "loopback_bypass=false must reject unauth loopback"
+        );
         let _ = master.shutdown();
     }
 
@@ -814,6 +864,7 @@ async fn test_adversarial_loopback_bypass_dev_toggle_permutations() {
                 dev_mode: true,
                 loopback_bypass: true,
                 tokens: Default::default(),
+                allowed_origins: Vec::new(),
             });
         let master = MasterServer::spawn(config).await.expect("spawn");
         let base_url = format!("http://{}", master.dashboard_addr().unwrap());
@@ -823,7 +874,11 @@ async fn test_adversarial_loopback_bypass_dev_toggle_permutations() {
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "explicit invalid token must not be bypassed");
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "explicit invalid token must not be bypassed"
+        );
         let _ = master.shutdown();
     }
 
@@ -835,6 +890,7 @@ async fn test_adversarial_loopback_bypass_dev_toggle_permutations() {
             dev_mode: true,
             loopback_bypass: true,
             tokens: Default::default(),
+            allowed_origins: Vec::new(),
         }
         .with_token("explicit-obs", "obs", &[AuthScope::Observer]);
 
@@ -850,7 +906,11 @@ async fn test_adversarial_loopback_bypass_dev_toggle_permutations() {
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN, "explicit observer token must not escalate to admin");
+        assert_eq!(
+            res.status(),
+            StatusCode::FORBIDDEN,
+            "explicit observer token must not escalate to admin"
+        );
         let _ = master.shutdown();
     }
 }
@@ -863,6 +923,7 @@ async fn test_adversarial_high_concurrency_stream_burst() {
         dev_mode: false,
         loopback_bypass: false,
         tokens: Default::default(),
+        allowed_origins: Vec::new(),
     }
     .with_token("stream-token", "stream-tester", &[AuthScope::Admin]);
 
@@ -883,7 +944,11 @@ async fn test_adversarial_high_concurrency_stream_burst() {
         let handle = tokio::spawn(async move {
             let (mut ws_stream, resp) = connect_async(&ws_url).await.expect("connect ws");
             assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
-            let msg = ws_stream.next().await.expect("snapshot msg").expect("frame");
+            let msg = ws_stream
+                .next()
+                .await
+                .expect("snapshot msg")
+                .expect("frame");
             assert!(msg.is_text());
             ws_stream
         });
@@ -896,7 +961,11 @@ async fn test_adversarial_high_concurrency_stream_burst() {
         let handle = tokio::spawn(async move {
             let (mut ws_stream, resp) = connect_async(&ws_url).await.expect("connect stream");
             assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
-            let msg = ws_stream.next().await.expect("snapshot msg").expect("frame");
+            let msg = ws_stream
+                .next()
+                .await
+                .expect("snapshot msg")
+                .expect("frame");
             assert!(msg.is_text());
             ws_stream
         });
@@ -943,4 +1012,3 @@ async fn test_adversarial_high_concurrency_stream_burst() {
 
     let _ = master.shutdown();
 }
-

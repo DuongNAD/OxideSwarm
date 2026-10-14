@@ -1,5 +1,14 @@
 # OxideSwarm Network Ping & Distributed Compute Success Confirmation
 
+> **HISTORICAL RECORD, not a test result you can reproduce from this repository.** It documents one manual
+> session on 2026-09-23 between two of the author's machines, before the shared-secret authentication existed
+> (see `docs/SECURITY.md`). The table below was filled in by hand: `sync_network.py` itself only performs an
+> HTTP `/ping` reachability probe on port 8085 and never starts, joins or queries a grid.
+> The P2P ticket that used to be printed in section 2 was removed because a ticket addresses a live master
+> (anyone holding it could dial that node). If that master key is still in use, rotate it: delete
+> `~/.oxideswarm/master_key.bin` on that machine so the next `--p2p` start generates a new identity, and purge
+> the old ticket from the git history if the repository is public.
+
 **Node ID**: node_win_case_166  
 **Role**: SERVER (Master Coordinator)  
 **Host**: DESKTOP-3EPV830 (Microsoft Windows 11 Pro 64-bit)  
@@ -24,7 +33,7 @@
 - **HTTP Status API**: `http://192.168.1.166:8081/api/status`
 - **Iroh P2P NAT Traversal Ticket**:
 ```json
-{"id":"682bcac05d603c0832f20de26c3e4f599391a9ff654f83d4b6c500e69b0e3f17","addrs":[{"Relay":"https://aps1-1.relay.n0.iroh.link./"}]}
+{"id":"<redacted>","addrs":[{"Relay":"<redacted>"}]}
 ```
 
 ---

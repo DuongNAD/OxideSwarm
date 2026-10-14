@@ -4,7 +4,7 @@ use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{split, AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
-use tokio_util::codec::{Framed, FramedRead, FramedWrite, LengthDelimitedCodec};
+use tokio_util::codec::{Framed, FramedParts, FramedWrite, LengthDelimitedCodec};
 use uuid::Uuid;
 
 use crate::capabilities::WorkerCapabilities;
@@ -18,6 +18,10 @@ pub const LENGTH_FIELD_BYTES: usize = 4;
 /// Wire protocol format discriminator identifiers.
 pub const WIRE_FORMAT_JSON: u8 = 0x01;
 pub const WIRE_FORMAT_BINCODE: u8 = 0x02;
+/// Discriminator of cluster-authentication handshake frames (see `cluster_auth`).
+/// These frames never carry a `WorkerMessage`/`MasterMessage`/`ClientMessage`; the typed
+/// decoder rejects them with `ProtocolError::InvalidFormatTag(0x03)`.
+pub const WIRE_FORMAT_AUTH: u8 = 0x03;
 
 /// Supported wire serialization formats for framed messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -135,6 +139,19 @@ pub enum WorkerMessage {
     },
     /// Graceful announcement that the worker is disconnecting.
     Disconnecting { worker_id: Uuid, reason: String },
+    /// Live battery/thermal status of a mobile or battery-powered worker, sent whenever it
+    /// changes. `Register` only carries a snapshot taken at connect time, so without this the
+    /// master would keep routing heavy work to a phone that has since drained or overheated.
+    /// Appended last so the positional (bincode) indices of the earlier variants do not move.
+    MobileTelemetry {
+        worker_id: Uuid,
+        /// Battery charge percentage (0-100), `None` when unknown or on AC power.
+        battery_pct: Option<u8>,
+        /// Whether the device is drawing external power, `None` when unknown.
+        is_charging: Option<bool>,
+        /// Whether the device is currently thermally throttled.
+        thermal_throttled: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -180,6 +197,15 @@ enum HumanWorkerMessage {
         worker_id: Uuid,
         reason: String,
     },
+    MobileTelemetry {
+        worker_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        battery_pct: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_charging: Option<bool>,
+        #[serde(default)]
+        thermal_throttled: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -219,6 +245,12 @@ enum BinaryWorkerMessage {
     Disconnecting {
         worker_id: Uuid,
         reason: String,
+    },
+    MobileTelemetry {
+        worker_id: Uuid,
+        battery_pct: Option<u8>,
+        is_charging: Option<bool>,
+        thermal_throttled: bool,
     },
 }
 
@@ -288,6 +320,17 @@ impl From<WorkerMessage> for HumanWorkerMessage {
             WorkerMessage::Disconnecting { worker_id, reason } => {
                 HumanWorkerMessage::Disconnecting { worker_id, reason }
             }
+            WorkerMessage::MobileTelemetry {
+                worker_id,
+                battery_pct,
+                is_charging,
+                thermal_throttled,
+            } => HumanWorkerMessage::MobileTelemetry {
+                worker_id,
+                battery_pct,
+                is_charging,
+                thermal_throttled,
+            },
         }
     }
 }
@@ -357,6 +400,17 @@ impl From<HumanWorkerMessage> for WorkerMessage {
             HumanWorkerMessage::Disconnecting { worker_id, reason } => {
                 WorkerMessage::Disconnecting { worker_id, reason }
             }
+            HumanWorkerMessage::MobileTelemetry {
+                worker_id,
+                battery_pct,
+                is_charging,
+                thermal_throttled,
+            } => WorkerMessage::MobileTelemetry {
+                worker_id,
+                battery_pct,
+                is_charging,
+                thermal_throttled,
+            },
         }
     }
 }
@@ -426,6 +480,17 @@ impl From<WorkerMessage> for BinaryWorkerMessage {
             WorkerMessage::Disconnecting { worker_id, reason } => {
                 BinaryWorkerMessage::Disconnecting { worker_id, reason }
             }
+            WorkerMessage::MobileTelemetry {
+                worker_id,
+                battery_pct,
+                is_charging,
+                thermal_throttled,
+            } => BinaryWorkerMessage::MobileTelemetry {
+                worker_id,
+                battery_pct,
+                is_charging,
+                thermal_throttled,
+            },
         }
     }
 }
@@ -495,6 +560,17 @@ impl From<BinaryWorkerMessage> for WorkerMessage {
             BinaryWorkerMessage::Disconnecting { worker_id, reason } => {
                 WorkerMessage::Disconnecting { worker_id, reason }
             }
+            BinaryWorkerMessage::MobileTelemetry {
+                worker_id,
+                battery_pct,
+                is_charging,
+                thermal_throttled,
+            } => WorkerMessage::MobileTelemetry {
+                worker_id,
+                battery_pct,
+                is_charging,
+                thermal_throttled,
+            },
         }
     }
 }
@@ -530,6 +606,7 @@ impl WorkerMessage {
             Self::TaskResult { .. } => "TaskResult",
             Self::Checkpoint { .. } => "Checkpoint",
             Self::Disconnecting { .. } => "Disconnecting",
+            Self::MobileTelemetry { .. } => "MobileTelemetry",
         }
     }
 
@@ -542,6 +619,7 @@ impl WorkerMessage {
             Self::TaskResult { worker_id, .. } => *worker_id,
             Self::Checkpoint { .. } => Uuid::nil(),
             Self::Disconnecting { worker_id, .. } => *worker_id,
+            Self::MobileTelemetry { worker_id, .. } => *worker_id,
         }
     }
 }
@@ -592,6 +670,35 @@ pub enum MasterMessage {
         reason: String,
         grace_period_secs: Option<u64>,
     },
+}
+
+/// Features a Master announces in the `message` of an accepted `RegisterAck`
+/// (`features=<name>,<name>`; a rejection's `message` stays a plain reason).
+///
+/// The wire format has no version negotiation and bincode is positional, so a message variant added
+/// after a Master was built is a decode error there that drops the connection. A Worker therefore
+/// sends such variants only to a Master that said it understands them. A Master that predates the
+/// announcement sends no `message`, which reads as "no optional features".
+pub mod master_features {
+    /// Understands `WorkerMessage::MobileTelemetry` (live battery / thermal reports).
+    pub const MOBILE_TELEMETRY: &str = "mobile-telemetry";
+
+    /// Every feature this build of the Master supports.
+    pub const SUPPORTED: &[&str] = &[MOBILE_TELEMETRY];
+
+    const PREFIX: &str = "features=";
+
+    /// The `RegisterAck` message announcing `features`.
+    pub fn announcement(features: &[&str]) -> String {
+        format!("{PREFIX}{}", features.join(","))
+    }
+
+    /// Whether a `RegisterAck`'s `message` announces `feature`.
+    pub fn announced(message: Option<&str>, feature: &str) -> bool {
+        message
+            .and_then(|m| m.trim().strip_prefix(PREFIX))
+            .is_some_and(|list| list.split(',').any(|f| f.trim() == feature))
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -864,6 +971,12 @@ pub enum ClientMessage {
     SubmitMapReduce {
         job: crate::mapreduce::MapReduceJobSpec,
     },
+    /// Polls for the outcome of a task without blocking: answered with
+    /// `ClientResponse::TaskCompleted` once the task is terminal and its result is retained,
+    /// `ClientResponse::TaskStatusInfo` while it is still in flight, and `ClientResponse::Error`
+    /// for an id the master does not know. Appended last so existing positional (bincode)
+    /// variant indices do not move.
+    GetTaskResult { task_id: TaskId },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -885,6 +998,9 @@ enum HumanClientMessage {
     SubmitMapReduce {
         job: crate::mapreduce::MapReduceJobSpec,
     },
+    GetTaskResult {
+        task_id: TaskId,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -904,6 +1020,9 @@ enum BinaryClientMessage {
     SubmitMapReduce {
         job: crate::mapreduce::MapReduceJobSpec,
     },
+    GetTaskResult {
+        task_id: TaskId,
+    },
 }
 
 impl From<ClientMessage> for HumanClientMessage {
@@ -919,6 +1038,9 @@ impl From<ClientMessage> for HumanClientMessage {
             ClientMessage::ClusterStatus => HumanClientMessage::ClusterStatus,
             ClientMessage::ListWorkers => HumanClientMessage::ListWorkers,
             ClientMessage::SubmitMapReduce { job } => HumanClientMessage::SubmitMapReduce { job },
+            ClientMessage::GetTaskResult { task_id } => {
+                HumanClientMessage::GetTaskResult { task_id }
+            }
         }
     }
 }
@@ -936,6 +1058,9 @@ impl From<HumanClientMessage> for ClientMessage {
             HumanClientMessage::ClusterStatus => ClientMessage::ClusterStatus,
             HumanClientMessage::ListWorkers => ClientMessage::ListWorkers,
             HumanClientMessage::SubmitMapReduce { job } => ClientMessage::SubmitMapReduce { job },
+            HumanClientMessage::GetTaskResult { task_id } => {
+                ClientMessage::GetTaskResult { task_id }
+            }
         }
     }
 }
@@ -953,6 +1078,9 @@ impl From<ClientMessage> for BinaryClientMessage {
             ClientMessage::ClusterStatus => BinaryClientMessage::ClusterStatus,
             ClientMessage::ListWorkers => BinaryClientMessage::ListWorkers,
             ClientMessage::SubmitMapReduce { job } => BinaryClientMessage::SubmitMapReduce { job },
+            ClientMessage::GetTaskResult { task_id } => {
+                BinaryClientMessage::GetTaskResult { task_id }
+            }
         }
     }
 }
@@ -970,6 +1098,9 @@ impl From<BinaryClientMessage> for ClientMessage {
             BinaryClientMessage::ClusterStatus => ClientMessage::ClusterStatus,
             BinaryClientMessage::ListWorkers => ClientMessage::ListWorkers,
             BinaryClientMessage::SubmitMapReduce { job } => ClientMessage::SubmitMapReduce { job },
+            BinaryClientMessage::GetTaskResult { task_id } => {
+                ClientMessage::GetTaskResult { task_id }
+            }
         }
     }
 }
@@ -1712,31 +1843,67 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
             None => Ok(None),
         }
     }
+
+    /// Reads raw frame bytes without deserializing, refusing frames longer than `max_len`.
+    ///
+    /// The limit is enforced on the 4-byte length header, so an oversized frame is rejected
+    /// before any of its payload is buffered. Used by the pre-authentication handshake, where
+    /// an unauthenticated peer must not be able to make us allocate up to `MAX_FRAME_SIZE`.
+    /// The transport's regular frame limit is restored before this returns; if the future is
+    /// dropped mid-read (e.g. by a timeout) the lowered limit stays in force, which is the safe
+    /// direction because handshake callers discard the connection in that case.
+    pub async fn recv_raw_frame_max(
+        &mut self,
+        max_len: usize,
+    ) -> Result<Option<Bytes>, ProtocolError> {
+        let limit = max_len.min(MAX_FRAME_SIZE);
+        self.inner.codec_mut().set_max_frame_length(limit);
+        let res = match self.inner.next().await {
+            Some(Ok(bytes)) => Ok(Some(bytes.freeze())),
+            Some(Err(e)) => {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    Err(ProtocolError::UnexpectedEof)
+                } else if e.kind() == std::io::ErrorKind::InvalidData {
+                    Err(ProtocolError::FrameTooLarge {
+                        size: 0,
+                        max: limit,
+                    })
+                } else {
+                    Err(ProtocolError::Io(e))
+                }
+            }
+            None => Ok(None),
+        };
+        self.inner.codec_mut().set_max_frame_length(MAX_FRAME_SIZE);
+        res
+    }
 }
 
 /// Unidirectional framed reader for receiving messages.
 pub struct MessageReader<R> {
-    inner: FramedRead<R, LengthDelimitedCodec>,
+    // A `Framed` (not a `FramedRead`) only because it can be built *with* a pre-filled read buffer
+    // that is decoded before the socket is read again; only its read half is ever used.
+    inner: Framed<R, LengthDelimitedCodec>,
     last_detected_codec: Option<WireCodec>,
 }
 
 impl<R: AsyncRead + Unpin> MessageReader<R> {
     /// Creates a new `MessageReader` wrapping an async reader.
     pub fn new(reader: R) -> Self {
-        Self {
-            inner: FramedRead::new(reader, default_codec()),
-            last_detected_codec: None,
-        }
+        Self::with_buffer(reader, BytesMut::new())
     }
 
     /// Creates a new `MessageReader` wrapping an async reader with pre-buffered data.
+    ///
+    /// Frames already complete in `buffer` (bytes a `MessageTransport` read ahead of the handshake
+    /// before it was split) are returned by the next `recv_msg` calls *without* waiting for the
+    /// socket: a `FramedRead` whose buffer is filled by hand only decodes it after the next
+    /// successful read, which stranded e.g. a task assignment sent right behind `RegisterAck`.
     pub fn with_buffer(reader: R, buffer: BytesMut) -> Self {
-        let mut framed = FramedRead::new(reader, default_codec());
-        if !buffer.is_empty() {
-            framed.read_buffer_mut().extend_from_slice(&buffer);
-        }
+        let mut parts = FramedParts::new::<Bytes>(reader, default_codec());
+        parts.read_buf = buffer;
         Self {
-            inner: framed,
+            inner: Framed::from_parts(parts),
             last_detected_codec: None,
         }
     }
@@ -2380,4 +2547,304 @@ mod tests {
             .expect("some ack");
         assert_eq!(client_ack, ack);
     }
+
+    #[tokio::test]
+    async fn test_recv_raw_frame_max_enforces_limit_on_header_and_restores_it() {
+        use tokio::io::AsyncWriteExt;
+        let (mut raw, server_io) = tokio::io::duplex(1 << 20);
+        let mut server = MessageTransport::new(server_io);
+
+        // Exactly at the limit is accepted; the transport limit is back to normal afterwards.
+        let mut frame = (64u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&[7u8; 64]);
+        raw.write_all(&frame).await.unwrap();
+        let got = server.recv_raw_frame_max(64).await.unwrap().unwrap();
+        assert_eq!(got.len(), 64);
+
+        let mut big = (4096u32).to_be_bytes().to_vec();
+        big.extend_from_slice(&[9u8; 4096]);
+        raw.write_all(&big).await.unwrap();
+        assert_eq!(server.recv_raw_frame().await.unwrap().unwrap().len(), 4096);
+
+        // One byte over is refused from the header alone: the payload never has to arrive.
+        raw.write_all(&(65u32).to_be_bytes()).await.unwrap();
+        match server.recv_raw_frame_max(64).await {
+            Err(ProtocolError::FrameTooLarge { max, .. }) => assert_eq!(max, 64),
+            other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
+
+        // Clean EOF is reported as None, and the limit cannot be raised above the global cap.
+        let (raw2, io2) = tokio::io::duplex(64);
+        let mut server2 = MessageTransport::new(io2);
+        drop(raw2);
+        assert!(server2
+            .recv_raw_frame_max(usize::MAX)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Bincode is positional, so a new variant is only wire-compatible if it is appended: every
+    /// existing variant must keep its index and `GetTaskResult` must take the next free one.
+    #[test]
+    fn test_get_task_result_is_appended_last_and_keeps_existing_bincode_indices() {
+        fn variant_index(msg: &ClientMessage) -> u32 {
+            let bytes = serialize_message(msg, WireCodec::Bincode).expect("serialize");
+            assert_eq!(bytes[0], WIRE_FORMAT_BINCODE);
+            u32::from_le_bytes(bytes[1..5].try_into().unwrap())
+        }
+        let task_id = TaskId::new();
+        let job = crate::mapreduce::MapReduceJobSpec::new(
+            "idx",
+            vec!["a".into()],
+            crate::mapreduce::MapFunctionSpec::Builtin {
+                operator: "word_count".into(),
+            },
+            crate::mapreduce::ReduceFunctionSpec::Builtin {
+                operator: "sum".into(),
+            },
+            1,
+            1,
+            30,
+        );
+        let task = Task::new(
+            TaskSpec::command("echo", vec!["x".into()]),
+            TaskRequirements::generic(1, 10),
+        );
+        assert_eq!(
+            variant_index(&ClientMessage::SubmitTask { task, wait: false }),
+            0
+        );
+        assert_eq!(variant_index(&ClientMessage::GetTaskStatus { task_id }), 1);
+        assert_eq!(variant_index(&ClientMessage::CancelTask { task_id }), 2);
+        assert_eq!(variant_index(&ClientMessage::ClusterStatus), 3);
+        assert_eq!(variant_index(&ClientMessage::ListWorkers), 4);
+        assert_eq!(variant_index(&ClientMessage::SubmitMapReduce { job }), 5);
+        assert_eq!(variant_index(&ClientMessage::GetTaskResult { task_id }), 6);
+    }
+
+    #[test]
+    fn test_get_task_result_roundtrip_both_codecs() {
+        let task_id = TaskId::new();
+        let msg = ClientMessage::GetTaskResult { task_id };
+
+        // Plain serde_json (human-readable mirror enum)
+        let json = serde_json::to_string(&msg).expect("serialize json");
+        assert!(json.contains("\"type\":\"GetTaskResult\""), "{json}");
+        let back: ClientMessage = serde_json::from_str(&json).expect("deserialize json");
+        assert_eq!(back, msg);
+
+        // Both wire codecs, as a raw ClientMessage and wrapped in an InboundMessage
+        for codec in [WireCodec::Bincode, WireCodec::Json] {
+            let bytes = serialize_message(&msg, codec).expect("serialize");
+            let (recovered, detected): (ClientMessage, WireCodec) =
+                deserialize_message(&bytes).expect("deserialize ClientMessage");
+            assert_eq!(recovered, msg);
+            assert_eq!(detected, codec);
+
+            // A peer that opens with the bare ClientMessage (what the CLI does) must be routed as a client.
+            let (inbound, detected): (InboundMessage, WireCodec) =
+                deserialize_message(&bytes).expect("deserialize InboundMessage from bare message");
+            assert_eq!(inbound, InboundMessage::Client(msg.clone()));
+            assert_eq!(detected, codec);
+
+            let wrapped = InboundMessage::Client(msg.clone());
+            let bytes = serialize_message(&wrapped, codec).expect("serialize inbound");
+            let (recovered, _): (InboundMessage, WireCodec) =
+                deserialize_message(&bytes).expect("deserialize wrapped");
+            assert_eq!(recovered, wrapped);
+        }
+    }
+
+    /// `MobileTelemetry` is appended after `Disconnecting`: every earlier `WorkerMessage` keeps its
+    /// positional (bincode) index and the new variant takes the next free one.
+    #[test]
+    fn test_mobile_telemetry_is_appended_last_and_keeps_existing_bincode_indices() {
+        fn variant_index(msg: &WorkerMessage) -> u32 {
+            let bytes = serialize_message(msg, WireCodec::Bincode).expect("serialize");
+            assert_eq!(bytes[0], WIRE_FORMAT_BINCODE);
+            u32::from_le_bytes(bytes[1..5].try_into().unwrap())
+        }
+        let worker_id = Uuid::new_v4();
+        let task_id = TaskId::new();
+        assert_eq!(
+            variant_index(&WorkerMessage::Register {
+                worker_id,
+                capabilities: WorkerCapabilities::detect(Some("idx".into()), Some(1), false),
+            }),
+            0
+        );
+        assert_eq!(
+            variant_index(&WorkerMessage::Heartbeat {
+                worker_id,
+                timestamp: 1,
+                active_tasks: 0,
+                cpu_usage_pct: 0.0,
+                ram_available_mb: 1,
+            }),
+            1
+        );
+        assert_eq!(
+            variant_index(&WorkerMessage::TaskProgress {
+                worker_id,
+                task_id,
+                status: TaskStatus::Running,
+            }),
+            2
+        );
+        assert_eq!(
+            variant_index(&WorkerMessage::Checkpoint {
+                task_id,
+                sequence: 1,
+                delta_state: TaskBytes::copy_from_slice(b"x"),
+            }),
+            4
+        );
+        assert_eq!(
+            variant_index(&WorkerMessage::Disconnecting {
+                worker_id,
+                reason: "bye".into(),
+            }),
+            5
+        );
+        assert_eq!(
+            variant_index(&WorkerMessage::MobileTelemetry {
+                worker_id,
+                battery_pct: Some(9),
+                is_charging: Some(false),
+                thermal_throttled: true,
+            }),
+            6
+        );
+    }
+
+    #[test]
+    fn test_mobile_telemetry_roundtrip_both_codecs() {
+        let worker_id = Uuid::new_v4();
+        let cases = [
+            WorkerMessage::MobileTelemetry {
+                worker_id,
+                battery_pct: Some(14),
+                is_charging: Some(false),
+                thermal_throttled: true,
+            },
+            // Unknown readings are legitimate (no battery sensor reachable): `None` must survive.
+            WorkerMessage::MobileTelemetry {
+                worker_id,
+                battery_pct: None,
+                is_charging: None,
+                thermal_throttled: false,
+            },
+        ];
+        for msg in cases {
+            assert_eq!(msg.variant_name(), "MobileTelemetry");
+            assert_eq!(msg.worker_id(), worker_id);
+
+            // Plain serde_json goes through the human-readable mirror.
+            let json = serde_json::to_string(&msg).expect("serialize json");
+            assert!(json.contains("\"type\":\"MobileTelemetry\""), "{json}");
+            let back: WorkerMessage = serde_json::from_str(&json).expect("deserialize json");
+            assert_eq!(back, msg);
+
+            for codec in [WireCodec::Bincode, WireCodec::Json] {
+                let bytes = serialize_message(&msg, codec).expect("serialize");
+                let (recovered, detected): (WorkerMessage, WireCodec) =
+                    deserialize_message(&bytes).expect("deserialize");
+                assert_eq!(recovered, msg);
+                assert_eq!(detected, codec);
+            }
+        }
+
+        // A JSON peer may omit the optional readings entirely.
+        let sparse = format!(r#"{{"type":"MobileTelemetry","worker_id":"{worker_id}"}}"#);
+        let parsed: WorkerMessage = serde_json::from_str(&sparse).expect("sparse json");
+        assert_eq!(
+            parsed,
+            WorkerMessage::MobileTelemetry {
+                worker_id,
+                battery_pct: None,
+                is_charging: None,
+                thermal_throttled: false,
+            }
+        );
+    }
+
+    /// Bytes a transport read ahead of a handshake (the next frame sent right behind `RegisterAck`)
+    /// must be delivered by the split reader at once, not stranded until more bytes arrive.
+    #[tokio::test]
+    async fn test_split_reader_decodes_frames_that_were_read_ahead_of_the_split() {
+        use tokio::io::AsyncWriteExt;
+        let (mut peer, ours) = tokio::io::duplex(64 * 1024);
+        let ack = MasterMessage::HeartbeatAck { timestamp: 1 };
+        let next = MasterMessage::HeartbeatAck { timestamp: 2 };
+        // Both frames arrive in a single write, so one socket read buffers both.
+        let mut both = Vec::new();
+        for msg in [&ack, &next] {
+            let payload = serialize_message(msg, WireCodec::Bincode).unwrap();
+            both.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            both.extend_from_slice(&payload);
+        }
+        peer.write_all(&both).await.unwrap();
+
+        let mut transport = MessageTransport::new(ours);
+        assert_eq!(transport.recv_msg::<MasterMessage>().await.unwrap(), Some(ack));
+
+        // The peer sends nothing more. The second frame is already in the buffer.
+        let (_writer, mut reader) = transport.split();
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.recv_msg::<MasterMessage>(),
+        )
+        .await
+        .expect("a frame read ahead of the split must not wait for more socket traffic")
+        .unwrap();
+        assert_eq!(got, Some(next));
+    }
+
+    #[test]
+    fn test_auth_frames_are_not_typed_messages() {
+        // The typed decoder must refuse handshake frames, never misparse them as messages.
+        let frame = [WIRE_FORMAT_AUTH, 0x01, 1, 2, 3];
+        assert!(matches!(
+            deserialize_message::<WorkerMessage>(&frame),
+            Err(ProtocolError::InvalidFormatTag(WIRE_FORMAT_AUTH))
+        ));
+        assert!(matches!(
+            deserialize_message::<MasterMessage>(&frame),
+            Err(ProtocolError::InvalidFormatTag(WIRE_FORMAT_AUTH))
+        ));
+        assert!(matches!(
+            deserialize_message::<InboundMessage>(&frame),
+            Err(ProtocolError::InvalidFormatTag(WIRE_FORMAT_AUTH))
+        ));
+    }
+    #[test]
+    fn test_master_feature_announcement_round_trips_and_old_masters_announce_nothing() {
+        use super::master_features::{announced, announcement, MOBILE_TELEMETRY, SUPPORTED};
+
+        let message = announcement(SUPPORTED);
+        assert!(announced(Some(&message), MOBILE_TELEMETRY));
+        assert!(announced(Some("features=other, mobile-telemetry"), MOBILE_TELEMETRY));
+        // A master built before the announcement sends no message on an accepted ack.
+        assert!(!announced(None, MOBILE_TELEMETRY));
+        assert!(!announced(Some(""), MOBILE_TELEMETRY));
+        // Not a feature list, or a different one: nothing is assumed.
+        assert!(!announced(Some("mobile-telemetry"), MOBILE_TELEMETRY));
+        assert!(!announced(Some("features=mobile-telemetry-v2"), MOBILE_TELEMETRY));
+        assert!(!announced(Some("features="), MOBILE_TELEMETRY));
+
+        // The announcement is just the `message` of an accepted RegisterAck: both codecs carry it.
+        let ack = MasterMessage::RegisterAck {
+            accepted: true,
+            worker_id: Uuid::nil(),
+            heartbeat_interval_secs: 3,
+            message: Some(message),
+        };
+        for codec in [WireCodec::Json, WireCodec::Bincode] {
+            let bytes = serialize_message(&ack, codec).unwrap();
+            let (back, _): (MasterMessage, _) = deserialize_message(&bytes).unwrap();
+            assert_eq!(back, ack, "{codec:?}");
+        }
+    }
+
 }

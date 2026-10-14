@@ -23,6 +23,14 @@ wgpu = { version = "22", optional = true }
 pollster = { version = "0.3", optional = true }
 bytemuck = { version = "1.25", features = ["derive"], optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# killpg() / setpriority() for task process groups (already in Cargo.lock via tokio)
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Job Objects for task process trees (already in Cargo.lock via tokio / mio)
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
 [features]
 default = ["p2p"]
 p2p = ["dep:iroh", "rusty_grid_core/p2p"]
@@ -31,6 +39,10 @@ gpu-wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 [dev-dependencies]
 rusty_grid_master = { path = "../master" }
 tempfile = "3"
+
+[[example]]
+name = "gemm_bench"
+required-features = ["gpu-wgpu"]
 
 [[test]]
 name = "m3_execution"
@@ -53,3 +65,14 @@ name = "gpu_wgpu_adversarial_test"
 path = "../../tests/gpu_wgpu_adversarial_test.rs"
 
 
+[[test]]
+name = "worker_cluster_auth"
+path = "../../tests/worker_cluster_auth.rs"
+
+[[test]]
+name = "worker_connection_lifecycle"
+path = "../../tests/worker_connection_lifecycle.rs"
+
+[[test]]
+name = "worker_task_shutdown"
+path = "../../tests/worker_task_shutdown.rs"

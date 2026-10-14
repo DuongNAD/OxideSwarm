@@ -7,8 +7,12 @@
 
   <!-- Executable Invocation -->
   <executable>%BASE%\bin\rusty-grid.exe</executable>
-  <arguments>worker --config "%BASE%\config\rusty-grid.toml"</arguments>
+  <!-- install_windows_service.ps1 rewrites this to the generated config (ACL-restricted, holds the ticket/secret path) -->
+  <arguments>worker --config "%ProgramData%\OxideSwarm\rusty-grid.toml"</arguments>
   <workingdirectory>%BASE%</workingdirectory>
+
+  <!-- Identity: install_windows_service.ps1 runs `sc.exe config <id> obj= "NT SERVICE\<id>"` after registration, so the worker
+       and every task it spawns run as a low-privilege virtual account instead of LocalSystem. -->
 
   <!-- Process & Session 0 Isolation Settings -->
   <priority>Normal</priority>

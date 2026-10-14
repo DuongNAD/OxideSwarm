@@ -3,6 +3,7 @@
 pub mod auth;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
+pub mod liveness;
 pub mod mapreduce;
 pub mod queue;
 pub mod reaper;
@@ -12,15 +13,22 @@ pub mod server;
 #[cfg(feature = "dashboard")]
 pub mod web_ui;
 
-pub use auth::{AuthConfig, AuthIdentity, ApiToken, AuthScope};
+pub use auth::{
+    dashboard_admin_token, resolve_dashboard_auth, ApiToken, AuthConfig, AuthIdentity, AuthScope,
+    DevBypass,
+};
 
+pub use liveness::{RxClock, StampedStream};
 pub use mapreduce::MapReduceEngine;
 pub use queue::{
-    DelayedRetryKey, QueueOrderKey, QueueStats, RetryAttempt, RetryPolicy, TaskEntry, TaskInfo,
-    TaskQueue, TaskState,
+    is_worker_rejection, AssignedLoad, CancelOutcome, DelayedRetryKey, QueueOrderKey, QueueStats,
+    ResultDisposition, ResultOutcome, RetryAttempt, RetryPolicy, TaskEntry, TaskInfo, TaskQueue,
+    TaskState, TaskView, DEFAULT_MAX_TERMINAL_BYTES, DEFAULT_MAX_TERMINAL_TASKS,
 };
 pub use reaper::{spawn_reaper, spawn_reaper_with_queue, ReaperConfig};
-pub use registry::{WorkerEntry, WorkerInfo, WorkerRegistry, WorkerStatus};
+pub use registry::{
+    HeartbeatOutcome, Registration, WorkerEntry, WorkerInfo, WorkerRegistry, WorkerStatus,
+};
 pub use scheduler::{
     ScheduleAssignment, ScheduleReport, ScheduleSkipReason, SchedulerConfig, SchedulingPolicy,
     WorkloadScheduler,

@@ -289,6 +289,30 @@ else
     info "WorkingDirectory is default/omitted."
 fi
 
+# Test 10b: the worker must not run as root (every task inherits its identity)
+TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+echo -n "[CHECK 10b] Validating service account (UserName, not root)... "
+USER_TYPE=$(plutil -type UserName "$TARGET_PLIST" 2>/dev/null || echo "missing")
+if [[ "$USER_TYPE" == "string" ]]; then
+    USER_VAL=$(plutil -extract UserName raw -o - "$TARGET_PLIST" 2>/dev/null || echo "")
+    if [[ "$USER_VAL" == "root" ]]; then
+        fail "UserName = root: every task the master dispatches runs as root and controls this Mac."
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+    elif [[ "$USER_VAL" == "REPLACE_WITH_SERVICE_ACCOUNT" ]]; then
+        if [[ "$TARGET_PLIST" == "/Library/LaunchDaemons/"* ]]; then
+            fail "UserName still holds the template placeholder."
+            FAILED_COUNT=$((FAILED_COUNT + 1))
+        else
+            pass "UserName is the template placeholder (install_mac_daemon.sh fills in the real account)"
+        fi
+    else
+        pass "UserName = '${USER_VAL}' (unprivileged service account)"
+    fi
+else
+    fail "Key 'UserName' is missing, so launchd runs the worker as root and every task as root. Reinstall with install_mac_daemon.sh (or --user NAME)."
+    FAILED_COUNT=$((FAILED_COUNT + 1))
+fi
+
 # ------------------------------------------------------------------------------
 # System-Level & Live Registration Verification (when applicable)
 # ------------------------------------------------------------------------------
@@ -342,12 +366,13 @@ if [[ "$MODE" == "live" || ("$MODE" == "auto" && "$IS_SYSTEM_PLIST" == true) ]];
     # Test 13: Process Supervision & Execution
     TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
     echo -n "[CHECK 13] Checking background worker process execution... "
-    WORKER_PIDS=$(pgrep -f "rusty-grid worker" 2>/dev/null || true)
+    # launchd knows which process it supervises; do not guess by name pattern.
+    WORKER_PIDS=$(launchctl print "system/${SERVICE_LABEL}" 2>/dev/null | awk '/^[[:space:]]*pid = / {print $3; exit}' || true)
     if [[ -n "$WORKER_PIDS" ]]; then
-        pass "Active worker process PID(s): ${WORKER_PIDS}"
+        pass "launchd-supervised worker PID: ${WORKER_PIDS}"
     else
         if [[ "$LAUNCHD_ACTIVE" == true ]]; then
-            warn "No active 'rusty-grid worker' process detected in process table (may be restarting or idle)."
+            warn "launchd reports no running worker process (restarting, or crash-looping: see worker.err.log)."
         else
             fail "Worker process is not running."
             FAILED_COUNT=$((FAILED_COUNT + 1))

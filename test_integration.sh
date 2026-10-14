@@ -11,6 +11,12 @@
 # - M5 Bonus: In-Memory Map/Reduce word count execution and JSON aggregation
 #
 # Non-interactive, non-colliding (ephemeral port), POSIX trap process cleanup.
+#
+# Isolation: every process runs with a private HOME/USERPROFILE and an empty config
+# file inside a temp dir, so this script never reads or writes the real
+# ~/.oxideswarm, never needs the cluster secret (everything is loopback) and never
+# touches a master or worker you are running. Cleanup only signals the PIDs this
+# script started; it does NOT kill processes by name.
 # ==============================================================================
 
 set -euo pipefail
@@ -26,11 +32,16 @@ NC='\033[0m'
 
 log_section() { echo -e "\n${BOLD}${CYAN}=== $* ===${NC}"; }
 log_info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
-log_pass()    { echo -e "${GREEN}[PASS]${NC} $*"; }
+PASS_COUNT=0
+log_pass()    { PASS_COUNT=$((PASS_COUNT + 1)); echo -e "${GREEN}[PASS]${NC} $*"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_fail()    { echo -e "${RED}[FAIL]${NC} $*" >&2; }
 
 TEST_DIR=$(mktemp -d "/tmp/rusty_grid_test_XXXXXX")
+TEST_HOME="${TEST_DIR}/home"
+EMPTY_CONFIG="${TEST_DIR}/empty.toml"
+mkdir -p "$TEST_HOME"
+: > "$EMPTY_CONFIG"
 PORT_FILE="${TEST_DIR}/master.port"
 MASTER_LOG="${TEST_DIR}/master.log"
 W1_LOG="${TEST_DIR}/worker_1.log"
@@ -67,7 +78,7 @@ cleanup() {
 
     if [[ $exit_code -eq 0 ]]; then
         echo -e "${BOLD}${GREEN}======================================================${NC}"
-        echo -e "${BOLD}${GREEN}   ALL INTEGRATION ACCEPTANCE TESTS PASSED (100%)    ${NC}"
+        echo -e "${BOLD}${GREEN}   INTEGRATION RUN COMPLETED: ${PASS_COUNT} CHECKS PASSED, 0 FAILED${NC}"
         echo -e "${BOLD}${GREEN}======================================================${NC}"
     else
         echo -e "${BOLD}${RED}======================================================${NC}"
@@ -82,12 +93,15 @@ trap cleanup EXIT INT TERM
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-log_section "PHASE 0: Cleaning up lingering cluster processes"
-if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || -n "${WINDIR:-}" ]]; then
-    taskkill //F //IM rusty-grid.exe 2>/dev/null || true
-else
-    pkill -9 -f "rusty-grid" 2>/dev/null || true
-fi
+log_section "PHASE 0: Isolating the test environment"
+# Children get a private HOME and no inherited grid settings. Existing masters/workers on this
+# machine are left alone (the test uses its own ephemeral ports).
+GRID_ENV=(env)
+for var in $(env | sed -n 's/^\(RUSTY_GRID_[A-Za-z0-9_]*\)=.*/\1/p') OXIDESWARM_SECRET OXIDESWARM_SECRET_FILE OXIDE_DEV_MODE OXIDE_SWARM_DASHBOARD_PORT OXIDE_SWARM_DASHBOARD_PORT_FILE; do
+    GRID_ENV+=(-u "$var")
+done
+GRID_ENV+=(HOME="$TEST_HOME" USERPROFILE="$TEST_HOME" RUSTY_GRID_CONFIG="$EMPTY_CONFIG")
+log_info "Private HOME ${TEST_HOME}; the real ~/.oxideswarm is not used"
 
 log_section "PHASE 1: Building Unified CLI Binary (rusty-grid)"
 if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || -n "${WINDIR:-}" || -f "./target/debug/rusty-grid.exe" ]]; then
@@ -108,11 +122,12 @@ if [[ ! -x "$BIN" && ! -f "$BIN" ]]; then
     log_fail "Failed to find executable binary at ${BIN}"
     exit 1
 fi
-log_pass "Verified binary: $($BIN --version)"
+BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
+log_pass "Verified binary: $("$BIN" --version)"
 
 log_section "PHASE 2: Starting Master Node with Ephemeral Port"
 log_info "Starting Master on 127.0.0.1:0 with port-file: ${PORT_FILE}"
-$BIN master --listen "127.0.0.1:0" --port-file "$PORT_FILE" > "$MASTER_LOG" 2>&1 &
+"${GRID_ENV[@]}" "$BIN" master --listen "127.0.0.1:0" --port-file "$PORT_FILE" > "$MASTER_LOG" 2>&1 &
 MASTER_PID=$!
 log_info "Master spawned with PID: ${MASTER_PID}"
 
@@ -141,7 +156,7 @@ log_pass "Master online and listening at ${MASTER_ADDR} (PID: ${MASTER_PID})"
 log_section "PHASE 3: Starting 3 Worker Nodes with Hardware Overrides"
 # Worker 1: Standard CPU Worker (2 cores, 2048 MB RAM, No GPU)
 log_info "Spawning Worker 1 (CPU-only: 2 cores, 2048 MB RAM)..."
-$BIN worker \
+"${GRID_ENV[@]}" "$BIN" worker \
     --master "$MASTER_ADDR" \
     --name "worker-cpu-node-1" \
     --cores 2 \
@@ -152,7 +167,7 @@ W1_PID=$!
 
 # Worker 2: Standard CPU Worker (4 cores, 4096 MB RAM, No GPU)
 log_info "Spawning Worker 2 (CPU-only: 4 cores, 4096 MB RAM)..."
-$BIN worker \
+"${GRID_ENV[@]}" "$BIN" worker \
     --master "$MASTER_ADDR" \
     --name "worker-cpu-node-2" \
     --cores 4 \
@@ -163,7 +178,7 @@ W2_PID=$!
 
 # Worker 3: GPU Compute Worker (8 cores, 8192 MB RAM, Simulated GPU)
 log_info "Spawning Worker 3 (GPU-enabled: 8 cores, 8192 MB RAM, Simulated GPU)..."
-$BIN worker \
+"${GRID_ENV[@]}" "$BIN" worker \
     --master "$MASTER_ADDR" \
     --name "worker-gpu-node-3" \
     --cores 8 \
@@ -181,7 +196,7 @@ MAX_ATTEMPTS=60
 WORKER_COUNT=0
 STATUS_JSON="[]"
 while [[ $WORKER_COUNT -lt 3 ]]; do
-    STATUS_JSON=$($BIN status --master "$MASTER_ADDR" --workers --json 2>/dev/null || echo "[]")
+    STATUS_JSON=$("${GRID_ENV[@]}" "$BIN" status --master "$MASTER_ADDR" --workers --json 2>/dev/null || echo "[]")
     WORKER_COUNT=$(echo "$STATUS_JSON" | grep -c '"cpu_cores"' 2>/dev/null || true)
     WORKER_COUNT=$(echo "$WORKER_COUNT" | tr -d '[:space:]')
     if [[ -z "$WORKER_COUNT" ]]; then
@@ -213,11 +228,11 @@ else
 fi
 
 # Print registered worker summary
-$BIN status --master "$MASTER_ADDR" --workers
+"${GRID_ENV[@]}" "$BIN" status --master "$MASTER_ADDR" --workers
 
 log_section "PHASE 5: Verifying AC3 (Generic Task Execution)"
 log_info "Submitting generic task: echo 'Hello RustyGrid Distributed Compute'..."
-GENERIC_OUTPUT=$($BIN submit --master "$MASTER_ADDR" --type generic --wait --command echo -- "Hello RustyGrid Distributed Compute")
+GENERIC_OUTPUT=$("${GRID_ENV[@]}" "$BIN" submit --master "$MASTER_ADDR" --type generic --wait --command echo -- "Hello RustyGrid Distributed Compute")
 echo "$GENERIC_OUTPUT"
 
 if echo "$GENERIC_OUTPUT" | grep -q "Hello RustyGrid Distributed Compute"; then
@@ -229,13 +244,24 @@ fi
 
 log_section "PHASE 6: Verifying AC4 (Workload-Specific Routing & GPU Isolation)"
 log_info "Submitting GPU-specific task with --gpu requirement..."
-GPU_OUTPUT=$($BIN submit --master "$MASTER_ADDR" --type gpu --gpu --cores 1 --wait)
+GPU_OUTPUT=$("${GRID_ENV[@]}" "$BIN" submit --master "$MASTER_ADDR" --type gpu --gpu --cores 1 --wait --json)
 echo "$GPU_OUTPUT"
 
-if echo "$GPU_OUTPUT" | grep -q "completed successfully"; then
-    log_pass "AC4 Succeeded: GPU task completed successfully on simulated GPU node."
+# Worker 3 is the only GPU-capable node. The result carries the id of the worker that ran the
+# task, so compare it with worker 3's own id (printed in its banner): a bare "completed" would
+# also be true if a CPU-only worker had run the task.
+W3_ID=$(sed -n 's/^RustyGrid Worker \([0-9a-f-]*\) initializing.*/\1/p' "$W3_LOG" | head -n1)
+GPU_WORKER_ID=$(echo "$GPU_OUTPUT" | sed -n 's/.*"worker_id": "\([^"]*\)".*/\1/p' | head -n1)
+if [[ -z "$W3_ID" || -z "$GPU_WORKER_ID" ]]; then
+    log_fail "AC4 Failed: could not read worker ids (worker 3: '${W3_ID}', task ran on: '${GPU_WORKER_ID}')."
+    exit 1
+fi
+if echo "$GPU_OUTPUT" | grep -q '"exit_code": 0' \
+    && echo "$GPU_OUTPUT" | grep -q '"is_gpu_executed": true' \
+    && [[ "$GPU_WORKER_ID" == "$W3_ID" ]]; then
+    log_pass "AC4: GPU task ran on the GPU worker (${W3_ID}), not on a CPU-only worker."
 else
-    log_fail "AC4 Failed: GPU task failed to execute."
+    log_fail "AC4 Failed: the GPU task ran on ${GPU_WORKER_ID}, expected the GPU worker ${W3_ID}."
     exit 1
 fi
 
@@ -247,11 +273,12 @@ mkdir -p "$BATCH_OUTPUT_DIR"
 TASK_PIDS=()
 for i in {1..5}; do
     (
-        $BIN submit \
+        "${GRID_ENV[@]}" "$BIN" submit \
             --master "$MASTER_ADDR" \
             --type command \
             --command echo \
             --wait \
+            --json \
             -- "Compiled crate module_${i}" > "${BATCH_OUTPUT_DIR}/task_${i}.out" 2>&1
     ) &
     TASK_PIDS+=($!)
@@ -265,8 +292,8 @@ done
 COMPLETED_COUNT=0
 for i in {1..5}; do
     TASK_OUT="${BATCH_OUTPUT_DIR}/task_${i}.out"
-    if grep -q "Compiled crate module_${i}" "$TASK_OUT"; then
-        log_info "Task ${i}: SUCCESS ($(grep 'Execution Time:' "$TASK_OUT" || echo 'completed'))"
+    if grep -q '"exit_code": 0' "$TASK_OUT" && grep -q "Compiled crate module_${i}" "$TASK_OUT"; then
+        log_info "Task ${i}: SUCCESS ($(grep '"execution_time_ms"' "$TASK_OUT" | tr -d ' ,' || echo 'completed'))"
         COMPLETED_COUNT=$((COMPLETED_COUNT + 1))
     else
         log_fail "Task ${i}: FAILED! Content:"
@@ -274,12 +301,16 @@ for i in {1..5}; do
     fi
 done
 
-if [[ $COMPLETED_COUNT -eq 5 ]]; then
-    log_pass "AC5 Succeeded: All 5 independent compilation tasks executed in parallel across workers."
-else
+if [[ $COMPLETED_COUNT -ne 5 ]]; then
     log_fail "AC5 Failed: Only ${COMPLETED_COUNT}/5 tasks succeeded."
     exit 1
 fi
+log_pass "AC5: all 5 independent tasks completed with exit code 0 and their own output."
+
+# Report (do not assert) how the scheduler spread them: quick echo tasks may legitimately all
+# land on one idle worker, so the distribution is information, not a pass criterion.
+DISTINCT_WORKERS=$(cat "${BATCH_OUTPUT_DIR}"/task_*.out | sed -n 's/.*"worker_id": "\([^"]*\)".*/\1/p' | sort -u | wc -l | tr -d '[:space:]')
+log_info "Scheduler spread the batch over ${DISTINCT_WORKERS} distinct worker(s) (informational)."
 
 log_section "PHASE 8: Verifying Milestone 5 Map/Reduce Execution"
 log_info "Preparing distributed Map/Reduce word count dataset..."
@@ -292,7 +323,7 @@ lightweight in memory map reduce word count execution
 EOF
 
 log_info "Executing Map/Reduce job via 'rusty-grid mapreduce'..."
-MAPREDUCE_OUTPUT=$($BIN mapreduce \
+MAPREDUCE_OUTPUT=$("${GRID_ENV[@]}" "$BIN" mapreduce \
     --master "$MASTER_ADDR" \
     --input "$INPUT_FILE" \
     --mapper word_count \
@@ -302,15 +333,18 @@ MAPREDUCE_OUTPUT=$($BIN mapreduce \
 
 echo "$MAPREDUCE_OUTPUT"
 
-# Verify word count outputs
-if echo "$MAPREDUCE_OUTPUT" | grep -q '"rusty":' && echo "$MAPREDUCE_OUTPUT" | grep -q '"grid":'; then
-    log_pass "Milestone 5 Map/Reduce Succeeded: Word count properly aggregated across workers."
+# Verify word count outputs: in the dataset above "rusty" and "grid" each occur on exactly two
+# lines, "distributed" on two, "rust" on two.
+if echo "$MAPREDUCE_OUTPUT" | grep -Eq '"rusty": *2' \
+    && echo "$MAPREDUCE_OUTPUT" | grep -Eq '"grid": *2' \
+    && echo "$MAPREDUCE_OUTPUT" | grep -Eq '"distributed": *2'; then
+    log_pass "Map/Reduce: word counts aggregated correctly (rusty=2, grid=2, distributed=2)."
 else
-    log_fail "Map/Reduce Failed: Missing aggregated word counts in output."
+    log_fail "Map/Reduce Failed: aggregated word counts do not match the dataset."
     exit 1
 fi
 
 log_section "PHASE 9: Querying Final Cluster Health Status"
-$BIN status --master "$MASTER_ADDR"
+"${GRID_ENV[@]}" "$BIN" status --master "$MASTER_ADDR"
 
-log_pass "Integration verification complete with 100% success!"
+log_info "Integration run finished: ${PASS_COUNT} checks passed (the banner above is printed only if no check failed)."

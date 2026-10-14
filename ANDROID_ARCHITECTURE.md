@@ -3,7 +3,28 @@
 **Document Version:** 1.0.0 (Production Architecture)  
 **Author:** OxideSwarm Architecture Team (Worker 1 / Core Systems)  
 **Classification:** Core System Architecture Specification  
-**Status:** Approved for Implementation & Benchmark Integration  
+**Status:** Design specification. Parts are implemented, parts are a roadmap; see "Implementation status" below.  
+
+---
+
+## Implementation status (read this first)
+
+This document was written as a design before the code existed. It has not been rewritten to match the code, so
+treat every section as a specification unless the table below says it exists.
+
+| Area | Status in this repository |
+|---|---|
+| In-process JNI worker (`crates/android_bridge`, `liboxideworker.so`), `nativeStartWorker` / `nativeStopWorker` / `nativeStartMaster` / `nativeStopMaster`, live telemetry injection (`nativeUpdateTelemetry`), P2P ticket wiring | **Implemented** (section 3.3 and 6.1 phases 1-3). `packaging/android/build_android_jni.sh` builds the library; the Gradle project does not. |
+| Kotlin foreground service, wake/Wi-Fi locks, boot receiver, battery-optimization helper | **Implemented** (`packaging/android/app`), not exercised by any automated test |
+| Termux worker daemon | **Implemented** (`packaging/android/termux`); it is the only Android path that can hold the cluster secret today |
+| Cluster-secret authentication for the app | **Not implemented**: the JNI start path and the UI have no secret, so the app cannot join a master that requires one |
+| 3.3 "100% immune to PPK" | **Qualified**: the worker loop is not a child process, but command / shell / compile tasks spawn child processes (`TaskRunner`), which PPK can kill |
+| 4.2 Adaptive dual-tier keepalive (RRC-aware 10 / 25 / 60 s) | **Design only.** The worker uses a fixed heartbeat interval plus TCP keepalive |
+| 5.1 Mobile master refusal matrix | **Design only** |
+| 5.2 Weighted authority score and election, 5.3 signed master lease tickets, `ClaimMasterRole` | **Design only.** No such code or message exists |
+| 5.4 Pre-sleep evacuation (`< 50 ms`) | **Design only** |
+| Automatic master failover / promotion | **Not implemented.** A person (or script) promotes a node with `switch_role`; if the master dies, workers retry and queued tasks wait |
+| Battery / thermal task throttling | The master scheduler skips mobile workers that are thermally throttled, or below 15 % battery (default `mobile_min_battery_pct`), for compile / GPU tasks. The richer policy model of 3.6 is design |
 
 ---
 
@@ -360,8 +381,14 @@ In Android 12 (API 31), Google introduced `PhantomProcessList.java` inside `Acti
    $$\text{kill}(pid, \text{SIGKILL})$$
    Signal 9 is uncatchable: no destructors execute, no socket close frames are transmitted, and no cleanup occurs.
 
+> **Scope of this claim.** The worker engine itself is not a phantom process. Tasks of type `Command`, `ShellScript` and
+> `RustCompilation` are executed by `TaskRunner` with `tokio::process::Command`, i.e. as child processes of the app, and those
+> **are** phantom processes subject to the limit and the CPU-based kill described above. Only built-in in-process task types
+> are fully covered. For command tasks on Android 12+ raise the limit (`device_config put activity_manager max_phantom_processes ...`,
+> see `packaging/android/README.md` section 3.4).
+
 #### OxideSwarm's Immunity Mechanism: The In-Process POSIX Model
-OxideSwarm completely eliminates phantom processes by compiling the worker engine as a native dynamic shared library (`liboxideworker.so`) and loading it into the Android Service process via JNI:
+OxideSwarm avoids making the worker engine itself a phantom process by compiling it as a native dynamic shared library (`liboxideworker.so`) and loading it into the Android Service process via JNI:
 
 ```
 +─────────────────────────────────────────────────────────────────────────────+
@@ -384,12 +411,12 @@ OxideSwarm completely eliminates phantom processes by compiling the worker engin
 +─────────────────────────────────────────────────────────────────────────────+
 │  Process Accounting:                                                        │
 │  - Total Processes Spawned: 1 (The Android Service Process)                 │
-│  - Total Child / Phantom Processes Spawned: 0 (ZERO)                        │
-│  - Verdict by PhantomProcessList: 100% IMMUNE TO PPK                        │
+│  - Child / Phantom Processes spawned by the engine itself: 0                │
+│  - (command/shell/compile TASKS still spawn children, see the note above)   │
 +─────────────────────────────────────────────────────────────────────────────+
 ```
 
-Because threads share the same Linux Thread Group ID (`tgid`) and process memory descriptor (`mm_struct`), the Linux kernel and Android `PhantomProcessList` register **zero additional processes**. This confers 100% architectural immunity to PPK across Android 12, 13, 14, and 15+.
+Because threads share the same Linux Thread Group ID (`tgid`) and process memory descriptor (`mm_struct`), the Linux kernel and Android `PhantomProcessList` register **zero additional processes**. This keeps the worker engine itself out of the phantom-process accounting on Android 12, 13, 14, and 15+.
 
 ---
 
@@ -565,6 +592,8 @@ Under modern cellular CGNAT, port allocation follows RFC 6056 randomized port se
 
 ### 4.2 Adaptive Dual-Tier Keepalive & Cellular Radio Control (RRC)
 
+> **DESIGN ONLY - NOT IMPLEMENTED.** Nothing in `crates/` or `packaging/android/app` does this yet; it is a roadmap item.
+
 #### The Cellular Tail Timer Trap
 Cellular baseband processors transition through 3GPP Radio Resource Control (RRC) states:
 1. **`RRC_CONNECTED`**: High-power transmission state ($\sim 1,000\text{mW} - 1,800\text{mW}$).
@@ -647,6 +676,8 @@ Under RFC 9000 §9:
 
 ### 5.1 Mobile Master Refusal Matrix
 
+> **DESIGN ONLY - NOT IMPLEMENTED.** Nothing in `crates/` or `packaging/android/app` does this yet; it is a roadmap item.
+
 While any OxideSwarm node can theoretically run `MasterServer`, mobile devices are inherently ill-suited to serve as persistent cluster coordinators. A mobile device MUST autonomously evaluate its environmental telemetry and **strictly refuse** the Master role when any of the following conditions occur:
 
 ```
@@ -672,6 +703,8 @@ If any refusal condition is met, the node automatically designates itself as pur
 ---
 
 ### 5.2 Weighted Authority Scoring Function ($S_{auth}$) & Election
+
+> **DESIGN ONLY - NOT IMPLEMENTED.** Nothing in `crates/` or `packaging/android/app` does this yet; it is a roadmap item.
 
 When a cluster's active Master becomes unreachable (e.g. desktop powered down, network drop), remaining nodes execute an autonomous **Weighted Authority Election**.
 
@@ -710,6 +743,8 @@ Any node with $S_{auth} < 2500$ is strictly disqualified from election. If a mob
 
 ### 5.3 Cryptographic Master Lease Tickets & Graceful Handover
 
+> **DESIGN ONLY - NOT IMPLEMENTED.** Nothing in `crates/` or `packaging/android/app` does this yet; it is a roadmap item.
+
 To prevent split-brain clusters without requiring heavyweight consensus protocols:
 1. **Time-Bounded Lease Ticket**: The active Master issues a signed cryptographic lease ticket:
    ```json
@@ -728,6 +763,8 @@ To prevent split-brain clusters without requiring heavyweight consensus protocol
 ---
 
 ### 5.4 Zero-Latency Pre-Sleep Evacuation (`< 50ms`)
+
+> **DESIGN ONLY - NOT IMPLEMENTED.** Nothing in `crates/` or `packaging/android/app` does this yet; it is a roadmap item.
 
 #### The Problem with Dead-Node Heartbeat Timeouts
 Standard cluster systems detect node failure reactively when heartbeats cease:
@@ -809,14 +846,15 @@ Verification follows a strict 6-point test matrix:
   TC-05    │ Compilation & Lints            │ `cargo check --workspace`
            │ (Zero compiler errors/warnings)│ Exit code 0
   TC-06    │ Full Bridge Test Suite         │ `cargo test -p rusty_grid_android_bridge`
-           │ (100% integration tests pass)  │ Exit code 0, 0 failures
+           │ (integration tests pass)       │ Exit code 0, 0 failures (the P2P ticket
+           │                                │ connect test needs the public iroh relays)
 ```
 
 ---
 
 ### 6.3 Failure Modes & Architectural Invariants
 
-1. **Invariant 1 (Zero Subprocesses)**: Under no circumstances shall `liboxideworker.so` invoke `fork()` or `execve()` on Android. All async tasks run on Tokio pthreads.
+1. **Invariant 1 (Zero Subprocesses)**: *(aspiration, not true today)* `liboxideworker.so` shall not invoke `fork()` or `execve()` on Android. Built-in async tasks run on Tokio pthreads, but `TaskRunner` still spawns child processes for command / shell / compile tasks.
 2. **Invariant 2 (Non-Root Sandbox Safety)**: No telemetry routine shall invoke `/system/bin/dumpsys` or read restricted `/sys/class/` paths. All telemetry must be passed via JNI from the Android SDK.
 3. **Invariant 3 (Battery Protection Rule)**: A mobile node whose battery is $< 15\%$ and discharging shall unconditionally reject incoming tasks and initiate pre-sleep disconnection.
 4. **Invariant 4 (Zero-Port WAN Reachability)**: If direct UDP hole-punching fails, the client shall transparently route traffic over Iroh DERP relays via TLS 443 with 0 dropped frames.

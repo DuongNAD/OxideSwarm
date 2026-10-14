@@ -7,6 +7,12 @@
 //! - `rusty-grid status`: Queries cluster metrics, task lifecycle state, or worker details.
 //! - `rusty-grid workers`: Inspects active worker nodes advertising capabilities.
 //! - `rusty-grid mapreduce`: Orchestrates in-memory distributed map-reduce jobs.
+//! - `rusty-grid secret`: Generates / shows the shared cluster secret.
+//!
+//! Every command that joins or drives a grid accepts the cluster secret (`--secret-file`,
+//! `--secret`, `OXIDESWARM_SECRET[_FILE]`, config file, `~/.oxideswarm/cluster.secret`); see
+//! [`crate::secret_cmd`]. Ports: the Master's grid port is 8088 (default for `--master` and
+//! `--listen`), the dashboard is 8080.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,17 +25,31 @@ use tokio::sync::watch;
 use tracing::info;
 use uuid::Uuid;
 
+use rusty_grid_core::cluster_auth::ClusterSecret;
+use rusty_grid_core::error::GridError;
 use rusty_grid_core::mapreduce::{MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec};
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport, WireCodec};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
 use rusty_grid_master::{MasterServer, ReaperConfig, SchedulerConfig, ServerConfig};
-use rusty_grid_worker::{WorkerClient, WorkerConfig};
+use rusty_grid_worker::{NoticeLevel, ProcessPriority, WorkerClient, WorkerConfig};
 
 use crate::config::{
-    self, load_config_file, resolve_bool, resolve_f32, resolve_opt_field, resolve_opt_string,
+    load_config_file, resolve_bool, resolve_f32, resolve_opt_field, resolve_opt_string,
     resolve_opt_u16, resolve_opt_u64, resolve_opt_usize, resolve_string, resolve_u32, resolve_u64,
+    resolve_usize, ConfigFile, SecretSection, SecretText,
+};
+use crate::connect::{
+    connect_master, normalize_master_addr, report_master_failure, AUTH_EXIT_CODE,
+    DEFAULT_MASTER_ADDR,
 };
 use crate::mode_cli;
+use crate::secret_cmd::{
+    announce_master_secret, announce_peer_secret, decide_master_secret, decide_peer_secret,
+    run_secret, PeerRole, PeerSecretOutcome, SecretCliArgs, SecretOpts,
+};
+
+/// Help text of `--insecure` on the commands that connect to a master (worker and clients).
+const INSECURE_PEER_HELP: &str = "Continue WITHOUT a cluster secret although the master is remote, found by 'auto' discovery, or reached through a P2P ticket. The master is then not authenticated: a rogue host can run commands on a worker or receive what a client submits. Without this flag such a connection is refused when no secret is configured.";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -61,8 +81,34 @@ pub struct Cli {
     )]
     pub config: Option<PathBuf>,
 
+    #[arg(
+        global = true,
+        long = "secret-file",
+        value_name = "PATH",
+        help = "File holding the cluster secret (hex); default: OXIDESWARM_SECRET[_FILE], then ~/.oxideswarm/cluster.secret"
+    )]
+    pub secret_file: Option<PathBuf>,
+
+    #[arg(
+        global = true,
+        long = "secret",
+        value_name = "HEX",
+        help = "Cluster secret as hex (discouraged: visible in the process list; prefer --secret-file)"
+    )]
+    pub secret: Option<SecretText>,
+
     #[command(subcommand)]
     pub command: Commands,
+}
+
+impl Cli {
+    /// The secret-related flags as one value.
+    pub fn secret_opts(&self) -> SecretOpts {
+        SecretOpts {
+            value: self.secret.clone(),
+            file: self.secret_file.clone(),
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -85,6 +131,9 @@ pub enum Commands {
     /// Execute a distributed Map/Reduce job
     Mapreduce(MapReduceArgs),
 
+    /// Generate or show the shared cluster secret
+    Secret(SecretCliArgs),
+
     /// Workflow modes and presets (test, dev, doc, research)
     Mode(mode_cli::ModeCliArgs),
 }
@@ -93,7 +142,7 @@ pub enum Commands {
 pub struct MasterArgs {
     #[arg(
         long,
-        help = "Socket address to bind TCP listener to (e.g. 127.0.0.1:8080 or 127.0.0.1:0)"
+        help = "Socket address of the grid listener for workers and clients (default 127.0.0.1:8088; use 0.0.0.0:8088 to accept other machines, 127.0.0.1:0 for an ephemeral port)"
     )]
     pub listen: Option<String>,
 
@@ -151,7 +200,10 @@ pub struct MasterArgs {
 
     #[arg(
         long,
-        help = "Address to bind HTTP Web UI Dashboard listener (e.g. 127.0.0.1:3000)"
+        conflicts_with = "dashboard_port",
+        help = "Address to bind the HTTP Web UI Dashboard listener (default: 127.0.0.1:8080, this machine only). \
+                A non-loopback address (e.g. 0.0.0.0:8080) exposes it over PLAIN HTTP to that network: use a tunnel/VPN. \
+                It also picks the port, so it cannot be combined with --dashboard-port"
     )]
     pub web_ui_addr: Option<String>,
 
@@ -202,6 +254,47 @@ pub struct MasterArgs {
         help = "Register an API token with name and comma-separated scopes (e.g. secret123:admin:admin or obs123:monitor:observer)"
     )]
     pub auth_tokens: Vec<String>,
+
+    #[arg(
+        long,
+        help = "Allow a master reachable beyond this machine (non-loopback --listen, or --p2p) to run WITHOUT a cluster secret. Anyone who can reach it can run commands on every worker."
+    )]
+    pub insecure: bool,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Finished tasks (with payload and output) the master retains, oldest evicted first (default 10000)"
+    )]
+    pub max_retained_tasks: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "MB",
+        help = "Megabytes of finished-task payload and output the master retains, oldest evicted first (default 256)"
+    )]
+    pub max_retained_mb: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Tasks of one mapreduce job in flight at once; keep it above the cluster's total slots (default 256)"
+    )]
+    pub mapreduce_parallelism: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Connections the grid port keeps open at once; further peers are closed (default 1024)"
+    )]
+    pub max_connections: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Connections allowed in the pre-authentication handshake at once (default 64)"
+    )]
+    pub max_pending_handshakes: Option<usize>,
 }
 
 
@@ -209,14 +302,17 @@ pub struct MasterArgs {
 pub struct WorkerArgs {
     #[arg(
         long,
-        help = "Address of the Master node to connect to (e.g. 127.0.0.1:8080)"
+        help = "Address of the Master's grid port (default 127.0.0.1:8088, the dashboard is on :8080); a bare host gets :8088; 'auto' discovers it on the LAN"
     )]
     pub master: Option<String>,
 
     #[arg(long, help = "P2P connection ticket string for NAT traversal")]
     pub p2p_ticket: Option<String>,
 
-    #[arg(long, help = "Human-readable worker node name override")]
+    #[arg(
+        long,
+        help = "Human-readable worker node name override. A named worker also keeps the same worker id across restarts (~/.oxideswarm/worker_id.<NAME>, or the file in RUSTY_GRID_WORKER_ID_FILE): give every worker that shares a home directory its own name. Without a name the id is new at each start"
+    )]
     pub name: Option<String>,
 
     #[arg(long, alias = "cpu-cores", help = "Override advertised CPU core count")]
@@ -230,13 +326,19 @@ pub struct WorkerArgs {
     )]
     pub ram_mb: Option<u64>,
 
-    #[arg(long, help = "Explicitly advertise physical GPU presence")]
+    #[arg(
+        long,
+        help = "Insist on a real GPU. A GPU is advertised only if this binary was built with `--features gpu-wgpu` and an adapter starts (it is looked for automatically unless --no-gpu); otherwise none is advertised and the reason is printed"
+    )]
     pub gpu: bool,
 
-    #[arg(long, help = "Explicitly disable GPU advertising")]
+    #[arg(long, help = "Never advertise a GPU (also skips looking for one)")]
     pub no_gpu: bool,
 
-    #[arg(long, help = "Advertise simulated GPU compute capabilities")]
+    #[arg(
+        long,
+        help = "TEST MODE: advertise a simulated GPU whose tasks run on the CPU and are labelled as simulated"
+    )]
     pub simulate_gpu: bool,
 
     #[arg(long, help = "Human-readable GPU device model string")]
@@ -256,8 +358,17 @@ pub struct WorkerArgs {
     )]
     pub heartbeat_interval_secs: Option<u64>,
 
-    #[arg(long, help = "Base directory for task scratch sandboxes")]
+    #[arg(
+        long,
+        help = "Base directory for task scratch sandboxes (default: RUSTY_GRID_SANDBOX_BASE_DIR, then TMPDIR, then the platform temp dir; must be writable)"
+    )]
     pub sandbox_base_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "CPU priority of task processes: normal, below-normal (default) or idle; env RUSTY_GRID_TASK_PRIORITY"
+    )]
+    pub task_priority: Option<String>,
 
     #[arg(long, help = "Retain task sandbox directories after execution")]
     pub keep_sandboxes: bool,
@@ -268,11 +379,17 @@ pub struct WorkerArgs {
         help = "Wire format codec: bincode or json (default: bincode)"
     )]
     pub wire_codec: String,
+
+    #[arg(long, help = INSECURE_PEER_HELP)]
+    pub insecure: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
 pub struct SubmitArgs {
-    #[arg(long, help = "Address of Master coordinator")]
+    #[arg(
+        long,
+        help = "Address of the Master's grid port (default 127.0.0.1:8088); a bare host gets :8088; 'auto' discovers it on the LAN"
+    )]
     pub master: Option<String>,
 
     #[arg(
@@ -314,11 +431,17 @@ pub struct SubmitArgs {
 
     #[arg(last = true, help = "Command arguments (trailing args after --)")]
     pub args: Vec<String>,
+
+    #[arg(long, help = INSECURE_PEER_HELP)]
+    pub insecure: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
 pub struct StatusArgs {
-    #[arg(long, help = "Address of Master coordinator")]
+    #[arg(
+        long,
+        help = "Address of the Master's grid port (default 127.0.0.1:8088); a bare host gets :8088; 'auto' discovers it on the LAN"
+    )]
     pub master: Option<String>,
 
     #[arg(long, alias = "task", help = "Query status of a specific task ID")]
@@ -329,20 +452,32 @@ pub struct StatusArgs {
 
     #[arg(long, help = "Format output as JSON")]
     pub json: bool,
+
+    #[arg(long, help = INSECURE_PEER_HELP)]
+    pub insecure: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
 pub struct WorkersArgs {
-    #[arg(long, help = "Address of Master coordinator")]
+    #[arg(
+        long,
+        help = "Address of the Master's grid port (default 127.0.0.1:8088); a bare host gets :8088; 'auto' discovers it on the LAN"
+    )]
     pub master: Option<String>,
 
     #[arg(long, help = "Format output as JSON")]
     pub json: bool,
+
+    #[arg(long, help = INSECURE_PEER_HELP)]
+    pub insecure: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
 pub struct MapReduceArgs {
-    #[arg(long, help = "Address of Master coordinator")]
+    #[arg(
+        long,
+        help = "Address of the Master's grid port (default 127.0.0.1:8088); a bare host gets :8088; 'auto' discovers it on the LAN"
+    )]
     pub master: Option<String>,
 
     #[arg(long, required = true, help = "Input data files or text datasets")]
@@ -376,6 +511,9 @@ pub struct MapReduceArgs {
     )]
     pub timeout_secs: u64,
 
+    #[arg(long, help = INSECURE_PEER_HELP)]
+    pub insecure: bool,
+
     #[arg(long, help = "Format output as JSON")]
     pub json: bool,
 }
@@ -406,13 +544,15 @@ pub async fn run_cli() -> ExitCode {
         }
     };
 
+    let secret_opts = cli.secret_opts();
     match cli.command {
-        Commands::Master(args) => run_master(args, config_file).await,
-        Commands::Worker(args) => run_worker(args, config_file).await,
-        Commands::Submit(args) => run_submit(args, config_file).await,
-        Commands::Status(args) => run_status(args, config_file).await,
-        Commands::Workers(args) => run_workers(args, config_file).await,
-        Commands::Mapreduce(args) => run_mapreduce(args, config_file).await,
+        Commands::Master(args) => run_master(args, config_file, secret_opts).await,
+        Commands::Worker(args) => run_worker(args, config_file, secret_opts).await,
+        Commands::Submit(args) => run_submit(args, config_file, secret_opts).await,
+        Commands::Status(args) => run_status(args, config_file, secret_opts).await,
+        Commands::Workers(args) => run_workers(args, config_file, secret_opts).await,
+        Commands::Mapreduce(args) => run_mapreduce(args, config_file, secret_opts).await,
+        Commands::Secret(args) => run_secret(args, &secret_opts, config_file.as_ref()),
         Commands::Mode(args) => {
             let code = mode_cli::run_mode_cli(args).await;
             if code == 0 {
@@ -424,14 +564,20 @@ pub async fn run_cli() -> ExitCode {
     }
 }
 
-async fn run_master(args: MasterArgs, config_file: Option<config::ConfigFile>) -> ExitCode {
+async fn run_master(
+    args: MasterArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
     let master_cfg = config_file.as_ref().and_then(|c| c.master.clone());
 
+    // Loopback by default: a bare `master` works with a bare `worker` on the same machine, and
+    // reaching other machines is an explicit `--listen 0.0.0.0:8088` that brings in the secret policy.
     let listen_addr_str = resolve_string(
         args.listen,
         &["RUSTY_GRID_MASTER_LISTEN", "RUSTY_GRID_LISTEN"],
         master_cfg.as_ref().and_then(|m| m.listen.clone()),
-        "127.0.0.1:0",
+        DEFAULT_MASTER_ADDR,
     );
 
     let port_file = resolve_opt_string(
@@ -539,10 +685,81 @@ async fn run_master(args: MasterArgs, config_file: Option<config::ConfigFile>) -
         server_config = server_config.with_p2p_ticket_file(tf);
     }
 
-    if let Some(ref w_addr) = args.web_ui_addr {
-        if let Ok(parsed) = w_addr.parse() {
-            server_config = server_config.with_web_ui(true).with_web_ui_addr(parsed);
+    server_config = match apply_web_ui_addr(server_config, args.web_ui_addr.as_deref()) {
+        Ok(config) => config,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
         }
+    };
+    // A bare master (no secret, no token) with a loopback dashboard gets local access without a
+    // login; the library enforces that this never applies to a non-loopback dashboard.
+    server_config = server_config.with_implicit_local_dashboard(true);
+
+    let max_retained_tasks = resolve_usize(
+        args.max_retained_tasks,
+        &["RUSTY_GRID_MAX_RETAINED_TASKS"],
+        master_cfg.as_ref().and_then(|m| m.max_retained_tasks),
+        rusty_grid_master::queue::DEFAULT_MAX_TERMINAL_TASKS,
+    );
+    let max_retained_mb = resolve_u64(
+        args.max_retained_mb,
+        &["RUSTY_GRID_MAX_RETAINED_MB"],
+        master_cfg.as_ref().and_then(|m| m.max_retained_mb),
+        (rusty_grid_master::queue::DEFAULT_MAX_TERMINAL_BYTES / (1024 * 1024)) as u64,
+    );
+    let mapreduce_parallelism = resolve_usize(
+        args.mapreduce_parallelism,
+        &["RUSTY_GRID_MAPREDUCE_PARALLELISM"],
+        master_cfg.as_ref().and_then(|m| m.mapreduce_parallelism),
+        rusty_grid_master::mapreduce::DEFAULT_MAPREDUCE_PARALLELISM,
+    );
+    let max_connections = resolve_usize(
+        args.max_connections,
+        &["RUSTY_GRID_MAX_CONNECTIONS"],
+        master_cfg.as_ref().and_then(|m| m.max_connections),
+        rusty_grid_master::server::DEFAULT_MAX_CONNECTIONS,
+    );
+    let max_pending_handshakes = resolve_usize(
+        args.max_pending_handshakes,
+        &["RUSTY_GRID_MAX_PENDING_HANDSHAKES"],
+        master_cfg.as_ref().and_then(|m| m.max_pending_handshakes),
+        rusty_grid_master::server::DEFAULT_MAX_PENDING_HANDSHAKES,
+    );
+    server_config = server_config
+        .with_max_terminal_tasks(max_retained_tasks)
+        .with_max_terminal_bytes(
+            usize::try_from(max_retained_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX),
+        )
+        .with_mapreduce_parallelism(mapreduce_parallelism)
+        .with_max_connections(max_connections)
+        .with_max_pending_handshakes(max_pending_handshakes);
+
+    // Cluster secret policy: a master reachable beyond this machine (non-loopback listener, or
+    // the P2P listener, since an iroh ticket is an address and not a credential) must
+    // authenticate its peers. Resolve the secret, generate the default file if nothing resolves,
+    // or honour the explicit --insecure escape hatch.
+    let insecure = resolve_bool(
+        if args.insecure { Some(true) } else { None },
+        &["RUSTY_GRID_INSECURE"],
+        master_cfg.as_ref().and_then(|m| m.insecure),
+        false,
+    );
+    let secret_outcome = match secret_opts
+        .resolve(config_file.as_ref(), SecretSection::Master)
+        .and_then(|resolved| {
+            let exposed = !server_config.bind_addr.ip().is_loopback() || enable_p2p;
+            decide_master_secret(resolved, exposed, insecure, ClusterSecret::default_path())
+        }) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    announce_master_secret(&secret_outcome, &listen_addr_str, insecure);
+    if let Some(secret) = secret_outcome.secret() {
+        server_config = server_config.with_cluster_secret(secret.clone());
     }
 
     if let Some(ref kf) = p2p_key_file {
@@ -575,8 +792,15 @@ async fn run_master(args: MasterArgs, config_file: Option<config::ConfigFile>) -
             .and_then(|m| m.dashboard_port_file.clone()),
     );
 
-    if let Some(dp) = dashboard_port {
-        server_config = server_config.with_dashboard_port(dp);
+    // `--web-ui-addr` (a flag, so it outranks the environment and the config file) names the whole
+    // dashboard address; a `dashboard_port` from RUSTY_GRID_DASHBOARD_PORT or the config file
+    // would otherwise take over and quietly put the dashboard back on loopback.
+    match (dashboard_port, args.web_ui_addr.is_some()) {
+        (Some(dp), true) => eprintln!(
+            "Note: ignoring dashboard_port {dp} from the environment or the config file: --web-ui-addr names the dashboard address"
+        ),
+        (Some(dp), false) => server_config = server_config.with_dashboard_port(dp),
+        (None, _) => {}
     }
     if let Some(ref dpf) = dashboard_port_file {
         server_config = server_config.with_dashboard_port_file(dpf);
@@ -627,6 +851,20 @@ async fn run_master(args: MasterArgs, config_file: Option<config::ConfigFile>) -
     println!("RustyGrid Master started on {}", handle.server_addr());
     if let Some(dash_addr) = handle.dashboard_addr() {
         println!("Embedded Dashboard available at http://{}", dash_addr);
+        for line in dashboard_banner(
+            dash_addr,
+            handle.dashboard_dev_bypass(),
+            secret_outcome.secret().is_some(),
+        ) {
+            println!("{line}");
+        }
+        if !dash_addr.ip().to_canonical().is_loopback() {
+            eprintln!(
+                "WARNING: the dashboard is listening on {dash_addr}, which is not loopback, and it speaks plain HTTP:\n\
+                 \x20        tokens and task output cross the network unencrypted. Keep it on 127.0.0.1\n\
+                 \x20        (the default) and reach it through an SSH tunnel or a VPN instead."
+            );
+        }
     }
 
     if enable_p2p {
@@ -645,22 +883,114 @@ async fn run_master(args: MasterArgs, config_file: Option<config::ConfigFile>) -
     ExitCode::SUCCESS
 }
 
-async fn run_worker(args: WorkerArgs, config_file: Option<config::ConfigFile>) -> ExitCode {
+/// Applies `--web-ui-addr` to the master's configuration.
+///
+/// Without the flag the dashboard keeps `ServerConfig`'s default, `127.0.0.1:8080`, whatever the
+/// grid listens on: a master that listens on `0.0.0.0` for workers must not publish its dashboard
+/// (plain HTTP) to the network as a side effect. Naming an address is the explicit opt-in.
+fn apply_web_ui_addr(
+    config: ServerConfig,
+    web_ui_addr: Option<&str>,
+) -> Result<ServerConfig, String> {
+    match web_ui_addr {
+        None => Ok(config),
+        Some(addr) => addr
+            .parse()
+            .map(|parsed| config.with_web_ui(true).with_web_ui_addr(parsed))
+            .map_err(|e| format!("Invalid web UI address '{addr}': {e}")),
+    }
+}
+
+/// Startup lines describing how the dashboard authenticates, from the resolved dev-bypass state.
+fn dashboard_banner(
+    dash_addr: std::net::SocketAddr,
+    bypass: rusty_grid_master::auth::DevBypass,
+    has_secret: bool,
+) -> Vec<String> {
+    use rusty_grid_master::auth::DevBypass;
+    let mut lines = Vec::new();
+    match bypass {
+        DevBypass::Implicit => lines.push(
+            "Dashboard access: this machine only, no login (no cluster secret and no --auth-token \
+             are configured). Set either one to require a token."
+                .to_string(),
+        ),
+        DevBypass::Explicit => lines.push(
+            "Dashboard access: --dev is ON, so requests from this machine are trusted without a login."
+                .to_string(),
+        ),
+        DevBypass::RefusedNonLoopback => lines.push(format!(
+            "Dashboard access: --dev / OXIDE_DEV_MODE ignored, the dashboard is not on a loopback address ({dash_addr}); a token is required."
+        )),
+        DevBypass::Off => {
+            if has_secret {
+                lines.push(
+                    "Dashboard login token: run `oxideswarm secret show --dashboard-token`"
+                        .to_string(),
+                );
+            } else {
+                lines.push(
+                    "Dashboard access: a token is required (--auth-token); --dev allows this machine without one."
+                        .to_string(),
+                );
+            }
+        }
+    }
+    if has_secret && matches!(bypass, DevBypass::Explicit | DevBypass::RefusedNonLoopback) {
+        lines.push(
+            "Dashboard login token: run `oxideswarm secret show --dashboard-token`".to_string(),
+        );
+    }
+    lines
+}
+
+async fn run_worker(
+    args: WorkerArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
     let worker_cfg = config_file.as_ref().and_then(|c| c.worker.clone());
     let hw_cfg = worker_cfg.as_ref().and_then(|w| w.hardware.clone());
 
-    let master_addr = resolve_string(
+    let master_addr = normalize_master_addr(&resolve_string(
         args.master,
         &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
         worker_cfg.as_ref().and_then(|w| w.master.clone()),
-        "127.0.0.1:8080",
-    );
+        DEFAULT_MASTER_ADDR,
+    ));
+
+    let cluster_secret = match secret_opts.resolve(config_file.as_ref(), SecretSection::Worker) {
+        Ok(secret) => secret,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let p2p_ticket = resolve_opt_string(
         args.p2p_ticket,
         &["RUSTY_GRID_P2P_TICKET"],
         worker_cfg.as_ref().and_then(|w| w.p2p_ticket.clone()),
     );
+
+    // Fail closed: a worker obeys whatever its master sends, so without a secret it may only
+    // follow a master on this machine. Remote, `auto`-discovered and P2P-ticket masters need the
+    // cluster secret (to prove the master is genuine) unless --insecure is given explicitly.
+    let insecure = peer_insecure(args.insecure, worker_cfg.as_ref().and_then(|w| w.insecure));
+    let peer_outcome = match decide_peer_secret(
+        cluster_secret.as_ref(),
+        &master_addr,
+        p2p_ticket.is_some(),
+        insecure,
+        PeerRole::Worker,
+    ) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(AUTH_EXIT_CODE);
+        }
+    };
+    announce_peer_secret(peer_outcome, PeerRole::Worker, &master_addr);
 
     let name = resolve_opt_string(
         args.name,
@@ -747,6 +1077,22 @@ async fn run_worker(args: WorkerArgs, config_file: Option<config::ConfigFile>) -
         worker_cfg.as_ref().and_then(|w| w.sandbox_base_dir.clone()),
     );
 
+    // A misspelt priority must not silently run tasks at full priority on the owner's machine.
+    let task_priority = match resolve_opt_string(
+        args.task_priority,
+        &["RUSTY_GRID_TASK_PRIORITY"],
+        None,
+    )
+    .map(|text| text.parse::<ProcessPriority>())
+    {
+        Some(Ok(priority)) => Some(priority),
+        Some(Err(e)) => {
+            eprintln!("--task-priority: {e}");
+            return ExitCode::FAILURE;
+        }
+        None => None,
+    };
+
     let keep_sandboxes = resolve_bool(
         if args.keep_sandboxes {
             Some(true)
@@ -758,7 +1104,16 @@ async fn run_worker(args: WorkerArgs, config_file: Option<config::ConfigFile>) -
         false,
     );
 
+    // Decided here, before `name` moves into the config: see `identity::persistence_wanted`.
+    let keep_worker_id = rusty_grid_worker::identity::persistence_wanted(
+        name.as_deref(),
+        std::env::var_os(rusty_grid_worker::identity::WORKER_ID_FILE_ENV).as_deref(),
+    );
+
     let mut config = WorkerConfig::new(master_addr);
+    if let Some(secret) = cluster_secret.as_ref() {
+        config = config.with_cluster_secret(secret.clone());
+    }
     if let Some(ticket) = p2p_ticket {
         config = config.with_p2p_ticket(ticket);
     }
@@ -777,6 +1132,8 @@ async fn run_worker(args: WorkerArgs, config_file: Option<config::ConfigFile>) -
     if no_gpu {
         config = config.with_no_gpu(true);
     }
+    // Look for a real GPU unless told not to (a build without the wgpu engine says so below).
+    config = config.with_gpu_autodetect(!no_gpu);
     if simulate_gpu {
         config = config.with_simulate_gpu(true);
     }
@@ -789,7 +1146,16 @@ async fn run_worker(args: WorkerArgs, config_file: Option<config::ConfigFile>) -
     if let Some(sbd) = sandbox_base_dir {
         config = config.with_sandbox_base_dir(PathBuf::from(sbd));
     }
+    if let Some(priority) = task_priority {
+        config = config.with_process_priority(priority);
+    }
     config = config.with_keep_sandboxes(keep_sandboxes);
+    // A restarted worker is the same machine, not a new one: keep its id (see `identity`), when it
+    // knows which machine it is. Otherwise every unnamed worker under this HOME would share one
+    // id and the master would keep closing the other's connection.
+    if keep_worker_id {
+        config = config.with_persistent_worker_id();
+    }
     config.default_heartbeat_interval = Duration::from_secs(heartbeat_interval);
 
     let wire_codec_str = resolve_string(
@@ -811,14 +1177,33 @@ async fn run_worker(args: WorkerArgs, config_file: Option<config::ConfigFile>) -
         client.capabilities().has_gpu,
         client.capabilities().is_simulated_gpu,
     );
+    for notice in client.gpu_notices() {
+        match notice.level {
+            NoticeLevel::Info => println!("GPU: {}", notice.message),
+            NoticeLevel::Warn => eprintln!("Warning: {}", notice.message),
+        }
+    }
+    match peer_outcome {
+        PeerSecretOutcome::Authenticated => println!("Cluster authentication: enabled"),
+        PeerSecretOutcome::OpenLocalOnly => println!(
+            "Cluster authentication: off (the master is on this machine; a master that requires a secret will refuse this worker)"
+        ),
+        PeerSecretOutcome::OpenInsecure => println!(
+            "Cluster authentication: OFF (--insecure; the master is not authenticated)"
+        ),
+    }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        wait_for_worker_shutdown_signal().await;
         let _ = shutdown_tx.send(true);
     });
 
-    match client.run(shutdown_rx).await {
+    let outcome = client.run(shutdown_rx).await;
+    // `run` has cancelled the running tasks, whose process trees die with them; this is the net
+    // under that, for a task that did not stop in time.
+    rusty_grid_worker::terminate_all_task_process_trees();
+    match outcome {
         Ok(()) => {
             println!("RustyGrid Worker finished cleanly.");
             ExitCode::SUCCESS
@@ -830,66 +1215,164 @@ async fn run_worker(args: WorkerArgs, config_file: Option<config::ConfigFile>) -
     }
 }
 
-async fn resolve_master_addr(addr: String) -> String {
-    if addr.eq_ignore_ascii_case("auto") || addr.starts_with("auto:") {
-        let disc_port = if let Some(port_str) = addr.strip_prefix("auto:") {
-            port_str
-                .parse::<u16>()
-                .unwrap_or(rusty_grid_core::DEFAULT_DISCOVERY_PORT)
-        } else {
-            rusty_grid_core::DEFAULT_DISCOVERY_PORT
-        };
-        info!(
-            port = disc_port,
-            "Master address set to 'auto'; performing LAN UDP discovery probe..."
-        );
-        match rusty_grid_core::discovery::discover_master(Duration::from_secs(3), disc_port).await {
-            Some(beacon) => {
-                info!(
-                    master = %beacon.cluster_addr,
-                    hostname = %beacon.hostname,
-                    "Discovered active Master via UDP LAN beacon"
-                );
-                beacon.cluster_addr
-            }
-            None => {
-                eprintln!("Auto-discovery timed out; falling back to 127.0.0.1:8088");
-                "127.0.0.1:8088".to_string()
-            }
+/// Resolves when the worker is asked to stop: Ctrl-C, and the signals a service manager, `kill`
+/// or the platform's stop mechanism send (SIGTERM; on Windows the console-close, break and
+/// system-shutdown events). Without them a plain `kill` ends the worker on the spot and leaves
+/// every running task process behind. SIGHUP is deliberately not handled, so `nohup` still works.
+async fn wait_for_worker_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                match terminate.as_mut() {
+                    Some(sigterm) => {
+                        sigterm.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
         }
-    } else {
-        addr
+    }
+
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_shutdown};
+        let mut brk = ctrl_break().ok();
+        let mut close = ctrl_close().ok();
+        let mut shutdown = ctrl_shutdown().ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                match brk.as_mut() {
+                    Some(event) => {
+                        event.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
+            _ = async {
+                match close.as_mut() {
+                    Some(event) => {
+                        event.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
+            _ = async {
+                match shutdown.as_mut() {
+                    Some(event) => {
+                        event.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
-async fn run_submit(args: SubmitArgs, config_file: Option<config::ConfigFile>) -> ExitCode {
-    let submit_cfg = config_file.as_ref().and_then(|c| c.submit.clone());
-    let master_addr = resolve_string(
-        args.master,
-        &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
-        submit_cfg.as_ref().and_then(|s| s.master.clone()),
-        "127.0.0.1:8080",
-    );
-    let master_addr = resolve_master_addr(master_addr).await;
+/// Sends one request on an authenticated connection and reads the single reply, printing a
+/// clear message and returning the exit code on any failure (including an authentication
+/// rejection from a Master that requires a secret this client does not have).
+async fn exchange(
+    transport: &mut MessageTransport<TcpStream>,
+    master_addr: &str,
+    had_secret: bool,
+    request: &ClientMessage,
+    send_failure: &str,
+) -> Result<ClientResponse, ExitCode> {
+    if let Err(e) = transport.send_msg(request).await {
+        return Err(report_master_failure(
+            master_addr,
+            had_secret,
+            send_failure,
+            &GridError::from(e),
+        ));
+    }
+    match transport.recv_msg::<ClientResponse>().await {
+        Ok(Some(response)) => Ok(response),
+        Ok(None) => Err(report_master_failure(
+            master_addr,
+            had_secret,
+            "Master closed the connection before replying",
+            &GridError::ConnectionClosed,
+        )),
+        Err(e) => Err(report_master_failure(
+            master_addr,
+            had_secret,
+            "Communication error with Master",
+            &GridError::from(e),
+        )),
+    }
+}
 
-    let stream = match TcpStream::connect(&master_addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to connect to Master at {master_addr}: {e}");
-            return ExitCode::FAILURE;
+/// Resolves `--insecure` for a worker or client command: the flag, then `RUSTY_GRID_INSECURE`,
+/// then the command's config-file key, else off.
+fn peer_insecure(flag: bool, config_value: Option<bool>) -> bool {
+    resolve_bool(
+        if flag { Some(true) } else { None },
+        &["RUSTY_GRID_INSECURE"],
+        config_value,
+        false,
+    )
+}
+
+/// Resolves the cluster secret for a client command and applies the fail-closed policy for
+/// `master_addr` (see [`decide_peer_secret`]), printing the error on failure: a configuration
+/// problem exits with 1, a refusal to talk to an unauthenticated remote / `auto` master without
+/// `--insecure` with the authentication exit code (6).
+fn client_secret(
+    secret_opts: &SecretOpts,
+    config_file: Option<&ConfigFile>,
+    section: SecretSection,
+    master_addr: &str,
+    insecure: bool,
+) -> Result<Option<ClusterSecret>, ExitCode> {
+    let secret = secret_opts.resolve(config_file, section).map_err(|e| {
+        eprintln!("{e}");
+        ExitCode::FAILURE
+    })?;
+    match decide_peer_secret(
+        secret.as_ref(),
+        master_addr,
+        false,
+        insecure,
+        PeerRole::Client,
+    ) {
+        Ok(outcome) => {
+            announce_peer_secret(outcome, PeerRole::Client, master_addr);
+            Ok(secret)
         }
-    };
+        Err(e) => {
+            eprintln!("{e}");
+            Err(ExitCode::from(AUTH_EXIT_CODE))
+        }
+    }
+}
 
-    let mut transport = MessageTransport::new(stream);
-
-    let is_gpu = args.gpu || args.task_type.eq_ignore_ascii_case("gpu");
-    let spec = match args.task_type.to_lowercase().as_str() {
+/// Builds the task `submit` sends from its flags.
+///
+/// * `--command PROG [-- ARGS...]`: run `PROG` with exactly `ARGS` (possibly none).
+/// * `-- PROG [ARGS...]` without `--command`: the first trailing token is the program.
+/// * neither: the default demo `echo "Hello from RustyGrid"`.
+///
+/// An explicit program with no arguments runs with no arguments; the demo greeting is only a
+/// default for a completely empty command line.
+fn build_task_spec(args: &SubmitArgs) -> TaskSpec {
+    match args.task_type.to_lowercase().as_str() {
         "gpu" => TaskSpec::GpuCompute {
             kernel_name: args
                 .command
                 .clone()
                 .unwrap_or_else(|| "matrix_multiply".into()),
-            input_data: vec![1, 2, 3, 4].into(),
+            input_data: vec![1, 2, 3, 4],
             work_group_size: 16,
             simulated_matrix_dim: 64,
             compute_intensity: 10,
@@ -907,31 +1390,63 @@ async fn run_submit(args: SubmitArgs, config_file: Option<config::ConfigFile>) -
             },
             target_dir: None,
         },
-        "shell" => TaskSpec::new_shell_script(args.command.clone().unwrap_or_else(|| {
-            if !args.args.is_empty() {
-                args.args.join(" ")
-            } else {
-                "echo 'Hello from shell task'".into()
-            }
-        })),
+        "shell" => TaskSpec::new_shell_script(match (&args.command, args.args.is_empty()) {
+            // `--command 'ls' -- -la`: the trailing words extend the script instead of being dropped.
+            (Some(script), _) => std::iter::once(script.as_str())
+                .chain(args.args.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" "),
+            (None, false) => args.args.join(" "),
+            (None, true) => "echo 'Hello from shell task'".into(),
+        }),
         _ => {
-            let cmd = args.command.clone().unwrap_or_else(|| {
-                if !args.args.is_empty() {
-                    args.args[0].clone()
-                } else {
-                    "echo".into()
-                }
-            });
-            let cmd_args = if args.command.is_some() {
-                args.args.clone()
-            } else if args.args.len() > 1 {
-                args.args[1..].to_vec()
-            } else {
-                vec!["Hello from RustyGrid".into()]
+            let (program, cmd_args) = match (&args.command, args.args.split_first()) {
+                (Some(program), _) => (program.clone(), args.args.clone()),
+                (None, Some((program, rest))) => (program.clone(), rest.to_vec()),
+                (None, None) => ("echo".to_string(), vec!["Hello from RustyGrid".to_string()]),
             };
-            TaskSpec::new_command(cmd, cmd_args)
+            TaskSpec::new_command(program, cmd_args)
+        }
+    }
+}
+
+async fn run_submit(
+    args: SubmitArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
+    let submit_cfg = config_file.as_ref().and_then(|c| c.submit.clone());
+    let master_addr = resolve_string(
+        args.master.clone(),
+        &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
+        submit_cfg.as_ref().and_then(|s| s.master.clone()),
+        DEFAULT_MASTER_ADDR,
+    );
+    let secret = match client_secret(
+        &secret_opts,
+        config_file.as_ref(),
+        SecretSection::Submit,
+        &master_addr,
+        peer_insecure(args.insecure, submit_cfg.as_ref().and_then(|s| s.insecure)),
+    ) {
+        Ok(secret) => secret,
+        Err(code) => return code,
+    };
+
+    let mut transport = match connect_master(&master_addr, secret.as_ref()).await {
+        Ok(t) => t,
+        Err(e) => {
+            return report_master_failure(
+                &master_addr,
+                secret.is_some(),
+                "Failed to connect to Master",
+                &e,
+            )
         }
     };
+
+    let is_gpu = args.gpu || args.task_type.eq_ignore_ascii_case("gpu");
+    let spec = build_task_spec(&args);
 
     let requirements = TaskRequirements {
         cpu_cores: args.cores,
@@ -947,13 +1462,21 @@ async fn run_submit(args: SubmitArgs, config_file: Option<config::ConfigFile>) -
         wait: args.wait,
     };
 
-    if let Err(e) = transport.send_msg(&submit_msg).await {
-        eprintln!("Failed to send task to Master: {e}");
-        return ExitCode::FAILURE;
-    }
+    let response = match exchange(
+        &mut transport,
+        &master_addr,
+        secret.is_some(),
+        &submit_msg,
+        "Failed to send task to Master",
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(code) => return code,
+    };
 
-    match transport.recv_msg::<ClientResponse>().await {
-        Ok(Some(ClientResponse::TaskSubmitted { task_id })) => {
+    match response {
+        ClientResponse::TaskSubmitted { task_id } => {
             if args.json {
                 println!(
                     "{}",
@@ -967,7 +1490,7 @@ async fn run_submit(args: SubmitArgs, config_file: Option<config::ConfigFile>) -
             }
             ExitCode::SUCCESS
         }
-        Ok(Some(ClientResponse::TaskCompleted { task_id, result })) => {
+        ClientResponse::TaskCompleted { task_id, result } => {
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&result).unwrap());
             } else {
@@ -987,7 +1510,7 @@ async fn run_submit(args: SubmitArgs, config_file: Option<config::ConfigFile>) -
                 ExitCode::from(result.exit_code.min(255) as u8)
             }
         }
-        Ok(Some(ClientResponse::Error { message })) => {
+        ClientResponse::Error { message } => {
             if args.json {
                 println!("{}", serde_json::json!({"error": message}));
             } else {
@@ -995,51 +1518,72 @@ async fn run_submit(args: SubmitArgs, config_file: Option<config::ConfigFile>) -
             }
             ExitCode::FAILURE
         }
-        Ok(other) => {
+        other => {
             eprintln!("Unexpected master response: {other:?}");
-            ExitCode::FAILURE
-        }
-        Err(e) => {
-            eprintln!("Communication error with Master: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
-async fn run_status(args: StatusArgs, config_file: Option<config::ConfigFile>) -> ExitCode {
+async fn run_status(
+    args: StatusArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
     let status_cfg = config_file.as_ref().and_then(|c| c.status.clone());
     let master_addr = resolve_string(
         args.master,
         &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
         status_cfg.as_ref().and_then(|s| s.master.clone()),
-        "127.0.0.1:8080",
+        DEFAULT_MASTER_ADDR,
     );
-    let master_addr = resolve_master_addr(master_addr).await;
+    let secret = match client_secret(
+        &secret_opts,
+        config_file.as_ref(),
+        SecretSection::Status,
+        &master_addr,
+        peer_insecure(args.insecure, status_cfg.as_ref().and_then(|s| s.insecure)),
+    ) {
+        Ok(secret) => secret,
+        Err(code) => return code,
+    };
 
-    let stream = match TcpStream::connect(&master_addr).await {
-        Ok(s) => s,
+    let mut transport = match connect_master(&master_addr, secret.as_ref()).await {
+        Ok(t) => t,
         Err(e) => {
-            eprintln!("Failed to connect to Master at {master_addr}: {e}");
-            return ExitCode::FAILURE;
+            return report_master_failure(
+                &master_addr,
+                secret.is_some(),
+                "Failed to connect to Master",
+                &e,
+            )
         }
     };
-    let mut transport = MessageTransport::new(stream);
+    let had_secret = secret.is_some();
 
     if let Some(task_uuid) = args.task_id {
         let task_id = TaskId(task_uuid);
         let msg = ClientMessage::GetTaskStatus { task_id };
-        if let Err(e) = transport.send_msg(&msg).await {
-            eprintln!("Failed to query task status: {e}");
-            return ExitCode::FAILURE;
-        }
-        match transport.recv_msg::<ClientResponse>().await {
-            Ok(Some(ClientResponse::TaskStatusInfo {
+        let response = match exchange(
+            &mut transport,
+            &master_addr,
+            had_secret,
+            &msg,
+            "Failed to query task status",
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(code) => return code,
+        };
+        match response {
+            ClientResponse::TaskStatusInfo {
                 task_id,
                 status,
                 state_name,
                 assigned_worker,
                 error,
-            })) => {
+            } => {
                 if args.json {
                     println!(
                         "{}",
@@ -1064,7 +1608,7 @@ async fn run_status(args: StatusArgs, config_file: Option<config::ConfigFile>) -
                 }
                 ExitCode::SUCCESS
             }
-            Ok(Some(ClientResponse::Error { message })) => {
+            ClientResponse::Error { message } => {
                 eprintln!("Error: {message}");
                 ExitCode::FAILURE
             }
@@ -1075,12 +1619,20 @@ async fn run_status(args: StatusArgs, config_file: Option<config::ConfigFile>) -
         }
     } else if args.workers {
         let msg = ClientMessage::ListWorkers;
-        if let Err(e) = transport.send_msg(&msg).await {
-            eprintln!("Failed to list workers: {e}");
-            return ExitCode::FAILURE;
-        }
-        match transport.recv_msg::<ClientResponse>().await {
-            Ok(Some(ClientResponse::WorkerList { workers })) => {
+        let response = match exchange(
+            &mut transport,
+            &master_addr,
+            had_secret,
+            &msg,
+            "Failed to list workers",
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(code) => return code,
+        };
+        match response {
+            ClientResponse::WorkerList { workers } => {
                 if args.json {
                     let enriched_workers: Vec<serde_json::Value> = workers
                         .iter()
@@ -1117,19 +1669,27 @@ async fn run_status(args: StatusArgs, config_file: Option<config::ConfigFile>) -
         }
     } else {
         let msg = ClientMessage::ClusterStatus;
-        if let Err(e) = transport.send_msg(&msg).await {
-            eprintln!("Failed to get cluster status: {e}");
-            return ExitCode::FAILURE;
-        }
-        match transport.recv_msg::<ClientResponse>().await {
-            Ok(Some(ClientResponse::ClusterStatus {
+        let response = match exchange(
+            &mut transport,
+            &master_addr,
+            had_secret,
+            &msg,
+            "Failed to get cluster status",
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(code) => return code,
+        };
+        match response {
+            ClientResponse::ClusterStatus {
                 total_tasks,
                 pending_tasks,
                 running_tasks,
                 completed_tasks,
                 failed_tasks,
                 workers,
-            })) => {
+            } => {
                 if args.json {
                     let enriched_workers: Vec<serde_json::Value> = workers
                         .iter()
@@ -1200,34 +1760,59 @@ fn parse_worker_link(w: &rusty_grid_core::WorkerCapabilities) -> Option<String> 
     Some("Link: TCP/LAN".to_string())
 }
 
-async fn run_workers(args: WorkersArgs, config_file: Option<config::ConfigFile>) -> ExitCode {
+async fn run_workers(
+    args: WorkersArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
     let status_args = StatusArgs {
         master: args.master,
         task_id: None,
         workers: true,
         json: args.json,
+        insecure: args.insecure,
     };
-    run_status(status_args, config_file).await
+    run_status(status_args, config_file, secret_opts).await
 }
 
-async fn run_mapreduce(args: MapReduceArgs, config_file: Option<config::ConfigFile>) -> ExitCode {
+async fn run_mapreduce(
+    args: MapReduceArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
+    if args.chunks == 0 {
+        eprintln!("--chunks must be at least 1");
+        return ExitCode::FAILURE;
+    }
     let submit_cfg = config_file.as_ref().and_then(|c| c.submit.clone());
     let master_addr = resolve_string(
         args.master,
         &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
         submit_cfg.as_ref().and_then(|s| s.master.clone()),
-        "127.0.0.1:8080",
+        DEFAULT_MASTER_ADDR,
     );
-    let master_addr = resolve_master_addr(master_addr).await;
+    let secret = match client_secret(
+        &secret_opts,
+        config_file.as_ref(),
+        SecretSection::Submit,
+        &master_addr,
+        peer_insecure(args.insecure, submit_cfg.as_ref().and_then(|s| s.insecure)),
+    ) {
+        Ok(secret) => secret,
+        Err(code) => return code,
+    };
 
-    let stream = match TcpStream::connect(&master_addr).await {
-        Ok(s) => s,
+    let mut transport = match connect_master(&master_addr, secret.as_ref()).await {
+        Ok(t) => t,
         Err(e) => {
-            eprintln!("Failed to connect to Master at {master_addr}: {e}");
-            return ExitCode::FAILURE;
+            return report_master_failure(
+                &master_addr,
+                secret.is_some(),
+                "Failed to connect to Master",
+                &e,
+            )
         }
     };
-    let mut transport = MessageTransport::new(stream);
 
     // Read input data from files or treat arguments directly as data
     let mut chunks: Vec<String> = Vec::new();
@@ -1294,15 +1879,41 @@ async fn run_mapreduce(args: MapReduceArgs, config_file: Option<config::ConfigFi
     );
 
     let msg = ClientMessage::SubmitMapReduce { job };
-    if let Err(e) = transport.send_msg(&msg).await {
-        eprintln!("Failed to dispatch MapReduce job to Master: {e}");
-        return ExitCode::FAILURE;
-    }
+    let response = match exchange(
+        &mut transport,
+        &master_addr,
+        secret.is_some(),
+        &msg,
+        "Failed to dispatch MapReduce job to Master",
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(code) => return code,
+    };
 
-    match transport.recv_msg::<ClientResponse>().await {
-        Ok(Some(ClientResponse::MapReduceCompleted { result })) => {
+    match response {
+        ClientResponse::MapReduceCompleted { result } => {
+            // The master answers a job that failed (a mapper exited non-zero, output was cut off,
+            // a reducer failed) with a result whose status is not "Completed": report it as a failure.
+            let succeeded = result.status == "Completed";
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            } else if !succeeded {
+                eprintln!("=== MapReduce Job FAILED ===");
+                eprintln!("Job ID:           {}", result.job_id);
+                eprintln!("Status:           {}", result.status);
+                eprintln!(
+                    "Map Tasks:        {}/{}",
+                    result.map_tasks_completed, result.map_tasks_total
+                );
+                eprintln!(
+                    "Reduce Tasks:     {}/{}",
+                    result.reduce_tasks_completed, result.reduce_tasks_total
+                );
+                if let Some(error) = &result.error {
+                    eprintln!("Error:            {error}");
+                }
             } else {
                 println!("=== MapReduce Job Completed ===");
                 println!("Job ID:           {}", result.job_id);
@@ -1324,9 +1935,13 @@ async fn run_mapreduce(args: MapReduceArgs, config_file: Option<config::ConfigFi
                     println!("  {key}: {val}");
                 }
             }
-            ExitCode::SUCCESS
+            if succeeded {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
-        Ok(Some(ClientResponse::Error { message })) => {
+        ClientResponse::Error { message } => {
             eprintln!("MapReduce execution error: {message}");
             ExitCode::FAILURE
         }
@@ -1340,7 +1955,239 @@ async fn run_mapreduce(args: MapReduceArgs, config_file: Option<config::ConfigFi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secret_cmd::SecretCliArgs;
     use rusty_grid_core::WorkerCapabilities;
+
+    fn parse(args: &[&str]) -> Cli {
+        let mut argv = vec!["oxideswarm"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).expect("arguments must parse")
+    }
+
+    fn submit_args(args: &[&str]) -> SubmitArgs {
+        match parse(&[&["submit"], args].concat()).command {
+            Commands::Submit(a) => a,
+            other => panic!("expected submit, got {other:?}"),
+        }
+    }
+
+    fn command_of(spec: TaskSpec) -> (String, Vec<String>) {
+        match spec {
+            TaskSpec::Command { program, args, .. } => (program, args),
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_submit_trailing_command_without_args_runs_with_no_args() {
+        // Regression: `submit -- nproc` used to run `nproc "Hello from RustyGrid"`.
+        for single in ["nproc", "uname", "hostname", "nvidia-smi"] {
+            let (program, args) = command_of(build_task_spec(&submit_args(&["--", single])));
+            assert_eq!(program, single);
+            assert!(
+                args.is_empty(),
+                "{single} must get no arguments, got {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_submit_trailing_command_keeps_its_arguments() {
+        let (program, args) = command_of(build_task_spec(&submit_args(&[
+            "--", "echo", "hi", "there",
+        ])));
+        assert_eq!(program, "echo");
+        assert_eq!(args, ["hi", "there"]);
+    }
+
+    #[test]
+    fn test_submit_command_flag_takes_trailing_args_verbatim() {
+        let (program, args) = command_of(build_task_spec(&submit_args(&[
+            "--command",
+            "sha256sum",
+            "--",
+            "a.bin",
+            "b.bin",
+        ])));
+        assert_eq!(program, "sha256sum");
+        assert_eq!(args, ["a.bin", "b.bin"]);
+
+        let (program, args) = command_of(build_task_spec(&submit_args(&["--command", "whoami"])));
+        assert_eq!(program, "whoami");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_submit_demo_greeting_only_for_a_completely_empty_command_line() {
+        let (program, args) = command_of(build_task_spec(&submit_args(&[])));
+        assert_eq!(program, "echo");
+        assert_eq!(args, ["Hello from RustyGrid"]);
+    }
+
+    #[test]
+    fn test_submit_shell_type_forwards_trailing_args() {
+        let script_of = |spec: TaskSpec| match spec {
+            TaskSpec::ShellScript { script, .. } => script,
+            other => panic!("expected ShellScript, got {other:?}"),
+        };
+        assert_eq!(
+            script_of(build_task_spec(&submit_args(&[
+                "--type",
+                "shell",
+                "--command",
+                "ls",
+                "--",
+                "-la",
+                "/tmp"
+            ]))),
+            "ls -la /tmp"
+        );
+        assert_eq!(
+            script_of(build_task_spec(&submit_args(&[
+                "--type", "shell", "--", "echo", "hi"
+            ]))),
+            "echo hi"
+        );
+        assert_eq!(
+            script_of(build_task_spec(&submit_args(&["--type", "shell"]))),
+            "echo 'Hello from shell task'"
+        );
+    }
+
+    #[test]
+    fn test_secret_flags_are_global_and_work_on_every_command() {
+        for args in [
+            &["master", "--secret-file", "/s"][..],
+            &["worker", "--secret-file", "/s"],
+            &["submit", "--secret-file", "/s", "--", "true"],
+            &["status", "--secret-file", "/s"],
+            &["workers", "--secret-file", "/s"],
+            &["mapreduce", "--input", "x", "--secret-file", "/s"],
+            // Also accepted before the subcommand.
+            &["--secret-file", "/s", "status"],
+        ] {
+            let cli = parse(args);
+            assert_eq!(cli.secret_file, Some(PathBuf::from("/s")), "args {args:?}");
+        }
+
+        let cli = parse(&["worker", "--secret", "abcd"]);
+        assert_eq!(cli.secret.as_ref().map(SecretText::as_str), Some("abcd"));
+        assert!(
+            !format!("{cli:?}").contains("abcd"),
+            "the secret must not appear in Debug output"
+        );
+    }
+
+    #[test]
+    fn test_secret_subcommands_parse() {
+        match parse(&["secret", "generate", "--out", "/tmp/s", "--force"]).command {
+            Commands::Secret(SecretCliArgs {
+                action: crate::secret_cmd::SecretAction::Generate(g),
+            }) => {
+                assert_eq!(g.out, Some(PathBuf::from("/tmp/s")));
+                assert!(g.force);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse(&["secret", "show", "--dashboard-token"]).command {
+            Commands::Secret(SecretCliArgs {
+                action: crate::secret_cmd::SecretAction::Show(s),
+            }) => assert!(s.dashboard_token),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["oxideswarm", "secret"]).is_err());
+    }
+
+    #[test]
+    fn test_master_insecure_flag_parses() {
+        match parse(&["master", "--listen", "0.0.0.0:8088", "--insecure"]).command {
+            Commands::Master(m) => assert!(m.insecure),
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse(&["master"]).command {
+            Commands::Master(m) => assert!(!m.insecure),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_worker_task_priority_flag_parses_into_a_known_priority() {
+        let priority_of = |args: &[&str]| match parse(args).command {
+            Commands::Worker(a) => a.task_priority,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(priority_of(&["worker"]), None, "unset: the library default applies");
+        let given = priority_of(&["worker", "--task-priority", "idle"]).unwrap();
+        assert_eq!(given.parse::<ProcessPriority>(), Ok(ProcessPriority::Idle));
+        let misspelt = priority_of(&["worker", "--task-priority", "realtime"]).unwrap();
+        assert!(
+            misspelt.parse::<ProcessPriority>().is_err(),
+            "run_worker must refuse this instead of running tasks at full priority"
+        );
+    }
+
+    #[test]
+    fn test_peer_insecure_flag_parses_on_worker_and_every_client_command() {
+        let insecure_of = |args: &[&str]| match parse(args).command {
+            Commands::Worker(a) => a.insecure,
+            Commands::Submit(a) => a.insecure,
+            Commands::Status(a) => a.insecure,
+            Commands::Workers(a) => a.insecure,
+            Commands::Mapreduce(a) => a.insecure,
+            other => panic!("unexpected {other:?}"),
+        };
+        for with_flag in [
+            &["worker", "--master", "auto", "--insecure"][..],
+            &["submit", "--insecure", "--", "true"],
+            &["status", "--insecure"],
+            &["workers", "--insecure"],
+            &["mapreduce", "--input", "x", "--insecure"],
+        ] {
+            assert!(insecure_of(with_flag), "{with_flag:?}");
+        }
+        // Off unless asked for.
+        for without_flag in [
+            &["worker"][..],
+            &["submit", "--", "true"],
+            &["status"],
+            &["workers"],
+            &["mapreduce", "--input", "x"],
+        ] {
+            assert!(!insecure_of(without_flag), "{without_flag:?}");
+        }
+    }
+
+    #[test]
+    fn test_peer_insecure_resolution_is_flag_then_config_and_defaults_to_off() {
+        // RUSTY_GRID_INSECURE is deliberately not touched here (process-global); the end-to-end
+        // test covers the environment tier.
+        if std::env::var_os("RUSTY_GRID_INSECURE").is_some() {
+            return;
+        }
+        assert!(!peer_insecure(false, None));
+        assert!(!peer_insecure(false, Some(false)));
+        assert!(peer_insecure(false, Some(true)));
+        assert!(peer_insecure(true, None));
+        assert!(peer_insecure(true, Some(false)));
+    }
+
+    #[test]
+    fn test_insecure_config_keys_exist_for_worker_submit_and_status() {
+        let parsed: ConfigFile = toml::from_str(
+            r#"
+[worker]
+insecure = true
+[submit]
+insecure = true
+[status]
+insecure = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.worker.unwrap().insecure, Some(true));
+        assert_eq!(parsed.submit.unwrap().insecure, Some(true));
+        assert_eq!(parsed.status.unwrap().insecure, Some(false));
+    }
 
     #[test]
     fn test_parse_worker_link_direct_p2p() {
@@ -1364,5 +2211,49 @@ mod tests {
         let link = parse_worker_link(&caps);
         assert_eq!(link.as_deref(), Some("Link: TCP/LAN"));
     }
-}
 
+    #[test]
+    fn test_dashboard_address_is_loopback_unless_web_ui_addr_names_another() {
+        // Whatever the grid listens on, no flag means the loopback default.
+        for listen in [
+            "127.0.0.1:8088",
+            "0.0.0.0:8088",
+            "192.168.1.5:8088",
+            "[::]:8088",
+        ] {
+            let config = ServerConfig::from_addr(listen).unwrap();
+            let config = apply_web_ui_addr(config, None).unwrap();
+            assert!(
+                config.web_ui_addr.ip().is_loopback(),
+                "listen {listen} must not move the dashboard: {}",
+                config.web_ui_addr
+            );
+        }
+
+        // The flag is the explicit opt-in, taken exactly as given.
+        let config = ServerConfig::from_addr("0.0.0.0:8088").unwrap();
+        let config = apply_web_ui_addr(config, Some("0.0.0.0:9090")).unwrap();
+        assert_eq!(config.web_ui_addr, "0.0.0.0:9090".parse().unwrap());
+        assert!(config.enable_web_ui);
+
+        // Garbage is an error, not a silent fallback.
+        let config = ServerConfig::from_addr("127.0.0.1:8088").unwrap();
+        assert!(apply_web_ui_addr(config, Some("not an address")).is_err());
+    }
+
+    #[test]
+    fn test_dashboard_banner_tells_the_truth_about_access() {
+        use rusty_grid_master::auth::DevBypass;
+        let addr: std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let text = |bypass, secret| dashboard_banner(addr, bypass, secret).join("\n");
+
+        assert!(text(DevBypass::Implicit, false).contains("this machine only, no login"));
+        assert!(text(DevBypass::Explicit, false).contains("--dev is ON"));
+        assert!(text(DevBypass::RefusedNonLoopback, false).contains("ignored"));
+        assert!(text(DevBypass::Off, true).contains("secret show --dashboard-token"));
+        let locked = text(DevBypass::Off, false);
+        assert!(locked.contains("token is required") && !locked.contains("no login"));
+        // Open access is never announced together with a secret-derived login hint.
+        assert!(!text(DevBypass::Implicit, false).contains("secret show"));
+    }
+}

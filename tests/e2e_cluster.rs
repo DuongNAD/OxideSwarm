@@ -458,8 +458,18 @@ async fn test_tier1_f2_capabilities_gpu_physical_flag() {
 
     let workers = cluster.master.list_workers().await.unwrap();
     let w = workers.iter().find(|w| w.worker_id == wid).unwrap();
-    assert!(w.capabilities.has_gpu);
-    assert!(w.capabilities.can_execute_gpu());
+    // `--gpu` is a request, not a claim (it used to advertise a GPU unconditionally): a worker
+    // advertises a real GPU only if its binary can compute on one. This test binary is built
+    // without the wgpu engine unless `--features gpu-wgpu`, and then it needs an adapter.
+    assert!(!w.capabilities.is_simulated_gpu);
+    assert_eq!(w.capabilities.has_gpu, w.capabilities.can_execute_gpu());
+    if !rusty_grid_worker::WGPU_COMPILED {
+        assert!(!w.capabilities.has_gpu, "no wgpu engine, so no real GPU may be advertised");
+        assert!(w.capabilities.gpu_device_name.is_none());
+    } else if w.capabilities.has_gpu {
+        let name = w.capabilities.gpu_device_name.as_deref().expect("the adapter name");
+        assert_ne!(name, "Physical GPU (Manual Override)");
+    }
 }
 
 #[tokio::test]

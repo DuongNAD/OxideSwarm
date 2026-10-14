@@ -116,7 +116,8 @@ fn test_adversarial_checkpoint_zero_length_payload_roundtrip() {
     assert_eq!(deser_json, cp_msg);
 
     // 2. Bincode Wire Codec
-    let bin_bytes = serialize_message(&cp_msg, WireCodec::Bincode).expect("serialize empty bincode");
+    let bin_bytes =
+        serialize_message(&cp_msg, WireCodec::Bincode).expect("serialize empty bincode");
     let (deser_bin, codec_bin): (WorkerMessage, WireCodec) =
         deserialize_message(&bin_bytes).expect("deserialize empty bincode");
     assert_eq!(codec_bin, WireCodec::Bincode);
@@ -221,14 +222,20 @@ fn test_adversarial_checkpoint_corrupted_wire_payloads() {
     // 2. Corrupted wire magic / non-JSON non-Bincode garbage
     let random_garbage = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
     let res: Result<(WorkerMessage, WireCodec), _> = deserialize_message(&random_garbage);
-    assert!(res.is_err(), "Random garbage must return error without panic");
+    assert!(
+        res.is_err(),
+        "Random garbage must return error without panic"
+    );
 
     // 3. Corrupted bincode payload (invalid length header claiming 4GB)
     let mut fake_bincode = vec![0x02]; // WIRE_FORMAT_BINCODE
     fake_bincode.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0x7F]); // huge length
     fake_bincode.extend_from_slice(&[0x00, 0x01, 0x02]);
     let bin_res: Result<(WorkerMessage, WireCodec), _> = deserialize_message(&fake_bincode);
-    assert!(bin_res.is_err(), "Corrupted bincode length must return error without panic");
+    assert!(
+        bin_res.is_err(),
+        "Corrupted bincode length must return error without panic"
+    );
 }
 
 // ==============================================================================================
@@ -268,7 +275,10 @@ async fn test_adversarial_runner_corrupted_and_boundary_delta_payloads() {
     // EMPIRICAL FINDING: Because runner.rs checks `if slice.len() >= 16` before JSON parsing,
     // any payload with >= 16 bytes is blindly decoded as little-endian u64 integers.
     // The first 8 bytes b"{\"iterat" are parsed as start_iter = 1953047163.
-    let malformed_json_cp = CheckpointData::new(3, TaskBytes::copy_from_slice(b"{\"iteration\": \"not_a_num\"}"));
+    let malformed_json_cp = CheckpointData::new(
+        3,
+        TaskBytes::copy_from_slice(b"{\"iteration\": \"not_a_num\"}"),
+    );
     let res3 = runner
         .execute_task_with_checkpoint(&task, Some(&malformed_json_cp), None, None, None)
         .await;
@@ -295,7 +305,10 @@ async fn test_adversarial_runner_corrupted_and_boundary_delta_payloads() {
     println!("res4 stdout: {}", res4.stdout);
     // Demonstrates that runner fails to parse JSON and instead reads binary slice:
     let json_parsed_correctly = res4.stdout.contains("resumed from 50");
-    println!("Was JSON parsed correctly as iteration 50? {}", json_parsed_correctly);
+    println!(
+        "Was JSON parsed correctly as iteration 50? {}",
+        json_parsed_correctly
+    );
     assert!(
         !json_parsed_correctly,
         "Empirical finding: runner.rs:438 JSON deserializer is completely bypassed by line 433 slice.len() >= 16"
@@ -309,7 +322,10 @@ async fn test_adversarial_runner_corrupted_and_boundary_delta_payloads() {
     let res5 = runner
         .execute_task_with_checkpoint(&task, Some(&oob_cp), None, None, None)
         .await;
-    assert!(res5.is_success(), "Out-of-bounds delta must safely handle empty loop range without panic");
+    assert!(
+        res5.is_success(),
+        "Out-of-bounds delta must safely handle empty loop range without panic"
+    );
     assert!(res5.stdout.contains("resumed from 500"));
 }
 
@@ -327,12 +343,21 @@ async fn test_adversarial_task_queue_monotonic_sequence_enforcement() {
     let task_id = queue.submit(task).await.expect("submit task");
 
     let worker_id = Uuid::new_v4();
-    let _ = queue.schedule_task(&task_id, worker_id).await.expect("schedule");
-    queue.mark_running(&task_id, worker_id).await.expect("running");
+    let _ = queue
+        .schedule_task(&task_id, worker_id)
+        .await
+        .expect("schedule");
+    queue
+        .mark_running(&task_id, worker_id)
+        .await
+        .expect("running");
 
     // 1. Initial checkpoint: sequence 10
     let cp10 = CheckpointData::new(10, TaskBytes::copy_from_slice(b"seq_10"));
-    queue.record_checkpoint(task_id, cp10.clone()).await.unwrap();
+    queue
+        .record_checkpoint(task_id, cp10.clone())
+        .await
+        .unwrap();
     assert_eq!(queue.get_checkpoint(&task_id).await.unwrap().sequence, 10);
 
     // 2. Stale sequence 5 -> must be ignored
@@ -344,7 +369,12 @@ async fn test_adversarial_task_queue_monotonic_sequence_enforcement() {
     let cp10_dup = CheckpointData::new(10, TaskBytes::copy_from_slice(b"seq_10_new_bytes"));
     queue.record_checkpoint(task_id, cp10_dup).await.unwrap();
     assert_eq!(
-        queue.get_checkpoint(&task_id).await.unwrap().delta_state.as_slice(),
+        queue
+            .get_checkpoint(&task_id)
+            .await
+            .unwrap()
+            .delta_state
+            .as_slice(),
         b"seq_10",
         "Duplicate sequence must not overwrite existing state"
     );
@@ -362,12 +392,22 @@ async fn test_adversarial_task_queue_monotonic_sequence_enforcement() {
     // 6. Boundary advance: sequence u64::MAX -> accepted
     let cp_max = CheckpointData::new(u64::MAX, TaskBytes::copy_from_slice(b"seq_max"));
     queue.record_checkpoint(task_id, cp_max).await.unwrap();
-    assert_eq!(queue.get_checkpoint(&task_id).await.unwrap().sequence, u64::MAX);
+    assert_eq!(
+        queue.get_checkpoint(&task_id).await.unwrap().sequence,
+        u64::MAX
+    );
 
     // 7. Stale sequence u64::MAX - 1 -> must be rejected
-    let cp_max_minus_1 = CheckpointData::new(u64::MAX - 1, TaskBytes::copy_from_slice(b"seq_max_sub_1"));
-    queue.record_checkpoint(task_id, cp_max_minus_1).await.unwrap();
-    assert_eq!(queue.get_checkpoint(&task_id).await.unwrap().sequence, u64::MAX);
+    let cp_max_minus_1 =
+        CheckpointData::new(u64::MAX - 1, TaskBytes::copy_from_slice(b"seq_max_sub_1"));
+    queue
+        .record_checkpoint(task_id, cp_max_minus_1)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue.get_checkpoint(&task_id).await.unwrap().sequence,
+        u64::MAX
+    );
 }
 
 #[tokio::test]
@@ -380,8 +420,14 @@ async fn test_adversarial_task_queue_concurrent_checkpoint_race() {
     let task_id = queue.submit(task).await.expect("submit task");
 
     let worker_id = Uuid::new_v4();
-    let _ = queue.schedule_task(&task_id, worker_id).await.expect("schedule");
-    queue.mark_running(&task_id, worker_id).await.expect("running");
+    let _ = queue
+        .schedule_task(&task_id, worker_id)
+        .await
+        .expect("schedule");
+    queue
+        .mark_running(&task_id, worker_id)
+        .await
+        .expect("running");
 
     // Spawn 100 concurrent tasks sending sequence numbers 1..=100 in scrambled order
     let mut handles = Vec::new();
@@ -400,7 +446,10 @@ async fn test_adversarial_task_queue_concurrent_checkpoint_race() {
     }
 
     // After all 100 concurrent updates complete, the queue must hold sequence 100
-    let final_cp = queue.get_checkpoint(&task_id).await.expect("checkpoint exists");
+    let final_cp = queue
+        .get_checkpoint(&task_id)
+        .await
+        .expect("checkpoint exists");
     assert_eq!(
         final_cp.sequence, 100,
         "Concurrent ingestion must converge to the highest sequence number (100)"
@@ -417,8 +466,14 @@ async fn test_adversarial_checkpoint_on_terminal_and_nonexistent_tasks() {
     );
     let task_id = queue.submit(task).await.expect("submit");
     let worker_id = Uuid::new_v4();
-    let _ = queue.schedule_task(&task_id, worker_id).await.expect("schedule");
-    queue.mark_running(&task_id, worker_id).await.expect("running");
+    let _ = queue
+        .schedule_task(&task_id, worker_id)
+        .await
+        .expect("schedule");
+    queue
+        .mark_running(&task_id, worker_id)
+        .await
+        .expect("running");
 
     // 1. Initial checkpoint
     let cp1 = CheckpointData::new(1, TaskBytes::copy_from_slice(b"delta_1"));
@@ -439,7 +494,10 @@ async fn test_adversarial_checkpoint_on_terminal_and_nonexistent_tasks() {
 
     // 4. Attempt to record checkpoint on non-existent task ID -> returns GridError::TaskNotFound
     let non_existent_id = TaskId::new();
-    let err = queue.record_checkpoint(non_existent_id, cp1).await.unwrap_err();
+    let err = queue
+        .record_checkpoint(non_existent_id, cp1)
+        .await
+        .unwrap_err();
     match err {
         GridError::TaskNotFound(id) => assert_eq!(id, non_existent_id.0),
         other => panic!("Expected TaskNotFound, got {other:?}"),
@@ -450,6 +508,7 @@ async fn test_adversarial_checkpoint_on_terminal_and_nonexistent_tasks() {
 async fn test_adversarial_checkpoint_retention_on_retry_exhaustion() {
     let mut policy = RetryPolicy::default();
     policy.max_retries = 1; // Only 1 retry allowed
+    policy.max_failovers = 1; // failover budget is separate from max_retries; pin it to the same limit
     let queue = TaskQueue::with_config(policy, None);
 
     let task = Task::new(
@@ -460,7 +519,10 @@ async fn test_adversarial_checkpoint_retention_on_retry_exhaustion() {
 
     // Worker 1 schedules & records checkpoint
     let w1 = Uuid::new_v4();
-    let _ = queue.schedule_task(&task_id, w1).await.expect("schedule w1");
+    let _ = queue
+        .schedule_task(&task_id, w1)
+        .await
+        .expect("schedule w1");
     queue.mark_running(&task_id, w1).await.expect("running w1");
     let cp = CheckpointData::new(1, TaskBytes::copy_from_slice(b"delta_before_crash"));
     queue.record_checkpoint(task_id, cp.clone()).await.unwrap();
@@ -473,7 +535,10 @@ async fn test_adversarial_checkpoint_retention_on_retry_exhaustion() {
 
     // Worker 2 schedules
     let w2 = Uuid::new_v4();
-    let _ = queue.schedule_task(&task_id, w2).await.expect("schedule w2");
+    let _ = queue
+        .schedule_task(&task_id, w2)
+        .await
+        .expect("schedule w2");
     queue.mark_running(&task_id, w2).await.expect("running w2");
 
     // Worker 2 crashes -> retries exhausted (1/1) -> task fails
@@ -542,7 +607,10 @@ async fn test_adversarial_multi_hop_failover_task_queue() {
 
     let final_info = queue.get_task(&task_id).await.unwrap();
     assert_eq!(final_info.state, TaskState::Completed);
-    assert_eq!(final_info.retry_count, 2, "Task must record exactly 2 retries across 2 failovers");
+    assert_eq!(
+        final_info.retry_count, 2,
+        "Task must record exactly 2 retries across 2 failovers"
+    );
     assert_eq!(queue.get_checkpoint(&task_id).await, Some(cp3));
 }
 
@@ -624,7 +692,11 @@ async fn test_adversarial_end_to_end_cluster_multi_hop_failover() {
     let (_w1_id, mut transport1) = spawn_mock_wire_worker(master_addr, "mock-w1").await;
 
     // Receive AssignTask
-    let assigned_w1 = match transport1.recv_msg::<MasterMessage>().await.expect("recv assign") {
+    let assigned_w1 = match transport1
+        .recv_msg::<MasterMessage>()
+        .await
+        .expect("recv assign")
+    {
         Some(MasterMessage::AssignTask { task }) => task,
         other => panic!("Expected AssignTask, got {other:?}"),
     };
@@ -643,13 +715,17 @@ async fn test_adversarial_end_to_end_cluster_multi_hop_failover() {
         .expect("send cp1");
 
     // Wait for Master to record Checkpoint 1
-    let recorded_cp1 = wait_for(Duration::from_secs(3), Duration::from_millis(50), || async {
-        if let Some(cp) = master.get_checkpoint(&task_id).await {
-            cp.sequence == 1
-        } else {
-            false
-        }
-    })
+    let recorded_cp1 = wait_for(
+        Duration::from_secs(3),
+        Duration::from_millis(50),
+        || async {
+            if let Some(cp) = master.get_checkpoint(&task_id).await {
+                cp.sequence == 1
+            } else {
+                false
+            }
+        },
+    )
     .await;
     assert!(recorded_cp1, "Master must record Checkpoint 1");
 
@@ -657,15 +733,23 @@ async fn test_adversarial_end_to_end_cluster_multi_hop_failover() {
     drop(transport1);
 
     // Wait for Master to requeue task (retry_count == 1)
-    let requeued_1 = wait_for(Duration::from_secs(4), Duration::from_millis(50), || async {
-        if let Ok(info) = master.get_task_info(task_id).await {
-            (info.state == TaskState::Queued || info.state == TaskState::Retrying) && info.retry_count == 1
-        } else {
-            false
-        }
-    })
+    let requeued_1 = wait_for(
+        Duration::from_secs(4),
+        Duration::from_millis(50),
+        || async {
+            if let Ok(info) = master.get_task_info(task_id).await {
+                (info.state == TaskState::Queued || info.state == TaskState::Retrying)
+                    && info.retry_count == 1
+            } else {
+                false
+            }
+        },
+    )
     .await;
-    assert!(requeued_1, "Master must requeue task after Worker 1 crash with retry_count == 1");
+    assert!(
+        requeued_1,
+        "Master must requeue task after Worker 1 crash with retry_count == 1"
+    );
 
     // Checkpoint 1 must be strictly preserved
     let cp_after_w1 = master.get_checkpoint(&task_id).await.unwrap();
@@ -678,8 +762,15 @@ async fn test_adversarial_end_to_end_cluster_multi_hop_failover() {
     let (_w2_id, mut transport2) = spawn_mock_wire_worker(master_addr, "mock-w2").await;
 
     // Receive AssignTaskWithCheckpoint containing Checkpoint 1
-    let (assigned_w2, latest_cp_w2) = match transport2.recv_msg::<MasterMessage>().await.expect("recv assign w2") {
-        Some(MasterMessage::AssignTaskWithCheckpoint { task, latest_checkpoint }) => (task, latest_checkpoint),
+    let (assigned_w2, latest_cp_w2) = match transport2
+        .recv_msg::<MasterMessage>()
+        .await
+        .expect("recv assign w2")
+    {
+        Some(MasterMessage::AssignTaskWithCheckpoint {
+            task,
+            latest_checkpoint,
+        }) => (task, latest_checkpoint),
         other => panic!("Expected AssignTaskWithCheckpoint on Worker 2, got {other:?}"),
     };
     assert_eq!(assigned_w2.id, task_id);
@@ -697,13 +788,17 @@ async fn test_adversarial_end_to_end_cluster_multi_hop_failover() {
         .expect("send cp2");
 
     // Wait for Master to record Checkpoint 2
-    let recorded_cp2 = wait_for(Duration::from_secs(3), Duration::from_millis(50), || async {
-        if let Some(cp) = master.get_checkpoint(&task_id).await {
-            cp.sequence == 2
-        } else {
-            false
-        }
-    })
+    let recorded_cp2 = wait_for(
+        Duration::from_secs(3),
+        Duration::from_millis(50),
+        || async {
+            if let Some(cp) = master.get_checkpoint(&task_id).await {
+                cp.sequence == 2
+            } else {
+                false
+            }
+        },
+    )
     .await;
     assert!(recorded_cp2, "Master must record Checkpoint 2");
 
@@ -711,15 +806,23 @@ async fn test_adversarial_end_to_end_cluster_multi_hop_failover() {
     drop(transport2);
 
     // Wait for Master to requeue task (retry_count == 2)
-    let requeued_2 = wait_for(Duration::from_secs(4), Duration::from_millis(50), || async {
-        if let Ok(info) = master.get_task_info(task_id).await {
-            (info.state == TaskState::Queued || info.state == TaskState::Retrying) && info.retry_count == 2
-        } else {
-            false
-        }
-    })
+    let requeued_2 = wait_for(
+        Duration::from_secs(4),
+        Duration::from_millis(50),
+        || async {
+            if let Ok(info) = master.get_task_info(task_id).await {
+                (info.state == TaskState::Queued || info.state == TaskState::Retrying)
+                    && info.retry_count == 2
+            } else {
+                false
+            }
+        },
+    )
     .await;
-    assert!(requeued_2, "Master must requeue task after Worker 2 crash with retry_count == 2");
+    assert!(
+        requeued_2,
+        "Master must requeue task after Worker 2 crash with retry_count == 2"
+    );
 
     // Checkpoint 2 must be strictly preserved
     let cp_after_w2 = master.get_checkpoint(&task_id).await.unwrap();
@@ -732,8 +835,15 @@ async fn test_adversarial_end_to_end_cluster_multi_hop_failover() {
     let (w3_id, mut transport3) = spawn_mock_wire_worker(master_addr, "mock-w3").await;
 
     // Receive AssignTaskWithCheckpoint containing Checkpoint 2
-    let (assigned_w3, latest_cp_w3) = match transport3.recv_msg::<MasterMessage>().await.expect("recv assign w3") {
-        Some(MasterMessage::AssignTaskWithCheckpoint { task, latest_checkpoint }) => (task, latest_checkpoint),
+    let (assigned_w3, latest_cp_w3) = match transport3
+        .recv_msg::<MasterMessage>()
+        .await
+        .expect("recv assign w3")
+    {
+        Some(MasterMessage::AssignTaskWithCheckpoint {
+            task,
+            latest_checkpoint,
+        }) => (task, latest_checkpoint),
         other => panic!("Expected AssignTaskWithCheckpoint on Worker 3, got {other:?}"),
     };
     assert_eq!(assigned_w3.id, task_id);
@@ -745,7 +855,9 @@ async fn test_adversarial_end_to_end_cluster_multi_hop_failover() {
             worker_id: w3_id,
             task_id,
             exit_code: 0,
-            stdout: TaskBytes::copy_from_slice(b"Completed successfully after multi-hop failovers\n"),
+            stdout: TaskBytes::copy_from_slice(
+                b"Completed successfully after multi-hop failovers\n",
+            ),
             stderr: TaskBytes::from(Vec::<u8>::new()),
             execution_time_ms: 250,
             is_gpu_executed: false,
@@ -756,15 +868,22 @@ async fn test_adversarial_end_to_end_cluster_multi_hop_failover() {
         .expect("send final result");
 
     // Wait for task to be marked Completed on Master
-    let completed = wait_for(Duration::from_secs(4), Duration::from_millis(50), || async {
-        if let Ok(info) = master.get_task_info(task_id).await {
-            info.state == TaskState::Completed
-        } else {
-            false
-        }
-    })
+    let completed = wait_for(
+        Duration::from_secs(4),
+        Duration::from_millis(50),
+        || async {
+            if let Ok(info) = master.get_task_info(task_id).await {
+                info.state == TaskState::Completed
+            } else {
+                false
+            }
+        },
+    )
     .await;
-    assert!(completed, "Task must transition to Completed after Worker 3 finishes");
+    assert!(
+        completed,
+        "Task must transition to Completed after Worker 3 finishes"
+    );
 
     let final_info = master.get_task_info(task_id).await.unwrap();
     assert_eq!(final_info.state, TaskState::Completed);

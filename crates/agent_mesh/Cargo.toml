@@ -31,6 +31,10 @@ thiserror = { workspace = true }
 sysinfo = { workspace = true }
 ring = "0.17"
 
+[target.'cfg(unix)'.dependencies]
+# killpg() for the mesh executor's process-group kill (already in Cargo.lock via tokio)
+libc = "0.2"
+
 [dev-dependencies]
 rusty_grid_worker = { workspace = true }
 tempfile = "3"

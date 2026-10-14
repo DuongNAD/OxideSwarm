@@ -15,7 +15,7 @@
     <string name="btn_stop">Stop Worker</string>
     
     <string name="label_master_address">Master Coordinator Address</string>
-    <string name="hint_master_address">e.g. 192.168.1.100:8080</string>
+    <string name="hint_master_address">e.g. 192.168.1.100:8088 (cluster port, not 8080)</string>
     <string name="label_worker_name">Worker Identifier</string>
     <string name="label_cpu_cores">CPU Cores Allocated</string>
     <string name="label_ram_mb">Memory Limit (MB)</string>

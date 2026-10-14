@@ -28,9 +28,33 @@ impl Bytes {
         Bytes(bytes::Bytes::from_static(bytes))
     }
 
+    /// Returns the longest valid UTF-8 prefix as a string slice.
+    ///
+    /// This is the view behind `Deref<Target = str>`, so it can only borrow: when the buffer
+    /// is not entirely valid UTF-8 (OEM code-page console output, a byte cap that cut a
+    /// multibyte character) everything from the first invalid byte on is not visible here.
+    /// It used to return `""` for the whole buffer, which silently erased the output. Use
+    /// [`Bytes::to_string_lossy`] when the full content matters (forwarding, display, logging)
+    /// and [`Bytes::try_as_str`] when invalid data must be detected.
     #[inline]
     pub fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.0).unwrap_or("")
+        match std::str::from_utf8(&self.0) {
+            Ok(s) => s,
+            Err(e) => std::str::from_utf8(&self.0[..e.valid_up_to()]).unwrap_or(""),
+        }
+    }
+
+    /// Returns the whole buffer as `&str`, or `None` if it is not valid UTF-8.
+    #[inline]
+    pub fn try_as_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.0).ok()
+    }
+
+    /// Returns the whole buffer as text, replacing invalid UTF-8 sequences with U+FFFD.
+    /// Borrows (no allocation) when the buffer is valid UTF-8.
+    #[inline]
+    pub fn to_string_lossy(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.0)
     }
 
     #[inline]
@@ -117,7 +141,7 @@ impl fmt::Debug for Bytes {
 
 impl fmt::Display for Bytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
+        f.write_str(&self.to_string_lossy())
     }
 }
 
@@ -170,45 +194,47 @@ impl PartialEq for Bytes {
     }
 }
 
+// String comparisons are byte-exact: a buffer that is not valid UTF-8 is never equal to any
+// string (it used to compare equal to `""`).
 impl PartialEq<str> for Bytes {
     #[inline]
     fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
+        self.0.as_ref() == other.as_bytes()
     }
 }
 
 impl PartialEq<&str> for Bytes {
     #[inline]
     fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
+        self.0.as_ref() == other.as_bytes()
     }
 }
 
 impl PartialEq<String> for Bytes {
     #[inline]
     fn eq(&self, other: &String) -> bool {
-        self.as_str() == other.as_str()
+        self.0.as_ref() == other.as_bytes()
     }
 }
 
 impl PartialEq<Bytes> for str {
     #[inline]
     fn eq(&self, other: &Bytes) -> bool {
-        self == other.as_str()
+        self.as_bytes() == other.0.as_ref()
     }
 }
 
 impl PartialEq<Bytes> for &str {
     #[inline]
     fn eq(&self, other: &Bytes) -> bool {
-        *self == other.as_str()
+        self.as_bytes() == other.0.as_ref()
     }
 }
 
 impl PartialEq<Bytes> for String {
     #[inline]
     fn eq(&self, other: &Bytes) -> bool {
-        self.as_str() == other.as_str()
+        self.as_bytes() == other.0.as_ref()
     }
 }
 
@@ -1315,21 +1341,13 @@ impl TaskResult {
     /// Returns stdout rendered as a string slice (lossy UTF-8 conversion if necessary).
     #[inline]
     pub fn stdout_str(&self) -> std::borrow::Cow<'_, str> {
-        if let Ok(s) = std::str::from_utf8(self.stdout.as_bytes()) {
-            std::borrow::Cow::Borrowed(s)
-        } else {
-            String::from_utf8_lossy(self.stdout.as_bytes())
-        }
+        self.stdout.to_string_lossy()
     }
 
     /// Returns stderr rendered as a string slice (lossy UTF-8 conversion if necessary).
     #[inline]
     pub fn stderr_str(&self) -> std::borrow::Cow<'_, str> {
-        if let Ok(s) = std::str::from_utf8(self.stderr.as_bytes()) {
-            std::borrow::Cow::Borrowed(s)
-        } else {
-            String::from_utf8_lossy(self.stderr.as_bytes())
-        }
+        self.stderr.to_string_lossy()
     }
 
     /// Convenience constructor for successful execution.
@@ -1456,6 +1474,120 @@ impl fmt::Display for TaskStatus {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// cp437/cp850 "dir" output with an accented byte (0x82 = e-acute), invalid as UTF-8.
+    fn oem_output() -> Vec<u8> {
+        let mut v = b"Volume in drive C is Syst".to_vec();
+        v.push(0x82);
+        v.extend_from_slice(b"me\r\n 12 File(s)\r\n");
+        v
+    }
+
+    #[test]
+    fn test_bytes_valid_utf8_views_are_whole_and_borrowed() {
+        let b = Bytes::from("h\u{e9}llo w\u{f6}rld \u{1f980}");
+        assert_eq!(b.as_str(), "h\u{e9}llo w\u{f6}rld \u{1f980}");
+        assert_eq!(b.try_as_str(), Some("h\u{e9}llo w\u{f6}rld \u{1f980}"));
+        assert!(matches!(b.to_string_lossy(), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(b.to_string(), "h\u{e9}llo w\u{f6}rld \u{1f980}");
+        assert_eq!(Bytes::new().as_str(), "");
+        assert_eq!(Bytes::new().try_as_str(), Some(""));
+    }
+
+    #[test]
+    fn test_bytes_non_utf8_output_is_not_blanked() {
+        let raw = oem_output();
+        let b = Bytes::from(raw.clone());
+
+        // The lossy accessor keeps everything, marking only the bad byte.
+        let lossy = b.to_string_lossy();
+        assert!(matches!(lossy, std::borrow::Cow::Owned(_)));
+        assert!(lossy.contains("Volume in drive C is Syst\u{fffd}me"));
+        assert!(lossy.contains("12 File(s)"));
+        assert_eq!(
+            b.to_string(),
+            lossy,
+            "Display must not blank invalid output either"
+        );
+
+        // The borrowed view keeps the valid prefix instead of discarding the buffer.
+        assert_eq!(b.as_str(), "Volume in drive C is Syst");
+        assert_eq!(b.try_as_str(), None);
+        // The raw bytes are untouched.
+        assert_eq!(b.as_bytes(), raw.as_slice());
+    }
+
+    #[test]
+    fn test_bytes_truncated_multibyte_char_keeps_everything_before_it() {
+        // A byte cap that lands inside a 4-byte character (the runner truncates at a byte limit).
+        let mut raw = b"first line\nsecond line\n".to_vec();
+        raw.extend_from_slice(&"\u{1f980}".as_bytes()[..2]);
+        let b = Bytes::from(raw);
+        assert_eq!(b.as_str(), "first line\nsecond line\n");
+        assert_eq!(b.to_string_lossy(), "first line\nsecond line\n\u{fffd}");
+        assert_eq!(b.try_as_str(), None);
+
+        // Invalid first byte: borrowed view is empty, lossy view is not.
+        let b = Bytes::from(vec![0xFF, 0xFE, b'o', b'k']);
+        assert_eq!(b.as_str(), "");
+        assert_eq!(b.to_string_lossy(), "\u{fffd}\u{fffd}ok");
+    }
+
+    #[test]
+    fn test_bytes_string_equality_is_byte_exact() {
+        let invalid = Bytes::from(vec![0xFF, 0xFE]);
+        // Invalid UTF-8 used to compare equal to "" because as_str() blanked it.
+        let (empty_str, empty_string) = ("", String::new());
+        assert!(invalid != empty_str);
+        assert!(invalid != *empty_str);
+        assert!(invalid != empty_string);
+        assert!(empty_str != invalid);
+        assert!(empty_string != invalid);
+
+        let partly = Bytes::from(b"abc\xFFdef".to_vec());
+        assert!(
+            partly != "abc",
+            "prefix view must not make a different buffer equal"
+        );
+        assert!(partly != "abcdef");
+
+        let ok = Bytes::from("same");
+        let owned = String::from("same");
+        assert!(ok == "same" && ok == *"same" && ok == owned);
+        assert!("same" == ok && owned == ok);
+        assert!(ok != "other");
+    }
+
+    #[test]
+    fn test_task_result_stdout_str_uses_lossy_accessor_for_non_utf8() {
+        let mut result = TaskResult::success(
+            Uuid::new_v4(),
+            TaskId::new(),
+            Bytes::from(oem_output()),
+            1,
+            false,
+        );
+        result.stderr = Bytes::from(vec![b'e', 0x80, b'r']);
+        assert!(result.stdout_str().contains("Syst\u{fffd}me"));
+        assert!(result.stdout_str().contains("12 File(s)"));
+        assert_eq!(result.stderr_str(), "e\u{fffd}r");
+
+        // Valid output is still borrowed, not copied.
+        let ok = TaskResult::success(Uuid::new_v4(), TaskId::new(), Bytes::from("fine"), 1, false);
+        assert!(matches!(
+            ok.stdout_str(),
+            std::borrow::Cow::Borrowed("fine")
+        ));
+    }
+
+    #[test]
+    fn test_bytes_non_utf8_survives_both_wire_codecs() {
+        let b = Bytes::from(oem_output());
+        let bin: Bytes = bincode::deserialize(&bincode::serialize(&b).unwrap()).unwrap();
+        assert_eq!(bin.as_bytes(), b.as_bytes());
+        let json: Bytes = serde_json::from_slice(&serde_json::to_vec(&b).unwrap()).unwrap();
+        assert_eq!(json.as_bytes(), b.as_bytes());
+    }
 
     #[test]
     fn test_task_id_serde_transparent() {

@@ -159,6 +159,14 @@ pub enum GridError {
     #[error("Worker registration rejected: {0}")]
     RegistrationRejected(String),
 
+    /// The peer demands cluster authentication but this side did not (or could not) provide it.
+    #[error("Authentication required: {0}")]
+    AuthRequired(String),
+
+    /// Cluster authentication was attempted and failed (wrong secret, rogue peer, bad handshake).
+    #[error("Authentication failed: {0}")]
+    AuthFailed(String),
+
     /// Configuration error (CLI flags, environment, invalid socket address).
     #[error("Configuration error: {0}")]
     Config(String),
@@ -198,6 +206,8 @@ impl GridError {
             GridError::InvalidTaskState { .. } => "INVALID_TASK_STATE",
             GridError::QueueFull { .. } => "QUEUE_FULL",
             GridError::RegistrationRejected(_) => "REGISTRATION_REJECTED",
+            GridError::AuthRequired(_) => "AUTH_REQUIRED",
+            GridError::AuthFailed(_) => "AUTH_FAILED",
             GridError::Config(_) => "CONFIG_ERROR",
             GridError::PortFile { .. } => "PORT_FILE_ERROR",
         }
@@ -232,6 +242,7 @@ impl GridError {
             | GridError::HeartbeatTimeout { .. }
             | GridError::TaskTimeout { .. } => 4,
             GridError::NoEligibleWorker { .. } => 5,
+            GridError::AuthRequired(_) | GridError::AuthFailed(_) => 6,
             GridError::ExecutionFailed {
                 exit_code: Some(code),
                 ..
@@ -262,6 +273,11 @@ impl From<ProtocolError> for GridError {
             ProtocolError::Io(e) => GridError::Io(e),
             ProtocolError::Json(e) => GridError::Serialization(e),
             ProtocolError::Bincode(e) => GridError::Framing(format!("Bincode error: {e}")),
+            // A client that has no secret and expects a typed reply but receives an
+            // authentication frame has been rejected by a master that requires the secret.
+            ProtocolError::InvalidFormatTag(crate::protocol::WIRE_FORMAT_AUTH) => {
+                GridError::AuthRequired(crate::cluster_auth::AUTH_REQUIRED_HINT.to_string())
+            }
             ProtocolError::InvalidFormatTag(tag) => GridError::Framing(format!(
                 "Unsupported wire format discriminator: 0x{tag:02x}"
             )),
@@ -329,6 +345,38 @@ mod tests {
 
         let q_full = GridError::QueueFull { capacity: 100 };
         assert!(q_full.is_transient());
+    }
+
+    #[test]
+    fn test_auth_errors_are_distinct_and_permanent() {
+        let required = GridError::AuthRequired("need secret".into());
+        let failed = GridError::AuthFailed("bad proof".into());
+        assert_eq!(required.error_code(), "AUTH_REQUIRED");
+        assert_eq!(failed.error_code(), "AUTH_FAILED");
+        // Retrying with the same secret cannot succeed, so callers must not hot-loop on these.
+        assert!(!required.is_transient());
+        assert!(!failed.is_transient());
+        assert_eq!(required.exit_code(), 6);
+        assert_eq!(failed.exit_code(), 6);
+        assert!(required.to_string().contains("need secret"));
+        assert!(failed.to_string().contains("bad proof"));
+    }
+
+    #[test]
+    fn test_auth_frame_where_typed_reply_expected_means_auth_required() {
+        use crate::protocol::WIRE_FORMAT_AUTH;
+        // A client without a secret that gets a REJECT frame back sees an undecodable 0x03 frame.
+        let err: GridError = ProtocolError::InvalidFormatTag(WIRE_FORMAT_AUTH).into();
+        match err {
+            GridError::AuthRequired(msg) => {
+                assert!(msg.contains("cluster secret"), "{msg}");
+                assert!(msg.contains("OXIDESWARM_SECRET"), "{msg}");
+            }
+            other => panic!("expected AuthRequired, got {other:?}"),
+        }
+        // Every other bad tag is still a plain framing error.
+        let err: GridError = ProtocolError::InvalidFormatTag(0x7e).into();
+        assert_eq!(err.error_code(), "FRAMING_ERROR");
     }
 
     #[test]

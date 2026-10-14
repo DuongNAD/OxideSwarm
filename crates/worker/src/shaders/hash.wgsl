@@ -1,3 +1,14 @@
+// EXPERIMENTAL, NOT USED BY ANY TASK: no code dispatches this shader (the only reference is a
+// compile-only test). It is a sketch of a GPU-side reduction, not a verification kernel:
+//   * it writes only thread 0's hash of its own grid-stride subsequence per work group, so 255 of
+//     256 threads' data is not covered by any digest, and there is no pass that combines the
+//     per-group partials;
+//   * its f32 sums accumulate in a different order than the CPU's f64 `trace` / `frobenius_norm`.
+// It therefore cannot reproduce the CPU digest of `cpu_simd::compute_matrix_metrics`. Results are
+// verified instead by `cpu_simd::verify_gemm` (a sampled f64 recomputation on the CPU). To turn
+// this into a real kernel, hash each element together with its index, combine the per-group
+// partials order-independently (XOR / wrapping sum) on the host, and test it against a CPU oracle.
+//
 // Parallel Reduction & Verification Hashing (WGSL Compute Shader)
 // Computes sum, sum of squares, trace, and 64-bit FNV-1a verification digest.
 

@@ -164,7 +164,7 @@ class OxideWorkerService : Service(), WorkerEngineListener {
                 return START_NOT_STICKY
             }
             ACTION_START -> {
-                val master = intent?.getStringExtra(EXTRA_MASTER) ?: "127.0.0.1:8080"
+                val master = intent?.getStringExtra(EXTRA_MASTER) ?: "127.0.0.1:8088"
                 val p2pTicket = intent?.getStringExtra(EXTRA_P2P_TICKET)
                 val name = intent?.getStringExtra(EXTRA_NAME) ?: SystemInfoHelper.getDefaultWorkerName()
                 val cores = intent?.getIntExtra(EXTRA_CORES, SystemInfoHelper.getAvailableCores())
@@ -307,6 +307,10 @@ class OxideWorkerService : Service(), WorkerEngineListener {
         // Choose optimal engine: In-Process JNI if available (immune to PPK), or ManagedProcessRunner
         val engine: WorkerEngine = if (OxideWorkerBridge.isAvailable()) {
             Log.i(TAG, "Using In-Process JNI Engine (liboxideworker.so)")
+            // The default sandbox location (/data/local/tmp) is closed to apps, and the in-process
+            // worker refuses to start without a writable one: same directory ManagedProcessRunner uses.
+            val sandboxDir = java.io.File(cacheDir, "sandboxes").apply { mkdirs() }
+            OxideWorkerBridge.setSandboxDir(sandboxDir.absolutePath)
             OxideWorkerBridge
         } else {
             Log.i(TAG, "Using ManagedProcessRunner (Binary Executor)")

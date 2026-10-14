@@ -1,5 +1,15 @@
 # Comparative Technical Benchmark & Empirical Evaluation: Remote Cluster Interconnect Solutions
 
+> **How to read the numbers.** Every figure below is a **single recorded run** from the author's own machines and
+> networks (a Mac, a Windows PC, a Galaxy S24 and the public n0 relays), written down by hand into
+> `benchmark_data.json` / `benchmark_matrix.csv`. They were not produced by a script in this repository and are not
+> reproduced in CI. `run_comparative_benchmark.sh` only checks that these files parse and re-runs two local Rust benches;
+> it does not run Tailscale or Cloudflare. The "composite MCDA score" is a weighted sum of the recorded values. Where this
+> document says "verified", "empirical" or "forensic", read "recorded once". Some memory figures conflict with
+> `docs/WHAT_WAS_DONE.md` (6.8 MB here vs 14.2 MB there) and the "Tailscale / Cloudflare RAM" cells in the CSV appear to be
+> throughput values; re-measure before relying on them.
+
+
 **Author**: OxideSwarm Forensic Performance & Network Engineering Team  
 **Evaluation Target**: Milestone 3 (Requirement R3: Quantitative Technical Evaluation & Comparative Benchmark Report)  
 **Publication Date**: September 2026  

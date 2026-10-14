@@ -21,8 +21,8 @@ use uuid::Uuid;
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::{
     deserialize_message, serialize_message, ClientMessage, ClientResponse, MasterMessage,
-    MessageTransport, ProtocolError, WireCodec, WorkerMessage, WIRE_FORMAT_BINCODE,
-    WIRE_FORMAT_JSON,
+    MessageTransport, ProtocolError, WireCodec, WorkerMessage, WIRE_FORMAT_AUTH,
+    WIRE_FORMAT_BINCODE, WIRE_FORMAT_JSON,
 };
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
 use rusty_grid_master::registry::WorkerStatus;
@@ -188,6 +188,17 @@ async fn test_m8_malformed_discriminator_handshake_rejection() {
         send_raw_frame(&mut stream, &malformed_payload)
             .await
             .expect("send_raw_frame");
+
+        // 0x03 is the cluster-authentication discriminator: a master that has no secret answers it
+        // with exactly one REJECT frame (`[0x03, 0x05, reason]`) and then closes like any other tag.
+        if tag == WIRE_FORMAT_AUTH {
+            let reject = recv_raw_frame(&mut stream)
+                .await
+                .expect("read REJECT frame")
+                .expect("master must answer an auth frame with a REJECT");
+            assert_eq!(&reject[..2], &[WIRE_FORMAT_AUTH, 0x05]);
+            assert_eq!(&reject[2..], b"server has no secret configured");
+        }
 
         // Master should drop/close the connection without crashing
         let mut buf = [0u8; 128];
