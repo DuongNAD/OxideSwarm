@@ -105,14 +105,23 @@ impl HeartbeatTracker {
         self.active_tasks.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Atomically decrements the active task count and returns the new count.
+    /// Atomically decrements the active task count (never below zero) and returns the new count.
     pub fn decrement_active_tasks(&self) -> usize {
-        self.active_tasks
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| {
-                Some(val.saturating_sub(1))
-            })
-            .unwrap_or(0)
-            .saturating_sub(1)
+        // A compare-exchange loop instead of `fetch_update`: newer Rust deprecates it (renamed to
+        // `try_update`), and older toolchains do not have `try_update` yet.
+        let mut current = self.active_tasks.load(Ordering::SeqCst);
+        loop {
+            let next = current.saturating_sub(1);
+            match self.active_tasks.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Returns the current number of active tasks.
