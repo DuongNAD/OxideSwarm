@@ -445,8 +445,8 @@ mod tests {
     #[test]
     fn grid_master_secret_is_required_beyond_loopback() {
         let dir = tempfile::tempdir().unwrap();
-        let default_file = dir.path().join("cluster.secret");
-        let default_file = Some(default_file.as_path());
+        let default_path = dir.path().join("cluster.secret");
+        let default_file = Some(default_path.as_path());
         let lan = addr("0.0.0.0:8089");
 
         // Loopback needs no secret.
@@ -458,8 +458,7 @@ mod tests {
 
         // Beyond loopback with no secret anywhere: refused, unless --insecure.
         let refused = grid_master_secret(None, lan, false, default_file)
-            .err()
-            .expect("a LAN master without a secret must be refused");
+            .expect_err("a LAN master without a secret must be refused");
         assert!(
             refused.to_string().contains("no cluster secret"),
             "{refused}"
@@ -470,7 +469,7 @@ mod tests {
 
         // The default secret file is used once it exists, --insecure or not.
         let saved = ClusterSecret::generate().unwrap();
-        saved.save_file(default_file.unwrap(), false).unwrap();
+        saved.save_file(&default_path, false).unwrap();
         for insecure in [false, true] {
             let used = grid_master_secret(None, lan, insecure, default_file)
                 .unwrap()
