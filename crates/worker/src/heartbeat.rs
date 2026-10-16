@@ -144,24 +144,26 @@ impl HeartbeatHandle {
 }
 
 static TELEMETRY_CACHE: std::sync::Mutex<(f32, u64)> = std::sync::Mutex::new((0.0, 8192));
-static TELEMETRY_INITIALIZED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static TELEMETRY_SAMPLER: std::sync::Once = std::sync::Once::new();
 
 fn ensure_telemetry_sampler_started() {
-    if TELEMETRY_INITIALIZED
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
+    // `call_once` also makes a concurrent first caller wait until the cache is seeded.
+    TELEMETRY_SAMPLER.call_once(|| {
+        // Seed the cache before the first heartbeat reads it. Starting from the (0 %, 8192 MB)
+        // placeholder made a freshly started worker report 8 GB free whatever the machine has,
+        // and the master's RAM gate trusts that figure. (CPU needs two samples, so it starts at 0.)
+        // Only memory is read here, which is cheap; the CPU sampler is set up on its own thread.
+        let mut mem = sysinfo::System::new();
+        mem.refresh_memory();
+        if let Ok(mut cache) = TELEMETRY_CACHE.lock() {
+            *cache = (0.0, mem.available_memory() / (1024 * 1024));
+        }
         std::thread::spawn(move || {
             let mut sys = sysinfo::System::new_with_specifics(
                 sysinfo::RefreshKind::new()
                     .with_cpu(sysinfo::CpuRefreshKind::new().with_cpu_usage())
                     .with_memory(sysinfo::MemoryRefreshKind::new().with_ram()),
             );
-            sys.refresh_memory();
-            if let Ok(mut cache) = TELEMETRY_CACHE.lock() {
-                *cache = (0.0, sys.available_memory() / (1024 * 1024));
-            }
             loop {
                 sys.refresh_cpu_specifics(sysinfo::CpuRefreshKind::new().with_cpu_usage());
                 sys.refresh_memory();
@@ -173,7 +175,7 @@ fn ensure_telemetry_sampler_started() {
                 std::thread::sleep(Duration::from_millis(500));
             }
         });
-    }
+    });
 }
 
 fn get_system_telemetry() -> (f32, u64) {
@@ -595,9 +597,18 @@ mod tests {
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total_mb = sys.total_memory() / (1024 * 1024);
+        let available_mb = sys.available_memory() / (1024 * 1024);
         assert!(
             ram_mb <= total_mb.max(1),
             "free {ram_mb} MB cannot exceed total {total_mb} MB"
+        );
+        // The bound above cannot catch the placeholder on a machine with more than 8 GB, so also
+        // compare with a fresh reading: the cached one is at most 500 ms old and stays close,
+        // while the placeholder is far off unless the machine happens to have about 8 GB free.
+        let tolerance_mb = (total_mb / 4).max(1024);
+        assert!(
+            available_mb == 0 || ram_mb.abs_diff(available_mb) <= tolerance_mb,
+            "first reading of {ram_mb} MB free is far from the {available_mb} MB actually free"
         );
     }
 
