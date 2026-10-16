@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_master::server::{MasterServer, ServerConfig};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, Level};
@@ -38,13 +39,16 @@ pub enum Commands {
         #[arg(long, env = "OXIDE_MESH_TOKEN", hide_env_values = true)]
         token: Option<String>,
 
-        /// Allow a non-loopback --listen address without a token. Anyone who can reach the port
-        /// can then run commands on every node.
+        /// Allow a non-loopback --listen address without a token, and a non-loopback --grid-master
+        /// without a cluster secret. Anyone who can reach those ports can then run commands on
+        /// every node and tasks on every worker.
         #[arg(long)]
         insecure: bool,
 
         /// Address on which to run an embedded Master Grid runtime (e.g. 127.0.0.1:8089 or 0.0.0.0:8089).
-        /// When set, the hub embeds MasterServer, attaches AgentGridBridge, and routes grid_* envelopes end-to-end.
+        /// When set, the hub starts its own MasterServer there (it does not connect to a running
+        /// master), attaches AgentGridBridge, and routes grid_* envelopes end-to-end. A non-loopback
+        /// address needs a cluster secret (--secret, else the default secret file) or --insecure.
         #[arg(long, env = "OXIDE_GRID_MASTER", num_args = 0..=1, default_missing_value = "127.0.0.1:0")]
         grid_master: Option<String>,
 
@@ -163,6 +167,44 @@ fn build_client(
     }
 }
 
+/// The cluster secret for the master that `hub --grid-master` embeds.
+///
+/// `--secret` / OXIDESWARM_SECRET (hex, or the path of a secret file) wins. A master reachable
+/// beyond loopback otherwise uses the default secret file, the one a CLI master creates, and with
+/// neither it is refused unless `insecure`: whoever can reach it could run tasks on its workers. A
+/// loopback-only master needs no secret.
+fn grid_master_secret(
+    secret: Option<&str>,
+    bind_addr: SocketAddr,
+    insecure: bool,
+    default_secret_file: Option<&Path>,
+) -> Result<Option<ClusterSecret>, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(text) = secret.map(str::trim).filter(|s| !s.is_empty()) {
+        let cs =
+            ClusterSecret::from_hex(text).or_else(|_| ClusterSecret::load_file(Path::new(text)))?;
+        return Ok(Some(cs));
+    }
+    if bind_addr.ip().is_loopback() {
+        return Ok(None);
+    }
+    if let Some(path) = default_secret_file.filter(|p| p.exists()) {
+        println!(
+            "[HUB] Embedded Master Grid uses the cluster secret in {}",
+            path.display()
+        );
+        return Ok(Some(ClusterSecret::load_file(path)?));
+    }
+    if insecure {
+        return Ok(None);
+    }
+    Err(format!(
+        "--grid-master {bind_addr} is reachable beyond loopback, but no cluster secret is set: pass \
+         --secret / OXIDESWARM_SECRET (hex or a secret file), create the default secret file with \
+         `oxideswarm secret generate`, or add --insecure to run it without authentication"
+    )
+    .into())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let subscriber = FmtSubscriber::builder()
@@ -211,13 +253,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     };
 
                 let mut server_config = ServerConfig::new(bind_addr);
-                let env_secret = std::env::var("OXIDESWARM_SECRET").ok();
-                let secret_opt = secret.as_deref().or(env_secret.as_deref());
-                if let Some(sec_str) = secret_opt.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                    let cs = ClusterSecret::from_hex(sec_str).or_else(|_| {
-                        ClusterSecret::load_file(&std::path::PathBuf::from(sec_str))
-                    })?;
-                    server_config = server_config.with_cluster_secret(cs);
+                // `secret` already holds OXIDESWARM_SECRET when the flag is absent (clap `env`).
+                let default_secret_file = ClusterSecret::default_path();
+                match grid_master_secret(
+                    secret.as_deref(),
+                    bind_addr,
+                    insecure,
+                    default_secret_file.as_deref(),
+                )? {
+                    Some(cs) => server_config = server_config.with_cluster_secret(cs),
+                    None if !bind_addr.ip().is_loopback() => eprintln!(
+                        "[HUB] WARNING: the embedded Master Grid on {bind_addr} runs WITHOUT a cluster secret (--insecure). Anyone who can reach it can run tasks on its workers."
+                    ),
+                    None => {}
                 }
 
                 let master_handle = MasterServer::spawn(server_config).await?;
@@ -384,4 +432,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn grid_master_secret_is_required_beyond_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_file = dir.path().join("cluster.secret");
+        let default_file = Some(default_file.as_path());
+        let lan = addr("0.0.0.0:8089");
+
+        // Loopback needs no secret.
+        assert!(
+            grid_master_secret(None, addr("127.0.0.1:8089"), false, default_file)
+                .unwrap()
+                .is_none()
+        );
+
+        // Beyond loopback with no secret anywhere: refused, unless --insecure.
+        let refused = grid_master_secret(None, lan, false, default_file)
+            .err()
+            .expect("a LAN master without a secret must be refused");
+        assert!(
+            refused.to_string().contains("no cluster secret"),
+            "{refused}"
+        );
+        assert!(grid_master_secret(None, lan, true, default_file)
+            .unwrap()
+            .is_none());
+
+        // The default secret file is used once it exists, --insecure or not.
+        let saved = ClusterSecret::generate().unwrap();
+        saved.save_file(default_file.unwrap(), false).unwrap();
+        for insecure in [false, true] {
+            let used = grid_master_secret(None, lan, insecure, default_file)
+                .unwrap()
+                .expect("default secret file");
+            assert_eq!(used.to_hex(), saved.to_hex());
+        }
+
+        // An explicit secret wins over the default file; one that is neither hex nor a file fails.
+        let explicit = ClusterSecret::generate().unwrap();
+        let used = grid_master_secret(Some(&explicit.to_hex()), lan, false, default_file)
+            .unwrap()
+            .expect("explicit secret");
+        assert_eq!(used.to_hex(), explicit.to_hex());
+        assert!(grid_master_secret(Some("neither-hex-nor-a-file"), lan, true, None).is_err());
+    }
 }
