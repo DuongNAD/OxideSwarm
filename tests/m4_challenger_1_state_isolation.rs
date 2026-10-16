@@ -1,7 +1,7 @@
 //! Adversarial State Isolation & Environment Protection Verification Suite for Milestone 4.
 //!
 //! Authored by M4 Challenger 1 to empirically verify:
-//! 1. Host Immutability: C:\Users\Admin\.oxideswarm is never touched by any test.
+//! 1. Host Immutability: the developer's real `~/.oxideswarm` is never touched by any test.
 //! 2. Path Resolution Adversarial Behavior:
 //!    - When `OXIDESWARM_HOME` is empty (`""`), all resolvers fall back to default user profile without panics.
 //!    - When `OXIDESWARM_HOME` is unset, all resolvers fall back to default user profile without panics.
@@ -13,8 +13,8 @@
 //!      - `default_worker_id_path(Some("worker-1"))` resolves to `<temp_dir>\worker_id.worker-1`
 //! 3. Master 0-Config P2P Default Key Persistence:
 //!    - Spawning a Master with P2P enabled and NO explicit key file creates `master_key.bin` in `<temp_dir>`
-//!    - The generated key is exactly 32 bytes and deterministic across restarts
-//!    - Host `C:\Users\Admin\.oxideswarm` remains 100% untouched and identical in metadata and contents.
+//!    - The generated key is exactly 32 bytes and gives the same P2P endpoint id across restarts
+//!    - The real `~/.oxideswarm` remains untouched and identical in metadata and contents.
 //! 4. Worker Identity File Environment Precedence:
 //!    - `RUSTY_GRID_WORKER_ID_FILE` takes precedence over `OXIDESWARM_HOME`
 //!    - Empty `RUSTY_GRID_WORKER_ID_FILE` falls back cleanly to `OXIDESWARM_HOME`
@@ -300,9 +300,20 @@ async fn test_master_p2p_default_key_creates_isolated_key_without_host_mutation(
     let ticket2 = tokio::fs::read_to_string(&ticket_file2)
         .await
         .expect("read ticket 2");
+    // Compare the endpoint id, which comes from the persisted key. The rest of the ticket is the
+    // address list: the home relay when one is reachable, otherwise direct addresses whose UDP
+    // port changes on every start, so whole tickets only match on a machine with Internet access.
+    let endpoint_id = |ticket: &str| {
+        let parsed: serde_json::Value = serde_json::from_str(ticket).expect("ticket is JSON");
+        parsed["id"]
+            .as_str()
+            .expect("ticket has an endpoint id")
+            .to_string()
+    };
     assert_eq!(
-        ticket1, ticket2,
-        "P2P ticket must be identical across restarts using persistent sandboxed key"
+        endpoint_id(&ticket1),
+        endpoint_id(&ticket2),
+        "P2P endpoint id must be identical across restarts using persistent sandboxed key"
     );
 
     master2.shutdown().expect("shutdown master 2");
