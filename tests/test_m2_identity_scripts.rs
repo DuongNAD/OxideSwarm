@@ -81,9 +81,7 @@ async fn test_0_config_master_secret_key_persistence() {
         .with_p2p(true)
         .with_p2p_ticket_file(&ticket_file1);
 
-    let master1 = MasterServer::spawn(config1)
-        .await
-        .expect("spawn master 1");
+    let master1 = MasterServer::spawn(config1).await.expect("spawn master 1");
     let ticket1 = tokio::fs::read_to_string(&ticket_file1)
         .await
         .expect("read ticket 1");
@@ -111,9 +109,7 @@ async fn test_0_config_master_secret_key_persistence() {
         .with_p2p(true)
         .with_p2p_ticket_file(&ticket_file2);
 
-    let master2 = MasterServer::spawn(config2)
-        .await
-        .expect("spawn master 2");
+    let master2 = MasterServer::spawn(config2).await.expect("spawn master 2");
     let ticket2 = tokio::fs::read_to_string(&ticket_file2)
         .await
         .expect("read ticket 2");
@@ -141,9 +137,7 @@ async fn test_worker_auto_reconnect_under_3_seconds() {
         .with_p2p_ticket_file(&ticket_file);
 
     // 1. Spawn Master Run 1
-    let master1 = MasterServer::spawn(config1)
-        .await
-        .expect("spawn master 1");
+    let master1 = MasterServer::spawn(config1).await.expect("spawn master 1");
     let ticket1 = tokio::fs::read_to_string(&ticket_file)
         .await
         .expect("read ticket 1");
@@ -195,9 +189,7 @@ async fn test_worker_auto_reconnect_under_3_seconds() {
         .with_p2p_key_file(&key_file)
         .with_p2p_ticket_file(&ticket_file);
 
-    let master2 = MasterServer::spawn(config2)
-        .await
-        .expect("spawn master 2");
+    let master2 = MasterServer::spawn(config2).await.expect("spawn master 2");
     let restart_start = std::time::Instant::now();
 
     // 5. Measure reconnect time: Worker must re-register within 3.0 seconds
@@ -236,19 +228,22 @@ async fn test_worker_auto_reconnect_under_3_seconds() {
 }
 
 fn resolve_functional_bash() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-
+    // Git for Windows does not put bash on PATH, so try its usual install locations first.
     #[cfg(windows)]
-    {
-        candidates.push(PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"));
-        candidates.push(PathBuf::from(r"C:\Program Files\Git\usr\bin\bash.exe"));
-        candidates.push(PathBuf::from(r"C:\Program Files (x86)\Git\bin\bash.exe"));
+    let candidates = {
+        let mut candidates = vec![
+            PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
+            PathBuf::from(r"C:\Program Files\Git\usr\bin\bash.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\Git\bin\bash.exe"),
+        ];
         if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
             candidates.push(PathBuf::from(local_app_data).join(r"Programs\Git\bin\bash.exe"));
         }
-    }
-
-    candidates.push(PathBuf::from("bash"));
+        candidates.push(PathBuf::from("bash"));
+        candidates
+    };
+    #[cfg(not(windows))]
+    let candidates = vec![PathBuf::from("bash")];
 
     for cand in candidates {
         if let Ok(output) = Command::new(&cand).args(["-c", "exit 0"]).output() {
@@ -280,7 +275,10 @@ fn test_connect_remote_sh_validation_and_dry_run() {
         .unwrap()
         .join("connect_remote.sh");
 
-    assert!(script_path.exists(), "connect_remote.sh must exist at repo root");
+    assert!(
+        script_path.exists(),
+        "connect_remote.sh must exist at repo root"
+    );
 
     // Verify syntax with bash -n
     let status_syntax = Command::new(&bash_bin)
@@ -364,7 +362,10 @@ fn test_connect_remote_cmd_integrity() {
         .unwrap()
         .join("connect_remote.cmd");
 
-    assert!(script_path.exists(), "connect_remote.cmd must exist at repo root");
+    assert!(
+        script_path.exists(),
+        "connect_remote.cmd must exist at repo root"
+    );
     let content = std::fs::read_to_string(&script_path).expect("read connect_remote.cmd");
 
     assert!(

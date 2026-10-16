@@ -469,10 +469,17 @@ async fn test_tier1_f2_capabilities_gpu_physical_flag() {
     assert!(!w.capabilities.is_simulated_gpu);
     assert_eq!(w.capabilities.has_gpu, w.capabilities.can_execute_gpu());
     if !rusty_grid_worker::WGPU_COMPILED {
-        assert!(!w.capabilities.has_gpu, "no wgpu engine, so no real GPU may be advertised");
+        assert!(
+            !w.capabilities.has_gpu,
+            "no wgpu engine, so no real GPU may be advertised"
+        );
         assert!(w.capabilities.gpu_device_name.is_none());
     } else if w.capabilities.has_gpu {
-        let name = w.capabilities.gpu_device_name.as_deref().expect("the adapter name");
+        let name = w
+            .capabilities
+            .gpu_device_name
+            .as_deref()
+            .expect("the adapter name");
         assert_ne!(name, "Physical GPU (Manual Override)");
     }
 }

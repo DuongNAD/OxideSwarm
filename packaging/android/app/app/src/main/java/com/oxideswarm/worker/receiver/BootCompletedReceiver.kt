@@ -40,7 +40,7 @@ class BootCompletedReceiver : BroadcastReceiver() {
             val cores = prefs.getInt(KEY_CORES, SystemInfoHelper.getAvailableCores())
             val ramMb = prefs.getLong(KEY_RAM_MB, SystemInfoHelper.getTotalRamMb(context))
             val simulateGpu = prefs.getBoolean(KEY_SIMULATE_GPU, false)
-            val clusterSecret = prefs.getString(KEY_CLUSTER_SECRET, null)
+            val clusterSecret = loadClusterSecret(targetContext)
 
             val config = WorkerConfig(
                 masterAddress = master,
@@ -70,5 +70,37 @@ class BootCompletedReceiver : BroadcastReceiver() {
         const val KEY_RAM_MB = "key_ram_mb"
         const val KEY_SIMULATE_GPU = "key_simulate_gpu"
         const val KEY_CLUSTER_SECRET = "key_cluster_secret"
+
+        /**
+         * The cluster secret lives in its own preferences file, which backup_rules.xml and
+         * data_extraction_rules.xml exclude, so it never reaches a cloud backup or a device
+         * transfer. Every other setting stays in [PREFS_NAME].
+         */
+        const val SECRET_PREFS_NAME = "worker_secure_tokens"
+
+        /** The saved cluster secret. One saved in [PREFS_NAME] by an older version is moved first. */
+        fun loadClusterSecret(storageContext: Context): String? {
+            val secretPrefs = storageContext.getSharedPreferences(SECRET_PREFS_NAME, Context.MODE_PRIVATE)
+            val prefs = storageContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val legacySecret = prefs.getString(KEY_CLUSTER_SECRET, null)
+            if (legacySecret != null) {
+                if (!secretPrefs.contains(KEY_CLUSTER_SECRET)) {
+                    secretPrefs.edit().putString(KEY_CLUSTER_SECRET, legacySecret).commit()
+                }
+                prefs.edit().remove(KEY_CLUSTER_SECRET).apply()
+            }
+            return secretPrefs.getString(KEY_CLUSTER_SECRET, null)?.takeIf { it.isNotBlank() }
+        }
+
+        /** Saves [secret], or removes the saved one when [secret] is blank. */
+        fun saveClusterSecret(storageContext: Context, secret: String?) {
+            val editor = storageContext.getSharedPreferences(SECRET_PREFS_NAME, Context.MODE_PRIVATE).edit()
+            if (secret.isNullOrBlank()) {
+                editor.remove(KEY_CLUSTER_SECRET)
+            } else {
+                editor.putString(KEY_CLUSTER_SECRET, secret)
+            }
+            editor.apply()
+        }
     }
 }

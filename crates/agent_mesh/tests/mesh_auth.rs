@@ -56,7 +56,9 @@ struct Raw {
 
 impl Raw {
     async fn connect(url: &str) -> Raw {
-        let (ws, _) = connect_async(url).await.expect("raw websocket connect failed");
+        let (ws, _) = connect_async(url)
+            .await
+            .expect("raw websocket connect failed");
         Raw { ws }
     }
 
@@ -71,7 +73,9 @@ impl Raw {
             let left = deadline.saturating_duration_since(Instant::now());
             match tokio::time::timeout(left, self.ws.next()).await {
                 Err(_) => return Frame::Silence,
-                Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => return Frame::Closed,
+                Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => {
+                    return Frame::Closed
+                }
                 Ok(Some(Ok(Message::Text(text)))) => {
                     return Frame::Json(serde_json::from_str(&text).expect("hub sent invalid JSON"))
                 }
@@ -119,7 +123,10 @@ impl Raw {
     async fn registered(url: &str, id: &str, token: Option<&str>) -> Raw {
         let mut raw = Raw::connect(url).await;
         let answer = raw.register(id, token).await;
-        assert_eq!(answer["type"], "NodeRegistrationAck", "registration of {id} failed: {answer}");
+        assert_eq!(
+            answer["type"], "NodeRegistrationAck",
+            "registration of {id} failed: {answer}"
+        );
         raw
     }
 }
@@ -177,7 +184,12 @@ fn marker_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
 async fn test_registration_without_or_with_wrong_token_is_rejected() {
     let (hub, url, _) = start_hub(token_config()).await;
 
-    let no_token = rejection(client(&url, "intruder").connect().await.expect_err("no token must be rejected"));
+    let no_token = rejection(
+        client(&url, "intruder")
+            .connect()
+            .await
+            .expect_err("no token must be rejected"),
+    );
     assert_eq!(no_token.error_code, ERR_UNAUTHORIZED);
 
     let wrong = rejection(
@@ -197,7 +209,10 @@ async fn test_registration_without_or_with_wrong_token_is_rejected() {
     assert_eq!(answer["type"], "DeliveryNack");
     assert_eq!(answer["error_code"], ERR_UNAUTHORIZED);
     raw.expect_closed().await;
-    assert!(node_ids(&hub).await.is_empty(), "a rejected node must not appear in the registry");
+    assert!(
+        node_ids(&hub).await.is_empty(),
+        "a rejected node must not appear in the registry"
+    );
 
     // The right token works.
     let ok = authed_client(&url, "legit");
@@ -219,7 +234,13 @@ async fn test_unauthenticated_socket_cannot_run_commands_on_nodes() {
     // 1. Never registers, just fires a shell command at the victim.
     let marker = marker_path(&dir, "never-registered");
     let mut raw = Raw::connect(&url).await;
-    raw.send(command("attacker", "victim", "shell_exec", touch_command(&marker))).await;
+    raw.send(command(
+        "attacker",
+        "victim",
+        "shell_exec",
+        touch_command(&marker),
+    ))
+    .await;
     let answer = raw.expect_json().await;
     assert_eq!(answer["type"], "DeliveryNack");
     assert_eq!(answer["error_code"], ERR_NOT_REGISTERED);
@@ -233,20 +254,40 @@ async fn test_unauthenticated_socket_cannot_run_commands_on_nodes() {
         "from": "attacker", "to": "hub", "token": "guess"
     }))
     .await;
-    raw.send(command("attacker", "victim", "shell_exec", touch_command(&marker2))).await;
+    raw.send(command(
+        "attacker",
+        "victim",
+        "shell_exec",
+        touch_command(&marker2),
+    ))
+    .await;
     raw.expect_closed().await;
 
     // 3. Spoofs the victim's own identity without any registration.
     let marker3 = marker_path(&dir, "spoofed-victim");
     let mut raw = Raw::connect(&url).await;
-    raw.send(command("victim", "victim", "shell_exec", touch_command(&marker3))).await;
+    raw.send(command(
+        "victim",
+        "victim",
+        "shell_exec",
+        touch_command(&marker3),
+    ))
+    .await;
     raw.expect_closed().await;
 
     tokio::time::sleep(Duration::from_millis(500)).await;
     for m in [&marker, &marker2, &marker3] {
-        assert!(!m.exists(), "an unauthenticated command ran: {}", m.display());
+        assert!(
+            !m.exists(),
+            "an unauthenticated command ran: {}",
+            m.display()
+        );
     }
-    assert_eq!(victim.executed_commands_count(), 0, "the victim executed an unauthenticated command");
+    assert_eq!(
+        victim.executed_commands_count(),
+        0,
+        "the victim executed an unauthenticated command"
+    );
     assert_eq!(node_ids(&hub).await, vec!["victim".to_string()]);
 
     victim.close().await;
@@ -265,14 +306,21 @@ async fn test_pre_registration_frames_are_constrained() {
 
     // So is one whose first frame is garbage...
     let mut garbage = Raw::connect(&url).await;
-    garbage.ws.send(Message::Text("this is not json".into())).await.unwrap();
+    garbage
+        .ws
+        .send(Message::Text("this is not json".into()))
+        .await
+        .unwrap();
     garbage.expect_closed().await;
 
     // ...or absurdly large before it proved anything.
     let mut oversized = Raw::connect(&url).await;
     let _ = oversized
         .ws
-        .send(Message::Text(json!({ "type": "NodeRegistration", "from": "big", "pad": "x".repeat(200_000) }).to_string()))
+        .send(Message::Text(
+            json!({ "type": "NodeRegistration", "from": "big", "pad": "x".repeat(200_000) })
+                .to_string(),
+        ))
         .await;
     oversized.expect_closed().await;
 
@@ -286,14 +334,18 @@ async fn test_token_less_legacy_registration_still_works_on_a_loopback_hub_witho
 
     // Exactly what a pre-token client sends: no `token` member at all.
     let mut raw = Raw::connect(&url).await;
-    raw.send(json!({"type": "NodeRegistration", "from": "old-timer", "platform": "linux"})).await;
+    raw.send(json!({"type": "NodeRegistration", "from": "old-timer", "platform": "linux"}))
+        .await;
     let answer = raw.expect_json().await;
     assert_eq!(answer["type"], "NodeRegistrationAck");
     assert_eq!(answer["status"], "accepted");
 
     // A token sent to a hub that does not need one is simply ignored.
     let tokened = client(&url, "has-token").with_token("whatever");
-    tokened.connect().await.expect("a hub without a token accepts any registration");
+    tokened
+        .connect()
+        .await
+        .expect("a hub without a token accepts any registration");
 
     tokened.close().await;
     hub.stop().await;
@@ -308,14 +360,31 @@ async fn test_rest_endpoints_need_the_token_and_send_no_cors_headers() {
     for path in ["/api/nodes", "/api/status"] {
         let anon = http.get(format!("{base}{path}")).send().await.unwrap();
         assert_eq!(anon.status(), 401, "{path} must require the token");
-        let wrong = http.get(format!("{base}{path}")).bearer_auth("nope").send().await.unwrap();
+        let wrong = http
+            .get(format!("{base}{path}"))
+            .bearer_auth("nope")
+            .send()
+            .await
+            .unwrap();
         assert_eq!(wrong.status(), 401);
-        let ok = http.get(format!("{base}{path}")).bearer_auth(TOKEN).send().await.unwrap();
+        let ok = http
+            .get(format!("{base}{path}"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(ok.status(), 200);
     }
     // Liveness probes stay open.
     for path in ["/api/health", "/health"] {
-        assert_eq!(http.get(format!("{base}{path}")).send().await.unwrap().status(), 200);
+        assert_eq!(
+            http.get(format!("{base}{path}"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
     }
 
     // No permissive CORS: a page on another origin must not be allowed to read any response.
@@ -339,7 +408,10 @@ async fn test_rest_endpoints_need_the_token_and_send_no_cors_headers() {
         .send()
         .await
         .unwrap();
-    assert!(preflight.headers().get("access-control-allow-origin").is_none());
+    assert!(preflight
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
 
     hub.stop().await;
 }
@@ -351,7 +423,9 @@ async fn test_rest_endpoints_need_the_token_and_send_no_cors_headers() {
 #[allow(clippy::result_large_err)]
 async fn connect_with_origin(url: &str, origin: &str) -> Result<Ws, WsError> {
     let mut request = url.into_client_request().unwrap();
-    request.headers_mut().insert("Origin", HeaderValue::from_str(origin).unwrap());
+    request
+        .headers_mut()
+        .insert("Origin", HeaderValue::from_str(origin).unwrap());
     connect_async(request).await.map(|(ws, _)| ws)
 }
 
@@ -360,7 +434,12 @@ async fn test_foreign_browser_origin_is_refused_on_upgrade() {
     for config in [HubConfig::default(), token_config()] {
         let (hub, url, _) = start_hub(config).await;
 
-        for evil in ["https://evil.example", "http://192.168.1.50:8080", "null", "http://localhost.evil.example"] {
+        for evil in [
+            "https://evil.example",
+            "http://192.168.1.50:8080",
+            "null",
+            "http://localhost.evil.example",
+        ] {
             match connect_with_origin(&url, evil).await {
                 Err(WsError::Http(resp)) => assert_eq!(resp.status(), 403, "Origin {evil:?}"),
                 Err(other) => panic!("Origin {evil:?}: unexpected error {other}"),
@@ -370,7 +449,11 @@ async fn test_foreign_browser_origin_is_refused_on_upgrade() {
         assert!(node_ids(&hub).await.is_empty());
 
         // Loopback origins (a locally served tool) and native clients without Origin still work.
-        for ok in ["http://localhost:5173", "http://127.0.0.1:3000", "http://[::1]:8080"] {
+        for ok in [
+            "http://localhost:5173",
+            "http://127.0.0.1:3000",
+            "http://[::1]:8080",
+        ] {
             connect_with_origin(&url, ok)
                 .await
                 .unwrap_or_else(|e| panic!("loopback Origin {ok:?} must be allowed: {e}"));
@@ -395,17 +478,30 @@ async fn test_duplicate_node_id_is_nacked_and_the_original_keeps_its_route() {
     caller.connect().await.expect("caller");
 
     let usurper = client(&url, "dup-node");
-    let rej = rejection(usurper.connect().await.expect_err("second registration of a live id must fail"));
+    let rej = rejection(
+        usurper
+            .connect()
+            .await
+            .expect_err("second registration of a live id must fail"),
+    );
     assert_eq!(rej.error_code, ERR_DUPLICATE_NODE_ID);
     assert!(rej.reason.contains("dup-node"));
 
     // The usurper's socket was dropped; that must not evict the original (the old bug deleted the
     // newer session when the older socket closed, and the other way round).
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(node_ids(&hub).await, vec!["dup-caller".to_string(), "dup-node".to_string()]);
+    assert_eq!(
+        node_ids(&hub).await,
+        vec!["dup-caller".to_string(), "dup-node".to_string()]
+    );
 
     let res = caller
-        .send_command("dup-node", "echo", json!({"message": "still mine"}), Some(3000))
+        .send_command(
+            "dup-node",
+            "echo",
+            json!({"message": "still mine"}),
+            Some(3000),
+        )
         .await
         .expect("command to the original");
     match res {
@@ -420,12 +516,17 @@ async fn test_duplicate_node_id_is_nacked_and_the_original_keeps_its_route() {
 
     // Once the owner is gone the id is free again.
     original.close().await;
-    wait_until("dup-node to be released", Duration::from_secs(3), || async {
-        !node_ids(&hub).await.contains(&"dup-node".to_string())
-    })
+    wait_until(
+        "dup-node to be released",
+        Duration::from_secs(3),
+        || async { !node_ids(&hub).await.contains(&"dup-node".to_string()) },
+    )
     .await;
     let successor = client(&url, "dup-node");
-    successor.connect().await.expect("a released id can be registered again");
+    successor
+        .connect()
+        .await
+        .expect("a released id can be registered again");
 
     successor.close().await;
     caller.close().await;
@@ -464,11 +565,21 @@ async fn test_forged_from_is_rejected_for_every_envelope_type() {
 
     // Impersonating alice to make bob run a command.
     let marker = marker_path(&dir, "forged-command");
-    mallory.send(command("alice", "bob", "shell_exec", touch_command(&marker))).await;
+    mallory
+        .send(command(
+            "alice",
+            "bob",
+            "shell_exec",
+            touch_command(&marker),
+        ))
+        .await;
     let nack = mallory.expect_json().await;
     assert_eq!(nack["type"], "DeliveryNack");
     assert_eq!(nack["error_code"], ERR_SENDER_MISMATCH);
-    assert_eq!(nack["to"], "mallory", "the NACK must reach the real sender, not the forged identity");
+    assert_eq!(
+        nack["to"], "mallory",
+        "the NACK must reach the real sender, not the forged identity"
+    );
 
     // Every other envelope type is checked the same way.
     let corr = "forged-corr";
@@ -487,21 +598,36 @@ async fn test_forged_from_is_rejected_for_every_envelope_type() {
         let kind = forged["type"].as_str().unwrap().to_string();
         mallory.send(forged).await;
         let answer = mallory.expect_json().await;
-        assert_eq!(answer["error_code"], ERR_SENDER_MISMATCH, "forged {kind} was not rejected: {answer}");
+        assert_eq!(
+            answer["error_code"], ERR_SENDER_MISMATCH,
+            "forged {kind} was not rejected: {answer}"
+        );
     }
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!marker.exists(), "a forged command was executed");
     assert_eq!(bob.executed_commands_count(), 0);
-    assert!(bob.received_data_payloads().await.is_empty(), "a forged data payload reached bob");
+    assert!(
+        bob.received_data_payloads().await.is_empty(),
+        "a forged data payload reached bob"
+    );
 
     // Mallory may still use her own identity normally.
-    mallory.send(command("mallory", "bob", "echo", json!({"message": "honest"}))).await;
+    mallory
+        .send(command(
+            "mallory",
+            "bob",
+            "echo",
+            json!({"message": "honest"}),
+        ))
+        .await;
     let forwarded = mallory.expect_json().await;
     assert_eq!(forwarded["type"], "DeliveryAck");
-    wait_until("bob to run the honest command", Duration::from_secs(3), || async {
-        bob.executed_commands_count() == 1
-    })
+    wait_until(
+        "bob to run the honest command",
+        Duration::from_secs(3),
+        || async { bob.executed_commands_count() == 1 },
+    )
     .await;
 
     alice.close().await;
@@ -521,7 +647,14 @@ async fn test_forged_response_cannot_satisfy_someone_elses_pending_request() {
     let pending = {
         let alice = alice.clone();
         tokio::spawn(async move {
-            alice.send_command("slow-node", "echo", json!({"message": "ignored"}), Some(5000)).await
+            alice
+                .send_command(
+                    "slow-node",
+                    "echo",
+                    json!({"message": "ignored"}),
+                    Some(5000),
+                )
+                .await
         })
     };
 
@@ -562,7 +695,15 @@ async fn test_forged_response_cannot_satisfy_someone_elses_pending_request() {
 async fn test_reserved_and_malformed_node_ids_cannot_be_registered() {
     let (hub, url, _) = start_hub(token_config()).await;
 
-    for bad in ["hub", "grid", "grid-master", "all", "", "line\nbreak", &"n".repeat(500)] {
+    for bad in [
+        "hub",
+        "grid",
+        "grid-master",
+        "all",
+        "",
+        "line\nbreak",
+        &"n".repeat(500),
+    ] {
         let mut raw = Raw::connect(&url).await;
         let answer = raw.register(bad, Some(TOKEN)).await;
         assert_eq!(answer["type"], "DeliveryNack", "id {bad:?} was accepted");
@@ -587,24 +728,36 @@ async fn test_every_id_of_a_socket_is_released_when_it_disconnects() {
     }
     assert_eq!(
         node_ids(&hub).await,
-        vec!["multi-a", "multi-b", "multi-c", "probe"].into_iter().map(String::from).collect::<Vec<_>>()
+        vec!["multi-a", "multi-b", "multi-c", "probe"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
     );
 
     // Each of its ids can speak, and only its own.
-    multi.send(json!({"type": "Heartbeat", "from": "multi-c", "to": "hub", "correlation_id": "hb"})).await;
+    multi
+        .send(json!({"type": "Heartbeat", "from": "multi-c", "to": "hub", "correlation_id": "hb"}))
+        .await;
     assert_eq!(multi.expect_json().await["type"], "HeartbeatAck");
 
     drop(multi);
-    wait_until("all ids of the socket to disappear", Duration::from_secs(5), || async {
-        node_ids(&hub).await == vec!["probe".to_string()]
-    })
+    wait_until(
+        "all ids of the socket to disappear",
+        Duration::from_secs(5),
+        || async { node_ids(&hub).await == vec!["probe".to_string()] },
+    )
     .await;
 
     // No phantom entries: a request to a released id is answered with a NACK, not swallowed.
     for id in ["multi-a", "multi-b", "multi-c"] {
-        let res = probe.send_command(id, "ping", Value::Null, Some(2000)).await.expect("NACK expected");
+        let res = probe
+            .send_command(id, "ping", Value::Null, Some(2000))
+            .await
+            .expect("NACK expected");
         match res {
-            AgentMeshEnvelope::DeliveryNack { error_code, .. } => assert_eq!(error_code, "ERR_NODE_NOT_FOUND"),
+            AgentMeshEnvelope::DeliveryNack { error_code, .. } => {
+                assert_eq!(error_code, "ERR_NODE_NOT_FOUND")
+            }
             other => panic!("{id}: expected DeliveryNack, got {other:?}"),
         }
     }
@@ -631,24 +784,40 @@ async fn test_half_open_node_is_dropped_so_its_id_can_be_reclaimed() {
     let ghost = Raw::registered(&url, "ghost", None).await;
 
     // While the ghost still looks alive its id is protected...
-    let rej = rejection(client(&url, "ghost").connect().await.expect_err("live id must be protected"));
+    let rej = rejection(
+        client(&url, "ghost")
+            .connect()
+            .await
+            .expect_err("live id must be protected"),
+    );
     assert_eq!(rej.error_code, ERR_DUPLICATE_NODE_ID);
 
     // ...but it does not hold the id forever.
-    wait_until("the silent node to be dropped", Duration::from_secs(8), || async {
-        node_ids(&hub).await.is_empty()
-    })
+    wait_until(
+        "the silent node to be dropped",
+        Duration::from_secs(8),
+        || async { node_ids(&hub).await.is_empty() },
+    )
     .await;
     let reborn = client(&url, "ghost");
-    reborn.connect().await.expect("the id must be claimable after the ghost timed out");
+    reborn
+        .connect()
+        .await
+        .expect("the id must be claimable after the ghost timed out");
 
     // A healthy node answers pings, so being idle for longer than the timeout does not drop it.
     tokio::time::sleep(Duration::from_millis(2500)).await;
     assert_eq!(node_ids(&hub).await, vec!["ghost".to_string()]);
     let peer = client(&url, "peer");
     peer.connect().await.unwrap();
-    let res = peer.send_command("ghost", "ping", Value::Null, Some(3000)).await.unwrap();
-    assert!(matches!(res, AgentMeshEnvelope::CommandResponse { .. }), "{res:?}");
+    let res = peer
+        .send_command("ghost", "ping", Value::Null, Some(3000))
+        .await
+        .unwrap();
+    assert!(
+        matches!(res, AgentMeshEnvelope::CommandResponse { .. }),
+        "{res:?}"
+    );
 
     drop(ghost);
     reborn.close().await;
@@ -680,8 +849,14 @@ async fn test_slow_consumer_is_disconnected_instead_of_buffering_forever() {
         async move { !state.nodes.read().await.contains_key("victim") }
     };
     while !victim_gone(&hub).await {
-        assert!(sent < 2000, "the hub kept queueing {sent} x 100 KiB for a peer that reads nothing");
-        sender.send_data_payload("victim", &chunk).await.expect("send");
+        assert!(
+            sent < 2000,
+            "the hub kept queueing {sent} x 100 KiB for a peer that reads nothing"
+        );
+        sender
+            .send_data_payload("victim", &chunk)
+            .await
+            .expect("send");
         sent += 1;
         if sent % 10 == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -691,10 +866,22 @@ async fn test_slow_consumer_is_disconnected_instead_of_buffering_forever() {
     println!("victim disconnected after {sent} x 100 KiB sends (queue cap: 8 messages / 256 KiB)");
 
     // Everyone else is unaffected, and the dead peer's id answers with a NACK from now on.
-    let res = sender.send_command("healthy", "ping", Value::Null, Some(3000)).await.unwrap();
-    assert!(matches!(res, AgentMeshEnvelope::CommandResponse { .. }), "{res:?}");
-    let res = sender.send_command("victim", "ping", Value::Null, Some(3000)).await.unwrap();
-    assert!(matches!(res, AgentMeshEnvelope::DeliveryNack { .. }), "{res:?}");
+    let res = sender
+        .send_command("healthy", "ping", Value::Null, Some(3000))
+        .await
+        .unwrap();
+    assert!(
+        matches!(res, AgentMeshEnvelope::CommandResponse { .. }),
+        "{res:?}"
+    );
+    let res = sender
+        .send_command("victim", "ping", Value::Null, Some(3000))
+        .await
+        .unwrap();
+    assert!(
+        matches!(res, AgentMeshEnvelope::DeliveryNack { .. }),
+        "{res:?}"
+    );
     assert!(node_ids(&hub).await.contains(&"flooder".to_string()));
 
     drop(victim);
@@ -710,15 +897,24 @@ async fn test_slow_consumer_is_disconnected_instead_of_buffering_forever() {
 #[tokio::test]
 async fn test_hub_refuses_public_bind_without_token() {
     let hub = AgentMeshHub::new();
-    let err = hub.start("0.0.0.0:0").await.expect_err("public bind without token must fail");
+    let err = hub
+        .start("0.0.0.0:0")
+        .await
+        .expect_err("public bind without token must fail");
     assert!(err.to_string().contains("token"), "{err}");
 
     let with_token = AgentMeshHub::with_config(token_config());
-    with_token.start("0.0.0.0:0").await.expect("token allows a public bind");
+    with_token
+        .start("0.0.0.0:0")
+        .await
+        .expect("token allows a public bind");
     with_token.stop().await;
 
     let insecure = AgentMeshHub::with_config(HubConfig::default().with_insecure_bind(true));
-    insecure.start("0.0.0.0:0").await.expect("explicit opt-out allows a public bind");
+    insecure
+        .start("0.0.0.0:0")
+        .await
+        .expect("explicit opt-out allows a public bind");
     insecure.stop().await;
 }
 
@@ -732,7 +928,9 @@ mod cli {
 
     fn base(args: &[&str]) -> Command {
         let mut cmd = Command::new(BIN);
-        cmd.args(args).env_remove("OXIDE_MESH_TOKEN").kill_on_drop(true);
+        cmd.args(args)
+            .env_remove("OXIDE_MESH_TOKEN")
+            .kill_on_drop(true);
         cmd
     }
 
@@ -742,7 +940,11 @@ mod cli {
         if let Some(t) = env_token {
             cmd.env("OXIDE_MESH_TOKEN", t);
         }
-        let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("spawn agent-mesh hub");
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn agent-mesh hub");
         let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
         let url = tokio::time::timeout(Duration::from_secs(15), async {
             while let Some(line) = lines.next_line().await.expect("hub stdout") {
@@ -766,9 +968,15 @@ mod cli {
             .output()
             .await
             .expect("run agent-mesh");
-        assert!(!out.status.success(), "a public, unauthenticated hub must not start");
+        assert!(
+            !out.status.success(),
+            "a public, unauthenticated hub must not start"
+        );
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("--token") && stderr.contains("--insecure"), "unhelpful error: {stderr}");
+        assert!(
+            stderr.contains("--token") && stderr.contains("--insecure"),
+            "unhelpful error: {stderr}"
+        );
     }
 
     #[tokio::test]
@@ -792,25 +1000,50 @@ mod cli {
     #[tokio::test]
     async fn test_cli_subcommands_take_the_token_from_flag_or_environment() {
         // The hub itself is configured from OXIDE_MESH_TOKEN.
-        let (mut hub, url) = spawn_hub(&["hub", "--listen", "127.0.0.1:0"], Some("cli-secret-token-0123456789")).await;
+        let (mut hub, url) = spawn_hub(
+            &["hub", "--listen", "127.0.0.1:0"],
+            Some("cli-secret-token-0123456789"),
+        )
+        .await;
 
         // No token: refused with an actionable message.
-        let out = base(&["list", "--hub", &url]).stdin(Stdio::null()).output().await.unwrap();
-        assert!(!out.status.success(), "list without a token must fail");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("ERR_UNAUTHORIZED"), "unhelpful error: {stderr}");
-
-        // Wrong token via the flag.
-        let out = base(&["list", "--hub", &url, "--token", "wrong"]).stdin(Stdio::null()).output().await.unwrap();
-        assert!(!out.status.success());
-
-        // Right token via the flag.
-        let out = base(&["list", "--hub", &url, "--token", "cli-secret-token-0123456789"])
+        let out = base(&["list", "--hub", &url])
             .stdin(Stdio::null())
             .output()
             .await
             .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(!out.status.success(), "list without a token must fail");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("ERR_UNAUTHORIZED"),
+            "unhelpful error: {stderr}"
+        );
+
+        // Wrong token via the flag.
+        let out = base(&["list", "--hub", &url, "--token", "wrong"])
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .unwrap();
+        assert!(!out.status.success());
+
+        // Right token via the flag.
+        let out = base(&[
+            "list",
+            "--hub",
+            &url,
+            "--token",
+            "cli-secret-token-0123456789",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert!(String::from_utf8_lossy(&out.stdout).contains("Connected Nodes"));
 
         // Right token via the environment.
@@ -820,7 +1053,11 @@ mod cli {
             .output()
             .await
             .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
 
         let _ = hub.kill().await;
     }

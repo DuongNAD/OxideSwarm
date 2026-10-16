@@ -16,7 +16,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -60,15 +62,6 @@ fn is_process_alive(pid: u32) -> bool {
         ok != 0 && exit_code == STILL_ACTIVE
     }
 }
-
-#[cfg(not(windows))]
-fn is_process_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-
 
 /// Helper: construct test capabilities.
 fn make_test_capabilities(name: &str, cores: usize, has_gpu: bool) -> WorkerCapabilities {
@@ -818,6 +811,7 @@ pub fn add(a: i64, b: i64) -> i64 {
 // CHALLENGE 5: OS Process Tree Containment (Windows Job Objects & Subprocess Tree Lifecycle)
 // =========================================================================================
 
+#[cfg(windows)]
 #[tokio::test]
 async fn test_process_tree_containment_grandchild_processes_killed_on_worker_task_drop() {
     let temp_dir = tempfile::tempdir().expect("temp dir for containment test");
@@ -825,218 +819,215 @@ async fn test_process_tree_containment_grandchild_processes_killed_on_worker_tas
 
     let (runner, _tmp) = make_test_runner(false);
 
-    #[cfg(windows)]
-    {
-        let gc_script = temp_dir.path().join("grandchild_5a.ps1");
-        std::fs::write(
-            &gc_script,
-            "param([string]$PidFile)\n\
-             $gc1 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','Start-Sleep -Seconds 300' -PassThru\n\
-             [System.IO.File]::AppendAllText($PidFile, \"$($gc1.Id)`n\")\n\
-             Start-Sleep -Seconds 300\n",
-        )
-        .expect("write grandchild script");
+    let gc_script = temp_dir.path().join("grandchild_5a.ps1");
+    std::fs::write(
+        &gc_script,
+        "param([string]$PidFile)\n\
+         $gc1 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','Start-Sleep -Seconds 300' -PassThru\n\
+         [System.IO.File]::AppendAllText($PidFile, \"$($gc1.Id)`n\")\n\
+         Start-Sleep -Seconds 300\n",
+    )
+    .expect("write grandchild script");
 
-        let task_script = temp_dir.path().join("task_5a.ps1");
-        std::fs::write(
-            &task_script,
-            "param([string]$PidFile, [string]$GcScript)\n\
-             $c1 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File', $GcScript, $PidFile -PassThru\n\
-             $c2 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','Start-Sleep -Seconds 300' -PassThru\n\
-             [System.IO.File]::AppendAllText($PidFile, \"$($c1.Id)`n$($c2.Id)`n\")\n\
-             Start-Sleep -Seconds 300\n",
-        )
-        .expect("write task script");
+    let task_script = temp_dir.path().join("task_5a.ps1");
+    std::fs::write(
+        &task_script,
+        "param([string]$PidFile, [string]$GcScript)\n\
+         $c1 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File', $GcScript, $PidFile -PassThru\n\
+         $c2 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','Start-Sleep -Seconds 300' -PassThru\n\
+         [System.IO.File]::AppendAllText($PidFile, \"$($c1.Id)`n$($c2.Id)`n\")\n\
+         Start-Sleep -Seconds 300\n",
+    )
+    .expect("write task script");
 
-        let task = Task::new(
-            TaskSpec::Command {
-                program: "powershell.exe".into(),
-                args: vec![
-                    "-NoProfile".into(),
-                    "-ExecutionPolicy".into(),
-                    "Bypass".into(),
-                    "-File".into(),
-                    task_script.to_string_lossy().to_string(),
-                    pid_file.to_string_lossy().to_string(),
-                    gc_script.to_string_lossy().to_string(),
-                ],
-                env: HashMap::new(),
-                working_dir: None,
-                stdin: None,
-            },
-            TaskRequirements::generic(1, 300),
-        );
+    let task = Task::new(
+        TaskSpec::Command {
+            program: "powershell.exe".into(),
+            args: vec![
+                "-NoProfile".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-File".into(),
+                task_script.to_string_lossy().to_string(),
+                pid_file.to_string_lossy().to_string(),
+                gc_script.to_string_lossy().to_string(),
+            ],
+            env: HashMap::new(),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements::generic(1, 300),
+    );
 
-        let direct_pid = Arc::new(AtomicU32::new(0));
-        let direct_pid_clone = Arc::clone(&direct_pid);
+    let direct_pid = Arc::new(AtomicU32::new(0));
+    let direct_pid_clone = Arc::clone(&direct_pid);
 
-        // Spawn task in a background tokio task so we can abruptly drop/abort it
-        let handle = tokio::spawn(async move {
-            let _ = runner.execute_task(&task, Some(direct_pid_clone), None).await;
-        });
+    // Spawn task in a background tokio task so we can abruptly drop/abort it
+    let handle = tokio::spawn(async move {
+        let _ = runner
+            .execute_task(&task, Some(direct_pid_clone), None)
+            .await;
+    });
 
-
-        // Wait until all 3 PIDs (Child 1, Child 2, Grandchild 1) are recorded in pid_file
-        let start = Instant::now();
-        let mut pids = Vec::new();
-        while start.elapsed() < Duration::from_secs(15) {
-            if pid_file.exists() {
-                let content = std::fs::read_to_string(&pid_file).unwrap_or_default();
-                let parsed: Vec<u32> = content
-                    .lines()
-                    .filter_map(|l| l.trim().parse::<u32>().ok())
-                    .collect();
-                if parsed.len() >= 3 {
-                    pids = parsed;
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(
-            pids.len() >= 3,
-            "Timed out waiting for child and grandchild processes to start, got {:?}",
-            pids
-        );
-
-        let direct = direct_pid.load(Ordering::Acquire);
-        if direct != 0 {
-            pids.push(direct);
-        }
-
-        // Empirically verify that every spawned child and grandchild process is actively running in the OS
-        for &pid in &pids {
-            assert!(
-                is_process_alive(pid),
-                "Process {} should be alive in the OS process table before drop",
-                pid
-            );
-        }
-
-        // Abruptly drop the task future (simulating worker abort / cancellation)
-        handle.abort();
-        let _ = handle.await;
-
-        // Allow Windows kernel Job Object termination to complete
-        let cleanup_start = Instant::now();
-        let mut all_dead = false;
-        while cleanup_start.elapsed() < Duration::from_secs(5) {
-            if pids.iter().all(|&pid| !is_process_alive(pid)) {
-                all_dead = true;
+    // Wait until all 3 PIDs (Child 1, Child 2, Grandchild 1) are recorded in pid_file
+    let start = Instant::now();
+    let mut pids = Vec::new();
+    while start.elapsed() < Duration::from_secs(15) {
+        if pid_file.exists() {
+            let content = std::fs::read_to_string(&pid_file).unwrap_or_default();
+            let parsed: Vec<u32> = content
+                .lines()
+                .filter_map(|l| l.trim().parse::<u32>().ok())
+                .collect();
+            if parsed.len() >= 3 {
+                pids = parsed;
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        pids.len() >= 3,
+        "Timed out waiting for child and grandchild processes to start, got {:?}",
+        pids
+    );
 
-        // Empirical assertion: zero orphaned processes left behind!
-        for &pid in &pids {
-            assert!(
-                !is_process_alive(pid),
-                "ORPHAN PROCESS BUG: PID {} is still alive after worker task dropped!",
-                pid
-            );
-        }
+    let direct = direct_pid.load(Ordering::Acquire);
+    if direct != 0 {
+        pids.push(direct);
+    }
+
+    // Empirically verify that every spawned child and grandchild process is actively running in the OS
+    for &pid in &pids {
         assert!(
-            all_dead,
-            "Windows Job Object must cleanly terminate all child and grandchild processes upon drop"
+            is_process_alive(pid),
+            "Process {} should be alive in the OS process table before drop",
+            pid
         );
     }
+
+    // Abruptly drop the task future (simulating worker abort / cancellation)
+    handle.abort();
+    let _ = handle.await;
+
+    // Allow Windows kernel Job Object termination to complete
+    let cleanup_start = Instant::now();
+    let mut all_dead = false;
+    while cleanup_start.elapsed() < Duration::from_secs(5) {
+        if pids.iter().all(|&pid| !is_process_alive(pid)) {
+            all_dead = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Empirical assertion: zero orphaned processes left behind!
+    for &pid in &pids {
+        assert!(
+            !is_process_alive(pid),
+            "ORPHAN PROCESS BUG: PID {} is still alive after worker task dropped!",
+            pid
+        );
+    }
+    assert!(
+        all_dead,
+        "Windows Job Object must cleanly terminate all child and grandchild processes upon drop"
+    );
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn test_process_tree_containment_worker_process_abrupt_kill() {
-    #[cfg(windows)]
-    {
-        let temp_dir = tempfile::tempdir().expect("temp dir for worker kill test");
-        let pid_file = temp_dir.path().join("pids_5b.txt");
-        let worker_pid_file = temp_dir.path().join("worker_pid_5b.txt");
+    let temp_dir = tempfile::tempdir().expect("temp dir for worker kill test");
+    let pid_file = temp_dir.path().join("pids_5b.txt");
+    let worker_pid_file = temp_dir.path().join("worker_pid_5b.txt");
 
-        // Spawn a child process running this test binary in worker containment mode
-        let current_exe = std::env::current_exe().expect("current test exe");
-        let mut worker_child = std::process::Command::new(current_exe)
-            .arg("--")
-            .arg("test_worker_containment_helper_proc")
-            .arg("--exact")
-            .arg("--nocapture")
-            .env("OXIDE_CONTAINMENT_WORKER_MODE", "1")
-            .env("OXIDE_CONTAINMENT_PID_FILE", &pid_file)
-            .env("OXIDE_CONTAINMENT_WORKER_PID_FILE", &worker_pid_file)
-            .spawn()
-            .expect("spawn worker process");
+    // Spawn a child process running this test binary in worker containment mode
+    let current_exe = std::env::current_exe().expect("current test exe");
+    let mut worker_child = std::process::Command::new(current_exe)
+        .arg("--")
+        .arg("test_worker_containment_helper_proc")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("OXIDE_CONTAINMENT_WORKER_MODE", "1")
+        .env("OXIDE_CONTAINMENT_PID_FILE", &pid_file)
+        .env("OXIDE_CONTAINMENT_WORKER_PID_FILE", &worker_pid_file)
+        .spawn()
+        .expect("spawn worker process");
 
-        // Wait until child and grandchild PIDs are written
-        let start = Instant::now();
-        let mut pids = Vec::new();
-        while start.elapsed() < Duration::from_secs(20) {
-            if pid_file.exists() {
-                let content = std::fs::read_to_string(&pid_file).unwrap_or_default();
-                let parsed: Vec<u32> = content
-                    .lines()
-                    .filter_map(|l| l.trim().parse::<u32>().ok())
-                    .collect();
-                if parsed.len() >= 3 {
-                    pids = parsed;
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(
-            pids.len() >= 3,
-            "Timed out waiting for worker process to spawn child and grandchild tree, got {:?}",
-            pids
-        );
-
-        // Verify worker and all child/grandchild processes are actively running
-        let worker_id = worker_child.id();
-        assert!(
-            is_process_alive(worker_id),
-            "Worker process {} must be running",
-            worker_id
-        );
-        for &pid in &pids {
-            assert!(
-                is_process_alive(pid),
-                "Child/grandchild PID {} must be running",
-                pid
-            );
-        }
-
-        // ABRUPTLY TERMINATE the worker process (TerminateProcess / SIGKILL)
-        // This simulates a hard crash/OOM and does NOT allow any userland cleanup or drop handlers to run!
-        worker_child.kill().expect("forcibly kill worker process");
-        let _ = worker_child.wait();
-
-        // Verify worker is dead
-        assert!(!is_process_alive(worker_id));
-
-        // Wait for OS kernel to close the Job Object handle and terminate all member processes
-        let cleanup_start = Instant::now();
-        let mut all_dead = false;
-        while cleanup_start.elapsed() < Duration::from_secs(5) {
-            if pids.iter().all(|&pid| !is_process_alive(pid)) {
-                all_dead = true;
+    // Wait until child and grandchild PIDs are written
+    let start = Instant::now();
+    let mut pids = Vec::new();
+    while start.elapsed() < Duration::from_secs(20) {
+        if pid_file.exists() {
+            let content = std::fs::read_to_string(&pid_file).unwrap_or_default();
+            let parsed: Vec<u32> = content
+                .lines()
+                .filter_map(|l| l.trim().parse::<u32>().ok())
+                .collect();
+            if parsed.len() >= 3 {
+                pids = parsed;
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        pids.len() >= 3,
+        "Timed out waiting for worker process to spawn child and grandchild tree, got {:?}",
+        pids
+    );
 
-        // Assert 100% clean termination: zero orphaned processes!
-        for &pid in &pids {
-            assert!(
-                !is_process_alive(pid),
-                "ORPHAN PROCESS BUG: PID {} survived worker process abrupt termination!",
-                pid
-            );
-        }
+    // Verify worker and all child/grandchild processes are actively running
+    let worker_id = worker_child.id();
+    assert!(
+        is_process_alive(worker_id),
+        "Worker process {} must be running",
+        worker_id
+    );
+    for &pid in &pids {
         assert!(
-            all_dead,
-            "OS Job Object must terminate all child and grandchild processes on worker termination"
+            is_process_alive(pid),
+            "Child/grandchild PID {} must be running",
+            pid
         );
     }
+
+    // ABRUPTLY TERMINATE the worker process (TerminateProcess / SIGKILL)
+    // This simulates a hard crash/OOM and does NOT allow any userland cleanup or drop handlers to run!
+    worker_child.kill().expect("forcibly kill worker process");
+    let _ = worker_child.wait();
+
+    // Verify worker is dead
+    assert!(!is_process_alive(worker_id));
+
+    // Wait for OS kernel to close the Job Object handle and terminate all member processes
+    let cleanup_start = Instant::now();
+    let mut all_dead = false;
+    while cleanup_start.elapsed() < Duration::from_secs(5) {
+        if pids.iter().all(|&pid| !is_process_alive(pid)) {
+            all_dead = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Assert 100% clean termination: zero orphaned processes!
+    for &pid in &pids {
+        assert!(
+            !is_process_alive(pid),
+            "ORPHAN PROCESS BUG: PID {} survived worker process abrupt termination!",
+            pid
+        );
+    }
+    assert!(
+        all_dead,
+        "OS Job Object must terminate all child and grandchild processes on worker termination"
+    );
 }
 
 /// Helper test function invoked as a child process by `test_process_tree_containment_worker_process_abrupt_kill`.
+#[cfg(windows)]
 #[tokio::test]
 async fn test_worker_containment_helper_proc() {
     if std::env::var("OXIDE_CONTAINMENT_WORKER_MODE").is_err() {
@@ -1095,100 +1086,104 @@ async fn test_worker_containment_helper_proc() {
     runner.execute_task(&task, None, None).await;
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn test_process_tree_direct_windows_job_object_fanout() {
-    #[cfg(windows)]
-    {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let pid_file = temp_dir.path().join("fanout_pids.txt");
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let pid_file = temp_dir.path().join("fanout_pids.txt");
 
-        // PowerShell script spawning 5 distinct background sleep processes
-        let script = temp_dir.path().join("fanout.ps1");
-        std::fs::write(
-            &script,
-            "param([string]$PidFile)\n\
-             for ($i = 0; $i -lt 5; $i++) {\n\
-                 $p = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','Start-Sleep -Seconds 300' -PassThru\n\
-                 [System.IO.File]::AppendAllText($PidFile, \"$($p.Id)`n\")\n\
-             }\n\
-             Start-Sleep -Seconds 300\n",
-        )
-        .expect("write fanout script");
+    // PowerShell script spawning 5 distinct background sleep processes
+    let script = temp_dir.path().join("fanout.ps1");
+    std::fs::write(
+        &script,
+        "param([string]$PidFile)\n\
+         for ($i = 0; $i -lt 5; $i++) {\n\
+             $p = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','Start-Sleep -Seconds 300' -PassThru\n\
+             [System.IO.File]::AppendAllText($PidFile, \"$($p.Id)`n\")\n\
+         }\n\
+         Start-Sleep -Seconds 300\n",
+    )
+    .expect("write fanout script");
 
-        let (runner, _tmp) = make_test_runner(false);
-        let task = Task::new(
-            TaskSpec::Command {
-                program: "powershell.exe".into(),
-                args: vec![
-                    "-NoProfile".into(),
-                    "-ExecutionPolicy".into(),
-                    "Bypass".into(),
-                    "-File".into(),
-                    script.to_string_lossy().to_string(),
-                    pid_file.to_string_lossy().to_string(),
-                ],
-                env: HashMap::new(),
-                working_dir: None,
-                stdin: None,
-            },
-            TaskRequirements::generic(1, 300),
-        );
+    let (runner, _tmp) = make_test_runner(false);
+    let task = Task::new(
+        TaskSpec::Command {
+            program: "powershell.exe".into(),
+            args: vec![
+                "-NoProfile".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-File".into(),
+                script.to_string_lossy().to_string(),
+                pid_file.to_string_lossy().to_string(),
+            ],
+            env: HashMap::new(),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements::generic(1, 300),
+    );
 
-        let direct_pid = Arc::new(AtomicU32::new(0));
-        let direct_pid_clone = Arc::clone(&direct_pid);
+    let direct_pid = Arc::new(AtomicU32::new(0));
+    let direct_pid_clone = Arc::clone(&direct_pid);
 
-        let handle = tokio::spawn(async move {
-            let _ = runner.execute_task(&task, Some(direct_pid_clone), None).await;
-        });
+    let handle = tokio::spawn(async move {
+        let _ = runner
+            .execute_task(&task, Some(direct_pid_clone), None)
+            .await;
+    });
 
-        // Wait until all 5 PIDs are written
-        let start = Instant::now();
-        let mut pids = Vec::new();
-        while start.elapsed() < Duration::from_secs(15) {
-            if pid_file.exists() {
-                let content = std::fs::read_to_string(&pid_file).unwrap_or_default();
-                let parsed: Vec<u32> = content
-                    .lines()
-                    .filter_map(|l| l.trim().parse::<u32>().ok())
-                    .collect();
-                if parsed.len() >= 5 {
-                    pids = parsed;
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(pids.len() >= 5, "Expected 5 fanout PIDs, got {:?}", pids);
-
-        let direct = direct_pid.load(Ordering::Acquire);
-        if direct != 0 {
-            pids.push(direct);
-        }
-
-        for &pid in &pids {
-            assert!(is_process_alive(pid), "Process {} should be alive", pid);
-        }
-
-        // Abruptly terminate task future
-        handle.abort();
-        let _ = handle.await;
-
-        // Allow kernel to reap
-        let cleanup_start = Instant::now();
-        let mut all_dead = false;
-        while cleanup_start.elapsed() < Duration::from_secs(5) {
-            if pids.iter().all(|&pid| !is_process_alive(pid)) {
-                all_dead = true;
+    // Wait until all 5 PIDs are written
+    let start = Instant::now();
+    let mut pids = Vec::new();
+    while start.elapsed() < Duration::from_secs(15) {
+        if pid_file.exists() {
+            let content = std::fs::read_to_string(&pid_file).unwrap_or_default();
+            let parsed: Vec<u32> = content
+                .lines()
+                .filter_map(|l| l.trim().parse::<u32>().ok())
+                .collect();
+            if parsed.len() >= 5 {
+                pids = parsed;
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-
-        for &pid in &pids {
-            assert!(!is_process_alive(pid), "PID {} was not terminated by ProcessTree", pid);
-        }
-        assert!(all_dead, "All 5 fanout processes must be terminated");
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    assert!(pids.len() >= 5, "Expected 5 fanout PIDs, got {:?}", pids);
+
+    let direct = direct_pid.load(Ordering::Acquire);
+    if direct != 0 {
+        pids.push(direct);
+    }
+
+    for &pid in &pids {
+        assert!(is_process_alive(pid), "Process {} should be alive", pid);
+    }
+
+    // Abruptly terminate task future
+    handle.abort();
+    let _ = handle.await;
+
+    // Allow kernel to reap
+    let cleanup_start = Instant::now();
+    let mut all_dead = false;
+    while cleanup_start.elapsed() < Duration::from_secs(5) {
+        if pids.iter().all(|&pid| !is_process_alive(pid)) {
+            all_dead = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    for &pid in &pids {
+        assert!(
+            !is_process_alive(pid),
+            "PID {} was not terminated by ProcessTree",
+            pid
+        );
+    }
+    assert!(all_dead, "All 5 fanout processes must be terminated");
 }
 
 // =========================================================================================
@@ -1261,7 +1256,11 @@ async fn test_high_concurrency_encrypted_worker_registration_and_heartbeats() {
                 .expect("expected ack message");
 
             match ack {
-                MasterMessage::RegisterAck { accepted, worker_id: ack_wid, .. } => {
+                MasterMessage::RegisterAck {
+                    accepted,
+                    worker_id: ack_wid,
+                    ..
+                } => {
                     assert!(accepted, "Registration must be accepted");
                     assert_eq!(ack_wid, worker_id);
                 }
@@ -1288,7 +1287,10 @@ async fn test_high_concurrency_encrypted_worker_registration_and_heartbeats() {
                 worker_id,
                 reason: "stress test complete".into(),
             };
-            transport.send_msg(&disc_msg).await.expect("send disconnecting");
+            transport
+                .send_msg(&disc_msg)
+                .await
+                .expect("send disconnecting");
 
             // Drop transport cleanly
             drop(transport);
@@ -1429,8 +1431,14 @@ async fn test_adversarial_encrypted_wire_attacks() {
         };
         transport.send_msg(&reg).await.expect("send reg");
 
-        let ack = transport.recv_msg::<MasterMessage>().await.expect("recv ack");
-        assert!(matches!(ack, Some(MasterMessage::RegisterAck { accepted: true, .. })));
+        let ack = transport
+            .recv_msg::<MasterMessage>()
+            .await
+            .expect("recv ack");
+        assert!(matches!(
+            ack,
+            Some(MasterMessage::RegisterAck { accepted: true, .. })
+        ));
 
         // Craft valid heartbeat plaintext and encrypt manually
         let hb = WorkerMessage::Heartbeat {
@@ -1532,6 +1540,8 @@ async fn test_adversarial_encrypted_wire_attacks() {
         .into_iter()
         .filter(|w| w.status != rusty_grid_master::registry::WorkerStatus::Disconnected)
         .collect();
-    assert!(active_workers.is_empty(), "No rogue or corrupted workers should remain active");
+    assert!(
+        active_workers.is_empty(),
+        "No rogue or corrupted workers should remain active"
+    );
 }
-

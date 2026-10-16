@@ -17,13 +17,13 @@
 //!    - Rogue worker with invalid secret is rejected by master handshake without crashing master
 //!    - Repeated rapid start/stop cycles operate cleanly without resource leak or deadlocks
 
-use std::time::Duration;
 use oxideworker::{
     get_worker_status_impl, set_cluster_secret_impl, set_sandbox_dir_impl,
     start_worker_with_secret_impl, stop_worker_impl,
 };
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_master::server::{MasterServer, ServerConfig};
+use std::time::Duration;
 use tempfile::tempdir;
 
 static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -40,8 +40,8 @@ async fn test_adversarial_auth_bad_hex_characters() {
         "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEG", // G is not hex
         "1234567890abcdefghijklmnopqrstuvwxyz",
         "01234567 89abcdef 01234567 89abcdef 01234567 89abcdef 01234567 89abcdef", // interior whitespace
-        "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",       // 0x prefix is not raw hex
-        "😊0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",       // unicode emoji
+        "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", // 0x prefix is not raw hex
+        "😊0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", // unicode emoji
     ];
 
     for input in &bad_hex_inputs {
@@ -65,12 +65,12 @@ async fn test_adversarial_auth_truncated_hex() {
     stop_worker_impl();
 
     let truncated_inputs = [
-        "a",                                    // 1 char
-        "01",                                   // 2 chars = 1 byte (min is 16 bytes = 32 chars)
-        "0123456789",                           // 10 chars = 5 bytes
-        "0123456789abcdef0123456789",           // 26 chars = 13 bytes
-        "0123456789abcdef0123456789abcd",       // 30 chars = 15 bytes (1 byte short of minimum)
-        "0123456789abcdef0123456789abcde",      // 31 chars = odd length
+        "a",                               // 1 char
+        "01",                              // 2 chars = 1 byte (min is 16 bytes = 32 chars)
+        "0123456789",                      // 10 chars = 5 bytes
+        "0123456789abcdef0123456789",      // 26 chars = 13 bytes
+        "0123456789abcdef0123456789abcd",  // 30 chars = 15 bytes (1 byte short of minimum)
+        "0123456789abcdef0123456789abcde", // 31 chars = odd length
     ];
 
     for input in &truncated_inputs {
@@ -97,7 +97,10 @@ async fn test_adversarial_auth_65_char_hex() {
     assert_eq!(hex_65.len(), 65);
 
     let result = set_cluster_secret_impl(hex_65);
-    assert!(!result, "65-character hex input (odd length) must return false");
+    assert!(
+        !result,
+        "65-character hex input (odd length) must return false"
+    );
 
     let status = get_worker_status_impl();
     assert!(
@@ -147,17 +150,27 @@ async fn test_adversarial_auth_nonexistent_and_corrupt_file_paths() {
     // 2. Only comment lines
     let comment_file = temp_dir.path().join("comments_only.secret");
     std::fs::write(&comment_file, b"# line 1 comment\n# line 2 comment\n").unwrap();
-    assert!(!set_cluster_secret_impl(&comment_file.display().to_string()));
+    assert!(!set_cluster_secret_impl(
+        &comment_file.display().to_string()
+    ));
 
     // 3. Corrupt/non-hex characters in file
     let corrupt_file = temp_dir.path().join("corrupt.secret");
-    std::fs::write(&corrupt_file, b"this_file_contains_invalid_hex_characters\n").unwrap();
-    assert!(!set_cluster_secret_impl(&corrupt_file.display().to_string()));
+    std::fs::write(
+        &corrupt_file,
+        b"this_file_contains_invalid_hex_characters\n",
+    )
+    .unwrap();
+    assert!(!set_cluster_secret_impl(
+        &corrupt_file.display().to_string()
+    ));
 
     // 4. Truncated hex in file (10 bytes = 20 chars)
     let truncated_file = temp_dir.path().join("truncated.secret");
     std::fs::write(&truncated_file, b"0123456789abcdef0123\n").unwrap();
-    assert!(!set_cluster_secret_impl(&truncated_file.display().to_string()));
+    assert!(!set_cluster_secret_impl(
+        &truncated_file.display().to_string()
+    ));
 
     // 5. 65-character hex in file
     let file_65 = temp_dir.path().join("hex65.secret");
@@ -214,7 +227,9 @@ async fn test_adversarial_rapid_worker_connect_disconnect_against_authenticated_
     let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_cluster_secret(secret.clone())
         .with_handshake_timeout(3);
-    let master = MasterServer::spawn(server_config).await.expect("Spawn master");
+    let master = MasterServer::spawn(server_config)
+        .await
+        .expect("Spawn master");
     let master_addr = master.server_addr();
 
     // 1. Run 5 rapid connect/disconnect cycles

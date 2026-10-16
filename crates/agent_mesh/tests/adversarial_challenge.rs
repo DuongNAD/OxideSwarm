@@ -12,7 +12,9 @@ use sysinfo::{Pid, System};
 
 #[tokio::test]
 async fn test_rust_executor_non_zero_exit_and_stderr() {
-    let script_path = std::env::current_dir().unwrap().join(format!("test_fail_{}.py", uuid::Uuid::new_v4()));
+    let script_path = std::env::current_dir()
+        .unwrap()
+        .join(format!("test_fail_{}.py", uuid::Uuid::new_v4()));
     let script_content = r#"
 import sys
 sys.stdout.write("stdout_marker_123\n")
@@ -23,7 +25,10 @@ sys.exit(42)
 "#;
     fs::write(&script_path, script_content).expect("Failed to write test script");
 
-    let cmd_str = format!("python {}", script_path.file_name().unwrap().to_str().unwrap());
+    let cmd_str = format!(
+        "python {}",
+        script_path.file_name().unwrap().to_str().unwrap()
+    );
     let res = CommandExecutor::execute(
         "shell_exec",
         &serde_json::json!({"cmd": cmd_str}),
@@ -42,8 +47,12 @@ sys.exit(42)
 
 #[tokio::test]
 async fn test_rust_executor_timeout_process_survival() {
-    let pid_file = std::env::current_dir().unwrap().join(format!("timeout_pid_{}.txt", uuid::Uuid::new_v4()));
-    let script_path = std::env::current_dir().unwrap().join(format!("test_hang_{}.py", uuid::Uuid::new_v4()));
+    let pid_file = std::env::current_dir()
+        .unwrap()
+        .join(format!("timeout_pid_{}.txt", uuid::Uuid::new_v4()));
+    let script_path = std::env::current_dir()
+        .unwrap()
+        .join(format!("test_hang_{}.py", uuid::Uuid::new_v4()));
 
     let script_content = format!(
         r#"
@@ -60,7 +69,10 @@ time.sleep(10)
     );
     fs::write(&script_path, script_content).expect("Failed to write test script");
 
-    let cmd_str = format!("python {}", script_path.file_name().unwrap().to_str().unwrap());
+    let cmd_str = format!(
+        "python {}",
+        script_path.file_name().unwrap().to_str().unwrap()
+    );
     println!("Executing command with timeout 1000ms: {}", cmd_str);
 
     // Timeout of 1000 ms on a 10-second sleep
@@ -140,7 +152,11 @@ async fn test_rust_executor_direct_hung_command_kill() {
     assert_eq!(res.status, "timeout");
     assert_eq!(res.exit_code, 124);
     assert!(res.stderr.contains("1000 ms"));
-    assert!(elapsed.as_millis() < 4000, "Direct command was not terminated upon timeout! Took {:?}", elapsed);
+    assert!(
+        elapsed.as_millis() < 4000,
+        "Direct command was not terminated upon timeout! Took {:?}",
+        elapsed
+    );
 }
 
 #[tokio::test]
@@ -163,14 +179,22 @@ async fn test_rust_bidirectional_burst_stress() {
     }
     let expected_fwd_hash = compute_sha256(&payload_64k);
 
-    let (_, fwd_hash) = node1.send_data_payload("rust-stress-and-3", &payload_64k).await.expect("send forward");
+    let (_, fwd_hash) = node1
+        .send_data_payload("rust-stress-and-3", &payload_64k)
+        .await
+        .expect("send forward");
     assert_eq!(fwd_hash, expected_fwd_hash);
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let rec_node3 = node3.received_data_payloads().await;
     assert_eq!(rec_node3.len(), 1);
-    if let AgentMeshEnvelope::DataPayload { data, checksum_sha256, .. } = &rec_node3[0] {
+    if let AgentMeshEnvelope::DataPayload {
+        data,
+        checksum_sha256,
+        ..
+    } = &rec_node3[0]
+    {
         let rec_bytes: Vec<u8> = data.as_ref().unwrap().chars().map(|c| c as u8).collect();
         assert_eq!(rec_bytes.len(), 65536);
         assert!(verify_sha256(&rec_bytes, checksum_sha256.as_ref().unwrap()));
@@ -184,14 +208,22 @@ async fn test_rust_bidirectional_burst_stress() {
     }
     let expected_rev_hash = compute_sha256(&payload_rev);
 
-    let (_, rev_hash) = node3.send_data_payload("rust-stress-win-1", &payload_rev).await.expect("send reverse");
+    let (_, rev_hash) = node3
+        .send_data_payload("rust-stress-win-1", &payload_rev)
+        .await
+        .expect("send reverse");
     assert_eq!(rev_hash, expected_rev_hash);
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let rec_node1 = node1.received_data_payloads().await;
     assert_eq!(rec_node1.len(), 1);
-    if let AgentMeshEnvelope::DataPayload { data, checksum_sha256, .. } = &rec_node1[0] {
+    if let AgentMeshEnvelope::DataPayload {
+        data,
+        checksum_sha256,
+        ..
+    } = &rec_node1[0]
+    {
         let rec_bytes: Vec<u8> = data.as_ref().unwrap().chars().map(|c| c as u8).collect();
         assert_eq!(rec_bytes.len(), 65536);
         assert!(verify_sha256(&rec_bytes, checksum_sha256.as_ref().unwrap()));
@@ -201,10 +233,14 @@ async fn test_rust_bidirectional_burst_stress() {
     // 3. High throughput burst: 100 packets (50 fwd, 50 rev)
     for i in 0..50 {
         let fwd_chunk = format!("burst-fwd-{}-{}", i, i * 7).into_bytes();
-        let _ = node1.send_data_payload("rust-stress-and-3", &fwd_chunk).await;
+        let _ = node1
+            .send_data_payload("rust-stress-and-3", &fwd_chunk)
+            .await;
 
         let rev_chunk = format!("burst-rev-{}-{}", i, i * 13).into_bytes();
-        let _ = node3.send_data_payload("rust-stress-win-1", &rev_chunk).await;
+        let _ = node3
+            .send_data_payload("rust-stress-win-1", &rev_chunk)
+            .await;
     }
 
     tokio::time::sleep(Duration::from_millis(500)).await;

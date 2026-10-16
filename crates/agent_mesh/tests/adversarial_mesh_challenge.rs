@@ -9,9 +9,7 @@
 //! 4. High-frequency rapid node churn (registration / deregistration)
 //! 5. High-throughput message bursts and large payload boundary testing
 
-use agent_mesh::{
-    compute_sha256, verify_sha256, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub,
-};
+use agent_mesh::{compute_sha256, verify_sha256, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,7 +17,10 @@ use std::time::Duration;
 /// Helper to spin up a hub on an ephemeral port
 async fn spawn_test_hub() -> (AgentMeshHub, String) {
     let hub = AgentMeshHub::new();
-    let port = hub.start("127.0.0.1:0").await.expect("Failed to start test hub");
+    let port = hub
+        .start("127.0.0.1:0")
+        .await
+        .expect("Failed to start test hub");
     let hub_url = format!("ws://127.0.0.1:{}/ws", port);
     (hub, hub_url)
 }
@@ -38,8 +39,16 @@ async fn test_adv_node1_to_node3_command_flow() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Verify all 3 registered in catalog
-    let catalog = node1.query_node_list(Some(3000)).await.expect("Catalog query failed");
-    assert_eq!(catalog.len(), 3, "Expected 3 nodes in catalog, found {}", catalog.len());
+    let catalog = node1
+        .query_node_list(Some(3000))
+        .await
+        .expect("Catalog query failed");
+    assert_eq!(
+        catalog.len(),
+        3,
+        "Expected 3 nodes in catalog, found {}",
+        catalog.len()
+    );
 
     // 1. Echo Command
     let echo_res = node1
@@ -72,7 +81,12 @@ async fn test_adv_node1_to_node3_command_flow() {
 
     // 2. Ping Command
     let ping_res = node1
-        .send_command("adv-node-android-3", "ping", serde_json::Value::Null, Some(3000))
+        .send_command(
+            "adv-node-android-3",
+            "ping",
+            serde_json::Value::Null,
+            Some(3000),
+        )
         .await
         .expect("Ping command failed");
 
@@ -96,18 +110,39 @@ async fn test_adv_node1_to_node3_command_flow() {
         .expect("Subprocess command failed");
 
     match shell_res {
-        AgentMeshEnvelope::CommandResponse { status, exit_code, stdout, .. } => {
+        AgentMeshEnvelope::CommandResponse {
+            status,
+            exit_code,
+            stdout,
+            ..
+        } => {
             assert_eq!(status, "success");
             assert_eq!(exit_code, 0);
-            assert!(stdout.contains("ADV_SUBPROCESS_OK"), "Unexpected stdout: {}", stdout);
+            assert!(
+                stdout.contains("ADV_SUBPROCESS_OK"),
+                "Unexpected stdout: {}",
+                stdout
+            );
         }
         other => panic!("Expected CommandResponse for shell_exec, got {:?}", other),
     }
 
     // Strict isolation verification
-    assert_eq!(node3.executed_commands_count(), 3, "Node 3 should have executed 3 commands");
-    assert_eq!(node2.executed_commands_count(), 0, "Node 2 isolation breached! Count > 0");
-    assert_eq!(node1.executed_commands_count(), 0, "Node 1 isolation breached! Count > 0");
+    assert_eq!(
+        node3.executed_commands_count(),
+        3,
+        "Node 3 should have executed 3 commands"
+    );
+    assert_eq!(
+        node2.executed_commands_count(),
+        0,
+        "Node 2 isolation breached! Count > 0"
+    );
+    assert_eq!(
+        node1.executed_commands_count(),
+        0,
+        "Node 1 isolation breached! Count > 0"
+    );
 
     node1.close().await;
     node2.close().await;
@@ -150,8 +185,14 @@ async fn test_adv_strict_node_isolation_under_heavy_concurrency() {
 
     let mut successful_responses = 0;
     for h in handles {
-        let res = h.await.expect("Task join failed").expect("Command send failed");
-        if let AgentMeshEnvelope::CommandResponse { status, exit_code, .. } = res {
+        let res = h
+            .await
+            .expect("Task join failed")
+            .expect("Command send failed");
+        if let AgentMeshEnvelope::CommandResponse {
+            status, exit_code, ..
+        } = res
+        {
             assert_eq!(status, "success");
             assert_eq!(exit_code, 0);
             successful_responses += 1;
@@ -204,28 +245,49 @@ async fn test_adv_negative_routing_delivery_nack() {
 
     // Test 1: Nonexistent ASCII ID
     let res1 = client
-        .send_command("ghost-node-404", "ping", serde_json::Value::Null, Some(3000))
+        .send_command(
+            "ghost-node-404",
+            "ping",
+            serde_json::Value::Null,
+            Some(3000),
+        )
         .await
         .expect("Command send failed");
 
     match res1 {
-        AgentMeshEnvelope::DeliveryNack { error_code, reason, to, from, .. } => {
+        AgentMeshEnvelope::DeliveryNack {
+            error_code,
+            reason,
+            to,
+            from,
+            ..
+        } => {
             assert_eq!(error_code, "ERR_NODE_NOT_FOUND");
             assert_eq!(to, "adv-caller");
             assert_eq!(from, "hub");
             assert!(reason.contains("ghost-node-404"));
         }
-        other => panic!("Expected DeliveryNack for nonexistent node, got {:?}", other),
+        other => panic!(
+            "Expected DeliveryNack for nonexistent node, got {:?}",
+            other
+        ),
     }
 
     // Test 2: Unicode Nonexistent ID
     let res2 = client
-        .send_command("nonexistent-🚀-node", "echo", serde_json::json!({"message": "test"}), Some(3000))
+        .send_command(
+            "nonexistent-🚀-node",
+            "echo",
+            serde_json::json!({"message": "test"}),
+            Some(3000),
+        )
         .await
         .expect("Command send failed");
 
     match res2 {
-        AgentMeshEnvelope::DeliveryNack { error_code, reason, .. } => {
+        AgentMeshEnvelope::DeliveryNack {
+            error_code, reason, ..
+        } => {
             assert_eq!(error_code, "ERR_NODE_NOT_FOUND");
             assert!(reason.contains("nonexistent-🚀-node"));
         }
@@ -251,11 +313,17 @@ async fn test_adv_rapid_node_churn() {
     let (hub, hub_url) = spawn_test_hub().await;
 
     let base_node = AgentMeshClient::new(&hub_url, "stable-anchor", "windows");
-    base_node.connect().await.expect("Base anchor failed to connect");
+    base_node
+        .connect()
+        .await
+        .expect("Base anchor failed to connect");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Initial catalog should have 1 node
-    let cat_init = base_node.query_node_list(Some(3000)).await.expect("Init query failed");
+    let cat_init = base_node
+        .query_node_list(Some(3000))
+        .await
+        .expect("Init query failed");
     assert_eq!(cat_init.len(), 1);
 
     // Rapidly connect and disconnect 30 nodes sequentially
@@ -281,9 +349,7 @@ async fn test_adv_rapid_node_churn() {
     let mut connect_handles = Vec::new();
     for c in &churn_clients {
         let client_clone = c.clone();
-        connect_handles.push(tokio::spawn(async move {
-            client_clone.connect().await
-        }));
+        connect_handles.push(tokio::spawn(async move { client_clone.connect().await }));
     }
 
     for h in connect_handles {
@@ -294,7 +360,10 @@ async fn test_adv_rapid_node_churn() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Verify catalog size: anchor + 10 = 11 nodes
-    let cat_churn = base_node.query_node_list(Some(3000)).await.expect("Churn query failed");
+    let cat_churn = base_node
+        .query_node_list(Some(3000))
+        .await
+        .expect("Churn query failed");
     assert_eq!(
         cat_churn.len(),
         1 + concurrent_count,
@@ -309,7 +378,10 @@ async fn test_adv_rapid_node_churn() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Final catalog should return to just the anchor node
-    let cat_final = base_node.query_node_list(Some(3000)).await.expect("Final query failed");
+    let cat_final = base_node
+        .query_node_list(Some(3000))
+        .await
+        .expect("Final query failed");
     assert_eq!(
         cat_final.len(),
         1,
@@ -347,7 +419,10 @@ async fn test_adv_rapid_message_burst() {
         let cf = counter_fwd.clone();
         send_handles.push(tokio::spawn(async move {
             let data = format!("BURST-FWD-{}-{}", i, "X".repeat(512)).into_bytes();
-            let (_corr, hash) = n1.send_data_payload("burst-node-3", &data).await.expect("Send failed");
+            let (_corr, hash) = n1
+                .send_data_payload("burst-node-3", &data)
+                .await
+                .expect("Send failed");
             cf.fetch_add(1, Ordering::SeqCst);
             hash
         }));
@@ -359,7 +434,10 @@ async fn test_adv_rapid_message_burst() {
         let cr = counter_rev.clone();
         send_handles.push(tokio::spawn(async move {
             let data = format!("BURST-REV-{}-{}", i, "Y".repeat(512)).into_bytes();
-            let (_corr, hash) = n3.send_data_payload("burst-node-1", &data).await.expect("Send failed");
+            let (_corr, hash) = n3
+                .send_data_payload("burst-node-1", &data)
+                .await
+                .expect("Send failed");
             cr.fetch_add(1, Ordering::SeqCst);
             hash
         }));
@@ -379,8 +457,18 @@ async fn test_adv_rapid_message_burst() {
     let rec1 = node1.received_data_payloads().await;
     let rec2 = node2.received_data_payloads().await;
 
-    assert_eq!(rec3.len(), 50, "Node 3 did not receive all 50 forward packets (got {})", rec3.len());
-    assert_eq!(rec1.len(), 50, "Node 1 did not receive all 50 reverse packets (got {})", rec1.len());
+    assert_eq!(
+        rec3.len(),
+        50,
+        "Node 3 did not receive all 50 forward packets (got {})",
+        rec3.len()
+    );
+    assert_eq!(
+        rec1.len(),
+        50,
+        "Node 1 did not receive all 50 reverse packets (got {})",
+        rec1.len()
+    );
     assert_eq!(
         rec2.len(),
         0,
@@ -429,9 +517,18 @@ async fn test_adv_large_payload_boundaries() {
             ..
         } = last_rec
         {
-            assert_eq!(*chunk_size_bytes, size, "Chunk size mismatch for size {}", size);
+            assert_eq!(
+                *chunk_size_bytes, size,
+                "Chunk size mismatch for size {}",
+                size
+            );
             let rec_bytes: Vec<u8> = data.as_ref().unwrap().chars().map(|c| c as u8).collect();
-            assert_eq!(rec_bytes.len(), size, "Received byte count mismatch for size {}", size);
+            assert_eq!(
+                rec_bytes.len(),
+                size,
+                "Received byte count mismatch for size {}",
+                size
+            );
             assert_eq!(
                 checksum_sha256.as_deref(),
                 Some(expected_hash.as_str()),

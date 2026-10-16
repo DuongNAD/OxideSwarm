@@ -297,7 +297,6 @@ pub struct MasterArgs {
     pub max_pending_handshakes: Option<usize>,
 }
 
-
 #[derive(Parser, Debug, Clone)]
 pub struct WorkerArgs {
     #[arg(
@@ -813,14 +812,11 @@ async fn run_master(
         if parts.len() >= 3 {
             let token = parts[0];
             let name = parts[1];
-            let scopes: Vec<rusty_grid_master::auth::AuthScope> = parts[2]
-                .split(',')
-                .filter_map(|s| s.parse().ok())
-                .collect();
+            let scopes: Vec<rusty_grid_master::auth::AuthScope> =
+                parts[2].split(',').filter_map(|s| s.parse().ok()).collect();
             server_config.auth_config.add_token(token, name, &scopes);
         }
     }
-
 
     let sched_config = SchedulerConfig {
         preserve_gpu_for_gpu_tasks: preserve_gpu,
@@ -1078,20 +1074,17 @@ async fn run_worker(
     );
 
     // A misspelt priority must not silently run tasks at full priority on the owner's machine.
-    let task_priority = match resolve_opt_string(
-        args.task_priority,
-        &["RUSTY_GRID_TASK_PRIORITY"],
-        None,
-    )
-    .map(|text| text.parse::<ProcessPriority>())
-    {
-        Some(Ok(priority)) => Some(priority),
-        Some(Err(e)) => {
-            eprintln!("--task-priority: {e}");
-            return ExitCode::FAILURE;
-        }
-        None => None,
-    };
+    let task_priority =
+        match resolve_opt_string(args.task_priority, &["RUSTY_GRID_TASK_PRIORITY"], None)
+            .map(|text| text.parse::<ProcessPriority>())
+        {
+            Some(Ok(priority)) => Some(priority),
+            Some(Err(e)) => {
+                eprintln!("--task-priority: {e}");
+                return ExitCode::FAILURE;
+            }
+            None => None,
+        };
 
     let keep_sandboxes = resolve_bool(
         if args.keep_sandboxes {
@@ -1647,7 +1640,10 @@ async fn run_status(
                             val
                         })
                         .collect();
-                    println!("{}", serde_json::to_string_pretty(&enriched_workers).unwrap());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&enriched_workers).unwrap()
+                    );
                 } else {
                     println!("Connected Workers ({}):", workers.len());
                     for w in &workers {
@@ -2116,7 +2112,11 @@ mod tests {
             Commands::Worker(a) => a.task_priority,
             other => panic!("unexpected {other:?}"),
         };
-        assert_eq!(priority_of(&["worker"]), None, "unset: the library default applies");
+        assert_eq!(
+            priority_of(&["worker"]),
+            None,
+            "unset: the library default applies"
+        );
         let given = priority_of(&["worker", "--task-priority", "idle"]).unwrap();
         assert_eq!(given.parse::<ProcessPriority>(), Ok(ProcessPriority::Idle));
         let misspelt = priority_of(&["worker", "--task-priority", "realtime"]).unwrap();

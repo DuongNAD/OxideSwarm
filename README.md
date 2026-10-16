@@ -84,7 +84,7 @@ Apple Silicon MacBooks, Windows gaming PCs, Android phones and Linux servers.
 | **14. Mid-task checkpointing** | `WorkerMessage::Checkpoint` / `MasterMessage::AssignTaskWithCheckpoint`; reassigned workers resume from the last delta. | Implemented + tests |
 | **15. GPU compute (`wgpu`)** | `cargo build --release --bin oxideswarm --features gpu-wgpu` gives a worker that multiplies matrices on the machine's GPU (Metal on macOS, Vulkan / DirectX 12 on Windows and Linux; discrete GPU prioritized over integrated), checks the product against a sampled CPU recomputation and reports `Status: VERIFIED_OK` only if that check passed. A `GpuCompute` task is a **seeded `simulated_matrix_dim` x `simulated_matrix_dim` GEMM** tiled by `work_group_size`. A GPU error, device loss or driver panic fails that task with an explicit message and the engine is rebuilt for the next one. A worker never runs a real-GPU task on the CPU: the CPU path is the labelled `--simulate-gpu` test mode only. Run benchmark with `cargo run --release -p rusty_grid_worker --features gpu-wgpu --example gemm_bench -- 1024`. | Implemented + tests (verified on Metal & Vulkan) |
 | **16. Security** | Shared-secret mutual authentication on the cluster port (TCP and P2P) and on the UDP beacon; authenticated TCP stream encryption via ChaCha20-Poly1305 (`0x04`) with directional keys derived from `cluster.secret`; token-protected, same-origin dashboard; agent-mesh hub token. See [docs/SECURITY.md](docs/SECURITY.md). | Implemented + tests |
-| **17. Agent Mesh ↔ Grid bridge** | `AgentGridBridge` connects `agent-mesh hub` to the Master Grid (`--grid-master <ADDR>`) routing `grid_compute` / `grid_compile` / `grid_submit` / `grid_status` envelopes directly to the compute grid. When unconfigured, returns `ERR_BRIDGE_NOT_CONFIGURED`. | Implemented + tests |
+| **17. Agent Mesh ↔ Grid bridge** | `AgentGridBridge` lets `agent-mesh hub` run a Master Grid of its own (`--grid-master <ADDR>` starts an embedded master; off loopback it needs a cluster secret or `--insecure`) and routes `grid_compute` / `grid_compile` / `grid_submit` / `grid_status` envelopes to it. When unconfigured, returns `ERR_BRIDGE_NOT_CONFIGURED`. | Implemented + tests |
 
 ---
 
@@ -439,11 +439,14 @@ python3 scripts/agent_node.py --hub ws://127.0.0.1:8090/ws --id node-android-3 -
 
 #### Master Grid Runtime Integration (`--grid-master`)
 
-The agent mesh hub can embed or connect to a live Master Grid coordinator via the `--grid-master [ADDR]` flag:
+`--grid-master [ADDR]` makes the hub start its own embedded Master Grid coordinator on `ADDR`. It does not connect
+to a master that is already running, so give it a free port. A non-loopback `ADDR` needs a cluster secret
+(`--secret` / `OXIDESWARM_SECRET`, else the default `~/.oxideswarm/cluster.secret`) or an explicit `--insecure`:
+the hub refuses to start an unauthenticated master that the network can reach.
 
 ```bash
-# Start the hub with embedded master server integration on 127.0.0.1:8088:
-./target/release/agent-mesh hub --listen 127.0.0.1:8090 --grid-master 127.0.0.1:8088
+# Start the hub with an embedded master on 127.0.0.1:9088 (loopback, so no secret is needed):
+./target/release/agent-mesh hub --listen 127.0.0.1:8090 --grid-master 127.0.0.1:9088
 
 # When --grid-master is configured, agent mesh nodes can dispatch compute envelopes:
 # grid_compute, grid_compile, grid_submit, and grid_status execute end-to-end against the grid.

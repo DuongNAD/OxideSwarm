@@ -80,12 +80,12 @@ The Hub also answers plain HTTP on the same port. When a token is configured, `/
 - **Health Check:** `http://127.0.0.1:8090/api/health`
 
 ### Option C: Launching with Master Grid Integration (`--grid-master`)
-Through the embedded `AgentGridBridge`, the hub can bridge agent tasks directly into the OxideSwarm Master Grid without external shims:
+Through the embedded `AgentGridBridge`, the hub can run agent tasks on a Master Grid of its own without external shims. `--grid-master ADDR` starts that embedded master on `ADDR`; it does not connect to a master that is already running, so pick a free port:
 ```bash
-# Launch Hub with Master Grid Bridge enabled
-./target/release/agent-mesh hub --listen 0.0.0.0:8090 --token "$OXIDE_MESH_TOKEN" --grid-master 127.0.0.1:8088
+# Launch Hub with an embedded Master Grid on 127.0.0.1:9088
+./target/release/agent-mesh hub --listen 0.0.0.0:8090 --token "$OXIDE_MESH_TOKEN" --grid-master 127.0.0.1:9088
 ```
-When `--grid-master` is provided, agent envelopes containing grid actions (`grid_submit`, `grid_compute`, `grid_compile`, `grid_status`) are forwarded directly to the compute grid. If omitted, the hub operates in standalone messaging mode and grid commands return `ERR_BRIDGE_NOT_CONFIGURED`.
+When `--grid-master` is provided, agent envelopes containing grid actions (`grid_submit`, `grid_compute`, `grid_compile`, `grid_status`) become tasks on that embedded master, whose workers connect to `ADDR` as to any master. A non-loopback `ADDR` needs a cluster secret (`--secret` / `OXIDESWARM_SECRET`, else the default `~/.oxideswarm/cluster.secret`) or an explicit `--insecure`. If omitted, the hub operates in standalone messaging mode and grid commands return `ERR_BRIDGE_NOT_CONFIGURED`.
 
 ---
 
@@ -307,7 +307,7 @@ The crate tests cover:
 
 | Subcommand | Flags | Description |
 |---|---|---|
-| `hub` | `--listen <ADDR>`, `--token <TOKEN>`, `--insecure`, `--grid-master [ADDR]` | Starts the WebSocket Relay Hub (default listen `127.0.0.1:8088`; `--grid-master` bridges agent tasks to Master Grid) |
+| `hub` | `--listen <ADDR>`, `--token <TOKEN>`, `--insecure`, `--grid-master [ADDR]` | Starts the WebSocket Relay Hub (default listen `127.0.0.1:8088`; `--grid-master` starts an embedded Master Grid for agent tasks; off loopback it needs a cluster secret or `--insecure`) |
 | `node` | `--hub <URL>`, `--id <NAME>`, `--platform <TAG>`, `--token <TOKEN>` | Starts an agent node client connected to the Hub |
 | `send` | `--hub <URL>`, `--from <ID>`, `--to <TARGET>`, `--command <CMD>`, `--args <JSON>`, `--timeout-ms <MS>`, `--token <TOKEN>` | Sends a command to a specific node and prints execution output |
 | `list` | `--hub <URL>`, `--from <ID>`, `--token <TOKEN>` | Prints all currently online nodes registered with the Hub |

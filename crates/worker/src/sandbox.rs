@@ -36,14 +36,19 @@ pub fn resolve_default_base_dir(
     if let Some(dir) = non_empty(SANDBOX_BASE_DIR_ENV) {
         return PathBuf::from(dir);
     }
-    let temp = non_empty("TMPDIR").map(PathBuf::from).unwrap_or(platform_temp);
+    let temp = non_empty("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or(platform_temp);
     temp.join("rusty_grid").join("sandboxes")
 }
 
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            base_dir: resolve_default_base_dir(|name| std::env::var(name).ok(), std::env::temp_dir()),
+            base_dir: resolve_default_base_dir(
+                |name| std::env::var(name).ok(),
+                std::env::temp_dir(),
+            ),
             keep_sandboxes: false,
         }
     }
@@ -71,8 +76,14 @@ impl SandboxConfig {
             path: self.base_dir.clone(),
             source,
         };
-        tokio::fs::create_dir_all(&self.base_dir).await.map_err(unusable)?;
-        let probe = self.base_dir.join(format!(".write_probe_{}_{}", std::process::id(), TaskId::new()));
+        tokio::fs::create_dir_all(&self.base_dir)
+            .await
+            .map_err(unusable)?;
+        let probe = self.base_dir.join(format!(
+            ".write_probe_{}_{}",
+            std::process::id(),
+            TaskId::new()
+        ));
         tokio::fs::write(&probe, b"probe").await.map_err(unusable)?;
         let _ = tokio::fs::remove_file(&probe).await;
         Ok(())
@@ -465,7 +476,10 @@ mod tests {
         );
         // 2. TMPDIR beats the platform temp dir
         assert_eq!(
-            resolve_default_base_dir(lookup(&[("TMPDIR", "/data/user/0/app/cache")]), platform.clone()),
+            resolve_default_base_dir(
+                lookup(&[("TMPDIR", "/data/user/0/app/cache")]),
+                platform.clone()
+            ),
             nested("/data/user/0/app/cache")
         );
         // 1. RUSTY_GRID_SANDBOX_BASE_DIR beats both and is used as the base itself
@@ -492,9 +506,16 @@ mod tests {
         let base = root.join("deep").join("base");
         let config = SandboxConfig::new(&base);
 
-        config.ensure_usable().await.expect("a creatable directory is usable");
+        config
+            .ensure_usable()
+            .await
+            .expect("a creatable directory is usable");
         assert!(base.is_dir());
-        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0, "the probe file must be removed");
+        assert_eq!(
+            std::fs::read_dir(&base).unwrap().count(),
+            0,
+            "the probe file must be removed"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -508,10 +529,19 @@ mod tests {
         std::fs::write(&blocker, b"x").unwrap();
         let config = SandboxConfig::new(blocker.join("sandboxes"));
 
-        let err = config.ensure_usable().await.expect_err("must not be usable");
-        assert!(matches!(err, SandboxError::BaseDirUnusable { .. }), "{err:?}");
+        let err = config
+            .ensure_usable()
+            .await
+            .expect_err("must not be usable");
+        assert!(
+            matches!(err, SandboxError::BaseDirUnusable { .. }),
+            "{err:?}"
+        );
         let text = err.to_string();
-        assert!(text.contains("blocker"), "the message must name the directory: {text}");
+        assert!(
+            text.contains("blocker"),
+            "the message must name the directory: {text}"
+        );
         assert!(
             text.contains("--sandbox-base-dir") && text.contains("RUSTY_GRID_SANDBOX_BASE_DIR"),
             "the message must say how to fix it: {text}"

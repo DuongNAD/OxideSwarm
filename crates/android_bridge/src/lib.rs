@@ -24,9 +24,7 @@ use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::protocol::{
     MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage, PROTOCOL_VERSION_CURRENT,
 };
-use rusty_grid_core::transport::{
-    iroh, serialize_p2p_ticket, BiStream, GridStream, GRID_ALPN,
-};
+use rusty_grid_core::transport::{iroh, serialize_p2p_ticket, BiStream, GridStream, GRID_ALPN};
 use rusty_grid_worker::{
     MobileTelemetryHandle, SandboxConfig, SandboxError, WorkerClient, WorkerConfig,
 };
@@ -105,8 +103,7 @@ fn get_worker_state() -> Arc<WorkerState> {
 /// one (`/data/local/tmp`) is not writable for an app. An empty string clears the setting.
 pub fn set_sandbox_dir_impl(dir: String) -> bool {
     let dir = dir.trim();
-    *get_worker_state().sandbox_dir.lock().unwrap() =
-        (!dir.is_empty()).then(|| PathBuf::from(dir));
+    *get_worker_state().sandbox_dir.lock().unwrap() = (!dir.is_empty()).then(|| PathBuf::from(dir));
     true
 }
 
@@ -536,7 +533,11 @@ pub fn start_master_impl(
     *state.connected_workers.lock().unwrap() = 0;
 
     let bind_port_u16 = if bind_port > 0 { bind_port as u16 } else { 0 };
-    let dashboard_port_u16 = if dashboard_port > 0 { dashboard_port as u16 } else { 0 };
+    let dashboard_port_u16 = if dashboard_port > 0 {
+        dashboard_port as u16
+    } else {
+        0
+    };
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -844,7 +845,9 @@ async fn handle_coordinator_stream(
 
     if registered_id.take().is_some() {
         let mut count = state_for_conn.connected_workers.lock().unwrap();
-        if *count > 0 { *count -= 1; }
+        if *count > 0 {
+            *count -= 1;
+        }
     }
 }
 
@@ -1226,7 +1229,11 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
     class: JClass<'local>,
     sandbox_dir: JString<'local>,
 ) -> jboolean {
-    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeSetSandboxDir(env, class, sandbox_dir)
+    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeSetSandboxDir(
+        env,
+        class,
+        sandbox_dir,
+    )
 }
 
 #[no_mangle]
@@ -1420,10 +1427,22 @@ mod tests {
         let _guard = TEST_MUTEX.lock().unwrap();
         reset_test_state();
         let state = get_worker_state();
-        assert!(state.mobile.live_status().is_none(), "nothing known before the app reports");
+        assert!(
+            state.mobile.live_status().is_none(),
+            "nothing known before the app reports"
+        );
 
-        assert!(update_telemetry_detailed_impl(23, false, true, Some(41.5), None));
-        let live = state.mobile.live_status().expect("the report must reach the worker's handle");
+        assert!(update_telemetry_detailed_impl(
+            23,
+            false,
+            true,
+            Some(41.5),
+            None
+        ));
+        let live = state
+            .mobile
+            .live_status()
+            .expect("the report must reach the worker's handle");
         assert_eq!(live.battery_pct, Some(23));
         assert_eq!(live.is_charging, Some(false));
         assert!(live.thermal_throttled);
@@ -1457,10 +1476,20 @@ mod tests {
         let dir = scratch_dir("blocked");
         let blocker = dir.join("not-a-directory");
         std::fs::write(&blocker, b"x").unwrap();
-        assert!(set_sandbox_dir_impl(blocker.join("sandboxes").display().to_string()));
+        assert!(set_sandbox_dir_impl(
+            blocker.join("sandboxes").display().to_string()
+        ));
 
         assert!(
-            !start_worker_impl("127.0.0.1:59990".into(), None, "NoSandbox".into(), 2, 1024, false, 5),
+            !start_worker_impl(
+                "127.0.0.1:59990".into(),
+                None,
+                "NoSandbox".into(),
+                2,
+                1024,
+                false,
+                5
+            ),
             "a worker that cannot create task sandboxes must not pretend to have started"
         );
         assert!(!is_running_impl());
@@ -1480,8 +1509,19 @@ mod tests {
         let sandboxes = dir.join("cache").join("sandboxes");
         assert!(set_sandbox_dir_impl(sandboxes.display().to_string()));
 
-        assert!(start_worker_impl("127.0.0.1:59991".into(), None, "WithSandbox".into(), 2, 1024, false, 5));
-        assert!(sandboxes.is_dir(), "the worker must have prepared the directory it was given");
+        assert!(start_worker_impl(
+            "127.0.0.1:59991".into(),
+            None,
+            "WithSandbox".into(),
+            2,
+            1024,
+            false,
+            5
+        ));
+        assert!(
+            sandboxes.is_dir(),
+            "the worker must have prepared the directory it was given"
+        );
         assert!(stop_worker_impl());
         reset_test_state();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1492,7 +1532,9 @@ mod tests {
         let _guard = TEST_MUTEX.lock().unwrap();
         reset_test_state();
         let dir = scratch_dir("bad-ticket");
-        assert!(set_sandbox_dir_impl(dir.join("sandboxes").display().to_string()));
+        assert!(set_sandbox_dir_impl(
+            dir.join("sandboxes").display().to_string()
+        ));
 
         // `run()` refuses an unusable P2P ticket right away, on the worker's own thread.
         assert!(start_worker_impl(
@@ -1612,7 +1654,11 @@ mod tests {
 
         // Verify genuine P2P ticket parses as iroh::EndpointAddr
         let parsed = rusty_grid_core::transport::parse_p2p_ticket(&ticket);
-        assert!(parsed.is_ok(), "Generated P2P ticket must parse into EndpointAddr: {:?}", parsed.err());
+        assert!(
+            parsed.is_ok(),
+            "Generated P2P ticket must parse into EndpointAddr: {:?}",
+            parsed.err()
+        );
 
         let status_json = get_master_status_impl();
         assert!(status_json.contains("\"running\":true"));
@@ -1672,7 +1718,10 @@ mod tests {
         // 4. Invalid secret (neither valid hex nor existing file)
         assert!(!set_cluster_secret_impl("not_a_valid_hex_or_file_xyz_123"));
         let status = status_text();
-        assert!(status.starts_with("ERROR: Invalid cluster secret:"), "{status}");
+        assert!(
+            status.starts_with("ERROR: Invalid cluster secret:"),
+            "{status}"
+        );
 
         reset_test_state();
         let _ = std::fs::remove_dir_all(&dir);

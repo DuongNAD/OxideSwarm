@@ -1163,7 +1163,6 @@ impl Task {
         self.latest_checkpoint = Some(checkpoint);
     }
 
-
     /// Validates the task and checks for specification/requirement mismatches.
     pub fn validate(&self) -> Result<(), String> {
         self.spec.validate()?;
@@ -1908,4 +1907,3 @@ mod tests {
         assert_eq!(decoded_bin.latest_checkpoint, Some(checkpoint));
     }
 }
-

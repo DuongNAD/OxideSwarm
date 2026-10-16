@@ -327,10 +327,7 @@ async fn test_normal_dialing_direct_p2p_and_path_introspection() {
         TaskSpec::command("echo", vec!["hello direct p2p".into()]),
         TaskRequirements::generic(1, 10),
     );
-    let task_id = master_handle
-        .submit_task(task)
-        .await
-        .expect("submit task");
+    let task_id = master_handle.submit_task(task).await.expect("submit task");
     let result = master_handle
         .wait_task(task_id, Some(Duration::from_secs(10)))
         .await
@@ -360,9 +357,7 @@ async fn test_ticket_determinism_and_reconnection() {
         .with_p2p_ticket_file(&ticket_file);
 
     // 1. Start Master Run 1
-    let master1 = MasterServer::spawn(config1)
-        .await
-        .expect("spawn master 1");
+    let master1 = MasterServer::spawn(config1).await.expect("spawn master 1");
     let ticket1 = tokio::fs::read_to_string(&ticket_file)
         .await
         .expect("read ticket 1");
@@ -387,7 +382,13 @@ async fn test_ticket_determinism_and_reconnection() {
     let start = std::time::Instant::now();
     let mut reg1 = false;
     while start.elapsed() < Duration::from_secs(10) {
-        if master1.registry().list_workers().await.iter().any(|w| w.worker_id == worker_id) {
+        if master1
+            .registry()
+            .list_workers()
+            .await
+            .iter()
+            .any(|w| w.worker_id == worker_id)
+        {
             reg1 = true;
             break;
         }
@@ -405,9 +406,7 @@ async fn test_ticket_determinism_and_reconnection() {
         .with_p2p_key_file(&key_file)
         .with_p2p_ticket_file(&ticket_file);
 
-    let master2 = MasterServer::spawn(config2)
-        .await
-        .expect("spawn master 2");
+    let master2 = MasterServer::spawn(config2).await.expect("spawn master 2");
     let ticket2 = tokio::fs::read_to_string(&ticket_file)
         .await
         .expect("read ticket 2");
@@ -418,17 +417,25 @@ async fn test_ticket_determinism_and_reconnection() {
     let reconnect_start = std::time::Instant::now();
     let mut reg2 = false;
     while reconnect_start.elapsed() < Duration::from_secs(10) {
-        if master2.registry().list_workers().await.iter().any(|w| w.worker_id == worker_id) {
+        if master2
+            .registry()
+            .list_workers()
+            .await
+            .iter()
+            .any(|w| w.worker_id == worker_id)
+        {
             reg2 = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(reg2, "Worker must automatically reconnect to Master 2 within timeout");
+    assert!(
+        reg2,
+        "Worker must automatically reconnect to Master 2 within timeout"
+    );
 
     // Clean teardown
     let _ = worker_shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;
     let _ = master2.shutdown();
 }
-
