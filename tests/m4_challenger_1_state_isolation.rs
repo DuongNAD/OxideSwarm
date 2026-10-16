@@ -121,14 +121,16 @@ fn test_adversarial_empty_oxideswarm_home_fallback() {
     );
 
     // 3. ClusterSecret::default_path
-    let secret = ClusterSecret::default_path().expect("ClusterSecret::default_path should not be None");
+    let secret =
+        ClusterSecret::default_path().expect("ClusterSecret::default_path should not be None");
     assert_eq!(
         secret, expected_secret,
         "ClusterSecret::default_path must fall back to default profile on empty OXIDESWARM_HOME"
     );
 
     // 4. default_worker_id_path(None)
-    let worker_id = default_worker_id_path(None).expect("default_worker_id_path(None) should not be None");
+    let worker_id =
+        default_worker_id_path(None).expect("default_worker_id_path(None) should not be None");
     assert_eq!(
         worker_id, expected_worker_id,
         "default_worker_id_path(None) must fall back to default profile on empty OXIDESWARM_HOME"
@@ -176,7 +178,10 @@ fn test_adversarial_isolated_temp_dir_resolution() {
 
     // 1. default_oxideswarm_dir must resolve to <temp_dir>
     let dir = default_oxideswarm_dir().expect("must resolve oxideswarm dir");
-    assert_eq!(dir, sandbox_path, "default_oxideswarm_dir must match temp_dir exactly");
+    assert_eq!(
+        dir, sandbox_path,
+        "default_oxideswarm_dir must match temp_dir exactly"
+    );
 
     // 2. default_master_key_file must resolve to <temp_dir>\master_key.bin
     let key = default_master_key_file().expect("must resolve master key");
@@ -191,7 +196,8 @@ fn test_adversarial_isolated_temp_dir_resolution() {
     assert_eq!(worker_id, sandbox_path.join("worker_id"));
 
     // 5. default_worker_id_path(Some("bench-worker"))
-    let worker_id_named = default_worker_id_path(Some("bench-worker")).expect("must resolve named worker id");
+    let worker_id_named =
+        default_worker_id_path(Some("bench-worker")).expect("must resolve named worker id");
     assert_eq!(worker_id_named, sandbox_path.join("worker_id.bench-worker"));
 }
 
@@ -229,7 +235,12 @@ async fn test_master_p2p_default_key_creates_isolated_key_without_host_mutation(
     let host_oxideswarm = get_expected_default_dir();
     let host_master_key = host_oxideswarm.join("master_key.bin");
     let host_pre_mtime = if host_master_key.exists() {
-        Some(std::fs::metadata(&host_master_key).unwrap().modified().unwrap())
+        Some(
+            std::fs::metadata(&host_master_key)
+                .unwrap()
+                .modified()
+                .unwrap(),
+        )
     } else {
         None
     };
@@ -298,7 +309,10 @@ async fn test_master_p2p_default_key_creates_isolated_key_without_host_mutation(
 
     // Critical: Verify host ~/.oxideswarm was NOT touched at all
     if let Some(pre_mtime) = host_pre_mtime {
-        let post_mtime = std::fs::metadata(&host_master_key).unwrap().modified().unwrap();
+        let post_mtime = std::fs::metadata(&host_master_key)
+            .unwrap()
+            .modified()
+            .unwrap();
         assert_eq!(
             pre_mtime, post_mtime,
             "CRITICAL: Host ~/.oxideswarm/master_key.bin was modified during isolated test!"

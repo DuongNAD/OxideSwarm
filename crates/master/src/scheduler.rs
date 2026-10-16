@@ -491,8 +491,10 @@ impl<'a> Engine<'a> {
                     .can_execute_gpu()
                     .cmp(&b.worker.capabilities.can_execute_gpu())
             } else if view.requires_gpu {
-                let a_real = a.worker.capabilities.has_gpu && !a.worker.capabilities.is_simulated_gpu;
-                let b_real = b.worker.capabilities.has_gpu && !b.worker.capabilities.is_simulated_gpu;
+                let a_real =
+                    a.worker.capabilities.has_gpu && !a.worker.capabilities.is_simulated_gpu;
+                let b_real =
+                    b.worker.capabilities.has_gpu && !b.worker.capabilities.is_simulated_gpu;
                 b_real.cmp(&a_real)
             } else {
                 std::cmp::Ordering::Equal

@@ -104,18 +104,36 @@ impl CommandExecutor {
                 };
             }
             "sha256_verify" => {
-                let data = args.get("data").and_then(|v| v.as_str()).unwrap_or_default();
-                let expected = args.get("expected").and_then(|v| v.as_str()).unwrap_or_default();
+                let data = args
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let expected = args
+                    .get("expected")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 let actual = crate::protocol::compute_sha256(data.as_bytes());
                 let matches = actual.eq_ignore_ascii_case(expected);
                 let duration_ms = start.elapsed().as_millis() as u64;
 
                 return CommandExecutionResult {
                     exit_code: if matches { 0 } else { 1 },
-                    stdout: if matches { "VERIFIED_MATCH".to_string() } else { "MISMATCH".to_string() },
-                    stderr: if matches { String::new() } else { format!("Calculated {} != expected {}", actual, expected) },
+                    stdout: if matches {
+                        "VERIFIED_MATCH".to_string()
+                    } else {
+                        "MISMATCH".to_string()
+                    },
+                    stderr: if matches {
+                        String::new()
+                    } else {
+                        format!("Calculated {} != expected {}", actual, expected)
+                    },
                     duration_ms,
-                    status: if matches { "success".to_string() } else { "failed".to_string() },
+                    status: if matches {
+                        "success".to_string()
+                    } else {
+                        "failed".to_string()
+                    },
                 };
             }
             _ => {}
@@ -140,7 +158,11 @@ impl CommandExecutor {
                 s.to_string()
             } else if let Some(arr) = args.as_array() {
                 arr.iter()
-                    .map(|x| x.as_str().map(|s| s.to_string()).unwrap_or_else(|| x.to_string()))
+                    .map(|x| {
+                        x.as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| x.to_string())
+                    })
                     .collect::<Vec<_>>()
                     .join(" ")
             } else {
@@ -254,8 +276,15 @@ impl CommandExecutor {
         match finished {
             Ok((Ok(status), out, err)) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
-                let exit_code = status.code().unwrap_or(if status.success() { 0 } else { 1 });
-                let status_str = if status.success() { "success" } else { "failed" }.to_string();
+                let exit_code = status
+                    .code()
+                    .unwrap_or(if status.success() { 0 } else { 1 });
+                let status_str = if status.success() {
+                    "success"
+                } else {
+                    "failed"
+                }
+                .to_string();
 
                 CommandExecutionResult {
                     exit_code,
@@ -282,7 +311,10 @@ impl CommandExecutor {
             }
             Err(_) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
-                warn!("Command execution timed out after {} ms", timeout_duration.as_millis());
+                warn!(
+                    "Command execution timed out after {} ms",
+                    timeout_duration.as_millis()
+                );
 
                 // Take the whole tree down (e.g. the cmd.exe / sh children), then reap the leader.
                 Self::terminate_process_tree(&mut child, process_group_id).await;
@@ -291,7 +323,10 @@ impl CommandExecutor {
                 let out = drain_after_kill(stdout_reader.as_mut()).await;
                 let err = drain_after_kill(stderr_reader.as_mut()).await;
 
-                let mut stderr = format!("Command timed out after {} ms", timeout_duration.as_millis());
+                let mut stderr = format!(
+                    "Command timed out after {} ms",
+                    timeout_duration.as_millis()
+                );
                 let partial_err = render_capture(err);
                 if !partial_err.is_empty() {
                     stderr.push('\n');
@@ -321,7 +356,9 @@ impl CommandExecutor {
         let live_leader = child.id();
 
         // Snapshot descendants first, to also catch processes that left the group (setsid).
-        let escaped = live_leader.map(Self::collect_descendants).unwrap_or_default();
+        let escaped = live_leader
+            .map(Self::collect_descendants)
+            .unwrap_or_default();
 
         #[cfg(unix)]
         {
@@ -480,7 +517,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_echo_builtin_execution() {
-        let res = CommandExecutor::execute("echo", &serde_json::json!({"message": "test echo"}), Some(1000)).await;
+        let res = CommandExecutor::execute(
+            "echo",
+            &serde_json::json!({"message": "test echo"}),
+            Some(1000),
+        )
+        .await;
         assert_eq!(res.status, "success");
         assert_eq!(res.exit_code, 0);
         assert_eq!(res.stdout, "test echo");
@@ -508,7 +550,8 @@ mod tests {
             "shell_exec",
             &serde_json::json!({"cmd": "echo shell_success"}),
             Some(3000),
-        ).await;
+        )
+        .await;
         assert_eq!(res.status, "success");
         assert_eq!(res.exit_code, 0);
         assert!(res.stdout.contains("shell_success"));
@@ -568,7 +611,12 @@ mod tests {
         )
         .await;
 
-        assert_eq!(res.status, "success", "a chatty command must still finish: {:?}", res.stderr.len());
+        assert_eq!(
+            res.status,
+            "success",
+            "a chatty command must still finish: {:?}",
+            res.stderr.len()
+        );
         assert_eq!(res.exit_code, 0);
         for (name, text, fill) in [("stdout", &res.stdout, 'x'), ("stderr", &res.stderr, 'y')] {
             assert!(
@@ -576,8 +624,14 @@ mod tests {
                 "{name} was not capped: {} bytes",
                 text.len()
             );
-            assert!(text.contains("output truncated"), "{name} lacks the truncation marker");
-            assert!(text.starts_with(fill), "{name} should keep the head of the output");
+            assert!(
+                text.contains("output truncated"),
+                "{name} lacks the truncation marker"
+            );
+            assert!(
+                text.starts_with(fill),
+                "{name} should keep the head of the output"
+            );
         }
     }
 
@@ -604,12 +658,18 @@ mod tests {
         }
 
         let probe = "echo \"[${OXIDESWARM_SECRET-unset}][${OXIDESWARM_SECRET_FILE-unset}][${OXIDE_MESH_TOKEN-unset}]\"";
-        let res = CommandExecutor::execute("shell_exec", &serde_json::json!({ "cmd": probe }), Some(5000)).await;
+        let res = CommandExecutor::execute(
+            "shell_exec",
+            &serde_json::json!({ "cmd": probe }),
+            Some(5000),
+        )
+        .await;
         assert_eq!(res.status, "success");
         assert_eq!(res.stdout.trim(), "[unset][unset][unset]");
 
         // Also for a plain program, not only for the shell wrapper.
-        let res = CommandExecutor::execute("sh", &serde_json::json!(["-c", probe]), Some(5000)).await;
+        let res =
+            CommandExecutor::execute("sh", &serde_json::json!(["-c", probe]), Some(5000)).await;
         assert_eq!(res.stdout.trim(), "[unset][unset][unset]");
 
         // What the peer passes explicitly is its own business and still arrives.
@@ -626,7 +686,9 @@ mod tests {
     #[tokio::test]
     async fn test_stdin_is_closed_for_commands() {
         // `cat` with no file reads stdin; with stdin=/dev/null it ends at once instead of hanging.
-        let res = CommandExecutor::execute("shell_exec", &serde_json::json!({"cmd": "cat"}), Some(3000)).await;
+        let res =
+            CommandExecutor::execute("shell_exec", &serde_json::json!({"cmd": "cat"}), Some(3000))
+                .await;
         assert_eq!(res.status, "success");
         assert!(res.stdout.is_empty());
     }
@@ -641,12 +703,18 @@ mod tests {
             pid_file.display()
         );
 
-        let res = CommandExecutor::execute("shell_exec", &serde_json::json!({ "cmd": cmd }), Some(800)).await;
+        let res =
+            CommandExecutor::execute("shell_exec", &serde_json::json!({ "cmd": cmd }), Some(800))
+                .await;
 
         assert_eq!(res.status, "timeout");
         assert_eq!(res.exit_code, 124);
         assert!(res.stderr.contains("timed out after 800 ms"));
-        assert!(res.stdout.contains("partial_marker"), "partial output lost: {:?}", res.stdout);
+        assert!(
+            res.stdout.contains("partial_marker"),
+            "partial output lost: {:?}",
+            res.stdout
+        );
         assert_pid_in_file_dies(&pid_file, Duration::from_secs(5)).await;
     }
 
@@ -660,7 +728,9 @@ mod tests {
         let pid_file = dir.path().join("orphan.pid");
         let cmd = format!("sleep 60 & echo $! > '{}'", pid_file.display());
 
-        let res = CommandExecutor::execute("shell_exec", &serde_json::json!({ "cmd": cmd }), Some(800)).await;
+        let res =
+            CommandExecutor::execute("shell_exec", &serde_json::json!({ "cmd": cmd }), Some(800))
+                .await;
 
         assert_eq!(res.status, "timeout");
         assert_eq!(res.exit_code, 124);
@@ -687,7 +757,10 @@ mod tests {
         assert_eq!(res.status, "timeout");
         assert_eq!(res.exit_code, 124);
         assert!(res.stderr.contains("timed out after 1000 ms"));
-        assert!(elapsed.as_millis() >= 950 && elapsed.as_millis() < 4000,
-            "Expected timeout in ~1000ms, elapsed: {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() >= 950 && elapsed.as_millis() < 4000,
+            "Expected timeout in ~1000ms, elapsed: {:?}",
+            elapsed
+        );
     }
 }

@@ -567,11 +567,18 @@ mod tests {
 
     #[test]
     fn test_envelope_serialization_roundtrip() {
-        let (env, hash) = AgentMeshEnvelope::new_data_payload("node-1", "node-2", b"test data payload");
+        let (env, hash) =
+            AgentMeshEnvelope::new_data_payload("node-1", "node-2", b"test data payload");
         let json_str = env.to_json_string().unwrap();
         let decoded = AgentMeshEnvelope::from_json_str(&json_str).unwrap();
 
-        if let AgentMeshEnvelope::DataPayload { checksum_sha256, from, to, .. } = decoded {
+        if let AgentMeshEnvelope::DataPayload {
+            checksum_sha256,
+            from,
+            to,
+            ..
+        } = decoded
+        {
             assert_eq!(from, "node-1");
             assert_eq!(to, "node-2");
             assert_eq!(checksum_sha256.as_deref(), Some(hash.as_str()));
@@ -619,7 +626,16 @@ mod tests {
     fn test_validate_node_id_rules() {
         assert!(validate_node_id("node-linux-box").is_ok());
         assert!(validate_node_id("nodé-🚀").is_ok());
-        for bad in ["", "hub", "HUB", "grid", "grid-master", "all", "has\nnewline", "nul\0byte"] {
+        for bad in [
+            "",
+            "hub",
+            "HUB",
+            "grid",
+            "grid-master",
+            "all",
+            "has\nnewline",
+            "nul\0byte",
+        ] {
             assert!(validate_node_id(bad).is_err(), "{bad:?} must be rejected");
         }
         assert!(validate_node_id(&"x".repeat(MAX_NODE_ID_LEN)).is_ok());

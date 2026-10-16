@@ -223,7 +223,8 @@ impl IoClock {
 
     /// Records that bytes were received.
     pub fn touch_rx(&self) {
-        self.last_rx_nanos.fetch_max(self.now_nanos(), Ordering::Relaxed);
+        self.last_rx_nanos
+            .fetch_max(self.now_nanos(), Ordering::Relaxed);
     }
 
     /// Records that the socket accepted part of a bulk write.
@@ -594,7 +595,10 @@ mod tests {
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total_mb = sys.total_memory() / (1024 * 1024);
-        assert!(ram_mb <= total_mb.max(1), "free {ram_mb} MB cannot exceed total {total_mb} MB");
+        assert!(
+            ram_mb <= total_mb.max(1),
+            "free {ram_mb} MB cannot exceed total {total_mb} MB"
+        );
     }
 
     #[tokio::test]
@@ -602,7 +606,10 @@ mod tests {
         let clock = IoClock::new();
         tokio::time::sleep(Duration::from_millis(60)).await;
         let idle = clock.silence();
-        assert!(idle >= Duration::from_millis(50), "idle connection ages: {idle:?}");
+        assert!(
+            idle >= Duration::from_millis(50),
+            "idle connection ages: {idle:?}"
+        );
 
         // Received bytes are life.
         clock.touch_rx();
@@ -614,7 +621,10 @@ mod tests {
         clock.touch_bulk_tx();
         assert!(clock.silence() < Duration::from_millis(40));
         tokio::time::sleep(Duration::from_millis(60)).await;
-        assert!(clock.silence() >= Duration::from_millis(50), "a stalled upload stops counting");
+        assert!(
+            clock.silence() >= Duration::from_millis(50),
+            "a stalled upload stops counting"
+        );
     }
 
     #[tokio::test]
@@ -635,11 +645,20 @@ mod tests {
         // A heartbeat-sized write succeeds into a dead peer's buffer too, so it proves nothing...
         tokio::time::sleep(Duration::from_millis(60)).await;
         stamped.write_all(b"pong").await.unwrap();
-        assert!(clock.silence() >= Duration::from_millis(50), "small writes are not life");
+        assert!(
+            clock.silence() >= Duration::from_millis(50),
+            "small writes are not life"
+        );
 
         // ...a bulk write does (the peer is draining a frame).
-        stamped.write_all(&vec![7u8; BULK_WRITE_BYTES * 2]).await.unwrap();
-        assert!(clock.silence() < Duration::from_millis(40), "bulk write progress is life");
+        stamped
+            .write_all(&vec![7u8; BULK_WRITE_BYTES * 2])
+            .await
+            .unwrap();
+        assert!(
+            clock.silence() < Duration::from_millis(40),
+            "bulk write progress is life"
+        );
     }
 
     #[test]
@@ -673,8 +692,15 @@ mod tests {
             thermal_throttled: true,
         });
         let snap = handle.snapshot().unwrap();
-        assert_eq!((snap.os_version.as_str(), snap.soc_model.as_str()), ("Android 14", "Tensor"));
-        assert_eq!(handle.live_status().unwrap().battery_pct, Some(3), "clones share state");
+        assert_eq!(
+            (snap.os_version.as_str(), snap.soc_model.as_str()),
+            ("Android 14", "Tensor")
+        );
+        assert_eq!(
+            handle.live_status().unwrap().battery_pct,
+            Some(3),
+            "clones share state"
+        );
         assert!(snap.thermal_throttled);
     }
 
@@ -703,7 +729,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         poller.abort();
         let snap = handle.snapshot().unwrap();
-        assert_eq!(snap.battery_pct, Some(7), "the startup snapshot must not stay frozen");
+        assert_eq!(
+            snap.battery_pct,
+            Some(7),
+            "the startup snapshot must not stay frozen"
+        );
         assert_eq!(snap.is_charging, Some(false));
         assert!(snap.thermal_throttled);
         assert_eq!(snap.os_version, "macOS");

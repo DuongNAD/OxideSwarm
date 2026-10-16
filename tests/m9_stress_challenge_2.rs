@@ -165,17 +165,13 @@ async fn test_boundary_max_retries_0_immediate_failure_on_crash() {
     let wait_timeout = Duration::from_secs(5);
 
     assert!(
-        wait_for(
-            wait_timeout,
-            Duration::from_millis(30),
-            || async {
-                master
-                    .list_workers()
-                    .await
-                    .map(|w| w.len() == 2)
-                    .unwrap_or(false)
-            }
-        )
+        wait_for(wait_timeout, Duration::from_millis(30), || async {
+            master
+                .list_workers()
+                .await
+                .map(|w| w.len() == 2)
+                .unwrap_or(false)
+        })
         .await
     );
 
@@ -300,17 +296,13 @@ async fn test_boundary_max_retries_1_single_retry_then_failure() {
     let wait_timeout = Duration::from_secs(5);
 
     assert!(
-        wait_for(
-            wait_timeout,
-            Duration::from_millis(30),
-            || async {
-                master
-                    .list_workers()
-                    .await
-                    .map(|w| w.len() == 1)
-                    .unwrap_or(false)
-            }
-        )
+        wait_for(wait_timeout, Duration::from_millis(30), || async {
+            master
+                .list_workers()
+                .await
+                .map(|w| w.len() == 1)
+                .unwrap_or(false)
+        })
         .await
     );
 

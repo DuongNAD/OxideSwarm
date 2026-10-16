@@ -182,12 +182,13 @@ pub async fn connect_master(
 
     let mut transport = MessageTransport::new(stream);
     if let Some(secret) = secret {
-        let session_key = tokio::time::timeout(AUTH_TIMEOUT, client_handshake(&mut transport, secret))
-            .await
-            .map_err(|_| GridError::Timeout {
-                operation: "cluster_authentication".into(),
-                duration_secs: AUTH_TIMEOUT.as_secs(),
-            })??;
+        let session_key =
+            tokio::time::timeout(AUTH_TIMEOUT, client_handshake(&mut transport, secret))
+                .await
+                .map_err(|_| GridError::Timeout {
+                    operation: "cluster_authentication".into(),
+                    duration_secs: AUTH_TIMEOUT.as_secs(),
+                })??;
         transport.enable_encryption(&session_key, EndpointRole::Client);
     }
     Ok(transport)

@@ -69,7 +69,6 @@ fn is_process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
-
 /// Helper: construct test capabilities.
 fn make_test_capabilities(name: &str, cores: usize, has_gpu: bool) -> WorkerCapabilities {
     WorkerCapabilities {
@@ -872,9 +871,10 @@ async fn test_process_tree_containment_grandchild_processes_killed_on_worker_tas
 
         // Spawn task in a background tokio task so we can abruptly drop/abort it
         let handle = tokio::spawn(async move {
-            let _ = runner.execute_task(&task, Some(direct_pid_clone), None).await;
+            let _ = runner
+                .execute_task(&task, Some(direct_pid_clone), None)
+                .await;
         });
-
 
         // Wait until all 3 PIDs (Child 1, Child 2, Grandchild 1) are recorded in pid_file
         let start = Instant::now();
@@ -1138,7 +1138,9 @@ async fn test_process_tree_direct_windows_job_object_fanout() {
         let direct_pid_clone = Arc::clone(&direct_pid);
 
         let handle = tokio::spawn(async move {
-            let _ = runner.execute_task(&task, Some(direct_pid_clone), None).await;
+            let _ = runner
+                .execute_task(&task, Some(direct_pid_clone), None)
+                .await;
         });
 
         // Wait until all 5 PIDs are written
@@ -1185,7 +1187,11 @@ async fn test_process_tree_direct_windows_job_object_fanout() {
         }
 
         for &pid in &pids {
-            assert!(!is_process_alive(pid), "PID {} was not terminated by ProcessTree", pid);
+            assert!(
+                !is_process_alive(pid),
+                "PID {} was not terminated by ProcessTree",
+                pid
+            );
         }
         assert!(all_dead, "All 5 fanout processes must be terminated");
     }
@@ -1261,7 +1267,11 @@ async fn test_high_concurrency_encrypted_worker_registration_and_heartbeats() {
                 .expect("expected ack message");
 
             match ack {
-                MasterMessage::RegisterAck { accepted, worker_id: ack_wid, .. } => {
+                MasterMessage::RegisterAck {
+                    accepted,
+                    worker_id: ack_wid,
+                    ..
+                } => {
                     assert!(accepted, "Registration must be accepted");
                     assert_eq!(ack_wid, worker_id);
                 }
@@ -1288,7 +1298,10 @@ async fn test_high_concurrency_encrypted_worker_registration_and_heartbeats() {
                 worker_id,
                 reason: "stress test complete".into(),
             };
-            transport.send_msg(&disc_msg).await.expect("send disconnecting");
+            transport
+                .send_msg(&disc_msg)
+                .await
+                .expect("send disconnecting");
 
             // Drop transport cleanly
             drop(transport);
@@ -1429,8 +1442,14 @@ async fn test_adversarial_encrypted_wire_attacks() {
         };
         transport.send_msg(&reg).await.expect("send reg");
 
-        let ack = transport.recv_msg::<MasterMessage>().await.expect("recv ack");
-        assert!(matches!(ack, Some(MasterMessage::RegisterAck { accepted: true, .. })));
+        let ack = transport
+            .recv_msg::<MasterMessage>()
+            .await
+            .expect("recv ack");
+        assert!(matches!(
+            ack,
+            Some(MasterMessage::RegisterAck { accepted: true, .. })
+        ));
 
         // Craft valid heartbeat plaintext and encrypt manually
         let hb = WorkerMessage::Heartbeat {
@@ -1532,6 +1551,8 @@ async fn test_adversarial_encrypted_wire_attacks() {
         .into_iter()
         .filter(|w| w.status != rusty_grid_master::registry::WorkerStatus::Disconnected)
         .collect();
-    assert!(active_workers.is_empty(), "No rogue or corrupted workers should remain active");
+    assert!(
+        active_workers.is_empty(),
+        "No rogue or corrupted workers should remain active"
+    );
 }
-

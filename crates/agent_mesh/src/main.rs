@@ -150,7 +150,12 @@ fn client_token(token: Option<String>) -> Option<String> {
 }
 
 /// Builds a client for `hub_url`, presenting `token` if there is one.
-fn build_client(hub_url: &str, node_id: &str, platform: &str, token: Option<String>) -> AgentMeshClient {
+fn build_client(
+    hub_url: &str,
+    node_id: &str,
+    platform: &str,
+    token: Option<String>,
+) -> AgentMeshClient {
     let client = AgentMeshClient::new(hub_url, node_id, platform);
     match client_token(token) {
         Some(t) => client.with_token(t),
@@ -192,20 +197,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let master_handle_opt = if let Some(ref master_spec) = grid_master {
                 let spec = master_spec.trim();
-                let bind_addr: SocketAddr = if spec.is_empty() || spec == "auto" || spec == "default" {
-                    "127.0.0.1:0".parse().unwrap()
-                } else if spec.contains(':') {
-                    spec.parse().map_err(|e| format!("Invalid grid master bind address '{spec}': {e}"))?
-                } else {
-                    format!("127.0.0.1:{spec}").parse().map_err(|e| format!("Invalid grid master port '{spec}': {e}"))?
-                };
+                let bind_addr: SocketAddr =
+                    if spec.is_empty() || spec == "auto" || spec == "default" {
+                        "127.0.0.1:0".parse().unwrap()
+                    } else if spec.contains(':') {
+                        spec.parse().map_err(|e| {
+                            format!("Invalid grid master bind address '{spec}': {e}")
+                        })?
+                    } else {
+                        format!("127.0.0.1:{spec}")
+                            .parse()
+                            .map_err(|e| format!("Invalid grid master port '{spec}': {e}"))?
+                    };
 
                 let mut server_config = ServerConfig::new(bind_addr);
                 let env_secret = std::env::var("OXIDESWARM_SECRET").ok();
                 let secret_opt = secret.as_deref().or(env_secret.as_deref());
                 if let Some(sec_str) = secret_opt.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                    let cs = ClusterSecret::from_hex(sec_str)
-                        .or_else(|_| ClusterSecret::load_file(&std::path::PathBuf::from(sec_str)))?;
+                    let cs = ClusterSecret::from_hex(sec_str).or_else(|_| {
+                        ClusterSecret::load_file(&std::path::PathBuf::from(sec_str))
+                    })?;
                     server_config = server_config.with_cluster_secret(cs);
                 }
 
@@ -213,7 +224,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let master_actual_addr = master_handle.server_addr();
                 let bridge = Arc::new(AgentGridBridge::new(master_handle.clone()));
                 hub.attach_bridge(bridge).await;
-                println!("[HUB] Embedded Master Grid runtime active on {}", master_actual_addr);
+                println!(
+                    "[HUB] Embedded Master Grid runtime active on {}",
+                    master_actual_addr
+                );
                 Some(master_handle)
             } else {
                 None
@@ -224,7 +238,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let host = listen.rsplit_once(':').map_or(listen.as_str(), |(h, _)| h);
             println!("[HUB] OxideRelay Hub running at ws://{}:{}/ws", host, port);
             println!("[HUB] REST Status API: http://{}:{}/api/status", host, port);
-            println!("[HUB] REST Nodes Catalog: http://{}:{}/api/nodes", host, port);
+            println!(
+                "[HUB] REST Nodes Catalog: http://{}:{}/api/nodes",
+                host, port
+            );
             if authenticated {
                 println!("[HUB] Token authentication: ENABLED (nodes need --token / OXIDE_MESH_TOKEN). The token is sent in clear text: use a TLS proxy (wss://) on untrusted networks.");
             } else if insecure {
@@ -242,7 +259,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        Commands::Node { hub, id, platform, token } => {
+        Commands::Node {
+            hub,
+            id,
+            platform,
+            token,
+        } => {
             let host_os = std::env::consts::OS.to_string();
             let hostname = sysinfo::System::host_name().unwrap_or_else(|| "device".to_string());
             let node_id = id.unwrap_or_else(|| format!("node-{}-{}", host_os, hostname));
@@ -279,7 +301,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             println!("[SEND] Routing command '{}' to '{}'...", command, to);
-            match client.send_command(&to, &command, parsed_args, Some(timeout_ms)).await {
+            match client
+                .send_command(&to, &command, parsed_args, Some(timeout_ms))
+                .await
+            {
                 Ok(resp) => match resp {
                     AgentMeshEnvelope::CommandResponse {
                         status,
@@ -299,8 +324,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             println!("\n--- STDERR ---\n{}", stderr);
                         }
                     }
-                    AgentMeshEnvelope::DeliveryNack { error_code, reason, .. } => {
-                        error!("[NACK] Command delivery failed: {} - {}", error_code, reason);
+                    AgentMeshEnvelope::DeliveryNack {
+                        error_code, reason, ..
+                    } => {
+                        error!(
+                            "[NACK] Command delivery failed: {} - {}",
+                            error_code, reason
+                        );
                         std::process::exit(1);
                     }
                     other => {

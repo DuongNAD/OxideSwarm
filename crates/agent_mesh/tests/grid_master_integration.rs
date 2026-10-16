@@ -6,15 +6,13 @@
 //! 2. An unattached hub (started without --grid-master) returns ERR_BRIDGE_NOT_CONFIGURED.
 //! 3. CLI argument parsing correctly handles --grid-master with and without address, and preserves None when omitted.
 
+use clap::Parser;
 use std::sync::Arc;
 use std::time::Duration;
-use clap::Parser;
 use tempfile::TempDir;
 use tokio::sync::watch;
 
-use agent_mesh::{
-    AgentGridBridge, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub,
-};
+use agent_mesh::{AgentGridBridge, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub};
 use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 
@@ -52,7 +50,10 @@ fn test_cli_grid_master_argument_parsing() {
     let cli1 = TestCli::parse_from(["app", "hub", "--listen", "127.0.0.1:9000"]);
     match cli1.command {
         TestCommands::Hub { grid_master, .. } => {
-            assert!(grid_master.is_none(), "When omitted, grid_master must be None");
+            assert!(
+                grid_master.is_none(),
+                "When omitted, grid_master must be None"
+            );
         }
     }
 
@@ -191,11 +192,22 @@ async fn test_attached_hub_processes_grid_envelopes_successfully() {
         .expect("submit_grid_compute response");
 
     match compute_resp {
-        AgentMeshEnvelope::CommandResponse { status, exit_code, .. } => {
-            assert_eq!(status, "success", "grid_compute should execute successfully");
-            assert_eq!(exit_code, 0, "matrix_multiply should succeed with exit code 0");
+        AgentMeshEnvelope::CommandResponse {
+            status, exit_code, ..
+        } => {
+            assert_eq!(
+                status, "success",
+                "grid_compute should execute successfully"
+            );
+            assert_eq!(
+                exit_code, 0,
+                "matrix_multiply should succeed with exit code 0"
+            );
         }
-        other => panic!("Expected CommandResponse for grid_compute, got: {:?}", other),
+        other => panic!(
+            "Expected CommandResponse for grid_compute, got: {:?}",
+            other
+        ),
     }
 
     // 3. Test grid_submit envelope
@@ -213,7 +225,12 @@ async fn test_attached_hub_processes_grid_envelopes_successfully() {
         .expect("send_command grid_submit response");
 
     match submit_resp {
-        AgentMeshEnvelope::CommandResponse { status, stdout, exit_code, .. } => {
+        AgentMeshEnvelope::CommandResponse {
+            status,
+            stdout,
+            exit_code,
+            ..
+        } => {
             assert_eq!(status, "success", "grid_submit should execute successfully");
             assert_eq!(exit_code, 0, "echo script should succeed");
             assert!(
@@ -238,7 +255,10 @@ async fn test_unattached_hub_returns_err_bridge_not_configured() {
     client.connect().await.expect("client connect");
 
     // grid_status on unattached hub must return ERR_BRIDGE_NOT_CONFIGURED
-    let status_resp = client.query_grid_status(Some(5000)).await.expect("response");
+    let status_resp = client
+        .query_grid_status(Some(5000))
+        .await
+        .expect("response");
     match status_resp {
         AgentMeshEnvelope::DeliveryNack { error_code, .. } => {
             assert_eq!(error_code, "ERR_BRIDGE_NOT_CONFIGURED");

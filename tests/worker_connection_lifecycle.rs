@@ -57,11 +57,14 @@ impl ScriptedMaster {
             .expect("the worker connected in time")
             .unwrap();
         let mut transport = MessageTransport::new(stream);
-        let register = tokio::time::timeout(Duration::from_secs(5), transport.recv_msg::<WorkerMessage>())
-            .await
-            .expect("Register in time")
-            .expect("Register decodes")
-            .expect("Register present");
+        let register = tokio::time::timeout(
+            Duration::from_secs(5),
+            transport.recv_msg::<WorkerMessage>(),
+        )
+        .await
+        .expect("Register in time")
+        .expect("Register decodes")
+        .expect("Register present");
         let WorkerMessage::Register { worker_id, .. } = register else {
             panic!("first message must be Register, got {register:?}");
         };
@@ -76,12 +79,17 @@ impl ScriptedMaster {
             })
             .await
             .unwrap();
-        Conn { transport, worker_id }
+        Conn {
+            transport,
+            worker_id,
+        }
     }
 
     /// True if no worker connection arrives within `window`.
     async fn quiet_for(&self, window: Duration) -> bool {
-        tokio::time::timeout(window, self.listener.accept()).await.is_err()
+        tokio::time::timeout(window, self.listener.accept())
+            .await
+            .is_err()
     }
 }
 
@@ -272,7 +280,10 @@ fn echo_task(id: TaskId, text: &str) -> Task {
 #[cfg(unix)]
 fn big_output_task(bytes: usize) -> Task {
     Task::new(
-        TaskSpec::command("head", vec!["-c".into(), bytes.to_string(), "/dev/zero".into()]),
+        TaskSpec::command(
+            "head",
+            vec!["-c".into(), bytes.to_string(), "/dev/zero".into()],
+        ),
         TaskRequirements::generic(1, 60),
     )
 }
@@ -285,7 +296,9 @@ fn big_output_task(bytes: usize) -> Task {
             vec![
                 "-NoProfile".into(),
                 "-Command".into(),
-                format!("[Console]::OpenStandardOutput().Write([byte[]]::new({bytes}), 0, {bytes})"),
+                format!(
+                    "[Console]::OpenStandardOutput().Write([byte[]]::new({bytes}), 0, {bytes})"
+                ),
             ],
         ),
         TaskRequirements::generic(1, 60),
@@ -315,7 +328,9 @@ async fn test_master_shutdown_frame_makes_the_worker_wait_and_reconnect() {
 
     // The worker says goodbye...
     let farewell = conn
-        .wait_for(Duration::from_secs(5), |m| matches!(m, WorkerMessage::Disconnecting { .. }))
+        .wait_for(Duration::from_secs(5), |m| {
+            matches!(m, WorkerMessage::Disconnecting { .. })
+        })
         .await;
     assert!(farewell.is_some(), "the worker announces its departure");
     drop(conn);
@@ -329,7 +344,10 @@ async fn test_master_shutdown_frame_makes_the_worker_wait_and_reconnect() {
         "reconnected only after {:?}",
         sent_at.elapsed()
     );
-    assert!(worker.running(), "a Master Shutdown frame must not end the worker");
+    assert!(
+        worker.running(),
+        "a Master Shutdown frame must not end the worker"
+    );
 
     // Only the local signal ends it.
     drop(again);
@@ -351,9 +369,17 @@ async fn test_connection_loss_cancels_running_tasks_and_a_redispatch_of_the_same
     let task = sleeper(&pid_file);
     let task_id = task.id;
     conn.send(MasterMessage::AssignTask { task }).await;
-    conn.wait_for(WAIT, |m| matches!(m, WorkerMessage::TaskProgress { status: TaskStatus::Running, .. }))
-        .await
-        .expect("task started");
+    conn.wait_for(WAIT, |m| {
+        matches!(
+            m,
+            WorkerMessage::TaskProgress {
+                status: TaskStatus::Running,
+                ..
+            }
+        )
+    })
+    .await
+    .expect("task started");
     let pid = read_pid(&pid_file).await;
     assert!(process_alive(pid));
 
@@ -379,7 +405,10 @@ async fn test_connection_loss_cancels_running_tasks_and_a_redispatch_of_the_same
         .expect("a result for the re-dispatched task");
     match result {
         WorkerMessage::TaskResult {
-            exit_code, stdout, error, ..
+            exit_code,
+            stdout,
+            error,
+            ..
         } => {
             assert_eq!(exit_code, 0, "re-dispatch failed: {error:?}");
             assert!(String::from_utf8_lossy(&stdout.0).contains("second attempt"));
@@ -388,7 +417,9 @@ async fn test_connection_loss_cancels_running_tasks_and_a_redispatch_of_the_same
     }
     // No stray cancellation of the old run may follow it (the Master would record the task as cancelled).
     assert!(
-        conn.wait_for(Duration::from_millis(500), |m| is_result_of(m, task_id)).await.is_none(),
+        conn.wait_for(Duration::from_millis(500), |m| is_result_of(m, task_id))
+            .await
+            .is_none(),
         "exactly one result per delivered task"
     );
     assert!(worker.table.read().await.is_empty());
@@ -405,11 +436,21 @@ async fn test_master_shutdown_also_cancels_running_tasks() {
     let pid_file = dir.path().join("pid");
 
     let mut conn = master.accept(1).await;
-    conn.send(MasterMessage::AssignTask { task: sleeper(&pid_file) }).await;
+    conn.send(MasterMessage::AssignTask {
+        task: sleeper(&pid_file),
+    })
+    .await;
     let pid = read_pid(&pid_file).await;
 
-    conn.send(MasterMessage::Shutdown { reason: "bye".into(), grace_period_secs: None }).await;
-    assert!(wait_dead(pid, Duration::from_secs(10)).await, "process {pid} survived the Master's shutdown");
+    conn.send(MasterMessage::Shutdown {
+        reason: "bye".into(),
+        grace_period_secs: None,
+    })
+    .await;
+    assert!(
+        wait_dead(pid, Duration::from_secs(10)).await,
+        "process {pid} survived the Master's shutdown"
+    );
     drop(conn);
     worker.stop().await;
 }
@@ -440,7 +481,10 @@ async fn test_aborting_the_worker_task_closes_its_connection_to_the_master() {
         while let Ok(Some(_)) = conn.transport.recv_msg::<WorkerMessage>().await {}
     })
     .await;
-    assert!(ended.is_ok(), "the socket stayed open after the worker task was aborted");
+    assert!(
+        ended.is_ok(),
+        "the socket stayed open after the worker task was aborted"
+    );
 }
 
 // ------------------------------------------------------------------------------------------
@@ -450,7 +494,9 @@ async fn test_aborting_the_worker_task_closes_its_connection_to_the_master() {
 #[tokio::test]
 async fn test_a_silent_master_is_detected_and_the_worker_reconnects() {
     let master = ScriptedMaster::start().await;
-    let worker = start_worker(master.addr, |c| c.with_dead_peer_timeout(Duration::from_millis(800)));
+    let worker = start_worker(master.addr, |c| {
+        c.with_dead_peer_timeout(Duration::from_millis(800))
+    });
 
     // Registers, then the "master" goes dark: socket open, no reads, no acks, no FIN. Writes
     // into it keep succeeding, so only the watchdog can notice.
@@ -504,7 +550,10 @@ async fn test_a_healthy_master_that_acks_heartbeats_is_never_dropped() {
         }
     }
     assert!(acked >= 3, "heartbeats keep flowing ({acked})");
-    assert!(master.quiet_for(Duration::from_millis(200)).await, "no reconnect while the master answers");
+    assert!(
+        master.quiet_for(Duration::from_millis(200)).await,
+        "no reconnect while the master answers"
+    );
     assert!(worker.running());
     drop(conn);
     worker.stop().await;
@@ -531,9 +580,17 @@ async fn test_worker_keeps_servicing_the_master_while_a_large_result_cannot_be_s
     let victim = sleeper(&pid_file);
     let victim_id = victim.id;
     conn.send(MasterMessage::AssignTask { task: victim }).await;
-    conn.wait_for(WAIT, |m| matches!(m, WorkerMessage::TaskProgress { status: TaskStatus::Running, .. }))
-        .await
-        .expect("victim running");
+    conn.wait_for(WAIT, |m| {
+        matches!(
+            m,
+            WorkerMessage::TaskProgress {
+                status: TaskStatus::Running,
+                ..
+            }
+        )
+    })
+    .await
+    .expect("victim running");
     let pid = read_pid(&pid_file).await;
 
     // A 40 MB result the master refuses to read: the worker's upload stalls in the middle of the frame.
@@ -559,7 +616,10 @@ async fn test_worker_keeps_servicing_the_master_while_a_large_result_cannot_be_s
         .wait_for(WAIT, |m| is_result_of(m, big_id))
         .await
         .expect("the large result is delivered");
-    if let WorkerMessage::TaskResult { stdout, exit_code, .. } = result {
+    if let WorkerMessage::TaskResult {
+        stdout, exit_code, ..
+    } = result
+    {
         assert_eq!(exit_code, 0);
         assert_eq!(stdout.0.len(), BIG);
     }
@@ -567,7 +627,10 @@ async fn test_worker_keeps_servicing_the_master_while_a_large_result_cannot_be_s
         .wait_for(WAIT, |m| is_result_of(m, victim_id))
         .await
         .expect("the cancellation result");
-    assert!(matches!(cancelled, WorkerMessage::TaskResult { exit_code: 130, .. }));
+    assert!(matches!(
+        cancelled,
+        WorkerMessage::TaskResult { exit_code: 130, .. }
+    ));
     assert!(worker.running());
     drop(conn);
     worker.stop().await;
@@ -620,7 +683,10 @@ async fn test_a_slow_but_progressing_upload_is_not_mistaken_for_a_dead_master() 
     let Conn { mut transport, .. } = conn;
     let big = big_output_task(BIG);
     let big_id = big.id;
-    transport.send_msg(&MasterMessage::AssignTask { task: big }).await.unwrap();
+    transport
+        .send_msg(&MasterMessage::AssignTask { task: big })
+        .await
+        .unwrap();
 
     // Switch to paced raw reads (13 MB/s): about 3 s for the part that does not fit the socket buffers.
     let parts = transport.into_inner().into_parts();
@@ -642,7 +708,9 @@ async fn test_a_slow_but_progressing_upload_is_not_mistaken_for_a_dead_master() 
     }
     let elapsed = started.elapsed();
     match delivered {
-        Some(WorkerMessage::TaskResult { stdout, exit_code, .. }) => {
+        Some(WorkerMessage::TaskResult {
+            stdout, exit_code, ..
+        }) => {
             assert_eq!(exit_code, 0);
             assert_eq!(stdout.0.len(), BIG);
         }
@@ -668,7 +736,10 @@ async fn test_a_stalled_upload_to_a_master_that_stopped_reading_is_detected() {
             .with_max_output_bytes(BIG + 1024)
     });
     let mut conn = master.accept(1).await;
-    conn.send(MasterMessage::AssignTask { task: big_output_task(BIG) }).await;
+    conn.send(MasterMessage::AssignTask {
+        task: big_output_task(BIG),
+    })
+    .await;
 
     // The master never reads again: the upload fills the socket buffers and stops making progress.
     let started = Instant::now();
@@ -723,10 +794,16 @@ fn phone(battery_pct: u8, charging: bool) -> MobileCapabilities {
 async fn test_live_battery_and_thermal_updates_reach_the_masters_scheduler_view() {
     let master = spawn_real_master().await;
     let handle = MobileTelemetryHandle::new(Some(phone(90, true)));
-    let worker = start_worker(master.server_addr(), |c| c.with_mobile_telemetry(handle.clone()));
+    let worker = start_worker(master.server_addr(), |c| {
+        c.with_mobile_telemetry(handle.clone())
+    });
 
     let registered = wait_until(Duration::from_secs(10), || async {
-        master.list_workers().await.map(|w| w.len() == 1).unwrap_or(false)
+        master
+            .list_workers()
+            .await
+            .map(|w| w.len() == 1)
+            .unwrap_or(false)
     })
     .await;
     assert!(registered, "worker registered");
@@ -741,7 +818,11 @@ async fn test_live_battery_and_thermal_updates_reach_the_masters_scheduler_view(
                 .and_then(|w| w.capabilities.mobile)
         }
     };
-    assert_eq!(mobile_of(&master).await.unwrap().battery_pct, Some(90), "Register carried the initial state");
+    assert_eq!(
+        mobile_of(&master).await.unwrap().battery_pct,
+        Some(90),
+        "Register carried the initial state"
+    );
 
     // The phone is unplugged, drains and overheats after registration: the Android app writes the
     // new readings into the shared handle, and the master must see them without a re-registration.
@@ -751,14 +832,20 @@ async fn test_live_battery_and_thermal_updates_reach_the_masters_scheduler_view(
         thermal_throttled: true,
     });
     let updated = wait_until(Duration::from_secs(10), || async {
-        mobile_of(&master)
-            .await
-            .is_some_and(|m| m.battery_pct == Some(4) && m.thermal_throttled && m.is_charging == Some(false))
+        mobile_of(&master).await.is_some_and(|m| {
+            m.battery_pct == Some(4) && m.thermal_throttled && m.is_charging == Some(false)
+        })
     })
     .await;
-    assert!(updated, "the master still sees the registration-time snapshot");
+    assert!(
+        updated,
+        "the master still sees the registration-time snapshot"
+    );
     // Static descriptors from the registration survive.
-    assert_eq!(mobile_of(&master).await.unwrap().soc_model, "Snapdragon 8 Gen 3");
+    assert_eq!(
+        mobile_of(&master).await.unwrap().soc_model,
+        "Snapdragon 8 Gen 3"
+    );
 
     // Plugged in and cooled down again.
     handle.update(MobileLiveStatus {
@@ -792,7 +879,11 @@ async fn test_a_restarted_worker_keeps_its_identity_at_the_master() {
     let first = start_worker(master.server_addr(), |c| c.with_worker_id_file(&id_file));
     assert!(
         wait_until(Duration::from_secs(10), || async {
-            master.list_workers().await.map(|w| w.len() == 1).unwrap_or(false)
+            master
+                .list_workers()
+                .await
+                .map(|w| w.len() == 1)
+                .unwrap_or(false)
         })
         .await
     );
@@ -807,7 +898,12 @@ async fn test_a_restarted_worker_keeps_its_identity_at_the_master() {
             master
                 .list_workers()
                 .await
-                .map(|w| w.iter().any(|i| i.worker_id == first_id && i.status != rusty_grid_master::registry::WorkerStatus::Disconnected))
+                .map(|w| {
+                    w.iter().any(|i| {
+                        i.worker_id == first_id
+                            && i.status != rusty_grid_master::registry::WorkerStatus::Disconnected
+                    })
+                })
                 .unwrap_or(false)
         })
         .await
@@ -838,7 +934,8 @@ async fn test_a_stale_p2p_ticket_falls_back_to_the_tcp_address() {
 
     let master = ScriptedMaster::start().await;
     let worker = start_worker(master.addr, |c| {
-        c.with_p2p_ticket(stale_ticket).with_connect_timeout(Duration::from_secs(2))
+        c.with_p2p_ticket(stale_ticket)
+            .with_connect_timeout(Duration::from_secs(2))
     });
 
     // Without the fallback the worker would redial the dead ticket forever and never show up here.

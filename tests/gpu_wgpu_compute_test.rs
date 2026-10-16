@@ -32,7 +32,12 @@ use rusty_grid_worker::runner::{
 use rusty_grid_worker::sandbox::SandboxConfig;
 use rusty_grid_worker::WorkerClient;
 
-fn make_capabilities(name: &str, cores: usize, has_gpu: bool, is_simulated: bool) -> WorkerCapabilities {
+fn make_capabilities(
+    name: &str,
+    cores: usize,
+    has_gpu: bool,
+    is_simulated: bool,
+) -> WorkerCapabilities {
     WorkerCapabilities {
         name: name.into(),
         cpu_cores: cores,
@@ -77,7 +82,9 @@ fn gpu_task(dim: u32, tile: u32, timeout_secs: u64) -> Task {
 fn real_gpu_engine_available() -> bool {
     #[cfg(feature = "gpu-wgpu")]
     {
-        rusty_grid_worker::wgpu_engine::EngineProvider::shared().get().is_ok()
+        rusty_grid_worker::wgpu_engine::EngineProvider::shared()
+            .get()
+            .is_ok()
     }
     #[cfg(not(feature = "gpu-wgpu"))]
     {
@@ -87,7 +94,8 @@ fn real_gpu_engine_available() -> bool {
 
 /// On the GPU lane (`RUSTY_GRID_REQUIRE_GPU=1`) a missing GPU engine is a failure, not a skip.
 fn require_gpu_lane_to_have_a_gpu(test: &str) {
-    if std::env::var("RUSTY_GRID_REQUIRE_GPU").as_deref() == Ok("1") && !real_gpu_engine_available() {
+    if std::env::var("RUSTY_GRID_REQUIRE_GPU").as_deref() == Ok("1") && !real_gpu_engine_available()
+    {
         panic!(
             "RUSTY_GRID_REQUIRE_GPU=1 but {test} found no GPU engine (built with gpu-wgpu: {})",
             rusty_grid_worker::WGPU_COMPILED
@@ -259,7 +267,9 @@ async fn test_simulated_gpu_backward_compatibility() {
 
     // Check all legacy string assertions expected by existing test suites
     assert!(res.stdout.contains("[GPU COMPUTE SIMULATOR]"));
-    assert!(res.stdout.contains("Device: Simulated Virtual GPU (Matrix Engine)"));
+    assert!(res
+        .stdout
+        .contains("Device: Simulated Virtual GPU (Matrix Engine)"));
     assert!(res.stdout.contains("Kernel: backward_compat_gemm"));
     assert!(res.stdout.contains("Matrix Dimension: 48x48"));
     assert!(res.stdout.contains("Status: VERIFIED_OK"));
@@ -315,7 +325,10 @@ fn test_cpu_simd_report_format() {
     assert!(stdout.contains("Kernel: fallback_kernel"));
     assert!(stdout.contains("Matrix Dimension: 32x32"));
     // VERIFIED_OK is earned: 1024 of 1024 entries were recomputed with an independent dot product.
-    assert!(stdout.contains("Verification: 1024 of 1024 entries"), "{stdout}");
+    assert!(
+        stdout.contains("Verification: 1024 of 1024 entries"),
+        "{stdout}"
+    );
     assert!(stdout.contains("Status: VERIFIED_OK"));
 }
 
@@ -339,14 +352,20 @@ async fn test_real_gpu_worker_computes_on_the_gpu_or_fails_it_never_fakes_it() {
         assert!(res.stdout.contains("Status: VERIFIED_OK"));
         assert_ne!(res.device_name.as_deref(), Some("CPU SIMD Fallback"));
     } else {
-        require_gpu_lane_to_have_a_gpu("test_real_gpu_worker_computes_on_the_gpu_or_fails_it_never_fakes_it");
+        require_gpu_lane_to_have_a_gpu(
+            "test_real_gpu_worker_computes_on_the_gpu_or_fails_it_never_fakes_it",
+        );
         // No engine: the task FAILS with the reason. It must not succeed on the CPU while
         // claiming GPU execution (the old behaviour: exit 0, is_gpu_executed, VERIFIED_OK).
         assert_eq!(res.exit_code, EXIT_CODE_GENERAL_ERROR);
         assert!(!res.is_success());
         assert!(!res.is_gpu_executed);
         assert!(res.device_name.is_none());
-        assert!(res.stdout.is_empty(), "no report for work that did not run: {}", res.stdout);
+        assert!(
+            res.stdout.is_empty(),
+            "no report for work that did not run: {}",
+            res.stdout
+        );
         let error = res.error.expect("failure must carry a message");
         if rusty_grid_worker::WGPU_COMPILED {
             assert!(error.contains("GPU unavailable"), "{error}");
@@ -412,7 +431,9 @@ fn test_physical_wgpu_execution_when_available() {
     {
         // Without the feature there is no GPU engine: say so, refuse on the GPU lane.
         require_gpu_lane_to_have_a_gpu("test_physical_wgpu_execution_when_available");
-        println!("Feature 'gpu-wgpu' not enabled in current build; physical shader execution skipped.");
+        println!(
+            "Feature 'gpu-wgpu' not enabled in current build; physical shader execution skipped."
+        );
     }
 }
 
@@ -518,7 +539,9 @@ async fn test_e2e_cluster_gpu_task_distribution() {
 async fn test_adversarial_concurrent_gpu_compute_invocations() {
     #[cfg(feature = "gpu-wgpu")]
     {
-        if let Some(engine) = gpu_engine_or_skip("test_adversarial_concurrent_gpu_compute_invocations") {
+        if let Some(engine) =
+            gpu_engine_or_skip("test_adversarial_concurrent_gpu_compute_invocations")
+        {
             // 1. Direct concurrent execute_gemm invocations across 12 threads
             const NUM_TASKS: usize = 12;
             let mut handles = Vec::with_capacity(NUM_TASKS);
@@ -571,7 +594,10 @@ async fn test_adversarial_concurrent_gpu_compute_invocations() {
         if real_gpu_engine_available() {
             assert_eq!(res.exit_code, 0, "Task {idx} must succeed: {:?}", res.error);
             assert!(res.is_gpu_executed, "Task {idx} must be GPU executed");
-            assert!(res.device_name.is_some(), "Task {idx} must report device name");
+            assert!(
+                res.device_name.is_some(),
+                "Task {idx} must report device name"
+            );
             assert!(
                 res.stdout.contains("Status: VERIFIED_OK"),
                 "Task {idx} must contain VERIFIED_OK in stdout"
@@ -579,7 +605,10 @@ async fn test_adversarial_concurrent_gpu_compute_invocations() {
         } else {
             require_gpu_lane_to_have_a_gpu("test_adversarial_concurrent_gpu_compute_invocations");
             assert_eq!(res.exit_code, EXIT_CODE_GENERAL_ERROR, "Task {idx}");
-            assert!(!res.is_gpu_executed, "Task {idx} must not claim GPU execution");
+            assert!(
+                !res.is_gpu_executed,
+                "Task {idx} must not claim GPU execution"
+            );
             assert!(res.error.is_some(), "Task {idx} must say why it failed");
         }
     }
@@ -597,28 +626,55 @@ async fn test_gpu_task_parameters_are_honoured_or_rejected_never_clamped() {
     for (dim, tile, needle) in [
         (0, 16, "simulated_matrix_dim must be at least 1"),
         (16, 0, "work_group_size must be at least 1"),
-        (100_000, 16, "simulated_matrix_dim 100000 is above what this device accepts (at most 2048"),
+        (
+            100_000,
+            16,
+            "simulated_matrix_dim 100000 is above what this device accepts (at most 2048",
+        ),
         (2049, 16, "at most 2048"),
         (64, 1000, "work_group_size 1000 is above"),
         (64, 33, "work_group_size 33 is above"),
     ] {
-        let res = runner.execute_task(&gpu_task(dim, tile, 10), None, None).await;
-        assert_eq!(res.exit_code, EXIT_CODE_GENERAL_ERROR, "dim {dim} tile {tile}");
+        let res = runner
+            .execute_task(&gpu_task(dim, tile, 10), None, None)
+            .await;
+        assert_eq!(
+            res.exit_code, EXIT_CODE_GENERAL_ERROR,
+            "dim {dim} tile {tile}"
+        );
         assert!(!res.is_gpu_executed, "dim {dim} tile {tile}");
-        assert!(res.stdout.is_empty(), "dim {dim} tile {tile}: {}", res.stdout);
+        assert!(
+            res.stdout.is_empty(),
+            "dim {dim} tile {tile}: {}",
+            res.stdout
+        );
         let error = res.error.expect("error message");
         assert!(error.contains(needle), "dim {dim} tile {tile}: {error}");
     }
 
     // In range: used exactly as asked. 513 is one above the old silent clamp of 512, 4 below its
     // old minimum work group edge.
-    let res = runner.execute_task(&gpu_task(513, 4, 120), None, None).await;
+    let res = runner
+        .execute_task(&gpu_task(513, 4, 120), None, None)
+        .await;
     assert_eq!(res.exit_code, 0, "{:?}", res.error);
-    assert!(res.stdout.contains("Matrix Dimension: 513x513"), "{}", res.stdout);
-    assert!(res.stdout.contains("Work Group Size: 4x4"), "{}", res.stdout);
+    assert!(
+        res.stdout.contains("Matrix Dimension: 513x513"),
+        "{}",
+        res.stdout
+    );
+    assert!(
+        res.stdout.contains("Work Group Size: 4x4"),
+        "{}",
+        res.stdout
+    );
     let res = runner.execute_task(&gpu_task(5, 1, 10), None, None).await;
     assert_eq!(res.exit_code, 0, "{:?}", res.error);
-    assert!(res.stdout.contains("Matrix Dimension: 5x5"), "{}", res.stdout);
+    assert!(
+        res.stdout.contains("Matrix Dimension: 5x5"),
+        "{}",
+        res.stdout
+    );
     assert!(res.stdout.contains("Status: VERIFIED_OK"));
 }
 
@@ -634,44 +690,72 @@ fn test_wgpu_engine_honours_dim_and_work_group_or_rejects_with_a_clear_error() {
 
     // Irregular dimensions and several work group edges produce correct products, and the report
     // prints the edge that was really dispatched.
-    for (dim, tile) in [(1usize, 1usize), (7, 4), (17, 8), (33, 16), (100, 12), (129, 16)] {
+    for (dim, tile) in [
+        (1usize, 1usize),
+        (7, 4),
+        (17, 8),
+        (33, 16),
+        (100, 12),
+        (129, 16),
+    ] {
         let outcome = engine
             .execute_gemm("tile_test", b"tile_payload", Uuid::new_v4(), dim, tile)
             .unwrap_or_else(|e| panic!("dim {dim} tile {tile}: {e}"));
         assert!(outcome.verification.passed(), "dim {dim} tile {tile}");
         assert!(
-            outcome.stdout.contains(&format!("Work Group Size: {tile}x{tile}\n")),
+            outcome
+                .stdout
+                .contains(&format!("Work Group Size: {tile}x{tile}\n")),
             "{}",
             outcome.stdout
         );
-        assert!(outcome.stdout.contains(&format!("Matrix Dimension: {dim}x{dim} ")));
+        assert!(outcome
+            .stdout
+            .contains(&format!("Matrix Dimension: {dim}x{dim} ")));
     }
 
     // A work group of 32x32 = 1024 threads only on devices that allow it.
     let big_tile = engine.execute_gemm("tile_test", b"", Uuid::new_v4(), 64, 32);
     if limits.max_workgroup_invocations >= 1024 && limits.max_workgroup_edge >= 32 {
-        assert!(big_tile.expect("32x32 allowed on this device").verification.passed());
+        assert!(big_tile
+            .expect("32x32 allowed on this device")
+            .verification
+            .passed());
     } else {
-        assert!(matches!(big_tile, Err(GpuError::InvalidRequest(_))), "{big_tile:?}");
+        assert!(
+            matches!(big_tile, Err(GpuError::InvalidRequest(_))),
+            "{big_tile:?}"
+        );
     }
 
     // Out of range: InvalidRequest before anything touches the device, naming the limit.
     for (dim, tile) in [(0usize, 16usize), (16, 0)] {
-        let err = engine.execute_gemm("k", b"", Uuid::new_v4(), dim, tile).unwrap_err();
+        let err = engine
+            .execute_gemm("k", b"", Uuid::new_v4(), dim, tile)
+            .unwrap_err();
         assert!(matches!(err, GpuError::InvalidRequest(_)), "{err:?}");
     }
     let too_big = limits.max_supported_dim() as usize + 1;
-    let err = engine.execute_gemm("k", b"", Uuid::new_v4(), too_big, 16).unwrap_err();
+    let err = engine
+        .execute_gemm("k", b"", Uuid::new_v4(), too_big, 16)
+        .unwrap_err();
     let GpuError::InvalidRequest(message) = &err else {
         panic!("{err:?}");
     };
-    assert!(message.contains(&format!("simulated_matrix_dim {too_big} is above")), "{message}");
+    assert!(
+        message.contains(&format!("simulated_matrix_dim {too_big} is above")),
+        "{message}"
+    );
     // The same holds for a size that does not even fit 32 bits.
-    let err = engine.execute_gemm("k", b"", Uuid::new_v4(), usize::MAX, 16).unwrap_err();
+    let err = engine
+        .execute_gemm("k", b"", Uuid::new_v4(), usize::MAX, 16)
+        .unwrap_err();
     assert!(matches!(err, GpuError::InvalidRequest(_)), "{err:?}");
     // None of that harmed the engine.
     assert!(!engine.is_lost());
-    assert!(engine.execute_gemm("k", b"", Uuid::new_v4(), 16, 16).is_ok());
+    assert!(engine
+        .execute_gemm("k", b"", Uuid::new_v4(), 16, 16)
+        .is_ok());
 }
 
 #[cfg(feature = "gpu-wgpu")]
@@ -697,12 +781,21 @@ fn gpu_output_matches_cpu_oracle_for_dims_1_15_16_17_255_512() {
         let bound = dim as f32 * f32::EPSILON;
         for (i, (&gpu, &cpu)) in outcome.matrix_c.iter().zip(&expected).enumerate() {
             let tolerance = bound * cpu.abs().max(1e-3) * 2.0;
-            assert!((gpu - cpu).abs() <= tolerance, "dim {dim} index {i}: gpu={gpu} cpu={cpu}");
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "dim {dim} index {i}: gpu={gpu} cpu={cpu}"
+            );
         }
         // The two engines' traces agree to far better than a unit in the last place of a sum.
         let cpu_metrics = cpu_simd::compute_matrix_metrics(&expected, dim);
-        let relative = (outcome.metrics.trace - cpu_metrics.trace).abs() / cpu_metrics.trace.abs().max(1e-9);
-        assert!(relative < 1e-4, "dim {dim}: trace {} vs {}", outcome.metrics.trace, cpu_metrics.trace);
+        let relative =
+            (outcome.metrics.trace - cpu_metrics.trace).abs() / cpu_metrics.trace.abs().max(1e-9);
+        assert!(
+            relative < 1e-4,
+            "dim {dim}: trace {} vs {}",
+            outcome.metrics.trace,
+            cpu_metrics.trace
+        );
     }
 }
 
@@ -718,11 +811,15 @@ fn device_loss_returns_failure_result_not_panic() {
     let engine = match rusty_grid_worker::wgpu_engine::WgpuEngine::try_init() {
         Ok(Some(engine)) => engine,
         other => {
-            println!("device_loss_returns_failure_result_not_panic: skipped, no GPU engine ({other:?})");
+            println!(
+                "device_loss_returns_failure_result_not_panic: skipped, no GPU engine ({other:?})"
+            );
             return;
         }
     };
-    assert!(engine.execute_gemm("before", b"x", Uuid::new_v4(), 32, 16).is_ok());
+    assert!(engine
+        .execute_gemm("before", b"x", Uuid::new_v4(), 32, 16)
+        .is_ok());
 
     // Destroy the underlying wgpu Device to simulate physical device loss / driver reset.
     engine.device.destroy();
@@ -731,15 +828,29 @@ fn device_loss_returns_failure_result_not_panic() {
     // must turn that into an Err, and keep turning it into one.
     for attempt in 0..3 {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            engine.execute_gemm("post_device_loss_kernel", b"lost_device_tensor", Uuid::new_v4(), 32, 16)
+            engine.execute_gemm(
+                "post_device_loss_kernel",
+                b"lost_device_tensor",
+                Uuid::new_v4(),
+                32,
+                16,
+            )
         }));
-        let outcome = result.unwrap_or_else(|_| panic!("attempt {attempt}: execute_gemm panicked on a lost device"));
+        let outcome = result.unwrap_or_else(|_| {
+            panic!("attempt {attempt}: execute_gemm panicked on a lost device")
+        });
         let err = outcome.expect_err("a destroyed device cannot compute");
-        assert!(matches!(err, GpuError::Device(_)), "attempt {attempt}: {err:?}");
+        assert!(
+            matches!(err, GpuError::Device(_)),
+            "attempt {attempt}: {err:?}"
+        );
         assert!(!err.to_string().is_empty());
         println!("attempt {attempt}: {err}");
     }
-    assert!(engine.is_lost(), "an engine that failed on the device is marked lost");
+    assert!(
+        engine.is_lost(),
+        "an engine that failed on the device is marked lost"
+    );
 }
 
 #[cfg(feature = "gpu-wgpu")]
@@ -751,14 +862,19 @@ async fn lost_engine_is_rebuilt_and_the_next_task_runs() {
     let first = match provider.get() {
         Ok(lease) => lease,
         Err(err) => {
-            println!("lost_engine_is_rebuilt_and_the_next_task_runs: skipped, no GPU engine ({err})");
+            println!(
+                "lost_engine_is_rebuilt_and_the_next_task_runs: skipped, no GPU engine ({err})"
+            );
             return;
         }
     };
     assert!(first.init_ms.is_some(), "the first lease built the engine");
     let again = provider.get().expect("engine still there");
     assert!(Arc::ptr_eq(&first.engine, &again.engine));
-    assert!(again.init_ms.is_none(), "a running engine is handed out without a rebuild");
+    assert!(
+        again.init_ms.is_none(),
+        "a running engine is handed out without a rebuild"
+    );
 
     let tmp = tempdir().unwrap();
     let runner = TaskRunner::new(
@@ -775,17 +891,35 @@ async fn lost_engine_is_rebuilt_and_the_next_task_runs() {
     // the runner task) ...
     first.engine.device.destroy();
     let failed = runner.execute_task(&gpu_task(32, 16, 30), None, None).await;
-    assert_eq!(failed.exit_code, EXIT_CODE_GENERAL_ERROR, "{:?}", failed.stdout);
+    assert_eq!(
+        failed.exit_code, EXIT_CODE_GENERAL_ERROR,
+        "{:?}",
+        failed.stdout
+    );
     assert!(!failed.is_gpu_executed);
-    assert!(failed.error.as_deref().is_some_and(|e| e.contains("GPU device error")), "{:?}", failed.error);
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("GPU device error")),
+        "{:?}",
+        failed.error
+    );
 
     // ... and the next task gets a fresh engine instead of the dead one cached for ever.
     let recovered = runner.execute_task(&gpu_task(32, 16, 30), None, None).await;
     assert_eq!(recovered.exit_code, 0, "{:?}", recovered.error);
     assert!(recovered.is_gpu_executed);
-    assert!(recovered.stdout.contains("Engine Init Time:"), "{}", recovered.stdout);
+    assert!(
+        recovered.stdout.contains("Engine Init Time:"),
+        "{}",
+        recovered.stdout
+    );
     let rebuilt = provider.get().expect("engine");
-    assert!(!Arc::ptr_eq(&first.engine, &rebuilt.engine), "a new engine replaced the lost one");
+    assert!(
+        !Arc::ptr_eq(&first.engine, &rebuilt.engine),
+        "a new engine replaced the lost one"
+    );
 }
 
 #[cfg(feature = "gpu-wgpu")]
@@ -840,7 +974,9 @@ async fn gpu_class_compute_does_not_block_the_async_runtime() {
     });
 
     let started = Instant::now();
-    let res = runner.execute_task(&gpu_task(1000, 16, 120), None, None).await;
+    let res = runner
+        .execute_task(&gpu_task(1000, 16, 120), None, None)
+        .await;
     let compute_wall = started.elapsed();
     assert_eq!(res.exit_code, 0, "{:?}", res.error);
 
@@ -867,7 +1003,11 @@ fn gpu_class_timeout_fires_and_stops_the_multiplication() {
     let res = runtime.block_on(runner.execute_task(&gpu_task(1500, 16, 1), None, None));
     assert_eq!(res.exit_code, EXIT_CODE_TIMEOUT, "{:?}", res.error);
     assert!(res.error.unwrap().contains("timed out"));
-    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
 
     let shutdown_started = Instant::now();
     drop(runtime);
@@ -891,7 +1031,11 @@ async fn gpu_class_cancel_is_honoured_promptly() {
         .execute_task(&gpu_task(1500, 16, 120), None, Some(cancel_rx))
         .await;
     assert_eq!(res.exit_code, EXIT_CODE_CANCELLED, "{:?}", res.error);
-    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 // ============================================================================
@@ -935,9 +1079,15 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
     );
     let w3_gpu_id = w3.worker_id();
 
-    tokio::spawn(async move { let _ = w1.run(w1_rx).await; });
-    tokio::spawn(async move { let _ = w2.run(w2_rx).await; });
-    tokio::spawn(async move { let _ = w3.run(w3_rx).await; });
+    tokio::spawn(async move {
+        let _ = w1.run(w1_rx).await;
+    });
+    tokio::spawn(async move {
+        let _ = w2.run(w2_rx).await;
+    });
+    tokio::spawn(async move {
+        let _ = w3.run(w3_rx).await;
+    });
 
     let ready = wait_for(
         Duration::from_secs(5),
@@ -986,7 +1136,9 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
 
     // 1. Verify CPU tasks
     for (i, res) in results[0..6].iter().enumerate() {
-        let r = res.as_ref().unwrap_or_else(|e| panic!("CPU task {i} failed: {e}"));
+        let r = res
+            .as_ref()
+            .unwrap_or_else(|e| panic!("CPU task {i} failed: {e}"));
         assert_eq!(r.exit_code, 0);
         assert!(!r.is_gpu_executed);
     }
@@ -994,7 +1146,9 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
     // 2. Strict negative capability assertion:
     // 100% of GPU tasks MUST have been executed by Worker 3 (GPU), and 0% by Worker 1 or 2!
     for (i, res) in results[6..12].iter().enumerate() {
-        let r = res.as_ref().unwrap_or_else(|e| panic!("GPU task {i} failed: {e}"));
+        let r = res
+            .as_ref()
+            .unwrap_or_else(|e| panic!("GPU task {i} failed: {e}"));
         assert_eq!(r.exit_code, 0);
         assert!(r.is_gpu_executed);
         assert_eq!(
@@ -1021,7 +1175,10 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
         Duration::from_millis(50),
         || async {
             let workers = master.list_workers().await.unwrap_or_default();
-            workers.iter().find(|w| w.worker_id == w3_gpu_id).map(|w| w.status)
+            workers
+                .iter()
+                .find(|w| w.worker_id == w3_gpu_id)
+                .map(|w| w.status)
                 == Some(WorkerStatus::Disconnected)
         },
     )
@@ -1033,11 +1190,17 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
         TaskSpec::gpu_compute("stranded_gpu_task", 32),
         TaskRequirements::gpu(15),
     );
-    let stranded_id = master.submit_task(stranded_gpu).await.expect("submit stranded");
+    let stranded_id = master
+        .submit_task(stranded_gpu)
+        .await
+        .expect("submit stranded");
 
     // Wait 500ms: Task MUST remain in Queued state and NEVER spill over to CPU workers
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let status = master.get_task_status(stranded_id).await.expect("status check");
+    let status = master
+        .get_task_status(stranded_id)
+        .await
+        .expect("status check");
     assert_eq!(
         status,
         rusty_grid_core::task::TaskStatus::Queued,
@@ -1050,7 +1213,10 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
         TaskRequirements::generic(1, 5),
     );
     let quick_id = master.submit_task(quick_cpu).await.expect("quick submit");
-    let quick_res = master.wait_task(quick_id, Some(Duration::from_secs(3))).await.expect("quick wait");
+    let quick_res = master
+        .wait_task(quick_id, Some(Duration::from_secs(3)))
+        .await
+        .expect("quick wait");
     assert_eq!(quick_res.exit_code, 0);
     assert!(quick_res.worker_id == w1_id || quick_res.worker_id == w2_id);
 
@@ -1059,4 +1225,3 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
     let _ = w2_tx.send(true);
     let _ = master.shutdown();
 }
-
