@@ -1,0 +1,124 @@
+# CI for the OxideSwarm Cargo workspace.
+#
+# Expected to fail for now (state of 58c0eb0, the commit this workflow was added on top of):
+#   * `rustfmt`: 51 files are not rustfmt-clean. It goes green once `cargo fmt --all` has been run and
+#     committed; it is a job of its own so that its failure does not stop clippy or the tests.
+#   * clippy, on every OS: stable Rust 1.99 deprecates `fetch_update` (crates/worker/src/heartbeat.rs), and
+#     on ubuntu and macOS tests/m3_challenger_2_stress.rs has items that only #[cfg(windows)] code uses.
+#     `-D warnings` rejects both. The test steps still run after that failure.
+#
+# Toolchain: the latest stable Rust. Cargo.toml still declares rust-version = "1.75", but iroh 1.2
+# needs Rust >= 1.91, so 1.75 is not tested. The real-GPU tests need `--features gpu-wgpu` and a GPU;
+# CI builds without that feature, so those tests are compiled out or skip.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push to a pull request cancels its older run; runs for pushes to master are never cancelled.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rustfmt:
+    name: rustfmt
+    # Formatting does not depend on the OS, so it is checked once, on ubuntu.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+  test:
+    name: clippy and tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    env:
+      # [profile.dev] has `debug = true`. Line tables keep file:line in panics and backtraces while keeping
+      # the ~60 test binaries small enough for the runners' disks and the cache.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # tests/test_ecosystem_convergence.rs runs scripts/agent_node.py (as `python3`, or `python` on Windows),
+      # which needs the `websockets` package. setup-python puts a Python first on PATH that pip may install
+      # into; the runners' system Pythons on ubuntu and macOS refuse that (PEP 668).
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: python -m pip install websockets
+        run: python -m pip install --disable-pip-version-check websockets
+      - uses: Swatinem/rust-cache@v2
+        id: cache
+        with:
+          # Pull requests read the cache that pushes to master write. A red run still saves it: the
+          # compiled dependencies are valid whatever the tests did.
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          cache-on-failure: true
+
+      # The checks after clippy also run when an earlier one failed, so that a lint failure cannot hide
+      # the test results. They are skipped only when the setup above did not finish.
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo check -p rusty_grid_master --no-default-features
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
+        run: cargo check -p rusty_grid_master --no-default-features
+
+      # --no-fail-fast: a failing test binary must not stop the ones after it, or one failure hides the
+      # results of the rest of the suite.
+      - name: cargo test --workspace --lib --no-fail-fast
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
+        run: cargo test --workspace --lib --no-fail-fast
+
+      # The full suite, stress tests included. Tests bind 127.0.0.1:0 and give child processes a temporary
+      # HOME, so they need no fixed ports and never touch the runner's ~/.oxideswarm.
+      # Timing-sensitive: android_bridge adversarial_challenge_tests::
+      # test_adversarial_worker_connect_via_master_p2p_ticket waits at most 5 s for the P2P registration
+      # and can fail on a busy runner.
+      - name: cargo test --workspace --no-fail-fast
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
+        timeout-minutes: 90
+        run: cargo test --workspace --no-fail-fast
+
+  launcher-scripts:
+    name: launcher scripts (${{ matrix.os }})
+    # tests/test_launcher_scripts.py globs the whole checkout, target/ included, and gets very slow once a
+    # target/ directory exists. Keep cargo and rust-cache out of this job so that the script always runs
+    # before any build: it needs none, it runs the launchers against fake binaries.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: python3 tests/test_launcher_scripts.py
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            # The launchers must work with macOS's own /bin/bash 3.2: run them with it, not with a newer
+            # Homebrew bash that may come first on the runner's PATH.
+            export PATH="/bin:$PATH"
+          fi
+          bash -c 'echo "bash $BASH_VERSION ($(command -v bash))"'
+          python3 --version
+          python3 tests/test_launcher_scripts.py
