@@ -123,25 +123,25 @@ pub(crate) fn configure_command(cmd: &mut tokio::process::Command, priority: Pro
     {
         cmd.process_group(0);
         let nice = priority.unix_nice();
-        if nice > 0 {
-            // SAFETY: the closure runs in the forked child before exec and only calls
-            // `setpriority`, which is async-signal-safe and touches no Rust state. A failure is
-            // deliberately ignored: running at normal priority beats not running the task.
-            unsafe {
-                cmd.pre_exec(move || {
+        unsafe {
+            cmd.pre_exec(move || {
+                #[cfg(target_os = "linux")]
+                {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                }
+                if nice > 0 {
                     libc::setpriority(libc::PRIO_PROCESS, 0, nice);
-                    Ok(())
-                });
-            }
+                }
+                Ok(())
+            });
         }
     }
 
     #[cfg(windows)]
     {
-        let flag = priority.windows_class_flag();
-        if flag != 0 {
-            cmd.creation_flags(flag);
-        }
+        const CREATE_SUSPENDED: u32 = 0x0000_0004;
+        let flag = priority.windows_class_flag() | CREATE_SUSPENDED;
+        cmd.creation_flags(flag);
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -192,9 +192,22 @@ mod imp {
         SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 
     /// A Job Object handle, as an integer so it can sit in a `static`.
     pub(super) type RawId = isize;
+
+    unsafe fn resume_process(process: HANDLE) {
+        type NtResumeProcessFn = unsafe extern "system" fn(HANDLE) -> i32;
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8);
+        if !ntdll.is_null() {
+            let func = GetProcAddress(ntdll, c"NtResumeProcess".as_ptr() as *const u8);
+            if let Some(func) = func {
+                let nt_resume: NtResumeProcessFn = std::mem::transmute(func);
+                let _ = nt_resume(process);
+            }
+        }
+    }
 
     pub(super) fn attach(child: &Child) -> Option<RawId> {
         let process: HANDLE = child.raw_handle()?;
@@ -204,6 +217,7 @@ mod imp {
         unsafe {
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             if job.is_null() {
+                resume_process(process);
                 return None;
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
@@ -216,8 +230,10 @@ mod imp {
             );
             if configured == 0 || AssignProcessToJobObject(job, process) == 0 {
                 CloseHandle(job);
+                resume_process(process);
                 return None;
             }
+            resume_process(process);
             Some(job as RawId)
         }
     }

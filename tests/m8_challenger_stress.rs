@@ -21,8 +21,8 @@ use uuid::Uuid;
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::{
     deserialize_message, serialize_message, ClientMessage, ClientResponse, MasterMessage,
-    MessageTransport, ProtocolError, WireCodec, WorkerMessage, WIRE_FORMAT_AUTH,
-    WIRE_FORMAT_BINCODE, WIRE_FORMAT_JSON,
+    MessageTransport, ProtocolCapabilities, ProtocolError, WireCodec, WorkerMessage,
+    PROTOCOL_VERSION_CURRENT, WIRE_FORMAT_AUTH, WIRE_FORMAT_BINCODE, WIRE_FORMAT_JSON,
 };
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
 use rusty_grid_master::registry::WorkerStatus;
@@ -272,6 +272,8 @@ async fn test_m8_post_handshake_malformed_discriminator_disconnects_worker() {
     let reg_msg = WorkerMessage::Register {
         worker_id,
         capabilities: WorkerCapabilities::new("worker-post-handshake", 2, 1024, false, false, None),
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: ProtocolCapabilities::all_supported(),
     };
     let framed_reg = serialize_message(&reg_msg, WireCodec::Bincode).expect("serialize Register");
     send_raw_frame(&mut stream, &framed_reg)
@@ -364,6 +366,8 @@ async fn test_m8_truncated_and_empty_frames() {
         let reg_msg = WorkerMessage::Register {
             worker_id: Uuid::new_v4(),
             capabilities: WorkerCapabilities::new("worker-truncated", 2, 1024, false, false, None),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         };
         let full_frame = serialize_message(&reg_msg, WireCodec::Bincode).expect("serialize");
         // Truncate to first 12 bytes of a 40+ byte message

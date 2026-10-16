@@ -29,7 +29,9 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
-use rusty_grid_core::protocol::{MasterMessage, MessageTransport, WorkerMessage};
+use rusty_grid_core::protocol::{
+    MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage, PROTOCOL_VERSION_CURRENT,
+};
 use rusty_grid_core::task::{Task, TaskRequirements, TaskResult, TaskSpec, TaskStatus};
 use rusty_grid_master::queue::{RetryPolicy, TaskQueue, TaskState};
 use rusty_grid_master::reaper::ReaperConfig;
@@ -433,6 +435,8 @@ async fn test_adversarial_disconnect_while_scheduled_pre_running() {
     let reg_msg = WorkerMessage::Register {
         worker_id: mock_worker_id,
         capabilities: WorkerCapabilities::new("mock-flaky-worker", 2, 2048, false, false, None),
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: ProtocolCapabilities::all_supported(),
     };
     transport.send_msg(&reg_msg).await.expect("send register");
 

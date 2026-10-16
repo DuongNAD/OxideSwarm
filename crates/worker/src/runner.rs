@@ -1759,7 +1759,7 @@ mod tests {
             args: vec![],
             env: HashMap::new(),
             working_dir: None,
-            stdin: Some(b"piped input data\n".to_vec().into()),
+            stdin: Some(b"piped input data\n".to_vec()),
         };
         let task = Task::new(spec, TaskRequirements::generic(1, 10));
 

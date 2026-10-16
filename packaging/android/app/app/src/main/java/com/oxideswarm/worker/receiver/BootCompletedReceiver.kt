@@ -40,13 +40,15 @@ class BootCompletedReceiver : BroadcastReceiver() {
             val cores = prefs.getInt(KEY_CORES, SystemInfoHelper.getAvailableCores())
             val ramMb = prefs.getLong(KEY_RAM_MB, SystemInfoHelper.getTotalRamMb(context))
             val simulateGpu = prefs.getBoolean(KEY_SIMULATE_GPU, false)
+            val clusterSecret = prefs.getString(KEY_CLUSTER_SECRET, null)
 
             val config = WorkerConfig(
                 masterAddress = master,
                 workerName = name,
                 cores = cores,
                 ramMb = ramMb,
-                simulateGpu = simulateGpu
+                simulateGpu = simulateGpu,
+                clusterSecret = clusterSecret
             )
 
             Log.i(TAG, "Auto-starting OxideWorkerService on boot with master: $master")
@@ -67,5 +69,6 @@ class BootCompletedReceiver : BroadcastReceiver() {
         const val KEY_CORES = "key_cpu_cores"
         const val KEY_RAM_MB = "key_ram_mb"
         const val KEY_SIMULATE_GPU = "key_simulate_gpu"
+        const val KEY_CLUSTER_SECRET = "key_cluster_secret"
     }
 }

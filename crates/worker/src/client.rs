@@ -40,8 +40,9 @@ use rusty_grid_core::cluster_auth::{client_handshake, ClusterSecret, WIRE_FORMAT
 use rusty_grid_core::discovery::{is_valid_host, sanitize_host_port, sanitize_http_origin};
 use rusty_grid_core::error::{GridError, GridResult};
 use rusty_grid_core::protocol::{
-    master_features, MasterMessage, MessageReader, MessageTransport, MessageWriter, ProtocolError,
-    WireCodec, WorkerMessage,
+    master_features, EndpointRole, MasterMessage, MessageReader, MessageTransport, MessageWriter,
+    ProtocolCapabilities, ProtocolError, WireCodec, WorkerMessage, PROTOCOL_VERSION_CURRENT,
+    PROTOCOL_VERSION_MIN_COMPATIBLE,
 };
 use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus};
 
@@ -889,6 +890,7 @@ impl WorkerClient {
         simulate_gpu: bool,
     ) -> Self {
         let mut config = WorkerConfig::new(master_addr);
+        config.enable_redirection_portal = false;
         if let Some(n) = name {
             config = config.with_name(n);
         }
@@ -1833,6 +1835,9 @@ impl WorkerClient {
                             MasterMessage::RegisterAck { .. } => {
                                 warn!("Unexpected RegisterAck during active connection");
                             }
+                            MasterMessage::UnknownVariant { tag, ref raw_bytes } => {
+                                warn!(tag, bytes_len = raw_bytes.len(), "Ignoring unknown MasterMessage variant");
+                            }
                         },
                         Some(Inbound::Closed(lane)) => {
                             info!(lane, "Master closed the connection (EOF)");
@@ -1925,8 +1930,8 @@ impl WorkerClient {
         transport: &mut MessageTransport<S>,
     ) -> GridResult<Duration> {
         if let Some(secret) = self.config.cluster_secret.as_ref() {
-            // The session key is unused until an AEAD record layer exists (see cluster_auth docs).
-            let _session_key = tokio::time::timeout(
+            // Upgrade transport to AEAD record layer upon successful authentication.
+            let session_key = tokio::time::timeout(
                 self.config.handshake_timeout,
                 client_handshake(transport, secret),
             )
@@ -1936,6 +1941,7 @@ impl WorkerClient {
                 duration_secs: self.config.handshake_timeout.as_secs(),
             })??;
             debug!(worker_id = %self.worker_id, "Master proved knowledge of the cluster secret");
+            transport.enable_encryption(&session_key, EndpointRole::Client);
         }
 
         // Whatever the previous connection's Master could do says nothing about this one.
@@ -1945,6 +1951,8 @@ impl WorkerClient {
         let register_msg = WorkerMessage::Register {
             worker_id: self.worker_id,
             capabilities,
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         };
 
         transport.send_msg(&register_msg).await.map_err(|e| {
@@ -1976,12 +1984,20 @@ impl WorkerClient {
                 worker_id: ack_wid,
                 heartbeat_interval_secs,
                 message,
+                protocol_version,
+                features: _features,
             } => {
                 if !accepted {
                     let reason =
                         message.unwrap_or_else(|| "Registration rejected by master".into());
                     warn!(worker_id = %self.worker_id, reason = %reason, "Master rejected registration");
                     return Err(GridError::RegistrationRejected(reason));
+                }
+
+                if protocol_version < PROTOCOL_VERSION_MIN_COMPATIBLE {
+                    return Err(GridError::HandshakeFailed(format!(
+                        "Incompatible Master protocol version: {protocol_version} (minimum required: {PROTOCOL_VERSION_MIN_COMPATIBLE})"
+                    )));
                 }
 
                 if ack_wid != self.worker_id {
@@ -2848,6 +2864,8 @@ mod tests {
                             worker_id,
                             heartbeat_interval_secs: 3,
                             message: None,
+                            protocol_version: PROTOCOL_VERSION_CURRENT,
+                            features: ProtocolCapabilities::all_supported(),
                         })
                         .await
                         .unwrap();
@@ -3334,6 +3352,8 @@ mod tests {
                     worker_id,
                     heartbeat_interval_secs: 3,
                     message: None,
+                    protocol_version: PROTOCOL_VERSION_CURRENT,
+                    features: ProtocolCapabilities::all_supported(),
                 })
                 .await
                 .unwrap();
@@ -3387,6 +3407,8 @@ mod tests {
                 worker_id,
                 heartbeat_interval_secs: 1,
                 message: ack_message,
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
             })
             .await
             .unwrap();

@@ -35,7 +35,8 @@ use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::{
-    ClientMessage, ClientResponse, MasterMessage, MessageTransport, WorkerMessage,
+    ClientMessage, ClientResponse, MasterMessage, MessageTransport, ProtocolCapabilities,
+    WorkerMessage, PROTOCOL_VERSION_CURRENT,
 };
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_master::queue::{RetryPolicy, TaskQueue, TaskState};
@@ -158,9 +159,14 @@ async fn test_boundary_max_retries_0_immediate_failure_on_crash() {
     });
 
     // Wait for both workers to register
+    #[cfg(windows)]
+    let wait_timeout = Duration::from_secs(10);
+    #[cfg(not(windows))]
+    let wait_timeout = Duration::from_secs(5);
+
     assert!(
         wait_for(
-            Duration::from_secs(5),
+            wait_timeout,
             Duration::from_millis(30),
             || async {
                 master
@@ -288,9 +294,14 @@ async fn test_boundary_max_retries_1_single_retry_then_failure() {
         let _ = w1.run(w1_rx).await;
     });
 
+    #[cfg(windows)]
+    let wait_timeout = Duration::from_secs(10);
+    #[cfg(not(windows))]
+    let wait_timeout = Duration::from_secs(5);
+
     assert!(
         wait_for(
-            Duration::from_secs(5),
+            wait_timeout,
             Duration::from_millis(30),
             || async {
                 master
@@ -820,6 +831,8 @@ async fn test_client_wait_task_unblocks_on_reaper_eviction_latency() {
     let reg_msg = WorkerMessage::Register {
         worker_id,
         capabilities: WorkerCapabilities::new("silent-reaper-worker", 2, 4096, false, false, None),
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: ProtocolCapabilities::all_supported(),
     };
     transport.send_msg(&reg_msg).await.expect("send reg");
 

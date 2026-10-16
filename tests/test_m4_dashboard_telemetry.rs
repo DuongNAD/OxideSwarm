@@ -421,6 +421,7 @@ async fn test_m4_master_server_full_spawn_with_p2p_and_web_ui() {
 
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_p2p(true)
+        .with_ephemeral_key(true)
         .with_p2p_ticket_file(&ticket_path)
         .with_web_ui(true)
         .with_web_ui_addr("127.0.0.1:0".parse().unwrap());

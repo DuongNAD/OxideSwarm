@@ -152,19 +152,16 @@ fn ensure_telemetry_sampler_started() {
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
-        let mut sys = sysinfo::System::new_with_specifics(
-            sysinfo::RefreshKind::new()
-                .with_cpu(sysinfo::CpuRefreshKind::new().with_cpu_usage())
-                .with_memory(sysinfo::MemoryRefreshKind::new().with_ram()),
-        );
-        // Seed the cache before the first heartbeat reads it. Starting from the (0 %, 8192 MB)
-        // placeholder made a freshly started worker report 8 GB free whatever the machine has,
-        // and the master's RAM gate trusts that figure. (CPU needs two samples, so it starts at 0.)
-        sys.refresh_memory();
-        if let Ok(mut cache) = TELEMETRY_CACHE.lock() {
-            *cache = (0.0, sys.available_memory() / (1024 * 1024));
-        }
         std::thread::spawn(move || {
+            let mut sys = sysinfo::System::new_with_specifics(
+                sysinfo::RefreshKind::new()
+                    .with_cpu(sysinfo::CpuRefreshKind::new().with_cpu_usage())
+                    .with_memory(sysinfo::MemoryRefreshKind::new().with_ram()),
+            );
+            sys.refresh_memory();
+            if let Ok(mut cache) = TELEMETRY_CACHE.lock() {
+                *cache = (0.0, sys.available_memory() / (1024 * 1024));
+            }
             loop {
                 sys.refresh_cpu_specifics(sysinfo::CpuRefreshKind::new().with_cpu_usage());
                 sys.refresh_memory();

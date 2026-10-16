@@ -5,7 +5,7 @@ Compatible with Python 3.6+ on macOS, Linux, and Windows.
 No third-party packages required (pure Python standard library).
 
 Authoritative reference:
-  - ORIGINAL_REQUEST.md (update 2026-09-23T05:23:20Z)
+  - PROJECT.md
   - explorer_protocol_strategy (OX-SYNC-PROTO-STRATEGY-01)
   - Protocol v1.0.0 (protocol_v1.json)
 """

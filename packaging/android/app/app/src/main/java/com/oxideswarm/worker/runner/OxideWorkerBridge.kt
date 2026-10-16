@@ -47,6 +47,21 @@ object OxideWorkerBridge : WorkerEngine {
         }
     }
 
+    /**
+     * Sets the shared cluster secret for worker authentication against the Master node.
+     * Accepts either a hex string (at least 32 hex chars / 16 bytes) or a file path to a secret file.
+     * Call it before [start].
+     */
+    fun setClusterSecret(secret: String): Boolean {
+        if (!isLibraryAvailable) return false
+        return try {
+            nativeSetClusterSecret(secret)
+        } catch (e: Throwable) {
+            Log.w(TAG, "Exception in nativeSetClusterSecret", e)
+            false
+        }
+    }
+
     /** The reason the native worker gave for not starting, from its status JSON ("ERROR: ..."). */
     private fun startFailureReason(): String {
         return try {
@@ -64,6 +79,10 @@ object OxideWorkerBridge : WorkerEngine {
         }
         activeListener = listener
         listener.onStateChanged(WorkerState.STARTING, "Initializing Rust Tokio runtime in-process...")
+
+        if (!config.clusterSecret.isNullOrBlank()) {
+            setClusterSecret(config.clusterSecret)
+        }
 
         return try {
             val started = nativeStartWorker(
@@ -192,6 +211,8 @@ object OxideWorkerBridge : WorkerEngine {
     ): Boolean
 
     private external fun nativeSetSandboxDir(sandboxDir: String): Boolean
+
+    external fun nativeSetClusterSecret(clusterSecret: String): Boolean
 
     private external fun nativeStopWorker(): Boolean
 

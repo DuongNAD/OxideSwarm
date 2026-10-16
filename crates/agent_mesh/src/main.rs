@@ -3,8 +3,12 @@
 //! Provides CLI subcommands to start the WebSocket Relay Hub, run a node client,
 //! query active node inventory, and route commands/payloads across nodes.
 
-use agent_mesh::{AgentMeshClient, AgentMeshEnvelope, AgentMeshHub, HubConfig};
+use agent_mesh::{AgentGridBridge, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub, HubConfig};
 use clap::{Parser, Subcommand};
+use rusty_grid_core::cluster_auth::ClusterSecret;
+use rusty_grid_master::server::{MasterServer, ServerConfig};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -38,6 +42,15 @@ pub enum Commands {
         /// can then run commands on every node.
         #[arg(long)]
         insecure: bool,
+
+        /// Address on which to run an embedded Master Grid runtime (e.g. 127.0.0.1:8089 or 0.0.0.0:8089).
+        /// When set, the hub embeds MasterServer, attaches AgentGridBridge, and routes grid_* envelopes end-to-end.
+        #[arg(long, env = "OXIDE_GRID_MASTER", num_args = 0..=1, default_missing_value = "127.0.0.1:0")]
+        grid_master: Option<String>,
+
+        /// Shared cluster secret for Master Grid authentication (hex string or path to secret file)
+        #[arg(long, env = "OXIDESWARM_SECRET", hide_env_values = true)]
+        secret: Option<String>,
     },
 
     /// Run an agent node client connected to the Hub
@@ -155,7 +168,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Hub { listen, token, insecure } => {
+        Commands::Hub {
+            listen,
+            token,
+            insecure,
+            grid_master,
+            secret,
+        } => {
             if token.as_deref() == Some("") {
                 return Err("--token / OXIDE_MESH_TOKEN is set but empty; an empty token would not protect the hub".into());
             }
@@ -170,6 +189,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 config = config.with_auth_token(t);
             }
             let hub = AgentMeshHub::with_config(config);
+
+            let master_handle_opt = if let Some(ref master_spec) = grid_master {
+                let spec = master_spec.trim();
+                let bind_addr: SocketAddr = if spec.is_empty() || spec == "auto" || spec == "default" {
+                    "127.0.0.1:0".parse().unwrap()
+                } else if spec.contains(':') {
+                    spec.parse().map_err(|e| format!("Invalid grid master bind address '{spec}': {e}"))?
+                } else {
+                    format!("127.0.0.1:{spec}").parse().map_err(|e| format!("Invalid grid master port '{spec}': {e}"))?
+                };
+
+                let mut server_config = ServerConfig::new(bind_addr);
+                let env_secret = std::env::var("OXIDESWARM_SECRET").ok();
+                let secret_opt = secret.as_deref().or(env_secret.as_deref());
+                if let Some(sec_str) = secret_opt.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    let cs = ClusterSecret::from_hex(sec_str)
+                        .or_else(|_| ClusterSecret::load_file(&std::path::PathBuf::from(sec_str)))?;
+                    server_config = server_config.with_cluster_secret(cs);
+                }
+
+                let master_handle = MasterServer::spawn(server_config).await?;
+                let master_actual_addr = master_handle.server_addr();
+                let bridge = Arc::new(AgentGridBridge::new(master_handle.clone()));
+                hub.attach_bridge(bridge).await;
+                println!("[HUB] Embedded Master Grid runtime active on {}", master_actual_addr);
+                Some(master_handle)
+            } else {
+                None
+            };
+
             // Refuses a non-loopback address without a token unless --insecure was given.
             let port = hub.start(&listen).await?;
             let host = listen.rsplit_once(':').map_or(listen.as_str(), |(h, _)| h);
@@ -188,6 +237,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tokio::signal::ctrl_c().await?;
             println!("\n[HUB] Shutdown signal received. Stopping hub...");
             hub.stop().await;
+            if let Some(handle) = master_handle_opt {
+                let _ = handle.shutdown();
+            }
         }
 
         Commands::Node { hub, id, platform, token } => {

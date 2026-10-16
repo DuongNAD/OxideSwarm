@@ -197,16 +197,21 @@ impl ConfigFile {
 /// Unix / macOS: ~/.oxideswarm
 /// Windows: %USERPROFILE%\.oxideswarm
 pub fn default_oxideswarm_dir() -> Option<PathBuf> {
+    if let Some(custom) = std::env::var_os("OXIDESWARM_HOME").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(custom));
+    }
     #[cfg(windows)]
     {
         std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
+            .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .map(|h| h.join(".oxideswarm"))
     }
     #[cfg(not(windows))]
     {
         std::env::var_os("HOME")
+            .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .map(|h| h.join(".oxideswarm"))
     }

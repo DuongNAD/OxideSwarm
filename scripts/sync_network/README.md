@@ -27,7 +27,6 @@ scripts/sync_network/
 ├── sync_network.cmd     # Windows launcher (py / python auto-detection)
 ├── protocol_v1.json     # design sketch of a larger mailbox (nodes/, verifications/, state machine); only part of it is implemented
 ├── ping_success.txt     # HISTORICAL sample output (2026-09-23, the author's machines)
-├── SUCCESS_CONFIRMED.md # HISTORICAL hand-written record of one session; its ticket was redacted
 └── README.md
 ```
 

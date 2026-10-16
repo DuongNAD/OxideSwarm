@@ -14,7 +14,9 @@ use oxideworker::{
     stop_master_impl, stop_worker_impl, update_telemetry_detailed_impl, update_telemetry_impl,
 };
 use rusty_grid_core::capabilities::WorkerCapabilities;
-use rusty_grid_core::protocol::{MasterMessage, MessageTransport, WorkerMessage};
+use rusty_grid_core::protocol::{
+    MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage, PROTOCOL_VERSION_CURRENT,
+};
 
 static ADVERSARIAL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -445,7 +447,12 @@ async fn test_adversarial_coordinator_concurrent_worker_stress() {
             // 1. Register
             let caps = WorkerCapabilities::new(format!("stress-worker-{i}"), 2, 1024, false, false, None);
             transport
-                .send_msg(&WorkerMessage::Register { worker_id, capabilities: caps })
+                .send_msg(&WorkerMessage::Register {
+                    worker_id,
+                    capabilities: caps,
+                    protocol_version: PROTOCOL_VERSION_CURRENT,
+                    features: ProtocolCapabilities::all_supported(),
+                })
                 .await
                 .expect("Send Register should succeed");
 
@@ -550,7 +557,12 @@ async fn test_adversarial_dirty_counter_leak_across_master_restarts() {
     let worker_id = Uuid::new_v4();
     let caps = WorkerCapabilities::new("leak-worker", 2, 1024, false, false, None);
     transport
-        .send_msg(&WorkerMessage::Register { worker_id, capabilities: caps })
+        .send_msg(&WorkerMessage::Register {
+            worker_id,
+            capabilities: caps,
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
+        })
         .await
         .expect("Send Register");
 
@@ -594,6 +606,8 @@ async fn test_adversarial_pre_sleep_evacuation_double_decrement() {
         .send_msg(&WorkerMessage::Register {
             worker_id: id1,
             capabilities: WorkerCapabilities::new("worker-1", 2, 1024, false, false, None),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .expect("Send Register 1");
@@ -607,6 +621,8 @@ async fn test_adversarial_pre_sleep_evacuation_double_decrement() {
         .send_msg(&WorkerMessage::Register {
             worker_id: id2,
             capabilities: WorkerCapabilities::new("worker-2", 2, 1024, false, false, None),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .expect("Send Register 2");

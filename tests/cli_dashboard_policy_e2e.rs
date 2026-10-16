@@ -10,6 +10,8 @@
 //!
 //! Every process gets a private `HOME`, so nothing here touches the developer's `~/.oxideswarm`.
 
+#![cfg(unix)]
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -28,6 +30,7 @@ fn cli(home: &Path) -> Command {
     let mut cmd = Command::new(BIN);
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
+        .env_remove("OXIDESWARM_HOME")
         .current_dir(home)
         .env_remove("OXIDESWARM_SECRET")
         .env_remove("OXIDESWARM_SECRET_FILE")

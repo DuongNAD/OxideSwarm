@@ -23,6 +23,7 @@ fn cli(home: &Path) -> Command {
     let mut cmd = Command::new(BIN);
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
+        .env_remove("OXIDESWARM_HOME")
         .current_dir(home)
         .env_remove("OXIDESWARM_SECRET")
         .env_remove("OXIDESWARM_SECRET_FILE")
@@ -68,6 +69,7 @@ impl Service {
     }
 
     /// Polls the log until it contains `needle`.
+    #[allow(dead_code)]
     fn wait_for_log(&self, needle: &str, timeout: Duration) -> bool {
         wait_for(timeout, || self.log().contains(needle))
     }
@@ -671,6 +673,7 @@ fn test_p2p_ticket_requires_a_secret_even_next_to_a_loopback_master() {
 }
 
 #[test]
+#[allow(clippy::type_complexity)]
 fn test_blank_secret_is_a_configuration_error_not_an_open_cluster() {
     let home = tempdir();
     // Even towards a loopback master (which would otherwise run open) a blank secret source is a

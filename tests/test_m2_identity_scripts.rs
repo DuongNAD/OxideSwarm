@@ -24,9 +24,38 @@ async fn test_0_config_master_secret_key_persistence() {
     let mock_home = temp_dir.path().join("mock_user_home");
     std::fs::create_dir_all(&mock_home).expect("create mock home");
 
-    // Override HOME and USERPROFILE for isolated test execution
+    struct EnvGuard {
+        orig_home: Option<std::ffi::OsString>,
+        orig_userprofile: Option<std::ffi::OsString>,
+        orig_oxideswarm_home: Option<std::ffi::OsString>,
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.orig_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.orig_userprofile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+            match &self.orig_oxideswarm_home {
+                Some(v) => std::env::set_var("OXIDESWARM_HOME", v),
+                None => std::env::remove_var("OXIDESWARM_HOME"),
+            }
+        }
+    }
+
+    let _guard = EnvGuard {
+        orig_home: std::env::var_os("HOME"),
+        orig_userprofile: std::env::var_os("USERPROFILE"),
+        orig_oxideswarm_home: std::env::var_os("OXIDESWARM_HOME"),
+    };
+
+    // Override HOME and USERPROFILE for isolated test execution, and ensure OXIDESWARM_HOME does not leak
     std::env::set_var("HOME", &mock_home);
     std::env::set_var("USERPROFILE", &mock_home);
+    std::env::remove_var("OXIDESWARM_HOME");
 
     let default_key = default_master_key_file().expect("default key path resolved");
     assert_eq!(
@@ -34,6 +63,15 @@ async fn test_0_config_master_secret_key_persistence() {
         mock_home.join(".oxideswarm").join("master_key.bin"),
         "Default key must point to ~/.oxideswarm/master_key.bin"
     );
+
+    // Verify OXIDESWARM_HOME override takes precedence
+    let custom_ox_dir = temp_dir.path().join("custom_oxideswarm");
+    std::env::set_var("OXIDESWARM_HOME", &custom_ox_dir);
+    assert_eq!(
+        default_master_key_file().expect("default key with OXIDESWARM_HOME"),
+        custom_ox_dir.join("master_key.bin")
+    );
+    std::env::remove_var("OXIDESWARM_HOME");
 
     let ticket_file1 = temp_dir.path().join("master1.ticket");
     let master_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -157,10 +195,10 @@ async fn test_worker_auto_reconnect_under_3_seconds() {
         .with_p2p_key_file(&key_file)
         .with_p2p_ticket_file(&ticket_file);
 
-    let restart_start = std::time::Instant::now();
     let master2 = MasterServer::spawn(config2)
         .await
         .expect("spawn master 2");
+    let restart_start = std::time::Instant::now();
 
     // 5. Measure reconnect time: Worker must re-register within 3.0 seconds
     let mut reconnected = false;
@@ -225,6 +263,7 @@ fn resolve_functional_bash() -> Option<PathBuf> {
 
 /// Test 3: Verifies connect_remote.sh script syntax, help message, and dry-run execution.
 #[test]
+#[allow(clippy::needless_return)]
 fn test_connect_remote_sh_validation_and_dry_run() {
     let bash_bin = match resolve_functional_bash() {
         Some(bin) => bin,

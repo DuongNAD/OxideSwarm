@@ -715,10 +715,10 @@ pub fn verify_documentation(workspace_root: &Path) -> ModeExecutionResult {
 
     let target_docs = [
         "README.md",
+        "CLAUDE.md",
         "PROJECT.md",
-        "TEST_INFRA.md",
-        "TEST_READY.md",
-        "ORIGINAL_REQUEST.md",
+        "DEPLOYMENT.md",
+        "ANDROID_ARCHITECTURE.md",
     ];
 
     let mut doc_details = Vec::new();
@@ -746,10 +746,18 @@ pub fn verify_documentation(workspace_root: &Path) -> ModeExecutionResult {
             Ok(content) => {
                 let lines_count = content.lines().count();
                 let bytes_count = content.len();
-                let headings_count = content
-                    .lines()
-                    .filter(|l| l.trim_start().starts_with('#'))
-                    .count();
+                let mut in_fence = false;
+                let mut headings_count = 0;
+                for l in content.lines() {
+                    let trimmed = l.trim_start();
+                    if trimmed.starts_with("```") {
+                        in_fence = !in_fence;
+                        continue;
+                    }
+                    if !in_fence && trimmed.starts_with('#') {
+                        headings_count += 1;
+                    }
+                }
 
                 total_lines += lines_count;
                 total_bytes += bytes_count;

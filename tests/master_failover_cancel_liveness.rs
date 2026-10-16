@@ -27,7 +27,7 @@ use uuid::Uuid;
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::{
     master_features, serialize_message, ClientMessage, ClientResponse, MasterMessage,
-    MessageTransport, WireCodec, WorkerMessage,
+    MessageTransport, ProtocolCapabilities, WireCodec, WorkerMessage, PROTOCOL_VERSION_CURRENT,
 };
 use rusty_grid_core::task::{
     Bytes as TaskBytes, Task, TaskId, TaskRequirements, TaskSpec, TaskStatus,
@@ -117,6 +117,8 @@ impl FakeWorker {
             .send_msg(&WorkerMessage::Register {
                 worker_id,
                 capabilities: WorkerCapabilities::new(name, cores, 8192, false, false, None),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
             })
             .await
             .expect("send Register");
@@ -359,6 +361,8 @@ async fn test_the_register_ack_announces_which_optional_messages_the_master_read
         .send_msg(&WorkerMessage::Register {
             worker_id: Uuid::new_v4(),
             capabilities: WorkerCapabilities::new("announce", 2, 4096, false, false, None),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .unwrap();
@@ -389,6 +393,8 @@ async fn register_without_waiting(
         .send_msg(&WorkerMessage::Register {
             worker_id,
             capabilities: WorkerCapabilities::new(name, 4, 8192, false, false, None),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .expect("send Register");
@@ -1264,6 +1270,8 @@ mod quic {
             .send_msg(&WorkerMessage::Register {
                 worker_id,
                 capabilities: WorkerCapabilities::new(name, 2, 4096, false, false, None),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
             })
             .await
             .unwrap();

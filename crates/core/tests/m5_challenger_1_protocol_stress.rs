@@ -141,7 +141,7 @@ fn test_adv_mapreduce_mapper_reducer_edge_specs() {
         },
     ];
 
-    let reducers = vec![
+    let reducers = [
         ReduceFunctionSpec::Builtin { operator: "".into() },
         ReduceFunctionSpec::ShellScript { script: "".into() },
         ReduceFunctionSpec::ShellScript { script: "awk '{s+=$2} END {print s}'".into() },
@@ -249,10 +249,7 @@ fn test_adv_worker_message_all_variants_bincode_inbound() {
         (
             0,
             "Register",
-            WorkerMessage::Register {
-                worker_id,
-                capabilities: dummy_capabilities(),
-            },
+            WorkerMessage::register(worker_id, dummy_capabilities()),
         ),
         (
             1,
@@ -494,10 +491,7 @@ async fn test_adv_inbound_message_roundtrip_over_transport() {
     let mut client_transport = MessageTransport::with_codec(client_stream, WireCodec::Bincode);
 
     // 1. Worker Register
-    let reg = WorkerMessage::Register {
-        worker_id: Uuid::new_v4(),
-        capabilities: dummy_capabilities(),
-    };
+    let reg = WorkerMessage::register(Uuid::new_v4(), dummy_capabilities());
     client_transport.send_msg(&reg).await.expect("send reg");
 
     // 2. Client SubmitMapReduce

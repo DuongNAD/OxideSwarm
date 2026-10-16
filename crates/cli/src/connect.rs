@@ -15,7 +15,7 @@ use tracing::info;
 
 use rusty_grid_core::cluster_auth::{client_handshake, ClusterSecret};
 use rusty_grid_core::error::{GridError, GridResult};
-use rusty_grid_core::protocol::MessageTransport;
+use rusty_grid_core::protocol::{EndpointRole, MessageTransport};
 use rusty_grid_core::transport::configure_tcp_stream;
 
 /// TCP port of the Master's grid listener (workers and clients).
@@ -182,13 +182,13 @@ pub async fn connect_master(
 
     let mut transport = MessageTransport::new(stream);
     if let Some(secret) = secret {
-        // The session key is unused until an AEAD record layer exists (see cluster_auth docs).
-        tokio::time::timeout(AUTH_TIMEOUT, client_handshake(&mut transport, secret))
+        let session_key = tokio::time::timeout(AUTH_TIMEOUT, client_handshake(&mut transport, secret))
             .await
             .map_err(|_| GridError::Timeout {
                 operation: "cluster_authentication".into(),
                 duration_secs: AUTH_TIMEOUT.as_secs(),
             })??;
+        transport.enable_encryption(&session_key, EndpointRole::Client);
     }
     Ok(transport)
 }
@@ -376,9 +376,11 @@ mod tests {
                 let secret = secret.clone();
                 tokio::spawn(async move {
                     let mut t = MessageTransport::new(stream);
-                    if server_handshake(&mut t, &secret).await.is_err() {
-                        return;
-                    }
+                    let session_key = match server_handshake(&mut t, &secret).await {
+                        Ok(k) => k,
+                        Err(_) => return,
+                    };
+                    t.enable_encryption(&session_key, EndpointRole::Server);
                     if let Ok(Some(ClientMessage::ClusterStatus)) =
                         t.recv_msg::<ClientMessage>().await
                     {

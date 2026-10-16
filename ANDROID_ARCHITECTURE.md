@@ -17,7 +17,7 @@ treat every section as a specification unless the table below says it exists.
 | In-process JNI worker (`crates/android_bridge`, `liboxideworker.so`), `nativeStartWorker` / `nativeStopWorker` / `nativeStartMaster` / `nativeStopMaster`, live telemetry injection (`nativeUpdateTelemetry`), P2P ticket wiring | **Implemented** (section 3.3 and 6.1 phases 1-3). `packaging/android/build_android_jni.sh` builds the library; the Gradle project does not. |
 | Kotlin foreground service, wake/Wi-Fi locks, boot receiver, battery-optimization helper | **Implemented** (`packaging/android/app`), not exercised by any automated test |
 | Termux worker daemon | **Implemented** (`packaging/android/termux`); it is the only Android path that can hold the cluster secret today |
-| Cluster-secret authentication for the app | **Not implemented**: the JNI start path and the UI have no secret, so the app cannot join a master that requires one |
+| Cluster-secret authentication for the app | **Implemented**: `crates/android_bridge` exposes `nativeSetClusterSecret` and `nativeStartWorkerWithSecret` JNI functions, and Kotlin `WorkerEngine` accepts `clusterSecret` configuring `WorkerConfig.with_cluster_secret` to authenticate against protected masters |
 | 3.3 "100% immune to PPK" | **Qualified**: the worker loop is not a child process, but command / shell / compile tasks spawn child processes (`TaskRunner`), which PPK can kill |
 | 4.2 Adaptive dual-tier keepalive (RRC-aware 10 / 25 / 60 s) | **Design only.** The worker uses a fixed heartbeat interval plus TCP keepalive |
 | 5.1 Mobile master refusal matrix | **Design only** |
@@ -30,44 +30,44 @@ treat every section as a specification unless the table below says it exists.
 
 ## Table of Contents
 
-1. [Executive Summary & System Topology](#1-executive-summary--system-topology)
-   - 1.1 [Mission & Architectural Philosophy](#11-mission--architectural-philosophy)
+1. [Executive Summary and System Topology](#1-executive-summary-and-system-topology)
+   - 1.1 [Mission and Architectural Philosophy](#11-mission-and-architectural-philosophy)
    - 1.2 [End-to-End System Topology](#12-end-to-end-system-topology)
    - 1.3 [Mobile Node Lifecycle State Machine](#13-mobile-node-lifecycle-state-machine)
 2. [In-Depth Comparative Analysis of Open-Source Reference Models](#2-in-depth-comparative-analysis-of-open-source-reference-models)
    - 2.1 [Tailscale Android (`tailscale/tailscale-android`)](#21-tailscale-android-tailscaletailscale-android)
    - 2.2 [BOINC on Android (`BOINC/boinc`)](#22-boinc-on-android-boincboinc)
-   - 2.3 [Syncthing-Android (`syncthing/syncthing-android`)](#23-syncthing-android-syncthingsyncthing-android)
+   - 2.3 [Syncthing-Android (`syncthing/syncthing-android` and `Syncthing-Fork`)](#23-syncthing-android-syncthingsyncthing-android-and-syncthing-fork)
    - 2.4 [Termux (`termux/termux-app`)](#24-termux-termuxtermux-app)
    - 2.5 [Iroh (`n0-computer/iroh`)](#25-iroh-n0-computeriroh)
    - 2.6 [Comprehensive Reference Model Comparison Matrix](#26-comprehensive-reference-model-comparison-matrix)
-3. [Android Background Execution & Battery Optimization Engine](#3-android-background-execution--battery-optimization-engine)
+3. [Android Background Execution and Battery Optimization Engine](#3-android-background-execution-and-battery-optimization-engine)
    - 3.1 [Doze Mode Mechanics: Light vs. Deep Doze and Maintenance Windows](#31-doze-mode-mechanics-light-vs-deep-doze-and-maintenance-windows)
    - 3.2 [Battery Optimization Whitelisting (`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`)](#32-battery-optimization-whitelisting-request_ignore_battery_optimizations)
    - 3.3 [Immunity to Android 12+ Phantom Process Killer (PPK)](#33-immunity-to-android-12-phantom-process-killer-ppk)
-   - 3.4 [Android 14+ (API 34) & 15+ Foreground Service Compliance](#34-android-14-api-34--15-foreground-service-compliance)
-   - 3.5 [Hardware WakeLocks & Low-Latency Wi-Fi Optimization](#35-hardware-wakelocks--low-latency-wi-fi-optimization)
-   - 3.6 [Dynamic Thermal & Battery Throttling Policies](#36-dynamic-thermal--battery-throttling-policies)
-4. [Mobile NAT Traversal & Carrier Network Realities](#4-mobile-nat-traversal--carrier-network-realities)
-   - 4.1 [Cellular CGNAT (RFC 6598) & Endpoint-Dependent Symmetric NAT](#41-cellular-cgnat-rfc-6598--endpoint-dependent-symmetric-nat)
-   - 4.2 [Adaptive Dual-Tier Keepalive & Cellular Radio Control (RRC)](#42-adaptive-dual-tier-keepalive--cellular-radio-control-rrc)
+   - 3.4 [Android 14+ (API 34) and 15+ Foreground Service Compliance](#34-android-14-api-34-and-15-foreground-service-compliance)
+   - 3.5 [Hardware WakeLocks and Low-Latency Wi-Fi Optimization](#35-hardware-wakelocks-and-low-latency-wi-fi-optimization)
+   - 3.6 [Dynamic Thermal and Battery Throttling Policies](#36-dynamic-thermal-and-battery-throttling-policies)
+4. [Mobile NAT Traversal and Carrier Network Realities](#4-mobile-nat-traversal-and-carrier-network-realities)
+   - 4.1 [Cellular CGNAT (RFC 6598) and Endpoint-Dependent Symmetric NAT](#41-cellular-cgnat-rfc-6598-and-endpoint-dependent-symmetric-nat)
+   - 4.2 [Adaptive Dual-Tier Keepalive and Cellular Radio Control (RRC)](#42-adaptive-dual-tier-keepalive-and-cellular-radio-control-rrc)
    - 4.3 [Zero-Port Fallback via Iroh N0 DERP Relays (TLS 443)](#43-zero-port-fallback-via-iroh-n0-derp-relays-tls-443)
    - 4.4 [QUIC Connection Migration (RFC 9000 §9) for Seamless Roaming](#44-quic-connection-migration-rfc-9000-9-for-seamless-roaming)
-5. [Dynamic Role Assignment & Mobile Coordination](#5-dynamic-role-assignment--mobile-coordination)
+5. [Dynamic Role Assignment and Mobile Coordination](#5-dynamic-role-assignment-and-mobile-coordination)
    - 5.1 [Mobile Master Refusal Matrix](#51-mobile-master-refusal-matrix)
-   - 5.2 [Weighted Authority Scoring Function ($S_{auth}$) & Election](#52-weighted-authority-scoring-function-s_auth--election)
-   - 5.3 [Cryptographic Master Lease Tickets & Graceful Handover](#53-cryptographic-master-lease-tickets--graceful-handover)
-   - 5.4 [Zero-Latency Pre-Sleep Evacuation (`< 50ms`)](#54-zero-latency-pre-sleep-evacuation--50ms)
-6. [Concrete Integration Roadmap & Verification Plan](#6-concrete-integration-roadmap--verification-plan)
-   - 6.1 [Implementation Phases & Milestones](#61-implementation-phases--milestones)
-   - 6.2 [Empirical Verification & Testing Framework](#62-empirical-verification--testing-framework)
-   - 6.3 [Failure Modes & Architectural Invariants](#63-failure-modes--architectural-invariants)
+   - 5.2 [Weighted Authority Scoring Function (S_auth) and Election](#52-weighted-authority-scoring-function-s_auth-and-election)
+   - 5.3 [Cryptographic Master Lease Tickets and Graceful Handover](#53-cryptographic-master-lease-tickets-and-graceful-handover)
+   - 5.4 [Zero-Latency Pre-Sleep Evacuation (under 50ms)](#54-zero-latency-pre-sleep-evacuation-under-50ms)
+6. [Concrete Integration Roadmap and Verification Plan](#6-concrete-integration-roadmap-and-verification-plan)
+   - 6.1 [Implementation Phases and Milestones](#61-implementation-phases-and-milestones)
+   - 6.2 [Empirical Verification and Testing Framework](#62-empirical-verification-and-testing-framework)
+   - 6.3 [Failure Modes and Architectural Invariants](#63-failure-modes-and-architectural-invariants)
 
 ---
 
-## 1. Executive Summary & System Topology
+## 1. Executive Summary and System Topology
 
-### 1.1 Mission & Architectural Philosophy
+### 1.1 Mission and Architectural Philosophy
 
 The objective of the OxideSwarm Android Native Architecture is to transform consumer Android smartphones into reliable, high-throughput, battery-conscious compute nodes capable of executing parallel grid workloads (e.g. distributed Rust crate compilation, chunk hashing, parallel matrix operations, and localized machine learning inference) across heterogeneous networks anywhere in the world.
 
@@ -211,7 +211,7 @@ OxideSwarm adopts BOINC's power and thermal safeguard policies while deliberatel
 
 ---
 
-### 2.3 Syncthing-Android (`syncthing/syncthing-android` & `Syncthing-Fork`)
+### 2.3 Syncthing-Android (`syncthing/syncthing-android` and `Syncthing-Fork`)
 
 Syncthing is an open-source peer-to-peer file synchronization engine written in Go.
 
@@ -281,7 +281,7 @@ OxideSwarm natively embeds `iroh` directly into `crates/android_bridge` and `cra
 
 ---
 
-## 3. Android Background Execution & Battery Optimization Engine
+## 3. Android Background Execution and Battery Optimization Engine
 
 ### 3.1 Doze Mode Mechanics: Light vs. Deep Doze and Maintenance Windows
 
@@ -420,7 +420,7 @@ Because threads share the same Linux Thread Group ID (`tgid`) and process memory
 
 ---
 
-### 3.4 Android 14+ (API 34) & 15+ Foreground Service Compliance
+### 3.4 Android 14+ (API 34) and 15+ Foreground Service Compliance
 
 Under Android 14+ (UPSIDE_DOWN_CAKE, API 34), Foreground Services require explicit declaration of service types and runtime permissions.
 
@@ -474,7 +474,7 @@ Running as a Foreground Service adjusts the process priority to `oom_score_adj <
 
 ---
 
-### 3.5 Hardware WakeLocks & Low-Latency Wi-Fi Optimization
+### 3.5 Hardware WakeLocks and Low-Latency Wi-Fi Optimization
 
 To prevent hardware components from powering down when the device display turns off:
 
@@ -491,7 +491,7 @@ To prevent hardware components from powering down when the device display turns 
 
 ---
 
-### 3.6 Dynamic Thermal & Battery Throttling Policies
+### 3.6 Dynamic Thermal and Battery Throttling Policies
 
 Mobile smartphones feature passive cooling: heat from the SoC dissipates through the aluminum chassis and glass screen. Sustained multi-core execution requires active thermal management.
 
@@ -516,67 +516,67 @@ Mobile smartphones feature passive cooling: heat from the SoC dissipates through
 Rather than executing `/system/bin/dumpsys` (which fails in non-root app sandboxes due to missing `android.permission.DUMP`), the Kotlin service registers an `ACTION_BATTERY_CHANGED` receiver and `PowerManager.OnThermalStatusChangedListener`. Telemetry is injected directly into Rust via `nativeUpdateTelemetryDetailed` (enriched 5-parameter model) or `nativeUpdateTelemetry` (backward-compatible legacy overload):
 
 ```rust
-#[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeUpdateTelemetryDetailed<
-    'local,
->(
-    mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    battery_pct: jint,
-    is_charging: jboolean,
-    thermal_throttled: jboolean,
-    battery_temperature: jfloat,
-    network_type: JString<'local>,
-) -> jboolean {
-    let net_opt: Option<String> = match env.get_string(&network_type) {
-        Ok(s) => {
-            let val: String = s.into();
-            if val.trim().is_empty() { None } else { Some(val) }
+    #[no_mangle]
+    pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeUpdateTelemetryDetailed<
+        'local,
+    >(
+        mut env: JNIEnv<'local>,
+        _class: JClass<'local>,
+        battery_pct: jint,
+        is_charging: jboolean,
+        thermal_throttled: jboolean,
+        battery_temperature: jfloat,
+        network_type: JString<'local>,
+    ) -> jboolean {
+        let net_opt: Option<String> = match env.get_string(&network_type) {
+            Ok(s) => {
+                let val: String = s.into();
+                if val.trim().is_empty() { None } else { Some(val) }
+            }
+            Err(_) => None,
+        };
+        let temp_opt = if battery_temperature < -40.0 {
+            None
+        } else {
+            Some(battery_temperature)
+        };
+
+        if update_telemetry_detailed_impl(
+            battery_pct,
+            is_charging != 0,
+            thermal_throttled != 0,
+            temp_opt,
+            net_opt,
+        ) {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
         }
-        Err(_) => None,
-    };
-    let temp_opt = if battery_temperature < -40.0 {
-        None
-    } else {
-        Some(battery_temperature)
-    };
-
-    if update_telemetry_detailed_impl(
-        battery_pct,
-        is_charging != 0,
-        thermal_throttled != 0,
-        temp_opt,
-        net_opt,
-    ) {
-        JNI_TRUE
-    } else {
-        JNI_FALSE
     }
-}
 
-#[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeUpdateTelemetry<
-    'local,
->(
-    _env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    battery_pct: jint,
-    is_charging: jboolean,
-    thermal_throttled: jboolean,
-) -> jboolean {
-    if update_telemetry_impl(battery_pct, is_charging != 0, thermal_throttled != 0) {
-        JNI_TRUE
-    } else {
-        JNI_FALSE
+    #[no_mangle]
+    pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeUpdateTelemetry<
+        'local,
+    >(
+        _env: JNIEnv<'local>,
+        _class: JClass<'local>,
+        battery_pct: jint,
+        is_charging: jboolean,
+        thermal_throttled: jboolean,
+    ) -> jboolean {
+        if update_telemetry_impl(battery_pct, is_charging != 0, thermal_throttled != 0) {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
     }
-}
 ```
 
 ---
 
-## 4. Mobile NAT Traversal & Carrier Network Realities
+## 4. Mobile NAT Traversal and Carrier Network Realities
 
-### 4.1 Cellular CGNAT (RFC 6598) & Endpoint-Dependent Symmetric NAT
+### 4.1 Cellular CGNAT (RFC 6598) and Endpoint-Dependent Symmetric NAT
 
 Mobile network operators assign private IPv4 addresses from the shared `100.64.0.0/10` block (RFC 6598) to mobile subscriber devices. 
 
@@ -590,7 +590,7 @@ Under modern cellular CGNAT, port allocation follows RFC 6056 randomized port se
 
 ---
 
-### 4.2 Adaptive Dual-Tier Keepalive & Cellular Radio Control (RRC)
+### 4.2 Adaptive Dual-Tier Keepalive and Cellular Radio Control (RRC)
 
 > **DESIGN ONLY - NOT IMPLEMENTED.** Nothing in `crates/` or `packaging/android/app` does this yet; it is a roadmap item.
 
@@ -672,7 +672,7 @@ Under RFC 9000 §9:
 
 ---
 
-## 5. Dynamic Role Assignment & Mobile Coordination
+## 5. Dynamic Role Assignment and Mobile Coordination
 
 ### 5.1 Mobile Master Refusal Matrix
 
@@ -702,7 +702,7 @@ If any refusal condition is met, the node automatically designates itself as pur
 
 ---
 
-### 5.2 Weighted Authority Scoring Function ($S_{auth}$) & Election
+### 5.2 Weighted Authority Scoring Function (S_auth) and Election
 
 > **DESIGN ONLY - NOT IMPLEMENTED.** Nothing in `crates/` or `packaging/android/app` does this yet; it is a roadmap item.
 
@@ -741,7 +741,7 @@ Any node with $S_{auth} < 2500$ is strictly disqualified from election. If a mob
 
 ---
 
-### 5.3 Cryptographic Master Lease Tickets & Graceful Handover
+### 5.3 Cryptographic Master Lease Tickets and Graceful Handover
 
 > **DESIGN ONLY - NOT IMPLEMENTED.** Nothing in `crates/` or `packaging/android/app` does this yet; it is a roadmap item.
 
@@ -762,7 +762,7 @@ To prevent split-brain clusters without requiring heavyweight consensus protocol
 
 ---
 
-### 5.4 Zero-Latency Pre-Sleep Evacuation (`< 50ms`)
+### 5.4 Zero-Latency Pre-Sleep Evacuation (under 50ms)
 
 > **DESIGN ONLY - NOT IMPLEMENTED.** Nothing in `crates/` or `packaging/android/app` does this yet; it is a roadmap item.
 
@@ -812,9 +812,9 @@ Android Worker                          Master Node
 
 ---
 
-## 6. Concrete Integration Roadmap & Verification Plan
+## 6. Concrete Integration Roadmap and Verification Plan
 
-### 6.1 Implementation Phases & Milestones
+### 6.1 Implementation Phases and Milestones
 
 | Phase | Milestone | Key Architectural Deliverables |
 |---|---|---|
@@ -825,7 +825,7 @@ Android Worker                          Master Node
 
 ---
 
-### 6.2 Empirical Verification & Testing Framework
+### 6.2 Empirical Verification and Testing Framework
 
 Verification follows a strict 6-point test matrix:
 
@@ -852,7 +852,7 @@ Verification follows a strict 6-point test matrix:
 
 ---
 
-### 6.3 Failure Modes & Architectural Invariants
+### 6.3 Failure Modes and Architectural Invariants
 
 1. **Invariant 1 (Zero Subprocesses)**: *(aspiration, not true today)* `liboxideworker.so` shall not invoke `fork()` or `execve()` on Android. Built-in async tasks run on Tokio pthreads, but `TaskRunner` still spawns child processes for command / shell / compile tasks.
 2. **Invariant 2 (Non-Root Sandbox Safety)**: No telemetry routine shall invoke `/system/bin/dumpsys` or read restricted `/sys/class/` paths. All telemetry must be passed via JNI from the Android SDK.

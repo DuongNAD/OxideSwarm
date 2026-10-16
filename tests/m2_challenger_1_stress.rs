@@ -27,8 +27,10 @@ use rusty_grid_core::protocol::{
 use rusty_grid_core::task::{Bytes, Task, TaskId, TaskRequirements, TaskResult, TaskSpec};
 use rusty_grid_core::transport::{BiStream, GridStream, STREAM_CONTROL, STREAM_DATA};
 use rusty_grid_master::queue::{TaskQueue, TaskState};
-use rusty_grid_master::registry::WorkerRegistry;
-use rusty_grid_master::scheduler::{SchedulerConfig, WorkloadScheduler};
+use rusty_grid_master::registry::{WorkerInfo, WorkerRegistry, WorkerStatus};
+use rusty_grid_master::scheduler::{
+    ScheduleSkipReason, SchedulerConfig, SchedulingPolicy, WorkloadScheduler,
+};
 use rusty_grid_worker::runner::read_bounded_stream;
 
 // =========================================================================
@@ -647,3 +649,406 @@ async fn test_scheduler_batch_atomicity_and_edge_cases() {
         "Already scheduled task must not be rescheduled"
     );
 }
+
+// =========================================================================
+// 8. ADVERSARIAL SCHEDULER PRIORITY & TOPOLOGY VERIFICATION
+// =========================================================================
+
+fn make_test_worker(
+    name: &str,
+    cores: usize,
+    ram_mb: u64,
+    has_gpu: bool,
+    is_simulated_gpu: bool,
+    active_tasks: usize,
+) -> WorkerInfo {
+    let caps = WorkerCapabilities::new(name, cores, ram_mb, has_gpu, is_simulated_gpu, None);
+    WorkerInfo {
+        worker_id: Uuid::new_v4(),
+        session_id: 1,
+        capabilities: caps,
+        status: WorkerStatus::Connected,
+        last_heartbeat_timestamp: 1000,
+        registered_timestamp: 1000,
+        active_tasks,
+        remote_addr: "127.0.0.1:9000".into(),
+        cpu_usage_pct: 0.0,
+        ram_available_mb: ram_mb,
+    }
+}
+
+/// Adversarial Topology 1:
+/// 1 Real GPU (saturated), 2 Simulated GPUs (idle) -> verify simulated GPU takes task.
+#[test]
+fn test_adversarial_topology_1_real_saturated_2_simulated_idle() {
+    let config = SchedulerConfig {
+        core_concurrency_multiplier: 1.0,
+        ..Default::default()
+    };
+
+    // 1 Real GPU worker: 2 cores, 8192 MB RAM, active_tasks = 2 (saturated)
+    let w_real = make_test_worker("worker-real-wgpu", 2, 8192, true, false, 2);
+    // 2 Simulated GPU workers: 4 cores, 8192 MB RAM each, active_tasks = 0 (idle)
+    let w_sim1 = make_test_worker("worker-sim-gpu-1", 4, 8192, true, true, 0);
+    let w_sim2 = make_test_worker("worker-sim-gpu-2", 4, 8192, true, true, 0);
+    // 1 CPU-only worker: 8 cores, active_tasks = 0 (idle)
+    let w_cpu = make_test_worker("worker-cpu-only", 8, 16384, false, false, 0);
+
+    let workers = vec![w_real.clone(), w_sim1.clone(), w_sim2.clone(), w_cpu.clone()];
+
+    let gpu_task = Task::new(
+        TaskSpec::gpu_compute("gemm_kernel", 64),
+        TaskRequirements::gpu(30),
+    );
+
+    let report = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&gpu_task), &workers);
+
+    assert_eq!(report.assignments.len(), 1, "Exactly one task should be placed");
+    let assigned_id = report.assignments[0].worker_id;
+
+    // Simulated GPU MUST take the task because real GPU is saturated
+    assert!(
+        assigned_id == w_sim1.worker_id || assigned_id == w_sim2.worker_id,
+        "Simulated GPU must take task when real GPU is saturated"
+    );
+    assert_ne!(assigned_id, w_real.worker_id, "Saturated real GPU must not receive task");
+    assert_ne!(assigned_id, w_cpu.worker_id, "CPU-only worker must never receive GPU task");
+}
+
+/// Adversarial Topology 2:
+/// 2 Real GPUs (1 idle, 1 busy), 2 Simulated GPUs (idle) -> verify idle real GPU takes task, not simulated GPU.
+#[test]
+fn test_adversarial_topology_2_real_1_idle_1_busy_2_simulated_idle() {
+    // 2 Real GPUs:
+    // Real GPU 1: idle (active_tasks = 0)
+    let w_real_idle = make_test_worker("worker-real-idle", 4, 8192, true, false, 0);
+    // Real GPU 2: busy (active_tasks = 1)
+    let w_real_busy = make_test_worker("worker-real-busy", 4, 8192, true, false, 1);
+
+    // 2 Simulated GPUs: both idle
+    let w_sim1 = make_test_worker("worker-sim-1", 4, 8192, true, true, 0);
+    let w_sim2 = make_test_worker("worker-sim-2", 4, 8192, true, true, 0);
+
+    // 1 CPU worker: idle
+    let w_cpu = make_test_worker("worker-cpu", 8, 16384, false, false, 0);
+
+    let workers = vec![
+        w_real_idle.clone(),
+        w_real_busy.clone(),
+        w_sim1.clone(),
+        w_sim2.clone(),
+        w_cpu.clone(),
+    ];
+
+    let gpu_task = Task::new(
+        TaskSpec::gpu_compute("conv2d_layer", 128),
+        TaskRequirements::gpu(30),
+    );
+
+    // 1. Verify under LeastLoaded policy: idle real GPU takes task
+    let least_loaded_config = SchedulerConfig {
+        policy: SchedulingPolicy::LeastLoaded,
+        ..Default::default()
+    };
+    let report_ll = WorkloadScheduler::matchmake(
+        &least_loaded_config,
+        std::slice::from_ref(&gpu_task),
+        &workers,
+    );
+    assert_eq!(report_ll.assignments.len(), 1);
+    assert_eq!(
+        report_ll.assignments[0].worker_id, w_real_idle.worker_id,
+        "LeastLoaded must pick idle real GPU over busy real GPU and simulated GPUs"
+    );
+
+    // 2. Verify under WeightedLeastLoaded policy: idle real GPU takes task
+    let weighted_config = SchedulerConfig {
+        policy: SchedulingPolicy::WeightedLeastLoaded,
+        ..Default::default()
+    };
+    let report_wll =
+        WorkloadScheduler::matchmake(&weighted_config, std::slice::from_ref(&gpu_task), &workers);
+    assert_eq!(report_wll.assignments.len(), 1);
+    assert_eq!(
+        report_wll.assignments[0].worker_id, w_real_idle.worker_id,
+        "WeightedLeastLoaded must pick idle real GPU"
+    );
+
+    // 3. Verify under RoundRobin policy: real GPU takes task, simulated GPUs NEVER selected
+    let rr_config = SchedulerConfig {
+        policy: SchedulingPolicy::RoundRobin,
+        ..Default::default()
+    };
+    let report_rr =
+        WorkloadScheduler::matchmake(&rr_config, std::slice::from_ref(&gpu_task), &workers);
+    assert_eq!(report_rr.assignments.len(), 1);
+    let assigned_rr = report_rr.assignments[0].worker_id;
+    assert!(
+        assigned_rr == w_real_idle.worker_id || assigned_rr == w_real_busy.worker_id,
+        "RoundRobin must select a real GPU, never simulated GPU"
+    );
+    assert_ne!(assigned_rr, w_sim1.worker_id);
+    assert_ne!(assigned_rr, w_sim2.worker_id);
+    assert_ne!(assigned_rr, w_cpu.worker_id);
+}
+
+/// Adversarial Concurrency Test:
+/// RoundRobin behavior under heavy concurrent task submissions across real and simulated GPU workers.
+#[test]
+fn test_adversarial_round_robin_heavy_concurrent_submissions() {
+    let config = SchedulerConfig {
+        policy: SchedulingPolicy::RoundRobin,
+        core_concurrency_multiplier: 1.0,
+        ..Default::default()
+    };
+
+    // 2 Real GPUs (4 cores = 4 slots each => 8 total real slots)
+    let w_real1 = make_test_worker("w-real-1", 4, 8192, true, false, 0);
+    let w_real2 = make_test_worker("w-real-2", 4, 8192, true, false, 0);
+
+    // 2 Simulated GPUs (4 cores = 4 slots each => 8 total sim slots)
+    let w_sim1 = make_test_worker("w-sim-1", 4, 8192, true, true, 0);
+    let w_sim2 = make_test_worker("w-sim-2", 4, 8192, true, true, 0);
+
+    let workers = vec![w_real1.clone(), w_real2.clone(), w_sim1.clone(), w_sim2.clone()];
+
+    // Generate 16 tasks (demanding 1 core each)
+    let tasks: Vec<Task> = (0..16)
+        .map(|i| {
+            Task::new(
+                TaskSpec::gpu_compute(format!("kernel_{i}"), 10),
+                TaskRequirements::gpu(10),
+            )
+        })
+        .collect();
+
+    let report = WorkloadScheduler::matchmake(&config, &tasks, &workers);
+    assert_eq!(
+        report.assignments.len(),
+        16,
+        "All 16 available slots across real and sim GPUs must be filled"
+    );
+
+    // Count assignments per worker
+    let mut real1_count = 0;
+    let mut real2_count = 0;
+    let mut sim1_count = 0;
+    let mut sim2_count = 0;
+
+    for a in &report.assignments {
+        if a.worker_id == w_real1.worker_id {
+            real1_count += 1;
+        } else if a.worker_id == w_real2.worker_id {
+            real2_count += 1;
+        } else if a.worker_id == w_sim1.worker_id {
+            sim1_count += 1;
+        } else if a.worker_id == w_sim2.worker_id {
+            sim2_count += 1;
+        }
+    }
+
+    // Both real GPUs must be completely filled to their maximum slot capacity (4 slots each)
+    assert_eq!(real1_count, 4, "Real GPU 1 must be fully utilized (4 tasks)");
+    assert_eq!(real2_count, 4, "Real GPU 2 must be fully utilized (4 tasks)");
+    // Remaining 8 tasks must spill over to simulated GPUs (4 each)
+    assert_eq!(sim1_count, 4, "Sim GPU 1 must receive remaining 4 tasks");
+    assert_eq!(sim2_count, 4, "Sim GPU 2 must receive remaining 4 tasks");
+
+    // Verify ordering: The first 8 tasks MUST all be assigned to real GPUs before any simulated GPU
+    for a in &report.assignments[0..8] {
+        assert!(
+            a.worker_id == w_real1.worker_id || a.worker_id == w_real2.worker_id,
+            "Initial 8 tasks must all be placed on real GPUs"
+        );
+    }
+    // Tasks 8..16 must be assigned to simulated GPUs
+    for a in &report.assignments[8..16] {
+        assert!(
+            a.worker_id == w_sim1.worker_id || a.worker_id == w_sim2.worker_id,
+            "Overflow tasks must spill over to simulated GPUs"
+        );
+    }
+}
+
+/// Adversarial Concurrency Test:
+/// LeastLoaded behavior under heavy concurrent task submissions with saturation threshold.
+#[test]
+fn test_adversarial_least_loaded_heavy_concurrent_submissions() {
+    let config = SchedulerConfig {
+        policy: SchedulingPolicy::LeastLoaded,
+        core_concurrency_multiplier: 1.0,
+        ..Default::default()
+    };
+
+    // 2 Real GPUs:
+    // Real 1 has 2 cores (2 max slots)
+    let w_real1 = make_test_worker("w-real-1", 2, 8192, true, false, 0);
+    // Real 2 has 4 cores (4 max slots)
+    let w_real2 = make_test_worker("w-real-2", 4, 8192, true, false, 0);
+
+    // 2 Simulated GPUs (4 cores each = 8 total sim slots)
+    let w_sim1 = make_test_worker("w-sim-1", 4, 8192, true, true, 0);
+    let w_sim2 = make_test_worker("w-sim-2", 4, 8192, true, true, 0);
+
+    // 1 CPU worker (16 cores)
+    let w_cpu = make_test_worker("w-cpu", 16, 32768, false, false, 0);
+
+    let workers = vec![
+        w_real1.clone(),
+        w_real2.clone(),
+        w_sim1.clone(),
+        w_sim2.clone(),
+        w_cpu.clone(),
+    ];
+
+    // Total GPU capacity = 2 + 4 + 4 + 4 = 14 slots.
+    // Submit 30 tasks in burst to test saturation handling.
+    let tasks: Vec<Task> = (0..30)
+        .map(|i| {
+            Task::new(
+                TaskSpec::gpu_compute(format!("burst_kernel_{i}"), 10),
+                TaskRequirements::gpu(10),
+            )
+        })
+        .collect();
+
+    let report = WorkloadScheduler::matchmake(&config, &tasks, &workers);
+
+    // Exactly 14 tasks placed (saturating all GPU workers)
+    assert_eq!(
+        report.assignments.len(),
+        14,
+        "Exactly 14 GPU tasks must be placed to saturate cluster"
+    );
+    // Exactly 16 tasks skipped due to NoGpuWorkersAvailable
+    assert_eq!(
+        report.skipped.len(),
+        16,
+        "Excess 16 tasks must be skipped cleanly"
+    );
+    for (_, reason) in &report.skipped {
+        assert_eq!(*reason, ScheduleSkipReason::NoGpuWorkersAvailable);
+    }
+
+    // Verify Real GPU capacity was completely exhausted (2 on w_real1, 4 on w_real2)
+    let real1_assigned = report
+        .assignments
+        .iter()
+        .filter(|a| a.worker_id == w_real1.worker_id)
+        .count();
+    let real2_assigned = report
+        .assignments
+        .iter()
+        .filter(|a| a.worker_id == w_real2.worker_id)
+        .count();
+    let sim1_assigned = report
+        .assignments
+        .iter()
+        .filter(|a| a.worker_id == w_sim1.worker_id)
+        .count();
+    let sim2_assigned = report
+        .assignments
+        .iter()
+        .filter(|a| a.worker_id == w_sim2.worker_id)
+        .count();
+    let cpu_assigned = report
+        .assignments
+        .iter()
+        .filter(|a| a.worker_id == w_cpu.worker_id)
+        .count();
+
+    assert_eq!(real1_assigned, 2, "Real GPU 1 saturated at 2 tasks");
+    assert_eq!(real2_assigned, 4, "Real GPU 2 saturated at 4 tasks");
+    assert_eq!(sim1_assigned, 4, "Sim GPU 1 saturated at 4 tasks");
+    assert_eq!(sim2_assigned, 4, "Sim GPU 2 saturated at 4 tasks");
+    assert_eq!(cpu_assigned, 0, "CPU worker must never receive GPU task");
+}
+
+/// Adversarial Concurrency Test with Live Async TaskQueue & Multi-threaded Task Submissions.
+#[tokio::test]
+async fn test_adversarial_live_queue_concurrent_gpu_submissions() {
+    let queue = TaskQueue::new();
+    let registry = WorkerRegistry::new();
+    let trigger = Arc::new(Notify::new());
+    let config = SchedulerConfig {
+        policy: SchedulingPolicy::LeastLoaded,
+        core_concurrency_multiplier: 1.0,
+        ..Default::default()
+    };
+
+    let scheduler =
+        WorkloadScheduler::new(config, registry.clone(), queue.clone(), trigger.clone());
+
+    // Register 1 Real GPU (4 slots) and 1 Simulated GPU (4 slots)
+    let w_real = Uuid::new_v4();
+    let (tx_real, mut rx_real) = tokio::sync::mpsc::channel(256);
+    tokio::spawn(async move { while rx_real.recv().await.is_some() {} });
+    let caps_real = WorkerCapabilities::new("w-real", 4, 8192, true, false, None);
+    registry
+        .register(
+            w_real,
+            caps_real,
+            "127.0.0.1:9110".parse().unwrap(),
+            tx_real,
+            None,
+        )
+        .await
+        .expect("register real gpu");
+
+    let w_sim = Uuid::new_v4();
+    let (tx_sim, mut rx_sim) = tokio::sync::mpsc::channel(256);
+    tokio::spawn(async move { while rx_sim.recv().await.is_some() {} });
+    let caps_sim = WorkerCapabilities::new("w-sim", 4, 8192, true, true, None);
+    registry
+        .register(
+            w_sim,
+            caps_sim,
+            "127.0.0.1:9111".parse().unwrap(),
+            tx_sim,
+            None,
+        )
+        .await
+        .expect("register sim gpu");
+
+    // Spawn 10 concurrent tokio tasks submitting 5 tasks each (50 total tasks)
+    let mut handles = Vec::new();
+    for thread_idx in 0..10 {
+        let q = queue.clone();
+        handles.push(tokio::spawn(async move {
+            for task_idx in 0..5 {
+                let task = Task::new(
+                    TaskSpec::gpu_compute(format!("concurrent_{thread_idx}_{task_idx}"), 10),
+                    TaskRequirements::gpu(10),
+                );
+                q.submit(task).await.expect("submit task");
+            }
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // Run scheduler pass
+    let report = scheduler.schedule_batch(64).await.expect("schedule batch");
+    assert_eq!(
+        report.assignments.len(),
+        8,
+        "Both 4-slot workers saturated at 8 tasks"
+    );
+
+    // All real slots must be used (4 tasks on real GPU), remaining 4 tasks on simulated GPU
+    let real_count = report
+        .assignments
+        .iter()
+        .filter(|a| a.worker_id == w_real)
+        .count();
+    let sim_count = report
+        .assignments
+        .iter()
+        .filter(|a| a.worker_id == w_sim)
+        .count();
+    assert_eq!(real_count, 4, "Real GPU must receive 4 tasks");
+    assert_eq!(sim_count, 4, "Simulated GPU must receive 4 tasks");
+}
+

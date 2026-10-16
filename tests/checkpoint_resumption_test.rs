@@ -162,8 +162,10 @@ fn test_checkpoint_serialization_roundtrip() {
 
 #[tokio::test]
 async fn test_task_queue_checkpoint_retention_across_reassignment() {
-    let mut policy = RetryPolicy::default();
-    policy.max_retries = 3;
+    let policy = RetryPolicy {
+        max_retries: 3,
+        ..Default::default()
+    };
     let queue = TaskQueue::with_config(policy, None);
 
     let task = Task::new(

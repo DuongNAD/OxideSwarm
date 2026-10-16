@@ -5,8 +5,7 @@
 > `benchmark_data.json` / `benchmark_matrix.csv`. They were not produced by a script in this repository and are not
 > reproduced in CI. `run_comparative_benchmark.sh` only checks that these files parse and re-runs two local Rust benches;
 > it does not run Tailscale or Cloudflare. The "composite MCDA score" is a weighted sum of the recorded values. Where this
-> document says "verified", "empirical" or "forensic", read "recorded once". Some memory figures conflict with
-> `docs/WHAT_WAS_DONE.md` (6.8 MB here vs 14.2 MB there) and the "Tailscale / Cloudflare RAM" cells in the CSV appear to be
+> document says "verified", "empirical" or "forensic", read "recorded once". The "Tailscale / Cloudflare RAM" cells in the CSV appear to be
 > throughput values; re-measure before relying on them.
 
 

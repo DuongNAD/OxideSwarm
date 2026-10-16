@@ -99,6 +99,10 @@ class ManagedProcessRunner(private val context: Context) : WorkerEngine {
                 if (config.simulateGpu) {
                     cmd.add("--simulate-gpu")
                 }
+                if (!config.clusterSecret.isNullOrBlank()) {
+                    cmd.add("--secret")
+                    cmd.add(config.clusterSecret)
+                }
 
                 val pb = ProcessBuilder(cmd)
                 pb.environment().apply {
@@ -106,6 +110,9 @@ class ManagedProcessRunner(private val context: Context) : WorkerEngine {
                     put("RUST_BACKTRACE", "1")
                     put("HOME", context.filesDir.absolutePath)
                     put("TMPDIR", context.cacheDir.absolutePath)
+                    if (!config.clusterSecret.isNullOrBlank()) {
+                        put("OXIDESWARM_SECRET", config.clusterSecret)
+                    }
                 }
                 pb.directory(context.filesDir)
 

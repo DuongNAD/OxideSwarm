@@ -342,6 +342,25 @@
                     </com.google.android.material.textfield.TextInputLayout>
                 </LinearLayout>
 
+                <!-- Cluster Secret (Optional for authenticated clusters) -->
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="10dp"
+                    android:hint="Cluster Secret (Hex / Optional)"
+                    app:boxBackgroundColor="@color/surface"
+                    app:boxStrokeColor="@color/accent"
+                    app:hintTextColor="@color/accent">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/etClusterSecret"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="textPassword"
+                        android:textColor="@color/text_primary"
+                        android:textSize="14sp" />
+                </com.google.android.material.textfield.TextInputLayout>
+
                 <!-- Switches -->
                 <com.google.android.material.switchmaterial.SwitchMaterial
                     android:id="@+id/switchSimulateGpu"

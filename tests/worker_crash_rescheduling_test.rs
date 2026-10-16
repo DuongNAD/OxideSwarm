@@ -493,6 +493,8 @@ async fn test_reaper_waiters_resolution() {
         capabilities: rusty_grid_core::capabilities::WorkerCapabilities::new(
             "w-reaper", 2, 4096, false, false, None,
         ),
+        protocol_version: rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT,
+        features: rusty_grid_core::protocol::ProtocolCapabilities::all_supported(),
     };
     transport.send_msg(&reg_msg).await.expect("send register");
 

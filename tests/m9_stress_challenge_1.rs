@@ -48,7 +48,9 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
-use rusty_grid_core::protocol::{MasterMessage, MessageTransport, WorkerMessage};
+use rusty_grid_core::protocol::{
+    MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage, PROTOCOL_VERSION_CURRENT,
+};
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_master::queue::TaskState;
 use rusty_grid_master::reaper::ReaperConfig;
@@ -1019,6 +1021,8 @@ async fn test_stress_reaper_detection_and_failover() {
         .send_msg(&WorkerMessage::Register {
             worker_id: w1_id,
             capabilities: WorkerCapabilities::new("w-silent", 2, 2048, false, false, None),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .expect("send register");
@@ -1073,6 +1077,8 @@ async fn test_stress_reaper_detection_and_failover() {
         .send_msg(&WorkerMessage::Register {
             worker_id: w2_id,
             capabilities: WorkerCapabilities::new("w-healthy", 2, 2048, false, false, None),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .expect("send register w2");

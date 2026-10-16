@@ -3273,8 +3273,10 @@ version = "0.1.0"
 dependencies = [
  "jni 0.21.1",
  "rusty_grid_core",
+ "rusty_grid_master",
  "rusty_grid_worker",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",

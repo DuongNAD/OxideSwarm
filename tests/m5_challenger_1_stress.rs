@@ -784,8 +784,19 @@ fn test_adversarial_cli_missing_and_invalid_arguments() {
     // The client commands resolve ~/.oxideswarm/cluster.secret; keep this test off the real home.
     let home = TempDir::new().expect("create temp home");
 
+    let isolated_cmd = || {
+        let mut cmd = Command::new(bin_path);
+        cmd.env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("OXIDESWARM_HOME", home.path().join(".oxideswarm"))
+            .env_remove("OXIDESWARM_SECRET")
+            .env_remove("OXIDESWARM_SECRET_FILE")
+            .current_dir(home.path());
+        cmd
+    };
+
     // 1. Invoking CLI with zero arguments: missing subcommand
-    let output_no_args = Command::new(bin_path).output().expect("invoke CLI");
+    let output_no_args = isolated_cmd().output().expect("invoke CLI");
     assert_eq!(
         output_no_args.status.code(),
         Some(2),
@@ -793,7 +804,7 @@ fn test_adversarial_cli_missing_and_invalid_arguments() {
     );
 
     // 2. Invoking CLI with non-existent subcommand
-    let output_bad_cmd = Command::new(bin_path)
+    let output_bad_cmd = isolated_cmd()
         .arg("nonexistent_command")
         .output()
         .expect("invoke CLI");
@@ -804,7 +815,7 @@ fn test_adversarial_cli_missing_and_invalid_arguments() {
     );
 
     // 3. Invoking mapreduce without required --input argument
-    let output_mr = Command::new(bin_path)
+    let output_mr = isolated_cmd()
         .arg("mapreduce")
         .output()
         .expect("invoke CLI");
@@ -817,9 +828,7 @@ fn test_adversarial_cli_missing_and_invalid_arguments() {
     assert!(stderr_mr.contains("--input"));
 
     // 4. Submitting task to closed/non-listening port
-    let output_submit_closed = Command::new(bin_path)
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
+    let output_submit_closed = isolated_cmd()
         .arg("submit")
         .arg("--master")
         .arg("127.0.0.1:1") // Closed port

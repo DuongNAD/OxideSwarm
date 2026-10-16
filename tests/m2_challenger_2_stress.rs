@@ -29,7 +29,9 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
-use rusty_grid_core::protocol::{MasterMessage, MessageTransport, WorkerMessage};
+use rusty_grid_core::protocol::{
+    MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage, PROTOCOL_VERSION_CURRENT,
+};
 use rusty_grid_core::task::TaskRequirements;
 use rusty_grid_master::reaper::{spawn_reaper, ReaperConfig};
 use rusty_grid_master::registry::{WorkerRegistry, WorkerStatus};
@@ -80,6 +82,8 @@ async fn test_reaper_accuracy_silent_worker_boundary_timing() {
     let reg_msg = WorkerMessage::Register {
         worker_id,
         capabilities: WorkerCapabilities::new("silent-node", 4, 4096, false, false, None),
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: ProtocolCapabilities::all_supported(),
     };
     transport.send_msg(&reg_msg).await.expect("send register");
     let _ack: MasterMessage = transport.recv_msg().await.expect("recv").expect("ack");
@@ -174,6 +178,8 @@ async fn test_reaper_selective_reaping_with_active_peers() {
         .send_msg(&WorkerMessage::Register {
             worker_id: w1_id,
             capabilities: WorkerCapabilities::new("active-worker-1", 4, 4096, false, false, None),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .unwrap();
@@ -189,6 +195,8 @@ async fn test_reaper_selective_reaping_with_active_peers() {
         .send_msg(&WorkerMessage::Register {
             worker_id: w2_id,
             capabilities: WorkerCapabilities::new("silent-worker-2", 4, 4096, false, false, None),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .unwrap();
@@ -258,6 +266,8 @@ async fn test_reaper_fast_path_abrupt_socket_drop_without_disconnecting() {
         .send_msg(&WorkerMessage::Register {
             worker_id,
             capabilities: WorkerCapabilities::new("drop-node", 4, 4096, false, false, None),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .unwrap();
@@ -717,6 +727,8 @@ async fn test_reaper_monotonic_clock_immune_to_worker_reported_epoch_skew() {
         .send_msg(&WorkerMessage::Register {
             worker_id: w_id,
             capabilities: WorkerCapabilities::new("clock-skew-worker", 2, 2048, false, false, None),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .unwrap();
@@ -994,6 +1006,7 @@ async fn test_adversarial_master_multiplexed_heartbeat_under_backpressured_data_
     // Configure master server with P2P
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_p2p(true)
+        .with_ephemeral_key(true)
         .with_heartbeat_interval(5)
         .with_handshake_timeout(5);
 
@@ -1058,6 +1071,8 @@ async fn test_adversarial_master_multiplexed_heartbeat_under_backpressured_data_
             false,
             None,
         ),
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: ProtocolCapabilities::all_supported(),
     };
     ctrl_transport
         .send_msg(&reg_msg)

@@ -115,13 +115,6 @@ impl AsRef<str> for Bytes {
     }
 }
 
-impl std::borrow::Borrow<str> for Bytes {
-    #[inline]
-    fn borrow(&self) -> &str {
-        self.as_str()
-    }
-}
-
 impl std::borrow::Borrow<[u8]> for Bytes {
     #[inline]
     fn borrow(&self) -> &[u8] {
@@ -134,7 +127,7 @@ impl fmt::Debug for Bytes {
         if let Ok(s) = std::str::from_utf8(&self.0) {
             write!(f, "{:?}", s)
         } else {
-            write!(f, "{:?}", &self.0)
+            write!(f, "{:?}", self.0)
         }
     }
 }
@@ -1660,7 +1653,7 @@ mod tests {
         // Spec requires GPU, but requirements state gpu_required = false
         let gpu_spec = TaskSpec::GpuCompute {
             kernel_name: "matrix_mult".into(),
-            input_data: vec![1, 2, 3].into(),
+            input_data: vec![1, 2, 3],
             work_group_size: 16,
             simulated_matrix_dim: 64,
             compute_intensity: 10,
@@ -1837,7 +1830,7 @@ mod tests {
             },
             TaskSpec::GpuCompute {
                 kernel_name: "gemm".into(),
-                input_data: vec![1, 2, 3, 4, 5].into(),
+                input_data: vec![1, 2, 3, 4, 5],
                 work_group_size: 32,
                 simulated_matrix_dim: 128,
                 compute_intensity: 50,

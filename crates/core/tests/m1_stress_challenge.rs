@@ -15,8 +15,9 @@ use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::{
-    default_codec, MasterMessage, MessageReader, MessageTransport, MessageWriter, ProtocolError,
-    WorkerMessage, LENGTH_FIELD_BYTES, MAX_FRAME_SIZE,
+    default_codec, MasterMessage, MessageReader, MessageTransport, MessageWriter,
+    ProtocolCapabilities, ProtocolError, WorkerMessage, LENGTH_FIELD_BYTES, MAX_FRAME_SIZE,
+    PROTOCOL_VERSION_CURRENT,
 };
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec, TaskStatus};
 
@@ -399,6 +400,8 @@ fn test_serde_worker_message_all_variants_and_edge_cases() {
                 tags: vec![s.clone(), "tag2".into()],
                 mobile: None,
             },
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         };
         let json = serde_json::to_string(&reg).unwrap();
         let de: WorkerMessage = serde_json::from_str(&json).unwrap();
@@ -486,18 +489,20 @@ fn test_serde_master_message_all_variants_and_edge_cases() {
 
     // 1. MasterMessage::RegisterAck edge cases
     let acks = vec![
-        MasterMessage::RegisterAck {
-            accepted: true,
+        MasterMessage::register_ack(
+            true,
             worker_id,
-            heartbeat_interval_secs: 0,
-            message: None,
-        },
-        MasterMessage::RegisterAck {
-            accepted: false,
+            0,
+            ProtocolCapabilities::all_supported(),
+            None,
+        ),
+        MasterMessage::register_ack(
+            false,
             worker_id,
-            heartbeat_interval_secs: u64::MAX,
-            message: Some("Rejected due to: \0 Unicode 🦀".into()),
-        },
+            u64::MAX,
+            ProtocolCapabilities::empty(),
+            Some("Rejected due to: \0 Unicode 🦀".into()),
+        ),
     ];
     for ack in acks {
         let json = serde_json::to_string(&ack).unwrap();

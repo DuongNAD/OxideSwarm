@@ -462,6 +462,7 @@ impl AgentMeshEnvelope {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_command_response(
         from: impl Into<String>,
         to: impl Into<String>,

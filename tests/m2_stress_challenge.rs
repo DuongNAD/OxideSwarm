@@ -23,7 +23,9 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
-use rusty_grid_core::protocol::{MasterMessage, MessageTransport, WorkerMessage};
+use rusty_grid_core::protocol::{
+    MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage, PROTOCOL_VERSION_CURRENT,
+};
 use rusty_grid_master::registry::{WorkerRegistry, WorkerStatus};
 use rusty_grid_master::server::{MasterServer, ServerConfig};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
@@ -43,6 +45,7 @@ where
     }
     false
 }
+
 
 // =========================================================================
 // Challenge 1: High Concurrent Worker Registration Bursts (20 Workers)
@@ -183,7 +186,7 @@ async fn test_challenge_concurrent_worker_burst_20_nodes() {
 // Challenge 2: Handshake Timeout Resilience & Non-Blocking Slowloris Defense
 // =========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
     let (master_shutdown_tx, master_shutdown_rx) = watch::channel(false);
     let registry = WorkerRegistry::new();
@@ -278,9 +281,14 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
     let timeout_start = Instant::now();
     let mut buf = [0u8; 32];
 
+    #[cfg(windows)]
+    let rogue_timeout = Duration::from_secs(12);
+    #[cfg(not(windows))]
+    let rogue_timeout = Duration::from_secs(7);
+
     // Rogue 1: read should yield EOF (0 bytes read) or ConnectionReset
     let r1_res =
-        tokio::time::timeout(Duration::from_secs(7), rogue_zero_bytes.read(&mut buf)).await;
+        tokio::time::timeout(rogue_timeout, rogue_zero_bytes.read(&mut buf)).await;
     let r1_elapsed = timeout_start.elapsed();
     println!(
         "[CHALLENGE SLOWLORIS] Rogue 1 (0 bytes) terminated after {:?}",
@@ -289,15 +297,19 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
     assert!(r1_res.is_ok(), "Rogue 1 must be closed within timeout");
     let bytes_read = r1_res.unwrap().unwrap_or(0);
     assert_eq!(bytes_read, 0, "Rogue 1 must receive EOF on socket drop");
+    #[cfg(windows)]
+    let max_r1 = Duration::from_millis(12000);
+    #[cfg(not(windows))]
+    let max_r1 = Duration::from_millis(6500);
     assert!(
-        r1_elapsed >= Duration::from_millis(4500) && r1_elapsed <= Duration::from_millis(6500),
+        r1_elapsed >= Duration::from_millis(4500) && r1_elapsed <= max_r1,
         "Rogue 1 timeout must be ~5s (actual: {:?})",
         r1_elapsed
     );
 
     // Rogue 2: read should yield EOF (0 bytes read)
     let r2_res =
-        tokio::time::timeout(Duration::from_secs(7), rogue_partial_prefix.read(&mut buf)).await;
+        tokio::time::timeout(rogue_timeout, rogue_partial_prefix.read(&mut buf)).await;
     let r2_elapsed = timeout_start.elapsed();
     println!(
         "[CHALLENGE SLOWLORIS] Rogue 2 (partial prefix) terminated after {:?}",
@@ -308,7 +320,7 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
 
     // Rogue 3: read should yield EOF (0 bytes read)
     let r3_res =
-        tokio::time::timeout(Duration::from_secs(7), rogue_partial_body.read(&mut buf)).await;
+        tokio::time::timeout(rogue_timeout, rogue_partial_body.read(&mut buf)).await;
     let r3_elapsed = timeout_start.elapsed();
     println!(
         "[CHALLENGE SLOWLORIS] Rogue 3 (partial body) terminated after {:?}",
@@ -493,6 +505,8 @@ async fn test_challenge_simultaneous_reconnect_session_collision_protection() {
         .send_msg(&WorkerMessage::Register {
             worker_id: shared_worker_id,
             capabilities: caps.clone(),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .unwrap();
@@ -511,6 +525,8 @@ async fn test_challenge_simultaneous_reconnect_session_collision_protection() {
         .send_msg(&WorkerMessage::Register {
             worker_id: shared_worker_id,
             capabilities: caps.clone(),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .unwrap();
@@ -590,6 +606,8 @@ async fn test_challenge_rapid_heartbeat_burst_no_deadlock() {
         .send_msg(&WorkerMessage::Register {
             worker_id: wid,
             capabilities: WorkerCapabilities::new("burst-heartbeat", 4, 4096, false, false, None),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .unwrap();

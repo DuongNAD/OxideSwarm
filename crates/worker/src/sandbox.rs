@@ -72,7 +72,7 @@ impl SandboxConfig {
             source,
         };
         tokio::fs::create_dir_all(&self.base_dir).await.map_err(unusable)?;
-        let probe = self.base_dir.join(format!(".write_probe_{}", std::process::id()));
+        let probe = self.base_dir.join(format!(".write_probe_{}_{}", std::process::id(), TaskId::new()));
         tokio::fs::write(&probe, b"probe").await.map_err(unusable)?;
         let _ = tokio::fs::remove_file(&probe).await;
         Ok(())

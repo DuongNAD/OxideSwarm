@@ -132,6 +132,7 @@ async fn test_tcp_real_socket_split_concurrent_bidirectional() {
             Some(WorkerMessage::Register {
                 worker_id,
                 capabilities,
+                ..
             }) => (worker_id, capabilities),
             other => panic!("Expected Register, got {other:?}"),
         };
@@ -139,12 +140,13 @@ async fn test_tcp_real_socket_split_concurrent_bidirectional() {
 
         // 2. Send RegisterAck
         server_tx
-            .send_msg(&MasterMessage::RegisterAck {
-                accepted: true,
-                worker_id: wid,
-                heartbeat_interval_secs: 2,
-                message: Some("Registered successfully".into()),
-            })
+            .send_msg(&MasterMessage::register_ack(
+                true,
+                wid,
+                2,
+                rusty_grid_core::protocol::ProtocolCapabilities::all_supported(),
+                Some("Registered successfully".into()),
+            ))
             .await
             .unwrap();
 
@@ -179,10 +181,10 @@ async fn test_tcp_real_socket_split_concurrent_bidirectional() {
 
     let wid = Uuid::new_v4();
     client_tx
-        .send_msg(&WorkerMessage::Register {
-            worker_id: wid,
-            capabilities: WorkerCapabilities::new("tcp-worker", 8, 16384, false, false, None),
-        })
+        .send_msg(&WorkerMessage::register(
+            wid,
+            WorkerCapabilities::new("tcp-worker", 8, 16384, false, false, None),
+        ))
         .await
         .unwrap();
 

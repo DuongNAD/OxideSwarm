@@ -10,7 +10,7 @@ The **OxideSwarm Agent Mesh** is a communication layer enabling coding agents an
 >   proxy, or a VPN / SSH tunnel;
 > * must **never be published to the Internet** (no quick tunnels, no router port forward).
 >
-> This mesh is separate from the compute grid (master/workers, `README.md`), which has its own cluster secret.
+> This mesh is separate from the compute grid (master/workers, `README.md`), which has its own cluster secret and encrypts post-handshake TCP traffic via ChaCha20-Poly1305 (`0x04`).
 > Both default to TCP port 8088: when they run on one machine give the hub another port (examples below use 8090).
 > Full model: [docs/SECURITY.md](docs/SECURITY.md).
 
@@ -78,6 +78,14 @@ The Hub also answers plain HTTP on the same port. When a token is configured, `/
 - **Node Catalog:** `http://127.0.0.1:8090/api/nodes` (connected nodes and capabilities)
 - **Cluster Status:** `http://127.0.0.1:8090/api/status` (uptime, routed command counts, delivery metrics)
 - **Health Check:** `http://127.0.0.1:8090/api/health`
+
+### Option C: Launching with Master Grid Integration (`--grid-master`)
+Through the embedded `AgentGridBridge`, the hub can bridge agent tasks directly into the OxideSwarm Master Grid without external shims:
+```bash
+# Launch Hub with Master Grid Bridge enabled
+./target/release/agent-mesh hub --listen 0.0.0.0:8090 --token "$OXIDE_MESH_TOKEN" --grid-master 127.0.0.1:8088
+```
+When `--grid-master` is provided, agent envelopes containing grid actions (`grid_submit`, `grid_compute`, `grid_compile`, `grid_status`) are forwarded directly to the compute grid. If omitted, the hub operates in standalone messaging mode and grid commands return `ERR_BRIDGE_NOT_CONFIGURED`.
 
 ---
 
@@ -245,7 +253,7 @@ This app runs the **compute-grid worker** (not the agent-mesh node) in-process v
 - It needs `liboxideworker.so`, built first with `packaging/android/build_android_jni.sh --release`; without it the app has no worker. See [packaging/android/README.md](packaging/android/README.md).
 - It uses an Android Foreground Service with an ongoing notification and holds `PARTIAL_WAKE_LOCK` / `WIFI_MODE_FULL_LOW_LATENCY`.
 - Built-in tasks run inside the app process and are not exposed to the Android 12+ **Phantom Process Killer (PPK)**; command, shell and compile tasks spawn child processes, and those can be killed by it.
-- It cannot hold the grid's cluster secret yet (see README, Known Limitations #5).
+- Supports cluster secret authentication via native JNI configuration (`nativeSetClusterSecret`, `nativeStartWorkerWithSecret`).
 
 ### 3.5 Upgrading a running grid (master and workers)
 The compute grid's wire protocol (master, workers, `submit` / `status`) has no version negotiation and encodes
@@ -299,7 +307,7 @@ The crate tests cover:
 
 | Subcommand | Flags | Description |
 |---|---|---|
-| `hub` | `--listen <ADDR>`, `--token <TOKEN>`, `--insecure` | Starts the WebSocket Relay Hub (default listen `127.0.0.1:8088`; a non-loopback address needs a token or `--insecure`) |
+| `hub` | `--listen <ADDR>`, `--token <TOKEN>`, `--insecure`, `--grid-master [ADDR]` | Starts the WebSocket Relay Hub (default listen `127.0.0.1:8088`; `--grid-master` bridges agent tasks to Master Grid) |
 | `node` | `--hub <URL>`, `--id <NAME>`, `--platform <TAG>`, `--token <TOKEN>` | Starts an agent node client connected to the Hub |
 | `send` | `--hub <URL>`, `--from <ID>`, `--to <TARGET>`, `--command <CMD>`, `--args <JSON>`, `--timeout-ms <MS>`, `--token <TOKEN>` | Sends a command to a specific node and prints execution output |
 | `list` | `--hub <URL>`, `--from <ID>`, `--token <TOKEN>` | Prints all currently online nodes registered with the Hub |

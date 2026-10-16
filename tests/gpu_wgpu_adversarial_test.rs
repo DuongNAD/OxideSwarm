@@ -120,6 +120,7 @@ fn test_simd_vs_oracle_irregular_dimensions() {
 // Scenario 2: Single Element (1x1) and Zero Dimension (0x0) Handling
 // ============================================================================
 #[test]
+#[allow(clippy::approx_constant)]
 fn test_single_element_1x1_matrix() {
     let a = vec![3.1415927f32];
     let b = vec![2.7182817f32];

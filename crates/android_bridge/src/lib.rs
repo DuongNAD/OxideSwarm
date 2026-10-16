@@ -20,7 +20,10 @@ use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 use rusty_grid_core::capabilities::MobileLiveStatus;
-use rusty_grid_core::protocol::{MasterMessage, MessageTransport, WorkerMessage};
+use rusty_grid_core::cluster_auth::ClusterSecret;
+use rusty_grid_core::protocol::{
+    MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage, PROTOCOL_VERSION_CURRENT,
+};
 use rusty_grid_core::transport::{
     iroh, serialize_p2p_ticket, BiStream, GridStream, GRID_ALPN,
 };
@@ -58,6 +61,7 @@ struct WorkerState {
     running: AtomicBool,
     worker_id: Mutex<Option<Uuid>>,
     p2p_ticket: Mutex<Option<String>>,
+    cluster_secret: Mutex<Option<ClusterSecret>>,
     status: Mutex<String>,
     telemetry: Mutex<MobileTelemetry>,
     /// The same readings, shared with the running `WorkerClient`: it reports every change to the
@@ -76,6 +80,7 @@ impl WorkerState {
             running: AtomicBool::new(false),
             worker_id: Mutex::new(None),
             p2p_ticket: Mutex::new(None),
+            cluster_secret: Mutex::new(None),
             status: Mutex::new("STOPPED".to_string()),
             telemetry: Mutex::new(MobileTelemetry::default()),
             mobile: MobileTelemetryHandle::default(),
@@ -102,6 +107,36 @@ pub fn set_sandbox_dir_impl(dir: String) -> bool {
     let dir = dir.trim();
     *get_worker_state().sandbox_dir.lock().unwrap() =
         (!dir.is_empty()).then(|| PathBuf::from(dir));
+    true
+}
+
+/// Configures or clears the shared cluster secret for worker authentication against the Master node.
+/// Accepts either a hex string (at least 32 hex chars / 16 bytes) or a file path to a cluster secret file.
+/// Passing an empty string clears the secret.
+pub fn set_cluster_secret_impl(secret_text: &str) -> bool {
+    let state = get_worker_state();
+    let trimmed = secret_text.trim();
+    if trimmed.is_empty() {
+        *state.cluster_secret.lock().unwrap() = None;
+        return true;
+    }
+
+    let secret = match ClusterSecret::from_hex(trimmed) {
+        Ok(s) => s,
+        Err(_) => {
+            let path = PathBuf::from(trimmed);
+            match ClusterSecret::load_file(&path) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(error = %e, "Invalid cluster secret: neither valid hex nor loadable file");
+                    *state.status.lock().unwrap() = format!("ERROR: Invalid cluster secret: {e}");
+                    return false;
+                }
+            }
+        }
+    };
+
+    *state.cluster_secret.lock().unwrap() = Some(secret);
     true
 }
 
@@ -157,6 +192,9 @@ pub fn start_worker_impl(
     config = config.with_simulate_gpu(simulate_gpu);
     if let Some(dir) = state.sandbox_dir.lock().unwrap().clone() {
         config = config.with_sandbox_base_dir(dir);
+    }
+    if let Some(sec) = state.cluster_secret.lock().unwrap().clone() {
+        config = config.with_cluster_secret(sec);
     }
     // Battery / thermal readings pushed by the Android app (`update_telemetry_*`) flow into the
     // worker through this handle for as long as it runs.
@@ -247,6 +285,34 @@ pub fn start_worker_legacy_impl(
     start_worker_impl(
         master_addr,
         None,
+        worker_name,
+        cores,
+        ram_mb,
+        simulate_gpu,
+        heartbeat_interval_secs,
+    )
+}
+
+/// Worker start implementation accepting an explicit cluster secret parameter.
+#[allow(clippy::too_many_arguments)]
+pub fn start_worker_with_secret_impl(
+    master_addr: String,
+    p2p_ticket: Option<String>,
+    cluster_secret: Option<String>,
+    worker_name: String,
+    cores: i32,
+    ram_mb: i64,
+    simulate_gpu: bool,
+    heartbeat_interval_secs: i64,
+) -> bool {
+    if let Some(ref sec) = cluster_secret {
+        if !set_cluster_secret_impl(sec) {
+            return false;
+        }
+    }
+    start_worker_impl(
+        master_addr,
+        p2p_ticket,
         worker_name,
         cores,
         ram_mb,
@@ -683,7 +749,8 @@ pub fn start_master_impl(
                 }
 
                 // Cleanly close and release active Iroh P2P endpoint inside background Tokio runtime
-                if let Some(ep) = state_clone.p2p_endpoint.lock().unwrap().take() {
+                let maybe_ep = state_clone.p2p_endpoint.lock().unwrap().take();
+                if let Some(ep) = maybe_ep {
                     ep.close().await;
                 }
 
@@ -737,6 +804,8 @@ async fn handle_coordinator_stream(
                                     worker_id,
                                     heartbeat_interval_secs: 3,
                                     message: Some("Registered with mobile coordinator".to_string()),
+                                    protocol_version: PROTOCOL_VERSION_CURRENT,
+                                    features: ProtocolCapabilities::all_supported(),
                                 };
                                 if transport.send_msg(&ack).await.is_err() {
                                     break;
@@ -948,6 +1017,26 @@ pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nati
     }
 }
 
+/// Sets the shared cluster secret before starting the worker.
+#[no_mangle]
+pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeSetClusterSecret<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    cluster_secret: JString<'local>,
+) -> jboolean {
+    let secret_str: String = match env.get_string(&cluster_secret) {
+        Ok(s) => s.into(),
+        Err(_) => return JNI_FALSE,
+    };
+    if set_cluster_secret_impl(&secret_str) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeUpdateTelemetry<
     'local,
@@ -1141,6 +1230,21 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeSetClusterSecret<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    class: JClass<'local>,
+    cluster_secret: JString<'local>,
+) -> jboolean {
+    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeSetClusterSecret(
+        env,
+        class,
+        cluster_secret,
+    )
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeStartWorkerLegacy<
     'local,
 >(
@@ -1297,6 +1401,7 @@ mod tests {
         ws.mobile.set(None);
         *ws.worker_id.lock().unwrap() = None;
         *ws.p2p_ticket.lock().unwrap() = None;
+        *ws.cluster_secret.lock().unwrap() = None;
         *ws.sandbox_dir.lock().unwrap() = None;
         *ws.status.lock().unwrap() = "STOPPED".to_string();
         ws.running.store(false, Ordering::SeqCst);
@@ -1528,5 +1633,48 @@ mod tests {
         let res = discover_master_impl(50);
         assert!(res.contains("found"));
         reset_test_state();
+    }
+
+    #[test]
+    fn test_bridge_cluster_secret_handling() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        reset_test_state();
+
+        // 1. Valid hex secret (64 hex characters / 32 bytes)
+        let valid_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(set_cluster_secret_impl(valid_hex));
+        {
+            let state = get_worker_state();
+            let sec = state.cluster_secret.lock().unwrap();
+            assert!(sec.is_some());
+            assert_eq!(sec.as_ref().unwrap().to_hex(), valid_hex);
+        }
+
+        // 2. Clear secret with empty string
+        assert!(set_cluster_secret_impl("   "));
+        {
+            let state = get_worker_state();
+            assert!(state.cluster_secret.lock().unwrap().is_none());
+        }
+
+        // 3. Valid secret file
+        let dir = scratch_dir("secret-file");
+        let secret_path = dir.join("test.secret");
+        std::fs::write(&secret_path, format!("{valid_hex}\n")).unwrap();
+        assert!(set_cluster_secret_impl(&secret_path.display().to_string()));
+        {
+            let state = get_worker_state();
+            let sec = state.cluster_secret.lock().unwrap();
+            assert!(sec.is_some());
+            assert_eq!(sec.as_ref().unwrap().to_hex(), valid_hex);
+        }
+
+        // 4. Invalid secret (neither valid hex nor existing file)
+        assert!(!set_cluster_secret_impl("not_a_valid_hex_or_file_xyz_123"));
+        let status = status_text();
+        assert!(status.starts_with("ERROR: Invalid cluster secret:"), "{status}");
+
+        reset_test_state();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

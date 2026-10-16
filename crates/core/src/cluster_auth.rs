@@ -298,6 +298,9 @@ impl ClusterSecret {
     /// Default secret file: `<home>/.oxideswarm/cluster.secret` (home is `HOME`, or
     /// `USERPROFILE` on Windows).
     pub fn default_path() -> Option<PathBuf> {
+        if let Some(custom) = std::env::var_os("OXIDESWARM_HOME").filter(|s| !s.is_empty()) {
+            return Some(PathBuf::from(custom).join(DEFAULT_SECRET_FILE_NAME));
+        }
         #[cfg(windows)]
         let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
         #[cfg(not(windows))]
@@ -461,6 +464,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub(crate) fn hex_decode(text: &str) -> Option<Vec<u8>> {
     let raw = text.as_bytes();
     if raw.len() & 1 == 1 {

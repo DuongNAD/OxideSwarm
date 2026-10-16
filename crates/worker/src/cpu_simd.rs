@@ -72,6 +72,7 @@ pub fn matmul_simd(a: &[f32], b: &[f32], c: &mut [f32], dim: usize) {
 /// [`matmul_simd`] that asks `should_stop` before every output row and gives up (returning
 /// `false`, `c` partially filled) as soon as it says so. A long CPU multiplication running on a
 /// blocking thread can only be cancelled or timed out cooperatively; this is the hook.
+#[allow(clippy::identity_op)]
 pub fn matmul_simd_cancellable(
     a: &[f32],
     b: &[f32],

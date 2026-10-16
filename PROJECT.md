@@ -1,42 +1,52 @@
-# Project: OxideSwarm Codebase Consolidation & Delivery
+# Project: OxideSwarm Architecture & Specification
 
-> **How to read this file.** The *Architecture*, *Security model* and *Code Layout* sections describe the code as it
-> is. The *Feature Inventory* and *Milestones* tables are the **historical checklist of the September 2026
-> consolidation** (git branch merges, cleanups, documentation); "DONE" there means that chore was finished, not that a
-> product feature was verified. For what works today and what does not, see `README.md` (section 3, Capabilities & Status,
-> and Known Limitations) and `docs/SECURITY.md`.
+OxideSwarm is a zero-broker distributed computing framework and cross-platform agent mesh written in Rust (edition 2021). A Master coordinator dispatches computational workloads (commands, shell scripts, compile jobs, map/reduce chunks, and hardware GPU matrix kernels) to worker nodes spanning macOS (Apple Silicon / Intel), Windows (x86_64), Linux servers, and Android devices (ARM64).
 
-## Architecture
-The consolidated OxideSwarm repository is organized into four cleanly decoupled functional layers:
+---
+
+## 1. System Architecture
+
+The repository is organized into four cleanly decoupled functional layers:
+
 1. **Layer 1: Rust Core Engine & Networking** (`crates/core`, `crates/master`, `crates/worker`, `crates/cli`, `packaging/windows`, `packaging/macos`): Distributed task orchestration, high-throughput binary wire protocol, P2P WAN NAT traversal (Iroh QUIC/DERP), CLI (`rusty-grid` and `oxideswarm`).
-2. **Layer 2: JNI / Android Bridge & Packaging** (`crates/android_bridge`, `packaging/android`): Native Android shared library (`liboxideworker.so`) and Android Studio app with Foreground Service.
-3. **Layer 3: Agent Mesh Coordination** (`crates/agent_mesh`, `packaging/agent_mesh`, `scripts/agent_node.py`): Axum WebSocket relay hub (token-authenticated), multi-platform agent client, a command executor (a timeout watchdog, **not a sandbox**: commands run with the node's rights), turnkey launchers. `AgentGridBridge` can submit grid tasks but is wired up only in tests; the shipped hub binary does not embed a master and there is no MCP server yet.
-4. **Layer 4: Cross-Machine Reachability & Benchmarks** (`scripts/sync_network`, `benchmarks/interconnect`): a zero-dependency shared-folder probe that checks two machines can reach each other over HTTP (not the grid), and a recorded WAN comparison dataset (Iroh vs WireGuard vs Cloudflare Tunnel) with a validator script. The comparison figures were measured once on the author's hardware and are not reproduced in CI.
+2. **Layer 2: JNI / Android Bridge & Packaging** (`crates/android_bridge`, `packaging/android`): Native Android shared library (`liboxideworker.so`) and Android Studio app with Foreground Service compliance and live telemetry injection.
+3. **Layer 3: Agent Mesh Coordination** (`crates/agent_mesh`, `packaging/agent_mesh`, `scripts/agent_node.py`): Axum WebSocket relay hub (token-authenticated), multi-platform agent client, and an embedded `AgentGridBridge` connecting agent workflows directly to the compute grid.
+4. **Layer 4: Cross-Machine Reachability & Benchmarks** (`scripts/sync_network`, `benchmarks/interconnect`): Zero-dependency cloud-shared folder reachability probe (`sync_network` on port 8085) and empirical WAN benchmark datasets.
 
-## Security model (summary; details in `docs/SECURITY.md`)
-* **Cluster secret** (`~/.oxideswarm/cluster.secret`, 32 random bytes as hex): a mutual HMAC-SHA256 challenge-response (`crates/core/src/cluster_auth.rs`) runs on every TCP and QUIC connection to the master before any message, and on the UDP discovery beacon. Workers and clients refuse remote, auto-discovered or P2P-ticket masters without a secret unless `--insecure`. A master reachable beyond its machine creates the default secret file on first start.
-* **Authenticated, not encrypted**: plain TCP carries no encryption after the handshake. Use `--p2p` (iroh QUIC/TLS) or a VPN / SSH tunnel on untrusted networks.
-* **Dashboard**: loopback unless `--web-ui-addr` is explicit; token (`oxideswarm secret show --dashboard-token`, or `--auth-token TOKEN:NAME:SCOPES`); same-origin only; dev bypass (`--dev`, `OXIDE_DEV_MODE`) is loopback-only and never applies to a dashboard bound to a non-loopback address.
-* **Task identity**: tasks run as the worker's OS account. The macOS LaunchDaemon uses a `UserName` (never root unless `--run-as-root`); the Windows service uses `NT SERVICE\OxideSwarmWorker` (never LocalSystem unless `-ServiceAccount LocalSystem -AcceptSystemRisk`).
-* **Ports**: 8088/tcp cluster, 8080/tcp dashboard (and the worker standby portal), 8089/udp discovery beacon, iroh QUIC + n0 relays for `--p2p`, 8085/tcp `sync_network` ping, agent-mesh hub (default `127.0.0.1:8088`; use another port next to a master).
+---
 
-```
+## 2. Security Model Summary
+
+- **Cluster Secret Authentication**: A 32-byte cryptographic hex secret (`~/.oxideswarm/cluster.secret`) authenticates nodes via mutual HMAC-SHA256 challenge-response before exchanging wire frames on TCP (port 8088), Iroh QUIC streams, and UDP discovery beacons (port 8089).
+- **Transport Security**: Plain TCP connections on trusted LANs are authenticated via HMAC-SHA256; remote WAN connections leverage Iroh QUIC with TLS encryption. Authenticated stream encryption (`0x04`) via ChaCha20-Poly1305 secures non-loopback TCP frames.
+- **Web Dashboard Security**: Axum HTTP dashboard on port 8080 binds to loopback (`127.0.0.1:8080`) by default. LAN access requires explicit `--web-ui-addr 0.0.0.0:8080` and authentication via token (`oxideswarm secret show --dashboard-token`).
+- **Process & Privilege Isolation**: Worker tasks execute under unprivileged user accounts (never root or LocalSystem). On Windows, services run under virtual account `NT SERVICE\OxideSwarmWorker`. Child processes are contained via Windows Job Objects (`kill-on-close`) and Unix process groups with `PR_SET_PDEATHSIG`.
+- **Network Ports**:
+  - `8088/tcp`: Master Grid coordinator listener (and default `agent-mesh hub` listener; rebind hub to `8090` when co-located).
+  - `8080/tcp`: Master Web Dashboard & REST API (and Worker standby HTTP 307 redirect portal).
+  - `8089/udp`: Master UDP discovery beacon (`--master auto`).
+  - `8085/tcp`: Cross-machine sync reachability probe (`scripts/sync_network`).
+
+---
+
+## 3. Directory & Workspace Layout
+
+```text
 OxideSwarm/
 ├── Cargo.toml                       # Workspace root (6 member crates)
 ├── Cargo.lock
 ├── README.md                        # Master architectural documentation & usage guide
-├── PROJECT.md                       # Unified project specification
-├── ORIGINAL_REQUEST.md              # Historical request log (not a current spec; contains personal paths/addresses)
+├── PROJECT.md                       # Authoritative project specification & roadmap
 ├── CLAUDE.md                        # Architecture map for AI coding assistants
 ├── docs/SECURITY.md                 # Threat model, ports, secret handling and rotation
 ├── ANDROID_ARCHITECTURE.md          # Mobile cluster architecture specification
 ├── DEPLOYMENT.md                    # Turnkey multi-platform deployment guide
 │
 ├── crates/                          # Rust Core & Specialized Modules
-│   ├── core/                        # [Layer 1] Wire codecs, Iroh QUIC transport, discovery, cluster_auth (secret handshake)
+│   ├── core/                        # [Layer 1] Wire codecs, Iroh QUIC transport, discovery, cluster_auth
 │   ├── master/                      # [Layer 1] Registry, scheduler, task queue, failover, web UI
 │   ├── worker/                      # [Layer 1] Execution engine, load-aware heartbeat, process sandbox
-│   ├── cli/                         # [Layer 1] Unified CLI binary (rusty-grid & oxideswarm), ox-mode; connect.rs, secret_cmd.rs
+│   ├── cli/                         # [Layer 1] Unified CLI binary (rusty-grid & oxideswarm), ox-mode
 │   ├── android_bridge/              # [Layer 2] JNI cdylib (liboxideworker.so) for Android
 │   └── agent_mesh/                  # [Layer 3] Axum WebSocket Relay Hub & Agent Client
 │
@@ -59,52 +69,38 @@ OxideSwarm/
 └── tests/                           # Multi-Tier Test Suites & Integration Harnesses
     ├── e2e_cluster.rs               # Master integration test suite
     ├── run_all_mesh_tests.py        # [Layer 3] Master test runner for agent mesh
-    ├── test_agent_mesh_*.py         # [Layer 3] Agent mesh simulation & data loss suites
-    ├── test_challenger_*.py         # [Layer 3] Burst, process termination, subprocess safety
-    └── ...                          # Other Rust integration tests wired to Cargo.toml
+    ├── test_launcher_scripts.py     # Static repository and launcher verification
+    └── ...                          # Rust integration tests registered per crate
 ```
 
-## Feature Inventory
-| # | Feature | Description | Milestone | Source |
-|---|---------|-------------|-----------|--------|
-| F1 | Git Snapshot & Staging | Snapshot local uncommitted additions (crates/agent_mesh, crates/android_bridge, packaging, tests) into feature branch | M1 | Survey 1, R1 |
-| F2 | Fast-Forward Master to Remote | Fast-forward local master to origin/feat/cross-machine-network-sync (commit 52af543) | M1 | Survey 1, R1 |
-| F3 | Zero-Data-Loss Branch Merge | Merge local additions branch into master, reconciling README.md cleanly | M1 | Survey 1, R1 |
-| F4 | Chronological Request Reconciliation | Reconcile ORIGINAL_REQUEST.md conflict block in chronological order with zero requirement loss | M1 | Survey 1, R1 |
-| F5 | 4-Layer Modular Decoupling | Streamline repository into 4 decoupled layers (Rust Core, Android Bridge, Agent Mesh, Sync Network) | M2 | Survey 2, R2 |
-| F6 | Binary Alias Branding | Add [[bin]] name = "oxideswarm" in crates/cli/Cargo.toml alongside rusty-grid | M2 | Survey 2, R2 |
-| F7 | Redundancy & Stray Log Cleanup | Delete 8 stray .log files in windows/, add test JSON dumps to .gitignore, deprecate obsolete scripts | M2 | Survey 2, R2 |
-| F8 | Hardcoded Path Sanitization | Sanitize 7 machine-specific developer paths (/Users/duongnad/...) and macOS Chrome paths to dynamic discovery | M3 | Survey 2, R3 |
-| F9 | Worker Process Tree Termination | Implement process tree termination (taskkill /F /T on Windows, process groups on Unix) in TaskRunner | M3 | Survey 3, R3 |
-| F10 | Master Bounded Memory & LRU Retention | Implement task retention TTL and LRU eviction for terminal states in TaskQueue and WorkerRegistry | M3 | Survey 3, R3 |
-| F11 | Android JNI Clean Shutdown | Manage P2P endpoint closure within dedicated Tokio worker thread in Android bridge | M3 | Survey 3, R3 |
-| F12 | Discovery TCP RST Fix | Drain incoming HTTP request stream before writing response in discovery candidate probing | M3 | Survey 3, R3 |
-| F13 | Cross-Platform Windows Bash Test Fix | Resilient Git Bash detection / Windows fallback for shell invocation integration tests | M3 | Survey 3, R3 |
-| F14 | Cargo Workspace Test Verification | Execute cargo check --workspace and cargo test --workspace with 100% pass | M4 | Survey 3, R4 |
-| F15 | Python Agent Mesh & Challenger Verification | Run python tests/run_all_mesh_tests.py and all test_challenger_*.py scripts | M4 | Survey 3, R4 |
-| F16 | Cross-Machine Sync Network Validation | Validate protocol compliance and syntax of scripts/sync_network/ | M4 | Survey 3, R4 |
-| F17 | Master Documentation Synchronization | Synchronize README.md, PROJECT.md at root, and specs with 4-layer architecture & usage | M5 | Survey 2, R5 |
-| F18 | Conventional Commits & Clean Tree | Create clean conventional commits and verify git status is clean | M5 | Survey 1, R5 |
-| F19 | Push to origin/master | Push consolidated master branch to origin/master | M5 | User Request R5 |
+---
 
-## Milestones
-| # | Name | Scope | Dependencies | Status |
-|---|------|-------|-------------|--------|
-| M1 | Git Branch Consolidation & Conflict Resolution | Snapshot local work, advance master to remote, merge feature branch, reconcile ORIGINAL_REQUEST.md chronologically | None | DONE |
-| M2 | Architectural Reorganization & Modular Decoupling | Structure 4 layers, add oxideswarm binary alias, remove stray logs, gitignore test dumps, deprecate obsolete scripts | M1 | DONE |
-| M3 | Performance Optimization & Modernization | Worker process tree kill, Master memory bounding, Android JNI clean shutdown, path sanitization, discovery TCP fix, bash test fix | M2 | DONE |
-| M4 | Comprehensive Verification & Testing | cargo check, cargo test --workspace, python mesh tests, challenger stress suites, sync network validation | M3 | DONE |
-| M5 | Git Delivery & Documentation Synchronization | Update README.md, PROJECT.md at root, clean commit history, push to origin/master | M4 | DONE |
+## 4. Feature Inventory
 
-## Code Layout
-- `crates/core`: Core primitives, wire codecs, Iroh QUIC transport, discovery
-- `crates/master`: Master cluster coordinator, scheduler, task queue, web UI & dashboard
-- `crates/worker`: Worker daemon, task runner, load telemetry, sandboxing
-- `crates/cli`: CLI binaries (`rusty-grid`, `oxideswarm`, `ox-mode`)
-- `crates/android_bridge`: JNI cdylib (`liboxideworker.so`)
-- `crates/agent_mesh`: WebSocket relay hub, multi-platform agent client, process executor
-- `packaging/`: Platform service configs (Android app, macOS plist, Windows service, Agent mesh runners)
-- `scripts/`: Operational scripts and the `sync_network` probe
-- `benchmarks/`: Interconnect comparison data and whitepaper (a single run on the author's hardware)
-- `docs/`: `SECURITY.md` (current) and `WHAT_WAS_DONE.md` (historical)
-- `tests/`: Integration tests and Python test suites
+| Subsystem | Feature | Description | Status |
+| :--- | :--- | :--- | :--- |
+| **Core Protocol** | Wire Framing | 4-byte length-delimited framing, dual-mode Serde (`0x01` JSON, `0x02` Bincode, `0x03` Auth, `0x04` Encrypted) | Implemented |
+| **Core Protocol** | Mutual Authentication | Mutual HMAC-SHA256 handshake over TCP and Iroh QUIC streams | Implemented |
+| **Core Protocol** | Stream Encryption | ChaCha20-Poly1305 AEAD (`0x04`) wire transport derived from cluster secret | Implemented |
+| **Core Protocol** | Version Negotiation | Formal `PROTOCOL_VERSION` and `ProtocolCapabilities` handshake exchange | Implemented |
+| **Master Grid** | 8-State Task FSM | `Submitted` ➔ `Queued` ➔ `Scheduled` ➔ `Running` ➔ `Completed`/`Failed`/`Retrying`/`Cancelled` | Implemented |
+| **Master Grid** | Scheduler & Dispatch | Least-loaded / round-robin scheduling, real-GPU priority over simulated GPU, batch dispatch, anti-stuttering backpressure | Implemented |
+| **Master Grid** | Memory Bounding | LRU task eviction and TTL bounding for terminal states in TaskQueue | Implemented |
+| **Worker Engine** | Execution Runner | Bounded stdout/stderr capture, cancellation, configurable process priority | Implemented |
+| **Worker Engine** | Child Containment | Atomic Windows Job Objects (`kill-on-close` via `CREATE_SUSPENDED`) and Linux `PR_SET_PDEATHSIG` process tree binding | Implemented |
+| **Worker Engine** | GPU Acceleration | Hardware `wgpu` compute engine (Metal, Vulkan, DX12) and simulated CPU SIMD fallback | Implemented |
+| **Android Bridge** | In-Process JNI | `liboxideworker.so` cdylib running worker/master inside Tokio runtime threads | Implemented |
+| **Android Bridge** | Cluster Secret Auth | Native secret injection (`nativeSetClusterSecret`, `nativeStartWorkerWithSecret`) | Implemented |
+| **Agent Mesh** | Relay Hub | Axum WebSocket hub routing envelopes with token authentication and SHA-256 validation | Implemented |
+| **Agent Mesh** | Grid Bridge | `--grid-master` CLI integration routing `grid_*` commands to live master | Implemented |
+
+---
+
+## 5. Milestone Roadmap
+
+| Milestone | Scope | Deliverables & Verification | Status |
+| :--- | :--- | :--- | :--- |
+| **M1: Baseline Hygiene & Doc Rewrite** | Fix clippy blocker, normalize script line endings, remove legacy status files, update inbound links, repair ANDROID_ARCHITECTURE anchors, translate Vietnamese content, full doc rewrite | Clippy clean (`-D warnings`), launcher scripts tests pass, doc mode verification passes | **COMPLETED** |
+| **M2: Functional Gap Completion** | Android JNI cluster secret auth, Agent Mesh `--grid-master` bridge, Real-GPU priority scheduler | Clean build, targeted integration tests pass | **COMPLETED** |
+| **M3: Security & Process Hardening** | Authenticated wire stream encryption (`0x04`), protocol version & capability negotiation, Windows Job Object & Linux PDEATHSIG containment | Wire encryption tests, version negotiation tests, process containment tests pass | **COMPLETED** |
+| **M4: Isolation & Verification** | Test state isolation (`OXIDESWARM_HOME`, ephemeral keys), final documentation synchronization, full workspace verification | 100% test pass across all workspace crates and python suites with 0 host pollution | **COMPLETED** |

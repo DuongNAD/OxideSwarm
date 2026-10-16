@@ -2,6 +2,8 @@
 
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+use ring::hmac;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{split, AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio_util::codec::{Framed, FramedParts, FramedWrite, LengthDelimitedCodec};
@@ -22,6 +24,264 @@ pub const WIRE_FORMAT_BINCODE: u8 = 0x02;
 /// These frames never carry a `WorkerMessage`/`MasterMessage`/`ClientMessage`; the typed
 /// decoder rejects them with `ProtocolError::InvalidFormatTag(0x03)`.
 pub const WIRE_FORMAT_AUTH: u8 = 0x03;
+/// Discriminator of post-handshake AEAD-encrypted frames (`[0x04][seq: 8B][ciphertext][tag: 16B]`).
+pub const WIRE_FORMAT_ENCRYPTED: u8 = 0x04;
+
+/// Current wire protocol version.
+pub const PROTOCOL_VERSION_CURRENT: u32 = 1;
+/// Minimum wire protocol version compatible with this build.
+pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 1;
+
+/// Default protocol version used in deserialization fallbacks.
+pub const fn default_protocol_version() -> u32 {
+    PROTOCOL_VERSION_CURRENT
+}
+
+/// Negotiable protocol capabilities and feature flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProtocolCapabilities(pub u64);
+
+impl ProtocolCapabilities {
+    pub const NONE: Self = Self(0);
+    pub const AEAD_ENCRYPTION: Self = Self(1 << 0);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+    pub const MOBILE_TELEMETRY: Self = Self(1 << 1);
+    pub const CHECKPOINT_DELTA: Self = Self(1 << 2);
+    pub const GPU_SCHEDULE_PRIO: Self = Self(1 << 3);
+    pub const EXTENDED_ERROR_INFO: Self = Self(1 << 4);
+    pub const BATCH_DISPATCH: Self = Self(1 << 5);
+
+    pub const fn all_supported() -> Self {
+        Self(
+            Self::AEAD_ENCRYPTION.0
+                | Self::MOBILE_TELEMETRY.0
+                | Self::CHECKPOINT_DELTA.0
+                | Self::GPU_SCHEDULE_PRIO.0
+                | Self::EXTENDED_ERROR_INFO.0
+                | Self::BATCH_DISPATCH.0,
+        )
+    }
+
+    pub fn contains(&self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    pub fn intersects(&self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
+
+    pub fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+
+    pub fn remove(&mut self, other: Self) {
+        self.0 &= !other.0;
+    }
+
+    pub fn bits(&self) -> u64 {
+        self.0
+    }
+
+    pub fn from_bits_truncate(bits: u64) -> Self {
+        Self(bits)
+    }
+}
+
+impl Default for ProtocolCapabilities {
+    fn default() -> Self {
+        Self::all_supported()
+    }
+}
+
+impl std::ops::BitOr for ProtocolCapabilities {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitAnd for ProtocolCapabilities {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self {
+        Self(self.0 & rhs.0)
+    }
+}
+
+/// Endpoint role in a bidirectional connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointRole {
+    Client,
+    Server,
+}
+
+/// AEAD encryption session for sealing outbound frames.
+pub struct AeadWriterSession {
+    key: LessSafeKey,
+    seq: u64,
+}
+
+impl AeadWriterSession {
+    /// Creates a new writer session with a 32-byte symmetric key.
+    pub fn new(write_key: &[u8; 32]) -> Self {
+        let unbound = UnboundKey::new(&CHACHA20_POLY1305, write_key)
+            .expect("valid 32-byte key for ChaCha20-Poly1305");
+        Self {
+            key: LessSafeKey::new(unbound),
+            seq: 0,
+        }
+    }
+
+    /// Encrypts `plaintext` into a framed encrypted payload:
+    /// `[0x04][seq: 8 bytes BE][ciphertext][16-byte Poly1305 tag]`
+    pub fn encrypt_frame(&mut self, plaintext: &[u8]) -> Result<Bytes, ProtocolError> {
+        let seq = self.seq;
+        self.seq = self.seq.checked_add(1).ok_or_else(|| {
+            ProtocolError::Violation("AEAD sequence counter overflow".into())
+        })?;
+
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[4..12].copy_from_slice(&seq.to_be_bytes());
+        let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
+            .map_err(|_| ProtocolError::Violation("Invalid AEAD nonce".into()))?;
+
+        let mut aad = [0u8; 9];
+        aad[0] = WIRE_FORMAT_ENCRYPTED;
+        aad[1..9].copy_from_slice(&seq.to_be_bytes());
+
+        let mut in_out = plaintext.to_vec();
+        self.key
+            .seal_in_place_append_tag(nonce, Aad::from(&aad), &mut in_out)
+            .map_err(|_| ProtocolError::Violation("AEAD encryption failure".into()))?;
+
+        let mut frame = Vec::with_capacity(9 + in_out.len());
+        frame.extend_from_slice(&aad);
+        frame.extend_from_slice(&in_out);
+
+        if frame.len() > MAX_FRAME_SIZE {
+            return Err(ProtocolError::FrameTooLarge {
+                size: frame.len(),
+                max: MAX_FRAME_SIZE,
+            });
+        }
+
+        Ok(Bytes::from(frame))
+    }
+
+    /// Returns the next sequence number to be sent.
+    pub fn current_seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+/// AEAD decryption session for opening inbound frames.
+pub struct AeadReaderSession {
+    key: LessSafeKey,
+    expected_seq: u64,
+}
+
+impl AeadReaderSession {
+    /// Creates a new reader session with a 32-byte symmetric key.
+    pub fn new(read_key: &[u8; 32]) -> Self {
+        let unbound = UnboundKey::new(&CHACHA20_POLY1305, read_key)
+            .expect("valid 32-byte key for ChaCha20-Poly1305");
+        Self {
+            key: LessSafeKey::new(unbound),
+            expected_seq: 0,
+        }
+    }
+
+    /// Decrypts a framed encrypted payload:
+    /// `[0x04][seq: 8 bytes BE][ciphertext][16-byte tag]`
+    /// and returns the decrypted plaintext bytes.
+    pub fn decrypt_frame(&mut self, frame: &[u8]) -> Result<Bytes, ProtocolError> {
+        const TAG_LEN: usize = 16;
+        const HEADER_LEN: usize = 9; // 1 byte format + 8 bytes seq
+        const MIN_ENCRYPTED_LEN: usize = HEADER_LEN + TAG_LEN;
+
+        if frame.len() < MIN_ENCRYPTED_LEN {
+            return Err(ProtocolError::Violation(format!(
+                "Encrypted frame too short: {} bytes (minimum {MIN_ENCRYPTED_LEN})",
+                frame.len()
+            )));
+        }
+
+        if frame[0] != WIRE_FORMAT_ENCRYPTED {
+            return Err(ProtocolError::Violation(format!(
+                "Expected encrypted wire format (0x04), received 0x{:02x}",
+                frame[0]
+            )));
+        }
+
+        let seq = u64::from_be_bytes(frame[1..9].try_into().unwrap());
+        if seq != self.expected_seq {
+            return Err(ProtocolError::Violation(format!(
+                "Anti-replay check failed: expected sequence number {}, received {}",
+                self.expected_seq, seq
+            )));
+        }
+
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[4..12].copy_from_slice(&seq.to_be_bytes());
+        let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
+            .map_err(|_| ProtocolError::Violation("Invalid AEAD nonce".into()))?;
+
+        let aad = &frame[0..9];
+        let mut in_out = frame[9..].to_vec();
+
+        let plaintext_slice = self
+            .key
+            .open_in_place(nonce, Aad::from(aad), &mut in_out)
+            .map_err(|_| {
+                ProtocolError::Violation("Ciphertext integrity verification failed".into())
+            })?;
+
+        let plaintext = Bytes::copy_from_slice(plaintext_slice);
+        self.expected_seq = self.expected_seq.checked_add(1).ok_or_else(|| {
+            ProtocolError::Violation("AEAD sequence counter overflow".into())
+        })?;
+
+        Ok(plaintext)
+    }
+
+    /// Returns the expected sequence number of the next incoming frame.
+    pub fn expected_seq(&self) -> u64 {
+        self.expected_seq
+    }
+}
+
+/// Derives directional AEAD keys from the HMAC session key.
+pub fn derive_aead_keys(
+    session_key: &[u8; 32],
+    role: EndpointRole,
+) -> (AeadWriterSession, AeadReaderSession) {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, session_key);
+    let c2s = hmac::sign(&key, b"oxs1-aead-c2s");
+    let s2c = hmac::sign(&key, b"oxs1-aead-s2c");
+
+    let mut client_write_key = [0u8; 32];
+    client_write_key.copy_from_slice(c2s.as_ref());
+
+    let mut server_write_key = [0u8; 32];
+    server_write_key.copy_from_slice(s2c.as_ref());
+
+    match role {
+        EndpointRole::Client => (
+            AeadWriterSession::new(&client_write_key),
+            AeadReaderSession::new(&server_write_key),
+        ),
+        EndpointRole::Server => (
+            AeadWriterSession::new(&server_write_key),
+            AeadReaderSession::new(&client_write_key),
+        ),
+    }
+}
 
 /// Supported wire serialization formats for framed messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -100,10 +360,12 @@ pub enum ProtocolError {
 /// Upstream messages sent from Worker nodes to the Master node.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkerMessage {
-    /// Initial registration advertising worker identity and capabilities.
+    /// Initial registration advertising worker identity, capabilities, and protocol negotiation.
     Register {
         worker_id: Uuid,
         capabilities: WorkerCapabilities,
+        protocol_version: u32,
+        features: ProtocolCapabilities,
     },
     /// Periodic heartbeat informing the master of worker liveness and load.
     Heartbeat {
@@ -140,17 +402,17 @@ pub enum WorkerMessage {
     /// Graceful announcement that the worker is disconnecting.
     Disconnecting { worker_id: Uuid, reason: String },
     /// Live battery/thermal status of a mobile or battery-powered worker, sent whenever it
-    /// changes. `Register` only carries a snapshot taken at connect time, so without this the
-    /// master would keep routing heavy work to a phone that has since drained or overheated.
-    /// Appended last so the positional (bincode) indices of the earlier variants do not move.
+    /// changes.
     MobileTelemetry {
         worker_id: Uuid,
-        /// Battery charge percentage (0-100), `None` when unknown or on AC power.
         battery_pct: Option<u8>,
-        /// Whether the device is drawing external power, `None` when unknown.
         is_charging: Option<bool>,
-        /// Whether the device is currently thermally throttled.
         thermal_throttled: bool,
+    },
+    /// Forward-compatible fallback variant for unrecognized messages from future protocol versions.
+    UnknownVariant {
+        tag: u32,
+        raw_bytes: Vec<u8>,
     },
 }
 
@@ -160,6 +422,10 @@ enum HumanWorkerMessage {
     Register {
         worker_id: Uuid,
         capabilities: WorkerCapabilities,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+        #[serde(default)]
+        features: ProtocolCapabilities,
     },
     Heartbeat {
         worker_id: Uuid,
@@ -206,10 +472,69 @@ enum HumanWorkerMessage {
         #[serde(default)]
         thermal_throttled: bool,
     },
+    #[serde(skip_deserializing)]
+    UnknownVariant {
+        tag: u32,
+        raw_bytes: Vec<u8>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
 enum BinaryWorkerMessage {
+    Register {
+        worker_id: Uuid,
+        capabilities: WorkerCapabilities,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+        #[serde(default)]
+        features: ProtocolCapabilities,
+    },
+    Heartbeat {
+        worker_id: Uuid,
+        timestamp: u64,
+        active_tasks: usize,
+        cpu_usage_pct: f32,
+        ram_available_mb: u64,
+    },
+    TaskProgress {
+        worker_id: Uuid,
+        task_id: TaskId,
+        status: TaskStatus,
+    },
+    TaskResult {
+        worker_id: Uuid,
+        task_id: TaskId,
+        exit_code: i32,
+        stdout: TaskBytes,
+        stderr: TaskBytes,
+        execution_time_ms: u64,
+        is_gpu_executed: bool,
+        device_name: Option<String>,
+        error: Option<String>,
+    },
+    Checkpoint {
+        task_id: TaskId,
+        sequence: u64,
+        delta_state: TaskBytes,
+    },
+    Disconnecting {
+        worker_id: Uuid,
+        reason: String,
+    },
+    MobileTelemetry {
+        worker_id: Uuid,
+        battery_pct: Option<u8>,
+        is_charging: Option<bool>,
+        thermal_throttled: bool,
+    },
+    UnknownVariant {
+        tag: u32,
+        raw_bytes: Vec<u8>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+enum LegacyBinaryWorkerMessage {
     Register {
         worker_id: Uuid,
         capabilities: WorkerCapabilities,
@@ -254,6 +579,87 @@ enum BinaryWorkerMessage {
     },
 }
 
+impl From<LegacyBinaryWorkerMessage> for WorkerMessage {
+    fn from(msg: LegacyBinaryWorkerMessage) -> Self {
+        match msg {
+            LegacyBinaryWorkerMessage::Register {
+                worker_id,
+                capabilities,
+            } => WorkerMessage::Register {
+                worker_id,
+                capabilities,
+                protocol_version: 0,
+                features: ProtocolCapabilities::empty(),
+            },
+            LegacyBinaryWorkerMessage::Heartbeat {
+                worker_id,
+                timestamp,
+                active_tasks,
+                cpu_usage_pct,
+                ram_available_mb,
+            } => WorkerMessage::Heartbeat {
+                worker_id,
+                timestamp,
+                active_tasks,
+                cpu_usage_pct,
+                ram_available_mb,
+            },
+            LegacyBinaryWorkerMessage::TaskProgress {
+                worker_id,
+                task_id,
+                status,
+            } => WorkerMessage::TaskProgress {
+                worker_id,
+                task_id,
+                status,
+            },
+            LegacyBinaryWorkerMessage::TaskResult {
+                worker_id,
+                task_id,
+                exit_code,
+                stdout,
+                stderr,
+                execution_time_ms,
+                is_gpu_executed,
+                device_name,
+                error,
+            } => WorkerMessage::TaskResult {
+                worker_id,
+                task_id,
+                exit_code,
+                stdout,
+                stderr,
+                execution_time_ms,
+                is_gpu_executed,
+                device_name,
+                error,
+            },
+            LegacyBinaryWorkerMessage::Checkpoint {
+                task_id,
+                sequence,
+                delta_state,
+            } => WorkerMessage::Checkpoint {
+                task_id,
+                sequence,
+                delta_state,
+            },
+            LegacyBinaryWorkerMessage::Disconnecting { worker_id, reason } => {
+                WorkerMessage::Disconnecting { worker_id, reason }
+            }
+            LegacyBinaryWorkerMessage::MobileTelemetry {
+                worker_id,
+                battery_pct,
+                is_charging,
+                thermal_throttled,
+            } => WorkerMessage::MobileTelemetry {
+                worker_id,
+                battery_pct,
+                is_charging,
+                thermal_throttled,
+            },
+        }
+    }
+}
 
 impl From<WorkerMessage> for HumanWorkerMessage {
     fn from(msg: WorkerMessage) -> Self {
@@ -261,9 +667,13 @@ impl From<WorkerMessage> for HumanWorkerMessage {
             WorkerMessage::Register {
                 worker_id,
                 capabilities,
+                protocol_version,
+                features,
             } => HumanWorkerMessage::Register {
                 worker_id,
                 capabilities,
+                protocol_version,
+                features,
             },
             WorkerMessage::Heartbeat {
                 worker_id,
@@ -331,6 +741,9 @@ impl From<WorkerMessage> for HumanWorkerMessage {
                 is_charging,
                 thermal_throttled,
             },
+            WorkerMessage::UnknownVariant { tag, raw_bytes } => {
+                HumanWorkerMessage::UnknownVariant { tag, raw_bytes }
+            }
         }
     }
 }
@@ -341,9 +754,13 @@ impl From<HumanWorkerMessage> for WorkerMessage {
             HumanWorkerMessage::Register {
                 worker_id,
                 capabilities,
+                protocol_version,
+                features,
             } => WorkerMessage::Register {
                 worker_id,
                 capabilities,
+                protocol_version,
+                features,
             },
             HumanWorkerMessage::Heartbeat {
                 worker_id,
@@ -411,6 +828,9 @@ impl From<HumanWorkerMessage> for WorkerMessage {
                 is_charging,
                 thermal_throttled,
             },
+            HumanWorkerMessage::UnknownVariant { tag, raw_bytes } => {
+                WorkerMessage::UnknownVariant { tag, raw_bytes }
+            }
         }
     }
 }
@@ -421,9 +841,13 @@ impl From<WorkerMessage> for BinaryWorkerMessage {
             WorkerMessage::Register {
                 worker_id,
                 capabilities,
+                protocol_version,
+                features,
             } => BinaryWorkerMessage::Register {
                 worker_id,
                 capabilities,
+                protocol_version,
+                features,
             },
             WorkerMessage::Heartbeat {
                 worker_id,
@@ -491,6 +915,9 @@ impl From<WorkerMessage> for BinaryWorkerMessage {
                 is_charging,
                 thermal_throttled,
             },
+            WorkerMessage::UnknownVariant { tag, raw_bytes } => {
+                BinaryWorkerMessage::UnknownVariant { tag, raw_bytes }
+            }
         }
     }
 }
@@ -501,9 +928,13 @@ impl From<BinaryWorkerMessage> for WorkerMessage {
             BinaryWorkerMessage::Register {
                 worker_id,
                 capabilities,
+                protocol_version,
+                features,
             } => WorkerMessage::Register {
                 worker_id,
                 capabilities,
+                protocol_version,
+                features,
             },
             BinaryWorkerMessage::Heartbeat {
                 worker_id,
@@ -571,10 +1002,12 @@ impl From<BinaryWorkerMessage> for WorkerMessage {
                 is_charging,
                 thermal_throttled,
             },
+            BinaryWorkerMessage::UnknownVariant { tag, raw_bytes } => {
+                WorkerMessage::UnknownVariant { tag, raw_bytes }
+            }
         }
     }
 }
-
 
 impl Serialize for WorkerMessage {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -597,6 +1030,16 @@ impl<'de> Deserialize<'de> for WorkerMessage {
 }
 
 impl WorkerMessage {
+    /// Helper constructor for creating a standard registration message.
+    pub fn register(worker_id: Uuid, capabilities: WorkerCapabilities) -> Self {
+        Self::Register {
+            worker_id,
+            capabilities,
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
+        }
+    }
+
     /// Returns the static variant name of the message.
     pub fn variant_name(&self) -> &'static str {
         match self {
@@ -607,6 +1050,7 @@ impl WorkerMessage {
             Self::Checkpoint { .. } => "Checkpoint",
             Self::Disconnecting { .. } => "Disconnecting",
             Self::MobileTelemetry { .. } => "MobileTelemetry",
+            Self::UnknownVariant { .. } => "UnknownVariant",
         }
     }
 
@@ -620,6 +1064,7 @@ impl WorkerMessage {
             Self::Checkpoint { .. } => Uuid::nil(),
             Self::Disconnecting { worker_id, .. } => *worker_id,
             Self::MobileTelemetry { worker_id, .. } => *worker_id,
+            Self::UnknownVariant { .. } => Uuid::nil(),
         }
     }
 }
@@ -644,11 +1089,13 @@ impl From<TaskResult> for WorkerMessage {
 /// Downstream messages sent from the Master node to Worker nodes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MasterMessage {
-    /// Acknowledgment of worker registration with operational parameters.
+    /// Acknowledgment of worker registration with operational parameters and protocol negotiation.
     RegisterAck {
         accepted: bool,
         worker_id: Uuid,
         heartbeat_interval_secs: u64,
+        protocol_version: u32,
+        features: ProtocolCapabilities,
         message: Option<String>,
     },
     /// Acknowledgment of heartbeat receipt confirming master liveness.
@@ -669,6 +1116,11 @@ pub enum MasterMessage {
     Shutdown {
         reason: String,
         grace_period_secs: Option<u64>,
+    },
+    /// Forward-compatible fallback variant for unrecognized messages from future protocol versions.
+    UnknownVariant {
+        tag: u32,
+        raw_bytes: Vec<u8>,
     },
 }
 
@@ -708,6 +1160,10 @@ enum HumanMasterMessage {
         accepted: bool,
         worker_id: Uuid,
         heartbeat_interval_secs: u64,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+        #[serde(default)]
+        features: ProtocolCapabilities,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
@@ -732,10 +1188,51 @@ enum HumanMasterMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         grace_period_secs: Option<u64>,
     },
+    #[serde(skip_deserializing)]
+    UnknownVariant {
+        tag: u32,
+        raw_bytes: Vec<u8>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
 enum BinaryMasterMessage {
+    RegisterAck {
+        accepted: bool,
+        worker_id: Uuid,
+        heartbeat_interval_secs: u64,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+        #[serde(default)]
+        features: ProtocolCapabilities,
+        message: Option<String>,
+    },
+    HeartbeatAck {
+        timestamp: u64,
+    },
+    AssignTask {
+        task: Task,
+    },
+    AssignTaskWithCheckpoint {
+        task: Task,
+        latest_checkpoint: Option<CheckpointData>,
+    },
+    CancelTask {
+        task_id: TaskId,
+        reason: Option<String>,
+    },
+    Shutdown {
+        reason: String,
+        grace_period_secs: Option<u64>,
+    },
+    UnknownVariant {
+        tag: u32,
+        raw_bytes: Vec<u8>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+enum LegacyBinaryMasterMessage {
     RegisterAck {
         accepted: bool,
         worker_id: Uuid,
@@ -762,6 +1259,46 @@ enum BinaryMasterMessage {
     },
 }
 
+impl From<LegacyBinaryMasterMessage> for MasterMessage {
+    fn from(msg: LegacyBinaryMasterMessage) -> Self {
+        match msg {
+            LegacyBinaryMasterMessage::RegisterAck {
+                accepted,
+                worker_id,
+                heartbeat_interval_secs,
+                message,
+            } => MasterMessage::RegisterAck {
+                accepted,
+                worker_id,
+                heartbeat_interval_secs,
+                protocol_version: 0,
+                features: ProtocolCapabilities::empty(),
+                message,
+            },
+            LegacyBinaryMasterMessage::HeartbeatAck { timestamp } => {
+                MasterMessage::HeartbeatAck { timestamp }
+            }
+            LegacyBinaryMasterMessage::AssignTask { task } => MasterMessage::AssignTask { task },
+            LegacyBinaryMasterMessage::AssignTaskWithCheckpoint {
+                task,
+                latest_checkpoint,
+            } => MasterMessage::AssignTaskWithCheckpoint {
+                task,
+                latest_checkpoint,
+            },
+            LegacyBinaryMasterMessage::CancelTask { task_id, reason } => {
+                MasterMessage::CancelTask { task_id, reason }
+            }
+            LegacyBinaryMasterMessage::Shutdown {
+                reason,
+                grace_period_secs,
+            } => MasterMessage::Shutdown {
+                reason,
+                grace_period_secs,
+            },
+        }
+    }
+}
 
 impl From<MasterMessage> for HumanMasterMessage {
     fn from(msg: MasterMessage) -> Self {
@@ -770,11 +1307,15 @@ impl From<MasterMessage> for HumanMasterMessage {
                 accepted,
                 worker_id,
                 heartbeat_interval_secs,
+                protocol_version,
+                features,
                 message,
             } => HumanMasterMessage::RegisterAck {
                 accepted,
                 worker_id,
                 heartbeat_interval_secs,
+                protocol_version,
+                features,
                 message,
             },
             MasterMessage::HeartbeatAck { timestamp } => {
@@ -798,6 +1339,9 @@ impl From<MasterMessage> for HumanMasterMessage {
                 reason,
                 grace_period_secs,
             },
+            MasterMessage::UnknownVariant { tag, raw_bytes } => {
+                HumanMasterMessage::UnknownVariant { tag, raw_bytes }
+            }
         }
     }
 }
@@ -809,11 +1353,15 @@ impl From<HumanMasterMessage> for MasterMessage {
                 accepted,
                 worker_id,
                 heartbeat_interval_secs,
+                protocol_version,
+                features,
                 message,
             } => MasterMessage::RegisterAck {
                 accepted,
                 worker_id,
                 heartbeat_interval_secs,
+                protocol_version,
+                features,
                 message,
             },
             HumanMasterMessage::HeartbeatAck { timestamp } => {
@@ -837,6 +1385,9 @@ impl From<HumanMasterMessage> for MasterMessage {
                 reason,
                 grace_period_secs,
             },
+            HumanMasterMessage::UnknownVariant { tag, raw_bytes } => {
+                MasterMessage::UnknownVariant { tag, raw_bytes }
+            }
         }
     }
 }
@@ -848,11 +1399,15 @@ impl From<MasterMessage> for BinaryMasterMessage {
                 accepted,
                 worker_id,
                 heartbeat_interval_secs,
+                protocol_version,
+                features,
                 message,
             } => BinaryMasterMessage::RegisterAck {
                 accepted,
                 worker_id,
                 heartbeat_interval_secs,
+                protocol_version,
+                features,
                 message,
             },
             MasterMessage::HeartbeatAck { timestamp } => {
@@ -876,6 +1431,9 @@ impl From<MasterMessage> for BinaryMasterMessage {
                 reason,
                 grace_period_secs,
             },
+            MasterMessage::UnknownVariant { tag, raw_bytes } => {
+                BinaryMasterMessage::UnknownVariant { tag, raw_bytes }
+            }
         }
     }
 }
@@ -887,11 +1445,15 @@ impl From<BinaryMasterMessage> for MasterMessage {
                 accepted,
                 worker_id,
                 heartbeat_interval_secs,
+                protocol_version,
+                features,
                 message,
             } => MasterMessage::RegisterAck {
                 accepted,
                 worker_id,
                 heartbeat_interval_secs,
+                protocol_version,
+                features,
                 message,
             },
             BinaryMasterMessage::HeartbeatAck { timestamp } => {
@@ -915,6 +1477,9 @@ impl From<BinaryMasterMessage> for MasterMessage {
                 reason,
                 grace_period_secs,
             },
+            BinaryMasterMessage::UnknownVariant { tag, raw_bytes } => {
+                MasterMessage::UnknownVariant { tag, raw_bytes }
+            }
         }
     }
 }
@@ -940,6 +1505,24 @@ impl<'de> Deserialize<'de> for MasterMessage {
 }
 
 impl MasterMessage {
+    /// Helper constructor for creating a standard RegisterAck message.
+    pub fn register_ack(
+        accepted: bool,
+        worker_id: Uuid,
+        heartbeat_interval_secs: u64,
+        features: ProtocolCapabilities,
+        message: Option<String>,
+    ) -> Self {
+        Self::RegisterAck {
+            accepted,
+            worker_id,
+            heartbeat_interval_secs,
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features,
+            message,
+        }
+    }
+
     /// Returns the static variant name of the message.
     pub fn variant_name(&self) -> &'static str {
         match self {
@@ -949,6 +1532,7 @@ impl MasterMessage {
             Self::AssignTaskWithCheckpoint { .. } => "AssignTaskWithCheckpoint",
             Self::CancelTask { .. } => "CancelTask",
             Self::Shutdown { .. } => "Shutdown",
+            Self::UnknownVariant { .. } => "UnknownVariant",
         }
     }
 }
@@ -1491,8 +2075,8 @@ pub enum InboundMessage {
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum HumanInboundMessage {
-    Worker(WorkerMessage),
     Client(ClientMessage),
+    Worker(WorkerMessage),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1619,16 +2203,64 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
             match bincode::deserialize::<M>(&bytes[1..]) {
                 Ok(msg) => Ok((msg, WireCodec::Bincode)),
                 Err(e) => {
+                    let slice = &bytes[1..];
+                    // Fallback for WorkerMessage (legacy or unknown variant)
+                    if std::any::TypeId::of::<M>() == std::any::TypeId::of::<WorkerMessage>() {
+                        if let Ok(legacy) = bincode::deserialize::<LegacyBinaryWorkerMessage>(slice) {
+                            let msg: WorkerMessage = legacy.into();
+                            let boxed: Box<dyn std::any::Any> = Box::new(msg);
+                            if let Ok(m) = boxed.downcast::<M>() {
+                                return Ok((*m, WireCodec::Bincode));
+                            }
+                        }
+                        if slice.len() >= 4 {
+                            let tag = u32::from_le_bytes(slice[0..4].try_into().unwrap());
+                            if (8..10_000).contains(&tag) {
+                                let unknown = WorkerMessage::UnknownVariant {
+                                    tag,
+                                    raw_bytes: slice[4..].to_vec(),
+                                };
+                                let boxed: Box<dyn std::any::Any> = Box::new(unknown);
+                                if let Ok(m) = boxed.downcast::<M>() {
+                                    return Ok((*m, WireCodec::Bincode));
+                                }
+                            }
+                        }
+                    }
+
+                    // Fallback for MasterMessage (legacy or unknown variant)
+                    if std::any::TypeId::of::<M>() == std::any::TypeId::of::<MasterMessage>() {
+                        if let Ok(legacy) = bincode::deserialize::<LegacyBinaryMasterMessage>(slice) {
+                            let msg: MasterMessage = legacy.into();
+                            let boxed: Box<dyn std::any::Any> = Box::new(msg);
+                            if let Ok(m) = boxed.downcast::<M>() {
+                                return Ok((*m, WireCodec::Bincode));
+                            }
+                        }
+                        if slice.len() >= 4 {
+                            let tag = u32::from_le_bytes(slice[0..4].try_into().unwrap());
+                            if (7..10_000).contains(&tag) {
+                                let unknown = MasterMessage::UnknownVariant {
+                                    tag,
+                                    raw_bytes: slice[4..].to_vec(),
+                                };
+                                let boxed: Box<dyn std::any::Any> = Box::new(unknown);
+                                if let Ok(m) = boxed.downcast::<M>() {
+                                    return Ok((*m, WireCodec::Bincode));
+                                }
+                            }
+                        }
+                    }
+
                     // Fallback for InboundMessage when peer sent raw WorkerMessage or ClientMessage
                     if std::any::TypeId::of::<M>() == std::any::TypeId::of::<InboundMessage>() {
                         use bincode::Options;
-                        let slice = &bytes[1..];
                         let slice_opts = bincode::DefaultOptions::new()
                             .with_fixint_encoding()
                             .allow_trailing_bytes()
                             .with_limit(slice.len() as u64);
 
-                        // 1. Try WorkerMessage: verify exact byte consumption AND worker registration invariant
+                        // 1. Try modern WorkerMessage: verify exact byte consumption AND worker registration invariant
                         let mut cursor_w = std::io::Cursor::new(slice);
                         if let Ok(w) = slice_opts.deserialize_from::<_, WorkerMessage>(&mut cursor_w) {
                             let matches_size = cursor_w.position() as usize == slice.len();
@@ -1663,12 +2295,41 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
                                 }
                             }
                         }
+
+                        // 4. Try legacy WorkerMessage (must consume all bytes of legacy frame)
+                        let mut cursor_leg = std::io::Cursor::new(slice);
+                        if let Ok(legacy) = slice_opts
+                            .deserialize_from::<_, LegacyBinaryWorkerMessage>(&mut cursor_leg)
+                        {
+                            if cursor_leg.position() as usize == slice.len() {
+                                let inbound = InboundMessage::Worker(legacy.into());
+                                let boxed: Box<dyn std::any::Any> = Box::new(inbound);
+                                if let Ok(m) = boxed.downcast::<M>() {
+                                    return Ok((*m, WireCodec::Bincode));
+                                }
+                            }
+                        }
                         // 4. Fallback: if ClientMessage was sent without exact size check
                         if let Ok(c) = slice_opts.deserialize::<ClientMessage>(slice) {
                             let inbound = InboundMessage::Client(c);
                             let boxed: Box<dyn std::any::Any> = Box::new(inbound);
                             if let Ok(m) = boxed.downcast::<M>() {
                                 return Ok((*m, WireCodec::Bincode));
+                            }
+                        }
+                        // 5. Fallback: Unknown variant WorkerMessage
+                        if slice.len() >= 4 {
+                            let tag = u32::from_le_bytes(slice[0..4].try_into().unwrap());
+                            if (8..10_000).contains(&tag) {
+                                let unknown = WorkerMessage::UnknownVariant {
+                                    tag,
+                                    raw_bytes: slice[4..].to_vec(),
+                                };
+                                let inbound = InboundMessage::Worker(unknown);
+                                let boxed: Box<dyn std::any::Any> = Box::new(inbound);
+                                if let Ok(m) = boxed.downcast::<M>() {
+                                    return Ok((*m, WireCodec::Bincode));
+                                }
                             }
                         }
                     }
@@ -1693,6 +2354,8 @@ pub struct MessageTransport<T> {
     inner: Framed<T, LengthDelimitedCodec>,
     codec: WireCodec,
     last_detected_codec: Option<WireCodec>,
+    aead_writer: Option<AeadWriterSession>,
+    aead_reader: Option<AeadReaderSession>,
 }
 
 impl<T> MessageTransport<T> {
@@ -1709,7 +2372,21 @@ impl<T> MessageTransport<T> {
             inner: Framed::new(io, default_codec()),
             codec,
             last_detected_codec: None,
+            aead_writer: None,
+            aead_reader: None,
         }
+    }
+
+    /// Enables AEAD frame encryption/decryption using directional keys derived from `session_key`.
+    pub fn enable_encryption(&mut self, session_key: &[u8; 32], role: EndpointRole) {
+        let (writer, reader) = derive_aead_keys(session_key, role);
+        self.aead_writer = Some(writer);
+        self.aead_reader = Some(reader);
+    }
+
+    /// Returns `true` if this transport has AEAD encryption enabled.
+    pub fn is_encrypted(&self) -> bool {
+        self.aead_writer.is_some() || self.aead_reader.is_some()
     }
 
     /// Returns the currently configured outbound wire codec.
@@ -1745,21 +2422,31 @@ impl<T> MessageTransport<T> {
 
 impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
     /// Splits transport into independent read and write halves via `tokio::io::split`,
-    /// preserving any unconsumed read buffer or unflushed write buffer and propagating
-    /// the configured outbound wire codec to `MessageWriter`.
+    /// preserving any unconsumed read buffer or unflushed write buffer, propagating
+    /// the configured outbound wire codec and AEAD crypto sessions.
     pub fn split(self) -> (MessageWriter<WriteHalf<T>>, MessageReader<ReadHalf<T>>) {
         let parts = self.inner.into_parts();
         let (read_half, write_half) = split(parts.io);
         (
-            MessageWriter::with_codec_and_buffer(write_half, self.codec, parts.write_buf),
-            MessageReader::with_buffer(read_half, parts.read_buf),
+            MessageWriter::with_codec_buffer_and_aead(
+                write_half,
+                self.codec,
+                parts.write_buf,
+                self.aead_writer,
+            ),
+            MessageReader::with_buffer_and_aead(read_half, parts.read_buf, self.aead_reader),
         )
     }
 
     /// Serializes and sends a message framed with a 4-byte length prefix using the configured wire codec.
+    /// If encryption is enabled, the frame is encrypted using the AEAD writer session.
     pub async fn send_msg<M: Serialize>(&mut self, msg: &M) -> Result<(), ProtocolError> {
         let payload = serialize_message(msg, self.codec)?;
-        self.inner.send(payload).await.map_err(|e| {
+        let frame = match self.aead_writer.as_mut() {
+            Some(w) => w.encrypt_frame(&payload)?,
+            None => payload,
+        };
+        self.inner.send(frame).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 ProtocolError::UnexpectedEof
             } else {
@@ -1781,12 +2468,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
     }
 
     /// Reads the next framed message and returns it alongside the detected wire codec.
+    /// If encryption is enabled, the frame is opened and verified using the AEAD reader session.
     pub async fn recv_msg_with_codec<M: DeserializeOwned + 'static>(
         &mut self,
     ) -> Result<Option<(M, WireCodec)>, ProtocolError> {
         match self.inner.next().await {
             Some(Ok(bytes)) => {
-                let (msg, codec) = deserialize_message::<M>(&bytes)?;
+                let plaintext = match self.aead_reader.as_mut() {
+                    Some(r) => r.decrypt_frame(&bytes)?,
+                    None => bytes.freeze(),
+                };
+                let (msg, codec) = deserialize_message::<M>(&plaintext)?;
                 self.last_detected_codec = Some(codec);
                 Ok(Some((msg, codec)))
             }
@@ -1845,13 +2537,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
     }
 
     /// Reads raw frame bytes without deserializing, refusing frames longer than `max_len`.
-    ///
-    /// The limit is enforced on the 4-byte length header, so an oversized frame is rejected
-    /// before any of its payload is buffered. Used by the pre-authentication handshake, where
-    /// an unauthenticated peer must not be able to make us allocate up to `MAX_FRAME_SIZE`.
-    /// The transport's regular frame limit is restored before this returns; if the future is
-    /// dropped mid-read (e.g. by a timeout) the lowered limit stays in force, which is the safe
-    /// direction because handshake callers discard the connection in that case.
     pub async fn recv_raw_frame_max(
         &mut self,
         max_len: usize,
@@ -1881,10 +2566,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
 
 /// Unidirectional framed reader for receiving messages.
 pub struct MessageReader<R> {
-    // A `Framed` (not a `FramedRead`) only because it can be built *with* a pre-filled read buffer
-    // that is decoded before the socket is read again; only its read half is ever used.
     inner: Framed<R, LengthDelimitedCodec>,
     last_detected_codec: Option<WireCodec>,
+    aead_reader: Option<AeadReaderSession>,
 }
 
 impl<R: AsyncRead + Unpin> MessageReader<R> {
@@ -1894,18 +2578,33 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
     }
 
     /// Creates a new `MessageReader` wrapping an async reader with pre-buffered data.
-    ///
-    /// Frames already complete in `buffer` (bytes a `MessageTransport` read ahead of the handshake
-    /// before it was split) are returned by the next `recv_msg` calls *without* waiting for the
-    /// socket: a `FramedRead` whose buffer is filled by hand only decodes it after the next
-    /// successful read, which stranded e.g. a task assignment sent right behind `RegisterAck`.
     pub fn with_buffer(reader: R, buffer: BytesMut) -> Self {
+        Self::with_buffer_and_aead(reader, buffer, None)
+    }
+
+    /// Creates a new `MessageReader` with pre-buffered data and optional AEAD reader session.
+    pub fn with_buffer_and_aead(
+        reader: R,
+        buffer: BytesMut,
+        aead_reader: Option<AeadReaderSession>,
+    ) -> Self {
         let mut parts = FramedParts::new::<Bytes>(reader, default_codec());
         parts.read_buf = buffer;
         Self {
             inner: Framed::from_parts(parts),
             last_detected_codec: None,
+            aead_reader,
         }
+    }
+
+    /// Enables AEAD decryption session.
+    pub fn enable_encryption(&mut self, reader: AeadReaderSession) {
+        self.aead_reader = Some(reader);
+    }
+
+    /// Returns `true` if AEAD decryption is enabled.
+    pub fn is_encrypted(&self) -> bool {
+        self.aead_reader.is_some()
     }
 
     /// Reads the next framed message from the reader.
@@ -1924,7 +2623,11 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
     ) -> Result<Option<(M, WireCodec)>, ProtocolError> {
         match self.inner.next().await {
             Some(Ok(bytes)) => {
-                let (msg, codec) = deserialize_message::<M>(&bytes)?;
+                let plaintext = match self.aead_reader.as_mut() {
+                    Some(r) => r.decrypt_frame(&bytes)?,
+                    None => bytes.freeze(),
+                };
+                let (msg, codec) = deserialize_message::<M>(&plaintext)?;
                 self.last_detected_codec = Some(codec);
                 Ok(Some((msg, codec)))
             }
@@ -1974,6 +2677,7 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
 pub struct MessageWriter<W> {
     inner: FramedWrite<W, LengthDelimitedCodec>,
     codec: WireCodec,
+    aead_writer: Option<AeadWriterSession>,
 }
 
 impl<W: AsyncWrite + Unpin> MessageWriter<W> {
@@ -1984,19 +2688,26 @@ impl<W: AsyncWrite + Unpin> MessageWriter<W> {
 
     /// Creates a new `MessageWriter` wrapping an async writer with specific wire codec.
     pub fn with_codec(writer: W, codec: WireCodec) -> Self {
-        Self {
-            inner: FramedWrite::new(writer, default_codec()),
-            codec,
-        }
+        Self::with_codec_buffer_and_aead(writer, codec, BytesMut::new(), None)
     }
 
     /// Creates a new `MessageWriter` wrapping an async writer with pre-buffered data and default codec.
     pub fn with_buffer(writer: W, buffer: BytesMut) -> Self {
-        Self::with_codec_and_buffer(writer, WireCodec::default(), buffer)
+        Self::with_codec_buffer_and_aead(writer, WireCodec::default(), buffer, None)
     }
 
     /// Creates a new `MessageWriter` wrapping an async writer with pre-buffered data and specified codec.
     pub fn with_codec_and_buffer(writer: W, codec: WireCodec, buffer: BytesMut) -> Self {
+        Self::with_codec_buffer_and_aead(writer, codec, buffer, None)
+    }
+
+    /// Creates a new `MessageWriter` wrapping an async writer with pre-buffered data, specified codec, and AEAD session.
+    pub fn with_codec_buffer_and_aead(
+        writer: W,
+        codec: WireCodec,
+        buffer: BytesMut,
+        aead_writer: Option<AeadWriterSession>,
+    ) -> Self {
         let mut framed = FramedWrite::new(writer, default_codec());
         if !buffer.is_empty() {
             framed.write_buffer_mut().extend_from_slice(&buffer);
@@ -2004,7 +2715,18 @@ impl<W: AsyncWrite + Unpin> MessageWriter<W> {
         Self {
             inner: framed,
             codec,
+            aead_writer,
         }
+    }
+
+    /// Enables AEAD encryption session.
+    pub fn enable_encryption(&mut self, writer: AeadWriterSession) {
+        self.aead_writer = Some(writer);
+    }
+
+    /// Returns `true` if AEAD encryption is enabled.
+    pub fn is_encrypted(&self) -> bool {
+        self.aead_writer.is_some()
     }
 
     /// Returns the currently configured outbound wire codec.
@@ -2020,7 +2742,11 @@ impl<W: AsyncWrite + Unpin> MessageWriter<W> {
     /// Serializes and sends a message framed with a 4-byte length prefix using the configured wire codec.
     pub async fn send_msg<M: Serialize>(&mut self, msg: &M) -> Result<(), ProtocolError> {
         let payload = serialize_message(msg, self.codec)?;
-        self.inner.send(payload).await.map_err(|e| {
+        let frame = match self.aead_writer.as_mut() {
+            Some(w) => w.encrypt_frame(&payload)?,
+            None => payload,
+        };
+        self.inner.send(frame).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 ProtocolError::UnexpectedEof
             } else {
@@ -2074,6 +2800,8 @@ mod tests {
                     tags: vec!["fast".into()],
                     mobile: None,
                 },
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
             },
             WorkerMessage::Heartbeat {
                 worker_id,
@@ -2133,6 +2861,8 @@ mod tests {
                 accepted: true,
                 worker_id,
                 heartbeat_interval_secs: 3,
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
                 message: Some("Registered".into()),
             },
             MasterMessage::HeartbeatAck {
@@ -2245,6 +2975,8 @@ mod tests {
                 tags: vec![],
                 mobile: None,
             },
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         };
 
         // Client -> Server
@@ -2257,6 +2989,8 @@ mod tests {
             accepted: true,
             worker_id,
             heartbeat_interval_secs: 3,
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
             message: None,
         };
         server.send_msg(&ack).await.unwrap();
@@ -2513,6 +3247,8 @@ mod tests {
             capabilities: crate::capabilities::WorkerCapabilities::new(
                 "worker-1", 4, 8192, false, false, None,
             ),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         };
 
         // Client sends Register message in JSON format
@@ -2535,6 +3271,8 @@ mod tests {
             accepted: true,
             worker_id: wid,
             heartbeat_interval_secs: 3,
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
             message: None,
         };
         server.send_msg(&ack).await.expect("server send ack");
@@ -2671,6 +3409,8 @@ mod tests {
             variant_index(&WorkerMessage::Register {
                 worker_id,
                 capabilities: WorkerCapabilities::detect(Some("idx".into()), Some(1), false),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
             }),
             0
         );
@@ -2838,6 +3578,8 @@ mod tests {
             accepted: true,
             worker_id: Uuid::nil(),
             heartbeat_interval_secs: 3,
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
             message: Some(message),
         };
         for codec in [WireCodec::Json, WireCodec::Bincode] {
@@ -2847,4 +3589,120 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_aead_sessions_roundtrip_tamper_and_replay() {
+        let session_key = [42u8; 32];
+        let (mut client_writer, mut client_reader) =
+            derive_aead_keys(&session_key, EndpointRole::Client);
+        let (mut server_writer, mut server_reader) =
+            derive_aead_keys(&session_key, EndpointRole::Server);
+
+        let plaintext = b"hello secure swarm world";
+        let encrypted = client_writer.encrypt_frame(plaintext).unwrap();
+        assert_eq!(encrypted[0], WIRE_FORMAT_ENCRYPTED);
+        assert_eq!(u64::from_be_bytes(encrypted[1..9].try_into().unwrap()), 0);
+
+        // Server decrypts successfully
+        let decrypted = server_reader.decrypt_frame(&encrypted).unwrap();
+        assert_eq!(&decrypted[..], plaintext);
+
+        // Replay of the same frame fails anti-replay
+        let replay_err = server_reader.decrypt_frame(&encrypted).unwrap_err();
+        match replay_err {
+            ProtocolError::Violation(v) => assert!(v.contains("Anti-replay")),
+            other => panic!("expected Violation, got {other:?}"),
+        }
+
+        // Tampered ciphertext fails Poly1305 verification
+        let encrypted2 = client_writer.encrypt_frame(b"second message").unwrap();
+        let mut tampered = encrypted2.to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01; // flip 1 bit in Poly1305 tag
+        let tamper_err = server_reader.decrypt_frame(&tampered).unwrap_err();
+        match tamper_err {
+            ProtocolError::Violation(v) => assert!(v.contains("Ciphertext integrity")),
+            other => panic!("expected Violation, got {other:?}"),
+        }
+
+        // Server response roundtrips to client
+        let server_reply = server_writer.encrypt_frame(b"ack payload").unwrap();
+        let client_decrypted = client_reader.decrypt_frame(&server_reply).unwrap();
+        assert_eq!(&client_decrypted[..], b"ack payload");
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_transport_duplex_and_rejection() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let mut client = MessageTransport::new(client_io);
+        let mut server = MessageTransport::new(server_io);
+
+        let session_key = [0x55u8; 32];
+        client.enable_encryption(&session_key, EndpointRole::Client);
+        server.enable_encryption(&session_key, EndpointRole::Server);
+
+        assert!(client.is_encrypted());
+        assert!(server.is_encrypted());
+
+        let wid = Uuid::new_v4();
+        let reg = WorkerMessage::register(
+            wid,
+            WorkerCapabilities::new("sec-worker", 4, 8192, false, false, None),
+        );
+
+        client.send_msg(&reg).await.unwrap();
+        let recv_reg: WorkerMessage = server.recv_msg().await.unwrap().unwrap();
+        assert_eq!(recv_reg, reg);
+
+        let ack = MasterMessage::register_ack(
+            true,
+            wid,
+            5,
+            ProtocolCapabilities::all_supported(),
+            Some("secure ok".into()),
+        );
+        server.send_msg(&ack).await.unwrap();
+        let recv_ack: MasterMessage = client.recv_msg().await.unwrap().unwrap();
+        assert_eq!(recv_ack, ack);
+    }
+
+    #[test]
+    fn test_unknown_variant_graceful_handling() {
+        // Unknown future WorkerMessage tag (e.g. tag 99) in Bincode
+        let mut buf = vec![WIRE_FORMAT_BINCODE];
+        buf.extend_from_slice(&99u32.to_le_bytes());
+        buf.extend_from_slice(b"future-payload-bytes");
+
+        let (msg, codec): (WorkerMessage, _) = deserialize_message(&buf).unwrap();
+        assert_eq!(codec, WireCodec::Bincode);
+        match msg {
+            WorkerMessage::UnknownVariant { tag, raw_bytes } => {
+                assert_eq!(tag, 99);
+                assert_eq!(raw_bytes, b"future-payload-bytes");
+            }
+            other => panic!("expected UnknownVariant, got {other:?}"),
+        }
+
+        // InboundMessage wrapping unknown variant
+        let (inbound, _): (InboundMessage, _) = deserialize_message(&buf).unwrap();
+        match inbound {
+            InboundMessage::Worker(WorkerMessage::UnknownVariant { tag, raw_bytes }) => {
+                assert_eq!(tag, 99);
+                assert_eq!(raw_bytes, b"future-payload-bytes");
+            }
+            other => panic!("expected InboundMessage::Worker(UnknownVariant), got {other:?}"),
+        }
+
+        // Unknown future MasterMessage tag in Bincode
+        let mut master_buf = vec![WIRE_FORMAT_BINCODE];
+        master_buf.extend_from_slice(&88u32.to_le_bytes());
+        master_buf.extend_from_slice(b"future-master-payload");
+        let (m_msg, _): (MasterMessage, _) = deserialize_message(&master_buf).unwrap();
+        match m_msg {
+            MasterMessage::UnknownVariant { tag, raw_bytes } => {
+                assert_eq!(tag, 88);
+                assert_eq!(raw_bytes, b"future-master-payload");
+            }
+            other => panic!("expected MasterMessage::UnknownVariant, got {other:?}"),
+        }
+    }
 }

@@ -11,10 +11,9 @@ with the rights of the account they were started under. Whoever can talk to the 
 valid peer can therefore run code on every worker, and whoever can impersonate the master can run code on
 every worker that follows it. OxideSwarm closes both doors with a **shared cluster secret**: a client or
 worker must prove it holds the secret before the master accepts anything from it, and the master must prove
-it holds the secret before a worker or client obeys or trusts it. The secret **authenticates**; it does
-**not encrypt**. Over plain TCP the traffic after the handshake is readable (and hijackable) by anyone on the
-path. Use the P2P/QUIC transport (`--p2p`, encrypted by iroh) or a VPN / SSH tunnel on any network you do not
-control.
+it holds the secret before a worker or client obeys or trusts it. The secret **authenticates**; it also derives
+session keys for **authenticated wire stream encryption (`0x04`)** via ChaCha20-Poly1305 over non-loopback TCP,
+while P2P/QUIC transport (`--p2p`) is secured via Iroh TLS.
 
 ## 2. Threat model
 
@@ -25,14 +24,15 @@ control.
 | Someone learns a P2P ticket (it is an address, not a credential) | The same handshake runs inside the QUIC stream; the ticket alone is not enough. |
 | A web page in your browser calls `http://127.0.0.1:8080` (CSRF / DNS rebinding) | The dashboard is same-origin only (no permissive CORS), every route needs a token, and the dev bypass checks the peer, the `Host` header, `X-Forwarded-*` and `Origin`. |
 | A leaked dashboard / agent-mesh token | Rotate it (section 5). Dashboard tokens derived from the cluster secret change when the secret changes. |
+| Network wire sniffing / tampering on non-loopback TCP | Protected by authenticated stream encryption (`0x04`) using ChaCha20-Poly1305 derived from the shared secret, or Iroh QUIC TLS (`--p2p`). |
 
 | Not considered / not provided | Consequence |
 | :--- | :--- |
-| Confidentiality and integrity of plain TCP after the handshake | Anyone on the path can read task payloads and results, and could hijack an authenticated connection. Use `--p2p`, a VPN or an SSH tunnel on untrusted networks. |
+| Unauthenticated loopback plain TCP traffic | Local development runs without a secret continue to use plaintext `0x01` / `0x02` frames for loopback performance and ease of debugging. |
 | A malicious or compromised cluster member (anyone holding the secret) | Members are mutually trusted: a holder can submit tasks to all workers. There is no per-user permission model on the cluster port. |
 | Sandboxing of tasks | A task runs as the worker's OS account. The "sandbox" is a per-task working directory, not a container. A task can read everything that account can read, **including the worker's cluster secret file** (and, on Linux, the worker's environment through `/proc`). The secret variables (`OXIDESWARM_SECRET`, `OXIDESWARM_SECRET_FILE`, `OXIDE_MESH_TOKEN`) are not *passed on* to task processes, but use a secret *file* anyway, and see section 7. |
 | Denial of service | A peer that cannot authenticate is cut off after a 5 s handshake timeout and a 250 ms penalty delay, but there is no rate limiting or quota. |
-| Replay across machines of recorded TCP sessions | Each handshake uses fresh 32-byte nonces from both sides, so a recorded handshake cannot be replayed; the session after it is not protected (see above). |
+| Replay across machines of recorded TCP sessions | Each handshake uses fresh 32-byte nonces from both sides, so a recorded handshake cannot be replayed; encrypted frames carry sequence counters preventing replay. |
 
 ## 3. The cluster secret
 
@@ -73,7 +73,7 @@ implemented.
 
 | Port | Where it listens | What it exposes | Protection |
 | :--- | :--- | :--- | :--- |
-| **8088/tcp** (cluster) | `127.0.0.1` by default; `0.0.0.0` only with `--listen 0.0.0.0:8088` (what `switch_role.sh master` and `windows\start_master.cmd` pass) | Worker registration, task submission, status. This is the port that runs code on your workers. | Cluster-secret handshake; **not encrypted**. |
+| **8088/tcp** (cluster) | `127.0.0.1` by default; `0.0.0.0` only with `--listen 0.0.0.0:8088` (what `switch_role.sh master` and `windows\start_master.cmd` pass) | Worker registration, task submission, status. This is the port that runs code on your workers. | Mutual cluster-secret handshake; post-handshake traffic is encrypted via ChaCha20-Poly1305 (`0x04`) using directional session keys (unauthenticated loopback fallback uses plaintext `0x01`/`0x02`). |
 | **8080/tcp** (dashboard) | Loopback unless `--web-ui-addr` says otherwise (the launchers pass `--web-ui-addr 127.0.0.1:8080`, or `0.0.0.0:8080` only when you ask for phone / LAN access) | Web UI, REST (`/api/*`), WebSocket `/ws`, SSE. Can submit and cancel tasks. | Bearer token / `X-API-Key` / `?token=` (section 6); same-origin only. |
 | **8080/tcp** on a *worker* | All interfaces (`0.0.0.0`); the CLI has no switch to turn it off. If the port is taken, e.g. by a master on the same machine, the portal just does not start. | A tiny "standby" page and `/api/status` that say which master this worker follows and redirect browsers to it. | None. It only reveals the master's address. |
 | **8089/udp** | Master broadcasts / answers on the LAN | Discovery beacon (`--master auto`): the master's cluster address and, only if the dashboard listens on a non-loopback address, its URL (empty otherwise). | With a secret the beacon carries a MAC and workers/clients ignore beacons without a valid one. Not encrypted. |
@@ -149,7 +149,7 @@ What the worker does limit, so that tasks stay out of the owner's way:
 | CPU priority | Task processes run at below-normal priority (`nice 10`; `BELOW_NORMAL_PRIORITY_CLASS` on Windows). `--task-priority normal\|below-normal\|idle` or `RUSTY_GRID_TASK_PRIORITY` changes it. |
 | Concurrency | Without `--max-concurrency` or `--cores`, a worker runs `cores - 1` tasks at once (at least 1). `--cores N` offers N; `--max-concurrency N` sets the limit directly. |
 | Wall-clock time | The task's `timeout_secs` (default 60 s). |
-| Process tree | Each task leads its own process group (Windows: Job Object). Timeout, cancellation, the end of the task and a stopped worker (Ctrl-C, SIGTERM, console close) kill the whole tree, grandchildren and background helpers included. A worker that is *killed* (SIGKILL, power loss) cannot do this on Unix: its task processes keep running until they finish. On Windows the Job Object ends them with the worker. |
+| Process tree | Each task leads its own process group (Windows: atomic Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` created via `CREATE_SUSPENDED`; Linux: `PR_SET_PDEATHSIG` child termination binding). Timeout, cancellation, the end of the task and a stopped or crashed worker kill the whole tree, grandchildren and background helpers included, guaranteeing zero orphaned processes across Windows and Linux. |
 | Memory, disk | **Not limited.** A task can use all the RAM and fill the disk of the account it runs as. |
 | Sandbox directory | `--sandbox-base-dir`, else `RUSTY_GRID_SANDBOX_BASE_DIR`, else `$TMPDIR/rusty_grid/sandboxes`, else the platform temp dir. The worker refuses to start, with the fix in the message, when that directory cannot be written (on Android pass the app's cache dir). |
 
@@ -158,7 +158,7 @@ What the worker does limit, so that tasks stay out of the owner's way:
 | File | Contains | Mode |
 | :--- | :--- | :--- |
 | `~/.oxideswarm/cluster.secret` | the cluster secret | 600 |
-| `~/.oxideswarm/master_key.bin` | the P2P node identity of a master | should be 600, but it is currently created with the process umask (usually 644): run `chmod 600 ~/.oxideswarm/master_key.bin` |
+| `~/.oxideswarm/master_key.bin` | the P2P node identity of a master | 600 (enforced on creation and tightened at startup by `server.rs`) |
 | `~/.oxideswarm/remote-worker.toml` (`connect_remote.sh`) | a P2P ticket and the path of the secret file | 600 |
 | `/etc/oxideswarm/worker.toml`, `/etc/oxideswarm/cluster.secret` (macOS daemon) | ticket / master address, secret copy | 600, owned by the service account |
 | `C:\ProgramData\OxideSwarm\rusty-grid.toml`, `cluster.secret` (Windows service) | ticket / master address, secret copy | ACL: SYSTEM, Administrators, the service account |

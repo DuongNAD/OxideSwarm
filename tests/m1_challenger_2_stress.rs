@@ -20,7 +20,9 @@ use tokio::net::TcpStream;
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
-use rusty_grid_core::protocol::{MasterMessage, MessageTransport, WorkerMessage};
+use rusty_grid_core::protocol::{
+    MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage, PROTOCOL_VERSION_CURRENT,
+};
 use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::server::{MasterServer, ServerConfig};
 
@@ -55,6 +57,8 @@ async fn spawn_mock_worker(
         .send_msg(&WorkerMessage::Register {
             worker_id,
             capabilities: caps,
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .expect("Failed to send Register");

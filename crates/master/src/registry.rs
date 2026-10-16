@@ -398,10 +398,10 @@ impl WorkerRegistry {
         let now = Instant::now();
         let mut to_remove = Vec::new();
         for (id, entry) in &inner.workers {
-            if entry.status == WorkerStatus::Disconnected {
-                if now.duration_since(entry.last_heartbeat_instant) >= stale_timeout {
-                    to_remove.push(*id);
-                }
+            if entry.status == WorkerStatus::Disconnected
+                && now.duration_since(entry.last_heartbeat_instant) >= stale_timeout
+            {
+                to_remove.push(*id);
             }
         }
         let count = to_remove.len();

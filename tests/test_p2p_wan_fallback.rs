@@ -257,6 +257,7 @@ async fn test_normal_dialing_direct_p2p_and_path_introspection() {
     let master_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let config = ServerConfig::new(master_bind)
         .with_p2p(true)
+        .with_ephemeral_key(true)
         .with_p2p_ticket_file(&ticket_file);
 
     let master_handle = MasterServer::spawn(config)

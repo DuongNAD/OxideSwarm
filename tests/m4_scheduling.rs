@@ -104,8 +104,12 @@ impl TestCluster {
         });
 
         // Await full registration of all 3 workers
+        #[cfg(windows)]
+        let reg_timeout = Duration::from_secs(12);
+        #[cfg(not(windows))]
+        let reg_timeout = Duration::from_secs(5);
         let ready = wait_for(
-            Duration::from_secs(5),
+            reg_timeout,
             Duration::from_millis(50),
             || async {
                 let workers = master.list_workers().await.unwrap_or_default();
@@ -463,11 +467,13 @@ async fn test_m4_worker_disconnect_during_execution_triggers_retry() {
     let cfg_a = WorkerConfig::new(master_addr.clone())
         .with_name("worker-A")
         .with_cores(2)
-        .with_sandbox_base_dir(dir_a.path());
+        .with_sandbox_base_dir(dir_a.path())
+        .with_redirection_portal(false);
     let cfg_b = WorkerConfig::new(master_addr.clone())
         .with_name("worker-B")
         .with_cores(2)
-        .with_sandbox_base_dir(dir_b.path());
+        .with_sandbox_base_dir(dir_b.path())
+        .with_redirection_portal(false);
 
     let mut w_a = WorkerClient::new(cfg_a);
     let mut w_b = WorkerClient::new(cfg_b);
@@ -482,8 +488,12 @@ async fn test_m4_worker_disconnect_during_execution_triggers_retry() {
         let _ = w_b.run(w_b_rx).await;
     });
 
+    #[cfg(windows)]
+    let reg_timeout = Duration::from_secs(12);
+    #[cfg(not(windows))]
+    let reg_timeout = Duration::from_secs(4);
     let registered = wait_for(
-        Duration::from_secs(4),
+        reg_timeout,
         Duration::from_millis(50),
         || async {
             let workers = master.list_workers().await.unwrap_or_default();

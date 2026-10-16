@@ -14,7 +14,8 @@ data class WorkerConfig(
     val cores: Int,
     val ramMb: Long,
     val simulateGpu: Boolean,
-    val heartbeatIntervalSecs: Long = 3L
+    val heartbeatIntervalSecs: Long = 3L,
+    val clusterSecret: String? = null
 )
 
 interface WorkerEngineListener {

@@ -23,8 +23,8 @@ use uuid::Uuid;
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::error::GridError;
 use rusty_grid_core::protocol::{
-    deserialize_message, serialize_message, MasterMessage, MessageTransport, ProtocolError,
-    WireCodec, WorkerMessage, MAX_FRAME_SIZE,
+    deserialize_message, serialize_message, MasterMessage, MessageTransport, ProtocolCapabilities,
+    ProtocolError, WireCodec, WorkerMessage, MAX_FRAME_SIZE, PROTOCOL_VERSION_CURRENT,
 };
 use rusty_grid_core::task::{
     Bytes as TaskBytes, CheckpointData, Task, TaskId, TaskRequirements, TaskResult, TaskSpec,
@@ -80,6 +80,8 @@ async fn spawn_mock_wire_worker(
         .send_msg(&WorkerMessage::Register {
             worker_id,
             capabilities: caps,
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .expect("send Register");
@@ -506,9 +508,11 @@ async fn test_adversarial_checkpoint_on_terminal_and_nonexistent_tasks() {
 
 #[tokio::test]
 async fn test_adversarial_checkpoint_retention_on_retry_exhaustion() {
-    let mut policy = RetryPolicy::default();
-    policy.max_retries = 1; // Only 1 retry allowed
-    policy.max_failovers = 1; // failover budget is separate from max_retries; pin it to the same limit
+    let policy = RetryPolicy {
+        max_retries: 1,
+        max_failovers: 1,
+        ..Default::default()
+    };
     let queue = TaskQueue::with_config(policy, None);
 
     let task = Task::new(
@@ -557,8 +561,10 @@ async fn test_adversarial_checkpoint_retention_on_retry_exhaustion() {
 
 #[tokio::test]
 async fn test_adversarial_multi_hop_failover_task_queue() {
-    let mut policy = RetryPolicy::default();
-    policy.max_retries = 5;
+    let policy = RetryPolicy {
+        max_retries: 5,
+        ..Default::default()
+    };
     let queue = TaskQueue::with_config(policy, None);
 
     let task = Task::new(

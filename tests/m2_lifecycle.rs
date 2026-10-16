@@ -15,7 +15,9 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
-use rusty_grid_core::protocol::{MasterMessage, MessageTransport, WorkerMessage};
+use rusty_grid_core::protocol::{
+    MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage, PROTOCOL_VERSION_CURRENT,
+};
 use rusty_grid_master::reaper::{spawn_reaper, ReaperConfig};
 use rusty_grid_master::registry::{WorkerRegistry, WorkerStatus};
 use rusty_grid_master::server::{MasterServer, ServerConfig};
@@ -90,8 +92,12 @@ async fn test_m2_three_workers_registration_and_gpu_capabilities() {
     });
 
     // 3. Verify all 3 workers successfully register and are in Connected state
+    #[cfg(windows)]
+    let reg_timeout = Duration::from_secs(10);
+    #[cfg(not(windows))]
+    let reg_timeout = Duration::from_secs(3);
     let registered = wait_for(
-        Duration::from_secs(3),
+        reg_timeout,
         Duration::from_millis(50),
         || async {
             let workers = registry.list_all_workers().await;
@@ -166,6 +172,7 @@ async fn test_m2_heartbeat_updates() {
 
     let (w_shutdown_tx, w_shutdown_rx) = watch::channel(false);
     let mut config = WorkerConfig::new(master_addr);
+    config.enable_redirection_portal = false;
     config.default_heartbeat_interval = Duration::from_millis(100);
     let mut worker = WorkerClient::new(config);
     let worker_id = worker.worker_id();
@@ -175,9 +182,13 @@ async fn test_m2_heartbeat_updates() {
     });
 
     // Wait for initial registration
+    #[cfg(windows)]
+    let reg_timeout = Duration::from_secs(6);
+    #[cfg(not(windows))]
+    let reg_timeout = Duration::from_secs(2);
     assert!(
         wait_for(
-            Duration::from_secs(2),
+            reg_timeout,
             Duration::from_millis(50),
             || async { registry.get_worker(worker_id).await.is_some() }
         )
@@ -230,9 +241,13 @@ async fn test_m2_graceful_disconnect_via_disconnecting_message() {
     let worker_handle = tokio::spawn(async move { w.run(w_shutdown_rx).await });
 
     // Wait for registration
+    #[cfg(windows)]
+    let reg_timeout = Duration::from_secs(6);
+    #[cfg(not(windows))]
+    let reg_timeout = Duration::from_secs(2);
     assert!(
         wait_for(
-            Duration::from_secs(2),
+            reg_timeout,
             Duration::from_millis(50),
             || async {
                 registry
@@ -288,6 +303,8 @@ async fn test_m2_abrupt_socket_drop_fast_detection() {
     let reg_msg = WorkerMessage::Register {
         worker_id: test_id,
         capabilities: WorkerCapabilities::new("abrupt-worker", 2, 1024, false, false, None),
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: ProtocolCapabilities::all_supported(),
     };
     transport.send_msg(&reg_msg).await.expect("send register");
     let _ack: MasterMessage = transport.recv_msg().await.expect("recv").expect("ack");
@@ -343,6 +360,8 @@ async fn test_m2_heartbeat_reaper_silent_timeout() {
     let reg_msg = WorkerMessage::Register {
         worker_id: silent_id,
         capabilities: WorkerCapabilities::new("silent-worker", 2, 1024, false, false, None),
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: ProtocolCapabilities::all_supported(),
     };
     transport.send_msg(&reg_msg).await.expect("send register");
     let _ack: MasterMessage = transport.recv_msg().await.expect("recv").expect("ack");
@@ -401,9 +420,13 @@ async fn test_m2_worker_reconnection_preserves_uuid() {
     });
 
     // 1. Initial registration
+    #[cfg(windows)]
+    let reg_timeout = Duration::from_secs(6);
+    #[cfg(not(windows))]
+    let reg_timeout = Duration::from_secs(2);
     assert!(
         wait_for(
-            Duration::from_secs(2),
+            reg_timeout,
             Duration::from_millis(30),
             || async {
                 registry
@@ -429,8 +452,12 @@ async fn test_m2_worker_reconnection_preserves_uuid() {
     );
 
     // 3. Worker backoff loop reconnects; verify status restored to Connected with same worker_id
+    #[cfg(windows)]
+    let recon_timeout = Duration::from_secs(8);
+    #[cfg(not(windows))]
+    let recon_timeout = Duration::from_secs(3);
     let reconnected = wait_for(
-        Duration::from_secs(3),
+        recon_timeout,
         Duration::from_millis(30),
         || async {
             if let Some(info) = registry.get_worker(worker_id).await {

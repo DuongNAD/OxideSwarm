@@ -24,8 +24,8 @@ Android's power-management architecture is designed to restrict and suspend back
 Without specialized packaging, a background worker process will be frozen or terminated within **3 to 15 minutes** of turning off the phone screen.
 
 OxideSwarm offers two deployment paths:
-* **Path A:** Native Android Foreground Service App (`packaging/android/app/`). It needs a native library you must build first (section 2.3) and cannot hold the cluster secret yet (see below).
-* **Path B:** Termux Background Daemon (`packaging/android/termux/`). Works with the cluster secret today and is the path to use against a master that requires one.
+* **Path A:** Native Android Foreground Service App (`packaging/android/app/`). Embeds the native library (`liboxideworker.so`) and supports cluster secret authentication via `nativeSetClusterSecret` and `nativeStartWorkerWithSecret`.
+* **Path B:** Termux Background Daemon (`packaging/android/termux/`). Works with the cluster secret today and provides a full Linux userspace for volunteer computing.
 
 > **What the phone needs to join a grid.** The master's *cluster* address, `HOST:8088` (8080 is the dashboard and
 > never works), and a copy of the master's `cluster.secret` (a master reachable beyond loopback creates

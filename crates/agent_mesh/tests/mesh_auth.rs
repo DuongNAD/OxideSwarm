@@ -348,6 +348,7 @@ async fn test_rest_endpoints_need_the_token_and_send_no_cors_headers() {
 // Browser Origin check
 // =========================================================================
 
+#[allow(clippy::result_large_err)]
 async fn connect_with_origin(url: &str, origin: &str) -> Result<Ws, WsError> {
     let mut request = url.into_client_request().unwrap();
     request.headers_mut().insert("Origin", HeaderValue::from_str(origin).unwrap());
@@ -618,9 +619,11 @@ async fn test_every_id_of_a_socket_is_released_when_it_disconnects() {
 
 #[tokio::test]
 async fn test_half_open_node_is_dropped_so_its_id_can_be_reclaimed() {
-    let mut config = HubConfig::default();
-    config.ping_interval = Duration::from_millis(100);
-    config.idle_timeout = Duration::from_millis(1500);
+    let config = HubConfig {
+        ping_interval: Duration::from_millis(100),
+        idle_timeout: Duration::from_millis(1500),
+        ..Default::default()
+    };
     let (hub, url, _) = start_hub(config).await;
 
     // "ghost" registers and then never reads again, so it never answers the hub's pings: this is
@@ -654,10 +657,13 @@ async fn test_half_open_node_is_dropped_so_its_id_can_be_reclaimed() {
 }
 
 #[tokio::test]
+#[allow(clippy::manual_is_multiple_of)]
 async fn test_slow_consumer_is_disconnected_instead_of_buffering_forever() {
-    let mut config = HubConfig::default();
-    config.max_queued_messages = 8;
-    config.max_queued_bytes = 256 * 1024;
+    let config = HubConfig {
+        max_queued_messages: 8,
+        max_queued_bytes: 256 * 1024,
+        ..Default::default()
+    };
     let (hub, url, _) = start_hub(config).await;
 
     let healthy = client(&url, "healthy");

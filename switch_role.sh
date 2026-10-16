@@ -69,7 +69,7 @@ detect_lan_ip() {
         ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
     fi
     if [[ -z "$ip" ]]; then
-        ip="<IP-cua-may-nay>"
+        ip="<HOST_IP>"
     fi
     echo "$ip"
 }

@@ -28,7 +28,9 @@ use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::cluster_auth::{client_handshake, ClusterSecret, WIRE_FORMAT_AUTH};
 use rusty_grid_core::discovery::{build_auth_probe, MasterBeacon, DISCOVERY_MAGIC_REQUEST};
 use rusty_grid_core::protocol::{
-    ClientMessage, ClientResponse, MasterMessage, MessageTransport, ProtocolError, WorkerMessage,
+    derive_aead_keys, serialize_message, ClientMessage, ClientResponse, EndpointRole,
+    MasterMessage, MessageTransport, ProtocolCapabilities, ProtocolError, WireCodec, WorkerMessage,
+    PROTOCOL_VERSION_CURRENT, WIRE_FORMAT_ENCRYPTED,
 };
 use rusty_grid_core::task::{Bytes as TaskBytes, Task, TaskRequirements, TaskSpec};
 use rusty_grid_core::{GridError, GridResult};
@@ -47,6 +49,7 @@ async fn spawn_master(secret: Option<&ClusterSecret>) -> MasterHandle {
     MasterServer::spawn(config).await.expect("spawn master")
 }
 
+#[allow(dead_code)]
 async fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -84,6 +87,8 @@ fn register_msg(worker_id: Uuid, name: &str) -> WorkerMessage {
     WorkerMessage::Register {
         worker_id,
         capabilities: WorkerCapabilities::new(name, 2, 4096, false, false, None),
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: ProtocolCapabilities::all_supported(),
     }
 }
 
@@ -109,7 +114,8 @@ async fn start_fake_worker(
     let stream = TcpStream::connect(addr).await.map_err(GridError::Io)?;
     let mut transport = MessageTransport::new(stream);
     if let Some(secret) = secret {
-        client_handshake(&mut transport, secret).await?;
+        let session_key = client_handshake(&mut transport, secret).await?;
+        transport.enable_encryption(&session_key, EndpointRole::Client);
     }
     let worker_id = Uuid::new_v4();
     transport
@@ -165,6 +171,7 @@ async fn start_fake_worker(
 }
 
 /// Submits `task` as a client that authenticates first. Returns the master's answer.
+#[allow(dead_code)]
 async fn submit_authenticated(
     addr: SocketAddr,
     secret: &ClusterSecret,
@@ -172,7 +179,8 @@ async fn submit_authenticated(
 ) -> GridResult<ClientResponse> {
     let stream = TcpStream::connect(addr).await.map_err(GridError::Io)?;
     let mut transport = MessageTransport::new(stream);
-    client_handshake(&mut transport, secret).await?;
+    let session_key = client_handshake(&mut transport, secret).await?;
+    transport.enable_encryption(&session_key, EndpointRole::Client);
     transport
         .send_msg(&ClientMessage::SubmitTask { task, wait: false })
         .await?;
@@ -695,9 +703,10 @@ mod quic {
 
         // The right secret registers.
         let mut authenticated = open_lanes(&client, master_addr).await;
-        client_handshake(&mut authenticated.control, &secret)
+        let session_key = client_handshake(&mut authenticated.control, &secret)
             .await
             .expect("handshake with the right secret");
+        authenticated.control.enable_encryption(&session_key, EndpointRole::Client);
         let worker_id = Uuid::new_v4();
         authenticated
             .control
@@ -724,4 +733,164 @@ fn test_protocol_error_for_auth_frames_maps_to_auth_required() {
     // What the typed decoder reports for a REJECT frame, as used by every secret-less client.
     let err: GridError = ProtocolError::InvalidFormatTag(WIRE_FORMAT_AUTH).into();
     assert!(matches!(err, GridError::AuthRequired(_)));
+}
+
+// =============================================================================================
+// Milestone 3: Authenticated TCP Stream Encryption (AEAD Record Layer) Verification
+// =============================================================================================
+
+#[tokio::test]
+async fn test_all_post_handshake_frames_use_wire_format_encrypted() {
+    let secret = secret(42);
+    let master = spawn_master(Some(&secret)).await;
+    let stream = TcpStream::connect(master.server_addr()).await.unwrap();
+    let mut transport = MessageTransport::new(stream);
+
+    assert!(!transport.is_encrypted());
+    let session_key = client_handshake(&mut transport, &secret)
+        .await
+        .expect("handshake succeeds");
+    assert!(!transport.is_encrypted());
+
+    // Upgrade client transport
+    transport.enable_encryption(&session_key, EndpointRole::Client);
+    assert!(transport.is_encrypted());
+
+    // Send Register
+    let worker_id = Uuid::new_v4();
+    transport
+        .send_msg(&register_msg(worker_id, "encrypted-worker"))
+        .await
+        .expect("send encrypted register");
+
+    // Read the raw frame from the wire directly to inspect its wire format byte
+    let raw_frame = transport
+        .recv_raw_frame()
+        .await
+        .expect("recv raw frame succeeds")
+        .expect("frame present");
+
+    // Wire format byte MUST be WIRE_FORMAT_ENCRYPTED (0x04)
+    assert_eq!(
+        raw_frame[0], WIRE_FORMAT_ENCRYPTED,
+        "Master must respond with wire-encrypted frame (0x04)"
+    );
+    // Sequence counter in AAD/frame header must be 0 for the first frame
+    let seq = u64::from_be_bytes(raw_frame[1..9].try_into().unwrap());
+    assert_eq!(seq, 0, "First encrypted frame from server must have sequence 0");
+
+    let (_, mut reader_session) = derive_aead_keys(&session_key, EndpointRole::Client);
+    let decrypted = reader_session
+        .decrypt_frame(&raw_frame)
+        .expect("decrypt raw frame");
+    let (ack, _): (MasterMessage, _) =
+        rusty_grid_core::protocol::deserialize_message(&decrypted).expect("deserialize ack");
+    assert!(matches!(ack, MasterMessage::RegisterAck { accepted: true, .. }));
+
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn test_tampered_ciphertext_causes_connection_rejection() {
+    let secret = secret(43);
+    let master = spawn_master(Some(&secret)).await;
+    let stream = TcpStream::connect(master.server_addr()).await.unwrap();
+    let mut transport = MessageTransport::new(stream);
+
+    let session_key = client_handshake(&mut transport, &secret)
+        .await
+        .expect("handshake succeeds");
+
+    let (mut writer_session, _) = derive_aead_keys(&session_key, EndpointRole::Client);
+
+    let worker_id = Uuid::new_v4();
+    let payload = serialize_message(&register_msg(worker_id, "tamper-worker"), WireCodec::Bincode).unwrap();
+    let encrypted_frame = writer_session.encrypt_frame(&payload).expect("seal frame");
+
+    // Tamper with the ciphertext (flip a bit in the encrypted payload)
+    let mut tampered = encrypted_frame.to_vec();
+    let len = tampered.len();
+    tampered[len - 1] ^= 0x55;
+
+    // Send the tampered frame directly
+    transport.send_raw_frame(Bytes::from(tampered)).await.unwrap();
+
+    // Master AEAD reader must fail authentication and immediately drop/close the connection
+    let resp: Result<Option<MasterMessage>, _> = transport.recv_msg().await;
+    match resp {
+        Ok(None) => {} // Clean connection closed by master
+        Err(_) => {}   // Connection reset or protocol error
+        Ok(Some(msg)) => panic!("Master must not accept tampered ciphertext frame! Got: {msg:?}"),
+    }
+
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn test_replayed_sequence_number_causes_connection_rejection() {
+    let secret = secret(44);
+    let master = spawn_master(Some(&secret)).await;
+    let stream = TcpStream::connect(master.server_addr()).await.unwrap();
+    let mut transport = MessageTransport::new(stream);
+
+    let session_key = client_handshake(&mut transport, &secret)
+        .await
+        .expect("handshake succeeds");
+
+    let (mut writer_session, mut reader_session) = derive_aead_keys(&session_key, EndpointRole::Client);
+
+    let worker_id = Uuid::new_v4();
+    let payload = serialize_message(&register_msg(worker_id, "replay-worker"), WireCodec::Bincode).unwrap();
+
+    // Encrypt frame 1 with seq = 0
+    let frame_seq0 = writer_session.encrypt_frame(&payload).expect("seal frame 0");
+    // Send frame 0 legitimately
+    transport.send_raw_frame(frame_seq0.clone()).await.unwrap();
+
+    // Read ack from master
+    let raw_ack = transport.recv_raw_frame().await.unwrap().expect("ack frame");
+    assert_eq!(raw_ack[0], WIRE_FORMAT_ENCRYPTED);
+    let _ = reader_session.decrypt_frame(&raw_ack).expect("decrypt ack");
+
+    // Replay frame_seq0 (seq = 0 again, when master expects seq = 1)
+    transport.send_raw_frame(frame_seq0).await.unwrap();
+
+    // Master AEAD reader MUST reject the replayed sequence number and terminate connection
+    let resp: Result<Option<MasterMessage>, _> = transport.recv_msg().await;
+    match resp {
+        Ok(None) => {} // Connection closed
+        Err(_) => {}   // Reset or protocol error
+        Ok(Some(msg)) => panic!("Master must reject replayed sequence number! Got: {msg:?}"),
+    }
+
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn test_unauthenticated_loopback_fallback_works_seamlessly() {
+    // Master with no secret configured (cluster_secret: None)
+    let master = spawn_master(None).await;
+    let stream = TcpStream::connect(master.server_addr()).await.unwrap();
+    let mut transport = MessageTransport::new(stream);
+
+    // Without secret, transport remains unencrypted
+    assert!(!transport.is_encrypted());
+
+    // Client sends request without handshake
+    transport
+        .send_msg(&ClientMessage::ClusterStatus)
+        .await
+        .expect("send cluster status");
+
+    // Receives plain bincode/json response with zero crypto overhead
+    let resp = transport
+        .recv_msg::<ClientResponse>()
+        .await
+        .expect("recv cluster status")
+        .expect("response present");
+
+    assert!(matches!(resp, ClientResponse::ClusterStatus { .. }));
+    assert!(!transport.is_encrypted());
+
+    let _ = master.shutdown();
 }

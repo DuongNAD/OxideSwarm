@@ -74,7 +74,11 @@ pub fn default_worker_id_path(name: Option<&str>) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os(WORKER_ID_FILE_ENV).filter(|p| !p.is_empty()) {
         return Some(PathBuf::from(path));
     }
-    let dir = home_dir()?.join(".oxideswarm");
+    let dir = if let Some(custom) = std::env::var_os("OXIDESWARM_HOME").filter(|s| !s.is_empty()) {
+        PathBuf::from(custom)
+    } else {
+        home_dir()?.join(".oxideswarm")
+    };
     let file = match name.map(sanitize_name).filter(|n| !n.is_empty()) {
         Some(n) => format!("worker_id.{n}"),
         None => "worker_id".to_string(),

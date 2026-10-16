@@ -12,7 +12,9 @@ use oxideworker::{
     get_master_worker_count_impl, is_master_running_impl, start_master_impl, stop_master_impl,
 };
 use rusty_grid_core::capabilities::WorkerCapabilities;
-use rusty_grid_core::protocol::{MasterMessage, MessageTransport, WorkerMessage};
+use rusty_grid_core::protocol::{
+    MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage, PROTOCOL_VERSION_CURRENT,
+};
 
 static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -31,6 +33,8 @@ async fn connect_and_register(
     let reg_msg = WorkerMessage::Register {
         worker_id,
         capabilities: caps,
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: ProtocolCapabilities::all_supported(),
     };
     transport
         .send_msg(&reg_msg)
@@ -280,6 +284,8 @@ async fn test_duplicate_registration_on_same_socket() {
         .send_msg(&WorkerMessage::Register {
             worker_id: id,
             capabilities: caps.clone(),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .expect("Send 1");
@@ -293,6 +299,8 @@ async fn test_duplicate_registration_on_same_socket() {
         .send_msg(&WorkerMessage::Register {
             worker_id: id,
             capabilities: caps,
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .expect("Send 2");

@@ -150,3 +150,8 @@ path = "../../tests/master_limits_and_scheduling.rs"
 name = "master_quic_limits"
 path = "../../tests/master_quic_limits.rs"
 required-features = ["p2p"]
+
+[[test]]
+name = "m3_challenger_1_wire_encryption_stress"
+path = "../../tests/m3_challenger_1_wire_encryption_stress.rs"
+

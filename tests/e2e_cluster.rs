@@ -1,6 +1,6 @@
 //! Comprehensive End-to-End Cluster Integration Test Suite for OxideSwarm (rusty_grid).
 //!
-//! Structured across Tiers 1–4 matching TEST_INFRA.md:
+//! Structured across Tiers 1–4 (Feature, Boundary, Concurrency, Chaos):
 //! - Tier 1: Feature Coverage (>=5 test cases per feature, 25 total)
 //!   * Feature 1: Master-Worker Connection & Registration (5 tests)
 //!   * Feature 2: Worker Capability Advertisement (CPU, RAM, GPU, Mobile) (5 tests)
@@ -37,7 +37,8 @@ use rusty_grid_core::capabilities::{MobileCapabilities, WorkerCapabilities};
 use rusty_grid_core::error::{GridError, GridResult};
 use rusty_grid_core::mapreduce::{MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec};
 use rusty_grid_core::protocol::{
-    ClientMessage, ClientResponse, MasterMessage, MessageTransport, WorkerMessage,
+    ClientMessage, ClientResponse, MasterMessage, MessageTransport, ProtocolCapabilities,
+    WorkerMessage, PROTOCOL_VERSION_CURRENT,
 };
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskResult, TaskSpec, TaskStatus};
 use rusty_grid_master::reaper::ReaperConfig;
@@ -238,6 +239,8 @@ async fn spawn_mock_wire_worker(
     let reg_msg = WorkerMessage::Register {
         worker_id,
         capabilities,
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: ProtocolCapabilities::all_supported(),
     };
     transport.send_msg(&reg_msg).await.expect("send register");
 
@@ -375,6 +378,8 @@ async fn test_tier1_f1_registration_heartbeat_liveness_acknowledged() {
     let reg = WorkerMessage::Register {
         worker_id: wid,
         capabilities: WorkerCapabilities::new("hb-worker", 2, 2048, false, false, None),
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: ProtocolCapabilities::all_supported(),
     };
     transport.send_msg(&reg).await.unwrap();
     let ack: Option<MasterMessage> = transport.recv_msg().await.unwrap();
@@ -1215,6 +1220,8 @@ async fn test_tier2_bva_zero_cpu_cores_registration_rejected() {
     let bad_reg = WorkerMessage::Register {
         worker_id: Uuid::new_v4(),
         capabilities: WorkerCapabilities::new("bad-worker", 0, 1024, false, false, None),
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: ProtocolCapabilities::all_supported(),
     };
     transport.send_msg(&bad_reg).await.unwrap();
 
@@ -1339,6 +1346,8 @@ async fn test_tier2_bva_duplicate_registration_replaces_session() {
     t1.send_msg(&WorkerMessage::Register {
         worker_id: wid,
         capabilities: WorkerCapabilities::new("session-worker", 2, 2048, false, false, None),
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: ProtocolCapabilities::all_supported(),
     })
     .await
     .unwrap();
@@ -1357,6 +1366,8 @@ async fn test_tier2_bva_duplicate_registration_replaces_session() {
     t2.send_msg(&WorkerMessage::Register {
         worker_id: wid,
         capabilities: WorkerCapabilities::new("session-worker", 2, 2048, false, false, None),
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: ProtocolCapabilities::all_supported(),
     })
     .await
     .unwrap();
@@ -1386,6 +1397,8 @@ async fn test_tier2_bva_worker_graceful_disconnect_message() {
         .send_msg(&WorkerMessage::Register {
             worker_id: wid,
             capabilities: WorkerCapabilities::new("polite-worker", 2, 2048, false, false, None),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         })
         .await
         .unwrap();

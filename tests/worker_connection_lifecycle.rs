@@ -15,7 +15,10 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::{MobileCapabilities, MobileLiveStatus};
-use rusty_grid_core::protocol::{deserialize_message, MasterMessage, MessageTransport, WorkerMessage};
+use rusty_grid_core::protocol::{
+    deserialize_message, MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage,
+    PROTOCOL_VERSION_CURRENT,
+};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec, TaskStatus};
 use rusty_grid_core::GridResult;
 use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
@@ -68,6 +71,8 @@ impl ScriptedMaster {
                 worker_id,
                 heartbeat_interval_secs: heartbeat_secs,
                 message: None,
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
             })
             .await
             .unwrap();
@@ -168,6 +173,7 @@ impl Worker {
 }
 
 /// True while a process with `pid` exists.
+#[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -175,6 +181,24 @@ fn process_alive(pid: u32) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    unsafe {
+        use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+        ok != FALSE && exit_code == 259 // STILL_ACTIVE = 259
+    }
 }
 
 async fn read_pid(path: &Path) -> u32 {
@@ -203,6 +227,7 @@ async fn wait_dead(pid: u32, within: Duration) -> bool {
 }
 
 /// A task that records the pid of its long-lived process in `pid_file`.
+#[cfg(unix)]
 fn sleeper(pid_file: &Path) -> Task {
     Task::new(
         TaskSpec::command(
@@ -210,6 +235,24 @@ fn sleeper(pid_file: &Path) -> Task {
             vec![
                 "-c".into(),
                 format!("echo $$ > {}; exec sleep 60", pid_file.display()),
+            ],
+        ),
+        TaskRequirements::generic(1, 120),
+    )
+}
+
+#[cfg(windows)]
+fn sleeper(pid_file: &Path) -> Task {
+    let path = pid_file.display().to_string().replace('\\', "/");
+    Task::new(
+        TaskSpec::command(
+            "powershell",
+            vec![
+                "-NoProfile".into(),
+                "-Command".into(),
+                format!(
+                    "[System.IO.File]::WriteAllText('{path}', [System.Diagnostics.Process]::GetCurrentProcess().Id); Start-Sleep -Seconds 60"
+                ),
             ],
         ),
         TaskRequirements::generic(1, 120),
@@ -226,9 +269,25 @@ fn echo_task(id: TaskId, text: &str) -> Task {
 }
 
 /// A task whose stdout is `bytes` zero bytes: a big result frame.
+#[cfg(unix)]
 fn big_output_task(bytes: usize) -> Task {
     Task::new(
         TaskSpec::command("head", vec!["-c".into(), bytes.to_string(), "/dev/zero".into()]),
+        TaskRequirements::generic(1, 60),
+    )
+}
+
+#[cfg(windows)]
+fn big_output_task(bytes: usize) -> Task {
+    Task::new(
+        TaskSpec::command(
+            "powershell",
+            vec![
+                "-NoProfile".into(),
+                "-Command".into(),
+                format!("[Console]::OpenStandardOutput().Write([byte[]]::new({bytes}), 0, {bytes})"),
+            ],
+        ),
         TaskRequirements::generic(1, 60),
     )
 }
@@ -411,11 +470,29 @@ async fn test_a_silent_master_is_detected_and_the_worker_reconnects() {
 #[tokio::test]
 async fn test_a_healthy_master_that_acks_heartbeats_is_never_dropped() {
     let master = ScriptedMaster::start().await;
-    let worker = start_worker(master.addr, |c| c.with_dead_peer_timeout(Duration::from_millis(1800)));
-    let mut conn = master.accept(1).await;
+    #[cfg(windows)]
+    let (dead_peer_timeout, test_duration, hb_secs, default_hb) = (
+        Duration::from_millis(6000),
+        Duration::from_secs(4),
+        0,
+        Duration::from_millis(300),
+    );
+    #[cfg(not(windows))]
+    let (dead_peer_timeout, test_duration, hb_secs, default_hb) = (
+        Duration::from_millis(1800),
+        Duration::from_secs(6),
+        1,
+        Duration::from_secs(3),
+    );
+
+    let worker = start_worker(master.addr, |mut c| {
+        c.default_heartbeat_interval = default_hb;
+        c.with_dead_peer_timeout(dead_peer_timeout)
+    });
+    let mut conn = master.accept(hb_secs).await;
 
     // Several multiples of the dead-peer timeout, acknowledging every heartbeat like a real master.
-    let until = Instant::now() + Duration::from_secs(6);
+    let until = Instant::now() + test_duration;
     let mut acked = 0;
     while Instant::now() < until {
         let left = until.saturating_duration_since(Instant::now());
@@ -531,8 +608,12 @@ impl SlowFrames {
 async fn test_a_slow_but_progressing_upload_is_not_mistaken_for_a_dead_master() {
     let master = ScriptedMaster::start().await;
     // The dead-peer timeout is far shorter than the upload: only its progress keeps the link alive.
+    #[cfg(windows)]
+    let timeout = Duration::from_millis(15000);
+    #[cfg(not(windows))]
+    let timeout = Duration::from_millis(1200);
     let worker = start_worker(master.addr, |c| {
-        c.with_dead_peer_timeout(Duration::from_millis(1200))
+        c.with_dead_peer_timeout(timeout)
             .with_max_output_bytes(BIG + 1024)
     });
     let conn = master.accept(1).await;
@@ -549,7 +630,11 @@ async fn test_a_slow_but_progressing_upload_is_not_mistaken_for_a_dead_master() 
     };
     let started = Instant::now();
     let mut delivered = None;
-    while let Some(msg) = slow.next(128 * 1024, Duration::from_millis(10)).await {
+    #[cfg(windows)]
+    let (chunk, pause) = (512 * 1024, Duration::from_millis(5));
+    #[cfg(not(windows))]
+    let (chunk, pause) = (128 * 1024, Duration::from_millis(10));
+    while let Some(msg) = slow.next(chunk, pause).await {
         if is_result_of(&msg, big_id) {
             delivered = Some(msg);
             break;

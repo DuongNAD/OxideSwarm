@@ -609,7 +609,7 @@ async fn test_security_headers_on_every_kind_of_response() {
             method,
             path,
             &headers,
-            Some("{}").filter(|_| method == "POST"),
+            (method == "POST").then_some("{}"),
         )
         .await;
         assert_eq!(resp.status, expected_status, "{method} {path}");

@@ -19,7 +19,10 @@ use rusty_grid_core::cluster_auth::{
     send_reject, server_handshake, ClusterSecret, REJECT_NO_SECRET, WIRE_FORMAT_AUTH,
 };
 use rusty_grid_core::mapreduce::{MapReduceJobSpec, MapReduceResult};
-use rusty_grid_core::protocol::{ClientMessage, ClientResponse, InboundMessage, ProtocolError};
+use rusty_grid_core::protocol::{
+    ClientMessage, ClientResponse, EndpointRole, InboundMessage, ProtocolCapabilities,
+    ProtocolError, PROTOCOL_VERSION_CURRENT, PROTOCOL_VERSION_MIN_COMPATIBLE,
+};
 use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus};
 #[cfg(feature = "p2p")]
 use rusty_grid_core::transport::{BiStream, GridStream, GRID_ALPN, STREAM_CONTROL, STREAM_DATA};
@@ -948,16 +951,21 @@ impl MasterServer {
 /// Unix / macOS: ~/.oxideswarm/master_key.bin
 /// Windows: %USERPROFILE%\.oxideswarm\master_key.bin
 pub fn default_master_key_file() -> Option<PathBuf> {
+    if let Some(custom) = std::env::var_os("OXIDESWARM_HOME").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(custom).join("master_key.bin"));
+    }
     #[cfg(windows)]
     {
         std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
+            .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .map(|h| h.join(".oxideswarm").join("master_key.bin"))
     }
     #[cfg(not(windows))]
     {
         std::env::var_os("HOME")
+            .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .map(|h| h.join(".oxideswarm").join("master_key.bin"))
     }
@@ -2467,9 +2475,9 @@ where
 
     if let Some(secret) = cluster_secret {
         match tokio::time::timeout_at(deadline, server_handshake(transport, secret)).await {
-            // The session key is unused until an AEAD record layer exists (see cluster_auth docs).
-            Ok(Ok(_session_key)) => {
+            Ok(Ok(session_key)) => {
                 debug!(remote = %peer, lane, "Peer authenticated with the cluster secret");
+                transport.enable_encryption(&session_key, EndpointRole::Server);
             }
             Ok(Err(e @ (GridError::ConnectionClosed | GridError::Io(_)))) => {
                 debug!(remote = %peer, lane, error = %e, "Peer disconnected during cluster authentication");
@@ -2654,16 +2662,36 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     };
 
     // 2. Validate Register message
-    let (worker_id, capabilities) = match worker_msg {
+    let (worker_id, capabilities, _worker_protocol_version, worker_features) = match worker_msg {
         WorkerMessage::Register {
             worker_id,
             capabilities,
+            protocol_version,
+            features,
         } => {
+            if protocol_version < PROTOCOL_VERSION_MIN_COMPATIBLE {
+                let reject_ack = MasterMessage::RegisterAck {
+                    accepted: false,
+                    worker_id,
+                    heartbeat_interval_secs: 0,
+                    protocol_version: PROTOCOL_VERSION_CURRENT,
+                    features: ProtocolCapabilities::empty(),
+                    message: Some(format!(
+                        "Incompatible protocol version {protocol_version} (minimum required: {PROTOCOL_VERSION_MIN_COMPATIBLE})"
+                    )),
+                };
+                let _ = transport.send_msg(&reject_ack).await;
+                return Err(GridError::RegistrationRejected(format!(
+                    "Incompatible protocol version {protocol_version}"
+                )));
+            }
             if capabilities.cpu_cores == 0 {
                 let reject_ack = MasterMessage::RegisterAck {
                     accepted: false,
                     worker_id,
                     heartbeat_interval_secs: 0,
+                    protocol_version: PROTOCOL_VERSION_CURRENT,
+                    features: ProtocolCapabilities::empty(),
                     message: Some("Invalid capability: cpu_cores must be > 0".into()),
                 };
                 let _ = transport.send_msg(&reject_ack).await;
@@ -2671,13 +2699,15 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     "cpu_cores must be > 0".into(),
                 ));
             }
-            (worker_id, capabilities)
+            (worker_id, capabilities, protocol_version, features)
         }
         other => {
             let reject_ack = MasterMessage::RegisterAck {
                 accepted: false,
                 worker_id: Uuid::nil(),
                 heartbeat_interval_secs: 0,
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
                 message: Some(format!(
                     "Expected Register message, received {}",
                     other.variant_name()
@@ -2743,10 +2773,13 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     };
 
     // 4. Send RegisterAck
+    let negotiated_features = worker_features & ProtocolCapabilities::all_supported();
     let ack = MasterMessage::RegisterAck {
         accepted: true,
         worker_id,
         heartbeat_interval_secs,
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: negotiated_features,
         message: Some(rusty_grid_core::protocol::master_features::announcement(
             rusty_grid_core::protocol::master_features::SUPPORTED,
         )),
@@ -2902,6 +2935,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             WorkerMessage::Register { .. } => {
                                 warn!(worker_id = %worker_id, "Ignoring unexpected Register message on active connection");
                             }
+                            WorkerMessage::UnknownVariant { tag, ref raw_bytes } => {
+                                warn!(worker_id = %worker_id, tag, raw_bytes_len = raw_bytes.len(), "Ignoring unrecognized WorkerMessage variant from future protocol version");
+                            }
 
                         }
                     }
@@ -3049,16 +3085,36 @@ async fn handle_multiplexed_connection<
     };
 
     // 2. Validate Register message
-    let (worker_id, capabilities) = match worker_msg {
+    let (worker_id, capabilities, _worker_protocol_version, worker_features) = match worker_msg {
         WorkerMessage::Register {
             worker_id,
             capabilities,
+            protocol_version,
+            features,
         } => {
+            if protocol_version < PROTOCOL_VERSION_MIN_COMPATIBLE {
+                let reject_ack = MasterMessage::RegisterAck {
+                    accepted: false,
+                    worker_id,
+                    heartbeat_interval_secs: 0,
+                    protocol_version: PROTOCOL_VERSION_CURRENT,
+                    features: ProtocolCapabilities::empty(),
+                    message: Some(format!(
+                        "Incompatible protocol version {protocol_version} (minimum required: {PROTOCOL_VERSION_MIN_COMPATIBLE})"
+                    )),
+                };
+                let _ = ctrl_transport.send_msg(&reject_ack).await;
+                return Err(GridError::RegistrationRejected(format!(
+                    "Incompatible protocol version {protocol_version}"
+                )));
+            }
             if capabilities.cpu_cores == 0 {
                 let reject_ack = MasterMessage::RegisterAck {
                     accepted: false,
                     worker_id,
                     heartbeat_interval_secs: 0,
+                    protocol_version: PROTOCOL_VERSION_CURRENT,
+                    features: ProtocolCapabilities::empty(),
                     message: Some("Invalid capability: cpu_cores must be > 0".into()),
                 };
                 let _ = ctrl_transport.send_msg(&reject_ack).await;
@@ -3066,13 +3122,15 @@ async fn handle_multiplexed_connection<
                     "cpu_cores must be > 0".into(),
                 ));
             }
-            (worker_id, capabilities)
+            (worker_id, capabilities, protocol_version, features)
         }
         other => {
             let reject_ack = MasterMessage::RegisterAck {
                 accepted: false,
                 worker_id: Uuid::nil(),
                 heartbeat_interval_secs: 0,
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
                 message: Some(format!(
                     "Expected Register message, received {}",
                     other.variant_name()
@@ -3137,10 +3195,13 @@ async fn handle_multiplexed_connection<
     };
 
     // 4. Send RegisterAck over control stream
+    let negotiated_features = worker_features & ProtocolCapabilities::all_supported();
     let ack = MasterMessage::RegisterAck {
         accepted: true,
         worker_id,
         heartbeat_interval_secs,
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: negotiated_features,
         message: Some(rusty_grid_core::protocol::master_features::announcement(
             rusty_grid_core::protocol::master_features::SUPPORTED,
         )),
@@ -3955,6 +4016,8 @@ mod tests {
         let bad_msg = WorkerMessage::Register {
             worker_id: Uuid::new_v4(),
             capabilities: WorkerCapabilities::new("bad-worker", 0, 1024, false, false, None),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
         };
         transport.send_msg(&bad_msg).await.unwrap();
 

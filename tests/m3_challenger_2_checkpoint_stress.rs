@@ -189,8 +189,10 @@ async fn test_adversarial_disconnect_race_during_checkpoint_emission() {
 
 #[tokio::test]
 async fn test_adversarial_zombie_worker_double_reassignment_rejection() {
-    let mut policy = RetryPolicy::default();
-    policy.max_retries = 3;
+    let policy = RetryPolicy {
+        max_retries: 3,
+        ..Default::default()
+    };
     let queue = TaskQueue::with_config(policy, None);
 
     let task = Task::new(
@@ -325,8 +327,10 @@ async fn test_adversarial_zombie_worker_double_reassignment_rejection() {
 
 #[tokio::test]
 async fn test_adversarial_cascading_multi_worker_failure_resumption() {
-    let mut policy = RetryPolicy::default();
-    policy.max_retries = 5;
+    let policy = RetryPolicy {
+        max_retries: 5,
+        ..Default::default()
+    };
     let queue = TaskQueue::with_config(policy, None);
 
     let iters = 100u32;

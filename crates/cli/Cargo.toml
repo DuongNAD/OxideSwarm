@@ -96,3 +96,7 @@ path = "../../tests/cli_dashboard_policy_e2e.rs"
 [[test]]
 name = "cli_worker_identity_e2e"
 path = "../../tests/cli_worker_identity_e2e.rs"
+
+[[test]]
+name = "m4_challenger_1_state_isolation"
+path = "../../tests/m4_challenger_1_state_isolation.rs"

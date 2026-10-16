@@ -10,7 +10,9 @@ use oxideworker::{
     update_telemetry_impl,
 };
 use rusty_grid_core::capabilities::WorkerCapabilities;
-use rusty_grid_core::protocol::{MasterMessage, MessageTransport, WorkerMessage};
+use rusty_grid_core::protocol::{
+    MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage, PROTOCOL_VERSION_CURRENT,
+};
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -129,6 +131,8 @@ async fn test_mobile_coordinator_registration_and_pre_sleep_evacuation() {
     let reg_msg = WorkerMessage::Register {
         worker_id,
         capabilities: caps,
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+        features: ProtocolCapabilities::all_supported(),
     };
     transport
         .send_msg(&reg_msg)

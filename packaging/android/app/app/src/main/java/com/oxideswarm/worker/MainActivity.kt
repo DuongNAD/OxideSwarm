@@ -42,6 +42,7 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
     private lateinit var etWorkerName: TextInputEditText
     private lateinit var etCores: TextInputEditText
     private lateinit var etRamMb: TextInputEditText
+    private lateinit var etClusterSecret: TextInputEditText
     private lateinit var switchSimulateGpu: SwitchMaterial
     private lateinit var switchAutoStart: SwitchMaterial
     private lateinit var tvLogs: TextView
@@ -118,6 +119,7 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
         etWorkerName = findViewById(R.id.etWorkerName)
         etCores = findViewById(R.id.etCores)
         etRamMb = findViewById(R.id.etRamMb)
+        etClusterSecret = findViewById(R.id.etClusterSecret)
         switchSimulateGpu = findViewById(R.id.switchSimulateGpu)
         switchAutoStart = findViewById(R.id.switchAutoStart)
         tvLogs = findViewById(R.id.tvLogs)
@@ -197,11 +199,13 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
         val defaultRam = prefs.getLong(BootCompletedReceiver.KEY_RAM_MB, SystemInfoHelper.getTotalRamMb(this))
         val defaultSimulateGpu = prefs.getBoolean(BootCompletedReceiver.KEY_SIMULATE_GPU, false)
         val defaultAutoStart = prefs.getBoolean(BootCompletedReceiver.KEY_AUTO_START, true)
+        val defaultSecret = prefs.getString(BootCompletedReceiver.KEY_CLUSTER_SECRET, "")
 
         etMasterAddress.setText(defaultMaster)
         etWorkerName.setText(defaultName)
         etCores.setText(defaultCores.toString())
         etRamMb.setText(defaultRam.toString())
+        etClusterSecret.setText(defaultSecret)
         switchSimulateGpu.isChecked = defaultSimulateGpu
         switchAutoStart.isChecked = defaultAutoStart
     }
@@ -214,6 +218,7 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
             .putString(BootCompletedReceiver.KEY_WORKER_NAME, config.workerName)
             .putInt(BootCompletedReceiver.KEY_CORES, config.cores)
             .putLong(BootCompletedReceiver.KEY_RAM_MB, config.ramMb)
+            .putString(BootCompletedReceiver.KEY_CLUSTER_SECRET, config.clusterSecret)
             .putBoolean(BootCompletedReceiver.KEY_SIMULATE_GPU, config.simulateGpu)
             .putBoolean(BootCompletedReceiver.KEY_AUTO_START, autoStart)
             .apply()
@@ -250,6 +255,8 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
         val ramMb = etRamMb.text?.toString()?.toLongOrNull() ?: SystemInfoHelper.getTotalRamMb(this)
         val simulateGpu = switchSimulateGpu.isChecked
         val autoStart = switchAutoStart.isChecked
+        val secret = etClusterSecret.text?.toString()?.trim().orEmpty()
+        val clusterSecret = if (secret.isEmpty()) null else secret
 
         if (master.isEmpty()) {
             etMasterAddress.error = "Master address or P2P ticket required (cluster port, e.g. 192.168.1.100:8088 - not the dashboard port 8080 - or {\"id\":...})"
@@ -266,7 +273,8 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
             workerName = if (name.isEmpty()) SystemInfoHelper.getDefaultWorkerName() else name,
             cores = cores,
             ramMb = ramMb,
-            simulateGpu = simulateGpu
+            simulateGpu = simulateGpu,
+            clusterSecret = clusterSecret
         )
         savePreferences(config, autoStart)
 

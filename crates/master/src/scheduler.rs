@@ -461,6 +461,21 @@ impl<'a> Engine<'a> {
             }
         }
 
+        // Stage 7: Real-GPU priority.
+        // For GPU-requiring tasks, prioritize hardware GPU (wgpu) workers over simulated
+        // GPU workers. Simulated GPU workers are only used when no idle real-GPU worker is available.
+        if view.requires_gpu {
+            let is_real_gpu = |seat: &Seat<'_>| {
+                seat.worker.capabilities.has_gpu && !seat.worker.capabilities.is_simulated_gpu
+            };
+            let has_idle_real_gpu = found
+                .iter()
+                .any(|&idx| is_real_gpu(&self.seats[idx]) && self.seats[idx].used_slots() == 0);
+            if has_idle_real_gpu {
+                found.retain(|&idx| is_real_gpu(&self.seats[idx]));
+            }
+        }
+
         found
     }
 
@@ -475,12 +490,31 @@ impl<'a> Engine<'a> {
                     .capabilities
                     .can_execute_gpu()
                     .cmp(&b.worker.capabilities.can_execute_gpu())
+            } else if view.requires_gpu {
+                let a_real = a.worker.capabilities.has_gpu && !a.worker.capabilities.is_simulated_gpu;
+                let b_real = b.worker.capabilities.has_gpu && !b.worker.capabilities.is_simulated_gpu;
+                b_real.cmp(&a_real)
             } else {
                 std::cmp::Ordering::Equal
             }
         };
         match config.policy {
             SchedulingPolicy::RoundRobin => {
+                if view.requires_gpu {
+                    let real_candidates: Vec<usize> = candidates
+                        .iter()
+                        .copied()
+                        .filter(|&c| {
+                            seats[c].worker.capabilities.has_gpu
+                                && !seats[c].worker.capabilities.is_simulated_gpu
+                        })
+                        .collect();
+                    if !real_candidates.is_empty() {
+                        let idx = self.rr_cursor % real_candidates.len();
+                        self.rr_cursor += 1;
+                        return real_candidates[idx];
+                    }
+                }
                 let idx = self.rr_cursor % candidates.len();
                 self.rr_cursor += 1;
                 candidates[idx]
@@ -2191,5 +2225,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_real_gpu_prioritized_over_simulated_gpu_when_both_idle() {
+        let config = SchedulerConfig::default();
+
+        let w_real = make_worker("worker-wgpu-real", 8, 16384, true, false);
+        let w_sim = make_worker("worker-gpu-simulated", 8, 16384, true, true);
+        let workers = vec![w_real.clone(), w_sim.clone()];
+
+        let gpu_task = Task::new(
+            TaskSpec::gpu_compute("gemm_kernel", 64),
+            TaskRequirements::gpu(30),
+        );
+
+        let report =
+            WorkloadScheduler::matchmake(&config, std::slice::from_ref(&gpu_task), &workers);
+
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].task_id, gpu_task.id);
+        assert_eq!(report.assignments[0].worker_id, w_real.worker_id);
+        assert_ne!(report.assignments[0].worker_id, w_sim.worker_id);
+    }
+
+    #[test]
+    fn test_simulated_gpu_used_when_real_gpu_is_busy() {
+        let config = SchedulerConfig {
+            core_concurrency_multiplier: 1.0,
+            ..Default::default()
+        };
+
+        let mut w_real = make_worker("worker-wgpu-real", 2, 8192, true, false);
+        w_real.active_tasks = 1; // Real GPU is busy (not idle)
+        let w_sim = make_worker("worker-gpu-simulated", 4, 8192, true, true);
+        let workers = vec![w_real.clone(), w_sim.clone()];
+
+        let gpu_task = Task::new(
+            TaskSpec::gpu_compute("gemm_kernel", 64),
+            TaskRequirements::gpu(30),
+        );
+
+        let report =
+            WorkloadScheduler::matchmake(&config, std::slice::from_ref(&gpu_task), &workers);
+
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].task_id, gpu_task.id);
+        // Because real GPU is not idle, simulated GPU can be used and is chosen by least-loaded
+        assert_eq!(report.assignments[0].worker_id, w_sim.worker_id);
+    }
+
+    #[test]
+    fn test_simulated_gpu_used_when_no_real_gpu_worker_in_cluster() {
+        let config = SchedulerConfig::default();
+
+        let w_cpu = make_worker("worker-cpu-only", 4, 8192, false, false);
+        let w_sim = make_worker("worker-gpu-simulated", 8, 16384, true, true);
+        let workers = vec![w_cpu.clone(), w_sim.clone()];
+
+        let gpu_task = Task::new(
+            TaskSpec::gpu_compute("gemm_kernel", 64),
+            TaskRequirements::gpu(30),
+        );
+
+        let report =
+            WorkloadScheduler::matchmake(&config, std::slice::from_ref(&gpu_task), &workers);
+
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].task_id, gpu_task.id);
+        assert_eq!(report.assignments[0].worker_id, w_sim.worker_id);
+        assert_ne!(report.assignments[0].worker_id, w_cpu.worker_id);
+    }
+
+    #[test]
+    fn test_real_gpu_priority_under_round_robin_policy() {
+        let config = SchedulerConfig {
+            policy: SchedulingPolicy::RoundRobin,
+            ..Default::default()
+        };
+
+        let w_real1 = make_worker("worker-wgpu-1", 4, 8192, true, false);
+        let w_real2 = make_worker("worker-wgpu-2", 4, 8192, true, false);
+        let w_sim = make_worker("worker-gpu-sim", 4, 8192, true, true);
+        let workers = vec![w_real1.clone(), w_real2.clone(), w_sim.clone()];
+
+        let task1 = Task::new(TaskSpec::gpu_compute("k1", 10), TaskRequirements::gpu(10));
+        let task2 = Task::new(TaskSpec::gpu_compute("k2", 10), TaskRequirements::gpu(10));
+        let tasks = vec![task1.clone(), task2.clone()];
+
+        let report = WorkloadScheduler::matchmake(&config, &tasks, &workers);
+
+        assert_eq!(report.assignments.len(), 2);
+        // Both tasks must go to real GPU workers, not simulated
+        let assigned_ids: Vec<Uuid> = report.assignments.iter().map(|a| a.worker_id).collect();
+        assert!(assigned_ids.contains(&w_real1.worker_id));
+        assert!(assigned_ids.contains(&w_real2.worker_id));
+        assert!(!assigned_ids.contains(&w_sim.worker_id));
     }
 }
