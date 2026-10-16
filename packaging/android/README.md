@@ -24,7 +24,7 @@ Android's power-management architecture is designed to restrict and suspend back
 Without specialized packaging, a background worker process will be frozen or terminated within **3 to 15 minutes** of turning off the phone screen.
 
 OxideSwarm offers two deployment paths:
-* **Path A:** Native Android Foreground Service App (`packaging/android/app/`). Embeds the native library (`liboxideworker.so`) and supports cluster secret authentication via `nativeSetClusterSecret` and `nativeStartWorkerWithSecret`.
+* **Path A:** Native Android Foreground Service App (`packaging/android/app/`). Embeds the native library (`liboxideworker.so`) and supports cluster secret authentication via `nativeSetClusterSecret`.
 * **Path B:** Termux Background Daemon (`packaging/android/termux/`). Works with the cluster secret today and provides a full Linux userspace for volunteer computing.
 
 > **What the phone needs to join a grid.** The master's *cluster* address, `HOST:8088` (8080 is the dashboard and
@@ -125,9 +125,12 @@ adb shell am start -n com.oxideswarm.worker/.MainActivity
 3. **Configure Coordinator Address:** Enter the master's *cluster* address, IP and port **8088** (e.g. `192.168.1.100:8088`), or a P2P ticket. Not 8080: that is the dashboard.
 4. **Tap "Start Worker":** The worker connects, displays an ongoing status notification, and begins heartbeating every 3 seconds.
 
-> **Known gap:** the app has no field for the cluster secret and its JNI start path builds the worker without one, so it
-> cannot join a master that requires the secret (any master with a non-loopback `--listen`). Until that is added use
-> the Termux worker (Path B). Tracked in the top-level README under Known Limitations.
+> **Cluster secret:** paste the master's secret (hex) into the secret field before tapping Start; a master with a
+> non-loopback `--listen` requires it. The app keeps it in its own preferences file (`worker_secure_tokens.xml`), which
+> is excluded from cloud backups and device transfers, and the worker service reads it from there. The in-process
+> worker gets it through `nativeSetClusterSecret`; the external-process engine gets it in the `OXIDESWARM_SECRET`
+> environment variable, never on its command line. A secret the native library rejects stops the start and the app
+> shows the reason; an empty field clears the secret.
 >
 > The in-process worker keeps its task sandboxes in `<app cache dir>/sandboxes` (the service hands that path to the
 > native library before starting it). If the directory cannot be created the worker does not start and the app shows

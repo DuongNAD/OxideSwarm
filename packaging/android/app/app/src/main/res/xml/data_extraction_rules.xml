@@ -1,9 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- The cluster secret (BootCompletedReceiver.SECRET_PREFS_NAME) stays on the device. The app keeps
+     its preferences in device-protected storage, hence device_sharedpref as well. -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="sharedpref" path="worker_secure_tokens.xml" />
+        <exclude domain="device_sharedpref" path="worker_secure_tokens.xml" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="worker_secure_tokens.xml" />
+        <exclude domain="device_sharedpref" path="worker_secure_tokens.xml" />
     </device-transfer>
 </data-extraction-rules>
