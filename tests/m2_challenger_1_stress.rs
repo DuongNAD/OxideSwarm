@@ -131,6 +131,7 @@ fn test_binary_non_utf8_stdout_stderr_slicing_and_cow() {
         is_gpu_executed: false,
         device_name: None,
         error: None,
+        artifacts: Vec::new(),
     };
 
     let cow_stdout = result.stdout_str();
@@ -184,6 +185,7 @@ fn test_large_payload_5mb_bincode_and_json_roundtrip() {
         is_gpu_executed: true,
         device_name: None,
         error: None,
+        artifacts: Vec::new(),
     };
 
     // --- Bincode Wire Codec Roundtrip ---
@@ -225,6 +227,7 @@ fn test_large_payload_5mb_bincode_and_json_roundtrip() {
         is_gpu_executed: false,
         device_name: None,
         error: None,
+        artifacts: Vec::new(),
     };
 
     let json_bytes = serialize_message(&json_msg, WireCodec::Json)
@@ -674,6 +677,7 @@ fn make_test_worker(
         remote_addr: "127.0.0.1:9000".into(),
         cpu_usage_pct: 0.0,
         ram_available_mb: ram_mb,
+        features: Default::default(),
     }
 }
 

@@ -372,6 +372,9 @@ mod middleware {
     pub fn route_required_scope(method: &Method, path: &str) -> Option<AuthScope> {
         match (method, path) {
             (&Method::GET, "/") => None, // Public SPA HTML (static, contains no cluster data)
+            (&Method::GET, p) if p.starts_with("/api/discovery/probe") => None,
+            (&Method::GET, p) if p.starts_with("/api/rendezvous/master") => None,
+            (&Method::POST, p) if p.starts_with("/api/rendezvous/register") => None,
             (&Method::GET, p)
                 if p.starts_with("/api/status")
                     || p.starts_with("/api/workers")

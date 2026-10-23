@@ -99,6 +99,9 @@ pub struct WebUiState {
     pub stream_slots: Arc<Semaphore>,
     /// Permits for concurrent `/api/chat` agent runs ([`MAX_CONCURRENT_CHATS`]).
     pub chat_slots: Arc<Semaphore>,
+    pub cluster_secret: Option<rusty_grid_core::ClusterSecret>,
+    pub rendezvous_registry:
+        Arc<tokio::sync::RwLock<Option<rusty_grid_core::discovery::RendezvousLease>>>,
 }
 
 impl WebUiState {
@@ -172,6 +175,9 @@ pub fn create_web_ui_state(
         logs: Vec::new(),
         last_result: None,
     }));
+    let cluster_secret = master_handle
+        .as_ref()
+        .and_then(|h| h.cluster_secret().cloned());
     WebUiState {
         registry,
         queue,
@@ -186,6 +192,8 @@ pub fn create_web_ui_state(
         auth_config: Arc::new(AuthConfig::default()),
         stream_slots: Arc::new(Semaphore::new(MAX_STREAM_CLIENTS)),
         chat_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_CHATS)),
+        cluster_secret,
+        rendezvous_registry: Arc::new(tokio::sync::RwLock::new(None)),
     }
 }
 
@@ -280,6 +288,9 @@ pub fn create_web_ui_router_full(
         _ => auth_config,
     };
 
+    let cluster_secret = master_handle
+        .as_ref()
+        .and_then(|h| h.cluster_secret().cloned());
     let state = WebUiState {
         registry,
         queue,
@@ -294,6 +305,8 @@ pub fn create_web_ui_router_full(
         auth_config: Arc::clone(&auth_config),
         stream_slots: Arc::new(Semaphore::new(MAX_STREAM_CLIENTS)),
         chat_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_CHATS)),
+        cluster_secret,
+        rendezvous_registry: Arc::new(tokio::sync::RwLock::new(None)),
     };
 
     Router::new()
@@ -304,6 +317,10 @@ pub fn create_web_ui_router_full(
         .route("/api/workers", get(api_get_workers))
         .route("/api/tasks", get(api_get_tasks).post(api_submit_task))
         .route("/api/tasks/:task_id", get(api_get_task_standardized))
+        // Discovery & Rendezvous Probe APIs
+        .route("/api/discovery/probe", get(api_discovery_probe))
+        .route("/api/rendezvous/register", post(api_rendezvous_register))
+        .route("/api/rendezvous/master", get(api_rendezvous_master))
         // Real-Time Telemetry Streaming
         .route("/ws", get(ws_handler))
         .route("/api/stream", get(ws_handler))
@@ -1502,6 +1519,152 @@ async fn api_run_mode(
         }),
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct DiscoveryProbeQuery {
+    pub nonce: Option<String>,
+}
+
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+        .collect()
+}
+
+pub async fn api_discovery_probe(
+    State(state): State<WebUiState>,
+    Query(params): Query<DiscoveryProbeQuery>,
+) -> Result<Json<rusty_grid_core::discovery::MasterBeacon>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(nonce_str) = params.nonce else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Missing nonce parameter",
+                "message": "Probe query requires a 32-hex-character nonce: ?nonce=<hex>"
+            })),
+        ));
+    };
+
+    if nonce_str.len() != rusty_grid_core::discovery::DISCOVERY_PROBE_NONCE_LEN * 2 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Invalid nonce length",
+                "message": "Nonce must be exactly 32 hex characters (16 bytes)"
+            })),
+        ));
+    }
+
+    let Some(nonce_bytes) = hex_decode(&nonce_str) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Invalid hex encoding",
+                "message": "Nonce contains non-hexadecimal characters"
+            })),
+        ));
+    };
+
+    if nonce_bytes.len() != rusty_grid_core::discovery::DISCOVERY_PROBE_NONCE_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Invalid nonce byte count",
+                "message": "Decoded nonce must be exactly 16 bytes"
+            })),
+        ));
+    }
+
+    let local_ip = if state.server_addr.ip().is_loopback() {
+        state.server_addr.ip()
+    } else if state.server_addr.ip().is_unspecified() {
+        rusty_grid_core::discovery::get_local_ip_or_loopback()
+    } else {
+        state.server_addr.ip()
+    };
+    let cluster_addr = format!("{}:{}", local_ip, state.server_addr.port());
+
+    let web_ui_url = state
+        .dashboard_addr
+        .map(|addr| {
+            let host = if addr.ip().is_unspecified() {
+                rusty_grid_core::discovery::get_local_ip_or_loopback()
+            } else {
+                addr.ip()
+            };
+            format!("http://{}:{}", host, addr.port())
+        })
+        .unwrap_or_default();
+
+    let hostname = sysinfo::System::host_name().unwrap_or_else(|| "OxideMaster".to_string());
+    let worker_count = state.registry.list_workers().await.len();
+
+    let mut beacon = rusty_grid_core::discovery::MasterBeacon::new(
+        cluster_addr,
+        web_ui_url,
+        hostname,
+        worker_count,
+    );
+
+    if let Some(ref secret) = state.cluster_secret {
+        beacon.sign(secret, &nonce_bytes);
+    }
+
+    Ok(Json(beacon))
+}
+
+pub async fn api_rendezvous_register(
+    State(state): State<WebUiState>,
+    Json(lease): Json<rusty_grid_core::discovery::RendezvousLease>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    if lease.service != rusty_grid_core::discovery::DISCOVERY_SERVICE_NAME {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Invalid service",
+                "message": "Lease service name does not match OxideSwarm"
+            })),
+        ));
+    }
+
+    if let Some(ref secret) = state.cluster_secret {
+        if !lease.verify(secret, 30) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Invalid signature",
+                    "message": "Rendezvous lease signature verification failed"
+                })),
+            ));
+        }
+    }
+
+    let mut guard = state.rendezvous_registry.write().await;
+    *guard = Some(lease);
+    Ok(StatusCode::OK)
+}
+
+pub async fn api_rendezvous_master(
+    State(state): State<WebUiState>,
+) -> Result<Json<rusty_grid_core::discovery::RendezvousLease>, StatusCode> {
+    let guard = state.rendezvous_registry.read().await;
+    if let Some(ref lease) = *guard {
+        let now = chrono::Utc::now().timestamp() as u64;
+        if now
+            <= lease
+                .timestamp
+                .saturating_add(lease.ttl_secs)
+                .saturating_add(30)
+        {
+            return Ok(Json(lease.clone()));
+        }
+    }
+    Err(StatusCode::NOT_FOUND)
 }
 
 #[cfg(test)]

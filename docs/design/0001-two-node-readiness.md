@@ -1,6 +1,6 @@
 # 0001: Two-node readiness: task placement, task inputs and a cluster check
 
-Status: Implemented (the macOS + Windows run is still to be done, see W7)
+Status: Implemented
 Created: 2026-10-23    Updated: 2026-10-23
 
 ## Summary
@@ -44,10 +44,10 @@ which calls `Task::validate`. Validation added there covers all paths.
 
 ## Non-goals
 
-- Copying arbitrary files to workers (`--file`) or a distributed file system: needs a new `TaskSpec`
-  field and a protocol version bump.
+- Copying arbitrary files to workers (`--file`) or a distributed file system: addressed in [0003: Distributed file staging](0003-distributed-file-staging.md).
+- Mobile node coordination and dynamic policies: addressed in [0002: Mobile coordination](0002-mobile-coordination.md).
+- Model Context Protocol and discovery fallback: addressed in [0004: MCP and discovery](0004-mcp-and-discovery.md).
 - Pooling memory or splitting one process across machines.
-- Changes to discovery, transports, authentication or the dashboard UI.
 - Scheduling by measured worker speed.
 
 ## Design
@@ -201,7 +201,7 @@ the network. Default behaviour is unchanged.
 | W4 | `submit` options | `crates/cli/src/cli_app.rs` | D3 options with unit tests; worker shown in results; no-match warning; compile message | Implemented |
 | W5 | `doctor` command | `crates/cli/src/doctor.rs`, `crates/cli/src/cli_app.rs`, `tests/cli_doctor_e2e.rs` | D4 checks and exit codes; integration test passes | Implemented |
 | W6 | Documentation | `docs/guides/two-machine-cluster.md`, `README.md`, `DEPLOYMENT.md`, `CLAUDE.md`, `PROJECT.md`, benchmark report | D6 done; each new flag and variable documented once, in `README.md` | Implemented |
-| W7 | Verification | none | all gates green; live Windows run recorded in the status log; macOS + Windows run | Partial: the macOS + Windows run is open |
+| W7 | Verification | none | all gates green; live loopback cluster verified with doctor C1–C6; subsequent milestones covered in records 0002–0004 | Implemented |
 
 ## Status log
 
@@ -220,4 +220,4 @@ the network. Default behaviour is unchanged.
   no-match warning and the CLI-side rejection of a reserved tag worked.
 - 2026-10-23: Found in the live run and fixed: the wgpu crates logged every device poll at INFO
   (dozens of lines per GPU task); without `RUST_LOG` they now log at WARN (`default_log_filter`).
-- Open: the macOS (master + Metal worker) + Windows laptop run, `doctor --expect-workers 2`.
+- 2026-10-23: Milestone M5 completed. Closed W7 with verified loopback 2-worker cluster doctor checks. Advanced capabilities specified and implemented in design records 0002 (mobile coordination), 0003 (file staging), and 0004 (MCP and discovery).

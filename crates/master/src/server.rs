@@ -124,6 +124,8 @@ pub struct ServerConfig {
     /// so a bare local master still has a usable dashboard (default: false; the CLI turns it on).
     /// See [`crate::auth::resolve_dashboard_auth`].
     pub implicit_local_dashboard: bool,
+    /// Optional URL of rendezvous registry for cross-subnet discovery (or set OXIDESWARM_RENDEZVOUS).
+    pub rendezvous_url: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -164,6 +166,7 @@ impl Default for ServerConfig {
             max_terminal_bytes: DEFAULT_MAX_TERMINAL_BYTES,
             mapreduce_parallelism: DEFAULT_MAPREDUCE_PARALLELISM,
             implicit_local_dashboard: false,
+            rendezvous_url: None,
         }
     }
 }
@@ -352,6 +355,12 @@ impl ServerConfig {
     /// [`ServerConfig::implicit_local_dashboard`]).
     pub fn with_implicit_local_dashboard(mut self, enable: bool) -> Self {
         self.implicit_local_dashboard = enable;
+        self
+    }
+
+    /// Sets the rendezvous registry URL for cross-subnet discovery (or set OXIDESWARM_RENDEZVOUS).
+    pub fn with_rendezvous_url(mut self, url: impl Into<String>) -> Self {
+        self.rendezvous_url = Some(url.into());
         self
     }
 }
@@ -807,6 +816,7 @@ impl MasterServer {
             #[cfg(feature = "p2p")]
             p2p_active_conns,
             p2p_ticket: p2p_ticket.clone(),
+            cluster_secret: config.cluster_secret.clone(),
         };
 
         // 4. Spawn Unified Web Observability & Control Dashboard (if enabled)
@@ -883,6 +893,51 @@ impl MasterServer {
                     disc_registry,
                     disc_secret,
                     disc_shutdown_rx,
+                )
+                .await;
+            });
+        }
+
+        // 6. Spawn Rendezvous Registry Periodic Registration (if configured)
+        let rendezvous_target = config.rendezvous_url.clone().or_else(|| {
+            std::env::var("OXIDESWARM_RENDEZVOUS")
+                .or_else(|_| std::env::var("RUSTY_GRID_RENDEZVOUS"))
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        });
+        if let Some(rendezvous_url) = rendezvous_target {
+            let web_ui_url = dashboard_addr
+                .map(|addr| {
+                    let host = if addr.ip().is_unspecified() {
+                        rusty_grid_core::discovery::get_local_ip_or_loopback()
+                    } else {
+                        addr.ip()
+                    };
+                    format!("http://{}:{}", host, addr.port())
+                })
+                .unwrap_or_default();
+            let hostname =
+                sysinfo::System::host_name().unwrap_or_else(|| "OxideMaster".to_string());
+            let reg = handle.registry().clone();
+            let sec = config.cluster_secret.clone();
+            let rx = shutdown_rx.clone();
+            let ticket = p2p_ticket.clone();
+            let c_addr = if server_addr.ip().is_unspecified() {
+                let local_ip = rusty_grid_core::discovery::get_local_ip_or_loopback();
+                format!("{}:{}", local_ip, server_addr.port())
+            } else {
+                server_addr.to_string()
+            };
+            tokio::spawn(async move {
+                spawn_master_rendezvous_registration(
+                    rendezvous_url,
+                    c_addr,
+                    web_ui_url,
+                    hostname,
+                    ticket,
+                    reg,
+                    sec,
+                    rx,
                 )
                 .await;
             });
@@ -1815,6 +1870,9 @@ async fn apply_mobile_telemetry(
     if claimed != worker_id {
         warn!(worker_id = %worker_id, claimed = %claimed, "Mobile telemetry names a different worker than its connection");
     }
+    let bat_pct = status.battery_pct;
+    let is_chg = status.is_charging;
+    let th_thr = status.thermal_throttled;
     match registry
         .update_mobile_telemetry(&worker_id, Some(session_id), status)
         .await
@@ -1822,9 +1880,9 @@ async fn apply_mobile_telemetry(
         Ok(true) => {
             debug!(
                 worker_id = %worker_id,
-                battery_pct = ?status.battery_pct,
-                is_charging = ?status.is_charging,
-                thermal_throttled = status.thermal_throttled,
+                battery_pct = ?bat_pct,
+                is_charging = ?is_chg,
+                thermal_throttled = th_thr,
                 "Worker mobile telemetry updated"
             );
             scheduler_notify.notify_one();
@@ -1882,6 +1940,7 @@ async fn handle_session_task_message(
             is_gpu_executed,
             device_name,
             error,
+            artifacts,
         } => {
             if claimed != worker_id {
                 warn!(worker_id = %worker_id, claimed = %claimed, task_id = %task_id, "Result names a different worker than its connection");
@@ -1896,6 +1955,7 @@ async fn handle_session_task_message(
                 is_gpu_executed,
                 device_name,
                 error,
+                artifacts,
             };
             // Once a result starts being applied it must finish, even if this connection is
             // aborted meanwhile (reaper, or the worker re-registering): the queue transition and
@@ -2706,6 +2766,90 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             }
             (worker_id, capabilities, protocol_version, features)
         }
+        WorkerMessage::ClaimMasterRole { ticket } => {
+            let now_epoch_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+
+            let verdict = if let Some(ref secret) = cluster_secret {
+                let incumbent_ticket = rusty_grid_core::arbitrage::MasterLeaseTicket::issue(
+                    ticket.cluster_id,
+                    Uuid::nil(),
+                    1,
+                    3500,
+                    now_epoch_ms,
+                    std::time::Duration::from_millis(
+                        rusty_grid_core::arbitrage::LEASE_VALIDITY_DURATION_MS,
+                    ),
+                    secret,
+                );
+                rusty_grid_core::arbitrage::evaluate_master_claim(
+                    &incumbent_ticket,
+                    &ticket,
+                    secret,
+                    now_epoch_ms,
+                )
+            } else if ticket.authority_score < rusty_grid_core::arbitrage::ELECTION_THRESHOLD_SCORE
+            {
+                rusty_grid_core::arbitrage::ClaimVerdict::RejectedInferiorScore
+            } else {
+                rusty_grid_core::arbitrage::ClaimVerdict::AcceptedAndStepDown
+            };
+
+            match verdict {
+                rusty_grid_core::arbitrage::ClaimVerdict::AcceptedAndStepDown => {
+                    let queue_snapshot = queue.get_schedulable_tasks().await;
+                    let connected_workers = registry
+                        .list_workers()
+                        .await
+                        .into_iter()
+                        .filter(|w| {
+                            w.status == crate::registry::WorkerStatus::Connected
+                                || w.status == crate::registry::WorkerStatus::Busy
+                        })
+                        .map(|w| w.capabilities)
+                        .collect();
+
+                    let ack = MasterMessage::RoleHandoverAck {
+                        accepted: true,
+                        reason: None,
+                        task_queue_snapshot: queue_snapshot,
+                        connected_workers,
+                    };
+                    let _ = transport.send_msg(&ack).await;
+                    info!(
+                        new_master = %ticket.master_id,
+                        score = ticket.authority_score,
+                        "Master role claim accepted during handshake; coordinator step-down complete"
+                    );
+                    return Ok(());
+                }
+                rusty_grid_core::arbitrage::ClaimVerdict::RejectedInferiorScore => {
+                    let ack = MasterMessage::RoleHandoverAck {
+                        accepted: false,
+                        reason: Some(format!(
+                            "Claimant authority score {} does not exceed incumbent authority score",
+                            ticket.authority_score
+                        )),
+                        task_queue_snapshot: Vec::new(),
+                        connected_workers: Vec::new(),
+                    };
+                    let _ = transport.send_msg(&ack).await;
+                    return Ok(());
+                }
+                rusty_grid_core::arbitrage::ClaimVerdict::RejectedInvalidTicket(err) => {
+                    let ack = MasterMessage::RoleHandoverAck {
+                        accepted: false,
+                        reason: Some(format!("Invalid lease ticket: {err}")),
+                        task_queue_snapshot: Vec::new(),
+                        connected_workers: Vec::new(),
+                    };
+                    let _ = transport.send_msg(&ack).await;
+                    return Ok(());
+                }
+            }
+        }
         other => {
             let reject_ack = MasterMessage::RegisterAck {
                 accepted: false,
@@ -2727,11 +2871,13 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     };
 
     // 3. Register in WorkerRegistry
+    let negotiated_features = worker_features & ProtocolCapabilities::all_supported();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<MasterMessage>(128);
     let registration = registry
         .register_session(
             worker_id,
             capabilities,
+            negotiated_features,
             remote_addr,
             outbound_tx.clone(),
             abort_handle,
@@ -2846,6 +2992,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     });
 
     // 7. Inbound reader loop
+    let mut handover_accepted = false;
     loop {
         tokio::select! {
             inbound_res = reader.recv_msg::<WorkerMessage>() => {
@@ -2927,15 +3074,115 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                     broadcast_tx.as_ref(),
                                 ).await;
                             }
-                            WorkerMessage::MobileTelemetry { worker_id: claimed, battery_pct, is_charging, thermal_throttled } => {
+                            WorkerMessage::MobileTelemetry {
+                                worker_id: claimed,
+                                battery_pct,
+                                is_charging,
+                                thermal_throttled,
+                                battery_temperature,
+                                network_type,
+                                battery_tier,
+                                thermal_tier,
+                            } => {
                                 apply_mobile_telemetry(
                                     &registry,
                                     &scheduler_notify,
                                     worker_id,
                                     session_id,
                                     claimed,
-                                    MobileLiveStatus { battery_pct, is_charging, thermal_throttled },
+                                    MobileLiveStatus {
+                                        battery_pct,
+                                        is_charging,
+                                        thermal_throttled,
+                                        battery_temperature,
+                                        network_type,
+                                        battery_tier,
+                                        thermal_tier,
+                                    },
                                 ).await;
+                            }
+                            WorkerMessage::ClaimMasterRole { ticket } => {
+                                let now_epoch_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+
+                                let verdict = if let Some(ref secret) = cluster_secret {
+                                    let incumbent_ticket = rusty_grid_core::arbitrage::MasterLeaseTicket::issue(
+                                        ticket.cluster_id,
+                                        Uuid::nil(),
+                                        1,
+                                        3500,
+                                        now_epoch_ms,
+                                        std::time::Duration::from_millis(
+                                            rusty_grid_core::arbitrage::LEASE_VALIDITY_DURATION_MS,
+                                        ),
+                                        secret,
+                                    );
+                                    rusty_grid_core::arbitrage::evaluate_master_claim(
+                                        &incumbent_ticket,
+                                        &ticket,
+                                        secret,
+                                        now_epoch_ms,
+                                    )
+                                } else if ticket.authority_score < rusty_grid_core::arbitrage::ELECTION_THRESHOLD_SCORE {
+                                    rusty_grid_core::arbitrage::ClaimVerdict::RejectedInferiorScore
+                                } else {
+                                    rusty_grid_core::arbitrage::ClaimVerdict::AcceptedAndStepDown
+                                };
+
+                                match verdict {
+                                    rusty_grid_core::arbitrage::ClaimVerdict::AcceptedAndStepDown => {
+                                        let queue_snapshot = queue.get_schedulable_tasks().await;
+                                        let connected_workers = registry
+                                            .list_workers()
+                                            .await
+                                            .into_iter()
+                                            .filter(|w| {
+                                                w.status == crate::registry::WorkerStatus::Connected
+                                                    || w.status == crate::registry::WorkerStatus::Busy
+                                            })
+                                            .map(|w| w.capabilities)
+                                            .collect();
+
+                                        let ack = MasterMessage::RoleHandoverAck {
+                                            accepted: true,
+                                            reason: None,
+                                            task_queue_snapshot: queue_snapshot,
+                                            connected_workers,
+                                        };
+                                        let _ = outbound_tx.send(ack).await;
+                                        info!(
+                                            worker_id = %worker_id,
+                                            new_master = %ticket.master_id,
+                                            score = ticket.authority_score,
+                                            "Master role claim accepted during active session; coordinator step-down complete"
+                                        );
+                                        handover_accepted = true;
+                                        break;
+                                    }
+                                    rusty_grid_core::arbitrage::ClaimVerdict::RejectedInferiorScore => {
+                                        let ack = MasterMessage::RoleHandoverAck {
+                                            accepted: false,
+                                            reason: Some(format!(
+                                                "Claimant authority score {} does not exceed incumbent authority score",
+                                                ticket.authority_score
+                                            )),
+                                            task_queue_snapshot: Vec::new(),
+                                            connected_workers: Vec::new(),
+                                        };
+                                        let _ = outbound_tx.send(ack).await;
+                                    }
+                                    rusty_grid_core::arbitrage::ClaimVerdict::RejectedInvalidTicket(err) => {
+                                        let ack = MasterMessage::RoleHandoverAck {
+                                            accepted: false,
+                                            reason: Some(format!("Invalid lease ticket: {err}")),
+                                            task_queue_snapshot: Vec::new(),
+                                            connected_workers: Vec::new(),
+                                        };
+                                        let _ = outbound_tx.send(ack).await;
+                                    }
+                                }
                             }
                             WorkerMessage::Register { .. } => {
                                 warn!(worker_id = %worker_id, "Ignoring unexpected Register message on active connection");
@@ -2996,6 +3243,20 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     }
 
     // 8. Cleanup upon disconnect
+    if handover_accepted {
+        info!(
+            worker_id = %worker_id,
+            "Handover accepted; stepping down cleanly without marking new master as disconnected"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        #[cfg(feature = "p2p")]
+        if let Some(ref guard) = _p2p_guard {
+            guard.unlist().await;
+        }
+        writer_task.abort();
+        return Ok(());
+    }
+
     handle_worker_disconnect_with_broadcast(
         &registry,
         &queue,
@@ -3150,11 +3411,13 @@ async fn handle_multiplexed_connection<
     };
 
     // 3. Register in WorkerRegistry
+    let negotiated_features = worker_features & ProtocolCapabilities::all_supported();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<MasterMessage>(128);
     let registration = registry
         .register_session(
             worker_id,
             capabilities,
+            negotiated_features,
             remote_addr,
             outbound_tx.clone(),
             abort_handle,
@@ -3356,6 +3619,7 @@ async fn handle_multiplexed_connection<
     });
 
     // 7. Multiplexed inbound reader loop
+    let mut handover_accepted = false;
     loop {
         tokio::select! {
             ctrl_res = ctrl_reader.recv_msg::<WorkerMessage>() => {
@@ -3422,15 +3686,115 @@ async fn handle_multiplexed_connection<
                                 ).await;
                                 break;
                             }
-                            WorkerMessage::MobileTelemetry { worker_id: claimed, battery_pct, is_charging, thermal_throttled } => {
+                            WorkerMessage::MobileTelemetry {
+                                worker_id: claimed,
+                                battery_pct,
+                                is_charging,
+                                thermal_throttled,
+                                battery_temperature,
+                                network_type,
+                                battery_tier,
+                                thermal_tier,
+                            } => {
                                 apply_mobile_telemetry(
                                     &registry,
                                     &scheduler_notify,
                                     worker_id,
                                     session_id,
                                     claimed,
-                                    MobileLiveStatus { battery_pct, is_charging, thermal_throttled },
+                                    MobileLiveStatus {
+                                        battery_pct,
+                                        is_charging,
+                                        thermal_throttled,
+                                        battery_temperature,
+                                        network_type,
+                                        battery_tier,
+                                        thermal_tier,
+                                    },
                                 ).await;
+                            }
+                            WorkerMessage::ClaimMasterRole { ticket } => {
+                                let now_epoch_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+
+                                let verdict = if let Some(ref secret) = cluster_secret {
+                                    let incumbent_ticket = rusty_grid_core::arbitrage::MasterLeaseTicket::issue(
+                                        ticket.cluster_id,
+                                        Uuid::nil(),
+                                        1,
+                                        3500,
+                                        now_epoch_ms,
+                                        std::time::Duration::from_millis(
+                                            rusty_grid_core::arbitrage::LEASE_VALIDITY_DURATION_MS,
+                                        ),
+                                        secret,
+                                    );
+                                    rusty_grid_core::arbitrage::evaluate_master_claim(
+                                        &incumbent_ticket,
+                                        &ticket,
+                                        secret,
+                                        now_epoch_ms,
+                                    )
+                                } else if ticket.authority_score < rusty_grid_core::arbitrage::ELECTION_THRESHOLD_SCORE {
+                                    rusty_grid_core::arbitrage::ClaimVerdict::RejectedInferiorScore
+                                } else {
+                                    rusty_grid_core::arbitrage::ClaimVerdict::AcceptedAndStepDown
+                                };
+
+                                match verdict {
+                                    rusty_grid_core::arbitrage::ClaimVerdict::AcceptedAndStepDown => {
+                                        let queue_snapshot = queue.get_schedulable_tasks().await;
+                                        let connected_workers = registry
+                                            .list_workers()
+                                            .await
+                                            .into_iter()
+                                            .filter(|w| {
+                                                w.status == crate::registry::WorkerStatus::Connected
+                                                    || w.status == crate::registry::WorkerStatus::Busy
+                                            })
+                                            .map(|w| w.capabilities)
+                                            .collect();
+
+                                        let ack = MasterMessage::RoleHandoverAck {
+                                            accepted: true,
+                                            reason: None,
+                                            task_queue_snapshot: queue_snapshot,
+                                            connected_workers,
+                                        };
+                                        let _ = ctrl_sender.send(ack).await;
+                                        info!(
+                                            worker_id = %worker_id,
+                                            new_master = %ticket.master_id,
+                                            score = ticket.authority_score,
+                                            "Master role claim accepted during active multiplexed session; coordinator step-down complete"
+                                        );
+                                        handover_accepted = true;
+                                        break;
+                                    }
+                                    rusty_grid_core::arbitrage::ClaimVerdict::RejectedInferiorScore => {
+                                        let ack = MasterMessage::RoleHandoverAck {
+                                            accepted: false,
+                                            reason: Some(format!(
+                                                "Claimant authority score {} does not exceed incumbent authority score",
+                                                ticket.authority_score
+                                            )),
+                                            task_queue_snapshot: Vec::new(),
+                                            connected_workers: Vec::new(),
+                                        };
+                                        let _ = ctrl_sender.send(ack).await;
+                                    }
+                                    rusty_grid_core::arbitrage::ClaimVerdict::RejectedInvalidTicket(err) => {
+                                        let ack = MasterMessage::RoleHandoverAck {
+                                            accepted: false,
+                                            reason: Some(format!("Invalid lease ticket: {err}")),
+                                            task_queue_snapshot: Vec::new(),
+                                            connected_workers: Vec::new(),
+                                        };
+                                        let _ = ctrl_sender.send(ack).await;
+                                    }
+                                }
                             }
                             other => {
                                 warn!(worker_id = %worker_id, message = %other.variant_name(), "Unexpected message on control stream");
@@ -3546,6 +3910,22 @@ async fn handle_multiplexed_connection<
     }
 
     // 8. Cleanup upon disconnect
+    if handover_accepted {
+        info!(
+            worker_id = %worker_id,
+            "Handover accepted; stepping down cleanly without marking new master as disconnected"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        #[cfg(feature = "p2p")]
+        if let Some(ref guard) = _p2p_guard {
+            guard.unlist().await;
+        }
+        ctrl_writer_task.abort();
+        data_writer_task.abort();
+        router_task.abort();
+        return Ok(());
+    }
+
     handle_worker_disconnect_with_broadcast(
         &registry,
         &queue,
@@ -3570,6 +3950,58 @@ async fn handle_multiplexed_connection<
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn spawn_master_rendezvous_registration(
+    rendezvous_url: String,
+    cluster_addr: String,
+    web_ui_url: String,
+    hostname: String,
+    p2p_ticket: Option<String>,
+    registry: WorkerRegistry,
+    cluster_secret: Option<ClusterSecret>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let cluster_addr = if let Ok(parsed) = cluster_addr.parse::<std::net::SocketAddr>() {
+        if parsed.ip().is_unspecified() {
+            let local_ip = rusty_grid_core::discovery::get_local_ip_or_loopback();
+            format!("{}:{}", local_ip, parsed.port())
+        } else {
+            cluster_addr
+        }
+    } else {
+        cluster_addr
+    };
+    let mut ticker = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let workers_count = registry.list_workers().await.len();
+                let mut lease = rusty_grid_core::discovery::RendezvousLease::new(
+                    &cluster_addr,
+                    &web_ui_url,
+                    &hostname,
+                    p2p_ticket.clone(),
+                    workers_count,
+                    120,
+                );
+                if let Some(ref secret) = cluster_secret {
+                    lease.sign(secret);
+                }
+                if let Err(e) = rusty_grid_core::discovery::register_rendezvous_lease(&rendezvous_url, &lease).await {
+                    warn!(url = %rendezvous_url, error = %e, "Failed to register Master lease with rendezvous registry");
+                } else {
+                    debug!(url = %rendezvous_url, "Successfully renewed Master lease in rendezvous registry");
+                }
+            }
+            res = shutdown_rx.changed() => {
+                if (res.is_ok() && *shutdown_rx.borrow()) || res.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Thread-safe client and programmatic handle to a running Master node.
 #[derive(Clone)]
 pub struct MasterHandle {
@@ -3591,9 +4023,15 @@ pub struct MasterHandle {
     p2p_active_conns: Arc<tokio::sync::RwLock<HashMap<Uuid, iroh::endpoint::Connection>>>,
     /// Master's active P2P ticket, if enabled.
     pub p2p_ticket: Option<String>,
+    pub cluster_secret: Option<ClusterSecret>,
 }
 
 impl MasterHandle {
+    /// Returns the shared cluster secret, if configured.
+    pub fn cluster_secret(&self) -> Option<&ClusterSecret> {
+        self.cluster_secret.as_ref()
+    }
+
     /// Returns the active P2P ticket for this master instance, if P2P is enabled.
     pub fn p2p_ticket(&self) -> Option<&str> {
         self.p2p_ticket.as_deref()

@@ -21,3 +21,17 @@ uuid = { workspace = true }
 [dev-dependencies]
 rusty_grid_master = { path = "../master" }
 tempfile = "3"
+
+[[test]]
+name = "mobile_coordination_test"
+path = "../../tests/mobile_coordination_test.rs"
+
+[[test]]
+name = "m5a_challenger_2_stress"
+path = "../../tests/m5a_challenger_2_stress.rs"
+
+[[test]]
+name = "m5a_challenger_1_stress"
+path = "../../tests/m5a_challenger_1_stress.rs"
+
+

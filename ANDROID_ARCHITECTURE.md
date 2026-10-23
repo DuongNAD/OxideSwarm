@@ -19,12 +19,12 @@ treat every section as a specification unless the table below says it exists.
 | Termux worker daemon | **Implemented** (`packaging/android/termux`); it is the only Android path that can hold the cluster secret today |
 | Cluster-secret authentication for the app | **Implemented**: `crates/android_bridge` exposes `nativeSetClusterSecret` and `nativeStartWorkerWithSecret` JNI functions, and Kotlin `WorkerEngine` accepts `clusterSecret` configuring `WorkerConfig.with_cluster_secret` to authenticate against protected masters |
 | 3.3 "100% immune to PPK" | **Qualified**: the worker loop is not a child process, but command / shell / compile tasks spawn child processes (`TaskRunner`), which PPK can kill |
-| 4.2 Adaptive dual-tier keepalive (RRC-aware 10 / 25 / 60 s) | **Design only.** The worker uses a fixed heartbeat interval plus TCP keepalive |
-| 5.1 Mobile master refusal matrix | **Design only** |
-| 5.2 Weighted authority score and election, 5.3 signed master lease tickets, `ClaimMasterRole` | **Design only.** No such code or message exists |
-| 5.4 Pre-sleep evacuation (`< 50 ms`) | **Design only** |
-| Automatic master failover / promotion | **Not implemented.** A person (or script) promotes a node with `switch_role`; if the master dies, workers retry and queued tasks wait |
-| Battery / thermal task throttling | The master scheduler skips mobile workers that are thermally throttled, or below 15 % battery (default `mobile_min_battery_pct`), for compile / GPU tasks. The richer policy model of 3.6 is design |
+| 3.6 Dynamic thermal and battery task throttling | **Implemented**: Multi-tier dynamic policy model ($C_{\text{eff}} = \min(C_{\text{bat}}, C_{\text{therm}})$) in `crates/core/src/capabilities.rs` and `crates/master/src/scheduler.rs`; see [docs/design/0002-mobile-coordination.md](docs/design/0002-mobile-coordination.md) |
+| 4.2 Adaptive dual-tier keepalive (RRC-aware 10 / 25 / 60 s) | **Implemented**: Adaptive heartbeat intervals (10s active, 25s cellular idle, 60s Wi-Fi idle) and dynamic master dead peer windows ($W_{\text{dead}} = \max(2\text{s}, 4 \times \tau_{\text{worker}})$) in `crates/core/src/arbitrage.rs` and `crates/master/src/registry.rs`; see [docs/design/0002-mobile-coordination.md](docs/design/0002-mobile-coordination.md) |
+| 5.1 Mobile master refusal matrix | **Implemented**: 5-rule strict refusal matrix enforced before assuming or holding coordinator role in `crates/core/src/arbitrage.rs`; see [docs/design/0002-mobile-coordination.md](docs/design/0002-mobile-coordination.md) |
+| 5.2 Weighted authority score and election, 5.3 signed master lease tickets, `ClaimMasterRole` | **Implemented**: $S_{\text{auth}} \in [-10000, 10000]$ calculation with 4-stage deterministic tie-breaking, HMAC-SHA256 signed lease tickets, and `ClaimMasterRole` message exchange in `crates/core/src/arbitrage.rs` and `crates/master/src/server.rs`; see [docs/design/0002-mobile-coordination.md](docs/design/0002-mobile-coordination.md) |
+| 5.4 Pre-sleep evacuation (`< 50 ms`) | **Implemented**: Fast evacuation returning in-flight tasks to master queue within $< 50\text{ ms}$ via `Disconnecting` frame with drain flag; see [docs/design/0002-mobile-coordination.md](docs/design/0002-mobile-coordination.md) |
+| Automatic master failover / promotion | **Implemented**: Authority scoring and ticket-based `ClaimMasterRole` handover in `crates/core/src/arbitrage.rs` and `crates/master/src/server.rs` |
 
 ---
 

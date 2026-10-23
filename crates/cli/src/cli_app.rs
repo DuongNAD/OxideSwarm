@@ -145,6 +145,9 @@ pub enum Commands {
 
     /// Workflow modes and presets (test, dev, doc, research)
     Mode(mode_cli::ModeCliArgs),
+
+    /// Model Context Protocol (MCP) server for external AI coding agents (Claude Desktop, Cline, Cursor)
+    Mcp(crate::mcp::McpArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -304,6 +307,13 @@ pub struct MasterArgs {
         help = "Connections allowed in the pre-authentication handshake at once (default 64)"
     )]
     pub max_pending_handshakes: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "URL",
+        help = "URL of rendezvous registry for cross-subnet discovery (or set OXIDESWARM_RENDEZVOUS)"
+    )]
+    pub rendezvous: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -403,6 +413,13 @@ pub struct WorkerArgs {
 
     #[arg(long, help = INSECURE_PEER_HELP)]
     pub insecure: bool,
+
+    #[arg(
+        long,
+        value_name = "URL",
+        help = "URL of rendezvous registry for cross-subnet discovery (or set OXIDESWARM_RENDEZVOUS)"
+    )]
+    pub rendezvous: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -519,6 +536,28 @@ pub struct SubmitArgs {
         help = "GPU tasks: edge of a workgroup tile (default 16)"
     )]
     pub work_group_size: Option<u32>,
+
+    #[arg(
+        long = "file",
+        value_name = "LOCAL[:SANDBOX]",
+        help = "Stage a local file into the task sandbox (repeatable, at most 32 MiB total). Syntax: PATH or LOCAL_PATH:SANDBOX_PATH"
+    )]
+    pub files: Vec<String>,
+
+    #[arg(
+        long = "output",
+        alias = "expected-output",
+        value_name = "PATH",
+        help = "Declare an output artifact path to retrieve from the sandbox upon task completion (repeatable)"
+    )]
+    pub outputs: Vec<String>,
+
+    #[arg(
+        long = "output-dir",
+        value_name = "DIR",
+        help = "Local directory where retrieved output artifacts are written upon task completion (default: current directory)"
+    )]
+    pub output_dir: Option<PathBuf>,
 
     #[arg(last = true, help = "Command arguments (trailing args after --)")]
     pub args: Vec<String>,
@@ -672,13 +711,15 @@ pub async fn run_cli() -> ExitCode {
     } else {
         "info"
     };
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(default_log_filter(log_level))
-            }),
-        )
-        .try_init();
+    let builder = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_log_filter(log_level))),
+    );
+    let _ = if matches!(cli.command, Commands::Mcp(_)) {
+        builder.with_writer(std::io::stderr).try_init()
+    } else {
+        builder.try_init()
+    };
 
     let config_file = match load_config_file(cli.config.as_deref()) {
         Ok(cfg) => cfg,
@@ -706,6 +747,7 @@ pub async fn run_cli() -> ExitCode {
                 ExitCode::from(code as u8)
             }
         }
+        Commands::Mcp(args) => crate::mcp::run_mcp(args, config_file, secret_opts).await,
     }
 }
 
@@ -828,6 +870,10 @@ async fn run_master(
 
     if let Some(ref tf) = p2p_ticket_file {
         server_config = server_config.with_p2p_ticket_file(tf);
+    }
+
+    if let Some(r_url) = args.rendezvous {
+        server_config = server_config.with_rendezvous_url(r_url);
     }
 
     server_config = match apply_web_ui_addr(server_config, args.web_ui_addr.as_deref()) {
@@ -1100,6 +1146,10 @@ async fn run_worker(
         worker_cfg.as_ref().and_then(|w| w.master.clone()),
         DEFAULT_MASTER_ADDR,
     ));
+
+    if let Some(ref r_url) = args.rendezvous {
+        std::env::set_var(rusty_grid_core::discovery::RENDEZVOUS_ENV, r_url);
+    }
 
     let cluster_secret = match secret_opts.resolve(config_file.as_ref(), SecretSection::Worker) {
         Ok(secret) => secret,
@@ -1805,6 +1855,30 @@ async fn run_submit(
         }
     };
 
+    let staged_files = if !args.files.is_empty() {
+        match crate::connect::prepare_staged_files(&args.files) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let expected_outputs = if !args.outputs.is_empty() {
+        match crate::connect::validate_output_paths(&args.outputs) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     let submit_cfg = config_file.as_ref().and_then(|c| c.submit.clone());
     let master_addr = resolve_string(
         args.master.clone(),
@@ -1860,11 +1934,11 @@ async fn run_submit(
         max_retries: args.max_retries,
     };
 
-    let task = Task::new(spec, requirements).with_placement(&placement);
-    let submit_msg = ClientMessage::SubmitTask {
-        task,
-        wait: args.wait,
-    };
+    let mut task = Task::new(spec, requirements).with_placement(&placement);
+    task.staged_files = staged_files;
+    task.expected_outputs = expected_outputs.clone();
+    let wait = args.wait || !expected_outputs.is_empty();
+    let submit_msg = ClientMessage::SubmitTask { task, wait };
 
     let response = match exchange(
         &mut transport,
@@ -1898,10 +1972,29 @@ async fn run_submit(
             let worker_name = fetch_workers(&mut transport, &master_addr, had_secret)
                 .await
                 .and_then(|workers| listed_worker_name(&workers, result.worker_id));
+
+            let output_dir = args.output_dir.as_deref().unwrap_or(Path::new("."));
+            let saved_artifacts = if !result.artifacts.is_empty() {
+                match crate::connect::save_output_artifacts(&result.artifacts, output_dir) {
+                    Ok(saved) => Some(saved),
+                    Err(e) => {
+                        eprintln!("Failed to save output artifacts: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             if args.json {
                 let mut value = serde_json::to_value(&result).unwrap_or_default();
                 if let Some(obj) = value.as_object_mut() {
                     obj.insert("worker_name".to_string(), serde_json::json!(worker_name));
+                    if let Some(ref saved) = saved_artifacts {
+                        let saved_strs: Vec<String> =
+                            saved.iter().map(|p| p.display().to_string()).collect();
+                        obj.insert("saved_artifacts".to_string(), serde_json::json!(saved_strs));
+                    }
                 }
                 println!("{}", serde_json::to_string_pretty(&value).unwrap());
             } else {
@@ -1912,6 +2005,22 @@ async fn run_submit(
                 }
                 println!("Exit Code: {}", result.exit_code);
                 println!("Execution Time: {}ms", result.execution_time_ms);
+                if let Some(ref saved) = saved_artifacts {
+                    println!(
+                        "Artifacts ({} saved to {}):",
+                        saved.len(),
+                        output_dir.display()
+                    );
+                    for (artifact, path) in result.artifacts.iter().zip(saved.iter()) {
+                        println!(
+                            "  - {} ({} bytes, sha256: {}) -> {}",
+                            artifact.path,
+                            artifact.size,
+                            artifact.sha256_hex(),
+                            path.display()
+                        );
+                    }
+                }
                 if !result.stdout.is_empty() {
                     println!("Stdout:\n{}", result.stdout_str().trim());
                 }
@@ -2826,6 +2935,7 @@ mod tests {
             Commands::Workers(a) => a.insecure,
             Commands::Mapreduce(a) => a.insecure,
             Commands::Doctor(a) => a.insecure,
+            Commands::Mcp(a) => a.insecure,
             other => panic!("unexpected {other:?}"),
         };
         for with_flag in [
@@ -2835,6 +2945,7 @@ mod tests {
             &["workers", "--insecure"],
             &["mapreduce", "--input", "x", "--insecure"],
             &["doctor", "--insecure"],
+            &["mcp", "--insecure"],
         ] {
             assert!(insecure_of(with_flag), "{with_flag:?}");
         }
@@ -2846,6 +2957,7 @@ mod tests {
             &["workers"],
             &["mapreduce", "--input", "x"],
             &["doctor"],
+            &["mcp"],
         ] {
             assert!(!insecure_of(without_flag), "{without_flag:?}");
         }

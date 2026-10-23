@@ -393,6 +393,8 @@ pub struct TaskView {
     pub requires_gpu: bool,
     /// Compilation and GPU specs, which throttled or low-battery mobile workers must not receive.
     pub heavy: bool,
+    /// True if the task has staged input files or expects output artifacts (Requirement R2).
+    pub requires_file_staging: bool,
     /// Workers that already handed this task back without running it.
     pub avoid: Vec<Uuid>,
     /// The task's placement constraints (`require:` tags), or why they cannot be read. Submission
@@ -412,6 +414,8 @@ impl TaskView {
                 task.spec,
                 TaskSpec::RustCompilation { .. } | TaskSpec::GpuCompute { .. }
             ),
+            requires_file_staging: !task.staged_files.is_empty()
+                || !task.expected_outputs.is_empty(),
             avoid: Vec::new(),
             placement: task.placement(),
         }
@@ -576,11 +580,22 @@ fn retained_bytes(entry: &TaskEntry) -> usize {
         .latest_checkpoint
         .as_ref()
         .map_or(0, |c| c.delta_state.0.len());
+    let staged_files_bytes: usize = entry
+        .task
+        .staged_files
+        .iter()
+        .map(|f| f.path.len() + f.data.len())
+        .sum();
+    let expected_outputs_bytes: usize = entry.task.expected_outputs.iter().map(String::len).sum();
     let result = entry.result.as_ref().map_or(0, |r| {
         r.stdout.0.len()
             + r.stderr.0.len()
             + r.error.as_ref().map_or(0, String::len)
             + r.device_name.as_ref().map_or(0, String::len)
+            + r.artifacts
+                .iter()
+                .map(|a| a.path.len() + a.data.len())
+                .sum::<usize>()
     });
     let history: usize = entry
         .retry_history
@@ -589,6 +604,8 @@ fn retained_bytes(entry: &TaskEntry) -> usize {
         .sum();
     RETAINED_ENTRY_OVERHEAD_BYTES
         + spec
+        + staged_files_bytes
+        + expected_outputs_bytes
         + checkpoint
         + result
         + history

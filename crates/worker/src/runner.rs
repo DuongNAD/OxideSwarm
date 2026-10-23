@@ -58,13 +58,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::cluster_auth::{ENV_SECRET, ENV_SECRET_FILE};
 use rusty_grid_core::protocol::WorkerMessage;
-use rusty_grid_core::task::{Bytes, BytesMut, CheckpointData, Task, TaskId, TaskResult, TaskSpec};
+use rusty_grid_core::task::{
+    sha256_digest, Bytes, BytesMut, CheckpointData, OutputArtifact, Task, TaskId, TaskResult,
+    TaskSpec, MAX_AGGREGATE_ARTIFACT_BYTES, MAX_OUTPUT_ARTIFACT_BYTES,
+};
 
 use crate::cpu_simd;
 use crate::gpu::{check_gemm_request, DeviceLimits, GpuError};
@@ -641,6 +644,7 @@ impl TaskRunner {
                     is_gpu_executed: false,
                     device_name: None,
                     error: Some("Worker lacks GPU capability".to_string()),
+                    artifacts: Vec::new(),
                 };
             }
         }
@@ -998,6 +1002,7 @@ impl TaskRunner {
                     is_gpu_executed: true,
                     device_name: Some(done.device_name),
                     error: None,
+                    artifacts: Vec::new(),
                 },
                 Ok(Err(err)) => self.gpu_failure(task_id, &err, timeout, start_time),
                 Err(join_error) => {
@@ -1144,6 +1149,102 @@ impl TaskRunner {
         })
     }
 
+    /// Extracts declared expected output artifacts from the sandbox before destruction.
+    pub async fn harvest_output_artifacts(
+        &self,
+        sandbox: &Sandbox,
+        expected_outputs: &[String],
+        task_id: TaskId,
+    ) -> Vec<OutputArtifact> {
+        let mut collected = Vec::new();
+        let mut total_bytes: usize = 0;
+
+        for expected in expected_outputs {
+            let target = match sanitize_relative_path(sandbox.path(), Path::new(expected)) {
+                Ok(p) => p,
+                Err(err) => {
+                    warn!(task_id = %task_id, path = %expected, error = %err, "Ignoring illegal expected output path");
+                    continue;
+                }
+            };
+
+            // Query symlink metadata without following links
+            let meta = match tokio::fs::symlink_metadata(&target).await {
+                Ok(m) => m,
+                Err(_) => {
+                    // File was not produced by task; silently skip
+                    debug!(task_id = %task_id, path = %expected, "Declared output artifact was not produced");
+                    continue;
+                }
+            };
+
+            // Strictly reject symlinks to prevent sandbox exfiltration
+            if meta.is_symlink() {
+                warn!(task_id = %task_id, path = %expected, "Skipping output artifact: symlinks are prohibited for security isolation");
+                continue;
+            }
+
+            if !meta.is_file() {
+                warn!(task_id = %task_id, path = %expected, "Skipping output artifact: path is not a regular file");
+                continue;
+            }
+
+            let size = meta.len() as usize;
+            if size > MAX_OUTPUT_ARTIFACT_BYTES {
+                warn!(task_id = %task_id, path = %expected, size = size, "Skipping output artifact: exceeds single file limit");
+                continue;
+            }
+
+            if total_bytes + size > MAX_AGGREGATE_ARTIFACT_BYTES {
+                warn!(task_id = %task_id, path = %expected, size = size, "Halting artifact collection: aggregate size exceeds 32 MiB limit");
+                break;
+            }
+
+            // Ensure canonical path resolves strictly within the sandbox root
+            if let (Ok(canonical_target), Ok(canonical_sandbox)) = (
+                tokio::fs::canonicalize(&target).await,
+                tokio::fs::canonicalize(sandbox.path()).await,
+            ) {
+                if !canonical_target.starts_with(&canonical_sandbox) {
+                    warn!(task_id = %task_id, path = %expected, "Skipping output artifact: path resolves outside sandbox root");
+                    continue;
+                }
+            }
+
+            // Read artifact content
+            match tokio::fs::read(&target).await {
+                Ok(data) => {
+                    let sha256 = sha256_digest(&data);
+                    total_bytes += size;
+                    collected.push(OutputArtifact {
+                        path: expected.clone(),
+                        size: meta.len(),
+                        sha256,
+                        data: Bytes::from(data),
+                    });
+                }
+                Err(err) => {
+                    warn!(task_id = %task_id, path = %expected, error = %err, "Failed to read output artifact file");
+                }
+            }
+        }
+
+        collected
+    }
+
+    /// Helper to stage files into sandbox before task execution.
+    pub async fn prepare_staged_files(
+        &self,
+        sandbox: &Sandbox,
+        task: &Task,
+    ) -> Result<(), SandboxError> {
+        if task.staged_files.is_empty() {
+            return Ok(());
+        }
+        let cache_base = self.config.sandbox_config.base_dir.join("cache");
+        sandbox.stage_files(&task.staged_files, &cache_base).await
+    }
+
     /// Executes `TaskSpec::Command` inside an isolated sandbox directory.
     #[allow(clippy::too_many_arguments)]
     async fn execute_command_workload(
@@ -1173,6 +1274,19 @@ impl TaskRunner {
                 );
             }
         };
+
+        if let Err(e) = self.prepare_staged_files(&sandbox, task).await {
+            let _ = sandbox.destroy().await;
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_GENERAL_ERROR,
+                "",
+                format!("Failed to stage input files: {e}"),
+                start_time.elapsed().as_millis() as u64,
+                Some(format!("File staging error: {e}")),
+            );
+        }
 
         let effective_cwd = if let Some(sub) = working_dir {
             match sanitize_relative_path(sandbox.path(), sub) {
@@ -1213,6 +1327,14 @@ impl TaskRunner {
             )
             .await;
 
+        let artifacts = if !task.expected_outputs.is_empty() {
+            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id)
+                .await
+        } else {
+            Vec::new()
+        };
+        let mut result = result;
+        result.artifacts = artifacts;
         let _ = sandbox.destroy().await;
         result
     }
@@ -1244,6 +1366,19 @@ impl TaskRunner {
                 );
             }
         };
+
+        if let Err(e) = self.prepare_staged_files(&sandbox, task).await {
+            let _ = sandbox.destroy().await;
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_GENERAL_ERROR,
+                "",
+                format!("Failed to stage input files: {e}"),
+                start_time.elapsed().as_millis() as u64,
+                Some(format!("File staging error: {e}")),
+            );
+        }
 
         let script_path = match sandbox.write_script("task_script.sh", script).await {
             Ok(p) => p,
@@ -1321,6 +1456,14 @@ impl TaskRunner {
             )
             .await;
 
+        let artifacts = if !task.expected_outputs.is_empty() {
+            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id)
+                .await
+        } else {
+            Vec::new()
+        };
+        let mut result = result;
+        result.artifacts = artifacts;
         let _ = sandbox.destroy().await;
         result
     }
@@ -1353,6 +1496,19 @@ impl TaskRunner {
                 );
             }
         };
+
+        if let Err(e) = self.prepare_staged_files(&sandbox, task).await {
+            let _ = sandbox.destroy().await;
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_GENERAL_ERROR,
+                "",
+                format!("Failed to stage input files: {e}"),
+                start_time.elapsed().as_millis() as u64,
+                Some(format!("File staging error: {e}")),
+            );
+        }
 
         // Materialize source files into sandbox
         for (rel_path, content) in source_files {
@@ -1476,6 +1632,14 @@ impl TaskRunner {
             }
         }
 
+        let artifacts = if !task.expected_outputs.is_empty() {
+            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id)
+                .await
+        } else {
+            Vec::new()
+        };
+        let mut res = res;
+        res.artifacts = artifacts;
         let _ = sandbox.destroy().await;
         res
     }

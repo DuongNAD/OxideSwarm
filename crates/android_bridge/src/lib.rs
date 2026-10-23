@@ -68,6 +68,7 @@ struct WorkerState {
     /// Writable directory for task sandboxes, handed over by the app (its cache directory) before
     /// the worker starts. The default, `/data/local/tmp`, is closed to apps.
     sandbox_dir: Mutex<Option<PathBuf>>,
+    evacuation_reason: Mutex<Option<String>>,
     shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
     thread_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -83,6 +84,7 @@ impl WorkerState {
             telemetry: Mutex::new(MobileTelemetry::default()),
             mobile: MobileTelemetryHandle::default(),
             sandbox_dir: Mutex::new(None),
+            evacuation_reason: Mutex::new(None),
             shutdown_tx: Mutex::new(None),
             thread_handle: Mutex::new(None),
         }
@@ -93,7 +95,10 @@ static WORKER_STATE: OnceLock<Arc<WorkerState>> = OnceLock::new();
 
 fn get_worker_state() -> Arc<WorkerState> {
     WORKER_STATE
-        .get_or_init(|| Arc::new(WorkerState::new()))
+        .get_or_init(|| {
+            rusty_grid_worker::client::set_evacuation_reason_hook(get_evacuation_reason_impl);
+            Arc::new(WorkerState::new())
+        })
         .clone()
 }
 
@@ -405,13 +410,19 @@ pub fn update_telemetry_detailed_impl(
     telem.battery_temperature = temp;
     telem.is_charging = Some(is_charging);
     telem.thermal_throttled = thermal_throttled;
-    telem.network_type = net;
+    telem.network_type = net.clone();
     // The worker's scheduling view of this device: without this the Master would keep the
     // registration-time snapshot for the whole run.
+    let bat_tier = MobileLiveStatus::compute_battery_tier(pct, Some(is_charging));
+    let therm_tier = MobileLiveStatus::compute_thermal_tier(temp, thermal_throttled);
     state.mobile.update(MobileLiveStatus {
         battery_pct: pct,
         is_charging: Some(is_charging),
         thermal_throttled,
+        battery_temperature: temp,
+        network_type: net,
+        battery_tier: Some(bat_tier),
+        thermal_tier: Some(therm_tier),
     });
     true
 }
@@ -420,6 +431,30 @@ pub fn update_telemetry_detailed_impl(
 /// Backward-compatible wrapper calling `update_telemetry_detailed_impl`.
 pub fn update_telemetry_impl(battery_pct: i32, is_charging: bool, thermal_throttled: bool) -> bool {
     update_telemetry_detailed_impl(battery_pct, is_charging, thermal_throttled, None, None)
+}
+
+/// Triggers fast pre-sleep task evacuation (< 50ms) before the OS suspends the app process.
+/// Stores the evacuation reason and triggers shutdown_tx so active tasks are aborted immediately
+/// without waiting for the 10-second drain timeout.
+pub fn trigger_fast_evacuation_impl(reason: &str) -> bool {
+    let state = get_worker_state();
+    let r = if reason.trim().is_empty() {
+        "PRE_SLEEP_EVACUATION".to_string()
+    } else {
+        reason.trim().to_string()
+    };
+    info!(reason = %r, "Triggering fast pre-sleep task evacuation (<50ms)");
+    *state.evacuation_reason.lock().unwrap() = Some(r);
+    rusty_grid_worker::client::set_evacuation_reason_hook(get_evacuation_reason_impl);
+    if let Some(tx) = state.shutdown_tx.lock().unwrap().as_ref() {
+        let _ = tx.send(true);
+    }
+    true
+}
+
+/// Retrieves the active evacuation reason, if any.
+pub fn get_evacuation_reason_impl() -> Option<String> {
+    get_worker_state().evacuation_reason.lock().unwrap().clone()
 }
 
 /// Retrieves the current cached mobile telemetry.
@@ -1190,6 +1225,25 @@ pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nati
     }
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeTriggerFastEvacuation<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    reason: JString<'local>,
+) -> jboolean {
+    let reason_str: String = match env.get_string(&reason) {
+        Ok(s) => s.into(),
+        Err(_) => "PRE_SLEEP_EVACUATION".to_string(),
+    };
+    if trigger_fast_evacuation_impl(&reason_str) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
 // ==============================================================================
 // JNI Exported Functions: com.oxideswarm.worker.runner.OxideWorkerBridge
 // ==============================================================================
@@ -1387,6 +1441,19 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
 ) -> jstring {
     Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeDiscoverMaster(
         env, class, timeout_ms,
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeTriggerFastEvacuation<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    class: JClass<'local>,
+    reason: JString<'local>,
+) -> jboolean {
+    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeTriggerFastEvacuation(
+        env, class, reason,
     )
 }
 

@@ -1109,6 +1109,210 @@ impl CheckpointData {
     }
 }
 
+/// Maximum allowable size for a single staged input file (32 MiB).
+pub const MAX_STAGED_FILE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Maximum allowable aggregate size for all staged input files in a task (32 MiB).
+pub const MAX_AGGREGATE_STAGED_BYTES: usize = 32 * 1024 * 1024;
+
+/// Maximum allowable size for a single output artifact captured from sandbox (10 MiB).
+pub const MAX_OUTPUT_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum allowable aggregate size for all output artifacts captured in a task (32 MiB).
+pub const MAX_AGGREGATE_ARTIFACT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Windows reserved DOS device names that cannot be created or accessed as files.
+pub const WINDOWS_RESERVED_DEVICE_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Computes SHA-256 digest over byte slice using ring.
+pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
+}
+
+/// Encodes byte slice into lowercase hexadecimal string without external dependencies.
+pub fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+/// Validates and normalizes a relative sandbox path.
+///
+/// Enforces:
+/// 1. Rejection of embedded null bytes (`\0`).
+/// 2. Normalization of Windows backslashes `\` to canonical forward slashes `/`.
+/// 3. Rejection of empty or root paths (`""`, `"/"`).
+/// 4. Rejection of Unix absolute paths (`/etc/passwd`).
+/// 5. Rejection of Windows drive letters (`C:\`, `C:foo.txt`).
+/// 6. Rejection of Windows UNC paths (`\\server\share`).
+/// 7. Rejection of parent directory traversal (`..`).
+/// 8. Rejection of colons or alternate data streams (`:`).
+/// 9. Rejection of Windows DOS reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`).
+///
+/// Returns the canonical forward-slash separated relative path.
+pub fn validate_relative_sandbox_path(raw: &str) -> Result<String, String> {
+    if raw.is_empty() {
+        return Err("Path cannot be empty".to_string());
+    }
+    if raw.contains('\0') {
+        return Err("Path contains prohibited null byte".to_string());
+    }
+    if raw.starts_with('/') || raw.starts_with('\\') {
+        return Err(format!("Absolute paths are prohibited: '{raw}'"));
+    }
+    if raw.contains(':') {
+        return Err(format!("Colons and drive letters are prohibited: '{raw}'"));
+    }
+
+    let normalized = raw.replace('\\', "/");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return Err("Path cannot be empty".to_string());
+    }
+    if trimmed.starts_with('/') {
+        return Err(format!("Absolute paths are prohibited: '{raw}'"));
+    }
+    if trimmed.starts_with("//") {
+        return Err(format!("UNC prefix is prohibited: '{raw}'"));
+    }
+
+    let mut segments = Vec::new();
+    for seg in trimmed.split('/') {
+        let seg_trimmed = seg.trim();
+        if seg_trimmed.is_empty() || seg_trimmed == "." {
+            continue;
+        }
+        if seg_trimmed == ".." {
+            return Err(format!(
+                "Parent directory traversal ('..') is prohibited: '{raw}'"
+            ));
+        }
+        let cleaned = seg_trimmed.trim_end_matches([' ', '.']);
+        if cleaned.is_empty() {
+            return Err(format!(
+                "Illegal path component '{seg_trimmed}' consisting only of dots/spaces: '{raw}'"
+            ));
+        }
+        let base_name = cleaned
+            .split('.')
+            .next()
+            .unwrap_or(cleaned)
+            .trim_end_matches([' ', '.'])
+            .to_ascii_uppercase();
+        if WINDOWS_RESERVED_DEVICE_NAMES.contains(&base_name.as_str()) {
+            return Err(format!(
+                "Windows reserved device name '{seg_trimmed}' is prohibited: '{raw}'"
+            ));
+        }
+        segments.push(seg_trimmed);
+    }
+
+    if segments.is_empty() {
+        return Err(format!(
+            "Path resolved to empty after normalization: '{raw}'"
+        ));
+    }
+
+    Ok(segments.join("/"))
+}
+
+/// Staged input file materialized into worker's task sandbox prior to execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedFile {
+    /// Relative path within sandbox (canonical forward-slash delimited, e.g. "data/input.csv").
+    pub path: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// SHA-256 content digest.
+    pub sha256: [u8; 32],
+    /// Unix executable permission flag (0o755 if true, 0o644 if false).
+    #[serde(default)]
+    pub executable: bool,
+    /// File payload bytes.
+    pub data: Bytes,
+}
+
+impl StagedFile {
+    pub fn new(path: impl Into<String>, data: impl Into<Bytes>, executable: bool) -> Self {
+        let path = path.into();
+        let data = data.into();
+        let size = data.len() as u64;
+        let sha256 = sha256_digest(data.as_bytes());
+        Self {
+            path,
+            size,
+            sha256,
+            executable,
+            data,
+        }
+    }
+
+    pub fn verify_checksum(&self) -> bool {
+        if self.data.len() as u64 != self.size {
+            return false;
+        }
+        sha256_digest(self.data.as_bytes()) == self.sha256
+    }
+
+    pub fn sha256_hex(&self) -> String {
+        hex_encode(&self.sha256)
+    }
+}
+
+/// Output artifact collected from worker's task sandbox upon task completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputArtifact {
+    /// Relative path within sandbox (e.g. "model/weights.bin").
+    pub path: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// SHA-256 content digest.
+    pub sha256: [u8; 32],
+    /// File payload bytes.
+    #[serde(alias = "content")]
+    pub data: Bytes,
+}
+
+impl OutputArtifact {
+    pub fn new(path: impl Into<String>, data: impl Into<Bytes>) -> Self {
+        let path = path.into();
+        let data = data.into();
+        let size = data.len() as u64;
+        let sha256 = sha256_digest(data.as_bytes());
+        Self {
+            path,
+            size,
+            sha256,
+            data,
+        }
+    }
+
+    pub fn verify_checksum(&self) -> bool {
+        if self.data.len() as u64 != self.size {
+            return false;
+        }
+        sha256_digest(self.data.as_bytes()) == self.sha256
+    }
+
+    pub fn sha256_hex(&self) -> String {
+        hex_encode(&self.sha256)
+    }
+
+    #[inline]
+    pub fn content(&self) -> &Bytes {
+        &self.data
+    }
+}
+
 /// The top-level task representation submitted to Master and dispatched to Workers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
@@ -1126,6 +1330,12 @@ pub struct Task {
     /// Latest checkpoint data for delta resumption.
     #[serde(default)]
     pub latest_checkpoint: Option<CheckpointData>,
+    /// Staged input files to be placed into the task sandbox prior to execution.
+    #[serde(default)]
+    pub staged_files: Vec<StagedFile>,
+    /// Declared output artifact paths to be captured from sandbox upon completion.
+    #[serde(default)]
+    pub expected_outputs: Vec<String>,
 }
 
 impl Task {
@@ -1143,6 +1353,8 @@ impl Task {
             created_at_utc,
             tags: Vec::new(),
             latest_checkpoint: None,
+            staged_files: Vec::new(),
+            expected_outputs: Vec::new(),
         }
     }
 
@@ -1155,6 +1367,30 @@ impl Task {
     /// Builder method to attach latest checkpoint data.
     pub fn with_checkpoint(mut self, checkpoint: CheckpointData) -> Self {
         self.latest_checkpoint = Some(checkpoint);
+        self
+    }
+
+    /// Builder method to attach staged input files.
+    pub fn with_staged_files(mut self, staged_files: Vec<StagedFile>) -> Self {
+        self.staged_files = staged_files;
+        self
+    }
+
+    /// Builder method to attach a single staged input file.
+    pub fn with_staged_file(mut self, file: StagedFile) -> Self {
+        self.staged_files.push(file);
+        self
+    }
+
+    /// Builder method to attach expected output artifact paths.
+    pub fn with_expected_outputs(mut self, expected_outputs: Vec<String>) -> Self {
+        self.expected_outputs = expected_outputs;
+        self
+    }
+
+    /// Builder method to attach a single expected output artifact path.
+    pub fn with_expected_output(mut self, path: impl Into<String>) -> Self {
+        self.expected_outputs.push(path.into());
         self
     }
 
@@ -1175,6 +1411,34 @@ impl Task {
         }
 
         self.placement()?;
+
+        let mut total_staged: u64 = 0;
+        for file in &self.staged_files {
+            if file.data.len() as u64 != file.size {
+                return Err(format!(
+                    "Staged file '{}' payload length {} does not match declared size {}",
+                    file.path,
+                    file.data.len(),
+                    file.size
+                ));
+            }
+            if file.size > MAX_STAGED_FILE_BYTES as u64 {
+                return Err(format!(
+                    "Staged file '{}' size {} exceeds single file limit of 32 MiB",
+                    file.path, file.size
+                ));
+            }
+            total_staged = total_staged.saturating_add(file.size);
+            if total_staged > MAX_AGGREGATE_STAGED_BYTES as u64 {
+                return Err("Aggregate staged files size exceeds limit of 32 MiB".to_string());
+            }
+            validate_relative_sandbox_path(&file.path)?;
+        }
+
+        for output in &self.expected_outputs {
+            validate_relative_sandbox_path(output)?;
+        }
+
         Ok(())
     }
 
@@ -1211,6 +1475,8 @@ pub struct TaskResult {
     pub device_name: Option<String>,
     /// Optional error message if execution or sandboxing encountered an error.
     pub error: Option<String>,
+    /// Captured output artifacts extracted from sandbox.
+    pub artifacts: Vec<OutputArtifact>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1228,6 +1494,8 @@ struct HumanTaskResult {
     pub device_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<OutputArtifact>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1243,6 +1511,40 @@ struct BinaryTaskResult {
     pub is_gpu_executed: bool,
     pub device_name: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub artifacts: Vec<OutputArtifact>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LegacyBinaryTaskResult {
+    pub worker_id: Uuid,
+    pub task_id: TaskId,
+    pub exit_code: i32,
+    #[serde(with = "bytes_serde")]
+    pub stdout: Bytes,
+    #[serde(with = "bytes_serde")]
+    pub stderr: Bytes,
+    pub execution_time_ms: u64,
+    pub is_gpu_executed: bool,
+    pub device_name: Option<String>,
+    pub error: Option<String>,
+}
+
+impl From<LegacyBinaryTaskResult> for TaskResult {
+    fn from(l: LegacyBinaryTaskResult) -> Self {
+        Self {
+            worker_id: l.worker_id,
+            task_id: l.task_id,
+            exit_code: l.exit_code,
+            stdout: l.stdout,
+            stderr: l.stderr,
+            execution_time_ms: l.execution_time_ms,
+            is_gpu_executed: l.is_gpu_executed,
+            device_name: l.device_name,
+            error: l.error,
+            artifacts: Vec::new(),
+        }
+    }
 }
 
 impl From<&TaskResult> for HumanTaskResult {
@@ -1257,6 +1559,7 @@ impl From<&TaskResult> for HumanTaskResult {
             is_gpu_executed: r.is_gpu_executed,
             device_name: r.device_name.clone(),
             error: r.error.clone(),
+            artifacts: r.artifacts.clone(),
         }
     }
 }
@@ -1273,6 +1576,7 @@ impl From<HumanTaskResult> for TaskResult {
             is_gpu_executed: h.is_gpu_executed,
             device_name: h.device_name,
             error: h.error,
+            artifacts: h.artifacts,
         }
     }
 }
@@ -1289,6 +1593,7 @@ impl From<&TaskResult> for BinaryTaskResult {
             is_gpu_executed: r.is_gpu_executed,
             device_name: r.device_name.clone(),
             error: r.error.clone(),
+            artifacts: r.artifacts.clone(),
         }
     }
 }
@@ -1305,6 +1610,7 @@ impl From<BinaryTaskResult> for TaskResult {
             is_gpu_executed: b.is_gpu_executed,
             device_name: b.device_name,
             error: b.error,
+            artifacts: b.artifacts,
         }
     }
 }
@@ -1372,6 +1678,7 @@ impl TaskResult {
             is_gpu_executed,
             device_name: None,
             error: None,
+            artifacts: Vec::new(),
         }
     }
 
@@ -1395,6 +1702,30 @@ impl TaskResult {
             is_gpu_executed: false,
             device_name: None,
             error,
+            artifacts: Vec::new(),
+        }
+    }
+
+    /// Builder method to attach captured output artifacts.
+    pub fn with_artifacts(mut self, artifacts: Vec<OutputArtifact>) -> Self {
+        self.artifacts = artifacts;
+        self
+    }
+
+    /// Builder method to attach a single output artifact.
+    pub fn with_artifact(mut self, artifact: OutputArtifact) -> Self {
+        self.artifacts.push(artifact);
+        self
+    }
+
+    /// Deserializes a `TaskResult` from bincode bytes with legacy binary schema fallback.
+    pub fn from_bincode_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        match bincode::deserialize::<BinaryTaskResult>(bytes) {
+            Ok(b) => Ok(b.into()),
+            Err(_) => {
+                let legacy: LegacyBinaryTaskResult = bincode::deserialize(bytes)?;
+                Ok(legacy.into())
+            }
         }
     }
 }

@@ -22,9 +22,12 @@ use tokio::sync::{watch, Notify};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use rusty_grid_core::capabilities::{
+    calculate_effective_concurrency, BatteryTier, MobileLiveStatus, ThermalTier,
+};
 use rusty_grid_core::error::GridResult;
 use rusty_grid_core::placement::Placement;
-use rusty_grid_core::protocol::MasterMessage;
+use rusty_grid_core::protocol::{MasterMessage, ProtocolCapabilities};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements};
 
 use crate::queue::{AssignedLoad, QueueOrderKey, TaskQueue, TaskView};
@@ -171,6 +174,7 @@ pub struct ScheduleReport {
 struct Shape {
     requires_gpu: bool,
     heavy: bool,
+    requires_file_staging: bool,
     cpu_cores: usize,
     ram_mb: u64,
     placement: Placement,
@@ -181,6 +185,7 @@ impl Shape {
         Self {
             requires_gpu: view.requires_gpu,
             heavy: view.heavy,
+            requires_file_staging: view.requires_file_staging,
             cpu_cores: view.requirements.cpu_cores,
             ram_mb: view.requirements.ram_mb,
             placement: placement.clone(),
@@ -284,9 +289,25 @@ impl<'a> Engine<'a> {
                         unstarted_ram_mb: 0,
                     },
                 };
+                let mut max_slots = config.effective_max_concurrency(worker);
+                if let Some(ref mobile) = worker.capabilities.mobile {
+                    let live = mobile.live_status();
+                    let bat = live.battery_tier.unwrap_or_else(|| {
+                        MobileLiveStatus::compute_battery_tier(live.battery_pct, live.is_charging)
+                    });
+                    let therm = live.thermal_tier.unwrap_or_else(|| {
+                        MobileLiveStatus::compute_thermal_tier(
+                            live.battery_temperature,
+                            live.thermal_throttled,
+                        )
+                    });
+                    let eff =
+                        calculate_effective_concurrency(worker.capabilities.cpu_cores, bat, therm);
+                    max_slots = max_slots.min(eff);
+                }
                 Seat {
                     worker,
-                    max_slots: config.effective_max_concurrency(worker),
+                    max_slots,
                     base,
                     placed: AssignedLoad::default(),
                 }
@@ -318,6 +339,18 @@ impl<'a> Engine<'a> {
         if view.requires_gpu && self.config.fail_unfulfillable_tasks && !self.any_gpu_worker {
             return Verdict::Unfulfillable("Cluster lacks workers with GPU capabilities".into());
         }
+        if view.requires_file_staging
+            && self.config.fail_unfulfillable_tasks
+            && !self.seats.iter().any(|seat| {
+                seat.worker
+                    .features
+                    .contains(ProtocolCapabilities::FILE_STAGING)
+            })
+        {
+            return Verdict::Unfulfillable(
+                "Cluster lacks workers with FILE_STAGING capability".into(),
+            );
+        }
         let nobody_matches = !placement.is_empty()
             && !self
                 .seats
@@ -330,6 +363,16 @@ impl<'a> Engine<'a> {
         }
         let skip_reason = if view.requires_gpu {
             ScheduleSkipReason::NoGpuWorkersAvailable
+        } else if view.requires_file_staging
+            && !self.seats.iter().any(|seat| {
+                seat.worker
+                    .features
+                    .contains(ProtocolCapabilities::FILE_STAGING)
+            })
+        {
+            ScheduleSkipReason::ClusterLacksCapability(
+                "cluster lacks workers with FILE_STAGING capability".into(),
+            )
         } else if nobody_matches {
             ScheduleSkipReason::ClusterLacksCapability(format!(
                 "no worker matches the placement constraints ({placement})"
@@ -442,6 +485,13 @@ impl<'a> Engine<'a> {
                 continue;
             }
 
+            // Stage 3b: File Staging capability gating (Requirement R2)
+            if view.requires_file_staging
+                && !worker.features.contains(ProtocolCapabilities::FILE_STAGING)
+            {
+                continue;
+            }
+
             // Stage 4: Mobile & Environmental Constraints via capability tags and mobile telemetry
             let is_thermal_throttled = worker
                 .capabilities
@@ -465,6 +515,59 @@ impl<'a> Engine<'a> {
             }
             if is_low_battery && view.heavy {
                 continue;
+            }
+
+            if let Some(ref mobile) = worker.capabilities.mobile {
+                let live = mobile.live_status();
+                let bat = live.battery_tier.unwrap_or_else(|| {
+                    MobileLiveStatus::compute_battery_tier(live.battery_pct, live.is_charging)
+                });
+                let therm = live.thermal_tier.unwrap_or_else(|| {
+                    MobileLiveStatus::compute_thermal_tier(
+                        live.battery_temperature,
+                        live.thermal_throttled,
+                    )
+                });
+                let is_charging = live.is_charging.unwrap_or(false);
+
+                // Zero effective concurrency means complete load-shedding
+                let eff =
+                    calculate_effective_concurrency(worker.capabilities.cpu_cores, bat, therm);
+                if eff == 0 {
+                    continue;
+                }
+
+                // Task eligibility based on battery tier
+                match bat {
+                    BatteryTier::Critical => continue,
+                    BatteryTier::SubLow => {
+                        if req.cpu_cores > 1 || view.heavy {
+                            continue;
+                        }
+                    }
+                    BatteryTier::Low => {
+                        if view.heavy {
+                            continue;
+                        }
+                    }
+                    BatteryTier::Normal => {}
+                }
+
+                // Task eligibility based on thermal tier
+                match therm {
+                    ThermalTier::Critical => continue,
+                    ThermalTier::Hot => {
+                        if req.cpu_cores > 1 || view.heavy {
+                            continue;
+                        }
+                    }
+                    ThermalTier::Warm => {
+                        if view.heavy && !is_charging {
+                            continue;
+                        }
+                    }
+                    ThermalTier::Normal => {}
+                }
             }
 
             // Stage 5: Concurrency saturation, in slots: a task occupies as many as the cores it
@@ -1095,6 +1198,7 @@ mod tests {
             remote_addr: "127.0.0.1:9000".into(),
             cpu_usage_pct: 0.0,
             ram_available_mb: ram_mb,
+            features: ProtocolCapabilities::all_supported(),
         }
     }
 

@@ -96,6 +96,10 @@ OxideSwarm/
 | **Android Bridge** | Cluster Secret Auth | Native secret injection (`nativeSetClusterSecret`, `nativeStartWorkerWithSecret`) | Implemented |
 | **Agent Mesh** | Relay Hub | Axum WebSocket hub routing envelopes with token authentication and SHA-256 validation | Implemented |
 | **Agent Mesh** | Grid Bridge | `--grid-master` CLI integration routing `grid_*` commands to live master | Implemented |
+| **Mobile Coordination** | Dynamic Throttling & Arbitrage | Multi-tier thermal/battery throttling, RRC adaptive keepalive, 5-rule refusal matrix, $S_{\text{auth}}$ election, cryptographic lease tickets, fast pre-sleep evacuation ([design 0002](docs/design/0002-mobile-coordination.md)) | Implemented |
+| **File Staging** | Distributed Staging & Artifacts | Distributed file staging (`submit --file`), output artifact collection (`--output`, `--output-dir`), SHA-256 worker cache, atomic hardlinks, sandbox isolation ([design 0003](docs/design/0003-distributed-file-staging.md)) | Implemented |
+| **AI Tooling** | MCP Server | Model Context Protocol server over JSON-RPC 2.0 stdio (`oxideswarm mcp`) exposing `status`, `workers`, `submit`, `task_result`, `doctor` ([design 0004](docs/design/0004-mcp-and-discovery.md)) | Implemented |
+| **Discovery** | Subnet-Isolated Fallback | 3-tier discovery hierarchy: UDP broadcast, authenticated HTTP probe (`GET /api/discovery/probe`), and signed rendezvous registry (`OXIDESWARM_RENDEZVOUS`) ([design 0004](docs/design/0004-mcp-and-discovery.md)) | Implemented |
 
 ---
 
@@ -107,4 +111,4 @@ OxideSwarm/
 | **M2: Functional Gap Completion** | Android JNI cluster secret auth, Agent Mesh `--grid-master` bridge, Real-GPU priority scheduler | Clean build, targeted integration tests pass | **COMPLETED** |
 | **M3: Security & Process Hardening** | Authenticated wire stream encryption (`0x04`), protocol version & capability negotiation, Windows Job Object & Linux PDEATHSIG containment | Wire encryption tests, version negotiation tests, process containment tests pass | **COMPLETED** |
 | **M4: Isolation & Verification** | Test state isolation (`OXIDESWARM_HOME`, ephemeral keys), final documentation synchronization, full workspace verification | 100% test pass across all workspace crates and python suites with 0 host pollution | **COMPLETED** |
-| **M5: Two-Node Readiness** | Task placement, task inputs, GPU task size, `oxideswarm doctor`, documentation standard and two-machine guide ([design 0001](docs/design/0001-two-node-readiness.md)) | Unit and integration tests, live `doctor` run; macOS + Windows run by the user | **IN PROGRESS** |
+| **M5: Production Completion & Verification** | Two-node readiness ([design 0001](docs/design/0001-two-node-readiness.md)), mobile coordination & dynamic policies ([design 0002](docs/design/0002-mobile-coordination.md)), distributed file staging ([design 0003](docs/design/0003-distributed-file-staging.md)), MCP server & discovery fallback ([design 0004](docs/design/0004-mcp-and-discovery.md)), full workspace verification | Unit and integration tests, 2-worker live `doctor` checks C1–C6 pass, documentation sync | **COMPLETED** |

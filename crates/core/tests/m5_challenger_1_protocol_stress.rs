@@ -332,6 +332,7 @@ fn test_adv_worker_message_all_variants_bincode_inbound() {
                 is_gpu_executed: true,
                 device_name: Some("Test GPU".into()),
                 error: None,
+                artifacts: Vec::new(),
             },
         ),
         (

@@ -51,8 +51,8 @@ use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus
 use crate::backoff::{BackoffConfig, ExponentialBackoff};
 use crate::gpu::{apply_gpu_policy, probe_real_gpu, GpuNotice, GpuRequest, NoticeLevel};
 use crate::heartbeat::{
-    current_epoch_secs, spawn_heartbeat_task, spawn_mobile_poller, HeartbeatTracker, IoClock,
-    MobileTelemetryHandle, StampedStream,
+    current_epoch_secs, spawn_adaptive_heartbeat_task, spawn_mobile_poller, HeartbeatTracker,
+    IoClock, MobileTelemetryHandle, StampedStream,
 };
 use crate::identity::{default_worker_id_path, load_or_create_worker_id};
 use crate::process_tree::ProcessPriority;
@@ -88,6 +88,28 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// this worker does not have). Retrying faster cannot succeed with the same secret and would only
 /// hammer the Master (which itself delays every failed authentication).
 pub const AUTH_FAILURE_MIN_BACKOFF: Duration = Duration::from_secs(30);
+
+type EvacuationHook = Box<dyn Fn() -> Option<String> + Send + Sync>;
+
+static EVACUATION_REASON_HOOK: std::sync::RwLock<Option<EvacuationHook>> =
+    std::sync::RwLock::new(None);
+
+/// Registers an external hook for querying an active evacuation reason (e.g. from Android bridge).
+pub fn set_evacuation_reason_hook<F: Fn() -> Option<String> + Send + Sync + 'static>(f: F) {
+    if let Ok(mut guard) = EVACUATION_REASON_HOOK.write() {
+        *guard = Some(Box::new(f));
+    }
+}
+
+/// Retrieves the active evacuation reason if set by an evacuation hook.
+pub fn current_evacuation_reason() -> Option<String> {
+    if let Ok(guard) = EVACUATION_REASON_HOOK.read() {
+        if let Some(hook) = guard.as_ref() {
+            return hook();
+        }
+    }
+    None
+}
 
 /// A Master that sends nothing for this many heartbeat intervals is considered gone.
 pub const DEAD_PEER_HEARTBEAT_FACTOR: u32 = 4;
@@ -1058,8 +1080,15 @@ impl WorkerClient {
 
             // Whatever ended the session, nothing that is still running can deliver its result any
             // more (see the module docs): stop it cleanly before the next connection starts.
-            self.cancel_all_active_tasks("connection to the Master ended")
-                .await;
+            let is_shutdown = *shutdown_rx.borrow();
+            let cancel_reason = if let Some(r) = current_evacuation_reason() {
+                r
+            } else if is_shutdown {
+                "FAST_SHUTDOWN".to_string()
+            } else {
+                "connection to the Master ended".to_string()
+            };
+            self.cancel_all_active_tasks(&cancel_reason).await;
 
             match outcome {
                 Ok(()) => {
@@ -1413,11 +1442,24 @@ impl WorkerClient {
             .into_iter()
             .filter_map(|handle| Self::begin_stop(handle, reason))
             .collect();
-        let deadline = tokio::time::Instant::now() + TASK_DRAIN_TIMEOUT;
-        for mut join in joins {
-            if tokio::time::timeout_at(deadline, &mut join).await.is_err() {
-                warn!("A cancelled task did not stop within the drain timeout; aborting it");
+        let is_fast_evac = {
+            let r = reason.to_ascii_uppercase();
+            r.contains("EVAC")
+                || r.contains("BATTERY")
+                || r.contains("SHUTDOWN")
+                || r.contains("FAST")
+        };
+        if is_fast_evac {
+            for join in joins {
                 join.abort();
+            }
+        } else {
+            let deadline = tokio::time::Instant::now() + TASK_DRAIN_TIMEOUT;
+            for mut join in joins {
+                if tokio::time::timeout_at(deadline, &mut join).await.is_err() {
+                    warn!("A cancelled task did not stop within the drain timeout; aborting it");
+                    join.abort();
+                }
             }
         }
         count
@@ -1821,14 +1863,20 @@ impl WorkerClient {
         shutdown_rx: &mut watch::Receiver<bool>,
     ) -> GridResult<()> {
         let worker_id = self.worker_id;
-        let heartbeat_handle = spawn_heartbeat_task(
+        let heartbeat_handle = spawn_adaptive_heartbeat_task(
             worker_id,
             heartbeat_interval,
             session.control_tx.clone(),
             Arc::clone(&self.heartbeat_tracker),
+            Some(self.mobile.clone()),
         );
 
-        let dead_after = self.dead_peer_timeout(heartbeat_interval);
+        let dead_after = if let Some(status) = self.mobile.live_status() {
+            let iv = status.recommended_keepalive_interval(0);
+            self.dead_peer_timeout(iv)
+        } else {
+            self.dead_peer_timeout(heartbeat_interval)
+        };
         let mut watchdog = tokio::time::interval(
             (dead_after / 8).clamp(Duration::from_millis(25), Duration::from_secs(1)),
         );
@@ -1877,6 +1925,9 @@ impl WorkerClient {
                             MasterMessage::RegisterAck { .. } => {
                                 warn!("Unexpected RegisterAck during active connection");
                             }
+                            MasterMessage::RoleHandoverAck { accepted, reason, .. } => {
+                                info!(accepted, reason = ?reason, "Received RoleHandoverAck from master");
+                            }
                             MasterMessage::UnknownVariant { tag, ref raw_bytes } => {
                                 warn!(tag, bytes_len = raw_bytes.len(), "Ignoring unknown MasterMessage variant");
                             }
@@ -1914,12 +1965,16 @@ impl WorkerClient {
                 _ = telemetry.tick(), if report_telemetry => {
                     let current = self.mobile.live_status();
                     if current != last_reported {
-                        if let Some(status) = current {
+                        if let Some(ref status) = current {
                             let report = WorkerMessage::MobileTelemetry {
                                 worker_id,
                                 battery_pct: status.battery_pct,
                                 is_charging: status.is_charging,
                                 thermal_throttled: status.thermal_throttled,
+                                battery_temperature: status.battery_temperature,
+                                network_type: status.network_type.clone(),
+                                battery_tier: status.battery_tier,
+                                thermal_tier: status.thermal_tier,
                             };
                             if session.control_tx.try_send(report).is_ok() {
                                 last_reported = current;
@@ -1931,10 +1986,12 @@ impl WorkerClient {
                 // External shutdown signal
                 res = shutdown_rx.changed() => {
                     if res.is_ok() && *shutdown_rx.borrow() {
-                        info!(worker_id = %worker_id, "Graceful worker shutdown initiated; notifying Master");
+                        let reason = current_evacuation_reason()
+                            .unwrap_or_else(|| "Graceful worker shutdown".to_string());
+                        info!(worker_id = %worker_id, reason = %reason, "Worker shutdown initiated; notifying Master");
                         farewell = Some(WorkerMessage::Disconnecting {
                             worker_id,
-                            reason: "Graceful worker shutdown".into(),
+                            reason,
                         });
                         break Ok(());
                     } else if res.is_err() {
@@ -3552,6 +3609,7 @@ mod tests {
             battery_pct: Some(42),
             is_charging: Some(false),
             thermal_throttled: false,
+            ..Default::default()
         });
 
         let mut seen = Vec::new();
@@ -3593,6 +3651,7 @@ mod tests {
             battery_pct: Some(33),
             is_charging: Some(true),
             thermal_throttled: false,
+            ..Default::default()
         });
         assert_eq!(
             client.mobile_telemetry().live_status().unwrap().battery_pct,

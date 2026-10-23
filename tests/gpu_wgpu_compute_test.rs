@@ -414,13 +414,13 @@ fn test_physical_wgpu_execution_when_available() {
         assert_eq!(outcome.matrix_c.len(), dim * dim);
 
         // Verify numerical convergence between GPU shader and CPU reference oracle
-        for i in 0..dim * dim {
-            let diff = (outcome.matrix_c[i] - c_expected[i]).abs();
+        for (i, (&gpu_val, &cpu_val)) in outcome.matrix_c.iter().zip(&c_expected).enumerate() {
+            let diff = (gpu_val - cpu_val).abs();
             assert!(
                 diff < 1e-2,
                 "GPU vs CPU mismatch at index {i}: gpu={}, cpu={}, diff={}",
-                outcome.matrix_c[i],
-                c_expected[i],
+                gpu_val,
+                cpu_val,
                 diff
             );
         }
