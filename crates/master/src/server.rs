@@ -27,7 +27,8 @@ use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus
 #[cfg(feature = "p2p")]
 use rusty_grid_core::transport::{BiStream, GridStream, GRID_ALPN, STREAM_CONTROL, STREAM_DATA};
 use rusty_grid_core::{
-    GridError, GridResult, MasterMessage, MessageTransport, WireCodec, WorkerMessage,
+    GridError, GridResult, MasterMessage, MessageTransport, WireCodec, WorkerCapabilities,
+    WorkerMessage,
 };
 
 use crate::auth::DevBypass;
@@ -2208,6 +2209,46 @@ async fn task_status_response(queue: &TaskQueue, task_id: TaskId) -> ClientRespo
     }
 }
 
+/// A worker as `ClusterStatus` and `ListWorkers` report it: its capabilities plus the tags only the
+/// master knows, `link:<path>`, `id:<worker id>` and `state:<state>` (see
+/// `rusty_grid_core::placement`). Clients get no `WorkerInfo`, so the `id:` tag is how they learn
+/// the id a `require:worker=` constraint can name.
+async fn listed_worker(
+    w: WorkerInfo,
+    #[cfg(feature = "p2p")] p2p_conns: Option<
+        &Arc<tokio::sync::RwLock<HashMap<Uuid, iroh::endpoint::Connection>>>,
+    >,
+) -> WorkerCapabilities {
+    #[cfg(feature = "p2p")]
+    let link = match p2p_conns {
+        Some(conns) => match conns.read().await.get(&w.worker_id) {
+            Some(conn) => match rusty_grid_core::transport::inspect_connection_paths(conn) {
+                Some(info) if info.is_relay => format!("link:Relay (DERP):{:.1}ms", info.rtt_ms),
+                Some(info) => format!("link:Direct P2P (QUIC):{:.1}ms", info.rtt_ms),
+                None => "link:Direct P2P (QUIC)".to_string(),
+            },
+            None => "link:TCP/LAN".to_string(),
+        },
+        None => "link:TCP/LAN".to_string(),
+    };
+    #[cfg(not(feature = "p2p"))]
+    let link = "link:TCP/LAN".to_string();
+
+    let mut caps = w.capabilities;
+    caps.tags.push(link);
+    caps.tags.push(format!(
+        "{}{}",
+        rusty_grid_core::placement::ID_TAG_PREFIX,
+        w.worker_id
+    ));
+    caps.tags.push(format!(
+        "{}{}",
+        rusty_grid_core::placement::STATE_TAG_PREFIX,
+        w.status.as_str()
+    ));
+    caps
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     first_msg: ClientMessage,
@@ -2339,32 +2380,14 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 let workers_info = registry.list_all_workers().await;
                 let mut workers = Vec::with_capacity(workers_info.len());
                 for w in workers_info {
-                    let mut caps = w.capabilities;
-                    #[cfg(feature = "p2p")]
-                    if let Some(ref conns) = p2p_conns {
-                        let guard = conns.read().await;
-                        if let Some(conn) = guard.get(&w.worker_id) {
-                            if let Some(info) =
-                                rusty_grid_core::transport::inspect_connection_paths(conn)
-                            {
-                                let tag = if info.is_relay {
-                                    format!("link:Relay (DERP):{:.1}ms", info.rtt_ms)
-                                } else {
-                                    format!("link:Direct P2P (QUIC):{:.1}ms", info.rtt_ms)
-                                };
-                                caps.tags.push(tag);
-                            } else {
-                                caps.tags.push("link:Direct P2P (QUIC)".to_string());
-                            }
-                        } else {
-                            caps.tags.push("link:TCP/LAN".to_string());
-                        }
-                    } else {
-                        caps.tags.push("link:TCP/LAN".to_string());
-                    }
-                    #[cfg(not(feature = "p2p"))]
-                    caps.tags.push("link:TCP/LAN".to_string());
-                    workers.push(caps);
+                    workers.push(
+                        listed_worker(
+                            w,
+                            #[cfg(feature = "p2p")]
+                            p2p_conns.as_ref(),
+                        )
+                        .await,
+                    );
                 }
                 let stats = queue.stats().await;
                 let (pending, running, completed, failed) = stats.cluster_buckets();
@@ -2382,32 +2405,14 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 let workers_info = registry.list_all_workers().await;
                 let mut workers = Vec::with_capacity(workers_info.len());
                 for w in workers_info {
-                    let mut caps = w.capabilities;
-                    #[cfg(feature = "p2p")]
-                    if let Some(ref conns) = p2p_conns {
-                        let guard = conns.read().await;
-                        if let Some(conn) = guard.get(&w.worker_id) {
-                            if let Some(info) =
-                                rusty_grid_core::transport::inspect_connection_paths(conn)
-                            {
-                                let tag = if info.is_relay {
-                                    format!("link:Relay (DERP):{:.1}ms", info.rtt_ms)
-                                } else {
-                                    format!("link:Direct P2P (QUIC):{:.1}ms", info.rtt_ms)
-                                };
-                                caps.tags.push(tag);
-                            } else {
-                                caps.tags.push("link:Direct P2P (QUIC)".to_string());
-                            }
-                        } else {
-                            caps.tags.push("link:TCP/LAN".to_string());
-                        }
-                    } else {
-                        caps.tags.push("link:TCP/LAN".to_string());
-                    }
-                    #[cfg(not(feature = "p2p"))]
-                    caps.tags.push("link:TCP/LAN".to_string());
-                    workers.push(caps);
+                    workers.push(
+                        listed_worker(
+                            w,
+                            #[cfg(feature = "p2p")]
+                            p2p_conns.as_ref(),
+                        )
+                        .await,
+                    );
                 }
                 let resp = ClientResponse::WorkerList { workers };
                 transport.send_msg(&resp).await?;

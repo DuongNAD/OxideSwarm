@@ -50,6 +50,17 @@ pub enum WorkerStatus {
     Disconnected,
 }
 
+impl WorkerStatus {
+    /// The state's name as it is serialized (`connected`, `busy`, `disconnected`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WorkerStatus::Connected => "connected",
+            WorkerStatus::Busy => "busy",
+            WorkerStatus::Disconnected => "disconnected",
+        }
+    }
+}
+
 /// Internal mutable state for a single connected worker.
 pub struct WorkerEntry {
     pub worker_id: Uuid,

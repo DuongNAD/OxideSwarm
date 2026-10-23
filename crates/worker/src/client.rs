@@ -702,6 +702,18 @@ impl Drop for Session {
     }
 }
 
+/// What the worker advertises in `WorkerCapabilities::tags`: its system tags (`os:`, `arch:`, see
+/// `rusty_grid_core::placement`), then the configured user tags that are not among them.
+fn advertised_tags(user_tags: &[String]) -> Vec<String> {
+    let mut tags = rusty_grid_core::placement::system_tags();
+    for tag in user_tags {
+        if !tags.contains(tag) {
+            tags.push(tag.clone());
+        }
+    }
+    tags
+}
+
 /// `RUSTY_GRID_ENABLE_PHYSICAL_GPU=1`: look for a real GPU without `--gpu` (the library-level
 /// opt-in; the CLI always looks unless `--no-gpu`).
 fn physical_gpu_requested_by_env() -> bool {
@@ -721,8 +733,8 @@ impl WorkerClient {
             simulate_gpu: config.simulate_gpu,
             gpu_name: config.gpu_name.clone(),
         };
-        let mut capabilities =
-            WorkerCapabilities::detect_with_overrides(overrides).with_tags(config.tags.clone());
+        let mut capabilities = WorkerCapabilities::detect_with_overrides(overrides)
+            .with_tags(advertised_tags(&config.tags));
         // A real GPU is advertised only if this binary can compute on one (see `gpu`).
         let gpu_request = GpuRequest {
             no_gpu: config.no_gpu,
@@ -991,6 +1003,18 @@ impl WorkerClient {
         if let Err(e) = self.runner.config().sandbox_config.ensure_usable().await {
             let err = GridError::Config(e.to_string());
             error!(worker_id = %self.worker_id, error = %err, "Task sandboxes cannot be created");
+            return Err(err);
+        }
+
+        // A user tag that looks like a system one (`os:`, `link:`, ...) would mislead placement.
+        if let Some(e) = self
+            .config
+            .tags
+            .iter()
+            .find_map(|t| rusty_grid_core::placement::validate_user_tag(t).err())
+        {
+            let err = GridError::Config(format!("Invalid worker tag: {e}"));
+            error!(worker_id = %self.worker_id, error = %err, "The configured worker tags cannot be used");
             return Err(err);
         }
 
@@ -3690,6 +3714,51 @@ mod tests {
                 );
             }
             other => panic!("expected a Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_worker_advertises_system_tags_then_user_tags() {
+        let client = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9")
+                .with_tags(vec![
+                    "laptop".into(),
+                    format!("os:{}", std::env::consts::OS),
+                ])
+                .with_redirection_portal(false),
+        );
+        assert_eq!(
+            client.capabilities().tags,
+            vec![
+                format!("os:{}", std::env::consts::OS),
+                format!("arch:{}", std::env::consts::ARCH),
+                "laptop".to_string(),
+            ],
+            "system tags first, a user tag equal to one of them is not repeated"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_refuses_a_reserved_or_malformed_user_tag() {
+        for bad in ["os:windows", "link:fake", "two words"] {
+            let mut client = WorkerClient::new(
+                WorkerConfig::new("127.0.0.1:9")
+                    .with_tags(vec![bad.into()])
+                    .with_redirection_portal(false),
+            );
+            let (_tx, rx) = watch::channel(false);
+            let result = tokio::time::timeout(Duration::from_secs(5), client.run(rx))
+                .await
+                .expect("an invalid tag must end run() at once, not loop");
+            match result {
+                Err(GridError::Config(msg)) => {
+                    assert!(
+                        msg.contains("Invalid worker tag") && msg.contains(bad),
+                        "{msg}"
+                    )
+                }
+                other => panic!("{bad}: expected a Config error, got {other:?}"),
+            }
         }
     }
 

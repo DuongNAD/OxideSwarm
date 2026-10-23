@@ -23,6 +23,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use rusty_grid_core::error::GridResult;
+use rusty_grid_core::placement::Placement;
 use rusty_grid_core::protocol::MasterMessage;
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements};
 
@@ -172,15 +173,17 @@ struct Shape {
     heavy: bool,
     cpu_cores: usize,
     ram_mb: u64,
+    placement: Placement,
 }
 
 impl Shape {
-    fn of(view: &TaskView) -> Self {
+    fn of(view: &TaskView, placement: &Placement) -> Self {
         Self {
             requires_gpu: view.requires_gpu,
             heavy: view.heavy,
             cpu_cores: view.requirements.cpu_cores,
             ram_mb: view.requirements.ram_mb,
+            placement: placement.clone(),
         }
     }
 }
@@ -189,6 +192,26 @@ impl Shape {
 fn statically_fits(requirements: &TaskRequirements, worker: &WorkerInfo) -> bool {
     (requirements.cpu_cores == 0 || worker.capabilities.cpu_cores >= requirements.cpu_cores)
         && (requirements.ram_mb == 0 || worker.capabilities.ram_mb >= requirements.ram_mb)
+}
+
+/// True if `worker` satisfies a task's placement constraints (`require:` tags: os, arch, worker,
+/// tag; see `rusty_grid_core::placement`).
+fn placement_admits(placement: &Placement, worker: &WorkerInfo) -> bool {
+    placement.matches(
+        worker.worker_id,
+        &worker.capabilities.name,
+        &worker.capabilities.tags,
+    )
+}
+
+/// [`statically_fits`] and [`placement_admits`] for a queued task's view. A view whose constraints
+/// cannot be read fits nowhere.
+fn view_fits(view: &TaskView, worker: &WorkerInfo) -> bool {
+    statically_fits(&view.requirements, worker)
+        && view
+            .placement
+            .as_ref()
+            .is_ok_and(|placement| placement_admits(placement, worker))
 }
 
 /// One worker as the placement engine tracks it during a pass.
@@ -288,16 +311,34 @@ impl<'a> Engine<'a> {
     }
 
     fn place(&mut self, view: &TaskView) -> Verdict {
+        let placement = match &view.placement {
+            Ok(placement) => placement,
+            Err(e) => return Verdict::Unfulfillable(format!("Invalid placement constraints: {e}")),
+        };
         if view.requires_gpu && self.config.fail_unfulfillable_tasks && !self.any_gpu_worker {
             return Verdict::Unfulfillable("Cluster lacks workers with GPU capabilities".into());
         }
+        let nobody_matches = !placement.is_empty()
+            && !self
+                .seats
+                .iter()
+                .any(|seat| placement_admits(placement, seat.worker));
+        if nobody_matches && self.config.fail_unfulfillable_tasks {
+            return Verdict::Unfulfillable(format!(
+                "No registered worker matches the placement constraints ({placement})"
+            ));
+        }
         let skip_reason = if view.requires_gpu {
             ScheduleSkipReason::NoGpuWorkersAvailable
+        } else if nobody_matches {
+            ScheduleSkipReason::ClusterLacksCapability(format!(
+                "no worker matches the placement constraints ({placement})"
+            ))
         } else {
             ScheduleSkipReason::AllEligibleWorkersSaturated
         };
 
-        let shape = Shape::of(view);
+        let shape = Shape::of(view, placement);
         if self.dead.contains(&shape) {
             return Verdict::Skip(skip_reason);
         }
@@ -376,8 +417,9 @@ impl<'a> Engine<'a> {
                 continue;
             }
 
-            // Stage 2: Hardware requirements (CPU & RAM) & Anti-stuttering backpressure
-            if !statically_fits(req, worker) {
+            // Stage 2: Hardware requirements (CPU & RAM), placement constraints (os, arch, worker,
+            // tag) & Anti-stuttering backpressure
+            if !view_fits(view, worker) {
                 continue;
             }
             // Anti-stuttering: if host CPU exceeds threshold, back off and skip this worker
@@ -706,9 +748,12 @@ impl WorkloadScheduler {
                 .queue
                 .any_queued(|task| {
                     (task.requirements.gpu_required || task.spec.requires_gpu())
-                        && gpu_workers
-                            .iter()
-                            .any(|w| statically_fits(&task.requirements, w))
+                        && task.placement().is_ok_and(|placement| {
+                            gpu_workers.iter().any(|w| {
+                                statically_fits(&task.requirements, w)
+                                    && placement_admits(&placement, w)
+                            })
+                        })
                 })
                 .await;
             let mut state = self.gpu_demand.lock().unwrap_or_else(|e| e.into_inner());
@@ -794,10 +839,9 @@ impl WorkloadScheduler {
                     && self.config.preserve_gpu_for_gpu_tasks
                     && views.iter().any(|v| {
                         v.requires_gpu
-                            && workers.iter().any(|w| {
-                                w.capabilities.can_execute_gpu()
-                                    && statically_fits(&v.requirements, w)
-                            })
+                            && workers
+                                .iter()
+                                .any(|w| w.capabilities.can_execute_gpu() && view_fits(v, w))
                     })
                 {
                     engine.gpu_waiting = true;
@@ -1052,6 +1096,176 @@ mod tests {
             cpu_usage_pct: 0.0,
             ram_available_mb: ram_mb,
         }
+    }
+
+    /// A 4-core CPU worker carrying `tags` (as `os:` / `arch:` / user tags arrive from a worker).
+    fn tagged_worker(name: &str, tags: &[&str]) -> WorkerInfo {
+        let mut worker = make_worker(name, 4, 8192, false, false);
+        worker.capabilities.tags = tags.iter().map(|t| t.to_string()).collect();
+        worker
+    }
+
+    /// A one-core built-in task with these `require:` constraints.
+    fn constrained_task(constraints: &[&str]) -> Task {
+        let task = Task::new(
+            TaskSpec::builtin_test("hash_compute", 10),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_tags(constraints.iter().map(|t| t.to_string()).collect());
+        task.validate().expect("test constraints must be valid");
+        task
+    }
+
+    #[test]
+    fn test_placement_pins_a_task_to_one_worker_by_id_or_name() {
+        let config = SchedulerConfig::default();
+        let mac = tagged_worker("MAC-M5", &["os:macos", "arch:aarch64"]);
+        let dell = tagged_worker("DELL-VOSTRO", &["os:windows", "arch:x86_64"]);
+        let workers = vec![mac.clone(), dell.clone()];
+
+        let by_id = constrained_task(&[&format!("require:worker={}", dell.worker_id)]);
+        let by_name = constrained_task(&["require:worker=mac-m5"]);
+        let report =
+            WorkloadScheduler::matchmake(&config, &[by_id.clone(), by_name.clone()], &workers);
+        let placed: HashMap<TaskId, Uuid> = report
+            .assignments
+            .iter()
+            .map(|a| (a.task_id, a.worker_id))
+            .collect();
+        assert_eq!(placed.get(&by_id.id), Some(&dell.worker_id));
+        assert_eq!(
+            placed.get(&by_name.id),
+            Some(&mac.worker_id),
+            "names ignore case"
+        );
+    }
+
+    #[test]
+    fn test_placement_os_arch_and_tag_constraints_select_matching_workers_only() {
+        let config = SchedulerConfig::default();
+        let mac = tagged_worker("mac", &["os:macos", "arch:aarch64", "laptop"]);
+        let dell = tagged_worker("dell", &["os:windows", "arch:x86_64", "laptop"]);
+        let desk = tagged_worker("desk", &["os:windows", "arch:x86_64", "gpu-box"]);
+        let workers = vec![mac.clone(), dell.clone(), desk.clone()];
+
+        for _ in 0..8 {
+            let on_windows_laptop = constrained_task(&["require:os=win", "require:tag=laptop"]);
+            let on_arm = constrained_task(&["require:arch=arm64"]);
+            let report = WorkloadScheduler::matchmake(
+                &config,
+                &[on_windows_laptop.clone(), on_arm.clone()],
+                &workers,
+            );
+            for a in &report.assignments {
+                if a.task_id == on_windows_laptop.id {
+                    assert_eq!(a.worker_id, dell.worker_id, "only dell is a Windows laptop");
+                } else {
+                    assert_eq!(a.worker_id, mac.worker_id, "only mac is aarch64");
+                }
+            }
+            assert_eq!(report.assignments.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_placement_without_a_match_waits_and_does_not_block_other_tasks() {
+        let config = SchedulerConfig::default();
+        let workers = vec![tagged_worker("dell", &["os:windows"])];
+        let on_linux = constrained_task(&["require:os=linux"]);
+        let anywhere = constrained_task(&[]);
+
+        let report =
+            WorkloadScheduler::matchmake(&config, &[on_linux.clone(), anywhere.clone()], &workers);
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].task_id, anywhere.id);
+        assert_eq!(report.skipped.len(), 1);
+        let (skipped_id, reason) = &report.skipped[0];
+        assert_eq!(*skipped_id, on_linux.id);
+        match reason {
+            ScheduleSkipReason::ClusterLacksCapability(msg) => {
+                assert!(msg.contains("os=linux"), "{msg}")
+            }
+            other => panic!("unexpected skip reason {other:?}"),
+        }
+        assert!(
+            report.unfulfillable.is_empty(),
+            "it waits for a matching worker"
+        );
+
+        let strict = SchedulerConfig {
+            fail_unfulfillable_tasks: true,
+            ..SchedulerConfig::default()
+        };
+        let report =
+            WorkloadScheduler::matchmake(&strict, std::slice::from_ref(&on_linux), &workers);
+        assert_eq!(report.unfulfillable.len(), 1);
+        assert!(report.unfulfillable[0].1.contains("os=linux"));
+    }
+
+    #[test]
+    fn test_placement_is_part_of_the_task_shape() {
+        // Same resources, different constraints: the first finds no worker, which must not make
+        // the engine skip the second as "the same kind of task".
+        let config = SchedulerConfig::default();
+        let workers = vec![tagged_worker("mac", &["os:macos"])];
+        let on_windows = constrained_task(&["require:os=windows"]);
+        let on_macos = constrained_task(&["require:os=macos"]);
+
+        let report = WorkloadScheduler::matchmake(
+            &config,
+            &[on_windows.clone(), on_macos.clone()],
+            &workers,
+        );
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].task_id, on_macos.id);
+    }
+
+    #[test]
+    fn test_a_pinned_task_waiting_for_slots_never_spills_to_another_worker() {
+        let config = SchedulerConfig {
+            core_concurrency_multiplier: 1.0,
+            ..Default::default()
+        };
+        let mut busy = tagged_worker("busy", &["os:macos"]);
+        busy.capabilities.cpu_cores = 2;
+        busy.active_tasks = 2;
+        let idle = tagged_worker("idle", &["os:windows"]);
+        let workers = vec![busy.clone(), idle.clone()];
+
+        let pinned = constrained_task(&[&format!("require:worker={}", busy.worker_id)]);
+        let free = constrained_task(&[]);
+        let report =
+            WorkloadScheduler::matchmake(&config, &[pinned.clone(), free.clone()], &workers);
+        assert_eq!(report.assignments.len(), 1, "{report:?}");
+        assert_eq!(report.assignments[0].task_id, free.id);
+        assert_eq!(report.assignments[0].worker_id, idle.worker_id);
+        assert_eq!(report.skipped[0].0, pinned.id);
+        assert_eq!(
+            report.skipped[0].1,
+            ScheduleSkipReason::AllEligibleWorkersSaturated
+        );
+    }
+
+    #[test]
+    fn test_unreadable_placement_constraints_place_the_task_nowhere() {
+        let config = SchedulerConfig::default();
+        let workers = vec![tagged_worker("w", &["os:linux"])];
+        // Bypasses `Task::validate`, as only a task inserted without submission could.
+        let task = Task::new(
+            TaskSpec::builtin_test("hash_compute", 10),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_tags(vec!["require:gpu_vendor=nvidia".into()]);
+        let report = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&task), &workers);
+        assert!(report.assignments.is_empty());
+        assert_eq!(report.unfulfillable.len(), 1);
+        assert!(
+            report.unfulfillable[0]
+                .1
+                .contains("Invalid placement constraints"),
+            "{:?}",
+            report.unfulfillable
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use rusty_grid_core::error::{GridError, GridResult};
+use rusty_grid_core::placement::Placement;
 use rusty_grid_core::task::{
     CheckpointData, Task, TaskId, TaskRequirements, TaskResult, TaskSpec, TaskStatus,
 };
@@ -394,6 +395,10 @@ pub struct TaskView {
     pub heavy: bool,
     /// Workers that already handed this task back without running it.
     pub avoid: Vec<Uuid>,
+    /// The task's placement constraints (`require:` tags), or why they cannot be read. Submission
+    /// validates them, so an error only reaches here for a task that bypassed it; such a task is
+    /// placed nowhere.
+    pub placement: Result<Placement, String>,
 }
 
 impl TaskView {
@@ -408,6 +413,7 @@ impl TaskView {
                 TaskSpec::RustCompilation { .. } | TaskSpec::GpuCompute { .. }
             ),
             avoid: Vec::new(),
+            placement: task.placement(),
         }
     }
 }

@@ -1174,7 +1174,19 @@ impl Task {
             );
         }
 
+        self.placement()?;
         Ok(())
+    }
+
+    /// The placement constraints in this task's `require:` tags (see [`crate::placement`]).
+    pub fn placement(&self) -> Result<crate::placement::Placement, String> {
+        crate::placement::Placement::from_task_tags(&self.tags)
+    }
+
+    /// Builder method to add placement constraints to the task's tags.
+    pub fn with_placement(mut self, placement: &crate::placement::Placement) -> Self {
+        self.tags.extend(placement.to_task_tags());
+        self
     }
 }
 

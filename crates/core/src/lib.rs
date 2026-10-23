@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod error;
 pub mod mapreduce;
 pub mod mode;
+pub mod placement;
 pub mod protocol;
 pub mod task;
 pub mod transport;
@@ -18,6 +19,7 @@ pub use discovery::{
 };
 pub use error::{GridError, GridResult};
 pub use mode::{ModeExecutionResult, WorkflowMode};
+pub use placement::Placement;
 pub use protocol::{
     default_codec, deserialize_message, serialize_message, MasterMessage, MessageReader,
     MessageTransport, MessageWriter, ProtocolError, WireCodec, WorkerMessage, LENGTH_FIELD_BYTES,
