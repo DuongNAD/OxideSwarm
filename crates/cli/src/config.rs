@@ -91,6 +91,8 @@ pub struct WorkerFileConfig {
     pub max_concurrency: Option<usize>,
     pub sandbox_base_dir: Option<String>,
     pub keep_sandboxes: Option<bool>,
+    /// Leave out the standby portal on :8080 (`worker --no-portal`).
+    pub no_portal: Option<bool>,
     pub cores: Option<usize>,
     pub ram_mb: Option<u64>,
     pub gpu: Option<bool>,

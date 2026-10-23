@@ -390,6 +390,12 @@ pub struct WorkerArgs {
 
     #[arg(
         long,
+        help = "Do not serve the standby portal (HTTP on 0.0.0.0:8080 that sends a browser to the master's dashboard); env RUSTY_GRID_NO_PORTAL. Useful for a second worker on one machine"
+    )]
+    pub no_portal: bool,
+
+    #[arg(
+        long,
         default_value = "bincode",
         help = "Wire format codec: bincode or json (default: bincode)"
     )]
@@ -659,7 +665,7 @@ pub async fn run_cli() -> ExitCode {
     let cli = Cli::parse();
 
     // Initialize tracing subscriber if not already set
-    let log_filter = if cli.verbose {
+    let log_level = if cli.verbose {
         "debug"
     } else if cli.quiet {
         "error"
@@ -668,8 +674,9 @@ pub async fn run_cli() -> ExitCode {
     };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_filter)),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(default_log_filter(log_level))
+            }),
         )
         .try_init();
 
@@ -1256,6 +1263,13 @@ async fn run_worker(
         false,
     );
 
+    let no_portal = resolve_bool(
+        args.no_portal.then_some(true),
+        &["RUSTY_GRID_NO_PORTAL"],
+        worker_cfg.as_ref().and_then(|w| w.no_portal),
+        false,
+    );
+
     // Decided here, before `name` moves into the config: see `identity::persistence_wanted`.
     let keep_worker_id = rusty_grid_worker::identity::persistence_wanted(
         name.as_deref(),
@@ -1303,6 +1317,7 @@ async fn run_worker(
         config = config.with_process_priority(priority);
     }
     config = config.with_keep_sandboxes(keep_sandboxes);
+    config = config.with_redirection_portal(!no_portal);
     // A restarted worker is the same machine, not a new one: keep its id (see `identity`), when it
     // knows which machine it is. Otherwise every unnamed worker under this HOME would share one
     // id and the master would keep closing the other's connection.
@@ -1714,6 +1729,12 @@ fn listed_worker_name(workers: &[WorkerCapabilities], worker_id: Uuid) -> Option
         .iter()
         .find(|w| listed_worker_id(w) == Some(worker_id))
         .map(|w| w.name.clone())
+}
+
+/// The log filter when `RUST_LOG` is not set: `level` for everything, except the wgpu crates, which
+/// log every device poll at INFO (dozens of lines per GPU task) and stay at WARN.
+fn default_log_filter(level: &str) -> String {
+    format!("{level},wgpu_core=warn,wgpu_hal=warn,naga=warn")
 }
 
 /// `doctor`: resolves the master and the secret like `submit`, runs [`crate::doctor`] and maps the
@@ -2660,6 +2681,16 @@ mod tests {
     }
 
     #[test]
+    fn test_default_log_filter_keeps_wgpu_quiet_and_parses() {
+        for level in ["debug", "info", "error"] {
+            let filter = default_log_filter(level);
+            assert!(filter.starts_with(level), "{filter}");
+            assert!(filter.contains("wgpu_core=warn"), "{filter}");
+            tracing_subscriber::EnvFilter::try_new(&filter).expect("a valid filter");
+        }
+    }
+
+    #[test]
     fn test_doctor_flags_parse_with_documented_defaults() {
         match parse(&["doctor"]).command {
             Commands::Doctor(a) => {
@@ -2697,7 +2728,14 @@ mod tests {
     #[test]
     fn test_worker_tag_flag_is_repeatable() {
         match parse(&["worker", "--tag", "laptop", "--tag", "fast"]).command {
-            Commands::Worker(a) => assert_eq!(a.tags, ["laptop", "fast"]),
+            Commands::Worker(a) => {
+                assert_eq!(a.tags, ["laptop", "fast"]);
+                assert!(!a.no_portal, "the portal stays on unless asked");
+            }
+            other => panic!("expected worker, got {other:?}"),
+        }
+        match parse(&["worker", "--no-portal"]).command {
+            Commands::Worker(a) => assert!(a.no_portal),
             other => panic!("expected worker, got {other:?}"),
         }
     }
