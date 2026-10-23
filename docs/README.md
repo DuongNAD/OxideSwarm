@@ -44,9 +44,10 @@ before adding or changing a document.
 7. **Fixed vocabulary.** Status: Implemented, Partial, Planned, Design only. Dates: ISO 8601
    (`2026-10-23`). Units: MB, MiB, ms, GFLOP/s.
 8. **Headings** in sentence case, without emoji; numbered only in long reference documents.
-9. **Same change, same commit.** A change to the wire protocol, a CLI flag, a port, an environment
-   variable or a default updates the `README.md` reference in the same commit, `CLAUDE.md` when the
-   architecture map changes, and gets a design record when it changes behaviour.
+9. **Code and documentation land together.** A change to the wire protocol, a CLI flag, a port, an
+   environment variable or a default updates the `README.md` reference in the same change (commit,
+   or pull request for a multi-commit branch), `CLAUDE.md` when the architecture map changes, and
+   gets a design record when it changes behaviour.
 
 ## Templates
 

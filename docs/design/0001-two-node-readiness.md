@@ -1,6 +1,6 @@
 # 0001: Two-node readiness: task placement, task inputs and a cluster check
 
-Status: Accepted, in progress
+Status: Implemented (the macOS + Windows run is still to be done, see W7)
 Created: 2026-10-23    Updated: 2026-10-23
 
 ## Summary
@@ -132,7 +132,13 @@ Checks a running master, with the same address and secret resolution as `submit`
 - `doctor` runs only built-in tasks, `echo` and GEMM; nothing is written on workers outside the
   per-task sandbox.
 
-### D5 Documentation
+### D5 Several workers on one host
+
+`worker --no-portal` (env `RUSTY_GRID_NO_PORTAL`, config `no_portal`) leaves out the standby portal
+that otherwise binds `0.0.0.0:8080`, so a second worker on one machine (or a test) opens no port to
+the network. Default behaviour is unchanged.
+
+### D6 Documentation
 
 - `docs/README.md`: index and writing standard (added with this record).
 - `docs/guides/two-machine-cluster.md`: macOS + Windows guide covering Wi-Fi, a direct Ethernet cable
@@ -189,14 +195,29 @@ Checks a running master, with the same address and secret resolution as `submit`
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| W1 | Placement module | `crates/core/src/placement.rs`, `crates/core/src/lib.rs`, `crates/core/src/task.rs` (`Task::validate`) | D2 parsing, formatting, matching and validation, with unit tests | Planned |
-| W2 | Worker tags | `crates/core/src/capabilities.rs`, `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs` | registered workers carry `os:`, `arch:` and user tags; reserved prefixes refused | Planned |
-| W3 | Master enforcement | `crates/master/src/queue.rs` (`TaskView`), `crates/master/src/scheduler.rs` | constrained tasks reach only matching workers; unit tests from the test plan pass | Planned |
-| W4 | `submit` options | `crates/cli/src/cli_app.rs` | D3 options with unit tests; worker shown in results; no-match warning; compile message | Planned |
-| W5 | `doctor` command | `crates/cli/src/doctor.rs`, `crates/cli/src/cli_app.rs`, integration test | D4 checks and exit codes; integration test passes | Planned |
-| W6 | Documentation | `docs/guides/two-machine-cluster.md`, `README.md`, `DEPLOYMENT.md`, `CLAUDE.md`, benchmark report | D5 done; each new flag and variable documented once, in `README.md` | Planned |
-| W7 | Verification | none | all gates green; live Windows run recorded in the status log | Planned |
+| W1 | Placement module | `crates/core/src/placement.rs`, `crates/core/src/lib.rs`, `crates/core/src/task.rs` (`Task::validate`) | D2 parsing, formatting, matching and validation, with unit tests | Implemented |
+| W2 | Worker tags | `crates/worker/src/client.rs`, `crates/master/src/server.rs` (`listed_worker`), `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs` | registered workers carry `os:`, `arch:` and user tags; listings add `id:` / `state:`; reserved prefixes refused; `--no-portal` (D5) | Implemented |
+| W3 | Master enforcement | `crates/master/src/queue.rs` (`TaskView`), `crates/master/src/scheduler.rs` | constrained tasks reach only matching workers; unit tests from the test plan pass | Implemented |
+| W4 | `submit` options | `crates/cli/src/cli_app.rs` | D3 options with unit tests; worker shown in results; no-match warning; compile message | Implemented |
+| W5 | `doctor` command | `crates/cli/src/doctor.rs`, `crates/cli/src/cli_app.rs`, `tests/cli_doctor_e2e.rs` | D4 checks and exit codes; integration test passes | Implemented |
+| W6 | Documentation | `docs/guides/two-machine-cluster.md`, `README.md`, `DEPLOYMENT.md`, `CLAUDE.md`, `PROJECT.md`, benchmark report | D6 done; each new flag and variable documented once, in `README.md` | Implemented |
+| W7 | Verification | none | all gates green; live Windows run recorded in the status log; macOS + Windows run | Partial: the macOS + Windows run is open |
 
 ## Status log
 
 - 2026-10-23: Created and accepted.
+- 2026-10-23: W1 to W6 implemented on branch `feat/two-node-readiness`. Gates on the Windows host:
+  `cargo test --workspace` 1132 passed, 0 failed (state after W4); `cargo test -p rusty_grid_cli`
+  passed after W5, including `tests/cli_doctor_e2e.rs` (5 tests); `cargo clippy --workspace
+  --all-targets -- -D warnings`, `cargo fmt --all -- --check` and
+  `cargo check -p rusty_grid_master --no-default-features` clean.
+- 2026-10-23: Live run on the Windows host (i5-14600KF, RTX 5060 Ti): an authenticated master on
+  loopback, one worker with the wgpu engine and one with `--no-gpu`, release build with
+  `--features gpu-wgpu`. `doctor --expect-workers 2 --gpu-dim 1024`: 8 passed, 0 failed; C5
+  verified a 1024 x 1024 GEMM on Vulkan; C6 ran 8 tasks of 500 ms in about 545 ms, 4 per worker.
+  `submit --os`, `--worker`, `--require-tag`, `--env`, `--stdin-file`, `--script-file` (Git for
+  Windows `sh`) and `--type gpu --matrix-dim 2048` (`VERIFIED_OK`) behaved as specified; the
+  no-match warning and the CLI-side rejection of a reserved tag worked.
+- 2026-10-23: Found in the live run and fixed: the wgpu crates logged every device poll at INFO
+  (dozens of lines per GPU task); without `RUST_LOG` they now log at WARN (`default_log_filter`).
+- Open: the macOS (master + Metal worker) + Windows laptop run, `doctor --expect-workers 2`.

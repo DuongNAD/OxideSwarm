@@ -49,8 +49,8 @@ This comprehensive benchmark report delivers an exhaustive, empirically validate
 +---------------------------------------+--------------------+------------------+------------------+
 ```
 
-### The "Nhẹ mà tốt" (Lightweight yet Superior) Thesis
-The empirical data decisively validates OxideSwarm's core architectural principle: **"Nhẹ mà tốt"**. By embedding Iroh QUIC directly into the single `rusty-grid` binary:
+### The "Lightweight yet Capable" Thesis
+The empirical data decisively validates OxideSwarm's core architectural principle: **lightweight yet capable**. By embedding Iroh QUIC directly into the single `rusty-grid` binary:
 - **Zero Third-Party Dependency**: No external daemons, no SaaS accounts, no billing credit cards, and no central coordination single-points-of-failure.
 - **Microsecond Precision**: Sub-millisecond latency on LAN (0.190 ms p50) by bypassing OS virtual network adapter context-switch boundaries.
 - **Minimal Host Footprint**: Under 7 MB idle RAM on macOS and < 0.05% background CPU, preserving maximum system resources for heavy compilation and GPU inference.
@@ -223,7 +223,7 @@ A major contributor to network throughput is the wire serialization format. Oxid
 
 ## 4. System Resource Footprint & Host Safety
 
-In a distributed computing framework, worker nodes frequently run on developer laptops, personal gaming rigs, or battery-powered mobile phones. The networking subsystem must remain invisible and lightweight ("Nhẹ mà tốt"), avoiding system stuttering or thermal throttling.
+In a distributed computing framework, worker nodes frequently run on developer laptops, personal gaming rigs, or battery-powered mobile phones. The networking subsystem must remain invisible and lightweight, avoiding system stuttering or thermal throttling.
 
 ### 4.1 Memory Footprint (RAM RSS) Across Operating Systems
 
@@ -312,7 +312,7 @@ Enterprise networks (corporate offices, universities, banks, and data centers) f
 
 ---
 
-## 6. Setup Complexity, Operational Friction & "Nhẹ mà tốt"
+## 6. Setup Complexity, Operational Friction & Footprint
 
 The real-world usability of a distributed cluster hinges on friction: How many steps does it take for a developer to connect a new machine?
 
@@ -373,7 +373,7 @@ Where:
 - $w_{\text{throughput}} = 0.20$ (Critical for large crate compilation and matrix streaming)
 - $w_{\text{resources}} = 0.20$ (Critical for host safety, low idle memory, and mobile battery)
 - $w_{\text{firewall}} = 0.15$ (Critical for corporate NAT and UDP traversal)
-- $w_{\text{friction}} = 0.20$ (Critical for "Nhẹ mà tốt", zero-config adoption)
+- $w_{\text{friction}} = 0.20$ (Critical for lightweight, zero-config adoption)
 
 ### 7.1 Weighted Scoring Table (Scale 0 – 100)
 
@@ -383,7 +383,7 @@ Where:
 | **Throughput & Wire Efficiency** | 20% | **92.4** | 74.2 | 55.4 |
 | **System Resource Lightness (RAM/CPU)** | 20% | **98.2** | 64.0 | 71.5 |
 | **Firewall & NAT Traversal Resilience** | 15% | **96.0** | 79.5 | 89.0 |
-| **Setup Simplicity & Friction ("Nhẹ mà tốt")**| 20% | **99.0** | 62.0 | 45.0 |
+| **Setup Simplicity & Friction** | 20% | **99.0** | 62.0 | 45.0 |
 | **COMPOSITE WEIGHTED SCORE** | **100%** | **96.4 / 100** | **72.3 / 100** | **60.7 / 100** |
 
 ```
@@ -468,4 +468,4 @@ The accompanying structured data files are located in `benchmarks/interconnect/`
 
 The quantitative findings of this investigation prove that embedding native P2P NAT traversal via **Iroh QUIC and N0 DERP Relay** provides an overwhelming technical and operational advantage over external VPNs (Tailscale) and reverse proxies (Cloudflare Tunnel).
 
-By eliminating kernel driver context switches, cutting idle RAM consumption by **14x**, avoiding SaaS vendor lock-in, and providing 1-click pairing scripts for macOS and Windows, OxideSwarm delivers a masterclass in modern systems software engineering: **"Nhẹ mà tốt" — truly lightweight, genuinely fast, and completely self-reliant.**
+By eliminating kernel driver context switches, cutting idle RAM consumption by **14x**, avoiding SaaS vendor lock-in, and providing 1-click pairing scripts for macOS and Windows, OxideSwarm delivers a masterclass in modern systems software engineering: **truly lightweight, genuinely fast, and completely self-reliant.**
