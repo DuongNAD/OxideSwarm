@@ -85,6 +85,8 @@ pub struct WorkerFileConfig {
     pub master: Option<String>,
     pub p2p_ticket: Option<String>,
     pub name: Option<String>,
+    /// User tags the worker advertises (`worker --tag`).
+    pub tags: Option<Vec<String>>,
     pub heartbeat_interval_secs: Option<u64>,
     pub max_concurrency: Option<usize>,
     pub sandbox_base_dir: Option<String>,

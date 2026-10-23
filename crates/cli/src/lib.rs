@@ -3,6 +3,7 @@
 pub mod cli_app;
 pub mod config;
 pub mod connect;
+pub mod doctor;
 pub mod mode_cli;
 pub mod secret_cmd;
 

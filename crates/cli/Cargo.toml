@@ -100,3 +100,7 @@ path = "../../tests/cli_worker_identity_e2e.rs"
 [[test]]
 name = "m4_challenger_1_state_isolation"
 path = "../../tests/m4_challenger_1_state_isolation.rs"
+
+[[test]]
+name = "cli_doctor_e2e"
+path = "../../tests/cli_doctor_e2e.rs"
