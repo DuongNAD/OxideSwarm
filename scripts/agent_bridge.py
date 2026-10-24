@@ -350,7 +350,15 @@ def cmd_diagnose(args):
                 print(f"  - Secret Hash   : MATCH (sha256[:12] = {my_fp})")
 
         peer_ip = peer_state.get("lan_ip")
+        my_master_up = my_state.get("local_ports", {}).get("master_cluster_8088_listening")
         peer_master_up = peer_state.get("local_ports", {}).get("master_cluster_8088_listening")
+        if my_master_up and peer_master_up:
+            issues.append(
+                f"[SPLIT-BRAIN MASTER] Both agent-{SELF_SHORT} ({my_state.get('lan_ip')}:8088) and agent-{PEER_SHORT} ({peer_ip}:8088) are running a Master coordinator simultaneously."
+            )
+            recommendations.append(
+                f"Keep Master on one node and switch the other node to Worker (e.g. `windows\\switch_role.cmd worker {my_state.get('lan_ip')}:8088` or `./switch_role.sh worker {peer_ip}:8088`)."
+            )
         if peer_ip and peer_ip != "127.0.0.1" and peer_master_up:
             reachable = check_tcp_port(peer_ip, 8088, timeout=1.5)
             if reachable:
