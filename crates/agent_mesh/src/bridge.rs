@@ -141,10 +141,22 @@ impl AgentGridBridge {
         let timeout_secs = timeout.as_secs().max(1);
 
         let (spec, reqs) = if let Some(test_name) = args.get("test_name").and_then(|v| v.as_str()) {
-            let iterations = args.get("iterations").and_then(|v| v.as_u64()).unwrap_or(100_000) as u32;
-            let duration_ms = args.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-            let should_fail = args.get("should_fail").and_then(|v| v.as_bool()).unwrap_or(false);
-            let require_gpu = args.get("require_gpu").and_then(|v| v.as_bool()).unwrap_or(false);
+            let iterations = args
+                .get("iterations")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100_000) as u32;
+            let duration_ms = args
+                .get("duration_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let should_fail = args
+                .get("should_fail")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let require_gpu = args
+                .get("require_gpu")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             (
                 TaskSpec::BuiltinTest {
                     test_name: test_name.to_string(),
@@ -212,21 +224,22 @@ impl AgentGridBridge {
         };
 
         let priority = args.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let task = Task::new(spec, reqs).with_tags(vec!["grid_compute".into(), "agent_bridge".into()]);
+        let task =
+            Task::new(spec, reqs).with_tags(vec!["grid_compute".into(), "agent_bridge".into()]);
 
         match self.master.submit_task_with_priority(task, priority).await {
-            Ok(task_id) => {
-                match self.master.wait_task(task_id, Some(timeout)).await {
-                    Ok(task_res) => map_task_result_to_response(task_res, from, correlation_id, command),
-                    Err(e) => make_error_response(
-                        from,
-                        correlation_id,
-                        command,
-                        124,
-                        &format!("Compute execution failed or timed out: {e}"),
-                    ),
+            Ok(task_id) => match self.master.wait_task(task_id, Some(timeout)).await {
+                Ok(task_res) => {
+                    map_task_result_to_response(task_res, from, correlation_id, command)
                 }
-            }
+                Err(e) => make_error_response(
+                    from,
+                    correlation_id,
+                    command,
+                    124,
+                    &format!("Compute execution failed or timed out: {e}"),
+                ),
+            },
             Err(e) => make_error_response(
                 from,
                 correlation_id,
@@ -263,7 +276,8 @@ impl AgentGridBridge {
         }
 
         let compiler_flags = parse_compiler_flags(
-            args.get("compiler_flags").or_else(|| args.get("cargo_args")),
+            args.get("compiler_flags")
+                .or_else(|| args.get("cargo_args")),
         );
 
         let timeout_secs = timeout.as_secs().max(1);
@@ -275,21 +289,22 @@ impl AgentGridBridge {
         };
         let reqs = TaskRequirements::generic(2, timeout_secs);
         let priority = args.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let task = Task::new(spec, reqs).with_tags(vec!["grid_compile".into(), "agent_bridge".into()]);
+        let task =
+            Task::new(spec, reqs).with_tags(vec!["grid_compile".into(), "agent_bridge".into()]);
 
         match self.master.submit_task_with_priority(task, priority).await {
-            Ok(task_id) => {
-                match self.master.wait_task(task_id, Some(timeout)).await {
-                    Ok(task_res) => map_task_result_to_response(task_res, from, correlation_id, command),
-                    Err(e) => make_error_response(
-                        from,
-                        correlation_id,
-                        command,
-                        124,
-                        &format!("Compilation failed or timed out: {e}"),
-                    ),
+            Ok(task_id) => match self.master.wait_task(task_id, Some(timeout)).await {
+                Ok(task_res) => {
+                    map_task_result_to_response(task_res, from, correlation_id, command)
                 }
-            }
+                Err(e) => make_error_response(
+                    from,
+                    correlation_id,
+                    command,
+                    124,
+                    &format!("Compilation failed or timed out: {e}"),
+                ),
+            },
             Err(e) => make_error_response(
                 from,
                 correlation_id,
@@ -316,7 +331,11 @@ impl AgentGridBridge {
             let cmd_args: Vec<String> = args
                 .get("args")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             Ok(TaskSpec::new_command(prog, cmd_args))
         } else if let Some(script) = args.get("script").and_then(|v| v.as_str()) {
@@ -342,20 +361,24 @@ impl AgentGridBridge {
         };
 
         let reqs = if let Some(reqs_val) = args.get("requirements") {
-            serde_json::from_value(reqs_val.clone()).unwrap_or_else(|_| TaskRequirements::generic(1, timeout_secs))
+            serde_json::from_value(reqs_val.clone())
+                .unwrap_or_else(|_| TaskRequirements::generic(1, timeout_secs))
         } else {
             TaskRequirements::generic(1, timeout_secs)
         };
 
         let priority = args.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
-        let task = Task::new(spec, reqs).with_tags(vec!["grid_submit".into(), "agent_bridge".into()]);
+        let task =
+            Task::new(spec, reqs).with_tags(vec!["grid_submit".into(), "agent_bridge".into()]);
 
         match self.master.submit_task_with_priority(task, priority).await {
             Ok(task_id) => {
                 if wait {
                     match self.master.wait_task(task_id, Some(timeout)).await {
-                        Ok(task_res) => map_task_result_to_response(task_res, from, correlation_id, command),
+                        Ok(task_res) => {
+                            map_task_result_to_response(task_res, from, correlation_id, command)
+                        }
                         Err(e) => make_error_response(
                             from,
                             correlation_id,
@@ -376,7 +399,10 @@ impl AgentGridBridge {
                         "",
                         0,
                     );
-                    if let AgentMeshEnvelope::CommandResponse { ref mut payload, .. } = resp {
+                    if let AgentMeshEnvelope::CommandResponse {
+                        ref mut payload, ..
+                    } = resp
+                    {
                         *payload = Some(serde_json::json!({
                             "task_id": task_id.to_string(),
                             "status": "submitted"
@@ -425,7 +451,10 @@ impl AgentGridBridge {
                                 "",
                                 0,
                             );
-                            if let AgentMeshEnvelope::CommandResponse { payload: ref mut p, .. } = resp {
+                            if let AgentMeshEnvelope::CommandResponse {
+                                payload: ref mut p, ..
+                            } = resp
+                            {
                                 *p = Some(payload);
                             }
                             resp
@@ -477,7 +506,10 @@ impl AgentGridBridge {
                         "",
                         0,
                     );
-                    if let AgentMeshEnvelope::CommandResponse { payload: ref mut p, .. } = resp {
+                    if let AgentMeshEnvelope::CommandResponse {
+                        payload: ref mut p, ..
+                    } = resp
+                    {
                         *p = Some(payload);
                     }
                     resp
@@ -864,7 +896,9 @@ fn parse_source_files(val: Option<&Value>) -> HashMap<String, String> {
 
 fn parse_compiler_flags(val: Option<&Value>) -> Vec<String> {
     if let Some(arr) = val.and_then(|v| v.as_array()) {
-        arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+        arr.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
     } else if let Some(s) = val.and_then(|v| v.as_str()) {
         s.split_whitespace().map(String::from).collect()
     } else {
@@ -878,7 +912,11 @@ fn map_task_result_to_response(
     correlation_id: &str,
     command: &str,
 ) -> AgentMeshEnvelope {
-    let status = if res.exit_code == 0 { "success" } else { "failed" };
+    let status = if res.exit_code == 0 {
+        "success"
+    } else {
+        "failed"
+    };
     // Lossy, not `as_str()`: non-UTF-8 console output (e.g. an OEM code page on Windows) must
     // reach the agent as text with replacement characters, not as an empty string.
     let mut stdout = res.stdout_str().into_owned();
@@ -937,7 +975,8 @@ fn map_task_result_to_response(
         payload: ref mut p,
         error: ref mut e,
         ..
-    } = resp {
+    } = resp
+    {
         *p = Some(payload);
         *e = res.error;
     }
@@ -963,10 +1002,7 @@ fn make_error_response(
         err_msg,
         0,
     );
-    if let AgentMeshEnvelope::CommandResponse {
-        ref mut error,
-        ..
-    } = resp {
+    if let AgentMeshEnvelope::CommandResponse { ref mut error, .. } = resp {
         *error = Some(err_msg.to_string());
     }
     resp

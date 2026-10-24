@@ -65,6 +65,7 @@ async fn test_cli_3d_sdf_submission_and_export() {
         preferred_provider: None,
         output: Some(out_glb_path.clone()),
         args: Vec::new(),
+        ..Default::default()
     };
 
     let exit_code = run_submit(args, None).await;
@@ -146,6 +147,7 @@ async fn test_cli_autorig_submission_and_export() {
         preferred_provider: Some("builtin".to_string()),
         output: Some(out_rigged_path.clone()),
         args: Vec::new(),
+        ..Default::default()
     };
 
     let exit_code = run_submit(args, None).await;
@@ -189,6 +191,7 @@ async fn test_cli_negative_validations() {
         preferred_provider: None,
         output: None,
         args: Vec::new(),
+        ..Default::default()
     };
     let exit_code = run_submit(args, None).await;
     assert_eq!(exit_code, ExitCode::FAILURE);
@@ -221,6 +224,7 @@ async fn test_cli_negative_validations() {
         preferred_provider: None,
         output: None,
         args: Vec::new(),
+        ..Default::default()
     };
     let exit_code = run_submit(args_mesh, None).await;
     assert_eq!(exit_code, ExitCode::FAILURE);

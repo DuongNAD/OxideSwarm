@@ -376,6 +376,7 @@ async fn test_adv_websocket_delivery_ack_and_correlation_routing() {
         hostname: "wire-box".into(),
         capabilities: serde_json::json!({}),
         timestamp: 1000,
+        token: None,
     };
     ws_tx
         .send(WsMessage::Text(reg_env.to_json_string().unwrap()))

@@ -46,7 +46,6 @@ where
     false
 }
 
-
 // =========================================================================
 // Challenge 1: High Concurrent Worker Registration Bursts (20 Workers)
 // =========================================================================
@@ -287,8 +286,7 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
     let rogue_timeout = Duration::from_secs(7);
 
     // Rogue 1: read should yield EOF (0 bytes read) or ConnectionReset
-    let r1_res =
-        tokio::time::timeout(rogue_timeout, rogue_zero_bytes.read(&mut buf)).await;
+    let r1_res = tokio::time::timeout(rogue_timeout, rogue_zero_bytes.read(&mut buf)).await;
     let r1_elapsed = timeout_start.elapsed();
     println!(
         "[CHALLENGE SLOWLORIS] Rogue 1 (0 bytes) terminated after {:?}",
@@ -308,8 +306,7 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
     );
 
     // Rogue 2: read should yield EOF (0 bytes read)
-    let r2_res =
-        tokio::time::timeout(rogue_timeout, rogue_partial_prefix.read(&mut buf)).await;
+    let r2_res = tokio::time::timeout(rogue_timeout, rogue_partial_prefix.read(&mut buf)).await;
     let r2_elapsed = timeout_start.elapsed();
     println!(
         "[CHALLENGE SLOWLORIS] Rogue 2 (partial prefix) terminated after {:?}",
@@ -319,8 +316,7 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
     assert_eq!(r2_res.unwrap().unwrap_or(0), 0, "Rogue 2 must receive EOF");
 
     // Rogue 3: read should yield EOF (0 bytes read)
-    let r3_res =
-        tokio::time::timeout(rogue_timeout, rogue_partial_body.read(&mut buf)).await;
+    let r3_res = tokio::time::timeout(rogue_timeout, rogue_partial_body.read(&mut buf)).await;
     let r3_elapsed = timeout_start.elapsed();
     println!(
         "[CHALLENGE SLOWLORIS] Rogue 3 (partial body) terminated after {:?}",

@@ -108,14 +108,10 @@ impl TestCluster {
         let reg_timeout = Duration::from_secs(12);
         #[cfg(not(windows))]
         let reg_timeout = Duration::from_secs(5);
-        let ready = wait_for(
-            reg_timeout,
-            Duration::from_millis(50),
-            || async {
-                let workers = master.list_workers().await.unwrap_or_default();
-                workers.len() == 3 && workers.iter().all(|w| w.status == WorkerStatus::Connected)
-            },
-        )
+        let ready = wait_for(reg_timeout, Duration::from_millis(50), || async {
+            let workers = master.list_workers().await.unwrap_or_default();
+            workers.len() == 3 && workers.iter().all(|w| w.status == WorkerStatus::Connected)
+        })
         .await;
 
         assert!(
@@ -492,14 +488,10 @@ async fn test_m4_worker_disconnect_during_execution_triggers_retry() {
     let reg_timeout = Duration::from_secs(12);
     #[cfg(not(windows))]
     let reg_timeout = Duration::from_secs(4);
-    let registered = wait_for(
-        reg_timeout,
-        Duration::from_millis(50),
-        || async {
-            let workers = master.list_workers().await.unwrap_or_default();
-            workers.len() == 2 && workers.iter().all(|w| w.status == WorkerStatus::Connected)
-        },
-    )
+    let registered = wait_for(reg_timeout, Duration::from_millis(50), || async {
+        let workers = master.list_workers().await.unwrap_or_default();
+        workers.len() == 2 && workers.iter().all(|w| w.status == WorkerStatus::Connected)
+    })
     .await;
     assert!(registered, "Both workers must register");
 

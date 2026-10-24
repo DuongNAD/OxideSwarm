@@ -82,10 +82,13 @@ OxideSwarm/
 | **Core Protocol** | Wire Framing | 4-byte length-delimited framing, dual-mode Serde (`0x01` JSON, `0x02` Bincode, `0x03` Auth, `0x04` Encrypted) | Implemented |
 | **Core Protocol** | Mutual Authentication | Mutual HMAC-SHA256 handshake over TCP and Iroh QUIC streams | Implemented |
 | **Core Protocol** | Stream Encryption | ChaCha20-Poly1305 AEAD (`0x04`) wire transport derived from cluster secret | Implemented |
-| **Core Protocol** | Version Negotiation | Formal `PROTOCOL_VERSION` and `ProtocolCapabilities` handshake exchange | Implemented |
+| **Core Protocol** | Version Negotiation | Workers send `PROTOCOL_VERSION` and `ProtocolCapabilities` at registration; the master refuses versions below the minimum. Client messages carry no version | Implemented |
+| **Core Protocol** | Task Placement | `require:` task tags (os, arch, worker, tag) and worker tags (`os:`, `arch:`, user tags); no wire change ([design 0001](docs/design/0001-two-node-readiness.md)) | Implemented |
 | **Master Grid** | 8-State Task FSM | `Submitted` ➔ `Queued` ➔ `Scheduled` ➔ `Running` ➔ `Completed`/`Failed`/`Retrying`/`Cancelled` | Implemented |
 | **Master Grid** | Scheduler & Dispatch | Least-loaded / round-robin scheduling, real-GPU priority over simulated GPU, batch dispatch, anti-stuttering backpressure | Implemented |
 | **Master Grid** | Memory Bounding | LRU task eviction and TTL bounding for terminal states in TaskQueue | Implemented |
+| **CLI** | Cluster Check | `oxideswarm doctor`: connection, workers, pinned in-process / process / GPU probes, spreading (checks C1-C6) | Implemented |
+| **CLI** | Task Inputs | `submit --stdin-file`, `--script-file`, `--interpreter`, `--env`; `--matrix-dim` / `--work-group-size` for GPU tasks | Implemented |
 | **Worker Engine** | Execution Runner | Bounded stdout/stderr capture, cancellation, configurable process priority | Implemented |
 | **Worker Engine** | Child Containment | Atomic Windows Job Objects (`kill-on-close` via `CREATE_SUSPENDED`) and Linux `PR_SET_PDEATHSIG` process tree binding | Implemented |
 | **Worker Engine** | GPU Acceleration | Hardware `wgpu` compute engine (Metal, Vulkan, DX12) and simulated CPU SIMD fallback | Implemented |
@@ -93,6 +96,10 @@ OxideSwarm/
 | **Android Bridge** | Cluster Secret Auth | Native secret injection (`nativeSetClusterSecret`, `nativeStartWorkerWithSecret`) | Implemented |
 | **Agent Mesh** | Relay Hub | Axum WebSocket hub routing envelopes with token authentication and SHA-256 validation | Implemented |
 | **Agent Mesh** | Grid Bridge | `--grid-master` CLI integration routing `grid_*` commands to live master | Implemented |
+| **Mobile Coordination** | Dynamic Throttling & Arbitrage | Multi-tier thermal/battery throttling, RRC adaptive keepalive, 5-rule refusal matrix, $S_{\text{auth}}$ election, cryptographic lease tickets, fast pre-sleep evacuation ([design 0002](docs/design/0002-mobile-coordination.md)) | Implemented |
+| **File Staging** | Distributed Staging & Artifacts | Distributed file staging (`submit --file`), output artifact collection (`--output`, `--output-dir`), SHA-256 worker cache, atomic hardlinks, sandbox isolation ([design 0003](docs/design/0003-distributed-file-staging.md)) | Implemented |
+| **AI Tooling** | MCP Server | Model Context Protocol server over JSON-RPC 2.0 stdio (`oxideswarm mcp`) exposing `status`, `workers`, `submit`, `task_result`, `doctor` ([design 0004](docs/design/0004-mcp-and-discovery.md)) | Implemented |
+| **Discovery** | Subnet-Isolated Fallback | 3-tier discovery hierarchy: UDP broadcast, authenticated HTTP probe (`GET /api/discovery/probe`), and signed rendezvous registry (`OXIDESWARM_RENDEZVOUS`) ([design 0004](docs/design/0004-mcp-and-discovery.md)) | Implemented |
 
 ---
 
@@ -104,3 +111,4 @@ OxideSwarm/
 | **M2: Functional Gap Completion** | Android JNI cluster secret auth, Agent Mesh `--grid-master` bridge, Real-GPU priority scheduler | Clean build, targeted integration tests pass | **COMPLETED** |
 | **M3: Security & Process Hardening** | Authenticated wire stream encryption (`0x04`), protocol version & capability negotiation, Windows Job Object & Linux PDEATHSIG containment | Wire encryption tests, version negotiation tests, process containment tests pass | **COMPLETED** |
 | **M4: Isolation & Verification** | Test state isolation (`OXIDESWARM_HOME`, ephemeral keys), final documentation synchronization, full workspace verification | 100% test pass across all workspace crates and python suites with 0 host pollution | **COMPLETED** |
+| **M5: Production Completion & Verification** | Two-node readiness ([design 0001](docs/design/0001-two-node-readiness.md)), mobile coordination & dynamic policies ([design 0002](docs/design/0002-mobile-coordination.md)), distributed file staging ([design 0003](docs/design/0003-distributed-file-staging.md)), MCP server & discovery fallback ([design 0004](docs/design/0004-mcp-and-discovery.md)), full workspace verification | Unit and integration tests, 2-worker live `doctor` checks C1–C6 pass, documentation sync | **COMPLETED** |

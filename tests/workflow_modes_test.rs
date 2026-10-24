@@ -217,22 +217,29 @@ fn test_cli_binary_mode_subcommand() {
 }
 
 fn resolve_functional_bash() -> Option<std::path::PathBuf> {
-    let mut candidates = Vec::new();
-
+    // Git for Windows does not put bash on PATH, so try its usual install locations first.
     #[cfg(windows)]
-    {
-        candidates.push(std::path::PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"));
-        candidates.push(std::path::PathBuf::from(r"C:\Program Files\Git\usr\bin\bash.exe"));
-        candidates.push(std::path::PathBuf::from(r"C:\Program Files (x86)\Git\bin\bash.exe"));
+    let candidates = {
+        let mut candidates = vec![
+            std::path::PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
+            std::path::PathBuf::from(r"C:\Program Files\Git\usr\bin\bash.exe"),
+            std::path::PathBuf::from(r"C:\Program Files (x86)\Git\bin\bash.exe"),
+        ];
         if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            candidates.push(std::path::PathBuf::from(local_app_data).join(r"Programs\Git\bin\bash.exe"));
+            candidates
+                .push(std::path::PathBuf::from(local_app_data).join(r"Programs\Git\bin\bash.exe"));
         }
-    }
-
-    candidates.push(std::path::PathBuf::from("bash"));
+        candidates.push(std::path::PathBuf::from("bash"));
+        candidates
+    };
+    #[cfg(not(windows))]
+    let candidates = vec![std::path::PathBuf::from("bash")];
 
     for cand in candidates {
-        if let Ok(output) = std::process::Command::new(&cand).args(["-c", "exit 0"]).output() {
+        if let Ok(output) = std::process::Command::new(&cand)
+            .args(["-c", "exit 0"])
+            .output()
+        {
             if output.status.success() {
                 return Some(cand);
             }

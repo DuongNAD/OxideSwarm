@@ -15,6 +15,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
+import com.oxideswarm.worker.receiver.BootCompletedReceiver
 import com.oxideswarm.worker.runner.*
 import com.oxideswarm.worker.util.SystemInfoHelper
 import java.util.concurrent.atomic.AtomicBoolean
@@ -172,6 +173,13 @@ class OxideWorkerService : Service(), WorkerEngineListener {
                 val ramMb = intent?.getLongExtra(EXTRA_RAM_MB, SystemInfoHelper.getTotalRamMb(this))
                     ?: SystemInfoHelper.getTotalRamMb(this)
                 val simulateGpu = intent?.getBooleanExtra(EXTRA_SIMULATE_GPU, false) ?: false
+                // The secret is not carried in the Intent. It is read from the app's own storage,
+                // the device-protected store the activity saves it to and the boot receiver reads.
+                val secretStorage = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    createDeviceProtectedStorageContext()
+                } else {
+                    this
+                }
 
                 val config = WorkerConfig(
                     masterAddress = master,
@@ -179,7 +187,8 @@ class OxideWorkerService : Service(), WorkerEngineListener {
                     workerName = name,
                     cores = cores,
                     ramMb = ramMb,
-                    simulateGpu = simulateGpu
+                    simulateGpu = simulateGpu,
+                    clusterSecret = BootCompletedReceiver.loadClusterSecret(secretStorage)
                 )
                 startWorkerEngine(config)
             }

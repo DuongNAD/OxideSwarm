@@ -105,14 +105,23 @@ impl HeartbeatTracker {
         self.active_tasks.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Atomically decrements the active task count and returns the new count.
+    /// Atomically decrements the active task count (never below zero) and returns the new count.
     pub fn decrement_active_tasks(&self) -> usize {
-        self.active_tasks
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| {
-                Some(val.saturating_sub(1))
-            })
-            .unwrap_or(0)
-            .saturating_sub(1)
+        // A compare-exchange loop instead of `fetch_update`: newer Rust deprecates it (renamed to
+        // `try_update`), and older toolchains do not have `try_update` yet.
+        let mut current = self.active_tasks.load(Ordering::SeqCst);
+        loop {
+            let next = current.saturating_sub(1);
+            match self.active_tasks.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Returns the current number of active tasks.
@@ -144,24 +153,26 @@ impl HeartbeatHandle {
 }
 
 static TELEMETRY_CACHE: std::sync::Mutex<(f32, u64)> = std::sync::Mutex::new((0.0, 8192));
-static TELEMETRY_INITIALIZED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static TELEMETRY_SAMPLER: std::sync::Once = std::sync::Once::new();
 
 fn ensure_telemetry_sampler_started() {
-    if TELEMETRY_INITIALIZED
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
+    // `call_once` also makes a concurrent first caller wait until the cache is seeded.
+    TELEMETRY_SAMPLER.call_once(|| {
+        // Seed the cache before the first heartbeat reads it. Starting from the (0 %, 8192 MB)
+        // placeholder made a freshly started worker report 8 GB free whatever the machine has,
+        // and the master's RAM gate trusts that figure. (CPU needs two samples, so it starts at 0.)
+        // Only memory is read here, which is cheap; the CPU sampler is set up on its own thread.
+        let mut mem = sysinfo::System::new();
+        mem.refresh_memory();
+        if let Ok(mut cache) = TELEMETRY_CACHE.lock() {
+            *cache = (0.0, mem.available_memory() / (1024 * 1024));
+        }
         std::thread::spawn(move || {
             let mut sys = sysinfo::System::new_with_specifics(
                 sysinfo::RefreshKind::new()
                     .with_cpu(sysinfo::CpuRefreshKind::new().with_cpu_usage())
                     .with_memory(sysinfo::MemoryRefreshKind::new().with_ram()),
             );
-            sys.refresh_memory();
-            if let Ok(mut cache) = TELEMETRY_CACHE.lock() {
-                *cache = (0.0, sys.available_memory() / (1024 * 1024));
-            }
             loop {
                 sys.refresh_cpu_specifics(sysinfo::CpuRefreshKind::new().with_cpu_usage());
                 sys.refresh_memory();
@@ -173,7 +184,7 @@ fn ensure_telemetry_sampler_started() {
                 std::thread::sleep(Duration::from_millis(500));
             }
         });
-    }
+    });
 }
 
 fn get_system_telemetry() -> (f32, u64) {
@@ -223,7 +234,8 @@ impl IoClock {
 
     /// Records that bytes were received.
     pub fn touch_rx(&self) {
-        self.last_rx_nanos.fetch_max(self.now_nanos(), Ordering::Relaxed);
+        self.last_rx_nanos
+            .fetch_max(self.now_nanos(), Ordering::Relaxed);
     }
 
     /// Records that the socket accepted part of a bulk write.
@@ -326,13 +338,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StampedStream<S> {
 #[derive(Debug, Clone, Default)]
 pub struct MobileTelemetryHandle {
     inner: Arc<RwLock<Option<MobileCapabilities>>>,
+    live: Arc<RwLock<Option<MobileLiveStatus>>>,
 }
 
 impl MobileTelemetryHandle {
     /// A handle starting at `initial` (`None` for a device without battery data).
     pub fn new(initial: Option<MobileCapabilities>) -> Self {
+        let live = initial.as_ref().map(|m| m.live_status());
         Self {
             inner: Arc::new(RwLock::new(initial)),
+            live: Arc::new(RwLock::new(live)),
         }
     }
 
@@ -346,10 +361,15 @@ impl MobileTelemetryHandle {
 
     /// Replaces the whole state (descriptors included).
     pub fn set(&self, mobile: Option<MobileCapabilities>) {
+        let live = mobile.as_ref().map(|m| m.live_status());
         *self
             .inner
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = mobile;
+        *self
+            .live
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = live;
     }
 
     /// Replaces the fast-changing readings. The OS / SoC descriptors are kept; if nothing was set
@@ -360,7 +380,7 @@ impl MobileTelemetryHandle {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = Some(match guard.as_ref() {
-            Some(current) => current.with_live_status(status),
+            Some(current) => current.with_live_status(status.clone()),
             None => MobileCapabilities {
                 os_version: "unknown".into(),
                 soc_model: "unknown".into(),
@@ -369,11 +389,24 @@ impl MobileTelemetryHandle {
                 thermal_throttled: status.thermal_throttled,
             },
         });
+        *self
+            .live
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(status);
     }
 
     /// The fast-changing readings alone, `None` while nothing is known.
     pub fn live_status(&self) -> Option<MobileLiveStatus> {
-        self.snapshot().map(|m| m.live_status())
+        let l = self
+            .live
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if l.is_some() {
+            l
+        } else {
+            self.snapshot().map(|m| m.live_status())
+        }
     }
 
     /// Replaces OS / SoC descriptors that are still "unknown" (an app pushed battery readings
@@ -416,18 +449,25 @@ pub fn spawn_mobile_poller(
     })
 }
 
-/// Spawns the background periodic heartbeat sender task.
-pub fn spawn_heartbeat_task(
+/// Spawns the background periodic heartbeat sender task with adaptive keepalive support.
+pub fn spawn_adaptive_heartbeat_task(
     worker_id: Uuid,
     interval: Duration,
     outbound_tx: mpsc::Sender<WorkerMessage>,
     tracker: Arc<HeartbeatTracker>,
+    mobile: Option<MobileTelemetryHandle>,
 ) -> HeartbeatHandle {
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
     let tracker_clone = Arc::clone(&tracker);
 
     let join_handle = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
+        let mut current_interval = interval;
+        if let Some(ref mob) = mobile {
+            if let Some(status) = mob.live_status() {
+                current_interval = status.recommended_keepalive_interval(0);
+            }
+        }
+        let mut ticker = tokio::time::interval(current_interval);
         // Skip the immediate initial tick so first heartbeat is sent after interval has elapsed
         ticker.tick().await;
 
@@ -436,6 +476,18 @@ pub fn spawn_heartbeat_task(
                 _ = ticker.tick() => {
                     let now_sec = current_epoch_secs();
                     let active = tracker_clone.active_tasks.load(Ordering::Relaxed);
+
+                    // Dynamically adapt keepalive interval based on cellular status and active tasks
+                    if let Some(ref mob) = mobile {
+                        if let Some(status) = mob.live_status() {
+                            let recommended = status.recommended_keepalive_interval(active);
+                            if recommended != current_interval {
+                                current_interval = recommended;
+                                ticker = tokio::time::interval(current_interval);
+                                ticker.tick().await;
+                            }
+                        }
+                    }
 
                     // Read current system telemetry from non-blocking background sampler
                     let (cpu_usage_pct, ram_available_mb) = get_system_telemetry();
@@ -457,10 +509,6 @@ pub fn spawn_heartbeat_task(
                         "Dispatching periodic heartbeat"
                     );
 
-                    // Never wait for room: while the writer is stuck in a large frame the queue
-                    // fills up, and a backlog of stale beats delivered in a burst afterwards says
-                    // nothing the next fresh beat does not. A full queue means a beat (or other
-                    // control traffic) is already waiting, so this one is simply skipped.
                     match outbound_tx.try_send(msg) {
                         Ok(()) => tracker_clone.record_sent(now_sec),
                         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -485,6 +533,16 @@ pub fn spawn_heartbeat_task(
         stop_tx: Some(stop_tx),
         join_handle,
     }
+}
+
+/// Spawns the background periodic heartbeat sender task.
+pub fn spawn_heartbeat_task(
+    worker_id: Uuid,
+    interval: Duration,
+    outbound_tx: mpsc::Sender<WorkerMessage>,
+    tracker: Arc<HeartbeatTracker>,
+) -> HeartbeatHandle {
+    spawn_adaptive_heartbeat_task(worker_id, interval, outbound_tx, tracker, None)
 }
 
 #[cfg(test)]
@@ -594,7 +652,19 @@ mod tests {
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total_mb = sys.total_memory() / (1024 * 1024);
-        assert!(ram_mb <= total_mb.max(1), "free {ram_mb} MB cannot exceed total {total_mb} MB");
+        let available_mb = sys.available_memory() / (1024 * 1024);
+        assert!(
+            ram_mb <= total_mb.max(1),
+            "free {ram_mb} MB cannot exceed total {total_mb} MB"
+        );
+        // The bound above cannot catch the placeholder on a machine with more than 8 GB, so also
+        // compare with a fresh reading: the cached one is at most 500 ms old and stays close,
+        // while the placeholder is far off unless the machine happens to have about 8 GB free.
+        let tolerance_mb = (total_mb / 4).max(1024);
+        assert!(
+            available_mb == 0 || ram_mb.abs_diff(available_mb) <= tolerance_mb,
+            "first reading of {ram_mb} MB free is far from the {available_mb} MB actually free"
+        );
     }
 
     #[tokio::test]
@@ -602,7 +672,10 @@ mod tests {
         let clock = IoClock::new();
         tokio::time::sleep(Duration::from_millis(60)).await;
         let idle = clock.silence();
-        assert!(idle >= Duration::from_millis(50), "idle connection ages: {idle:?}");
+        assert!(
+            idle >= Duration::from_millis(50),
+            "idle connection ages: {idle:?}"
+        );
 
         // Received bytes are life.
         clock.touch_rx();
@@ -614,7 +687,10 @@ mod tests {
         clock.touch_bulk_tx();
         assert!(clock.silence() < Duration::from_millis(40));
         tokio::time::sleep(Duration::from_millis(60)).await;
-        assert!(clock.silence() >= Duration::from_millis(50), "a stalled upload stops counting");
+        assert!(
+            clock.silence() >= Duration::from_millis(50),
+            "a stalled upload stops counting"
+        );
     }
 
     #[tokio::test]
@@ -635,11 +711,20 @@ mod tests {
         // A heartbeat-sized write succeeds into a dead peer's buffer too, so it proves nothing...
         tokio::time::sleep(Duration::from_millis(60)).await;
         stamped.write_all(b"pong").await.unwrap();
-        assert!(clock.silence() >= Duration::from_millis(50), "small writes are not life");
+        assert!(
+            clock.silence() >= Duration::from_millis(50),
+            "small writes are not life"
+        );
 
         // ...a bulk write does (the peer is draining a frame).
-        stamped.write_all(&vec![7u8; BULK_WRITE_BYTES * 2]).await.unwrap();
-        assert!(clock.silence() < Duration::from_millis(40), "bulk write progress is life");
+        stamped
+            .write_all(&vec![7u8; BULK_WRITE_BYTES * 2])
+            .await
+            .unwrap();
+        assert!(
+            clock.silence() < Duration::from_millis(40),
+            "bulk write progress is life"
+        );
     }
 
     #[test]
@@ -653,6 +738,7 @@ mod tests {
             battery_pct: Some(61),
             is_charging: Some(true),
             thermal_throttled: false,
+            ..Default::default()
         });
         let first = handle.snapshot().unwrap();
         assert_eq!(first.battery_pct, Some(61));
@@ -671,10 +757,18 @@ mod tests {
             battery_pct: Some(3),
             is_charging: Some(false),
             thermal_throttled: true,
+            ..Default::default()
         });
         let snap = handle.snapshot().unwrap();
-        assert_eq!((snap.os_version.as_str(), snap.soc_model.as_str()), ("Android 14", "Tensor"));
-        assert_eq!(handle.live_status().unwrap().battery_pct, Some(3), "clones share state");
+        assert_eq!(
+            (snap.os_version.as_str(), snap.soc_model.as_str()),
+            ("Android 14", "Tensor")
+        );
+        assert_eq!(
+            handle.live_status().unwrap().battery_pct,
+            Some(3),
+            "clones share state"
+        );
         assert!(snap.thermal_throttled);
     }
 
@@ -683,6 +777,7 @@ mod tests {
             battery_pct: Some(7),
             is_charging: Some(false),
             thermal_throttled: true,
+            ..Default::default()
         })
     }
 
@@ -703,7 +798,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         poller.abort();
         let snap = handle.snapshot().unwrap();
-        assert_eq!(snap.battery_pct, Some(7), "the startup snapshot must not stay frozen");
+        assert_eq!(
+            snap.battery_pct,
+            Some(7),
+            "the startup snapshot must not stay frozen"
+        );
         assert_eq!(snap.is_charging, Some(false));
         assert!(snap.thermal_throttled);
         assert_eq!(snap.os_version, "macOS");

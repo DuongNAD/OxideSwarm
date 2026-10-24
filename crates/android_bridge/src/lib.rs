@@ -24,9 +24,7 @@ use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::protocol::{
     MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage, PROTOCOL_VERSION_CURRENT,
 };
-use rusty_grid_core::transport::{
-    iroh, serialize_p2p_ticket, BiStream, GridStream, GRID_ALPN,
-};
+use rusty_grid_core::transport::{iroh, serialize_p2p_ticket, BiStream, GridStream, GRID_ALPN};
 use rusty_grid_worker::{
     MobileTelemetryHandle, SandboxConfig, SandboxError, WorkerClient, WorkerConfig,
 };
@@ -70,6 +68,7 @@ struct WorkerState {
     /// Writable directory for task sandboxes, handed over by the app (its cache directory) before
     /// the worker starts. The default, `/data/local/tmp`, is closed to apps.
     sandbox_dir: Mutex<Option<PathBuf>>,
+    evacuation_reason: Mutex<Option<String>>,
     shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
     thread_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -85,6 +84,7 @@ impl WorkerState {
             telemetry: Mutex::new(MobileTelemetry::default()),
             mobile: MobileTelemetryHandle::default(),
             sandbox_dir: Mutex::new(None),
+            evacuation_reason: Mutex::new(None),
             shutdown_tx: Mutex::new(None),
             thread_handle: Mutex::new(None),
         }
@@ -95,7 +95,10 @@ static WORKER_STATE: OnceLock<Arc<WorkerState>> = OnceLock::new();
 
 fn get_worker_state() -> Arc<WorkerState> {
     WORKER_STATE
-        .get_or_init(|| Arc::new(WorkerState::new()))
+        .get_or_init(|| {
+            rusty_grid_worker::client::set_evacuation_reason_hook(get_evacuation_reason_impl);
+            Arc::new(WorkerState::new())
+        })
         .clone()
 }
 
@@ -105,8 +108,7 @@ fn get_worker_state() -> Arc<WorkerState> {
 /// one (`/data/local/tmp`) is not writable for an app. An empty string clears the setting.
 pub fn set_sandbox_dir_impl(dir: String) -> bool {
     let dir = dir.trim();
-    *get_worker_state().sandbox_dir.lock().unwrap() =
-        (!dir.is_empty()).then(|| PathBuf::from(dir));
+    *get_worker_state().sandbox_dir.lock().unwrap() = (!dir.is_empty()).then(|| PathBuf::from(dir));
     true
 }
 
@@ -408,13 +410,19 @@ pub fn update_telemetry_detailed_impl(
     telem.battery_temperature = temp;
     telem.is_charging = Some(is_charging);
     telem.thermal_throttled = thermal_throttled;
-    telem.network_type = net;
+    telem.network_type = net.clone();
     // The worker's scheduling view of this device: without this the Master would keep the
     // registration-time snapshot for the whole run.
+    let bat_tier = MobileLiveStatus::compute_battery_tier(pct, Some(is_charging));
+    let therm_tier = MobileLiveStatus::compute_thermal_tier(temp, thermal_throttled);
     state.mobile.update(MobileLiveStatus {
         battery_pct: pct,
         is_charging: Some(is_charging),
         thermal_throttled,
+        battery_temperature: temp,
+        network_type: net,
+        battery_tier: Some(bat_tier),
+        thermal_tier: Some(therm_tier),
     });
     true
 }
@@ -423,6 +431,30 @@ pub fn update_telemetry_detailed_impl(
 /// Backward-compatible wrapper calling `update_telemetry_detailed_impl`.
 pub fn update_telemetry_impl(battery_pct: i32, is_charging: bool, thermal_throttled: bool) -> bool {
     update_telemetry_detailed_impl(battery_pct, is_charging, thermal_throttled, None, None)
+}
+
+/// Triggers fast pre-sleep task evacuation (< 50ms) before the OS suspends the app process.
+/// Stores the evacuation reason and triggers shutdown_tx so active tasks are aborted immediately
+/// without waiting for the 10-second drain timeout.
+pub fn trigger_fast_evacuation_impl(reason: &str) -> bool {
+    let state = get_worker_state();
+    let r = if reason.trim().is_empty() {
+        "PRE_SLEEP_EVACUATION".to_string()
+    } else {
+        reason.trim().to_string()
+    };
+    info!(reason = %r, "Triggering fast pre-sleep task evacuation (<50ms)");
+    *state.evacuation_reason.lock().unwrap() = Some(r);
+    rusty_grid_worker::client::set_evacuation_reason_hook(get_evacuation_reason_impl);
+    if let Some(tx) = state.shutdown_tx.lock().unwrap().as_ref() {
+        let _ = tx.send(true);
+    }
+    true
+}
+
+/// Retrieves the active evacuation reason, if any.
+pub fn get_evacuation_reason_impl() -> Option<String> {
+    get_worker_state().evacuation_reason.lock().unwrap().clone()
 }
 
 /// Retrieves the current cached mobile telemetry.
@@ -536,7 +568,11 @@ pub fn start_master_impl(
     *state.connected_workers.lock().unwrap() = 0;
 
     let bind_port_u16 = if bind_port > 0 { bind_port as u16 } else { 0 };
-    let dashboard_port_u16 = if dashboard_port > 0 { dashboard_port as u16 } else { 0 };
+    let dashboard_port_u16 = if dashboard_port > 0 {
+        dashboard_port as u16
+    } else {
+        0
+    };
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -844,7 +880,9 @@ async fn handle_coordinator_stream(
 
     if registered_id.take().is_some() {
         let mut count = state_for_conn.connected_workers.lock().unwrap();
-        if *count > 0 { *count -= 1; }
+        if *count > 0 {
+            *count -= 1;
+        }
     }
 }
 
@@ -1187,6 +1225,25 @@ pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nati
     }
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeTriggerFastEvacuation<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    reason: JString<'local>,
+) -> jboolean {
+    let reason_str: String = match env.get_string(&reason) {
+        Ok(s) => s.into(),
+        Err(_) => "PRE_SLEEP_EVACUATION".to_string(),
+    };
+    if trigger_fast_evacuation_impl(&reason_str) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
 // ==============================================================================
 // JNI Exported Functions: com.oxideswarm.worker.runner.OxideWorkerBridge
 // ==============================================================================
@@ -1226,7 +1283,11 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
     class: JClass<'local>,
     sandbox_dir: JString<'local>,
 ) -> jboolean {
-    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeSetSandboxDir(env, class, sandbox_dir)
+    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeSetSandboxDir(
+        env,
+        class,
+        sandbox_dir,
+    )
 }
 
 #[no_mangle]
@@ -1383,6 +1444,19 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
     )
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeTriggerFastEvacuation<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    class: JClass<'local>,
+    reason: JString<'local>,
+) -> jboolean {
+    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeTriggerFastEvacuation(
+        env, class, reason,
+    )
+}
+
 // ==============================================================================
 // Unit Tests
 // ==============================================================================
@@ -1420,10 +1494,22 @@ mod tests {
         let _guard = TEST_MUTEX.lock().unwrap();
         reset_test_state();
         let state = get_worker_state();
-        assert!(state.mobile.live_status().is_none(), "nothing known before the app reports");
+        assert!(
+            state.mobile.live_status().is_none(),
+            "nothing known before the app reports"
+        );
 
-        assert!(update_telemetry_detailed_impl(23, false, true, Some(41.5), None));
-        let live = state.mobile.live_status().expect("the report must reach the worker's handle");
+        assert!(update_telemetry_detailed_impl(
+            23,
+            false,
+            true,
+            Some(41.5),
+            None
+        ));
+        let live = state
+            .mobile
+            .live_status()
+            .expect("the report must reach the worker's handle");
         assert_eq!(live.battery_pct, Some(23));
         assert_eq!(live.is_charging, Some(false));
         assert!(live.thermal_throttled);
@@ -1457,10 +1543,20 @@ mod tests {
         let dir = scratch_dir("blocked");
         let blocker = dir.join("not-a-directory");
         std::fs::write(&blocker, b"x").unwrap();
-        assert!(set_sandbox_dir_impl(blocker.join("sandboxes").display().to_string()));
+        assert!(set_sandbox_dir_impl(
+            blocker.join("sandboxes").display().to_string()
+        ));
 
         assert!(
-            !start_worker_impl("127.0.0.1:59990".into(), None, "NoSandbox".into(), 2, 1024, false, 5),
+            !start_worker_impl(
+                "127.0.0.1:59990".into(),
+                None,
+                "NoSandbox".into(),
+                2,
+                1024,
+                false,
+                5
+            ),
             "a worker that cannot create task sandboxes must not pretend to have started"
         );
         assert!(!is_running_impl());
@@ -1480,8 +1576,19 @@ mod tests {
         let sandboxes = dir.join("cache").join("sandboxes");
         assert!(set_sandbox_dir_impl(sandboxes.display().to_string()));
 
-        assert!(start_worker_impl("127.0.0.1:59991".into(), None, "WithSandbox".into(), 2, 1024, false, 5));
-        assert!(sandboxes.is_dir(), "the worker must have prepared the directory it was given");
+        assert!(start_worker_impl(
+            "127.0.0.1:59991".into(),
+            None,
+            "WithSandbox".into(),
+            2,
+            1024,
+            false,
+            5
+        ));
+        assert!(
+            sandboxes.is_dir(),
+            "the worker must have prepared the directory it was given"
+        );
         assert!(stop_worker_impl());
         reset_test_state();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1492,7 +1599,9 @@ mod tests {
         let _guard = TEST_MUTEX.lock().unwrap();
         reset_test_state();
         let dir = scratch_dir("bad-ticket");
-        assert!(set_sandbox_dir_impl(dir.join("sandboxes").display().to_string()));
+        assert!(set_sandbox_dir_impl(
+            dir.join("sandboxes").display().to_string()
+        ));
 
         // `run()` refuses an unusable P2P ticket right away, on the worker's own thread.
         assert!(start_worker_impl(
@@ -1612,7 +1721,11 @@ mod tests {
 
         // Verify genuine P2P ticket parses as iroh::EndpointAddr
         let parsed = rusty_grid_core::transport::parse_p2p_ticket(&ticket);
-        assert!(parsed.is_ok(), "Generated P2P ticket must parse into EndpointAddr: {:?}", parsed.err());
+        assert!(
+            parsed.is_ok(),
+            "Generated P2P ticket must parse into EndpointAddr: {:?}",
+            parsed.err()
+        );
 
         let status_json = get_master_status_impl();
         assert!(status_json.contains("\"running\":true"));
@@ -1672,7 +1785,10 @@ mod tests {
         // 4. Invalid secret (neither valid hex nor existing file)
         assert!(!set_cluster_secret_impl("not_a_valid_hex_or_file_xyz_123"));
         let status = status_text();
-        assert!(status.starts_with("ERROR: Invalid cluster secret:"), "{status}");
+        assert!(
+            status.starts_with("ERROR: Invalid cluster secret:"),
+            "{status}"
+        );
 
         reset_test_state();
         let _ = std::fs::remove_dir_all(&dir);

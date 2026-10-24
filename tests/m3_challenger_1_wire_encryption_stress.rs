@@ -23,11 +23,10 @@ use uuid::Uuid;
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::cluster_auth::{client_handshake, ClusterSecret, WIRE_FORMAT_AUTH};
 use rusty_grid_core::protocol::{
-    derive_aead_keys, deserialize_message, serialize_message, AeadReaderSession,
-    AeadWriterSession, ClientMessage, ClientResponse, EndpointRole, InboundMessage, MasterMessage,
-    MessageTransport, ProtocolCapabilities, ProtocolError, WireCodec, WorkerMessage,
-    PROTOCOL_VERSION_CURRENT, WIRE_FORMAT_BINCODE,
-    WIRE_FORMAT_ENCRYPTED, WIRE_FORMAT_JSON,
+    derive_aead_keys, deserialize_message, serialize_message, AeadReaderSession, AeadWriterSession,
+    ClientMessage, ClientResponse, EndpointRole, InboundMessage, MasterMessage, MessageTransport,
+    ProtocolCapabilities, ProtocolError, WireCodec, WorkerMessage, PROTOCOL_VERSION_CURRENT,
+    WIRE_FORMAT_BINCODE, WIRE_FORMAT_ENCRYPTED, WIRE_FORMAT_JSON,
 };
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec, TaskStatus};
 use rusty_grid_core::GridError;
@@ -44,7 +43,9 @@ async fn spawn_test_master(secret: Option<&ClusterSecret>) -> MasterHandle {
     if let Some(s) = secret {
         config = config.with_cluster_secret(s.clone());
     }
-    MasterServer::spawn(config).await.expect("spawn test master")
+    MasterServer::spawn(config)
+        .await
+        .expect("spawn test master")
 }
 
 fn test_register_msg(worker_id: Uuid, name: &str) -> WorkerMessage {
@@ -70,7 +71,10 @@ async fn test_adversarial_single_bit_flip_ciphertext() {
 
     assert_eq!(encrypted_frame[0], WIRE_FORMAT_ENCRYPTED);
     let frame_len = encrypted_frame.len();
-    assert!(frame_len >= 25, "frame must contain header, ciphertext, and tag");
+    assert!(
+        frame_len >= 25,
+        "frame must contain header, ciphertext, and tag"
+    );
 
     // Ciphertext range: header is 9 bytes (1 byte format + 8 bytes seq), tag is last 16 bytes.
     let ciphertext_start = 9;
@@ -142,7 +146,10 @@ async fn test_adversarial_single_bit_flip_ciphertext() {
 
     // Verify worker was NOT registered
     let workers = master.list_workers().await.unwrap();
-    assert!(workers.is_empty(), "Worker must not be registered after tampered frame");
+    assert!(
+        workers.is_empty(),
+        "Worker must not be registered after tampered frame"
+    );
 
     let _ = master.shutdown();
 }
@@ -196,7 +203,10 @@ async fn test_adversarial_corrupt_poly1305_tag() {
         assert!(res.is_err(), "{name} must fail decryption");
         match res.unwrap_err() {
             ProtocolError::Violation(msg) => {
-                assert!(msg.contains("integrity"), "{name} expected integrity error, got {msg}");
+                assert!(
+                    msg.contains("integrity"),
+                    "{name} expected integrity error, got {msg}"
+                );
             }
             other => panic!("{name} expected Violation, got {other:?}"),
         }
@@ -243,8 +253,14 @@ async fn test_adversarial_truncated_frames_rejection() {
         ("empty", &[]),
         ("discriminator_only", &[WIRE_FORMAT_ENCRYPTED]),
         ("header_partial_4b", &[WIRE_FORMAT_ENCRYPTED, 0, 0, 0, 0]),
-        ("header_partial_8b", &[WIRE_FORMAT_ENCRYPTED, 0, 0, 0, 0, 0, 0, 0]),
-        ("header_only_9b", &[WIRE_FORMAT_ENCRYPTED, 0, 0, 0, 0, 0, 0, 0, 0]),
+        (
+            "header_partial_8b",
+            &[WIRE_FORMAT_ENCRYPTED, 0, 0, 0, 0, 0, 0, 0],
+        ),
+        (
+            "header_only_9b",
+            &[WIRE_FORMAT_ENCRYPTED, 0, 0, 0, 0, 0, 0, 0, 0],
+        ),
         ("short_16b", &valid_frame[..16]),
         ("short_24b", &valid_frame[..24]), // exactly 1 byte less than MIN_ENCRYPTED_LEN (25)
         ("minus_1_byte", &valid_frame[..valid_frame.len() - 1]),
@@ -259,7 +275,9 @@ async fn test_adversarial_truncated_frames_rejection() {
         match res.unwrap_err() {
             ProtocolError::Violation(msg) => {
                 assert!(
-                    msg.contains("too short") || msg.contains("integrity") || msg.contains("Expected encrypted"),
+                    msg.contains("too short")
+                        || msg.contains("integrity")
+                        || msg.contains("Expected encrypted"),
                     "Unexpected message for '{label}': {msg}"
                 );
             }
@@ -276,8 +294,24 @@ async fn test_adversarial_truncated_frames_rejection() {
     let _ = client_handshake(&mut transport, &secret).await.unwrap();
 
     // Send truncated 12-byte encrypted frame
-    let truncated = vec![WIRE_FORMAT_ENCRYPTED, 0, 0, 0, 0, 0, 0, 0, 0, 0xAA, 0xBB, 0xCC];
-    transport.send_raw_frame(Bytes::from(truncated)).await.unwrap();
+    let truncated = vec![
+        WIRE_FORMAT_ENCRYPTED,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0xAA,
+        0xBB,
+        0xCC,
+    ];
+    transport
+        .send_raw_frame(Bytes::from(truncated))
+        .await
+        .unwrap();
 
     let resp: Result<Option<MasterMessage>, _> = transport.recv_msg().await;
     match resp {
@@ -311,7 +345,10 @@ async fn test_adversarial_aad_mutation_tampering() {
     // Replay check fails because expected_seq is 0, but frame carries seq 1
     match err2 {
         ProtocolError::Violation(msg) => {
-            assert!(msg.contains("Anti-replay"), "Expected anti-replay violation, got: {msg}");
+            assert!(
+                msg.contains("Anti-replay"),
+                "Expected anti-replay violation, got: {msg}"
+            );
         }
         other => panic!("Expected Violation, got: {other:?}"),
     }
@@ -344,7 +381,10 @@ async fn test_adversarial_replay_attack_exact_duplicate_frame() {
     assert_eq!(ack_raw[0], WIRE_FORMAT_ENCRYPTED);
     let ack_plain = reader.decrypt_frame(&ack_raw).unwrap();
     let (ack, _): (MasterMessage, _) = deserialize_message(&ack_plain).unwrap();
-    assert!(matches!(ack, MasterMessage::RegisterAck { accepted: true, .. }));
+    assert!(matches!(
+        ack,
+        MasterMessage::RegisterAck { accepted: true, .. }
+    ));
 
     // Replay Frame 0!
     transport.send_raw_frame(frame_seq0).await.unwrap();
@@ -376,7 +416,10 @@ async fn test_adversarial_replay_stale_sequence_number_burst() {
         .unwrap();
 
     let ack: MasterMessage = transport.recv_msg().await.unwrap().expect("ack");
-    assert!(matches!(ack, MasterMessage::RegisterAck { accepted: true, .. }));
+    assert!(matches!(
+        ack,
+        MasterMessage::RegisterAck { accepted: true, .. }
+    ));
 
     // Send valid heartbeat at seq 1
     let hb1 = WorkerMessage::Heartbeat {
@@ -440,7 +483,10 @@ async fn test_adversarial_out_of_order_sequence_skip() {
     let ack_raw = transport.recv_raw_frame().await.unwrap().expect("ack");
     let ack_plain = reader.decrypt_frame(&ack_raw).unwrap();
     let (ack, _): (MasterMessage, _) = deserialize_message(&ack_plain).unwrap();
-    assert!(matches!(ack, MasterMessage::RegisterAck { accepted: true, .. }));
+    assert!(matches!(
+        ack,
+        MasterMessage::RegisterAck { accepted: true, .. }
+    ));
 
     // Burn seq 1 locally so writer now produces seq 2!
     let _burned_frame = writer.encrypt_frame(b"burned").unwrap(); // seq 1
@@ -463,7 +509,9 @@ async fn test_adversarial_out_of_order_sequence_skip() {
     let resp: Result<Option<MasterMessage>, _> = transport.recv_msg().await;
     match resp {
         Ok(None) | Err(_) => {}
-        Ok(Some(msg)) => panic!("Master accepted out-of-order skipped sequence number! Got: {msg:?}"),
+        Ok(Some(msg)) => {
+            panic!("Master accepted out-of-order skipped sequence number! Got: {msg:?}")
+        }
     }
 
     let _ = master.shutdown();
@@ -487,7 +535,10 @@ fn test_adversarial_sequence_counter_u64_max_overflow() {
     let err = reader.decrypt_frame(&fake_frame).unwrap_err();
     match err {
         ProtocolError::Violation(msg) => {
-            assert!(msg.contains("Anti-replay"), "Expected anti-replay violation, got: {msg}");
+            assert!(
+                msg.contains("Anti-replay"),
+                "Expected anti-replay violation, got: {msg}"
+            );
         }
         other => panic!("Expected Violation, got: {other:?}"),
     }
@@ -506,7 +557,10 @@ async fn test_adversarial_unauthenticated_loopback_fallback() {
     assert!(!transport.is_encrypted());
 
     // Send ClusterStatus request without cluster secret
-    transport.send_msg(&ClientMessage::ClusterStatus).await.unwrap();
+    transport
+        .send_msg(&ClientMessage::ClusterStatus)
+        .await
+        .unwrap();
 
     // Read raw frame from wire to confirm wire format
     let raw_frame = transport.recv_raw_frame().await.unwrap().expect("response");
@@ -525,7 +579,10 @@ async fn test_adversarial_unauthenticated_loopback_fallback() {
 
     // Send 5 successive requests; ensure transport remains unencrypted with 0 crypto overhead
     for _ in 0..5 {
-        transport.send_msg(&ClientMessage::ClusterStatus).await.unwrap();
+        transport
+            .send_msg(&ClientMessage::ClusterStatus)
+            .await
+            .unwrap();
         let resp: ClientResponse = transport.recv_msg().await.unwrap().expect("response");
         assert!(matches!(resp, ClientResponse::ClusterStatus { .. }));
         assert!(!transport.is_encrypted());
@@ -563,7 +620,10 @@ async fn test_adversarial_unauthenticated_worker_lifecycle_loopback() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(registered, "Worker must register on unauthenticated loopback master");
+    assert!(
+        registered,
+        "Worker must register on unauthenticated loopback master"
+    );
 
     // Submit task
     let task = Task::new(
@@ -583,7 +643,10 @@ async fn test_adversarial_unauthenticated_worker_lifecycle_loopback() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(completed, "Task must execute to completion on unauthenticated loopback");
+    assert!(
+        completed,
+        "Task must execute to completion on unauthenticated loopback"
+    );
 
     worker_handle.abort();
     let _ = master.shutdown();
@@ -650,7 +713,10 @@ async fn test_adversarial_forward_compatible_worker_message_no_connection_drop()
         .unwrap();
 
     let ack: MasterMessage = transport.recv_msg().await.unwrap().expect("ack");
-    assert!(matches!(ack, MasterMessage::RegisterAck { accepted: true, .. }));
+    assert!(matches!(
+        ack,
+        MasterMessage::RegisterAck { accepted: true, .. }
+    ));
 
     // Now send a forward-compatible unknown WorkerMessage variant (tag = 42)
     let mut unknown_frame = Vec::new();
@@ -727,7 +793,10 @@ fn test_adversarial_out_of_range_tags_and_corrupted_payloads_rejected() {
         raw.extend_from_slice(b"payload-for-out-of-range-tag");
 
         let res: Result<(WorkerMessage, _), _> = deserialize_message(&raw);
-        assert!(res.is_err(), "Tag {tag} is out of range and must be rejected");
+        assert!(
+            res.is_err(),
+            "Tag {tag} is out of range and must be rejected"
+        );
         match res.unwrap_err() {
             ProtocolError::Bincode(_) => {}
             other => panic!("Expected Bincode error for tag {tag}, got {other:?}"),
@@ -834,7 +903,10 @@ async fn test_adversarial_protocol_version_mismatch_master_ack_rejection() {
     let stream = TcpStream::connect(server_addr).await.unwrap();
     let mut transport = MessageTransport::new(stream);
     let run_res = worker.perform_handshake(&mut transport).await;
-    assert!(run_res.is_err(), "Worker must fail handshake when master sends version 0");
+    assert!(
+        run_res.is_err(),
+        "Worker must fail handshake when master sends version 0"
+    );
     match run_res.unwrap_err() {
         GridError::HandshakeFailed(msg) => {
             assert!(
@@ -878,10 +950,17 @@ async fn test_adversarial_secret_configuration_asymmetry_rejection() {
     let mut transport2 = MessageTransport::new(stream2);
 
     let auth_res = client_handshake(&mut transport2, &secret).await;
-    assert!(auth_res.is_err(), "Auth handshake against open master must fail");
+    assert!(
+        auth_res.is_err(),
+        "Auth handshake against open master must fail"
+    );
     match auth_res.unwrap_err() {
         GridError::AuthFailed(msg) => {
-            assert!(msg.contains("no cluster secret") || msg.contains("no secret configured") || msg.contains("rejected"));
+            assert!(
+                msg.contains("no cluster secret")
+                    || msg.contains("no secret configured")
+                    || msg.contains("rejected")
+            );
         }
         other => panic!("Expected AuthFailed, got: {other:?}"),
     }

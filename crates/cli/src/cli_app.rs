@@ -7,6 +7,7 @@
 //! - `rusty-grid status`: Queries cluster metrics, task lifecycle state, or worker details.
 //! - `rusty-grid workers`: Inspects active worker nodes advertising capabilities.
 //! - `rusty-grid mapreduce`: Orchestrates in-memory distributed map-reduce jobs.
+//! - `rusty-grid doctor`: Checks a running cluster end to end ([`crate::doctor`]).
 //! - `rusty-grid secret`: Generates / shows the shared cluster secret.
 //!
 //! Every command that joins or drives a grid accepts the cluster secret (`--secret-file`,
@@ -29,8 +30,12 @@ use uuid::Uuid;
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::error::GridError;
 use rusty_grid_core::mapreduce::{MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec};
+use rusty_grid_core::placement::{
+    listed_worker_id, tag_value, validate_user_tag, Placement, REQUIRE_PREFIX, STATE_TAG_PREFIX,
+};
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport, WireCodec};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
+use rusty_grid_core::WorkerCapabilities;
 use rusty_grid_master::{MasterServer, ReaperConfig, SchedulerConfig, ServerConfig};
 use rusty_grid_worker::{NoticeLevel, ProcessPriority, WorkerClient, WorkerConfig};
 
@@ -43,6 +48,7 @@ use crate::connect::{
     connect_master, normalize_master_addr, report_master_failure, AUTH_EXIT_CODE,
     DEFAULT_MASTER_ADDR,
 };
+use crate::doctor::{run_doctor, DoctorOptions};
 use crate::mode_cli;
 use crate::secret_cmd::{
     announce_master_secret, announce_peer_secret, decide_master_secret, decide_peer_secret,
@@ -132,11 +138,17 @@ pub enum Commands {
     /// Execute a distributed Map/Reduce job
     Mapreduce(MapReduceArgs),
 
+    /// Check a running cluster end to end: connection, workers, pinned probes, GPUs, spreading
+    Doctor(DoctorArgs),
+
     /// Generate or show the shared cluster secret
     Secret(SecretCliArgs),
 
     /// Workflow modes and presets (test, dev, doc, research)
     Mode(mode_cli::ModeCliArgs),
+
+    /// Model Context Protocol (MCP) server for external AI coding agents (Claude Desktop, Cline, Cursor)
+    Mcp(crate::mcp::McpArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -296,8 +308,14 @@ pub struct MasterArgs {
         help = "Connections allowed in the pre-authentication handshake at once (default 64)"
     )]
     pub max_pending_handshakes: Option<usize>,
-}
 
+    #[arg(
+        long,
+        value_name = "URL",
+        help = "URL of rendezvous registry for cross-subnet discovery (or set OXIDESWARM_RENDEZVOUS)"
+    )]
+    pub rendezvous: Option<String>,
+}
 
 #[derive(Parser, Debug, Clone)]
 pub struct WorkerArgs {
@@ -315,6 +333,13 @@ pub struct WorkerArgs {
         help = "Human-readable worker node name override. A named worker also keeps the same worker id across restarts (~/.oxideswarm/worker_id.<NAME>, or the file in RUSTY_GRID_WORKER_ID_FILE): give every worker that shares a home directory its own name. Without a name the id is new at each start"
     )]
     pub name: Option<String>,
+
+    #[arg(
+        long = "tag",
+        value_name = "TAG",
+        help = "User tag advertised to the master, matched by `submit --require-tag` (repeatable; env RUSTY_GRID_WORKER_TAGS, comma-separated). The prefixes os:, arch:, link:, id: and state: are reserved"
+    )]
+    pub tags: Vec<String>,
 
     #[arg(long, alias = "cpu-cores", help = "Override advertised CPU core count")]
     pub cores: Option<usize>,
@@ -397,6 +422,12 @@ pub struct WorkerArgs {
 
     #[arg(
         long,
+        help = "Do not serve the standby portal (HTTP on 0.0.0.0:8080 that sends a browser to the master's dashboard); env RUSTY_GRID_NO_PORTAL. Useful for a second worker on one machine"
+    )]
+    pub no_portal: bool,
+
+    #[arg(
+        long,
         default_value = "bincode",
         help = "Wire format codec: bincode or json (default: bincode)"
     )]
@@ -404,9 +435,16 @@ pub struct WorkerArgs {
 
     #[arg(long, help = INSECURE_PEER_HELP)]
     pub insecure: bool,
+
+    #[arg(
+        long,
+        value_name = "URL",
+        help = "URL of rendezvous registry for cross-subnet discovery (or set OXIDESWARM_RENDEZVOUS)"
+    )]
+    pub rendezvous: Option<String>,
 }
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Default)]
 pub struct SubmitArgs {
     #[arg(
         long,
@@ -418,7 +456,7 @@ pub struct SubmitArgs {
         long = "type",
         alias = "task-type",
         default_value = "generic",
-        help = "Task type: generic, gpu, compile, shell, command"
+        help = "Task type: command (default, also `generic`), shell, gpu, 3d, or autorig. `compile` needs source files, which only the agent-mesh bridge sends"
     )]
     pub task_type: String,
 
@@ -532,11 +570,104 @@ pub struct SubmitArgs {
     // =========================================================================
     #[arg(
         short = 'o',
-        long = "output",
+        long = "output-asset",
+        alias = "glb-output",
         value_name = "OUTPUT_PATH",
         help = "Destination file path to write generated or rigged glTF 2.0 binary asset (.glb)"
     )]
     pub output: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "OS",
+        help = "Run only on a worker with this operating system: macos, windows, linux, android (aliases: mac, darwin, osx, win)"
+    )]
+    pub os: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "ARCH",
+        help = "Run only on a worker with this CPU architecture: x86_64, aarch64 (aliases: amd64, x64, arm64)"
+    )]
+    pub arch: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "NAME|ID",
+        help = "Run only on this worker: its name (ignoring case) or its id, as `workers --json` lists them"
+    )]
+    pub worker: Option<String>,
+
+    #[arg(
+        long = "require-tag",
+        value_name = "TAG",
+        help = "Run only on a worker that carries this user tag (`worker --tag`); repeatable, all must match"
+    )]
+    pub require_tags: Vec<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Command tasks: send this local file as the program's standard input (at most 32 MiB)"
+    )]
+    pub stdin_file: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Shell tasks: send this local file as the script (at most 32 MiB), instead of --command or words after --"
+    )]
+    pub script_file: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "PROG",
+        help = "Shell tasks: run the script with PROG (for example python3) instead of sh or cmd.exe"
+    )]
+    pub interpreter: Option<String>,
+
+    #[arg(
+        long = "env",
+        value_name = "KEY=VALUE",
+        help = "Command and shell tasks: environment variable of the task process (repeatable)"
+    )]
+    pub env: Vec<String>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "GPU tasks: edge of the square matrices to multiply (default 64; a real GPU accepts up to 8192 within its limits, the simulated GPU 2048)"
+    )]
+    pub matrix_dim: Option<u32>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "GPU tasks: edge of a workgroup tile (default 16)"
+    )]
+    pub work_group_size: Option<u32>,
+
+    #[arg(
+        long = "file",
+        value_name = "LOCAL[:SANDBOX]",
+        help = "Stage a local file into the task sandbox (repeatable, at most 32 MiB total). Syntax: PATH or LOCAL_PATH:SANDBOX_PATH"
+    )]
+    pub files: Vec<String>,
+
+    #[arg(
+        long = "output",
+        alias = "expected-output",
+        value_name = "PATH",
+        help = "Declare an output artifact path to retrieve from the sandbox upon task completion (repeatable)"
+    )]
+    pub outputs: Vec<String>,
+
+    #[arg(
+        long = "output-dir",
+        value_name = "DIR",
+        help = "Local directory where retrieved output artifacts are written upon task completion (default: current directory)"
+    )]
+    pub output_dir: Option<PathBuf>,
 
     #[arg(last = true, help = "Command arguments (trailing args after --)")]
     pub args: Vec<String>,
@@ -627,23 +758,78 @@ pub struct MapReduceArgs {
     pub json: bool,
 }
 
+#[derive(Parser, Debug, Clone)]
+pub struct DoctorArgs {
+    #[arg(
+        long,
+        help = "Address of the Master's grid port (default 127.0.0.1:8088); a bare host gets :8088; 'auto' discovers it on the LAN"
+    )]
+    pub master: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        default_value = "1",
+        help = "Fail unless at least N workers are connected"
+    )]
+    pub expect_workers: usize,
+
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value = "60",
+        help = "How long each probe, and the spread check as a whole, may take"
+    )]
+    pub probe_timeout_secs: u64,
+
+    #[arg(
+        long,
+        value_name = "N",
+        default_value = "512",
+        help = "Matrix edge of the GEMM probe on GPU workers (at most 2048 on a simulated GPU)"
+    )]
+    pub gpu_dim: u32,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Unpinned 500 ms tasks of the spread check (default: 4 per connected worker)"
+    )]
+    pub spread_tasks: Option<usize>,
+
+    #[arg(long, help = "Leave out the GPU probe (C5)")]
+    pub skip_gpu: bool,
+
+    #[arg(long, help = "Leave out the spread check (C6)")]
+    pub skip_spread: bool,
+
+    #[arg(long, help = "Print the report as JSON")]
+    pub json: bool,
+
+    #[arg(long, help = INSECURE_PEER_HELP)]
+    pub insecure: bool,
+}
+
 pub async fn run_cli() -> ExitCode {
     let cli = Cli::parse();
 
     // Initialize tracing subscriber if not already set
-    let log_filter = if cli.verbose {
+    let log_level = if cli.verbose {
         "debug"
     } else if cli.quiet {
         "error"
     } else {
         "info"
     };
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_filter)),
-        )
-        .try_init();
+    let builder = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_log_filter(log_level))),
+    );
+    let _ = if matches!(cli.command, Commands::Mcp(_)) {
+        builder.with_writer(std::io::stderr).try_init()
+    } else {
+        builder.try_init()
+    };
 
     let config_file = match load_config_file(cli.config.as_deref()) {
         Ok(cfg) => cfg,
@@ -657,10 +843,11 @@ pub async fn run_cli() -> ExitCode {
     match cli.command {
         Commands::Master(args) => run_master(args, config_file, secret_opts).await,
         Commands::Worker(args) => run_worker(args, config_file, secret_opts).await,
-        Commands::Submit(args) => run_submit(args, config_file, secret_opts).await,
+        Commands::Submit(args) => run_submit_with_secret(args, config_file, secret_opts).await,
         Commands::Status(args) => run_status(args, config_file, secret_opts).await,
         Commands::Workers(args) => run_workers(args, config_file, secret_opts).await,
         Commands::Mapreduce(args) => run_mapreduce(args, config_file, secret_opts).await,
+        Commands::Doctor(args) => run_doctor_command(args, config_file, secret_opts).await,
         Commands::Secret(args) => run_secret(args, &secret_opts, config_file.as_ref()),
         Commands::Mode(args) => {
             let code = mode_cli::run_mode_cli(args).await;
@@ -670,6 +857,7 @@ pub async fn run_cli() -> ExitCode {
                 ExitCode::from(code as u8)
             }
         }
+        Commands::Mcp(args) => crate::mcp::run_mcp(args, config_file, secret_opts).await,
     }
 }
 
@@ -792,6 +980,10 @@ async fn run_master(
 
     if let Some(ref tf) = p2p_ticket_file {
         server_config = server_config.with_p2p_ticket_file(tf);
+    }
+
+    if let Some(r_url) = args.rendezvous {
+        server_config = server_config.with_rendezvous_url(r_url);
     }
 
     server_config = match apply_web_ui_addr(server_config, args.web_ui_addr.as_deref()) {
@@ -922,14 +1114,11 @@ async fn run_master(
         if parts.len() >= 3 {
             let token = parts[0];
             let name = parts[1];
-            let scopes: Vec<rusty_grid_master::auth::AuthScope> = parts[2]
-                .split(',')
-                .filter_map(|s| s.parse().ok())
-                .collect();
+            let scopes: Vec<rusty_grid_master::auth::AuthScope> =
+                parts[2].split(',').filter_map(|s| s.parse().ok()).collect();
             server_config.auth_config.add_token(token, name, &scopes);
         }
     }
-
 
     let sched_config = SchedulerConfig {
         preserve_gpu_for_gpu_tasks: preserve_gpu,
@@ -1068,6 +1257,10 @@ async fn run_worker(
         DEFAULT_MASTER_ADDR,
     ));
 
+    if let Some(ref r_url) = args.rendezvous {
+        std::env::set_var(rusty_grid_core::discovery::RENDEZVOUS_ENV, r_url);
+    }
+
     let cluster_secret = match secret_opts.resolve(config_file.as_ref(), SecretSection::Worker) {
         Ok(secret) => secret,
         Err(e) => {
@@ -1106,6 +1299,26 @@ async fn run_worker(
         &["RUSTY_GRID_WORKER_NAME", "RUSTY_GRID_NAME"],
         worker_cfg.as_ref().and_then(|w| w.name.clone()),
     );
+
+    let tags = resolve_opt_field(
+        (!args.tags.is_empty()).then_some(args.tags),
+        &["RUSTY_GRID_WORKER_TAGS"],
+        worker_cfg.as_ref().and_then(|w| w.tags.clone()),
+        |list| {
+            let tags: Vec<String> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect();
+            (!tags.is_empty()).then_some(tags)
+        },
+    )
+    .unwrap_or_default();
+    if let Some(e) = tags.iter().find_map(|t| validate_user_tag(t).err()) {
+        eprintln!("--tag: {e}");
+        return ExitCode::FAILURE;
+    }
 
     let cores = resolve_opt_usize(
         args.cores,
@@ -1254,20 +1467,17 @@ async fn run_worker(
     );
 
     // A misspelt priority must not silently run tasks at full priority on the owner's machine.
-    let task_priority = match resolve_opt_string(
-        args.task_priority,
-        &["RUSTY_GRID_TASK_PRIORITY"],
-        None,
-    )
-    .map(|text| text.parse::<ProcessPriority>())
-    {
-        Some(Ok(priority)) => Some(priority),
-        Some(Err(e)) => {
-            eprintln!("--task-priority: {e}");
-            return ExitCode::FAILURE;
-        }
-        None => None,
-    };
+    let task_priority =
+        match resolve_opt_string(args.task_priority, &["RUSTY_GRID_TASK_PRIORITY"], None)
+            .map(|text| text.parse::<ProcessPriority>())
+        {
+            Some(Ok(priority)) => Some(priority),
+            Some(Err(e)) => {
+                eprintln!("--task-priority: {e}");
+                return ExitCode::FAILURE;
+            }
+            None => None,
+        };
 
     let keep_sandboxes = resolve_bool(
         if args.keep_sandboxes {
@@ -1277,6 +1487,13 @@ async fn run_worker(
         },
         &["RUSTY_GRID_KEEP_SANDBOXES"],
         worker_cfg.as_ref().and_then(|w| w.keep_sandboxes),
+        false,
+    );
+
+    let no_portal = resolve_bool(
+        args.no_portal.then_some(true),
+        &["RUSTY_GRID_NO_PORTAL"],
+        worker_cfg.as_ref().and_then(|w| w.no_portal),
         false,
     );
 
@@ -1296,6 +1513,7 @@ async fn run_worker(
     if let Some(n) = name {
         config = config.with_name(n);
     }
+    config = config.with_tags(tags);
     if let Some(c) = cores {
         config = config.with_cores(c);
     }
@@ -1347,6 +1565,7 @@ async fn run_worker(
         config = config.with_process_priority(priority);
     }
     config = config.with_keep_sandboxes(keep_sandboxes);
+    config = config.with_redirection_portal(!no_portal);
     // A restarted worker is the same machine, not a new one: keep its id (see `identity`), when it
     // knows which machine it is. Otherwise every unnamed worker under this HOME would share one
     // id and the master would keep closing the other's connection.
@@ -1374,6 +1593,7 @@ async fn run_worker(
         client.capabilities().has_gpu,
         client.capabilities().is_simulated_gpu,
     );
+    println!("Tags: {}", client.capabilities().tags.join(", "));
     for notice in client.gpu_notices() {
         match notice.level {
             NoticeLevel::Info => println!("GPU: {}", notice.message),
@@ -1554,7 +1774,70 @@ fn client_secret(
     }
 }
 
-/// Builds the task `submit` sends from its flags.
+/// Largest file `submit --stdin-file` / `--script-file` sends: well below the 64 MiB frame limit
+/// (`MAX_FRAME_SIZE`), which also has to carry the rest of the task.
+const MAX_TASK_INPUT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Validates that a binary buffer has a well-formed glTF 2.0 binary (`.glb`) header and JSON chunk 0.
+pub fn validate_glb_header(raw: &[u8]) -> Result<(), String> {
+    if raw.len() < 20 {
+        return Err(format!(
+            "Asset buffer too small ({} bytes < 20 bytes minimum for glTF 2.0 binary)",
+            raw.len()
+        ));
+    }
+    if &raw[0..4] != b"glTF" {
+        return Err(format!(
+            "Invalid glTF magic number: expected b\"glTF\", got {:?}",
+            &raw[0..4]
+        ));
+    }
+    let version = u32::from_le_bytes(raw[4..8].try_into().unwrap());
+    if version != 2 {
+        return Err(format!(
+            "Unsupported glTF binary version: {version} (expected 2)"
+        ));
+    }
+    let total_length = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
+    if total_length > raw.len() || total_length < 20 {
+        return Err(format!(
+            "Corrupted glTF binary: header length ({total_length}) exceeds buffer ({})",
+            raw.len()
+        ));
+    }
+    let chunk0_length = u32::from_le_bytes(raw[12..16].try_into().unwrap()) as usize;
+    if 20usize.saturating_add(chunk0_length) > raw.len() {
+        return Err(format!(
+            "Corrupted glTF chunk 0: length ({chunk0_length}) exceeds buffer ({})",
+            raw.len()
+        ));
+    }
+    let chunk0_type = u32::from_le_bytes(raw[16..20].try_into().unwrap());
+    if chunk0_type != 0x4E4F534A {
+        return Err(format!(
+            "Invalid glTF chunk 0 type: 0x{chunk0_type:08X} (expected 0x4E4F534A 'JSON')"
+        ));
+    }
+    let json_slice = &raw[20..20 + chunk0_length];
+    let json_str = std::str::from_utf8(json_slice)
+        .map_err(|e| format!("glTF chunk 0 is not valid UTF-8: {e}"))?;
+    let json_val: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| format!("Failed to parse glTF chunk 0 JSON: {e}"))?;
+    let asset_ver = json_val
+        .get("asset")
+        .and_then(|a| a.get("version"))
+        .and_then(|v| v.as_str());
+    if asset_ver != Some("2.0") {
+        return Err(format!(
+            "Invalid glTF asset version: {:?} (expected Some(\"2.0\"))",
+            asset_ver
+        ));
+    }
+    Ok(())
+}
+
+/// Builds the task spec `submit` sends from its flags, reading `--stdin-file` / `--script-file`;
+/// an error names the flag at fault. Nothing is sent before this succeeds.
 ///
 /// * `--command PROG [-- ARGS...]`: run `PROG` with exactly `ARGS` (possibly none).
 /// * `-- PROG [ARGS...]` without `--command`: the first trailing token is the program.
@@ -1562,56 +1845,424 @@ fn client_secret(
 ///
 /// An explicit program with no arguments runs with no arguments; the demo greeting is only a
 /// default for a completely empty command line.
-fn build_task_spec(args: &SubmitArgs) -> TaskSpec {
-    match args.task_type.to_lowercase().as_str() {
-        "gpu" => TaskSpec::GpuCompute {
-            kernel_name: args
-                .command
+fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
+    let mut kind = args.task_type.to_lowercase();
+    if (kind == "generic" || kind == "command" || kind.is_empty())
+        && (args.prompt.is_some() || args.image.is_some())
+    {
+        kind = "3d".to_string();
+    } else if (kind == "generic" || kind == "command" || kind.is_empty())
+        && args.input_mesh.is_some()
+    {
+        kind = "autorig".to_string();
+    }
+    let is_command = !matches!(
+        kind.as_str(),
+        "gpu"
+            | "compile"
+            | "shell"
+            | "3d"
+            | "gen3d"
+            | "3d_generate"
+            | "generative_3d"
+            | "autorig"
+            | "auto_rig"
+            | "rig"
+    );
+    let only_for = |flag: &str, kinds: &str| {
+        Err(format!(
+            "{flag} applies to {kinds} tasks, not to `--type {}`",
+            args.task_type
+        ))
+    };
+    if args.stdin_file.is_some() && !is_command {
+        return only_for("--stdin-file", "command");
+    }
+    if kind != "shell" {
+        if args.script_file.is_some() {
+            return only_for("--script-file", "shell");
+        }
+        if args.interpreter.is_some() {
+            return only_for("--interpreter", "shell");
+        }
+    }
+    if !args.env.is_empty() && !is_command && kind != "shell" {
+        return only_for("--env", "command and shell");
+    }
+    if kind != "gpu" {
+        if args.matrix_dim.is_some() {
+            return only_for("--matrix-dim", "gpu");
+        }
+        if args.work_group_size.is_some() {
+            return only_for("--work-group-size", "gpu");
+        }
+    }
+    let env = parse_env_pairs(&args.env)?;
+
+    match kind.as_str() {
+        "3d" | "gen3d" | "3d_generate" | "generative_3d" => {
+            let prompt = match &args.prompt {
+                Some(p) => {
+                    let trimmed = p.trim();
+                    if trimmed.is_empty() {
+                        return Err("--prompt cannot be empty or whitespace".to_string());
+                    }
+                    Some(trimmed.to_string())
+                }
+                None => None,
+            };
+            let image_data = match &args.image {
+                Some(img_path) => {
+                    let meta = std::fs::metadata(img_path)
+                        .map_err(|e| format!("--image {}: {e}", img_path.display()))?;
+                    if !meta.is_file() {
+                        return Err(format!(
+                            "--image {}: path is not a regular file",
+                            img_path.display()
+                        ));
+                    }
+                    if meta.len() == 0 {
+                        return Err(format!(
+                            "--image {}: file is empty (0 bytes)",
+                            img_path.display()
+                        ));
+                    }
+                    let bytes = read_task_input(img_path, "--image")?;
+                    Some(rusty_grid_core::task::Bytes::from(bytes))
+                }
+                None => None,
+            };
+            if prompt.is_none() && image_data.is_none() {
+                return Err(
+                    "3D generation requires either --prompt or --image".to_string(),
+                );
+            }
+            let quality = args
+                .quality
                 .clone()
-                .unwrap_or_else(|| "matrix_multiply".into()),
-            input_data: vec![1, 2, 3, 4],
-            work_group_size: 16,
-            simulated_matrix_dim: 64,
-            compute_intensity: 10,
-        },
-        "compile" => TaskSpec::RustCompilation {
-            crate_name: args
-                .command
-                .clone()
-                .unwrap_or_else(|| "simulated_crate".into()),
-            source_files: HashMap::new(),
-            compiler_flags: if !args.args.is_empty() {
-                args.args.clone()
+                .unwrap_or_else(|| "standard".to_string())
+                .to_lowercase();
+            let engine_preference = args
+                .engine
+                .as_ref()
+                .map(|e| e.to_lowercase())
+                .filter(|e| e != "auto");
+            let export_texture = if args.no_export_texture {
+                false
+            } else if args.export_texture {
+                true
             } else {
-                vec!["build".into()]
-            },
-            target_dir: None,
-        },
-        "shell" => TaskSpec::new_shell_script(match (&args.command, args.args.is_empty()) {
-            // `--command 'ls' -- -la`: the trailing words extend the script instead of being dropped.
-            (Some(script), _) => std::iter::once(script.as_str())
-                .chain(args.args.iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join(" "),
-            (None, false) => args.args.join(" "),
-            (None, true) => "echo 'Hello from shell task'".into(),
-        }),
+                true
+            };
+            let spec = TaskSpec::Generative3D(rusty_grid_core::task::Generative3DSpec {
+                prompt,
+                image_data,
+                quality,
+                engine_preference,
+                export_texture,
+            });
+            spec.validate()?;
+            Ok(spec)
+        }
+        "autorig" | "auto_rig" | "rig" => {
+            let mesh_path = args
+                .input_mesh
+                .as_ref()
+                .ok_or_else(|| "Auto-rigging requires --input-mesh <PATH>".to_string())?;
+            let meta = std::fs::metadata(mesh_path)
+                .map_err(|e| format!("--input-mesh {}: {e}", mesh_path.display()))?;
+            if !meta.is_file() {
+                return Err(format!(
+                    "--input-mesh {}: path is not a regular file",
+                    mesh_path.display()
+                ));
+            }
+            if meta.len() == 0 {
+                return Err(format!(
+                    "--input-mesh {}: file is empty (0 bytes)",
+                    mesh_path.display()
+                ));
+            }
+            let bytes = read_task_input(mesh_path, "--input-mesh")?;
+            let rig_preset = args
+                .rig_preset
+                .clone()
+                .unwrap_or_else(|| "biped".to_string());
+            let spec = TaskSpec::AutoRig(rusty_grid_core::task::AutoRigSpec {
+                input_mesh: rusty_grid_core::task::Bytes::from(bytes),
+                rig_preset,
+                embed_animations: args.embed_animations.clone(),
+                preferred_provider: args.preferred_provider.clone(),
+            });
+            spec.validate()?;
+            Ok(spec)
+        }
+        "gpu" => {
+            let dim = args.matrix_dim.unwrap_or(64);
+            let tile = args.work_group_size.unwrap_or(16);
+            if dim == 0 || tile == 0 {
+                return Err("--matrix-dim and --work-group-size must be at least 1".to_string());
+            }
+            Ok(TaskSpec::GpuCompute {
+                kernel_name: args
+                    .command
+                    .clone()
+                    .unwrap_or_else(|| "matrix_multiply".into()),
+                input_data: vec![1, 2, 3, 4],
+                work_group_size: tile,
+                simulated_matrix_dim: dim,
+                compute_intensity: 10,
+            })
+        }
+        "compile" => Err(
+            "compile tasks need the crate's source files, which `submit` cannot send; they are \
+             submitted through the agent-mesh bridge (`grid_compile`)"
+                .to_string(),
+        ),
+        "shell" => {
+            let script = match &args.script_file {
+                Some(path) => {
+                    if args.command.is_some() || !args.args.is_empty() {
+                        return Err(
+                            "--script-file cannot be combined with --command or words after --"
+                                .to_string(),
+                        );
+                    }
+                    String::from_utf8(read_task_input(path, "--script-file")?).map_err(|_| {
+                        format!(
+                            "--script-file {}: the file is not UTF-8 text",
+                            path.display()
+                        )
+                    })?
+                }
+                None => match (&args.command, args.args.is_empty()) {
+                    // `--command 'ls' -- -la`: the trailing words extend the script instead of
+                    // being dropped.
+                    (Some(script), _) => std::iter::once(script.as_str())
+                        .chain(args.args.iter().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    (None, false) => args.args.join(" "),
+                    (None, true) => "echo 'Hello from shell task'".into(),
+                },
+            };
+            Ok(TaskSpec::ShellScript {
+                script,
+                interpreter: args.interpreter.clone(),
+                env,
+            })
+        }
         _ => {
             let (program, cmd_args) = match (&args.command, args.args.split_first()) {
                 (Some(program), _) => (program.clone(), args.args.clone()),
                 (None, Some((program, rest))) => (program.clone(), rest.to_vec()),
                 (None, None) => ("echo".to_string(), vec!["Hello from RustyGrid".to_string()]),
             };
-            TaskSpec::new_command(program, cmd_args)
+            let stdin = match &args.stdin_file {
+                Some(path) => Some(read_task_input(path, "--stdin-file")?),
+                None => None,
+            };
+            Ok(TaskSpec::Command {
+                program,
+                args: cmd_args,
+                env,
+                working_dir: None,
+                stdin,
+            })
         }
     }
 }
 
-async fn run_submit(
+/// Reads a file `submit` sends with the task, refusing one above [`MAX_TASK_INPUT_BYTES`].
+fn read_task_input(path: &Path, flag: &str) -> Result<Vec<u8>, String> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| format!("{flag} {}: {e}", path.display()))?
+        .len();
+    if len > MAX_TASK_INPUT_BYTES {
+        return Err(format!(
+            "{flag} {}: {len} bytes, more than the {} MiB a task may carry",
+            path.display(),
+            MAX_TASK_INPUT_BYTES / (1024 * 1024)
+        ));
+    }
+    std::fs::read(path).map_err(|e| format!("{flag} {}: {e}", path.display()))
+}
+
+/// `--env KEY=VALUE` pairs as a map; the first `=` ends the key, which must not be empty.
+fn parse_env_pairs(pairs: &[String]) -> Result<HashMap<String, String>, String> {
+    let mut env = HashMap::new();
+    for pair in pairs {
+        match pair.split_once('=') {
+            Some((key, value)) if !key.is_empty() => {
+                env.insert(key.to_string(), value.to_string());
+            }
+            _ => return Err(format!("--env {pair}: expected KEY=VALUE")),
+        }
+    }
+    Ok(env)
+}
+
+/// The placement constraints of `submit --os / --arch / --worker / --require-tag`, checked and
+/// normalised exactly as the master will read them.
+fn build_placement(args: &SubmitArgs) -> Result<Placement, String> {
+    let mut tags = Vec::new();
+    if let Some(os) = &args.os {
+        tags.push(format!("{REQUIRE_PREFIX}os={os}"));
+    }
+    if let Some(arch) = &args.arch {
+        tags.push(format!("{REQUIRE_PREFIX}arch={arch}"));
+    }
+    if let Some(worker) = &args.worker {
+        tags.push(format!("{REQUIRE_PREFIX}worker={worker}"));
+    }
+    for tag in &args.require_tags {
+        tags.push(format!("{REQUIRE_PREFIX}tag={tag}"));
+    }
+    Placement::from_task_tags(&tags)
+}
+
+/// The master's worker list, each entry tagged by the master with `id:` / `state:` / `link:`
+/// (see `rusty_grid_core::placement`). `None` when the master did not answer with a list.
+async fn fetch_workers(
+    transport: &mut MessageTransport<TcpStream>,
+    master_addr: &str,
+    had_secret: bool,
+) -> Option<Vec<WorkerCapabilities>> {
+    match exchange(
+        transport,
+        master_addr,
+        had_secret,
+        &ClientMessage::ListWorkers,
+        "Failed to list the workers",
+    )
+    .await
+    {
+        Ok(ClientResponse::WorkerList { workers }) => Some(workers),
+        _ => None,
+    }
+}
+
+/// Whether a listed worker is connected (the master marks the others `state:disconnected`).
+fn listed_as_connected(caps: &WorkerCapabilities) -> bool {
+    tag_value(&caps.tags, STATE_TAG_PREFIX) != Some("disconnected")
+}
+
+/// The name of the listed worker with this id, if the list has it.
+fn listed_worker_name(workers: &[WorkerCapabilities], worker_id: Uuid) -> Option<String> {
+    workers
+        .iter()
+        .find(|w| listed_worker_id(w) == Some(worker_id))
+        .map(|w| w.name.clone())
+}
+
+/// The log filter when `RUST_LOG` is not set: `level` for everything, except the wgpu crates, which
+/// log every device poll at INFO (dozens of lines per GPU task) and stay at WARN.
+fn default_log_filter(level: &str) -> String {
+    format!("{level},wgpu_core=warn,wgpu_hal=warn,naga=warn")
+}
+
+/// `doctor`: resolves the master and the secret like `submit`, runs [`crate::doctor`] and maps the
+/// report to an exit code (0 all passed, 1 a check failed, 6 authentication failed).
+async fn run_doctor_command(
+    args: DoctorArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
+    let submit_cfg = config_file.as_ref().and_then(|c| c.submit.clone());
+    let master_addr = resolve_string(
+        args.master.clone(),
+        &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
+        submit_cfg.as_ref().and_then(|s| s.master.clone()),
+        DEFAULT_MASTER_ADDR,
+    );
+    let secret = match client_secret(
+        &secret_opts,
+        config_file.as_ref(),
+        SecretSection::Submit,
+        &master_addr,
+        peer_insecure(args.insecure, submit_cfg.as_ref().and_then(|s| s.insecure)),
+    ) {
+        Ok(secret) => secret,
+        Err(code) => return code,
+    };
+
+    let options = DoctorOptions {
+        expect_workers: args.expect_workers,
+        probe_timeout: Duration::from_secs(args.probe_timeout_secs.max(1)),
+        gpu_dim: args.gpu_dim.max(1),
+        spread_tasks: args.spread_tasks,
+        skip_gpu: args.skip_gpu,
+        skip_spread: args.skip_spread,
+    };
+    let report = run_doctor(&master_addr, secret.as_ref(), &options).await;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
+    } else {
+        print!("{}", report.render());
+    }
+    if report.auth_failed {
+        ExitCode::from(AUTH_EXIT_CODE)
+    } else if report.failed() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Public entry point for programmatic/test submission with default secret options.
+pub async fn run_submit(args: SubmitArgs, config_file: Option<ConfigFile>) -> ExitCode {
+    run_submit_with_secret(args, config_file, SecretOpts::default()).await
+}
+
+async fn run_submit_with_secret(
     args: SubmitArgs,
     config_file: Option<ConfigFile>,
     secret_opts: SecretOpts,
 ) -> ExitCode {
+    // Everything wrong with the arguments is reported before connecting.
+    let (spec, placement) = match build_task_spec(&args).and_then(|spec| {
+        let placement = build_placement(&args)?;
+        Ok((spec, placement))
+    }) {
+        Ok(built) => built,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let is_asset_task = matches!(
+        spec,
+        TaskSpec::Generative3D(_) | TaskSpec::AutoRig(_)
+    );
+
+    let staged_files = if !args.files.is_empty() {
+        match crate::connect::prepare_staged_files(&args.files) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let expected_outputs = if !args.outputs.is_empty() && !is_asset_task {
+        match crate::connect::validate_output_paths(&args.outputs) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     let submit_cfg = config_file.as_ref().and_then(|c| c.submit.clone());
     let master_addr = resolve_string(
         args.master.clone(),
@@ -1642,28 +2293,41 @@ async fn run_submit(
         }
     };
 
-    let is_gpu = args.gpu || args.task_type.eq_ignore_ascii_case("gpu");
-    let spec = build_task_spec(&args);
+    let had_secret = secret.is_some();
+    // A constrained task nobody can take would wait silently; say so (it is still submitted, a
+    // matching worker may connect later).
+    if !placement.is_empty() {
+        if let Some(workers) = fetch_workers(&mut transport, &master_addr, had_secret).await {
+            if !workers
+                .iter()
+                .any(|w| listed_as_connected(w) && placement.matches_listed(w))
+            {
+                eprintln!(
+                    "Warning: no connected worker matches the placement constraints ({placement}); the task waits in the queue until one does"
+                );
+            }
+        }
+    }
 
+    let is_gpu = args.gpu || args.task_type.eq_ignore_ascii_case("gpu");
     let requirements = TaskRequirements {
-        cpu_cores: args.cores,
+        cpu_cores: args.cores.max(1),
         ram_mb: args.ram_mb,
         gpu_required: is_gpu,
-        timeout_secs: args.timeout_secs,
+        timeout_secs: args.timeout_secs.max(1),
         max_retries: args.max_retries,
     };
 
-    let task = Task::new(spec, requirements);
-    let should_wait = args.wait || args.output.is_some();
-    let submit_msg = ClientMessage::SubmitTask {
-        task,
-        wait: should_wait,
-    };
+    let mut task = Task::new(spec, requirements).with_placement(&placement);
+    task.staged_files = staged_files;
+    task.expected_outputs = expected_outputs.clone();
+    let wait = args.wait || args.output.is_some() || !expected_outputs.is_empty();
+    let submit_msg = ClientMessage::SubmitTask { task, wait };
 
     let response = match exchange(
         &mut transport,
         &master_addr,
-        secret.is_some(),
+        had_secret,
         &submit_msg,
         "Failed to send task to Master",
     )
@@ -1689,12 +2353,90 @@ async fn run_submit(
             ExitCode::SUCCESS
         }
         ClientResponse::TaskCompleted { task_id, result } => {
+            let worker_name = fetch_workers(&mut transport, &master_addr, had_secret)
+                .await
+                .and_then(|workers| listed_worker_name(&workers, result.worker_id));
+
+            let asset_output_path = args.output.clone().or_else(|| {
+                if is_asset_task && args.outputs.len() == 1 {
+                    Some(PathBuf::from(&args.outputs[0]))
+                } else {
+                    None
+                }
+            });
+
+            if let (Some(ref out_path), Some(ref asset_bytes)) =
+                (&asset_output_path, &result.asset_bytes)
+            {
+                if let Err(e) = validate_glb_header(asset_bytes.as_slice()) {
+                    eprintln!("Asset validation failed before writing to disk: {e}");
+                    return ExitCode::FAILURE;
+                }
+                if let Some(parent) = out_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            eprintln!(
+                                "Failed to create output directory '{}': {e}",
+                                parent.display()
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+                if let Err(e) = std::fs::write(out_path, asset_bytes.as_slice()) {
+                    eprintln!("Failed to write asset to '{}': {e}", out_path.display());
+                    return ExitCode::FAILURE;
+                }
+            }
+
+            let output_dir = args.output_dir.as_deref().unwrap_or(Path::new("."));
+            let saved_artifacts = if !result.artifacts.is_empty() {
+                match crate::connect::save_output_artifacts(&result.artifacts, output_dir) {
+                    Ok(saved) => Some(saved),
+                    Err(e) => {
+                        eprintln!("Failed to save output artifacts: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                let mut value = serde_json::to_value(&result).unwrap_or_default();
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("worker_name".to_string(), serde_json::json!(worker_name));
+                    if let Some(ref saved) = saved_artifacts {
+                        let saved_strs: Vec<String> =
+                            saved.iter().map(|p| p.display().to_string()).collect();
+                        obj.insert("saved_artifacts".to_string(), serde_json::json!(saved_strs));
+                    }
+                }
+                println!("{}", serde_json::to_string_pretty(&value).unwrap());
             } else {
                 println!("Task {task_id} completed successfully.");
+                match &worker_name {
+                    Some(name) => println!("Worker: {name} ({})", result.worker_id),
+                    None => println!("Worker: {}", result.worker_id),
+                }
                 println!("Exit Code: {}", result.exit_code);
                 println!("Execution Time: {}ms", result.execution_time_ms);
+                if let Some(ref saved) = saved_artifacts {
+                    println!(
+                        "Artifacts ({} saved to {}):",
+                        saved.len(),
+                        output_dir.display()
+                    );
+                    for (artifact, path) in result.artifacts.iter().zip(saved.iter()) {
+                        println!(
+                            "  - {} ({} bytes, sha256: {}) -> {}",
+                            artifact.path,
+                            artifact.size,
+                            artifact.sha256_hex(),
+                            path.display()
+                        );
+                    }
+                }
                 if !result.stdout.is_empty() {
                     println!("Stdout:\n{}", result.stdout_str().trim());
                 }
@@ -1845,7 +2587,10 @@ async fn run_status(
                             val
                         })
                         .collect();
-                    println!("{}", serde_json::to_string_pretty(&enriched_workers).unwrap());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&enriched_workers).unwrap()
+                    );
                 } else {
                     println!("Connected Workers ({}):", workers.len());
                     for w in &workers {
@@ -2169,8 +2914,8 @@ mod tests {
         }
     }
 
-    fn command_of(spec: TaskSpec) -> (String, Vec<String>) {
-        match spec {
+    fn command_of(spec: Result<TaskSpec, String>) -> (String, Vec<String>) {
+        match spec.expect("the spec must build") {
             TaskSpec::Command { program, args, .. } => (program, args),
             other => panic!("expected Command, got {other:?}"),
         }
@@ -2224,7 +2969,7 @@ mod tests {
 
     #[test]
     fn test_submit_shell_type_forwards_trailing_args() {
-        let script_of = |spec: TaskSpec| match spec {
+        let script_of = |spec: Result<TaskSpec, String>| match spec.expect("the spec must build") {
             TaskSpec::ShellScript { script, .. } => script,
             other => panic!("expected ShellScript, got {other:?}"),
         };
@@ -2253,6 +2998,274 @@ mod tests {
     }
 
     #[test]
+    fn test_submit_placement_flags_become_require_tags() {
+        let placement = build_placement(&submit_args(&[
+            "--os",
+            "Mac",
+            "--arch",
+            "arm64",
+            "--worker",
+            "MAC-M5",
+            "--require-tag",
+            "laptop",
+            "--require-tag",
+            "fast",
+            "--",
+            "true",
+        ]))
+        .unwrap();
+        assert_eq!(placement.os.as_deref(), Some("macos"));
+        assert_eq!(placement.arch.as_deref(), Some("aarch64"));
+        assert_eq!(placement.worker.as_deref(), Some("MAC-M5"));
+        assert_eq!(placement.tags, ["fast", "laptop"]);
+        let task = Task::new(
+            TaskSpec::builtin_test("hash_compute", 1),
+            TaskRequirements::generic(1, 5),
+        )
+        .with_placement(&placement);
+        assert_eq!(
+            task.placement().unwrap(),
+            placement,
+            "the master reads back what the CLI meant"
+        );
+
+        assert!(build_placement(&submit_args(&["--", "true"]))
+            .unwrap()
+            .is_empty());
+        let err = build_placement(&submit_args(&["--require-tag", "os:macos", "--", "true"]))
+            .unwrap_err();
+        assert!(err.contains("only the worker or the master"), "{err}");
+    }
+
+    #[test]
+    fn test_submit_stdin_file_and_env_reach_the_command_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.txt");
+        std::fs::write(&input, b"line 1\nline 2\n").unwrap();
+        let spec = build_task_spec(&submit_args(&[
+            "--stdin-file",
+            input.to_str().unwrap(),
+            "--env",
+            "MODE=fast",
+            "--env",
+            "EMPTY=",
+            "--env",
+            "EQ=a=b",
+            "--command",
+            "wc",
+            "--",
+            "-l",
+        ]))
+        .unwrap();
+        match spec {
+            TaskSpec::Command {
+                program,
+                args,
+                env,
+                stdin,
+                ..
+            } => {
+                assert_eq!(program, "wc");
+                assert_eq!(args, ["-l"]);
+                assert_eq!(stdin.as_deref(), Some(&b"line 1\nline 2\n"[..]));
+                assert_eq!(env.get("MODE").map(String::as_str), Some("fast"));
+                assert_eq!(env.get("EMPTY").map(String::as_str), Some(""));
+                assert_eq!(env.get("EQ").map(String::as_str), Some("a=b"));
+            }
+            other => panic!("expected Command, got {other:?}"),
+        }
+
+        let err = build_task_spec(&submit_args(&["--env", "=x", "--", "true"])).unwrap_err();
+        assert!(err.contains("expected KEY=VALUE"), "{err}");
+        let missing = dir.path().join("missing.txt");
+        let err = build_task_spec(&submit_args(&[
+            "--stdin-file",
+            missing.to_str().unwrap(),
+            "--",
+            "cat",
+        ]))
+        .unwrap_err();
+        assert!(err.starts_with("--stdin-file"), "{err}");
+    }
+
+    #[test]
+    fn test_submit_script_file_and_interpreter_reach_the_shell_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("job.py");
+        std::fs::write(&script, "print('hi')\n").unwrap();
+        let path = script.to_str().unwrap();
+        match build_task_spec(&submit_args(&[
+            "--type",
+            "shell",
+            "--script-file",
+            path,
+            "--interpreter",
+            "python3",
+        ]))
+        .unwrap()
+        {
+            TaskSpec::ShellScript {
+                script,
+                interpreter,
+                ..
+            } => {
+                assert_eq!(script, "print('hi')\n");
+                assert_eq!(interpreter.as_deref(), Some("python3"));
+            }
+            other => panic!("expected ShellScript, got {other:?}"),
+        }
+
+        let err = build_task_spec(&submit_args(&[
+            "--type",
+            "shell",
+            "--script-file",
+            path,
+            "--",
+            "extra",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("cannot be combined"), "{err}");
+        std::fs::write(&script, [0xff, 0xfe, 0x00]).unwrap();
+        let err =
+            build_task_spec(&submit_args(&["--type", "shell", "--script-file", path])).unwrap_err();
+        assert!(err.contains("not UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn test_submit_gpu_size_flags() {
+        let size_of = |args: &[&str]| match build_task_spec(&submit_args(args)).unwrap() {
+            TaskSpec::GpuCompute {
+                simulated_matrix_dim,
+                work_group_size,
+                ..
+            } => (simulated_matrix_dim, work_group_size),
+            other => panic!("expected GpuCompute, got {other:?}"),
+        };
+        assert_eq!(size_of(&["--type", "gpu"]), (64, 16), "defaults unchanged");
+        assert_eq!(
+            size_of(&[
+                "--type",
+                "gpu",
+                "--matrix-dim",
+                "1024",
+                "--work-group-size",
+                "8"
+            ]),
+            (1024, 8)
+        );
+        assert!(build_task_spec(&submit_args(&["--type", "gpu", "--matrix-dim", "0"])).is_err());
+    }
+
+    #[test]
+    fn test_submit_refuses_flags_of_another_task_type_and_compile() {
+        for (args, needle) in [
+            (
+                &["--type", "shell", "--stdin-file", "x", "--", "cat"][..],
+                "--stdin-file applies to command",
+            ),
+            (
+                &["--script-file", "x", "--", "true"],
+                "--script-file applies to shell",
+            ),
+            (
+                &["--interpreter", "python3", "--", "true"],
+                "--interpreter applies to shell",
+            ),
+            (
+                &["--type", "gpu", "--env", "A=1"],
+                "--env applies to command and shell",
+            ),
+            (
+                &["--matrix-dim", "128", "--", "true"],
+                "--matrix-dim applies to gpu",
+            ),
+            (
+                &["--type", "shell", "--work-group-size", "8", "--", "ls"],
+                "--work-group-size applies to gpu",
+            ),
+            (
+                &["--type", "compile", "--command", "demo"],
+                "agent-mesh bridge",
+            ),
+        ] {
+            let err = build_task_spec(&submit_args(args)).unwrap_err();
+            assert!(err.contains(needle), "{args:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_submit_input_files_above_the_limit_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.bin");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_TASK_INPUT_BYTES + 1)
+            .unwrap();
+        let err = read_task_input(&big, "--stdin-file").unwrap_err();
+        assert!(err.contains("32 MiB"), "{err}");
+    }
+
+    #[test]
+    fn test_default_log_filter_keeps_wgpu_quiet_and_parses() {
+        for level in ["debug", "info", "error"] {
+            let filter = default_log_filter(level);
+            assert!(filter.starts_with(level), "{filter}");
+            assert!(filter.contains("wgpu_core=warn"), "{filter}");
+            tracing_subscriber::EnvFilter::try_new(&filter).expect("a valid filter");
+        }
+    }
+
+    #[test]
+    fn test_doctor_flags_parse_with_documented_defaults() {
+        match parse(&["doctor"]).command {
+            Commands::Doctor(a) => {
+                assert_eq!(a.expect_workers, 1);
+                assert_eq!(a.probe_timeout_secs, 60);
+                assert_eq!(a.gpu_dim, 512);
+                assert_eq!(a.spread_tasks, None);
+                assert!(!a.skip_gpu && !a.skip_spread && !a.json);
+            }
+            other => panic!("expected doctor, got {other:?}"),
+        }
+        match parse(&[
+            "doctor",
+            "--master",
+            "10.0.0.7",
+            "--expect-workers",
+            "2",
+            "--spread-tasks",
+            "16",
+            "--skip-gpu",
+            "--json",
+        ])
+        .command
+        {
+            Commands::Doctor(a) => {
+                assert_eq!(a.master.as_deref(), Some("10.0.0.7"));
+                assert_eq!(a.expect_workers, 2);
+                assert_eq!(a.spread_tasks, Some(16));
+                assert!(a.skip_gpu && a.json);
+            }
+            other => panic!("expected doctor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_worker_tag_flag_is_repeatable() {
+        match parse(&["worker", "--tag", "laptop", "--tag", "fast"]).command {
+            Commands::Worker(a) => {
+                assert_eq!(a.tags, ["laptop", "fast"]);
+                assert!(!a.no_portal, "the portal stays on unless asked");
+            }
+            other => panic!("expected worker, got {other:?}"),
+        }
+        match parse(&["worker", "--no-portal"]).command {
+            Commands::Worker(a) => assert!(a.no_portal),
+            other => panic!("expected worker, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_secret_flags_are_global_and_work_on_every_command() {
         for args in [
             &["master", "--secret-file", "/s"][..],
@@ -2261,6 +3274,7 @@ mod tests {
             &["status", "--secret-file", "/s"],
             &["workers", "--secret-file", "/s"],
             &["mapreduce", "--input", "x", "--secret-file", "/s"],
+            &["doctor", "--secret-file", "/s"],
             // Also accepted before the subcommand.
             &["--secret-file", "/s", "status"],
         ] {
@@ -2314,7 +3328,11 @@ mod tests {
             Commands::Worker(a) => a.task_priority,
             other => panic!("unexpected {other:?}"),
         };
-        assert_eq!(priority_of(&["worker"]), None, "unset: the library default applies");
+        assert_eq!(
+            priority_of(&["worker"]),
+            None,
+            "unset: the library default applies"
+        );
         let given = priority_of(&["worker", "--task-priority", "idle"]).unwrap();
         assert_eq!(given.parse::<ProcessPriority>(), Ok(ProcessPriority::Idle));
         let misspelt = priority_of(&["worker", "--task-priority", "realtime"]).unwrap();
@@ -2332,6 +3350,8 @@ mod tests {
             Commands::Status(a) => a.insecure,
             Commands::Workers(a) => a.insecure,
             Commands::Mapreduce(a) => a.insecure,
+            Commands::Doctor(a) => a.insecure,
+            Commands::Mcp(a) => a.insecure,
             other => panic!("unexpected {other:?}"),
         };
         for with_flag in [
@@ -2340,6 +3360,8 @@ mod tests {
             &["status", "--insecure"],
             &["workers", "--insecure"],
             &["mapreduce", "--input", "x", "--insecure"],
+            &["doctor", "--insecure"],
+            &["mcp", "--insecure"],
         ] {
             assert!(insecure_of(with_flag), "{with_flag:?}");
         }
@@ -2350,6 +3372,8 @@ mod tests {
             &["status"],
             &["workers"],
             &["mapreduce", "--input", "x"],
+            &["doctor"],
+            &["mcp"],
         ] {
             assert!(!insecure_of(without_flag), "{without_flag:?}");
         }

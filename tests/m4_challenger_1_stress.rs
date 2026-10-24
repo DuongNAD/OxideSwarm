@@ -587,6 +587,7 @@ fn test_adversarial_pure_matchmake_spread_under_varied_topologies() {
             remote_addr: "127.0.0.1:9000".into(),
             cpu_usage_pct: 0.0,
             ram_available_mb: 8192,
+            features: Default::default(),
         }
     }
 

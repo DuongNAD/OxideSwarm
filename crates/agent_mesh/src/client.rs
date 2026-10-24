@@ -5,8 +5,8 @@
 
 use crate::executor::CommandExecutor;
 use crate::protocol::{
-    verify_sha256, AgentMeshEnvelope, CorrelationId, NodeDescriptor, ERR_DUPLICATE_NODE_ID,
-    ERR_INVALID_NODE_ID, ERR_UNAUTHORIZED,
+    compute_sha256, verify_sha256, AgentMeshEnvelope, CorrelationId, NodeDescriptor,
+    ERR_DUPLICATE_NODE_ID, ERR_INVALID_NODE_ID, ERR_UNAUTHORIZED,
 };
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -35,7 +35,11 @@ pub struct RegistrationRejected {
 
 impl fmt::Display for RegistrationRejected {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "hub rejected the registration: {} - {}", self.error_code, self.reason)
+        write!(
+            f,
+            "hub rejected the registration: {} - {}",
+            self.error_code, self.reason
+        )
     }
 }
 
@@ -213,8 +217,12 @@ impl AgentMeshClient {
                                 let request_corr_id = corr_id.clone();
 
                                 tokio::spawn(async move {
-                                    info!("[{}] Executing command '{}' from '{}'", node_id, cmd, sender);
-                                    let exec_res = CommandExecutor::execute(&cmd, &cmd_args, timeout_ms).await;
+                                    info!(
+                                        "[{}] Executing command '{}' from '{}'",
+                                        node_id, cmd, sender
+                                    );
+                                    let exec_res =
+                                        CommandExecutor::execute(&cmd, &cmd_args, timeout_ms).await;
 
                                     let resp = AgentMeshEnvelope::new_command_response(
                                         node_id,
@@ -272,14 +280,18 @@ impl AgentMeshClient {
                                 }
 
                                 // Resolve any local pending future matching correlation ID
-                                if let Some(sender_channel) = pending_map.write().await.remove(&corr_id) {
+                                if let Some(sender_channel) =
+                                    pending_map.write().await.remove(&corr_id)
+                                {
                                     let _ = sender_channel.send(envelope);
                                 }
                             }
 
                             AgentMeshEnvelope::DeliveryAck { ref status, .. } => {
                                 if status != "target_forwarded" {
-                                    if let Some(sender_channel) = pending_map.write().await.remove(&corr_id) {
+                                    if let Some(sender_channel) =
+                                        pending_map.write().await.remove(&corr_id)
+                                    {
                                         let _ = sender_channel.send(envelope);
                                     }
                                 }
@@ -289,7 +301,9 @@ impl AgentMeshClient {
                             | AgentMeshEnvelope::DeliveryNack { .. }
                             | AgentMeshEnvelope::NodeListResponse { .. }
                             | AgentMeshEnvelope::NodeRegistrationAck { .. } => {
-                                if let Some(sender_channel) = pending_map.write().await.remove(&corr_id) {
+                                if let Some(sender_channel) =
+                                    pending_map.write().await.remove(&corr_id)
+                                {
                                     let _ = sender_channel.send(envelope);
                                 }
                             }
@@ -308,7 +322,9 @@ impl AgentMeshClient {
         });
 
         match tokio::time::timeout(REGISTRATION_TIMEOUT, reg_rx).await {
-            Ok(Ok(AgentMeshEnvelope::DeliveryNack { error_code, reason, .. })) => {
+            Ok(Ok(AgentMeshEnvelope::DeliveryNack {
+                error_code, reason, ..
+            })) => {
                 self.close().await;
                 Err(Box::new(RegistrationRejected { error_code, reason }))
             }
@@ -318,7 +334,10 @@ impl AgentMeshClient {
                 Err("hub closed the connection before accepting the registration".into())
             }
             Err(_) => {
-                warn!("Hub did not answer the registration within {:?}; continuing", REGISTRATION_TIMEOUT);
+                warn!(
+                    "Hub did not answer the registration within {:?}; continuing",
+                    REGISTRATION_TIMEOUT
+                );
                 Ok(())
             }
         }
@@ -418,7 +437,8 @@ impl AgentMeshClient {
             "matrix_dim": matrix_dim,
             "simulated_matrix_dim": matrix_dim,
         });
-        self.send_command("grid", "grid_compute", args, timeout_ms).await
+        self.send_command("grid", "grid_compute", args, timeout_ms)
+            .await
     }
 
     /// Submits a distributed Rust compilation job to the OxideSwarm Grid via the Agent-Grid Bridge.
@@ -438,7 +458,8 @@ impl AgentMeshClient {
             "source_files": files,
             "compiler_flags": compiler_flags,
         });
-        self.send_command("grid", "grid_compile", args, timeout_ms.or(Some(30000))).await
+        self.send_command("grid", "grid_compile", args, timeout_ms.or(Some(30000)))
+            .await
     }
 
     /// Convenience alias for `submit_grid_compilation`.
@@ -449,7 +470,8 @@ impl AgentMeshClient {
         flags: Vec<String>,
         timeout_ms: Option<u64>,
     ) -> Result<AgentMeshEnvelope, Box<dyn std::error::Error + Send + Sync>> {
-        self.submit_grid_compilation(crate_name, files, flags, timeout_ms).await
+        self.submit_grid_compilation(crate_name, files, flags, timeout_ms)
+            .await
     }
 
     /// Queries cluster status and scheduler queue metrics from the Master Grid scheduler.
@@ -457,7 +479,13 @@ impl AgentMeshClient {
         &self,
         timeout_ms: Option<u64>,
     ) -> Result<AgentMeshEnvelope, Box<dyn std::error::Error + Send + Sync>> {
-        self.send_command("grid", "grid_status", serde_json::json!({}), timeout_ms.or(Some(5000))).await
+        self.send_command(
+            "grid",
+            "grid_status",
+            serde_json::json!({}),
+            timeout_ms.or(Some(5000)),
+        )
+        .await
     }
 
     /// Queries grid status or specific task info.
@@ -470,7 +498,8 @@ impl AgentMeshClient {
         if let Some(id) = task_id {
             args["task_id"] = serde_json::json!(id);
         }
-        self.send_command("grid", "grid_status", args, timeout_ms.or(Some(5000))).await
+        self.send_command("grid", "grid_status", args, timeout_ms.or(Some(5000)))
+            .await
     }
 
     /// Submits a distributed 3D generative task to the OxideSwarm Grid.
@@ -684,7 +713,10 @@ mod tests {
         client1.connect().await.expect("Client 1 failed to connect");
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let nodes = client1.query_node_list(Some(3000)).await.expect("Query failed");
+        let nodes = client1
+            .query_node_list(Some(3000))
+            .await
+            .expect("Query failed");
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].node_id, "test-client-1");
 
@@ -794,11 +826,19 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let res = node1
-            .send_command("non-existent-target", "ping", serde_json::Value::Null, Some(2000))
+            .send_command(
+                "non-existent-target",
+                "ping",
+                serde_json::Value::Null,
+                Some(2000),
+            )
             .await
             .expect("Send command should resolve with NACK");
 
-        if let AgentMeshEnvelope::DeliveryNack { error_code, reason, .. } = res {
+        if let AgentMeshEnvelope::DeliveryNack {
+            error_code, reason, ..
+        } = res
+        {
             assert_eq!(error_code, "ERR_NODE_NOT_FOUND");
             assert!(reason.contains("non-existent-target"));
         } else {

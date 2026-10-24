@@ -870,6 +870,7 @@ async fn test_adversarial_end_to_end_cluster_multi_hop_failover() {
             device_name: None,
             error: None,
             asset_bytes: None,
+            artifacts: Vec::new(),
         })
         .await
         .expect("send final result");

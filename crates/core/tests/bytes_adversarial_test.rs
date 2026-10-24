@@ -180,8 +180,7 @@ fn test_bytes_serde_json_human_readable_roundtrips() {
     let original_utf8 = Bytes::from("standard utf8 string with emojis \u{1F980}\u{2728}");
     let json_utf8 = serde_json::to_string(&original_utf8).expect("serialize utf8 json");
     assert!(json_utf8.starts_with('"'));
-    let roundtripped_utf8: Bytes =
-        serde_json::from_str(&json_utf8).expect("deserialize utf8 json");
+    let roundtripped_utf8: Bytes = serde_json::from_str(&json_utf8).expect("deserialize utf8 json");
     assert_eq!(original_utf8, roundtripped_utf8);
     assert_eq!(original_utf8.as_bytes(), roundtripped_utf8.as_bytes());
 

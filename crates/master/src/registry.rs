@@ -12,6 +12,7 @@ use tokio::task::AbortHandle;
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::{MobileCapabilities, MobileLiveStatus};
+use rusty_grid_core::protocol::ProtocolCapabilities;
 use rusty_grid_core::{GridError, GridResult, MasterMessage, TaskRequirements, WorkerCapabilities};
 
 use crate::liveness::RxClock;
@@ -50,6 +51,17 @@ pub enum WorkerStatus {
     Disconnected,
 }
 
+impl WorkerStatus {
+    /// The state's name as it is serialized (`connected`, `busy`, `disconnected`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WorkerStatus::Connected => "connected",
+            WorkerStatus::Busy => "busy",
+            WorkerStatus::Disconnected => "disconnected",
+        }
+    }
+}
+
 /// Internal mutable state for a single connected worker.
 pub struct WorkerEntry {
     pub worker_id: Uuid,
@@ -83,6 +95,15 @@ pub struct WorkerEntry {
     pub consecutive_rejections: u32,
     /// Scheduling exclusion deadline after rejections; the worker stays registered meanwhile.
     pub excluded_until: Option<Instant>,
+    /// Configured or dynamically negotiated heartbeat interval.
+    pub heartbeat_interval: Option<Duration>,
+    /// Negotiated protocol capabilities (Requirement R2).
+    pub features: ProtocolCapabilities,
+}
+
+/// Dynamically calculates the Master dead-peer liveness timeout window for a worker ($W_{\text{dead}} = \max(2\text{s}, 4 \times \tau_{\text{worker}})$).
+pub fn calculate_master_dead_peer_window(tau: Duration) -> Duration {
+    std::cmp::max(Duration::from_secs(2), tau.saturating_mul(4))
 }
 
 /// Serializable public snapshot of worker metadata for CLI queries and monitoring.
@@ -100,6 +121,8 @@ pub struct WorkerInfo {
     pub cpu_usage_pct: f32,
     #[serde(default)]
     pub ram_available_mb: u64,
+    #[serde(default)]
+    pub features: ProtocolCapabilities,
 }
 
 impl WorkerInfo {
@@ -126,6 +149,7 @@ impl WorkerInfo {
             remote_addr,
             cpu_usage_pct: 0.0,
             ram_available_mb: ram,
+            features: ProtocolCapabilities::empty(),
         }
     }
 }
@@ -143,15 +167,20 @@ impl WorkerEntry {
     /// A heartbeat inside the window is always enough. Past it, bytes arriving on the connection
     /// still count (a multi-MB result upload starves heartbeats on the single TCP lane), but only
     /// until the heartbeat has been missing for [`RX_LIVENESS_CEILING_FACTOR`] timeouts.
-    fn is_silent(&self, now: Instant, timeout: Duration) -> bool {
+    pub fn is_silent(&self, now: Instant, timeout: Duration) -> bool {
+        let effective_timeout = match self.heartbeat_interval {
+            Some(tau) => calculate_master_dead_peer_window(tau),
+            None => timeout,
+        };
         let since_heartbeat = now.saturating_duration_since(self.last_heartbeat_instant);
-        if since_heartbeat <= timeout {
+        if since_heartbeat <= effective_timeout {
             return false;
         }
         match &self.rx_clock {
             Some(clock) => {
-                now.saturating_duration_since(clock.last_rx()) > timeout
-                    || since_heartbeat > timeout.saturating_mul(RX_LIVENESS_CEILING_FACTOR)
+                now.saturating_duration_since(clock.last_rx()) > effective_timeout
+                    || since_heartbeat
+                        > effective_timeout.saturating_mul(RX_LIVENESS_CEILING_FACTOR)
             }
             None => true,
         }
@@ -169,6 +198,7 @@ impl WorkerEntry {
             remote_addr: self.remote_addr.to_string(),
             cpu_usage_pct: self.cpu_usage_pct,
             ram_available_mb: self.ram_available_mb,
+            features: self.features,
         }
     }
 }
@@ -240,12 +270,19 @@ impl WorkerRegistry {
         sender: mpsc::Sender<MasterMessage>,
         abort_handle: Option<AbortHandle>,
     ) -> GridResult<u64> {
-        self.register_session(worker_id, capabilities, remote_addr, sender, abort_handle)
-            .await
-            .map(|registration| registration.session_id)
+        self.register_session(
+            worker_id,
+            capabilities,
+            ProtocolCapabilities::empty(),
+            remote_addr,
+            sender,
+            abort_handle,
+        )
+        .await
+        .map(|registration| registration.session_id)
     }
 
-    /// Like [`register`](Self::register), but also reports the session it replaced.
+    /// Like [`register`](Self::register), but also reports the session it replaced and accepts negotiated features.
     ///
     /// When `worker_id` re-registers while its previous session is still live (the master never
     /// saw an EOF, e.g. a Wi-Fi to LTE handoff), the old connection is aborted and its in-flight
@@ -255,6 +292,7 @@ impl WorkerRegistry {
         &self,
         worker_id: Uuid,
         capabilities: WorkerCapabilities,
+        features: ProtocolCapabilities,
         remote_addr: SocketAddr,
         sender: mpsc::Sender<MasterMessage>,
         abort_handle: Option<AbortHandle>,
@@ -278,6 +316,7 @@ impl WorkerRegistry {
             let ram = capabilities.ram_mb;
             existing.session_id = session_id;
             existing.capabilities = capabilities;
+            existing.features = features;
             existing.status = WorkerStatus::Connected;
             existing.last_heartbeat_instant = now_instant;
             existing.last_heartbeat_timestamp = now_epoch;
@@ -292,13 +331,23 @@ impl WorkerRegistry {
             // A fresh Register carries a fresh capability snapshot, so a past rejection streak no longer applies.
             existing.consecutive_rejections = 0;
             existing.excluded_until = None;
+            existing.heartbeat_interval = existing
+                .capabilities
+                .mobile
+                .as_ref()
+                .map(|m| m.live_status().recommended_keepalive_interval(0));
             tracing::info!(worker_id = %worker_id, session_id = session_id, superseded = ?superseded_session, "Rebound existing worker registration");
         } else {
             let ram = capabilities.ram_mb;
+            let hb_interval = capabilities
+                .mobile
+                .as_ref()
+                .map(|m| m.live_status().recommended_keepalive_interval(0));
             let entry = WorkerEntry {
                 worker_id,
                 session_id,
                 capabilities,
+                features,
                 status: WorkerStatus::Connected,
                 last_heartbeat_instant: now_instant,
                 last_heartbeat_timestamp: now_epoch,
@@ -314,6 +363,7 @@ impl WorkerRegistry {
                 rx_clock: None,
                 consecutive_rejections: 0,
                 excluded_until: None,
+                heartbeat_interval: hb_interval,
             };
             inner.workers.insert(worker_id, entry);
             tracing::info!(worker_id = %worker_id, session_id = session_id, "Registered new worker");
@@ -497,6 +547,28 @@ impl WorkerRegistry {
         entry.reported_active_tasks = active_tasks;
         entry.cpu_usage_pct = cpu_usage_pct;
         entry.ram_available_mb = ram_available_mb;
+        if let Some(ref mob) = entry.capabilities.mobile {
+            let live = mob.live_status();
+            let is_cellular = live.network_type.as_ref().is_some_and(|net| {
+                let n = net.to_ascii_lowercase();
+                n.contains("cellular")
+                    || n.contains("mobile")
+                    || n.contains("lte")
+                    || n.contains("5g")
+                    || n.contains("4g")
+                    || n.contains("3g")
+                    || n.contains("cgnat")
+            }) || entry
+                .heartbeat_interval
+                .is_some_and(|d| d < Duration::from_secs(60));
+
+            if is_cellular {
+                entry.heartbeat_interval =
+                    Some(live.recommended_keepalive_interval(entry.active_tasks));
+            } else if entry.heartbeat_interval.is_none() {
+                entry.heartbeat_interval = Some(Duration::from_secs(60));
+            }
+        }
         let revive = entry.status == WorkerStatus::Disconnected && expected_session.is_some();
         if entry.status != WorkerStatus::Disconnected || revive {
             entry.status = if entry.visible_active_tasks() > 0 {
@@ -538,6 +610,7 @@ impl WorkerRegistry {
                 return Ok(false);
             }
         }
+        entry.heartbeat_interval = Some(status.recommended_keepalive_interval(entry.active_tasks));
         let updated = match entry.capabilities.mobile.as_ref() {
             Some(current) => current.with_live_status(status),
             // The worker registered without mobile data but now reports some (an app feeding
@@ -1148,7 +1221,14 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
 
         let first = registry
-            .register_session(id, caps("w"), addr, tx1, None)
+            .register_session(
+                id,
+                caps("w"),
+                ProtocolCapabilities::empty(),
+                addr,
+                tx1,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1159,7 +1239,14 @@ mod tests {
         // Re-registering while the previous session is still live supersedes it.
         registry.increment_active_tasks(&id).await.unwrap();
         let second = registry
-            .register_session(id, caps("w"), addr, tx2, None)
+            .register_session(
+                id,
+                caps("w"),
+                ProtocolCapabilities::empty(),
+                addr,
+                tx2,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(second.superseded_session, Some(first.session_id));
@@ -1176,7 +1263,14 @@ mod tests {
             .await
             .unwrap();
         let third = registry
-            .register_session(id, caps("w"), addr, tx3, None)
+            .register_session(
+                id,
+                caps("w"),
+                ProtocolCapabilities::empty(),
+                addr,
+                tx3,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(third.superseded_session, None);
@@ -1612,9 +1706,10 @@ mod tests {
             battery_pct: Some(4),
             is_charging: Some(false),
             thermal_throttled: true,
+            ..Default::default()
         };
         assert!(registry
-            .update_mobile_telemetry(&id, Some(session), drained)
+            .update_mobile_telemetry(&id, Some(session), drained.clone())
             .await
             .unwrap());
         let mobile = registry
@@ -1642,9 +1737,10 @@ mod tests {
             battery_pct: Some(100),
             is_charging: Some(true),
             thermal_throttled: false,
+            ..Default::default()
         };
         assert!(!registry
-            .update_mobile_telemetry(&id, Some(session + 1), stale)
+            .update_mobile_telemetry(&id, Some(session + 1), stale.clone())
             .await
             .unwrap());
         assert_eq!(
@@ -1693,6 +1789,7 @@ mod tests {
             battery_pct: Some(50),
             is_charging: None,
             thermal_throttled: false,
+            ..Default::default()
         };
         assert!(registry
             .update_mobile_telemetry(&id, Some(session), status)
@@ -1758,15 +1855,16 @@ mod tests {
         );
         assert_eq!(placed(vec![multi_core()], workers), 1);
 
-        // Unplugged and drained to 4%: heavy work stops, light work still goes.
+        // Unplugged and drained to 35%: heavy work stops, light work still goes.
         registry
             .update_mobile_telemetry(
                 &id,
                 Some(session),
                 MobileLiveStatus {
-                    battery_pct: Some(4),
+                    battery_pct: Some(35),
                     is_charging: Some(false),
                     thermal_throttled: false,
+                    ..Default::default()
                 },
             )
             .await
@@ -1775,7 +1873,7 @@ mod tests {
         assert_eq!(
             placed(vec![compile()], workers.clone()),
             0,
-            "a flat battery must not get builds"
+            "a low battery must not get builds"
         );
         assert_eq!(placed(vec![multi_core()], workers), 1);
 
@@ -1785,9 +1883,10 @@ mod tests {
                 &id,
                 Some(session),
                 MobileLiveStatus {
-                    battery_pct: Some(4),
+                    battery_pct: Some(35),
                     is_charging: Some(true),
                     thermal_throttled: false,
+                    ..Default::default()
                 },
             )
             .await
@@ -1804,6 +1903,7 @@ mod tests {
                     battery_pct: Some(80),
                     is_charging: Some(true),
                     thermal_throttled: true,
+                    ..Default::default()
                 },
             )
             .await

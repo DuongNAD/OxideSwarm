@@ -14,12 +14,10 @@ use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
-use rusty_grid_core::mapreduce::{
-    MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec,
-};
+use rusty_grid_core::mapreduce::{MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec};
 use rusty_grid_core::protocol::{
-    deserialize_message, serialize_message, ClientMessage, InboundMessage,
-    MessageTransport, ProtocolError, WireCodec, WorkerMessage,
+    deserialize_message, serialize_message, ClientMessage, InboundMessage, MessageTransport,
+    ProtocolError, WireCodec, WorkerMessage,
 };
 use rusty_grid_core::task::{
     Bytes as TaskBytes, Task, TaskId, TaskRequirements, TaskSpec, TaskStatus,
@@ -56,17 +54,17 @@ fn test_adv_mapreduce_job_name_lengths_and_encodings() {
     let long10k = "long_name_".repeat(1000);
 
     let test_names: Vec<&str> = vec![
-        "",                                                  // Empty
-        "a",                                                 // 1 char
-        "standard_job_name",                                // Standard
-        &long256,                                           // 256 chars
-        &long10k,                                           // 10,000 chars
-        "分布式计算_MapReduce_任务_🦀_🚀",                     // Chinese + Emojis
-        "مهمة_توزيع_البيانات_12345",                         // Arabic RTL
-        "Пайплайн_обработки_данных_2026",                   // Cyrillic
-        "Name with \t tabs \n newlines \r returns",         // Whitespace control chars
-        "\"quoted\" and 'single' and `backticks`",          // Quotes
-        "!@#$%^&*()_+~|}{[]:;?><,./-=",                     // Punctuation
+        "",                                         // Empty
+        "a",                                        // 1 char
+        "standard_job_name",                        // Standard
+        &long256,                                   // 256 chars
+        &long10k,                                   // 10,000 chars
+        "分布式计算_MapReduce_任务_🦀_🚀",          // Chinese + Emojis
+        "مهمة_توزيع_البيانات_12345",                // Arabic RTL
+        "Пайплайн_обработки_данных_2026",           // Cyrillic
+        "Name with \t tabs \n newlines \r returns", // Whitespace control chars
+        "\"quoted\" and 'single' and `backticks`",  // Quotes
+        "!@#$%^&*()_+~|}{[]:;?><,./-=",             // Punctuation
     ];
 
     for name in test_names {
@@ -95,7 +93,12 @@ fn test_adv_mapreduce_job_name_lengths_and_encodings() {
         assert_eq!(codec, WireCodec::Bincode);
         match inbound {
             InboundMessage::Client(ClientMessage::SubmitMapReduce { job }) => {
-                assert_eq!(job.name, name, "Job name mismatch for length {}", name.len());
+                assert_eq!(
+                    job.name,
+                    name,
+                    "Job name mismatch for length {}",
+                    name.len()
+                );
                 assert_eq!(job.job_id, spec.job_id);
                 assert_eq!(job.input_data, spec.input_data);
                 assert_eq!(job.partition_count, 2);
@@ -108,8 +111,8 @@ fn test_adv_mapreduce_job_name_lengths_and_encodings() {
         }
 
         // Test JSON serialization & deserialization as InboundMessage
-        let json_bytes = serialize_message(&client_msg, WireCodec::Json)
-            .expect("json serialization failed");
+        let json_bytes =
+            serialize_message(&client_msg, WireCodec::Json).expect("json serialization failed");
         let (inbound_json, codec_json): (InboundMessage, _) = deserialize_message(&json_bytes)
             .expect("json deserialization as InboundMessage failed");
 
@@ -130,12 +133,24 @@ fn test_adv_mapreduce_job_name_lengths_and_encodings() {
 #[test]
 fn test_adv_mapreduce_mapper_reducer_edge_specs() {
     let mappers = vec![
-        MapFunctionSpec::Builtin { operator: "".into() },
+        MapFunctionSpec::Builtin {
+            operator: "".into(),
+        },
         MapFunctionSpec::ShellScript { script: "".into() },
-        MapFunctionSpec::ShellScript { script: "while read l; do echo \"$l\"; done".into() },
-        MapFunctionSpec::Command { program: "".into(), args: vec![] },
-        MapFunctionSpec::Command { program: "python".into(), args: vec!["-c".into(), "import sys; print(sys.stdin.read())".into()] },
-        MapFunctionSpec::ShellScript { script: "x".repeat(50_000) }, // 50KB script
+        MapFunctionSpec::ShellScript {
+            script: "while read l; do echo \"$l\"; done".into(),
+        },
+        MapFunctionSpec::Command {
+            program: "".into(),
+            args: vec![],
+        },
+        MapFunctionSpec::Command {
+            program: "python".into(),
+            args: vec!["-c".into(), "import sys; print(sys.stdin.read())".into()],
+        },
+        MapFunctionSpec::ShellScript {
+            script: "x".repeat(50_000),
+        }, // 50KB script
         MapFunctionSpec::Command {
             program: "custom_mapper".into(),
             args: (0..500).map(|i| format!("--arg-{i}=value_{i}")).collect(),
@@ -143,12 +158,24 @@ fn test_adv_mapreduce_mapper_reducer_edge_specs() {
     ];
 
     let reducers = [
-        ReduceFunctionSpec::Builtin { operator: "".into() },
+        ReduceFunctionSpec::Builtin {
+            operator: "".into(),
+        },
         ReduceFunctionSpec::ShellScript { script: "".into() },
-        ReduceFunctionSpec::ShellScript { script: "awk '{s+=$2} END {print s}'".into() },
-        ReduceFunctionSpec::Command { program: "".into(), args: vec![] },
-        ReduceFunctionSpec::Command { program: "sort".into(), args: vec!["-k1,1".into()] },
-        ReduceFunctionSpec::ShellScript { script: "y".repeat(50_000) }, // 50KB reducer script
+        ReduceFunctionSpec::ShellScript {
+            script: "awk '{s+=$2} END {print s}'".into(),
+        },
+        ReduceFunctionSpec::Command {
+            program: "".into(),
+            args: vec![],
+        },
+        ReduceFunctionSpec::Command {
+            program: "sort".into(),
+            args: vec!["-k1,1".into()],
+        },
+        ReduceFunctionSpec::ShellScript {
+            script: "y".repeat(50_000),
+        }, // 50KB reducer script
     ];
 
     for (m_idx, mapper) in mappers.into_iter().enumerate() {
@@ -178,7 +205,10 @@ fn test_adv_mapreduce_mapper_reducer_edge_specs() {
                     assert_eq!(job.partition_count, 0);
                 }
                 InboundMessage::Worker(wm) => {
-                    panic!("CRITICAL BUG: edge spec deserialized as WorkerMessage: {:?}", wm);
+                    panic!(
+                        "CRITICAL BUG: edge spec deserialized as WorkerMessage: {:?}",
+                        wm
+                    );
                 }
                 other => panic!("Unexpected variant: {:?}", other),
             }
@@ -196,20 +226,35 @@ fn test_adv_client_message_all_variants_bincode_inbound() {
     let sample_job = MapReduceJobSpec::new(
         "sample",
         vec!["line1".into()],
-        MapFunctionSpec::Builtin { operator: "word_count".into() },
-        ReduceFunctionSpec::Builtin { operator: "sum".into() },
+        MapFunctionSpec::Builtin {
+            operator: "word_count".into(),
+        },
+        ReduceFunctionSpec::Builtin {
+            operator: "sum".into(),
+        },
         1,
         1,
         10,
     );
 
     let client_messages = vec![
-        (0, "SubmitTask", ClientMessage::SubmitTask { task: dummy_task(), wait: true }),
+        (
+            0,
+            "SubmitTask",
+            ClientMessage::SubmitTask {
+                task: dummy_task(),
+                wait: true,
+            },
+        ),
         (1, "GetTaskStatus", ClientMessage::GetTaskStatus { task_id }),
         (2, "CancelTask", ClientMessage::CancelTask { task_id }),
         (3, "ClusterStatus", ClientMessage::ClusterStatus),
         (4, "ListWorkers", ClientMessage::ListWorkers),
-        (5, "SubmitMapReduce", ClientMessage::SubmitMapReduce { job: sample_job }),
+        (
+            5,
+            "SubmitMapReduce",
+            ClientMessage::SubmitMapReduce { job: sample_job },
+        ),
     ];
 
     for (variant_idx, name, msg) in client_messages {
@@ -228,7 +273,10 @@ fn test_adv_client_message_all_variants_bincode_inbound() {
                 (3, ClientMessage::ClusterStatus) => {}
                 (4, ClientMessage::ListWorkers) => {}
                 (5, ClientMessage::SubmitMapReduce { job }) => assert_eq!(job.name, "sample"),
-                (idx, unexpected) => panic!("Variant mismatch: expected variant index {idx}, got {:?}", unexpected),
+                (idx, unexpected) => panic!(
+                    "Variant mismatch: expected variant index {idx}, got {:?}",
+                    unexpected
+                ),
             },
             InboundMessage::Worker(wm) => {
                 panic!("CRITICAL COLLISION: ClientMessage {name} (index {variant_idx}) decoded as WorkerMessage: {:?}", wm);
@@ -286,6 +334,7 @@ fn test_adv_worker_message_all_variants_bincode_inbound() {
                 device_name: Some("Test GPU".into()),
                 error: None,
                 asset_bytes: None,
+                artifacts: Vec::new(),
             },
         ),
         (
@@ -319,14 +368,25 @@ fn test_adv_worker_message_all_variants_bincode_inbound() {
             InboundMessage::Worker(w) => match (variant_idx, w) {
                 (0, WorkerMessage::Register { worker_id: wid, .. }) => assert_eq!(wid, worker_id),
                 (1, WorkerMessage::Heartbeat { worker_id: wid, .. }) => assert_eq!(wid, worker_id),
-                (2, WorkerMessage::TaskProgress { worker_id: wid, .. }) => assert_eq!(wid, worker_id),
+                (2, WorkerMessage::TaskProgress { worker_id: wid, .. }) => {
+                    assert_eq!(wid, worker_id)
+                }
                 (3, WorkerMessage::TaskResult { worker_id: wid, .. }) => assert_eq!(wid, worker_id),
                 (4, WorkerMessage::Checkpoint { task_id: tid, .. }) => assert_eq!(tid, task_id),
-                (5, WorkerMessage::Disconnecting { worker_id: wid, reason }) => {
+                (
+                    5,
+                    WorkerMessage::Disconnecting {
+                        worker_id: wid,
+                        reason,
+                    },
+                ) => {
                     assert_eq!(wid, worker_id);
                     assert_eq!(reason, "Graceful shutdown");
                 }
-                (idx, unexpected) => panic!("Variant mismatch: expected variant index {idx}, got {:?}", unexpected),
+                (idx, unexpected) => panic!(
+                    "Variant mismatch: expected variant index {idx}, got {:?}",
+                    unexpected
+                ),
             },
             InboundMessage::Client(cm) => {
                 panic!("CRITICAL COLLISION: WorkerMessage {name} (index {variant_idx}) decoded as ClientMessage: {:?}", cm);
@@ -371,9 +431,16 @@ fn test_adv_tag_5_collision_fuzz_stress() {
 
         let mr_spec = MapReduceJobSpec::new(
             job_name,
-            vec![format!("data partition {i}"), format!("data partition {i} bis")],
-            MapFunctionSpec::Builtin { operator: "word_count".into() },
-            ReduceFunctionSpec::Builtin { operator: "sum".into() },
+            vec![
+                format!("data partition {i}"),
+                format!("data partition {i} bis"),
+            ],
+            MapFunctionSpec::Builtin {
+                operator: "word_count".into(),
+            },
+            ReduceFunctionSpec::Builtin {
+                operator: "sum".into(),
+            },
             2,
             1,
             20,
@@ -387,8 +454,8 @@ fn test_adv_tag_5_collision_fuzz_stress() {
     let mut mr_count = 0;
 
     for (is_worker_expected, bytes) in messages {
-        let (inbound, codec): (InboundMessage, _) = deserialize_message(&bytes)
-            .expect("Failed to deserialize in tag 5 fuzz test");
+        let (inbound, codec): (InboundMessage, _) =
+            deserialize_message(&bytes).expect("Failed to deserialize in tag 5 fuzz test");
         assert_eq!(codec, WireCodec::Bincode);
 
         if is_worker_expected {
@@ -397,7 +464,10 @@ fn test_adv_tag_5_collision_fuzz_stress() {
                     disc_count += 1;
                 }
                 InboundMessage::Client(cm) => {
-                    panic!("WorkerMessage::Disconnecting misclassified as ClientMessage: {:?}", cm);
+                    panic!(
+                        "WorkerMessage::Disconnecting misclassified as ClientMessage: {:?}",
+                        cm
+                    );
                 }
                 other => panic!("Unexpected message: {:?}", other),
             }
@@ -407,7 +477,10 @@ fn test_adv_tag_5_collision_fuzz_stress() {
                     mr_count += 1;
                 }
                 InboundMessage::Worker(wm) => {
-                    panic!("ClientMessage::SubmitMapReduce misclassified as WorkerMessage: {:?}", wm);
+                    panic!(
+                        "ClientMessage::SubmitMapReduce misclassified as WorkerMessage: {:?}",
+                        wm
+                    );
                 }
                 other => panic!("Unexpected message: {:?}", other),
             }
@@ -427,8 +500,12 @@ fn test_adv_truncated_and_corrupted_payloads() {
     let spec = MapReduceJobSpec::new(
         "test_truncated_job",
         vec!["hello world".into()],
-        MapFunctionSpec::Builtin { operator: "word_count".into() },
-        ReduceFunctionSpec::Builtin { operator: "sum".into() },
+        MapFunctionSpec::Builtin {
+            operator: "word_count".into(),
+        },
+        ReduceFunctionSpec::Builtin {
+            operator: "sum".into(),
+        },
         1,
         1,
         10,
@@ -440,7 +517,8 @@ fn test_adv_truncated_and_corrupted_payloads() {
     let mut ok_matches = Vec::new();
     for len in 1..bytes.len() - 1 {
         let truncated = &bytes[..len];
-        let res: Result<(InboundMessage, WireCodec), ProtocolError> = deserialize_message(truncated);
+        let res: Result<(InboundMessage, WireCodec), ProtocolError> =
+            deserialize_message(truncated);
         if let Ok((inbound, _codec)) = res {
             ok_matches.push((len, format!("{:?}", inbound)));
         }
@@ -453,7 +531,6 @@ fn test_adv_truncated_and_corrupted_payloads() {
             "Unexpected truncated match at length {len}: {desc}"
         );
     }
-
 
     // Corrupted tag
     let mut corrupted = bytes.to_vec();
@@ -468,7 +545,9 @@ fn test_adv_truncated_and_corrupted_payloads() {
 
 #[tokio::test]
 async fn test_adv_inbound_message_roundtrip_over_transport() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind listener");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
     let addr = listener.local_addr().expect("local addr");
 
     let server_task = tokio::spawn(async move {
@@ -476,17 +555,49 @@ async fn test_adv_inbound_message_roundtrip_over_transport() {
         let mut transport = MessageTransport::new(stream);
 
         // Receive 4 messages: Register, SubmitMapReduce, Disconnecting, ClusterStatus
-        let msg1 = transport.recv_msg_with_codec::<InboundMessage>().await.unwrap().unwrap().0;
-        assert!(matches!(msg1, InboundMessage::Worker(WorkerMessage::Register { .. })));
+        let msg1 = transport
+            .recv_msg_with_codec::<InboundMessage>()
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        assert!(matches!(
+            msg1,
+            InboundMessage::Worker(WorkerMessage::Register { .. })
+        ));
 
-        let msg2 = transport.recv_msg_with_codec::<InboundMessage>().await.unwrap().unwrap().0;
-        assert!(matches!(msg2, InboundMessage::Client(ClientMessage::SubmitMapReduce { .. })));
+        let msg2 = transport
+            .recv_msg_with_codec::<InboundMessage>()
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        assert!(matches!(
+            msg2,
+            InboundMessage::Client(ClientMessage::SubmitMapReduce { .. })
+        ));
 
-        let msg3 = transport.recv_msg_with_codec::<InboundMessage>().await.unwrap().unwrap().0;
-        assert!(matches!(msg3, InboundMessage::Worker(WorkerMessage::Disconnecting { .. })));
+        let msg3 = transport
+            .recv_msg_with_codec::<InboundMessage>()
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        assert!(matches!(
+            msg3,
+            InboundMessage::Worker(WorkerMessage::Disconnecting { .. })
+        ));
 
-        let msg4 = transport.recv_msg_with_codec::<InboundMessage>().await.unwrap().unwrap().0;
-        assert!(matches!(msg4, InboundMessage::Client(ClientMessage::ClusterStatus)));
+        let msg4 = transport
+            .recv_msg_with_codec::<InboundMessage>()
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        assert!(matches!(
+            msg4,
+            InboundMessage::Client(ClientMessage::ClusterStatus)
+        ));
     });
 
     let client_stream = TcpStream::connect(addr).await.expect("connect");
@@ -501,8 +612,12 @@ async fn test_adv_inbound_message_roundtrip_over_transport() {
         job: MapReduceJobSpec::new(
             "stream_mr",
             vec!["sample".into()],
-            MapFunctionSpec::Builtin { operator: "word_count".into() },
-            ReduceFunctionSpec::Builtin { operator: "sum".into() },
+            MapFunctionSpec::Builtin {
+                operator: "word_count".into(),
+            },
+            ReduceFunctionSpec::Builtin {
+                operator: "sum".into(),
+            },
             1,
             1,
             10,
@@ -519,7 +634,10 @@ async fn test_adv_inbound_message_roundtrip_over_transport() {
 
     // 4. Client ClusterStatus
     let status = ClientMessage::ClusterStatus;
-    client_transport.send_msg(&status).await.expect("send status");
+    client_transport
+        .send_msg(&status)
+        .await
+        .expect("send status");
 
     server_task.await.expect("server task completed");
 }

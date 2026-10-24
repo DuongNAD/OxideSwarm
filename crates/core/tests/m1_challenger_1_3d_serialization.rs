@@ -338,6 +338,7 @@ fn test_adv_03_auto_rig_32mb_payload_bincode_and_wire_framing() {
         device_name: Some("CPU Geodesic Solver".to_string()),
         error: None,
         asset_bytes: Some(original_task_bytes.clone()),
+        artifacts: Vec::new(),
     };
 
     let t_frame = Instant::now();
@@ -403,6 +404,7 @@ async fn test_adv_04_wire_framing_transport_32mb_duplex() {
         device_name: Some("NVIDIA RTX 4090".to_string()),
         error: None,
         asset_bytes: Some(asset_bytes.clone()),
+        artifacts: Vec::new(),
     };
 
     // Client sends message concurrently, server receives message
@@ -459,6 +461,7 @@ async fn test_adv_04_wire_framing_transport_32mb_duplex() {
         device_name: None,
         error: None,
         asset_bytes: Some(asset_bytes),
+        artifacts: Vec::new(),
     }, WireCodec::Json);
 
     assert!(json_result.is_err(), "32MB binary payload in JSON must exceed MAX_FRAME_SIZE (64MB)");
@@ -483,6 +486,7 @@ async fn test_adv_04_wire_framing_transport_32mb_duplex() {
         device_name: None,
         error: None,
         asset_bytes: Some(small_asset.clone()),
+        artifacts: Vec::new(),
     }, WireCodec::Json);
 
     assert!(small_json_res.is_ok(), "512KB binary payload must fit in JSON wire frame");
@@ -525,6 +529,7 @@ fn test_adv_05_zero_copy_pointer_identity_and_latency() {
         device_name: Some("GPU".to_string()),
         error: None,
         asset_bytes: Some(original_task_bytes.clone()),
+        artifacts: Vec::new(),
     };
 
     // Check pointer inside TaskResult
@@ -734,6 +739,7 @@ fn test_adv_08_concurrent_multithreaded_zero_copy_access() {
         device_name: Some("Multi-Threaded Bus".to_string()),
         error: None,
         asset_bytes: Some(original_bytes.clone()),
+        artifacts: Vec::new(),
     });
 
     let num_threads = 8;

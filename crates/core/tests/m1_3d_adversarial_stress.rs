@@ -430,6 +430,7 @@ fn test_legacy_worker_message_register_wire_protocol_deserialization() {
         WorkerMessage::Register {
             worker_id,
             capabilities,
+            ..
         } => {
             assert_eq!(worker_id, wid);
             assert_eq!(capabilities.name, "legacy-worker-1");
@@ -750,6 +751,7 @@ async fn test_cli_e2e_conflicting_flags_no_gpu_wire_domination() {
         WorkerMessage::Register {
             worker_id,
             capabilities,
+            ..
         } => {
             println!("Received Register from Worker {worker_id} (name: {})", capabilities.name);
             println!("Advertised Capabilities: {:?}", capabilities);
@@ -853,6 +855,7 @@ async fn test_cli_e2e_conflicting_flags_no_blender_wire_domination() {
         WorkerMessage::Register {
             worker_id,
             capabilities,
+            ..
         } => {
             println!("Received Register from Worker {worker_id} (name: {})", capabilities.name);
             println!("Advertised Capabilities: {:?}", capabilities);

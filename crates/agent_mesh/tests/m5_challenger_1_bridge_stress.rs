@@ -204,7 +204,9 @@ async fn test_adv_bridge_timeout_handling() {
 
     // Either the client times out locally, or the bridge returns an error response
     match res {
-        Ok(AgentMeshEnvelope::CommandResponse { status, exit_code, .. }) => {
+        Ok(AgentMeshEnvelope::CommandResponse {
+            status, exit_code, ..
+        }) => {
             assert!(
                 status == "failed" || exit_code == 124 || exit_code != 0,
                 "Expected failure status or non-zero exit code on timeout"
@@ -224,7 +226,9 @@ async fn test_adv_bridge_timeout_handling() {
         .expect("Cluster should remain responsive after timeout");
 
     match status_res {
-        AgentMeshEnvelope::CommandResponse { status, exit_code, .. } => {
+        AgentMeshEnvelope::CommandResponse {
+            status, exit_code, ..
+        } => {
             assert_eq!(status, "success");
             assert_eq!(exit_code, 0);
         }
@@ -253,11 +257,20 @@ async fn test_adv_bridge_invalid_task_ids() {
         .expect("query nil uuid");
 
     match nil_res {
-        AgentMeshEnvelope::CommandResponse { status, exit_code, stderr, error, .. } => {
+        AgentMeshEnvelope::CommandResponse {
+            status,
+            exit_code,
+            stderr,
+            error,
+            ..
+        } => {
             assert_eq!(status, "failed");
             assert_ne!(exit_code, 0);
             let err_msg = format!("{}{}", stderr, error.unwrap_or_default());
-            assert!(err_msg.contains("Task not found"), "Expected 'Task not found', got: {err_msg}");
+            assert!(
+                err_msg.contains("Task not found"),
+                "Expected 'Task not found', got: {err_msg}"
+            );
         }
         other => panic!("Expected failed CommandResponse, got: {:?}", other),
     }
@@ -270,7 +283,13 @@ async fn test_adv_bridge_invalid_task_ids() {
         .expect("query random uuid");
 
     match rand_res {
-        AgentMeshEnvelope::CommandResponse { status, exit_code, stderr, error, .. } => {
+        AgentMeshEnvelope::CommandResponse {
+            status,
+            exit_code,
+            stderr,
+            error,
+            ..
+        } => {
             assert_eq!(status, "failed");
             assert_ne!(exit_code, 0);
             let err_msg = format!("{}{}", stderr, error.unwrap_or_default());
@@ -286,11 +305,20 @@ async fn test_adv_bridge_invalid_task_ids() {
         .expect("query malformed uuid");
 
     match malformed_res {
-        AgentMeshEnvelope::CommandResponse { status, exit_code, stderr, error, .. } => {
+        AgentMeshEnvelope::CommandResponse {
+            status,
+            exit_code,
+            stderr,
+            error,
+            ..
+        } => {
             assert_eq!(status, "failed");
             assert_ne!(exit_code, 0);
             let err_msg = format!("{}{}", stderr, error.unwrap_or_default());
-            assert!(err_msg.contains("Invalid task UUID"), "Expected 'Invalid task UUID', got: {err_msg}");
+            assert!(
+                err_msg.contains("Invalid task UUID"),
+                "Expected 'Invalid task UUID', got: {err_msg}"
+            );
         }
         other => panic!("Expected failed CommandResponse, got: {:?}", other),
     }
@@ -302,11 +330,20 @@ async fn test_adv_bridge_invalid_task_ids() {
         .expect("query empty uuid");
 
     match empty_res {
-        AgentMeshEnvelope::CommandResponse { status, exit_code, stderr, error, .. } => {
+        AgentMeshEnvelope::CommandResponse {
+            status,
+            exit_code,
+            stderr,
+            error,
+            ..
+        } => {
             assert_eq!(status, "failed");
             assert_ne!(exit_code, 0);
             let err_msg = format!("{}{}", stderr, error.unwrap_or_default());
-            assert!(err_msg.contains("Invalid task UUID"), "Expected 'Invalid task UUID', got: {err_msg}");
+            assert!(
+                err_msg.contains("Invalid task UUID"),
+                "Expected 'Invalid task UUID', got: {err_msg}"
+            );
         }
         other => panic!("Expected failed CommandResponse, got: {:?}", other),
     }
@@ -333,7 +370,13 @@ async fn test_adv_bridge_compilation_error_propagation() {
         .expect("submit empty sources");
 
     match empty_sources_res {
-        AgentMeshEnvelope::CommandResponse { status, exit_code, error, stderr, .. } => {
+        AgentMeshEnvelope::CommandResponse {
+            status,
+            exit_code,
+            error,
+            stderr,
+            ..
+        } => {
             assert_eq!(status, "failed");
             assert_ne!(exit_code, 0);
             let msg = format!("{}{}", stderr, error.unwrap_or_default());
@@ -369,7 +412,9 @@ async fn test_adv_bridge_unattached_rejection() {
         .expect("submit compute");
 
     match compute_res {
-        AgentMeshEnvelope::DeliveryNack { error_code, reason, .. } => {
+        AgentMeshEnvelope::DeliveryNack {
+            error_code, reason, ..
+        } => {
             assert_eq!(error_code, "ERR_BRIDGE_NOT_CONFIGURED");
             assert!(reason.contains("AgentGridBridge is not attached"));
         }

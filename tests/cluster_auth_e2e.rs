@@ -159,7 +159,9 @@ async fn start_fake_worker(
                     is_gpu_executed: false,
                     device_name: None,
                     error: None,
-                })
+                    artifacts: Vec::new(),
+            asset_bytes: None,
+        })
                 .await;
         }
     });
@@ -706,7 +708,9 @@ mod quic {
         let session_key = client_handshake(&mut authenticated.control, &secret)
             .await
             .expect("handshake with the right secret");
-        authenticated.control.enable_encryption(&session_key, EndpointRole::Client);
+        authenticated
+            .control
+            .enable_encryption(&session_key, EndpointRole::Client);
         let worker_id = Uuid::new_v4();
         authenticated
             .control
@@ -777,7 +781,10 @@ async fn test_all_post_handshake_frames_use_wire_format_encrypted() {
     );
     // Sequence counter in AAD/frame header must be 0 for the first frame
     let seq = u64::from_be_bytes(raw_frame[1..9].try_into().unwrap());
-    assert_eq!(seq, 0, "First encrypted frame from server must have sequence 0");
+    assert_eq!(
+        seq, 0,
+        "First encrypted frame from server must have sequence 0"
+    );
 
     let (_, mut reader_session) = derive_aead_keys(&session_key, EndpointRole::Client);
     let decrypted = reader_session
@@ -785,7 +792,10 @@ async fn test_all_post_handshake_frames_use_wire_format_encrypted() {
         .expect("decrypt raw frame");
     let (ack, _): (MasterMessage, _) =
         rusty_grid_core::protocol::deserialize_message(&decrypted).expect("deserialize ack");
-    assert!(matches!(ack, MasterMessage::RegisterAck { accepted: true, .. }));
+    assert!(matches!(
+        ack,
+        MasterMessage::RegisterAck { accepted: true, .. }
+    ));
 
     let _ = master.shutdown();
 }
@@ -804,7 +814,11 @@ async fn test_tampered_ciphertext_causes_connection_rejection() {
     let (mut writer_session, _) = derive_aead_keys(&session_key, EndpointRole::Client);
 
     let worker_id = Uuid::new_v4();
-    let payload = serialize_message(&register_msg(worker_id, "tamper-worker"), WireCodec::Bincode).unwrap();
+    let payload = serialize_message(
+        &register_msg(worker_id, "tamper-worker"),
+        WireCodec::Bincode,
+    )
+    .unwrap();
     let encrypted_frame = writer_session.encrypt_frame(&payload).expect("seal frame");
 
     // Tamper with the ciphertext (flip a bit in the encrypted payload)
@@ -813,7 +827,10 @@ async fn test_tampered_ciphertext_causes_connection_rejection() {
     tampered[len - 1] ^= 0x55;
 
     // Send the tampered frame directly
-    transport.send_raw_frame(Bytes::from(tampered)).await.unwrap();
+    transport
+        .send_raw_frame(Bytes::from(tampered))
+        .await
+        .unwrap();
 
     // Master AEAD reader must fail authentication and immediately drop/close the connection
     let resp: Result<Option<MasterMessage>, _> = transport.recv_msg().await;
@@ -837,18 +854,29 @@ async fn test_replayed_sequence_number_causes_connection_rejection() {
         .await
         .expect("handshake succeeds");
 
-    let (mut writer_session, mut reader_session) = derive_aead_keys(&session_key, EndpointRole::Client);
+    let (mut writer_session, mut reader_session) =
+        derive_aead_keys(&session_key, EndpointRole::Client);
 
     let worker_id = Uuid::new_v4();
-    let payload = serialize_message(&register_msg(worker_id, "replay-worker"), WireCodec::Bincode).unwrap();
+    let payload = serialize_message(
+        &register_msg(worker_id, "replay-worker"),
+        WireCodec::Bincode,
+    )
+    .unwrap();
 
     // Encrypt frame 1 with seq = 0
-    let frame_seq0 = writer_session.encrypt_frame(&payload).expect("seal frame 0");
+    let frame_seq0 = writer_session
+        .encrypt_frame(&payload)
+        .expect("seal frame 0");
     // Send frame 0 legitimately
     transport.send_raw_frame(frame_seq0.clone()).await.unwrap();
 
     // Read ack from master
-    let raw_ack = transport.recv_raw_frame().await.unwrap().expect("ack frame");
+    let raw_ack = transport
+        .recv_raw_frame()
+        .await
+        .unwrap()
+        .expect("ack frame");
     assert_eq!(raw_ack[0], WIRE_FORMAT_ENCRYPTED);
     let _ = reader_session.decrypt_frame(&raw_ack).expect("decrypt ack");
 

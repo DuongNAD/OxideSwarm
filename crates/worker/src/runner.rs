@@ -58,13 +58,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::cluster_auth::{ENV_SECRET, ENV_SECRET_FILE};
 use rusty_grid_core::protocol::WorkerMessage;
-use rusty_grid_core::task::{Bytes, BytesMut, CheckpointData, Task, TaskId, TaskResult, TaskSpec};
+use rusty_grid_core::task::{
+    sha256_digest, Bytes, BytesMut, CheckpointData, OutputArtifact, Task, TaskId, TaskResult,
+    TaskSpec, MAX_AGGREGATE_ARTIFACT_BYTES, MAX_OUTPUT_ARTIFACT_BYTES,
+};
 
 use crate::cpu_simd;
 use crate::gpu::{check_gemm_request, DeviceLimits, GpuError};
@@ -294,7 +297,9 @@ impl StreamCapture {
 type SharedCapture = Arc<Mutex<StreamCapture>>;
 
 fn lock_capture(capture: &SharedCapture) -> std::sync::MutexGuard<'_, StreamCapture> {
-    capture.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    capture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Reads `reader` to EOF into `capture`, keeping at most `max_bytes` and draining the rest.
@@ -348,10 +353,18 @@ impl OutputReaders {
         let stderr_capture = SharedCapture::default();
         Self {
             stdout: stdout.map(|pipe| {
-                tokio::spawn(read_into_capture(pipe, max_bytes, Arc::clone(&stdout_capture)))
+                tokio::spawn(read_into_capture(
+                    pipe,
+                    max_bytes,
+                    Arc::clone(&stdout_capture),
+                ))
             }),
             stderr: stderr.map(|pipe| {
-                tokio::spawn(read_into_capture(pipe, max_bytes, Arc::clone(&stderr_capture)))
+                tokio::spawn(read_into_capture(
+                    pipe,
+                    max_bytes,
+                    Arc::clone(&stderr_capture),
+                ))
             }),
             stdout_capture,
             stderr_capture,
@@ -381,7 +394,10 @@ impl OutputReaders {
     }
 
     fn abort(&mut self) {
-        for reader in [self.stdout.take(), self.stderr.take()].into_iter().flatten() {
+        for reader in [self.stdout.take(), self.stderr.take()]
+            .into_iter()
+            .flatten()
+        {
             reader.abort();
         }
     }
@@ -573,7 +589,10 @@ impl TaskRunner {
     /// Runs GPU-class tasks on `provider` instead of the process-wide engine (tests that
     /// destroy a device use one of their own).
     #[cfg(feature = "gpu-wgpu")]
-    pub fn with_gpu_engine_provider(mut self, provider: Arc<crate::wgpu_engine::EngineProvider>) -> Self {
+    pub fn with_gpu_engine_provider(
+        mut self,
+        provider: Arc<crate::wgpu_engine::EngineProvider>,
+    ) -> Self {
         self.gpu_engine = provider;
         self
     }
@@ -626,6 +645,7 @@ impl TaskRunner {
                     device_name: None,
                     error: Some("Worker lacks GPU capability".to_string()),
                     asset_bytes: None,
+                    artifacts: Vec::new(),
                 };
             }
         }
@@ -633,8 +653,15 @@ impl TaskRunner {
         // 2. Dispatch in-memory workloads (BuiltinTest, GpuCompute) or process-based workloads
         match &task.spec {
             TaskSpec::BuiltinTest { .. } => {
-                self.execute_builtin_test(task, checkpoint, checkpoint_tx, timeout_duration, cancel_rx, start_time)
-                    .await
+                self.execute_builtin_test(
+                    task,
+                    checkpoint,
+                    checkpoint_tx,
+                    timeout_duration,
+                    cancel_rx,
+                    start_time,
+                )
+                .await
             }
 
             TaskSpec::GpuCompute { .. } => {
@@ -740,8 +767,14 @@ impl TaskRunner {
         child_pid: Option<Arc<AtomicU32>>,
         cancel_rx: Option<oneshot::Receiver<String>>,
     ) -> TaskResult {
-        self.execute_task_with_checkpoint(task, task.latest_checkpoint.as_ref(), None, child_pid, cancel_rx)
-            .await
+        self.execute_task_with_checkpoint(
+            task,
+            task.latest_checkpoint.as_ref(),
+            None,
+            child_pid,
+            cancel_rx,
+        )
+        .await
     }
 
     /// Executes in-memory BuiltinTest tasks with optional sleep, arithmetic stress, or hash computation,
@@ -861,7 +894,8 @@ impl TaskRunner {
                     let current_count = i + 1;
                     if let Some(ref tx) = checkpoint_tx {
                         if current_count < iters
-                            && (current_count % checkpoint_interval == 0 || (iters >= 100 && current_count == 50))
+                            && (current_count % checkpoint_interval == 0
+                                || (iters >= 100 && current_count == 50))
                         {
                             sequence += 1;
                             let mut delta = Vec::with_capacity(16);
@@ -961,7 +995,14 @@ impl TaskRunner {
                 Ok(checked) => checked,
                 Err(err) => return self.gpu_failure(task_id, &err, timeout, start_time),
             };
-            spawn_simulated_gpu_job(kernel_name, input_data, *task_id.as_uuid(), dim, tile, Arc::clone(&stop))
+            spawn_simulated_gpu_job(
+                kernel_name,
+                input_data,
+                *task_id.as_uuid(),
+                dim,
+                tile,
+                Arc::clone(&stop),
+            )
         } else {
             self.spawn_real_gpu_job(
                 kernel_name,
@@ -990,6 +1031,8 @@ impl TaskRunner {
                     is_gpu_executed: true,
                     device_name: Some(done.device_name),
                     error: None,
+                    asset_bytes: None,
+                    artifacts: Vec::new(),
                 },
                 Ok(Err(err)) => self.gpu_failure(task_id, &err, timeout, start_time),
                 Err(join_error) => {
@@ -1035,11 +1078,25 @@ impl TaskRunner {
     /// The failed [`TaskResult`] for a GPU-class task that ended in `err`. A job that gave up
     /// because its deadline passed is a timeout like any other; everything else is a plain
     /// failure whose message says what was wrong, so the Master can retry it elsewhere.
-    fn gpu_failure(&self, task_id: TaskId, err: &GpuError, timeout: Duration, start_time: Instant) -> TaskResult {
+    fn gpu_failure(
+        &self,
+        task_id: TaskId,
+        err: &GpuError,
+        timeout: Duration,
+        start_time: Instant,
+    ) -> TaskResult {
         let elapsed = start_time.elapsed().as_millis() as u64;
         if let GpuError::Interrupted(_) = err {
             let msg = format!("Task timed out after {}s", timeout.as_secs());
-            return TaskResult::failure(self.worker_id, task_id, EXIT_CODE_TIMEOUT, "", msg.clone(), elapsed, Some(msg));
+            return TaskResult::failure(
+                self.worker_id,
+                task_id,
+                EXIT_CODE_TIMEOUT,
+                "",
+                msg.clone(),
+                elapsed,
+                Some(msg),
+            );
         }
         warn!(%task_id, "GPU task failed: {err}");
         let msg = err.to_string();
@@ -1078,7 +1135,9 @@ impl TaskRunner {
                 extra_report_lines: Vec::new(),
             };
             if let Some(init_ms) = lease.init_ms {
-                control.extra_report_lines.push(format!("Engine Init Time: {init_ms} ms"));
+                control
+                    .extra_report_lines
+                    .push(format!("Engine Init Time: {init_ms} ms"));
             }
             let outcome = lease.engine.execute_gemm_controlled(
                 &kernel_name,
@@ -1120,6 +1179,102 @@ impl TaskRunner {
         })
     }
 
+    /// Extracts declared expected output artifacts from the sandbox before destruction.
+    pub async fn harvest_output_artifacts(
+        &self,
+        sandbox: &Sandbox,
+        expected_outputs: &[String],
+        task_id: TaskId,
+    ) -> Vec<OutputArtifact> {
+        let mut collected = Vec::new();
+        let mut total_bytes: usize = 0;
+
+        for expected in expected_outputs {
+            let target = match sanitize_relative_path(sandbox.path(), Path::new(expected)) {
+                Ok(p) => p,
+                Err(err) => {
+                    warn!(task_id = %task_id, path = %expected, error = %err, "Ignoring illegal expected output path");
+                    continue;
+                }
+            };
+
+            // Query symlink metadata without following links
+            let meta = match tokio::fs::symlink_metadata(&target).await {
+                Ok(m) => m,
+                Err(_) => {
+                    // File was not produced by task; silently skip
+                    debug!(task_id = %task_id, path = %expected, "Declared output artifact was not produced");
+                    continue;
+                }
+            };
+
+            // Strictly reject symlinks to prevent sandbox exfiltration
+            if meta.is_symlink() {
+                warn!(task_id = %task_id, path = %expected, "Skipping output artifact: symlinks are prohibited for security isolation");
+                continue;
+            }
+
+            if !meta.is_file() {
+                warn!(task_id = %task_id, path = %expected, "Skipping output artifact: path is not a regular file");
+                continue;
+            }
+
+            let size = meta.len() as usize;
+            if size > MAX_OUTPUT_ARTIFACT_BYTES {
+                warn!(task_id = %task_id, path = %expected, size = size, "Skipping output artifact: exceeds single file limit");
+                continue;
+            }
+
+            if total_bytes + size > MAX_AGGREGATE_ARTIFACT_BYTES {
+                warn!(task_id = %task_id, path = %expected, size = size, "Halting artifact collection: aggregate size exceeds 32 MiB limit");
+                break;
+            }
+
+            // Ensure canonical path resolves strictly within the sandbox root
+            if let (Ok(canonical_target), Ok(canonical_sandbox)) = (
+                tokio::fs::canonicalize(&target).await,
+                tokio::fs::canonicalize(sandbox.path()).await,
+            ) {
+                if !canonical_target.starts_with(&canonical_sandbox) {
+                    warn!(task_id = %task_id, path = %expected, "Skipping output artifact: path resolves outside sandbox root");
+                    continue;
+                }
+            }
+
+            // Read artifact content
+            match tokio::fs::read(&target).await {
+                Ok(data) => {
+                    let sha256 = sha256_digest(&data);
+                    total_bytes += size;
+                    collected.push(OutputArtifact {
+                        path: expected.clone(),
+                        size: meta.len(),
+                        sha256,
+                        data: Bytes::from(data),
+                    });
+                }
+                Err(err) => {
+                    warn!(task_id = %task_id, path = %expected, error = %err, "Failed to read output artifact file");
+                }
+            }
+        }
+
+        collected
+    }
+
+    /// Helper to stage files into sandbox before task execution.
+    pub async fn prepare_staged_files(
+        &self,
+        sandbox: &Sandbox,
+        task: &Task,
+    ) -> Result<(), SandboxError> {
+        if task.staged_files.is_empty() {
+            return Ok(());
+        }
+        let cache_base = self.config.sandbox_config.base_dir.join("cache");
+        sandbox.stage_files(&task.staged_files, &cache_base).await
+    }
+
     /// Executes `TaskSpec::Command` inside an isolated sandbox directory.
     #[allow(clippy::too_many_arguments)]
     async fn execute_command_workload(
@@ -1149,6 +1304,19 @@ impl TaskRunner {
                 );
             }
         };
+
+        if let Err(e) = self.prepare_staged_files(&sandbox, task).await {
+            let _ = sandbox.destroy().await;
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_GENERAL_ERROR,
+                "",
+                format!("Failed to stage input files: {e}"),
+                start_time.elapsed().as_millis() as u64,
+                Some(format!("File staging error: {e}")),
+            );
+        }
 
         let effective_cwd = if let Some(sub) = working_dir {
             match sanitize_relative_path(sandbox.path(), sub) {
@@ -1189,6 +1357,14 @@ impl TaskRunner {
             )
             .await;
 
+        let artifacts = if !task.expected_outputs.is_empty() {
+            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id)
+                .await
+        } else {
+            Vec::new()
+        };
+        let mut result = result;
+        result.artifacts = artifacts;
         let _ = sandbox.destroy().await;
         result
     }
@@ -1220,6 +1396,19 @@ impl TaskRunner {
                 );
             }
         };
+
+        if let Err(e) = self.prepare_staged_files(&sandbox, task).await {
+            let _ = sandbox.destroy().await;
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_GENERAL_ERROR,
+                "",
+                format!("Failed to stage input files: {e}"),
+                start_time.elapsed().as_millis() as u64,
+                Some(format!("File staging error: {e}")),
+            );
+        }
 
         let script_path = match sandbox.write_script("task_script.sh", script).await {
             Ok(p) => p,
@@ -1297,6 +1486,14 @@ impl TaskRunner {
             )
             .await;
 
+        let artifacts = if !task.expected_outputs.is_empty() {
+            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id)
+                .await
+        } else {
+            Vec::new()
+        };
+        let mut result = result;
+        result.artifacts = artifacts;
         let _ = sandbox.destroy().await;
         result
     }
@@ -1329,6 +1526,19 @@ impl TaskRunner {
                 );
             }
         };
+
+        if let Err(e) = self.prepare_staged_files(&sandbox, task).await {
+            let _ = sandbox.destroy().await;
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_GENERAL_ERROR,
+                "",
+                format!("Failed to stage input files: {e}"),
+                start_time.elapsed().as_millis() as u64,
+                Some(format!("File staging error: {e}")),
+            );
+        }
 
         // Materialize source files into sandbox
         for (rel_path, content) in source_files {
@@ -1452,6 +1662,14 @@ impl TaskRunner {
             }
         }
 
+        let artifacts = if !task.expected_outputs.is_empty() {
+            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id)
+                .await
+        } else {
+            Vec::new()
+        };
+        let mut res = res;
+        res.artifacts = artifacts;
         let _ = sandbox.destroy().await;
         res
     }
@@ -2235,7 +2453,13 @@ impl TaskRunner {
                 let elapsed = start_time.elapsed().as_millis() as u64;
                 match status_res {
                     Ok(status) if status.success() => {
-                        let mut res = TaskResult::success(self.worker_id, task_id, stdout_bytes, elapsed, false);
+                        let mut res = TaskResult::success(
+                            self.worker_id,
+                            task_id,
+                            stdout_bytes,
+                            elapsed,
+                            false,
+                        );
                         res.stderr = stderr_bytes;
                         res
                     }
@@ -2311,6 +2535,25 @@ impl TaskRunner {
         let _ = child.start_kill();
         let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
     }
+
+    /// Fallback process-tree terminator for subprocesses when JobObject is unavailable.
+    pub fn terminate_process_tree(pid: u32) {
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        #[cfg(unix)]
+        {
+            unsafe {
+                let _ = libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
 }
 
 /// Aborts the wrapped task when dropped.
@@ -2347,7 +2590,7 @@ mod tests {
             is_simulated_gpu: has_gpu,
             gpu_device_name: if has_gpu {
                 Some("Test Virtual GPU".into())
-            } else {
+        } else {
                 None
             },
             tags: vec![],
@@ -2567,7 +2810,11 @@ mod tests {
         // Receive emitted checkpoint at iteration 50
         let received_cp = cp_rx.recv().await.expect("must emit checkpoint");
         let (cp_seq, cp_delta) = match received_cp {
-            WorkerMessage::Checkpoint { sequence, delta_state, .. } => (sequence, delta_state),
+            WorkerMessage::Checkpoint {
+                sequence,
+                delta_state,
+                ..
+            } => (sequence, delta_state),
             other => panic!("Unexpected message: {:?}", other),
         };
         assert_eq!(cp_seq, 1);
@@ -2738,6 +2985,7 @@ mod outcome_tests {
             gpu_device_name: None,
             tags: vec![],
             mobile: None,
+            ..Default::default()
         };
         TaskRunner::new(
             Uuid::new_v4(),
@@ -2793,7 +3041,10 @@ mod outcome_tests {
 
         let res = runner.execute_task(&task, None, None).await;
         assert!(!res.is_success());
-        assert_ne!(res.exit_code, EXIT_CODE_CANCELLED, "130 is reserved for cancellation");
+        assert_ne!(
+            res.exit_code, EXIT_CODE_CANCELLED,
+            "130 is reserved for cancellation"
+        );
         assert_eq!(res.exit_code, EXIT_CODE_INTERRUPTED);
         assert!(!res.error.as_deref().unwrap_or("").starts_with("Cancelled"));
     }
@@ -2811,7 +3062,10 @@ mod outcome_tests {
         let res = runner.execute_task(&task, None, None).await;
         assert_eq!(res.exit_code, 128 + 15);
         let error = res.error.expect("a signalled process must say so");
-        assert!(error.contains("signal 15") && error.contains("SIGTERM"), "{error}");
+        assert!(
+            error.contains("signal 15") && error.contains("SIGTERM"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -2829,7 +3083,10 @@ mod outcome_tests {
                 TaskRequirements::generic(1, 10),
             );
             let res = runner.execute_task(&task, None, Some(rx)).await;
-            assert!(res.is_success(), "a vanished cancel sender must not kill the task: {res:?}");
+            assert!(
+                res.is_success(),
+                "a vanished cancel sender must not kill the task: {res:?}"
+            );
             assert_eq!(res.stdout_str().trim(), "survived");
         }
 
@@ -2853,16 +3110,20 @@ mod outcome_tests {
     #[tokio::test]
     async fn test_cancellation_helper_ignores_a_closed_channel_but_delivers_a_reason() {
         let mut none: Option<oneshot::Receiver<String>> = None;
-        assert!(tokio::time::timeout(Duration::from_millis(50), cancellation(&mut none))
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), cancellation(&mut none))
+                .await
+                .is_err()
+        );
 
         let (tx, rx) = oneshot::channel::<String>();
         drop(tx);
         let mut closed = Some(rx);
-        assert!(tokio::time::timeout(Duration::from_millis(50), cancellation(&mut closed))
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), cancellation(&mut closed))
+                .await
+                .is_err()
+        );
 
         let (tx, rx) = oneshot::channel::<String>();
         tx.send("because".into()).unwrap();
@@ -2890,7 +3151,10 @@ mod outcome_tests {
         // /bin/sh (the preferred location) wins where it exists...
         assert_eq!(pick_shell(&[preferred], path, &[fallback]), preferred);
         // ...Termux-style: no /bin/sh, but an `sh` on PATH...
-        assert_eq!(pick_shell(&[missing], path, &[fallback]), path_sh.to_str().unwrap());
+        assert_eq!(
+            pick_shell(&[missing], path, &[fallback]),
+            path_sh.to_str().unwrap()
+        );
         // ...Android: no /bin/sh and none on PATH, the system shell...
         assert_eq!(pick_shell(&[missing], "", &[fallback]), fallback);
         assert_eq!(pick_shell(&[missing], missing, &[fallback]), fallback);
@@ -2902,7 +3166,10 @@ mod outcome_tests {
     #[test]
     fn test_default_shell_exists_on_this_host() {
         let shell = resolve_default_shell(&std::env::var("PATH").unwrap_or_default());
-        assert!(Path::new(&shell).is_file(), "resolved shell {shell:?} must exist");
+        assert!(
+            Path::new(&shell).is_file(),
+            "resolved shell {shell:?} must exist"
+        );
     }
 
     #[cfg(unix)]
@@ -2927,7 +3194,9 @@ mod process_tree_tests {
     use super::*;
     use rusty_grid_core::task::TaskRequirements;
 
-    fn runner_with(configure: impl FnOnce(RunnerConfig) -> RunnerConfig) -> (Arc<TaskRunner>, tempfile::TempDir) {
+    fn runner_with(
+        configure: impl FnOnce(RunnerConfig) -> RunnerConfig,
+    ) -> (Arc<TaskRunner>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let caps = WorkerCapabilities {
             name: "tree-test-worker".into(),
@@ -2938,6 +3207,7 @@ mod process_tree_tests {
             gpu_device_name: None,
             tags: vec![],
             mobile: None,
+            ..Default::default()
         };
         let config = configure(RunnerConfig::new(SandboxConfig::new(dir.path())));
         (Arc::new(TaskRunner::new(Uuid::new_v4(), caps, config)), dir)
@@ -3007,8 +3277,16 @@ mod process_tree_tests {
         let res = runner.execute_task(&task, None, None).await;
 
         assert_eq!(res.exit_code, EXIT_CODE_TIMEOUT);
-        assert_dies("background child", recorded_pid(&pids.path().join("child.pid")).await).await;
-        assert_dies("nested grandchild", recorded_pid(&pids.path().join("grandchild.pid")).await).await;
+        assert_dies(
+            "background child",
+            recorded_pid(&pids.path().join("child.pid")).await,
+        )
+        .await;
+        assert_dies(
+            "nested grandchild",
+            recorded_pid(&pids.path().join("grandchild.pid")).await,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3024,7 +3302,10 @@ mod process_tree_tests {
         });
         let child = recorded_pid(&pids.path().join("child.pid")).await;
         let grandchild = recorded_pid(&pids.path().join("grandchild.pid")).await;
-        assert!(alive(child) && alive(grandchild), "the tree must be running before the cancel");
+        assert!(
+            alive(child) && alive(grandchild),
+            "the tree must be running before the cancel"
+        );
 
         cancel_tx.send("stop".into()).unwrap();
         let res = run.await.unwrap();
@@ -3097,10 +3378,20 @@ mod process_tree_tests {
         let res = runner.execute_task(&task, None, None).await;
         let elapsed = t0.elapsed();
 
-        assert!(elapsed < Duration::from_secs(10), "must not wait for the pipes or the timeout: {elapsed:?}");
-        assert_eq!(res.exit_code, 7, "the real exit status, not a timeout: {res:?}");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "must not wait for the pipes or the timeout: {elapsed:?}"
+        );
+        assert_eq!(
+            res.exit_code, 7,
+            "the real exit status, not a timeout: {res:?}"
+        );
         assert_ne!(res.exit_code, EXIT_CODE_TIMEOUT);
-        assert!(res.stdout_str().contains("done-output"), "output must be kept: {:?}", res.stdout_str());
+        assert!(
+            res.stdout_str().contains("done-output"),
+            "output must be kept: {:?}",
+            res.stdout_str()
+        );
         assert!(res.stderr_str().contains("some-warning"));
         assert!(
             res.stderr_str().contains("kept the output pipes open"),
@@ -3116,7 +3407,10 @@ mod process_tree_tests {
         let pids = tempfile::tempdir().unwrap();
         let pid_file = pids.path().join("holder.pid");
         let task = script_task(
-            format!("sleep 300 &\necho $! > '{}'\necho built\n", pid_file.display()),
+            format!(
+                "sleep 300 &\necho $! > '{}'\necho built\n",
+                pid_file.display()
+            ),
             20,
         );
 
@@ -3132,7 +3426,11 @@ mod process_tree_tests {
     async fn test_a_helper_that_escaped_the_process_group_cannot_hold_the_run_hostage() {
         // A helper in its own session is out of reach of the group kill and holds the pipes. The
         // run must still end after the drain grace, with the real status and the output so far.
-        if std::process::Command::new("python3").arg("--version").output().is_err() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             eprintln!("python3 not available; skipping");
             return;
         }
@@ -3152,24 +3450,47 @@ mod process_tree_tests {
         let res = runner.execute_task(&task, None, None).await;
         let elapsed = t0.elapsed();
 
-        let escaped: Option<u32> = res.stdout_str().lines().next().and_then(|l| l.trim().parse().ok());
+        let escaped: Option<u32> = res
+            .stdout_str()
+            .lines()
+            .next()
+            .and_then(|l| l.trim().parse().ok());
         if let Some(pid) = escaped {
             kill_stray(pid);
         }
         assert!(res.is_success(), "{res:?}");
-        assert!(escaped.is_some(), "the pid line was captured: {:?}", res.stdout_str());
+        assert!(
+            escaped.is_some(),
+            "the pid line was captured: {:?}",
+            res.stdout_str()
+        );
         assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
     }
 
     #[tokio::test]
     async fn test_partial_output_survives_timeout_and_cancellation() {
         let (runner, _dir) = runner_with(|c| c);
-        let task = script_task("echo partial-out\necho partial-err >&2\nsleep 300\n".into(), 1);
+        let task = script_task(
+            "echo partial-out\necho partial-err >&2\nsleep 300\n".into(),
+            1,
+        );
         let res = runner.execute_task(&task, None, None).await;
         assert_eq!(res.exit_code, EXIT_CODE_TIMEOUT);
-        assert!(res.stdout_str().contains("partial-out"), "{:?}", res.stdout_str());
-        assert!(res.stderr_str().contains("partial-err"), "{:?}", res.stderr_str());
-        assert!(res.stderr_str().contains("Task timed out after 1s"), "{:?}", res.stderr_str());
+        assert!(
+            res.stdout_str().contains("partial-out"),
+            "{:?}",
+            res.stdout_str()
+        );
+        assert!(
+            res.stderr_str().contains("partial-err"),
+            "{:?}",
+            res.stderr_str()
+        );
+        assert!(
+            res.stderr_str().contains("Task timed out after 1s"),
+            "{:?}",
+            res.stderr_str()
+        );
         assert!(res.error.as_deref().unwrap().contains("timed out after 1s"));
 
         let task = script_task("echo partial-out\nsleep 300\n".into(), 60);
@@ -3182,12 +3503,19 @@ mod process_tree_tests {
         cancel_tx.send("enough".into()).unwrap();
         let res = run.await.unwrap();
         assert_eq!(res.exit_code, EXIT_CODE_CANCELLED);
-        assert!(res.stdout_str().contains("partial-out"), "{:?}", res.stdout_str());
+        assert!(
+            res.stdout_str().contains("partial-out"),
+            "{:?}",
+            res.stdout_str()
+        );
     }
 
     #[tokio::test]
     async fn test_ending_a_tree_leaves_an_unrelated_process_alone() {
-        let mut bystander = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+        let mut bystander = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .unwrap();
         let bystander_pid = bystander.id();
 
         let (runner, _dir) = runner_with(|c| c);
@@ -3204,7 +3532,10 @@ mod process_tree_tests {
         let still_there = alive(bystander_pid);
         let _ = bystander.kill();
         let _ = bystander.wait();
-        assert!(still_there, "an unrelated process was killed along with a task's tree");
+        assert!(
+            still_there,
+            "an unrelated process was killed along with a task's tree"
+        );
     }
 
     #[tokio::test]
@@ -3217,7 +3548,10 @@ mod process_tree_tests {
             );
             let res = runner.execute_task(&task, None, None).await;
             assert!(res.is_success(), "{res:?}");
-            res.stdout_str().trim().parse().unwrap_or_else(|_| panic!("no nice value in {:?}", res.stdout_str()))
+            res.stdout_str()
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("no nice value in {:?}", res.stdout_str()))
         }
 
         let own_nice: i32 = {
@@ -3228,7 +3562,8 @@ mod process_tree_tests {
             String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
         };
 
-        let (default_runner, _d1) = runner_with(|c| c.with_process_priority(ProcessPriority::default()));
+        let (default_runner, _d1) =
+            runner_with(|c| c.with_process_priority(ProcessPriority::default()));
         assert_eq!(ProcessPriority::default(), ProcessPriority::BelowNormal);
         assert_eq!(task_nice(&default_runner).await, own_nice.max(10));
 
@@ -3279,7 +3614,10 @@ mod process_tree_tests {
 
         // A value the task is explicitly given is its own business and still arrives.
         let mut env = HashMap::new();
-        env.insert("OXIDE_MESH_TOKEN".to_string(), "given-on-purpose".to_string());
+        env.insert(
+            "OXIDE_MESH_TOKEN".to_string(),
+            "given-on-purpose".to_string(),
+        );
         let task = Task::new(
             TaskSpec::Command {
                 program: "sh".into(),
@@ -3291,6 +3629,10 @@ mod process_tree_tests {
             TaskRequirements::generic(1, 10),
         );
         let res = runner.execute_task(&task, None, None).await;
-        assert_eq!(res.stdout_str().trim(), "[unset][unset][given-on-purpose]", "{res:?}");
+        assert_eq!(
+            res.stdout_str().trim(),
+            "[unset][unset][given-on-purpose]",
+            "{res:?}"
+        );
     }
 }

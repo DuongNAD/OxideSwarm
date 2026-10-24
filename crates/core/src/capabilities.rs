@@ -1,22 +1,68 @@
 //! Worker hardware capability models, auto-detection, and requirement matching.
 
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::task::TaskRequirements;
 
+/// Battery status tier for mobile load-shedding and concurrency limiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum BatteryTier {
+    Normal = 0,
+    Low = 1,
+    SubLow = 2,
+    Critical = 3,
+}
+
+impl BatteryTier {
+    pub fn from_readings(pct: Option<u8>, is_charging: Option<bool>) -> Self {
+        MobileLiveStatus::compute_battery_tier(pct, is_charging)
+    }
+}
+
+/// Thermal status tier for mobile load-shedding and hardware protection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ThermalTier {
+    Normal = 0,
+    Warm = 1,
+    Hot = 2,
+    Critical = 3,
+}
+
+impl ThermalTier {
+    pub fn from_temp_c(temp: Option<f32>, thermal_throttled: bool) -> Self {
+        MobileLiveStatus::compute_thermal_tier(temp, thermal_throttled)
+    }
+}
+
 /// Mobile-specific hardware and environmental telemetry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileCapabilities {
     /// Operating system version and API level (e.g. "Android 14 (API 34)", "macOS 14.5").
     pub os_version: String,
     /// System-on-Chip descriptor (e.g. "Snapdragon 8 Gen 2", "Apple M2 Max").
     pub soc_model: String,
     /// Battery charge percentage (0-100), or `None` if running on AC power or emulator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub battery_pct: Option<u8>,
     /// Whether the device is actively drawing external power / charging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_charging: Option<bool>,
     /// Whether the device is currently experiencing CPU/GPU thermal throttling.
+    #[serde(default)]
     pub thermal_throttled: bool,
+}
+
+impl Default for MobileCapabilities {
+    fn default() -> Self {
+        Self {
+            os_version: "unknown".into(),
+            soc_model: "unknown".into(),
+            battery_pct: None,
+            is_charging: None,
+            thermal_throttled: false,
+        }
+    }
 }
 
 impl MobileCapabilities {
@@ -38,13 +84,17 @@ impl MobileCapabilities {
             battery_pct: self.battery_pct,
             is_charging: self.is_charging,
             thermal_throttled: self.thermal_throttled,
+            battery_temperature: None,
+            network_type: None,
+            battery_tier: None,
+            thermal_tier: None,
         }
     }
 }
 
 /// The part of [`MobileCapabilities`] that changes while a worker runs: what has to be re-read
 /// (or pushed by the platform, e.g. Android's `BatteryManager`) to keep scheduling decisions fresh.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MobileLiveStatus {
     /// Battery charge percentage (0-100), `None` when unknown or on AC power.
     pub battery_pct: Option<u8>,
@@ -52,94 +102,186 @@ pub struct MobileLiveStatus {
     pub is_charging: Option<bool>,
     /// Whether the device is currently thermally throttled.
     pub thermal_throttled: bool,
+    /// Battery temperature in degrees Celsius (from HAL/sysfs).
+    pub battery_temperature: Option<f32>,
+    /// Network connection type (e.g., "wifi", "cellular", "ethernet").
+    pub network_type: Option<String>,
+    /// Computed battery status tier.
+    pub battery_tier: Option<BatteryTier>,
+    /// Computed thermal status tier.
+    pub thermal_tier: Option<ThermalTier>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct HumanMobileCapabilities {
-    pub os_version: String,
-    pub soc_model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub battery_pct: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub is_charging: Option<bool>,
-    #[serde(default)]
-    pub thermal_throttled: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-struct BinaryMobileCapabilities {
-    pub os_version: String,
-    pub soc_model: String,
-    pub battery_pct: Option<u8>,
-    pub is_charging: Option<bool>,
-    pub thermal_throttled: bool,
-}
-
-impl From<MobileCapabilities> for HumanMobileCapabilities {
-    fn from(m: MobileCapabilities) -> Self {
-        Self {
-            os_version: m.os_version,
-            soc_model: m.soc_model,
-            battery_pct: m.battery_pct,
-            is_charging: m.is_charging,
-            thermal_throttled: m.thermal_throttled,
-        }
+impl PartialEq for MobileLiveStatus {
+    fn eq(&self, other: &Self) -> bool {
+        self.battery_pct == other.battery_pct
+            && self.is_charging == other.is_charging
+            && self.thermal_throttled == other.thermal_throttled
+            && match (self.battery_temperature, other.battery_temperature) {
+                (Some(a), Some(b)) => a.to_bits() == b.to_bits(),
+                (None, None) => true,
+                _ => false,
+            }
+            && self.network_type == other.network_type
+            && self.battery_tier == other.battery_tier
+            && self.thermal_tier == other.thermal_tier
     }
 }
 
-impl From<HumanMobileCapabilities> for MobileCapabilities {
-    fn from(h: HumanMobileCapabilities) -> Self {
-        Self {
-            os_version: h.os_version,
-            soc_model: h.soc_model,
-            battery_pct: h.battery_pct,
-            is_charging: h.is_charging,
-            thermal_throttled: h.thermal_throttled,
+impl Eq for MobileLiveStatus {}
+
+impl MobileLiveStatus {
+    /// Computes the battery tier based on state of charge and charging status.
+    pub fn compute_battery_tier(pct: Option<u8>, is_charging: Option<bool>) -> BatteryTier {
+        if is_charging.unwrap_or(false) {
+            return BatteryTier::Normal;
+        }
+        match pct {
+            Some(p) if p >= 50 => BatteryTier::Normal,
+            Some(p) if p >= 30 => BatteryTier::Low,
+            Some(p) if p >= 15 => BatteryTier::SubLow,
+            Some(_) => BatteryTier::Critical,
+            None => BatteryTier::Normal,
         }
     }
-}
 
-impl From<MobileCapabilities> for BinaryMobileCapabilities {
-    fn from(m: MobileCapabilities) -> Self {
-        Self {
-            os_version: m.os_version,
-            soc_model: m.soc_model,
-            battery_pct: m.battery_pct,
-            is_charging: m.is_charging,
-            thermal_throttled: m.thermal_throttled,
-        }
-    }
-}
-
-impl From<BinaryMobileCapabilities> for MobileCapabilities {
-    fn from(b: BinaryMobileCapabilities) -> Self {
-        Self {
-            os_version: b.os_version,
-            soc_model: b.soc_model,
-            battery_pct: b.battery_pct,
-            is_charging: b.is_charging,
-            thermal_throttled: b.thermal_throttled,
-        }
-    }
-}
-
-impl Serialize for MobileCapabilities {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if serializer.is_human_readable() {
-            HumanMobileCapabilities::from(self.clone()).serialize(serializer)
+    /// Computes the thermal tier based on battery/chassis temperature and OS throttle flag.
+    pub fn compute_thermal_tier(temp: Option<f32>, thermal_throttled: bool) -> ThermalTier {
+        if let Some(t) = temp {
+            if t > 42.0 {
+                ThermalTier::Critical
+            } else if t > 40.0 {
+                ThermalTier::Hot
+            } else if t > 37.0 || thermal_throttled {
+                ThermalTier::Warm
+            } else {
+                ThermalTier::Normal
+            }
+        } else if thermal_throttled {
+            ThermalTier::Warm
         } else {
-            BinaryMobileCapabilities::from(self.clone()).serialize(serializer)
+            ThermalTier::Normal
+        }
+    }
+
+    /// Derives effective concurrency capacity: C_eff = min(C_bat, C_therm).
+    pub fn effective_concurrency(&self, max_cores: usize) -> usize {
+        let bat = self
+            .battery_tier
+            .unwrap_or_else(|| Self::compute_battery_tier(self.battery_pct, self.is_charging));
+        let therm = self.thermal_tier.unwrap_or_else(|| {
+            Self::compute_thermal_tier(self.battery_temperature, self.thermal_throttled)
+        });
+
+        calculate_effective_concurrency(max_cores, bat, therm)
+    }
+
+    /// Calculates RRC-aware heartbeat interval in seconds.
+    pub fn recommended_keepalive_interval(&self, active_tasks: usize) -> Duration {
+        let is_cellular = self.network_type.as_ref().is_some_and(|net| {
+            let n = net.to_ascii_lowercase();
+            n.contains("cellular")
+                || n.contains("mobile")
+                || n.contains("lte")
+                || n.contains("5g")
+                || n.contains("4g")
+                || n.contains("3g")
+                || n.contains("cgnat")
+        });
+
+        if is_cellular {
+            if active_tasks > 0 {
+                Duration::from_secs(10)
+            } else {
+                Duration::from_secs(25)
+            }
+        } else {
+            Duration::from_secs(60)
         }
     }
 }
 
-impl<'de> Deserialize<'de> for MobileCapabilities {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        if deserializer.is_human_readable() {
-            HumanMobileCapabilities::deserialize(deserializer).map(Into::into)
-        } else {
-            BinaryMobileCapabilities::deserialize(deserializer).map(Into::into)
+/// Derives effective concurrency capacity: C_eff = min(C_bat, C_therm).
+pub fn calculate_effective_concurrency(
+    max_cores: usize,
+    bat: BatteryTier,
+    therm: ThermalTier,
+) -> usize {
+    let c_bat = match bat {
+        BatteryTier::Normal => max_cores,
+        BatteryTier::Low => (max_cores / 2).max(1),
+        BatteryTier::SubLow => 1,
+        BatteryTier::Critical => 0,
+    };
+    let c_therm = match therm {
+        ThermalTier::Normal => max_cores,
+        ThermalTier::Warm => (max_cores / 2).max(1),
+        ThermalTier::Hot => 1,
+        ThermalTier::Critical => 0,
+    };
+    c_bat.min(c_therm)
+}
+
+/// Helper function to check task eligibility under battery and thermal tiers.
+pub fn is_task_eligible(
+    spec: &crate::task::TaskSpec,
+    bat: BatteryTier,
+    therm: ThermalTier,
+    is_charging: bool,
+) -> bool {
+    let eff = calculate_effective_concurrency(8, bat, therm);
+    if eff == 0 {
+        return false;
+    }
+    let is_heavy = matches!(
+        spec,
+        crate::task::TaskSpec::RustCompilation { .. } | crate::task::TaskSpec::GpuCompute { .. }
+    );
+    match bat {
+        BatteryTier::Critical => return false,
+        BatteryTier::SubLow | BatteryTier::Low => {
+            if is_heavy {
+                return false;
+            }
         }
+        BatteryTier::Normal => {}
+    }
+    match therm {
+        ThermalTier::Critical => return false,
+        ThermalTier::Hot => {
+            if is_heavy {
+                return false;
+            }
+        }
+        ThermalTier::Warm => {
+            if is_heavy && !is_charging {
+                return false;
+            }
+        }
+        ThermalTier::Normal => {}
+    }
+    true
+}
+
+/// Calculates RRC-aware heartbeat interval in seconds.
+pub fn calculate_keepalive_interval(network_type: &str, active_tasks: usize) -> Duration {
+    let n = network_type.to_ascii_lowercase();
+    let is_cellular = n.contains("cellular")
+        || n.contains("mobile")
+        || n.contains("lte")
+        || n.contains("5g")
+        || n.contains("4g")
+        || n.contains("3g")
+        || n.contains("cgnat");
+
+    if is_cellular {
+        if active_tasks > 0 {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(25)
+        }
+    } else {
+        Duration::from_secs(60)
     }
 }
 
@@ -728,10 +870,17 @@ pub fn detect_live_mobile_status() -> Option<MobileLiveStatus> {
     if !is_android_env() && battery_pct.is_none() {
         return None;
     }
+    let thermal_throttled = detect_thermal_throttling();
+    let bat_tier = MobileLiveStatus::compute_battery_tier(battery_pct, is_charging);
+    let therm_tier = MobileLiveStatus::compute_thermal_tier(None, thermal_throttled);
     Some(MobileLiveStatus {
         battery_pct,
         is_charging,
-        thermal_throttled: detect_thermal_throttling(),
+        thermal_throttled,
+        battery_temperature: None,
+        network_type: None,
+        battery_tier: Some(bat_tier),
+        thermal_tier: Some(therm_tier),
     })
 }
 
@@ -1461,6 +1610,10 @@ mod tests {
             battery_pct: Some(4),
             is_charging: Some(false),
             thermal_throttled: true,
+            battery_temperature: Some(41.0),
+            network_type: Some("cellular".into()),
+            battery_tier: Some(BatteryTier::Critical),
+            thermal_tier: Some(ThermalTier::Hot),
         });
         assert_eq!(live.os_version, "Android 14");
         assert_eq!(live.soc_model, "Snapdragon 8 Gen 2");
@@ -1470,6 +1623,122 @@ mod tests {
         assert_eq!(live.live_status().battery_pct, Some(4));
         // The original snapshot is untouched.
         assert_eq!(snapshot.battery_pct, Some(90));
+    }
+
+    #[test]
+    fn test_battery_and_thermal_tier_computations() {
+        // Battery tiers
+        assert_eq!(
+            MobileLiveStatus::compute_battery_tier(Some(80), Some(false)),
+            BatteryTier::Normal
+        );
+        assert_eq!(
+            MobileLiveStatus::compute_battery_tier(Some(50), Some(false)),
+            BatteryTier::Normal
+        );
+        assert_eq!(
+            MobileLiveStatus::compute_battery_tier(Some(49), Some(false)),
+            BatteryTier::Low
+        );
+        assert_eq!(
+            MobileLiveStatus::compute_battery_tier(Some(30), Some(false)),
+            BatteryTier::Low
+        );
+        assert_eq!(
+            MobileLiveStatus::compute_battery_tier(Some(29), Some(false)),
+            BatteryTier::SubLow
+        );
+        assert_eq!(
+            MobileLiveStatus::compute_battery_tier(Some(15), Some(false)),
+            BatteryTier::SubLow
+        );
+        assert_eq!(
+            MobileLiveStatus::compute_battery_tier(Some(14), Some(false)),
+            BatteryTier::Critical
+        );
+        // Charging overrides battery percentage
+        assert_eq!(
+            MobileLiveStatus::compute_battery_tier(Some(10), Some(true)),
+            BatteryTier::Normal
+        );
+
+        // Thermal tiers
+        assert_eq!(
+            MobileLiveStatus::compute_thermal_tier(Some(35.0), false),
+            ThermalTier::Normal
+        );
+        assert_eq!(
+            MobileLiveStatus::compute_thermal_tier(Some(37.0), false),
+            ThermalTier::Normal
+        );
+        assert_eq!(
+            MobileLiveStatus::compute_thermal_tier(Some(38.0), false),
+            ThermalTier::Warm
+        );
+        assert_eq!(
+            MobileLiveStatus::compute_thermal_tier(Some(40.0), false),
+            ThermalTier::Warm
+        );
+        assert_eq!(
+            MobileLiveStatus::compute_thermal_tier(Some(41.0), false),
+            ThermalTier::Hot
+        );
+        assert_eq!(
+            MobileLiveStatus::compute_thermal_tier(Some(42.0), false),
+            ThermalTier::Hot
+        );
+        assert_eq!(
+            MobileLiveStatus::compute_thermal_tier(Some(43.0), false),
+            ThermalTier::Critical
+        );
+        assert_eq!(
+            MobileLiveStatus::compute_thermal_tier(None, true),
+            ThermalTier::Warm
+        );
+
+        // Effective concurrency C_eff = min(C_bat, C_therm)
+        assert_eq!(
+            calculate_effective_concurrency(8, BatteryTier::Normal, ThermalTier::Normal),
+            8
+        );
+        assert_eq!(
+            calculate_effective_concurrency(8, BatteryTier::Low, ThermalTier::Normal),
+            4
+        );
+        assert_eq!(
+            calculate_effective_concurrency(8, BatteryTier::SubLow, ThermalTier::Warm),
+            1
+        );
+        assert_eq!(
+            calculate_effective_concurrency(8, BatteryTier::Low, ThermalTier::Hot),
+            1
+        );
+        assert_eq!(
+            calculate_effective_concurrency(8, BatteryTier::Critical, ThermalTier::Normal),
+            0
+        );
+        assert_eq!(
+            calculate_effective_concurrency(8, BatteryTier::Normal, ThermalTier::Critical),
+            0
+        );
+
+        // Keepalive intervals
+        assert_eq!(
+            calculate_keepalive_interval("wifi", 0),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("ethernet", 2),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("cellular", 0),
+            Duration::from_secs(25)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("5G LTE", 1),
+            Duration::from_secs(10)
+        );
     }
 
     #[test]

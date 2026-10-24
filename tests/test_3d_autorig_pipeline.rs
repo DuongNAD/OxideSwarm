@@ -1242,6 +1242,7 @@ async fn test_e2e_cli_submit_3d_and_disk_export() {
         preferred_provider: None,
         output: Some(out_mesh_path.clone()),
         args: Vec::new(),
+        ..Default::default()
     };
 
     let exit_code = run_submit(args_3d, None).await;
@@ -1277,6 +1278,7 @@ async fn test_e2e_cli_submit_3d_and_disk_export() {
         preferred_provider: Some("builtin".to_string()),
         output: Some(out_rigged_path.clone()),
         args: Vec::new(),
+        ..Default::default()
     };
 
     let exit_code_rig = run_submit(args_rig, None).await;
@@ -1464,6 +1466,7 @@ async fn test_boundary_and_corrupted_mesh_rejection() {
         preferred_provider: None,
         output: None,
         args: Vec::new(),
+        ..Default::default()
     };
     let exit_code = run_submit(args_mesh, None).await;
     assert_eq!(exit_code, ExitCode::FAILURE);

@@ -1196,6 +1196,7 @@ fn test_adversarial_zero_copy_huge_payload_slicing_and_cow() {
         is_gpu_executed: false,
         device_name: None,
         asset_bytes: None,
+        artifacts: Vec::new(),
     };
 
     let stdout_cow = res.stdout_str();

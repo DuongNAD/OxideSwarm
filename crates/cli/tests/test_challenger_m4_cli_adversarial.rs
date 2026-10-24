@@ -234,6 +234,7 @@ async fn test_cli_malicious_mesh_input_paths() {
         preferred_provider: None,
         output: None,
         args: Vec::new(),
+        ..Default::default()
     };
     let exit1 = run_submit(args1, None).await;
     assert_eq!(exit1, ExitCode::FAILURE, "Non-existent mesh must return failure without panic");
@@ -264,6 +265,7 @@ async fn test_cli_malicious_mesh_input_paths() {
         preferred_provider: None,
         output: None,
         args: Vec::new(),
+        ..Default::default()
     };
     let exit2 = run_submit(args2, None).await;
     assert_eq!(exit2, ExitCode::FAILURE, "Zero-byte mesh file must return failure without panic");
@@ -294,6 +296,7 @@ async fn test_cli_malicious_mesh_input_paths() {
         preferred_provider: None,
         output: None,
         args: Vec::new(),
+        ..Default::default()
     };
     let exit3 = run_submit(args3, None).await;
     assert_eq!(exit3, ExitCode::FAILURE, "Directory as mesh must return failure without panic");
@@ -328,6 +331,7 @@ async fn test_cli_malicious_image_and_prompt_inputs() {
         preferred_provider: None,
         output: None,
         args: Vec::new(),
+        ..Default::default()
     };
     let exit1 = run_submit(args1, None).await;
     assert_eq!(exit1, ExitCode::FAILURE, "Non-existent image must fail without panic");
@@ -358,6 +362,7 @@ async fn test_cli_malicious_image_and_prompt_inputs() {
         preferred_provider: None,
         output: None,
         args: Vec::new(),
+        ..Default::default()
     };
     let exit2 = run_submit(args2, None).await;
     assert_eq!(exit2, ExitCode::FAILURE, "Zero-byte image must fail without panic");
@@ -388,6 +393,7 @@ async fn test_cli_malicious_image_and_prompt_inputs() {
         preferred_provider: None,
         output: None,
         args: Vec::new(),
+        ..Default::default()
     };
     let exit3 = run_submit(args3, None).await;
     assert_eq!(exit3, ExitCode::FAILURE, "Directory as image must fail without panic");
@@ -416,6 +422,7 @@ async fn test_cli_malicious_image_and_prompt_inputs() {
         preferred_provider: None,
         output: None,
         args: Vec::new(),
+        ..Default::default()
     };
     let exit4 = run_submit(args4, None).await;
     assert_eq!(exit4, ExitCode::FAILURE, "Whitespace prompt must fail without panic");
@@ -444,6 +451,7 @@ async fn test_cli_malicious_image_and_prompt_inputs() {
         preferred_provider: None,
         output: None,
         args: Vec::new(),
+        ..Default::default()
     };
     let exit5 = run_submit(args5, None).await;
     assert_eq!(exit5, ExitCode::FAILURE, "Missing prompt and image must fail");
@@ -517,6 +525,7 @@ async fn test_cli_deeply_nested_output_directory_creation() {
         preferred_provider: None,
         output: Some(deeply_nested_out.clone()),
         args: Vec::new(),
+        ..Default::default()
     };
 
     let exit_code = run_submit(args, None).await;

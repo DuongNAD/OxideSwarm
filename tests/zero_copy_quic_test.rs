@@ -95,6 +95,7 @@ fn test_task_result_stdout_stderr_cow_methods() {
         is_gpu_executed: false,
         device_name: None,
         asset_bytes: None,
+        artifacts: Vec::new(),
     };
 
     match res_utf8.stdout_str() {
@@ -119,6 +120,7 @@ fn test_task_result_stdout_stderr_cow_methods() {
         is_gpu_executed: false,
         device_name: None,
         asset_bytes: None,
+        artifacts: Vec::new(),
     };
 
     match res_binary.stdout_str() {
@@ -156,6 +158,7 @@ fn test_zero_copy_large_payload_serialization_roundtrip() {
         is_gpu_executed: true,
         device_name: None,
         asset_bytes: None,
+        artifacts: Vec::new(),
     };
 
     // 1. Test JSON Roundtrip
@@ -180,6 +183,7 @@ fn test_zero_copy_large_payload_serialization_roundtrip() {
         device_name: None,
         error: None,
         asset_bytes: None,
+        artifacts: Vec::new(),
     };
 
     let msg_bincode =

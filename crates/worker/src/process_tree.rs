@@ -160,7 +160,10 @@ mod imp {
     pub(super) fn attach(child: &Child) -> Option<RawId> {
         // The child leads its own group (see `configure_command`), so the group id is its PID.
         // Never 0 or 1: `killpg(0)` would signal the worker's own group.
-        child.id().and_then(|pid| RawId::try_from(pid).ok()).filter(|pgid| *pgid > 1)
+        child
+            .id()
+            .and_then(|pid| RawId::try_from(pid).ok())
+            .filter(|pgid| *pgid > 1)
     }
 
     pub(super) fn request_stop(id: RawId) -> bool {
@@ -409,7 +412,11 @@ mod tests {
         assert!("realtime".parse::<ProcessPriority>().is_err());
         assert!("".parse::<ProcessPriority>().is_err());
         assert_eq!(ProcessPriority::default(), ProcessPriority::BelowNormal);
-        for p in [ProcessPriority::Normal, ProcessPriority::BelowNormal, ProcessPriority::Idle] {
+        for p in [
+            ProcessPriority::Normal,
+            ProcessPriority::BelowNormal,
+            ProcessPriority::Idle,
+        ] {
             assert_eq!(p.as_str().parse::<ProcessPriority>(), Ok(p));
         }
     }

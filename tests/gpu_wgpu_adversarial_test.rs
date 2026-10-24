@@ -22,7 +22,9 @@ use uuid::Uuid;
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_worker::cpu_simd;
-use rusty_grid_worker::runner::{RunnerConfig, TaskRunner, EXIT_CODE_GENERAL_ERROR, EXIT_CODE_SUCCESS};
+use rusty_grid_worker::runner::{
+    RunnerConfig, TaskRunner, EXIT_CODE_GENERAL_ERROR, EXIT_CODE_SUCCESS,
+};
 use rusty_grid_worker::sandbox::SandboxConfig;
 
 fn make_test_runner(has_gpu: bool, is_simulated: bool) -> (TaskRunner, tempfile::TempDir) {
@@ -52,7 +54,9 @@ fn make_test_runner(has_gpu: bool, is_simulated: bool) -> (TaskRunner, tempfile:
 /// The shared GPU engine, or None (after saying so) on a host/build without one. With
 /// `RUSTY_GRID_REQUIRE_GPU=1` a missing engine fails the test instead.
 #[cfg(feature = "gpu-wgpu")]
-fn gpu_engine_or_skip(test: &str) -> Option<std::sync::Arc<rusty_grid_worker::wgpu_engine::WgpuEngine>> {
+fn gpu_engine_or_skip(
+    test: &str,
+) -> Option<std::sync::Arc<rusty_grid_worker::wgpu_engine::WgpuEngine>> {
     match rusty_grid_worker::wgpu_engine::EngineProvider::shared().get() {
         Ok(lease) => Some(lease.engine),
         Err(err) => {
@@ -71,7 +75,9 @@ fn gpu_engine_or_skip(test: &str) -> Option<std::sync::Arc<rusty_grid_worker::wg
 // ============================================================================
 #[test]
 fn test_simd_vs_oracle_irregular_dimensions() {
-    let test_dims = [1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 512];
+    let test_dims = [
+        1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 512,
+    ];
     let seed = 0xa5a5a5a5_5a5a5a5a_u64;
 
     for &dim in &test_dims {
@@ -252,9 +258,13 @@ fn test_simd_fuzzing_arbitrary_matrices() {
         // Linear congruential pseudo-random generator with diverse float magnitudes
         let mut state = base_seed as u64;
         for i in 0..num {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let val_a = ((state >> 32) as i32) as f32 / 65536.0;
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let val_b = ((state >> 32) as i32) as f32 / 65536.0;
 
             a[i] = val_a;
@@ -353,26 +363,36 @@ fn test_wgpu_hardware_irregular_dimensions() {
             cpu_simd::matmul_simd(&a, &b, &mut c_expected, dim);
 
             let outcome = engine
-                .execute_gemm(&format!("adversarial_gemm_{dim}"), payload, task_id, dim, 16)
+                .execute_gemm(
+                    &format!("adversarial_gemm_{dim}"),
+                    payload,
+                    task_id,
+                    dim,
+                    16,
+                )
                 .unwrap_or_else(|e| panic!("execute_gemm failed for dim {dim}x{dim}: {e}"));
 
             assert_eq!(outcome.matrix_c.len(), dim * dim);
-            assert!(outcome.verification.passed(), "dim {dim}: {}", outcome.verification.summary());
+            assert!(
+                outcome.verification.passed(),
+                "dim {dim}: {}",
+                outcome.verification.summary()
+            );
             assert!(outcome.stdout.contains("Status: VERIFIED_OK"));
             assert_eq!(outcome.device_name, adapter_info.name);
 
             // Check maximum absolute and relative error against CPU reference
             let mut max_abs_diff = 0.0f32;
-            for i in 0..dim * dim {
-                let diff = (outcome.matrix_c[i] - c_expected[i]).abs();
+            for (i, (&gpu_val, &cpu_val)) in outcome.matrix_c.iter().zip(&c_expected).enumerate() {
+                let diff = (gpu_val - cpu_val).abs();
                 if diff > max_abs_diff {
                     max_abs_diff = diff;
                 }
                 assert!(
                     diff < 1e-1,
                     "Excessive GPU vs CPU error at index {i} for dim {dim}x{dim}: gpu={}, cpu={}, diff={}",
-                    outcome.matrix_c[i],
-                    c_expected[i],
+                    gpu_val,
+                    cpu_val,
                     diff
                 );
             }
@@ -403,7 +423,13 @@ fn test_wgpu_hardware_rapid_burst_stress() {
 
         for iter in 1..=20 {
             let outcome = engine
-                .execute_gemm(&format!("burst_kernel_{iter}"), b"burst_test_payload", Uuid::new_v4(), dim, 16)
+                .execute_gemm(
+                    &format!("burst_kernel_{iter}"),
+                    b"burst_test_payload",
+                    Uuid::new_v4(),
+                    dim,
+                    16,
+                )
                 .unwrap_or_else(|e| panic!("Burst iteration {iter} failed: {e}"));
 
             assert_eq!(outcome.matrix_c.len(), dim * dim);
@@ -436,9 +462,15 @@ async fn test_runner_hostile_parameter_clamping() {
     let res_underflow = runner.execute_task(&task_underflow, None, None).await;
     assert_eq!(res_underflow.exit_code, EXIT_CODE_GENERAL_ERROR);
     assert!(!res_underflow.is_gpu_executed);
-    assert!(res_underflow.stdout.is_empty(), "no result for a rejected request");
+    assert!(
+        res_underflow.stdout.is_empty(),
+        "no result for a rejected request"
+    );
     let error = res_underflow.error.expect("error message");
-    assert!(error.contains("simulated_matrix_dim must be at least 1"), "{error}");
+    assert!(
+        error.contains("simulated_matrix_dim must be at least 1"),
+        "{error}"
+    );
 
     // 2. Hostile overflow: dim = 100000, work_group_size = 999. These used to be silently
     // lowered to 512 and 32 (so a caller asking for 100000 got a 512 benchmark and exit 0).
@@ -499,16 +531,23 @@ fn test_hash_wgsl_shader_compilation() {
             let hash_wgsl = include_str!("../crates/worker/src/shaders/hash.wgsl");
             // The engine's device reports errors to a logging handler instead of panicking, so
             // the compilation result has to be read from an error scope.
-            engine.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let shader = engine.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("adversarial_hash_shader_module"),
-                source: wgpu::ShaderSource::Wgsl(hash_wgsl.into()),
-            });
+            engine
+                .device
+                .push_error_scope(wgpu::ErrorFilter::Validation);
+            let shader = engine
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("adversarial_hash_shader_module"),
+                    source: wgpu::ShaderSource::Wgsl(hash_wgsl.into()),
+                });
             let error = pollster::block_on(engine.device.pop_error_scope());
             assert!(error.is_none(), "hash.wgsl no longer compiles: {error:?}");
 
             // Verify shader module compilation succeeds
-            println!("  [PASS] WGSL validation of hash.wgsl succeeded: {:?}", shader);
+            println!(
+                "  [PASS] WGSL validation of hash.wgsl succeeded: {:?}",
+                shader
+            );
         }
     }
 }

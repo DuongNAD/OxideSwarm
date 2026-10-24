@@ -3,7 +3,161 @@
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, warn};
 
-use rusty_grid_core::task::{TaskId, TaskSpec};
+use rusty_grid_core::task::{
+    hex_encode, StagedFile, TaskId, TaskSpec, MAX_AGGREGATE_STAGED_BYTES, MAX_STAGED_FILE_BYTES,
+};
+
+/// Windows reserved DOS device names that cannot be created or accessed as files.
+pub const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Normalizes a relative path string into a canonical forward-slash separated path,
+/// enforcing strict isolation boundaries:
+/// - Rejects path traversal (`..`)
+/// - Rejects absolute paths (`/`, `\`, drive letters `C:`)
+/// - Rejects colons / alternate data streams (`:`)
+/// - Rejects null bytes (`\0`)
+/// - Rejects Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`)
+/// - Normalizes Windows backslashes `\` to `/`
+pub fn normalize_relative_path_str(raw: &str) -> Result<String, SandboxError> {
+    let trimmed_raw = raw.trim();
+    if trimmed_raw.is_empty() {
+        return Err(SandboxError::PathTraversal {
+            task_id: TaskId::default(),
+            path: raw.to_string(),
+            reason: "Empty path is prohibited".to_string(),
+        });
+    }
+
+    if raw.contains('\0') {
+        return Err(SandboxError::PathTraversal {
+            task_id: TaskId::default(),
+            path: raw.to_string(),
+            reason: "Path contains illegal null byte".to_string(),
+        });
+    }
+
+    // Prohibit leading slashes (absolute paths on Unix or Windows UNC)
+    if trimmed_raw.starts_with('/') || trimmed_raw.starts_with('\\') {
+        return Err(SandboxError::PathTraversal {
+            task_id: TaskId::default(),
+            path: raw.to_string(),
+            reason: "Absolute paths with leading slash are prohibited".to_string(),
+        });
+    }
+
+    // Prohibit Windows drive letters, alternate data streams (ADS), or colons
+    if raw.contains(':') {
+        return Err(SandboxError::PathTraversal {
+            task_id: TaskId::default(),
+            path: raw.to_string(),
+            reason: "Colons and drive prefixes are prohibited in relative paths".to_string(),
+        });
+    }
+
+    // Normalize backslashes to forward slashes
+    let normalized = trimmed_raw.replace('\\', "/");
+
+    let mut segments = Vec::new();
+    for segment in normalized.split('/') {
+        let seg_trimmed = segment.trim();
+        if seg_trimmed.is_empty() || seg_trimmed == "." {
+            continue;
+        }
+        if seg_trimmed == ".." {
+            return Err(SandboxError::PathTraversal {
+                task_id: TaskId::default(),
+                path: raw.to_string(),
+                reason: "Path traversal '..' component detected".to_string(),
+            });
+        }
+
+        // Check for segments consisting solely of dots and/or spaces (e.g. "...", "....")
+        let cleaned = seg_trimmed.trim_end_matches([' ', '.']);
+        if cleaned.is_empty() {
+            return Err(SandboxError::PathTraversal {
+                task_id: TaskId::default(),
+                path: raw.to_string(),
+                reason: format!(
+                    "Illegal path component '{seg_trimmed}' consisting only of dots/spaces"
+                ),
+            });
+        }
+
+        // Check for Windows reserved DOS device names:
+        // Strip trailing spaces and dots which Windows Win32 API strips
+        let stem = cleaned
+            .split('.')
+            .next()
+            .unwrap_or(cleaned)
+            .trim_end_matches([' ', '.'])
+            .to_ascii_uppercase();
+        if WINDOWS_RESERVED_NAMES.contains(&stem.as_str()) {
+            return Err(SandboxError::PathTraversal {
+                task_id: TaskId::default(),
+                path: raw.to_string(),
+                reason: format!("Windows reserved device name '{seg_trimmed}' is prohibited"),
+            });
+        }
+
+        segments.push(seg_trimmed);
+    }
+
+    if segments.is_empty() {
+        return Err(SandboxError::PathTraversal {
+            task_id: TaskId::default(),
+            path: raw.to_string(),
+            reason: "Path resolves to empty root".to_string(),
+        });
+    }
+
+    Ok(segments.join("/"))
+}
+
+/// Validates that a requested path does not escape the sandbox root directory.
+pub fn sanitize_relative_path(base_dir: &Path, rel_path: &Path) -> Result<PathBuf, SandboxError> {
+    if rel_path.is_absolute() {
+        return Err(SandboxError::PathTraversal {
+            task_id: TaskId::default(),
+            path: rel_path.display().to_string(),
+            reason: "Absolute paths are prohibited in sandbox".to_string(),
+        });
+    }
+
+    for comp in rel_path.components() {
+        match comp {
+            Component::Normal(_) => {}
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(SandboxError::PathTraversal {
+                    task_id: TaskId::default(),
+                    path: rel_path.display().to_string(),
+                    reason: "Path traversal '..' component detected".to_string(),
+                });
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(SandboxError::PathTraversal {
+                    task_id: TaskId::default(),
+                    path: rel_path.display().to_string(),
+                    reason: "Root or drive prefix detected in relative path".to_string(),
+                });
+            }
+        }
+    }
+
+    let raw_str = rel_path
+        .to_str()
+        .ok_or_else(|| SandboxError::PathTraversal {
+            task_id: TaskId::default(),
+            path: rel_path.display().to_string(),
+            reason: "Path contains non-UTF-8 characters".to_string(),
+        })?;
+
+    let normalized = normalize_relative_path_str(raw_str)?;
+    Ok(base_dir.join(normalized))
+}
 
 /// Environment variable that names the sandbox base directory itself (task sandboxes are created
 /// directly inside it).
@@ -36,14 +190,19 @@ pub fn resolve_default_base_dir(
     if let Some(dir) = non_empty(SANDBOX_BASE_DIR_ENV) {
         return PathBuf::from(dir);
     }
-    let temp = non_empty("TMPDIR").map(PathBuf::from).unwrap_or(platform_temp);
+    let temp = non_empty("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or(platform_temp);
     temp.join("rusty_grid").join("sandboxes")
 }
 
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            base_dir: resolve_default_base_dir(|name| std::env::var(name).ok(), std::env::temp_dir()),
+            base_dir: resolve_default_base_dir(
+                |name| std::env::var(name).ok(),
+                std::env::temp_dir(),
+            ),
             keep_sandboxes: false,
         }
     }
@@ -71,8 +230,14 @@ impl SandboxConfig {
             path: self.base_dir.clone(),
             source,
         };
-        tokio::fs::create_dir_all(&self.base_dir).await.map_err(unusable)?;
-        let probe = self.base_dir.join(format!(".write_probe_{}_{}", std::process::id(), TaskId::new()));
+        tokio::fs::create_dir_all(&self.base_dir)
+            .await
+            .map_err(unusable)?;
+        let probe = self.base_dir.join(format!(
+            ".write_probe_{}_{}",
+            std::process::id(),
+            TaskId::new()
+        ));
         tokio::fs::write(&probe, b"probe").await.map_err(unusable)?;
         let _ = tokio::fs::remove_file(&probe).await;
         Ok(())
@@ -120,40 +285,6 @@ pub enum SandboxError {
         #[source]
         source: std::io::Error,
     },
-}
-
-/// Validates that a requested path does not escape the sandbox root directory.
-pub fn sanitize_relative_path(base_dir: &Path, rel_path: &Path) -> Result<PathBuf, SandboxError> {
-    if rel_path.is_absolute() {
-        return Err(SandboxError::PathTraversal {
-            task_id: TaskId::default(),
-            path: rel_path.display().to_string(),
-            reason: "Absolute paths are prohibited in sandbox".to_string(),
-        });
-    }
-
-    for comp in rel_path.components() {
-        match comp {
-            Component::Normal(_) => {}
-            Component::CurDir => {}
-            Component::ParentDir => {
-                return Err(SandboxError::PathTraversal {
-                    task_id: TaskId::default(),
-                    path: rel_path.display().to_string(),
-                    reason: "Path traversal '..' component detected".to_string(),
-                });
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(SandboxError::PathTraversal {
-                    task_id: TaskId::default(),
-                    path: rel_path.display().to_string(),
-                    reason: "Root or drive prefix detected in relative path".to_string(),
-                });
-            }
-        }
-    }
-
-    Ok(base_dir.join(rel_path))
 }
 
 #[cfg(unix)]
@@ -277,6 +408,110 @@ impl Sandbox {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    /// Materializes staged files into the sandbox directory, utilizing the worker's
+    /// content-hash cache for deduplication and hardlink acceleration.
+    pub async fn stage_files(
+        &self,
+        staged_files: &[StagedFile],
+        cache_base_dir: &Path,
+    ) -> Result<(), SandboxError> {
+        let mut total_bytes: u64 = 0;
+        for staged in staged_files {
+            if staged.size > MAX_STAGED_FILE_BYTES as u64 {
+                return Err(SandboxError::PathTraversal {
+                    task_id: self.task_id,
+                    path: staged.path.clone(),
+                    reason: format!("Staged file size {} exceeds limit of 32 MiB", staged.size),
+                });
+            }
+            total_bytes = total_bytes.saturating_add(staged.size);
+            if total_bytes > MAX_AGGREGATE_STAGED_BYTES as u64 {
+                return Err(SandboxError::PathTraversal {
+                    task_id: self.task_id,
+                    path: staged.path.clone(),
+                    reason: "Aggregate staged file size exceeds 32 MiB".to_string(),
+                });
+            }
+            if !staged.verify_checksum() {
+                return Err(SandboxError::PathTraversal {
+                    task_id: self.task_id,
+                    path: staged.path.clone(),
+                    reason: "Checksum verification failed for staged file".to_string(),
+                });
+            }
+        }
+
+        let objects_dir = cache_base_dir.join("objects");
+        let tmp_cache_dir = cache_base_dir.join("tmp");
+
+        let _ = tokio::fs::create_dir_all(&objects_dir).await;
+        let _ = tokio::fs::create_dir_all(&tmp_cache_dir).await;
+
+        for staged in staged_files {
+            let rel_path = normalize_relative_path_str(&staged.path).map_err(|mut err| {
+                if let SandboxError::PathTraversal {
+                    ref mut task_id, ..
+                } = err
+                {
+                    *task_id = self.task_id;
+                }
+                err
+            })?;
+
+            let target = self.path.join(&rel_path);
+            if let Some(parent) = target.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| SandboxError::Io {
+                        task_id: self.task_id,
+                        source: e,
+                    })?;
+            }
+
+            let sha256_hex = hex_encode(&staged.sha256);
+            let cache_obj_path = objects_dir.join(&sha256_hex);
+
+            let mut linked_from_cache = false;
+            if tokio::fs::try_exists(&cache_obj_path)
+                .await
+                .unwrap_or(false)
+            {
+                // Try hard-link first (zero disk duplication), then fallback to copy
+                if tokio::fs::hard_link(&cache_obj_path, &target).await.is_ok()
+                    || tokio::fs::copy(&cache_obj_path, &target).await.is_ok()
+                {
+                    linked_from_cache = true;
+                }
+            }
+
+            if !linked_from_cache {
+                tokio::fs::write(&target, staged.data.as_bytes())
+                    .await
+                    .map_err(|e| SandboxError::Io {
+                        task_id: self.task_id,
+                        source: e,
+                    })?;
+
+                // Asynchronously / atomically populate cache
+                let tmp_file = tmp_cache_dir.join(format!("{}_{}", self.task_id, sha256_hex));
+                if tokio::fs::write(&tmp_file, staged.data.as_bytes())
+                    .await
+                    .is_ok()
+                {
+                    let _ = tokio::fs::rename(&tmp_file, &cache_obj_path).await;
+                }
+            }
+
+            // Apply executable permissions
+            let mode = if staged.executable { 0o755 } else { 0o644 };
+            if let Err(e) = set_permissions(&target, mode) {
+                warn!(task_id = %self.task_id, path = %target.display(), error = %e, "Failed to set staged file permissions");
+            }
+        }
+
         Ok(())
     }
 
@@ -465,7 +700,10 @@ mod tests {
         );
         // 2. TMPDIR beats the platform temp dir
         assert_eq!(
-            resolve_default_base_dir(lookup(&[("TMPDIR", "/data/user/0/app/cache")]), platform.clone()),
+            resolve_default_base_dir(
+                lookup(&[("TMPDIR", "/data/user/0/app/cache")]),
+                platform.clone()
+            ),
             nested("/data/user/0/app/cache")
         );
         // 1. RUSTY_GRID_SANDBOX_BASE_DIR beats both and is used as the base itself
@@ -492,9 +730,16 @@ mod tests {
         let base = root.join("deep").join("base");
         let config = SandboxConfig::new(&base);
 
-        config.ensure_usable().await.expect("a creatable directory is usable");
+        config
+            .ensure_usable()
+            .await
+            .expect("a creatable directory is usable");
         assert!(base.is_dir());
-        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0, "the probe file must be removed");
+        assert_eq!(
+            std::fs::read_dir(&base).unwrap().count(),
+            0,
+            "the probe file must be removed"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -508,10 +753,19 @@ mod tests {
         std::fs::write(&blocker, b"x").unwrap();
         let config = SandboxConfig::new(blocker.join("sandboxes"));
 
-        let err = config.ensure_usable().await.expect_err("must not be usable");
-        assert!(matches!(err, SandboxError::BaseDirUnusable { .. }), "{err:?}");
+        let err = config
+            .ensure_usable()
+            .await
+            .expect_err("must not be usable");
+        assert!(
+            matches!(err, SandboxError::BaseDirUnusable { .. }),
+            "{err:?}"
+        );
         let text = err.to_string();
-        assert!(text.contains("blocker"), "the message must name the directory: {text}");
+        assert!(
+            text.contains("blocker"),
+            "the message must name the directory: {text}"
+        );
         assert!(
             text.contains("--sandbox-base-dir") && text.contains("RUSTY_GRID_SANDBOX_BASE_DIR"),
             "the message must say how to fix it: {text}"

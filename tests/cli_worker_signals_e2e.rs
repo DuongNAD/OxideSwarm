@@ -84,18 +84,24 @@ struct Master {
 fn start_master(home: &Path) -> Master {
     let port_file = home.join("master.port");
     let mut cmd = cli(home);
-    cmd.args(["master", "--listen", "127.0.0.1:0", "--port-file"]).arg(&port_file);
+    cmd.args(["master", "--listen", "127.0.0.1:0", "--port-file"])
+        .arg(&port_file);
     let service = Service::spawn(cmd, home.join("master.log"));
     let mut port = None;
     assert!(
         wait_for(Duration::from_secs(20), || {
-            port = fs::read_to_string(&port_file).ok().and_then(|p| p.trim().parse::<u16>().ok());
+            port = fs::read_to_string(&port_file)
+                .ok()
+                .and_then(|p| p.trim().parse::<u16>().ok());
             port.is_some()
         }),
         "master did not publish its port; log:\n{}",
         service.log()
     );
-    Master { _service: service, addr: format!("127.0.0.1:{}", port.unwrap()) }
+    Master {
+        _service: service,
+        addr: format!("127.0.0.1:{}", port.unwrap()),
+    }
 }
 
 fn start_worker(home: &Path, master: &str, name: &str, args: &[&str]) -> Service {
@@ -108,7 +114,10 @@ fn start_worker(home: &Path, master: &str, name: &str, args: &[&str]) -> Service
 }
 
 fn worker_count(home: &Path, master: &str) -> Option<usize> {
-    let out = cli(home).args(["workers", "--master", master, "--json"]).output().ok()?;
+    let out = cli(home)
+        .args(["workers", "--master", master, "--json"])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -118,7 +127,8 @@ fn worker_count(home: &Path, master: &str) -> Option<usize> {
 
 fn wait_for_worker(home: &Path, master: &Master, worker: &Service) {
     assert!(
-        wait_for(Duration::from_secs(30), || worker_count(home, &master.addr) == Some(1)),
+        wait_for(Duration::from_secs(30), || worker_count(home, &master.addr)
+            == Some(1)),
         "worker never registered.\nworker log:\n{}",
         worker.log()
     );
@@ -126,7 +136,10 @@ fn wait_for_worker(home: &Path, master: &Master, worker: &Service) {
 
 fn alive(pid: u32) -> bool {
     // A zombie still answers `kill -0`; ask ps for its state instead.
-    let out = Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
     let state = text(&out.stdout);
     let state = state.trim();
     !state.is_empty() && !state.starts_with('Z')
@@ -136,7 +149,9 @@ fn recorded_pid(file: &Path) -> u32 {
     let mut pid = None;
     assert!(
         wait_for(Duration::from_secs(20), || {
-            pid = fs::read_to_string(file).ok().and_then(|t| t.trim().parse::<u32>().ok());
+            pid = fs::read_to_string(file)
+                .ok()
+                .and_then(|t| t.trim().parse::<u32>().ok());
             pid.is_some()
         }),
         "{} was never written",
@@ -151,7 +166,10 @@ struct KillOnDrop(Vec<u32>);
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
         for pid in &self.0 {
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).stderr(Stdio::null()).status();
+            let _ = Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status();
         }
     }
 }
@@ -176,7 +194,17 @@ fn test_sigterm_stops_the_worker_gracefully_and_takes_its_task_trees_with_it() {
         grandchild_file.display()
     );
     let out: Output = cli(home.path())
-        .args(["submit", "--master", &master.addr, "--timeout-secs", "600", "--", "sh", "-c", &script])
+        .args([
+            "submit",
+            "--master",
+            &master.addr,
+            "--timeout-secs",
+            "600",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
         .output()
         .unwrap();
     assert!(out.status.success(), "submit failed: {}", text(&out.stderr));
@@ -186,7 +214,10 @@ fn test_sigterm_stops_the_worker_gracefully_and_takes_its_task_trees_with_it() {
     assert!(alive(child) && alive(grandchild));
 
     // What `kill`, systemd and launchd send.
-    let status = Command::new("kill").args(["-TERM", &worker.child.id().to_string()]).status().unwrap();
+    let status = Command::new("kill")
+        .args(["-TERM", &worker.child.id().to_string()])
+        .status()
+        .unwrap();
     assert!(status.success());
 
     let mut exit = None;
@@ -199,10 +230,22 @@ fn test_sigterm_stops_the_worker_gracefully_and_takes_its_task_trees_with_it() {
         worker.log()
     );
     // A clean exit through the shutdown path, not death by the default signal action.
-    assert_eq!(exit.unwrap().code(), Some(0), "worker log:\n{}", worker.log());
-    assert!(worker.log().contains("finished cleanly"), "worker log:\n{}", worker.log());
+    assert_eq!(
+        exit.unwrap().code(),
+        Some(0),
+        "worker log:\n{}",
+        worker.log()
+    );
+    assert!(
+        worker.log().contains("finished cleanly"),
+        "worker log:\n{}",
+        worker.log()
+    );
 
-    for (what, pid) in [("background child", child), ("nested grandchild", grandchild)] {
+    for (what, pid) in [
+        ("background child", child),
+        ("nested grandchild", grandchild),
+    ] {
         assert!(
             wait_for(Duration::from_secs(10), || !alive(pid)),
             "the {what} (pid {pid}) outlived the worker that was asked to stop"
@@ -214,11 +257,25 @@ fn test_sigterm_stops_the_worker_gracefully_and_takes_its_task_trees_with_it() {
 fn test_task_priority_flag_sets_the_nice_value_of_task_processes() {
     let home = tempdir();
     let master = start_master(home.path());
-    let worker = start_worker(home.path(), &master.addr, "idle-worker", &["--task-priority", "idle"]);
+    let worker = start_worker(
+        home.path(),
+        &master.addr,
+        "idle-worker",
+        &["--task-priority", "idle"],
+    );
     wait_for_worker(home.path(), &master, &worker);
 
     let out = cli(home.path())
-        .args(["submit", "--master", &master.addr, "--wait", "--", "sh", "-c", "ps -o ni= -p $$"])
+        .args([
+            "submit",
+            "--master",
+            &master.addr,
+            "--wait",
+            "--",
+            "sh",
+            "-c",
+            "ps -o ni= -p $$",
+        ])
         .output()
         .unwrap();
     assert!(out.status.success(), "submit failed: {}", text(&out.stderr));
@@ -233,10 +290,19 @@ fn test_task_priority_flag_sets_the_nice_value_of_task_processes() {
 fn test_misspelt_task_priority_is_refused_instead_of_running_tasks_at_full_priority() {
     let home = tempdir();
     let out = cli(home.path())
-        .args(["worker", "--master", "127.0.0.1:1", "--task-priority", "realtime"])
+        .args([
+            "worker",
+            "--master",
+            "127.0.0.1:1",
+            "--task-priority",
+            "realtime",
+        ])
         .output()
         .unwrap();
     assert!(!out.status.success());
     let stderr = text(&out.stderr);
-    assert!(stderr.contains("--task-priority") && stderr.contains("below-normal"), "{stderr}");
+    assert!(
+        stderr.contains("--task-priority") && stderr.contains("below-normal"),
+        "{stderr}"
+    );
 }

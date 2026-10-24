@@ -38,7 +38,10 @@ async fn recorded_pid(file: &Path) -> u32 {
 
 #[tokio::test]
 async fn test_terminate_all_task_process_trees_kills_every_running_tree_and_nothing_else() {
-    let mut bystander = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+    let mut bystander = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .unwrap();
     let bystander_pid = bystander.id();
 
     let sandboxes = tempfile::tempdir().unwrap();
@@ -52,6 +55,10 @@ async fn test_terminate_all_task_process_trees_kills_every_running_tree_and_noth
         gpu_device_name: None,
         tags: vec![],
         mobile: None,
+        has_blender: false,
+        blender_version: None,
+        vram_mb: None,
+        has_cuda: false,
     };
     let runner = Arc::new(TaskRunner::new(
         Uuid::new_v4(),
@@ -70,9 +77,14 @@ async fn test_terminate_all_task_process_trees_kills_every_running_tree_and_noth
             child.display(),
             grandchild.display()
         );
-        let task = Task::new(TaskSpec::shell_script(script), TaskRequirements::generic(1, 120));
+        let task = Task::new(
+            TaskSpec::shell_script(script),
+            TaskRequirements::generic(1, 120),
+        );
         let runner = Arc::clone(&runner);
-        runs.push(tokio::spawn(async move { runner.execute_task(&task, None, None).await }));
+        runs.push(tokio::spawn(async move {
+            runner.execute_task(&task, None, None).await
+        }));
         expected_dead.push(child);
         expected_dead.push(grandchild);
     }
@@ -92,7 +104,10 @@ async fn test_terminate_all_task_process_trees_kills_every_running_tree_and_noth
             .expect("a run whose tree was killed must end")
             .unwrap();
         assert!(!res.is_success());
-        assert_ne!(res.exit_code, EXIT_CODE_TIMEOUT, "killed, not timed out: {res:?}");
+        assert_ne!(
+            res.exit_code, EXIT_CODE_TIMEOUT,
+            "killed, not timed out: {res:?}"
+        );
     }
     for pid in pids_to_check {
         let mut dead = false;
@@ -106,7 +121,10 @@ async fn test_terminate_all_task_process_trees_kills_every_running_tree_and_noth
         if !dead {
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         }
-        assert!(dead, "process {pid} survived terminate_all_task_process_trees");
+        assert!(
+            dead,
+            "process {pid} survived terminate_all_task_process_trees"
+        );
     }
 
     // Once the runs have ended nothing is registered any more, and the bystander was never touched.
