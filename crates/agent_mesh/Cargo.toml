@@ -30,6 +30,7 @@ chrono = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
 sysinfo = { workspace = true }
 ring = "0.17"
+base64 = "0.22"
 
 [target.'cfg(unix)'.dependencies]
 # killpg() for the mesh executor's process-group kill (already in Cargo.lock via tokio)

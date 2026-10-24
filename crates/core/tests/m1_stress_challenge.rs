@@ -399,6 +399,7 @@ fn test_serde_worker_message_all_variants_and_edge_cases() {
                 gpu_device_name: Some(s.clone()),
                 tags: vec![s.clone(), "tag2".into()],
                 mobile: None,
+                ..Default::default()
             },
             protocol_version: PROTOCOL_VERSION_CURRENT,
             features: ProtocolCapabilities::all_supported(),
@@ -475,6 +476,7 @@ fn test_serde_worker_message_all_variants_and_edge_cases() {
             is_gpu_executed: true,
             device_name: None,
             error: Some("Failed with error \0".into()),
+            asset_bytes: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let de: WorkerMessage = serde_json::from_str(&json).unwrap();

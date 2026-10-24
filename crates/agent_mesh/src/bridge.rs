@@ -10,12 +10,12 @@ use std::time::Duration;
 use serde_json::Value;
 
 use rusty_grid_core::task::{
-    Task, TaskId, TaskRequirements, TaskResult, TaskSpec,
+    AutoRigSpec, Bytes, Generative3DSpec, Task, TaskId, TaskRequirements, TaskResult, TaskSpec,
 };
 use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::server::MasterHandle;
 
-use crate::protocol::AgentMeshEnvelope;
+use crate::protocol::{compute_sha256, AgentMeshEnvelope};
 
 /// In-process bridge connecting `AgentMeshHub` to `MasterHandle`.
 #[derive(Clone)]
@@ -110,6 +110,14 @@ impl AgentGridBridge {
             }
             "grid_status" | "status" => {
                 self.handle_status(command, args, from, correlation_id)
+                    .await
+            }
+            "grid_3d_generate" | "3d_generate" | "generate_3d" => {
+                self.handle_3d_generate(command, args, from, correlation_id, timeout)
+                    .await
+            }
+            "grid_auto_rig" | "auto_rig" => {
+                self.handle_auto_rig(command, args, from, correlation_id, timeout)
                     .await
             }
             unknown => make_error_response(
@@ -484,6 +492,269 @@ impl AgentGridBridge {
             }
         }
     }
+
+    async fn handle_3d_generate(
+        &self,
+        command: &str,
+        args: &Value,
+        from: &str,
+        correlation_id: &str,
+        timeout: Duration,
+    ) -> AgentMeshEnvelope {
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let image_bytes = parse_binary_data(
+            args.get("image")
+                .or_else(|| args.get("image_data"))
+                .or_else(|| args.get("image_bytes")),
+        );
+
+        if prompt.is_none() && image_bytes.is_empty() {
+            return make_error_response(
+                from,
+                correlation_id,
+                command,
+                1,
+                "3D generation requires either non-empty 'prompt' or 'image'",
+            );
+        }
+
+        let quality = args
+            .get("quality")
+            .and_then(|v| v.as_str())
+            .unwrap_or("standard")
+            .to_lowercase();
+
+        let engine_preference = args
+            .get("engine")
+            .or_else(|| args.get("engine_preference"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_lowercase())
+            .filter(|s| s != "auto");
+
+        let export_texture = args
+            .get("export_texture")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let spec = TaskSpec::Generative3D(Generative3DSpec {
+            prompt,
+            image_data: if image_bytes.is_empty() {
+                None
+            } else {
+                Some(Bytes::from(image_bytes))
+            },
+            quality,
+            engine_preference,
+            export_texture,
+        });
+
+        if let Err(e) = spec.validate() {
+            return make_error_response(
+                from,
+                correlation_id,
+                command,
+                1,
+                &format!("Invalid 3D generation specification: {e}"),
+            );
+        }
+
+        let timeout_secs = timeout.as_secs().max(1);
+        let gpu_required = if let Some(req_gpu) = args
+            .get("gpu_required")
+            .or_else(|| args.get("require_gpu"))
+            .and_then(|v| v.as_bool())
+        {
+            req_gpu
+        } else {
+            match spec {
+                TaskSpec::Generative3D(ref s) => {
+                    let is_sdf = s
+                        .engine_preference
+                        .as_deref()
+                        .map(|e| e == "sdf" || e == "tier0_sdf" || e == "procedural")
+                        .unwrap_or(false);
+                    !is_sdf
+                }
+                _ => true,
+            }
+        };
+
+        let reqs = TaskRequirements {
+            cpu_cores: 2,
+            ram_mb: if gpu_required { 4096 } else { 1024 },
+            gpu_required,
+            timeout_secs,
+            max_retries: None,
+        };
+
+        let priority = args.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
+        let task = Task::new(spec, reqs).with_tags(vec!["grid_3d_generate".into(), "agent_bridge".into()]);
+
+        match self.master.submit_task_with_priority(task, priority).await {
+            Ok(task_id) => {
+                if wait {
+                    match self.master.wait_task(task_id, Some(timeout)).await {
+                        Ok(task_res) => map_task_result_to_response(task_res, from, correlation_id, command),
+                        Err(e) => make_error_response(
+                            from,
+                            correlation_id,
+                            command,
+                            124,
+                            &format!("3D generation failed or timed out: {e}"),
+                        ),
+                    }
+                } else {
+                    let mut resp = AgentMeshEnvelope::new_command_response(
+                        "grid",
+                        from,
+                        correlation_id,
+                        Some(command.to_string()),
+                        "success",
+                        0,
+                        format!("3D generation task submitted successfully with ID: {task_id}"),
+                        "",
+                        0,
+                    );
+                    if let AgentMeshEnvelope::CommandResponse { ref mut payload, .. } = resp {
+                        *payload = Some(serde_json::json!({
+                            "task_id": task_id.to_string(),
+                            "status": "submitted"
+                        }));
+                    }
+                    resp
+                }
+            }
+            Err(e) => make_error_response(
+                from,
+                correlation_id,
+                command,
+                1,
+                &format!("Failed to submit 3D generation task: {e}"),
+            ),
+        }
+    }
+
+    async fn handle_auto_rig(
+        &self,
+        command: &str,
+        args: &Value,
+        from: &str,
+        correlation_id: &str,
+        timeout: Duration,
+    ) -> AgentMeshEnvelope {
+        let input_mesh_bytes = parse_binary_data(
+            args.get("input_mesh")
+                .or_else(|| args.get("input_mesh_bytes"))
+                .or_else(|| args.get("mesh")),
+        );
+
+        if input_mesh_bytes.is_empty() {
+            return make_error_response(
+                from,
+                correlation_id,
+                command,
+                1,
+                "AutoRig requires non-empty 'input_mesh' (base64, byte array, or file path)",
+            );
+        }
+
+        let rig_preset = args
+            .get("rig_preset")
+            .and_then(|v| v.as_str())
+            .unwrap_or("biped")
+            .to_string();
+
+        let embed_animations: Vec<String> = args
+            .get("embed_animations")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        let preferred_provider = args
+            .get("preferred_provider")
+            .or_else(|| args.get("provider"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let spec = TaskSpec::AutoRig(AutoRigSpec {
+            input_mesh: Bytes::from(input_mesh_bytes),
+            rig_preset,
+            embed_animations,
+            preferred_provider,
+        });
+
+        if let Err(e) = spec.validate() {
+            return make_error_response(
+                from,
+                correlation_id,
+                command,
+                1,
+                &format!("Invalid AutoRig specification: {e}"),
+            );
+        }
+
+        let timeout_secs = timeout.as_secs().max(1);
+        let reqs = TaskRequirements {
+            cpu_cores: 2,
+            ram_mb: 2048,
+            gpu_required: false,
+            timeout_secs,
+            max_retries: None,
+        };
+
+        let priority = args.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
+        let task = Task::new(spec, reqs).with_tags(vec!["grid_auto_rig".into(), "agent_bridge".into()]);
+
+        match self.master.submit_task_with_priority(task, priority).await {
+            Ok(task_id) => {
+                if wait {
+                    match self.master.wait_task(task_id, Some(timeout)).await {
+                        Ok(task_res) => map_task_result_to_response(task_res, from, correlation_id, command),
+                        Err(e) => make_error_response(
+                            from,
+                            correlation_id,
+                            command,
+                            124,
+                            &format!("AutoRig failed or timed out: {e}"),
+                        ),
+                    }
+                } else {
+                    let mut resp = AgentMeshEnvelope::new_command_response(
+                        "grid",
+                        from,
+                        correlation_id,
+                        Some(command.to_string()),
+                        "success",
+                        0,
+                        format!("AutoRig task submitted successfully with ID: {task_id}"),
+                        "",
+                        0,
+                    );
+                    if let AgentMeshEnvelope::CommandResponse { ref mut payload, .. } = resp {
+                        *payload = Some(serde_json::json!({
+                            "task_id": task_id.to_string(),
+                            "status": "submitted"
+                        }));
+                    }
+                    resp
+                }
+            }
+            Err(e) => make_error_response(
+                from,
+                correlation_id,
+                command,
+                1,
+                &format!("Failed to submit AutoRig task: {e}"),
+            ),
+        }
+    }
 }
 
 fn parse_input_bytes(val: Option<&Value>) -> Vec<u8> {
@@ -508,6 +779,56 @@ fn parse_input_bytes(val: Option<&Value>) -> Vec<u8> {
             .iter()
             .filter_map(|v| v.as_u64().map(|n| n as u8))
             .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_binary_data(val: Option<&Value>) -> Vec<u8> {
+    match val {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_u64().map(|n| n as u8))
+            .collect(),
+        Some(Value::String(s)) => {
+            let s_trim = s.trim();
+            if s_trim.starts_with("0x") || s_trim.starts_with("0X") {
+                (2..s_trim.len())
+                    .step_by(2)
+                    .filter_map(|i| {
+                        if i + 2 <= s_trim.len() {
+                            u8::from_str_radix(&s_trim[i..i + 2], 16).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                use base64::engine::general_purpose::STANDARD;
+                use base64::Engine;
+                let p = std::path::Path::new(s_trim);
+                if p.exists()
+                    && (s_trim.ends_with(".glb")
+                        || s_trim.ends_with(".gltf")
+                        || s_trim.ends_with(".obj")
+                        || s_trim.ends_with(".png")
+                        || s_trim.ends_with(".jpg"))
+                {
+                    if let Ok(bytes) = std::fs::read(p) {
+                        return bytes;
+                    }
+                }
+                if let Ok(bytes) = STANDARD.decode(s_trim) {
+                    if !bytes.is_empty() {
+                        return bytes;
+                    }
+                }
+                if let Ok(bytes) = std::fs::read(s_trim) {
+                    bytes
+                } else {
+                    s_trim.as_bytes().to_vec()
+                }
+            }
+        }
         _ => Vec::new(),
     }
 }
@@ -576,13 +897,29 @@ fn map_task_result_to_response(
         }
     }
 
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "task_id": res.task_id.to_string(),
         "worker_id": res.worker_id.to_string(),
         "is_gpu_executed": res.is_gpu_executed,
         "device_name": res.device_name,
         "execution_time_ms": res.execution_time_ms,
     });
+
+    if let Some(ref asset) = res.asset_bytes {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        let asset_slice = asset.as_slice();
+        let b64 = STANDARD.encode(asset_slice);
+        let sha256 = compute_sha256(asset_slice);
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("asset_bytes_len".to_string(), serde_json::json!(asset_slice.len()));
+            obj.insert("asset_sha256".to_string(), serde_json::json!(sha256));
+            obj.insert("asset_base64".to_string(), serde_json::json!(b64));
+        }
+        if stdout.is_empty() {
+            stdout = format!("Asset generated successfully ({} bytes, sha256: {})", asset_slice.len(), sha256);
+        }
+    }
 
     let mut resp = AgentMeshEnvelope::new_command_response(
         "grid",

@@ -1106,6 +1106,7 @@ async fn test_stress_reaper_detection_and_failover() {
         is_gpu_executed: false,
         device_name: None,
         error: None,
+        asset_bytes: None,
     };
     transport2
         .send_msg(&result_msg)

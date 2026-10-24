@@ -545,6 +545,308 @@ fn default_iterations() -> u32 {
     100_000
 }
 
+// ============================================================================
+// 3D Generation & Auto-Rigging Defaults and Specifications
+// ============================================================================
+
+fn default_3d_quality() -> String {
+    "standard".to_string()
+}
+
+fn default_rig_preset() -> String {
+    "biped".to_string()
+}
+
+fn default_embed_animations() -> Vec<String> {
+    vec![
+        "idle".to_string(),
+        "walk".to_string(),
+        "turnaround".to_string(),
+    ]
+}
+
+fn default_export_texture() -> bool {
+    true
+}
+
+/// Specification for local on-device 3D mesh generation from text prompt or input image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Generative3DSpec {
+    /// Optional natural language text prompt describing the 3D asset (e.g. "a low-poly treasure chest").
+    pub prompt: Option<String>,
+    /// Optional input image bytes (PNG, JPEG, WebP) for image-to-3D mesh reconstruction.
+    pub image_data: Option<Bytes>,
+    /// Generation fidelity / quality preset ("fast", "standard", "high"). Defaults to "standard".
+    pub quality: String,
+    /// Preferred generation engine ("sdf", "triposr", "auto"). Defaults to None ("auto").
+    pub engine_preference: Option<String>,
+    /// Whether to generate and bake PBR UV texture maps into the output glTF asset. Defaults to true.
+    pub export_texture: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HumanGenerative3DSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
+    #[serde(default, with = "opt_bytes_serde", skip_serializing_if = "Option::is_none")]
+    image_data: Option<Bytes>,
+    #[serde(default = "default_3d_quality")]
+    quality: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    engine_preference: Option<String>,
+    #[serde(default = "default_export_texture")]
+    pub export_texture: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BinaryGenerative3DSpec {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default, with = "opt_bytes_serde")]
+    image_data: Option<Bytes>,
+    #[serde(default = "default_3d_quality")]
+    quality: String,
+    #[serde(default)]
+    engine_preference: Option<String>,
+    #[serde(default = "default_export_texture")]
+    pub export_texture: bool,
+}
+
+impl From<&Generative3DSpec> for HumanGenerative3DSpec {
+    fn from(s: &Generative3DSpec) -> Self {
+        Self {
+            prompt: s.prompt.clone(),
+            image_data: s.image_data.clone(),
+            quality: s.quality.clone(),
+            engine_preference: s.engine_preference.clone(),
+            export_texture: s.export_texture,
+        }
+    }
+}
+
+impl From<HumanGenerative3DSpec> for Generative3DSpec {
+    fn from(s: HumanGenerative3DSpec) -> Self {
+        Self {
+            prompt: s.prompt,
+            image_data: s.image_data,
+            quality: s.quality,
+            engine_preference: s.engine_preference,
+            export_texture: s.export_texture,
+        }
+    }
+}
+
+impl From<&Generative3DSpec> for BinaryGenerative3DSpec {
+    fn from(s: &Generative3DSpec) -> Self {
+        Self {
+            prompt: s.prompt.clone(),
+            image_data: s.image_data.clone(),
+            quality: s.quality.clone(),
+            engine_preference: s.engine_preference.clone(),
+            export_texture: s.export_texture,
+        }
+    }
+}
+
+impl From<BinaryGenerative3DSpec> for Generative3DSpec {
+    fn from(s: BinaryGenerative3DSpec) -> Self {
+        Self {
+            prompt: s.prompt,
+            image_data: s.image_data,
+            quality: s.quality,
+            engine_preference: s.engine_preference,
+            export_texture: s.export_texture,
+        }
+    }
+}
+
+impl Serialize for Generative3DSpec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            HumanGenerative3DSpec::from(self).serialize(serializer)
+        } else {
+            BinaryGenerative3DSpec::from(self).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Generative3DSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            HumanGenerative3DSpec::deserialize(deserializer).map(Into::into)
+        } else {
+            BinaryGenerative3DSpec::deserialize(deserializer).map(Into::into)
+        }
+    }
+}
+
+impl Generative3DSpec {
+    /// Creates a 3D generation spec from a text prompt with standard quality and texture export enabled.
+    pub fn new_prompt(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: Some(prompt.into()),
+            image_data: None,
+            quality: default_3d_quality(),
+            engine_preference: None,
+            export_texture: true,
+        }
+    }
+
+    /// Creates a 3D generation spec from an input image buffer.
+    pub fn new_image(image_data: impl Into<Bytes>) -> Self {
+        Self {
+            prompt: None,
+            image_data: Some(image_data.into()),
+            quality: default_3d_quality(),
+            engine_preference: None,
+            export_texture: true,
+        }
+    }
+
+    /// Sets the quality preset ("fast", "standard", "high").
+    pub fn with_quality(mut self, quality: impl Into<String>) -> Self {
+        self.quality = quality.into();
+        self
+    }
+
+    /// Sets the engine preference ("sdf", "triposr", "auto").
+    pub fn with_engine(mut self, engine: impl Into<String>) -> Self {
+        self.engine_preference = Some(engine.into());
+        self
+    }
+
+    /// Sets whether UV textures should be baked and exported.
+    pub fn with_export_texture(mut self, export_texture: bool) -> Self {
+        self.export_texture = export_texture;
+        self
+    }
+}
+
+/// Specification for local automated skeleton rigging and animation synthesis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoRigSpec {
+    /// Input 3D mesh file bytes (glTF/GLB or OBJ binary format).
+    pub input_mesh: Bytes,
+    /// Target skeletal armature preset ("biped", "quadruped", "generic"). Defaults to "biped".
+    pub rig_preset: String,
+    /// Standard animation clips to synthesize and embed in the output glTF asset.
+    pub embed_animations: Vec<String>,
+    /// Preferred auto-rigging backend provider ("builtin", "blender"). Defaults to None ("builtin").
+    pub preferred_provider: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HumanAutoRigSpec {
+    #[serde(with = "bytes_serde")]
+    input_mesh: Bytes,
+    #[serde(default = "default_rig_preset")]
+    rig_preset: String,
+    #[serde(default = "default_embed_animations")]
+    embed_animations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preferred_provider: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BinaryAutoRigSpec {
+    #[serde(with = "bytes_serde")]
+    input_mesh: Bytes,
+    #[serde(default = "default_rig_preset")]
+    rig_preset: String,
+    #[serde(default = "default_embed_animations")]
+    embed_animations: Vec<String>,
+    #[serde(default)]
+    preferred_provider: Option<String>,
+}
+
+impl From<&AutoRigSpec> for HumanAutoRigSpec {
+    fn from(s: &AutoRigSpec) -> Self {
+        Self {
+            input_mesh: s.input_mesh.clone(),
+            rig_preset: s.rig_preset.clone(),
+            embed_animations: s.embed_animations.clone(),
+            preferred_provider: s.preferred_provider.clone(),
+        }
+    }
+}
+
+impl From<HumanAutoRigSpec> for AutoRigSpec {
+    fn from(s: HumanAutoRigSpec) -> Self {
+        Self {
+            input_mesh: s.input_mesh,
+            rig_preset: s.rig_preset,
+            embed_animations: s.embed_animations,
+            preferred_provider: s.preferred_provider,
+        }
+    }
+}
+
+impl From<&AutoRigSpec> for BinaryAutoRigSpec {
+    fn from(s: &AutoRigSpec) -> Self {
+        Self {
+            input_mesh: s.input_mesh.clone(),
+            rig_preset: s.rig_preset.clone(),
+            embed_animations: s.embed_animations.clone(),
+            preferred_provider: s.preferred_provider.clone(),
+        }
+    }
+}
+
+impl From<BinaryAutoRigSpec> for AutoRigSpec {
+    fn from(s: BinaryAutoRigSpec) -> Self {
+        Self {
+            input_mesh: s.input_mesh,
+            rig_preset: s.rig_preset,
+            embed_animations: s.embed_animations,
+            preferred_provider: s.preferred_provider,
+        }
+    }
+}
+
+impl Serialize for AutoRigSpec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            HumanAutoRigSpec::from(self).serialize(serializer)
+        } else {
+            BinaryAutoRigSpec::from(self).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AutoRigSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            HumanAutoRigSpec::deserialize(deserializer).map(Into::into)
+        } else {
+            BinaryAutoRigSpec::deserialize(deserializer).map(Into::into)
+        }
+    }
+}
+
+impl AutoRigSpec {
+    /// Creates an auto-rig spec with the input mesh and specified rig preset.
+    pub fn new(input_mesh: impl Into<Bytes>, rig_preset: impl Into<String>) -> Self {
+        Self {
+            input_mesh: input_mesh.into(),
+            rig_preset: rig_preset.into(),
+            embed_animations: default_embed_animations(),
+            preferred_provider: None,
+        }
+    }
+
+    /// Overrides the animation clips to embed in the output asset.
+    pub fn with_animations(mut self, animations: Vec<String>) -> Self {
+        self.embed_animations = animations;
+        self
+    }
+
+    /// Sets the preferred auto-rigging provider ("builtin", "blender").
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        self.preferred_provider = Some(provider.into());
+        self
+    }
+}
+
 /// Concrete computation payload and execution specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskSpec {
@@ -587,6 +889,10 @@ pub enum TaskSpec {
         should_fail: bool,
         require_gpu: bool,
     },
+    /// Local on-device 3D mesh generation from text prompt or input image.
+    Generative3D(Generative3DSpec),
+    /// Local automated skeleton rigging and animation synthesis for a 3D mesh.
+    AutoRig(AutoRigSpec),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -641,6 +947,10 @@ enum HumanTaskSpec {
         #[serde(default)]
         require_gpu: bool,
     },
+    #[serde(alias = "generative_3d", alias = "generative3d", alias = "3d", alias = "Generative3d")]
+    Generative3D(Generative3DSpec),
+    #[serde(alias = "auto_rig", alias = "autorig", alias = "rig", alias = "Auto_Rig")]
+    AutoRig(AutoRigSpec),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -679,6 +989,8 @@ enum BinaryTaskSpec {
         should_fail: bool,
         require_gpu: bool,
     },
+    Generative3D(Generative3DSpec),
+    AutoRig(AutoRigSpec),
 }
 
 impl From<TaskSpec> for HumanTaskSpec {
@@ -743,6 +1055,8 @@ impl From<TaskSpec> for HumanTaskSpec {
                 should_fail,
                 require_gpu,
             },
+            TaskSpec::Generative3D(s) => HumanTaskSpec::Generative3D(s),
+            TaskSpec::AutoRig(s) => HumanTaskSpec::AutoRig(s),
         }
     }
 }
@@ -809,6 +1123,8 @@ impl From<HumanTaskSpec> for TaskSpec {
                 should_fail,
                 require_gpu,
             },
+            HumanTaskSpec::Generative3D(s) => TaskSpec::Generative3D(s),
+            HumanTaskSpec::AutoRig(s) => TaskSpec::AutoRig(s),
         }
     }
 }
@@ -875,6 +1191,8 @@ impl From<TaskSpec> for BinaryTaskSpec {
                 should_fail,
                 require_gpu,
             },
+            TaskSpec::Generative3D(s) => BinaryTaskSpec::Generative3D(s),
+            TaskSpec::AutoRig(s) => BinaryTaskSpec::AutoRig(s),
         }
     }
 }
@@ -941,6 +1259,8 @@ impl From<BinaryTaskSpec> for TaskSpec {
                 should_fail,
                 require_gpu,
             },
+            BinaryTaskSpec::Generative3D(s) => TaskSpec::Generative3D(s),
+            BinaryTaskSpec::AutoRig(s) => TaskSpec::AutoRig(s),
         }
     }
 }
@@ -1041,6 +1361,44 @@ impl TaskSpec {
         Self::new_builtin_test(test_name, iterations)
     }
 
+    /// Creates a new Generative3D task specification from a text prompt.
+    pub fn new_generative_3d(prompt: impl Into<String>) -> Self {
+        Self::Generative3D(Generative3DSpec::new_prompt(prompt))
+    }
+
+    /// Alias for new_generative_3d.
+    pub fn generative_3d(prompt: impl Into<String>) -> Self {
+        Self::new_generative_3d(prompt)
+    }
+
+    /// Creates a new Generative3D task specification from an input image buffer.
+    pub fn new_generative_3d_image(image_data: impl Into<Bytes>) -> Self {
+        Self::Generative3D(Generative3DSpec::new_image(image_data))
+    }
+
+    /// Creates a new AutoRig task specification from input mesh bytes and a rig preset.
+    pub fn new_auto_rig(input_mesh: impl Into<Bytes>, rig_preset: impl Into<String>) -> Self {
+        Self::AutoRig(AutoRigSpec::new(input_mesh, rig_preset))
+    }
+
+    /// Alias for new_auto_rig.
+    pub fn auto_rig(input_mesh: impl Into<Bytes>, rig_preset: impl Into<String>) -> Self {
+        Self::new_auto_rig(input_mesh, rig_preset)
+    }
+
+    /// Returns the static string descriptor of the task variant type.
+    pub fn task_type(&self) -> &'static str {
+        match self {
+            TaskSpec::Command { .. } => "Command",
+            TaskSpec::ShellScript { .. } => "ShellScript",
+            TaskSpec::RustCompilation { .. } => "RustCompilation",
+            TaskSpec::GpuCompute { .. } => "GpuCompute",
+            TaskSpec::BuiltinTest { .. } => "BuiltinTest",
+            TaskSpec::Generative3D(_) => "Generative3D",
+            TaskSpec::AutoRig(_) => "AutoRig",
+        }
+    }
+
     /// Validates internal consistency of the task specification.
     pub fn validate(&self) -> Result<(), String> {
         match self {
@@ -1072,6 +1430,24 @@ impl TaskSpec {
                 }
             }
             TaskSpec::BuiltinTest { .. } => {}
+            TaskSpec::Generative3D(spec) => {
+                let has_prompt = spec.prompt.as_ref().map(|p| !p.trim().is_empty()).unwrap_or(false);
+                let has_image = spec.image_data.as_ref().map(|img| !img.is_empty()).unwrap_or(false);
+                if !has_prompt && !has_image {
+                    return Err("Generative3D requires at least a non-empty prompt or non-empty image_data".to_string());
+                }
+                if spec.quality.trim().is_empty() {
+                    return Err("Generative3D quality cannot be empty".to_string());
+                }
+            }
+            TaskSpec::AutoRig(spec) => {
+                if spec.input_mesh.is_empty() {
+                    return Err("AutoRig input_mesh cannot be empty".to_string());
+                }
+                if spec.rig_preset.trim().is_empty() {
+                    return Err("AutoRig rig_preset cannot be empty".to_string());
+                }
+            }
         }
         Ok(())
     }
@@ -1081,6 +1457,14 @@ impl TaskSpec {
         match self {
             TaskSpec::GpuCompute { .. } => true,
             TaskSpec::BuiltinTest { require_gpu, .. } => *require_gpu,
+            TaskSpec::Generative3D(spec) => {
+                // Procedural SDF engine runs on CPU; neural or auto engines require GPU
+                match spec.engine_preference.as_deref() {
+                    Some("sdf") | Some("procedural") => false,
+                    _ => true,
+                }
+            }
+            TaskSpec::AutoRig(_) => false,
             _ => false,
         }
     }
@@ -1200,6 +1584,8 @@ pub struct TaskResult {
     pub device_name: Option<String>,
     /// Optional error message if execution or sandboxing encountered an error.
     pub error: Option<String>,
+    /// Optional zero-copy binary asset payload (e.g. glTF 2.0 .glb model).
+    pub asset_bytes: Option<Bytes>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1217,6 +1603,8 @@ struct HumanTaskResult {
     pub device_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, with = "opt_bytes_serde", skip_serializing_if = "Option::is_none")]
+    pub asset_bytes: Option<Bytes>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1232,6 +1620,8 @@ struct BinaryTaskResult {
     pub is_gpu_executed: bool,
     pub device_name: Option<String>,
     pub error: Option<String>,
+    #[serde(default, with = "opt_bytes_serde")]
+    pub asset_bytes: Option<Bytes>,
 }
 
 impl From<&TaskResult> for HumanTaskResult {
@@ -1246,6 +1636,7 @@ impl From<&TaskResult> for HumanTaskResult {
             is_gpu_executed: r.is_gpu_executed,
             device_name: r.device_name.clone(),
             error: r.error.clone(),
+            asset_bytes: r.asset_bytes.clone(),
         }
     }
 }
@@ -1262,6 +1653,7 @@ impl From<HumanTaskResult> for TaskResult {
             is_gpu_executed: h.is_gpu_executed,
             device_name: h.device_name,
             error: h.error,
+            asset_bytes: h.asset_bytes,
         }
     }
 }
@@ -1278,6 +1670,7 @@ impl From<&TaskResult> for BinaryTaskResult {
             is_gpu_executed: r.is_gpu_executed,
             device_name: r.device_name.clone(),
             error: r.error.clone(),
+            asset_bytes: r.asset_bytes.clone(),
         }
     }
 }
@@ -1294,6 +1687,7 @@ impl From<BinaryTaskResult> for TaskResult {
             is_gpu_executed: b.is_gpu_executed,
             device_name: b.device_name,
             error: b.error,
+            asset_bytes: b.asset_bytes,
         }
     }
 }
@@ -1331,6 +1725,22 @@ impl TaskResult {
         self
     }
 
+    /// Attaches an asset binary payload (e.g. generated .glb file) to the result.
+    pub fn with_asset_bytes(mut self, asset_bytes: impl Into<Bytes>) -> Self {
+        self.asset_bytes = Some(asset_bytes.into());
+        self
+    }
+
+    /// Sets or clears the asset binary payload.
+    pub fn set_asset_bytes(&mut self, asset_bytes: Option<Bytes>) {
+        self.asset_bytes = asset_bytes;
+    }
+
+    /// Returns a reference to the asset binary payload if present.
+    pub fn asset_bytes(&self) -> Option<&Bytes> {
+        self.asset_bytes.as_ref()
+    }
+
     /// Returns stdout rendered as a string slice (lossy UTF-8 conversion if necessary).
     #[inline]
     pub fn stdout_str(&self) -> std::borrow::Cow<'_, str> {
@@ -1361,6 +1771,7 @@ impl TaskResult {
             is_gpu_executed,
             device_name: None,
             error: None,
+            asset_bytes: None,
         }
     }
 
@@ -1384,6 +1795,7 @@ impl TaskResult {
             is_gpu_executed: false,
             device_name: None,
             error,
+            asset_bytes: None,
         }
     }
 }
@@ -1906,6 +2318,263 @@ mod tests {
         let decoded_bin: Task = bincode::deserialize(&bin).unwrap();
         assert_eq!(task, decoded_bin);
         assert_eq!(decoded_bin.latest_checkpoint, Some(checkpoint));
+    }
+
+    #[test]
+    fn test_generative_3d_spec_json_roundtrip() {
+        let spec = Generative3DSpec::new_prompt("a cybernetic owl")
+            .with_quality("high")
+            .with_engine("sdf")
+            .with_export_texture(false);
+
+        let task_spec = TaskSpec::Generative3D(spec);
+        let json = serde_json::to_string(&task_spec).expect("JSON serialization failed");
+
+        // Verify JSON contains expected tag and flattened fields
+        assert!(json.contains("\"type\":\"Generative3D\""));
+        assert!(json.contains("\"prompt\":\"a cybernetic owl\""));
+        assert!(json.contains("\"quality\":\"high\""));
+        assert!(json.contains("\"engine_preference\":\"sdf\""));
+        assert!(json.contains("\"export_texture\":false"));
+
+        let decoded: TaskSpec = serde_json::from_str(&json).expect("JSON deserialization failed");
+        assert_eq!(task_spec, decoded);
+    }
+
+    #[test]
+    fn test_generative_3d_spec_bincode_roundtrip() {
+        let spec = Generative3DSpec::new_image(Bytes::copy_from_slice(b"\x89PNG\r\n\x1a\n"))
+            .with_quality("fast");
+        let task_spec = TaskSpec::Generative3D(spec);
+
+        let encoded = bincode::serialize(&task_spec).expect("Bincode serialization failed");
+        let decoded: TaskSpec = bincode::deserialize(&encoded).expect("Bincode deserialization failed");
+        assert_eq!(task_spec, decoded);
+    }
+
+    #[test]
+    fn test_generative_3d_aliases_and_defaults() {
+        let json_minimal = r#"{"type":"3d","prompt":"fantasy sword"}"#;
+        let decoded: TaskSpec = serde_json::from_str(json_minimal).expect("Alias deserialization failed");
+
+        match decoded {
+            TaskSpec::Generative3D(s) => {
+                assert_eq!(s.prompt, Some("fantasy sword".to_string()));
+                assert_eq!(s.quality, "standard");
+                assert_eq!(s.export_texture, true);
+                assert!(s.image_data.is_none());
+                assert!(s.engine_preference.is_none());
+            }
+            _ => panic!("Expected Generative3D variant"),
+        }
+    }
+
+    #[test]
+    fn test_auto_rig_spec_serde_roundtrip() {
+        let mesh_data = Bytes::copy_from_slice(b"glTF binary payload test");
+        let spec = AutoRigSpec::new(mesh_data, "humanoid")
+            .with_provider("builtin");
+
+        let task_spec = TaskSpec::AutoRig(spec);
+
+        // JSON roundtrip
+        let json = serde_json::to_string(&task_spec).unwrap();
+        assert!(json.contains("\"type\":\"AutoRig\""));
+        assert!(json.contains("\"rig_preset\":\"humanoid\""));
+        let decoded_json: TaskSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(task_spec, decoded_json);
+
+        // Bincode roundtrip
+        let bin = bincode::serialize(&task_spec).unwrap();
+        let decoded_bin: TaskSpec = bincode::deserialize(&bin).unwrap();
+        assert_eq!(task_spec, decoded_bin);
+    }
+
+    #[test]
+    fn test_auto_rig_aliases_and_defaults() {
+        let json = r#"{"type":"auto_rig","input_mesh":"Z2xURg=="}"#;
+        let decoded: TaskSpec = serde_json::from_str(json).expect("Deserialization failed");
+        match decoded {
+            TaskSpec::AutoRig(s) => {
+                assert_eq!(s.rig_preset, "biped");
+                assert_eq!(s.embed_animations, vec!["idle", "walk", "turnaround"]);
+                assert!(s.preferred_provider.is_none());
+            }
+            _ => panic!("Expected AutoRig variant"),
+        }
+    }
+
+    #[test]
+    fn test_task_spec_3d_validation() {
+        // Valid prompt
+        assert!(TaskSpec::new_generative_3d("valid prompt").validate().is_ok());
+
+        // Valid image
+        assert!(TaskSpec::new_generative_3d_image(Bytes::from_static(b"image")).validate().is_ok());
+
+        // Invalid: empty prompt and no image
+        let empty_prompt = TaskSpec::Generative3D(Generative3DSpec {
+            prompt: Some("   ".to_string()),
+            image_data: None,
+            quality: "standard".to_string(),
+            engine_preference: None,
+            export_texture: true,
+        });
+        assert!(empty_prompt.validate().is_err());
+
+        // Invalid: AutoRig empty mesh
+        let empty_mesh = TaskSpec::AutoRig(AutoRigSpec::new(Bytes::new(), "biped"));
+        assert!(empty_mesh.validate().is_err());
+
+        // Invalid: AutoRig empty preset
+        let empty_preset = TaskSpec::AutoRig(AutoRigSpec::new(Bytes::from_static(b"mesh"), "  "));
+        assert!(empty_preset.validate().is_err());
+    }
+
+    #[test]
+    fn test_task_spec_3d_requires_gpu() {
+        // Standard / triposr engine requires GPU
+        let gen_gpu = TaskSpec::new_generative_3d("mech");
+        assert!(gen_gpu.requires_gpu());
+
+        // Procedural SDF engine does NOT require GPU (CPU CI safe)
+        let gen_cpu = TaskSpec::Generative3D(
+            Generative3DSpec::new_prompt("cube").with_engine("sdf")
+        );
+        assert!(!gen_cpu.requires_gpu());
+
+        // AutoRig does NOT require GPU
+        let rig = TaskSpec::new_auto_rig(Bytes::from_static(b"mesh"), "biped");
+        assert!(!rig.requires_gpu());
+    }
+
+    #[test]
+    fn test_task_spec_task_type() {
+        assert_eq!(TaskSpec::new_generative_3d("x").task_type(), "Generative3D");
+        assert_eq!(TaskSpec::new_auto_rig(Bytes::new(), "biped").task_type(), "AutoRig");
+        assert_eq!(TaskSpec::new_command("ls", vec![]).task_type(), "Command");
+    }
+
+    #[test]
+    fn test_task_result_asset_bytes_roundtrip() {
+        let wid = Uuid::new_v4();
+        let tid = TaskId::new();
+        let payload = Bytes::copy_from_slice(b"glTF 2.0 binary asset mock");
+
+        let mut res = TaskResult::success(wid, tid, "3D generation complete", 250, true);
+        res = res.with_asset_bytes(payload.clone());
+
+        assert_eq!(res.asset_bytes(), Some(&payload));
+
+        // JSON roundtrip
+        let json = serde_json::to_string(&res).expect("TaskResult JSON serialize failed");
+        let decoded_json: TaskResult = serde_json::from_str(&json).expect("TaskResult JSON deserialize failed");
+        assert_eq!(res, decoded_json);
+
+        // Bincode roundtrip
+        let bin = bincode::serialize(&res).expect("TaskResult Bincode serialize failed");
+        let decoded_bin: TaskResult = bincode::deserialize(&bin).expect("TaskResult Bincode deserialize failed");
+        assert_eq!(res, decoded_bin);
+
+        // Verify None case omits asset_bytes in JSON
+        let res_none = TaskResult::success(wid, tid, "done", 50, false);
+        let json_none = serde_json::to_string(&res_none).unwrap();
+        assert!(!json_none.contains("\"asset_bytes\""));
+    }
+
+    #[test]
+    fn test_task_result_asset_bytes_backward_compat() {
+        let worker_id = Uuid::new_v4();
+        let task_id = TaskId::new();
+
+        // 1. TaskResult::success without asset_bytes
+        let res = TaskResult::success(worker_id, task_id, "build success", 120, false);
+        assert!(res.asset_bytes.is_none());
+
+        // In JSON, asset_bytes = None must be omitted from output
+        let json = serde_json::to_string(&res).expect("serialize legacy TaskResult");
+        assert!(!json.contains("asset_bytes"), "JSON should skip asset_bytes when None: {json}");
+
+        // 2. Deserializing legacy JSON (without asset_bytes field) must yield None
+        let legacy_json = format!(
+            r#"{{"worker_id":"{worker_id}","task_id":"{task_id}","exit_code":0,"stdout":"ok","stderr":"","execution_time_ms":100,"is_gpu_executed":false}}"#
+        );
+        let deser_legacy: TaskResult = serde_json::from_str(&legacy_json).expect("deserialize legacy json");
+        assert_eq!(deser_legacy.asset_bytes, None);
+        assert_eq!(deser_legacy.stdout.as_str(), "ok");
+    }
+
+    #[test]
+    fn test_task_result_zero_copy_subslice_integrity() {
+        // 1 MB binary payload
+        let raw_payload: Vec<u8> = (0..1_000_000).map(|i| (i % 256) as u8).collect();
+        let original_bytes = Bytes::copy_from_slice(&raw_payload);
+
+        let res = TaskResult::success(Uuid::new_v4(), TaskId::new(), "", 10, false)
+            .with_asset_bytes(original_bytes.clone());
+
+        let asset = res.asset_bytes.as_ref().unwrap();
+        assert_eq!(asset.len(), 1_000_000);
+
+        // Subslice first 12 bytes (glTF header)
+        let header = asset.slice(0..12);
+        assert_eq!(header.len(), 12);
+        assert_eq!(header.as_bytes(), &raw_payload[0..12]);
+
+        // Subslice body (offset 12 to 1MB)
+        let body = asset.slice(12..);
+        assert_eq!(body.len(), 999_988);
+        assert_eq!(body.as_bytes(), &raw_payload[12..]);
+
+        // Zero copy verification: memory pointers point into the same allocation
+        let base_ptr = asset.as_bytes().as_ptr();
+        let body_ptr = body.as_bytes().as_ptr();
+        assert_eq!(unsafe { base_ptr.add(12) }, body_ptr);
+    }
+
+    #[test]
+    fn test_task_spec_conversion_parity() {
+        let gen_spec = Generative3DSpec::new_prompt("cyberpunk character")
+            .with_quality("standard")
+            .with_engine("sdf");
+        let rig_spec = AutoRigSpec::new(Bytes::copy_from_slice(b"dummy_mesh_geometry"), "biped");
+
+        let specs = vec![TaskSpec::Generative3D(gen_spec), TaskSpec::AutoRig(rig_spec)];
+
+        for spec in specs {
+            // TaskSpec -> HumanTaskSpec -> TaskSpec parity
+            let human: HumanTaskSpec = spec.clone().into();
+            let from_human: TaskSpec = human.into();
+            assert_eq!(spec, from_human, "HumanTaskSpec From conversion parity failed");
+
+            // TaskSpec -> BinaryTaskSpec -> TaskSpec parity
+            let binary: BinaryTaskSpec = spec.clone().into();
+            let from_binary: TaskSpec = binary.into();
+            assert_eq!(spec, from_binary, "BinaryTaskSpec From conversion parity failed");
+        }
+    }
+
+    #[test]
+    fn test_full_task_3d_roundtrip() {
+        let gen_spec = Generative3DSpec::new_prompt("sci-fi hovercraft")
+            .with_quality("high")
+            .with_engine("auto");
+        let spec = TaskSpec::Generative3D(gen_spec);
+        let reqs = TaskRequirements::gpu(120);
+        let task = Task::new(spec, reqs).with_tags(vec!["3d".into(), "production".into()]);
+
+        // Validation must pass (Generative3D requires GPU, requirements state gpu_required = true)
+        assert!(task.validate().is_ok());
+
+        // JSON roundtrip
+        let json = serde_json::to_string(&task).expect("serialize Task with Generative3D");
+        let deser_task: Task = serde_json::from_str(&json).expect("deserialize Task with Generative3D");
+        assert_eq!(task, deser_task);
+
+        // Bincode roundtrip
+        let bin = bincode::serialize(&task).expect("bincode serialize Task with Generative3D");
+        let deser_bin: Task = bincode::deserialize(&bin).expect("bincode deserialize Task with Generative3D");
+        assert_eq!(task, deser_bin);
     }
 }
 

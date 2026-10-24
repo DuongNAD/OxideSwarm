@@ -284,10 +284,14 @@ impl HubState {
                         "grid_compile",
                         "grid_submit",
                         "grid_status",
+                        "grid_3d_generate",
+                        "grid_auto_rig",
                         "compute",
                         "compile",
                         "status",
-                        "submit"
+                        "submit",
+                        "3d_generate",
+                        "auto_rig"
                     ],
                     "engine": "OxideSwarm Supercomputing Grid",
                     "layer": 1,

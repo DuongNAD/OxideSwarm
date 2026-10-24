@@ -78,6 +78,13 @@ pub struct WorkerHardwareConfig {
     pub no_gpu: Option<bool>,
     pub simulate_gpu: Option<bool>,
     pub gpu_name: Option<String>,
+    pub blender: Option<bool>,
+    pub no_blender: Option<bool>,
+    pub blender_path: Option<String>,
+    pub blender_version: Option<String>,
+    pub vram_mb: Option<u64>,
+    pub cuda: Option<bool>,
+    pub no_cuda: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -95,6 +102,13 @@ pub struct WorkerFileConfig {
     pub no_gpu: Option<bool>,
     pub simulate_gpu: Option<bool>,
     pub gpu_name: Option<String>,
+    pub blender: Option<bool>,
+    pub no_blender: Option<bool>,
+    pub blender_path: Option<String>,
+    pub blender_version: Option<String>,
+    pub vram_mb: Option<u64>,
+    pub cuda: Option<bool>,
+    pub no_cuda: Option<bool>,
     pub wire_codec: Option<String>,
     #[serde(default)]
     pub hardware: Option<WorkerHardwareConfig>,

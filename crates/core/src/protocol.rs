@@ -392,6 +392,7 @@ pub enum WorkerMessage {
         is_gpu_executed: bool,
         device_name: Option<String>,
         error: Option<String>,
+        asset_bytes: Option<TaskBytes>,
     },
     /// Incremental computational snapshot checkpoint emitted during task execution.
     Checkpoint {
@@ -453,6 +454,8 @@ enum HumanWorkerMessage {
         device_name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        #[serde(default, with = "crate::task::opt_bytes_serde", skip_serializing_if = "Option::is_none")]
+        asset_bytes: Option<TaskBytes>,
     },
     Checkpoint {
         task_id: TaskId,
@@ -561,6 +564,8 @@ enum LegacyBinaryWorkerMessage {
         is_gpu_executed: bool,
         device_name: Option<String>,
         error: Option<String>,
+        #[serde(default, with = "crate::task::opt_bytes_serde")]
+        asset_bytes: Option<TaskBytes>,
     },
     Checkpoint {
         task_id: TaskId,
@@ -707,6 +712,7 @@ impl From<WorkerMessage> for HumanWorkerMessage {
                 is_gpu_executed,
                 device_name,
                 error,
+                asset_bytes,
             } => HumanWorkerMessage::TaskResult {
                 worker_id,
                 task_id,
@@ -717,6 +723,7 @@ impl From<WorkerMessage> for HumanWorkerMessage {
                 is_gpu_executed,
                 device_name,
                 error,
+                asset_bytes,
             },
             WorkerMessage::Checkpoint {
                 task_id,
@@ -794,6 +801,7 @@ impl From<HumanWorkerMessage> for WorkerMessage {
                 is_gpu_executed,
                 device_name,
                 error,
+                asset_bytes,
             } => WorkerMessage::TaskResult {
                 worker_id,
                 task_id,
@@ -804,6 +812,7 @@ impl From<HumanWorkerMessage> for WorkerMessage {
                 is_gpu_executed,
                 device_name,
                 error,
+                asset_bytes,
             },
             HumanWorkerMessage::Checkpoint {
                 task_id,
@@ -881,6 +890,7 @@ impl From<WorkerMessage> for BinaryWorkerMessage {
                 is_gpu_executed,
                 device_name,
                 error,
+                asset_bytes,
             } => BinaryWorkerMessage::TaskResult {
                 worker_id,
                 task_id,
@@ -891,6 +901,7 @@ impl From<WorkerMessage> for BinaryWorkerMessage {
                 is_gpu_executed,
                 device_name,
                 error,
+                asset_bytes,
             },
             WorkerMessage::Checkpoint {
                 task_id,
@@ -968,6 +979,7 @@ impl From<BinaryWorkerMessage> for WorkerMessage {
                 is_gpu_executed,
                 device_name,
                 error,
+                asset_bytes,
             } => WorkerMessage::TaskResult {
                 worker_id,
                 task_id,
@@ -978,6 +990,7 @@ impl From<BinaryWorkerMessage> for WorkerMessage {
                 is_gpu_executed,
                 device_name,
                 error,
+                asset_bytes,
             },
             BinaryWorkerMessage::Checkpoint {
                 task_id,
@@ -1082,6 +1095,7 @@ impl From<TaskResult> for WorkerMessage {
             is_gpu_executed: r.is_gpu_executed,
             device_name: r.device_name,
             error: r.error,
+            asset_bytes: r.asset_bytes,
         }
     }
 }
@@ -2779,7 +2793,9 @@ impl<W: AsyncWrite + Unpin> MessageWriter<W> {
 mod tests {
     use super::*;
     use crate::capabilities::WorkerCapabilities;
-    use crate::task::{Task, TaskId, TaskRequirements, TaskSpec, TaskStatus};
+    use crate::task::{
+        Generative3DSpec, Task, TaskId, TaskRequirements, TaskResult, TaskSpec, TaskStatus,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -2799,6 +2815,7 @@ mod tests {
                     gpu_device_name: Some("Simulated M1 GPU".into()),
                     tags: vec!["fast".into()],
                     mobile: None,
+                    ..Default::default()
                 },
                 protocol_version: PROTOCOL_VERSION_CURRENT,
                 features: ProtocolCapabilities::all_supported(),
@@ -2825,6 +2842,7 @@ mod tests {
                 is_gpu_executed: true,
                 device_name: Some("Simulated M1 GPU".into()),
                 error: None,
+                asset_bytes: None,
             },
             WorkerMessage::Checkpoint {
                 task_id,
@@ -2974,6 +2992,7 @@ mod tests {
                 gpu_device_name: None,
                 tags: vec![],
                 mobile: None,
+                ..Default::default()
             },
             protocol_version: PROTOCOL_VERSION_CURRENT,
             features: ProtocolCapabilities::all_supported(),

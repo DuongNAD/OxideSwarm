@@ -271,6 +271,13 @@ impl WorkerConfig {
             no_gpu: false,
             simulate_gpu: false,
             gpu_name: None,
+            blender: None,
+            no_blender: false,
+            blender_path: None,
+            blender_version: None,
+            vram_mb: None,
+            cuda: None,
+            no_cuda: false,
             max_concurrency: None,
             process_priority: None,
             default_heartbeat_interval: Duration::from_secs(3),
@@ -363,6 +370,41 @@ impl WorkerConfig {
 
     pub fn with_gpu_name(mut self, name: impl Into<String>) -> Self {
         self.gpu_name = Some(name.into());
+        self
+    }
+
+    pub fn with_blender(mut self, blender: bool) -> Self {
+        self.blender = Some(blender);
+        self
+    }
+
+    pub fn with_no_blender(mut self, no_blender: bool) -> Self {
+        self.no_blender = no_blender;
+        self
+    }
+
+    pub fn with_blender_path(mut self, path: impl Into<String>) -> Self {
+        self.blender_path = Some(path.into());
+        self
+    }
+
+    pub fn with_blender_version(mut self, version: impl Into<String>) -> Self {
+        self.blender_version = Some(version.into());
+        self
+    }
+
+    pub fn with_vram_mb(mut self, vram_mb: u64) -> Self {
+        self.vram_mb = Some(vram_mb);
+        self
+    }
+
+    pub fn with_cuda(mut self, cuda: bool) -> Self {
+        self.cuda = Some(cuda);
+        self
+    }
+
+    pub fn with_no_cuda(mut self, no_cuda: bool) -> Self {
+        self.no_cuda = no_cuda;
         self
     }
 
@@ -721,6 +763,13 @@ impl WorkerClient {
             no_gpu: config.no_gpu,
             simulate_gpu: config.simulate_gpu,
             gpu_name: config.gpu_name.clone(),
+            blender: config.blender,
+            no_blender: config.no_blender,
+            blender_path: config.blender_path.clone(),
+            blender_version: config.blender_version.clone(),
+            vram_mb: config.vram_mb,
+            cuda: config.cuda,
+            no_cuda: config.no_cuda,
         };
         let mut capabilities =
             WorkerCapabilities::detect_with_overrides(overrides).with_tags(config.tags.clone());

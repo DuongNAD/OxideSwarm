@@ -77,6 +77,12 @@ pub struct SchedulerConfig {
     pub mobile_min_battery_pct: u8,
     /// Maximum host CPU usage percentage before anti-stuttering backpressure rejects assignments (default: 85.0).
     pub max_host_cpu_pct: f32,
+    /// Minimum VRAM in MB required for "fast" quality 3D neural generation (default: 2048 MB).
+    pub min_vram_fast_mb: u64,
+    /// Minimum VRAM in MB required for "standard" quality 3D neural generation (default: 4096 MB).
+    pub min_vram_standard_mb: u64,
+    /// Minimum VRAM in MB required for "high" quality 3D neural generation (default: 6144 MB).
+    pub min_vram_high_mb: u64,
     /// Fallback periodic tick interval for the scheduling loop (default: 100ms).
     pub tick_interval: Duration,
     /// Micro-batch accumulation debounce window during burst submissions (default: 5ms).
@@ -101,6 +107,9 @@ impl Default for SchedulerConfig {
             fail_unfulfillable_tasks: false,
             mobile_min_battery_pct: 15,
             max_host_cpu_pct: 85.0,
+            min_vram_fast_mb: 2048,
+            min_vram_standard_mb: 4096,
+            min_vram_high_mb: 6144,
             tick_interval: Duration::from_millis(100),
             micro_batch_window: Duration::from_millis(5),
             max_batch_size: 128,
@@ -118,6 +127,23 @@ impl SchedulerConfig {
         match self.max_tasks_per_worker {
             Some(cap) => limit.min(cap),
             None => limit,
+        }
+    }
+
+    /// Determines the required VRAM in MB for a given task.
+    pub fn required_vram_mb(&self, task: &Task) -> u64 {
+        match &task.spec {
+            TaskSpec::Generative3D(spec) => {
+                match spec.engine_preference.as_deref() {
+                    Some("sdf") | Some("procedural") => 0,
+                    _ => match spec.quality.as_str() {
+                        "fast" => self.min_vram_fast_mb,
+                        "high" => self.min_vram_high_mb,
+                        _ => self.min_vram_standard_mb,
+                    },
+                }
+            }
+            _ => 0,
         }
     }
 

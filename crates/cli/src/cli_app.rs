@@ -15,9 +15,10 @@
 //! `--listen`), the dashboard is 8080.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use tokio::net::TcpStream;
@@ -344,6 +345,27 @@ pub struct WorkerArgs {
     #[arg(long, help = "Human-readable GPU device model string")]
     pub gpu_name: Option<String>,
 
+    #[arg(long, help = "Explicitly advertise Blender capability")]
+    pub blender: bool,
+
+    #[arg(long, help = "Explicitly disable Blender capability")]
+    pub no_blender: bool,
+
+    #[arg(long, help = "Path to Blender executable")]
+    pub blender_path: Option<String>,
+
+    #[arg(long, help = "Blender version string override")]
+    pub blender_version: Option<String>,
+
+    #[arg(long, help = "GPU VRAM in Megabytes override")]
+    pub vram_mb: Option<u64>,
+
+    #[arg(long, help = "Explicitly advertise CUDA capability")]
+    pub cuda: bool,
+
+    #[arg(long, help = "Explicitly disable CUDA capability")]
+    pub no_cuda: bool,
+
     #[arg(
         long,
         alias = "max-concurrent-tasks",
@@ -428,6 +450,93 @@ pub struct SubmitArgs {
 
     #[arg(long, help = "Format output as JSON")]
     pub json: bool,
+
+    // =========================================================================
+    // 3D Generation Flags (Feature F19)
+    // =========================================================================
+    #[arg(
+        long,
+        help = "Text prompt for 3D mesh generation (e.g. 'a low-poly chest')"
+    )]
+    pub prompt: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "IMAGE_PATH",
+        help = "Input image file path (PNG, JPEG, WebP) for image-to-3D mesh reconstruction"
+    )]
+    pub image: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "QUALITY",
+        help = "3D generation quality preset: fast, standard, high (default: standard)"
+    )]
+    pub quality: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "ENGINE",
+        help = "Preferred 3D generation engine: sdf, triposr, auto (default: auto)"
+    )]
+    pub engine: Option<String>,
+
+    #[arg(
+        long = "export-texture",
+        action = clap::ArgAction::SetTrue,
+        help = "Bake and export PBR UV texture maps into output glTF asset (default: true)"
+    )]
+    pub export_texture: bool,
+
+    #[arg(
+        long = "no-export-texture",
+        action = clap::ArgAction::SetTrue,
+        help = "Disable texture map generation and export untextured mesh"
+    )]
+    pub no_export_texture: bool,
+
+    // =========================================================================
+    // Automated Rigging & Animation Flags (Feature F19)
+    // =========================================================================
+    #[arg(
+        long = "input-mesh",
+        value_name = "MESH_PATH",
+        help = "Input 3D mesh file path (glTF/GLB or Wavefront OBJ) for automated rigging"
+    )]
+    pub input_mesh: Option<PathBuf>,
+
+    #[arg(
+        long = "rig-preset",
+        value_name = "PRESET",
+        help = "Target skeletal armature preset: biped, quadruped, generic (default: biped)"
+    )]
+    pub rig_preset: Option<String>,
+
+    #[arg(
+        long = "embed-animations",
+        value_name = "ANIMATIONS",
+        value_delimiter = ',',
+        help = "Comma-separated list of animation clips to embed (e.g. idle,walk,turnaround)"
+    )]
+    pub embed_animations: Vec<String>,
+
+    #[arg(
+        long = "preferred-provider",
+        value_name = "PROVIDER",
+        help = "Preferred auto-rigging provider: builtin, blender (default: builtin)"
+    )]
+    pub preferred_provider: Option<String>,
+
+    // =========================================================================
+    // Asset Export Flag (Feature F19)
+    // =========================================================================
+    #[arg(
+        short = 'o',
+        long = "output",
+        value_name = "OUTPUT_PATH",
+        help = "Destination file path to write generated or rigged glTF 2.0 binary asset (.glb)"
+    )]
+    pub output: Option<PathBuf>,
 
     #[arg(last = true, help = "Command arguments (trailing args after --)")]
     pub args: Vec<String>,
@@ -1055,6 +1164,73 @@ async fn run_worker(
             .or_else(|| hw_cfg.as_ref().and_then(|h| h.gpu_name.clone())),
     );
 
+    let blender = resolve_opt_field(
+        if args.blender { Some(true) } else { None },
+        &["RUSTY_GRID_BLENDER", "RUSTY_GRID_ENABLE_BLENDER"],
+        worker_cfg
+            .as_ref()
+            .and_then(|w| w.blender)
+            .or_else(|| hw_cfg.as_ref().and_then(|h| h.blender)),
+        |s| s.parse().ok(),
+    );
+
+    let no_blender = resolve_bool(
+        if args.no_blender { Some(true) } else { None },
+        &["RUSTY_GRID_NO_BLENDER", "RUSTY_GRID_DISABLE_BLENDER"],
+        worker_cfg
+            .as_ref()
+            .and_then(|w| w.no_blender)
+            .or_else(|| hw_cfg.as_ref().and_then(|h| h.no_blender)),
+        false,
+    );
+
+    let blender_path = resolve_opt_string(
+        args.blender_path,
+        &["RUSTY_GRID_BLENDER_PATH"],
+        worker_cfg
+            .as_ref()
+            .and_then(|w| w.blender_path.clone())
+            .or_else(|| hw_cfg.as_ref().and_then(|h| h.blender_path.clone())),
+    );
+
+    let blender_version = resolve_opt_string(
+        args.blender_version,
+        &["RUSTY_GRID_BLENDER_VERSION"],
+        worker_cfg
+            .as_ref()
+            .and_then(|w| w.blender_version.clone())
+            .or_else(|| hw_cfg.as_ref().and_then(|h| h.blender_version.clone())),
+    );
+
+    let vram_mb = resolve_opt_u64(
+        args.vram_mb,
+        &["RUSTY_GRID_VRAM_MB", "RUSTY_GRID_GPU_VRAM_MB"],
+        worker_cfg
+            .as_ref()
+            .and_then(|w| w.vram_mb)
+            .or_else(|| hw_cfg.as_ref().and_then(|h| h.vram_mb)),
+    );
+
+    let cuda = resolve_opt_field(
+        if args.cuda { Some(true) } else { None },
+        &["RUSTY_GRID_CUDA", "RUSTY_GRID_ENABLE_CUDA"],
+        worker_cfg
+            .as_ref()
+            .and_then(|w| w.cuda)
+            .or_else(|| hw_cfg.as_ref().and_then(|h| h.cuda)),
+        |s| s.parse().ok(),
+    );
+
+    let no_cuda = resolve_bool(
+        if args.no_cuda { Some(true) } else { None },
+        &["RUSTY_GRID_NO_CUDA", "RUSTY_GRID_DISABLE_CUDA"],
+        worker_cfg
+            .as_ref()
+            .and_then(|w| w.no_cuda)
+            .or_else(|| hw_cfg.as_ref().and_then(|h| h.no_cuda)),
+        false,
+    );
+
     let max_concurrency = resolve_opt_usize(
         args.max_concurrency,
         &[
@@ -1139,6 +1315,27 @@ async fn run_worker(
     }
     if let Some(gn) = gpu_name {
         config = config.with_gpu_name(gn);
+    }
+    if let Some(b) = blender {
+        config = config.with_blender(b);
+    }
+    if no_blender {
+        config = config.with_no_blender(true);
+    }
+    if let Some(bp) = blender_path {
+        config = config.with_blender_path(bp);
+    }
+    if let Some(bv) = blender_version {
+        config = config.with_blender_version(bv);
+    }
+    if let Some(vram) = vram_mb {
+        config = config.with_vram_mb(vram);
+    }
+    if let Some(c) = cuda {
+        config = config.with_cuda(c);
+    }
+    if no_cuda {
+        config = config.with_no_cuda(true);
     }
     if let Some(mc) = max_concurrency {
         config = config.with_max_concurrency(mc);
@@ -1457,9 +1654,10 @@ async fn run_submit(
     };
 
     let task = Task::new(spec, requirements);
+    let should_wait = args.wait || args.output.is_some();
     let submit_msg = ClientMessage::SubmitTask {
         task,
-        wait: args.wait,
+        wait: should_wait,
     };
 
     let response = match exchange(

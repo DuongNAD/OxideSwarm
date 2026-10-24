@@ -42,6 +42,7 @@ fn make_test_runner(has_gpu: bool, is_simulated: bool) -> (TaskRunner, tempfile:
         },
         tags: vec!["challenger_m4".into()],
         mobile: None,
+        ..Default::default()
     };
     let cfg = RunnerConfig::new(SandboxConfig::new(tmp.path()));
     let runner = TaskRunner::new(Uuid::new_v4(), caps, cfg);

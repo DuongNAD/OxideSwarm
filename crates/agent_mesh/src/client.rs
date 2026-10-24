@@ -473,6 +473,116 @@ impl AgentMeshClient {
         self.send_command("grid", "grid_status", args, timeout_ms.or(Some(5000))).await
     }
 
+    /// Submits a distributed 3D generative task to the OxideSwarm Grid.
+    pub async fn generate_3d(
+        &self,
+        prompt: Option<&str>,
+        image_bytes: Option<&[u8]>,
+        quality: Option<&str>,
+        engine: Option<&str>,
+        export_texture: Option<bool>,
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentMeshEnvelope, Box<dyn std::error::Error + Send + Sync>> {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        let mut args = serde_json::json!({
+            "quality": quality.unwrap_or("standard"),
+            "engine": engine.unwrap_or("auto"),
+            "export_texture": export_texture.unwrap_or(true),
+        });
+
+        if let Some(p) = prompt {
+            args["prompt"] = serde_json::json!(p);
+        }
+        if let Some(img) = image_bytes {
+            args["image"] = serde_json::json!(STANDARD.encode(img));
+        }
+
+        self.send_command("grid", "grid_3d_generate", args, timeout_ms.or(Some(60000))).await
+    }
+
+    /// Convenience method to generate 3D asset from a text prompt.
+    pub async fn generate_3d_from_prompt(
+        &self,
+        prompt: &str,
+        quality: Option<&str>,
+        engine: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentMeshEnvelope, Box<dyn std::error::Error + Send + Sync>> {
+        self.generate_3d(Some(prompt), None, quality, engine, None, timeout_ms).await
+    }
+
+    /// Convenience method to generate 3D asset from an image.
+    pub async fn generate_3d_from_image(
+        &self,
+        image_bytes: &[u8],
+        quality: Option<&str>,
+        engine: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentMeshEnvelope, Box<dyn std::error::Error + Send + Sync>> {
+        self.generate_3d(None, Some(image_bytes), quality, engine, None, timeout_ms).await
+    }
+
+    /// Submits an AutoRig task to the OxideSwarm Grid.
+    pub async fn auto_rig(
+        &self,
+        input_mesh: &[u8],
+        rig_preset: Option<&str>,
+        embed_animations: Option<Vec<String>>,
+        preferred_provider: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentMeshEnvelope, Box<dyn std::error::Error + Send + Sync>> {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        let mut args = serde_json::json!({
+            "input_mesh": STANDARD.encode(input_mesh),
+            "rig_preset": rig_preset.unwrap_or("biped"),
+            "embed_animations": embed_animations.unwrap_or_default(),
+        });
+        if let Some(p) = preferred_provider {
+            args["preferred_provider"] = serde_json::json!(p);
+        }
+
+        self.send_command("grid", "grid_auto_rig", args, timeout_ms.or(Some(60000))).await
+    }
+
+    /// Extracts and cryptographically verifies binary asset bytes from a CommandResponse envelope.
+    pub fn extract_asset_bytes(
+        envelope: &AgentMeshEnvelope,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        match envelope {
+            AgentMeshEnvelope::CommandResponse {
+                payload: Some(payload),
+                status,
+                ..
+            } => {
+                if status != "success" {
+                    return Err(format!("Command response status is '{status}', expected 'success'").into());
+                }
+                let b64_str = payload
+                    .get("asset_base64")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Payload does not contain 'asset_base64'")?;
+                let bytes = STANDARD.decode(b64_str)?;
+                if let Some(expected_sha) = payload.get("asset_sha256").and_then(|v| v.as_str()) {
+                    if !verify_sha256(&bytes, expected_sha) {
+                        return Err(format!(
+                            "Asset SHA-256 verification failed: expected {expected_sha}, got {}",
+                            compute_sha256(&bytes)
+                        ).into());
+                    }
+                }
+                Ok(bytes)
+            }
+            _ => Err("Envelope is not a CommandResponse with payload".into()),
+        }
+    }
+
     pub async fn send_envelope(
         &self,
         envelope: AgentMeshEnvelope,

@@ -48,6 +48,7 @@ fn make_capabilities(name: &str, cores: usize, has_gpu: bool, is_simulated: bool
         },
         tags: vec!["m4_test".into()],
         mobile: None,
+        ..Default::default()
     }
 }
 

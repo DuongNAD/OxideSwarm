@@ -625,6 +625,7 @@ impl TaskRunner {
                     is_gpu_executed: false,
                     device_name: None,
                     error: Some("Worker lacks GPU capability".to_string()),
+                    asset_bytes: None,
                 };
             }
         }
@@ -693,6 +694,34 @@ impl TaskRunner {
                     source_files,
                     compiler_flags,
                     target_dir.as_ref(),
+                    timeout_duration,
+                    child_pid,
+                    cancel_rx,
+                    start_time,
+                )
+                .await
+            }
+
+            TaskSpec::Generative3D(spec) => {
+                self.execute_generative_3d_workload(
+                    task,
+                    spec,
+                    checkpoint,
+                    checkpoint_tx,
+                    timeout_duration,
+                    child_pid,
+                    cancel_rx,
+                    start_time,
+                )
+                .await
+            }
+
+            TaskSpec::AutoRig(ref spec) => {
+                self.execute_auto_rig_workload(
+                    task,
+                    spec,
+                    checkpoint,
+                    checkpoint_tx,
                     timeout_duration,
                     child_pid,
                     cancel_rx,
@@ -1427,6 +1456,615 @@ impl TaskRunner {
         res
     }
 
+    /// Executes a `TaskSpec::Generative3D` workload via Tier 0 (SDF) or Tier 1 (Subprocess).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_generative_3d_workload(
+        &self,
+        task: &Task,
+        spec: &rusty_grid_core::task::Generative3DSpec,
+        _checkpoint: Option<&CheckpointData>,
+        checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
+        timeout: Duration,
+        child_pid: Option<Arc<AtomicU32>>,
+        mut cancel_rx: Option<oneshot::Receiver<String>>,
+        start_time: Instant,
+    ) -> TaskResult {
+        let pref = spec.engine_preference.as_deref().unwrap_or("auto").to_lowercase();
+
+        // 1. If explicit SDF requested, execute Tier 0 directly in-process (< 50ms)
+        if pref == "sdf" {
+            info!(task_id = %task.id, "Executing Tier 0 Procedural SDF engine");
+            return self.execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time).await;
+        }
+
+        // 2. Check for Python & Entrypoint availability
+        let py_bin = crate::gen3d::runner::resolve_python_runtime();
+        let script = crate::gen3d::runner::resolve_entrypoint_script();
+
+        if py_bin.is_none() || script.is_none() {
+            if pref == "auto" {
+                info!(task_id = %task.id, "Local Python 3D engine not found; degrading gracefully to Tier 0 SDF");
+                return self.execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time).await;
+            } else {
+                return TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    Bytes::new(),
+                    Bytes::from_static(b"Local 3D engine script or Python runtime not found"),
+                    start_time.elapsed().as_millis() as u64,
+                    Some("Missing Python or engines/generative_3d/entrypoint.py".to_string()),
+                );
+            }
+        }
+
+        let py_bin = py_bin.unwrap();
+        let script = script.unwrap();
+
+        // 3. Create isolated sandbox workspace
+        let mut sandbox = match Sandbox::create(&self.config.sandbox_config, task.id).await {
+            Ok(s) => s,
+            Err(e) => {
+                return TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    Bytes::new(),
+                    format!("Failed to create 3D task sandbox: {e}"),
+                    start_time.elapsed().as_millis() as u64,
+                    Some(format!("Sandbox error: {e}")),
+                );
+            }
+        };
+
+        // 4. Stage input assets into sandbox
+        let mut cmd_args = Vec::new();
+        cmd_args.push(script.to_string_lossy().to_string());
+
+        if let Some(ref img_bytes) = spec.image_data {
+            let input_img_path = sandbox.path().join("input_concept.png");
+            if let Err(e) = tokio::fs::write(&input_img_path, img_bytes.as_slice()).await {
+                let _ = sandbox.destroy().await;
+                return TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    Bytes::new(),
+                    format!("Failed to write input image to sandbox: {e}"),
+                    start_time.elapsed().as_millis() as u64,
+                    Some(format!("I/O error: {e}")),
+                );
+            }
+            cmd_args.push("--input".to_string());
+            cmd_args.push(input_img_path.to_string_lossy().to_string());
+        }
+
+        if let Some(ref prompt) = spec.prompt {
+            cmd_args.push("--prompt".to_string());
+            cmd_args.push(prompt.clone());
+        }
+
+        let output_glb_path = sandbox.path().join("output_model.glb");
+        cmd_args.push("--output".to_string());
+        cmd_args.push(output_glb_path.to_string_lossy().to_string());
+
+        // Device Selection
+        let device = if self.capabilities.has_cuda {
+            "cuda:0"
+        } else {
+            "cpu"
+        };
+        cmd_args.push("--device".to_string());
+        cmd_args.push(device.to_string());
+
+        cmd_args.push("--quality".to_string());
+        cmd_args.push(spec.quality.clone());
+
+        if spec.export_texture {
+            cmd_args.push("--export-texture".to_string());
+        } else {
+            cmd_args.push("--no-texture".to_string());
+        }
+
+        cmd_args.push("--offline".to_string());
+
+        // 5. Initialize Win32 Job Object for kernel process tree supervision
+        let mut job_object = match crate::job_object::JobObject::create() {
+            Ok(job) => Some(job),
+            Err(e) => {
+                warn!("Failed to create Win32 Job Object (falling back to standard supervision): {e}");
+                None
+            }
+        };
+
+        // 6. Build Tokio Command
+        let mut cmd = tokio::process::Command::new(&py_bin);
+        cmd.args(&cmd_args);
+        cmd.current_dir(sandbox.path());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.stdin(std::process::Stdio::null());
+        cmd.kill_on_drop(true);
+
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+
+        cmd.env("HF_HUB_OFFLINE", "1");
+        cmd.env("TRANSFORMERS_OFFLINE", "1");
+        cmd.env("RUSTY_GRID_TASK_ID", task.id.to_string());
+        cmd.env("RUSTY_GRID_WORKER_ID", self.worker_id.to_string());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = sandbox.destroy().await;
+                if pref == "auto" {
+                    info!(task_id = %task.id, "Failed to spawn Python process ({e}); degrading gracefully to Tier 0 SDF");
+                    return self.execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time).await;
+                }
+                return TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    Bytes::new(),
+                    format!("Failed to spawn 3D engine subprocess: {e}"),
+                    start_time.elapsed().as_millis() as u64,
+                    Some(format!("Spawn error: {e}")),
+                );
+            }
+        };
+
+        if let Some(pid) = child.id() {
+            if let Some(ref holder) = child_pid {
+                holder.store(pid, Ordering::Release);
+            }
+            if let Some(ref mut job) = job_object {
+                let _ = job.assign_pid(pid);
+            }
+        }
+
+        // 7. Supervised execution with streaming stdout, stderr, and cancellation
+        let child_stdout = child.stdout.take();
+        let child_stderr = child.stderr.take();
+        let max_output = self.config.max_output_bytes;
+
+        let stdout_fut = async move {
+            if let Some(pipe) = child_stdout {
+                read_bounded_stream(pipe, max_output).await
+            } else {
+                (Bytes::new(), false)
+            }
+        };
+
+        let stderr_fut = async move {
+            if let Some(pipe) = child_stderr {
+                read_bounded_stream(pipe, max_output).await
+            } else {
+                (Bytes::new(), false)
+            }
+        };
+
+        let execution_fut = async {
+            let ((stdout_bytes, _), (stderr_bytes, _), status_res) =
+                tokio::join!(stdout_fut, stderr_fut, child.wait());
+            (stdout_bytes, stderr_bytes, status_res)
+        };
+
+        let result = tokio::select! {
+            (stdout_bytes, stderr_bytes, status_res) = execution_fut => {
+                let elapsed = start_time.elapsed().as_millis() as u64;
+
+                // Process progress checkpoints from stdout if checkpoint_tx provided
+                if let Some(ref tx) = checkpoint_tx {
+                    let stdout_str = String::from_utf8_lossy(stdout_bytes.as_slice());
+                    let mut seq = 1u64;
+                    for line in stdout_str.lines() {
+                        if let Some((frac, msg)) = crate::gen3d::runner::parse_progress_marker(line) {
+                            let delta = serde_json::json!({
+                                "progress": frac,
+                                "message": msg,
+                                "stage": "generative_3d",
+                            });
+                            let _ = tx.send(WorkerMessage::Checkpoint {
+                                task_id: task.id,
+                                sequence: seq,
+                                delta_state: Bytes::from(delta.to_string().into_bytes()),
+                            }).await;
+                            seq += 1;
+                        }
+                    }
+                }
+
+                match status_res {
+                    Ok(status) if status.success() => {
+                        if output_glb_path.is_file() {
+                            match tokio::fs::read(&output_glb_path).await {
+                                Ok(data) => {
+                                    if data.len() >= 12 && &data[0..4] == b"glTF" {
+                                        let asset_bytes = Bytes::from(data);
+                                        let mut res = TaskResult::success(
+                                            self.worker_id,
+                                            task.id,
+                                            stdout_bytes,
+                                            elapsed,
+                                            self.capabilities.has_cuda,
+                                        );
+                                        res.stderr = stderr_bytes;
+                                        res = res.with_asset_bytes(asset_bytes);
+                                        res = res.with_device_name(if self.capabilities.has_cuda { "TripoSR-CUDA" } else { "TripoSR-CPU" });
+                                        res
+                                    } else {
+                                        TaskResult::failure(
+                                            self.worker_id,
+                                            task.id,
+                                            EXIT_CODE_GENERAL_ERROR,
+                                            stdout_bytes,
+                                            stderr_bytes,
+                                            elapsed,
+                                            Some("Generated .glb file has invalid glTF 2.0 header".to_string()),
+                                        )
+                                    }
+                                }
+                                Err(e) => {
+                                    TaskResult::failure(
+                                        self.worker_id,
+                                        task.id,
+                                        EXIT_CODE_GENERAL_ERROR,
+                                        stdout_bytes,
+                                        stderr_bytes,
+                                        elapsed,
+                                        Some(format!("Failed to read generated .glb asset: {e}")),
+                                    )
+                                }
+                            }
+                        } else if pref == "auto" {
+                            warn!("Subprocess exited 0 but output.glb missing; falling back to Tier 0 SDF");
+                            self.execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time).await
+                        } else {
+                            TaskResult::failure(
+                                self.worker_id,
+                                task.id,
+                                EXIT_CODE_GENERAL_ERROR,
+                                stdout_bytes,
+                                stderr_bytes,
+                                elapsed,
+                                Some("Subprocess succeeded but output_model.glb was not produced".to_string()),
+                            )
+                        }
+                    }
+                    Ok(status) => {
+                        let code = status.code().unwrap_or(EXIT_CODE_GENERAL_ERROR);
+                        if pref == "auto" {
+                            warn!("Tier 1 engine exited with error code {code}; falling back to Tier 0 SDF");
+                            self.execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time).await
+                        } else {
+                            TaskResult::failure(
+                                self.worker_id,
+                                task.id,
+                                code,
+                                stdout_bytes,
+                                stderr_bytes,
+                                elapsed,
+                                Some(format!("3D engine subprocess failed with exit code {code}")),
+                            )
+                        }
+                    }
+                    Err(e) => {
+                        TaskResult::failure(
+                            self.worker_id,
+                            task.id,
+                            EXIT_CODE_GENERAL_ERROR,
+                            stdout_bytes,
+                            stderr_bytes,
+                            elapsed,
+                            Some(format!("Process wait error: {e}")),
+                        )
+                    }
+                }
+            }
+
+            cancel_msg = async {
+                if let Some(ref mut rx) = cancel_rx {
+                    rx.await.ok()
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                info!(task_id = %task.id, "Cancelling 3D engine subprocess");
+                if let Some(ref job) = job_object {
+                    let _ = job.terminate(EXIT_CODE_CANCELLED as u32);
+                } else if let Some(pid) = child.id() {
+                    Self::terminate_process_tree(pid);
+                }
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let elapsed = start_time.elapsed().as_millis() as u64;
+                let reason = cancel_msg.unwrap_or_else(|| "Task cancelled by master".to_string());
+                TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_CANCELLED,
+                    Bytes::new(),
+                    Bytes::new(),
+                    elapsed,
+                    Some(format!("Cancelled: {reason}")),
+                )
+            }
+
+            _ = tokio::time::sleep(timeout) => {
+                warn!(task_id = %task.id, "3D engine subprocess timed out after {}s", timeout.as_secs());
+                if let Some(ref job) = job_object {
+                    let _ = job.terminate(EXIT_CODE_TIMEOUT as u32);
+                } else if let Some(pid) = child.id() {
+                    Self::terminate_process_tree(pid);
+                }
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let elapsed = start_time.elapsed().as_millis() as u64;
+                let msg = format!("3D generation timed out after {}s", timeout.as_secs());
+                TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_TIMEOUT,
+                    Bytes::new(),
+                    msg.clone(),
+                    elapsed,
+                    Some(msg),
+                )
+            }
+        };
+
+        let _ = sandbox.destroy().await;
+        result
+    }
+
+    /// Direct Tier 0 Procedural Signed Distance Function mesh generator (< 50 ms)
+    /// with incremental milestone progress checkpoints (25%, 50%, 75%, 100%).
+    async fn execute_tier0_sdf(
+        &self,
+        task: &Task,
+        spec: &rusty_grid_core::task::Generative3DSpec,
+        checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
+        start_time: Instant,
+    ) -> TaskResult {
+        let task_id = task.id;
+        let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel();
+        let spec_clone = spec.clone();
+
+        let compute_handle = tokio::task::spawn_blocking(move || {
+            crate::gen3d::generate_procedural_3d_with_progress(&spec_clone, |frac, stage, msg| {
+                let _ = prog_tx.send((frac, stage, msg));
+            })
+        });
+
+        let mut seq = 1u64;
+        while let Some((frac, stage, msg)) = prog_rx.recv().await {
+            if let Some(ref tx) = checkpoint_tx {
+                let delta = serde_json::json!({
+                    "progress": frac,
+                    "stage": stage,
+                    "message": msg,
+                });
+                let _ = tx
+                    .send(WorkerMessage::Checkpoint {
+                        task_id,
+                        sequence: seq,
+                        delta_state: Bytes::from(delta.to_string().into_bytes()),
+                    })
+                    .await;
+                seq += 1;
+            }
+        }
+
+        match compute_handle.await {
+            Ok(Ok((glb_bytes, stats))) => {
+                let elapsed = start_time.elapsed().as_millis() as u64;
+                let mut res = TaskResult::success(
+                    self.worker_id,
+                    task_id,
+                    Bytes::from(format!(
+                        "Tier 0 procedural SDF mesh generated: {} vertices, {} triangles in {} ms\n",
+                        stats.vertex_count, stats.triangle_count, stats.execution_time_ms
+                    )),
+                    elapsed,
+                    false,
+                );
+                res = res.with_asset_bytes(Bytes::from(glb_bytes));
+                res = res.with_device_name("Procedural-SDF-PureRust");
+                res
+            }
+            Ok(Err(e)) => {
+                let elapsed = start_time.elapsed().as_millis() as u64;
+                TaskResult::failure(
+                    self.worker_id,
+                    task_id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    Bytes::new(),
+                    format!("Procedural SDF generation error: {e}"),
+                    elapsed,
+                    Some(format!("SDF error: {e}")),
+                )
+            }
+            Err(e) => {
+                let elapsed = start_time.elapsed().as_millis() as u64;
+                TaskResult::failure(
+                    self.worker_id,
+                    task_id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    Bytes::new(),
+                    format!("Compute join error: {e}"),
+                    elapsed,
+                    Some(format!("Join error: {e}")),
+                )
+            }
+        }
+    }
+
+    /// Executes an automated skeleton rigging and animation synthesis workload (`TaskSpec::AutoRig`)
+    /// with incremental milestone progress checkpoints (25%, 50%, 75%, 100%).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_auto_rig_workload(
+        &self,
+        task: &Task,
+        spec: &rusty_grid_core::task::AutoRigSpec,
+        _checkpoint: Option<&CheckpointData>,
+        checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
+        timeout: Duration,
+        _child_pid: Option<Arc<AtomicU32>>,
+        mut cancel_rx: Option<oneshot::Receiver<String>>,
+        start_time: Instant,
+    ) -> TaskResult {
+        let task_id = task.id;
+        let pref = spec.preferred_provider.as_deref().unwrap_or("builtin").to_lowercase();
+        let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel();
+        let spec_clone = spec.clone();
+        let tx_clone = checkpoint_tx.clone();
+        let tx_forward = tx_clone.clone();
+
+        // Background forwarder for progress checkpoints
+        let forward_handle = tokio::spawn(async move {
+            let mut seq = 1u64;
+            while let Some((frac, stage, msg)) = prog_rx.recv().await {
+                if let Some(ref tx) = tx_forward {
+                    let delta = serde_json::json!({
+                        "progress": frac,
+                        "stage": stage,
+                        "message": msg,
+                    });
+                    let _ = tx
+                        .send(WorkerMessage::Checkpoint {
+                            task_id,
+                            sequence: seq,
+                            delta_state: Bytes::from(delta.to_string().into_bytes()),
+                        })
+                        .await;
+                    seq += 1;
+                }
+            }
+        });
+
+        let compute_fut = async {
+            if pref == "blender" {
+                if let Some(blender_bin) = crate::autorig::blender_provider::resolve_blender_binary() {
+                    if let Some(ref tx) = tx_clone {
+                        let _ = tx
+                            .send(WorkerMessage::Checkpoint {
+                                task_id,
+                                sequence: 1,
+                                delta_state: Bytes::from_static(b"analyzing_mesh"),
+                            })
+                            .await;
+                    }
+                    match crate::autorig::BlenderRigProvider::execute_rigging(
+                        &blender_bin,
+                        spec_clone.input_mesh.as_bytes(),
+                        &spec_clone.rig_preset,
+                        &spec_clone.embed_animations,
+                        60,
+                    ).await {
+                        Ok(glb) => {
+                            if let Some(ref tx) = tx_clone {
+                                let _ = tx
+                                    .send(WorkerMessage::Checkpoint {
+                                        task_id,
+                                        sequence: 2,
+                                        delta_state: Bytes::from_static(b"completed"),
+                                    })
+                                    .await;
+                            }
+                            return Ok(glb);
+                        }
+                        Err(e) => {
+                            warn!("Blender auto-rigging failed ({e}); falling back to pure-Rust engine");
+                        }
+                    }
+                } else {
+                    warn!("Blender executable not found; falling back to pure-Rust engine");
+                }
+            }
+
+            tokio::task::spawn_blocking(move || {
+                crate::autorig::auto_rig_mesh_with_progress(&spec_clone, |frac, stage, msg| {
+                    let _ = prog_tx.send((frac, stage, msg));
+                })
+            })
+            .await
+            .map_err(|e| crate::autorig::WorkerError::AutoRig(format!("Join error: {e}")))?
+        };
+
+        tokio::select! {
+            result = tokio::time::timeout(timeout, compute_fut) => {
+                let _ = forward_handle.await;
+                match result {
+                    Ok(Ok(glb_bytes)) => {
+                        let elapsed = start_time.elapsed().as_millis() as u64;
+                        let mut res = TaskResult::success(
+                            self.worker_id,
+                            task.id,
+                            Bytes::from(format!(
+                                "Auto-rigging completed successfully: {} bytes .glb generated in {} ms\n",
+                                glb_bytes.len(),
+                                elapsed
+                            )),
+                            elapsed,
+                            false,
+                        );
+                        res = res.with_asset_bytes(Bytes::from(glb_bytes));
+                        res = res.with_device_name("OxideSwarm-AutoRig-Engine");
+                        res
+                    }
+                    Ok(Err(e)) => {
+                        let elapsed = start_time.elapsed().as_millis() as u64;
+                        TaskResult::failure(
+                            self.worker_id,
+                            task.id,
+                            EXIT_CODE_GENERAL_ERROR,
+                            Bytes::new(),
+                            Bytes::from(format!("Auto-rigging execution error: {e}")),
+                            elapsed,
+                            Some(format!("Auto-rig error: {e}")),
+                        )
+                    }
+                    Err(_) => {
+                        let elapsed = start_time.elapsed().as_millis() as u64;
+                        TaskResult::failure(
+                            self.worker_id,
+                            task.id,
+                            EXIT_CODE_TIMEOUT,
+                            Bytes::new(),
+                            Bytes::from(format!("Auto-rigging task timed out after {}s", timeout.as_secs())),
+                            elapsed,
+                            Some("Task timed out".to_string()),
+                        )
+                    }
+                }
+            }
+
+            cancel_msg = async {
+                if let Some(ref mut rx) = cancel_rx {
+                    rx.await.ok()
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                forward_handle.abort();
+                let elapsed = start_time.elapsed().as_millis() as u64;
+                let reason = cancel_msg.unwrap_or_else(|| "Task cancelled by master".to_string());
+                TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_CANCELLED,
+                    Bytes::new(),
+                    Bytes::new(),
+                    elapsed,
+                    Some(format!("Cancelled: {reason}")),
+                )
+            }
+        }
+    }
+
     /// Spawns a child process with deadlock-free bounded I/O, watchdog timeouts, and cooperative cancellation.
     ///
     /// The child leads its own process tree (see [`crate::process_tree`]). Whatever ends the run
@@ -1714,6 +2352,7 @@ mod tests {
             },
             tags: vec![],
             mobile: None,
+            ..Default::default()
         }
     }
 
@@ -1972,6 +2611,113 @@ mod tests {
         assert!(res.is_success());
         assert_eq!(res.exit_code, 0);
         assert!(res.stdout_str().contains("compilation artifacts generated"));
+    }
+
+    #[tokio::test]
+    async fn test_runner_generative_3d_tier0_checkpoints() {
+        let spec = rusty_grid_core::task::Generative3DSpec::new_prompt("procedural drone".to_string())
+            .with_engine("sdf")
+            .with_quality("fast");
+        let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::generic(1, 30));
+
+        let (cp_tx, mut cp_rx) = mpsc::channel(10);
+        let task_clone = task.clone();
+        let runner_clone = test_runner(false);
+
+        let run_handle = tokio::spawn(async move {
+            runner_clone
+                .execute_task_with_checkpoint(&task_clone, None, Some(cp_tx), None, None)
+                .await
+        });
+
+        // Collect emitted checkpoints
+        let mut checkpoints = Vec::new();
+        while let Some(msg) = cp_rx.recv().await {
+            if let WorkerMessage::Checkpoint { sequence, delta_state, .. } = msg {
+                checkpoints.push((sequence, delta_state));
+            }
+        }
+
+        let res = run_handle.await.expect("task must join");
+        assert!(res.is_success());
+        assert_eq!(res.exit_code, 0);
+
+        // Verify sequential checkpoints 1..4
+        assert_eq!(checkpoints.len(), 4);
+        assert_eq!(checkpoints[0].0, 1);
+        assert_eq!(checkpoints[1].0, 2);
+        assert_eq!(checkpoints[2].0, 3);
+        assert_eq!(checkpoints[3].0, 4);
+
+        let delta1: serde_json::Value = serde_json::from_slice(checkpoints[0].1.as_slice()).unwrap();
+        assert_eq!(delta1["stage"], "sdf_geometry");
+        assert_eq!(delta1["progress"], 0.25);
+
+        let delta4: serde_json::Value = serde_json::from_slice(checkpoints[3].1.as_slice()).unwrap();
+        assert_eq!(delta4["stage"], "gltf_pack");
+        assert_eq!(delta4["progress"], 1.00);
+
+        // Verify asset bytes
+        assert!(res.asset_bytes.is_some());
+        let asset = res.asset_bytes.unwrap();
+        assert!(asset.len() >= 20);
+        assert_eq!(&asset.as_slice()[0..4], b"glTF");
+    }
+
+    #[tokio::test]
+    async fn test_runner_autorig_checkpoints() {
+        // Generate a small mesh first
+        let gen_spec = rusty_grid_core::task::Generative3DSpec::new_prompt("cylinder".to_string())
+            .with_engine("sdf")
+            .with_quality("fast");
+        let (mesh_bytes, _) = crate::gen3d::generate_procedural_3d(&gen_spec).expect("mesh gen failed");
+
+        let rig_spec = rusty_grid_core::task::AutoRigSpec::new(mesh_bytes, "biped")
+            .with_animations(vec!["idle".to_string()]);
+        let task = Task::new(TaskSpec::AutoRig(rig_spec), TaskRequirements::generic(1, 30));
+
+        let (cp_tx, mut cp_rx) = mpsc::channel(10);
+        let task_clone = task.clone();
+        let runner_clone = test_runner(false);
+
+        let run_handle = tokio::spawn(async move {
+            runner_clone
+                .execute_task_with_checkpoint(&task_clone, None, Some(cp_tx), None, None)
+                .await
+        });
+
+        // Collect emitted checkpoints
+        let mut checkpoints = Vec::new();
+        while let Some(msg) = cp_rx.recv().await {
+            if let WorkerMessage::Checkpoint { sequence, delta_state, .. } = msg {
+                checkpoints.push((sequence, delta_state));
+            }
+        }
+
+        let res = run_handle.await.expect("task must join");
+        assert!(res.is_success());
+        assert_eq!(res.exit_code, 0);
+
+        // Verify sequential checkpoints 1..4
+        assert_eq!(checkpoints.len(), 4);
+        assert_eq!(checkpoints[0].0, 1);
+        assert_eq!(checkpoints[1].0, 2);
+        assert_eq!(checkpoints[2].0, 3);
+        assert_eq!(checkpoints[3].0, 4);
+
+        let delta1: serde_json::Value = serde_json::from_slice(checkpoints[0].1.as_slice()).unwrap();
+        assert_eq!(delta1["stage"], "landmark_extraction");
+        assert_eq!(delta1["progress"], 0.25);
+
+        let delta4: serde_json::Value = serde_json::from_slice(checkpoints[3].1.as_slice()).unwrap();
+        assert_eq!(delta4["stage"], "animation_export");
+        assert_eq!(delta4["progress"], 1.00);
+
+        // Verify asset bytes
+        assert!(res.asset_bytes.is_some());
+        let asset = res.asset_bytes.unwrap();
+        assert!(asset.len() >= 20);
+        assert_eq!(&asset.as_slice()[0..4], b"glTF");
     }
 }
 
