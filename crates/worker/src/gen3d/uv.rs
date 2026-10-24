@@ -1,7 +1,7 @@
 //! Conformal multi-chart UV parameterization and gutter-padded atlas packing (Feature F7).
 
-use std::collections::HashMap;
 use super::types::RawMesh;
+use std::collections::HashMap;
 
 pub const DEFAULT_GUTTER_PIXELS: u32 = 4;
 pub const DEFAULT_ATLAS_SIZE: u32 = 1024;
@@ -25,9 +25,21 @@ impl UvUnwrapper for MultiChartBoxUnwrapper {
 
         // 1. Assign each face to one of 6 cardinal charts (+-X, +-Y, +-Z)
         for chunk in mesh.indices.chunks_exact(3) {
-            let n0 = mesh.normals.get(chunk[0] as usize).copied().unwrap_or([0.0, 1.0, 0.0]);
-            let n1 = mesh.normals.get(chunk[1] as usize).copied().unwrap_or([0.0, 1.0, 0.0]);
-            let n2 = mesh.normals.get(chunk[2] as usize).copied().unwrap_or([0.0, 1.0, 0.0]);
+            let n0 = mesh
+                .normals
+                .get(chunk[0] as usize)
+                .copied()
+                .unwrap_or([0.0, 1.0, 0.0]);
+            let n1 = mesh
+                .normals
+                .get(chunk[1] as usize)
+                .copied()
+                .unwrap_or([0.0, 1.0, 0.0]);
+            let n2 = mesh
+                .normals
+                .get(chunk[2] as usize)
+                .copied()
+                .unwrap_or([0.0, 1.0, 0.0]);
             let avg_n = [
                 n0[0] + n1[0] + n2[0],
                 n0[1] + n1[1] + n2[1],
@@ -39,30 +51,50 @@ impl UvUnwrapper for MultiChartBoxUnwrapper {
             let az = avg_n[2].abs();
 
             let chart = if ax >= ay && ax >= az {
-                if avg_n[0] > 0.0 { 0 } else { 1 } // +X, -X
+                if avg_n[0] > 0.0 {
+                    0
+                } else {
+                    1
+                } // +X, -X
             } else if ay >= ax && ay >= az {
-                if avg_n[1] > 0.0 { 2 } else { 3 } // +Y, -Y
+                if avg_n[1] > 0.0 {
+                    2
+                } else {
+                    3
+                } // +Y, -Y
             } else {
-                if avg_n[2] > 0.0 { 4 } else { 5 } // +Z, -Z
+                if avg_n[2] > 0.0 {
+                    4
+                } else {
+                    5
+                } // +Z, -Z
             };
             face_charts.push(chart);
         }
 
         // 2. Compute local 2D bounds per chart
-        let mut chart_bounds = vec![
-            ([f32::INFINITY, f32::INFINITY], [f32::NEG_INFINITY, f32::NEG_INFINITY]);
-            6
-        ];
+        let mut chart_bounds = [(
+            [f32::INFINITY, f32::INFINITY],
+            [f32::NEG_INFINITY, f32::NEG_INFINITY],
+        ); 6];
         for (f_idx, chunk) in mesh.indices.chunks_exact(3).enumerate() {
             let chart = face_charts[f_idx];
             for &v_idx in chunk {
                 let p = mesh.positions[v_idx as usize];
                 let (u, v) = project_2d(p, chart);
                 let (min, max) = &mut chart_bounds[chart];
-                if u < min[0] { min[0] = u; }
-                if v < min[1] { min[1] = v; }
-                if u > max[0] { max[0] = u; }
-                if v > max[1] { max[1] = v; }
+                if u < min[0] {
+                    min[0] = u;
+                }
+                if v < min[1] {
+                    min[1] = v;
+                }
+                if u > max[0] {
+                    max[0] = u;
+                }
+                if v > max[1] {
+                    max[1] = v;
+                }
             }
         }
 
@@ -95,7 +127,11 @@ impl UvUnwrapper for MultiChartBoxUnwrapper {
                     new_indices.push(new_id);
                 } else {
                     let p = mesh.positions[v_idx as usize];
-                    let norm = mesh.normals.get(v_idx as usize).copied().unwrap_or([0.0, 1.0, 0.0]);
+                    let norm = mesh
+                        .normals
+                        .get(v_idx as usize)
+                        .copied()
+                        .unwrap_or([0.0, 1.0, 0.0]);
                     let (raw_u, raw_v) = project_2d(p, chart);
 
                     let norm_u = (raw_u - min[0]) / span_u;

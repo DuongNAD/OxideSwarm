@@ -639,7 +639,9 @@ impl WorkerCapabilities {
             None
         } else if let Some(vram) = overrides.vram_mb {
             Some(vram)
-        } else if let Ok(vram_str) = std::env::var("RUSTY_GRID_VRAM_MB").or_else(|_| std::env::var("OXIDE_SWARM_VRAM_MB")) {
+        } else if let Ok(vram_str) =
+            std::env::var("RUSTY_GRID_VRAM_MB").or_else(|_| std::env::var("OXIDE_SWARM_VRAM_MB"))
+        {
             vram_str.trim().parse::<u64>().ok()
         } else if has_gpu {
             detect_gpu_vram_mb()
@@ -652,9 +654,13 @@ impl WorkerCapabilities {
             false
         } else if let Some(c) = overrides.cuda {
             c
-        } else if let Ok(val) = std::env::var("RUSTY_GRID_CUDA").or_else(|_| std::env::var("OXIDE_SWARM_CUDA")) {
+        } else if let Ok(val) =
+            std::env::var("RUSTY_GRID_CUDA").or_else(|_| std::env::var("OXIDE_SWARM_CUDA"))
+        {
             val == "1" || val.eq_ignore_ascii_case("true")
-        } else if let Ok(val) = std::env::var("RUSTY_GRID_NO_CUDA").or_else(|_| std::env::var("OXIDE_SWARM_NO_CUDA")) {
+        } else if let Ok(val) =
+            std::env::var("RUSTY_GRID_NO_CUDA").or_else(|_| std::env::var("OXIDE_SWARM_NO_CUDA"))
+        {
             if val == "1" || val.eq_ignore_ascii_case("true") {
                 false
             } else {
@@ -1140,7 +1146,11 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
     }
 
     // 2. Check environment variables
-    for env_var in &["RUSTY_GRID_BLENDER_PATH", "OXIDE_SWARM_BLENDER_PATH", "BLENDER_PATH"] {
+    for env_var in &[
+        "RUSTY_GRID_BLENDER_PATH",
+        "OXIDE_SWARM_BLENDER_PATH",
+        "BLENDER_PATH",
+    ] {
         if let Ok(env_path) = std::env::var(env_var) {
             let p = std::path::Path::new(env_path.trim());
             if p.is_file() {
@@ -1163,9 +1173,15 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
             search_dirs.push(std::path::PathBuf::from(pf86).join("Blender Foundation"));
         }
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            search_dirs.push(std::path::PathBuf::from(local).join("Programs").join("Blender Foundation"));
+            search_dirs.push(
+                std::path::PathBuf::from(local)
+                    .join("Programs")
+                    .join("Blender Foundation"),
+            );
         }
-        search_dirs.push(std::path::PathBuf::from(r"C:\Program Files\Blender Foundation"));
+        search_dirs.push(std::path::PathBuf::from(
+            r"C:\Program Files\Blender Foundation",
+        ));
 
         for base_dir in search_dirs {
             if base_dir.is_dir() {
@@ -1194,7 +1210,9 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
         }
 
         // Check Steam standard path
-        let steam_blender = std::path::PathBuf::from(r"C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe");
+        let steam_blender = std::path::PathBuf::from(
+            r"C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe",
+        );
         if steam_blender.is_file() {
             if let Some(ver) = query_blender_version(&steam_blender) {
                 return (true, Some(ver));
@@ -1334,10 +1352,7 @@ pub fn detect_cuda_support(has_gpu: bool) -> bool {
     }
 
     // 2. Probe nvcc compiler on PATH
-    if let Ok(output) = std::process::Command::new("nvcc")
-        .arg("--version")
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("nvcc").arg("--version").output() {
         if output.status.success() {
             return true;
         }
@@ -1769,10 +1784,11 @@ mod tests {
 
     #[test]
     fn test_capabilities_3d_builders() {
-        let caps = WorkerCapabilities::new("worker-3d", 8, 16384, true, false, Some("RTX 4090".into()))
-            .with_blender(true, Some("Blender 4.5.4 LTS".into()))
-            .with_vram_mb(Some(24576))
-            .with_cuda(true);
+        let caps =
+            WorkerCapabilities::new("worker-3d", 8, 16384, true, false, Some("RTX 4090".into()))
+                .with_blender(true, Some("Blender 4.5.4 LTS".into()))
+                .with_vram_mb(Some(24576))
+                .with_cuda(true);
 
         assert!(caps.has_blender);
         assert_eq!(caps.blender_version.as_deref(), Some("Blender 4.5.4 LTS"));
@@ -1793,7 +1809,8 @@ mod tests {
             "tags": []
         }"#;
 
-        let caps: WorkerCapabilities = serde_json::from_str(legacy_json).expect("Deserialization failed");
+        let caps: WorkerCapabilities =
+            serde_json::from_str(legacy_json).expect("Deserialization failed");
         assert_eq!(caps.name, "legacy-worker");
         assert_eq!(caps.cpu_cores, 4);
         assert_eq!(caps.ram_mb, 8192);
@@ -1805,11 +1822,13 @@ mod tests {
 
     #[test]
     fn test_capabilities_json_roundtrip_with_3d() {
-        let caps = WorkerCapabilities::new("3d-worker", 16, 32768, true, false, Some("RTX 5090".into()))
-            .with_3d_capabilities(true, Some("Blender 4.5".into()), Some(32768), true);
+        let caps =
+            WorkerCapabilities::new("3d-worker", 16, 32768, true, false, Some("RTX 5090".into()))
+                .with_3d_capabilities(true, Some("Blender 4.5".into()), Some(32768), true);
 
         let json = serde_json::to_string(&caps).expect("Failed to serialize");
-        let deserialized: WorkerCapabilities = serde_json::from_str(&json).expect("Failed to deserialize");
+        let deserialized: WorkerCapabilities =
+            serde_json::from_str(&json).expect("Failed to deserialize");
 
         assert_eq!(caps, deserialized);
         assert!(deserialized.has_blender);

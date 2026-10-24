@@ -14,7 +14,8 @@ impl SurfaceSampler for ProceduralPbrSampler {
     fn sample(&self, pos: [f32; 3], norm: [f32; 3]) -> [u8; 4] {
         // Directional light from top-right-front
         let light_dir = [0.577f32, 0.577, 0.577];
-        let ndotl = (norm[0] * light_dir[0] + norm[1] * light_dir[1] + norm[2] * light_dir[2]).max(0.0);
+        let ndotl =
+            (norm[0] * light_dir[0] + norm[1] * light_dir[1] + norm[2] * light_dir[2]).max(0.0);
         let ambient = 0.35 + 0.15 * (norm[1] * 0.5 + 0.5);
         let factor = (ambient + ndotl * 0.5).clamp(0.0, 1.0);
 

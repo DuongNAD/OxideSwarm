@@ -217,11 +217,11 @@ init_secret_args() {
 
 detect_role() {
     if pid_is_ours "$MASTER_PID_FILE"; then
-        echo "MASTER (Đang lắng nghe tại :${CLUSTER_PORT}, PID $(read_pid "$MASTER_PID_FILE"))"
+        echo "MASTER (Listening on :${CLUSTER_PORT}, PID $(read_pid "$MASTER_PID_FILE"))"
     elif pid_is_ours "$WORKER_PID_FILE"; then
-        echo "WORKER (Đang chạy ngầm, PID $(read_pid "$WORKER_PID_FILE"))"
+        echo "WORKER (Running in background, PID $(read_pid "$WORKER_PID_FILE"))"
     else
-        echo "STOPPED (Chưa chạy qua switch_role.sh)"
+        echo "STOPPED (Not started by switch_role.sh)"
     fi
 }
 
@@ -242,14 +242,14 @@ do_master() {
     resolve_bin
 
     echo ""
-    echo "[INFO] Đang chuyển đổi sang vai trò MASTER..."
+    echo "[INFO] Switching node role to MASTER..."
     stop_all
 
     local owner
     owner="$(port_owner "$CLUSTER_PORT")"
     if [[ -n "$owner" ]]; then
-        echo "[ERROR] Cổng ${CLUSTER_PORT} đang được dùng bởi tiến trình ${owner}; không khởi chạy được Master." >&2
-        echo "        Dừng tiến trình đó (nếu là Master chạy tay) rồi thử lại." >&2
+        echo "[ERROR] Port ${CLUSTER_PORT} is already in use by ${owner}; cannot start Master." >&2
+        echo "        Stop that process (if it is a manually started Master) and retry." >&2
         exit 1
     fi
 
@@ -278,7 +278,7 @@ do_master() {
         args+=("${extra[@]}")
     fi
 
-    echo "[OK] Khởi chạy OxideSwarm Master: $(basename "$BIN") ${args[*]}"
+    echo "[OK] Starting OxideSwarm Master: $(basename "$BIN") ${args[*]}"
     start_tracked "$MASTER_PID_FILE" "$MASTER_LOG" "$BIN" "${args[@]}"
 
     local i started=false
@@ -293,13 +293,13 @@ do_master() {
         sleep 0.2
     done
     if [[ "$started" != true ]]; then
-        echo "[ERROR] Master không khởi động được (xem log bên dưới)." >&2
+        echo "[ERROR] Master failed to start (see log tail below)." >&2
         show_log_tail "$MASTER_LOG"
         stop_tracked "master" "$MASTER_PID_FILE"
         exit 1
     fi
 
-    local worker_note="không chạy (--no-worker)"
+    local worker_note="disabled (--no-worker)"
     if [[ "$with_worker" == true ]]; then
         local wargs=(worker --master "127.0.0.1:${CLUSTER_PORT}" --name "$(default_worker_name)")
         if [[ ${#SECRET_ARGS[@]} -gt 0 ]]; then
@@ -309,12 +309,12 @@ do_master() {
         start_tracked "$WORKER_PID_FILE" "$WORKER_LOG" "$BIN" "${wargs[@]}"
         sleep 1
         if ! pid_is_ours "$WORKER_PID_FILE"; then
-            worker_note="KHÔNG khởi động được, xem ${WORKER_LOG}"
+            worker_note="FAILED to start, see ${WORKER_LOG}"
             show_log_tail "$WORKER_LOG"
         elif wait_registered "$WORKER_LOG" 10; then
-            worker_note="đang chạy và ĐÃ đăng ký với Master (PID $(read_pid "$WORKER_PID_FILE")), log: ${WORKER_LOG}"
+            worker_note="running and REGISTERED with Master (PID $(read_pid "$WORKER_PID_FILE")), log: ${WORKER_LOG}"
         else
-            worker_note="đang chạy nhưng CHƯA đăng ký được với Master sau 5s, xem ${WORKER_LOG}"
+            worker_note="running but NOT YET registered after 5s, see ${WORKER_LOG}"
             show_log_tail "$WORKER_LOG"
         fi
     fi
@@ -329,36 +329,36 @@ do_master() {
 
     echo ""
     echo "=============================================================================="
-    echo "[SUCCESS] Máy này đã trở thành MASTER (PID $(read_pid "$MASTER_PID_FILE"))"
+    echo "[SUCCESS] This node is now MASTER (PID $(read_pid "$MASTER_PID_FILE"))"
     echo "=============================================================================="
-    echo "  - Cổng cụm điều phối : ${LOCAL_IP}:${CLUSTER_PORT}  (workers dùng cổng này, KHÔNG phải ${DASHBOARD_PORT})"
+    echo "  - Cluster TCP port    : ${LOCAL_IP}:${CLUSTER_PORT}  (workers connect here, NOT ${DASHBOARD_PORT})"
     if [[ "$dashboard_lan" == true ]]; then
-        echo "  - Web Dashboard       : http://${LOCAL_IP}:${DASHBOARD_PORT}  (mở cho cả mạng LAN)"
+        echo "  - Web Dashboard       : http://${LOCAL_IP}:${DASHBOARD_PORT}  (exposed on LAN)"
     else
-        echo "  - Web Dashboard       : http://127.0.0.1:${DASHBOARD_PORT}  (chỉ máy này; thêm --dashboard-lan để mở cho điện thoại/LAN)"
+        echo "  - Web Dashboard       : http://127.0.0.1:${DASHBOARD_PORT}  (loopback only; pass --dashboard-lan for LAN access)"
     fi
-    echo "  - Token Dashboard     : $BIN secret show --dashboard-token"
+    echo "  - Dashboard Token     : $BIN secret show --dashboard-token"
     echo "  - Cluster secret      : ${SECRET_FILE}"
-    echo "      Sao chép file này sang các máy worker (scp hoặc USB) rồi đặt vào"
-    echo "      ~/.oxideswarm/cluster.secret (chmod 600). Không gửi qua chat/email."
-    echo "  - Worker cục bộ       : ${worker_note}"
-    echo "  - Log Master          : ${MASTER_LOG}"
+    echo "      Copy this file to every worker machine (scp or USB) and place it at"
+    echo "      ~/.oxideswarm/cluster.secret (chmod 600). Never send via chat/e-mail."
+    echo "  - Local worker        : ${worker_note}"
+    echo "  - Master log          : ${MASTER_LOG}"
     if [[ "$use_p2p" == true ]]; then
         if [[ -s "$TICKET_FILE" ]]; then
             echo "  - P2P Ticket (WAN)    : $(tr -d '\r\n' < "$TICKET_FILE")"
         else
-            echo "  - P2P Ticket (WAN)    : chưa sẵn sàng; sẽ nằm trong ${TICKET_FILE} (cần Internet tới relay iroh)"
+            echo "  - P2P Ticket (WAN)    : pending; will be written to ${TICKET_FILE} (requires outbound Internet to iroh relays)"
         fi
-        echo "      Máy ở mạng khác: ./connect_remote.sh '<TICKET>' --secret-file <file secret>"
+        echo "      Remote worker command: ./connect_remote.sh '<TICKET>' --secret-file <secret_path>"
     else
-        echo "  - Máy ở mạng khác (WAN): chạy lại với --p2p để có P2P ticket."
+        echo "  - Remote networks     : re-run with --p2p to publish a WAN P2P ticket."
     fi
     echo ""
-    echo "  * KẾT NỐI TỪ MÁY KHÁC (cùng LAN), sau khi đã chép secret:"
-    echo "      ./switch_role.sh worker ${LOCAL_IP}:${CLUSTER_PORT}      (Mac/Linux)"
+    echo "  * CONNECT FROM OTHER LAN MACHINES (after copying cluster.secret):"
+    echo "      ./switch_role.sh worker ${LOCAL_IP}:${CLUSTER_PORT}      (macOS/Linux)"
     echo "      windows\\switch_role.cmd worker ${LOCAL_IP}:${CLUSTER_PORT}   (Windows)"
-    echo "  * Cảnh báo: cổng ${CLUSTER_PORT} được xác thực bằng secret nhưng KHÔNG mã hóa."
-    echo "    Trên mạng không tin cậy hãy dùng --p2p (QUIC) hoặc VPN/SSH tunnel."
+    echo "  * Security: authenticated TCP on :${CLUSTER_PORT} encrypts traffic post-handshake (ChaCha20-Poly1305)."
+    echo "    Across untrusted WAN networks, use --p2p (QUIC) or a VPN/SSH tunnel."
     echo "=============================================================================="
     echo ""
 }
@@ -386,12 +386,12 @@ do_worker() {
     resolve_bin
 
     echo ""
-    echo "[INFO] Đang chuyển đổi sang vai trò WORKER..."
+    echo "[INFO] Switching node role to WORKER..."
     stop_all
 
     local name
     name="$(default_worker_name)"
-    echo "[OK] Kết nối ${name} tới Master tại ${target_master} (cổng cụm ${CLUSTER_PORT}; 'auto' = dò UDP trong LAN)..."
+    echo "[OK] Connecting ${name} to Master at ${target_master} (cluster port ${CLUSTER_PORT}; 'auto' = LAN UDP beacon)..."
     local args=(worker --master "$target_master" --name "$name")
     if [[ ${#SECRET_ARGS[@]} -gt 0 ]]; then
         args+=("${SECRET_ARGS[@]}")
@@ -404,9 +404,9 @@ do_worker() {
     sleep 2
 
     if ! pid_is_ours "$WORKER_PID_FILE"; then
-        echo "[ERROR] Worker đã thoát ngay sau khi khởi động (xem log bên dưới)." >&2
-        echo "        Nếu log nói thiếu cluster secret: chép ~/.oxideswarm/cluster.secret từ máy Master" >&2
-        echo "        (scp hoặc USB), hoặc dùng --secret-file PATH. Chỉ dùng '-- --insecure' trên mạng bạn tự kiểm soát." >&2
+        echo "[ERROR] Worker exited immediately after startup (see log tail below)." >&2
+        echo "        If the log reports a missing cluster secret: copy ~/.oxideswarm/cluster.secret from the Master" >&2
+        echo "        (scp or USB), or pass --secret-file PATH. Only pass '-- --insecure' on a network you control." >&2
         show_log_tail "$WORKER_LOG"
         rm -f "$WORKER_PID_FILE"
         exit 1
@@ -414,22 +414,22 @@ do_worker() {
 
     local reg_note
     if wait_registered "$WORKER_LOG" 20; then
-        reg_note="ĐÃ đăng ký với Master"
+        reg_note="REGISTERED with Master"
     else
-        reg_note="CHƯA đăng ký sau ~12s (worker vẫn thử lại; kiểm tra Master đã chạy, địa chỉ :${CLUSTER_PORT}, secret)"
+        reg_note="NOT YET registered after ~12s (worker keeps retrying; check Master address :${CLUSTER_PORT} and secret)"
         show_log_tail "$WORKER_LOG"
     fi
 
     echo ""
     echo "=============================================================================="
-    echo "[STARTED] Worker (${name}) đang chạy, PID $(read_pid "$WORKER_PID_FILE")"
+    echo "[STARTED] Worker (${name}) is running, PID $(read_pid "$WORKER_PID_FILE")"
     echo "=============================================================================="
     echo "  - Target Master : ${target_master}"
-    echo "  - Đăng ký       : ${reg_note}"
-    echo "  - Secret        : $( [[ -f "$SECRET_FILE" ]] && echo "$SECRET_FILE" || echo "theo OXIDESWARM_SECRET[_FILE] / cấu hình" )"
+    echo "  - Registration  : ${reg_note}"
+    echo "  - Secret        : $( [[ -f "$SECRET_FILE" ]] && echo "$SECRET_FILE" || echo "via OXIDESWARM_SECRET[_FILE] / config" )"
     echo "  - Log           : ${WORKER_LOG}"
-    echo "  - Kiểm tra lại : '$BIN workers --master ${target_master}'"
-    echo "  - GPU: worker tự dò GPU nếu binary build với --features gpu-wgpu (xem dòng 'GPU:' trong ${WORKER_LOG}); --no-gpu để tắt, ví dụ: ./switch_role.sh worker ${target_master} -- --no-gpu"
+    echo "  - Verify        : '$BIN workers --master ${target_master}'"
+    echo "  - GPU           : auto-detected when built with --features gpu-wgpu (see 'GPU:' in ${WORKER_LOG}); pass '-- --no-gpu' to disable"
     echo "=============================================================================="
     echo ""
 }
@@ -444,7 +444,7 @@ do_status() {
     local owner
     owner="$(port_owner "$CLUSTER_PORT")"
     if [[ -n "$owner" ]]; then
-        echo "  Port ${CLUSTER_PORT}     : đang được lắng nghe bởi ${owner}"
+        echo "  Port ${CLUSTER_PORT}     : listening (${owner})"
     fi
     echo ""
     local shown=false
@@ -457,12 +457,12 @@ do_status() {
         shown=true
     fi
     if [[ "$shown" != true ]]; then
-        echo "  Không có tiến trình nào do switch_role.sh quản lý."
+        echo "  No active processes tracked by switch_role.sh."
     fi
     if [[ -f "$SECRET_FILE" ]]; then
         echo "  Cluster secret: ${SECRET_FILE}"
     else
-        echo "  Cluster secret: (chưa có ${SECRET_FILE}; Master sẽ tự tạo khi chạy)"
+        echo "  Cluster secret: (not found at ${SECRET_FILE}; Master generates it on first start)"
     fi
     if [[ -s "$TICKET_FILE" ]]; then
         echo "  P2P Ticket    : $(tr -d '\r\n' < "$TICKET_FILE")"
@@ -472,9 +472,9 @@ do_status() {
 }
 
 do_stop() {
-    echo "[INFO] Đang tắt các tiến trình OxideSwarm do switch_role.sh khởi chạy..."
+    echo "[INFO] Stopping OxideSwarm processes tracked by switch_role.sh..."
     stop_all
-    echo "[OK] Đã dừng (chỉ các tiến trình có PID file trong ${RUN_DIR})."
+    echo "[OK] Stopped (only processes with PID files in ${RUN_DIR})."
 }
 
 usage() {
@@ -512,19 +512,19 @@ case "$CMD" in
         echo "  Current Role  : [$(detect_role)]"
         echo "=============================================================================="
         echo ""
-        echo "  [1] Chuyển máy này thành MASTER (Điều phối cụm; dashboard chỉ trên máy này)"
-        echo "  [2] Chuyển máy này thành WORKER (Tự động quét UDP 'auto' hoặc kết nối tới Master)"
-        echo "  [3] Kiểm tra trạng thái hiện tại"
-        echo "  [4] Dừng các tiến trình do script này chạy (Stop)"
-        echo "  [5] Thoát"
+        echo "  [1] Promote this machine to MASTER (Cluster coordinator; loopback dashboard by default)"
+        echo "  [2] Switch this machine to WORKER (UDP 'auto' discovery or explicit Master IP:8088)"
+        echo "  [3] Show current node status"
+        echo "  [4] Stop processes started by this launcher"
+        echo "  [5] Exit"
         echo ""
-        read -r -p "Nhập lựa chọn [1-5]: " CHOICE
+        read -r -p "Select option [1-5]: " CHOICE
         case "$CHOICE" in
             1)
                 MASTER_OPTS=()
-                read -r -p "Mở dashboard cho điện thoại/LAN (--dashboard-lan)? [y/N]: " ANS
+                read -r -p "Expose dashboard on LAN (--dashboard-lan)? [y/N]: " ANS
                 if [[ "$ANS" =~ ^[Yy]$ ]]; then MASTER_OPTS+=(--dashboard-lan); fi
-                read -r -p "Bật P2P cho máy ở mạng khác (--p2p)? [y/N]: " ANS
+                read -r -p "Enable P2P for remote networks (--p2p)? [y/N]: " ANS
                 if [[ "$ANS" =~ ^[Yy]$ ]]; then MASTER_OPTS+=(--p2p); fi
                 if [[ ${#MASTER_OPTS[@]} -gt 0 ]]; then
                     do_master "${MASTER_OPTS[@]}"
@@ -533,13 +533,13 @@ case "$CMD" in
                 fi
                 ;;
             2)
-                read -r -p "Nhập địa chỉ Master dạng IP:8088 [Enter để tự động quét 'auto']: " CUSTOM_IP
+                read -r -p "Enter Master address IP:8088 [Press Enter for 'auto' discovery]: " CUSTOM_IP
                 do_worker "${CUSTOM_IP:-auto}"
                 ;;
             3) do_status ;;
             4) do_stop ;;
             5) exit 0 ;;
-            *) echo "Lựa chọn không hợp lệ." ;;
+            *) echo "Invalid option." ;;
         esac
         ;;
     *)

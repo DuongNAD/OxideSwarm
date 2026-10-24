@@ -31,7 +31,7 @@ const CLR_DIM: &str = "\x1b[2m";
     version
 )]
 pub struct ModeCliArgs {
-    /// Workflow mode: test (kiểm tra), dev (phát triển), doc (tài liệu), research (nghiên cứu)
+    /// Workflow mode: test, dev, doc, research
     #[arg(index = 1)]
     pub mode: Option<String>,
 
@@ -570,27 +570,27 @@ pub async fn run_interactive_menu(workspace_root: &Path) -> i32 {
         );
         println!("  Select a workflow mode:");
         println!(
-            "    {}1.{} {}🧪 Chế độ Test / Kiểm tra{}  (Unit tests, Clippy lints, Flaky detector)",
+            "    {}1.{} {}🧪 Test & QA Mode{}         (Unit tests, Clippy lints, Flaky detector)",
             CLR_BOLD, CLR_RESET, CLR_CYAN, CLR_RESET
         );
         println!(
-            "    {}2.{} {}⚡ Chế độ Phát triển{}      (Fast check, Local cluster dev, Health probe)",
+            "    {}2.{} {}⚡ Development Mode{}       (Fast check, Local cluster dev, Health probe)",
             CLR_BOLD, CLR_RESET, CLR_YELLOW, CLR_RESET
         );
         println!(
-            "    {}3.{} {}📚 Chế độ Viết tài liệu{}    (Cargo doc build, Spec verify, Export architecture)",
+            "    {}3.{} {}📚 Documentation Mode{}     (Cargo doc build, Spec verify, Export architecture)",
             CLR_BOLD, CLR_RESET, CLR_MAGENTA, CLR_RESET
         );
         println!(
-            "    {}4.{} {}🔬 Chế độ Nghiên cứu{}       (Hardware profile, Micro-benchmarks, Distributed)",
+            "    {}4.{} {}🔬 Research & Bench Mode{}  (Hardware profile, Micro-benchmarks, Distributed)",
             CLR_BOLD, CLR_RESET, CLR_GREEN, CLR_RESET
         );
-        println!("    {}0.{} Thoát (Exit)", CLR_BOLD, CLR_RESET);
+        println!("    {}0.{} Exit", CLR_BOLD, CLR_RESET);
         println!(
             "{}--------------------------------------------------------------------------------{}",
             CLR_DIM, CLR_RESET
         );
-        print!("Nhập lựa chọn của bạn [0-4]: ");
+        print!("Enter your choice [0-4]: ");
         io::stdout().flush().unwrap();
 
         let mut input = String::new();
@@ -613,12 +613,12 @@ pub async fn run_interactive_menu(workspace_root: &Path) -> i32 {
                 run_research_menu(workspace_root).await;
             }
             "0" | "q" | "exit" => {
-                println!("Tạm biệt!");
+                println!("Goodbye!");
                 return 0;
             }
             _ => {
                 println!(
-                    "{}Lựa chọn không hợp lệ. Vui lòng chọn từ 0 đến 4.{}",
+                    "{}Invalid selection. Please choose from 0 to 4.{}",
                     CLR_YELLOW, CLR_RESET
                 );
             }
@@ -629,37 +629,37 @@ pub async fn run_interactive_menu(workspace_root: &Path) -> i32 {
 async fn run_test_menu(workspace_root: &Path) {
     println!();
     println!(
-        "{}=== 🧪 CHẾ ĐỘ TEST & KIỂM TRA CHẤT LƯỢNG ==={}",
+        "{}=== 🧪 TEST & QUALITY ASSURANCE MODE ==={}",
         CLR_BOLD, CLR_RESET
     );
     println!("  [1] Quick Unit Tests (cargo test --workspace --lib)");
     println!("  [2] Lint Checks & Formatting (cargo clippy & fmt)");
     println!("  [3] Flaky Test Detector (5 iterations test loop)");
     println!("  [4] Full Integration & E2E Test Suite (cargo test --workspace)");
-    println!("  [0] Quay lại Menu chính");
-    print!("Lựa chọn [0-4]: ");
+    println!("  [0] Back to Main Menu");
+    print!("Select [0-4]: ");
     io::stdout().flush().unwrap();
 
     let mut input = String::new();
     let _ = io::stdin().read_line(&mut input);
     match input.trim() {
         "1" => {
-            println!("Đang chạy Quick Unit Tests...");
+            println!("Running Quick Unit Tests...");
             let res = execute_single_action(WorkflowMode::Test, "quick", 5, workspace_root).await;
             render_execution_result(&res);
         }
         "2" => {
-            println!("Đang chạy Lint & Format checks...");
+            println!("Running Lint & Format checks...");
             let res = execute_single_action(WorkflowMode::Test, "lint", 5, workspace_root).await;
             render_execution_result(&res);
         }
         "3" => {
-            println!("Đang chạy Flaky Test Detector (5 lần lặp)...");
+            println!("Running Flaky Test Detector (5 iterations)...");
             let res = execute_single_action(WorkflowMode::Test, "flaky", 5, workspace_root).await;
             render_execution_result(&res);
         }
         "4" => {
-            println!("Đang chạy Full Test Suite...");
+            println!("Running Full Test Suite...");
             let res = execute_single_action(WorkflowMode::Test, "full", 5, workspace_root).await;
             render_execution_result(&res);
         }
@@ -670,16 +670,16 @@ async fn run_test_menu(workspace_root: &Path) {
 async fn run_dev_menu(workspace_root: &Path) {
     println!();
     println!(
-        "{}=== ⚡ CHẾ ĐỘ PHÁT TRIỂN & CỤM DEV LOCAL ==={}",
+        "{}=== ⚡ DEVELOPMENT & LOCAL CLUSTER MODE ==={}",
         CLR_BOLD, CLR_RESET
     );
     println!("  [1] Fast Incremental Check (cargo check --workspace)");
-    println!("  [2] Live-Reload Watch Mode (Tự động biên dịch khi file thay đổi)");
-    println!("  [3] Khởi chạy Local Dev Cluster (Master + 2 Workers)");
-    println!("  [4] Kiểm tra sức khỏe cụm (Cluster Health Status)");
-    println!("  [5] Dừng Local Dev Cluster (Stop cluster)");
-    println!("  [0] Quay lại Menu chính");
-    print!("Lựa chọn [0-5]: ");
+    println!("  [2] Live-Reload Watch Mode (auto re-check on file changes)");
+    println!("  [3] Start Local Dev Cluster (Master + 2 Workers)");
+    println!("  [4] Check Cluster Health Status");
+    println!("  [5] Stop Local Dev Cluster");
+    println!("  [0] Back to Main Menu");
+    print!("Select [0-5]: ");
     io::stdout().flush().unwrap();
 
     let mut input = String::new();
@@ -712,14 +712,14 @@ async fn run_dev_menu(workspace_root: &Path) {
 async fn run_doc_menu(workspace_root: &Path) {
     println!();
     println!(
-        "{}=== 📚 CHẾ ĐỘ VIẾT TÀI LIỆU & ĐẶC TẢ KIẾN TRÚC ==={}",
+        "{}=== 📚 DOCUMENTATION & ARCHITECTURE SPECIFICATION MODE ==={}",
         CLR_BOLD, CLR_RESET
     );
-    println!("  [1] Kiểm tra tính toàn vẹn tài liệu Markdown (Verify Docs & Specs)");
-    println!("  [2] Xuất toàn văn Đặc tả Kiến trúc thống nhất (Export Architecture Spec)");
-    println!("  [3] Biên dịch tài liệu mã nguồn (cargo doc --workspace --no-deps)");
-    println!("  [0] Quay lại Menu chính");
-    print!("Lựa chọn [0-3]: ");
+    println!("  [1] Verify Markdown Documentation & Specs");
+    println!("  [2] Export Unified Architecture Specification");
+    println!("  [3] Build Source Documentation (cargo doc --workspace --no-deps)");
+    println!("  [0] Back to Main Menu");
+    print!("Select [0-3]: ");
     io::stdout().flush().unwrap();
 
     let mut input = String::new();
@@ -744,15 +744,15 @@ async fn run_doc_menu(workspace_root: &Path) {
 async fn run_research_menu(workspace_root: &Path) {
     println!();
     println!(
-        "{}=== 🔬 CHẾ ĐỘ NGHIÊN CỨU & ĐO KIỂM HIỆU NĂNG ==={}",
+        "{}=== 🔬 RESEARCH & PERFORMANCE BENCHMARKING MODE ==={}",
         CLR_BOLD, CLR_RESET
     );
-    println!("  [1] Phân tích & đo lường tài nguyên phần cứng (CPU/RAM Profiler)");
+    println!("  [1] Hardware Resource Profiler (CPU/RAM)");
     println!("  [2] Micro-Benchmarks (Serde, Queue & Codec Throughput)");
     println!("  [3] Distributed Scheduling Simulation Benchmark");
-    println!("  [4] Tạo Báo cáo Nghiên cứu hoàn chỉnh (Export Research JSON Report)");
-    println!("  [0] Quay lại Menu chính");
-    print!("Lựa chọn [0-4]: ");
+    println!("  [4] Export Complete Research JSON Report");
+    println!("  [0] Back to Main Menu");
+    print!("Select [0-4]: ");
     io::stdout().flush().unwrap();
 
     let mut input = String::new();

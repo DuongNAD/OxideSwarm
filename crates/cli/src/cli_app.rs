@@ -16,10 +16,9 @@
 //! `--listen`), the dashboard is 8080.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use tokio::net::TcpStream;
@@ -119,6 +118,7 @@ impl Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Commands {
     /// Start master coordinator node
     Master(MasterArgs),
@@ -1933,9 +1933,7 @@ fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
                 None => None,
             };
             if prompt.is_none() && image_data.is_none() {
-                return Err(
-                    "3D generation requires either --prompt or --image".to_string(),
-                );
+                return Err("3D generation requires either --prompt or --image".to_string());
             }
             let quality = args
                 .quality
@@ -1947,13 +1945,8 @@ fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
                 .as_ref()
                 .map(|e| e.to_lowercase())
                 .filter(|e| e != "auto");
-            let export_texture = if args.no_export_texture {
-                false
-            } else if args.export_texture {
-                true
-            } else {
-                true
-            };
+            let _ = args.export_texture;
+            let export_texture = !args.no_export_texture;
             let spec = TaskSpec::Generative3D(rusty_grid_core::task::Generative3DSpec {
                 prompt,
                 image_data,
@@ -2234,10 +2227,7 @@ async fn run_submit_with_secret(
         }
     };
 
-    let is_asset_task = matches!(
-        spec,
-        TaskSpec::Generative3D(_) | TaskSpec::AutoRig(_)
-    );
+    let is_asset_task = matches!(spec, TaskSpec::Generative3D(_) | TaskSpec::AutoRig(_));
 
     let staged_files = if !args.files.is_empty() {
         match crate::connect::prepare_staged_files(&args.files) {

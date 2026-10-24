@@ -30,7 +30,8 @@ use rusty_grid_master::server::{MasterServer, ServerConfig};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 
 fn create_valid_test_glb() -> Vec<u8> {
-    let json_bytes = br#"{"asset":{"version":"2.0"},"scenes":[{"nodes":[0]}],"nodes":[{"name":"RootNode"}]}"#;
+    let json_bytes =
+        br#"{"asset":{"version":"2.0"},"scenes":[{"nodes":[0]}],"nodes":[{"name":"RootNode"}]}"#;
     let pad = (4 - (json_bytes.len() % 4)) % 4;
     let mut padded_json = json_bytes.to_vec();
     padded_json.extend(vec![b' '; pad]);
@@ -148,9 +149,7 @@ fn test_fuzz_glb_header_chunk_types() {
 
     let invalid_chunk_types: Vec<u32> = vec![
         0x004E4942, // "BIN\0" (Chunk 1 type, not Chunk 0)
-        0x00000000,
-        0xFFFFFFFF,
-        0x58585858, // "XXXX"
+        0x00000000, 0xFFFFFFFF, 0x58585858, // "XXXX"
     ];
 
     for ctype in invalid_chunk_types {
@@ -184,7 +183,9 @@ fn test_fuzz_glb_header_corrupted_json() {
     glb_malformed.extend_from_slice(malformed_json);
     let res2 = validate_glb_header(&glb_malformed);
     assert!(res2.is_err());
-    assert!(res2.unwrap_err().contains("Failed to parse glTF chunk 0 JSON"));
+    assert!(res2
+        .unwrap_err()
+        .contains("Failed to parse glTF chunk 0 JSON"));
 
     // 3. Invalid glTF asset version string
     let bad_ver_json = b"{\"asset\":{\"version\":\"1.0\"}}";
@@ -237,7 +238,11 @@ async fn test_cli_malicious_mesh_input_paths() {
         ..Default::default()
     };
     let exit1 = run_submit(args1, None).await;
-    assert_eq!(exit1, ExitCode::FAILURE, "Non-existent mesh must return failure without panic");
+    assert_eq!(
+        exit1,
+        ExitCode::FAILURE,
+        "Non-existent mesh must return failure without panic"
+    );
 
     // Case 2: Zero-byte mesh file
     let empty_mesh = temp_dir.path().join("zero_byte_mesh.glb");
@@ -268,7 +273,11 @@ async fn test_cli_malicious_mesh_input_paths() {
         ..Default::default()
     };
     let exit2 = run_submit(args2, None).await;
-    assert_eq!(exit2, ExitCode::FAILURE, "Zero-byte mesh file must return failure without panic");
+    assert_eq!(
+        exit2,
+        ExitCode::FAILURE,
+        "Zero-byte mesh file must return failure without panic"
+    );
 
     // Case 3: Directory passed as mesh
     let dir_as_mesh = temp_dir.path().join("directory_not_a_file");
@@ -299,7 +308,11 @@ async fn test_cli_malicious_mesh_input_paths() {
         ..Default::default()
     };
     let exit3 = run_submit(args3, None).await;
-    assert_eq!(exit3, ExitCode::FAILURE, "Directory as mesh must return failure without panic");
+    assert_eq!(
+        exit3,
+        ExitCode::FAILURE,
+        "Directory as mesh must return failure without panic"
+    );
 }
 
 #[tokio::test]
@@ -334,7 +347,11 @@ async fn test_cli_malicious_image_and_prompt_inputs() {
         ..Default::default()
     };
     let exit1 = run_submit(args1, None).await;
-    assert_eq!(exit1, ExitCode::FAILURE, "Non-existent image must fail without panic");
+    assert_eq!(
+        exit1,
+        ExitCode::FAILURE,
+        "Non-existent image must fail without panic"
+    );
 
     // Case 2: Zero-byte image file
     let empty_img = temp_dir.path().join("empty_image.png");
@@ -365,7 +382,11 @@ async fn test_cli_malicious_image_and_prompt_inputs() {
         ..Default::default()
     };
     let exit2 = run_submit(args2, None).await;
-    assert_eq!(exit2, ExitCode::FAILURE, "Zero-byte image must fail without panic");
+    assert_eq!(
+        exit2,
+        ExitCode::FAILURE,
+        "Zero-byte image must fail without panic"
+    );
 
     // Case 3: Directory passed as image
     let dir_as_img = temp_dir.path().join("image_directory");
@@ -396,7 +417,11 @@ async fn test_cli_malicious_image_and_prompt_inputs() {
         ..Default::default()
     };
     let exit3 = run_submit(args3, None).await;
-    assert_eq!(exit3, ExitCode::FAILURE, "Directory as image must fail without panic");
+    assert_eq!(
+        exit3,
+        ExitCode::FAILURE,
+        "Directory as image must fail without panic"
+    );
 
     // Case 4: Empty prompt string ("" or whitespace)
     let args4 = SubmitArgs {
@@ -425,7 +450,11 @@ async fn test_cli_malicious_image_and_prompt_inputs() {
         ..Default::default()
     };
     let exit4 = run_submit(args4, None).await;
-    assert_eq!(exit4, ExitCode::FAILURE, "Whitespace prompt must fail without panic");
+    assert_eq!(
+        exit4,
+        ExitCode::FAILURE,
+        "Whitespace prompt must fail without panic"
+    );
 
     // Case 5: Missing both prompt and image for 3D
     let args5 = SubmitArgs {
@@ -454,7 +483,11 @@ async fn test_cli_malicious_image_and_prompt_inputs() {
         ..Default::default()
     };
     let exit5 = run_submit(args5, None).await;
-    assert_eq!(exit5, ExitCode::FAILURE, "Missing prompt and image must fail");
+    assert_eq!(
+        exit5,
+        ExitCode::FAILURE,
+        "Missing prompt and image must fail"
+    );
 }
 
 // =========================================================================
@@ -529,7 +562,11 @@ async fn test_cli_deeply_nested_output_directory_creation() {
     };
 
     let exit_code = run_submit(args, None).await;
-    assert_eq!(exit_code, ExitCode::SUCCESS, "Task submission and export must succeed");
+    assert_eq!(
+        exit_code,
+        ExitCode::SUCCESS,
+        "Task submission and export must succeed"
+    );
 
     // 4. Verify deeply nested parent dirs were created and file exists
     assert!(

@@ -4,10 +4,16 @@
 //! descendants are unconditionally terminated upon job close, worker exit, or timeout.
 
 use std::io;
+#[cfg(windows)]
 use tracing::{debug, warn};
 
 #[cfg(windows)]
-#[allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 mod win32 {
     use core::ffi::c_void;
 
@@ -65,10 +71,7 @@ mod win32 {
 
     #[link(name = "kernel32")]
     extern "system" {
-        pub fn CreateJobObjectW(
-            lpJobAttributes: *mut c_void,
-            lpName: *const u16,
-        ) -> HANDLE;
+        pub fn CreateJobObjectW(lpJobAttributes: *mut c_void, lpName: *const u16) -> HANDLE;
 
         pub fn SetInformationJobObject(
             hJob: HANDLE,
@@ -77,15 +80,9 @@ mod win32 {
             cbJobObjectInformationLength: DWORD,
         ) -> BOOL;
 
-        pub fn AssignProcessToJobObject(
-            hJob: HANDLE,
-            hProcess: HANDLE,
-        ) -> BOOL;
+        pub fn AssignProcessToJobObject(hJob: HANDLE, hProcess: HANDLE) -> BOOL;
 
-        pub fn TerminateJobObject(
-            hJob: HANDLE,
-            uExitCode: u32,
-        ) -> BOOL;
+        pub fn TerminateJobObject(hJob: HANDLE, uExitCode: u32) -> BOOL;
 
         pub fn OpenProcess(
             dwDesiredAccess: DWORD,
@@ -140,7 +137,10 @@ impl JobObject {
                     return Err(err);
                 }
 
-                debug!("Created Win32 Job Object {:?} with KILL_ON_JOB_CLOSE", handle);
+                debug!(
+                    "Created Win32 Job Object {:?} with KILL_ON_JOB_CLOSE",
+                    handle
+                );
                 Ok(Self { handle })
             }
         }
@@ -209,6 +209,7 @@ impl JobObject {
 
         #[cfg(not(windows))]
         {
+            let _ = exit_code;
             if let Some(pgid) = self.pgid {
                 let _ = std::process::Command::new("kill")
                     .args(["-9", &format!("-{pgid}")])

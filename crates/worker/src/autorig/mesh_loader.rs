@@ -44,8 +44,18 @@ fn load_glb_mesh(data: &[u8]) -> Result<RawMesh, String> {
     if offset + 8 > data.len() {
         return Err("Missing Chunk 0 in GLB".to_string());
     }
-    let json_len = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]) as usize;
-    let json_type = u32::from_le_bytes([data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]]);
+    let json_len = u32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ]) as usize;
+    let json_type = u32::from_le_bytes([
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
+    ]);
     if json_type != CHUNK_TYPE_JSON {
         return Err("Expected JSON Chunk 0 in GLB".to_string());
     }
@@ -59,8 +69,18 @@ fn load_glb_mesh(data: &[u8]) -> Result<RawMesh, String> {
 
     // Chunk 1: BIN
     let bin_slice = if offset + 8 <= data.len() {
-        let bin_len = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]) as usize;
-        let bin_type = u32::from_le_bytes([data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]]);
+        let bin_len = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
+        let bin_type = u32::from_le_bytes([
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]);
         if bin_type == CHUNK_TYPE_BIN {
             offset += 8;
             if offset + bin_len <= data.len() {
@@ -78,43 +98,58 @@ fn load_glb_mesh(data: &[u8]) -> Result<RawMesh, String> {
     let gltf: Value = serde_json::from_slice(json_slice)
         .map_err(|e| format!("Failed to parse glTF JSON: {e}"))?;
 
-    let meshes = gltf.get("meshes").and_then(|m| m.as_array())
+    let meshes = gltf
+        .get("meshes")
+        .and_then(|m| m.as_array())
         .ok_or("No meshes found in glTF JSON")?;
     if meshes.is_empty() {
         return Err("glTF meshes array is empty".to_string());
     }
 
-    let primitives = meshes[0].get("primitives").and_then(|p| p.as_array())
+    let primitives = meshes[0]
+        .get("primitives")
+        .and_then(|p| p.as_array())
         .ok_or("No primitives found in glTF mesh")?;
     if primitives.is_empty() {
         return Err("glTF primitives array is empty".to_string());
     }
 
     let prim = &primitives[0];
-    let attributes = prim.get("attributes").and_then(|a| a.as_object())
+    let attributes = prim
+        .get("attributes")
+        .and_then(|a| a.as_object())
         .ok_or("No attributes found in primitive")?;
 
-    let pos_acc_idx = attributes.get("POSITION").and_then(|idx| idx.as_u64())
+    let pos_acc_idx = attributes
+        .get("POSITION")
+        .and_then(|idx| idx.as_u64())
         .ok_or("Primitive missing POSITION attribute")? as usize;
 
-    let accessors = gltf.get("accessors").and_then(|a| a.as_array())
+    let accessors = gltf
+        .get("accessors")
+        .and_then(|a| a.as_array())
         .ok_or("No accessors found in glTF")?;
-    let buffer_views = gltf.get("bufferViews").and_then(|b| b.as_array())
+    let buffer_views = gltf
+        .get("bufferViews")
+        .and_then(|b| b.as_array())
         .ok_or("No bufferViews found in glTF")?;
 
     // Read positions
     let positions = read_vec3_accessor(pos_acc_idx, accessors, buffer_views, bin_slice)?;
 
     // Read optional normals
-    let normals = if let Some(norm_acc_idx) = attributes.get("NORMAL").and_then(|idx| idx.as_u64()) {
-        read_vec3_accessor(norm_acc_idx as usize, accessors, buffer_views, bin_slice).unwrap_or_default()
+    let normals = if let Some(norm_acc_idx) = attributes.get("NORMAL").and_then(|idx| idx.as_u64())
+    {
+        read_vec3_accessor(norm_acc_idx as usize, accessors, buffer_views, bin_slice)
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
 
     // Read optional UVs
     let uvs = if let Some(uv_acc_idx) = attributes.get("TEXCOORD_0").and_then(|idx| idx.as_u64()) {
-        read_vec2_accessor(uv_acc_idx as usize, accessors, buffer_views, bin_slice).unwrap_or_default()
+        read_vec2_accessor(uv_acc_idx as usize, accessors, buffer_views, bin_slice)
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -142,15 +177,25 @@ fn read_vec3_accessor(
     bin: &[u8],
 ) -> Result<Vec<[f32; 3]>, String> {
     let acc = accessors.get(acc_idx).ok_or("Invalid accessor index")?;
-    let count = acc.get("count").and_then(|c| c.as_u64()).ok_or("Missing count")? as usize;
-    let bv_idx = acc.get("bufferView").and_then(|b| b.as_u64()).ok_or("Missing bufferView")? as usize;
+    let count = acc
+        .get("count")
+        .and_then(|c| c.as_u64())
+        .ok_or("Missing count")? as usize;
+    let bv_idx = acc
+        .get("bufferView")
+        .and_then(|b| b.as_u64())
+        .ok_or("Missing bufferView")? as usize;
     let acc_byte_offset = acc.get("byteOffset").and_then(|o| o.as_u64()).unwrap_or(0) as usize;
 
     let bv = buffer_views.get(bv_idx).ok_or("Invalid bufferView index")?;
     let bv_byte_offset = bv.get("byteOffset").and_then(|o| o.as_u64()).unwrap_or(0) as usize;
 
     let total_offset = bv_byte_offset + acc_byte_offset;
-    let byte_stride = bv.get("byteStride").and_then(|s| s.as_u64()).map(|s| s as usize).unwrap_or(12);
+    let byte_stride = bv
+        .get("byteStride")
+        .and_then(|s| s.as_u64())
+        .map(|s| s as usize)
+        .unwrap_or(12);
 
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
@@ -159,8 +204,18 @@ fn read_vec3_accessor(
             return Err("Buffer overrun while reading Vec3 accessor".to_string());
         }
         let x = f32::from_le_bytes([bin[start], bin[start + 1], bin[start + 2], bin[start + 3]]);
-        let y = f32::from_le_bytes([bin[start + 4], bin[start + 5], bin[start + 6], bin[start + 7]]);
-        let z = f32::from_le_bytes([bin[start + 8], bin[start + 9], bin[start + 10], bin[start + 11]]);
+        let y = f32::from_le_bytes([
+            bin[start + 4],
+            bin[start + 5],
+            bin[start + 6],
+            bin[start + 7],
+        ]);
+        let z = f32::from_le_bytes([
+            bin[start + 8],
+            bin[start + 9],
+            bin[start + 10],
+            bin[start + 11],
+        ]);
         out.push([x, y, z]);
     }
     Ok(out)
@@ -173,15 +228,25 @@ fn read_vec2_accessor(
     bin: &[u8],
 ) -> Result<Vec<[f32; 2]>, String> {
     let acc = accessors.get(acc_idx).ok_or("Invalid accessor index")?;
-    let count = acc.get("count").and_then(|c| c.as_u64()).ok_or("Missing count")? as usize;
-    let bv_idx = acc.get("bufferView").and_then(|b| b.as_u64()).ok_or("Missing bufferView")? as usize;
+    let count = acc
+        .get("count")
+        .and_then(|c| c.as_u64())
+        .ok_or("Missing count")? as usize;
+    let bv_idx = acc
+        .get("bufferView")
+        .and_then(|b| b.as_u64())
+        .ok_or("Missing bufferView")? as usize;
     let acc_byte_offset = acc.get("byteOffset").and_then(|o| o.as_u64()).unwrap_or(0) as usize;
 
     let bv = buffer_views.get(bv_idx).ok_or("Invalid bufferView index")?;
     let bv_byte_offset = bv.get("byteOffset").and_then(|o| o.as_u64()).unwrap_or(0) as usize;
 
     let total_offset = bv_byte_offset + acc_byte_offset;
-    let byte_stride = bv.get("byteStride").and_then(|s| s.as_u64()).map(|s| s as usize).unwrap_or(8);
+    let byte_stride = bv
+        .get("byteStride")
+        .and_then(|s| s.as_u64())
+        .map(|s| s as usize)
+        .unwrap_or(8);
 
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
@@ -190,7 +255,12 @@ fn read_vec2_accessor(
             return Err("Buffer overrun while reading Vec2 accessor".to_string());
         }
         let u = f32::from_le_bytes([bin[start], bin[start + 1], bin[start + 2], bin[start + 3]]);
-        let v = f32::from_le_bytes([bin[start + 4], bin[start + 5], bin[start + 6], bin[start + 7]]);
+        let v = f32::from_le_bytes([
+            bin[start + 4],
+            bin[start + 5],
+            bin[start + 6],
+            bin[start + 7],
+        ]);
         out.push([u, v]);
     }
     Ok(out)
@@ -203,9 +273,18 @@ fn read_indices_accessor(
     bin: &[u8],
 ) -> Result<Vec<u32>, String> {
     let acc = accessors.get(acc_idx).ok_or("Invalid accessor index")?;
-    let count = acc.get("count").and_then(|c| c.as_u64()).ok_or("Missing count")? as usize;
-    let comp_type = acc.get("componentType").and_then(|t| t.as_u64()).unwrap_or(5123) as u32;
-    let bv_idx = acc.get("bufferView").and_then(|b| b.as_u64()).ok_or("Missing bufferView")? as usize;
+    let count = acc
+        .get("count")
+        .and_then(|c| c.as_u64())
+        .ok_or("Missing count")? as usize;
+    let comp_type = acc
+        .get("componentType")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(5123) as u32;
+    let bv_idx = acc
+        .get("bufferView")
+        .and_then(|b| b.as_u64())
+        .ok_or("Missing bufferView")? as usize;
     let acc_byte_offset = acc.get("byteOffset").and_then(|o| o.as_u64()).unwrap_or(0) as usize;
 
     let bv = buffer_views.get(bv_idx).ok_or("Invalid bufferView index")?;
@@ -231,7 +310,8 @@ fn read_indices_accessor(
             if start + 4 > bin.len() {
                 return Err("Buffer overrun while reading u32 indices".to_string());
             }
-            let idx = u32::from_le_bytes([bin[start], bin[start + 1], bin[start + 2], bin[start + 3]]);
+            let idx =
+                u32::from_le_bytes([bin[start], bin[start + 1], bin[start + 2], bin[start + 3]]);
             out.push(idx);
         }
     } else {
@@ -243,8 +323,8 @@ fn read_indices_accessor(
 
 /// Parses a Wavefront OBJ text buffer into a `RawMesh`.
 fn load_obj_mesh(data: &[u8]) -> Result<RawMesh, String> {
-    let text = std::str::from_utf8(data)
-        .map_err(|e| format!("OBJ data contains invalid UTF-8: {e}"))?;
+    let text =
+        std::str::from_utf8(data).map_err(|e| format!("OBJ data contains invalid UTF-8: {e}"))?;
 
     let mut raw_positions: Vec<[f32; 3]> = Vec::new();
     let mut raw_normals: Vec<[f32; 3]> = Vec::new();
@@ -313,8 +393,14 @@ fn load_obj_mesh(data: &[u8]) -> Result<RawMesh, String> {
         for token in face_tokens {
             let mut subtokens = token.split('/');
             let v_idx: i32 = subtokens.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let vt_idx: Option<i32> = subtokens.next().and_then(|s| if s.is_empty() { None } else { s.parse().ok() });
-            let vn_idx: Option<i32> = subtokens.next().and_then(|s| if s.is_empty() { None } else { s.parse().ok() });
+            let vt_idx: Option<i32> =
+                subtokens
+                    .next()
+                    .and_then(|s| if s.is_empty() { None } else { s.parse().ok() });
+            let vn_idx: Option<i32> =
+                subtokens
+                    .next()
+                    .and_then(|s| if s.is_empty() { None } else { s.parse().ok() });
 
             let pos_idx = resolve_obj_index(v_idx, raw_positions.len()).ok_or_else(|| {
                 format!(

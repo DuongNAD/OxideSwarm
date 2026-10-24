@@ -528,7 +528,8 @@ impl AgentMeshClient {
             args["image"] = serde_json::json!(STANDARD.encode(img));
         }
 
-        self.send_command("grid", "grid_3d_generate", args, timeout_ms.or(Some(60000))).await
+        self.send_command("grid", "grid_3d_generate", args, timeout_ms.or(Some(60000)))
+            .await
     }
 
     /// Convenience method to generate 3D asset from a text prompt.
@@ -539,7 +540,8 @@ impl AgentMeshClient {
         engine: Option<&str>,
         timeout_ms: Option<u64>,
     ) -> Result<AgentMeshEnvelope, Box<dyn std::error::Error + Send + Sync>> {
-        self.generate_3d(Some(prompt), None, quality, engine, None, timeout_ms).await
+        self.generate_3d(Some(prompt), None, quality, engine, None, timeout_ms)
+            .await
     }
 
     /// Convenience method to generate 3D asset from an image.
@@ -550,7 +552,8 @@ impl AgentMeshClient {
         engine: Option<&str>,
         timeout_ms: Option<u64>,
     ) -> Result<AgentMeshEnvelope, Box<dyn std::error::Error + Send + Sync>> {
-        self.generate_3d(None, Some(image_bytes), quality, engine, None, timeout_ms).await
+        self.generate_3d(None, Some(image_bytes), quality, engine, None, timeout_ms)
+            .await
     }
 
     /// Submits an AutoRig task to the OxideSwarm Grid.
@@ -574,7 +577,8 @@ impl AgentMeshClient {
             args["preferred_provider"] = serde_json::json!(p);
         }
 
-        self.send_command("grid", "grid_auto_rig", args, timeout_ms.or(Some(60000))).await
+        self.send_command("grid", "grid_auto_rig", args, timeout_ms.or(Some(60000)))
+            .await
     }
 
     /// Extracts and cryptographically verifies binary asset bytes from a CommandResponse envelope.
@@ -591,7 +595,10 @@ impl AgentMeshClient {
                 ..
             } => {
                 if status != "success" {
-                    return Err(format!("Command response status is '{status}', expected 'success'").into());
+                    return Err(format!(
+                        "Command response status is '{status}', expected 'success'"
+                    )
+                    .into());
                 }
                 let b64_str = payload
                     .get("asset_base64")
@@ -603,7 +610,8 @@ impl AgentMeshClient {
                         return Err(format!(
                             "Asset SHA-256 verification failed: expected {expected_sha}, got {}",
                             compute_sha256(&bytes)
-                        ).into());
+                        )
+                        .into());
                     }
                 }
                 Ok(bytes)
@@ -641,7 +649,7 @@ impl AgentMeshClient {
 
     /// Runs a long-lived agent node loop with automatic reconnection.
     pub async fn run_daemon(&self) {
-        while self.running.load(Ordering::SeqCst) || true {
+        loop {
             if let Err(e) = self.connect().await {
                 let delay = match e.downcast_ref::<RegistrationRejected>() {
                     Some(rej)

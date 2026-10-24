@@ -16,10 +16,10 @@
 //!    - Exact correlation_id routing verification across all concurrent channels
 //!    - WebSocket DeliveryAck ("target_forwarded") and CommandResponse sequencing
 
+#![allow(clippy::needless_borrow, clippy::needless_borrows_for_generic_args)]
+
 use agent_mesh::bridge::AgentGridBridge;
-use agent_mesh::{
-    compute_sha256, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub,
-};
+use agent_mesh::{compute_sha256, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use futures::{SinkExt, StreamExt};
@@ -34,7 +34,8 @@ use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use uuid::Uuid;
 
 fn create_minimal_valid_glb() -> Vec<u8> {
-    let json_bytes = br#"{"asset":{"version":"2.0"},"scenes":[{"nodes":[0]}],"nodes":[{"name":"RootNode"}]}"#;
+    let json_bytes =
+        br#"{"asset":{"version":"2.0"},"scenes":[{"nodes":[0]}],"nodes":[{"name":"RootNode"}]}"#;
     let pad = (4 - (json_bytes.len() % 4)) % 4;
     let mut padded_json = json_bytes.to_vec();
     padded_json.extend(vec![b' '; pad]);
@@ -157,8 +158,14 @@ fn test_adv_sha256_single_bit_flip_tampering_rust() {
         "corr-attack-0",
     );
     let res_0 = AgentMeshClient::extract_asset_bytes(&env_tampered_0);
-    assert!(res_0.is_err(), "Single bit flip at byte 0 must fail SHA-256");
-    assert!(res_0.unwrap_err().to_string().contains("Asset SHA-256 verification failed"));
+    assert!(
+        res_0.is_err(),
+        "Single bit flip at byte 0 must fail SHA-256"
+    );
+    assert!(res_0
+        .unwrap_err()
+        .to_string()
+        .contains("Asset SHA-256 verification failed"));
 
     // Attack 2: Single bit flip at middle byte
     let mid_idx = original_bytes.len() / 2;
@@ -175,8 +182,14 @@ fn test_adv_sha256_single_bit_flip_tampering_rust() {
         "corr-attack-mid",
     );
     let res_mid = AgentMeshClient::extract_asset_bytes(&env_tampered_mid);
-    assert!(res_mid.is_err(), "Single bit flip at middle byte must fail SHA-256");
-    assert!(res_mid.unwrap_err().to_string().contains("Asset SHA-256 verification failed"));
+    assert!(
+        res_mid.is_err(),
+        "Single bit flip at middle byte must fail SHA-256"
+    );
+    assert!(res_mid
+        .unwrap_err()
+        .to_string()
+        .contains("Asset SHA-256 verification failed"));
 
     // Attack 3: Single bit flip at final byte (MSB)
     let last_idx = original_bytes.len() - 1;
@@ -193,12 +206,25 @@ fn test_adv_sha256_single_bit_flip_tampering_rust() {
         "corr-attack-last",
     );
     let res_last = AgentMeshClient::extract_asset_bytes(&env_tampered_last);
-    assert!(res_last.is_err(), "Single bit flip at last byte must fail SHA-256");
-    assert!(res_last.unwrap_err().to_string().contains("Asset SHA-256 verification failed"));
+    assert!(
+        res_last.is_err(),
+        "Single bit flip at last byte must fail SHA-256"
+    );
+    assert!(res_last
+        .unwrap_err()
+        .to_string()
+        .contains("Asset SHA-256 verification failed"));
 
     // Attack 4: Altered SHA-256 checksum string
     let mut altered_sha = original_sha.clone();
-    altered_sha.replace_range(0..1, if altered_sha.starts_with('a') { "b" } else { "a" });
+    altered_sha.replace_range(
+        0..1,
+        if altered_sha.starts_with('a') {
+            "b"
+        } else {
+            "a"
+        },
+    );
     let env_altered_sha = make_command_response(
         "success",
         0,
@@ -255,28 +281,28 @@ async fn test_adv_bridge_binary_data_parser_fuzzing() {
 
     let adversarial_inputs: Vec<serde_json::Value> = vec![
         serde_json::json!("0x12345678"),
-        serde_json::json!("0x12345"),      // odd-length hex
-        serde_json::json!("0XDEADBEEF"),   // uppercase hex prefix
-        serde_json::json!("0xZZZZ"),       // invalid hex characters
-        serde_json::json!("0x"),           // empty hex prefix
+        serde_json::json!("0x12345"),    // odd-length hex
+        serde_json::json!("0XDEADBEEF"), // uppercase hex prefix
+        serde_json::json!("0xZZZZ"),     // invalid hex characters
+        serde_json::json!("0x"),         // empty hex prefix
         serde_json::json!("0X"),
-        serde_json::json!("aGVsbG8gd29ybGQ="), // valid base64
-        serde_json::json!("!@#$%^&*()_+~`"),  // invalid base64 string
-        serde_json::json!("aGVsbG8==="),      // corrupted padding
+        serde_json::json!("aGVsbG8gd29ybGQ="),  // valid base64
+        serde_json::json!("!@#$%^&*()_+~`"),    // invalid base64 string
+        serde_json::json!("aGVsbG8==="),        // corrupted padding
         serde_json::json!([0, 1, 2, 127, 255]), // raw byte array
-        serde_json::json!([-5, 300, 1000000]), // negative & overflow values
+        serde_json::json!([-5, 300, 1000000]),  // negative & overflow values
         serde_json::json!(["string", "in", "array"]),
-        serde_json::json!([]),                // empty array
-        serde_json::json!(""),                // empty string
-        serde_json::json!("   \r\n\t  "),     // whitespace
-        serde_json::json!("null\0byte\0str"), // embedded null
-        serde_json::json!("🤖📦🔥✨🚀"),       // unicode / emoji string
+        serde_json::json!([]),                            // empty array
+        serde_json::json!(""),                            // empty string
+        serde_json::json!("   \r\n\t  "),                 // whitespace
+        serde_json::json!("null\0byte\0str"),             // embedded null
+        serde_json::json!("🤖📦🔥✨🚀"),                  // unicode / emoji string
         serde_json::json!("non_existent_file_98765.glb"), // non-existent file
         serde_json::json!(existing_file.to_string_lossy().to_string()), // existing file path
-        serde_json::json!(123456),             // integer
-        serde_json::json!(true),               // boolean
-        serde_json::Value::Null,              // null
-        serde_json::json!({"nested": "object"}), // object
+        serde_json::json!(123456),                        // integer
+        serde_json::json!(true),                          // boolean
+        serde_json::Value::Null,                          // null
+        serde_json::json!({"nested": "object"}),          // object
     ];
 
     for (idx, input_val) in adversarial_inputs.into_iter().enumerate() {
@@ -387,7 +413,10 @@ async fn test_adv_websocket_delivery_ack_and_correlation_routing() {
     let reg_ack_msg = ws_rx.next().await.unwrap().unwrap();
     let reg_ack: AgentMeshEnvelope =
         AgentMeshEnvelope::from_json_str(&reg_ack_msg.to_text().unwrap()).unwrap();
-    assert!(matches!(reg_ack, AgentMeshEnvelope::NodeRegistrationAck { .. }));
+    assert!(matches!(
+        reg_ack,
+        AgentMeshEnvelope::NodeRegistrationAck { .. }
+    ));
 
     // Send 3D generation request with require_ack: true
     let target_corr_id = format!("corr-wire-3d-{}", Uuid::new_v4());
@@ -423,8 +452,14 @@ async fn test_adv_websocket_delivery_ack_and_correlation_routing() {
             to,
             ..
         } => {
-            assert_eq!(status, "target_forwarded", "Immediate ACK status must be 'target_forwarded'");
-            assert_eq!(correlation_id, target_corr_id, "DeliveryAck correlation_id mismatch");
+            assert_eq!(
+                status, "target_forwarded",
+                "Immediate ACK status must be 'target_forwarded'"
+            );
+            assert_eq!(
+                correlation_id, target_corr_id,
+                "DeliveryAck correlation_id mismatch"
+            );
             assert_eq!(from, "hub");
             assert_eq!(to, "adv-wire-agent");
         }
@@ -445,7 +480,10 @@ async fn test_adv_websocket_delivery_ack_and_correlation_routing() {
         } => {
             assert_eq!(status, "success");
             assert_eq!(*exit_code, 0);
-            assert_eq!(correlation_id, &target_corr_id, "CommandResponse correlation_id mismatch");
+            assert_eq!(
+                correlation_id, &target_corr_id,
+                "CommandResponse correlation_id mismatch"
+            );
             assert_eq!(from, "grid");
             assert_eq!(to, "adv-wire-agent");
 
@@ -526,7 +564,13 @@ async fn test_adv_high_concurrency_mesh_burst() {
                     .expect("Concurrent generate_3d_from_prompt failed")
             } else {
                 client
-                    .auto_rig(&mesh_clone, Some("biped"), None, Some("builtin"), Some(30000))
+                    .auto_rig(
+                        &mesh_clone,
+                        Some("biped"),
+                        None,
+                        Some("builtin"),
+                        Some(30000),
+                    )
                     .await
                     .expect("Concurrent auto_rig failed")
             };
@@ -539,9 +583,16 @@ async fn test_adv_high_concurrency_mesh_burst() {
                     ref from,
                     ..
                 } => {
-                    assert_eq!(status, "success", "Client {client_id} task failed: {:?}", resp);
+                    assert_eq!(
+                        status, "success",
+                        "Client {client_id} task failed: {:?}",
+                        resp
+                    );
                     assert_eq!(*exit_code, 0);
-                    assert_eq!(to, &client_id, "Response routed to wrong agent! Expected {client_id}, got {to}");
+                    assert_eq!(
+                        to, &client_id,
+                        "Response routed to wrong agent! Expected {client_id}, got {to}"
+                    );
                     assert_eq!(from, "grid");
 
                     let asset = AgentMeshClient::extract_asset_bytes(&resp)
@@ -549,7 +600,10 @@ async fn test_adv_high_concurrency_mesh_burst() {
                     assert!(asset.len() >= 20);
                     assert_eq!(&asset[0..4], b"glTF");
                 }
-                other => panic!("Client {client_id} expected CommandResponse, got {:?}", other),
+                other => panic!(
+                    "Client {client_id} expected CommandResponse, got {:?}",
+                    other
+                ),
             }
 
             client.close().await;
@@ -558,7 +612,8 @@ async fn test_adv_high_concurrency_mesh_burst() {
 
     // Wait for all 10 concurrent requests to resolve
     for (idx, task) in client_tasks.into_iter().enumerate() {
-        task.await.unwrap_or_else(|e| panic!("Client task {idx} panicked: {e}"));
+        task.await
+            .unwrap_or_else(|e| panic!("Client task {idx} panicked: {e}"));
     }
 
     // Cleanup

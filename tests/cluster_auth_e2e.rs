@@ -160,8 +160,8 @@ async fn start_fake_worker(
                     device_name: None,
                     error: None,
                     artifacts: Vec::new(),
-            asset_bytes: None,
-        })
+                    asset_bytes: None,
+                })
                 .await;
         }
     });

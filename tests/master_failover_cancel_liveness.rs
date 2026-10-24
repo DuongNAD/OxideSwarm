@@ -249,8 +249,8 @@ fn result_msg(worker_id: Uuid, task_id: TaskId, exit_code: i32, stdout: &[u8]) -
         device_name: None,
         error: None,
         artifacts: Vec::new(),
-            asset_bytes: None,
-        }
+        asset_bytes: None,
+    }
 }
 
 /// A protocol-level client (what the CLI and the MCP server are).

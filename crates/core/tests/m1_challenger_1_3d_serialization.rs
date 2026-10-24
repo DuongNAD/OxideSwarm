@@ -11,16 +11,15 @@
 //! 6. Verify concurrent multi-threaded zero-copy access and thread safety across threads.
 //! 7. Verify invalid Bincode enum variant indices resilience.
 
+use bytes::BytesMut;
 use std::sync::Arc;
 use std::time::Instant;
-use bytes::BytesMut;
 use tokio_util::codec::Decoder;
 use uuid::Uuid;
 
 use rusty_grid_core::protocol::{
-    default_codec, deserialize_message, serialize_message, MessageTransport,
-    ProtocolError, WireCodec, WorkerMessage, MAX_FRAME_SIZE,
-    WIRE_FORMAT_BINCODE, WIRE_FORMAT_JSON,
+    default_codec, deserialize_message, serialize_message, MessageTransport, ProtocolError,
+    WireCodec, WorkerMessage, MAX_FRAME_SIZE, WIRE_FORMAT_BINCODE, WIRE_FORMAT_JSON,
 };
 use rusty_grid_core::task::{
     AutoRigSpec, Bytes as TaskBytes, CheckpointData, Generative3DSpec, Task, TaskId,
@@ -58,8 +57,13 @@ fn create_simulated_glb(total_size: usize) -> Vec<u8> {
     data[bin_header_start + 4..bin_header_start + 8].copy_from_slice(b"BIN\0");
 
     // Fill remaining binary chunk with deterministic patterned pseudo-random data
-    for i in bin_data_start..total_size {
-        data[i] = ((i * 31 + 17) & 0xFF) as u8;
+    for (i, byte) in data
+        .iter_mut()
+        .enumerate()
+        .take(total_size)
+        .skip(bin_data_start)
+    {
+        *byte = ((i * 31 + 17) & 0xFF) as u8;
     }
 
     data
@@ -82,14 +86,26 @@ fn test_adv_01_generative_3d_extreme_inputs_and_fuzzing() {
         export_texture: true,
     };
     let val_result = TaskSpec::Generative3D(empty_spec).validate();
-    assert!(val_result.is_err(), "Empty prompt + None image must fail validation");
-    println!("  [+] Empty prompt + None image correctly rejected: {:?}", val_result.unwrap_err());
+    assert!(
+        val_result.is_err(),
+        "Empty prompt + None image must fail validation"
+    );
+    println!(
+        "  [+] Empty prompt + None image correctly rejected: {:?}",
+        val_result.unwrap_err()
+    );
 
     // Vector B: Whitespace-only prompt fails validation
     let whitespace_spec = Generative3DSpec::new_prompt("   \t\n  \r\n ");
     let ws_result = TaskSpec::Generative3D(whitespace_spec).validate();
-    assert!(ws_result.is_err(), "Whitespace-only prompt must fail validation");
-    println!("  [+] Whitespace-only prompt correctly rejected: {:?}", ws_result.unwrap_err());
+    assert!(
+        ws_result.is_err(),
+        "Whitespace-only prompt must fail validation"
+    );
+    println!(
+        "  [+] Whitespace-only prompt correctly rejected: {:?}",
+        ws_result.unwrap_err()
+    );
 
     // Vector C: Massive 1MB prompt (1,048,576 bytes)
     let one_mb = 1024 * 1024;
@@ -105,28 +121,40 @@ fn test_adv_01_generative_3d_extreme_inputs_and_fuzzing() {
         .with_export_texture(true);
 
     // Validation must pass
-    assert!(TaskSpec::Generative3D(large_spec.clone()).validate().is_ok());
+    assert!(TaskSpec::Generative3D(large_spec.clone())
+        .validate()
+        .is_ok());
 
     // JSON roundtrip
     let t0 = Instant::now();
     let json_str = serde_json::to_string(&large_spec).expect("JSON serialize 1MB prompt");
-    let deser_json: Generative3DSpec = serde_json::from_str(&json_str).expect("JSON deserialize 1MB prompt");
+    let deser_json: Generative3DSpec =
+        serde_json::from_str(&json_str).expect("JSON deserialize 1MB prompt");
     let json_elapsed = t0.elapsed();
     assert_eq!(deser_json.prompt.as_ref().unwrap().len(), one_mb);
     assert_eq!(deser_json.prompt.as_ref().unwrap(), &large_prompt);
     assert_eq!(deser_json.quality, "high");
     assert_eq!(deser_json.engine_preference.as_deref(), Some("triposr"));
     assert!(deser_json.export_texture);
-    println!("  [+] 1MB prompt JSON roundtrip succeeded in {:?} (size: {} bytes)", json_elapsed, json_str.len());
+    println!(
+        "  [+] 1MB prompt JSON roundtrip succeeded in {:?} (size: {} bytes)",
+        json_elapsed,
+        json_str.len()
+    );
 
     // Bincode roundtrip
     let t1 = Instant::now();
     let bin_bytes = bincode::serialize(&large_spec).expect("Bincode serialize 1MB prompt");
-    let deser_bin: Generative3DSpec = bincode::deserialize(&bin_bytes).expect("Bincode deserialize 1MB prompt");
+    let deser_bin: Generative3DSpec =
+        bincode::deserialize(&bin_bytes).expect("Bincode deserialize 1MB prompt");
     let bin_elapsed = t1.elapsed();
     assert_eq!(deser_bin.prompt.as_ref().unwrap().len(), one_mb);
     assert_eq!(deser_bin.prompt.as_ref().unwrap(), &large_prompt);
-    println!("  [+] 1MB prompt Bincode roundtrip succeeded in {:?} (size: {} bytes)", bin_elapsed, bin_bytes.len());
+    println!(
+        "  [+] 1MB prompt Bincode roundtrip succeeded in {:?} (size: {} bytes)",
+        bin_elapsed,
+        bin_bytes.len()
+    );
 
     // Vector D: Adversarial Unicode, diacritics, RTL override, emojis, embedded null bytes
     let adversarial_prompts = vec![
@@ -156,13 +184,25 @@ fn test_adv_01_generative_3d_extreme_inputs_and_fuzzing() {
 
         // JSON roundtrip
         let json_enc = serde_json::to_string(&spec).expect("JSON serialize adv prompt");
-        let json_dec: Generative3DSpec = serde_json::from_str(&json_enc).expect("JSON deserialize adv prompt");
-        assert_eq!(json_dec.prompt.as_deref(), Some(adv_prompt), "JSON adv prompt #{} mismatch", idx);
+        let json_dec: Generative3DSpec =
+            serde_json::from_str(&json_enc).expect("JSON deserialize adv prompt");
+        assert_eq!(
+            json_dec.prompt.as_deref(),
+            Some(adv_prompt),
+            "JSON adv prompt #{} mismatch",
+            idx
+        );
 
         // Bincode roundtrip
         let bin_enc = bincode::serialize(&spec).expect("Bincode serialize adv prompt");
-        let bin_dec: Generative3DSpec = bincode::deserialize(&bin_enc).expect("Bincode deserialize adv prompt");
-        assert_eq!(bin_dec.prompt.as_deref(), Some(adv_prompt), "Bincode adv prompt #{} mismatch", idx);
+        let bin_dec: Generative3DSpec =
+            bincode::deserialize(&bin_enc).expect("Bincode deserialize adv prompt");
+        assert_eq!(
+            bin_dec.prompt.as_deref(),
+            Some(adv_prompt),
+            "Bincode adv prompt #{} mismatch",
+            idx
+        );
     }
     println!("  [+] Successfully verified 7 adversarial Unicode, ZWJ emoji, RTL, null byte, and injection strings.");
 
@@ -174,7 +214,12 @@ fn test_adv_01_generative_3d_extreme_inputs_and_fuzzing() {
         engine_preference: None,
         export_texture: true,
     };
-    assert!(TaskSpec::Generative3D(empty_quality_spec).validate().is_err(), "Empty quality must fail validation");
+    assert!(
+        TaskSpec::Generative3D(empty_quality_spec)
+            .validate()
+            .is_err(),
+        "Empty quality must fail validation"
+    );
 
     let whitespace_quality_spec = Generative3DSpec {
         prompt: Some("valid prompt".to_string()),
@@ -183,20 +228,36 @@ fn test_adv_01_generative_3d_extreme_inputs_and_fuzzing() {
         engine_preference: None,
         export_texture: true,
     };
-    assert!(TaskSpec::Generative3D(whitespace_quality_spec).validate().is_err(), "Whitespace quality must fail validation");
+    assert!(
+        TaskSpec::Generative3D(whitespace_quality_spec)
+            .validate()
+            .is_err(),
+        "Whitespace quality must fail validation"
+    );
 
     // Vector F: Engine preference & GPU requirements logic
     let sdf_spec = TaskSpec::Generative3D(Generative3DSpec::new_prompt("cube").with_engine("sdf"));
     assert!(!sdf_spec.requires_gpu(), "SDF engine must NOT require GPU");
 
-    let procedural_spec = TaskSpec::Generative3D(Generative3DSpec::new_prompt("cube").with_engine("procedural"));
-    assert!(!procedural_spec.requires_gpu(), "Procedural engine must NOT require GPU");
+    let procedural_spec =
+        TaskSpec::Generative3D(Generative3DSpec::new_prompt("cube").with_engine("procedural"));
+    assert!(
+        !procedural_spec.requires_gpu(),
+        "Procedural engine must NOT require GPU"
+    );
 
-    let triposr_spec = TaskSpec::Generative3D(Generative3DSpec::new_prompt("cube").with_engine("triposr"));
-    assert!(triposr_spec.requires_gpu(), "TripoSR engine MUST require GPU");
+    let triposr_spec =
+        TaskSpec::Generative3D(Generative3DSpec::new_prompt("cube").with_engine("triposr"));
+    assert!(
+        triposr_spec.requires_gpu(),
+        "TripoSR engine MUST require GPU"
+    );
 
     let auto_spec = TaskSpec::Generative3D(Generative3DSpec::new_prompt("cube"));
-    assert!(auto_spec.requires_gpu(), "Default/auto engine MUST require GPU");
+    assert!(
+        auto_spec.requires_gpu(),
+        "Default/auto engine MUST require GPU"
+    );
     println!("  [+] Verified engine preferences and GPU requirement rules.");
 }
 
@@ -212,24 +273,39 @@ fn test_adv_02_auto_rig_extreme_inputs_and_fuzzing() {
     let empty_rig = AutoRigSpec::new(TaskBytes::new(), "biped");
     // Serializes/deserializes without error
     let json_empty = serde_json::to_string(&empty_rig).expect("Serialize empty AutoRigSpec");
-    let deser_empty: AutoRigSpec = serde_json::from_str(&json_empty).expect("Deserialize empty AutoRigSpec");
+    let deser_empty: AutoRigSpec =
+        serde_json::from_str(&json_empty).expect("Deserialize empty AutoRigSpec");
     assert!(deser_empty.input_mesh.is_empty());
 
     // But validation MUST fail
     let val_empty = TaskSpec::AutoRig(empty_rig).validate();
-    assert!(val_empty.is_err(), "AutoRig with empty input_mesh must fail validation");
-    println!("  [+] Empty input_mesh correctly rejected during validation: {:?}", val_empty.unwrap_err());
+    assert!(
+        val_empty.is_err(),
+        "AutoRig with empty input_mesh must fail validation"
+    );
+    println!(
+        "  [+] Empty input_mesh correctly rejected during validation: {:?}",
+        val_empty.unwrap_err()
+    );
 
     // Vector B: Empty rig_preset validation
     let mut empty_preset_rig = AutoRigSpec::new(TaskBytes::from("valid_mesh_bytes"), "biped");
     empty_preset_rig.rig_preset = "   ".to_string();
     let val_preset = TaskSpec::AutoRig(empty_preset_rig).validate();
-    assert!(val_preset.is_err(), "Whitespace rig_preset must fail validation");
-    println!("  [+] Empty rig_preset correctly rejected: {:?}", val_preset.unwrap_err());
+    assert!(
+        val_preset.is_err(),
+        "Whitespace rig_preset must fail validation"
+    );
+    println!(
+        "  [+] Empty rig_preset correctly rejected: {:?}",
+        val_preset.unwrap_err()
+    );
 
     // Vector C: Massive animation clip list (10,000 clips)
     let clip_count = 10_000;
-    let clips: Vec<String> = (0..clip_count).map(|i| format!("anim_clip_{:05}_run_jump_attack", i)).collect();
+    let clips: Vec<String> = (0..clip_count)
+        .map(|i| format!("anim_clip_{:05}_run_jump_attack", i))
+        .collect();
     let heavy_rig = AutoRigSpec::new(TaskBytes::from("mesh_header_data"), "quadruped")
         .with_animations(clips.clone())
         .with_provider("blender");
@@ -237,20 +313,30 @@ fn test_adv_02_auto_rig_extreme_inputs_and_fuzzing() {
     // JSON roundtrip
     let t0 = Instant::now();
     let json_str = serde_json::to_string(&heavy_rig).expect("Serialize 10k clips JSON");
-    let deser_json: AutoRigSpec = serde_json::from_str(&json_str).expect("Deserialize 10k clips JSON");
+    let deser_json: AutoRigSpec =
+        serde_json::from_str(&json_str).expect("Deserialize 10k clips JSON");
     let json_time = t0.elapsed();
     assert_eq!(deser_json.embed_animations.len(), clip_count);
     assert_eq!(deser_json.rig_preset, "quadruped");
     assert_eq!(deser_json.preferred_provider.as_deref(), Some("blender"));
-    println!("  [+] 10,000 animation clips JSON roundtrip in {:?} (size: {} bytes)", json_time, json_str.len());
+    println!(
+        "  [+] 10,000 animation clips JSON roundtrip in {:?} (size: {} bytes)",
+        json_time,
+        json_str.len()
+    );
 
     // Bincode roundtrip
     let t1 = Instant::now();
     let bin_bytes = bincode::serialize(&heavy_rig).expect("Serialize 10k clips Bincode");
-    let deser_bin: AutoRigSpec = bincode::deserialize(&bin_bytes).expect("Deserialize 10k clips Bincode");
+    let deser_bin: AutoRigSpec =
+        bincode::deserialize(&bin_bytes).expect("Deserialize 10k clips Bincode");
     let bin_time = t1.elapsed();
     assert_eq!(deser_bin.embed_animations.len(), clip_count);
-    println!("  [+] 10,000 animation clips Bincode roundtrip in {:?} (size: {} bytes)", bin_time, bin_bytes.len());
+    println!(
+        "  [+] 10,000 animation clips Bincode roundtrip in {:?} (size: {} bytes)",
+        bin_time,
+        bin_bytes.len()
+    );
 
     // Vector D: Adversarial animation names (emojis, diacritics, nulls)
     let adv_clips = vec![
@@ -282,11 +368,18 @@ fn test_adv_03_auto_rig_32mb_payload_bincode_and_wire_framing() {
     let glb_bytes = create_simulated_glb(payload_size);
     let gen_time = t_gen.elapsed();
     assert_eq!(glb_bytes.len(), payload_size);
-    println!("  [+] Generated 32MB simulated .glb payload in {:?}", gen_time);
+    println!(
+        "  [+] Generated 32MB simulated .glb payload in {:?}",
+        gen_time
+    );
 
     let original_task_bytes = TaskBytes::from(glb_bytes);
     let auto_rig_spec = AutoRigSpec::new(original_task_bytes.clone(), "biped")
-        .with_animations(vec!["idle".to_string(), "walk".to_string(), "run".to_string()])
+        .with_animations(vec![
+            "idle".to_string(),
+            "walk".to_string(),
+            "run".to_string(),
+        ])
         .with_provider("builtin");
 
     // Validation must pass
@@ -294,17 +387,30 @@ fn test_adv_03_auto_rig_32mb_payload_bincode_and_wire_framing() {
 
     // Step A: Pure Bincode roundtrip of AutoRigSpec
     let t_ser = Instant::now();
-    let bincode_buf = bincode::serialize(&auto_rig_spec).expect("Bincode serialize 32MB AutoRigSpec");
+    let bincode_buf =
+        bincode::serialize(&auto_rig_spec).expect("Bincode serialize 32MB AutoRigSpec");
     let ser_time = t_ser.elapsed();
-    println!("  [+] Serialized 32MB AutoRigSpec to Bincode in {:?} (output buffer: {} bytes)", ser_time, bincode_buf.len());
+    println!(
+        "  [+] Serialized 32MB AutoRigSpec to Bincode in {:?} (output buffer: {} bytes)",
+        ser_time,
+        bincode_buf.len()
+    );
 
     let t_deser = Instant::now();
-    let deser_spec: AutoRigSpec = bincode::deserialize(&bincode_buf).expect("Bincode deserialize 32MB AutoRigSpec");
+    let deser_spec: AutoRigSpec =
+        bincode::deserialize(&bincode_buf).expect("Bincode deserialize 32MB AutoRigSpec");
     let deser_time = t_deser.elapsed();
-    println!("  [+] Deserialized 32MB AutoRigSpec from Bincode in {:?}", deser_time);
+    println!(
+        "  [+] Deserialized 32MB AutoRigSpec from Bincode in {:?}",
+        deser_time
+    );
 
     // Verify exact byte count preservation
-    assert_eq!(deser_spec.input_mesh.len(), payload_size, "Byte count must be exactly 32MB");
+    assert_eq!(
+        deser_spec.input_mesh.len(),
+        payload_size,
+        "Byte count must be exactly 32MB"
+    );
     assert_eq!(deser_spec.rig_preset, "biped");
     assert_eq!(deser_spec.embed_animations.len(), 3);
     assert_eq!(deser_spec.preferred_provider.as_deref(), Some("builtin"));
@@ -314,15 +420,33 @@ fn test_adv_03_auto_rig_32mb_payload_bincode_and_wire_framing() {
     let deser_slice = deser_spec.input_mesh.as_slice();
 
     // Check header
-    assert_eq!(&orig_slice[0..12], &deser_slice[0..12], "glTF header must match");
+    assert_eq!(
+        &orig_slice[0..12],
+        &deser_slice[0..12],
+        "glTF header must match"
+    );
     // Check first 1KB
-    assert_eq!(&orig_slice[0..1024], &deser_slice[0..1024], "First 1KB must match");
+    assert_eq!(
+        &orig_slice[0..1024],
+        &deser_slice[0..1024],
+        "First 1KB must match"
+    );
     // Check midpoint 1KB
     let mid = payload_size / 2;
-    assert_eq!(&orig_slice[mid..mid + 1024], &deser_slice[mid..mid + 1024], "Midpoint 1KB must match");
+    assert_eq!(
+        &orig_slice[mid..mid + 1024],
+        &deser_slice[mid..mid + 1024],
+        "Midpoint 1KB must match"
+    );
     // Check last 1KB
-    assert_eq!(&orig_slice[payload_size - 1024..payload_size], &deser_slice[payload_size - 1024..payload_size], "Last 1KB must match");
-    println!("  [+] Verified byte-for-byte data integrity across all checkpoints (header, mid, footer).");
+    assert_eq!(
+        &orig_slice[payload_size - 1024..payload_size],
+        &deser_slice[payload_size - 1024..payload_size],
+        "Last 1KB must match"
+    );
+    println!(
+        "  [+] Verified byte-for-byte data integrity across all checkpoints (header, mid, footer)."
+    );
 
     // Step B: Wire message framing with WorkerMessage::TaskResult carrying 32MB asset_bytes
     let worker_id = Uuid::new_v4();
@@ -342,17 +466,29 @@ fn test_adv_03_auto_rig_32mb_payload_bincode_and_wire_framing() {
     };
 
     let t_frame = Instant::now();
-    let framed_payload = serialize_message(&worker_msg, WireCodec::Bincode).expect("serialize_message with 32MB payload");
+    let framed_payload = serialize_message(&worker_msg, WireCodec::Bincode)
+        .expect("serialize_message with 32MB payload");
     let frame_time = t_frame.elapsed();
-    assert_eq!(framed_payload[0], WIRE_FORMAT_BINCODE, "Discriminator must be 0x02");
-    println!("  [+] Framed WorkerMessage with 32MB payload in {:?} (framed size: {} bytes)", frame_time, framed_payload.len());
+    assert_eq!(
+        framed_payload[0], WIRE_FORMAT_BINCODE,
+        "Discriminator must be 0x02"
+    );
+    println!(
+        "  [+] Framed WorkerMessage with 32MB payload in {:?} (framed size: {} bytes)",
+        frame_time,
+        framed_payload.len()
+    );
 
     // Decode message
     let t_unframe = Instant::now();
-    let (deser_msg, codec) = deserialize_message::<WorkerMessage>(&framed_payload).expect("deserialize_message with 32MB payload");
+    let (deser_msg, codec) = deserialize_message::<WorkerMessage>(&framed_payload)
+        .expect("deserialize_message with 32MB payload");
     let unframe_time = t_unframe.elapsed();
     assert_eq!(codec, WireCodec::Bincode);
-    println!("  [+] Deserialized framed WorkerMessage in {:?}", unframe_time);
+    println!(
+        "  [+] Deserialized framed WorkerMessage in {:?}",
+        unframe_time
+    );
 
     match deser_msg {
         WorkerMessage::TaskResult {
@@ -410,13 +546,19 @@ async fn test_adv_04_wire_framing_transport_32mb_duplex() {
     // Client sends message concurrently, server receives message
     let send_handle = tokio::spawn(async move {
         let t0 = Instant::now();
-        client_transport.send_msg(&task_result_msg).await.expect("Client send 32MB message");
+        client_transport
+            .send_msg(&task_result_msg)
+            .await
+            .expect("Client send 32MB message");
         t0.elapsed()
     });
 
     let recv_handle = tokio::spawn(async move {
         let t0 = Instant::now();
-        let received: Option<WorkerMessage> = server_transport.recv_msg().await.expect("Server recv 32MB message");
+        let received: Option<WorkerMessage> = server_transport
+            .recv_msg()
+            .await
+            .expect("Server recv 32MB message");
         (received, t0.elapsed())
     });
 
@@ -441,8 +583,14 @@ async fn test_adv_04_wire_framing_transport_32mb_duplex() {
             assert_eq!(rec_asset.len(), payload_size);
             // Verify byte integrity at offset 0, 16MB, 32MB - 1
             assert_eq!(&rec_asset.as_slice()[0..4], b"glTF");
-            assert_eq!(rec_asset.as_slice()[16 * 1024 * 1024], asset_bytes.as_slice()[16 * 1024 * 1024]);
-            assert_eq!(rec_asset.as_slice()[payload_size - 1], asset_bytes.as_slice()[payload_size - 1]);
+            assert_eq!(
+                rec_asset.as_slice()[16 * 1024 * 1024],
+                asset_bytes.as_slice()[16 * 1024 * 1024]
+            );
+            assert_eq!(
+                rec_asset.as_slice()[payload_size - 1],
+                asset_bytes.as_slice()[payload_size - 1]
+            );
         }
         _ => panic!("Expected TaskResult variant"),
     }
@@ -450,24 +598,33 @@ async fn test_adv_04_wire_framing_transport_32mb_duplex() {
     // Boundary Test: JSON serialization of 32MB binary payload
     // Serializing 32MB binary non-UTF8 data as JSON numbers ([103,108,84,...]) would expand to > 120MB,
     // which MUST trigger ProtocolError::FrameTooLarge (> 64MB).
-    let json_result = serialize_message(&WorkerMessage::TaskResult {
-        worker_id,
-        task_id,
-        exit_code: 0,
-        stdout: TaskBytes::new(),
-        stderr: TaskBytes::new(),
-        execution_time_ms: 0,
-        is_gpu_executed: false,
-        device_name: None,
-        error: None,
-        asset_bytes: Some(asset_bytes),
-        artifacts: Vec::new(),
-    }, WireCodec::Json);
+    let json_result = serialize_message(
+        &WorkerMessage::TaskResult {
+            worker_id,
+            task_id,
+            exit_code: 0,
+            stdout: TaskBytes::new(),
+            stderr: TaskBytes::new(),
+            execution_time_ms: 0,
+            is_gpu_executed: false,
+            device_name: None,
+            error: None,
+            asset_bytes: Some(asset_bytes),
+            artifacts: Vec::new(),
+        },
+        WireCodec::Json,
+    );
 
-    assert!(json_result.is_err(), "32MB binary payload in JSON must exceed MAX_FRAME_SIZE (64MB)");
+    assert!(
+        json_result.is_err(),
+        "32MB binary payload in JSON must exceed MAX_FRAME_SIZE (64MB)"
+    );
     match json_result.unwrap_err() {
         ProtocolError::FrameTooLarge { size, max } => {
-            println!("  [+] Confirmed JSON expansion boundary: {} bytes exceeds max frame {} bytes", size, max);
+            println!(
+                "  [+] Confirmed JSON expansion boundary: {} bytes exceeds max frame {} bytes",
+                size, max
+            );
             assert_eq!(max, MAX_FRAME_SIZE);
         }
         other => panic!("Expected ProtocolError::FrameTooLarge, got: {:?}", other),
@@ -475,24 +632,35 @@ async fn test_adv_04_wire_framing_transport_32mb_duplex() {
 
     // But a 512KB binary payload in JSON should comfortably fit within 64MB (< 2.5MB JSON)
     let small_asset = TaskBytes::from(create_simulated_glb(512 * 1024));
-    let small_json_res = serialize_message(&WorkerMessage::TaskResult {
-        worker_id,
-        task_id,
-        exit_code: 0,
-        stdout: TaskBytes::new(),
-        stderr: TaskBytes::new(),
-        execution_time_ms: 0,
-        is_gpu_executed: false,
-        device_name: None,
-        error: None,
-        asset_bytes: Some(small_asset.clone()),
-        artifacts: Vec::new(),
-    }, WireCodec::Json);
+    let small_json_res = serialize_message(
+        &WorkerMessage::TaskResult {
+            worker_id,
+            task_id,
+            exit_code: 0,
+            stdout: TaskBytes::new(),
+            stderr: TaskBytes::new(),
+            execution_time_ms: 0,
+            is_gpu_executed: false,
+            device_name: None,
+            error: None,
+            asset_bytes: Some(small_asset.clone()),
+            artifacts: Vec::new(),
+        },
+        WireCodec::Json,
+    );
 
-    assert!(small_json_res.is_ok(), "512KB binary payload must fit in JSON wire frame");
-    let (deser_small, codec) = deserialize_message::<WorkerMessage>(&small_json_res.unwrap()).expect("Deserialize small JSON");
+    assert!(
+        small_json_res.is_ok(),
+        "512KB binary payload must fit in JSON wire frame"
+    );
+    let (deser_small, codec) = deserialize_message::<WorkerMessage>(&small_json_res.unwrap())
+        .expect("Deserialize small JSON");
     assert_eq!(codec, WireCodec::Json);
-    if let WorkerMessage::TaskResult { asset_bytes: Some(b), .. } = deser_small {
+    if let WorkerMessage::TaskResult {
+        asset_bytes: Some(b),
+        ..
+    } = deser_small
+    {
         assert_eq!(b.len(), 512 * 1024);
     } else {
         panic!("Expected small asset bytes");
@@ -515,7 +683,10 @@ fn test_adv_05_zero_copy_pointer_identity_and_latency() {
 
     // Initial buffer pointer in memory
     let ptr_original = original_task_bytes.inner().as_ptr();
-    println!("  [+] Original 32MB buffer memory address: {:p}", ptr_original);
+    println!(
+        "  [+] Original 32MB buffer memory address: {:p}",
+        ptr_original
+    );
 
     // Store in TaskResult
     let result = TaskResult {
@@ -534,22 +705,39 @@ fn test_adv_05_zero_copy_pointer_identity_and_latency() {
 
     // Check pointer inside TaskResult
     let ptr_in_result = result.asset_bytes.as_ref().unwrap().inner().as_ptr();
-    assert_eq!(ptr_original, ptr_in_result, "Cloning TaskBytes into TaskResult must not copy memory");
+    assert_eq!(
+        ptr_original, ptr_in_result,
+        "Cloning TaskBytes into TaskResult must not copy memory"
+    );
 
     // Clone entire TaskResult
     let cloned_result = result.clone();
     let ptr_in_cloned = cloned_result.asset_bytes.as_ref().unwrap().inner().as_ptr();
-    assert_eq!(ptr_original, ptr_in_cloned, "Cloning TaskResult must preserve identical buffer memory address");
-    println!("  [+] Verified identical buffer pointer across TaskResult clones: {:p} == {:p}", ptr_in_result, ptr_in_cloned);
+    assert_eq!(
+        ptr_original, ptr_in_cloned,
+        "Cloning TaskResult must preserve identical buffer memory address"
+    );
+    println!(
+        "  [+] Verified identical buffer pointer across TaskResult clones: {:p} == {:p}",
+        ptr_in_result, ptr_in_cloned
+    );
 
     // Slicing zero-copy check
     let slice_offset = 1024 * 1024; // 1MB offset
     let slice_len = 2 * 1024 * 1024; // 2MB slice
     let sub_slice = original_task_bytes.slice(slice_offset..slice_offset + slice_len);
     let expected_sub_ptr = unsafe { ptr_original.add(slice_offset) };
-    assert_eq!(sub_slice.inner().as_ptr(), expected_sub_ptr, "Slicing TaskBytes must be zero-copy pointer offset");
+    assert_eq!(
+        sub_slice.inner().as_ptr(),
+        expected_sub_ptr,
+        "Slicing TaskBytes must be zero-copy pointer offset"
+    );
     assert_eq!(sub_slice.len(), slice_len);
-    println!("  [+] Verified zero-copy sub-slicing pointer offset: {:p} == {:p}", sub_slice.inner().as_ptr(), expected_sub_ptr);
+    println!(
+        "  [+] Verified zero-copy sub-slicing pointer offset: {:p} == {:p}",
+        sub_slice.inner().as_ptr(),
+        expected_sub_ptr
+    );
 
     // Microbenchmark: 100,000 clones of 32MB TaskResult
     // An O(1) Arc refcount clone takes ~10-30 nanoseconds per iteration.
@@ -563,8 +751,14 @@ fn test_adv_05_zero_copy_pointer_identity_and_latency() {
     let total_elapsed = t_start.elapsed();
     let ns_per_clone = total_elapsed.as_nanos() as f64 / iterations as f64;
 
-    println!("  [+] Benchmark: 100,000 clones of 32MB TaskResult took {:?}", total_elapsed);
-    println!("  [+] Average time per clone: {:.2} ns (threshold: < 500 ns)", ns_per_clone);
+    println!(
+        "  [+] Benchmark: 100,000 clones of 32MB TaskResult took {:?}",
+        total_elapsed
+    );
+    println!(
+        "  [+] Average time per clone: {:.2} ns (threshold: < 500 ns)",
+        ns_per_clone
+    );
 
     assert!(
         ns_per_clone < 500.0,
@@ -598,14 +792,15 @@ fn test_adv_06_corrupted_wire_tags_and_truncation() {
     // Test B: Truncated Bincode binary frames
     // Take a valid serialized message
     let valid_spec = Generative3DSpec::new_prompt("robot model").with_quality("high");
-    let valid_bincode = serialize_message(&valid_spec, WireCodec::Bincode).expect("Serialize valid spec");
+    let valid_bincode =
+        serialize_message(&valid_spec, WireCodec::Bincode).expect("Serialize valid spec");
     assert!(valid_bincode.len() > 10);
 
     // Truncate at various critical boundaries:
     let truncation_points = vec![
-        1,  // Only discriminator tag (0x02), 0 payload bytes
-        2,  // Tag + 1 byte
-        5,  // Tag + partial string length
+        1,                       // Only discriminator tag (0x02), 0 payload bytes
+        2,                       // Tag + 1 byte
+        5,                       // Tag + partial string length
         valid_bincode.len() / 2, // Halfway through payload
         valid_bincode.len() - 1, // Cut last byte
     ];
@@ -613,22 +808,40 @@ fn test_adv_06_corrupted_wire_tags_and_truncation() {
     for trunc_len in truncation_points {
         let truncated = &valid_bincode[0..trunc_len];
         let result = deserialize_message::<Generative3DSpec>(truncated);
-        assert!(result.is_err(), "Truncated frame at length {} must return error", trunc_len);
+        assert!(
+            result.is_err(),
+            "Truncated frame at length {} must return error",
+            trunc_len
+        );
         match result.unwrap_err() {
             ProtocolError::Bincode(_) => {} // Clean Bincode error, no panic!
             other => panic!("Expected ProtocolError::Bincode, got {:?}", other),
         }
     }
-    println!("  [+] Truncated binary frames safely returned ProtocolError::Bincode without crashing.");
+    println!(
+        "  [+] Truncated binary frames safely returned ProtocolError::Bincode without crashing."
+    );
 
     // Test C: Corrupted JSON strings and malicious tag strings
     let malformed_json_cases = vec![
-        (r#"{"type":"NonExistentVariant","prompt":"test"}"#, "unknown variant"),
+        (
+            r#"{"type":"NonExistentVariant","prompt":"test"}"#,
+            "unknown variant",
+        ),
         (r#"{"type":12345,"prompt":"test"}"#, "invalid type tag"),
         (r#"{"type":null,"prompt":"test"}"#, "null type tag"),
-        (r#"{"type":"Generative3D","quality":12345}"#, "type mismatch in field"),
-        (r#"{"type":"Generative3D","prompt": "#, "unclosed JSON syntax"),
-        (r#"{"type":"Generative3D","export_texture":"not_a_bool"}"#, "boolean mismatch"),
+        (
+            r#"{"type":"Generative3D","quality":12345}"#,
+            "type mismatch in field",
+        ),
+        (
+            r#"{"type":"Generative3D","prompt": "#,
+            "unclosed JSON syntax",
+        ),
+        (
+            r#"{"type":"Generative3D","export_texture":"not_a_bool"}"#,
+            "boolean mismatch",
+        ),
     ];
 
     for (json_case, desc) in malformed_json_cases {
@@ -637,10 +850,15 @@ fn test_adv_06_corrupted_wire_tags_and_truncation() {
         assert!(result.is_err(), "Malformed JSON case '{}' must fail", desc);
         match result.unwrap_err() {
             ProtocolError::Json(_) => {} // Clean JSON error
-            other => panic!("Expected ProtocolError::Json for '{}', got {:?}", desc, other),
+            other => panic!(
+                "Expected ProtocolError::Json for '{}', got {:?}",
+                desc, other
+            ),
         }
     }
-    println!("  [+] Malformed JSON tag strings and syntax errors safely returned ProtocolError::Json.");
+    println!(
+        "  [+] Malformed JSON tag strings and syntax errors safely returned ProtocolError::Json."
+    );
 
     // Test D: Oversized frame rejection by LengthDelimitedCodec (> 64 MB)
     let mut codec = default_codec();
@@ -652,9 +870,16 @@ fn test_adv_06_corrupted_wire_tags_and_truncation() {
     oversized_buffer.extend_from_slice(&[0x02]);
 
     let decode_result = codec.decode(&mut oversized_buffer);
-    assert!(decode_result.is_err(), "LengthDelimitedCodec must reject frame > 64MB");
+    assert!(
+        decode_result.is_err(),
+        "LengthDelimitedCodec must reject frame > 64MB"
+    );
     let err = decode_result.unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "Expected InvalidData error for frame too large");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::InvalidData,
+        "Expected InvalidData error for frame too large"
+    );
     println!("  [+] LengthDelimitedCodec strictly rejects frames > 64MB with std::io::ErrorKind::InvalidData.");
 }
 
@@ -664,7 +889,9 @@ fn test_adv_06_corrupted_wire_tags_and_truncation() {
 
 #[test]
 fn test_adv_07_full_task_spec_interchange_and_checkpoint_zero_copy() {
-    println!("\n=== [ADV-07] Full Task Interchange, Requirements Validation, & Checkpoint Payloads ===");
+    println!(
+        "\n=== [ADV-07] Full Task Interchange, Requirements Validation, & Checkpoint Payloads ==="
+    );
 
     // Construct Generative3D Task
     let gen_spec = Generative3DSpec::new_prompt("cybernetic dragon")
@@ -672,8 +899,11 @@ fn test_adv_07_full_task_spec_interchange_and_checkpoint_zero_copy() {
         .with_engine("triposr");
     let reqs_gpu = TaskRequirements::gpu(300);
 
-    let task_3d = Task::new(TaskSpec::Generative3D(gen_spec), reqs_gpu)
-        .with_tags(vec!["3d".to_string(), "gen".to_string(), "gpu".to_string()]);
+    let task_3d = Task::new(TaskSpec::Generative3D(gen_spec), reqs_gpu).with_tags(vec![
+        "3d".to_string(),
+        "gen".to_string(),
+        "gpu".to_string(),
+    ]);
 
     // Validation must pass because TripoSR requires GPU and requirements say gpu_required = true
     assert!(task_3d.validate().is_ok());
@@ -684,8 +914,14 @@ fn test_adv_07_full_task_spec_interchange_and_checkpoint_zero_copy() {
         TaskRequirements::generic(4, 60), // gpu_required = false
     );
     let mismatch_err = task_3d_mismatched.validate();
-    assert!(mismatch_err.is_err(), "Mismatched GPU requirements must fail validation");
-    println!("  [+] GPU requirement mismatch correctly caught: {:?}", mismatch_err.unwrap_err());
+    assert!(
+        mismatch_err.is_err(),
+        "Mismatched GPU requirements must fail validation"
+    );
+    println!(
+        "  [+] GPU requirement mismatch correctly caught: {:?}",
+        mismatch_err.unwrap_err()
+    );
 
     // Attach 1MB CheckpointData to task
     let checkpoint_bytes = TaskBytes::from(vec![0xAA; 1024 * 1024]);
@@ -694,14 +930,22 @@ fn test_adv_07_full_task_spec_interchange_and_checkpoint_zero_copy() {
 
     let task_with_checkpoint = task_3d.with_checkpoint(checkpoint);
     assert_eq!(
-        task_with_checkpoint.latest_checkpoint.as_ref().unwrap().delta_state.inner().as_ptr(),
+        task_with_checkpoint
+            .latest_checkpoint
+            .as_ref()
+            .unwrap()
+            .delta_state
+            .inner()
+            .as_ptr(),
         ptr_checkpoint_orig,
         "CheckpointData delta_state must be zero-copy pointer"
     );
 
     // Bincode roundtrip of Task with Checkpoint
-    let bin_task = bincode::serialize(&task_with_checkpoint).expect("Serialize Task with Checkpoint");
-    let deser_task: Task = bincode::deserialize(&bin_task).expect("Deserialize Task with Checkpoint");
+    let bin_task =
+        bincode::serialize(&task_with_checkpoint).expect("Serialize Task with Checkpoint");
+    let deser_task: Task =
+        bincode::deserialize(&bin_task).expect("Deserialize Task with Checkpoint");
 
     assert_eq!(deser_task.id, task_with_checkpoint.id);
     assert_eq!(deser_task.tags, vec!["3d", "gen", "gpu"]);
@@ -712,7 +956,9 @@ fn test_adv_07_full_task_spec_interchange_and_checkpoint_zero_copy() {
     assert_eq!(ck.delta_state.as_slice()[0], 0xAA);
     assert_eq!(ck.delta_state.as_slice()[1024 * 1024 - 1], 0xAA);
 
-    println!("  [+] Full Task with 1MB CheckpointData successfully serialized, validated, and restored.");
+    println!(
+        "  [+] Full Task with 1MB CheckpointData successfully serialized, validated, and restored."
+    );
 }
 
 // =========================================================================
@@ -751,15 +997,27 @@ fn test_adv_08_concurrent_multithreaded_zero_copy_access() {
         handles.push(std::thread::spawn(move || {
             let asset = res_clone.asset_bytes.as_ref().unwrap();
             let thread_ptr = asset.inner().as_ptr() as usize;
-            assert_eq!(thread_ptr, original_ptr, "Thread {} must see identical pointer", t_idx);
+            assert_eq!(
+                thread_ptr, original_ptr,
+                "Thread {} must see identical pointer",
+                t_idx
+            );
 
             // Read samples concurrently from multiple offsets
             let offset_1 = t_idx * 1024 * 1024;
             let offset_2 = offset_1 + 512 * 1024;
             let b1 = asset[offset_1];
             let b2 = asset[offset_2];
-            assert_eq!(b1, orig_clone[offset_1], "Thread {} offset {} mismatch", t_idx, offset_1);
-            assert_eq!(b2, orig_clone[offset_2], "Thread {} offset {} mismatch", t_idx, offset_2);
+            assert_eq!(
+                b1, orig_clone[offset_1],
+                "Thread {} offset {} mismatch",
+                t_idx, offset_1
+            );
+            assert_eq!(
+                b2, orig_clone[offset_2],
+                "Thread {} offset {} mismatch",
+                t_idx, offset_2
+            );
 
             // Sub-slice check inside thread
             let slice = asset.slice(offset_1..offset_2);
@@ -769,7 +1027,8 @@ fn test_adv_08_concurrent_multithreaded_zero_copy_access() {
     }
 
     for h in handles {
-        h.join().expect("Worker thread panicked during concurrent buffer access");
+        h.join()
+            .expect("Worker thread panicked during concurrent buffer access");
     }
     println!("  [+] Successfully validated 8 concurrent threads sharing 32MB zero-copy buffer with zero data races.");
 }
@@ -788,14 +1047,26 @@ fn test_adv_09_bincode_invalid_enum_indices() {
     bogus_bincode.extend_from_slice(b"arbitrary trailing payload data");
 
     let res = bincode::deserialize::<TaskSpec>(&bogus_bincode);
-    assert!(res.is_err(), "Bogus enum variant index must fail deserialization");
-    println!("  [+] Invalid TaskSpec enum variant index cleanly rejected: {:?}", res.unwrap_err());
+    assert!(
+        res.is_err(),
+        "Bogus enum variant index must fail deserialization"
+    );
+    println!(
+        "  [+] Invalid TaskSpec enum variant index cleanly rejected: {:?}",
+        res.unwrap_err()
+    );
 
     let mut bogus_worker_msg = Vec::new();
     bogus_worker_msg.extend_from_slice(&8888u32.to_le_bytes()); // Invalid variant index for WorkerMessage
     bogus_worker_msg.extend_from_slice(b"arbitrary payload");
 
     let res_msg = bincode::deserialize::<WorkerMessage>(&bogus_worker_msg);
-    assert!(res_msg.is_err(), "Bogus WorkerMessage variant index must fail deserialization");
-    println!("  [+] Invalid WorkerMessage variant index cleanly rejected: {:?}", res_msg.unwrap_err());
+    assert!(
+        res_msg.is_err(),
+        "Bogus WorkerMessage variant index must fail deserialization"
+    );
+    println!(
+        "  [+] Invalid WorkerMessage variant index cleanly rejected: {:?}",
+        res_msg.unwrap_err()
+    );
 }

@@ -471,7 +471,11 @@ enum HumanWorkerMessage {
         device_name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
-        #[serde(default, with = "crate::task::opt_bytes_serde", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            with = "crate::task::opt_bytes_serde",
+            skip_serializing_if = "Option::is_none"
+        )]
         asset_bytes: Option<TaskBytes>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         artifacts: Vec<crate::task::OutputArtifact>,
@@ -2967,9 +2971,7 @@ impl<W: AsyncWrite + Unpin> MessageWriter<W> {
 mod tests {
     use super::*;
     use crate::capabilities::WorkerCapabilities;
-    use crate::task::{
-        Generative3DSpec, Task, TaskId, TaskRequirements, TaskResult, TaskSpec, TaskStatus,
-    };
+    use crate::task::{Task, TaskId, TaskRequirements, TaskSpec, TaskStatus};
     use std::collections::HashMap;
 
     #[test]

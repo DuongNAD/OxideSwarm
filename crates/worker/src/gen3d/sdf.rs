@@ -111,22 +111,12 @@ impl SdfPreset {
     /// Returns the tight world-space bounding box `(min, max)` for grid sampling.
     pub fn bounds(&self) -> (Vec3, Vec3) {
         match self {
-            Self::HumanoidDummy => (
-                Vec3::new(-0.95, -0.05, -0.45),
-                Vec3::new(0.95, 1.85, 0.45),
-            ),
-            Self::RobotTorso => (
-                Vec3::new(-0.85, -0.05, -0.45),
-                Vec3::new(0.85, 1.80, 0.45),
-            ),
-            Self::StylizedCharacter => (
-                Vec3::new(-0.75, -0.05, -0.60),
-                Vec3::new(0.75, 1.35, 0.60),
-            ),
-            Self::TestOrb => (
-                Vec3::new(-0.85, -0.05, -0.85),
-                Vec3::new(0.85, 1.65, 0.85),
-            ),
+            Self::HumanoidDummy => (Vec3::new(-0.95, -0.05, -0.45), Vec3::new(0.95, 1.85, 0.45)),
+            Self::RobotTorso => (Vec3::new(-0.85, -0.05, -0.45), Vec3::new(0.85, 1.80, 0.45)),
+            Self::StylizedCharacter => {
+                (Vec3::new(-0.75, -0.05, -0.60), Vec3::new(0.75, 1.35, 0.60))
+            }
+            Self::TestOrb => (Vec3::new(-0.85, -0.05, -0.85), Vec3::new(0.85, 1.65, 0.85)),
         }
     }
 }
@@ -138,11 +128,25 @@ pub fn resolve_preset(prompt: Option<&str>) -> SdfPreset {
         None => return SdfPreset::HumanoidDummy,
     };
 
-    if text.contains("robot") || text.contains("mech") || text.contains("droid") || text.contains("cyber") || text.contains("armor") {
+    if text.contains("robot")
+        || text.contains("mech")
+        || text.contains("droid")
+        || text.contains("cyber")
+        || text.contains("armor")
+    {
         SdfPreset::RobotTorso
-    } else if text.contains("chibi") || text.contains("cute") || text.contains("mascot") || text.contains("creature") || text.contains("stylized") {
+    } else if text.contains("chibi")
+        || text.contains("cute")
+        || text.contains("mascot")
+        || text.contains("creature")
+        || text.contains("stylized")
+    {
         SdfPreset::StylizedCharacter
-    } else if text.contains("orb") || text.contains("sphere") || text.contains("math") || text.contains("test") {
+    } else if text.contains("orb")
+        || text.contains("sphere")
+        || text.contains("math")
+        || text.contains("test")
+    {
         SdfPreset::TestOrb
     } else {
         SdfPreset::HumanoidDummy
@@ -155,10 +159,7 @@ pub fn resolve_preset(prompt: Option<&str>) -> SdfPreset {
 #[inline(always)]
 fn eval_humanoid_dummy(p: Vec3) -> f32 {
     // 1. Head (centered at Y=1.62)
-    let head = sd_ellipsoid(
-        p - Vec3::new(0.0, 1.62, 0.0),
-        Vec3::new(0.11, 0.14, 0.12),
-    );
+    let head = sd_ellipsoid(p - Vec3::new(0.0, 1.62, 0.0), Vec3::new(0.11, 0.14, 0.12));
 
     // 2. Neck
     let neck = sd_capsule(
@@ -208,7 +209,11 @@ fn eval_humanoid_dummy(p: Vec3) -> f32 {
         Vec3::new(0.82, 0.80, 0.04),
         0.04,
     );
-    let arm = op_smin(op_smin(shoulder, upper_arm, 0.04), op_smin(forearm, hand, 0.03), 0.04);
+    let arm = op_smin(
+        op_smin(shoulder, upper_arm, 0.04),
+        op_smin(forearm, hand, 0.03),
+        0.04,
+    );
 
     // Legs
     let thigh = sd_capsule(
@@ -263,7 +268,10 @@ fn eval_robot_torso(p: Vec3) -> f32 {
     let arm = sd_capped_cylinder(sym_p - Vec3::new(0.42, 1.05, 0.0), 0.05, 0.20);
     let thigh = sd_capped_cylinder(sym_p - Vec3::new(0.15, 0.55, 0.0), 0.07, 0.18);
     let calf = sd_capped_cylinder(sym_p - Vec3::new(0.15, 0.22, 0.0), 0.06, 0.15);
-    let foot = sd_box(sym_p - Vec3::new(0.15, 0.04, 0.05), Vec3::new(0.06, 0.04, 0.12));
+    let foot = sd_box(
+        sym_p - Vec3::new(0.15, 0.04, 0.05),
+        Vec3::new(0.06, 0.04, 0.12),
+    );
 
     let limbs = op_union(
         op_union(shoulder, arm),
@@ -297,8 +305,7 @@ fn eval_stylized_character(p: Vec3) -> f32 {
     );
 
     let with_ears = op_smin(body, ear, 0.08);
-    let with_limbs = op_smin(with_ears, op_union(leg, arm), 0.06);
-    with_limbs
+    op_smin(with_ears, op_union(leg, arm), 0.06)
 }
 
 /// Sci-fi test orb with 3 intersecting toruses for topological testing.

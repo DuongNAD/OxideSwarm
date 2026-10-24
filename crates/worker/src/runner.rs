@@ -1687,12 +1687,18 @@ impl TaskRunner {
         mut cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
     ) -> TaskResult {
-        let pref = spec.engine_preference.as_deref().unwrap_or("auto").to_lowercase();
+        let pref = spec
+            .engine_preference
+            .as_deref()
+            .unwrap_or("auto")
+            .to_lowercase();
 
         // 1. If explicit SDF requested, execute Tier 0 directly in-process (< 50ms)
         if pref == "sdf" {
             info!(task_id = %task.id, "Executing Tier 0 Procedural SDF engine");
-            return self.execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time).await;
+            return self
+                .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
+                .await;
         }
 
         // 2. Check for Python & Entrypoint availability
@@ -1702,7 +1708,9 @@ impl TaskRunner {
         if py_bin.is_none() || script.is_none() {
             if pref == "auto" {
                 info!(task_id = %task.id, "Local Python 3D engine not found; degrading gracefully to Tier 0 SDF");
-                return self.execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time).await;
+                return self
+                    .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
+                    .await;
             } else {
                 return TaskResult::failure(
                     self.worker_id,
@@ -1790,7 +1798,9 @@ impl TaskRunner {
         let mut job_object = match crate::job_object::JobObject::create() {
             Ok(job) => Some(job),
             Err(e) => {
-                warn!("Failed to create Win32 Job Object (falling back to standard supervision): {e}");
+                warn!(
+                    "Failed to create Win32 Job Object (falling back to standard supervision): {e}"
+                );
                 None
             }
         };
@@ -1820,7 +1830,9 @@ impl TaskRunner {
                 let _ = sandbox.destroy().await;
                 if pref == "auto" {
                     info!(task_id = %task.id, "Failed to spawn Python process ({e}); degrading gracefully to Tier 0 SDF");
-                    return self.execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time).await;
+                    return self
+                        .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
+                        .await;
                 }
                 return TaskResult::failure(
                     self.worker_id,
@@ -2135,7 +2147,11 @@ impl TaskRunner {
         start_time: Instant,
     ) -> TaskResult {
         let task_id = task.id;
-        let pref = spec.preferred_provider.as_deref().unwrap_or("builtin").to_lowercase();
+        let pref = spec
+            .preferred_provider
+            .as_deref()
+            .unwrap_or("builtin")
+            .to_lowercase();
         let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel();
         let spec_clone = spec.clone();
         let tx_clone = checkpoint_tx.clone();
@@ -2165,7 +2181,9 @@ impl TaskRunner {
 
         let compute_fut = async {
             if pref == "blender" {
-                if let Some(blender_bin) = crate::autorig::blender_provider::resolve_blender_binary() {
+                if let Some(blender_bin) =
+                    crate::autorig::blender_provider::resolve_blender_binary()
+                {
                     if let Some(ref tx) = tx_clone {
                         let _ = tx
                             .send(WorkerMessage::Checkpoint {
@@ -2181,7 +2199,9 @@ impl TaskRunner {
                         &spec_clone.rig_preset,
                         &spec_clone.embed_animations,
                         60,
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(glb) => {
                             if let Some(ref tx) = tx_clone {
                                 let _ = tx
@@ -2590,7 +2610,7 @@ mod tests {
             is_simulated_gpu: has_gpu,
             gpu_device_name: if has_gpu {
                 Some("Test Virtual GPU".into())
-        } else {
+            } else {
                 None
             },
             tags: vec![],
@@ -2862,10 +2882,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_generative_3d_tier0_checkpoints() {
-        let spec = rusty_grid_core::task::Generative3DSpec::new_prompt("procedural drone".to_string())
-            .with_engine("sdf")
-            .with_quality("fast");
-        let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::generic(1, 30));
+        let spec =
+            rusty_grid_core::task::Generative3DSpec::new_prompt("procedural drone".to_string())
+                .with_engine("sdf")
+                .with_quality("fast");
+        let task = Task::new(
+            TaskSpec::Generative3D(spec),
+            TaskRequirements::generic(1, 30),
+        );
 
         let (cp_tx, mut cp_rx) = mpsc::channel(10);
         let task_clone = task.clone();
@@ -2880,7 +2904,12 @@ mod tests {
         // Collect emitted checkpoints
         let mut checkpoints = Vec::new();
         while let Some(msg) = cp_rx.recv().await {
-            if let WorkerMessage::Checkpoint { sequence, delta_state, .. } = msg {
+            if let WorkerMessage::Checkpoint {
+                sequence,
+                delta_state,
+                ..
+            } = msg
+            {
                 checkpoints.push((sequence, delta_state));
             }
         }
@@ -2896,11 +2925,13 @@ mod tests {
         assert_eq!(checkpoints[2].0, 3);
         assert_eq!(checkpoints[3].0, 4);
 
-        let delta1: serde_json::Value = serde_json::from_slice(checkpoints[0].1.as_slice()).unwrap();
+        let delta1: serde_json::Value =
+            serde_json::from_slice(checkpoints[0].1.as_slice()).unwrap();
         assert_eq!(delta1["stage"], "sdf_geometry");
         assert_eq!(delta1["progress"], 0.25);
 
-        let delta4: serde_json::Value = serde_json::from_slice(checkpoints[3].1.as_slice()).unwrap();
+        let delta4: serde_json::Value =
+            serde_json::from_slice(checkpoints[3].1.as_slice()).unwrap();
         assert_eq!(delta4["stage"], "gltf_pack");
         assert_eq!(delta4["progress"], 1.00);
 
@@ -2917,11 +2948,15 @@ mod tests {
         let gen_spec = rusty_grid_core::task::Generative3DSpec::new_prompt("cylinder".to_string())
             .with_engine("sdf")
             .with_quality("fast");
-        let (mesh_bytes, _) = crate::gen3d::generate_procedural_3d(&gen_spec).expect("mesh gen failed");
+        let (mesh_bytes, _) =
+            crate::gen3d::generate_procedural_3d(&gen_spec).expect("mesh gen failed");
 
         let rig_spec = rusty_grid_core::task::AutoRigSpec::new(mesh_bytes, "biped")
             .with_animations(vec!["idle".to_string()]);
-        let task = Task::new(TaskSpec::AutoRig(rig_spec), TaskRequirements::generic(1, 30));
+        let task = Task::new(
+            TaskSpec::AutoRig(rig_spec),
+            TaskRequirements::generic(1, 30),
+        );
 
         let (cp_tx, mut cp_rx) = mpsc::channel(10);
         let task_clone = task.clone();
@@ -2936,7 +2971,12 @@ mod tests {
         // Collect emitted checkpoints
         let mut checkpoints = Vec::new();
         while let Some(msg) = cp_rx.recv().await {
-            if let WorkerMessage::Checkpoint { sequence, delta_state, .. } = msg {
+            if let WorkerMessage::Checkpoint {
+                sequence,
+                delta_state,
+                ..
+            } = msg
+            {
                 checkpoints.push((sequence, delta_state));
             }
         }
@@ -2952,11 +2992,13 @@ mod tests {
         assert_eq!(checkpoints[2].0, 3);
         assert_eq!(checkpoints[3].0, 4);
 
-        let delta1: serde_json::Value = serde_json::from_slice(checkpoints[0].1.as_slice()).unwrap();
+        let delta1: serde_json::Value =
+            serde_json::from_slice(checkpoints[0].1.as_slice()).unwrap();
         assert_eq!(delta1["stage"], "landmark_extraction");
         assert_eq!(delta1["progress"], 0.25);
 
-        let delta4: serde_json::Value = serde_json::from_slice(checkpoints[3].1.as_slice()).unwrap();
+        let delta4: serde_json::Value =
+            serde_json::from_slice(checkpoints[3].1.as_slice()).unwrap();
         assert_eq!(delta4["stage"], "animation_export");
         assert_eq!(delta4["progress"], 1.00);
 

@@ -9,6 +9,8 @@
 //! 2. Verify Win32 Job Object containment: kill tasks midway and assert strictly 0 orphan/zombie Blender or python processes remain.
 //! 3. Verify graceful fallback when Blender executable is missing or invalid (clean fallback to built-in pure-Rust pipeline).
 
+#![allow(clippy::field_reassign_with_default)]
+
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
@@ -20,7 +22,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::WorkerMessage;
-use rusty_grid_core::task::{AutoRigSpec, Bytes, Generative3DSpec, Task, TaskRequirements, TaskSpec};
+use rusty_grid_core::task::{
+    AutoRigSpec, Bytes, Generative3DSpec, Task, TaskRequirements, TaskSpec,
+};
 use rusty_grid_worker::autorig::{
     auto_rig_mesh, auto_rig_mesh_async, blender_provider, load_mesh_from_bytes, BlenderRigProvider,
 };
@@ -81,8 +85,15 @@ fn generate_test_glb_mesh() -> Vec<u8> {
 
     let (gen_glb, stats) = rusty_grid_worker::gen3d::generate_procedural_3d(&gen_spec)
         .expect("Procedural SDF generation should succeed");
-    assert!(stats.vertex_count > 30, "SDF mesh must have sufficient vertices");
-    assert_eq!(&gen_glb[0..4], b"glTF", "SDF mesh must be a valid GLB container");
+    assert!(
+        stats.vertex_count > 30,
+        "SDF mesh must have sufficient vertices"
+    );
+    assert_eq!(
+        &gen_glb[0..4],
+        b"glTF",
+        "SDF mesh must be a valid GLB container"
+    );
     gen_glb
 }
 
@@ -94,11 +105,7 @@ fn validate_and_parse_glb(glb_bytes: &[u8]) -> serde_json::Value {
         glb_bytes.len()
     );
     // Magic: 0x46546C67 ("glTF")
-    assert_eq!(
-        &glb_bytes[0..4],
-        b"glTF",
-        "Invalid glTF 2.0 magic header"
-    );
+    assert_eq!(&glb_bytes[0..4], b"glTF", "Invalid glTF 2.0 magic header");
     // Version: 2
     let version = u32::from_le_bytes(glb_bytes[4..8].try_into().unwrap());
     assert_eq!(version, 2, "glTF version must be 2, got {version}");
@@ -166,7 +173,8 @@ fn assert_all_dead(pids: &[u32], timeout: Duration) {
 
 #[test]
 fn test_verify_host_blender_installation_and_version() {
-    let expected_path = PathBuf::from(r"C:\Program Files\Blender Foundation\Blender 4.5\blender.exe");
+    let expected_path =
+        PathBuf::from(r"C:\Program Files\Blender Foundation\Blender 4.5\blender.exe");
     assert!(
         expected_path.is_file(),
         "Host Blender 4.5.4 LTS executable must exist at {}",
@@ -201,8 +209,8 @@ fn test_verify_host_blender_installation_and_version() {
 
 #[tokio::test]
 async fn test_verify_host_blender_headless_autorig_execution_glb() {
-    let blender_bin = blender_provider::resolve_blender_binary()
-        .expect("Host Blender 4.5 executable not found");
+    let blender_bin =
+        blender_provider::resolve_blender_binary().expect("Host Blender 4.5 executable not found");
 
     let input_mesh = generate_test_glb_mesh();
     let animations = vec![
@@ -217,14 +225,9 @@ async fn test_verify_host_blender_headless_autorig_execution_glb() {
     );
 
     let t0 = Instant::now();
-    let result = BlenderRigProvider::execute_rigging(
-        &blender_bin,
-        &input_mesh,
-        "biped",
-        &animations,
-        60,
-    )
-    .await;
+    let result =
+        BlenderRigProvider::execute_rigging(&blender_bin, &input_mesh, "biped", &animations, 60)
+            .await;
 
     let elapsed = t0.elapsed();
     println!("Blender headless auto-rig completed in {:?}", elapsed);
@@ -252,7 +255,10 @@ async fn test_verify_host_blender_headless_autorig_execution_glb() {
         "glTF must contain at least one skin binding"
     );
     let skin = &skins.unwrap()[0];
-    let joints = skin.get("joints").and_then(|j| j.as_array()).expect("Skin must have joints array");
+    let joints = skin
+        .get("joints")
+        .and_then(|j| j.as_array())
+        .expect("Skin must have joints array");
     assert!(
         joints.len() >= 10,
         "Rigged mesh must have an armature with at least 10 joints, found {}",
@@ -276,14 +282,32 @@ async fn test_verify_host_blender_headless_autorig_execution_glb() {
     );
 
     // 3. Verify mesh primitive contains JOINTS_0 and WEIGHTS_0
-    let meshes = gltf_json.get("meshes").and_then(|m| m.as_array()).expect("Meshes must exist");
+    let meshes = gltf_json
+        .get("meshes")
+        .and_then(|m| m.as_array())
+        .expect("Meshes must exist");
     assert!(!meshes.is_empty());
-    let primitives = meshes[0].get("primitives").and_then(|p| p.as_array()).expect("Primitives must exist");
+    let primitives = meshes[0]
+        .get("primitives")
+        .and_then(|p| p.as_array())
+        .expect("Primitives must exist");
     assert!(!primitives.is_empty());
-    let attrs = primitives[0].get("attributes").and_then(|a| a.as_object()).expect("Attributes must exist");
-    assert!(attrs.contains_key("POSITION"), "Primitive must have POSITION attribute");
-    assert!(attrs.contains_key("JOINTS_0"), "Primitive must have JOINTS_0 attribute for skinning");
-    assert!(attrs.contains_key("WEIGHTS_0"), "Primitive must have WEIGHTS_0 attribute for skinning");
+    let attrs = primitives[0]
+        .get("attributes")
+        .and_then(|a| a.as_object())
+        .expect("Attributes must exist");
+    assert!(
+        attrs.contains_key("POSITION"),
+        "Primitive must have POSITION attribute"
+    );
+    assert!(
+        attrs.contains_key("JOINTS_0"),
+        "Primitive must have JOINTS_0 attribute for skinning"
+    );
+    assert!(
+        attrs.contains_key("WEIGHTS_0"),
+        "Primitive must have WEIGHTS_0 attribute for skinning"
+    );
 }
 
 #[tokio::test]
@@ -300,7 +324,10 @@ async fn test_verify_autorig_async_with_preferred_provider_blender() {
     let t0 = Instant::now();
     let result = auto_rig_mesh_async(&spec).await;
     let elapsed = t0.elapsed();
-    println!("auto_rig_mesh_async with preferred_provider=blender took {:?}", elapsed);
+    println!(
+        "auto_rig_mesh_async with preferred_provider=blender took {:?}",
+        elapsed
+    );
 
     assert!(
         result.is_ok(),
@@ -345,20 +372,35 @@ async fn test_verify_task_runner_autorig_execution_with_blender() {
         result.error
     );
 
-    assert!(result.asset_bytes.is_some(), "asset_bytes must be populated");
+    assert!(
+        result.asset_bytes.is_some(),
+        "asset_bytes must be populated"
+    );
     let asset = result.asset_bytes.unwrap();
     assert_eq!(&asset.as_bytes()[0..4], b"glTF");
 
     // Collect and verify checkpoints
     let mut checkpoints = Vec::new();
     while let Ok(msg) = rx.try_recv() {
-        if let WorkerMessage::Checkpoint { sequence, delta_state, .. } = msg {
-            checkpoints.push((sequence, String::from_utf8_lossy(delta_state.as_bytes()).to_string()));
+        if let WorkerMessage::Checkpoint {
+            sequence,
+            delta_state,
+            ..
+        } = msg
+        {
+            checkpoints.push((
+                sequence,
+                String::from_utf8_lossy(delta_state.as_bytes()).to_string(),
+            ));
         }
     }
     println!("Received checkpoints: {:?}", checkpoints);
-    assert!(checkpoints.iter().any(|(seq, msg)| *seq == 1 && msg.contains("analyzing_mesh")));
-    assert!(checkpoints.iter().any(|(seq, msg)| *seq == 2 && msg.contains("completed")));
+    assert!(checkpoints
+        .iter()
+        .any(|(seq, msg)| *seq == 1 && msg.contains("analyzing_mesh")));
+    assert!(checkpoints
+        .iter()
+        .any(|(seq, msg)| *seq == 2 && msg.contains("completed")));
 }
 
 // ============================================================================
@@ -367,8 +409,8 @@ async fn test_verify_task_runner_autorig_execution_with_blender() {
 
 #[tokio::test]
 async fn test_win32_job_object_blender_process_termination_on_abort() {
-    let blender_bin = blender_provider::resolve_blender_binary()
-        .expect("Host Blender 4.5 executable not found");
+    let blender_bin =
+        blender_provider::resolve_blender_binary().expect("Host Blender 4.5 executable not found");
 
     // Create Win32 Job Object with KILL_ON_JOB_CLOSE
     let mut job = JobObject::create().expect("Failed to create Win32 Job Object");
@@ -386,13 +428,15 @@ async fn test_win32_job_object_blender_process_termination_on_abort() {
     let blender_pid = child.id().expect("Failed to get Blender PID");
     println!("Spawned Blender test PID: {}", blender_pid);
 
-    job.assign_pid(blender_pid).expect("Failed to assign Blender PID to Job Object");
+    job.assign_pid(blender_pid)
+        .expect("Failed to assign Blender PID to Job Object");
 
     // Verify Blender is alive in the OS process table
     let mut sys = sysinfo::System::new();
     sys.refresh_processes();
     assert!(
-        sys.process(sysinfo::Pid::from(blender_pid as usize)).is_some(),
+        sys.process(sysinfo::Pid::from(blender_pid as usize))
+            .is_some(),
         "Blender PID {blender_pid} must be alive before kill"
     );
 
@@ -402,15 +446,19 @@ async fn test_win32_job_object_blender_process_termination_on_abort() {
 
     // Assert: Blender PID must be strictly dead with 0 orphans
     assert_all_dead(&[blender_pid], Duration::from_secs(4));
-    println!("Blender PID {} verified dead in {:?}", blender_pid, t0.elapsed());
+    println!(
+        "Blender PID {} verified dead in {:?}",
+        blender_pid,
+        t0.elapsed()
+    );
 
     let _ = child.wait().await;
 }
 
 #[tokio::test]
 async fn test_win32_job_object_implicit_drop_cleanup_blender() {
-    let blender_bin = blender_provider::resolve_blender_binary()
-        .expect("Host Blender 4.5 executable not found");
+    let blender_bin =
+        blender_provider::resolve_blender_binary().expect("Host Blender 4.5 executable not found");
 
     let mut job = JobObject::create().expect("Failed to create Win32 Job Object");
 
@@ -423,11 +471,14 @@ async fn test_win32_job_object_implicit_drop_cleanup_blender() {
     let mut child = cmd.spawn().expect("Failed to spawn Blender subprocess");
     let blender_pid = child.id().expect("Failed to get Blender PID");
 
-    job.assign_pid(blender_pid).expect("Failed to assign Blender PID to Job Object");
+    job.assign_pid(blender_pid)
+        .expect("Failed to assign Blender PID to Job Object");
 
     let mut sys = sysinfo::System::new();
     sys.refresh_processes();
-    assert!(sys.process(sysinfo::Pid::from(blender_pid as usize)).is_some());
+    assert!(sys
+        .process(sysinfo::Pid::from(blender_pid as usize))
+        .is_some());
 
     // Act: Drop JobObject handle WITHOUT calling terminate()!
     // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE must trigger Windows NT kernel auto-reap.
@@ -442,8 +493,8 @@ async fn test_win32_job_object_implicit_drop_cleanup_blender() {
 
 #[tokio::test]
 async fn test_win32_job_object_blender_grandchild_process_tree_containment() {
-    let blender_bin = blender_provider::resolve_blender_binary()
-        .expect("Host Blender 4.5 executable not found");
+    let blender_bin =
+        blender_provider::resolve_blender_binary().expect("Host Blender 4.5 executable not found");
 
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let pids_file = temp_dir.path().join("pids_blender_tree.txt");
@@ -540,7 +591,10 @@ time.sleep(60)
 
     // Assert: Strictly 0 survivors across all 3 generations
     assert_all_dead(&pids, Duration::from_secs(4));
-    println!("All {} processes across tree terminated with 0 orphans!", pids.len());
+    println!(
+        "All {} processes across tree terminated with 0 orphans!",
+        pids.len()
+    );
 
     let _ = child.wait().await;
 }
@@ -580,8 +634,7 @@ time.sleep(30.0)
     drop(f);
 
     let input_mesh = generate_test_glb_mesh();
-    let spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped")
-        .with_provider("blender");
+    let spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped").with_provider("blender");
 
     let mut requirements = TaskRequirements::default();
     requirements.timeout_secs = 60;
@@ -607,7 +660,10 @@ time.sleep(30.0)
     let _ = cancel_tx.send("Adversarial cancellation midway through auto-rig".to_string());
 
     let result = task_handle.await.expect("Task runner join failed");
-    println!("Cancellation task result: exit_code={}, error={:?}", result.exit_code, result.error);
+    println!(
+        "Cancellation task result: exit_code={}, error={:?}",
+        result.exit_code, result.error
+    );
 
     assert_eq!(
         result.exit_code, EXIT_CODE_CANCELLED,
@@ -623,7 +679,11 @@ time.sleep(30.0)
 #[tokio::test]
 async fn test_graceful_fallback_when_blender_path_is_invalid_or_missing() {
     // Set BLENDER_PATH to non-existent executable
-    let _env = ScopedEnvVar::set("BLENDER_PATH", r"C:\nonexistent_blender_dir\blender_invalid_404.exe").await;
+    let _env = ScopedEnvVar::set(
+        "BLENDER_PATH",
+        r"C:\nonexistent_blender_dir\blender_invalid_404.exe",
+    )
+    .await;
 
     let input_mesh = generate_test_glb_mesh();
     let spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped")

@@ -137,16 +137,14 @@ impl SchedulerConfig {
     /// Determines the required VRAM in MB for a given task.
     pub fn required_vram_mb(&self, task: &Task) -> u64 {
         match &task.spec {
-            TaskSpec::Generative3D(spec) => {
-                match spec.engine_preference.as_deref() {
-                    Some("sdf") | Some("procedural") => 0,
-                    _ => match spec.quality.as_str() {
-                        "fast" => self.min_vram_fast_mb,
-                        "high" => self.min_vram_high_mb,
-                        _ => self.min_vram_standard_mb,
-                    },
-                }
-            }
+            TaskSpec::Generative3D(spec) => match spec.engine_preference.as_deref() {
+                Some("sdf") | Some("procedural") => 0,
+                _ => match spec.quality.as_str() {
+                    "fast" => self.min_vram_fast_mb,
+                    "high" => self.min_vram_high_mb,
+                    _ => self.min_vram_standard_mb,
+                },
+            },
             _ => 0,
         }
     }

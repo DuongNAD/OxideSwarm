@@ -626,13 +626,16 @@ impl AgentGridBridge {
 
         let priority = args.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
-        let task = Task::new(spec, reqs).with_tags(vec!["grid_3d_generate".into(), "agent_bridge".into()]);
+        let task =
+            Task::new(spec, reqs).with_tags(vec!["grid_3d_generate".into(), "agent_bridge".into()]);
 
         match self.master.submit_task_with_priority(task, priority).await {
             Ok(task_id) => {
                 if wait {
                     match self.master.wait_task(task_id, Some(timeout)).await {
-                        Ok(task_res) => map_task_result_to_response(task_res, from, correlation_id, command),
+                        Ok(task_res) => {
+                            map_task_result_to_response(task_res, from, correlation_id, command)
+                        }
                         Err(e) => make_error_response(
                             from,
                             correlation_id,
@@ -653,7 +656,10 @@ impl AgentGridBridge {
                         "",
                         0,
                     );
-                    if let AgentMeshEnvelope::CommandResponse { ref mut payload, .. } = resp {
+                    if let AgentMeshEnvelope::CommandResponse {
+                        ref mut payload, ..
+                    } = resp
+                    {
                         *payload = Some(serde_json::json!({
                             "task_id": task_id.to_string(),
                             "status": "submitted"
@@ -705,7 +711,11 @@ impl AgentGridBridge {
         let embed_animations: Vec<String> = args
             .get("embed_animations")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let preferred_provider = args
@@ -742,13 +752,16 @@ impl AgentGridBridge {
 
         let priority = args.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
-        let task = Task::new(spec, reqs).with_tags(vec!["grid_auto_rig".into(), "agent_bridge".into()]);
+        let task =
+            Task::new(spec, reqs).with_tags(vec!["grid_auto_rig".into(), "agent_bridge".into()]);
 
         match self.master.submit_task_with_priority(task, priority).await {
             Ok(task_id) => {
                 if wait {
                     match self.master.wait_task(task_id, Some(timeout)).await {
-                        Ok(task_res) => map_task_result_to_response(task_res, from, correlation_id, command),
+                        Ok(task_res) => {
+                            map_task_result_to_response(task_res, from, correlation_id, command)
+                        }
                         Err(e) => make_error_response(
                             from,
                             correlation_id,
@@ -769,7 +782,10 @@ impl AgentGridBridge {
                         "",
                         0,
                     );
-                    if let AgentMeshEnvelope::CommandResponse { ref mut payload, .. } = resp {
+                    if let AgentMeshEnvelope::CommandResponse {
+                        ref mut payload, ..
+                    } = resp
+                    {
                         *payload = Some(serde_json::json!({
                             "task_id": task_id.to_string(),
                             "status": "submitted"
@@ -950,12 +966,19 @@ fn map_task_result_to_response(
         let b64 = STANDARD.encode(asset_slice);
         let sha256 = compute_sha256(asset_slice);
         if let Some(obj) = payload.as_object_mut() {
-            obj.insert("asset_bytes_len".to_string(), serde_json::json!(asset_slice.len()));
+            obj.insert(
+                "asset_bytes_len".to_string(),
+                serde_json::json!(asset_slice.len()),
+            );
             obj.insert("asset_sha256".to_string(), serde_json::json!(sha256));
             obj.insert("asset_base64".to_string(), serde_json::json!(b64));
         }
         if stdout.is_empty() {
-            stdout = format!("Asset generated successfully ({} bytes, sha256: {})", asset_slice.len(), sha256);
+            stdout = format!(
+                "Asset generated successfully ({} bytes, sha256: {})",
+                asset_slice.len(),
+                sha256
+            );
         }
     }
 

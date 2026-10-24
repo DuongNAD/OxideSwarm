@@ -124,33 +124,44 @@ fn test_math_linear_algebra_and_eigen_decomposition() {
 
     // t = 0.0 must match q1
     let q_0 = Quat::slerp(q1, q2, 0.0);
-    assert!((q_0.dot(q1).abs() - 1.0).abs() < 1e-5, "q(0.0) must match q1");
+    assert!(
+        (q_0.dot(q1).abs() - 1.0).abs() < 1e-5,
+        "q(0.0) must match q1"
+    );
 
     // t = 0.25 must match rotation by PI * 0.125
     let q_025 = Quat::slerp(q1, q2, 0.25);
     let q_exp_025 = Quat::from_axis_angle(Vec3::UP, std::f32::consts::PI * 0.125);
-    assert!((q_025.dot(q_exp_025).abs() - 1.0).abs() < 1e-4, "q(0.25) angular fidelity failed");
+    assert!(
+        (q_025.dot(q_exp_025).abs() - 1.0).abs() < 1e-4,
+        "q(0.25) angular fidelity failed"
+    );
 
     // t = 0.5 must match rotation by PI * 0.25
     let q_mid = Quat::slerp(q1, q2, 0.5);
     let q_expected = Quat::from_axis_angle(Vec3::UP, std::f32::consts::PI * 0.25);
-    assert!((q_mid.dot(q_expected).abs() - 1.0).abs() < 1e-4, "q(0.5) angular fidelity failed");
+    assert!(
+        (q_mid.dot(q_expected).abs() - 1.0).abs() < 1e-4,
+        "q(0.5) angular fidelity failed"
+    );
 
     // t = 0.75 must match rotation by PI * 0.375
     let q_075 = Quat::slerp(q1, q2, 0.75);
     let q_exp_075 = Quat::from_axis_angle(Vec3::UP, std::f32::consts::PI * 0.375);
-    assert!((q_075.dot(q_exp_075).abs() - 1.0).abs() < 1e-4, "q(0.75) angular fidelity failed");
+    assert!(
+        (q_075.dot(q_exp_075).abs() - 1.0).abs() < 1e-4,
+        "q(0.75) angular fidelity failed"
+    );
 
     // t = 1.0 must match q2 (endpoint fidelity)
     let q_1 = Quat::slerp(q1, q2, 1.0);
-    assert!((q_1.dot(q2).abs() - 1.0).abs() < 1e-5, "q(1.0) must match q2");
+    assert!(
+        (q_1.dot(q2).abs() - 1.0).abs() < 1e-5,
+        "q(1.0) must match q2"
+    );
 
     // 4. Cardano / Smith 3x3 symmetric eigen-decomposition
-    let diag_matrix = [
-        [5.0, 0.0, 0.0],
-        [0.0, 2.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ];
+    let diag_matrix = [[5.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]];
     let eigen = eigen_symmetric_3x3(diag_matrix);
     assert!((eigen.eigenvalues[0] - 5.0).abs() < 1e-4);
     assert!((eigen.eigenvalues[1] - 2.0).abs() < 1e-4);
@@ -316,7 +327,11 @@ fn test_f14_procedural_animation_synthesizer() {
     let landmarks = extract_landmarks(&mesh, RigPreset::Biped).unwrap();
     let armature = build_standard_armature(&landmarks, RigPreset::Biped);
 
-    let requested = vec!["idle".to_string(), "walk".to_string(), "turnaround".to_string()];
+    let requested = vec![
+        "idle".to_string(),
+        "walk".to_string(),
+        "turnaround".to_string(),
+    ];
     let clips = ClipSynthesizer::synthesize_all(&requested, landmarks.height, &armature);
 
     assert_eq!(clips.len(), 3);
@@ -355,9 +370,14 @@ fn test_f15_rigged_gltf_binary_export_and_conformance() {
     let landmarks = extract_landmarks(&mesh, RigPreset::Biped).unwrap();
     let armature = build_standard_armature(&landmarks, RigPreset::Biped);
     let bone_segments = build_bone_segments(&armature, &landmarks);
-    let skin_weights = compute_skin_weights(&mesh, &bone_segments, &SkinningConfig::default()).unwrap();
+    let skin_weights =
+        compute_skin_weights(&mesh, &bone_segments, &SkinningConfig::default()).unwrap();
     let clips = ClipSynthesizer::synthesize_all(
-        &["idle".to_string(), "walk".to_string(), "turnaround".to_string()],
+        &[
+            "idle".to_string(),
+            "walk".to_string(),
+            "turnaround".to_string(),
+        ],
         landmarks.height,
         &armature,
     );
@@ -370,15 +390,18 @@ fn test_f15_rigged_gltf_binary_export_and_conformance() {
     // 1. Validate Container Header
     let magic = u32::from_le_bytes([glb_bytes[0], glb_bytes[1], glb_bytes[2], glb_bytes[3]]);
     let version = u32::from_le_bytes([glb_bytes[4], glb_bytes[5], glb_bytes[6], glb_bytes[7]]);
-    let total_len = u32::from_le_bytes([glb_bytes[8], glb_bytes[9], glb_bytes[10], glb_bytes[11]]) as usize;
+    let total_len =
+        u32::from_le_bytes([glb_bytes[8], glb_bytes[9], glb_bytes[10], glb_bytes[11]]) as usize;
 
     assert_eq!(magic, GLB_MAGIC, "Invalid GLB magic header");
     assert_eq!(version, 2, "glTF version must be 2");
     assert_eq!(total_len, glb_bytes.len(), "Total length header mismatch");
 
     // 2. Validate Chunk 0 (JSON)
-    let json_len = u32::from_le_bytes([glb_bytes[12], glb_bytes[13], glb_bytes[14], glb_bytes[15]]) as usize;
-    let json_type = u32::from_le_bytes([glb_bytes[16], glb_bytes[17], glb_bytes[18], glb_bytes[19]]);
+    let json_len =
+        u32::from_le_bytes([glb_bytes[12], glb_bytes[13], glb_bytes[14], glb_bytes[15]]) as usize;
+    let json_type =
+        u32::from_le_bytes([glb_bytes[16], glb_bytes[17], glb_bytes[18], glb_bytes[19]]);
     assert_eq!(json_type, CHUNK_TYPE_JSON);
     assert_eq!(json_len % 4, 0, "JSON chunk length must be a multiple of 4");
 
@@ -393,7 +416,9 @@ fn test_f15_rigged_gltf_binary_export_and_conformance() {
 
     let skins = gltf["skins"].as_array().expect("skins must be present");
     assert_eq!(skins.len(), 1);
-    let skin_joints = skins[0]["joints"].as_array().expect("skin joints must be present");
+    let skin_joints = skins[0]["joints"]
+        .as_array()
+        .expect("skin joints must be present");
     assert_eq!(skin_joints.len(), 15);
 
     let meshes = gltf["meshes"].as_array().expect("meshes must be present");
@@ -403,7 +428,9 @@ fn test_f15_rigged_gltf_binary_export_and_conformance() {
     assert!(prim["attributes"]["WEIGHTS_0"].is_number());
     assert_eq!(prim["mode"], 4);
 
-    let anims = gltf["animations"].as_array().expect("animations must be present");
+    let anims = gltf["animations"]
+        .as_array()
+        .expect("animations must be present");
     assert_eq!(anims.len(), 3);
 
     // 4. Validate Chunk 1 (BIN)
@@ -427,11 +454,16 @@ fn test_f15_rigged_gltf_binary_export_and_conformance() {
     let buffer_views = gltf["bufferViews"].as_array().unwrap();
     for bv in buffer_views {
         let byte_offset = bv["byteOffset"].as_u64().unwrap_or(0);
-        assert_eq!(byte_offset % 4, 0, "bufferView byteOffset must be 4-byte aligned");
+        assert_eq!(
+            byte_offset % 4,
+            0,
+            "bufferView byteOffset must be 4-byte aligned"
+        );
     }
 
     // 6. Verify round-trip parsing of output .glb through our own loader
-    let parsed_back = load_mesh_from_bytes(&glb_bytes).expect("Should be able to parse generated GLB");
+    let parsed_back =
+        load_mesh_from_bytes(&glb_bytes).expect("Should be able to parse generated GLB");
     assert_eq!(parsed_back.positions.len(), mesh.positions.len());
 }
 
@@ -451,14 +483,18 @@ async fn test_f16_autorig_task_runner_execution() {
     // 2. Full TaskRunner pipeline execution test
     let caps = WorkerCapabilities::new("test_worker", 4, 8192, false, false, None);
     let runner = TaskRunner::new(Uuid::new_v4(), caps, RunnerConfig::default());
-    let task = Task::new(
-        TaskSpec::AutoRig(spec),
-        TaskRequirements::default(),
-    );
+    let task = Task::new(TaskSpec::AutoRig(spec), TaskRequirements::default());
 
     let result = runner.execute_task(&task, None, None).await;
-    assert!(result.is_success(), "Task execution failed: {:?}", result.error);
-    assert!(result.asset_bytes.is_some(), "asset_bytes must be populated");
+    assert!(
+        result.is_success(),
+        "Task execution failed: {:?}",
+        result.error
+    );
+    assert!(
+        result.asset_bytes.is_some(),
+        "asset_bytes must be populated"
+    );
 
     let asset = result.asset_bytes.unwrap();
     assert!(asset.len() > 1000);
@@ -485,12 +521,14 @@ fn test_e2e_procedural_sdf_to_autorig() {
         ])
         .with_provider("builtin");
 
-    let rigged_glb = auto_rig_mesh(&rig_spec).expect("Auto-rigging procedural SDF mesh should succeed");
+    let rigged_glb =
+        auto_rig_mesh(&rig_spec).expect("Auto-rigging procedural SDF mesh should succeed");
     assert!(rigged_glb.len() > 2000);
     assert_eq!(&rigged_glb[0..4], b"glTF");
 
     // 3. Verify that the output can be loaded back
-    let reloaded = load_mesh_from_bytes(&rigged_glb).expect("Output rigged GLB should be valid and reloadable");
+    let reloaded = load_mesh_from_bytes(&rigged_glb)
+        .expect("Output rigged GLB should be valid and reloadable");
     assert_eq!(reloaded.positions.len(), stats.vertex_count);
 }
 
@@ -506,7 +544,9 @@ fn test_edge_cases_and_error_handling() {
     assert!(auto_rig_mesh(&tiny_spec).is_err());
 
     // 3. Corrupted GLB data
-    let corrupt_bytes = vec![0x46, 0x54, 0x6C, 0x67, 0x02, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF];
+    let corrupt_bytes = vec![
+        0x46, 0x54, 0x6C, 0x67, 0x02, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+    ];
     let corrupt_spec = AutoRigSpec::new(Bytes::from(corrupt_bytes), "biped");
     assert!(auto_rig_mesh(&corrupt_spec).is_err());
 }
@@ -581,7 +621,10 @@ fn test_pca_mesh_alignment_on_rotated_humanoid() {
         base_lm.width,
         rot_lm.width
     );
-    assert!(rot_lm.is_symmetric, "Rotated mesh must retain bilateral symmetry in PCA space");
+    assert!(
+        rot_lm.is_symmetric,
+        "Rotated mesh must retain bilateral symmetry in PCA space"
+    );
 
     // World-space landmarks: Head and root should remain on rotation axis
     assert!((rot_lm.head.x).abs() < 0.05);
@@ -654,8 +697,8 @@ fn test_forward_kinematics_traversal() {
 
     // Joint 0 (Hips) and Legs (5..10) must be unaffected
     assert_eq!(posed_fk[0], armature.joints[0].world_transform);
-    for j in 5..=10 {
-        assert_eq!(posed_fk[j], armature.joints[j].world_transform);
+    for (j, fk_mat) in posed_fk.iter().enumerate().take(11).skip(5) {
+        assert_eq!(*fk_mat, armature.joints[j].world_transform);
     }
 
     // Joint 4 (Head, descendant of Spine) must have rotated world transform
@@ -692,8 +735,13 @@ vt 1.0 1.0
 f 1/1 2/2 3/3
 f 1 3 4
 ";
-    let mesh = load_mesh_from_bytes(partial_uv_obj.as_bytes()).expect("Partial UV OBJ should parse");
-    assert_eq!(mesh.positions.len(), mesh.uvs.len(), "UV count must equal position count");
+    let mesh =
+        load_mesh_from_bytes(partial_uv_obj.as_bytes()).expect("Partial UV OBJ should parse");
+    assert_eq!(
+        mesh.positions.len(),
+        mesh.uvs.len(),
+        "UV count must equal position count"
+    );
 
     // 2. Partial normals: face 1 specifies vn, face 2 does not
     let partial_norm_obj = "\
@@ -705,8 +753,13 @@ vn 0.0 0.0 1.0
 f 1//1 2//1 3//1
 f 1 3 4
 ";
-    let mesh_norm = load_mesh_from_bytes(partial_norm_obj.as_bytes()).expect("Partial normal OBJ should parse");
-    assert_eq!(mesh_norm.positions.len(), mesh_norm.normals.len(), "Normal count must equal position count");
+    let mesh_norm =
+        load_mesh_from_bytes(partial_norm_obj.as_bytes()).expect("Partial normal OBJ should parse");
+    assert_eq!(
+        mesh_norm.positions.len(),
+        mesh_norm.normals.len(),
+        "Normal count must equal position count"
+    );
 
     // 3. Out-of-bounds vertex index
     let oob_obj = "\
@@ -716,7 +769,10 @@ v 1.0 1.0 0.0
 f 1 2 999
 ";
     let oob_result = load_mesh_from_bytes(oob_obj.as_bytes());
-    assert!(oob_result.is_err(), "Out-of-bounds positive vertex index must return Err");
+    assert!(
+        oob_result.is_err(),
+        "Out-of-bounds positive vertex index must return Err"
+    );
 
     // 4. Invalid index 0
     let zero_idx_obj = "\
@@ -736,5 +792,8 @@ v 1.0 1.0 0.0
 f -1 -2 -999
 ";
     let neg_result = load_mesh_from_bytes(neg_oob_obj.as_bytes());
-    assert!(neg_result.is_err(), "Out-of-bounds negative vertex index must return Err");
+    assert!(
+        neg_result.is_err(),
+        "Out-of-bounds negative vertex index must return Err"
+    );
 }

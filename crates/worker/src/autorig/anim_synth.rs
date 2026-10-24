@@ -5,8 +5,8 @@
 //! - `walk`: cyclic biped locomotion, double-frequency pelvic bounce, antiphase arm/leg swing.
 //! - `turnaround`: 360-degree yaw rotation with alternating foot steps.
 
-use super::types::Armature;
 use super::math::Quat;
+use super::types::Armature;
 
 /// glTF 2.0 animation channel target path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,13 +301,43 @@ impl ClipSynthesizer {
                 r_foot_r.extend_from_slice(&Quat::from_euler(ank_r, 0.0, 0.0).to_array());
             }
 
-            tracks.push(AnimationTrack { target_joint: 5, path: AnimationTargetPath::Rotation, timestamps: timestamps.clone(), values: l_thigh_r });
-            tracks.push(AnimationTrack { target_joint: 6, path: AnimationTargetPath::Rotation, timestamps: timestamps.clone(), values: l_shin_r });
-            tracks.push(AnimationTrack { target_joint: 7, path: AnimationTargetPath::Rotation, timestamps: timestamps.clone(), values: l_foot_r });
+            tracks.push(AnimationTrack {
+                target_joint: 5,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: l_thigh_r,
+            });
+            tracks.push(AnimationTrack {
+                target_joint: 6,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: l_shin_r,
+            });
+            tracks.push(AnimationTrack {
+                target_joint: 7,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: l_foot_r,
+            });
 
-            tracks.push(AnimationTrack { target_joint: 8, path: AnimationTargetPath::Rotation, timestamps: timestamps.clone(), values: r_thigh_r });
-            tracks.push(AnimationTrack { target_joint: 9, path: AnimationTargetPath::Rotation, timestamps: timestamps.clone(), values: r_shin_r });
-            tracks.push(AnimationTrack { target_joint: 10, path: AnimationTargetPath::Rotation, timestamps: timestamps.clone(), values: r_foot_r });
+            tracks.push(AnimationTrack {
+                target_joint: 8,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: r_thigh_r,
+            });
+            tracks.push(AnimationTrack {
+                target_joint: 9,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: r_shin_r,
+            });
+            tracks.push(AnimationTrack {
+                target_joint: 10,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: r_foot_r,
+            });
         }
 
         // 4. Arms (UpperArm_L: 11, LowerArm_L: 12; UpperArm_R: 13, LowerArm_R: 14)
@@ -332,10 +362,30 @@ impl ClipSynthesizer {
                 r_forearm_r.extend_from_slice(&Quat::from_euler(el_r, 0.0, 0.0).to_array());
             }
 
-            tracks.push(AnimationTrack { target_joint: 11, path: AnimationTargetPath::Rotation, timestamps: timestamps.clone(), values: l_arm_r });
-            tracks.push(AnimationTrack { target_joint: 12, path: AnimationTargetPath::Rotation, timestamps: timestamps.clone(), values: l_forearm_r });
-            tracks.push(AnimationTrack { target_joint: 13, path: AnimationTargetPath::Rotation, timestamps: timestamps.clone(), values: r_arm_r });
-            tracks.push(AnimationTrack { target_joint: 14, path: AnimationTargetPath::Rotation, timestamps: timestamps.clone(), values: r_forearm_r });
+            tracks.push(AnimationTrack {
+                target_joint: 11,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: l_arm_r,
+            });
+            tracks.push(AnimationTrack {
+                target_joint: 12,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: l_forearm_r,
+            });
+            tracks.push(AnimationTrack {
+                target_joint: 13,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: r_arm_r,
+            });
+            tracks.push(AnimationTrack {
+                target_joint: 14,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: r_forearm_r,
+            });
         }
 
         ProceduralClip {
@@ -403,11 +453,11 @@ impl ClipSynthesizer {
                 let (lift_r, lift_l) = if step_phase < 0.5 {
                     // Right leg lifts and turns
                     let tau = step_phase / 0.5;
-                    ( (std::f32::consts::PI * tau).sin() * 0.45, 0.0f32 )
+                    ((std::f32::consts::PI * tau).sin() * 0.45, 0.0f32)
                 } else {
                     // Left leg lifts and turns
                     let tau = (step_phase - 0.5) / 0.5;
-                    ( 0.0f32, (std::f32::consts::PI * tau).sin() * 0.45 )
+                    (0.0f32, (std::f32::consts::PI * tau).sin() * 0.45)
                 };
 
                 r_thigh_r.extend_from_slice(&Quat::from_euler(lift_r * 0.6, 0.0, 0.0).to_array());
@@ -417,11 +467,31 @@ impl ClipSynthesizer {
                 l_shin_r.extend_from_slice(&Quat::from_euler(-lift_l * 1.2, 0.0, 0.0).to_array());
             }
 
-            tracks.push(AnimationTrack { target_joint: 5, path: AnimationTargetPath::Rotation, timestamps: timestamps.clone(), values: l_thigh_r });
-            tracks.push(AnimationTrack { target_joint: 6, path: AnimationTargetPath::Rotation, timestamps: timestamps.clone(), values: l_shin_r });
+            tracks.push(AnimationTrack {
+                target_joint: 5,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: l_thigh_r,
+            });
+            tracks.push(AnimationTrack {
+                target_joint: 6,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: l_shin_r,
+            });
 
-            tracks.push(AnimationTrack { target_joint: 8, path: AnimationTargetPath::Rotation, timestamps: timestamps.clone(), values: r_thigh_r });
-            tracks.push(AnimationTrack { target_joint: 9, path: AnimationTargetPath::Rotation, timestamps: timestamps.clone(), values: r_shin_r });
+            tracks.push(AnimationTrack {
+                target_joint: 8,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: r_thigh_r,
+            });
+            tracks.push(AnimationTrack {
+                target_joint: 9,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: r_shin_r,
+            });
         }
 
         ProceduralClip {

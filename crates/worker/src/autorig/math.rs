@@ -14,14 +14,46 @@ pub struct Vec3 {
 }
 
 impl Vec3 {
-    pub const ZERO: Self = Self { x: 0.0, y: 0.0, z: 0.0 };
-    pub const ONE: Self = Self { x: 1.0, y: 1.0, z: 1.0 };
-    pub const UP: Self = Self { x: 0.0, y: 1.0, z: 0.0 };
-    pub const DOWN: Self = Self { x: 0.0, y: -1.0, z: 0.0 };
-    pub const FORWARD: Self = Self { x: 0.0, y: 0.0, z: 1.0 };
-    pub const BACK: Self = Self { x: 0.0, y: 0.0, z: -1.0 };
-    pub const RIGHT: Self = Self { x: 1.0, y: 0.0, z: 0.0 };
-    pub const LEFT: Self = Self { x: -1.0, y: 0.0, z: 0.0 };
+    pub const ZERO: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
+    pub const ONE: Self = Self {
+        x: 1.0,
+        y: 1.0,
+        z: 1.0,
+    };
+    pub const UP: Self = Self {
+        x: 0.0,
+        y: 1.0,
+        z: 0.0,
+    };
+    pub const DOWN: Self = Self {
+        x: 0.0,
+        y: -1.0,
+        z: 0.0,
+    };
+    pub const FORWARD: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        z: 1.0,
+    };
+    pub const BACK: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        z: -1.0,
+    };
+    pub const RIGHT: Self = Self {
+        x: 1.0,
+        y: 0.0,
+        z: 0.0,
+    };
+    pub const LEFT: Self = Self {
+        x: -1.0,
+        y: 0.0,
+        z: 0.0,
+    };
 
     #[inline(always)]
     pub const fn new(x: f32, y: f32, z: f32) -> Self {
@@ -321,9 +353,24 @@ impl Mat4 {
 
         Self {
             cols: [
-                [(1.0 - (yy + zz)) * s.x, (xy + wz) * s.x, (xz - wy) * s.x, 0.0],
-                [(xy - wz) * s.y, (1.0 - (xx + zz)) * s.y, (yz + wx) * s.y, 0.0],
-                [(xz + wy) * s.z, (yz - wx) * s.z, (1.0 - (xx + yy)) * s.z, 0.0],
+                [
+                    (1.0 - (yy + zz)) * s.x,
+                    (xy + wz) * s.x,
+                    (xz - wy) * s.x,
+                    0.0,
+                ],
+                [
+                    (xy - wz) * s.y,
+                    (1.0 - (xx + zz)) * s.y,
+                    (yz + wx) * s.y,
+                    0.0,
+                ],
+                [
+                    (xz + wy) * s.z,
+                    (yz - wx) * s.z,
+                    (1.0 - (xx + yy)) * s.z,
+                    0.0,
+                ],
                 [t.x, t.y, t.z, 1.0],
             ],
         }
@@ -331,6 +378,7 @@ impl Mat4 {
 
     /// Matrix multiplication: `self * rhs`.
     #[inline]
+    #[allow(clippy::needless_range_loop)]
     pub fn mul_mat4(&self, rhs: &Self) -> Self {
         let mut out = [[0.0f32; 4]; 4];
         for col in 0..4 {
@@ -351,9 +399,15 @@ impl Mat4 {
     #[inline]
     pub fn inverse_rigid(&self) -> Self {
         // Transpose 3x3 upper-left rotation block
-        let r00 = self.cols[0][0]; let r01 = self.cols[1][0]; let r02 = self.cols[2][0];
-        let r10 = self.cols[0][1]; let r11 = self.cols[1][1]; let r12 = self.cols[2][1];
-        let r20 = self.cols[0][2]; let r21 = self.cols[1][2]; let r22 = self.cols[2][2];
+        let r00 = self.cols[0][0];
+        let r01 = self.cols[1][0];
+        let r02 = self.cols[2][0];
+        let r10 = self.cols[0][1];
+        let r11 = self.cols[1][1];
+        let r12 = self.cols[2][1];
+        let r20 = self.cols[0][2];
+        let r21 = self.cols[1][2];
+        let r22 = self.cols[2][2];
 
         // Translation vector
         let tx = self.cols[3][0];
@@ -389,10 +443,22 @@ impl Mat4 {
     #[inline]
     pub fn to_column_major_array(&self) -> [f32; 16] {
         [
-            self.cols[0][0], self.cols[0][1], self.cols[0][2], self.cols[0][3],
-            self.cols[1][0], self.cols[1][1], self.cols[1][2], self.cols[1][3],
-            self.cols[2][0], self.cols[2][1], self.cols[2][2], self.cols[2][3],
-            self.cols[3][0], self.cols[3][1], self.cols[3][2], self.cols[3][3],
+            self.cols[0][0],
+            self.cols[0][1],
+            self.cols[0][2],
+            self.cols[0][3],
+            self.cols[1][0],
+            self.cols[1][1],
+            self.cols[1][2],
+            self.cols[1][3],
+            self.cols[2][0],
+            self.cols[2][1],
+            self.cols[2][2],
+            self.cols[2][3],
+            self.cols[3][0],
+            self.cols[3][1],
+            self.cols[3][2],
+            self.cols[3][3],
         ]
     }
 }
@@ -419,19 +485,28 @@ pub fn eigen_decomposition_3x3(c: [[f32; 3]; 3]) -> EigenDecomposition3 {
 /// Input matrix `c` is given as symmetric 3x3:
 /// `[[c00, c01, c02], [c01, c11, c12], [c02, c12, c22]]`
 pub fn eigen_symmetric_3x3(c: [[f32; 3]; 3]) -> EigenDecomposition3 {
-    let c00 = c[0][0]; let c01 = c[0][1]; let c02 = c[0][2];
-    let c11 = c[1][1]; let c12 = c[1][2];
+    let c00 = c[0][0];
+    let c01 = c[0][1];
+    let c02 = c[0][2];
+    let c11 = c[1][1];
+    let c12 = c[1][2];
     let c22 = c[2][2];
 
     // 1. Mean trace
     let m = (c00 + c11 + c22) / 3.0;
 
     // 2. Shifted matrix B = C - m * I
-    let b00 = c00 - m; let b11 = c11 - m; let b22 = c22 - m;
-    let b01 = c01; let b02 = c02; let b12 = c12;
+    let b00 = c00 - m;
+    let b11 = c11 - m;
+    let b22 = c22 - m;
+    let b01 = c01;
+    let b02 = c02;
+    let b12 = c12;
 
     // 3. Invariants
-    let q = 0.5 * (b00 * (b11 * b22 - b12 * b12) - b01 * (b01 * b22 - b02 * b12) + b02 * (b01 * b12 - b02 * b11));
+    let q = 0.5
+        * (b00 * (b11 * b22 - b12 * b12) - b01 * (b01 * b22 - b02 * b12)
+            + b02 * (b01 * b12 - b02 * b11));
     let p = (b00 * b00 + b11 * b11 + b22 * b22 + 2.0 * (b01 * b01 + b02 * b02 + b12 * b12)) / 6.0;
 
     if p < 1e-12 {

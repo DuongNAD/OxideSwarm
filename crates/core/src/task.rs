@@ -588,7 +588,11 @@ pub struct Generative3DSpec {
 struct HumanGenerative3DSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prompt: Option<String>,
-    #[serde(default, with = "opt_bytes_serde", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "opt_bytes_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
     image_data: Option<Bytes>,
     #[serde(default = "default_3d_quality")]
     quality: String,
@@ -947,9 +951,19 @@ enum HumanTaskSpec {
         #[serde(default)]
         require_gpu: bool,
     },
-    #[serde(alias = "generative_3d", alias = "generative3d", alias = "3d", alias = "Generative3d")]
+    #[serde(
+        alias = "generative_3d",
+        alias = "generative3d",
+        alias = "3d",
+        alias = "Generative3d"
+    )]
     Generative3D(Generative3DSpec),
-    #[serde(alias = "auto_rig", alias = "autorig", alias = "rig", alias = "Auto_Rig")]
+    #[serde(
+        alias = "auto_rig",
+        alias = "autorig",
+        alias = "rig",
+        alias = "Auto_Rig"
+    )]
     AutoRig(AutoRigSpec),
 }
 
@@ -1431,10 +1445,21 @@ impl TaskSpec {
             }
             TaskSpec::BuiltinTest { .. } => {}
             TaskSpec::Generative3D(spec) => {
-                let has_prompt = spec.prompt.as_ref().map(|p| !p.trim().is_empty()).unwrap_or(false);
-                let has_image = spec.image_data.as_ref().map(|img| !img.is_empty()).unwrap_or(false);
+                let has_prompt = spec
+                    .prompt
+                    .as_ref()
+                    .map(|p| !p.trim().is_empty())
+                    .unwrap_or(false);
+                let has_image = spec
+                    .image_data
+                    .as_ref()
+                    .map(|img| !img.is_empty())
+                    .unwrap_or(false);
                 if !has_prompt && !has_image {
-                    return Err("Generative3D requires at least a non-empty prompt or non-empty image_data".to_string());
+                    return Err(
+                        "Generative3D requires at least a non-empty prompt or non-empty image_data"
+                            .to_string(),
+                    );
                 }
                 if spec.quality.trim().is_empty() {
                     return Err("Generative3D quality cannot be empty".to_string());
@@ -1459,10 +1484,10 @@ impl TaskSpec {
             TaskSpec::BuiltinTest { require_gpu, .. } => *require_gpu,
             TaskSpec::Generative3D(spec) => {
                 // Procedural SDF engine runs on CPU; neural or auto engines require GPU
-                match spec.engine_preference.as_deref() {
-                    Some("sdf") | Some("procedural") => false,
-                    _ => true,
-                }
+                !matches!(
+                    spec.engine_preference.as_deref(),
+                    Some("sdf") | Some("procedural")
+                )
             }
             TaskSpec::AutoRig(_) => false,
             _ => false,
@@ -1880,7 +1905,11 @@ struct HumanTaskResult {
     pub device_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    #[serde(default, with = "opt_bytes_serde", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "opt_bytes_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub asset_bytes: Option<Bytes>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<OutputArtifact>,
@@ -2691,20 +2720,22 @@ mod tests {
         let task_spec = TaskSpec::Generative3D(spec);
 
         let encoded = bincode::serialize(&task_spec).expect("Bincode serialization failed");
-        let decoded: TaskSpec = bincode::deserialize(&encoded).expect("Bincode deserialization failed");
+        let decoded: TaskSpec =
+            bincode::deserialize(&encoded).expect("Bincode deserialization failed");
         assert_eq!(task_spec, decoded);
     }
 
     #[test]
     fn test_generative_3d_aliases_and_defaults() {
         let json_minimal = r#"{"type":"3d","prompt":"fantasy sword"}"#;
-        let decoded: TaskSpec = serde_json::from_str(json_minimal).expect("Alias deserialization failed");
+        let decoded: TaskSpec =
+            serde_json::from_str(json_minimal).expect("Alias deserialization failed");
 
         match decoded {
             TaskSpec::Generative3D(s) => {
                 assert_eq!(s.prompt, Some("fantasy sword".to_string()));
                 assert_eq!(s.quality, "standard");
-                assert_eq!(s.export_texture, true);
+                assert!(s.export_texture);
                 assert!(s.image_data.is_none());
                 assert!(s.engine_preference.is_none());
             }
@@ -2715,8 +2746,7 @@ mod tests {
     #[test]
     fn test_auto_rig_spec_serde_roundtrip() {
         let mesh_data = Bytes::copy_from_slice(b"glTF binary payload test");
-        let spec = AutoRigSpec::new(mesh_data, "humanoid")
-            .with_provider("builtin");
+        let spec = AutoRigSpec::new(mesh_data, "humanoid").with_provider("builtin");
 
         let task_spec = TaskSpec::AutoRig(spec);
 
@@ -2750,10 +2780,16 @@ mod tests {
     #[test]
     fn test_task_spec_3d_validation() {
         // Valid prompt
-        assert!(TaskSpec::new_generative_3d("valid prompt").validate().is_ok());
+        assert!(TaskSpec::new_generative_3d("valid prompt")
+            .validate()
+            .is_ok());
 
         // Valid image
-        assert!(TaskSpec::new_generative_3d_image(Bytes::from_static(b"image")).validate().is_ok());
+        assert!(
+            TaskSpec::new_generative_3d_image(Bytes::from_static(b"image"))
+                .validate()
+                .is_ok()
+        );
 
         // Invalid: empty prompt and no image
         let empty_prompt = TaskSpec::Generative3D(Generative3DSpec {
@@ -2781,9 +2817,8 @@ mod tests {
         assert!(gen_gpu.requires_gpu());
 
         // Procedural SDF engine does NOT require GPU (CPU CI safe)
-        let gen_cpu = TaskSpec::Generative3D(
-            Generative3DSpec::new_prompt("cube").with_engine("sdf")
-        );
+        let gen_cpu =
+            TaskSpec::Generative3D(Generative3DSpec::new_prompt("cube").with_engine("sdf"));
         assert!(!gen_cpu.requires_gpu());
 
         // AutoRig does NOT require GPU
@@ -2794,7 +2829,10 @@ mod tests {
     #[test]
     fn test_task_spec_task_type() {
         assert_eq!(TaskSpec::new_generative_3d("x").task_type(), "Generative3D");
-        assert_eq!(TaskSpec::new_auto_rig(Bytes::new(), "biped").task_type(), "AutoRig");
+        assert_eq!(
+            TaskSpec::new_auto_rig(Bytes::new(), "biped").task_type(),
+            "AutoRig"
+        );
         assert_eq!(TaskSpec::new_command("ls", vec![]).task_type(), "Command");
     }
 
@@ -2811,12 +2849,14 @@ mod tests {
 
         // JSON roundtrip
         let json = serde_json::to_string(&res).expect("TaskResult JSON serialize failed");
-        let decoded_json: TaskResult = serde_json::from_str(&json).expect("TaskResult JSON deserialize failed");
+        let decoded_json: TaskResult =
+            serde_json::from_str(&json).expect("TaskResult JSON deserialize failed");
         assert_eq!(res, decoded_json);
 
         // Bincode roundtrip
         let bin = bincode::serialize(&res).expect("TaskResult Bincode serialize failed");
-        let decoded_bin: TaskResult = bincode::deserialize(&bin).expect("TaskResult Bincode deserialize failed");
+        let decoded_bin: TaskResult =
+            bincode::deserialize(&bin).expect("TaskResult Bincode deserialize failed");
         assert_eq!(res, decoded_bin);
 
         // Verify None case omits asset_bytes in JSON
@@ -2836,13 +2876,17 @@ mod tests {
 
         // In JSON, asset_bytes = None must be omitted from output
         let json = serde_json::to_string(&res).expect("serialize legacy TaskResult");
-        assert!(!json.contains("asset_bytes"), "JSON should skip asset_bytes when None: {json}");
+        assert!(
+            !json.contains("asset_bytes"),
+            "JSON should skip asset_bytes when None: {json}"
+        );
 
         // 2. Deserializing legacy JSON (without asset_bytes field) must yield None
         let legacy_json = format!(
             r#"{{"worker_id":"{worker_id}","task_id":"{task_id}","exit_code":0,"stdout":"ok","stderr":"","execution_time_ms":100,"is_gpu_executed":false}}"#
         );
-        let deser_legacy: TaskResult = serde_json::from_str(&legacy_json).expect("deserialize legacy json");
+        let deser_legacy: TaskResult =
+            serde_json::from_str(&legacy_json).expect("deserialize legacy json");
         assert_eq!(deser_legacy.asset_bytes, None);
         assert_eq!(deser_legacy.stdout.as_str(), "ok");
     }
@@ -2882,18 +2926,27 @@ mod tests {
             .with_engine("sdf");
         let rig_spec = AutoRigSpec::new(Bytes::copy_from_slice(b"dummy_mesh_geometry"), "biped");
 
-        let specs = vec![TaskSpec::Generative3D(gen_spec), TaskSpec::AutoRig(rig_spec)];
+        let specs = vec![
+            TaskSpec::Generative3D(gen_spec),
+            TaskSpec::AutoRig(rig_spec),
+        ];
 
         for spec in specs {
             // TaskSpec -> HumanTaskSpec -> TaskSpec parity
             let human: HumanTaskSpec = spec.clone().into();
             let from_human: TaskSpec = human.into();
-            assert_eq!(spec, from_human, "HumanTaskSpec From conversion parity failed");
+            assert_eq!(
+                spec, from_human,
+                "HumanTaskSpec From conversion parity failed"
+            );
 
             // TaskSpec -> BinaryTaskSpec -> TaskSpec parity
             let binary: BinaryTaskSpec = spec.clone().into();
             let from_binary: TaskSpec = binary.into();
-            assert_eq!(spec, from_binary, "BinaryTaskSpec From conversion parity failed");
+            assert_eq!(
+                spec, from_binary,
+                "BinaryTaskSpec From conversion parity failed"
+            );
         }
     }
 
@@ -2911,12 +2964,14 @@ mod tests {
 
         // JSON roundtrip
         let json = serde_json::to_string(&task).expect("serialize Task with Generative3D");
-        let deser_task: Task = serde_json::from_str(&json).expect("deserialize Task with Generative3D");
+        let deser_task: Task =
+            serde_json::from_str(&json).expect("deserialize Task with Generative3D");
         assert_eq!(task, deser_task);
 
         // Bincode roundtrip
         let bin = bincode::serialize(&task).expect("bincode serialize Task with Generative3D");
-        let deser_bin: Task = bincode::deserialize(&bin).expect("bincode deserialize Task with Generative3D");
+        let deser_bin: Task =
+            bincode::deserialize(&bin).expect("bincode deserialize Task with Generative3D");
         assert_eq!(task, deser_bin);
     }
 }

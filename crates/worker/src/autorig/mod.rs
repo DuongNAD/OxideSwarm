@@ -20,11 +20,14 @@ pub use armature::{build_bone_segments, build_standard_armature};
 pub use blender_provider::BlenderRigProvider;
 pub use gltf_export::{export_rigged_glb, CHUNK_TYPE_BIN, CHUNK_TYPE_JSON, GLB_MAGIC};
 pub use landmark::extract_landmarks;
-pub use math::{eigen_decomposition_3x3, eigen_symmetric_3x3, EigenDecomposition3, Mat4, Quat, Vec3};
+pub use math::{
+    eigen_decomposition_3x3, eigen_symmetric_3x3, EigenDecomposition3, Mat4, Quat, Vec3,
+};
 pub use mesh_loader::load_mesh_from_bytes;
 pub use skinning::{compute_skin_weights, SkinningConfig};
 pub use types::{
-    AnatomicalLandmarks, Armature, BoneSegment, Joint, LimbSide, RigPreset, SkinWeights, WorkerError,
+    AnatomicalLandmarks, Armature, BoneSegment, Joint, LimbSide, RigPreset, SkinWeights,
+    WorkerError,
 };
 
 use rusty_grid_core::task::AutoRigSpec;
@@ -52,25 +55,42 @@ where
     // 3. Feature F11: Extract anatomical landmarks and symmetry (25%)
     let landmarks = extract_landmarks(&raw_mesh, preset)
         .map_err(|e| WorkerError::AutoRig(format!("Landmark extraction failed: {e}")))?;
-    on_progress(0.25, "landmark_extraction", "PCA symmetry and 15 anatomical landmarks extracted");
+    on_progress(
+        0.25,
+        "landmark_extraction",
+        "PCA symmetry and 15 anatomical landmarks extracted",
+    );
 
     // 4. Feature F12: Build standard DAG armature hierarchy & IBMs (50%)
     let armature = build_standard_armature(&landmarks, preset);
     let bone_segments = build_bone_segments(&armature, &landmarks);
-    on_progress(0.50, "armature_ibm", "Standard 15-joint DAG armature and inverse bind matrices computed");
+    on_progress(
+        0.50,
+        "armature_ibm",
+        "Standard 15-joint DAG armature and inverse bind matrices computed",
+    );
 
     // 5. Feature F13: Geodesic skin weighting & top-4 pruning (75%)
     let skin_weights = compute_skin_weights(&raw_mesh, &bone_segments, &SkinningConfig::default())
         .map_err(|e| WorkerError::AutoRig(format!("Skin weighting failed: {e}")))?;
-    on_progress(0.75, "geodesic_skinning", "Geodesic surface skin weights computed with topological barrier");
+    on_progress(
+        0.75,
+        "geodesic_skinning",
+        "Geodesic surface skin weights computed with topological barrier",
+    );
 
     // 6. Feature F14: Procedural TRS animation track synthesis
-    let clips = ClipSynthesizer::synthesize_all(&spec.embed_animations, landmarks.height, &armature);
+    let clips =
+        ClipSynthesizer::synthesize_all(&spec.embed_animations, landmarks.height, &armature);
 
     // 7. Feature F15: Rigged glTF 2.0 Binary (.glb) serialization (100%)
     let glb_bytes = export_rigged_glb(&raw_mesh, &armature, &skin_weights, &clips, None)
         .map_err(|e| WorkerError::AutoRig(format!("glTF binary export failed: {e}")))?;
-    on_progress(1.00, "animation_export", "TRS keyframes synthesized and rigged glTF 2.0 container exported");
+    on_progress(
+        1.00,
+        "animation_export",
+        "TRS keyframes synthesized and rigged glTF 2.0 container exported",
+    );
 
     Ok(glb_bytes)
 }
@@ -91,7 +111,11 @@ pub fn auto_rig_mesh(spec: &AutoRigSpec) -> Result<Vec<u8>, WorkerError> {
 /// Supports headless Blender 4.5.4 LTS fallback (F16) when requested,
 /// with automatic deterministic fallback to the built-in pure-Rust rigging engine.
 pub async fn auto_rig_mesh_async(spec: &AutoRigSpec) -> Result<Vec<u8>, WorkerError> {
-    let pref = spec.preferred_provider.as_deref().unwrap_or("builtin").to_lowercase();
+    let pref = spec
+        .preferred_provider
+        .as_deref()
+        .unwrap_or("builtin")
+        .to_lowercase();
 
     if pref == "blender" {
         if let Some(blender_bin) = blender_provider::resolve_blender_binary() {

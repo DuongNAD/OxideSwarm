@@ -18,9 +18,7 @@ use uuid::Uuid;
 
 use rusty_grid_core::capabilities::{HardwareOverrides, WorkerCapabilities};
 use rusty_grid_core::protocol::{MessageTransport, WireCodec, WorkerMessage};
-use rusty_grid_core::task::{
-    TaskId, TaskRequirements, TaskResult, TaskSpec,
-};
+use rusty_grid_core::task::{TaskId, TaskRequirements, TaskResult, TaskSpec};
 
 // =========================================================================
 // Win32 Process Handle Query Helper
@@ -71,11 +69,23 @@ fn test_adversarial_overrides_no_gpu_dominates_cuda() {
 
     assert_eq!(caps.name, "node-no-gpu-cuda");
     assert!(!caps.has_gpu, "no_gpu MUST force has_gpu to false");
-    assert!(!caps.is_simulated_gpu, "no_gpu MUST force is_simulated_gpu to false");
-    assert!(caps.gpu_device_name.is_none(), "no_gpu MUST strip gpu_device_name");
-    assert!(!caps.has_cuda, "no_gpu MUST dominate cuda and force has_cuda to false");
+    assert!(
+        !caps.is_simulated_gpu,
+        "no_gpu MUST force is_simulated_gpu to false"
+    );
+    assert!(
+        caps.gpu_device_name.is_none(),
+        "no_gpu MUST strip gpu_device_name"
+    );
+    assert!(
+        !caps.has_cuda,
+        "no_gpu MUST dominate cuda and force has_cuda to false"
+    );
     assert!(caps.vram_mb.is_none(), "no_gpu MUST force vram_mb to None");
-    assert!(!caps.can_execute_gpu(), "can_execute_gpu() must return false");
+    assert!(
+        !caps.can_execute_gpu(),
+        "can_execute_gpu() must return false"
+    );
     assert!(
         !caps.satisfies(&TaskRequirements::gpu(60)),
         "Worker with no_gpu must NEVER satisfy GPU tasks"
@@ -117,9 +127,18 @@ fn test_adversarial_overrides_no_gpu_dominates_all_gpu_flags_combined() {
     };
     let caps = WorkerCapabilities::detect_with_overrides(overrides);
 
-    assert!(!caps.has_gpu, "no_gpu must strictly dominate gpu: Some(true)");
-    assert!(!caps.is_simulated_gpu, "no_gpu must strictly dominate simulate_gpu: true");
-    assert!(caps.gpu_device_name.is_none(), "no_gpu must strip custom gpu_device_name");
+    assert!(
+        !caps.has_gpu,
+        "no_gpu must strictly dominate gpu: Some(true)"
+    );
+    assert!(
+        !caps.is_simulated_gpu,
+        "no_gpu must strictly dominate simulate_gpu: true"
+    );
+    assert!(
+        caps.gpu_device_name.is_none(),
+        "no_gpu must strip custom gpu_device_name"
+    );
     assert!(caps.vram_mb.is_none(), "no_gpu must strip vram_mb");
     assert!(!caps.has_cuda, "no_gpu must strip has_cuda");
     assert!(!caps.can_execute_gpu());
@@ -147,7 +166,10 @@ fn test_adversarial_overrides_no_gpu_dominates_environment_variables() {
     std::env::remove_var("OXIDE_SWARM_VRAM_MB");
 
     assert!(!caps.has_gpu);
-    assert!(caps.vram_mb.is_none(), "no_gpu must override RUSTY_GRID_VRAM_MB");
+    assert!(
+        caps.vram_mb.is_none(),
+        "no_gpu must override RUSTY_GRID_VRAM_MB"
+    );
     assert!(!caps.has_cuda, "no_gpu must override RUSTY_GRID_CUDA");
 }
 
@@ -164,7 +186,10 @@ fn test_adversarial_overrides_no_cuda_dominates_cuda() {
 
     assert!(caps.has_gpu);
     assert_eq!(caps.vram_mb, Some(8192));
-    assert!(!caps.has_cuda, "no_cuda MUST strictly dominate cuda: Some(true)");
+    assert!(
+        !caps.has_cuda,
+        "no_cuda MUST strictly dominate cuda: Some(true)"
+    );
 }
 
 // =========================================================================
@@ -204,7 +229,10 @@ fn test_adversarial_overrides_no_blender_dominates_all_blender_flags_combined() 
     };
     let caps = WorkerCapabilities::detect_with_overrides(overrides);
 
-    assert!(!caps.has_blender, "no_blender must dominate blender: Some(true)");
+    assert!(
+        !caps.has_blender,
+        "no_blender must dominate blender: Some(true)"
+    );
     assert!(
         caps.blender_version.is_none(),
         "no_blender must strip custom blender_version"
@@ -280,23 +308,38 @@ fn test_legacy_worker_capabilities_json_seamless_deserialization() {
         "tags": ["production", "us-east-1"]
     }"#;
 
-    let caps: WorkerCapabilities =
-        serde_json::from_str(legacy_worker_json).expect("Legacy WorkerCapabilities JSON MUST deserialize seamlessly");
+    let caps: WorkerCapabilities = serde_json::from_str(legacy_worker_json)
+        .expect("Legacy WorkerCapabilities JSON MUST deserialize seamlessly");
 
     assert_eq!(caps.name, "legacy-worker-v0.1.0");
     assert_eq!(caps.cpu_cores, 16);
     assert_eq!(caps.ram_mb, 65536);
     assert!(caps.has_gpu);
     assert!(!caps.is_simulated_gpu);
-    assert_eq!(caps.gpu_device_name.as_deref(), Some("NVIDIA GeForce RTX 4090"));
+    assert_eq!(
+        caps.gpu_device_name.as_deref(),
+        Some("NVIDIA GeForce RTX 4090")
+    );
     assert_eq!(caps.tags, vec!["production", "us-east-1"]);
     assert!(caps.mobile.is_none());
 
     // Milestone 1 default fields:
-    assert!(!caps.has_blender, "Legacy JSON missing has_blender must default to false");
-    assert!(caps.blender_version.is_none(), "Legacy JSON missing blender_version must default to None");
-    assert!(caps.vram_mb.is_none(), "Legacy JSON missing vram_mb must default to None");
-    assert!(!caps.has_cuda, "Legacy JSON missing has_cuda must default to false");
+    assert!(
+        !caps.has_blender,
+        "Legacy JSON missing has_blender must default to false"
+    );
+    assert!(
+        caps.blender_version.is_none(),
+        "Legacy JSON missing blender_version must default to None"
+    );
+    assert!(
+        caps.vram_mb.is_none(),
+        "Legacy JSON missing vram_mb must default to None"
+    );
+    assert!(
+        !caps.has_cuda,
+        "Legacy JSON missing has_cuda must default to false"
+    );
 }
 
 #[test]
@@ -343,8 +386,8 @@ fn test_legacy_task_result_json_seamless_deserialization() {
         }}"#
     );
 
-    let result: TaskResult =
-        serde_json::from_str(&legacy_result_json).expect("Legacy TaskResult JSON MUST deserialize seamlessly");
+    let result: TaskResult = serde_json::from_str(&legacy_result_json)
+        .expect("Legacy TaskResult JSON MUST deserialize seamlessly");
 
     assert_eq!(result.worker_id, wid);
     assert_eq!(result.task_id, tid);
@@ -381,8 +424,8 @@ fn test_legacy_worker_message_task_result_wire_protocol_deserialization() {
         }}"#
     );
 
-    let msg: WorkerMessage =
-        serde_json::from_str(&legacy_wire_json).expect("Legacy WorkerMessage::TaskResult MUST deserialize seamlessly");
+    let msg: WorkerMessage = serde_json::from_str(&legacy_wire_json)
+        .expect("Legacy WorkerMessage::TaskResult MUST deserialize seamlessly");
 
     match msg {
         WorkerMessage::TaskResult {
@@ -423,8 +466,8 @@ fn test_legacy_worker_message_register_wire_protocol_deserialization() {
         }}"#
     );
 
-    let msg: WorkerMessage =
-        serde_json::from_str(&legacy_register_json).expect("Legacy Register message MUST deserialize seamlessly");
+    let msg: WorkerMessage = serde_json::from_str(&legacy_register_json)
+        .expect("Legacy Register message MUST deserialize seamlessly");
 
     match msg {
         WorkerMessage::Register {
@@ -456,7 +499,8 @@ fn test_legacy_task_spec_variants_unaffected() {
         stdin: None,
     };
     let json = serde_json::to_string(&cmd).expect("TaskSpec::Command JSON serialize failed");
-    let deser: TaskSpec = serde_json::from_str(&json).expect("TaskSpec::Command JSON deserialize failed");
+    let deser: TaskSpec =
+        serde_json::from_str(&json).expect("TaskSpec::Command JSON deserialize failed");
     assert_eq!(cmd, deser);
 
     let shell = TaskSpec::ShellScript {
@@ -472,20 +516,27 @@ fn test_legacy_task_spec_variants_unaffected() {
 #[test]
 fn test_new_3d_task_spec_serde_aliases() {
     // Human JSON with tag alias "generative_3d"
-    let json_3d = r#"{"type": "generative_3d", "prompt": "A medieval fortress", "quality": "fast"}"#;
-    let task_spec: TaskSpec = serde_json::from_str(json_3d).expect("Deserializing generative_3d alias failed");
+    let json_3d =
+        r#"{"type": "generative_3d", "prompt": "A medieval fortress", "quality": "fast"}"#;
+    let task_spec: TaskSpec =
+        serde_json::from_str(json_3d).expect("Deserializing generative_3d alias failed");
     match task_spec {
         TaskSpec::Generative3D(spec) => {
             assert_eq!(spec.prompt.as_deref(), Some("A medieval fortress"));
             assert_eq!(spec.quality, "fast");
-            assert_eq!(spec.export_texture, true, "export_texture must default to true when omitted in JSON");
+            assert!(
+                spec.export_texture,
+                "export_texture must default to true when omitted in JSON"
+            );
         }
         other => panic!("Expected TaskSpec::Generative3D, got {other:?}"),
     }
 
     // Explicit export_texture: true
-    let json_3d_explicit = r#"{"type": "generative_3d", "prompt": "A medieval fortress", "export_texture": true}"#;
-    let spec_explicit: TaskSpec = serde_json::from_str(json_3d_explicit).expect("Deserializing explicit export_texture failed");
+    let json_3d_explicit =
+        r#"{"type": "generative_3d", "prompt": "A medieval fortress", "export_texture": true}"#;
+    let spec_explicit: TaskSpec = serde_json::from_str(json_3d_explicit)
+        .expect("Deserializing explicit export_texture failed");
     match spec_explicit {
         TaskSpec::Generative3D(s) => {
             assert!(s.export_texture, "Explicit export_texture must be true");
@@ -495,7 +546,8 @@ fn test_new_3d_task_spec_serde_aliases() {
 
     // Human JSON with tag alias "3d"
     let json_3d_short = r#"{"type": "3d", "prompt": "low-poly car"}"#;
-    let spec_short: TaskSpec = serde_json::from_str(json_3d_short).expect("Deserializing 3d alias failed");
+    let spec_short: TaskSpec =
+        serde_json::from_str(json_3d_short).expect("Deserializing 3d alias failed");
     match spec_short {
         TaskSpec::Generative3D(s) => {
             assert_eq!(s.prompt.as_deref(), Some("low-poly car"));
@@ -506,7 +558,8 @@ fn test_new_3d_task_spec_serde_aliases() {
 
     // Human JSON with tag alias "auto_rig" using byte array
     let json_rig = r#"{"type": "auto_rig", "input_mesh": [1, 2, 3, 4], "rig_preset": "quadruped"}"#;
-    let spec_rig: TaskSpec = serde_json::from_str(json_rig).expect("Deserializing auto_rig alias failed");
+    let spec_rig: TaskSpec =
+        serde_json::from_str(json_rig).expect("Deserializing auto_rig alias failed");
     match spec_rig {
         TaskSpec::AutoRig(s) => {
             assert_eq!(s.input_mesh.as_slice(), &[1, 2, 3, 4]);
@@ -518,7 +571,8 @@ fn test_new_3d_task_spec_serde_aliases() {
 
     // Human JSON with tag alias "rig" using string/path
     let json_rig_str = r#"{"type": "rig", "input_mesh": "character.glb"}"#;
-    let spec_rig_str: TaskSpec = serde_json::from_str(json_rig_str).expect("Deserializing rig alias failed");
+    let spec_rig_str: TaskSpec =
+        serde_json::from_str(json_rig_str).expect("Deserializing rig alias failed");
     match spec_rig_str {
         TaskSpec::AutoRig(s) => {
             assert_eq!(s.input_mesh.as_slice(), b"character.glb");
@@ -535,7 +589,9 @@ fn test_new_3d_task_spec_serde_aliases() {
 #[test]
 fn test_rapid_repeated_detection_sequential_leak_and_stability() {
     const ITERATIONS: usize = 200;
-    println!("\n=== Starting Rapid Repeated Capability Detection Stress ({ITERATIONS} iterations) ===");
+    println!(
+        "\n=== Starting Rapid Repeated Capability Detection Stress ({ITERATIONS} iterations) ==="
+    );
 
     let initial_handles = get_current_process_handle_count();
     let mut latencies: Vec<Duration> = Vec::with_capacity(ITERATIONS);
@@ -601,8 +657,14 @@ fn test_rapid_repeated_detection_sequential_leak_and_stability() {
     // Compute empirical stats
     let total_millis: f64 = latencies.iter().map(|d| d.as_secs_f64() * 1000.0).sum();
     let mean_ms = total_millis / ITERATIONS as f64;
-    let min_ms = latencies.iter().map(|d| d.as_secs_f64() * 1000.0).fold(f64::INFINITY, f64::min);
-    let max_ms = latencies.iter().map(|d| d.as_secs_f64() * 1000.0).fold(0.0, f64::max);
+    let min_ms = latencies
+        .iter()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .fold(f64::INFINITY, f64::min);
+    let max_ms = latencies
+        .iter()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .fold(0.0, f64::max);
 
     latencies.sort();
     let p50_ms = latencies[ITERATIONS * 50 / 100].as_secs_f64() * 1000.0;
@@ -753,7 +815,10 @@ async fn test_cli_e2e_conflicting_flags_no_gpu_wire_domination() {
             capabilities,
             ..
         } => {
-            println!("Received Register from Worker {worker_id} (name: {})", capabilities.name);
+            println!(
+                "Received Register from Worker {worker_id} (name: {})",
+                capabilities.name
+            );
             println!("Advertised Capabilities: {:?}", capabilities);
 
             assert_eq!(capabilities.name, "worker-cli-no-gpu");
@@ -857,7 +922,10 @@ async fn test_cli_e2e_conflicting_flags_no_blender_wire_domination() {
             capabilities,
             ..
         } => {
-            println!("Received Register from Worker {worker_id} (name: {})", capabilities.name);
+            println!(
+                "Received Register from Worker {worker_id} (name: {})",
+                capabilities.name
+            );
             println!("Advertised Capabilities: {:?}", capabilities);
 
             assert_eq!(capabilities.name, "worker-cli-no-blender");
