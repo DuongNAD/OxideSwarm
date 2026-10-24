@@ -22,6 +22,7 @@ import platform
 import shutil
 import socket
 import subprocess
+import sys
 import time
 import unicodedata
 
@@ -483,6 +484,88 @@ def cmd_incident(args):
     print(f"[OK] Incident recorded: {filepath}")
 
 
+def cmd_serve_secret(args):
+    """Serve ~/.oxideswarm/cluster.secret over LAN TCP only to the peer's LAN IP (never touches cloud storage)."""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    hub_dir = find_hub_dir(args.hub_dir)
+    peer_state = safe_read_json(os.path.join(hub_dir, "nodes", f"{PEER_SHORT}_state.json")) or {}
+    allowed_peer_ip = peer_state.get("lan_ip")
+
+    sec_info = get_oxideswarm_home_info()
+    secret_path = os.path.join(sec_info["oxideswarm_home"], "cluster.secret")
+    if not os.path.exists(secret_path):
+        print(f"[ERROR] Secret file not found at {secret_path}", file=sys.stderr)
+        sys.exit(1)
+
+    with open(secret_path, "rb") as f:
+        secret_bytes = f.read().strip() + b"\n"
+
+    class SecretHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            client_ip = self.client_address[0]
+            if allowed_peer_ip and client_ip not in (allowed_peer_ip, "127.0.0.1"):
+                self.send_response(403)
+                self.end_headers()
+                return
+            if self.path != "/cluster.secret":
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(secret_bytes)))
+            self.end_headers()
+            self.wfile.write(secret_bytes)
+
+        def log_message(self, fmt, *log_args):
+            pass
+
+    server = HTTPServer(("0.0.0.0", args.port), SecretHandler)
+    server.timeout = 1.0
+    deadline = time.time() + args.timeout
+    print(
+        f"[OK] Serving cluster.secret over LAN on {get_lan_ip()}:{args.port}/cluster.secret "
+        f"(allowed peer: {allowed_peer_ip or 'any LAN'}, timeout: {args.timeout}s)"
+    )
+    while time.time() < deadline:
+        server.handle_request()
+
+
+def cmd_pull_secret(args):
+    """Pull cluster.secret directly over LAN TCP from the peer Master and verify its SHA-256 prefix."""
+    from urllib.request import urlopen
+
+    hub_dir = find_hub_dir(args.hub_dir)
+    peer_state = safe_read_json(os.path.join(hub_dir, "nodes", f"{PEER_SHORT}_state.json"))
+    if not peer_state:
+        print(f"[ERROR] Peer state {PEER_SHORT}_state.json not found.", file=sys.stderr)
+        sys.exit(1)
+
+    peer_ip = args.host or peer_state.get("lan_ip")
+    expected_fp = peer_state.get("security_and_config", {}).get("secret_sha256_12")
+    url = f"http://{peer_ip}:{args.port}/cluster.secret"
+    print(f"[INFO] Pulling cluster.secret over LAN from {url} ...")
+    with urlopen(url, timeout=5.0) as resp:
+        raw = resp.read().strip()
+
+    actual_fp = hashlib.sha256(raw).hexdigest()[:12]
+    if expected_fp and actual_fp != expected_fp:
+        print(f"[ERROR] SHA-256 fingerprint mismatch: expected {expected_fp}, got {actual_fp}", file=sys.stderr)
+        sys.exit(1)
+
+    sec_info = get_oxideswarm_home_info()
+    ox_home = sec_info["oxideswarm_home"]
+    os.makedirs(ox_home, exist_ok=True)
+    secret_path = os.path.join(ox_home, "cluster.secret")
+    atomic_write(secret_path, raw.decode("utf-8") + "\n")
+    try:
+        os.chmod(secret_path, 0o600)
+    except Exception:
+        pass
+    print(f"[OK] Synchronized cluster.secret to {secret_path} (sha256[:12] = {actual_fp})")
+
+
 def main():
     parser = argparse.ArgumentParser(description="OxideSwarm Multi-Agent Google Drive Bridge")
     parser.add_argument("--hub-dir", help="Explicit path to OxideSwarm_Agent_Hub", default=None)
@@ -515,6 +598,16 @@ def main():
     p_inc.add_argument("--verification", default="", help="Verification evidence")
     p_inc.add_argument("--status", default="OPEN", choices=["OPEN", "FIXED", "VERIFIED", "CLOSED"])
     p_inc.set_defaults(func=cmd_incident)
+
+    p_ssec = sub.add_parser("serve-secret", help="Serve cluster.secret over LAN TCP only to the peer node IP")
+    p_ssec.add_argument("--port", type=int, default=8086, help="LAN TCP port (default: 8086)")
+    p_ssec.add_argument("--timeout", type=int, default=600, help="Seconds to keep the LAN endpoint open")
+    p_ssec.set_defaults(func=cmd_serve_secret)
+
+    p_psec = sub.add_parser("pull-secret", help="Pull cluster.secret over LAN TCP from the peer Master")
+    p_psec.add_argument("--host", default=None, help="Peer Master LAN IP override")
+    p_psec.add_argument("--port", type=int, default=8086, help="LAN TCP port (default: 8086)")
+    p_psec.set_defaults(func=cmd_pull_secret)
 
     args = parser.parse_args()
     args.func(args)
