@@ -2372,7 +2372,7 @@ async fn resolve_portal_master(
 
 fn worker_portal_standby_html() -> String {
     r#"<!DOCTYPE html>
-<html lang="vi" data-theme="dark">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
@@ -2392,9 +2392,9 @@ fn worker_portal_standby_html() -> String {
   <div class="card">
     <div class="spinner"></div>
     <div class="title">OxideSwarm Standby Node (Worker)</div>
-    <div class="desc">Thiết bị này đang ở vai trò <strong>Worker</strong>. Đang tự động dò tìm Master đang hoạt động trong mạng LAN...</div>
-    <button class="btn" onclick="probeCluster()">Thử kết nối lại ngay</button>
-    <div class="status" id="scanStatus">Đang quét cụm...</div>
+    <div class="desc">This device is operating as a <strong>Worker</strong>. Automatically discovering an active Master on the LAN...</div>
+    <button class="btn" onclick="probeCluster()">Retry Connection Now</button>
+    <div class="status" id="scanStatus">Scanning cluster...</div>
   </div>
   <script>
     // Asks this worker (same origin) which Master it is connected to; the answer is validated
@@ -2402,20 +2402,20 @@ fn worker_portal_standby_html() -> String {
     const safeOrigin = /^https?:\/\/[A-Za-z0-9._\-]+(:[0-9]{1,5})?$|^https?:\/\/\[[0-9A-Fa-f:.]+\](:[0-9]{1,5})?$/;
     async function probeCluster() {
       const s = document.getElementById('scanStatus');
-      if (s) s.textContent = 'Đang kiểm tra các node...';
+      if (s) s.textContent = 'Checking cluster nodes...';
       try {
         const res = await fetch('/api/status', { cache: 'no-store' });
         if (res.ok) {
           const data = await res.json();
           const url = data && data.redirect_url;
           if (typeof url === 'string' && safeOrigin.test(url)) {
-            if (s) s.textContent = 'Đã tìm thấy Master tại ' + url + '! Đang chuyển hướng...';
+            if (s) s.textContent = 'Master found at ' + url + '! Redirecting...';
             window.location.replace(url);
             return;
           }
         }
       } catch (_) {}
-      if (s) s.textContent = 'Chưa phát hiện Master. Sẽ tự động thử lại sau 2 giây...';
+      if (s) s.textContent = 'No Master detected yet. Retrying in 2 seconds...';
     }
     probeCluster();
     setInterval(probeCluster, 2000);
@@ -2481,7 +2481,7 @@ fn portal_redirect_response(web_ui_url: &str, cluster_addr: &str) -> String {
     // `web_ui` is `scheme://host[:port]` over [A-Za-z0-9._:-] and brackets: nothing in it can
     // end a header line, an HTML attribute or a JavaScript string.
     let html_body = format!(
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"0; url={0}\"><title>OxideSwarm Auto-Redirect</title></head><body style=\"font-family:-apple-system,BlinkMacSystemFont,sans-serif;text-align:center;padding:50px;background:#090d16;color:#e2e8f0;\"><h2>OxideSwarm Node (Worker)</h2><p>Thiết bị này đang ở vai trò Worker. Đang chuyển hướng sang Master tại <a style=\"color:#38bdf8;\" href=\"{0}\">{0}</a>...</p><script>window.location.replace(\"{0}\");</script></body></html>",
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"0; url={0}\"><title>OxideSwarm Auto-Redirect</title></head><body style=\"font-family:-apple-system,BlinkMacSystemFont,sans-serif;text-align:center;padding:50px;background:#090d16;color:#e2e8f0;\"><h2>OxideSwarm Node (Worker)</h2><p>This device is operating as a Worker. Redirecting to Master at <a style=\"color:#38bdf8;\" href=\"{0}\">{0}</a>...</p><script>window.location.replace(\"{0}\");</script></body></html>",
         web_ui
     );
     portal_http_response(

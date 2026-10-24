@@ -2307,11 +2307,11 @@
             if (data.role === 'WORKER_PORTAL') {
                 const dest = parseSafeUrl(data.redirect_url);
                 if (dest && isTrustedTarget(dest)) {
-                    showDiscoveryToast(`Thiết bị này đang là Worker. Đang chuyển hướng sang Master tại ${dest.origin}...`);
+                    showDiscoveryToast(`This node is a Worker. Redirecting to Master at ${dest.origin}...`);
                     setTimeout(() => window.location.replace(dest.origin + '/'), 500);
                 } else {
-                    showDiscoveryToast("Thiết bị này đang là Worker và chưa tìm thấy Master.", 4000);
-                    setSummary(html`<span style="color:var(--dot-busy)">● Worker portal (chưa có Master)</span>`);
+                    showDiscoveryToast("This node is a Worker and has not discovered a Master yet.", 4000);
+                    setSummary(html`<span style="color:var(--dot-busy)">● Worker portal (no Master yet)</span>`);
                 }
                 return;
             }

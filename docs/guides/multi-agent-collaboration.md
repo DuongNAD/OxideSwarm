@@ -65,6 +65,22 @@ python scripts/agent_bridge.py inbox
 python scripts/agent_bridge.py inbox --ack all
 ```
 
+### 4. Watch for peer messages and git updates automatically
+
+Run `watch --once-on-message --auto-pull` in the background so the agent refreshes its heartbeat every 10 seconds, pulls new peer commits when the working tree is clean, and wakes up immediately when a new message or incident arrives:
+
+On the Mac (Terminal, repository root):
+
+```bash
+python3 scripts/agent_bridge.py watch --interval 10 --once-on-message --auto-pull
+```
+
+On Windows (PowerShell, repository root):
+
+```powershell
+python scripts/agent_bridge.py watch --interval 10 --once-on-message --auto-pull
+```
+
 ## Verify
 
 On either machine (repository root):
@@ -87,6 +103,6 @@ Expected output when both nodes are synchronized:
 | Symptom | Cause | Fix |
 |---|---|---|
 | `[GIT DRIFT] Commit mismatch` | One machine has not pulled the latest commit | Run `git pull` and rebuild release binaries on the behind node |
-| `[AUTH MISMATCH] cluster.secret SHA-256 fingerprint differs` | `~/.oxideswarm/cluster.secret` differs between Master and Worker | Copy `cluster.secret` from the Master over `scp` or USB (never via Google Drive) |
+| `[AUTH MISMATCH] cluster.secret SHA-256 fingerprint differs` | `~/.oxideswarm/cluster.secret` differs between Master and Worker | Run `python3 scripts/agent_bridge.py serve-secret` on Master and `python scripts/agent_bridge.py pull-secret` on Worker over LAN TCP (never via Google Drive) |
 | `[LOCAL CRITICAL] .../rusty-grid.toml contains an active p2p_ticket` | A leftover `p2p_ticket` in `rusty-grid.toml` overrides `--master` | Remove or comment out `p2p_ticket` in `rusty-grid.toml` |
 | `[NETWORK BLOCKED] Peer Master is listening on <MASTER_IP>:8088, but TCP connection failed` | Host firewall or Wi-Fi client isolation blocks TCP `8088` | Allow inbound TCP `8088` on the Master host or start the Master with `--p2p` |

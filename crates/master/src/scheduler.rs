@@ -292,6 +292,49 @@ struct Engine<'a> {
     reserved: Vec<bool>,
 }
 
+/// Returns the effective [`BatteryTier`] for scheduling on `worker`.
+///
+/// Desktop/laptop operating systems (`macOS`, `Windows`, non-Android `Linux`) populate
+/// [`rusty_grid_core::capabilities::MobileCapabilities`] via `pmset` / `sysfs` for dashboard
+/// telemetry and critical (`<15%`) battery cut-off, but have a much larger battery and thermal
+/// envelope than smartphones. On those laptops, battery levels above `Critical` (`>=15%`) are
+/// treated as [`BatteryTier::Normal`] so unplugged laptops between 15% and 49% remain eligible for
+/// GPU and compilation workloads.
+fn effective_scheduler_battery_tier(
+    worker: &WorkerInfo,
+    mobile: &rusty_grid_core::capabilities::MobileCapabilities,
+    live: &MobileLiveStatus,
+) -> BatteryTier {
+    let raw = live.battery_tier.unwrap_or_else(|| {
+        MobileLiveStatus::compute_battery_tier(live.battery_pct, live.is_charging)
+    });
+    if raw == BatteryTier::Critical {
+        return BatteryTier::Critical;
+    }
+    let os = mobile.os_version.to_ascii_lowercase();
+    let is_mobile_os = os.contains("android")
+        || os.contains("ios")
+        || worker
+            .capabilities
+            .tags
+            .iter()
+            .any(|t| t == "os:android" || t == "os:ios");
+    let is_laptop_os = !is_mobile_os
+        && (os.starts_with("macos")
+            || os.starts_with("linux")
+            || os.starts_with("windows")
+            || worker
+                .capabilities
+                .tags
+                .iter()
+                .any(|t| t == "os:macos" || t == "os:windows" || t == "os:linux"));
+    if is_laptop_os {
+        BatteryTier::Normal
+    } else {
+        raw
+    }
+}
+
 impl<'a> Engine<'a> {
     /// `loads` is the master's own accounting per worker. `None` takes each worker's
     /// `active_tasks` as its load instead (the pure `matchmake` API, which has no queue).
@@ -316,9 +359,7 @@ impl<'a> Engine<'a> {
                 let mut max_slots = config.effective_max_concurrency(worker);
                 if let Some(ref mobile) = worker.capabilities.mobile {
                     let live = mobile.live_status();
-                    let bat = live.battery_tier.unwrap_or_else(|| {
-                        MobileLiveStatus::compute_battery_tier(live.battery_pct, live.is_charging)
-                    });
+                    let bat = effective_scheduler_battery_tier(worker, mobile, &live);
                     let therm = live.thermal_tier.unwrap_or_else(|| {
                         MobileLiveStatus::compute_thermal_tier(
                             live.battery_temperature,
@@ -543,9 +584,7 @@ impl<'a> Engine<'a> {
 
             if let Some(ref mobile) = worker.capabilities.mobile {
                 let live = mobile.live_status();
-                let bat = live.battery_tier.unwrap_or_else(|| {
-                    MobileLiveStatus::compute_battery_tier(live.battery_pct, live.is_charging)
-                });
+                let bat = effective_scheduler_battery_tier(worker, mobile, &live);
                 let therm = live.thermal_tier.unwrap_or_else(|| {
                     MobileLiveStatus::compute_thermal_tier(
                         live.battery_temperature,
@@ -2665,5 +2704,48 @@ mod tests {
         assert!(assigned_ids.contains(&w_real1.worker_id));
         assert!(assigned_ids.contains(&w_real2.worker_id));
         assert!(!assigned_ids.contains(&w_sim.worker_id));
+    }
+
+    #[test]
+    fn test_laptop_battery_above_critical_accepts_gpu_and_compile_tasks() {
+        let config = SchedulerConfig::default();
+
+        let mut macbook = make_worker("macbook-air-m5", 10, 32768, true, false);
+        macbook.capabilities.tags.push("os:macos".into());
+        macbook.capabilities.mobile = Some(rusty_grid_core::capabilities::MobileCapabilities {
+            os_version: "macOS 26.0".into(),
+            soc_model: "Apple M5".into(),
+            battery_pct: Some(35),
+            is_charging: Some(false),
+            thermal_throttled: false,
+        });
+
+        let gpu_task = Task::new(
+            TaskSpec::gpu_compute("gemm_kernel", 64),
+            TaskRequirements::gpu(30),
+        );
+        let report = WorkloadScheduler::matchmake(
+            &config,
+            std::slice::from_ref(&gpu_task),
+            std::slice::from_ref(&macbook),
+        );
+        assert_eq!(
+            report.assignments.len(),
+            1,
+            "Unplugged macOS laptop at 35% battery must still accept GPU tasks"
+        );
+
+        // At <15% battery (Critical), the laptop is still protected from heavy/GPU tasks.
+        macbook.capabilities.mobile.as_mut().unwrap().battery_pct = Some(10);
+        let critical_report = WorkloadScheduler::matchmake(
+            &config,
+            std::slice::from_ref(&gpu_task),
+            std::slice::from_ref(&macbook),
+        );
+        assert_eq!(
+            critical_report.assignments.len(),
+            0,
+            "Unplugged laptop below 15% critical battery must refuse GPU tasks"
+        );
     }
 }

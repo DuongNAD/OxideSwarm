@@ -566,6 +566,112 @@ def cmd_pull_secret(args):
     print(f"[OK] Synchronized cluster.secret to {secret_path} (sha256[:12] = {actual_fp})")
 
 
+def cmd_watch(args):
+    """Continuously poll OxideSwarm_Agent_Hub for peer messages, incident updates, and git commits."""
+    hub_dir = find_hub_dir(args.hub_dir)
+    repo_dir = args.repo or os.getcwd()
+    inbox_dir = os.path.join(hub_dir, "mailbox", f"to_{SELF_SHORT}")
+    inc_dir = os.path.join(hub_dir, "incidents")
+    os.makedirs(inbox_dir, exist_ok=True)
+    os.makedirs(inc_dir, exist_ok=True)
+
+    seen_inbox = {}
+    seen_incidents = {}
+    for fname in os.listdir(inc_dir):
+        if fname.endswith(".md"):
+            fpath = os.path.join(inc_dir, fname)
+            try:
+                seen_incidents[fname] = os.path.getmtime(fpath)
+            except OSError:
+                pass
+
+    last_peer_head = None
+    print(
+        f"[WATCH] Monitoring {hub_dir} as agent-{SELF_SHORT} "
+        f"(interval={args.interval}s, once_on_message={args.once_on_message}, auto_pull={args.auto_pull})"
+    )
+    sys.stdout.flush()
+
+    while True:
+        # 1. Refresh own heartbeat
+        state = collect_state(repo_dir)
+        out_path = os.path.join(hub_dir, "nodes", f"{SELF_SHORT}_state.json")
+        atomic_write(out_path, json.dumps(state, indent=2, ensure_ascii=False) + "\n")
+
+        # 2. Check peer git commit and optionally auto-pull
+        peer_state = safe_read_json(os.path.join(hub_dir, "nodes", f"{PEER_SHORT}_state.json"))
+        if peer_state:
+            peer_head = peer_state.get("git", {}).get("git_head")
+            self_head = state.get("git", {}).get("git_head")
+            if peer_head and peer_head != last_peer_head:
+                last_peer_head = peer_head
+                if peer_head != self_head:
+                    print(
+                        f"\n[WATCH: PEER GIT UPDATE] agent-{PEER_SHORT} is at {peer_head[:12]} "
+                        f"(local: {str(self_head)[:12]})"
+                    )
+                    if args.auto_pull and not state.get("git", {}).get("git_dirty"):
+                        try:
+                            pull_out = subprocess.check_output(
+                                ["git", "pull", "--rebase", "origin", "master"],
+                                cwd=find_repo_dir(repo_dir),
+                                stderr=subprocess.STDOUT,
+                                text=True,
+                                timeout=20.0,
+                            ).strip()
+                            print(f"[WATCH: AUTO-PULL] {pull_out}")
+                        except Exception as exc:
+                            print(f"[WATCH: AUTO-PULL WARN] {exc}")
+                    sys.stdout.flush()
+
+        # 3. Check for new or updated incident reports
+        triggered_event = False
+        for fname in sorted(os.listdir(inc_dir)):
+            if not fname.endswith(".md"):
+                continue
+            fpath = os.path.join(inc_dir, fname)
+            try:
+                mtime = os.path.getmtime(fpath)
+            except OSError:
+                continue
+            if fname not in seen_incidents or mtime > seen_incidents[fname] + 0.5:
+                seen_incidents[fname] = mtime
+                print(f"\n{'=' * 72}\n[WATCH: INCIDENT UPDATE] {fname}\n{'=' * 72}")
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        print(f.read().strip())
+                except Exception as exc:
+                    print(f"[WARN] Could not read {fname}: {exc}")
+                sys.stdout.flush()
+                triggered_event = True
+
+        # 4. Check inbox for new peer messages
+        for fname in sorted(os.listdir(inbox_dir)):
+            if not fname.endswith(".md"):
+                continue
+            fpath = os.path.join(inbox_dir, fname)
+            try:
+                mtime = os.path.getmtime(fpath)
+            except OSError:
+                continue
+            if fname not in seen_inbox or mtime > seen_inbox[fname] + 0.5:
+                seen_inbox[fname] = mtime
+                print(f"\n{'=' * 72}\n[WATCH: NEW MESSAGE] {fname}\n{'=' * 72}")
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        print(f.read().strip())
+                except Exception as exc:
+                    print(f"[WARN] Could not read {fname}: {exc}")
+                sys.stdout.flush()
+                triggered_event = True
+
+        if triggered_event and args.once_on_message:
+            print("[WATCH] Event received (--once-on-message); exiting to trigger agent wakeup.")
+            return
+
+        time.sleep(max(2, args.interval))
+
+
 def main():
     parser = argparse.ArgumentParser(description="OxideSwarm Multi-Agent Google Drive Bridge")
     parser.add_argument("--hub-dir", help="Explicit path to OxideSwarm_Agent_Hub", default=None)
@@ -608,6 +714,24 @@ def main():
     p_psec.add_argument("--host", default=None, help="Peer Master LAN IP override")
     p_psec.add_argument("--port", type=int, default=8086, help="LAN TCP port (default: 8086)")
     p_psec.set_defaults(func=cmd_pull_secret)
+
+    p_watch = sub.add_parser(
+        "watch",
+        help="Continuously poll Google Drive hub for peer messages, incidents, and git updates",
+    )
+    p_watch.add_argument("--repo", help="Path to OxideSwarm repository", default=None)
+    p_watch.add_argument("--interval", type=int, default=10, help="Polling interval in seconds (default: 10)")
+    p_watch.add_argument(
+        "--once-on-message",
+        action="store_true",
+        help="Exit with code 0 as soon as a new message or incident arrives (triggers reactive agent wakeup)",
+    )
+    p_watch.add_argument(
+        "--auto-pull",
+        action="store_true",
+        help="Automatically run 'git pull --rebase origin master' when peer pushes a new commit and working tree is clean",
+    )
+    p_watch.set_defaults(func=cmd_watch)
 
     args = parser.parse_args()
     args.func(args)
