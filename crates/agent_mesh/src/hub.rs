@@ -887,6 +887,7 @@ impl Connection {
     /// Routes an authenticated envelope whose `from` is one of this socket's node ids.
     async fn route(&self, envelope: AgentMeshEnvelope, raw_text: String, corr_id: String) {
         let state = self.state.clone();
+        #[allow(clippy::collapsible_match)]
         match envelope {
             AgentMeshEnvelope::NodeList { from, .. } => {
                 let catalog = state.get_catalog().await;

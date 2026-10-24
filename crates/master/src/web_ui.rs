@@ -981,6 +981,7 @@ async fn handle_ws_client(
                 }
             }
             client_msg = receiver.next() => {
+                #[allow(clippy::collapsible_match)]
                 match client_msg {
                     Some(Ok(Message::Ping(payload))) => {
                         if !send_ws(&mut sender, Message::Pong(payload)).await {

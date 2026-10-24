@@ -200,6 +200,7 @@ impl AgentMeshClient {
                             continue;
                         }
 
+                        #[allow(clippy::collapsible_match)]
                         match envelope {
                             AgentMeshEnvelope::CommandRequest {
                                 ref from,

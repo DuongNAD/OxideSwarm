@@ -12,7 +12,8 @@ use tracing::{debug, warn};
     non_snake_case,
     non_camel_case_types,
     non_upper_case_globals,
-    dead_code
+    dead_code,
+    clippy::upper_case_acronyms
 )]
 mod win32 {
     use core::ffi::c_void;
