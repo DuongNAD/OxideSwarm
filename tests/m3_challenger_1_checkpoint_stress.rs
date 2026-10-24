@@ -869,6 +869,7 @@ async fn test_adversarial_end_to_end_cluster_multi_hop_failover() {
             is_gpu_executed: false,
             device_name: None,
             error: None,
+            asset_bytes: None,
         })
         .await
         .expect("send final result");

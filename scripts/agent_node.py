@@ -559,6 +559,93 @@ class OxideAgentNode:
         """
         return await self.send_command("grid", "grid_status", {}, timeout=timeout_s)
 
+    async def submit_3d_generate(
+        self,
+        prompt: str = None,
+        image_bytes: bytes = None,
+        quality: str = "standard",
+        engine: str = "auto",
+        export_texture: bool = True,
+        output_path: str = None,
+        timeout_s: float = 60.0,
+    ) -> dict:
+        """
+        Submits a distributed 3D generative task to the OxideSwarm Grid via the Agent-Grid Bridge.
+        Awaits and returns the CommandResponse envelope dictionary.
+        Optionally verifies and saves the returned binary asset to output_path.
+        """
+        import base64
+        args = {
+            "quality": quality,
+            "engine": engine,
+            "export_texture": export_texture,
+        }
+        if prompt is not None:
+            args["prompt"] = prompt
+        if image_bytes is not None:
+            args["image"] = base64.b64encode(image_bytes).decode("ascii")
+
+        res = await self.send_command("grid", "grid_3d_generate", args, timeout=timeout_s)
+        if output_path and res.get("status") == "success":
+            self.extract_and_verify_asset(res, output_path=output_path)
+        return res
+
+    async def submit_auto_rig(
+        self,
+        input_mesh: bytes,
+        rig_preset: str = "biped",
+        embed_animations: list = None,
+        preferred_provider: str = "builtin",
+        output_path: str = None,
+        timeout_s: float = 60.0,
+    ) -> dict:
+        """
+        Submits an AutoRig task to the OxideSwarm Grid via the Agent-Grid Bridge.
+        Awaits and returns the CommandResponse envelope dictionary.
+        Optionally verifies and saves the rigged binary asset to output_path.
+        """
+        import base64
+        args = {
+            "input_mesh": base64.b64encode(input_mesh).decode("ascii"),
+            "rig_preset": rig_preset,
+            "embed_animations": embed_animations or [],
+            "preferred_provider": preferred_provider,
+        }
+        res = await self.send_command("grid", "grid_auto_rig", args, timeout=timeout_s)
+        if output_path and res.get("status") == "success":
+            self.extract_and_verify_asset(res, output_path=output_path)
+        return res
+
+    def extract_and_verify_asset(self, response: dict, output_path: str = None) -> bytes:
+        """
+        Extracts and cryptographically verifies binary asset bytes from a CommandResponse envelope.
+        Validates SHA-256 against asset_sha256 if present, and optionally writes to output_path.
+        """
+        import base64
+        payload = response.get("payload") or {}
+        b64_data = payload.get("asset_base64")
+        if not b64_data:
+            raise ValueError("Response payload does not contain 'asset_base64'")
+
+        asset_bytes = base64.b64decode(b64_data)
+        expected_sha256 = payload.get("asset_sha256")
+        if expected_sha256:
+            actual_sha256 = hashlib.sha256(asset_bytes).hexdigest()
+            if actual_sha256.lower() != expected_sha256.lower():
+                raise ValueError(
+                    f"Asset SHA-256 verification failed: expected {expected_sha256}, got {actual_sha256}"
+                )
+
+        if output_path:
+            out_dir = os.path.dirname(os.path.abspath(output_path))
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(output_path, "wb") as f:
+                f.write(asset_bytes)
+            logger.info(f"Verified asset written to {output_path} ({len(asset_bytes)} bytes)")
+
+        return asset_bytes
+
     async def close(self):
         self.running = False
         if self.ws:
@@ -609,6 +696,36 @@ def main():
     parser.add_argument("--flags", nargs="*", default=["build"], help="Compiler flags")
     parser.add_argument("--timeout", type=float, default=30.0, help="Operation timeout in seconds")
 
+    # 3D Generative and AutoRig submission options
+    parser.add_argument(
+        "--submit-3d-generate",
+        "--3d-generate",
+        dest="submit_3d_generate",
+        nargs="?",
+        const="",
+        default=None,
+        help="Submit 3D generation job to grid (specify prompt or use --prompt)",
+    )
+    parser.add_argument(
+        "--submit-auto-rig",
+        "--auto-rig",
+        dest="submit_auto_rig",
+        nargs="?",
+        const="",
+        default=None,
+        help="Submit AutoRig job to grid (specify input mesh path or use --input-mesh)",
+    )
+    parser.add_argument("--prompt", default=None, help="Text prompt for 3D generation")
+    parser.add_argument("--image", default=None, help="Image file path for image-to-3D generation")
+    parser.add_argument("--quality", default="standard", choices=["fast", "standard", "high"], help="3D quality tier")
+    parser.add_argument("--engine", default="auto", help="3D generative engine (auto, rodin, trellis, hunyuan, triposr, tier0_sdf)")
+    parser.add_argument("--export-texture", dest="export_texture", action="store_true", default=True, help="Export textures in generated 3D asset")
+    parser.add_argument("--no-export-texture", dest="export_texture", action="store_false", help="Disable texture export")
+    parser.add_argument("--input-mesh", "--mesh", dest="input_mesh", default=None, help="Input mesh file path for AutoRig")
+    parser.add_argument("--rig-preset", default="biped", choices=["biped", "quadruped", "vehicle", "generic"], help="AutoRig preset skeleton")
+    parser.add_argument("--provider", "--preferred-provider", dest="preferred_provider", default="builtin", help="Preferred AutoRig provider (builtin, blender)")
+    parser.add_argument("-o", "--output", dest="output_path", default=None, help="Output file path to save resulting GLB asset")
+
     subparsers = parser.add_subparsers(dest="subcommand", help="Optional subcommand")
     compute_sub = subparsers.add_parser("grid-compute", help="Submit compute job")
     compute_sub.add_argument("kernel", nargs="?", default="matrix_multiply")
@@ -622,6 +739,21 @@ def main():
 
     status_sub = subparsers.add_parser("grid-status", help="Query grid status")
     status_sub.add_argument("--timeout", type=float, default=10.0)
+
+    gen3d_sub = subparsers.add_parser("3d-generate", help="Submit 3D generation job")
+    gen3d_sub.add_argument("--prompt", default=None)
+    gen3d_sub.add_argument("--image", default=None)
+    gen3d_sub.add_argument("--quality", default="standard")
+    gen3d_sub.add_argument("--engine", default="auto")
+    gen3d_sub.add_argument("-o", "--output", dest="output_path", default=None)
+    gen3d_sub.add_argument("--timeout", type=float, default=60.0)
+
+    autorig_sub = subparsers.add_parser("auto-rig", help="Submit AutoRig job")
+    autorig_sub.add_argument("input_mesh", nargs="?", default=None)
+    autorig_sub.add_argument("--rig-preset", default="biped")
+    autorig_sub.add_argument("--provider", default="builtin")
+    autorig_sub.add_argument("-o", "--output", dest="output_path", default=None)
+    autorig_sub.add_argument("--timeout", type=float, default=60.0)
 
     args = parser.parse_args()
 
@@ -640,8 +772,86 @@ def main():
             getattr(args, "query_grid_status", False)
             or args.subcommand in ("grid-status", "query-grid-status")
         )
+        is_3d = (
+            args.submit_3d_generate is not None
+            or args.subcommand in ("3d-generate", "grid-3d-generate", "submit-3d-generate")
+        )
+        is_autorig = (
+            args.submit_auto_rig is not None
+            or args.subcommand in ("auto-rig", "grid-auto-rig", "submit-auto-rig")
+        )
 
-        if is_compute:
+        if is_3d:
+            prompt = args.prompt or (
+                args.submit_3d_generate
+                if isinstance(args.submit_3d_generate, str) and args.submit_3d_generate
+                else None
+            )
+            image_bytes = None
+            if args.image:
+                if not os.path.exists(args.image):
+                    logger.error(f"Image file not found: {args.image}")
+                    sys.exit(1)
+                with open(args.image, "rb") as f:
+                    image_bytes = f.read()
+
+            if not prompt and not image_bytes:
+                logger.error("3D generation requires --prompt or --image")
+                sys.exit(1)
+
+            await node.connect()
+            listener_task = asyncio.create_task(node.listen())
+            try:
+                res = await node.submit_3d_generate(
+                    prompt=prompt,
+                    image_bytes=image_bytes,
+                    quality=getattr(args, "quality", "standard"),
+                    engine=getattr(args, "engine", "auto"),
+                    export_texture=getattr(args, "export_texture", True),
+                    output_path=getattr(args, "output_path", None),
+                    timeout_s=args.timeout,
+                )
+                print(json.dumps(res, indent=2))
+                is_ok = res.get("status") == "success" and res.get("exit_code") == 0
+                sys.exit(0 if is_ok else 1)
+            finally:
+                listener_task.cancel()
+                await node.close()
+
+        elif is_autorig:
+            mesh_path = (
+                args.input_mesh
+                or (
+                    args.submit_auto_rig
+                    if isinstance(args.submit_auto_rig, str) and args.submit_auto_rig
+                    else None
+                )
+            )
+            if not mesh_path or not os.path.exists(mesh_path):
+                logger.error(f"AutoRig requires valid mesh file path, got: {mesh_path}")
+                sys.exit(1)
+
+            with open(mesh_path, "rb") as f:
+                mesh_bytes = f.read()
+
+            await node.connect()
+            listener_task = asyncio.create_task(node.listen())
+            try:
+                res = await node.submit_auto_rig(
+                    input_mesh=mesh_bytes,
+                    rig_preset=getattr(args, "rig_preset", "biped"),
+                    preferred_provider=getattr(args, "preferred_provider", "builtin"),
+                    output_path=getattr(args, "output_path", None),
+                    timeout_s=args.timeout,
+                )
+                print(json.dumps(res, indent=2))
+                is_ok = res.get("status") == "success" and res.get("exit_code") == 0
+                sys.exit(0 if is_ok else 1)
+            finally:
+                listener_task.cancel()
+                await node.close()
+
+        elif is_compute:
             kernel = args.kernel or (
                 args.submit_grid_compute
                 if isinstance(args.submit_grid_compute, str) and args.submit_grid_compute != "matrix_multiply"

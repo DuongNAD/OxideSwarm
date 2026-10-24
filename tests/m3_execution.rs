@@ -39,6 +39,7 @@ fn make_capabilities(name: &str, cores: usize, has_gpu: bool) -> WorkerCapabilit
         },
         tags: vec!["m3_test".into()],
         mobile: None,
+        ..Default::default()
     }
 }
 

@@ -55,6 +55,7 @@ fn create_test_capabilities(cores: usize, has_gpu: bool) -> WorkerCapabilities {
         },
         tags: vec!["adversarial_test".into()],
         mobile: None,
+        ..Default::default()
     }
 }
 

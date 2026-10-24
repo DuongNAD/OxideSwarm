@@ -42,6 +42,7 @@ name = "agent_mesh"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "clap",
@@ -3286,6 +3287,9 @@ dependencies = [
 name = "rusty_grid_cli"
 version = "0.1.0"
 dependencies = [
+ "agent_mesh",
+ "base64 0.22.1",
+ "bytes",
  "clap",
  "futures",
  "rusty_grid_core",

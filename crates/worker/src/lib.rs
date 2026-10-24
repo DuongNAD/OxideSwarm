@@ -3,6 +3,7 @@
 //! Provides TCP client networking, hardware capability detection,
 //! registration handshake, periodic heartbeat telemetry, and resilient backoff.
 
+pub mod autorig;
 pub mod backoff;
 pub mod client;
 pub mod cpu_simd;

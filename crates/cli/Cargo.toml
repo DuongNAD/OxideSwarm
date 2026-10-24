@@ -42,6 +42,13 @@ gpu-wgpu = ["rusty_grid_worker/gpu-wgpu"]
 [dev-dependencies]
 tempfile = "3"
 futures = { workspace = true }
+agent_mesh = { workspace = true }
+bytes = { workspace = true }
+base64 = "0.22"
+
+[[test]]
+name = "test_3d_autorig_pipeline"
+path = "../../tests/test_3d_autorig_pipeline.rs"
 
 [[test]]
 name = "e2e_cluster"
@@ -78,6 +85,10 @@ path = "../../tests/test_p2p_wan_fallback.rs"
 [[test]]
 name = "test_m2_identity_scripts"
 path = "../../tests/test_m2_identity_scripts.rs"
+
+[[test]]
+name = "test_challenger_m5_3d_pipeline"
+path = "../../tests/test_challenger_m5_3d_pipeline.rs"
 
 
 

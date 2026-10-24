@@ -1807,6 +1807,7 @@ async fn test_tier3_pairwise_dynamic_load_backpressure_high_cpu() {
                     is_gpu_executed: false,
                     device_name: None,
                     error: None,
+                    asset_bytes: None,
                 })
                 .await
                 .unwrap();
@@ -1971,6 +1972,7 @@ async fn test_tier3_pairwise_mobile_worker_thermal_throttling_constraint() {
         is_gpu_executed: false,
         device_name: None,
         error: None,
+        asset_bytes: None,
     })
     .await
     .unwrap();
@@ -2035,6 +2037,7 @@ async fn test_tier3_pairwise_mobile_worker_low_battery_constraint() {
             is_gpu_executed: false,
             device_name: None,
             error: None,
+            asset_bytes: None,
         })
         .await;
 }

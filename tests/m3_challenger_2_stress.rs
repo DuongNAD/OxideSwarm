@@ -78,6 +78,7 @@ fn make_test_capabilities(name: &str, cores: usize, has_gpu: bool) -> WorkerCapa
         },
         tags: vec!["challenger_m3_2".into()],
         mobile: None,
+        ..Default::default()
     }
 }
 

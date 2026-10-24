@@ -512,3 +512,189 @@ async fn test_convergence_error_propagation_and_timeout() {
     client_unattached.close().await;
     hub_unattached.stop().await;
 }
+
+// =========================================================================
+// TEST SUITE 7: Rust Agent 3D Generative Workload via Bridge (F20)
+// =========================================================================
+
+#[tokio::test]
+async fn test_convergence_rust_agent_3d_generate() {
+    let cluster = ConvergenceCluster::spawn(1).await;
+
+    let client = AgentMeshClient::new(&cluster.hub_url, "rust-3d-agent", "rust-runtime");
+    client.connect().await.expect("client connect failed");
+
+    let res = client
+        .generate_3d_from_prompt("crystalline relic", Some("fast"), Some("sdf"), Some(30000))
+        .await
+        .expect("generate_3d_from_prompt failed");
+
+    match res {
+        AgentMeshEnvelope::CommandResponse {
+            ref from,
+            ref to,
+            ref status,
+            exit_code,
+            ref payload,
+            ..
+        } => {
+            assert_eq!(from, "grid");
+            assert_eq!(to, "rust-3d-agent");
+            assert_eq!(status, "success");
+            assert_eq!(exit_code, 0);
+
+            let payload_val = payload.as_ref().expect("payload must be present");
+            assert!(payload_val.get("asset_sha256").is_some());
+            assert!(payload_val.get("asset_base64").is_some());
+
+            let asset_bytes = AgentMeshClient::extract_asset_bytes(&res)
+                .expect("extract_asset_bytes must succeed and verify SHA-256");
+            assert!(asset_bytes.len() >= 20);
+            assert_eq!(&asset_bytes[0..4], b"glTF");
+            let ver = u32::from_le_bytes(asset_bytes[4..8].try_into().unwrap());
+            assert_eq!(ver, 2);
+        }
+        other => panic!("Expected CommandResponse, got {:?}", other),
+    }
+
+    client.close().await;
+    cluster.shutdown().await;
+}
+
+fn create_humanoid_obj_bytes() -> Vec<u8> {
+    let mut s = String::new();
+    s.push_str("# OxideSwarm Test Humanoid OBJ\n");
+    let boxes = [
+        (-0.20f32, 0.50f32, 0.0f32, 0.08f32, 0.50f32, 0.08f32),
+        (0.20, 0.50, 0.0, 0.08, 0.50, 0.08),
+        (0.0, 1.30, 0.0, 0.22, 0.30, 0.12),
+        (-0.38, 1.35, 0.0, 0.14, 0.06, 0.06),
+        (0.38, 1.35, 0.0, 0.14, 0.06, 0.06),
+        (0.0, 1.80, 0.0, 0.12, 0.20, 0.12),
+    ];
+    let mut v_str = String::new();
+    let mut f_str = String::new();
+    let mut base = 1usize;
+    for (cx, cy, cz, hx, hy, hz) in boxes {
+        for &dx in &[-hx, hx] {
+            for &dy in &[-hy, hy] {
+                for &dz in &[-hz, hz] {
+                    v_str.push_str(&format!("v {:.4} {:.4} {:.4}\n", cx + dx, cy + dy, cz + dz));
+                }
+            }
+        }
+        let faces = [
+            (base, base + 2, base + 1),
+            (base + 1, base + 2, base + 3),
+            (base + 4, base + 5, base + 6),
+            (base + 5, base + 7, base + 6),
+            (base, base + 1, base + 4),
+            (base + 1, base + 5, base + 4),
+            (base + 2, base + 6, base + 3),
+            (base + 3, base + 6, base + 7),
+            (base, base + 4, base + 2),
+            (base + 2, base + 4, base + 6),
+            (base + 1, base + 3, base + 5),
+            (base + 3, base + 7, base + 5),
+        ];
+        for f in faces {
+            f_str.push_str(&format!("f {} {} {}\n", f.0, f.1, f.2));
+        }
+        base += 8;
+    }
+    s.push_str(&v_str);
+    s.push_str(&f_str);
+    s.into_bytes()
+}
+
+#[tokio::test]
+async fn test_convergence_rust_agent_auto_rig() {
+    let cluster = ConvergenceCluster::spawn(1).await;
+
+    let client = AgentMeshClient::new(&cluster.hub_url, "rust-autorig-agent", "rust-runtime");
+    client.connect().await.expect("client connect failed");
+
+    let input_mesh = create_humanoid_obj_bytes();
+
+    let res = client
+        .auto_rig(&input_mesh, Some("biped"), None, Some("builtin"), Some(30000))
+        .await
+        .expect("auto_rig failed");
+
+    match res {
+        AgentMeshEnvelope::CommandResponse {
+            ref from,
+            ref to,
+            ref status,
+            exit_code,
+            ref payload,
+            ..
+        } => {
+            assert_eq!(from, "grid");
+            assert_eq!(to, "rust-autorig-agent");
+            assert_eq!(status, "success");
+            assert_eq!(exit_code, 0);
+
+            let payload_val = payload.as_ref().expect("payload must be present");
+            assert!(payload_val.get("asset_sha256").is_some());
+            assert!(payload_val.get("asset_base64").is_some());
+
+            let asset_bytes = AgentMeshClient::extract_asset_bytes(&res)
+                .expect("extract_asset_bytes must succeed and verify SHA-256");
+            assert!(asset_bytes.len() >= 20);
+            assert_eq!(&asset_bytes[0..4], b"glTF");
+            let ver = u32::from_le_bytes(asset_bytes[4..8].try_into().unwrap());
+            assert_eq!(ver, 2);
+        }
+        other => panic!("Expected CommandResponse, got {:?}", other),
+    }
+
+    client.close().await;
+    cluster.shutdown().await;
+}
+
+// =========================================================================
+// TEST SUITE 9: Python Agent Node End-to-End 3D Challenger Suite (F21)
+// =========================================================================
+
+#[tokio::test]
+async fn test_convergence_python_agent_node_3d() {
+    let cluster = ConvergenceCluster::spawn(1).await;
+
+    let test_script = [
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test_challenger_m4_3d_agent_node.py"),
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/test_challenger_m4_3d_agent_node.py"),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
+    .expect("test_challenger_m4_3d_agent_node.py must exist in repository");
+
+    let python_bin = if cfg!(windows) { "python" } else { "python3" };
+
+    let output = tokio::process::Command::new(python_bin)
+        .arg(&test_script)
+        .arg("--hub")
+        .arg(&cluster.hub_url)
+        .output()
+        .await;
+
+    match output {
+        Ok(out) => {
+            let stdout_str = String::from_utf8_lossy(&out.stdout);
+            let stderr_str = String::from_utf8_lossy(&out.stderr);
+            let combined = format!("{}\n{}", stdout_str, stderr_str);
+            println!("Python STDOUT:\n{}", stdout_str);
+            println!("Python STDERR:\n{}", stderr_str);
+            assert!(out.status.success(), "Python 3D challenger test exited with failure: {stderr_str}");
+            assert!(
+                combined.contains("PASSED (100% SUCCESS)"),
+                "Expected all challenger tests to pass, got output:\n{combined}"
+            );
+        }
+        Err(e) => {
+            panic!("Failed to spawn python 3D challenger test: {:?}", e);
+        }
+    }
+
+    cluster.shutdown().await;
+}

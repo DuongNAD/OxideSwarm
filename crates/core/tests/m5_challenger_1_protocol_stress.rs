@@ -40,6 +40,7 @@ fn dummy_capabilities() -> WorkerCapabilities {
         gpu_device_name: None,
         tags: vec!["test".into()],
         mobile: None,
+        ..Default::default()
     }
 }
 
@@ -332,6 +333,7 @@ fn test_adv_worker_message_all_variants_bincode_inbound() {
                 is_gpu_executed: true,
                 device_name: Some("Test GPU".into()),
                 error: None,
+                asset_bytes: None,
             },
         ),
         (

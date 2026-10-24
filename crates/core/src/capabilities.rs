@@ -153,6 +153,14 @@ pub struct HardwareOverrides {
     pub no_gpu: bool,
     pub simulate_gpu: bool,
     pub gpu_name: Option<String>,
+    // --- 3D and Compute Overrides (Milestone 1) ---
+    pub blender: Option<bool>,
+    pub no_blender: bool,
+    pub blender_path: Option<String>,
+    pub blender_version: Option<String>,
+    pub vram_mb: Option<u64>,
+    pub cuda: Option<bool>,
+    pub no_cuda: bool,
 }
 
 /// Represents the hardware resources and computational capabilities of a Worker node.
@@ -174,6 +182,15 @@ pub struct WorkerCapabilities {
     pub tags: Vec<String>,
     /// Optional mobile capabilities (populated automatically on Android, iOS, or battery-powered devices).
     pub mobile: Option<MobileCapabilities>,
+    // --- 3D & Hardware Acceleration Telemetry (Milestone 1) ---
+    /// Whether the host has Blender installed and available for headless auto-rigging.
+    pub has_blender: bool,
+    /// Discovered or reported Blender version (e.g. "Blender 4.5.4 LTS").
+    pub blender_version: Option<String>,
+    /// Dedicated Video RAM in Megabytes (MB), if GPU is present.
+    pub vram_mb: Option<u64>,
+    /// Whether the host supports NVIDIA CUDA execution.
+    pub has_cuda: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -188,6 +205,14 @@ struct HumanWorkerCapabilities {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mobile: Option<MobileCapabilities>,
+    #[serde(default)]
+    pub has_blender: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blender_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram_mb: Option<u64>,
+    #[serde(default)]
+    pub has_cuda: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -200,6 +225,12 @@ struct BinaryWorkerCapabilities {
     pub gpu_device_name: Option<String>,
     pub tags: Vec<String>,
     pub mobile: Option<MobileCapabilities>,
+    #[serde(default)]
+    pub has_blender: bool,
+    pub blender_version: Option<String>,
+    pub vram_mb: Option<u64>,
+    #[serde(default)]
+    pub has_cuda: bool,
 }
 
 impl From<WorkerCapabilities> for HumanWorkerCapabilities {
@@ -213,6 +244,10 @@ impl From<WorkerCapabilities> for HumanWorkerCapabilities {
             gpu_device_name: w.gpu_device_name,
             tags: w.tags,
             mobile: w.mobile,
+            has_blender: w.has_blender,
+            blender_version: w.blender_version,
+            vram_mb: w.vram_mb,
+            has_cuda: w.has_cuda,
         }
     }
 }
@@ -228,6 +263,10 @@ impl From<HumanWorkerCapabilities> for WorkerCapabilities {
             gpu_device_name: h.gpu_device_name,
             tags: h.tags,
             mobile: h.mobile,
+            has_blender: h.has_blender,
+            blender_version: h.blender_version,
+            vram_mb: h.vram_mb,
+            has_cuda: h.has_cuda,
         }
     }
 }
@@ -243,6 +282,10 @@ impl From<WorkerCapabilities> for BinaryWorkerCapabilities {
             gpu_device_name: w.gpu_device_name,
             tags: w.tags,
             mobile: w.mobile,
+            has_blender: w.has_blender,
+            blender_version: w.blender_version,
+            vram_mb: w.vram_mb,
+            has_cuda: w.has_cuda,
         }
     }
 }
@@ -258,6 +301,10 @@ impl From<BinaryWorkerCapabilities> for WorkerCapabilities {
             gpu_device_name: b.gpu_device_name,
             tags: b.tags,
             mobile: b.mobile,
+            has_blender: b.has_blender,
+            blender_version: b.blender_version,
+            vram_mb: b.vram_mb,
+            has_cuda: b.has_cuda,
         }
     }
 }
@@ -282,8 +329,28 @@ impl<'de> Deserialize<'de> for WorkerCapabilities {
     }
 }
 
+impl Default for WorkerCapabilities {
+    fn default() -> Self {
+        Self {
+            name: "default-worker".to_string(),
+            cpu_cores: 1,
+            ram_mb: 1024,
+            has_gpu: false,
+            is_simulated_gpu: false,
+            gpu_device_name: None,
+            tags: Vec::new(),
+            mobile: None,
+            has_blender: false,
+            blender_version: None,
+            vram_mb: None,
+            has_cuda: false,
+        }
+    }
+}
+
 impl WorkerCapabilities {
     /// Creates an explicit WorkerCapabilities instance.
+    /// Preserves exact 6-parameter signature for 100% backward compatibility.
     pub fn new(
         name: impl Into<String>,
         cpu_cores: usize,
@@ -301,6 +368,10 @@ impl WorkerCapabilities {
             gpu_device_name,
             tags: Vec::new(),
             mobile: None,
+            has_blender: false,
+            blender_version: None,
+            vram_mb: None,
+            has_cuda: false,
         }
     }
 
@@ -313,6 +384,40 @@ impl WorkerCapabilities {
     /// Builder method to attach mobile capabilities.
     pub fn with_mobile(mut self, mobile: Option<MobileCapabilities>) -> Self {
         self.mobile = mobile;
+        self
+    }
+
+    /// Builder method to attach Blender capability and version.
+    pub fn with_blender(mut self, has_blender: bool, version: Option<String>) -> Self {
+        self.has_blender = has_blender;
+        self.blender_version = version;
+        self
+    }
+
+    /// Builder method to attach VRAM in MB.
+    pub fn with_vram_mb(mut self, vram_mb: Option<u64>) -> Self {
+        self.vram_mb = vram_mb;
+        self
+    }
+
+    /// Builder method to attach CUDA capability.
+    pub fn with_cuda(mut self, has_cuda: bool) -> Self {
+        self.has_cuda = has_cuda;
+        self
+    }
+
+    /// Builder method to attach comprehensive 3D capabilities.
+    pub fn with_3d_capabilities(
+        mut self,
+        has_blender: bool,
+        blender_version: Option<String>,
+        vram_mb: Option<u64>,
+        has_cuda: bool,
+    ) -> Self {
+        self.has_blender = has_blender;
+        self.blender_version = blender_version;
+        self.vram_mb = vram_mb;
+        self.has_cuda = has_cuda;
         self
     }
 
@@ -363,6 +468,62 @@ impl WorkerCapabilities {
             }
         };
 
+        // --- Blender Detection & Overrides ---
+        let (has_blender, blender_version) = if overrides.no_blender {
+            (false, None)
+        } else if overrides.blender == Some(true) {
+            let ver = overrides
+                .blender_version
+                .or_else(|| probe_blender_version_from_path(overrides.blender_path.as_deref()))
+                .or_else(|| Some("Blender (Manual Override)".to_string()));
+            (true, ver)
+        } else if overrides.blender == Some(false) {
+            (false, None)
+        } else {
+            let env_no_blender = std::env::var("RUSTY_GRID_NO_BLENDER")
+                .or_else(|_| std::env::var("OXIDE_SWARM_NO_BLENDER"))
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+
+            if env_no_blender {
+                (false, None)
+            } else {
+                detect_blender(overrides.blender_path.as_deref())
+            }
+        };
+
+        // --- VRAM Detection & Overrides ---
+        let vram_mb = if overrides.no_gpu {
+            None
+        } else if let Some(vram) = overrides.vram_mb {
+            Some(vram)
+        } else if let Ok(vram_str) = std::env::var("RUSTY_GRID_VRAM_MB").or_else(|_| std::env::var("OXIDE_SWARM_VRAM_MB")) {
+            vram_str.trim().parse::<u64>().ok()
+        } else if has_gpu {
+            detect_gpu_vram_mb()
+        } else {
+            None
+        };
+
+        // --- CUDA Detection & Overrides ---
+        let has_cuda = if overrides.no_gpu || overrides.no_cuda {
+            false
+        } else if let Some(c) = overrides.cuda {
+            c
+        } else if let Ok(val) = std::env::var("RUSTY_GRID_CUDA").or_else(|_| std::env::var("OXIDE_SWARM_CUDA")) {
+            val == "1" || val.eq_ignore_ascii_case("true")
+        } else if let Ok(val) = std::env::var("RUSTY_GRID_NO_CUDA").or_else(|_| std::env::var("OXIDE_SWARM_NO_CUDA")) {
+            if val == "1" || val.eq_ignore_ascii_case("true") {
+                false
+            } else {
+                detect_cuda_support(has_gpu)
+            }
+        } else if has_gpu {
+            detect_cuda_support(has_gpu)
+        } else {
+            false
+        };
+
         let mobile = detect_mobile_capabilities();
 
         Self {
@@ -374,6 +535,10 @@ impl WorkerCapabilities {
             gpu_device_name,
             tags: Vec::new(),
             mobile,
+            has_blender,
+            blender_version,
+            vram_mb,
+            has_cuda,
         }
     }
 
@@ -812,6 +977,257 @@ fn detect_os_version(is_android: bool) -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
+/// Discovers Blender executable and queries its version.
+pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
+    // 1. Check explicit path
+    if let Some(path_str) = explicit_path {
+        let p = std::path::Path::new(path_str);
+        if p.is_file() {
+            if let Some(ver) = query_blender_version(p) {
+                return (true, Some(ver));
+            }
+            return (true, Some("Blender (Custom Path)".to_string()));
+        }
+    }
+
+    // 2. Check environment variables
+    for env_var in &["RUSTY_GRID_BLENDER_PATH", "OXIDE_SWARM_BLENDER_PATH", "BLENDER_PATH"] {
+        if let Ok(env_path) = std::env::var(env_var) {
+            let p = std::path::Path::new(env_path.trim());
+            if p.is_file() {
+                if let Some(ver) = query_blender_version(p) {
+                    return (true, Some(ver));
+                }
+                return (true, Some("Blender (Env Path)".to_string()));
+            }
+        }
+    }
+
+    // 3. Platform standard paths
+    #[cfg(windows)]
+    {
+        let mut search_dirs = Vec::new();
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            search_dirs.push(std::path::PathBuf::from(pf).join("Blender Foundation"));
+        }
+        if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
+            search_dirs.push(std::path::PathBuf::from(pf86).join("Blender Foundation"));
+        }
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            search_dirs.push(std::path::PathBuf::from(local).join("Programs").join("Blender Foundation"));
+        }
+        search_dirs.push(std::path::PathBuf::from(r"C:\Program Files\Blender Foundation"));
+
+        for base_dir in search_dirs {
+            if base_dir.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&base_dir) {
+                    let mut version_dirs: Vec<std::path::PathBuf> = entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.is_dir())
+                        .collect();
+
+                    // Sort descending so newer versions (e.g. 4.5) precede older versions (e.g. 4.2)
+                    version_dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+
+                    for dir in version_dirs {
+                        let candidate = dir.join("blender.exe");
+                        if candidate.is_file() {
+                            if let Some(ver) = query_blender_version(&candidate) {
+                                return (true, Some(ver));
+                            }
+                            let dir_name = dir.file_name().map(|n| n.to_string_lossy().to_string());
+                            return (true, dir_name);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check Steam standard path
+        let steam_blender = std::path::PathBuf::from(r"C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe");
+        if steam_blender.is_file() {
+            if let Some(ver) = query_blender_version(&steam_blender) {
+                return (true, Some(ver));
+            }
+            return (true, Some("Blender (Steam)".to_string()));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        for app_path in &[
+            "/Applications/Blender.app/Contents/MacOS/Blender",
+            "/Applications/Blender/Blender.app/Contents/MacOS/Blender",
+        ] {
+            let p = std::path::Path::new(app_path);
+            if p.is_file() {
+                if let Some(ver) = query_blender_version(p) {
+                    return (true, Some(ver));
+                }
+                return (true, Some("Blender".to_string()));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        for linux_path in &[
+            "/usr/bin/blender",
+            "/usr/local/bin/blender",
+            "/snap/bin/blender",
+        ] {
+            let p = std::path::Path::new(linux_path);
+            if p.is_file() {
+                if let Some(ver) = query_blender_version(p) {
+                    return (true, Some(ver));
+                }
+                return (true, Some("Blender".to_string()));
+            }
+        }
+    }
+
+    // 4. PATH lookup fallback (e.g. `blender --version`)
+    if let Ok(output) = std::process::Command::new("blender")
+        .arg("--version")
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(text) = std::str::from_utf8(&output.stdout) {
+                if let Some(first_line) = text.lines().next() {
+                    let trimmed = first_line.trim();
+                    if trimmed.starts_with("Blender") {
+                        return (true, Some(trimmed.to_string()));
+                    }
+                }
+            }
+            return (true, Some("Blender".to_string()));
+        }
+    }
+
+    (false, None)
+}
+
+fn query_blender_version(exe_path: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new(exe_path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let text = std::str::from_utf8(&output.stdout).ok()?;
+        let first_line = text.lines().next()?.trim();
+        if first_line.starts_with("Blender") {
+            return Some(first_line.to_string());
+        }
+    }
+    None
+}
+
+fn probe_blender_version_from_path(path: Option<&str>) -> Option<String> {
+    let path_str = path?;
+    query_blender_version(std::path::Path::new(path_str))
+}
+
+/// Inspects host GPU dedicated VRAM in Megabytes.
+pub fn detect_gpu_vram_mb() -> Option<u64> {
+    // 1. Probe nvidia-smi
+    if let Ok(output) = std::process::Command::new("nvidia-smi")
+        .arg("--query-gpu=memory.total")
+        .arg("--format=csv,noheader,nounits")
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(text) = std::str::from_utf8(&output.stdout) {
+                for line in text.lines() {
+                    if let Ok(mb) = line.trim().parse::<u64>() {
+                        if mb > 0 {
+                            return Some(mb);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Linux sysfs: /sys/class/drm/card0/device/mem_info_vram_total
+    #[cfg(target_os = "linux")]
+    {
+        for card_idx in 0..4 {
+            let path = format!("/sys/class/drm/card{card_idx}/device/mem_info_vram_total");
+            if let Ok(bytes_str) = std::fs::read_to_string(&path) {
+                if let Ok(bytes) = bytes_str.trim().parse::<u64>() {
+                    return Some(bytes / (1024 * 1024));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Discovers whether NVIDIA CUDA toolkit/runtime is available on host.
+pub fn detect_cuda_support(has_gpu: bool) -> bool {
+    // 1. Check CUDA_PATH or CUDA_HOME environment variables
+    for env_key in &["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"] {
+        if let Ok(cuda_dir) = std::env::var(env_key) {
+            let p = std::path::Path::new(cuda_dir.trim());
+            if p.is_dir() {
+                #[cfg(windows)]
+                let nvcc = p.join("bin").join("nvcc.exe");
+                #[cfg(not(windows))]
+                let nvcc = p.join("bin").join("nvcc");
+
+                if nvcc.is_file() || p.join("include").join("cuda.h").is_file() || p.is_dir() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // 2. Probe nvcc compiler on PATH
+    if let Ok(output) = std::process::Command::new("nvcc")
+        .arg("--version")
+        .output()
+    {
+        if output.status.success() {
+            return true;
+        }
+    }
+
+    // 3. Platform standard paths
+    #[cfg(windows)]
+    {
+        let cuda_base = std::path::Path::new(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA");
+        if cuda_base.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(cuda_base) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if std::path::Path::new("/usr/local/cuda").exists() {
+            return true;
+        }
+    }
+
+    // 4. If has_gpu is true and nvidia-smi ran successfully, NVIDIA driver provides CUDA runtime
+    if has_gpu {
+        if let Ok(output) = std::process::Command::new("nvidia-smi").output() {
+            if output.status.success() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,6 +1334,7 @@ mod tests {
             no_gpu: false,
             simulate_gpu: true,
             gpu_name: Some("Custom Tensor Node".into()),
+            ..Default::default()
         };
         let caps = WorkerCapabilities::detect_with_overrides(overrides);
         assert_eq!(caps.name, "custom-node");
@@ -1070,5 +1487,133 @@ mod tests {
         assert!(cooling_device_indicates_throttling("cpu-isolate0", 1));
         assert!(cooling_device_indicates_throttling("devfreq-gpu", 1));
         assert!(cooling_device_indicates_throttling("intel_powerclamp", 10));
+    }
+
+    #[test]
+    fn test_capabilities_3d_extensions_default() {
+        let caps = WorkerCapabilities::new("worker-3d", 4, 8192, false, false, None);
+        assert!(!caps.has_blender);
+        assert!(caps.blender_version.is_none());
+        assert!(caps.vram_mb.is_none());
+        assert!(!caps.has_cuda);
+    }
+
+    #[test]
+    fn test_capabilities_3d_builders() {
+        let caps = WorkerCapabilities::new("worker-3d", 8, 16384, true, false, Some("RTX 4090".into()))
+            .with_blender(true, Some("Blender 4.5.4 LTS".into()))
+            .with_vram_mb(Some(24576))
+            .with_cuda(true);
+
+        assert!(caps.has_blender);
+        assert_eq!(caps.blender_version.as_deref(), Some("Blender 4.5.4 LTS"));
+        assert_eq!(caps.vram_mb, Some(24576));
+        assert!(caps.has_cuda);
+    }
+
+    #[test]
+    fn test_capabilities_json_backward_compatibility() {
+        // Legacy JSON missing has_blender, blender_version, vram_mb, has_cuda
+        let legacy_json = r#"{
+            "name": "legacy-worker",
+            "cpu_cores": 4,
+            "ram_mb": 8192,
+            "has_gpu": false,
+            "is_simulated_gpu": false,
+            "gpu_device_name": null,
+            "tags": []
+        }"#;
+
+        let caps: WorkerCapabilities = serde_json::from_str(legacy_json).expect("Deserialization failed");
+        assert_eq!(caps.name, "legacy-worker");
+        assert_eq!(caps.cpu_cores, 4);
+        assert_eq!(caps.ram_mb, 8192);
+        assert!(!caps.has_blender);
+        assert!(caps.blender_version.is_none());
+        assert!(caps.vram_mb.is_none());
+        assert!(!caps.has_cuda);
+    }
+
+    #[test]
+    fn test_capabilities_json_roundtrip_with_3d() {
+        let caps = WorkerCapabilities::new("3d-worker", 16, 32768, true, false, Some("RTX 5090".into()))
+            .with_3d_capabilities(true, Some("Blender 4.5".into()), Some(32768), true);
+
+        let json = serde_json::to_string(&caps).expect("Failed to serialize");
+        let deserialized: WorkerCapabilities = serde_json::from_str(&json).expect("Failed to deserialize");
+
+        assert_eq!(caps, deserialized);
+        assert!(deserialized.has_blender);
+        assert_eq!(deserialized.blender_version.as_deref(), Some("Blender 4.5"));
+        assert_eq!(deserialized.vram_mb, Some(32768));
+        assert!(deserialized.has_cuda);
+    }
+
+    #[test]
+    fn test_capabilities_detect_with_blender_overrides() {
+        let overrides = HardwareOverrides {
+            blender: Some(true),
+            blender_version: Some("Blender 4.5 Custom".into()),
+            ..Default::default()
+        };
+        let caps = WorkerCapabilities::detect_with_overrides(overrides);
+        assert!(caps.has_blender);
+        assert_eq!(caps.blender_version.as_deref(), Some("Blender 4.5 Custom"));
+
+        let no_blender_overrides = HardwareOverrides {
+            no_blender: true,
+            blender: Some(true),
+            blender_version: Some("Should be ignored".into()),
+            ..Default::default()
+        };
+        let caps_disabled = WorkerCapabilities::detect_with_overrides(no_blender_overrides);
+        assert!(!caps_disabled.has_blender);
+        assert!(caps_disabled.blender_version.is_none());
+    }
+
+    #[test]
+    fn test_capabilities_detect_with_vram_and_cuda_overrides() {
+        let overrides = HardwareOverrides {
+            gpu: Some(true),
+            vram_mb: Some(16384),
+            cuda: Some(true),
+            ..Default::default()
+        };
+        let caps = WorkerCapabilities::detect_with_overrides(overrides);
+        assert!(caps.has_gpu);
+        assert_eq!(caps.vram_mb, Some(16384));
+        assert!(caps.has_cuda);
+
+        let overrides_no_cuda = HardwareOverrides {
+            gpu: Some(true),
+            vram_mb: Some(8192),
+            cuda: Some(true),
+            no_cuda: true,
+            ..Default::default()
+        };
+        let caps_no_cuda = WorkerCapabilities::detect_with_overrides(overrides_no_cuda);
+        assert!(!caps_no_cuda.has_cuda);
+    }
+
+    #[test]
+    fn test_capabilities_no_gpu_dominates_vram_and_cuda() {
+        let overrides = HardwareOverrides {
+            no_gpu: true,
+            vram_mb: Some(32768),
+            cuda: Some(true),
+            ..Default::default()
+        };
+        let caps = WorkerCapabilities::detect_with_overrides(overrides);
+        assert!(!caps.has_gpu);
+        assert!(caps.vram_mb.is_none(), "no_gpu must strip vram_mb");
+        assert!(!caps.has_cuda, "no_gpu must force has_cuda to false");
+    }
+
+    #[test]
+    fn test_detect_blender_non_panicking() {
+        let (has_blender, ver) = detect_blender(None);
+        if has_blender {
+            assert!(ver.is_some());
+        }
     }
 }

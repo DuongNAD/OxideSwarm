@@ -53,6 +53,7 @@ fn make_capabilities(
         },
         tags: vec!["m4_test".into()],
         mobile: None,
+        ..Default::default()
     }
 }
 
