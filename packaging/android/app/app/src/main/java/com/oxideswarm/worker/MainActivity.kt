@@ -199,7 +199,7 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
         val defaultRam = prefs.getLong(BootCompletedReceiver.KEY_RAM_MB, SystemInfoHelper.getTotalRamMb(this))
         val defaultSimulateGpu = prefs.getBoolean(BootCompletedReceiver.KEY_SIMULATE_GPU, false)
         val defaultAutoStart = prefs.getBoolean(BootCompletedReceiver.KEY_AUTO_START, true)
-        val defaultSecret = prefs.getString(BootCompletedReceiver.KEY_CLUSTER_SECRET, "")
+        val defaultSecret = BootCompletedReceiver.loadClusterSecret(storageContext) ?: ""
 
         etMasterAddress.setText(defaultMaster)
         etWorkerName.setText(defaultName)
@@ -218,10 +218,10 @@ class MainActivity : AppCompatActivity(), OxideWorkerService.WorkerServiceListen
             .putString(BootCompletedReceiver.KEY_WORKER_NAME, config.workerName)
             .putInt(BootCompletedReceiver.KEY_CORES, config.cores)
             .putLong(BootCompletedReceiver.KEY_RAM_MB, config.ramMb)
-            .putString(BootCompletedReceiver.KEY_CLUSTER_SECRET, config.clusterSecret)
             .putBoolean(BootCompletedReceiver.KEY_SIMULATE_GPU, config.simulateGpu)
             .putBoolean(BootCompletedReceiver.KEY_AUTO_START, autoStart)
             .apply()
+        BootCompletedReceiver.saveClusterSecret(storageContext, config.clusterSecret)
     }
 
     private fun checkPermissions() {

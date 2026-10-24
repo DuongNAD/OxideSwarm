@@ -96,14 +96,10 @@ async fn test_m2_three_workers_registration_and_gpu_capabilities() {
     let reg_timeout = Duration::from_secs(10);
     #[cfg(not(windows))]
     let reg_timeout = Duration::from_secs(3);
-    let registered = wait_for(
-        reg_timeout,
-        Duration::from_millis(50),
-        || async {
-            let workers = registry.list_all_workers().await;
-            workers.len() == 3 && workers.iter().all(|w| w.status == WorkerStatus::Connected)
-        },
-    )
+    let registered = wait_for(reg_timeout, Duration::from_millis(50), || async {
+        let workers = registry.list_all_workers().await;
+        workers.len() == 3 && workers.iter().all(|w| w.status == WorkerStatus::Connected)
+    })
     .await;
     assert!(
         registered,
@@ -187,11 +183,9 @@ async fn test_m2_heartbeat_updates() {
     #[cfg(not(windows))]
     let reg_timeout = Duration::from_secs(2);
     assert!(
-        wait_for(
-            reg_timeout,
-            Duration::from_millis(50),
-            || async { registry.get_worker(worker_id).await.is_some() }
-        )
+        wait_for(reg_timeout, Duration::from_millis(50), || async {
+            registry.get_worker(worker_id).await.is_some()
+        })
         .await
     );
 
@@ -246,17 +240,13 @@ async fn test_m2_graceful_disconnect_via_disconnecting_message() {
     #[cfg(not(windows))]
     let reg_timeout = Duration::from_secs(2);
     assert!(
-        wait_for(
-            reg_timeout,
-            Duration::from_millis(50),
-            || async {
-                registry
-                    .get_worker(w_id)
-                    .await
-                    .map(|e| e.status == WorkerStatus::Connected)
-                    .unwrap_or(false)
-            }
-        )
+        wait_for(reg_timeout, Duration::from_millis(50), || async {
+            registry
+                .get_worker(w_id)
+                .await
+                .map(|e| e.status == WorkerStatus::Connected)
+                .unwrap_or(false)
+        })
         .await
     );
 
@@ -425,17 +415,13 @@ async fn test_m2_worker_reconnection_preserves_uuid() {
     #[cfg(not(windows))]
     let reg_timeout = Duration::from_secs(2);
     assert!(
-        wait_for(
-            reg_timeout,
-            Duration::from_millis(30),
-            || async {
-                registry
-                    .get_worker(worker_id)
-                    .await
-                    .map(|e| e.status == WorkerStatus::Connected)
-                    .unwrap_or(false)
-            }
-        )
+        wait_for(reg_timeout, Duration::from_millis(30), || async {
+            registry
+                .get_worker(worker_id)
+                .await
+                .map(|e| e.status == WorkerStatus::Connected)
+                .unwrap_or(false)
+        })
         .await
     );
 
@@ -456,17 +442,13 @@ async fn test_m2_worker_reconnection_preserves_uuid() {
     let recon_timeout = Duration::from_secs(8);
     #[cfg(not(windows))]
     let recon_timeout = Duration::from_secs(3);
-    let reconnected = wait_for(
-        recon_timeout,
-        Duration::from_millis(30),
-        || async {
-            if let Some(info) = registry.get_worker(worker_id).await {
-                info.status == WorkerStatus::Connected && info.session_id > session_id
-            } else {
-                false
-            }
-        },
-    )
+    let reconnected = wait_for(recon_timeout, Duration::from_millis(30), || async {
+        if let Some(info) = registry.get_worker(worker_id).await {
+            info.status == WorkerStatus::Connected && info.session_id > session_id
+        } else {
+            false
+        }
+    })
     .await;
     assert!(
         reconnected,

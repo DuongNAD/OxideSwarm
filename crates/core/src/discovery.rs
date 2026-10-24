@@ -259,7 +259,10 @@ pub fn sanitize_host_port(addr: &str) -> Option<String> {
 /// control characters. Whatever passes can be reflected into a `Location` header, an HTML
 /// attribute or a JavaScript string without further escaping.
 pub fn sanitize_http_origin(url: &str) -> Option<String> {
-    let lower_prefix = |p: &str| url.get(..p.len()).is_some_and(|s| s.eq_ignore_ascii_case(p));
+    let lower_prefix = |p: &str| {
+        url.get(..p.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(p))
+    };
     let (scheme, rest) = if lower_prefix("https://") {
         ("https", &url["https://".len()..])
     } else if lower_prefix("http://") {
@@ -1298,7 +1301,10 @@ mod tests {
             vec!["10.0.0.5", "nas.local", "10.0.0.6"]
         );
         let many: String = (0..40).map(|i| format!("10.0.0.{i},")).collect();
-        assert_eq!(parse_candidate_hosts(&many).len(), MAX_CONFIGURED_CANDIDATES);
+        assert_eq!(
+            parse_candidate_hosts(&many).len(),
+            MAX_CONFIGURED_CANDIDATES
+        );
     }
 
     #[test]
@@ -1311,7 +1317,11 @@ mod tests {
             ("http://[::1]", "http://[::1]"),
             ("http://my_pc-1", "http://my_pc-1"),
         ] {
-            assert_eq!(sanitize_http_origin(input).as_deref(), Some(expected), "{input:?}");
+            assert_eq!(
+                sanitize_http_origin(input).as_deref(),
+                Some(expected),
+                "{input:?}"
+            );
         }
         for bad in [
             "",
@@ -1345,9 +1355,18 @@ mod tests {
 
     #[test]
     fn test_sanitize_host_port_accepts_only_plain_host_port() {
-        assert_eq!(sanitize_host_port("10.0.0.5:8088").as_deref(), Some("10.0.0.5:8088"));
-        assert_eq!(sanitize_host_port("master.local:8088").as_deref(), Some("master.local:8088"));
-        assert_eq!(sanitize_host_port("[fd00::5]:8088").as_deref(), Some("[fd00::5]:8088"));
+        assert_eq!(
+            sanitize_host_port("10.0.0.5:8088").as_deref(),
+            Some("10.0.0.5:8088")
+        );
+        assert_eq!(
+            sanitize_host_port("master.local:8088").as_deref(),
+            Some("master.local:8088")
+        );
+        assert_eq!(
+            sanitize_host_port("[fd00::5]:8088").as_deref(),
+            Some("[fd00::5]:8088")
+        );
         for bad in [
             "",
             "10.0.0.5",
@@ -1375,7 +1394,10 @@ mod tests {
                 normalize_beacon_source(beacon_advertising(bad), remote).is_none(),
                 "{bad:?}"
             );
-            assert!(accept_verified_beacon(beacon_advertising(bad), remote).is_none(), "{bad:?}");
+            assert!(
+                accept_verified_beacon(beacon_advertising(bad), remote).is_none(),
+                "{bad:?}"
+            );
         }
     }
 
@@ -1395,7 +1417,10 @@ mod tests {
             }))
             .await;
             let beacon = probe_http_candidate("127.0.0.1", port, Duration::from_millis(600)).await;
-            assert!(beacon.is_none(), "redirect {redirect:?} must not become a beacon: {beacon:?}");
+            assert!(
+                beacon.is_none(),
+                "redirect {redirect:?} must not become a beacon: {beacon:?}"
+            );
         }
 
         // A well-formed portal answer is followed, with the validated forms of both fields.

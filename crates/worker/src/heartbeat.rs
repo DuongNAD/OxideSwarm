@@ -105,14 +105,23 @@ impl HeartbeatTracker {
         self.active_tasks.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Atomically decrements the active task count and returns the new count.
+    /// Atomically decrements the active task count (never below zero) and returns the new count.
     pub fn decrement_active_tasks(&self) -> usize {
-        self.active_tasks
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| {
-                Some(val.saturating_sub(1))
-            })
-            .unwrap_or(0)
-            .saturating_sub(1)
+        // A compare-exchange loop instead of `fetch_update`: newer Rust deprecates it (renamed to
+        // `try_update`), and older toolchains do not have `try_update` yet.
+        let mut current = self.active_tasks.load(Ordering::SeqCst);
+        loop {
+            let next = current.saturating_sub(1);
+            match self.active_tasks.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Returns the current number of active tasks.
@@ -144,24 +153,26 @@ impl HeartbeatHandle {
 }
 
 static TELEMETRY_CACHE: std::sync::Mutex<(f32, u64)> = std::sync::Mutex::new((0.0, 8192));
-static TELEMETRY_INITIALIZED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static TELEMETRY_SAMPLER: std::sync::Once = std::sync::Once::new();
 
 fn ensure_telemetry_sampler_started() {
-    if TELEMETRY_INITIALIZED
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
+    // `call_once` also makes a concurrent first caller wait until the cache is seeded.
+    TELEMETRY_SAMPLER.call_once(|| {
+        // Seed the cache before the first heartbeat reads it. Starting from the (0 %, 8192 MB)
+        // placeholder made a freshly started worker report 8 GB free whatever the machine has,
+        // and the master's RAM gate trusts that figure. (CPU needs two samples, so it starts at 0.)
+        // Only memory is read here, which is cheap; the CPU sampler is set up on its own thread.
+        let mut mem = sysinfo::System::new();
+        mem.refresh_memory();
+        if let Ok(mut cache) = TELEMETRY_CACHE.lock() {
+            *cache = (0.0, mem.available_memory() / (1024 * 1024));
+        }
         std::thread::spawn(move || {
             let mut sys = sysinfo::System::new_with_specifics(
                 sysinfo::RefreshKind::new()
                     .with_cpu(sysinfo::CpuRefreshKind::new().with_cpu_usage())
                     .with_memory(sysinfo::MemoryRefreshKind::new().with_ram()),
             );
-            sys.refresh_memory();
-            if let Ok(mut cache) = TELEMETRY_CACHE.lock() {
-                *cache = (0.0, sys.available_memory() / (1024 * 1024));
-            }
             loop {
                 sys.refresh_cpu_specifics(sysinfo::CpuRefreshKind::new().with_cpu_usage());
                 sys.refresh_memory();
@@ -173,7 +184,7 @@ fn ensure_telemetry_sampler_started() {
                 std::thread::sleep(Duration::from_millis(500));
             }
         });
-    }
+    });
 }
 
 fn get_system_telemetry() -> (f32, u64) {
@@ -223,7 +234,8 @@ impl IoClock {
 
     /// Records that bytes were received.
     pub fn touch_rx(&self) {
-        self.last_rx_nanos.fetch_max(self.now_nanos(), Ordering::Relaxed);
+        self.last_rx_nanos
+            .fetch_max(self.now_nanos(), Ordering::Relaxed);
     }
 
     /// Records that the socket accepted part of a bulk write.
@@ -594,7 +606,19 @@ mod tests {
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total_mb = sys.total_memory() / (1024 * 1024);
-        assert!(ram_mb <= total_mb.max(1), "free {ram_mb} MB cannot exceed total {total_mb} MB");
+        let available_mb = sys.available_memory() / (1024 * 1024);
+        assert!(
+            ram_mb <= total_mb.max(1),
+            "free {ram_mb} MB cannot exceed total {total_mb} MB"
+        );
+        // The bound above cannot catch the placeholder on a machine with more than 8 GB, so also
+        // compare with a fresh reading: the cached one is at most 500 ms old and stays close,
+        // while the placeholder is far off unless the machine happens to have about 8 GB free.
+        let tolerance_mb = (total_mb / 4).max(1024);
+        assert!(
+            available_mb == 0 || ram_mb.abs_diff(available_mb) <= tolerance_mb,
+            "first reading of {ram_mb} MB free is far from the {available_mb} MB actually free"
+        );
     }
 
     #[tokio::test]
@@ -602,7 +626,10 @@ mod tests {
         let clock = IoClock::new();
         tokio::time::sleep(Duration::from_millis(60)).await;
         let idle = clock.silence();
-        assert!(idle >= Duration::from_millis(50), "idle connection ages: {idle:?}");
+        assert!(
+            idle >= Duration::from_millis(50),
+            "idle connection ages: {idle:?}"
+        );
 
         // Received bytes are life.
         clock.touch_rx();
@@ -614,7 +641,10 @@ mod tests {
         clock.touch_bulk_tx();
         assert!(clock.silence() < Duration::from_millis(40));
         tokio::time::sleep(Duration::from_millis(60)).await;
-        assert!(clock.silence() >= Duration::from_millis(50), "a stalled upload stops counting");
+        assert!(
+            clock.silence() >= Duration::from_millis(50),
+            "a stalled upload stops counting"
+        );
     }
 
     #[tokio::test]
@@ -635,11 +665,20 @@ mod tests {
         // A heartbeat-sized write succeeds into a dead peer's buffer too, so it proves nothing...
         tokio::time::sleep(Duration::from_millis(60)).await;
         stamped.write_all(b"pong").await.unwrap();
-        assert!(clock.silence() >= Duration::from_millis(50), "small writes are not life");
+        assert!(
+            clock.silence() >= Duration::from_millis(50),
+            "small writes are not life"
+        );
 
         // ...a bulk write does (the peer is draining a frame).
-        stamped.write_all(&vec![7u8; BULK_WRITE_BYTES * 2]).await.unwrap();
-        assert!(clock.silence() < Duration::from_millis(40), "bulk write progress is life");
+        stamped
+            .write_all(&vec![7u8; BULK_WRITE_BYTES * 2])
+            .await
+            .unwrap();
+        assert!(
+            clock.silence() < Duration::from_millis(40),
+            "bulk write progress is life"
+        );
     }
 
     #[test]
@@ -673,8 +712,15 @@ mod tests {
             thermal_throttled: true,
         });
         let snap = handle.snapshot().unwrap();
-        assert_eq!((snap.os_version.as_str(), snap.soc_model.as_str()), ("Android 14", "Tensor"));
-        assert_eq!(handle.live_status().unwrap().battery_pct, Some(3), "clones share state");
+        assert_eq!(
+            (snap.os_version.as_str(), snap.soc_model.as_str()),
+            ("Android 14", "Tensor")
+        );
+        assert_eq!(
+            handle.live_status().unwrap().battery_pct,
+            Some(3),
+            "clones share state"
+        );
         assert!(snap.thermal_throttled);
     }
 
@@ -703,7 +749,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         poller.abort();
         let snap = handle.snapshot().unwrap();
-        assert_eq!(snap.battery_pct, Some(7), "the startup snapshot must not stay frozen");
+        assert_eq!(
+            snap.battery_pct,
+            Some(7),
+            "the startup snapshot must not stay frozen"
+        );
         assert_eq!(snap.is_charging, Some(false));
         assert!(snap.thermal_throttled);
         assert_eq!(snap.os_version, "macOS");

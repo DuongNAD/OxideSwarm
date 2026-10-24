@@ -697,7 +697,12 @@ fn test_adversarial_topology_1_real_saturated_2_simulated_idle() {
     // 1 CPU-only worker: 8 cores, active_tasks = 0 (idle)
     let w_cpu = make_test_worker("worker-cpu-only", 8, 16384, false, false, 0);
 
-    let workers = vec![w_real.clone(), w_sim1.clone(), w_sim2.clone(), w_cpu.clone()];
+    let workers = vec![
+        w_real.clone(),
+        w_sim1.clone(),
+        w_sim2.clone(),
+        w_cpu.clone(),
+    ];
 
     let gpu_task = Task::new(
         TaskSpec::gpu_compute("gemm_kernel", 64),
@@ -706,7 +711,11 @@ fn test_adversarial_topology_1_real_saturated_2_simulated_idle() {
 
     let report = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&gpu_task), &workers);
 
-    assert_eq!(report.assignments.len(), 1, "Exactly one task should be placed");
+    assert_eq!(
+        report.assignments.len(),
+        1,
+        "Exactly one task should be placed"
+    );
     let assigned_id = report.assignments[0].worker_id;
 
     // Simulated GPU MUST take the task because real GPU is saturated
@@ -714,8 +723,14 @@ fn test_adversarial_topology_1_real_saturated_2_simulated_idle() {
         assigned_id == w_sim1.worker_id || assigned_id == w_sim2.worker_id,
         "Simulated GPU must take task when real GPU is saturated"
     );
-    assert_ne!(assigned_id, w_real.worker_id, "Saturated real GPU must not receive task");
-    assert_ne!(assigned_id, w_cpu.worker_id, "CPU-only worker must never receive GPU task");
+    assert_ne!(
+        assigned_id, w_real.worker_id,
+        "Saturated real GPU must not receive task"
+    );
+    assert_ne!(
+        assigned_id, w_cpu.worker_id,
+        "CPU-only worker must never receive GPU task"
+    );
 }
 
 /// Adversarial Topology 2:
@@ -813,7 +828,12 @@ fn test_adversarial_round_robin_heavy_concurrent_submissions() {
     let w_sim1 = make_test_worker("w-sim-1", 4, 8192, true, true, 0);
     let w_sim2 = make_test_worker("w-sim-2", 4, 8192, true, true, 0);
 
-    let workers = vec![w_real1.clone(), w_real2.clone(), w_sim1.clone(), w_sim2.clone()];
+    let workers = vec![
+        w_real1.clone(),
+        w_real2.clone(),
+        w_sim1.clone(),
+        w_sim2.clone(),
+    ];
 
     // Generate 16 tasks (demanding 1 core each)
     let tasks: Vec<Task> = (0..16)
@@ -851,8 +871,14 @@ fn test_adversarial_round_robin_heavy_concurrent_submissions() {
     }
 
     // Both real GPUs must be completely filled to their maximum slot capacity (4 slots each)
-    assert_eq!(real1_count, 4, "Real GPU 1 must be fully utilized (4 tasks)");
-    assert_eq!(real2_count, 4, "Real GPU 2 must be fully utilized (4 tasks)");
+    assert_eq!(
+        real1_count, 4,
+        "Real GPU 1 must be fully utilized (4 tasks)"
+    );
+    assert_eq!(
+        real2_count, 4,
+        "Real GPU 2 must be fully utilized (4 tasks)"
+    );
     // Remaining 8 tasks must spill over to simulated GPUs (4 each)
     assert_eq!(sim1_count, 4, "Sim GPU 1 must receive remaining 4 tasks");
     assert_eq!(sim2_count, 4, "Sim GPU 2 must receive remaining 4 tasks");
@@ -1054,4 +1080,3 @@ async fn test_adversarial_live_queue_concurrent_gpu_submissions() {
     assert_eq!(real_count, 4, "Real GPU must receive 4 tasks");
     assert_eq!(sim_count, 4, "Simulated GPU must receive 4 tasks");
 }
-

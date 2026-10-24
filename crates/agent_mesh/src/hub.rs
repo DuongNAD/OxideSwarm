@@ -29,9 +29,9 @@
 
 use crate::bridge::AgentGridBridge;
 use crate::protocol::{
-    validate_node_id, AgentMeshEnvelope, NodeDescriptor, ERR_DUPLICATE_NODE_ID, MAX_NODE_ID_LEN,
+    validate_node_id, AgentMeshEnvelope, NodeDescriptor, ERR_DUPLICATE_NODE_ID,
     ERR_INVALID_NODE_ID, ERR_NODE_UNAVAILABLE, ERR_NOT_REGISTERED, ERR_SENDER_MISMATCH,
-    ERR_UNAUTHORIZED,
+    ERR_UNAUTHORIZED, MAX_NODE_ID_LEN,
 };
 use axum::{
     extract::{
@@ -116,7 +116,10 @@ impl Default for HubConfig {
 impl std::fmt::Debug for HubConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HubConfig")
-            .field("auth_token", &self.auth_token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
             .field("allow_insecure_bind", &self.allow_insecure_bind)
             .field("max_queued_messages", &self.max_queued_messages)
             .field("max_queued_bytes", &self.max_queued_bytes)
@@ -398,7 +401,10 @@ impl AgentMeshHub {
     ///
     /// Fails (without serving anything) when the address is not a loopback address and the hub
     /// has neither an auth token nor `allow_insecure_bind`.
-    pub async fn start(&self, bind_addr: &str) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn start(
+        &self,
+        bind_addr: &str,
+    ) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
         let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
         let port = local_addr.port();
@@ -423,7 +429,11 @@ impl AgentMeshHub {
             "OxideRelay Hub listening on ws://{}:{} (token auth {})",
             local_addr.ip(),
             port,
-            if config.auth_token.is_some() { "on" } else { "off" }
+            if config.auth_token.is_some() {
+                "on"
+            } else {
+                "off"
+            }
         );
 
         let app = Self::build_router(self.state.clone());
@@ -533,7 +543,8 @@ async fn ws_handler(
         if !allowed {
             warn!(
                 "Hub: refused WebSocket upgrade from {} with foreign Origin {:?}",
-                peer.map(|ConnectInfo(a)| a.to_string()).unwrap_or_else(|| "unknown peer".into()),
+                peer.map(|ConnectInfo(a)| a.to_string())
+                    .unwrap_or_else(|| "unknown peer".into()),
                 origin
             );
             return (
@@ -555,7 +566,9 @@ async fn ws_handler(
 enum Flow {
     Continue,
     /// Close the connection; `graceful` flushes the queued NACK and a close frame first.
-    Close { graceful: bool },
+    Close {
+        graceful: bool,
+    },
 }
 
 /// Per-socket routing state.
@@ -633,7 +646,10 @@ impl Connection {
     async fn handle_text(&mut self, raw_text: String) -> Flow {
         let registered = !self.owned.is_empty();
         if !registered && raw_text.len() > PRE_REGISTRATION_MAX_BYTES {
-            warn!("Hub: dropping unregistered peer {}: oversized first frame", self.peer);
+            warn!(
+                "Hub: dropping unregistered peer {}: oversized first frame",
+                self.peer
+            );
             return Flow::Close { graceful: false };
         }
 
@@ -641,10 +657,16 @@ impl Connection {
             Ok(env) => env,
             Err(e) => {
                 if !registered {
-                    warn!("Hub: dropping unregistered peer {}: malformed first frame", self.peer);
+                    warn!(
+                        "Hub: dropping unregistered peer {}: malformed first frame",
+                        self.peer
+                    );
                     return Flow::Close { graceful: false };
                 }
-                error!("Hub received malformed JSON envelope: {}", clip(&e.to_string()));
+                error!(
+                    "Hub received malformed JSON envelope: {}",
+                    clip(&e.to_string())
+                );
                 return Flow::Continue;
             }
         };
@@ -732,7 +754,11 @@ impl Connection {
                 "Hub: rejected registration of '{}' from {}: {}",
                 reply_to,
                 self.peer,
-                if missing { "token missing" } else { "token mismatch" }
+                if missing {
+                    "token missing"
+                } else {
+                    "token mismatch"
+                }
             );
             self.nack(
                 &reply_to,
@@ -756,7 +782,12 @@ impl Connection {
 
         if let Err(why) = validate_node_id(&from) {
             warn!("Hub: rejected registration from {}: {}", self.peer, why);
-            self.nack(&reply_to, &correlation_id, ERR_INVALID_NODE_ID, format!("Invalid node id: {why}."));
+            self.nack(
+                &reply_to,
+                &correlation_id,
+                ERR_INVALID_NODE_ID,
+                format!("Invalid node id: {why}."),
+            );
             return close_if_first;
         }
         if !self.owns(&from) && self.owned.len() >= MAX_NODE_IDS_PER_SOCKET {
@@ -798,7 +829,10 @@ impl Connection {
         };
 
         if taken {
-            warn!("Hub: rejected duplicate registration of '{}' from {}", reply_to, self.peer);
+            warn!(
+                "Hub: rejected duplicate registration of '{}' from {}",
+                reply_to, self.peer
+            );
             self.nack(
                 &reply_to,
                 &correlation_id,
@@ -836,7 +870,10 @@ impl Connection {
         match outbox.push(Message::Text(raw_text)) {
             Ok(()) => Ok(()),
             Err(PushError::Full) => {
-                warn!("Hub: node '{}' is not draining its queue; disconnecting it", dest);
+                warn!(
+                    "Hub: node '{}' is not draining its queue; disconnecting it",
+                    dest
+                );
                 Err(PushError::Full)
             }
             Err(PushError::Closed) => {
@@ -983,7 +1020,10 @@ impl Connection {
                                 &from,
                                 &corr_id,
                                 ERR_NODE_UNAVAILABLE,
-                                format!("Target node '{}' is not keeping up and was disconnected.", clip(&to)),
+                                format!(
+                                    "Target node '{}' is not keeping up and was disconnected.",
+                                    clip(&to)
+                                ),
                             )
                             .await;
                         }
@@ -1012,7 +1052,9 @@ impl Connection {
                 }
             }
 
-            AgentMeshEnvelope::DataPayload { ref from, ref to, .. } => {
+            AgentMeshEnvelope::DataPayload {
+                ref from, ref to, ..
+            } => {
                 {
                     let mut stats = state.stats.write().await;
                     stats.routed_data += 1;
@@ -1025,7 +1067,10 @@ impl Connection {
                             from,
                             &corr_id,
                             ERR_NODE_UNAVAILABLE,
-                            format!("Data target '{}' is not keeping up and was disconnected.", clip(to)),
+                            format!(
+                                "Data target '{}' is not keeping up and was disconnected.",
+                                clip(to)
+                            ),
                         );
                     }
                     Err(PushError::Closed) => {
@@ -1059,7 +1104,10 @@ impl Connection {
 
                 for (nid, dest_tx) in all_txs {
                     if dest_tx.push(Message::Text(raw_text.clone())) == Err(PushError::Full) {
-                        warn!("Hub: node '{}' is not draining its queue; disconnecting it", nid);
+                        warn!(
+                            "Hub: node '{}' is not draining its queue; disconnecting it",
+                            nid
+                        );
                     }
                 }
             }
@@ -1101,7 +1149,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<HubState>, peer: Option<Soc
         id: state.next_conn_id.fetch_add(1, Ordering::Relaxed),
         state: state.clone(),
         outbox: outbox.clone(),
-        peer: peer.map(|p| p.to_string()).unwrap_or_else(|| "unknown peer".to_string()),
+        peer: peer
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "unknown peer".to_string()),
         owned: Vec::new(),
     };
 
@@ -1168,7 +1218,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<HubState>, peer: Option<Soc
     if graceful {
         let _ = outbox.push(Message::Close(None));
         let mut write_task = write_task;
-        if tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, &mut write_task).await.is_err() {
+        if tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, &mut write_task)
+            .await
+            .is_err()
+        {
             write_task.abort();
         }
     } else {
@@ -1310,7 +1363,10 @@ mod tests {
             "http://127.0.0.1:notaport",
             "localhost",
         ] {
-            assert!(!origin_is_loopback(bad), "{bad:?} must be treated as foreign");
+            assert!(
+                !origin_is_loopback(bad),
+                "{bad:?} must be treated as foreign"
+            );
         }
     }
 
@@ -1342,15 +1398,24 @@ mod tests {
         assert_eq!(outbox.push(Message::Text("b".into())), Ok(()));
         assert!(!outbox.is_dead());
         assert_eq!(outbox.push(Message::Text("c".into())), Err(PushError::Full));
-        assert!(outbox.is_dead(), "a full queue must schedule the slow consumer for disconnection");
-        assert_eq!(outbox.push(Message::Text("d".into())), Err(PushError::Closed));
+        assert!(
+            outbox.is_dead(),
+            "a full queue must schedule the slow consumer for disconnection"
+        );
+        assert_eq!(
+            outbox.push(Message::Text("d".into())),
+            Err(PushError::Closed)
+        );
     }
 
     #[test]
     fn test_outbox_overflow_by_bytes_kicks_the_connection() {
         let (outbox, _rx) = test_outbox(1000, 10);
         assert_eq!(outbox.push(Message::Text("123456".into())), Ok(()));
-        assert_eq!(outbox.push(Message::Text("123456".into())), Err(PushError::Full));
+        assert_eq!(
+            outbox.push(Message::Text("123456".into())),
+            Err(PushError::Full)
+        );
         assert!(outbox.is_dead());
     }
 
@@ -1369,28 +1434,48 @@ mod tests {
         let (outbox, rx) = test_outbox(4, 1 << 20);
         drop(rx);
         assert!(outbox.is_dead());
-        assert_eq!(outbox.push(Message::Text("x".into())), Err(PushError::Closed));
+        assert_eq!(
+            outbox.push(Message::Text("x".into())),
+            Err(PushError::Closed)
+        );
     }
 
     #[tokio::test]
     async fn test_non_loopback_bind_requires_a_token_or_insecure_flag() {
         let hub = AgentMeshHub::new();
-        let err = hub.start("0.0.0.0:0").await.expect_err("0.0.0.0 without a token must be refused");
+        let err = hub
+            .start("0.0.0.0:0")
+            .await
+            .expect_err("0.0.0.0 without a token must be refused");
         let msg = err.to_string();
-        assert!(msg.contains("--token") && msg.contains("--insecure"), "unhelpful message: {msg}");
+        assert!(
+            msg.contains("--token") && msg.contains("--insecure"),
+            "unhelpful message: {msg}"
+        );
 
         let with_token = AgentMeshHub::with_config(HubConfig::default().with_auth_token("t0ken"));
-        with_token.start("0.0.0.0:0").await.expect("a token makes a public bind acceptable");
+        with_token
+            .start("0.0.0.0:0")
+            .await
+            .expect("a token makes a public bind acceptable");
         with_token.stop().await;
 
         let insecure = AgentMeshHub::with_config(HubConfig::default().with_insecure_bind(true));
-        insecure.start("0.0.0.0:0").await.expect("--insecure allows a public bind");
+        insecure
+            .start("0.0.0.0:0")
+            .await
+            .expect("--insecure allows a public bind");
         insecure.stop().await;
     }
 
     /// One raw HTTP/1.1 GET, so the `Host` header can be anything (HTTP clients derive it from the
     /// URL). Returns the status code.
-    async fn raw_get(port: u16, path: &str, host: Option<&str>, authorization: Option<&str>) -> u16 {
+    async fn raw_get(
+        port: u16,
+        path: &str,
+        host: Option<&str>,
+        authorization: Option<&str>,
+    ) -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut request = match host {
             Some(host) => format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n"),
@@ -1401,7 +1486,9 @@ mod tests {
         }
         request.push_str("Connection: close\r\n\r\n");
 
-        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).await.unwrap();
@@ -1425,7 +1512,11 @@ mod tests {
                 "127.0.0.1".to_string(),
                 format!("hub.localhost:{port}"),
             ] {
-                assert_eq!(raw_get(port, path, Some(&host), None).await, 200, "{path} with Host {host}");
+                assert_eq!(
+                    raw_get(port, path, Some(&host), None).await,
+                    200,
+                    "{path} with Host {host}"
+                );
             }
             // DNS rebinding: the page's own domain resolves to 127.0.0.1, but Host stays its own.
             for host in [
@@ -1438,14 +1529,25 @@ mod tests {
                 "localhost@evil.example",
                 "",
             ] {
-                assert_eq!(raw_get(port, path, Some(host), None).await, 403, "{path} with Host {host:?}");
+                assert_eq!(
+                    raw_get(port, path, Some(host), None).await,
+                    403,
+                    "{path} with Host {host:?}"
+                );
             }
             // A request that names no host cannot be shown to be loopback.
-            assert_eq!(raw_get(port, path, None, None).await, 403, "{path} without Host");
+            assert_eq!(
+                raw_get(port, path, None, None).await,
+                403,
+                "{path} without Host"
+            );
         }
 
         // The health probe returns nothing about the hub and stays reachable.
-        assert_eq!(raw_get(port, "/api/health", Some("evil.example"), None).await, 200);
+        assert_eq!(
+            raw_get(port, "/api/health", Some("evil.example"), None).await,
+            200
+        );
 
         hub.stop().await;
     }
@@ -1457,10 +1559,19 @@ mod tests {
 
         for path in ["/api/nodes", "/api/status"] {
             assert_eq!(raw_get(port, path, Some("evil.example"), None).await, 401);
-            assert_eq!(raw_get(port, path, Some("127.0.0.1"), Some("Bearer wrong")).await, 401);
+            assert_eq!(
+                raw_get(port, path, Some("127.0.0.1"), Some("Bearer wrong")).await,
+                401
+            );
             // Who holds the token may read it from any address the hub is reachable at.
-            assert_eq!(raw_get(port, path, Some("hub.lan:8088"), Some("Bearer t0ken")).await, 200);
-            assert_eq!(raw_get(port, path, Some("127.0.0.1"), Some("Bearer t0ken")).await, 200);
+            assert_eq!(
+                raw_get(port, path, Some("hub.lan:8088"), Some("Bearer t0ken")).await,
+                200
+            );
+            assert_eq!(
+                raw_get(port, path, Some("127.0.0.1"), Some("Bearer t0ken")).await,
+                200
+            );
         }
 
         hub.stop().await;

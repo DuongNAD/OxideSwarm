@@ -224,7 +224,10 @@ mod tests {
         use std::ffi::OsStr;
         assert!(persistence_wanted(Some("gpu-pc"), None));
         assert!(persistence_wanted(None, Some(OsStr::new("/var/lib/ox/id"))));
-        assert!(persistence_wanted(Some("gpu-pc"), Some(OsStr::new("/var/lib/ox/id"))));
+        assert!(persistence_wanted(
+            Some("gpu-pc"),
+            Some(OsStr::new("/var/lib/ox/id"))
+        ));
         // Nothing says which machine this is: it would share ~/.oxideswarm/worker_id with the others.
         assert!(!persistence_wanted(None, None));
         assert!(!persistence_wanted(Some(""), None));
@@ -237,8 +240,15 @@ mod tests {
         let path = dir.path().join("nested").join("worker_id");
         let first = load_or_create_worker_id(&path).expect("created");
         assert!(path.is_file());
-        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), first.to_string());
-        assert_eq!(load_or_create_worker_id(&path), Some(first), "second start reuses it");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            first.to_string()
+        );
+        assert_eq!(
+            load_or_create_worker_id(&path),
+            Some(first),
+            "second start reuses it"
+        );
         assert_eq!(load_or_create_worker_id(&path), Some(first));
     }
 
@@ -251,7 +261,11 @@ mod tests {
         load_or_create_worker_id(&path).unwrap();
         let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600, "id file mode");
-        let dir_mode = std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(dir_mode, 0o700, "directory mode");
     }
 
@@ -276,7 +290,10 @@ mod tests {
             ids.iter().all(|id| *id == Some(first)),
             "every concurrent starter must see the same id, got {ids:?}"
         );
-        assert_eq!(parse_id(&std::fs::read_to_string(&*path).unwrap()), Some(first));
+        assert_eq!(
+            parse_id(&std::fs::read_to_string(&*path).unwrap()),
+            Some(first)
+        );
     }
 
     #[test]
@@ -317,7 +334,9 @@ mod tests {
         let Some(plain) = default_worker_id_path(None) else {
             return; // no home directory in this environment
         };
-        assert!(plain.ends_with(".oxideswarm/worker_id") || plain.ends_with(".oxideswarm\\worker_id"));
+        assert!(
+            plain.ends_with(".oxideswarm/worker_id") || plain.ends_with(".oxideswarm\\worker_id")
+        );
         let named = default_worker_id_path(Some("gpu node/1")).unwrap();
         assert_eq!(named.file_name().unwrap(), "worker_id.gpu_node_1");
         let other = default_worker_id_path(Some("cpu-2")).unwrap();

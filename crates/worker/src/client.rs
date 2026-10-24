@@ -35,7 +35,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use rusty_grid_core::capabilities::{detect_live_mobile_status, MobileLiveStatus, WorkerCapabilities};
+use rusty_grid_core::capabilities::{
+    detect_live_mobile_status, MobileLiveStatus, WorkerCapabilities,
+};
 use rusty_grid_core::cluster_auth::{client_handshake, ClusterSecret, WIRE_FORMAT_AUTH};
 use rusty_grid_core::discovery::{is_valid_host, sanitize_host_port, sanitize_http_origin};
 use rusty_grid_core::error::{GridError, GridResult};
@@ -705,11 +707,8 @@ impl Session {
             self.closing_tx.subscribe(),
             self.inbound_tx.clone(),
         )));
-        self.readers.push(spawn_lane_reader(
-            reader,
-            lane,
-            self.inbound_tx.clone(),
-        ));
+        self.readers
+            .push(spawn_lane_reader(reader, lane, self.inbound_tx.clone()));
     }
 
     fn stop_lanes(&self) {
@@ -801,7 +800,10 @@ impl WorkerClient {
                 }
                 (handle, true)
             }
-            None => (MobileTelemetryHandle::new(capabilities.mobile.clone()), false),
+            None => (
+                MobileTelemetryHandle::new(capabilities.mobile.clone()),
+                false,
+            ),
         };
 
         let active_tasks = Arc::new(AtomicUsize::new(0));
@@ -916,7 +918,6 @@ impl WorkerClient {
         }
         self
     }
-
 
     /// Returns a shared reference to the discovered master beacon state.
     pub fn master_beacon(&self) -> Arc<RwLock<Option<rusty_grid_core::discovery::MasterBeacon>>> {
@@ -1178,7 +1179,10 @@ impl WorkerClient {
         // running a task the Master has already given up on, which would also hold a slot the
         // Master believes is free.
         let was_cancelled = {
-            let mut seen = self.cancelled_unseen.lock().unwrap_or_else(|e| e.into_inner());
+            let mut seen = self
+                .cancelled_unseen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             match seen.iter().position(|id| *id == task_id) {
                 Some(pos) => {
                     seen.remove(pos);
@@ -1362,7 +1366,10 @@ impl WorkerClient {
             // The Master sends AssignTask before CancelTask, but a cancelled task that is still
             // on its way must not run once it arrives; a task id is never assigned again after
             // it was cancelled, so remembering the id is safe.
-            let mut seen = self.cancelled_unseen.lock().unwrap_or_else(|e| e.into_inner());
+            let mut seen = self
+                .cancelled_unseen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if !seen.contains(&task_id) {
                 if seen.len() >= CANCELLED_UNSEEN_MEMORY {
                     seen.pop_front();
@@ -1393,8 +1400,13 @@ impl WorkerClient {
             return;
         };
         warn!(task_id = %task_id, "Task assigned again while its previous run is still active; cancelling the old run first");
-        if let Some(mut join) = Self::begin_stop(previous, "superseded by a new assignment of the same task") {
-            if tokio::time::timeout(TASK_DRAIN_TIMEOUT, &mut join).await.is_err() {
+        if let Some(mut join) =
+            Self::begin_stop(previous, "superseded by a new assignment of the same task")
+        {
+            if tokio::time::timeout(TASK_DRAIN_TIMEOUT, &mut join)
+                .await
+                .is_err()
+            {
                 warn!(task_id = %task_id, "Previous run did not stop in time; aborting it");
                 join.abort();
             }
@@ -1449,13 +1461,21 @@ impl WorkerClient {
                 chrono::Utc::now().timestamp_millis()
             ));
             match tokio::fs::rename(&path, &aside).await {
-                Ok(()) => info!(task_id = %task_id, moved_to = %aside.display(), "Moved a leftover sandbox of this task aside"),
-                Err(e) => warn!(task_id = %task_id, error = %e, "Could not move a leftover sandbox aside"),
+                Ok(()) => {
+                    info!(task_id = %task_id, moved_to = %aside.display(), "Moved a leftover sandbox of this task aside")
+                }
+                Err(e) => {
+                    warn!(task_id = %task_id, error = %e, "Could not move a leftover sandbox aside")
+                }
             }
         } else {
             match tokio::fs::remove_dir_all(&path).await {
-                Ok(()) => info!(task_id = %task_id, path = %path.display(), "Removed a leftover sandbox of this task"),
-                Err(e) => warn!(task_id = %task_id, error = %e, "Could not remove a leftover sandbox"),
+                Ok(()) => {
+                    info!(task_id = %task_id, path = %path.display(), "Removed a leftover sandbox of this task")
+                }
+                Err(e) => {
+                    warn!(task_id = %task_id, error = %e, "Could not remove a leftover sandbox")
+                }
             }
         }
     }
@@ -1472,9 +1492,7 @@ impl WorkerClient {
     /// (the Android app passes both) the worker falls back to TCP instead of retrying a stale
     /// ticket forever: after the Master restarts with a new identity the old ticket never works
     /// again, while its LAN address still does.
-    async fn establish_stream(
-        &self,
-    ) -> GridResult<(WorkerStreamMode, String)> {
+    async fn establish_stream(&self) -> GridResult<(WorkerStreamMode, String)> {
         #[cfg(feature = "p2p")]
         if self.config.p2p_ticket.is_some() {
             return match self.establish_p2p().await {
@@ -1524,9 +1542,7 @@ impl WorkerClient {
                     .bind()
                     .await
                     .map_err(|e| {
-                        GridError::ConnectionFailed(format!(
-                            "Failed to bind iroh endpoint: {e}"
-                        ))
+                        GridError::ConnectionFailed(format!("Failed to bind iroh endpoint: {e}"))
                     })?;
                 *ep_guard = Some(ep.clone());
                 (ep, false)
@@ -1769,7 +1785,8 @@ impl WorkerClient {
                 let (writer, reader) = transport.split();
                 let mut session = Session::new(clock);
                 session.attach_lane(writer, reader, "master", true, true);
-                self.run_session(session, heartbeat_interval, shutdown_rx).await
+                self.run_session(session, heartbeat_interval, shutdown_rx)
+                    .await
             }
             #[cfg(feature = "p2p")]
             WorkerStreamMode::Multiplexed { control, data } => {
@@ -1812,7 +1829,8 @@ impl WorkerClient {
                 let mut session = Session::new(clock);
                 session.attach_lane(ctrl_writer, ctrl_reader, "control", true, false);
                 session.attach_lane(data_writer, data_reader, "data", false, true);
-                self.run_session(session, heartbeat_interval, shutdown_rx).await
+                self.run_session(session, heartbeat_interval, shutdown_rx)
+                    .await
             }
         }
     }
@@ -1994,7 +2012,8 @@ impl WorkerClient {
         }
 
         // Whatever the previous connection's Master could do says nothing about this one.
-        self.master_takes_mobile_telemetry.store(false, Ordering::Release);
+        self.master_takes_mobile_telemetry
+            .store(false, Ordering::Release);
         let mut capabilities = self.capabilities.clone();
         capabilities.mobile = self.mobile.snapshot();
         let register_msg = WorkerMessage::Register {
@@ -2062,8 +2081,10 @@ impl WorkerClient {
                     self.config.default_heartbeat_interval
                 };
 
-                let takes_telemetry =
-                    master_features::announced(message.as_deref(), master_features::MOBILE_TELEMETRY);
+                let takes_telemetry = master_features::announced(
+                    message.as_deref(),
+                    master_features::MOBILE_TELEMETRY,
+                );
                 self.master_takes_mobile_telemetry
                     .store(takes_telemetry, Ordering::Release);
                 if !takes_telemetry && self.mobile.live_status().is_some() {
@@ -2198,7 +2219,11 @@ fn portal_master_from_beacon(
             if is_local_only_host(&cluster_host) && !client_ip.is_loopback() {
                 return None;
             }
-            format!("http://{}:{}", url_host(&cluster_host), PORTAL_DASHBOARD_PORT)
+            format!(
+                "http://{}:{}",
+                url_host(&cluster_host),
+                PORTAL_DASHBOARD_PORT
+            )
         }
     };
     Some((ui, cluster))
@@ -2307,7 +2332,12 @@ fn worker_portal_standby_html() -> String {
 
 /// Wraps `body` in a complete `Connection: close` HTTP response. The portal never needs
 /// cross-origin access (its standby page only talks to its own origin), so it sends no CORS header.
-fn portal_http_response(status: &str, content_type: &str, extra_headers: &str, body: &str) -> String {
+fn portal_http_response(
+    status: &str,
+    content_type: &str,
+    extra_headers: &str,
+    body: &str,
+) -> String {
     format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{extra_headers}X-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -2396,8 +2426,8 @@ async fn read_portal_request_line_with<S: AsyncRead + Unpin>(
                 break;
             }
             head.extend_from_slice(&chunk[..n]);
-            let complete = head.windows(4).any(|w| w == b"\r\n\r\n")
-                || head.windows(2).any(|w| w == b"\n\n");
+            let complete =
+                head.windows(4).any(|w| w == b"\r\n\r\n") || head.windows(2).any(|w| w == b"\n\n");
             if complete || head.len() >= PORTAL_MAX_REQUEST_BYTES {
                 break;
             }
@@ -2437,7 +2467,9 @@ async fn handle_portal_connection(
         portal_status_response(master.as_ref())
     } else {
         match master {
-            Some((web_ui_url, cluster_addr)) => portal_redirect_response(&web_ui_url, &cluster_addr),
+            Some((web_ui_url, cluster_addr)) => {
+                portal_redirect_response(&web_ui_url, &cluster_addr)
+            }
             None => portal_standby_response(),
         }
     };
@@ -2600,7 +2632,11 @@ mod tests {
             let notices = client.gpu_notices();
             assert_eq!(notices.len(), 1, "{notices:?}");
             assert_eq!(notices[0].level, NoticeLevel::Warn);
-            assert!(notices[0].message.contains("--features gpu-wgpu"), "{}", notices[0].message);
+            assert!(
+                notices[0].message.contains("--features gpu-wgpu"),
+                "{}",
+                notices[0].message
+            );
         } else if caps.has_gpu {
             let name = caps.gpu_device_name.as_deref().expect("the adapter's name");
             assert_ne!(name, "Physical GPU (Manual Override)");
@@ -2620,7 +2656,10 @@ mod tests {
             assert!(!caps.has_gpu);
         }
         // Without --gpu nothing is a warning: it just says what happened.
-        assert!(client.gpu_notices().iter().all(|n| n.level == NoticeLevel::Info));
+        assert!(client
+            .gpu_notices()
+            .iter()
+            .all(|n| n.level == NoticeLevel::Info));
         assert_eq!(client.gpu_notices().len(), 1);
     }
 
@@ -2641,7 +2680,10 @@ mod tests {
         );
         let caps = simulated.capabilities();
         assert!(caps.has_gpu && caps.is_simulated_gpu);
-        assert_eq!(caps.gpu_device_name.as_deref(), Some("Simulated Virtual GPU (Matrix Engine)"));
+        assert_eq!(
+            caps.gpu_device_name.as_deref(),
+            Some("Simulated Virtual GPU (Matrix Engine)")
+        );
         assert!(simulated.gpu_notices()[0].message.contains("SIMULATED"));
     }
 
@@ -3040,9 +3082,20 @@ mod tests {
         client.handle_assign_task(task.clone(), tx.clone()).await;
 
         let mut results = Vec::new();
-        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(800), rx.recv()).await {
-            if let WorkerMessage::TaskResult { exit_code, stdout, error, .. } = msg {
-                results.push((exit_code, String::from_utf8_lossy(&stdout.0).to_string(), error));
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(800), rx.recv()).await
+        {
+            if let WorkerMessage::TaskResult {
+                exit_code,
+                stdout,
+                error,
+                ..
+            } = msg
+            {
+                results.push((
+                    exit_code,
+                    String::from_utf8_lossy(&stdout.0).to_string(),
+                    error,
+                ));
             }
         }
         assert_eq!(
@@ -3050,7 +3103,10 @@ mod tests {
             1,
             "exactly one result: the new run's. The superseded run must not report a cancellation (the Master would record the task as cancelled): {results:?}"
         );
-        assert_eq!(results[0].0, 0, "the re-dispatch must run, not fail: {results:?}");
+        assert_eq!(
+            results[0].0, 0,
+            "the re-dispatch must run, not fail: {results:?}"
+        );
         assert!(results[0].1.contains("second"));
 
         // The old run's cleanup cannot have removed anything of the new run, and both are gone now.
@@ -3124,7 +3180,9 @@ mod tests {
             // The `Running` report precedes the spawn of the child by a moment.
             let mut pid = 0;
             for _ in 0..100 {
-                pid = client.active_task_table().read().await[id].child_pid.load(Ordering::Acquire);
+                pid = client.active_task_table().read().await[id]
+                    .child_pid
+                    .load(Ordering::Acquire);
                 if pid != 0 {
                     break;
                 }
@@ -3135,17 +3193,28 @@ mod tests {
             pids.push(pid);
         }
 
-        let cancelled = client.cancel_all_active_tasks("test: connection lost").await;
+        let cancelled = client
+            .cancel_all_active_tasks("test: connection lost")
+            .await;
         assert_eq!(cancelled, 2);
         assert!(client.active_task_table().read().await.is_empty());
-        assert_eq!(client.concurrency_semaphore().available_permits(), 2, "permits released");
+        assert_eq!(
+            client.concurrency_semaphore().available_permits(),
+            2,
+            "permits released"
+        );
         assert_eq!(client.heartbeat_tracker().active_tasks(), 0);
         for pid in pids {
-            assert!(!process_alive(pid), "child {pid} of a cancelled task must be dead, not orphaned");
+            assert!(
+                !process_alive(pid),
+                "child {pid} of a cancelled task must be dead, not orphaned"
+            );
         }
         // Their results could only go to the dead session: nothing is sent.
         assert!(
-            tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
             "no result may be sent for a task the worker cancelled itself"
         );
         // And with nothing running the call is a cheap no-op.
@@ -3174,7 +3243,9 @@ mod tests {
         assert_eq!(client.cancel_all_active_tasks("test").await, 2);
         assert!(client.active_task_table().read().await.is_empty());
         assert_eq!(client.concurrency_semaphore().available_permits(), 1);
-        assert!(tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -3194,7 +3265,12 @@ mod tests {
         client.handle_assign_task(task.clone(), tx).await;
         loop {
             match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
-                Ok(Some(WorkerMessage::TaskResult { exit_code, stdout, error, .. })) => {
+                Ok(Some(WorkerMessage::TaskResult {
+                    exit_code,
+                    stdout,
+                    error,
+                    ..
+                })) => {
                     assert_eq!(
                         exit_code, 0,
                         "a stale sandbox directory must not turn into a terminal task failure: {error:?}"
@@ -3297,7 +3373,10 @@ mod tests {
         let mut lane = spawn_lane(1024);
         let worker_id = Uuid::new_v4();
         // `big` blocks mid-write on the tiny pipe (nobody reads yet); `small` waits behind it.
-        lane.data_tx.send(big_result(worker_id, 200_000)).await.unwrap();
+        lane.data_tx
+            .send(big_result(worker_id, 200_000))
+            .await
+            .unwrap();
         lane.data_tx.send(big_result(worker_id, 10)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
         // A heartbeat that arrives while `big` is on the wire ...
@@ -3315,11 +3394,14 @@ mod tests {
         // ... goes out right after it, ahead of the data message that was queued earlier.
         let mut order = Vec::new();
         for _ in 0..3 {
-            let msg = tokio::time::timeout(Duration::from_secs(5), lane.peer.recv_msg::<WorkerMessage>())
-                .await
-                .expect("frame in time")
-                .unwrap()
-                .expect("frame");
+            let msg = tokio::time::timeout(
+                Duration::from_secs(5),
+                lane.peer.recv_msg::<WorkerMessage>(),
+            )
+            .await
+            .expect("frame in time")
+            .unwrap()
+            .expect("frame");
             order.push(match msg {
                 WorkerMessage::Heartbeat { .. } => "heartbeat".to_string(),
                 WorkerMessage::TaskResult { stdout, .. } => format!("result:{}", stdout.0.len()),
@@ -3334,7 +3416,10 @@ mod tests {
     async fn test_lane_writer_reports_a_write_failure() {
         let mut lane = spawn_lane(1024);
         // The peer vanished: the next write must surface as an event, not be silently dropped.
-        drop(std::mem::replace(&mut lane.peer, MessageReader::new(tokio::io::duplex(1).1)));
+        drop(std::mem::replace(
+            &mut lane.peer,
+            MessageReader::new(tokio::io::duplex(1).1),
+        ));
         lane.control_tx
             .send(WorkerMessage::Disconnecting {
                 worker_id: Uuid::new_v4(),
@@ -3344,7 +3429,10 @@ mod tests {
             .unwrap();
         match tokio::time::timeout(Duration::from_secs(2), lane.events_rx.recv()).await {
             Ok(Some(Inbound::Failed("test", _))) => {}
-            other => panic!("expected a write failure event, got {:?}", other.map(|o| o.is_some())),
+            other => panic!(
+                "expected a write failure event, got {:?}",
+                other.map(|o| o.is_some())
+            ),
         }
         lane.task.await.unwrap();
     }
@@ -3364,7 +3452,12 @@ mod tests {
         // Data queued after the close request is not started.
         let _ = lane.data_tx.try_send(big_result(worker_id, 10));
 
-        let msg = lane.peer.recv_msg::<WorkerMessage>().await.unwrap().unwrap();
+        let msg = lane
+            .peer
+            .recv_msg::<WorkerMessage>()
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(msg, WorkerMessage::Disconnecting { .. }));
         tokio::time::timeout(Duration::from_secs(2), lane.task)
             .await
@@ -3394,7 +3487,11 @@ mod tests {
 
         let master = tokio::spawn(async move {
             let mut master_transport = MessageTransport::new(master_io);
-            let msg = master_transport.recv_msg::<WorkerMessage>().await.unwrap().unwrap();
+            let msg = master_transport
+                .recv_msg::<WorkerMessage>()
+                .await
+                .unwrap()
+                .unwrap();
             master_transport
                 .send_msg(&MasterMessage::RegisterAck {
                     accepted: true,
@@ -3410,7 +3507,10 @@ mod tests {
         });
 
         let mut transport = MessageTransport::new(client_io);
-        client.perform_handshake(&mut transport).await.expect("handshake");
+        client
+            .perform_handshake(&mut transport)
+            .await
+            .expect("handshake");
         match master.await.unwrap() {
             WorkerMessage::Register { capabilities, .. } => {
                 let mobile = capabilities.mobile.expect("mobile state in Register");
@@ -3519,7 +3619,10 @@ mod tests {
             is_charging: Some(true),
             thermal_throttled: false,
         });
-        assert_eq!(client.mobile_telemetry().live_status().unwrap().battery_pct, Some(33));
+        assert_eq!(
+            client.mobile_telemetry().live_status().unwrap().battery_pct,
+            Some(33)
+        );
         assert!(client.mobile_fed_externally);
     }
 
@@ -3534,8 +3637,10 @@ mod tests {
         assert_ne!(a, b);
 
         // With a file: the same id across "restarts".
-        let first = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_worker_id_file(&path));
-        let second = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_worker_id_file(&path));
+        let first =
+            WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_worker_id_file(&path));
+        let second =
+            WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_worker_id_file(&path));
         assert_eq!(first.worker_id(), second.worker_id());
         assert_eq!(
             std::fs::read_to_string(&path).unwrap().trim(),
@@ -3564,13 +3669,20 @@ mod tests {
         let path = blocker.join("worker_id");
         let a = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_worker_id_file(&path));
         let b = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_worker_id_file(&path));
-        assert_ne!(a.worker_id(), b.worker_id(), "no persistence, but the worker still starts");
+        assert_ne!(
+            a.worker_id(),
+            b.worker_id(),
+            "no persistence, but the worker still starts"
+        );
     }
 
     #[test]
     fn test_dead_peer_timeout_scales_with_the_heartbeat_interval() {
         let client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999"));
-        assert_eq!(client.dead_peer_timeout(Duration::from_secs(3)), Duration::from_secs(12));
+        assert_eq!(
+            client.dead_peer_timeout(Duration::from_secs(3)),
+            Duration::from_secs(12)
+        );
         assert_eq!(
             client.dead_peer_timeout(Duration::from_millis(100)),
             MIN_DEAD_PEER_TIMEOUT,
@@ -3579,7 +3691,10 @@ mod tests {
         let tuned = WorkerClient::new(
             WorkerConfig::new("127.0.0.1:9999").with_dead_peer_timeout(Duration::from_millis(700)),
         );
-        assert_eq!(tuned.dead_peer_timeout(Duration::from_secs(3)), Duration::from_millis(700));
+        assert_eq!(
+            tuned.dead_peer_timeout(Duration::from_secs(3)),
+            Duration::from_millis(700)
+        );
     }
 
     #[cfg(feature = "p2p")]
@@ -3614,8 +3729,14 @@ mod tests {
             .expect("an unusable sandbox directory must end run() at once, not loop");
         match result {
             Err(GridError::Config(msg)) => {
-                assert!(msg.contains("not writable") && msg.contains("blocker"), "{msg}");
-                assert!(msg.contains("--sandbox-base-dir"), "the fix must be in the message: {msg}");
+                assert!(
+                    msg.contains("not writable") && msg.contains("blocker"),
+                    "{msg}"
+                );
+                assert!(
+                    msg.contains("--sandbox-base-dir"),
+                    "the fix must be in the message: {msg}"
+                );
             }
             other => panic!("expected a Config error, got {other:?}"),
         }
@@ -3642,7 +3763,9 @@ mod tests {
         let named = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_cores(6));
         assert_eq!(named.concurrency_semaphore().available_permits(), 6);
         let limited = WorkerClient::new(
-            WorkerConfig::new("127.0.0.1:9999").with_cores(6).with_max_concurrency(2),
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_cores(6)
+                .with_max_concurrency(2),
         );
         assert_eq!(limited.concurrency_semaphore().available_permits(), 2);
         let all = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_max_concurrency(64));
@@ -3654,7 +3777,10 @@ mod tests {
         let client = WorkerClient::new(
             WorkerConfig::new("127.0.0.1:9999").with_process_priority(ProcessPriority::Idle),
         );
-        assert_eq!(client.runner().config().process_priority, ProcessPriority::Idle);
+        assert_eq!(
+            client.runner().config().process_priority,
+            ProcessPriority::Idle
+        );
     }
 
     // ------------------------------------------------------------------------------------------
@@ -3738,7 +3864,11 @@ mod tests {
             "auto",
         ] {
             let b = beacon(cluster, "http://10.1.2.3:8080");
-            assert_eq!(portal_master_from_beacon(&b, visitor), None, "cluster {cluster:?}");
+            assert_eq!(
+                portal_master_from_beacon(&b, visitor),
+                None,
+                "cluster {cluster:?}"
+            );
         }
     }
 
@@ -3751,14 +3881,18 @@ mod tests {
             "http://10.0.0.5';alert(1);//",
         ] {
             let response = portal_redirect_response(hostile, "10.0.0.5:8088\r\nX-Evil: 1");
-            assert!(response.starts_with("HTTP/1.1 200 OK"), "falls back to the standby page: {hostile:?}");
+            assert!(
+                response.starts_with("HTTP/1.1 200 OK"),
+                "falls back to the standby page: {hostile:?}"
+            );
             assert!(!response.contains("Set-Cookie"));
             assert!(!response.contains("X-Evil"));
             assert!(!response.contains("alert(document.cookie)"));
             assert!(!response.contains("Location:"));
         }
         // A valid origin with a hostile cluster address: still redirected, header omitted.
-        let response = portal_redirect_response("http://10.0.0.5:8080", "10.0.0.5:8088\r\nX-Evil: 1");
+        let response =
+            portal_redirect_response("http://10.0.0.5:8080", "10.0.0.5:8088\r\nX-Evil: 1");
         assert!(response.starts_with("HTTP/1.1 307 Temporary Redirect"));
         assert!(response.contains("Location: http://10.0.0.5:8080\r\n"));
         assert!(!response.contains("X-Evil"));
@@ -3771,23 +3905,37 @@ mod tests {
     #[test]
     fn test_portal_has_no_hard_coded_hosts_and_no_cors_wildcard() {
         let standby = portal_standby_response();
-        assert!(!standby.contains("192.168."), "the standby page must not probe fixed hosts");
-        assert!(standby.contains("fetch('/api/status'"), "it asks its own origin instead");
+        assert!(
+            !standby.contains("192.168."),
+            "the standby page must not probe fixed hosts"
+        );
+        assert!(
+            standby.contains("fetch('/api/status'"),
+            "it asks its own origin instead"
+        );
         assert!(standby.contains("probeCluster()"));
-        assert!(!standby.to_ascii_lowercase().contains("access-control-allow-origin"));
+        assert!(!standby
+            .to_ascii_lowercase()
+            .contains("access-control-allow-origin"));
 
         let status = portal_status_response(None);
         assert!(!status.contains("192.168."));
         assert!(!status.contains("candidate_nodes"));
         assert!(status.contains("\"status\":\"searching_master\""));
-        let status = portal_status_response(Some(&("http://10.1.2.3:8080".into(), "10.1.2.3:8088".into())));
+        let status = portal_status_response(Some(&(
+            "http://10.1.2.3:8080".into(),
+            "10.1.2.3:8088".into(),
+        )));
         assert!(status.contains("\"redirect_url\":\"http://10.1.2.3:8080\""));
 
         // The source of the portal itself carries no site-specific address either.
         let source = include_str!("client.rs");
         let code = source.split("#[cfg(test)]").next().unwrap();
         assert!(
-            !code.lines().filter(|l| !l.trim_start().starts_with("//")).any(|l| l.contains("192.168.1.")),
+            !code
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains("192.168.1.")),
             "client.rs must not hard-code LAN hosts"
         );
     }
@@ -3809,7 +3957,13 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        tokio::spawn(run_portal(listener, target, None, shutdown_rx, max_connections));
+        tokio::spawn(run_portal(
+            listener,
+            target,
+            None,
+            shutdown_rx,
+            max_connections,
+        ));
         (addr, shutdown_tx)
     }
 
@@ -3853,12 +4007,25 @@ mod tests {
         let state = Arc::new(RwLock::new(Some(beacon("10.1.2.3:8088", ""))));
         let (addr, shutdown) = portal_fixture(PortalTarget::Dynamic(Arc::clone(&state)), 8).await;
         let response = portal_get(addr, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{}", &response[..response.len().min(60)]);
-        assert!(!response.contains("Location:"), "no redirect to a guessed address");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "{}",
+            &response[..response.len().min(60)]
+        );
+        assert!(
+            !response.contains("Location:"),
+            "no redirect to a guessed address"
+        );
         // The status API still names the master that is being followed.
         let status = portal_get(addr, b"GET /api/status HTTP/1.1\r\nHost: x\r\n\r\n").await;
-        assert!(status.contains("\"status\":\"connected_to_master\""), "{status}");
-        assert!(status.contains("\"master_cluster_addr\":\"10.1.2.3:8088\""), "{status}");
+        assert!(
+            status.contains("\"status\":\"connected_to_master\""),
+            "{status}"
+        );
+        assert!(
+            status.contains("\"master_cluster_addr\":\"10.1.2.3:8088\""),
+            "{status}"
+        );
         assert!(status.contains("\"redirect_url\":null"), "{status}");
         let _ = shutdown.send(true);
     }
@@ -3871,7 +4038,11 @@ mod tests {
         request.extend_from_slice(&[b'a'; 6000]);
         request.extend_from_slice(b"\r\n\r\n");
         let response = portal_get(addr, &request).await;
-        assert!(response.starts_with("HTTP/1.1 307 Temporary Redirect"), "{}", &response[..response.len().min(80)]);
+        assert!(
+            response.starts_with("HTTP/1.1 307 Temporary Redirect"),
+            "{}",
+            &response[..response.len().min(80)]
+        );
         assert!(response.contains("Location: http://10.1.2.3:8080"));
         let _ = shutdown.send(true);
     }
@@ -3891,8 +4062,14 @@ mod tests {
         });
         client.write_all(b"GET /api/sta").await.unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
-        client.write_all(b"tus HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
-        assert_eq!(reader.await.unwrap().as_deref(), Some("GET /api/status HTTP/1.1"));
+        client
+            .write_all(b"tus HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.await.unwrap().as_deref(),
+            Some("GET /api/status HTTP/1.1")
+        );
     }
 
     #[tokio::test]

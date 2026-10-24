@@ -1,7 +1,7 @@
 //! Adversarial State Isolation & Environment Protection Verification Suite for Milestone 4.
 //!
 //! Authored by M4 Challenger 1 to empirically verify:
-//! 1. Host Immutability: C:\Users\Admin\.oxideswarm is never touched by any test.
+//! 1. Host Immutability: the developer's real `~/.oxideswarm` is never touched by any test.
 //! 2. Path Resolution Adversarial Behavior:
 //!    - When `OXIDESWARM_HOME` is empty (`""`), all resolvers fall back to default user profile without panics.
 //!    - When `OXIDESWARM_HOME` is unset, all resolvers fall back to default user profile without panics.
@@ -13,8 +13,8 @@
 //!      - `default_worker_id_path(Some("worker-1"))` resolves to `<temp_dir>\worker_id.worker-1`
 //! 3. Master 0-Config P2P Default Key Persistence:
 //!    - Spawning a Master with P2P enabled and NO explicit key file creates `master_key.bin` in `<temp_dir>`
-//!    - The generated key is exactly 32 bytes and deterministic across restarts
-//!    - Host `C:\Users\Admin\.oxideswarm` remains 100% untouched and identical in metadata and contents.
+//!    - The generated key is exactly 32 bytes and gives the same P2P endpoint id across restarts
+//!    - The real `~/.oxideswarm` remains untouched and identical in metadata and contents.
 //! 4. Worker Identity File Environment Precedence:
 //!    - `RUSTY_GRID_WORKER_ID_FILE` takes precedence over `OXIDESWARM_HOME`
 //!    - Empty `RUSTY_GRID_WORKER_ID_FILE` falls back cleanly to `OXIDESWARM_HOME`
@@ -121,14 +121,16 @@ fn test_adversarial_empty_oxideswarm_home_fallback() {
     );
 
     // 3. ClusterSecret::default_path
-    let secret = ClusterSecret::default_path().expect("ClusterSecret::default_path should not be None");
+    let secret =
+        ClusterSecret::default_path().expect("ClusterSecret::default_path should not be None");
     assert_eq!(
         secret, expected_secret,
         "ClusterSecret::default_path must fall back to default profile on empty OXIDESWARM_HOME"
     );
 
     // 4. default_worker_id_path(None)
-    let worker_id = default_worker_id_path(None).expect("default_worker_id_path(None) should not be None");
+    let worker_id =
+        default_worker_id_path(None).expect("default_worker_id_path(None) should not be None");
     assert_eq!(
         worker_id, expected_worker_id,
         "default_worker_id_path(None) must fall back to default profile on empty OXIDESWARM_HOME"
@@ -176,7 +178,10 @@ fn test_adversarial_isolated_temp_dir_resolution() {
 
     // 1. default_oxideswarm_dir must resolve to <temp_dir>
     let dir = default_oxideswarm_dir().expect("must resolve oxideswarm dir");
-    assert_eq!(dir, sandbox_path, "default_oxideswarm_dir must match temp_dir exactly");
+    assert_eq!(
+        dir, sandbox_path,
+        "default_oxideswarm_dir must match temp_dir exactly"
+    );
 
     // 2. default_master_key_file must resolve to <temp_dir>\master_key.bin
     let key = default_master_key_file().expect("must resolve master key");
@@ -191,7 +196,8 @@ fn test_adversarial_isolated_temp_dir_resolution() {
     assert_eq!(worker_id, sandbox_path.join("worker_id"));
 
     // 5. default_worker_id_path(Some("bench-worker"))
-    let worker_id_named = default_worker_id_path(Some("bench-worker")).expect("must resolve named worker id");
+    let worker_id_named =
+        default_worker_id_path(Some("bench-worker")).expect("must resolve named worker id");
     assert_eq!(worker_id_named, sandbox_path.join("worker_id.bench-worker"));
 }
 
@@ -229,7 +235,12 @@ async fn test_master_p2p_default_key_creates_isolated_key_without_host_mutation(
     let host_oxideswarm = get_expected_default_dir();
     let host_master_key = host_oxideswarm.join("master_key.bin");
     let host_pre_mtime = if host_master_key.exists() {
-        Some(std::fs::metadata(&host_master_key).unwrap().modified().unwrap())
+        Some(
+            std::fs::metadata(&host_master_key)
+                .unwrap()
+                .modified()
+                .unwrap(),
+        )
     } else {
         None
     };
@@ -289,16 +300,30 @@ async fn test_master_p2p_default_key_creates_isolated_key_without_host_mutation(
     let ticket2 = tokio::fs::read_to_string(&ticket_file2)
         .await
         .expect("read ticket 2");
+    // Compare the endpoint id, which comes from the persisted key. The rest of the ticket is the
+    // address list: the home relay when one is reachable, otherwise direct addresses whose UDP
+    // port changes on every start, so whole tickets only match on a machine with Internet access.
+    let endpoint_id = |ticket: &str| {
+        let parsed: serde_json::Value = serde_json::from_str(ticket).expect("ticket is JSON");
+        parsed["id"]
+            .as_str()
+            .expect("ticket has an endpoint id")
+            .to_string()
+    };
     assert_eq!(
-        ticket1, ticket2,
-        "P2P ticket must be identical across restarts using persistent sandboxed key"
+        endpoint_id(&ticket1),
+        endpoint_id(&ticket2),
+        "P2P endpoint id must be identical across restarts using persistent sandboxed key"
     );
 
     master2.shutdown().expect("shutdown master 2");
 
     // Critical: Verify host ~/.oxideswarm was NOT touched at all
     if let Some(pre_mtime) = host_pre_mtime {
-        let post_mtime = std::fs::metadata(&host_master_key).unwrap().modified().unwrap();
+        let post_mtime = std::fs::metadata(&host_master_key)
+            .unwrap()
+            .modified()
+            .unwrap();
         assert_eq!(
             pre_mtime, post_mtime,
             "CRITICAL: Host ~/.oxideswarm/master_key.bin was modified during isolated test!"

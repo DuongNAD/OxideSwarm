@@ -142,9 +142,10 @@ impl AeadWriterSession {
     /// `[0x04][seq: 8 bytes BE][ciphertext][16-byte Poly1305 tag]`
     pub fn encrypt_frame(&mut self, plaintext: &[u8]) -> Result<Bytes, ProtocolError> {
         let seq = self.seq;
-        self.seq = self.seq.checked_add(1).ok_or_else(|| {
-            ProtocolError::Violation("AEAD sequence counter overflow".into())
-        })?;
+        self.seq = self
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| ProtocolError::Violation("AEAD sequence counter overflow".into()))?;
 
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[4..12].copy_from_slice(&seq.to_be_bytes());
@@ -243,9 +244,10 @@ impl AeadReaderSession {
             })?;
 
         let plaintext = Bytes::copy_from_slice(plaintext_slice);
-        self.expected_seq = self.expected_seq.checked_add(1).ok_or_else(|| {
-            ProtocolError::Violation("AEAD sequence counter overflow".into())
-        })?;
+        self.expected_seq = self
+            .expected_seq
+            .checked_add(1)
+            .ok_or_else(|| ProtocolError::Violation("AEAD sequence counter overflow".into()))?;
 
         Ok(plaintext)
     }
@@ -411,10 +413,7 @@ pub enum WorkerMessage {
         thermal_throttled: bool,
     },
     /// Forward-compatible fallback variant for unrecognized messages from future protocol versions.
-    UnknownVariant {
-        tag: u32,
-        raw_bytes: Vec<u8>,
-    },
+    UnknownVariant { tag: u32, raw_bytes: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1082,7 +1081,6 @@ impl WorkerMessage {
     }
 }
 
-
 impl From<TaskResult> for WorkerMessage {
     fn from(r: TaskResult) -> Self {
         WorkerMessage::TaskResult {
@@ -1132,10 +1130,7 @@ pub enum MasterMessage {
         grace_period_secs: Option<u64>,
     },
     /// Forward-compatible fallback variant for unrecognized messages from future protocol versions.
-    UnknownVariant {
-        tag: u32,
-        raw_bytes: Vec<u8>,
-    },
+    UnknownVariant { tag: u32, raw_bytes: Vec<u8> },
 }
 
 /// Features a Master announces in the `message` of an accepted `RegisterAck`
@@ -1550,7 +1545,6 @@ impl MasterMessage {
         }
     }
 }
-
 
 /// Messages sent from CLI client (or external RPC) to the Master node.
 #[derive(Debug, Clone, PartialEq)]
@@ -2220,7 +2214,8 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
                     let slice = &bytes[1..];
                     // Fallback for WorkerMessage (legacy or unknown variant)
                     if std::any::TypeId::of::<M>() == std::any::TypeId::of::<WorkerMessage>() {
-                        if let Ok(legacy) = bincode::deserialize::<LegacyBinaryWorkerMessage>(slice) {
+                        if let Ok(legacy) = bincode::deserialize::<LegacyBinaryWorkerMessage>(slice)
+                        {
                             let msg: WorkerMessage = legacy.into();
                             let boxed: Box<dyn std::any::Any> = Box::new(msg);
                             if let Ok(m) = boxed.downcast::<M>() {
@@ -2244,7 +2239,8 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
 
                     // Fallback for MasterMessage (legacy or unknown variant)
                     if std::any::TypeId::of::<M>() == std::any::TypeId::of::<MasterMessage>() {
-                        if let Ok(legacy) = bincode::deserialize::<LegacyBinaryMasterMessage>(slice) {
+                        if let Ok(legacy) = bincode::deserialize::<LegacyBinaryMasterMessage>(slice)
+                        {
                             let msg: MasterMessage = legacy.into();
                             let boxed: Box<dyn std::any::Any> = Box::new(msg);
                             if let Ok(m) = boxed.downcast::<M>() {
@@ -2276,7 +2272,9 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
 
                         // 1. Try modern WorkerMessage: verify exact byte consumption AND worker registration invariant
                         let mut cursor_w = std::io::Cursor::new(slice);
-                        if let Ok(w) = slice_opts.deserialize_from::<_, WorkerMessage>(&mut cursor_w) {
+                        if let Ok(w) =
+                            slice_opts.deserialize_from::<_, WorkerMessage>(&mut cursor_w)
+                        {
                             let matches_size = cursor_w.position() as usize == slice.len();
                             let is_initial_worker_msg = matches!(w, WorkerMessage::Register { .. });
                             if matches_size && is_initial_worker_msg {
@@ -2289,7 +2287,9 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
                         }
                         // 2. Try ClientMessage: verify exact byte consumption
                         let mut cursor_c = std::io::Cursor::new(slice);
-                        if let Ok(c) = slice_opts.deserialize_from::<_, ClientMessage>(&mut cursor_c) {
+                        if let Ok(c) =
+                            slice_opts.deserialize_from::<_, ClientMessage>(&mut cursor_c)
+                        {
                             if cursor_c.position() as usize == slice.len() {
                                 let inbound = InboundMessage::Client(c);
                                 let boxed: Box<dyn std::any::Any> = Box::new(inbound);
@@ -2300,7 +2300,9 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
                         }
                         // 3. Fallback: if WorkerMessage consumed all bytes without Register requirement
                         let mut cursor_w2 = std::io::Cursor::new(slice);
-                        if let Ok(w) = slice_opts.deserialize_from::<_, WorkerMessage>(&mut cursor_w2) {
+                        if let Ok(w) =
+                            slice_opts.deserialize_from::<_, WorkerMessage>(&mut cursor_w2)
+                        {
                             if cursor_w2.position() as usize == slice.len() {
                                 let inbound = InboundMessage::Worker(w);
                                 let boxed: Box<dyn std::any::Any> = Box::new(inbound);
@@ -2929,7 +2931,10 @@ mod tests {
                     tags: vec!["test".into()],
                     latest_checkpoint: None,
                 },
-                latest_checkpoint: Some(CheckpointData::new(5, TaskBytes::copy_from_slice(b"checkpoint-state"))),
+                latest_checkpoint: Some(CheckpointData::new(
+                    5,
+                    TaskBytes::copy_from_slice(b"checkpoint-state"),
+                )),
             },
             MasterMessage::CancelTask {
                 task_id,
@@ -3546,7 +3551,10 @@ mod tests {
         peer.write_all(&both).await.unwrap();
 
         let mut transport = MessageTransport::new(ours);
-        assert_eq!(transport.recv_msg::<MasterMessage>().await.unwrap(), Some(ack));
+        assert_eq!(
+            transport.recv_msg::<MasterMessage>().await.unwrap(),
+            Some(ack)
+        );
 
         // The peer sends nothing more. The second frame is already in the buffer.
         let (_writer, mut reader) = transport.split();
@@ -3583,13 +3591,19 @@ mod tests {
 
         let message = announcement(SUPPORTED);
         assert!(announced(Some(&message), MOBILE_TELEMETRY));
-        assert!(announced(Some("features=other, mobile-telemetry"), MOBILE_TELEMETRY));
+        assert!(announced(
+            Some("features=other, mobile-telemetry"),
+            MOBILE_TELEMETRY
+        ));
         // A master built before the announcement sends no message on an accepted ack.
         assert!(!announced(None, MOBILE_TELEMETRY));
         assert!(!announced(Some(""), MOBILE_TELEMETRY));
         // Not a feature list, or a different one: nothing is assumed.
         assert!(!announced(Some("mobile-telemetry"), MOBILE_TELEMETRY));
-        assert!(!announced(Some("features=mobile-telemetry-v2"), MOBILE_TELEMETRY));
+        assert!(!announced(
+            Some("features=mobile-telemetry-v2"),
+            MOBILE_TELEMETRY
+        ));
         assert!(!announced(Some("features="), MOBILE_TELEMETRY));
 
         // The announcement is just the `message` of an accepted RegisterAck: both codecs carry it.

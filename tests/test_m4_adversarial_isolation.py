@@ -3,7 +3,9 @@ Milestone 4 Adversarial State Isolation & Environment Protection Harness.
 Authored by M4 Challenger 1.
 
 Verifies:
-1. Complete immutability of host C:\\Users\\Admin\\.oxideswarm (LastWriteTime, size, hash, file count).
+1. The developer's real OxideSwarm state directory (`OXIDESWARM_HOME`, else `~/.oxideswarm`) is
+   left untouched: same file list, sizes and modification times. File contents are never read,
+   because that directory holds the real cluster.secret.
 2. Direct execution and validation of Rust test `m4_challenger_1_state_isolation`:
    - Empty string fallback for all 4 default path resolvers.
    - Unset fallback for all 4 resolvers.
@@ -11,42 +13,38 @@ Verifies:
    - Worker ID file env var precedence.
    - Master P2P 0-config key persistence in isolated sandbox without touching host state.
 3. Subprocess CLI validation:
-   - Invoking oxideswarm / rusty-grid with OXIDESWARM_HOME=<isolated_sandbox>
-   - Ensuring no state leaks to host ~/.oxideswarm.
+   - Invoking rusty-grid with OXIDESWARM_HOME=<isolated_sandbox>
+   - Ensuring no state leaks to the real state directory.
 """
 
-import hashlib
-import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-HOST_OXIDESWARM_DIR = r"C:\Users\Admin\.oxideswarm"
+HOST_OXIDESWARM_DIR = os.environ.get("OXIDESWARM_HOME") or os.path.join(
+    os.path.expanduser("~"), ".oxideswarm"
+)
+BINARY_NAME = "rusty-grid.exe" if os.name == "nt" else "rusty-grid"
 
 
 def get_dir_state(path):
+    """Metadata snapshot of `path`; contents are not read (the directory holds the real secret)."""
     if not os.path.exists(path):
         return {"exists": False}
-    stat = os.stat(path)
     files = {}
     for root, _, filenames in os.walk(path):
         for f in filenames:
             fpath = os.path.join(root, f)
-            rel = os.path.relpath(fpath, path)
             fstat = os.stat(fpath)
-            with open(fpath, "rb") as fp:
-                content_hash = hashlib.sha256(fp.read()).hexdigest()
-            files[rel] = {
+            files[os.path.relpath(fpath, path)] = {
                 "size": fstat.st_size,
-                "mtime": fstat.st_mtime,
-                "sha256": content_hash,
+                "mtime_ns": fstat.st_mtime_ns,
             }
     return {
         "exists": True,
-        "mtime": stat.st_mtime,
+        "mtime_ns": os.stat(path).st_mtime_ns,
         "files": files,
     }
 
@@ -62,7 +60,7 @@ class TestMilestone4StateIsolation(unittest.TestCase):
         self.assertEqual(
             self.initial_host_state,
             current_state,
-            "CRITICAL: Host C:\\Users\\Admin\\.oxideswarm state was modified during test!",
+            f"CRITICAL: the real state directory {HOST_OXIDESWARM_DIR} was modified during the test!",
         )
 
     def test_01_rust_state_isolation_test_suite(self):
@@ -98,15 +96,21 @@ class TestMilestone4StateIsolation(unittest.TestCase):
             env.pop("RUSTY_GRID_WORKER_ID_FILE", None)
 
             # Build or locate target binary
-            bin_path = os.path.join(self.repo_root, "target", "debug", "rusty-grid.exe")
+            bin_path = os.path.join(self.repo_root, "target", "debug", BINARY_NAME)
             if not os.path.exists(bin_path):
                 # Build binary if not already compiled
-                subprocess.run(["cargo", "build", "-p", "rusty_grid_cli", "--bin", "rusty-grid"], cwd=self.repo_root, check=True)
+                subprocess.run(
+                    ["cargo", "build", "-p", "rusty_grid_cli", "--bin", "rusty-grid"],
+                    cwd=self.repo_root,
+                    check=True,
+                )
 
             self.assertTrue(os.path.exists(bin_path), f"Binary not found: {bin_path}")
 
             # Run rusty-grid --help to verify clean execution under isolated OXIDESWARM_HOME
-            proc = subprocess.run([bin_path, "--help"], env=env, cwd=self.repo_root, capture_output=True, text=True)
+            proc = subprocess.run(
+                [bin_path, "--help"], env=env, cwd=self.repo_root, capture_output=True, text=True
+            )
             self.assertEqual(proc.returncode, 0, f"rusty-grid --help failed: {proc.stderr}")
 
             # Verify no host mutation

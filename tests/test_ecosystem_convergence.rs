@@ -173,7 +173,10 @@ async fn test_convergence_rust_agent_gpu_compute() {
             assert!(execution_duration_ms > 0);
             assert!(payload.is_some());
             let p = payload.unwrap();
-            assert_eq!(p.get("is_gpu_executed").and_then(|v| v.as_bool()), Some(true));
+            assert_eq!(
+                p.get("is_gpu_executed").and_then(|v| v.as_bool()),
+                Some(true)
+            );
         }
         other => panic!("Expected CommandResponse, got {:?}", other),
     }
@@ -277,7 +280,10 @@ async fn test_convergence_python_agent_node_compute() {
             if !out.status.success() {
                 println!("Python STDERR: {}", stderr_str);
             }
-            assert!(out.status.success(), "Python agent node exited with failure");
+            assert!(
+                out.status.success(),
+                "Python agent node exited with failure"
+            );
             assert!(
                 stdout_str.contains("\"status\": \"success\"") || stdout_str.contains("success"),
                 "Expected success status in Python output"
@@ -329,7 +335,12 @@ async fn test_convergence_cluster_status_query() {
             assert!(val.get("workers").is_some());
             let workers = val["workers"].as_array().expect("workers array");
             assert!(workers.len() >= 2);
-            assert!(val.get("active_workers").and_then(|v| v.as_u64()).unwrap_or(0) >= 2);
+            assert!(
+                val.get("active_workers")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    >= 2
+            );
             assert!(val.get("queue").is_some());
         }
         other => panic!("Expected CommandResponse, got {:?}", other),
@@ -350,7 +361,11 @@ async fn test_convergence_multi_agent_burst_stress() {
     let mut clients = Vec::new();
     for i in 1..=5 {
         let node_id = format!("agent-burst-{}", i);
-        let client = Arc::new(AgentMeshClient::new(&cluster.hub_url, &node_id, "rust-burst"));
+        let client = Arc::new(AgentMeshClient::new(
+            &cluster.hub_url,
+            &node_id,
+            "rust-burst",
+        ));
         client.connect().await.expect("burst client connect failed");
         clients.push(client);
     }
@@ -408,12 +423,23 @@ async fn test_convergence_error_propagation_and_timeout() {
     client.connect().await.expect("client connect failed");
 
     let res = client
-        .send_command("grid", "grid_invalid_opcode_xyz", serde_json::json!({}), Some(5000))
+        .send_command(
+            "grid",
+            "grid_invalid_opcode_xyz",
+            serde_json::json!({}),
+            Some(5000),
+        )
         .await
         .expect("send_command failed");
 
     match res {
-        AgentMeshEnvelope::CommandResponse { status, exit_code, error, stderr, .. } => {
+        AgentMeshEnvelope::CommandResponse {
+            status,
+            exit_code,
+            error,
+            stderr,
+            ..
+        } => {
             assert_eq!(status, "failed");
             assert_ne!(exit_code, 0);
             assert!(
@@ -434,7 +460,13 @@ async fn test_convergence_error_propagation_and_timeout() {
         .expect("submit_grid_status failed");
 
     match not_found_res {
-        AgentMeshEnvelope::CommandResponse { status, exit_code, stderr, error, .. } => {
+        AgentMeshEnvelope::CommandResponse {
+            status,
+            exit_code,
+            stderr,
+            error,
+            ..
+        } => {
             assert_eq!(status, "failed");
             assert_ne!(exit_code, 0);
             assert!(
@@ -457,7 +489,10 @@ async fn test_convergence_error_propagation_and_timeout() {
     let unattached_url = format!("ws://127.0.0.1:{}/ws", port);
 
     let client_unattached = AgentMeshClient::new(&unattached_url, "agent-unattached", "test-rt");
-    client_unattached.connect().await.expect("connect unattached");
+    client_unattached
+        .connect()
+        .await
+        .expect("connect unattached");
 
     let nack_res = client_unattached
         .submit_grid_compute("matrix_multiply", 32, Some(5000))
@@ -465,7 +500,9 @@ async fn test_convergence_error_propagation_and_timeout() {
         .expect("submit_grid_compute should resolve with NACK");
 
     match nack_res {
-        AgentMeshEnvelope::DeliveryNack { error_code, reason, .. } => {
+        AgentMeshEnvelope::DeliveryNack {
+            error_code, reason, ..
+        } => {
             assert_eq!(error_code, "ERR_BRIDGE_NOT_CONFIGURED");
             assert!(reason.contains("AgentGridBridge is not attached"));
         }

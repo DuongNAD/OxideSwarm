@@ -80,8 +80,17 @@ object OxideWorkerBridge : WorkerEngine {
         activeListener = listener
         listener.onStateChanged(WorkerState.STARTING, "Initializing Rust Tokio runtime in-process...")
 
-        if (!config.clusterSecret.isNullOrBlank()) {
-            setClusterSecret(config.clusterSecret)
+        // Always hand the secret over: a blank one clears a secret left from an earlier start in
+        // this process, and one the library rejects stops the start instead of letting the worker
+        // connect without it.
+        val secret = config.clusterSecret?.trim().orEmpty()
+        if (secret.isEmpty()) {
+            setClusterSecret("")
+        } else if (!setClusterSecret(secret)) {
+            val status = startFailureReason()
+            val reason = if (status.startsWith("ERROR")) status else "Cluster secret could not be set"
+            listener.onStateChanged(WorkerState.ERROR, reason)
+            return false
         }
 
         return try {

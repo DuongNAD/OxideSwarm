@@ -92,7 +92,12 @@ fn tree_listing(root: &Path) -> Vec<String> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            out.push(path.strip_prefix(root).unwrap_or(&path).display().to_string());
+            out.push(
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+            );
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 walk(&path, root, out);
             }
@@ -137,7 +142,11 @@ async fn test_adversarial_path_traversal_rust_compilation_source_files() {
         // existed (it may, legitimately, on the host) and require that nothing changed.
         let absolute_target = Path::new(hostile_path).is_absolute().then(|| {
             let target = Path::new(hostile_path);
-            (target, target.exists(), std::fs::metadata(target).ok().map(|m| m.len()))
+            (
+                target,
+                target.exists(),
+                std::fs::metadata(target).ok().map(|m| m.len()),
+            )
         });
 
         let mut sources = HashMap::new();
@@ -163,7 +172,10 @@ async fn test_adversarial_path_traversal_rust_compilation_source_files() {
             "Hostile path '{}' must emit EXIT_CODE_GENERAL_ERROR",
             hostile_path
         );
-        let error = res.error.clone().expect("hostile path must have an error message");
+        let error = res
+            .error
+            .clone()
+            .expect("hostile path must have an error message");
 
         // It must have been refused when the source was materialized: not by rustc, not by an
         // unrelated failure (missing compiler, ...) that would also make the task fail.
@@ -197,7 +209,12 @@ async fn test_adversarial_path_traversal_rust_compilation_source_files() {
             hostile_path
         );
         if let Some((target, existed, len)) = absolute_target {
-            assert_eq!(target.exists(), existed, "'{}' was created or removed", hostile_path);
+            assert_eq!(
+                target.exists(),
+                existed,
+                "'{}' was created or removed",
+                hostile_path
+            );
             assert_eq!(
                 std::fs::metadata(target).ok().map(|m| m.len()),
                 len,
@@ -989,8 +1006,16 @@ async fn test_timeout_kills_grandchild_process() {
     let res = runner.execute_task(&task, None, None).await;
 
     assert_eq!(res.exit_code, EXIT_CODE_TIMEOUT);
-    assert_process_dies("background child", recorded_pid(&pids.path().join("child.pid")).await).await;
-    assert_process_dies("nested grandchild", recorded_pid(&pids.path().join("grandchild.pid")).await).await;
+    assert_process_dies(
+        "background child",
+        recorded_pid(&pids.path().join("child.pid")).await,
+    )
+    .await;
+    assert_process_dies(
+        "nested grandchild",
+        recorded_pid(&pids.path().join("grandchild.pid")).await,
+    )
+    .await;
 }
 
 #[cfg(unix)]
@@ -1025,7 +1050,11 @@ async fn test_cancel_kills_three_level_tree() {
             .expect("a result after the cancel")
             .expect("channel open")
         {
-            WorkerMessage::TaskResult { task_id: rid, exit_code, .. } if rid == task_id => {
+            WorkerMessage::TaskResult {
+                task_id: rid,
+                exit_code,
+                ..
+            } if rid == task_id => {
                 assert_eq!(exit_code, EXIT_CODE_CANCELLED);
                 break;
             }
@@ -1086,7 +1115,10 @@ async fn test_worker_shutdown_kills_all_running_trees() {
     }
 
     // What a session end / worker shutdown does.
-    assert_eq!(client.cancel_all_active_tasks("worker shutting down").await, 3);
+    assert_eq!(
+        client.cancel_all_active_tasks("worker shutting down").await,
+        3
+    );
 
     for pid in all {
         assert_process_dies("task descendant", pid).await;

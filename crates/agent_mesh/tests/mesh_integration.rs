@@ -9,9 +9,7 @@
 //! 6. Negative routing with DeliveryNack generation on missing target
 //! 7. REST Observability endpoints (/api/status, /api/nodes, /api/health)
 
-use agent_mesh::{
-    compute_sha256, verify_sha256, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub,
-};
+use agent_mesh::{compute_sha256, verify_sha256, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub};
 use std::time::Duration;
 
 #[tokio::test]
@@ -32,7 +30,10 @@ async fn test_three_node_simulation_and_routing() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // 3. Verify Active Directory Catalog
-    let nodes = node1.query_node_list(Some(3000)).await.expect("Catalog query failed");
+    let nodes = node1
+        .query_node_list(Some(3000))
+        .await
+        .expect("Catalog query failed");
     let node_ids: Vec<String> = nodes.iter().map(|n| n.node_id.clone()).collect();
     assert!(node_ids.contains(&"sim-win-1".to_string()));
     assert!(node_ids.contains(&"sim-mac-2".to_string()));
@@ -227,7 +228,12 @@ async fn test_negative_routing_delivery_nack() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let res = client
-        .send_command("ghost-node-404", "ping", serde_json::Value::Null, Some(2000))
+        .send_command(
+            "ghost-node-404",
+            "ping",
+            serde_json::Value::Null,
+            Some(2000),
+        )
         .await
         .expect("Command send should complete");
 

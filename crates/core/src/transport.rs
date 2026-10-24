@@ -194,7 +194,10 @@ pub struct P2pPathInfo {
 #[cfg(feature = "p2p")]
 pub fn inspect_connection_paths(conn: &iroh::endpoint::Connection) -> Option<P2pPathInfo> {
     let paths = conn.paths();
-    let selected = paths.iter().find(|p| p.is_selected()).or_else(|| paths.iter().next());
+    let selected = paths
+        .iter()
+        .find(|p| p.is_selected())
+        .or_else(|| paths.iter().next());
     selected.map(|p| {
         let rtt_ms = p.rtt().as_secs_f64() * 1000.0;
         let is_relay = p.is_relay();
@@ -217,8 +220,6 @@ pub fn inspect_connection_paths(conn: &iroh::endpoint::Connection) -> Option<P2p
         }
     })
 }
-
-
 
 #[cfg(test)]
 mod tests {
