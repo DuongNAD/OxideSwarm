@@ -11,9 +11,10 @@ with the rights of the account they were started under. Whoever can talk to the 
 valid peer can therefore run code on every worker, and whoever can impersonate the master can run code on
 every worker that follows it. OxideSwarm closes both doors with a **shared cluster secret**: a client or
 worker must prove it holds the secret before the master accepts anything from it, and the master must prove
-it holds the secret before a worker or client obeys or trusts it. The secret **authenticates**; it also derives
-session keys for **authenticated wire stream encryption (`0x04`)** via ChaCha20-Poly1305 over non-loopback TCP,
-while P2P/QUIC transport (`--p2p`) is secured via Iroh TLS.
+it holds the secret before a worker or client obeys or trusts it. The secret **authenticates** both sides
+(cluster authentication version 2, `crates/core/src/cluster_auth.rs`) and keys an **AEAD record layer**: after
+the handshake every frame of the connection is a ChaCha20-Poly1305 record (`0x04`), so someone on the path can
+neither read the traffic nor alter, inject, replay or reorder it. P2P/QUIC (`--p2p`) adds iroh's TLS underneath.
 
 ## 2. Threat model
 
@@ -24,7 +25,8 @@ while P2P/QUIC transport (`--p2p`) is secured via Iroh TLS.
 | Someone learns a P2P ticket (it is an address, not a credential) | The same handshake runs inside the QUIC stream; the ticket alone is not enough. |
 | A web page in your browser calls `http://127.0.0.1:8080` (CSRF / DNS rebinding) | The dashboard is same-origin only (no permissive CORS), every route needs a token, and the dev bypass checks the peer, the `Host` header, `X-Forwarded-*` and `Origin`. |
 | A leaked dashboard / agent-mesh token | Rotate it (section 5). Dashboard tokens derived from the cluster secret change when the secret changes. |
-| Network wire sniffing / tampering on non-loopback TCP | Protected by authenticated stream encryption (`0x04`) using ChaCha20-Poly1305 derived from the shared secret, or Iroh QUIC TLS (`--p2p`). |
+| Someone on the network path reads, alters or injects cluster traffic (for example an `AssignTask` to a worker) | Every frame after the handshake is an AEAD record (`0x04`) with its own key per direction and a sequence number. A forged, altered, injected, replayed, reordered or reflected frame makes the receiver drop the connection, and nothing in it is acted on (`AeadReaderSession`). Over `--p2p` iroh's TLS comes on top. |
+| A peer that runs an older release (cluster authentication version 1, which does not guarantee the record layer) | Refused during the handshake (`unsupported auth version`); there is no unencrypted fallback. Upgrade every node, master first (`DEPLOYMENT.md` section 3.5). |
 
 | Not considered / not provided | Consequence |
 | :--- | :--- |
@@ -33,6 +35,7 @@ while P2P/QUIC transport (`--p2p`) is secured via Iroh TLS.
 | Sandboxing of tasks | A task runs as the worker's OS account. The "sandbox" is a per-task working directory, not a container. A task can read everything that account can read, **including the worker's cluster secret file** (and, on Linux, the worker's environment through `/proc`). The secret variables (`OXIDESWARM_SECRET`, `OXIDESWARM_SECRET_FILE`, `OXIDE_MESH_TOKEN`) are not *passed on* to task processes, but use a secret *file* anyway, and see section 7. |
 | Denial of service | A peer that cannot authenticate is cut off after a 5 s handshake timeout and a 250 ms penalty delay, but there is no rate limiting or quota. |
 | Replay across machines of recorded TCP sessions | Each handshake uses fresh 32-byte nonces from both sides, so a recorded handshake cannot be replayed; encrypted frames carry sequence counters preventing replay. |
+| Traffic analysis, cut connections, forward secrecy | Frame sizes and timing stay visible, and someone on the path can always break a connection (the peers see a disconnect and reconnect). All keys derive from the cluster secret and the handshake nonces, which travel in clear: whoever records a session and later obtains the secret can decrypt it. Rotate the secret when a machine that held it is lost (section 5). |
 
 ## 3. The cluster secret
 
@@ -73,7 +76,7 @@ implemented.
 
 | Port | Where it listens | What it exposes | Protection |
 | :--- | :--- | :--- | :--- |
-| **8088/tcp** (cluster) | `127.0.0.1` by default; `0.0.0.0` only with `--listen 0.0.0.0:8088` (what `switch_role.sh master` and `windows\start_master.cmd` pass) | Worker registration, task submission, status. This is the port that runs code on your workers. | Mutual cluster-secret handshake; post-handshake traffic is encrypted via ChaCha20-Poly1305 (`0x04`) using directional session keys (unauthenticated loopback fallback uses plaintext `0x01`/`0x02`). |
+| **8088/tcp** (cluster) | `127.0.0.1` by default; `0.0.0.0` only with `--listen 0.0.0.0:8088` (what `switch_role.sh master` and `windows\start_master.cmd` pass) | Worker registration, task submission, status. This is the port that runs code on your workers. | Mutual cluster-secret handshake (version 2; a version 1 peer is refused); post-handshake traffic is encrypted via ChaCha20-Poly1305 (`0x04`) using directional session keys (unauthenticated loopback fallback uses plaintext `0x01`/`0x02`). |
 | **8080/tcp** (dashboard) | Loopback unless `--web-ui-addr` says otherwise (the launchers pass `--web-ui-addr 127.0.0.1:8080`, or `0.0.0.0:8080` only when you ask for phone / LAN access) | Web UI, REST (`/api/*`), WebSocket `/ws`, SSE. Can submit and cancel tasks. | Bearer token / `X-API-Key` / `?token=` (section 6); same-origin only. |
 | **8080/tcp** on a *worker* | All interfaces (`0.0.0.0`); the CLI has no switch to turn it off. If the port is taken, e.g. by a master on the same machine, the portal just does not start. | A tiny "standby" page and `/api/status` that say which master this worker follows and redirect browsers to it. | None. It only reveals the master's address. |
 | **8089/udp** | Master broadcasts / answers on the LAN | Discovery beacon (`--master auto`): the master's cluster address and, only if the dashboard listens on a non-loopback address, its URL (empty otherwise). | With a secret the beacon carries a MAC and workers/clients ignore beacons without a valid one. Not encrypted. |

@@ -43,6 +43,8 @@ pub struct ProtocolCapabilities(pub u64);
 
 impl ProtocolCapabilities {
     pub const NONE: Self = Self(0);
+    /// Informational only: the record layer is selected by the cluster handshake version
+    /// (`cluster_auth::AUTH_VERSION`), never by this bit, which travels after the handshake.
     pub const AEAD_ENCRYPTION: Self = Self(1 << 0);
 
     pub const fn empty() -> Self {
@@ -130,7 +132,25 @@ pub enum EndpointRole {
     Server,
 }
 
-/// AEAD encryption session for sealing outbound frames.
+// Error texts of the record layer. They are fixed strings on purpose: callers log them, so they
+// must never carry key material, nonces / sequence numbers or plaintext.
+const AEAD_ERR_TOO_SHORT: &str = "Encrypted frame too short to be an AEAD record";
+const AEAD_ERR_NOT_ENCRYPTED: &str = "Expected encrypted wire format (0x04) after the handshake";
+const AEAD_ERR_SEQUENCE: &str =
+    "Anti-replay check failed: record out of sequence (replayed, reordered or dropped)";
+const AEAD_ERR_INTEGRITY: &str = "Ciphertext integrity verification failed";
+const AEAD_ERR_OVERFLOW: &str = "AEAD sequence counter overflow";
+const AEAD_ERR_CLOSED: &str = "AEAD session closed after an earlier record failure";
+
+/// Bytes an AEAD record adds to the frame it carries: format byte, 8-byte sequence number and
+/// 16-byte Poly1305 tag.
+pub const AEAD_RECORD_OVERHEAD: usize = 1 + 8 + 16;
+
+/// AEAD encryption session for sealing outbound frames (one direction of a connection).
+///
+/// Each record uses the nonce `0x00000000 || seq` (big endian) and authenticates its header as
+/// AAD. `seq` starts at 0 and grows by one per record; it never wraps, so a nonce is never used
+/// twice under one key.
 pub struct AeadWriterSession {
     key: LessSafeKey,
     seq: u64,
@@ -147,14 +167,33 @@ impl AeadWriterSession {
         }
     }
 
+    /// A writer whose next record carries `seq` (for the counter-overflow tests).
+    #[cfg(test)]
+    fn starting_at(write_key: &[u8; 32], seq: u64) -> Self {
+        Self {
+            seq,
+            ..Self::new(write_key)
+        }
+    }
+
     /// Encrypts `plaintext` into a framed encrypted payload:
     /// `[0x04][seq: 8 bytes BE][ciphertext][16-byte Poly1305 tag]`
+    ///
+    /// A record that would exceed [`MAX_FRAME_SIZE`] is refused without using up a sequence
+    /// number, so the direction stays in sync. Once the counter is exhausted every call fails.
     pub fn encrypt_frame(&mut self, plaintext: &[u8]) -> Result<Bytes, ProtocolError> {
+        let size = plaintext.len() + AEAD_RECORD_OVERHEAD;
+        if size > MAX_FRAME_SIZE {
+            return Err(ProtocolError::FrameTooLarge {
+                size,
+                max: MAX_FRAME_SIZE,
+            });
+        }
         let seq = self.seq;
-        self.seq = self
-            .seq
+        // The counter only moves once the record is sealed; `u64::MAX` itself is never used.
+        let next_seq = seq
             .checked_add(1)
-            .ok_or_else(|| ProtocolError::Violation("AEAD sequence counter overflow".into()))?;
+            .ok_or_else(|| ProtocolError::Violation(AEAD_ERR_OVERFLOW.into()))?;
 
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[4..12].copy_from_slice(&seq.to_be_bytes());
@@ -174,13 +213,7 @@ impl AeadWriterSession {
         frame.extend_from_slice(&aad);
         frame.extend_from_slice(&in_out);
 
-        if frame.len() > MAX_FRAME_SIZE {
-            return Err(ProtocolError::FrameTooLarge {
-                size: frame.len(),
-                max: MAX_FRAME_SIZE,
-            });
-        }
-
+        self.seq = next_seq;
         Ok(Bytes::from(frame))
     }
 
@@ -190,10 +223,16 @@ impl AeadWriterSession {
     }
 }
 
-/// AEAD decryption session for opening inbound frames.
+/// AEAD decryption session for opening inbound frames (one direction of a connection).
+///
+/// It accepts exactly the next sequence number, so a replayed, reordered, dropped or injected
+/// record is refused, and it fails closed: after the first refused record every later one is
+/// refused too, even a genuine one.
 pub struct AeadReaderSession {
     key: LessSafeKey,
     expected_seq: u64,
+    /// Set by the first refused record.
+    failed: bool,
 }
 
 impl AeadReaderSession {
@@ -204,6 +243,16 @@ impl AeadReaderSession {
         Self {
             key: LessSafeKey::new(unbound),
             expected_seq: 0,
+            failed: false,
+        }
+    }
+
+    /// A reader that expects `expected_seq` next (for the counter-overflow tests).
+    #[cfg(test)]
+    fn starting_at(read_key: &[u8; 32], expected_seq: u64) -> Self {
+        Self {
+            expected_seq,
+            ..Self::new(read_key)
         }
     }
 
@@ -211,30 +260,26 @@ impl AeadReaderSession {
     /// `[0x04][seq: 8 bytes BE][ciphertext][16-byte tag]`
     /// and returns the decrypted plaintext bytes.
     pub fn decrypt_frame(&mut self, frame: &[u8]) -> Result<Bytes, ProtocolError> {
-        const TAG_LEN: usize = 16;
-        const HEADER_LEN: usize = 9; // 1 byte format + 8 bytes seq
-        const MIN_ENCRYPTED_LEN: usize = HEADER_LEN + TAG_LEN;
+        if self.failed {
+            return Err(ProtocolError::Violation(AEAD_ERR_CLOSED.into()));
+        }
+        let opened = self.open(frame);
+        self.failed = opened.is_err();
+        opened
+    }
 
-        if frame.len() < MIN_ENCRYPTED_LEN {
-            return Err(ProtocolError::Violation(format!(
-                "Encrypted frame too short: {} bytes (minimum {MIN_ENCRYPTED_LEN})",
-                frame.len()
-            )));
+    fn open(&mut self, frame: &[u8]) -> Result<Bytes, ProtocolError> {
+        if frame.len() < AEAD_RECORD_OVERHEAD {
+            return Err(ProtocolError::Violation(AEAD_ERR_TOO_SHORT.into()));
         }
 
         if frame[0] != WIRE_FORMAT_ENCRYPTED {
-            return Err(ProtocolError::Violation(format!(
-                "Expected encrypted wire format (0x04), received 0x{:02x}",
-                frame[0]
-            )));
+            return Err(ProtocolError::Violation(AEAD_ERR_NOT_ENCRYPTED.into()));
         }
 
         let seq = u64::from_be_bytes(frame[1..9].try_into().unwrap());
         if seq != self.expected_seq {
-            return Err(ProtocolError::Violation(format!(
-                "Anti-replay check failed: expected sequence number {}, received {}",
-                self.expected_seq, seq
-            )));
+            return Err(ProtocolError::Violation(AEAD_ERR_SEQUENCE.into()));
         }
 
         let mut nonce_bytes = [0u8; 12];
@@ -248,15 +293,13 @@ impl AeadReaderSession {
         let plaintext_slice = self
             .key
             .open_in_place(nonce, Aad::from(aad), &mut in_out)
-            .map_err(|_| {
-                ProtocolError::Violation("Ciphertext integrity verification failed".into())
-            })?;
+            .map_err(|_| ProtocolError::Violation(AEAD_ERR_INTEGRITY.into()))?;
 
         let plaintext = Bytes::copy_from_slice(plaintext_slice);
         self.expected_seq = self
             .expected_seq
             .checked_add(1)
-            .ok_or_else(|| ProtocolError::Violation("AEAD sequence counter overflow".into()))?;
+            .ok_or_else(|| ProtocolError::Violation(AEAD_ERR_OVERFLOW.into()))?;
 
         Ok(plaintext)
     }
@@ -3817,45 +3860,248 @@ mod tests {
         }
     }
 
+    /// The text of a `ProtocolError::Violation`; the record layer reports nothing else.
+    fn violation_text(err: ProtocolError) -> String {
+        match err {
+            ProtocolError::Violation(text) => text,
+            other => panic!("expected a protocol violation, got {other:?}"),
+        }
+    }
+
+    fn server_reader(session_key: &[u8; 32]) -> AeadReaderSession {
+        derive_aead_keys(session_key, EndpointRole::Server).1
+    }
+
     #[test]
-    fn test_aead_sessions_roundtrip_tamper_and_replay() {
+    fn test_aead_sessions_roundtrip_in_both_directions() {
         let session_key = [42u8; 32];
         let (mut client_writer, mut client_reader) =
             derive_aead_keys(&session_key, EndpointRole::Client);
         let (mut server_writer, mut server_reader) =
             derive_aead_keys(&session_key, EndpointRole::Server);
 
-        let plaintext = b"hello secure swarm world";
-        let encrypted = client_writer.encrypt_frame(plaintext).unwrap();
-        assert_eq!(encrypted[0], WIRE_FORMAT_ENCRYPTED);
-        assert_eq!(u64::from_be_bytes(encrypted[1..9].try_into().unwrap()), 0);
+        for seq in 0..3u64 {
+            let body = format!("client frame number {seq}");
+            let encrypted = client_writer.encrypt_frame(body.as_bytes()).unwrap();
+            assert_eq!(encrypted[0], WIRE_FORMAT_ENCRYPTED);
+            assert_eq!(&encrypted[1..9], &seq.to_be_bytes());
+            assert_eq!(encrypted.len(), body.len() + AEAD_RECORD_OVERHEAD);
+            assert!(!encrypted.windows(body.len()).any(|w| w == body.as_bytes()));
+            let decrypted = server_reader.decrypt_frame(&encrypted).unwrap();
+            assert_eq!(&decrypted[..], body.as_bytes());
 
-        // Server decrypts successfully
-        let decrypted = server_reader.decrypt_frame(&encrypted).unwrap();
-        assert_eq!(&decrypted[..], plaintext);
+            let server_reply = server_writer.encrypt_frame(b"ack payload").unwrap();
+            let client_decrypted = client_reader.decrypt_frame(&server_reply).unwrap();
+            assert_eq!(&client_decrypted[..], b"ack payload");
+        }
+        assert_eq!(client_writer.current_seq(), 3);
+        assert_eq!(server_reader.expected_seq(), 3);
+    }
 
-        // Replay of the same frame fails anti-replay
-        let replay_err = server_reader.decrypt_frame(&encrypted).unwrap_err();
-        match replay_err {
-            ProtocolError::Violation(v) => assert!(v.contains("Anti-replay")),
-            other => panic!("expected Violation, got {other:?}"),
+    #[test]
+    fn test_aead_record_with_any_flipped_bit_is_refused_and_closes_the_session() {
+        let session_key = [7u8; 32];
+        let (mut writer, _) = derive_aead_keys(&session_key, EndpointRole::Client);
+        let body = b"AssignTask: echo hello";
+        let record = writer.encrypt_frame(body).unwrap();
+
+        for index in 0..record.len() {
+            for bit in [0u8, 3, 7] {
+                let mut tampered = record.to_vec();
+                tampered[index] ^= 1 << bit;
+                let mut reader = server_reader(&session_key);
+                let refused = violation_text(reader.decrypt_frame(&tampered).unwrap_err());
+                // The header fails the format or sequence check, everything else Poly1305.
+                let expected = match index {
+                    0 => AEAD_ERR_NOT_ENCRYPTED,
+                    1..=8 => AEAD_ERR_SEQUENCE,
+                    _ => AEAD_ERR_INTEGRITY,
+                };
+                assert_eq!(refused, expected, "byte {index} bit {bit}");
+                // Fail closed: after the forgery even the genuine record is refused.
+                assert_eq!(
+                    violation_text(reader.decrypt_frame(&record).unwrap_err()),
+                    AEAD_ERR_CLOSED,
+                    "byte {index} bit {bit}"
+                );
+            }
         }
 
-        // Tampered ciphertext fails Poly1305 verification
-        let encrypted2 = client_writer.encrypt_frame(b"second message").unwrap();
-        let mut tampered = encrypted2.to_vec();
-        let last = tampered.len() - 1;
-        tampered[last] ^= 0x01; // flip 1 bit in Poly1305 tag
-        let tamper_err = server_reader.decrypt_frame(&tampered).unwrap_err();
-        match tamper_err {
-            ProtocolError::Violation(v) => assert!(v.contains("Ciphertext integrity")),
-            other => panic!("expected Violation, got {other:?}"),
+        // Control: the untouched record opens.
+        let mut reader = server_reader(&session_key);
+        assert_eq!(&reader.decrypt_frame(&record).unwrap()[..], body);
+    }
+
+    #[test]
+    fn test_aead_replayed_reordered_and_dropped_records_are_refused() {
+        let session_key = [9u8; 32];
+        let (mut writer, _) = derive_aead_keys(&session_key, EndpointRole::Client);
+        let records: Vec<Bytes> = (0..3u8)
+            .map(|i| writer.encrypt_frame(&[i; 8]).unwrap())
+            .collect();
+
+        // Replay: the same record twice. The session is closed afterwards.
+        let mut reader = server_reader(&session_key);
+        reader.decrypt_frame(&records[0]).unwrap();
+        assert_eq!(
+            violation_text(reader.decrypt_frame(&records[0]).unwrap_err()),
+            AEAD_ERR_SEQUENCE
+        );
+        assert_eq!(
+            violation_text(reader.decrypt_frame(&records[1]).unwrap_err()),
+            AEAD_ERR_CLOSED
+        );
+
+        // Reorder: record 1 before record 0.
+        let mut reader = server_reader(&session_key);
+        assert_eq!(
+            violation_text(reader.decrypt_frame(&records[1]).unwrap_err()),
+            AEAD_ERR_SEQUENCE
+        );
+
+        // Drop: record 1 never arrives.
+        let mut reader = server_reader(&session_key);
+        reader.decrypt_frame(&records[0]).unwrap();
+        assert_eq!(
+            violation_text(reader.decrypt_frame(&records[2]).unwrap_err()),
+            AEAD_ERR_SEQUENCE
+        );
+
+        // Control: in order all three open.
+        let mut reader = server_reader(&session_key);
+        for (i, record) in records.iter().enumerate() {
+            assert_eq!(&reader.decrypt_frame(record).unwrap()[..], &[i as u8; 8]);
+        }
+    }
+
+    #[test]
+    fn test_aead_reflected_and_foreign_records_are_refused() {
+        let session_key = [11u8; 32];
+        let (mut client_w, mut client_r) = derive_aead_keys(&session_key, EndpointRole::Client);
+        let (mut server_w, mut server_r) = derive_aead_keys(&session_key, EndpointRole::Server);
+
+        // Reflection: a record sent back to its own sender, who opens with the other direction's
+        // key. The sequence number matches, so only the key can stop it.
+        let to_server = client_w.encrypt_frame(b"from the client").unwrap();
+        assert_eq!(
+            violation_text(client_r.decrypt_frame(&to_server).unwrap_err()),
+            AEAD_ERR_INTEGRITY
+        );
+        let to_client = server_w.encrypt_frame(b"from the server").unwrap();
+        assert_eq!(
+            violation_text(server_r.decrypt_frame(&to_client).unwrap_err()),
+            AEAD_ERR_INTEGRITY
+        );
+
+        // A record of another connection (other session key) with the expected sequence number.
+        let (mut other_w, _) = derive_aead_keys(&[12u8; 32], EndpointRole::Client);
+        let foreign = other_w.encrypt_frame(b"from the client").unwrap();
+        assert_eq!(
+            violation_text(
+                server_reader(&session_key)
+                    .decrypt_frame(&foreign)
+                    .unwrap_err()
+            ),
+            AEAD_ERR_INTEGRITY
+        );
+
+        // Control: delivered to the right side, the record opens.
+        assert_eq!(
+            &server_reader(&session_key)
+                .decrypt_frame(&to_server)
+                .unwrap()[..],
+            b"from the client"
+        );
+    }
+
+    #[test]
+    fn test_aead_sequence_counter_never_wraps() {
+        let key = [13u8; 32];
+        let mut writer = AeadWriterSession::starting_at(&key, u64::MAX - 1);
+        let last = writer.encrypt_frame(b"last record").unwrap();
+        assert_eq!(&last[1..9], &(u64::MAX - 1).to_be_bytes());
+        assert_eq!(writer.current_seq(), u64::MAX);
+
+        // `u64::MAX` is never used as a nonce and the counter does not wrap to 0: the writer
+        // refuses for good.
+        for _ in 0..2 {
+            assert_eq!(
+                violation_text(writer.encrypt_frame(b"one more").unwrap_err()),
+                AEAD_ERR_OVERFLOW
+            );
+            assert_eq!(writer.current_seq(), u64::MAX);
         }
 
-        // Server response roundtrips to client
-        let server_reply = server_writer.encrypt_frame(b"ack payload").unwrap();
-        let client_decrypted = client_reader.decrypt_frame(&server_reply).unwrap();
-        assert_eq!(&client_decrypted[..], b"ack payload");
+        let mut reader = AeadReaderSession::starting_at(&key, u64::MAX - 1);
+        assert_eq!(&reader.decrypt_frame(&last).unwrap()[..], b"last record");
+        assert_eq!(reader.expected_seq(), u64::MAX);
+    }
+
+    #[test]
+    fn test_aead_oversized_frame_is_refused_without_using_a_sequence_number() {
+        let key = [14u8; 32];
+        let mut writer = AeadWriterSession::new(&key);
+        let mut reader = AeadReaderSession::new(&key);
+
+        match writer.encrypt_frame(&vec![0u8; MAX_FRAME_SIZE - AEAD_RECORD_OVERHEAD + 1]) {
+            Err(ProtocolError::FrameTooLarge { size, max }) => {
+                assert_eq!((size, max), (MAX_FRAME_SIZE + 1, MAX_FRAME_SIZE));
+            }
+            other => panic!(
+                "expected FrameTooLarge, got {:?}",
+                other.map(|record| record.len())
+            ),
+        }
+        assert_eq!(
+            writer.current_seq(),
+            0,
+            "a refused frame must not use a nonce"
+        );
+
+        // The direction is still in sync: the next record carries sequence number 0 and opens.
+        let record = writer.encrypt_frame(b"small").unwrap();
+        assert_eq!(&reader.decrypt_frame(&record).unwrap()[..], b"small");
+    }
+
+    #[test]
+    fn test_aead_reader_refuses_truncated_and_unencrypted_frames() {
+        let key = [15u8; 32];
+        let header = [vec![WIRE_FORMAT_ENCRYPTED], 0u64.to_be_bytes().to_vec()].concat();
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            ("empty", vec![], AEAD_ERR_TOO_SHORT),
+            ("header only", header.clone(), AEAD_ERR_TOO_SHORT),
+            (
+                "one byte short of a tag",
+                [header.clone(), vec![0u8; 15]].concat(),
+                AEAD_ERR_TOO_SHORT,
+            ),
+            (
+                "header and a zero tag",
+                [header, vec![0u8; 16]].concat(),
+                AEAD_ERR_INTEGRITY,
+            ),
+            (
+                "plaintext bincode",
+                [vec![WIRE_FORMAT_BINCODE], vec![7u8; 40]].concat(),
+                AEAD_ERR_NOT_ENCRYPTED,
+            ),
+            (
+                "plaintext json",
+                br#"{"type":"ClusterStatus","padding":"............"}"#.to_vec(),
+                AEAD_ERR_NOT_ENCRYPTED,
+            ),
+            (
+                "handshake frame",
+                [vec![WIRE_FORMAT_AUTH, 0x01, 2], vec![1u8; 32]].concat(),
+                AEAD_ERR_NOT_ENCRYPTED,
+            ),
+        ];
+        for (name, frame, expected) in cases {
+            let mut reader = AeadReaderSession::new(&key);
+            // Fixed texts: nothing from the frame (sequence number, bytes) is echoed.
+            let text = violation_text(reader.decrypt_frame(&frame).unwrap_err());
+            assert_eq!(text, expected, "{name}");
+        }
     }
 
     #[tokio::test]
@@ -3891,6 +4137,74 @@ mod tests {
         server.send_msg(&ack).await.unwrap();
         let recv_ack: MasterMessage = client.recv_msg().await.unwrap().unwrap();
         assert_eq!(recv_ack, ack);
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_transport_drops_a_tampered_frame_for_good() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let mut client = MessageTransport::new(client_io);
+        let mut server = MessageTransport::new(server_io);
+        let session_key = [0x56u8; 32];
+        client.enable_encryption(&session_key, EndpointRole::Client);
+        server.enable_encryption(&session_key, EndpointRole::Server);
+
+        // What an on-path observer sees: a record, without the plaintext.
+        let marker = "plaintext-marker-7f3a";
+        let bye = WorkerMessage::Disconnecting {
+            worker_id: Uuid::new_v4(),
+            reason: marker.into(),
+        };
+        client.send_msg(&bye).await.unwrap();
+        let on_wire = server.recv_raw_frame().await.unwrap().unwrap();
+        assert_eq!(on_wire[0], WIRE_FORMAT_ENCRYPTED);
+        assert!(!on_wire
+            .windows(marker.len())
+            .any(|w| w == marker.as_bytes()));
+
+        // An attacker flips one bit of that record in transit: the receiver refuses it...
+        let mut tampered = on_wire.to_vec();
+        tampered[on_wire.len() / 2] ^= 0x01;
+        client.send_raw_frame(Bytes::from(tampered)).await.unwrap();
+        assert_eq!(
+            violation_text(server.recv_msg::<WorkerMessage>().await.unwrap_err()),
+            AEAD_ERR_INTEGRITY
+        );
+        // ...and nothing gets through afterwards, neither the genuine record nor a new one.
+        client.send_raw_frame(on_wire).await.unwrap();
+        assert_eq!(
+            violation_text(server.recv_msg::<WorkerMessage>().await.unwrap_err()),
+            AEAD_ERR_CLOSED
+        );
+        client.send_msg(&bye).await.unwrap();
+        assert_eq!(
+            violation_text(server.recv_msg::<WorkerMessage>().await.unwrap_err()),
+            AEAD_ERR_CLOSED
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_split_reader_refuses_an_injected_plaintext_assignment() {
+        // An on-path host injects a well-formed plaintext `AssignTask` into an encrypted
+        // master -> worker connection (the worker reads through the split reader half).
+        let (attacker_io, worker_io) = tokio::io::duplex(64 * 1024);
+        let mut attacker = MessageTransport::new(attacker_io);
+        let mut worker = MessageTransport::new(worker_io);
+        worker.enable_encryption(&[0x66u8; 32], EndpointRole::Client);
+        let (_worker_tx, mut worker_rx) = worker.split();
+        assert!(worker_rx.is_encrypted());
+
+        let task = Task::new(
+            TaskSpec::new_shell_script("touch /tmp/injected"),
+            TaskRequirements::generic(1, 30),
+        );
+        attacker
+            .send_msg(&MasterMessage::AssignTask { task })
+            .await
+            .unwrap();
+        assert_eq!(
+            violation_text(worker_rx.recv_msg::<MasterMessage>().await.unwrap_err()),
+            AEAD_ERR_NOT_ENCRYPTED
+        );
     }
 
     #[test]

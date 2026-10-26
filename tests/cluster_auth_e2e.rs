@@ -25,7 +25,9 @@ use tokio_util::bytes::Bytes;
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
-use rusty_grid_core::cluster_auth::{client_handshake, ClusterSecret, WIRE_FORMAT_AUTH};
+use rusty_grid_core::cluster_auth::{
+    client_handshake, ClusterSecret, AUTH_VERSION, WIRE_FORMAT_AUTH,
+};
 use rusty_grid_core::discovery::{build_auth_probe, MasterBeacon, DISCOVERY_MAGIC_REQUEST};
 use rusty_grid_core::protocol::{
     derive_aead_keys, serialize_message, ClientMessage, ClientResponse, EndpointRole,
@@ -376,7 +378,7 @@ async fn test_wrong_secret_worker_never_registers() {
     // by the master with the generic reason.
     let stream = TcpStream::connect(addr).await.unwrap();
     let mut forger = MessageTransport::new(stream);
-    let mut hello = vec![WIRE_FORMAT_AUTH, 0x01, 1];
+    let mut hello = vec![WIRE_FORMAT_AUTH, 0x01, AUTH_VERSION];
     hello.extend_from_slice(&[7u8; 32]);
     forger.send_raw_frame(Bytes::from(hello)).await.unwrap();
     let challenge = forger.recv_raw_frame().await.unwrap().expect("CHALLENGE");
