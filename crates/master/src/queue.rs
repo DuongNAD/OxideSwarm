@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use rusty_grid_core::error::{GridError, GridResult};
 use rusty_grid_core::placement::Placement;
+use rusty_grid_core::protocol::ProtocolCapabilities;
 use rusty_grid_core::task::{
     CheckpointData, Task, TaskId, TaskRequirements, TaskResult, TaskSpec, TaskStatus,
 };
@@ -393,8 +394,10 @@ pub struct TaskView {
     pub requires_gpu: bool,
     /// Compilation and GPU specs, which throttled or low-battery mobile workers must not receive.
     pub heavy: bool,
-    /// True if the task has staged input files or expects output artifacts (Requirement R2).
-    pub requires_file_staging: bool,
+    /// Protocol features a worker must advertise to run the task: `FILE_STAGING` for inline staged
+    /// files or expected outputs (Requirement R2), `BLOB_TRANSFER` for blob inputs or output
+    /// patterns.
+    pub required_features: ProtocolCapabilities,
     /// Workers that already handed this task back without running it.
     pub avoid: Vec<Uuid>,
     /// The task's placement constraints (`require:` tags), or why they cannot be read. Submission
@@ -414,12 +417,23 @@ impl TaskView {
                 task.spec,
                 TaskSpec::RustCompilation { .. } | TaskSpec::GpuCompute { .. }
             ),
-            requires_file_staging: !task.staged_files.is_empty()
-                || !task.expected_outputs.is_empty(),
+            required_features: required_features(task),
             avoid: Vec::new(),
             placement: task.placement(),
         }
     }
+}
+
+/// The protocol features a worker needs to run `task` (see [`TaskView::required_features`]).
+fn required_features(task: &Task) -> ProtocolCapabilities {
+    let mut features = ProtocolCapabilities::empty();
+    if !task.staged_files.is_empty() || !task.expected_outputs.is_empty() {
+        features.insert(ProtocolCapabilities::FILE_STAGING);
+    }
+    if task.uses_blobs() {
+        features.insert(ProtocolCapabilities::BLOB_TRANSFER);
+    }
+    features
 }
 
 /// What the master's own books say a worker is carrying: the tasks assigned to it that have not
@@ -530,6 +544,9 @@ struct TaskQueueInner {
     terminal_bytes: usize,
 }
 
+/// Bytes one blob reference (id, size, flags) is charged in addition to its path.
+const BLOB_REF_BYTES: usize = 48;
+
 /// Bytes of payload and output a task entry keeps alive: its spec (stdin, sources, input data),
 /// checkpoint, captured stdout/stderr and the strings of its history.
 fn retained_bytes(entry: &TaskEntry) -> usize {
@@ -598,6 +615,14 @@ fn retained_bytes(entry: &TaskEntry) -> usize {
         .map(|f| f.path.len() + f.data.len())
         .sum();
     let expected_outputs_bytes: usize = entry.task.expected_outputs.iter().map(String::len).sum();
+    // Blob inputs and outputs are references (the content lives in the blob store).
+    let blob_refs_bytes: usize = entry
+        .task
+        .inputs
+        .iter()
+        .map(|i| i.path.len() + BLOB_REF_BYTES)
+        .chain(entry.task.output_globs.iter().map(String::len))
+        .sum();
     let result = entry.result.as_ref().map_or(0, |r| {
         r.stdout.0.len()
             + r.stderr.0.len()
@@ -606,6 +631,10 @@ fn retained_bytes(entry: &TaskEntry) -> usize {
             + r.artifacts
                 .iter()
                 .map(|a| a.path.len() + a.data.len())
+                .sum::<usize>()
+            + r.outputs
+                .iter()
+                .map(|o| o.path.len() + BLOB_REF_BYTES)
                 .sum::<usize>()
     });
     let history: usize = entry
@@ -617,6 +646,7 @@ fn retained_bytes(entry: &TaskEntry) -> usize {
         + spec
         + staged_files_bytes
         + expected_outputs_bytes
+        + blob_refs_bytes
         + checkpoint
         + result
         + history

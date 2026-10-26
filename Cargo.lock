@@ -3310,6 +3310,7 @@ name = "rusty_grid_core"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "blake3",
  "bytes",
  "chrono",
  "futures",

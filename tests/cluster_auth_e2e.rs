@@ -161,6 +161,7 @@ async fn start_fake_worker(
                     error: None,
                     artifacts: Vec::new(),
                     asset_bytes: None,
+                    outputs: Vec::new(),
                 })
                 .await;
         }

@@ -1745,6 +1745,14 @@ pub struct Task {
     /// Declared output artifact paths to be captured from sandbox upon completion.
     #[serde(default)]
     pub expected_outputs: Vec<String>,
+    /// Content-addressed inputs (files and directory trees) the worker places into the sandbox
+    /// before the run, fetching the blobs it lacks from the Master (see [`crate::blob`]).
+    #[serde(default)]
+    pub inputs: Vec<crate::blob::TaskInput>,
+    /// Sandbox-relative patterns ([`crate::blob::OutputPattern`]) of files to bring back as
+    /// blobs in `TaskResult::outputs`.
+    #[serde(default)]
+    pub output_globs: Vec<String>,
 }
 
 impl Task {
@@ -1764,6 +1772,8 @@ impl Task {
             latest_checkpoint: None,
             staged_files: Vec::new(),
             expected_outputs: Vec::new(),
+            inputs: Vec::new(),
+            output_globs: Vec::new(),
         }
     }
 
@@ -1801,6 +1811,35 @@ impl Task {
     pub fn with_expected_output(mut self, path: impl Into<String>) -> Self {
         self.expected_outputs.push(path.into());
         self
+    }
+
+    /// Builder method to attach content-addressed inputs.
+    pub fn with_inputs(mut self, inputs: Vec<crate::blob::TaskInput>) -> Self {
+        self.inputs = inputs;
+        self
+    }
+
+    /// Builder method to attach one content-addressed input.
+    pub fn with_input(mut self, input: crate::blob::TaskInput) -> Self {
+        self.inputs.push(input);
+        self
+    }
+
+    /// Builder method to attach output file patterns.
+    pub fn with_output_globs(mut self, patterns: Vec<String>) -> Self {
+        self.output_globs = patterns;
+        self
+    }
+
+    /// Builder method to attach one output file pattern.
+    pub fn with_output_glob(mut self, pattern: impl Into<String>) -> Self {
+        self.output_globs.push(pattern.into());
+        self
+    }
+
+    /// True when the task moves files through the blob store (inputs or output patterns).
+    pub fn uses_blobs(&self) -> bool {
+        !self.inputs.is_empty() || !self.output_globs.is_empty()
     }
 
     /// Mutates the task to record an updated checkpoint snapshot.
@@ -1848,6 +1887,24 @@ impl Task {
             validate_relative_sandbox_path(output)?;
         }
 
+        if self.uses_blobs() {
+            // Only the workloads that run in a sandbox the task controls can use files.
+            if !matches!(
+                self.spec,
+                TaskSpec::Command { .. }
+                    | TaskSpec::ShellScript { .. }
+                    | TaskSpec::RustCompilation { .. }
+            ) {
+                return Err(format!(
+                    "Input and output files are supported for Command, ShellScript and \
+                     RustCompilation tasks, not {}",
+                    self.spec.task_type()
+                ));
+            }
+            crate::blob::validate_task_inputs(&self.inputs)?;
+            crate::blob::validate_output_patterns(&self.output_globs)?;
+        }
+
         Ok(())
     }
 
@@ -1888,6 +1945,9 @@ pub struct TaskResult {
     pub asset_bytes: Option<Bytes>,
     /// Captured output artifacts extracted from sandbox.
     pub artifacts: Vec<OutputArtifact>,
+    /// Files matched by `Task::output_globs` (and a `RustCompilation`'s artifacts), as blobs the
+    /// worker uploaded to the Master's blob store (see [`crate::blob`]).
+    pub outputs: Vec<crate::blob::BlobFile>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1913,6 +1973,8 @@ struct HumanTaskResult {
     pub asset_bytes: Option<Bytes>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<OutputArtifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<crate::blob::BlobFile>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1932,6 +1994,8 @@ struct BinaryTaskResult {
     pub asset_bytes: Option<Bytes>,
     #[serde(default)]
     pub artifacts: Vec<OutputArtifact>,
+    #[serde(default)]
+    pub outputs: Vec<crate::blob::BlobFile>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1963,6 +2027,7 @@ impl From<LegacyBinaryTaskResult> for TaskResult {
             error: l.error,
             asset_bytes: None,
             artifacts: Vec::new(),
+            outputs: Vec::new(),
         }
     }
 }
@@ -1981,6 +2046,7 @@ impl From<&TaskResult> for HumanTaskResult {
             error: r.error.clone(),
             asset_bytes: r.asset_bytes.clone(),
             artifacts: r.artifacts.clone(),
+            outputs: r.outputs.clone(),
         }
     }
 }
@@ -1999,6 +2065,7 @@ impl From<HumanTaskResult> for TaskResult {
             error: h.error,
             asset_bytes: h.asset_bytes,
             artifacts: h.artifacts,
+            outputs: h.outputs,
         }
     }
 }
@@ -2017,6 +2084,7 @@ impl From<&TaskResult> for BinaryTaskResult {
             error: r.error.clone(),
             asset_bytes: r.asset_bytes.clone(),
             artifacts: r.artifacts.clone(),
+            outputs: r.outputs.clone(),
         }
     }
 }
@@ -2035,6 +2103,7 @@ impl From<BinaryTaskResult> for TaskResult {
             error: b.error,
             asset_bytes: b.asset_bytes,
             artifacts: b.artifacts,
+            outputs: b.outputs,
         }
     }
 }
@@ -2120,6 +2189,7 @@ impl TaskResult {
             error: None,
             asset_bytes: None,
             artifacts: Vec::new(),
+            outputs: Vec::new(),
         }
     }
 
@@ -2145,6 +2215,7 @@ impl TaskResult {
             error,
             asset_bytes: None,
             artifacts: Vec::new(),
+            outputs: Vec::new(),
         }
     }
 
@@ -2157,6 +2228,12 @@ impl TaskResult {
     /// Builder method to attach a single output artifact.
     pub fn with_artifact(mut self, artifact: OutputArtifact) -> Self {
         self.artifacts.push(artifact);
+        self
+    }
+
+    /// Builder method to attach output files held as blobs.
+    pub fn with_outputs(mut self, outputs: Vec<crate::blob::BlobFile>) -> Self {
+        self.outputs = outputs;
         self
     }
 

@@ -5,6 +5,8 @@
 
 pub mod autorig;
 pub mod backoff;
+pub mod blob_cache;
+pub mod blob_client;
 pub mod client;
 pub mod cpu_simd;
 pub mod gen3d;
@@ -15,10 +17,12 @@ pub mod job_object;
 pub mod process_tree;
 pub mod runner;
 pub mod sandbox;
+pub mod staging;
 #[cfg(feature = "gpu-wgpu")]
 pub mod wgpu_engine;
 
 pub use backoff::{BackoffConfig, ExponentialBackoff};
+pub use blob_cache::{BlobCache, CachePin, DEFAULT_BLOB_CACHE_MAX_BYTES};
 pub use client::{WorkerClient, WorkerConfig};
 pub use gpu::{GpuError, GpuNotice, NoticeLevel, WGPU_COMPILED};
 pub use heartbeat::{HeartbeatHandle, HeartbeatTracker, MobileTelemetryHandle};
@@ -29,6 +33,7 @@ pub use runner::{
     EXIT_CODE_TIMEOUT,
 };
 pub use sandbox::{sanitize_relative_path, Sandbox, SandboxConfig, SandboxError};
+pub use staging::{OutputLimits, DEFAULT_MAX_OUTPUT_FILES, DEFAULT_OUTPUT_LIMIT_BYTES};
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

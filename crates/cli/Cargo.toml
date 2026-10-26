@@ -97,6 +97,10 @@ name = "cli_secret_e2e"
 path = "../../tests/cli_secret_e2e.rs"
 
 [[test]]
+name = "blob_transfer_e2e"
+path = "../../tests/blob_transfer_e2e.rs"
+
+[[test]]
 name = "cli_worker_signals_e2e"
 path = "../../tests/cli_worker_signals_e2e.rs"
 
