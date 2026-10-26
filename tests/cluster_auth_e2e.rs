@@ -159,6 +159,8 @@ async fn start_fake_worker(
                     is_gpu_executed: false,
                     device_name: None,
                     error: None,
+                    artifacts: Vec::new(),
+                    asset_bytes: None,
                 })
                 .await;
         }

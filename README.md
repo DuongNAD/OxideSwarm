@@ -33,6 +33,9 @@ Apple Silicon MacBooks, Windows gaming PCs, Android phones and Linux servers.
 * **Quick role swapping and discovery**: `switch_role.sh` / `windows\switch_role.cmd` turn a machine into a master or a worker in a few seconds. Workers can find a master with `--master auto` (authenticated UDP beacon on `:8089`).
 * **Decoupled 4-layer layout**: Rust core engine, Android JNI bridge, Agent Mesh coordination hub, cross-machine sync/benchmarks.
 * **Process-tree lifecycle and bounded memory**: task process trees are terminated (`taskkill /F /T` / process groups), with LRU task eviction and stale-worker pruning on the master.
+* **Task placement and a cluster check**: pin a task to an OS, an architecture, a tag or one worker (`submit --os`, `--arch`, `--require-tag`, `--worker`), send a script and input data with it, and verify a running cluster with `oxideswarm doctor`.
+
+Documentation index and writing standard: [docs/README.md](docs/README.md). A macOS + Windows walk-through, verified end to end: [docs/guides/two-machine-cluster.md](docs/guides/two-machine-cluster.md).
 
 ---
 
@@ -76,7 +79,7 @@ Apple Silicon MacBooks, Windows gaming PCs, Android phones and Linux servers.
 | **6. Heterogeneous hardware** | macOS, Linux, Android (ARM64), and Windows (x86_64) supported. Windows binaries cross-compile (`build_windows_worker.sh`); Windows launchers run under PowerShell 5.1+ and cmd. | Hardware-verified |
 | **7. Headless Windows worker** | [windows/run_worker_silent.vbs](windows/run_worker_silent.vbs) starts a worker without console windows (it needs the master's `cluster.secret` first); [windows/status_worker.cmd](windows/status_worker.cmd) shows the real working set; [windows/stop_worker.cmd](windows/stop_worker.cmd) stops only the process it started. | Implemented + launcher tests |
 | **8. Role swapping** | [switch_role.sh](switch_role.sh) (macOS/Linux) and [windows/switch_role.cmd](windows/switch_role.cmd): stop whatever this launcher started, start the new role, wait until it is up (the macOS/Linux script also checks that a worker registered) and print the next steps. Takes a few seconds. There is **no automatic failover or election**; a person (or script) decides. | Implemented |
-| **9. Master discovery** | **Tier 1** worker standby portal (`:8080` HTTP 307 to the master's dashboard; only when that dashboard is reachable from the network, i.e. the master was started with `--web-ui-addr`: a loopback-only dashboard, the default, is advertised as "none" and the portal keeps showing its standby page); **Tier 2** the dashboard probes the host it was loaded from, hosts saved in your browser and hosts the master lists in `/api/status`, then offers to switch (it does **not** scan a subnet); **Tier 3** UDP beacon on `:8089` (`--master auto`, assumes a /24 broadcast domain; with a secret the beacon is authenticated). | Tier 3 + tests; Tier 1/2 partial |
+| **9. Master discovery & fallback** | Multi-tier authenticated coordinator discovery: Tier 1 LAN UDP beacon on `:8089` (`--master auto`), Tier 2 authenticated HTTP probe (`GET /api/discovery/probe?nonce=<hex>`), Tier 3 signed rendezvous registry (`--rendezvous <URL>` / `OXIDESWARM_RENDEZVOUS`) for cross-subnet and AP-isolated environments. Standby portal on `:8080` HTTP 307 redirect remains supported. Design: [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md). | Implemented + tests |
 | **10. Web dashboard** | Axum server serving the SPA `crates/master/src/dashboard.html` (no CDN) plus REST, `/ws` and SSE. Loopback by default; reachable from phones/LAN only when you pass `--web-ui-addr 0.0.0.0:8080` (or `switch_role.sh master --dashboard-lan`); every request off the dev bypass needs the token printed by `oxideswarm secret show --dashboard-token`. | Implemented + tests |
 | **11. Workflow modes (`ox-mode`)** | `test` (quick / lint / flaky / full), `dev` (fast check / local cluster / watch), `doc`, `research` (profile / bench / report). | Implemented + tests |
 | **12. Benchmarks & chaos** | Empirical baseline performance demonstrates parallel SHA-256 throughput of 341.3 MB/s (1.55x scaling across two nodes) and mid-task worker failure detection within 319 ms. Reproduce telemetry: [run_cluster_benchmark.sh](run_cluster_benchmark.sh) (two local worker processes, or a phone with `--adb-id`) and [run_chaos_test.sh](run_chaos_test.sh) (starts its own cluster, kills a worker that holds running tasks, verifies re-execution). | Implemented + scripts |
@@ -85,6 +88,10 @@ Apple Silicon MacBooks, Windows gaming PCs, Android phones and Linux servers.
 | **15. GPU compute (`wgpu`)** | `cargo build --release --bin oxideswarm --features gpu-wgpu` gives a worker that multiplies matrices on the machine's GPU (Metal on macOS, Vulkan / DirectX 12 on Windows and Linux; discrete GPU prioritized over integrated), checks the product against a sampled CPU recomputation and reports `Status: VERIFIED_OK` only if that check passed. A `GpuCompute` task is a **seeded `simulated_matrix_dim` x `simulated_matrix_dim` GEMM** tiled by `work_group_size`. A GPU error, device loss or driver panic fails that task with an explicit message and the engine is rebuilt for the next one. A worker never runs a real-GPU task on the CPU: the CPU path is the labelled `--simulate-gpu` test mode only. Run benchmark with `cargo run --release -p rusty_grid_worker --features gpu-wgpu --example gemm_bench -- 1024`. | Implemented + tests (verified on Metal & Vulkan) |
 | **16. Security** | Shared-secret mutual authentication on the cluster port (TCP and P2P) and on the UDP beacon; authenticated TCP stream encryption via ChaCha20-Poly1305 (`0x04`) with directional keys derived from `cluster.secret`; token-protected, same-origin dashboard; agent-mesh hub token. See [docs/SECURITY.md](docs/SECURITY.md). | Implemented + tests |
 | **17. Agent Mesh ↔ Grid bridge** | `AgentGridBridge` lets `agent-mesh hub` run a Master Grid of its own (`--grid-master <ADDR>` starts an embedded master; off loopback it needs a cluster secret or `--insecure`) and routes `grid_compute` / `grid_compile` / `grid_submit` / `grid_status` envelopes to it. When unconfigured, returns `ERR_BRIDGE_NOT_CONFIGURED`. | Implemented + tests |
+| **18. Task placement & cluster check** | Workers advertise `os:` and `arch:` tags plus user tags (`worker --tag`); `submit --os`, `--arch`, `--worker`, `--require-tag` pin a task through `require:` task tags, so the wire format is unchanged. `submit --stdin-file`, `--script-file`, `--interpreter` and `--env` send input with the task; `--matrix-dim` sizes a GPU task. `oxideswarm doctor` checks connection, every worker, process start-up, every GPU and spreading. Design: [docs/design/0001-two-node-readiness.md](docs/design/0001-two-node-readiness.md). | Implemented + tests |
+| **19. Mobile coordination & battery governance** | Multi-tier throttling $C_{\text{eff}} = \min(C_{\text{bat}}, C_{\text{therm}})$, RRC adaptive keepalive (10s/25s/60s), 5-rule refusal matrix, authenticated candidate score election $S_{\text{auth}}$, cryptographic lease tickets, and pre-sleep evacuation. Design: [docs/design/0002-mobile-coordination.md](docs/design/0002-mobile-coordination.md). | Implemented + tests |
+| **20. Distributed file staging** | Content-addressed file transfer with SHA-256 worker caching, atomic staging, sandbox execution, and artifact collection (`submit --file`, `--output`, `--output-dir`). Design: [docs/design/0003-distributed-file-staging.md](docs/design/0003-distributed-file-staging.md). | Implemented + tests |
+| **21. Model Context Protocol (MCP) server** | Standard JSON-RPC 2.0 stdio MCP server (`oxideswarm mcp`) exposing 5 core cluster tools (`oxideswarm_status`, `oxideswarm_workers`, `oxideswarm_submit`, `oxideswarm_task_status`, `oxideswarm_cancel`) to LLM coding agents with strict stdout hygiene. Design: [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md). | Implemented + tests |
 
 ---
 
@@ -93,12 +100,12 @@ Apple Silicon MacBooks, Windows gaming PCs, Android phones and Linux servers.
 | # | Limitation / Goal | Status | Technical details |
 |---|---|---|---|
 | **1** | Encrypted TCP stream transport | Completed | Authenticated TCP connections negotiate directional ChaCha20-Poly1305 AEAD keys derived from `cluster.secret` (`0x04` wire format). Transparent loopback fallback is maintained for unauthenticated dev/test runs. |
-| **2** | No automatic master failover | Roadmap | If the master dies, workers keep reconnecting and queued work waits. The election / signed-lease design in `ANDROID_ARCHITECTURE.md` is a design only. |
-| **3** | MCP server for AI agents | Roadmap | Not in this repository. The CLI's `connect_master` helper (`crates/cli/src/connect.rs`) is the shared authenticated client path such a server would use. |
+| **2** | Mobile coordination & automatic failover | Completed | Dynamic task throttling $C_{\text{eff}} = \min(C_{\text{bat}}, C_{\text{therm}})$, RRC adaptive keepalive (10s/25s/60s), 5-rule refusal matrix, authenticated candidate score election $S_{\text{auth}}$, cryptographic lease tickets, and pre-sleep task evacuation. Documented in [docs/design/0002-mobile-coordination.md](docs/design/0002-mobile-coordination.md). |
+| **3** | MCP server for AI agents | Completed | Standard JSON-RPC 2.0 stdio Model Context Protocol (MCP) server (`oxideswarm mcp`) exposing `oxideswarm_status`, `oxideswarm_workers`, `oxideswarm_submit`, `oxideswarm_task_status`, and `oxideswarm_cancel` tools to LLM coding agents with strict stdout transport hygiene. Documented in [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md). |
 | **4** | Real GPU scheduler preference | Completed | Master scheduler strictly prioritizes idle hardware GPU (`wgpu`) workers over simulated GPU (`--simulate-gpu`) workers for `requires_gpu` tasks, dispatching to simulated workers only when no hardware GPU is available. |
 | **5** | Android app cluster secret auth | Completed | `crates/android_bridge` exposes `nativeSetClusterSecret` and `nativeStartWorkerWithSecret` JNI exports, and Kotlin `WorkerEngine` accepts `clusterSecret` to authenticate against protected masters. |
-| **6** | Distributed file system (`rusty_grid_fs`) | Roadmap | Not started. |
-| **7** | UDP discovery on isolated subnets | Roadmap | A rendezvous fallback is not implemented; use `--master HOST:8088` or `--p2p`. |
+| **6** | Distributed file staging | Completed | Content-addressed distributed file staging (`submit --file <PATH>`, `--output <PATH>`, `--output-dir <DIR>`) with SHA-256 worker caching, atomic hardlinks/copies into task sandboxes, and output artifact collection. Documented in [docs/design/0003-distributed-file-staging.md](docs/design/0003-distributed-file-staging.md). |
+| **7** | UDP discovery on isolated subnets | Completed | 3-tier discovery fallback: Tier 1 LAN UDP beacon (:8089), Tier 2 authenticated HTTP probe (`GET /api/discovery/probe?nonce=<hex>`), Tier 3 signed rendezvous registry (`--rendezvous <URL>` / `OXIDESWARM_RENDEZVOUS`) for cross-subnet and AP isolation environments. Documented in [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md). |
 | **8** | Mid-task checkpointing | Done | See feature 14. |
 | **9** | OS child process containment | Hardened | Spawned task child processes are atomically bound to OS-level containment handles: Windows Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` with `CREATE_SUSPENDED`) and Linux `PR_SET_PDEATHSIG(SIGKILL)` guarantee child tree cleanup on worker termination. |
 | **10** | Protocol version & capability negotiation | Completed | Formal `PROTOCOL_VERSION` and `ProtocolCapabilities` handshake exchange prevents frame drops and enables graceful capability mismatch handling across master, worker, and CLI. |
@@ -148,6 +155,9 @@ A master bound to loopback only (plain `oxideswarm master`) needs no secret. The
 `oxideswarm secret show --dashboard-token`. More: [docs/SECURITY.md](docs/SECURITY.md).
 
 ### Step 2: Connect compute workers
+
+For a Mac and a Windows PC, follow [docs/guides/two-machine-cluster.md](docs/guides/two-machine-cluster.md): it covers
+the link (Wi-Fi, Ethernet, P2P), both roles and the check with `oxideswarm doctor`.
 
 #### A. Windows GPU rig (headless background worker)
 Put the master's `cluster.secret` into `%USERPROFILE%\.oxideswarm\`, then in the `windows\` folder:
@@ -201,8 +211,11 @@ A lightweight utility for two machines sharing a cloud-synchronized folder (e.g.
 
 ### Troubleshooting
 
+Start with `oxideswarm doctor --expect-workers <N>` on any machine that holds the secret: it names the check that fails.
+
 | Symptom | Likely cause and fix |
 | :--- | :--- |
+| `submit` warns that no connected worker matches the placement constraints | `--os`, `--arch`, `--worker` or `--require-tag` names something no connected worker has. The task waits in the queue; start that worker or fix the constraint (`workers --json` lists the `os:`, `arch:`, `id:` and user tags). |
 | `Authentication required: ...` / `refusing to connect ... without a cluster secret` (exit code 6) | This machine has no (matching) secret. Copy `~/.oxideswarm/cluster.secret` from the master, or pass `--secret-file PATH`. `--insecure` skips the check and is only for networks you fully control. |
 | `Authentication failed` | The secrets differ, e.g. the master ran `secret generate --force`. Copy the master's file again and restart the worker. |
 | Worker logs `Connection refused` or times out | Wrong port (use the **cluster** port 8088, not the dashboard's 8080); the master listens on loopback only (the default; start it with `--listen 0.0.0.0:8088`); a firewall blocks 8088. |
@@ -247,22 +260,54 @@ or `~/.oxideswarm/cluster.secret`.
 ./target/release/oxideswarm master --listen 0.0.0.0:8088
 # Dashboard on the LAN as well (explicit; default is loopback):
 ./target/release/oxideswarm master --listen 0.0.0.0:8088 --web-ui-addr 0.0.0.0:8080
+# Register with Tier 3 HTTP rendezvous registry:
+./target/release/oxideswarm master --listen 0.0.0.0:8088 --rendezvous http://rendezvous.example.com:8080
 
 # Worker: --master takes the CLUSTER port (default 127.0.0.1:8088; a bare host gets :8088; 'auto' = LAN discovery)
 ./target/release/oxideswarm worker --master 192.168.1.100:8088
 ./target/release/oxideswarm worker --master 192.168.1.100:8088                  # a --features gpu-wgpu build finds and uses the GPU itself
 ./target/release/oxideswarm worker --master 192.168.1.100:8088 --gpu            # insist: warns and advertises no GPU if there is none / no wgpu
 ./target/release/oxideswarm worker --master 192.168.1.100:8088 --no-gpu         # keep this machine's GPU out of the grid
+./target/release/oxideswarm worker --master auto --rendezvous http://rendezvous.example.com:8080  # discover via Tier 3 fallback
 
 # Submit work (--command is the executable, arguments follow after --; the file must exist on the worker)
 ./target/release/oxideswarm submit --master 127.0.0.1:8088 --command echo --wait -- hello
 ./target/release/oxideswarm submit --master 127.0.0.1:8088 --command sha256sum --wait -- /path/present/on/the/worker
 ./target/release/oxideswarm submit --master 127.0.0.1:8088 --type gpu --gpu --wait   # routed to a worker that advertises a GPU
 
+# Distributed file staging (stage input files to worker sandbox; collect output artifacts to coordinator)
+./target/release/oxideswarm submit --file input.dat --output results.csv --command process_data -- --input input.dat --output results.csv
+./target/release/oxideswarm submit --file weights.bin --output-dir outputs/ --command run_eval -- --weights weights.bin --outdir outputs/
+
+# Worker with user tags (matched by `submit --require-tag`); os:/arch: tags are added automatically
+./target/release/oxideswarm worker --master <MASTER_IP>:8088 --tag laptop --tag office
+# A second worker on the same machine: give it its own name and no standby portal on :8080
+./target/release/oxideswarm worker --master <MASTER_IP>:8088 --name <NAME>-2 --no-portal
+
+# Pin a task to an OS, an architecture, a tag or one worker (a name, or an id from `workers --json`)
+./target/release/oxideswarm submit --os windows --wait --command cmd -- /C ver
+./target/release/oxideswarm submit --worker <WORKER_NAME> --wait -- uname -a
+./target/release/oxideswarm submit --require-tag laptop --arch x86_64 --wait -- hostname
+
+# Send input with the task (each file at most 32 MiB): a script, standard input, environment variables
+./target/release/oxideswarm submit --type shell --interpreter python3 --script-file job.py --wait
+./target/release/oxideswarm submit --stdin-file data.txt --env MODE=fast --wait --command wc -- -l
+
+# GPU task of a chosen size (default 64; up to 8192 on a real GPU, 2048 on the simulated one)
+./target/release/oxideswarm submit --type gpu --matrix-dim 2048 --wait
+
 # Inspect the grid
 ./target/release/oxideswarm workers --master 127.0.0.1:8088
 ./target/release/oxideswarm status --master 127.0.0.1:8088 --json
 ./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --mapper word_count --reducer sum
+
+# Model Context Protocol (MCP) stdio server for AI coding assistants
+./target/release/oxideswarm mcp --master 127.0.0.1:8088
+
+# Check the whole cluster: every worker, process start-up, every GPU, spreading
+# (exit code 0 = all checks passed, 1 = a check failed, 6 = authentication failed)
+./target/release/oxideswarm doctor --expect-workers 2
+./target/release/oxideswarm doctor --json --skip-gpu
 
 # Secret management
 ./target/release/oxideswarm secret generate
@@ -278,23 +323,23 @@ you pass `--insecure`.
 | :--- | :--- | :--- | :--- |
 | **8088** | TCP | Master Grid Coordinator | Primary cluster communication port for worker node registration, heartbeat exchanges, task distribution, and CLI client requests (`submit`, `status`, `workers`, `mapreduce`). Protected by mutual HMAC-SHA256 handshake (`cluster_auth`). |
 | **8088** | TCP (WS/HTTP) | Agent Mesh Relay Hub | Default listener for `agent-mesh hub`. **Critical Port Conflict:** The default binding `127.0.0.1:8088` collides with the Master Grid port when co-located on the same physical host. Operators MUST bind the Hub to alternate ports (e.g. `--listen 0.0.0.0:8090`) when co-locating services. |
-| **8080** | HTTP | Master Dashboard & Worker Standby | Embedded Axum web server providing cluster telemetry, live status graphs, task submission, and WebSocket streams (`/ws`). Bound to loopback by default; requires explicit `--web-ui-addr 0.0.0.0:8080` to expose across LAN. Protected by RBAC bearer tokens or derived cluster admin token (`oxs1-dashboard-admin`). When a standalone worker runs without a master, it binds `0.0.0.0:8080` to serve an HTTP 307 redirect to the discovered Master. |
+| **8080** | HTTP | Master Dashboard & Worker Standby | Embedded Axum web server providing cluster telemetry, live status graphs, task submission, and WebSocket streams (`/ws`). Bound to loopback by default; requires explicit `--web-ui-addr 0.0.0.0:8080` to expose across LAN. Protected by RBAC bearer tokens or derived cluster admin token (`oxs1-dashboard-admin`). When a standalone worker runs without a master, it binds `0.0.0.0:8080` to serve an HTTP 307 redirect to the discovered Master (`worker --no-portal` turns that off). |
 | **8089** | UDP | Master Discovery Beacon | Master broadcasts cluster address and optional dashboard URL to subnet broadcast (`255.255.255.255:8089`). When a cluster secret is present, beacon payloads include HMAC-SHA256 signatures to prevent rogue discovery spoofing. Workers with `--master auto` listen here. |
 | **8085** | TCP (HTTP) | Cross-Machine Sync Probe | Standalone reachability probe used strictly by `scripts/sync_network` to verify LAN connectivity between nodes using cloud-shared mailboxes. Completely independent of the Rust grid runtime. |
 
-### Environment Variables Inventory (69 Variables)
+### Environment Variables Inventory
 
 OxideSwarm resolves configuration through a 4-tier hierarchical engine:
 $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (rusty-grid.toml)} > \text{Defaults}$$
 
-#### Tier A: Core Authentication & Configuration Engine (3 Variables)
+#### Tier A: Core Authentication & Configuration Engine
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
 | `OXIDESWARM_SECRET` | Global | 64-character hex cluster secret for mutual node authentication |
 | `OXIDESWARM_SECRET_FILE` | Global | File path pointing to cluster secret (mode 0600; preferred over inline hex) |
 | `RUSTY_GRID_CONFIG` | Global | Path to TOML or JSON configuration file |
 
-#### Tier B: Master Coordinator & Scheduling (29 Variables)
+#### Tier B: Master Coordinator & Scheduling
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
 | `RUSTY_GRID_MASTER_LISTEN` | Master | Primary listen socket address for grid coordinator |
@@ -325,16 +370,19 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_DISABLE_WEB_UI` | Master | Disables embedding of Axum web dashboard server |
 | `RUSTY_GRID_ENABLE_WEB_UI` | Master | Explicit override to force-enable web dashboard server |
 | `RUSTY_GRID_DISABLE_DISCOVERY` | Master | Disables UDP discovery beacon listener/broadcaster |
+| `OXIDESWARM_RENDEZVOUS` | Master | HTTP rendezvous registry URL for publishing coordinator address lease |
 | `OXIDE_DEV_MODE` | Master | Enables dashboard local development bypass on loopback interfaces |
 
-#### Tier C: Worker Node Engine (22 Variables)
+#### Tier C: Worker Node Engine
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
 | `RUSTY_GRID_MASTER_ADDR` | Worker | Target Master grid address (`HOST:PORT`) |
 | `RUSTY_GRID_MASTER` | Worker | Secondary alias for Master grid address |
+| `OXIDESWARM_RENDEZVOUS` | Worker | HTTP rendezvous registry URL for discovering active master address |
 | `RUSTY_GRID_P2P_TICKET` | Worker | Iroh P2P connection ticket for remote NAT traversal |
 | `RUSTY_GRID_WORKER_NAME` | Worker | Advertised worker name (persists ID to `~/.oxideswarm/worker_id.<NAME>`) |
 | `RUSTY_GRID_NAME` | Worker | Secondary alias for worker name |
+| `RUSTY_GRID_WORKER_TAGS` | Worker | Comma-separated user tags advertised to the master (`--tag`; matched by `submit --require-tag`) |
 | `RUSTY_GRID_WORKER_ID_FILE` | Worker | Explicit file path where worker node UUID is persisted |
 | `RUSTY_GRID_CORES` | Worker | Advertised CPU core count override |
 | `RUSTY_GRID_CPU_CORES` | Worker | Secondary alias for advertised CPU core count |
@@ -352,25 +400,27 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_SANDBOX_BASE_DIR` | Worker | Base filesystem directory for task execution sandboxes |
 | `RUSTY_GRID_TASK_PRIORITY` | Worker | Process scheduling priority: `normal`, `below-normal`, or `idle` |
 | `RUSTY_GRID_KEEP_SANDBOXES` | Worker | Retains task working directories upon completion |
+| `RUSTY_GRID_NO_PORTAL` | Worker | Leaves out the standby portal on `0.0.0.0:8080` (`--no-portal`), e.g. for a second worker on one machine |
 
-#### Tier D: Task Child Process Injection Environment (3 Variables)
+#### Tier D: Task Child Process Injection Environment
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
 | `RUSTY_GRID_TASK_ID` | Task Runner | UUIDv4 string of the currently executing task (injected into child env) |
 | `RUSTY_GRID_WORKER_ID` | Task Runner | UUIDv4 string of the assigned worker node |
 | `RUSTY_GRID_SANDBOX_DIR` | Task Runner | Absolute path to the isolated scratch working directory |
 
-#### Tier E: Subnet Discovery & Network Helpers (1 Variable)
+#### Tier E: Subnet Discovery & Network Helpers
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
 | `OXIDESWARM_DISCOVERY_CANDIDATES` | Discovery | Comma-separated list of candidate IP addresses probed during auto-discovery |
+| `OXIDESWARM_RENDEZVOUS` | Discovery | Tier 3 HTTP rendezvous registry URL for discovery fallback on isolated subnets |
 
-#### Tier F: Agent Mesh Framework (1 Variable)
+#### Tier F: Agent Mesh Framework
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
 | `OXIDE_MESH_TOKEN` | Agent Mesh | Bearer token for authenticating nodes and HTTP API requests against hub |
 
-#### Tier G: Platform Packaging, Service Automation & Launchers (10 Variables)
+#### Tier G: Platform Packaging, Service Automation & Launchers
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
 | `OXIDESWARM_HOME` | Launchers | Custom state directory override (default: `~/.oxideswarm` / `%USERPROFILE%\.oxideswarm`) |
@@ -464,7 +514,8 @@ OxideSwarm/
 ├── Cargo.toml                     # Workspace root manifest (no root package)
 ├── README.md                      # This file
 ├── CLAUDE.md                      # Architecture map for AI coding assistants
-├── docs/SECURITY.md               # Threat model, ports, secret handling, rotation
+├── docs/                          # README.md (index + writing standard), SECURITY.md (threat model),
+│                                  # guides/ (runbooks), design/ (design records)
 ├── DEPLOYMENT.md                  # Agent Mesh deployment guide
 ├── ANDROID_ARCHITECTURE.md        # Android architecture (parts are design only, marked as such)
 ├── switch_role.sh                 # Master <-> Worker role switcher for macOS / Linux

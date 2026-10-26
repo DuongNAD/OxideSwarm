@@ -9,12 +9,17 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, info, warn};
 
-pub const EMBEDDED_BLENDER_RIG_SCRIPT: &str = include_str!("../../../../engines/autorig/blender_rig.py");
+pub const EMBEDDED_BLENDER_RIG_SCRIPT: &str =
+    include_str!("../../../../engines/autorig/blender_rig.py");
 
 /// Resolves the file path to host Blender executable.
 pub fn resolve_blender_binary() -> Option<PathBuf> {
     // 1. Environment variables
-    for env_var in &["RUSTY_GRID_BLENDER_PATH", "OXIDE_SWARM_BLENDER_PATH", "BLENDER_PATH"] {
+    for env_var in &[
+        "RUSTY_GRID_BLENDER_PATH",
+        "OXIDE_SWARM_BLENDER_PATH",
+        "BLENDER_PATH",
+    ] {
         if let Ok(env_path) = std::env::var(env_var) {
             let p = PathBuf::from(env_path.trim());
             if p.is_file() {
@@ -41,7 +46,13 @@ pub fn resolve_blender_binary() -> Option<PathBuf> {
                     let mut version_dirs: Vec<PathBuf> = entries
                         .flatten()
                         .map(|e| e.path())
-                        .filter(|p| p.is_dir() && p.file_name().unwrap_or_default().to_string_lossy().starts_with("Blender"))
+                        .filter(|p| {
+                            p.is_dir()
+                                && p.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .starts_with("Blender")
+                        })
                         .collect();
                     version_dirs.sort_by(|a, b| b.cmp(a)); // Descending version order (prefer 4.5 over older)
                     for dir in version_dirs {
@@ -56,7 +67,10 @@ pub fn resolve_blender_binary() -> Option<PathBuf> {
     }
 
     // 3. Fallback check for "blender" on PATH
-    if let Ok(output) = std::process::Command::new("blender").arg("--version").output() {
+    if let Ok(output) = std::process::Command::new("blender")
+        .arg("--version")
+        .output()
+    {
         if output.status.success() {
             return Some(PathBuf::from("blender"));
         }
@@ -110,7 +124,9 @@ impl BlenderRigProvider {
 
         // Write driver script (using local file or embedded script)
         let script_content = if let Some(local_script) = resolve_blender_rig_script() {
-            tokio::fs::read_to_string(&local_script).await.unwrap_or_else(|_| EMBEDDED_BLENDER_RIG_SCRIPT.to_string())
+            tokio::fs::read_to_string(&local_script)
+                .await
+                .unwrap_or_else(|_| EMBEDDED_BLENDER_RIG_SCRIPT.to_string())
         } else {
             EMBEDDED_BLENDER_RIG_SCRIPT.to_string()
         };
@@ -168,7 +184,10 @@ impl BlenderRigProvider {
         }
 
         // Stream output
-        let stdout = child.stdout.take().ok_or("Failed to capture Blender stdout")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("Failed to capture Blender stdout")?;
         let mut reader = BufReader::new(stdout).lines();
 
         let execution = async {
@@ -189,17 +208,24 @@ impl BlenderRigProvider {
                         .map_err(|e| format!("Failed to read Blender output .glb: {e}"))?;
                     Ok(glb_bytes)
                 } else {
-                    Err("Blender process finished with success but output .glb is missing".to_string())
+                    Err(
+                        "Blender process finished with success but output .glb is missing"
+                            .to_string(),
+                    )
                 }
             }
-            Ok(Ok(status)) => Err(format!("Blender process exited with error status: {status}")),
+            Ok(Ok(status)) => Err(format!(
+                "Blender process exited with error status: {status}"
+            )),
             Ok(Err(e)) => Err(format!("I/O error during Blender execution: {e}")),
             Err(_) => {
                 // Timeout: enforce termination
                 if let Some(ref job) = job_object {
                     let _ = job.terminate(1);
                 }
-                Err(format!("Blender auto-rigging timed out after {timeout_secs}s"))
+                Err(format!(
+                    "Blender auto-rigging timed out after {timeout_secs}s"
+                ))
             }
         }
     }

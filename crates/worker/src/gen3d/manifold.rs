@@ -1,7 +1,7 @@
 //! Manifold mesh repair and area-weighted smooth normal calculation (Feature F6).
 
-use std::collections::HashMap;
 use super::types::RawMesh;
+use std::collections::HashMap;
 
 pub const DEDUPLICATION_EPSILON: f32 = 1e-5;
 
@@ -31,7 +31,9 @@ pub fn repair_manifold_mesh(raw: &RawMesh) -> RawMesh {
                     if let Some(candidates) = grid.get(&(kx + dx, ky + dy, kz + dz)) {
                         for &cand_idx in candidates {
                             let q = unique_positions[cand_idx as usize];
-                            let dist_sq = (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2);
+                            let dist_sq = (p[0] - q[0]).powi(2)
+                                + (p[1] - q[1]).powi(2)
+                                + (p[2] - q[2]).powi(2);
                             if dist_sq < eps_sq {
                                 matched_idx = Some(cand_idx);
                                 break 'search;
@@ -90,9 +92,12 @@ pub fn repair_manifold_mesh(raw: &RawMesh) -> RawMesh {
             let norm_sq = cx * cx + cy * cy + cz * cz;
 
             if norm_sq < 1e-14 {
-                let d01 = (p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2) + (p1[2] - p0[2]).powi(2);
-                let d12 = (p2[0] - p1[0]).powi(2) + (p2[1] - p1[1]).powi(2) + (p2[2] - p1[2]).powi(2);
-                let d20 = (p0[0] - p2[0]).powi(2) + (p0[1] - p2[1]).powi(2) + (p0[2] - p2[2]).powi(2);
+                let d01 =
+                    (p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2) + (p1[2] - p0[2]).powi(2);
+                let d12 =
+                    (p2[0] - p1[0]).powi(2) + (p2[1] - p1[1]).powi(2) + (p2[2] - p1[2]).powi(2);
+                let d20 =
+                    (p0[0] - p2[0]).powi(2) + (p0[1] - p2[1]).powi(2) + (p0[2] - p2[2]).powi(2);
 
                 let (keep_v, drop_v) = if d01 <= d12 && d01 <= d20 {
                     (i0 as u32, i1 as u32)

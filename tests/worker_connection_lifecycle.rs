@@ -830,6 +830,7 @@ async fn test_live_battery_and_thermal_updates_reach_the_masters_scheduler_view(
         battery_pct: Some(4),
         is_charging: Some(false),
         thermal_throttled: true,
+        ..Default::default()
     });
     let updated = wait_until(Duration::from_secs(10), || async {
         mobile_of(&master).await.is_some_and(|m| {
@@ -852,6 +853,7 @@ async fn test_live_battery_and_thermal_updates_reach_the_masters_scheduler_view(
         battery_pct: Some(5),
         is_charging: Some(true),
         thermal_throttled: false,
+        ..Default::default()
     });
     assert!(
         wait_until(Duration::from_secs(10), || async {

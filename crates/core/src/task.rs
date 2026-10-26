@@ -588,7 +588,11 @@ pub struct Generative3DSpec {
 struct HumanGenerative3DSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prompt: Option<String>,
-    #[serde(default, with = "opt_bytes_serde", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "opt_bytes_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
     image_data: Option<Bytes>,
     #[serde(default = "default_3d_quality")]
     quality: String,
@@ -947,9 +951,19 @@ enum HumanTaskSpec {
         #[serde(default)]
         require_gpu: bool,
     },
-    #[serde(alias = "generative_3d", alias = "generative3d", alias = "3d", alias = "Generative3d")]
+    #[serde(
+        alias = "generative_3d",
+        alias = "generative3d",
+        alias = "3d",
+        alias = "Generative3d"
+    )]
     Generative3D(Generative3DSpec),
-    #[serde(alias = "auto_rig", alias = "autorig", alias = "rig", alias = "Auto_Rig")]
+    #[serde(
+        alias = "auto_rig",
+        alias = "autorig",
+        alias = "rig",
+        alias = "Auto_Rig"
+    )]
     AutoRig(AutoRigSpec),
 }
 
@@ -1431,10 +1445,21 @@ impl TaskSpec {
             }
             TaskSpec::BuiltinTest { .. } => {}
             TaskSpec::Generative3D(spec) => {
-                let has_prompt = spec.prompt.as_ref().map(|p| !p.trim().is_empty()).unwrap_or(false);
-                let has_image = spec.image_data.as_ref().map(|img| !img.is_empty()).unwrap_or(false);
+                let has_prompt = spec
+                    .prompt
+                    .as_ref()
+                    .map(|p| !p.trim().is_empty())
+                    .unwrap_or(false);
+                let has_image = spec
+                    .image_data
+                    .as_ref()
+                    .map(|img| !img.is_empty())
+                    .unwrap_or(false);
                 if !has_prompt && !has_image {
-                    return Err("Generative3D requires at least a non-empty prompt or non-empty image_data".to_string());
+                    return Err(
+                        "Generative3D requires at least a non-empty prompt or non-empty image_data"
+                            .to_string(),
+                    );
                 }
                 if spec.quality.trim().is_empty() {
                     return Err("Generative3D quality cannot be empty".to_string());
@@ -1459,10 +1484,10 @@ impl TaskSpec {
             TaskSpec::BuiltinTest { require_gpu, .. } => *require_gpu,
             TaskSpec::Generative3D(spec) => {
                 // Procedural SDF engine runs on CPU; neural or auto engines require GPU
-                match spec.engine_preference.as_deref() {
-                    Some("sdf") | Some("procedural") => false,
-                    _ => true,
-                }
+                !matches!(
+                    spec.engine_preference.as_deref(),
+                    Some("sdf") | Some("procedural")
+                )
             }
             TaskSpec::AutoRig(_) => false,
             _ => false,
@@ -1493,6 +1518,210 @@ impl CheckpointData {
     }
 }
 
+/// Maximum allowable size for a single staged input file (32 MiB).
+pub const MAX_STAGED_FILE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Maximum allowable aggregate size for all staged input files in a task (32 MiB).
+pub const MAX_AGGREGATE_STAGED_BYTES: usize = 32 * 1024 * 1024;
+
+/// Maximum allowable size for a single output artifact captured from sandbox (10 MiB).
+pub const MAX_OUTPUT_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum allowable aggregate size for all output artifacts captured in a task (32 MiB).
+pub const MAX_AGGREGATE_ARTIFACT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Windows reserved DOS device names that cannot be created or accessed as files.
+pub const WINDOWS_RESERVED_DEVICE_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Computes SHA-256 digest over byte slice using ring.
+pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
+}
+
+/// Encodes byte slice into lowercase hexadecimal string without external dependencies.
+pub fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+/// Validates and normalizes a relative sandbox path.
+///
+/// Enforces:
+/// 1. Rejection of embedded null bytes (`\0`).
+/// 2. Normalization of Windows backslashes `\` to canonical forward slashes `/`.
+/// 3. Rejection of empty or root paths (`""`, `"/"`).
+/// 4. Rejection of Unix absolute paths (`/etc/passwd`).
+/// 5. Rejection of Windows drive letters (`C:\`, `C:foo.txt`).
+/// 6. Rejection of Windows UNC paths (`\\server\share`).
+/// 7. Rejection of parent directory traversal (`..`).
+/// 8. Rejection of colons or alternate data streams (`:`).
+/// 9. Rejection of Windows DOS reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`).
+///
+/// Returns the canonical forward-slash separated relative path.
+pub fn validate_relative_sandbox_path(raw: &str) -> Result<String, String> {
+    if raw.is_empty() {
+        return Err("Path cannot be empty".to_string());
+    }
+    if raw.contains('\0') {
+        return Err("Path contains prohibited null byte".to_string());
+    }
+    if raw.starts_with('/') || raw.starts_with('\\') {
+        return Err(format!("Absolute paths are prohibited: '{raw}'"));
+    }
+    if raw.contains(':') {
+        return Err(format!("Colons and drive letters are prohibited: '{raw}'"));
+    }
+
+    let normalized = raw.replace('\\', "/");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return Err("Path cannot be empty".to_string());
+    }
+    if trimmed.starts_with('/') {
+        return Err(format!("Absolute paths are prohibited: '{raw}'"));
+    }
+    if trimmed.starts_with("//") {
+        return Err(format!("UNC prefix is prohibited: '{raw}'"));
+    }
+
+    let mut segments = Vec::new();
+    for seg in trimmed.split('/') {
+        let seg_trimmed = seg.trim();
+        if seg_trimmed.is_empty() || seg_trimmed == "." {
+            continue;
+        }
+        if seg_trimmed == ".." {
+            return Err(format!(
+                "Parent directory traversal ('..') is prohibited: '{raw}'"
+            ));
+        }
+        let cleaned = seg_trimmed.trim_end_matches([' ', '.']);
+        if cleaned.is_empty() {
+            return Err(format!(
+                "Illegal path component '{seg_trimmed}' consisting only of dots/spaces: '{raw}'"
+            ));
+        }
+        let base_name = cleaned
+            .split('.')
+            .next()
+            .unwrap_or(cleaned)
+            .trim_end_matches([' ', '.'])
+            .to_ascii_uppercase();
+        if WINDOWS_RESERVED_DEVICE_NAMES.contains(&base_name.as_str()) {
+            return Err(format!(
+                "Windows reserved device name '{seg_trimmed}' is prohibited: '{raw}'"
+            ));
+        }
+        segments.push(seg_trimmed);
+    }
+
+    if segments.is_empty() {
+        return Err(format!(
+            "Path resolved to empty after normalization: '{raw}'"
+        ));
+    }
+
+    Ok(segments.join("/"))
+}
+
+/// Staged input file materialized into worker's task sandbox prior to execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedFile {
+    /// Relative path within sandbox (canonical forward-slash delimited, e.g. "data/input.csv").
+    pub path: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// SHA-256 content digest.
+    pub sha256: [u8; 32],
+    /// Unix executable permission flag (0o755 if true, 0o644 if false).
+    #[serde(default)]
+    pub executable: bool,
+    /// File payload bytes.
+    pub data: Bytes,
+}
+
+impl StagedFile {
+    pub fn new(path: impl Into<String>, data: impl Into<Bytes>, executable: bool) -> Self {
+        let path = path.into();
+        let data = data.into();
+        let size = data.len() as u64;
+        let sha256 = sha256_digest(data.as_bytes());
+        Self {
+            path,
+            size,
+            sha256,
+            executable,
+            data,
+        }
+    }
+
+    pub fn verify_checksum(&self) -> bool {
+        if self.data.len() as u64 != self.size {
+            return false;
+        }
+        sha256_digest(self.data.as_bytes()) == self.sha256
+    }
+
+    pub fn sha256_hex(&self) -> String {
+        hex_encode(&self.sha256)
+    }
+}
+
+/// Output artifact collected from worker's task sandbox upon task completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputArtifact {
+    /// Relative path within sandbox (e.g. "model/weights.bin").
+    pub path: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// SHA-256 content digest.
+    pub sha256: [u8; 32],
+    /// File payload bytes.
+    #[serde(alias = "content")]
+    pub data: Bytes,
+}
+
+impl OutputArtifact {
+    pub fn new(path: impl Into<String>, data: impl Into<Bytes>) -> Self {
+        let path = path.into();
+        let data = data.into();
+        let size = data.len() as u64;
+        let sha256 = sha256_digest(data.as_bytes());
+        Self {
+            path,
+            size,
+            sha256,
+            data,
+        }
+    }
+
+    pub fn verify_checksum(&self) -> bool {
+        if self.data.len() as u64 != self.size {
+            return false;
+        }
+        sha256_digest(self.data.as_bytes()) == self.sha256
+    }
+
+    pub fn sha256_hex(&self) -> String {
+        hex_encode(&self.sha256)
+    }
+
+    #[inline]
+    pub fn content(&self) -> &Bytes {
+        &self.data
+    }
+}
+
 /// The top-level task representation submitted to Master and dispatched to Workers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
@@ -1510,6 +1739,12 @@ pub struct Task {
     /// Latest checkpoint data for delta resumption.
     #[serde(default)]
     pub latest_checkpoint: Option<CheckpointData>,
+    /// Staged input files to be placed into the task sandbox prior to execution.
+    #[serde(default)]
+    pub staged_files: Vec<StagedFile>,
+    /// Declared output artifact paths to be captured from sandbox upon completion.
+    #[serde(default)]
+    pub expected_outputs: Vec<String>,
 }
 
 impl Task {
@@ -1527,6 +1762,8 @@ impl Task {
             created_at_utc,
             tags: Vec::new(),
             latest_checkpoint: None,
+            staged_files: Vec::new(),
+            expected_outputs: Vec::new(),
         }
     }
 
@@ -1539,6 +1776,30 @@ impl Task {
     /// Builder method to attach latest checkpoint data.
     pub fn with_checkpoint(mut self, checkpoint: CheckpointData) -> Self {
         self.latest_checkpoint = Some(checkpoint);
+        self
+    }
+
+    /// Builder method to attach staged input files.
+    pub fn with_staged_files(mut self, staged_files: Vec<StagedFile>) -> Self {
+        self.staged_files = staged_files;
+        self
+    }
+
+    /// Builder method to attach a single staged input file.
+    pub fn with_staged_file(mut self, file: StagedFile) -> Self {
+        self.staged_files.push(file);
+        self
+    }
+
+    /// Builder method to attach expected output artifact paths.
+    pub fn with_expected_outputs(mut self, expected_outputs: Vec<String>) -> Self {
+        self.expected_outputs = expected_outputs;
+        self
+    }
+
+    /// Builder method to attach a single expected output artifact path.
+    pub fn with_expected_output(mut self, path: impl Into<String>) -> Self {
+        self.expected_outputs.push(path.into());
         self
     }
 
@@ -1558,7 +1819,47 @@ impl Task {
             );
         }
 
+        self.placement()?;
+
+        let mut total_staged: u64 = 0;
+        for file in &self.staged_files {
+            if file.data.len() as u64 != file.size {
+                return Err(format!(
+                    "Staged file '{}' payload length {} does not match declared size {}",
+                    file.path,
+                    file.data.len(),
+                    file.size
+                ));
+            }
+            if file.size > MAX_STAGED_FILE_BYTES as u64 {
+                return Err(format!(
+                    "Staged file '{}' size {} exceeds single file limit of 32 MiB",
+                    file.path, file.size
+                ));
+            }
+            total_staged = total_staged.saturating_add(file.size);
+            if total_staged > MAX_AGGREGATE_STAGED_BYTES as u64 {
+                return Err("Aggregate staged files size exceeds limit of 32 MiB".to_string());
+            }
+            validate_relative_sandbox_path(&file.path)?;
+        }
+
+        for output in &self.expected_outputs {
+            validate_relative_sandbox_path(output)?;
+        }
+
         Ok(())
+    }
+
+    /// The placement constraints in this task's `require:` tags (see [`crate::placement`]).
+    pub fn placement(&self) -> Result<crate::placement::Placement, String> {
+        crate::placement::Placement::from_task_tags(&self.tags)
+    }
+
+    /// Builder method to add placement constraints to the task's tags.
+    pub fn with_placement(mut self, placement: &crate::placement::Placement) -> Self {
+        self.tags.extend(placement.to_task_tags());
+        self
     }
 }
 
@@ -1585,6 +1886,8 @@ pub struct TaskResult {
     pub error: Option<String>,
     /// Optional zero-copy binary asset payload (e.g. glTF 2.0 .glb model).
     pub asset_bytes: Option<Bytes>,
+    /// Captured output artifacts extracted from sandbox.
+    pub artifacts: Vec<OutputArtifact>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1602,8 +1905,14 @@ struct HumanTaskResult {
     pub device_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    #[serde(default, with = "opt_bytes_serde", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "opt_bytes_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub asset_bytes: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<OutputArtifact>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1621,6 +1930,41 @@ struct BinaryTaskResult {
     pub error: Option<String>,
     #[serde(default, with = "opt_bytes_serde")]
     pub asset_bytes: Option<Bytes>,
+    #[serde(default)]
+    pub artifacts: Vec<OutputArtifact>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LegacyBinaryTaskResult {
+    pub worker_id: Uuid,
+    pub task_id: TaskId,
+    pub exit_code: i32,
+    #[serde(with = "bytes_serde")]
+    pub stdout: Bytes,
+    #[serde(with = "bytes_serde")]
+    pub stderr: Bytes,
+    pub execution_time_ms: u64,
+    pub is_gpu_executed: bool,
+    pub device_name: Option<String>,
+    pub error: Option<String>,
+}
+
+impl From<LegacyBinaryTaskResult> for TaskResult {
+    fn from(l: LegacyBinaryTaskResult) -> Self {
+        Self {
+            worker_id: l.worker_id,
+            task_id: l.task_id,
+            exit_code: l.exit_code,
+            stdout: l.stdout,
+            stderr: l.stderr,
+            execution_time_ms: l.execution_time_ms,
+            is_gpu_executed: l.is_gpu_executed,
+            device_name: l.device_name,
+            error: l.error,
+            asset_bytes: None,
+            artifacts: Vec::new(),
+        }
+    }
 }
 
 impl From<&TaskResult> for HumanTaskResult {
@@ -1636,6 +1980,7 @@ impl From<&TaskResult> for HumanTaskResult {
             device_name: r.device_name.clone(),
             error: r.error.clone(),
             asset_bytes: r.asset_bytes.clone(),
+            artifacts: r.artifacts.clone(),
         }
     }
 }
@@ -1653,6 +1998,7 @@ impl From<HumanTaskResult> for TaskResult {
             device_name: h.device_name,
             error: h.error,
             asset_bytes: h.asset_bytes,
+            artifacts: h.artifacts,
         }
     }
 }
@@ -1670,6 +2016,7 @@ impl From<&TaskResult> for BinaryTaskResult {
             device_name: r.device_name.clone(),
             error: r.error.clone(),
             asset_bytes: r.asset_bytes.clone(),
+            artifacts: r.artifacts.clone(),
         }
     }
 }
@@ -1687,6 +2034,7 @@ impl From<BinaryTaskResult> for TaskResult {
             device_name: b.device_name,
             error: b.error,
             asset_bytes: b.asset_bytes,
+            artifacts: b.artifacts,
         }
     }
 }
@@ -1771,6 +2119,7 @@ impl TaskResult {
             device_name: None,
             error: None,
             asset_bytes: None,
+            artifacts: Vec::new(),
         }
     }
 
@@ -1795,6 +2144,30 @@ impl TaskResult {
             device_name: None,
             error,
             asset_bytes: None,
+            artifacts: Vec::new(),
+        }
+    }
+
+    /// Builder method to attach captured output artifacts.
+    pub fn with_artifacts(mut self, artifacts: Vec<OutputArtifact>) -> Self {
+        self.artifacts = artifacts;
+        self
+    }
+
+    /// Builder method to attach a single output artifact.
+    pub fn with_artifact(mut self, artifact: OutputArtifact) -> Self {
+        self.artifacts.push(artifact);
+        self
+    }
+
+    /// Deserializes a `TaskResult` from bincode bytes with legacy binary schema fallback.
+    pub fn from_bincode_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        match bincode::deserialize::<BinaryTaskResult>(bytes) {
+            Ok(b) => Ok(b.into()),
+            Err(_) => {
+                let legacy: LegacyBinaryTaskResult = bincode::deserialize(bytes)?;
+                Ok(legacy.into())
+            }
         }
     }
 }
@@ -2347,20 +2720,22 @@ mod tests {
         let task_spec = TaskSpec::Generative3D(spec);
 
         let encoded = bincode::serialize(&task_spec).expect("Bincode serialization failed");
-        let decoded: TaskSpec = bincode::deserialize(&encoded).expect("Bincode deserialization failed");
+        let decoded: TaskSpec =
+            bincode::deserialize(&encoded).expect("Bincode deserialization failed");
         assert_eq!(task_spec, decoded);
     }
 
     #[test]
     fn test_generative_3d_aliases_and_defaults() {
         let json_minimal = r#"{"type":"3d","prompt":"fantasy sword"}"#;
-        let decoded: TaskSpec = serde_json::from_str(json_minimal).expect("Alias deserialization failed");
+        let decoded: TaskSpec =
+            serde_json::from_str(json_minimal).expect("Alias deserialization failed");
 
         match decoded {
             TaskSpec::Generative3D(s) => {
                 assert_eq!(s.prompt, Some("fantasy sword".to_string()));
                 assert_eq!(s.quality, "standard");
-                assert_eq!(s.export_texture, true);
+                assert!(s.export_texture);
                 assert!(s.image_data.is_none());
                 assert!(s.engine_preference.is_none());
             }
@@ -2371,8 +2746,7 @@ mod tests {
     #[test]
     fn test_auto_rig_spec_serde_roundtrip() {
         let mesh_data = Bytes::copy_from_slice(b"glTF binary payload test");
-        let spec = AutoRigSpec::new(mesh_data, "humanoid")
-            .with_provider("builtin");
+        let spec = AutoRigSpec::new(mesh_data, "humanoid").with_provider("builtin");
 
         let task_spec = TaskSpec::AutoRig(spec);
 
@@ -2406,10 +2780,16 @@ mod tests {
     #[test]
     fn test_task_spec_3d_validation() {
         // Valid prompt
-        assert!(TaskSpec::new_generative_3d("valid prompt").validate().is_ok());
+        assert!(TaskSpec::new_generative_3d("valid prompt")
+            .validate()
+            .is_ok());
 
         // Valid image
-        assert!(TaskSpec::new_generative_3d_image(Bytes::from_static(b"image")).validate().is_ok());
+        assert!(
+            TaskSpec::new_generative_3d_image(Bytes::from_static(b"image"))
+                .validate()
+                .is_ok()
+        );
 
         // Invalid: empty prompt and no image
         let empty_prompt = TaskSpec::Generative3D(Generative3DSpec {
@@ -2437,9 +2817,8 @@ mod tests {
         assert!(gen_gpu.requires_gpu());
 
         // Procedural SDF engine does NOT require GPU (CPU CI safe)
-        let gen_cpu = TaskSpec::Generative3D(
-            Generative3DSpec::new_prompt("cube").with_engine("sdf")
-        );
+        let gen_cpu =
+            TaskSpec::Generative3D(Generative3DSpec::new_prompt("cube").with_engine("sdf"));
         assert!(!gen_cpu.requires_gpu());
 
         // AutoRig does NOT require GPU
@@ -2450,7 +2829,10 @@ mod tests {
     #[test]
     fn test_task_spec_task_type() {
         assert_eq!(TaskSpec::new_generative_3d("x").task_type(), "Generative3D");
-        assert_eq!(TaskSpec::new_auto_rig(Bytes::new(), "biped").task_type(), "AutoRig");
+        assert_eq!(
+            TaskSpec::new_auto_rig(Bytes::new(), "biped").task_type(),
+            "AutoRig"
+        );
         assert_eq!(TaskSpec::new_command("ls", vec![]).task_type(), "Command");
     }
 
@@ -2467,12 +2849,14 @@ mod tests {
 
         // JSON roundtrip
         let json = serde_json::to_string(&res).expect("TaskResult JSON serialize failed");
-        let decoded_json: TaskResult = serde_json::from_str(&json).expect("TaskResult JSON deserialize failed");
+        let decoded_json: TaskResult =
+            serde_json::from_str(&json).expect("TaskResult JSON deserialize failed");
         assert_eq!(res, decoded_json);
 
         // Bincode roundtrip
         let bin = bincode::serialize(&res).expect("TaskResult Bincode serialize failed");
-        let decoded_bin: TaskResult = bincode::deserialize(&bin).expect("TaskResult Bincode deserialize failed");
+        let decoded_bin: TaskResult =
+            bincode::deserialize(&bin).expect("TaskResult Bincode deserialize failed");
         assert_eq!(res, decoded_bin);
 
         // Verify None case omits asset_bytes in JSON
@@ -2492,13 +2876,17 @@ mod tests {
 
         // In JSON, asset_bytes = None must be omitted from output
         let json = serde_json::to_string(&res).expect("serialize legacy TaskResult");
-        assert!(!json.contains("asset_bytes"), "JSON should skip asset_bytes when None: {json}");
+        assert!(
+            !json.contains("asset_bytes"),
+            "JSON should skip asset_bytes when None: {json}"
+        );
 
         // 2. Deserializing legacy JSON (without asset_bytes field) must yield None
         let legacy_json = format!(
             r#"{{"worker_id":"{worker_id}","task_id":"{task_id}","exit_code":0,"stdout":"ok","stderr":"","execution_time_ms":100,"is_gpu_executed":false}}"#
         );
-        let deser_legacy: TaskResult = serde_json::from_str(&legacy_json).expect("deserialize legacy json");
+        let deser_legacy: TaskResult =
+            serde_json::from_str(&legacy_json).expect("deserialize legacy json");
         assert_eq!(deser_legacy.asset_bytes, None);
         assert_eq!(deser_legacy.stdout.as_str(), "ok");
     }
@@ -2538,18 +2926,27 @@ mod tests {
             .with_engine("sdf");
         let rig_spec = AutoRigSpec::new(Bytes::copy_from_slice(b"dummy_mesh_geometry"), "biped");
 
-        let specs = vec![TaskSpec::Generative3D(gen_spec), TaskSpec::AutoRig(rig_spec)];
+        let specs = vec![
+            TaskSpec::Generative3D(gen_spec),
+            TaskSpec::AutoRig(rig_spec),
+        ];
 
         for spec in specs {
             // TaskSpec -> HumanTaskSpec -> TaskSpec parity
             let human: HumanTaskSpec = spec.clone().into();
             let from_human: TaskSpec = human.into();
-            assert_eq!(spec, from_human, "HumanTaskSpec From conversion parity failed");
+            assert_eq!(
+                spec, from_human,
+                "HumanTaskSpec From conversion parity failed"
+            );
 
             // TaskSpec -> BinaryTaskSpec -> TaskSpec parity
             let binary: BinaryTaskSpec = spec.clone().into();
             let from_binary: TaskSpec = binary.into();
-            assert_eq!(spec, from_binary, "BinaryTaskSpec From conversion parity failed");
+            assert_eq!(
+                spec, from_binary,
+                "BinaryTaskSpec From conversion parity failed"
+            );
         }
     }
 
@@ -2567,12 +2964,14 @@ mod tests {
 
         // JSON roundtrip
         let json = serde_json::to_string(&task).expect("serialize Task with Generative3D");
-        let deser_task: Task = serde_json::from_str(&json).expect("deserialize Task with Generative3D");
+        let deser_task: Task =
+            serde_json::from_str(&json).expect("deserialize Task with Generative3D");
         assert_eq!(task, deser_task);
 
         // Bincode roundtrip
         let bin = bincode::serialize(&task).expect("bincode serialize Task with Generative3D");
-        let deser_bin: Task = bincode::deserialize(&bin).expect("bincode deserialize Task with Generative3D");
+        let deser_bin: Task =
+            bincode::deserialize(&bin).expect("bincode deserialize Task with Generative3D");
         assert_eq!(task, deser_bin);
     }
 }

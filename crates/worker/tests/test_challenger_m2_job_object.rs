@@ -11,6 +11,8 @@
 //! 6. TaskRunner Generative3D watchdog timeout: verify exit code 124 and zero orphaned descendants.
 //! 7. TaskRunner future drop/abort mid-execution: verify RAII JobObject cleanup.
 
+#![allow(clippy::field_reassign_with_default)]
+
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,9 +26,7 @@ use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::task::{Generative3DSpec, Task, TaskRequirements, TaskSpec};
 use rusty_grid_worker::job_object::JobObject;
 use rusty_grid_worker::sandbox::SandboxConfig;
-use rusty_grid_worker::{
-    RunnerConfig, TaskRunner, EXIT_CODE_CANCELLED, EXIT_CODE_TIMEOUT,
-};
+use rusty_grid_worker::{RunnerConfig, TaskRunner, EXIT_CODE_CANCELLED, EXIT_CODE_TIMEOUT};
 
 /// Resolves python executable for tests.
 fn get_python_exe() -> PathBuf {
@@ -95,7 +95,8 @@ if __name__ == "__main__":
     main()
 "#;
     let mut f = File::create(&script_path).expect("Failed to create tree script");
-    f.write_all(content.as_bytes()).expect("Failed to write script");
+    f.write_all(content.as_bytes())
+        .expect("Failed to write script");
     script_path
 }
 
@@ -121,9 +122,7 @@ fn poll_pids(pids_file: &Path, expected_count: usize, timeout: Duration) -> Vec<
         std::thread::sleep(Duration::from_millis(50));
     }
     let current_content = std::fs::read_to_string(pids_file).unwrap_or_default();
-    panic!(
-        "Timed out waiting for {expected_count} PIDs. Current content:\n{current_content}"
-    );
+    panic!("Timed out waiting for {expected_count} PIDs. Current content:\n{current_content}");
 }
 
 /// Verifies that all given PIDs are actively running in the OS process table.
@@ -182,10 +181,7 @@ impl ScopedEnvVar {
     pub async fn set(key: &'static str, val: &Path) -> Self {
         let guard = ENV_LOCK.lock().await;
         std::env::set_var(key, val);
-        Self {
-            _guard: guard,
-            key,
-        }
+        Self { _guard: guard, key }
     }
 }
 
@@ -215,10 +211,10 @@ async fn poll_pids_async(pids_file: &Path, expected_count: usize, timeout: Durat
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let current_content = tokio::fs::read_to_string(pids_file).await.unwrap_or_default();
-    panic!(
-        "Timed out waiting for {expected_count} PIDs. Current content:\n{current_content}"
-    );
+    let current_content = tokio::fs::read_to_string(pids_file)
+        .await
+        .unwrap_or_default();
+    panic!("Timed out waiting for {expected_count} PIDs. Current content:\n{current_content}");
 }
 
 async fn assert_all_dead_async(sys: &mut sysinfo::System, pids: &[u32], timeout: Duration) {
@@ -283,7 +279,8 @@ fn test_adversarial_job_object_grandchild_tree_explicit_terminate() {
         .expect("Failed to spawn root process");
 
     let root_pid = child.id();
-    job.assign_pid(root_pid).expect("Failed to assign root PID to JobObject");
+    job.assign_pid(root_pid)
+        .expect("Failed to assign root PID to JobObject");
 
     // Wait until all 7 descendant processes are running and registered
     let pids = poll_pids(&pids_file, 7, Duration::from_secs(25));
@@ -292,7 +289,10 @@ fn test_adversarial_job_object_grandchild_tree_explicit_terminate() {
 
     let mut sys = sysinfo::System::new();
     assert_all_alive(&mut sys, &pids);
-    println!("Verified all 7 processes (root, 2 children, 4 grandchildren) alive: {:?}", pids);
+    println!(
+        "Verified all 7 processes (root, 2 children, 4 grandchildren) alive: {:?}",
+        pids
+    );
 
     // Act: Explicitly terminate Job Object
     let t0 = Instant::now();
@@ -300,7 +300,10 @@ fn test_adversarial_job_object_grandchild_tree_explicit_terminate() {
 
     // Assert: All 7 processes must be reaped with 0 survivors
     assert_all_dead(&mut sys, &pids, Duration::from_secs(4));
-    println!("All 7 processes terminated via JobObject::terminate in {:?}", t0.elapsed());
+    println!(
+        "All 7 processes terminated via JobObject::terminate in {:?}",
+        t0.elapsed()
+    );
 
     let _ = child.wait();
 }
@@ -334,13 +337,17 @@ fn test_adversarial_job_object_grandchild_tree_implicit_drop_cleanup() {
         .expect("Failed to spawn root process");
 
     let root_pid = child.id();
-    job.assign_pid(root_pid).expect("Failed to assign root PID to JobObject");
+    job.assign_pid(root_pid)
+        .expect("Failed to assign root PID to JobObject");
 
     // Wait until all 7 descendant processes are running
     let pids = poll_pids(&pids_file, 7, Duration::from_secs(25));
     let mut sys = sysinfo::System::new();
     assert_all_alive(&mut sys, &pids);
-    println!("Verified all 7 processes actively running before drop: {:?}", pids);
+    println!(
+        "Verified all 7 processes actively running before drop: {:?}",
+        pids
+    );
 
     // Act: Drop JobObject handle WITHOUT calling terminate()!
     // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE must trigger Windows NT kernel auto-reap.
@@ -349,7 +356,10 @@ fn test_adversarial_job_object_grandchild_tree_implicit_drop_cleanup() {
 
     // Assert: Kernel must terminate all 7 descendant processes
     assert_all_dead(&mut sys, &pids, Duration::from_secs(4));
-    println!("All 7 processes auto-reaped by Windows kernel on drop in {:?}", t0.elapsed());
+    println!(
+        "All 7 processes auto-reaped by Windows kernel on drop in {:?}",
+        t0.elapsed()
+    );
 
     let _ = child.wait();
 }
@@ -464,6 +474,7 @@ else:
         .arg(&crash_worker_script)
         .status()
         .expect("Failed to execute crash worker");
+    let _ = status;
 
     #[cfg(windows)]
     {
@@ -542,7 +553,8 @@ sys.exit(0)
             .expect("Failed to spawn breakaway tester");
 
         let root_pid = child.id();
-        job.assign_pid(root_pid).expect("Failed to assign root PID to JobObject");
+        job.assign_pid(root_pid)
+            .expect("Failed to assign root PID to JobObject");
 
         let _ = child.wait();
 
@@ -630,7 +642,10 @@ time.sleep(30.0)
     assert_eq!(pids.len(), 2);
     let mut sys = sysinfo::System::new();
     assert_all_alive(&mut sys, &pids);
-    println!("Verified TaskRunner spawned 3D engine and grandchild PID: {:?}", pids);
+    println!(
+        "Verified TaskRunner spawned 3D engine and grandchild PID: {:?}",
+        pids
+    );
 
     // Cancel the running 3D task
     let _ = cancel_tx.send("Adversarial cancellation requested".to_string());

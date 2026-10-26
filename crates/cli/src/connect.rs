@@ -7,6 +7,7 @@
 //! REST / WebSocket port is 8080 and is never a valid `--master` target.
 
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -16,6 +17,10 @@ use tracing::info;
 use rusty_grid_core::cluster_auth::{client_handshake, ClusterSecret};
 use rusty_grid_core::error::{GridError, GridResult};
 use rusty_grid_core::protocol::{EndpointRole, MessageTransport};
+use rusty_grid_core::task::{
+    validate_relative_sandbox_path, OutputArtifact, StagedFile, MAX_AGGREGATE_STAGED_BYTES,
+    MAX_STAGED_FILE_BYTES,
+};
 use rusty_grid_core::transport::configure_tcp_stream;
 
 /// TCP port of the Master's grid listener (workers and clients).
@@ -234,6 +239,195 @@ pub fn report_master_failure(
         other => eprintln!("{what}: {other}"),
     }
     ExitCode::FAILURE
+}
+
+/// Parses a `--file <LOCAL[:SANDBOX]>` specification, handling Windows drive letters (e.g., `C:\...`).
+pub fn parse_file_spec(spec: &str) -> Result<(PathBuf, String), String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err("Staged file specification cannot be empty".to_string());
+    }
+
+    // Determine split point, respecting Windows drive letter at index 1 (e.g. "C:\...")
+    let split_pos = if let Some(first_colon) = spec.find(':') {
+        let is_drive = first_colon == 1 && spec.as_bytes()[0].is_ascii_alphabetic();
+        if is_drive {
+            // Search for separator colon after drive prefix
+            spec[2..].find(':').map(|idx| idx + 2)
+        } else {
+            Some(first_colon)
+        }
+    } else {
+        None
+    };
+
+    let (local_str, sandbox_str) = match split_pos {
+        Some(pos) => {
+            let local = spec[..pos].trim();
+            let sandbox = spec[pos + 1..].trim();
+            if local.is_empty() {
+                return Err(format!("--file '{spec}': local path cannot be empty"));
+            }
+            if sandbox.is_empty() {
+                return Err(format!(
+                    "--file '{spec}': sandbox destination path cannot be empty"
+                ));
+            }
+            (local, Some(sandbox))
+        }
+        None => (spec, None),
+    };
+
+    let local_path = PathBuf::from(local_str);
+    let sandbox_path = match sandbox_str {
+        Some(s) => validate_relative_sandbox_path(s)?,
+        None => {
+            // Default sandbox path: if local path is already a safe relative path, preserve it;
+            // otherwise (absolute path or starts with ..), default to filename.
+            let path_str = local_path
+                .to_str()
+                .ok_or_else(|| format!("--file '{spec}': path contains non-UTF8 characters"))?;
+            match validate_relative_sandbox_path(path_str) {
+                Ok(norm) => norm,
+                Err(_) => {
+                    let file_name =
+                        local_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .ok_or_else(|| {
+                                format!(
+                                    "--file '{spec}': cannot determine file name for sandbox path"
+                                )
+                            })?;
+                    validate_relative_sandbox_path(file_name)?
+                }
+            }
+        }
+    };
+
+    Ok((local_path, sandbox_path))
+}
+
+/// Pre-flight validation and reading of staged files on the client side before submission.
+pub fn prepare_staged_files(specs: &[String]) -> Result<Vec<StagedFile>, String> {
+    let mut staged_files = Vec::with_capacity(specs.len());
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut total_bytes: u64 = 0;
+
+    for spec in specs {
+        let (local_path, sandbox_rel_path) = parse_file_spec(spec)?;
+        if !seen_paths.insert(sandbox_rel_path.clone()) {
+            return Err(format!(
+                "Duplicate sandbox path detected: '{sandbox_rel_path}' is mapped multiple times"
+            ));
+        }
+
+        let meta = std::fs::metadata(&local_path)
+            .map_err(|e| format!("--file {}: cannot read metadata: {e}", local_path.display()))?;
+        if !meta.is_file() {
+            return Err(format!(
+                "--file {}: target is not a regular file",
+                local_path.display()
+            ));
+        }
+        let size = meta.len();
+        if size > MAX_STAGED_FILE_BYTES as u64 {
+            return Err(format!(
+                "--file {}: file size ({size} bytes) exceeds maximum limit of {} MiB",
+                local_path.display(),
+                MAX_STAGED_FILE_BYTES / (1024 * 1024)
+            ));
+        }
+        total_bytes = total_bytes.saturating_add(size);
+        if total_bytes > MAX_AGGREGATE_STAGED_BYTES as u64 {
+            return Err(format!(
+                "Aggregate staged files size ({total_bytes} bytes) exceeds maximum limit of {} MiB",
+                MAX_AGGREGATE_STAGED_BYTES / (1024 * 1024)
+            ));
+        }
+
+        let content = std::fs::read(&local_path)
+            .map_err(|e| format!("--file {}: failed to read file: {e}", local_path.display()))?;
+
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let executable = false;
+
+        let staged = StagedFile::new(sandbox_rel_path, content, executable);
+        staged_files.push(staged);
+    }
+
+    Ok(staged_files)
+}
+
+/// Validates declared expected output paths against path traversal and DOS device attacks.
+pub fn validate_output_paths(paths: &[String]) -> Result<Vec<String>, String> {
+    let mut validated = Vec::with_capacity(paths.len());
+    for p in paths {
+        let clean = validate_relative_sandbox_path(p)
+            .map_err(|e| format!("--output '{p}': illegal output path: {e}"))?;
+        validated.push(clean);
+    }
+    Ok(validated)
+}
+
+/// Writes harvested output artifacts to the specified client-side destination directory,
+/// verifying SHA-256 checksums and preventing directory traversal escapes.
+pub fn save_output_artifacts(
+    artifacts: &[OutputArtifact],
+    output_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    std::fs::create_dir_all(output_dir).map_err(|e| {
+        format!(
+            "Failed to create output directory {}: {e}",
+            output_dir.display()
+        )
+    })?;
+
+    let canonical_dest = output_dir
+        .canonicalize()
+        .map_err(|e| format!("Failed to canonicalize output directory: {e}"))?;
+
+    let mut written_paths = Vec::with_capacity(artifacts.len());
+
+    for artifact in artifacts {
+        let clean_rel = validate_relative_sandbox_path(&artifact.path)
+            .map_err(|e| format!("Invalid artifact path '{}': {e}", artifact.path))?;
+        let target_path = output_dir.join(&clean_rel);
+
+        if let Some(parent) = target_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
+        }
+
+        if !artifact.verify_checksum() {
+            return Err(format!(
+                "Artifact checksum verification failed for '{}'",
+                artifact.path
+            ));
+        }
+
+        std::fs::write(&target_path, artifact.data.as_bytes())
+            .map_err(|e| format!("Failed to write artifact {}: {e}", target_path.display()))?;
+
+        if let Ok(canon_target) = target_path.canonicalize() {
+            if !canon_target.starts_with(&canonical_dest) {
+                let _ = std::fs::remove_file(&target_path);
+                return Err(format!(
+                    "Security violation: artifact path '{}' escaped output directory",
+                    artifact.path
+                ));
+            }
+        }
+
+        written_paths.push(target_path);
+    }
+
+    Ok(written_paths)
 }
 
 #[cfg(test)]

@@ -11,8 +11,8 @@ use rusty_grid_core::task::Generative3DSpec;
 use rusty_grid_worker::gen3d::bake::encode_png_rgba;
 use rusty_grid_worker::gen3d::generate_procedural_3d;
 use rusty_grid_worker::gen3d::gltf_pack::{
-    CHUNK_TYPE_BIN, CHUNK_TYPE_JSON, COMPONENT_TYPE_FLOAT,
-    COMPONENT_TYPE_UNSIGNED_INT, COMPONENT_TYPE_UNSIGNED_SHORT, GLB_MAGIC, GLB_VERSION,
+    CHUNK_TYPE_BIN, CHUNK_TYPE_JSON, COMPONENT_TYPE_FLOAT, COMPONENT_TYPE_UNSIGNED_INT,
+    COMPONENT_TYPE_UNSIGNED_SHORT, GLB_MAGIC, GLB_VERSION,
 };
 use rusty_grid_worker::gen3d::manifold::repair_manifold_mesh;
 use rusty_grid_worker::gen3d::marching_cubes::extract_isosurface;
@@ -28,7 +28,10 @@ fn test_adversarial_prompt_resolution_edge_cases() {
     // 1. None & Empty
     assert_eq!(resolve_preset(None), SdfPreset::HumanoidDummy);
     assert_eq!(resolve_preset(Some("")), SdfPreset::HumanoidDummy);
-    assert_eq!(resolve_preset(Some("   \t\r\n   ")), SdfPreset::HumanoidDummy);
+    assert_eq!(
+        resolve_preset(Some("   \t\r\n   ")),
+        SdfPreset::HumanoidDummy
+    );
 
     // 2. Multi-lingual Unicode & Emoji
     assert_eq!(
@@ -77,11 +80,7 @@ fn test_multi_resolution_and_preset_matrix() {
         ("Orb", SdfPreset::TestOrb),
     ];
 
-    let resolutions = [
-        ("fast", 32),
-        ("standard", 48),
-        ("high", 64),
-    ];
+    let resolutions = [("fast", 32), ("standard", 48), ("high", 64)];
 
     for (p_name, preset) in &presets {
         for (r_name, res) in &resolutions {
@@ -97,8 +96,14 @@ fn test_multi_resolution_and_preset_matrix() {
             );
 
             // Assert non-empty geometry
-            assert!(clean.vertex_count() > 50, "Vertex count too low for {p_name} at {r_name}");
-            assert!(clean.triangle_count() > 80, "Triangle count too low for {p_name} at {r_name}");
+            assert!(
+                clean.vertex_count() > 50,
+                "Vertex count too low for {p_name} at {r_name}"
+            );
+            assert!(
+                clean.triangle_count() > 80,
+                "Triangle count too low for {p_name} at {r_name}"
+            );
 
             // Assert all positions are finite
             let (min, max) = clean.compute_aabb();
@@ -156,7 +161,10 @@ fn test_tier0_latency_benchmark_under_50ms() {
         mc_latencies.push(start.elapsed());
         assert!(raw.vertex_count() > 0);
     }
-    let avg_mc_ms = mc_latencies.iter().map(|d| d.as_secs_f64() * 1000.0).sum::<f64>()
+    let avg_mc_ms = mc_latencies
+        .iter()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .sum::<f64>()
         / mc_latencies.len() as f64;
     println!(
         "[LATENCY BENCHMARK - MARCHING CUBES 48^3] avg = {:.2} ms (budget < 50 ms)",
@@ -168,7 +176,10 @@ fn test_tier0_latency_benchmark_under_50ms() {
     );
 
     // 2. Benchmark Full End-to-End Pipeline (SDF + MC + Manifold + UV + Pack)
-    let avg_geom_ms = geom_latencies.iter().map(|d| d.as_secs_f64() * 1000.0).sum::<f64>()
+    let avg_geom_ms = geom_latencies
+        .iter()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .sum::<f64>()
         / geom_latencies.len() as f64;
     let max_geom_ms = geom_latencies
         .iter()
@@ -179,7 +190,11 @@ fn test_tier0_latency_benchmark_under_50ms() {
         "[LATENCY BENCHMARK - FULL PIPELINE 48^3] avg = {:.2} ms, max = {:.2} ms (profile: {})",
         avg_geom_ms,
         max_geom_ms,
-        if cfg!(debug_assertions) { "debug" } else { "release" }
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
     );
 
     if !cfg!(debug_assertions) {
@@ -202,7 +217,8 @@ fn test_tier0_latency_benchmark_under_50ms() {
         .with_export_texture(true);
 
     let start = Instant::now();
-    let (glb_tex, stats_tex) = generate_procedural_3d(&spec_with_tex).expect("Textured generation failed");
+    let (glb_tex, stats_tex) =
+        generate_procedural_3d(&spec_with_tex).expect("Textured generation failed");
     let full_time = start.elapsed();
 
     println!(
@@ -235,84 +251,97 @@ fn test_topological_manifoldness_and_no_degenerates() {
             let raw = extract_isosurface(preset, res).expect("Isosurface failed");
             let clean = repair_manifold_mesh(&raw);
 
-        // 1. Check for collapsed index triangles
-        for chunk in clean.indices.chunks_exact(3) {
-            let (i0, i1, i2) = (chunk[0], chunk[1], chunk[2]);
-            assert_ne!(i0, i1, "Collapsed edge found in {preset:?}");
-            assert_ne!(i1, i2, "Collapsed edge found in {preset:?}");
-            assert_ne!(i2, i0, "Collapsed edge found in {preset:?}");
+            // 1. Check for collapsed index triangles
+            for chunk in clean.indices.chunks_exact(3) {
+                let (i0, i1, i2) = (chunk[0], chunk[1], chunk[2]);
+                assert_ne!(i0, i1, "Collapsed edge found in {preset:?}");
+                assert_ne!(i1, i2, "Collapsed edge found in {preset:?}");
+                assert_ne!(i2, i0, "Collapsed edge found in {preset:?}");
 
-            // 2. Check for zero-area triangles
-            let p0 = clean.positions[i0 as usize];
-            let p1 = clean.positions[i1 as usize];
-            let p2 = clean.positions[i2 as usize];
+                // 2. Check for zero-area triangles
+                let p0 = clean.positions[i0 as usize];
+                let p1 = clean.positions[i1 as usize];
+                let p2 = clean.positions[i2 as usize];
 
-            let u = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
-            let v = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+                let u = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+                let v = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
 
-            let cx = u[1] * v[2] - u[2] * v[1];
-            let cy = u[2] * v[0] - u[0] * v[2];
-            let cz = u[0] * v[1] - u[1] * v[0];
-            let area_sq = cx * cx + cy * cy + cz * cz;
+                let cx = u[1] * v[2] - u[2] * v[1];
+                let cy = u[2] * v[0] - u[0] * v[2];
+                let cz = u[0] * v[1] - u[1] * v[0];
+                let area_sq = cx * cx + cy * cy + cz * cz;
 
-            assert!(
-                area_sq >= 1e-14,
-                "Degenerate zero-area triangle detected in {preset:?}: area_sq={area_sq}"
+                assert!(
+                    area_sq >= 1e-14,
+                    "Degenerate zero-area triangle detected in {preset:?}: area_sq={area_sq}"
+                );
+            }
+
+            // 3. Topological Edge Sharing Check:
+            // In an orientable closed 2-manifold, every directed edge (A -> B) has a matching opposite directed edge (B -> A).
+            let mut directed_edges: HashSet<(u32, u32)> = HashSet::new();
+            let mut undirected_edge_counts: HashMap<(u32, u32), usize> = HashMap::new();
+
+            for chunk in clean.indices.chunks_exact(3) {
+                let edges = [
+                    (chunk[0], chunk[1]),
+                    (chunk[1], chunk[2]),
+                    (chunk[2], chunk[0]),
+                ];
+                for (a, b) in edges {
+                    directed_edges.insert((a, b));
+                    let key = if a < b { (a, b) } else { (b, a) };
+                    *undirected_edge_counts.entry(key).or_insert(0) += 1;
+                }
+            }
+
+            // Also check raw mesh edge counts
+            let mut raw_undirected: HashMap<(u32, u32), usize> = HashMap::new();
+            for chunk in raw.indices.chunks_exact(3) {
+                let edges = [
+                    (chunk[0], chunk[1]),
+                    (chunk[1], chunk[2]),
+                    (chunk[2], chunk[0]),
+                ];
+                for (a, b) in edges {
+                    let key = if a < b { (a, b) } else { (b, a) };
+                    *raw_undirected.entry(key).or_insert(0) += 1;
+                }
+            }
+            let raw_non_manifold: Vec<_> = raw_undirected
+                .iter()
+                .filter(|(_, &count)| count != 2)
+                .collect();
+
+            // For a closed 2-manifold without boundary: every undirected edge must be shared by exactly 2 triangles
+            let non_manifold_edges: Vec<_> = undirected_edge_counts
+                .iter()
+                .filter(|(_, &count)| count != 2)
+                .collect();
+
+            println!(
+                "[MANIFOLD CHECK] Preset {:?}: raw_non_manifold={}, clean_non_manifold={}",
+                preset,
+                raw_non_manifold.len(),
+                non_manifold_edges.len()
             );
-        }
 
-        // 3. Topological Edge Sharing Check:
-        // In an orientable closed 2-manifold, every directed edge (A -> B) has a matching opposite directed edge (B -> A).
-        let mut directed_edges: HashSet<(u32, u32)> = HashSet::new();
-        let mut undirected_edge_counts: HashMap<(u32, u32), usize> = HashMap::new();
-
-        for chunk in clean.indices.chunks_exact(3) {
-            let edges = [
-                (chunk[0], chunk[1]),
-                (chunk[1], chunk[2]),
-                (chunk[2], chunk[0]),
-            ];
-            for (a, b) in edges {
-                directed_edges.insert((a, b));
-                let key = if a < b { (a, b) } else { (b, a) };
-                *undirected_edge_counts.entry(key).or_insert(0) += 1;
+            for (edge, count) in &non_manifold_edges {
+                let p0 = clean.positions[edge.0 as usize];
+                let p1 = clean.positions[edge.1 as usize];
+                println!(
+                    "   -> non-manifold edge {:?} count={}: p0={:?}, p1={:?}",
+                    edge, count, p0, p1
+                );
             }
-        }
-
-        // Also check raw mesh edge counts
-        let mut raw_undirected: HashMap<(u32, u32), usize> = HashMap::new();
-        for chunk in raw.indices.chunks_exact(3) {
-            let edges = [(chunk[0], chunk[1]), (chunk[1], chunk[2]), (chunk[2], chunk[0])];
-            for (a, b) in edges {
-                let key = if a < b { (a, b) } else { (b, a) };
-                *raw_undirected.entry(key).or_insert(0) += 1;
-            }
-        }
-        let raw_non_manifold: Vec<_> = raw_undirected.iter().filter(|(_, &count)| count != 2).collect();
-
-        // For a closed 2-manifold without boundary: every undirected edge must be shared by exactly 2 triangles
-        let non_manifold_edges: Vec<_> = undirected_edge_counts
-            .iter()
-            .filter(|(_, &count)| count != 2)
-            .collect();
-
-        println!(
-            "[MANIFOLD CHECK] Preset {:?}: raw_non_manifold={}, clean_non_manifold={}",
-            preset,
-            raw_non_manifold.len(),
-            non_manifold_edges.len()
-        );
-
-        for (edge, count) in &non_manifold_edges {
-            let p0 = clean.positions[edge.0 as usize];
-            let p1 = clean.positions[edge.1 as usize];
-            println!("   -> non-manifold edge {:?} count={}: p0={:?}, p1={:?}", edge, count, p0, p1);
-        }
 
             total_violations += non_manifold_edges.len();
         }
     }
-    println!("\n[TOTAL TOPOLOGICAL MANIFOLD VIOLATIONS FOUND]: {}", total_violations);
+    println!(
+        "\n[TOTAL TOPOLOGICAL MANIFOLD VIOLATIONS FOUND]: {}",
+        total_violations
+    );
     assert_eq!(
         total_violations, 0,
         "Total non-manifold edges across all presets/resolutions: {}",
@@ -369,11 +398,16 @@ fn test_strict_gltf_binary_conformance_and_min_max_matching() {
 
     // 4. Chunk 1: BIN
     let bin_header_offset = 20 + json_len;
-    let bin_len =
-        u32::from_le_bytes(glb[bin_header_offset..bin_header_offset + 4].try_into().unwrap())
-            as usize;
-    let bin_type =
-        u32::from_le_bytes(glb[bin_header_offset + 4..bin_header_offset + 8].try_into().unwrap());
+    let bin_len = u32::from_le_bytes(
+        glb[bin_header_offset..bin_header_offset + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let bin_type = u32::from_le_bytes(
+        glb[bin_header_offset + 4..bin_header_offset + 8]
+            .try_into()
+            .unwrap(),
+    );
 
     assert_eq!(bin_type, CHUNK_TYPE_BIN, "Chunk 1 must be BIN");
     assert_eq!(bin_len % 4, 0, "Chunk 1 length must be a multiple of 4");
@@ -418,13 +452,25 @@ fn test_strict_gltf_binary_conformance_and_min_max_matching() {
         let y = f32::from_le_bytes(bin_data[offset + 4..offset + 8].try_into().unwrap());
         let z = f32::from_le_bytes(bin_data[offset + 8..offset + 12].try_into().unwrap());
 
-        if x < empirical_min[0] { empirical_min[0] = x; }
-        if y < empirical_min[1] { empirical_min[1] = y; }
-        if z < empirical_min[2] { empirical_min[2] = z; }
+        if x < empirical_min[0] {
+            empirical_min[0] = x;
+        }
+        if y < empirical_min[1] {
+            empirical_min[1] = y;
+        }
+        if z < empirical_min[2] {
+            empirical_min[2] = z;
+        }
 
-        if x > empirical_max[0] { empirical_max[0] = x; }
-        if y > empirical_max[1] { empirical_max[1] = y; }
-        if z > empirical_max[2] { empirical_max[2] = z; }
+        if x > empirical_max[0] {
+            empirical_max[0] = x;
+        }
+        if y > empirical_max[1] {
+            empirical_max[1] = y;
+        }
+        if z > empirical_max[2] {
+            empirical_max[2] = z;
+        }
     }
 
     let json_min = pos_acc["min"].as_array().expect("pos min missing");
@@ -486,7 +532,10 @@ fn test_strict_gltf_binary_conformance_and_min_max_matching() {
     let png_bytes = &bin_data[img_offset..img_offset + img_len];
     assert!(png_bytes.len() > 100);
     // Standard PNG magic signature: 0x89 0x50 0x4E 0x47 0x0D 0x0A 0x1A 0x0A
-    assert_eq!(&png_bytes[0..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+    assert_eq!(
+        &png_bytes[0..8],
+        &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    );
 }
 
 // ============================================================================
@@ -510,7 +559,10 @@ fn test_png_encoder_crc32_and_adler32_correctness() {
 
     let png = encode_png_rgba(&pixels, w, h);
     assert!(!png.is_empty());
-    assert_eq!(&png[0..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+    assert_eq!(
+        &png[0..8],
+        &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    );
 
     // Parse PNG chunks and verify CRC-32 on each chunk
     let mut offset = 8;
@@ -522,12 +574,15 @@ fn test_png_encoder_crc32_and_adler32_correctness() {
         let chunk_len = u32::from_be_bytes(png[offset..offset + 4].try_into().unwrap()) as usize;
         let chunk_type = &png[offset + 4..offset + 8];
         let chunk_data = &png[offset + 8..offset + 8 + chunk_len];
-        let expected_crc =
-            u32::from_be_bytes(png[offset + 8 + chunk_len..offset + 12 + chunk_len].try_into().unwrap());
+        let expected_crc = u32::from_be_bytes(
+            png[offset + 8 + chunk_len..offset + 12 + chunk_len]
+                .try_into()
+                .unwrap(),
+        );
 
         // Compute CRC-32 over chunk_type + chunk_data
         let mut crc_val = 0xFFFFFFFFu32;
-        let chunk_bytes = [&chunk_type[..], chunk_data].concat();
+        let chunk_bytes = [chunk_type, chunk_data].concat();
         for &b in &chunk_bytes {
             crc_val ^= b as u32;
             for _ in 0..8 {
@@ -541,7 +596,8 @@ fn test_png_encoder_crc32_and_adler32_correctness() {
         crc_val ^= 0xFFFFFFFF;
 
         assert_eq!(
-            crc_val, expected_crc,
+            crc_val,
+            expected_crc,
             "CRC mismatch in chunk {:?}",
             std::str::from_utf8(chunk_type)
         );
@@ -595,7 +651,8 @@ fn test_job_object_tree_kill_resilience() {
     let pid = child.id();
 
     let mut job = job;
-    job.assign_pid(pid).expect("Failed to assign PID to JobObject");
+    job.assign_pid(pid)
+        .expect("Failed to assign PID to JobObject");
 
     // Small yield to let child and grandchild spin up
     std::thread::sleep(Duration::from_millis(100));
@@ -604,7 +661,10 @@ fn test_job_object_tree_kill_resilience() {
     job.terminate(99).expect("Failed to terminate JobObject");
 
     let status = child.wait().expect("Wait failed");
-    assert!(!status.success(), "Process tree should not exit successfully");
+    assert!(
+        !status.success(),
+        "Process tree should not exit successfully"
+    );
 }
 
 // ============================================================================
@@ -613,9 +673,13 @@ fn test_job_object_tree_kill_resilience() {
 
 #[test]
 fn test_blender_headless_import_of_all_presets() {
-    let blender_path = PathBuf::from(r"C:\Program Files\Blender Foundation\Blender 4.5\blender.exe");
+    let blender_path =
+        PathBuf::from(r"C:\Program Files\Blender Foundation\Blender 4.5\blender.exe");
     if !blender_path.is_file() {
-        println!("[SKIP] Blender 4.5 not found at {:?}, skipping live headless import", blender_path);
+        println!(
+            "[SKIP] Blender 4.5 not found at {:?}, skipping live headless import",
+            blender_path
+        );
         return;
     }
 

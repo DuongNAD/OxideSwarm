@@ -10,9 +10,18 @@ use super::types::RawMesh;
 
 /// Corner indices for the 12 edges in Paul Bourke's Marching Cubes canonical cube.
 pub const EDGE_CORNERS: [(usize, usize); 12] = [
-    (0, 1), (1, 2), (2, 3), (3, 0), // 0..3: Bottom face (Z = 0)
-    (4, 5), (5, 6), (6, 7), (7, 4), // 4..7: Top face (Z = 1)
-    (0, 4), (1, 5), (2, 6), (3, 7), // 8..11: Vertical struts
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 0), // 0..3: Bottom face (Z = 0)
+    (4, 5),
+    (5, 6),
+    (6, 7),
+    (7, 4), // 4..7: Top face (Z = 1)
+    (0, 4),
+    (1, 5),
+    (2, 6),
+    (3, 7), // 8..11: Vertical struts
 ];
 
 /// Extracts an isosurface mesh from an SDF preset at the given grid resolution.
@@ -20,8 +29,10 @@ pub fn extract_isosurface(preset: &SdfPreset, resolution: usize) -> Result<RawMe
     let (min_b, max_b) = preset.bounds();
 
     let nx = resolution;
-    let ny = (resolution as f32 * ((max_b.y - min_b.y) / (max_b.x - min_b.x)).max(0.5)).round() as usize;
-    let nz = (resolution as f32 * ((max_b.z - min_b.z) / (max_b.x - min_b.x)).max(0.5)).round() as usize;
+    let ny =
+        (resolution as f32 * ((max_b.y - min_b.y) / (max_b.x - min_b.x)).max(0.5)).round() as usize;
+    let nz =
+        (resolution as f32 * ((max_b.z - min_b.z) / (max_b.x - min_b.x)).max(0.5)).round() as usize;
 
     let dx = (max_b.x - min_b.x) / (nx as f32);
     let dy = (max_b.y - min_b.y) / (ny as f32);

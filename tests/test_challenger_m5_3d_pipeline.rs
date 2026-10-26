@@ -18,6 +18,12 @@
 //! 5. High-Concurrency Burst:
 //!    - Parallel multi-task dispatch across worker pool without deadlocks.
 
+#![allow(
+    unknown_lints,
+    clippy::manual_is_multiple_of,
+    clippy::needless_borrows_for_generic_args
+)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -259,7 +265,10 @@ impl ChallengerCluster {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(ready, "Timed out waiting for {num_workers} workers to connect");
+        assert!(
+            ready,
+            "Timed out waiting for {num_workers} workers to connect"
+        );
 
         Self {
             master,
@@ -347,8 +356,15 @@ async fn test_challenger_worker_crash_during_3d_sdf_rescheduling() {
     let spec = Generative3DSpec::new_prompt("crash_resilient_titan".to_string())
         .with_quality("fast")
         .with_engine("sdf");
-    let sdf_task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::generic(1, 30));
-    let sdf_id = cluster.master.submit_task(sdf_task).await.expect("submit 3d");
+    let sdf_task = Task::new(
+        TaskSpec::Generative3D(spec),
+        TaskRequirements::generic(1, 30),
+    );
+    let sdf_id = cluster
+        .master
+        .submit_task(sdf_task)
+        .await
+        .expect("submit 3d");
     let sdf_res = cluster
         .master
         .wait_task(sdf_id, Some(Duration::from_secs(15)))
@@ -422,7 +438,10 @@ async fn test_challenger_worker_crash_during_autorig_rescheduling() {
     let gen_spec = Generative3DSpec::new_prompt("biped_for_crash_test".to_string())
         .with_quality("fast")
         .with_engine("sdf");
-    let gen_task = Task::new(TaskSpec::Generative3D(gen_spec), TaskRequirements::generic(1, 30));
+    let gen_task = Task::new(
+        TaskSpec::Generative3D(gen_spec),
+        TaskRequirements::generic(1, 30),
+    );
     let gen_res = runner.execute_task(&gen_task, None, None).await;
     assert!(gen_res.is_success());
     let source_mesh = gen_res.asset_bytes.expect("source mesh");
@@ -430,8 +449,15 @@ async fn test_challenger_worker_crash_during_autorig_rescheduling() {
     // Submit AutoRig task to survivor
     let rig_spec = AutoRigSpec::new(source_mesh.as_slice().to_vec(), "biped")
         .with_animations(vec!["idle".to_string(), "walk".to_string()]);
-    let rig_task = Task::new(TaskSpec::AutoRig(rig_spec), TaskRequirements::generic(1, 30));
-    let rig_id = cluster.master.submit_task(rig_task).await.expect("submit AutoRig");
+    let rig_task = Task::new(
+        TaskSpec::AutoRig(rig_spec),
+        TaskRequirements::generic(1, 30),
+    );
+    let rig_id = cluster
+        .master
+        .submit_task(rig_task)
+        .await
+        .expect("submit AutoRig");
 
     let rig_result = cluster
         .master
@@ -445,7 +471,6 @@ async fn test_challenger_worker_crash_during_autorig_rescheduling() {
 
     cluster.shutdown().await;
 }
-
 
 // =========================================================================
 // CHALLENGER TEST 3: CASCADING WORKER CRASHES EXHAUST RETRIES SAFELY
@@ -535,7 +560,10 @@ async fn test_challenger_cascading_worker_crashes_exhaust_retries() {
     let final_info = cluster.master.get_task_info(task_id).await.unwrap();
     assert_eq!(final_info.state, TaskState::Failed);
     assert!(
-        final_info.error_message.unwrap().contains("maximum retry limit"),
+        final_info
+            .error_message
+            .unwrap()
+            .contains("maximum retry limit"),
         "Error message must specify max retry limit"
     );
 
@@ -608,7 +636,10 @@ async fn test_challenger_orphaned_task_survives_zero_workers() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(completed, "Task must complete on newly joined rescuer worker");
+    assert!(
+        completed,
+        "Task must complete on newly joined rescuer worker"
+    );
 
     let _ = shutdown_tx.send(true);
     let _ = handle.await;
@@ -639,9 +670,12 @@ async fn test_challenger_zero_copy_and_sha256_e2e_fidelity() {
         .expect("3d generate");
 
     let reported_sha = match &resp {
-        AgentMeshEnvelope::CommandResponse { payload: Some(p), .. } => {
-            p["asset_sha256"].as_str().expect("asset_sha256").to_string()
-        }
+        AgentMeshEnvelope::CommandResponse {
+            payload: Some(p), ..
+        } => p["asset_sha256"]
+            .as_str()
+            .expect("asset_sha256")
+            .to_string(),
         _ => panic!("Expected CommandResponse with payload"),
     };
 
@@ -676,7 +710,10 @@ async fn test_challenger_checkpoint_monotonicity_and_stale_rejection() {
     let (tx, mut rx) = mpsc::channel(16);
 
     let sdf_spec = Generative3DSpec::new_prompt("cp_stress").with_engine("sdf");
-    let sdf_task = Task::new(TaskSpec::Generative3D(sdf_spec), TaskRequirements::generic(1, 30));
+    let sdf_task = Task::new(
+        TaskSpec::Generative3D(sdf_spec),
+        TaskRequirements::generic(1, 30),
+    );
 
     let run_handle = tokio::spawn(async move {
         runner
@@ -686,7 +723,12 @@ async fn test_challenger_checkpoint_monotonicity_and_stale_rejection() {
 
     let mut recorded_seqs = Vec::new();
     while let Some(msg) = rx.recv().await {
-        if let WorkerMessage::Checkpoint { sequence, delta_state, .. } = msg {
+        if let WorkerMessage::Checkpoint {
+            sequence,
+            delta_state,
+            ..
+        } = msg
+        {
             recorded_seqs.push((sequence, delta_state));
         }
     }
@@ -777,7 +819,8 @@ fn test_challenger_boundary_corrupted_container_fuzzing() {
     assert!(res_unalign.unwrap_err().contains("not 4-byte aligned"));
 
     // 8. BufferView overrun inside BIN
-    let json_txt = r#"{"asset":{"version":"2.0"},"bufferViews":[{"byteOffset":0,"byteLength":100}]}"#;
+    let json_txt =
+        r#"{"asset":{"version":"2.0"},"bufferViews":[{"byteOffset":0,"byteLength":100}]}"#;
     let mut json_bytes = json_txt.as_bytes().to_vec();
     while json_bytes.len() % 4 != 0 {
         json_bytes.push(b' ');
@@ -797,7 +840,9 @@ fn test_challenger_boundary_corrupted_container_fuzzing() {
 
     let res_overrun = parse_and_validate_glb_container(&overrun_glb);
     assert!(res_overrun.is_err());
-    assert!(res_overrun.unwrap_err().contains("exceeds BIN chunk length"));
+    assert!(res_overrun
+        .unwrap_err()
+        .contains("exceeds BIN chunk length"));
 }
 
 // =========================================================================
@@ -814,7 +859,10 @@ async fn test_challenger_autorig_corrupted_geometry_and_non_manifold_fuzz() {
         *b = ((i * 101 + 37) % 256) as u8;
     }
     let noise_spec = AutoRigSpec::new(rng_bytes, "biped");
-    let noise_task = Task::new(TaskSpec::AutoRig(noise_spec), TaskRequirements::generic(1, 30));
+    let noise_task = Task::new(
+        TaskSpec::AutoRig(noise_spec),
+        TaskRequirements::generic(1, 30),
+    );
     let res = runner.execute_task(&noise_task, None, None).await;
     assert!(!res.is_success());
     assert_eq!(res.exit_code, EXIT_CODE_GENERAL_ERROR);
@@ -827,7 +875,10 @@ async fn test_challenger_autorig_corrupted_geometry_and_non_manifold_fuzz() {
     // 3. Degenerate OBJ mesh with 0 faces
     let empty_obj = b"# empty obj\nv 0.0 0.0 0.0\nv 1.0 1.0 1.0\n";
     let obj_spec = AutoRigSpec::new(empty_obj.to_vec(), "biped");
-    let obj_task = Task::new(TaskSpec::AutoRig(obj_spec), TaskRequirements::generic(1, 30));
+    let obj_task = Task::new(
+        TaskSpec::AutoRig(obj_spec),
+        TaskRequirements::generic(1, 30),
+    );
     let res_obj = runner.execute_task(&obj_task, None, None).await;
     assert!(!res_obj.is_success());
 }
@@ -846,8 +897,15 @@ async fn test_challenger_concurrent_mesh_generation_burst() {
         let spec = Generative3DSpec::new_prompt(format!("burst_warrior_{i}"))
             .with_quality("fast")
             .with_engine("sdf");
-        let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::generic(1, 30));
-        let tid = cluster.master.submit_task(task).await.expect("submit burst");
+        let task = Task::new(
+            TaskSpec::Generative3D(spec),
+            TaskRequirements::generic(1, 30),
+        );
+        let tid = cluster
+            .master
+            .submit_task(task)
+            .await
+            .expect("submit burst");
         task_ids.push(tid);
     }
 

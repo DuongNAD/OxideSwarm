@@ -57,6 +57,12 @@ impl ProtocolCapabilities {
     pub const GPU_SCHEDULE_PRIO: Self = Self(1 << 3);
     pub const EXTENDED_ERROR_INFO: Self = Self(1 << 4);
     pub const BATCH_DISPATCH: Self = Self(1 << 5);
+    /// Distributed file staging and output artifact collection.
+    pub const FILE_STAGING: Self = Self(1 << 6);
+    /// Autonomous role arbitrage, lease tickets, and graceful role handover.
+    pub const ROLE_ARBITRAGE: Self = Self(1 << 7);
+    /// Cellular RRC-aware adaptive keepalive intervals.
+    pub const ADAPTIVE_KEEPALIVE: Self = Self(1 << 8);
 
     pub const fn all_supported() -> Self {
         Self(
@@ -65,7 +71,10 @@ impl ProtocolCapabilities {
                 | Self::CHECKPOINT_DELTA.0
                 | Self::GPU_SCHEDULE_PRIO.0
                 | Self::EXTENDED_ERROR_INFO.0
-                | Self::BATCH_DISPATCH.0,
+                | Self::BATCH_DISPATCH.0
+                | Self::FILE_STAGING.0
+                | Self::ROLE_ARBITRAGE.0
+                | Self::ADAPTIVE_KEEPALIVE.0,
         )
     }
 
@@ -395,6 +404,7 @@ pub enum WorkerMessage {
         device_name: Option<String>,
         error: Option<String>,
         asset_bytes: Option<TaskBytes>,
+        artifacts: Vec<crate::task::OutputArtifact>,
     },
     /// Incremental computational snapshot checkpoint emitted during task execution.
     Checkpoint {
@@ -411,6 +421,14 @@ pub enum WorkerMessage {
         battery_pct: Option<u8>,
         is_charging: Option<bool>,
         thermal_throttled: bool,
+        battery_temperature: Option<f32>,
+        network_type: Option<String>,
+        battery_tier: Option<crate::capabilities::BatteryTier>,
+        thermal_tier: Option<crate::capabilities::ThermalTier>,
+    },
+    /// Claims the Master coordinator role by presenting a valid cryptographic lease ticket (§5.3).
+    ClaimMasterRole {
+        ticket: crate::arbitrage::MasterLeaseTicket,
     },
     /// Forward-compatible fallback variant for unrecognized messages from future protocol versions.
     UnknownVariant { tag: u32, raw_bytes: Vec<u8> },
@@ -453,8 +471,14 @@ enum HumanWorkerMessage {
         device_name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
-        #[serde(default, with = "crate::task::opt_bytes_serde", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            with = "crate::task::opt_bytes_serde",
+            skip_serializing_if = "Option::is_none"
+        )]
         asset_bytes: Option<TaskBytes>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifacts: Vec<crate::task::OutputArtifact>,
     },
     Checkpoint {
         task_id: TaskId,
@@ -473,6 +497,17 @@ enum HumanWorkerMessage {
         is_charging: Option<bool>,
         #[serde(default)]
         thermal_throttled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        battery_temperature: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        network_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        battery_tier: Option<crate::capabilities::BatteryTier>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thermal_tier: Option<crate::capabilities::ThermalTier>,
+    },
+    ClaimMasterRole {
+        ticket: crate::arbitrage::MasterLeaseTicket,
     },
     #[serde(skip_deserializing)]
     UnknownVariant {
@@ -513,6 +548,10 @@ enum BinaryWorkerMessage {
         is_gpu_executed: bool,
         device_name: Option<String>,
         error: Option<String>,
+        #[serde(default, with = "crate::task::opt_bytes_serde")]
+        asset_bytes: Option<TaskBytes>,
+        #[serde(default)]
+        artifacts: Vec<crate::task::OutputArtifact>,
     },
     Checkpoint {
         task_id: TaskId,
@@ -528,6 +567,17 @@ enum BinaryWorkerMessage {
         battery_pct: Option<u8>,
         is_charging: Option<bool>,
         thermal_throttled: bool,
+        #[serde(default)]
+        battery_temperature: Option<f32>,
+        #[serde(default)]
+        network_type: Option<String>,
+        #[serde(default)]
+        battery_tier: Option<crate::capabilities::BatteryTier>,
+        #[serde(default)]
+        thermal_tier: Option<crate::capabilities::ThermalTier>,
+    },
+    ClaimMasterRole {
+        ticket: crate::arbitrage::MasterLeaseTicket,
     },
     UnknownVariant {
         tag: u32,
@@ -563,8 +613,6 @@ enum LegacyBinaryWorkerMessage {
         is_gpu_executed: bool,
         device_name: Option<String>,
         error: Option<String>,
-        #[serde(default, with = "crate::task::opt_bytes_serde")]
-        asset_bytes: Option<TaskBytes>,
     },
     Checkpoint {
         task_id: TaskId,
@@ -637,6 +685,8 @@ impl From<LegacyBinaryWorkerMessage> for WorkerMessage {
                 is_gpu_executed,
                 device_name,
                 error,
+                asset_bytes: None,
+                artifacts: Vec::new(),
             },
             LegacyBinaryWorkerMessage::Checkpoint {
                 task_id,
@@ -660,6 +710,10 @@ impl From<LegacyBinaryWorkerMessage> for WorkerMessage {
                 battery_pct,
                 is_charging,
                 thermal_throttled,
+                battery_temperature: None,
+                network_type: None,
+                battery_tier: None,
+                thermal_tier: None,
             },
         }
     }
@@ -712,6 +766,7 @@ impl From<WorkerMessage> for HumanWorkerMessage {
                 device_name,
                 error,
                 asset_bytes,
+                artifacts,
             } => HumanWorkerMessage::TaskResult {
                 worker_id,
                 task_id,
@@ -723,6 +778,7 @@ impl From<WorkerMessage> for HumanWorkerMessage {
                 device_name,
                 error,
                 asset_bytes,
+                artifacts,
             },
             WorkerMessage::Checkpoint {
                 task_id,
@@ -741,12 +797,23 @@ impl From<WorkerMessage> for HumanWorkerMessage {
                 battery_pct,
                 is_charging,
                 thermal_throttled,
+                battery_temperature,
+                network_type,
+                battery_tier,
+                thermal_tier,
             } => HumanWorkerMessage::MobileTelemetry {
                 worker_id,
                 battery_pct,
                 is_charging,
                 thermal_throttled,
+                battery_temperature,
+                network_type,
+                battery_tier,
+                thermal_tier,
             },
+            WorkerMessage::ClaimMasterRole { ticket } => {
+                HumanWorkerMessage::ClaimMasterRole { ticket }
+            }
             WorkerMessage::UnknownVariant { tag, raw_bytes } => {
                 HumanWorkerMessage::UnknownVariant { tag, raw_bytes }
             }
@@ -801,6 +868,7 @@ impl From<HumanWorkerMessage> for WorkerMessage {
                 device_name,
                 error,
                 asset_bytes,
+                artifacts,
             } => WorkerMessage::TaskResult {
                 worker_id,
                 task_id,
@@ -812,6 +880,7 @@ impl From<HumanWorkerMessage> for WorkerMessage {
                 device_name,
                 error,
                 asset_bytes,
+                artifacts,
             },
             HumanWorkerMessage::Checkpoint {
                 task_id,
@@ -830,12 +899,23 @@ impl From<HumanWorkerMessage> for WorkerMessage {
                 battery_pct,
                 is_charging,
                 thermal_throttled,
+                battery_temperature,
+                network_type,
+                battery_tier,
+                thermal_tier,
             } => WorkerMessage::MobileTelemetry {
                 worker_id,
                 battery_pct,
                 is_charging,
                 thermal_throttled,
+                battery_temperature,
+                network_type,
+                battery_tier,
+                thermal_tier,
             },
+            HumanWorkerMessage::ClaimMasterRole { ticket } => {
+                WorkerMessage::ClaimMasterRole { ticket }
+            }
             HumanWorkerMessage::UnknownVariant { tag, raw_bytes } => {
                 WorkerMessage::UnknownVariant { tag, raw_bytes }
             }
@@ -890,6 +970,7 @@ impl From<WorkerMessage> for BinaryWorkerMessage {
                 device_name,
                 error,
                 asset_bytes,
+                artifacts,
             } => BinaryWorkerMessage::TaskResult {
                 worker_id,
                 task_id,
@@ -901,6 +982,7 @@ impl From<WorkerMessage> for BinaryWorkerMessage {
                 device_name,
                 error,
                 asset_bytes,
+                artifacts,
             },
             WorkerMessage::Checkpoint {
                 task_id,
@@ -919,12 +1001,23 @@ impl From<WorkerMessage> for BinaryWorkerMessage {
                 battery_pct,
                 is_charging,
                 thermal_throttled,
+                battery_temperature,
+                network_type,
+                battery_tier,
+                thermal_tier,
             } => BinaryWorkerMessage::MobileTelemetry {
                 worker_id,
                 battery_pct,
                 is_charging,
                 thermal_throttled,
+                battery_temperature,
+                network_type,
+                battery_tier,
+                thermal_tier,
             },
+            WorkerMessage::ClaimMasterRole { ticket } => {
+                BinaryWorkerMessage::ClaimMasterRole { ticket }
+            }
             WorkerMessage::UnknownVariant { tag, raw_bytes } => {
                 BinaryWorkerMessage::UnknownVariant { tag, raw_bytes }
             }
@@ -979,6 +1072,7 @@ impl From<BinaryWorkerMessage> for WorkerMessage {
                 device_name,
                 error,
                 asset_bytes,
+                artifacts,
             } => WorkerMessage::TaskResult {
                 worker_id,
                 task_id,
@@ -990,6 +1084,7 @@ impl From<BinaryWorkerMessage> for WorkerMessage {
                 device_name,
                 error,
                 asset_bytes,
+                artifacts,
             },
             BinaryWorkerMessage::Checkpoint {
                 task_id,
@@ -1008,12 +1103,23 @@ impl From<BinaryWorkerMessage> for WorkerMessage {
                 battery_pct,
                 is_charging,
                 thermal_throttled,
+                battery_temperature,
+                network_type,
+                battery_tier,
+                thermal_tier,
             } => WorkerMessage::MobileTelemetry {
                 worker_id,
                 battery_pct,
                 is_charging,
                 thermal_throttled,
+                battery_temperature,
+                network_type,
+                battery_tier,
+                thermal_tier,
             },
+            BinaryWorkerMessage::ClaimMasterRole { ticket } => {
+                WorkerMessage::ClaimMasterRole { ticket }
+            }
             BinaryWorkerMessage::UnknownVariant { tag, raw_bytes } => {
                 WorkerMessage::UnknownVariant { tag, raw_bytes }
             }
@@ -1062,6 +1168,7 @@ impl WorkerMessage {
             Self::Checkpoint { .. } => "Checkpoint",
             Self::Disconnecting { .. } => "Disconnecting",
             Self::MobileTelemetry { .. } => "MobileTelemetry",
+            Self::ClaimMasterRole { .. } => "ClaimMasterRole",
             Self::UnknownVariant { .. } => "UnknownVariant",
         }
     }
@@ -1076,6 +1183,7 @@ impl WorkerMessage {
             Self::Checkpoint { .. } => Uuid::nil(),
             Self::Disconnecting { worker_id, .. } => *worker_id,
             Self::MobileTelemetry { worker_id, .. } => *worker_id,
+            Self::ClaimMasterRole { ticket } => ticket.master_id,
             Self::UnknownVariant { .. } => Uuid::nil(),
         }
     }
@@ -1094,6 +1202,7 @@ impl From<TaskResult> for WorkerMessage {
             device_name: r.device_name,
             error: r.error,
             asset_bytes: r.asset_bytes,
+            artifacts: r.artifacts,
         }
     }
 }
@@ -1128,6 +1237,13 @@ pub enum MasterMessage {
     Shutdown {
         reason: String,
         grace_period_secs: Option<u64>,
+    },
+    /// Response to ClaimMasterRole acknowledging or rejecting coordinator role handover.
+    RoleHandoverAck {
+        accepted: bool,
+        reason: Option<String>,
+        task_queue_snapshot: Vec<Task>,
+        connected_workers: Vec<WorkerCapabilities>,
     },
     /// Forward-compatible fallback variant for unrecognized messages from future protocol versions.
     UnknownVariant { tag: u32, raw_bytes: Vec<u8> },
@@ -1197,6 +1313,15 @@ enum HumanMasterMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         grace_period_secs: Option<u64>,
     },
+    RoleHandoverAck {
+        accepted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        task_queue_snapshot: Vec<Task>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        connected_workers: Vec<WorkerCapabilities>,
+    },
     #[serde(skip_deserializing)]
     UnknownVariant {
         tag: u32,
@@ -1233,6 +1358,12 @@ enum BinaryMasterMessage {
     Shutdown {
         reason: String,
         grace_period_secs: Option<u64>,
+    },
+    RoleHandoverAck {
+        accepted: bool,
+        reason: Option<String>,
+        task_queue_snapshot: Vec<Task>,
+        connected_workers: Vec<WorkerCapabilities>,
     },
     UnknownVariant {
         tag: u32,
@@ -1348,6 +1479,17 @@ impl From<MasterMessage> for HumanMasterMessage {
                 reason,
                 grace_period_secs,
             },
+            MasterMessage::RoleHandoverAck {
+                accepted,
+                reason,
+                task_queue_snapshot,
+                connected_workers,
+            } => HumanMasterMessage::RoleHandoverAck {
+                accepted,
+                reason,
+                task_queue_snapshot,
+                connected_workers,
+            },
             MasterMessage::UnknownVariant { tag, raw_bytes } => {
                 HumanMasterMessage::UnknownVariant { tag, raw_bytes }
             }
@@ -1393,6 +1535,17 @@ impl From<HumanMasterMessage> for MasterMessage {
             } => MasterMessage::Shutdown {
                 reason,
                 grace_period_secs,
+            },
+            HumanMasterMessage::RoleHandoverAck {
+                accepted,
+                reason,
+                task_queue_snapshot,
+                connected_workers,
+            } => MasterMessage::RoleHandoverAck {
+                accepted,
+                reason,
+                task_queue_snapshot,
+                connected_workers,
             },
             HumanMasterMessage::UnknownVariant { tag, raw_bytes } => {
                 MasterMessage::UnknownVariant { tag, raw_bytes }
@@ -1440,6 +1593,17 @@ impl From<MasterMessage> for BinaryMasterMessage {
                 reason,
                 grace_period_secs,
             },
+            MasterMessage::RoleHandoverAck {
+                accepted,
+                reason,
+                task_queue_snapshot,
+                connected_workers,
+            } => BinaryMasterMessage::RoleHandoverAck {
+                accepted,
+                reason,
+                task_queue_snapshot,
+                connected_workers,
+            },
             MasterMessage::UnknownVariant { tag, raw_bytes } => {
                 BinaryMasterMessage::UnknownVariant { tag, raw_bytes }
             }
@@ -1485,6 +1649,17 @@ impl From<BinaryMasterMessage> for MasterMessage {
             } => MasterMessage::Shutdown {
                 reason,
                 grace_period_secs,
+            },
+            BinaryMasterMessage::RoleHandoverAck {
+                accepted,
+                reason,
+                task_queue_snapshot,
+                connected_workers,
+            } => MasterMessage::RoleHandoverAck {
+                accepted,
+                reason,
+                task_queue_snapshot,
+                connected_workers,
             },
             BinaryMasterMessage::UnknownVariant { tag, raw_bytes } => {
                 MasterMessage::UnknownVariant { tag, raw_bytes }
@@ -1541,6 +1716,7 @@ impl MasterMessage {
             Self::AssignTaskWithCheckpoint { .. } => "AssignTaskWithCheckpoint",
             Self::CancelTask { .. } => "CancelTask",
             Self::Shutdown { .. } => "Shutdown",
+            Self::RoleHandoverAck { .. } => "RoleHandoverAck",
             Self::UnknownVariant { .. } => "UnknownVariant",
         }
     }
@@ -2795,9 +2971,7 @@ impl<W: AsyncWrite + Unpin> MessageWriter<W> {
 mod tests {
     use super::*;
     use crate::capabilities::WorkerCapabilities;
-    use crate::task::{
-        Generative3DSpec, Task, TaskId, TaskRequirements, TaskResult, TaskSpec, TaskStatus,
-    };
+    use crate::task::{Task, TaskId, TaskRequirements, TaskSpec, TaskStatus};
     use std::collections::HashMap;
 
     #[test]
@@ -2845,6 +3019,7 @@ mod tests {
                 device_name: Some("Simulated M1 GPU".into()),
                 error: None,
                 asset_bytes: None,
+                artifacts: Vec::new(),
             },
             WorkerMessage::Checkpoint {
                 task_id,
@@ -2908,6 +3083,8 @@ mod tests {
                     created_at_utc: 1726747200,
                     tags: vec!["test".into()],
                     latest_checkpoint: None,
+                    staged_files: Vec::new(),
+                    expected_outputs: Vec::new(),
                 },
             },
             MasterMessage::AssignTaskWithCheckpoint {
@@ -2930,6 +3107,8 @@ mod tests {
                     created_at_utc: 1726747200,
                     tags: vec!["test".into()],
                     latest_checkpoint: None,
+                    staged_files: Vec::new(),
+                    expected_outputs: Vec::new(),
                 },
                 latest_checkpoint: Some(CheckpointData::new(
                     5,
@@ -3477,6 +3656,10 @@ mod tests {
                 battery_pct: Some(9),
                 is_charging: Some(false),
                 thermal_throttled: true,
+                battery_temperature: None,
+                network_type: None,
+                battery_tier: None,
+                thermal_tier: None,
             }),
             6
         );
@@ -3491,6 +3674,10 @@ mod tests {
                 battery_pct: Some(14),
                 is_charging: Some(false),
                 thermal_throttled: true,
+                battery_temperature: Some(38.5),
+                network_type: Some("cellular".into()),
+                battery_tier: Some(crate::capabilities::BatteryTier::Critical),
+                thermal_tier: Some(crate::capabilities::ThermalTier::Warm),
             },
             // Unknown readings are legitimate (no battery sensor reachable): `None` must survive.
             WorkerMessage::MobileTelemetry {
@@ -3498,6 +3685,10 @@ mod tests {
                 battery_pct: None,
                 is_charging: None,
                 thermal_throttled: false,
+                battery_temperature: None,
+                network_type: None,
+                battery_tier: None,
+                thermal_tier: None,
             },
         ];
         for msg in cases {
@@ -3529,6 +3720,10 @@ mod tests {
                 battery_pct: None,
                 is_charging: None,
                 thermal_throttled: false,
+                battery_temperature: None,
+                network_type: None,
+                battery_tier: None,
+                thermal_tier: None,
             }
         );
     }

@@ -51,8 +51,26 @@ fn test_sdf_primitives_analytical_correctness() {
     assert!((sd_torus(Vec3::new(2.5, 0.0, 0.0), 2.0, 0.5)).abs() < 1e-6);
 
     // 4. Capsule from (0, 0, 0) to (0, 2, 0) with radius 0.5
-    assert!((sd_capsule(Vec3::new(0.0, 1.0, 0.0), Vec3::ZERO, Vec3::new(0.0, 2.0, 0.0), 0.5) - (-0.5)).abs() < 1e-6);
-    assert!((sd_capsule(Vec3::new(0.5, 1.0, 0.0), Vec3::ZERO, Vec3::new(0.0, 2.0, 0.0), 0.5)).abs() < 1e-6);
+    assert!(
+        (sd_capsule(
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::ZERO,
+            Vec3::new(0.0, 2.0, 0.0),
+            0.5
+        ) - (-0.5))
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        (sd_capsule(
+            Vec3::new(0.5, 1.0, 0.0),
+            Vec3::ZERO,
+            Vec3::new(0.0, 2.0, 0.0),
+            0.5
+        ))
+        .abs()
+            < 1e-6
+    );
 
     // 5. CSG Operators
     assert_eq!(op_union(1.0, -0.5), -0.5);
@@ -94,7 +112,10 @@ fn test_marching_cubes_watertightness_and_speed() {
     for n in &mesh.normals {
         assert!(n[0].is_finite() && n[1].is_finite() && n[2].is_finite());
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-        assert!((len - 1.0).abs() < 1e-2, "Normal vector not normalized: len={len}");
+        assert!(
+            (len - 1.0).abs() < 1e-2,
+            "Normal vector not normalized: len={len}"
+        );
     }
 }
 
@@ -157,8 +178,16 @@ fn test_uv_unwrapper_bounds_and_split() {
 
     // All UVs must lie strictly within [0.0, 1.0]
     for uv in &uv_mesh.uvs {
-        assert!(uv[0] >= 0.0 && uv[0] <= 1.0, "UV u out of bounds: {}", uv[0]);
-        assert!(uv[1] >= 0.0 && uv[1] <= 1.0, "UV v out of bounds: {}", uv[1]);
+        assert!(
+            uv[0] >= 0.0 && uv[0] <= 1.0,
+            "UV u out of bounds: {}",
+            uv[0]
+        );
+        assert!(
+            uv[1] >= 0.0 && uv[1] <= 1.0,
+            "UV v out of bounds: {}",
+            uv[1]
+        );
     }
 }
 
@@ -219,13 +248,22 @@ fn test_glb_container_compliance() {
     assert_eq!(json_len % 4, 0, "JSON chunk length must be 4-byte aligned");
 
     let json_str = std::str::from_utf8(&glb[20..20 + json_len]).expect("Invalid JSON UTF-8");
-    let parsed: serde_json::Value = serde_json::from_str(json_str).expect("Failed to parse glTF JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_str(json_str).expect("Failed to parse glTF JSON");
 
     // 3. Mandatory min and max on POSITION accessor
-    let accessors = parsed["accessors"].as_array().expect("accessors not an array");
+    let accessors = parsed["accessors"]
+        .as_array()
+        .expect("accessors not an array");
     let pos_acc = &accessors[0];
-    assert!(pos_acc["min"].is_array(), "POSITION accessor missing min bounding box");
-    assert!(pos_acc["max"].is_array(), "POSITION accessor missing max bounding box");
+    assert!(
+        pos_acc["min"].is_array(),
+        "POSITION accessor missing min bounding box"
+    );
+    assert!(
+        pos_acc["max"].is_array(),
+        "POSITION accessor missing max bounding box"
+    );
 
     // 4. Chunk 1 must be BIN (type 0x004E4942)
     let bin_offset = 20 + json_len;
@@ -235,7 +273,8 @@ fn test_glb_container_compliance() {
     assert_eq!(bin_len % 4, 0, "BIN chunk length must be 4-byte aligned");
     assert_eq!(12 + 8 + json_len + 8 + bin_len, glb.len());
 
-    let out_path = std::path::PathBuf::from(r"E:\teamwork_projects\OxideSwarm\target\tier0_test.glb");
+    let out_path =
+        std::path::PathBuf::from(r"E:\teamwork_projects\OxideSwarm\target\tier0_test.glb");
     if let Some(parent) = out_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -265,7 +304,8 @@ fn test_job_object_creation_and_lifecycle() {
     let pid = child.id();
 
     let mut job = job;
-    job.assign_pid(pid).expect("Failed to assign PID to JobObject");
+    job.assign_pid(pid)
+        .expect("Failed to assign PID to JobObject");
 
     // Terminate via JobObject
     job.terminate(130).expect("Failed to terminate JobObject");
@@ -289,7 +329,10 @@ async fn test_task_runner_generative3d_sdf_execution() {
     let result = runner.execute_task(&task, None, None).await;
 
     assert!(result.is_success(), "Task failed: {:?}", result.error);
-    assert!(result.asset_bytes.is_some(), "Asset bytes missing from TaskResult");
+    assert!(
+        result.asset_bytes.is_some(),
+        "Asset bytes missing from TaskResult"
+    );
 
     let asset = result.asset_bytes.unwrap();
     assert!(asset.len() >= 12);

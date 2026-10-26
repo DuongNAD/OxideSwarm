@@ -11,6 +11,7 @@ pub enum RigPreset {
 }
 
 impl RigPreset {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().trim() {
             "quadruped" => Self::Quadruped,

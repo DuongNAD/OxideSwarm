@@ -124,55 +124,146 @@ pub fn build_bone_segments(armature: &Armature, lm: &AnatomicalLandmarks) -> Vec
     let mut segments = Vec::new();
 
     // Helper closure
-    let mut add_segment = |joint_idx: usize, start: Vec3, end: Vec3, r_fraction: f32, side: LimbSide| {
-        segments.push(BoneSegment {
-            joint_index: joint_idx as u16,
-            start,
-            end,
-            radius: r_fraction * h,
-            side,
-        });
-    };
+    let mut add_segment =
+        |joint_idx: usize, start: Vec3, end: Vec3, r_fraction: f32, side: LimbSide| {
+            segments.push(BoneSegment {
+                joint_index: joint_idx as u16,
+                start,
+                end,
+                radius: r_fraction * h,
+                side,
+            });
+        };
 
     // Axial Spine Segments
     // 0: Hips -> Spine
-    add_segment(0, armature.joints[0].rest_world_pos, armature.joints[1].rest_world_pos, 0.16, LimbSide::Axial);
+    add_segment(
+        0,
+        armature.joints[0].rest_world_pos,
+        armature.joints[1].rest_world_pos,
+        0.16,
+        LimbSide::Axial,
+    );
     // 1: Spine -> Chest
-    add_segment(1, armature.joints[1].rest_world_pos, armature.joints[2].rest_world_pos, 0.14, LimbSide::Axial);
+    add_segment(
+        1,
+        armature.joints[1].rest_world_pos,
+        armature.joints[2].rest_world_pos,
+        0.14,
+        LimbSide::Axial,
+    );
     // 2: Chest -> Neck
-    add_segment(2, armature.joints[2].rest_world_pos, armature.joints[3].rest_world_pos, 0.15, LimbSide::Axial);
+    add_segment(
+        2,
+        armature.joints[2].rest_world_pos,
+        armature.joints[3].rest_world_pos,
+        0.15,
+        LimbSide::Axial,
+    );
     // 3: Neck -> Head
-    add_segment(3, armature.joints[3].rest_world_pos, armature.joints[4].rest_world_pos, 0.08, LimbSide::Axial);
+    add_segment(
+        3,
+        armature.joints[3].rest_world_pos,
+        armature.joints[4].rest_world_pos,
+        0.08,
+        LimbSide::Axial,
+    );
     // 4: Head endcap
-    add_segment(4, armature.joints[4].rest_world_pos, armature.joints[4].rest_world_pos + Vec3::new(0.0, 0.08 * h, 0.0), 0.12, LimbSide::Axial);
+    add_segment(
+        4,
+        armature.joints[4].rest_world_pos,
+        armature.joints[4].rest_world_pos + Vec3::new(0.0, 0.08 * h, 0.0),
+        0.12,
+        LimbSide::Axial,
+    );
 
     // Left Leg Segments
     // 5: UpperLeg_L (Hip -> Knee)
-    add_segment(5, armature.joints[5].rest_world_pos, armature.joints[6].rest_world_pos, 0.10, LimbSide::Left);
+    add_segment(
+        5,
+        armature.joints[5].rest_world_pos,
+        armature.joints[6].rest_world_pos,
+        0.10,
+        LimbSide::Left,
+    );
     // 6: LowerLeg_L (Knee -> Ankle)
-    add_segment(6, armature.joints[6].rest_world_pos, armature.joints[7].rest_world_pos, 0.08, LimbSide::Left);
+    add_segment(
+        6,
+        armature.joints[6].rest_world_pos,
+        armature.joints[7].rest_world_pos,
+        0.08,
+        LimbSide::Left,
+    );
     // 7: Foot_L (Ankle -> Toe terminal)
-    add_segment(7, armature.joints[7].rest_world_pos, armature.joints[7].rest_world_pos + Vec3::new(0.0, 0.0, 0.08 * h), 0.07, LimbSide::Left);
+    add_segment(
+        7,
+        armature.joints[7].rest_world_pos,
+        armature.joints[7].rest_world_pos + Vec3::new(0.0, 0.0, 0.08 * h),
+        0.07,
+        LimbSide::Left,
+    );
 
     // Right Leg Segments
     // 8: UpperLeg_R (Hip -> Knee)
-    add_segment(8, armature.joints[8].rest_world_pos, armature.joints[9].rest_world_pos, 0.10, LimbSide::Right);
+    add_segment(
+        8,
+        armature.joints[8].rest_world_pos,
+        armature.joints[9].rest_world_pos,
+        0.10,
+        LimbSide::Right,
+    );
     // 9: LowerLeg_R (Knee -> Ankle)
-    add_segment(9, armature.joints[9].rest_world_pos, armature.joints[10].rest_world_pos, 0.08, LimbSide::Right);
+    add_segment(
+        9,
+        armature.joints[9].rest_world_pos,
+        armature.joints[10].rest_world_pos,
+        0.08,
+        LimbSide::Right,
+    );
     // 10: Foot_R (Ankle -> Toe terminal)
-    add_segment(10, armature.joints[10].rest_world_pos, armature.joints[10].rest_world_pos + Vec3::new(0.0, 0.0, 0.08 * h), 0.07, LimbSide::Right);
+    add_segment(
+        10,
+        armature.joints[10].rest_world_pos,
+        armature.joints[10].rest_world_pos + Vec3::new(0.0, 0.0, 0.08 * h),
+        0.07,
+        LimbSide::Right,
+    );
 
     // Left Arm Segments
     // 11: UpperArm_L (Shoulder -> Elbow)
-    add_segment(11, armature.joints[11].rest_world_pos, armature.joints[12].rest_world_pos, 0.08, LimbSide::Left);
+    add_segment(
+        11,
+        armature.joints[11].rest_world_pos,
+        armature.joints[12].rest_world_pos,
+        0.08,
+        LimbSide::Left,
+    );
     // 12: LowerArm_L (Elbow -> Wrist terminal)
-    add_segment(12, armature.joints[12].rest_world_pos, lm.wrist_l, 0.06, LimbSide::Left);
+    add_segment(
+        12,
+        armature.joints[12].rest_world_pos,
+        lm.wrist_l,
+        0.06,
+        LimbSide::Left,
+    );
 
     // Right Arm Segments
     // 13: UpperArm_R (Shoulder -> Elbow)
-    add_segment(13, armature.joints[13].rest_world_pos, armature.joints[14].rest_world_pos, 0.08, LimbSide::Right);
+    add_segment(
+        13,
+        armature.joints[13].rest_world_pos,
+        armature.joints[14].rest_world_pos,
+        0.08,
+        LimbSide::Right,
+    );
     // 14: LowerArm_R (Elbow -> Wrist terminal)
-    add_segment(14, armature.joints[14].rest_world_pos, lm.wrist_r, 0.06, LimbSide::Right);
+    add_segment(
+        14,
+        armature.joints[14].rest_world_pos,
+        lm.wrist_r,
+        0.06,
+        LimbSide::Right,
+    );
 
     segments
 }

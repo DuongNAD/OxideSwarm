@@ -477,6 +477,7 @@ fn test_serde_worker_message_all_variants_and_edge_cases() {
             device_name: None,
             error: Some("Failed with error \0".into()),
             asset_bytes: None,
+            artifacts: Vec::new(),
         };
         let json = serde_json::to_string(&result).unwrap();
         let de: WorkerMessage = serde_json::from_str(&json).unwrap();
@@ -587,6 +588,8 @@ fn test_serde_master_message_all_variants_and_edge_cases() {
             created_at_utc: u64::MAX,
             tags: vec!["tag1".into(), "unicode_🏷️".into(), "".into()],
             latest_checkpoint: None,
+            staged_files: Vec::new(),
+            expected_outputs: Vec::new(),
         };
 
         let assign = MasterMessage::AssignTask { task };

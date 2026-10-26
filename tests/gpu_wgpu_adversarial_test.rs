@@ -383,16 +383,16 @@ fn test_wgpu_hardware_irregular_dimensions() {
 
             // Check maximum absolute and relative error against CPU reference
             let mut max_abs_diff = 0.0f32;
-            for i in 0..dim * dim {
-                let diff = (outcome.matrix_c[i] - c_expected[i]).abs();
+            for (i, (&gpu_val, &cpu_val)) in outcome.matrix_c.iter().zip(&c_expected).enumerate() {
+                let diff = (gpu_val - cpu_val).abs();
                 if diff > max_abs_diff {
                     max_abs_diff = diff;
                 }
                 assert!(
                     diff < 1e-1,
                     "Excessive GPU vs CPU error at index {i} for dim {dim}x{dim}: gpu={}, cpu={}, diff={}",
-                    outcome.matrix_c[i],
-                    c_expected[i],
+                    gpu_val,
+                    cpu_val,
                     diff
                 );
             }

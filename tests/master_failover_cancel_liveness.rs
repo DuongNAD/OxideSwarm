@@ -248,6 +248,8 @@ fn result_msg(worker_id: Uuid, task_id: TaskId, exit_code: i32, stdout: &[u8]) -
         is_gpu_executed: false,
         device_name: None,
         error: None,
+        artifacts: Vec::new(),
+        asset_bytes: None,
     }
 }
 
@@ -643,6 +645,8 @@ async fn test_client_cancel_reaches_the_worker_and_wakes_waiting_clients() {
             is_gpu_executed: false,
             device_name: None,
             error: Some("Cancelled: by master".into()),
+            artifacts: Vec::new(),
+            asset_bytes: None,
         })
         .await;
     worker.sync().await;
@@ -1173,6 +1177,8 @@ async fn test_a_worker_that_rejects_tasks_instantly_does_not_swallow_the_work() 
             is_gpu_executed: false,
             device_name: None,
             error: Some("Battery critically low (<15% discharging)".into()),
+            artifacts: Vec::new(),
+            asset_bytes: None,
         })
         .await;
 

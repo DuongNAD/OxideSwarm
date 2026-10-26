@@ -256,11 +256,14 @@ This app runs the **compute-grid worker** (not the agent-mesh node) in-process v
 - Supports cluster secret authentication via native JNI configuration (`nativeSetClusterSecret`, `nativeStartWorkerWithSecret`).
 
 ### 3.5 Upgrading a running grid (master and workers)
-The compute grid's wire protocol (master, workers, `submit` / `status`) has no version negotiation and encodes
-messages positionally, so a message type that an older master does not know is treated as a corrupt frame and the
-sender is disconnected (and its running tasks failed over). Always **restart the master first**, then the workers
-and CLIs. A worker newer than its master keeps working for the messages a master announces in its registration
-reply (the live battery report is one); a client command newer than the master (`GetTaskResult`) is not guarded.
+Workers send a protocol version and feature bits when they register, and the master refuses a worker below
+`PROTOCOL_VERSION_MIN_COMPATIBLE`; client commands (`submit`, `status`, `doctor`, ...) send no version. Messages
+are still encoded positionally, so a message type that an older peer does not know is treated as a corrupt frame
+and the sender is disconnected (and its running tasks failed over). Always **restart the master first**, then the
+workers and CLIs. A worker newer than its master keeps working for the messages a master announces in its
+registration reply (the live battery report is one); a client command newer than the master (`GetTaskResult`) is
+not guarded. Placement constraints (`submit --os`, `--arch`, `--worker`, `--require-tag`) travel in task tags: an
+older master ignores them and may run the task on any worker, which `oxideswarm doctor` reports.
 The Agent Mesh hub in this guide uses its own JSON envelopes and is unaffected.
 
 ---

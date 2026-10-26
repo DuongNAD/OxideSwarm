@@ -82,30 +82,30 @@ mode_test() {
         shift
     fi
 
-    log_header "🧪 CHẾ ĐỘ TEST & KIỂM TRA CHẤT LƯỢNG (Action: ${action})"
+    log_header "🧪 TEST & QUALITY ASSURANCE MODE (Action: ${action})"
 
     case "${action}" in
         quick)
-            log_step "Đang chạy Quick Unit Tests (cargo test --workspace --lib)..."
+            log_step "Running Quick Unit Tests (cargo test --workspace --lib)..."
             run_ox_mode_bin test quick "$@"
             ;;
         lint)
-            log_step "Đang chạy Lints & Code Formatting (cargo clippy & fmt)..."
+            log_step "Running Lints & Code Formatting (cargo clippy & fmt)..."
             run_ox_mode_bin test lint "$@"
             ;;
         flaky)
             if [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; then
                 local iters="$1"
                 shift
-                log_step "Đang chạy Flaky Test Detector (${iters} iterations)..."
+                log_step "Running Flaky Test Detector (${iters} iterations)..."
                 run_ox_mode_bin test flaky --iterations "${iters}" "$@"
             else
-                log_step "Đang chạy Flaky Test Detector..."
+                log_step "Running Flaky Test Detector..."
                 run_ox_mode_bin test flaky "$@"
             fi
             ;;
         full)
-            log_step "Đang chạy Full Workspace Test Suite (unit + integration)..."
+            log_step "Running Full Workspace Test Suite (unit + integration)..."
             run_ox_mode_bin test full "$@"
             ;;
         *)
@@ -125,27 +125,27 @@ mode_dev() {
         shift
     fi
 
-    log_header "⚡ CHẾ ĐỘ PHÁT TRIỂN & CỤM DEV LOCAL (Action: ${action})"
+    log_header "⚡ DEVELOPMENT & LOCAL CLUSTER MODE (Action: ${action})"
 
     case "${action}" in
         fast)
-            log_step "Đang chạy Fast Incremental Check (cargo check --workspace)..."
+            log_step "Running Fast Incremental Check (cargo check --workspace)..."
             run_ox_mode_bin dev fast "$@"
             ;;
         watch|reload)
-            log_step "Khởi chạy Live-Reload Watch Loop (tự động re-check khi thay đổi mã)..."
+            log_step "Starting Live-Reload Watch Loop (auto re-check on file changes)..."
             run_ox_mode_bin dev watch "$@"
             ;;
         cluster)
-            log_step "Khởi chạy cụm Local Dev Cluster (Master + 2 Workers)..."
+            log_step "Starting Local Dev Cluster (Master + 2 Workers)..."
             run_ox_mode_bin dev cluster "$@"
             ;;
         status)
-            log_step "Kiểm tra sức khỏe cụm (Cluster Health Status)..."
+            log_step "Checking Cluster Health Status..."
             run_ox_mode_bin dev status "$@"
             ;;
         stop)
-            log_step "Dừng cụm Local Dev Cluster..."
+            log_step "Stopping Local Dev Cluster..."
             run_ox_mode_bin dev stop "$@"
             ;;
         *)
@@ -165,19 +165,19 @@ mode_doc() {
         shift
     fi
 
-    log_header "📚 CHẾ ĐỘ VIẾT TÀI LIỆU & ĐẶC TẢ KIẾN TRÚC (Action: ${action})"
+    log_header "📚 DOCUMENTATION & ARCHITECTURE SPECIFICATION MODE (Action: ${action})"
 
     case "${action}" in
         verify)
-            log_step "Kiểm tra tính toàn vẹn tài liệu Markdown & Specs..."
+            log_step "Verifying Markdown Documentation & Specification Integrity..."
             run_ox_mode_bin doc verify "$@"
             ;;
         export|update)
-            log_step "Xuất / Cập nhật Đặc tả Kiến trúc & Giao thức thống nhất..."
+            log_step "Exporting / Updating Unified Architecture & Protocol Specification..."
             run_ox_mode_bin doc export "$@"
             ;;
         build)
-            log_step "Biên dịch tài liệu mã nguồn (cargo doc --workspace --no-deps)..."
+            log_step "Building Source Documentation (cargo doc --workspace --no-deps)..."
             run_ox_mode_bin doc build "$@"
             ;;
         *)
@@ -197,23 +197,23 @@ mode_research() {
         shift
     fi
 
-    log_header "🔬 CHẾ ĐỘ NGHIÊN CỨU & ĐO KIỂM HIỆU NĂNG (Action: ${action})"
+    log_header "🔬 RESEARCH & PERFORMANCE BENCHMARKING MODE (Action: ${action})"
 
     case "${action}" in
         profile)
-            log_step "Đo lường cấu hình phần cứng và tài nguyên hệ thống..."
+            log_step "Profiling Hardware Configuration & System Resources..."
             run_ox_mode_bin research profile "$@"
             ;;
         bench)
-            log_step "Chạy Micro-Benchmarks (Serde, Queue & Codec Throughput)..."
+            log_step "Running Micro-Benchmarks (Serde, Queue & Codec Throughput)..."
             run_ox_mode_bin research bench "$@"
             ;;
         distributed)
-            log_step "Chạy Distributed Scheduling Simulation Benchmark..."
+            log_step "Running Distributed Scheduling Simulation Benchmark..."
             run_ox_mode_bin research distributed "$@"
             ;;
         report)
-            log_step "Tạo Báo cáo Nghiên cứu hoàn chỉnh (target/research_report.json)..."
+            log_step "Generating Complete Research Report (target/research_report.json)..."
             run_ox_mode_bin research report "$@"
             ;;
         *)

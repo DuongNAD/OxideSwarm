@@ -210,10 +210,16 @@ pub fn pack_glb(mesh: &RawMesh, material: Option<&BakedMaterial>) -> Result<Vec<
         "POSITION": 0
     });
     if let Some(norm_idx) = normal_accessor_idx {
-        attributes.as_object_mut().unwrap().insert("NORMAL".to_string(), json!(norm_idx));
+        attributes
+            .as_object_mut()
+            .unwrap()
+            .insert("NORMAL".to_string(), json!(norm_idx));
     }
     if let Some(uv_idx) = uv_accessor_idx {
-        attributes.as_object_mut().unwrap().insert("TEXCOORD_0".to_string(), json!(uv_idx));
+        attributes
+            .as_object_mut()
+            .unwrap()
+            .insert("TEXCOORD_0".to_string(), json!(uv_idx));
     }
 
     let primitive = json!({
@@ -242,9 +248,18 @@ pub fn pack_glb(mesh: &RawMesh, material: Option<&BakedMaterial>) -> Result<Vec<
     });
 
     if !textures.is_empty() {
-        gltf_json.as_object_mut().unwrap().insert("textures".to_string(), json!(textures));
-        gltf_json.as_object_mut().unwrap().insert("images".to_string(), json!(images));
-        gltf_json.as_object_mut().unwrap().insert("samplers".to_string(), json!(samplers));
+        gltf_json
+            .as_object_mut()
+            .unwrap()
+            .insert("textures".to_string(), json!(textures));
+        gltf_json
+            .as_object_mut()
+            .unwrap()
+            .insert("images".to_string(), json!(images));
+        gltf_json
+            .as_object_mut()
+            .unwrap()
+            .insert("samplers".to_string(), json!(samplers));
     }
 
     let mut json_bytes = serde_json::to_vec(&gltf_json)
@@ -280,6 +295,7 @@ pub fn pack_glb(mesh: &RawMesh, material: Option<&BakedMaterial>) -> Result<Vec<
 }
 
 #[inline(always)]
+#[allow(unknown_lints, clippy::manual_is_multiple_of)]
 fn pad_to_4(buf: &mut Vec<u8>) {
     while buf.len() % 4 != 0 {
         buf.push(0);

@@ -34,4 +34,4 @@ UX / Setup,Installation Steps,Step Count,1 step (Run command or script),6 steps 
 UX / Setup,Root / Admin Required,Privilege Level,No (Runs as standard user),Yes (Kernel network extension),No (Standard user space),OxideSwarm & Cloudflare
 UX / Setup,Average Onboarding Time,Seconds,20 seconds,720 seconds (12 minutes),1800 seconds (30 minutes),OxideSwarm (36x faster setup)
 UX / Setup,1-Click Script Automation,Script Available,Yes (connect_remote.sh & .cmd),No (Requires manual GUI login),No (Requires manual cloudflare auth),OxideSwarm (Native 1-click pairing)
-Evaluation,Composite Evaluation Score,Score out of 100,96.4 / 100,72.3 / 100,60.7 / 100,OxideSwarm ("Nhẹ mà tốt" champion)
+Evaluation,Composite Evaluation Score,Score out of 100,96.4 / 100,72.3 / 100,60.7 / 100,OxideSwarm (lightweight yet capable)

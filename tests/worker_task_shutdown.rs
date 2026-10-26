@@ -55,6 +55,10 @@ async fn test_terminate_all_task_process_trees_kills_every_running_tree_and_noth
         gpu_device_name: None,
         tags: vec![],
         mobile: None,
+        has_blender: false,
+        blender_version: None,
+        vram_mb: None,
+        has_cuda: false,
     };
     let runner = Arc::new(TaskRunner::new(
         Uuid::new_v4(),

@@ -338,13 +338,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StampedStream<S> {
 #[derive(Debug, Clone, Default)]
 pub struct MobileTelemetryHandle {
     inner: Arc<RwLock<Option<MobileCapabilities>>>,
+    live: Arc<RwLock<Option<MobileLiveStatus>>>,
 }
 
 impl MobileTelemetryHandle {
     /// A handle starting at `initial` (`None` for a device without battery data).
     pub fn new(initial: Option<MobileCapabilities>) -> Self {
+        let live = initial.as_ref().map(|m| m.live_status());
         Self {
             inner: Arc::new(RwLock::new(initial)),
+            live: Arc::new(RwLock::new(live)),
         }
     }
 
@@ -358,10 +361,15 @@ impl MobileTelemetryHandle {
 
     /// Replaces the whole state (descriptors included).
     pub fn set(&self, mobile: Option<MobileCapabilities>) {
+        let live = mobile.as_ref().map(|m| m.live_status());
         *self
             .inner
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = mobile;
+        *self
+            .live
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = live;
     }
 
     /// Replaces the fast-changing readings. The OS / SoC descriptors are kept; if nothing was set
@@ -372,7 +380,7 @@ impl MobileTelemetryHandle {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = Some(match guard.as_ref() {
-            Some(current) => current.with_live_status(status),
+            Some(current) => current.with_live_status(status.clone()),
             None => MobileCapabilities {
                 os_version: "unknown".into(),
                 soc_model: "unknown".into(),
@@ -381,11 +389,24 @@ impl MobileTelemetryHandle {
                 thermal_throttled: status.thermal_throttled,
             },
         });
+        *self
+            .live
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(status);
     }
 
     /// The fast-changing readings alone, `None` while nothing is known.
     pub fn live_status(&self) -> Option<MobileLiveStatus> {
-        self.snapshot().map(|m| m.live_status())
+        let l = self
+            .live
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if l.is_some() {
+            l
+        } else {
+            self.snapshot().map(|m| m.live_status())
+        }
     }
 
     /// Replaces OS / SoC descriptors that are still "unknown" (an app pushed battery readings
@@ -428,18 +449,25 @@ pub fn spawn_mobile_poller(
     })
 }
 
-/// Spawns the background periodic heartbeat sender task.
-pub fn spawn_heartbeat_task(
+/// Spawns the background periodic heartbeat sender task with adaptive keepalive support.
+pub fn spawn_adaptive_heartbeat_task(
     worker_id: Uuid,
     interval: Duration,
     outbound_tx: mpsc::Sender<WorkerMessage>,
     tracker: Arc<HeartbeatTracker>,
+    mobile: Option<MobileTelemetryHandle>,
 ) -> HeartbeatHandle {
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
     let tracker_clone = Arc::clone(&tracker);
 
     let join_handle = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
+        let mut current_interval = interval;
+        if let Some(ref mob) = mobile {
+            if let Some(status) = mob.live_status() {
+                current_interval = status.recommended_keepalive_interval(0);
+            }
+        }
+        let mut ticker = tokio::time::interval(current_interval);
         // Skip the immediate initial tick so first heartbeat is sent after interval has elapsed
         ticker.tick().await;
 
@@ -448,6 +476,18 @@ pub fn spawn_heartbeat_task(
                 _ = ticker.tick() => {
                     let now_sec = current_epoch_secs();
                     let active = tracker_clone.active_tasks.load(Ordering::Relaxed);
+
+                    // Dynamically adapt keepalive interval based on cellular status and active tasks
+                    if let Some(ref mob) = mobile {
+                        if let Some(status) = mob.live_status() {
+                            let recommended = status.recommended_keepalive_interval(active);
+                            if recommended != current_interval {
+                                current_interval = recommended;
+                                ticker = tokio::time::interval(current_interval);
+                                ticker.tick().await;
+                            }
+                        }
+                    }
 
                     // Read current system telemetry from non-blocking background sampler
                     let (cpu_usage_pct, ram_available_mb) = get_system_telemetry();
@@ -469,10 +509,6 @@ pub fn spawn_heartbeat_task(
                         "Dispatching periodic heartbeat"
                     );
 
-                    // Never wait for room: while the writer is stuck in a large frame the queue
-                    // fills up, and a backlog of stale beats delivered in a burst afterwards says
-                    // nothing the next fresh beat does not. A full queue means a beat (or other
-                    // control traffic) is already waiting, so this one is simply skipped.
                     match outbound_tx.try_send(msg) {
                         Ok(()) => tracker_clone.record_sent(now_sec),
                         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -497,6 +533,16 @@ pub fn spawn_heartbeat_task(
         stop_tx: Some(stop_tx),
         join_handle,
     }
+}
+
+/// Spawns the background periodic heartbeat sender task.
+pub fn spawn_heartbeat_task(
+    worker_id: Uuid,
+    interval: Duration,
+    outbound_tx: mpsc::Sender<WorkerMessage>,
+    tracker: Arc<HeartbeatTracker>,
+) -> HeartbeatHandle {
+    spawn_adaptive_heartbeat_task(worker_id, interval, outbound_tx, tracker, None)
 }
 
 #[cfg(test)]
@@ -692,6 +738,7 @@ mod tests {
             battery_pct: Some(61),
             is_charging: Some(true),
             thermal_throttled: false,
+            ..Default::default()
         });
         let first = handle.snapshot().unwrap();
         assert_eq!(first.battery_pct, Some(61));
@@ -710,6 +757,7 @@ mod tests {
             battery_pct: Some(3),
             is_charging: Some(false),
             thermal_throttled: true,
+            ..Default::default()
         });
         let snap = handle.snapshot().unwrap();
         assert_eq!(
@@ -729,6 +777,7 @@ mod tests {
             battery_pct: Some(7),
             is_charging: Some(false),
             thermal_throttled: true,
+            ..Default::default()
         })
     }
 

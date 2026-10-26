@@ -8,9 +8,15 @@ use super::types::{AnatomicalLandmarks, RigPreset};
 use crate::gen3d::types::RawMesh;
 
 /// Analyzes mesh geometry and extracts 3D anatomical landmarks using PCA alignment.
-pub fn extract_landmarks(mesh: &RawMesh, _preset: RigPreset) -> Result<AnatomicalLandmarks, String> {
+pub fn extract_landmarks(
+    mesh: &RawMesh,
+    _preset: RigPreset,
+) -> Result<AnatomicalLandmarks, String> {
     if mesh.positions.len() < 8 {
-        return Err("Mesh has insufficient vertices for landmark extraction (minimum 8 required)".to_string());
+        return Err(
+            "Mesh has insufficient vertices for landmark extraction (minimum 8 required)"
+                .to_string(),
+        );
     }
 
     let n = mesh.positions.len() as f32;
@@ -66,11 +72,12 @@ pub fn extract_landmarks(mesh: &RawMesh, _preset: RigPreset) -> Result<Anatomica
     }
 
     let other_indices: Vec<usize> = (0..3).filter(|&idx| idx != up_idx).collect();
-    let (lat_idx, _depth_idx) = if eigen.eigenvalues[other_indices[0]] >= eigen.eigenvalues[other_indices[1]] {
-        (other_indices[0], other_indices[1])
-    } else {
-        (other_indices[1], other_indices[0])
-    };
+    let (lat_idx, _depth_idx) =
+        if eigen.eigenvalues[other_indices[0]] >= eigen.eigenvalues[other_indices[1]] {
+            (other_indices[0], other_indices[1])
+        } else {
+            (other_indices[1], other_indices[0])
+        };
 
     let mut axis_y = eigen.eigenvectors[up_idx];
     let mut axis_x = eigen.eigenvectors[lat_idx];
@@ -143,13 +150,22 @@ pub fn extract_landmarks(mesh: &RawMesh, _preset: RigPreset) -> Result<Anatomica
     let step = (canonical_positions.len() / sample_count).max(1);
     let mut sym_err_acc = 0.0f32;
 
-    for i in (0..canonical_positions.len()).step_by(step).take(sample_count) {
+    for i in (0..canonical_positions.len())
+        .step_by(step)
+        .take(sample_count)
+    {
         let p = canonical_positions[i];
         let p_refl = [2.0 * center_x - p[0], p[1], p[2]];
         let mut min_d = f32::INFINITY;
-        for j in (0..canonical_positions.len()).step_by(step * 2).take(sample_count / 2) {
+        for j in (0..canonical_positions.len())
+            .step_by(step * 2)
+            .take(sample_count / 2)
+        {
             let q = canonical_positions[j];
-            let d = ((p_refl[0] - q[0]).powi(2) + (p_refl[1] - q[1]).powi(2) + (p_refl[2] - q[2]).powi(2)).sqrt();
+            let d = ((p_refl[0] - q[0]).powi(2)
+                + (p_refl[1] - q[1]).powi(2)
+                + (p_refl[2] - q[2]).powi(2))
+            .sqrt();
             if d < min_d {
                 min_d = d;
             }
@@ -173,8 +189,12 @@ pub fn extract_landmarks(mesh: &RawMesh, _preset: RigPreset) -> Result<Anatomica
         let k = ((rel_y / delta_y) as usize).min(K - 1);
         slice_counts[k] += 1;
 
-        if p[0] < slice_min_x[k] { slice_min_x[k] = p[0]; }
-        if p[0] > slice_max_x[k] { slice_max_x[k] = p[0]; }
+        if p[0] < slice_min_x[k] {
+            slice_min_x[k] = p[0];
+        }
+        if p[0] > slice_max_x[k] {
+            slice_max_x[k] = p[0];
+        }
 
         let rel_x = p[0] - center_x;
         if rel_x < -0.02 * width {
@@ -229,9 +249,8 @@ pub fn extract_landmarks(mesh: &RawMesh, _preset: RigPreset) -> Result<Anatomica
     let elbow_prebend_z = center_z - 0.02 * height;
 
     // 11. Helper to transform canonical coordinates back to mesh world space
-    let to_world = |cx: f32, cy: f32, cz: f32| -> Vec3 {
-        centroid + axis_x * cx + axis_y * cy + axis_z * cz
-    };
+    let to_world =
+        |cx: f32, cy: f32, cz: f32| -> Vec3 { centroid + axis_x * cx + axis_y * cy + axis_z * cz };
 
     Ok(AnatomicalLandmarks {
         height,

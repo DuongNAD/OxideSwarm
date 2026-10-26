@@ -51,8 +51,8 @@ use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus
 use crate::backoff::{BackoffConfig, ExponentialBackoff};
 use crate::gpu::{apply_gpu_policy, probe_real_gpu, GpuNotice, GpuRequest, NoticeLevel};
 use crate::heartbeat::{
-    current_epoch_secs, spawn_heartbeat_task, spawn_mobile_poller, HeartbeatTracker, IoClock,
-    MobileTelemetryHandle, StampedStream,
+    current_epoch_secs, spawn_adaptive_heartbeat_task, spawn_mobile_poller, HeartbeatTracker,
+    IoClock, MobileTelemetryHandle, StampedStream,
 };
 use crate::identity::{default_worker_id_path, load_or_create_worker_id};
 use crate::process_tree::ProcessPriority;
@@ -88,6 +88,28 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// this worker does not have). Retrying faster cannot succeed with the same secret and would only
 /// hammer the Master (which itself delays every failed authentication).
 pub const AUTH_FAILURE_MIN_BACKOFF: Duration = Duration::from_secs(30);
+
+type EvacuationHook = Box<dyn Fn() -> Option<String> + Send + Sync>;
+
+static EVACUATION_REASON_HOOK: std::sync::RwLock<Option<EvacuationHook>> =
+    std::sync::RwLock::new(None);
+
+/// Registers an external hook for querying an active evacuation reason (e.g. from Android bridge).
+pub fn set_evacuation_reason_hook<F: Fn() -> Option<String> + Send + Sync + 'static>(f: F) {
+    if let Ok(mut guard) = EVACUATION_REASON_HOOK.write() {
+        *guard = Some(Box::new(f));
+    }
+}
+
+/// Retrieves the active evacuation reason if set by an evacuation hook.
+pub fn current_evacuation_reason() -> Option<String> {
+    if let Ok(guard) = EVACUATION_REASON_HOOK.read() {
+        if let Some(hook) = guard.as_ref() {
+            return hook();
+        }
+    }
+    None
+}
 
 /// A Master that sends nothing for this many heartbeat intervals is considered gone.
 pub const DEAD_PEER_HEARTBEAT_FACTOR: u32 = 4;
@@ -255,6 +277,20 @@ pub struct WorkerConfig {
     pub redirection_portal_port: u16,
     /// Wire serialization codec (Bincode or Json, default: Bincode).
     pub wire_codec: WireCodec,
+    /// Explicit Blender availability override (CLI `--blender`).
+    pub blender: Option<bool>,
+    /// Explicitly disable Blender capability (CLI `--no-blender`).
+    pub no_blender: bool,
+    /// Optional explicit path to Blender executable (CLI `--blender-path`).
+    pub blender_path: Option<String>,
+    /// Optional explicit Blender version string override (CLI `--blender-version`).
+    pub blender_version: Option<String>,
+    /// Optional explicit GPU VRAM in MB override (CLI `--vram-mb`).
+    pub vram_mb: Option<u64>,
+    /// Explicit CUDA availability override (CLI `--cuda`).
+    pub cuda: Option<bool>,
+    /// Explicitly disable CUDA capability (CLI `--no-cuda`).
+    pub no_cuda: bool,
 }
 
 impl WorkerConfig {
@@ -744,6 +780,18 @@ impl Drop for Session {
     }
 }
 
+/// What the worker advertises in `WorkerCapabilities::tags`: its system tags (`os:`, `arch:`, see
+/// `rusty_grid_core::placement`), then the configured user tags that are not among them.
+fn advertised_tags(user_tags: &[String]) -> Vec<String> {
+    let mut tags = rusty_grid_core::placement::system_tags();
+    for tag in user_tags {
+        if !tags.contains(tag) {
+            tags.push(tag.clone());
+        }
+    }
+    tags
+}
+
 /// `RUSTY_GRID_ENABLE_PHYSICAL_GPU=1`: look for a real GPU without `--gpu` (the library-level
 /// opt-in; the CLI always looks unless `--no-gpu`).
 fn physical_gpu_requested_by_env() -> bool {
@@ -770,8 +818,8 @@ impl WorkerClient {
             cuda: config.cuda,
             no_cuda: config.no_cuda,
         };
-        let mut capabilities =
-            WorkerCapabilities::detect_with_overrides(overrides).with_tags(config.tags.clone());
+        let mut capabilities = WorkerCapabilities::detect_with_overrides(overrides)
+            .with_tags(advertised_tags(&config.tags));
         // A real GPU is advertised only if this binary can compute on one (see `gpu`).
         let gpu_request = GpuRequest {
             no_gpu: config.no_gpu,
@@ -1043,6 +1091,18 @@ impl WorkerClient {
             return Err(err);
         }
 
+        // A user tag that looks like a system one (`os:`, `link:`, ...) would mislead placement.
+        if let Some(e) = self
+            .config
+            .tags
+            .iter()
+            .find_map(|t| rusty_grid_core::placement::validate_user_tag(t).err())
+        {
+            let err = GridError::Config(format!("Invalid worker tag: {e}"));
+            error!(worker_id = %self.worker_id, error = %err, "The configured worker tags cannot be used");
+            return Err(err);
+        }
+
         let mut backoff = ExponentialBackoff::new(self.backoff_config.clone());
 
         if self.config.enable_redirection_portal {
@@ -1083,8 +1143,15 @@ impl WorkerClient {
 
             // Whatever ended the session, nothing that is still running can deliver its result any
             // more (see the module docs): stop it cleanly before the next connection starts.
-            self.cancel_all_active_tasks("connection to the Master ended")
-                .await;
+            let is_shutdown = *shutdown_rx.borrow();
+            let cancel_reason = if let Some(r) = current_evacuation_reason() {
+                r
+            } else if is_shutdown {
+                "FAST_SHUTDOWN".to_string()
+            } else {
+                "connection to the Master ended".to_string()
+            };
+            self.cancel_all_active_tasks(&cancel_reason).await;
 
             match outcome {
                 Ok(()) => {
@@ -1438,11 +1505,24 @@ impl WorkerClient {
             .into_iter()
             .filter_map(|handle| Self::begin_stop(handle, reason))
             .collect();
-        let deadline = tokio::time::Instant::now() + TASK_DRAIN_TIMEOUT;
-        for mut join in joins {
-            if tokio::time::timeout_at(deadline, &mut join).await.is_err() {
-                warn!("A cancelled task did not stop within the drain timeout; aborting it");
+        let is_fast_evac = {
+            let r = reason.to_ascii_uppercase();
+            r.contains("EVAC")
+                || r.contains("BATTERY")
+                || r.contains("SHUTDOWN")
+                || r.contains("FAST")
+        };
+        if is_fast_evac {
+            for join in joins {
                 join.abort();
+            }
+        } else {
+            let deadline = tokio::time::Instant::now() + TASK_DRAIN_TIMEOUT;
+            for mut join in joins {
+                if tokio::time::timeout_at(deadline, &mut join).await.is_err() {
+                    warn!("A cancelled task did not stop within the drain timeout; aborting it");
+                    join.abort();
+                }
             }
         }
         count
@@ -1846,14 +1926,20 @@ impl WorkerClient {
         shutdown_rx: &mut watch::Receiver<bool>,
     ) -> GridResult<()> {
         let worker_id = self.worker_id;
-        let heartbeat_handle = spawn_heartbeat_task(
+        let heartbeat_handle = spawn_adaptive_heartbeat_task(
             worker_id,
             heartbeat_interval,
             session.control_tx.clone(),
             Arc::clone(&self.heartbeat_tracker),
+            Some(self.mobile.clone()),
         );
 
-        let dead_after = self.dead_peer_timeout(heartbeat_interval);
+        let dead_after = if let Some(status) = self.mobile.live_status() {
+            let iv = status.recommended_keepalive_interval(0);
+            self.dead_peer_timeout(iv)
+        } else {
+            self.dead_peer_timeout(heartbeat_interval)
+        };
         let mut watchdog = tokio::time::interval(
             (dead_after / 8).clamp(Duration::from_millis(25), Duration::from_secs(1)),
         );
@@ -1902,6 +1988,9 @@ impl WorkerClient {
                             MasterMessage::RegisterAck { .. } => {
                                 warn!("Unexpected RegisterAck during active connection");
                             }
+                            MasterMessage::RoleHandoverAck { accepted, reason, .. } => {
+                                info!(accepted, reason = ?reason, "Received RoleHandoverAck from master");
+                            }
                             MasterMessage::UnknownVariant { tag, ref raw_bytes } => {
                                 warn!(tag, bytes_len = raw_bytes.len(), "Ignoring unknown MasterMessage variant");
                             }
@@ -1939,12 +2028,16 @@ impl WorkerClient {
                 _ = telemetry.tick(), if report_telemetry => {
                     let current = self.mobile.live_status();
                     if current != last_reported {
-                        if let Some(status) = current {
+                        if let Some(ref status) = current {
                             let report = WorkerMessage::MobileTelemetry {
                                 worker_id,
                                 battery_pct: status.battery_pct,
                                 is_charging: status.is_charging,
                                 thermal_throttled: status.thermal_throttled,
+                                battery_temperature: status.battery_temperature,
+                                network_type: status.network_type.clone(),
+                                battery_tier: status.battery_tier,
+                                thermal_tier: status.thermal_tier,
                             };
                             if session.control_tx.try_send(report).is_ok() {
                                 last_reported = current;
@@ -1956,10 +2049,12 @@ impl WorkerClient {
                 // External shutdown signal
                 res = shutdown_rx.changed() => {
                     if res.is_ok() && *shutdown_rx.borrow() {
-                        info!(worker_id = %worker_id, "Graceful worker shutdown initiated; notifying Master");
+                        let reason = current_evacuation_reason()
+                            .unwrap_or_else(|| "Graceful worker shutdown".to_string());
+                        info!(worker_id = %worker_id, reason = %reason, "Worker shutdown initiated; notifying Master");
                         farewell = Some(WorkerMessage::Disconnecting {
                             worker_id,
-                            reason: "Graceful worker shutdown".into(),
+                            reason,
                         });
                         break Ok(());
                     } else if res.is_err() {
@@ -2277,7 +2372,7 @@ async fn resolve_portal_master(
 
 fn worker_portal_standby_html() -> String {
     r#"<!DOCTYPE html>
-<html lang="vi" data-theme="dark">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
@@ -2297,9 +2392,9 @@ fn worker_portal_standby_html() -> String {
   <div class="card">
     <div class="spinner"></div>
     <div class="title">OxideSwarm Standby Node (Worker)</div>
-    <div class="desc">Thiết bị này đang ở vai trò <strong>Worker</strong>. Đang tự động dò tìm Master đang hoạt động trong mạng LAN...</div>
-    <button class="btn" onclick="probeCluster()">Thử kết nối lại ngay</button>
-    <div class="status" id="scanStatus">Đang quét cụm...</div>
+    <div class="desc">This device is operating as a <strong>Worker</strong>. Automatically discovering an active Master on the LAN...</div>
+    <button class="btn" onclick="probeCluster()">Retry Connection Now</button>
+    <div class="status" id="scanStatus">Scanning cluster...</div>
   </div>
   <script>
     // Asks this worker (same origin) which Master it is connected to; the answer is validated
@@ -2307,20 +2402,20 @@ fn worker_portal_standby_html() -> String {
     const safeOrigin = /^https?:\/\/[A-Za-z0-9._\-]+(:[0-9]{1,5})?$|^https?:\/\/\[[0-9A-Fa-f:.]+\](:[0-9]{1,5})?$/;
     async function probeCluster() {
       const s = document.getElementById('scanStatus');
-      if (s) s.textContent = 'Đang kiểm tra các node...';
+      if (s) s.textContent = 'Checking cluster nodes...';
       try {
         const res = await fetch('/api/status', { cache: 'no-store' });
         if (res.ok) {
           const data = await res.json();
           const url = data && data.redirect_url;
           if (typeof url === 'string' && safeOrigin.test(url)) {
-            if (s) s.textContent = 'Đã tìm thấy Master tại ' + url + '! Đang chuyển hướng...';
+            if (s) s.textContent = 'Master found at ' + url + '! Redirecting...';
             window.location.replace(url);
             return;
           }
         }
       } catch (_) {}
-      if (s) s.textContent = 'Chưa phát hiện Master. Sẽ tự động thử lại sau 2 giây...';
+      if (s) s.textContent = 'No Master detected yet. Retrying in 2 seconds...';
     }
     probeCluster();
     setInterval(probeCluster, 2000);
@@ -2386,7 +2481,7 @@ fn portal_redirect_response(web_ui_url: &str, cluster_addr: &str) -> String {
     // `web_ui` is `scheme://host[:port]` over [A-Za-z0-9._:-] and brackets: nothing in it can
     // end a header line, an HTML attribute or a JavaScript string.
     let html_body = format!(
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"0; url={0}\"><title>OxideSwarm Auto-Redirect</title></head><body style=\"font-family:-apple-system,BlinkMacSystemFont,sans-serif;text-align:center;padding:50px;background:#090d16;color:#e2e8f0;\"><h2>OxideSwarm Node (Worker)</h2><p>Thiết bị này đang ở vai trò Worker. Đang chuyển hướng sang Master tại <a style=\"color:#38bdf8;\" href=\"{0}\">{0}</a>...</p><script>window.location.replace(\"{0}\");</script></body></html>",
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"0; url={0}\"><title>OxideSwarm Auto-Redirect</title></head><body style=\"font-family:-apple-system,BlinkMacSystemFont,sans-serif;text-align:center;padding:50px;background:#090d16;color:#e2e8f0;\"><h2>OxideSwarm Node (Worker)</h2><p>This device is operating as a Worker. Redirecting to Master at <a style=\"color:#38bdf8;\" href=\"{0}\">{0}</a>...</p><script>window.location.replace(\"{0}\");</script></body></html>",
         web_ui
     );
     portal_http_response(
@@ -3577,6 +3672,7 @@ mod tests {
             battery_pct: Some(42),
             is_charging: Some(false),
             thermal_throttled: false,
+            ..Default::default()
         });
 
         let mut seen = Vec::new();
@@ -3618,6 +3714,7 @@ mod tests {
             battery_pct: Some(33),
             is_charging: Some(true),
             thermal_throttled: false,
+            ..Default::default()
         });
         assert_eq!(
             client.mobile_telemetry().live_status().unwrap().battery_pct,
@@ -3739,6 +3836,51 @@ mod tests {
                 );
             }
             other => panic!("expected a Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_worker_advertises_system_tags_then_user_tags() {
+        let client = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9")
+                .with_tags(vec![
+                    "laptop".into(),
+                    format!("os:{}", std::env::consts::OS),
+                ])
+                .with_redirection_portal(false),
+        );
+        assert_eq!(
+            client.capabilities().tags,
+            vec![
+                format!("os:{}", std::env::consts::OS),
+                format!("arch:{}", std::env::consts::ARCH),
+                "laptop".to_string(),
+            ],
+            "system tags first, a user tag equal to one of them is not repeated"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_refuses_a_reserved_or_malformed_user_tag() {
+        for bad in ["os:windows", "link:fake", "two words"] {
+            let mut client = WorkerClient::new(
+                WorkerConfig::new("127.0.0.1:9")
+                    .with_tags(vec![bad.into()])
+                    .with_redirection_portal(false),
+            );
+            let (_tx, rx) = watch::channel(false);
+            let result = tokio::time::timeout(Duration::from_secs(5), client.run(rx))
+                .await
+                .expect("an invalid tag must end run() at once, not loop");
+            match result {
+                Err(GridError::Config(msg)) => {
+                    assert!(
+                        msg.contains("Invalid worker tag") && msg.contains(bad),
+                        "{msg}"
+                    )
+                }
+                other => panic!("{bad}: expected a Config error, got {other:?}"),
+            }
         }
     }
 

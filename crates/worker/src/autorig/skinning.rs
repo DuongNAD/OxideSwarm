@@ -148,19 +148,29 @@ pub fn compute_skin_weights(
             }
             let j = bones[b_idx].joint_index;
             if rw > top_w[0] {
-                top_w[3] = top_w[2]; top_j[3] = top_j[2];
-                top_w[2] = top_w[1]; top_j[2] = top_j[1];
-                top_w[1] = top_w[0]; top_j[1] = top_j[0];
-                top_w[0] = rw;       top_j[0] = j;
+                top_w[3] = top_w[2];
+                top_j[3] = top_j[2];
+                top_w[2] = top_w[1];
+                top_j[2] = top_j[1];
+                top_w[1] = top_w[0];
+                top_j[1] = top_j[0];
+                top_w[0] = rw;
+                top_j[0] = j;
             } else if rw > top_w[1] {
-                top_w[3] = top_w[2]; top_j[3] = top_j[2];
-                top_w[2] = top_w[1]; top_j[2] = top_j[1];
-                top_w[1] = rw;       top_j[1] = j;
+                top_w[3] = top_w[2];
+                top_j[3] = top_j[2];
+                top_w[2] = top_w[1];
+                top_j[2] = top_j[1];
+                top_w[1] = rw;
+                top_j[1] = j;
             } else if rw > top_w[2] {
-                top_w[3] = top_w[2]; top_j[3] = top_j[2];
-                top_w[2] = rw;       top_j[2] = j;
+                top_w[3] = top_w[2];
+                top_j[3] = top_j[2];
+                top_w[2] = rw;
+                top_j[2] = j;
             } else {
-                top_w[3] = rw;       top_j[3] = j;
+                top_w[3] = rw;
+                top_j[3] = j;
             }
         }
 
@@ -212,7 +222,10 @@ impl Eq for DijkstraEntry {}
 
 impl Ord for DijkstraEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.cost.partial_cmp(&self.cost).unwrap_or(Ordering::Equal)
+        other
+            .cost
+            .partial_cmp(&self.cost)
+            .unwrap_or(Ordering::Equal)
     }
 }
 
@@ -229,9 +242,12 @@ fn build_mesh_adjacency(num_verts: usize, indices: &[u32]) -> Vec<Vec<usize>> {
         let i1 = tri[1] as usize;
         let i2 = tri[2] as usize;
         if i0 < num_verts && i1 < num_verts && i2 < num_verts {
-            adj[i0].push(i1); adj[i0].push(i2);
-            adj[i1].push(i0); adj[i1].push(i2);
-            adj[i2].push(i0); adj[i2].push(i1);
+            adj[i0].push(i1);
+            adj[i0].push(i2);
+            adj[i1].push(i0);
+            adj[i1].push(i2);
+            adj[i2].push(i0);
+            adj[i2].push(i1);
         }
     }
     // Deduplicate neighbors
@@ -258,11 +274,7 @@ fn find_nearest_vertex(positions: &[[f32; 3]], point: Vec3) -> usize {
     best_idx
 }
 
-fn dijkstra_shortest_paths(
-    start: usize,
-    adj: &[Vec<usize>],
-    positions: &[[f32; 3]],
-) -> Vec<f32> {
+fn dijkstra_shortest_paths(start: usize, adj: &[Vec<usize>], positions: &[[f32; 3]]) -> Vec<f32> {
     if start >= adj.len() {
         return vec![f32::INFINITY; adj.len()];
     }
@@ -271,7 +283,10 @@ fn dijkstra_shortest_paths(
     let mut heap = BinaryHeap::new();
 
     dist[start] = 0.0;
-    heap.push(DijkstraEntry { vertex: start, cost: 0.0 });
+    heap.push(DijkstraEntry {
+        vertex: start,
+        cost: 0.0,
+    });
 
     while let Some(DijkstraEntry { vertex, cost }) = heap.pop() {
         if cost > dist[vertex] {
@@ -284,10 +299,9 @@ fn dijkstra_shortest_paths(
                 continue;
             }
             let p_v = positions[neighbor];
-            let edge_len = ((p_u[0] - p_v[0]).powi(2)
-                + (p_u[1] - p_v[1]).powi(2)
-                + (p_u[2] - p_v[2]).powi(2))
-            .sqrt();
+            let edge_len =
+                ((p_u[0] - p_v[0]).powi(2) + (p_u[1] - p_v[1]).powi(2) + (p_u[2] - p_v[2]).powi(2))
+                    .sqrt();
 
             let next_cost = cost + edge_len;
             if next_cost < dist[neighbor] {

@@ -5,8 +5,8 @@ use std::path::PathBuf;
 /// Resolves the optimal Python executable for executing local 3D models.
 pub fn resolve_python_runtime() -> Option<PathBuf> {
     // 1. Explicit environment variable override
-    if let Ok(custom) = std::env::var("OXIDESWARM_PYTHON")
-        .or_else(|_| std::env::var("RUSTY_GRID_PYTHON"))
+    if let Ok(custom) =
+        std::env::var("OXIDESWARM_PYTHON").or_else(|_| std::env::var("RUSTY_GRID_PYTHON"))
     {
         let p = PathBuf::from(custom);
         if p.is_file() {
@@ -37,12 +37,18 @@ pub fn resolve_python_runtime() -> Option<PathBuf> {
     }
 
     // 3. Fallback: check if standard python executable is available on PATH
-    if let Ok(output) = std::process::Command::new("python").arg("--version").output() {
+    if let Ok(output) = std::process::Command::new("python")
+        .arg("--version")
+        .output()
+    {
         if output.status.success() {
             return Some(PathBuf::from("python"));
         }
     }
-    if let Ok(output) = std::process::Command::new("python3").arg("--version").output() {
+    if let Ok(output) = std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+    {
         if output.status.success() {
             return Some(PathBuf::from("python3"));
         }
@@ -125,4 +131,3 @@ mod tests {
         assert_eq!(parse_progress_marker("Random output without marker"), None);
     }
 }
-

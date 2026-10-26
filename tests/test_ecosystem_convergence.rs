@@ -617,7 +617,13 @@ async fn test_convergence_rust_agent_auto_rig() {
     let input_mesh = create_humanoid_obj_bytes();
 
     let res = client
-        .auto_rig(&input_mesh, Some("biped"), None, Some("builtin"), Some(30000))
+        .auto_rig(
+            &input_mesh,
+            Some("biped"),
+            None,
+            Some("builtin"),
+            Some(30000),
+        )
         .await
         .expect("auto_rig failed");
 
@@ -662,8 +668,10 @@ async fn test_convergence_python_agent_node_3d() {
     let cluster = ConvergenceCluster::spawn(1).await;
 
     let test_script = [
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test_challenger_m4_3d_agent_node.py"),
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/test_challenger_m4_3d_agent_node.py"),
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/test_challenger_m4_3d_agent_node.py"),
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/test_challenger_m4_3d_agent_node.py"),
     ]
     .into_iter()
     .find(|p| p.exists())
@@ -685,7 +693,10 @@ async fn test_convergence_python_agent_node_3d() {
             let combined = format!("{}\n{}", stdout_str, stderr_str);
             println!("Python STDOUT:\n{}", stdout_str);
             println!("Python STDERR:\n{}", stderr_str);
-            assert!(out.status.success(), "Python 3D challenger test exited with failure: {stderr_str}");
+            assert!(
+                out.status.success(),
+                "Python 3D challenger test exited with failure: {stderr_str}"
+            );
             assert!(
                 combined.contains("PASSED (100% SUCCESS)"),
                 "Expected all challenger tests to pass, got output:\n{combined}"

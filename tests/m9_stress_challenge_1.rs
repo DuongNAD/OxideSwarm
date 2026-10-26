@@ -1107,6 +1107,7 @@ async fn test_stress_reaper_detection_and_failover() {
         device_name: None,
         error: None,
         asset_bytes: None,
+        artifacts: Vec::new(),
     };
     transport2
         .send_msg(&result_msg)

@@ -85,6 +85,7 @@ fn create_mock_worker_info(
         remote_addr: "127.0.0.1:9000".into(),
         cpu_usage_pct,
         ram_available_mb: ram_mb,
+        features: Default::default(),
     }
 }
 
@@ -290,7 +291,7 @@ fn test_mobile_battery_edge_cases_0_14_15_pct() {
         TaskRequirements::generic(1, 10),
     );
 
-    // Case 1: 0% battery, discharging -> compile task skipped, command task permitted
+    // Case 1: 0% battery, discharging -> critical battery refuses all tasks
     let w_0 = make_mobile_worker(0, false);
     let report_0_compile = WorkloadScheduler::matchmake(
         &config,
@@ -310,8 +311,8 @@ fn test_mobile_battery_edge_cases_0_14_15_pct() {
     );
     assert_eq!(
         report_0_cmd.assignments.len(),
-        1,
-        "0% battery discharging can run lightweight command tasks"
+        0,
+        "0% battery discharging must refuse all tasks"
     );
 
     // Case 2: 14% battery (boundary < 15%), discharging -> compile task skipped
@@ -327,7 +328,7 @@ fn test_mobile_battery_edge_cases_0_14_15_pct() {
         "14% battery discharging must skip compile tasks"
     );
 
-    // Case 3: 15% battery (boundary == 15%), discharging -> compile task ASSIGNED!
+    // Case 3: 15% battery (boundary == 15%), discharging -> compile task skipped (SubLow), command task ASSIGNED!
     let w_15 = make_mobile_worker(15, false);
     let report_15_compile = WorkloadScheduler::matchmake(
         &config,
@@ -336,10 +337,21 @@ fn test_mobile_battery_edge_cases_0_14_15_pct() {
     );
     assert_eq!(
         report_15_compile.assignments.len(),
-        1,
-        "15% battery discharging must be accepted for compile tasks"
+        0,
+        "15% battery discharging must skip compile tasks (SubLow tier)"
     );
-    assert_eq!(report_15_compile.assignments[0].worker_id, w_15.worker_id);
+
+    let report_15_cmd = WorkloadScheduler::matchmake(
+        &config,
+        std::slice::from_ref(&command_task),
+        std::slice::from_ref(&w_15),
+    );
+    assert_eq!(
+        report_15_cmd.assignments.len(),
+        1,
+        "15% battery discharging must be accepted for command tasks"
+    );
+    assert_eq!(report_15_cmd.assignments[0].worker_id, w_15.worker_id);
 
     // Case 4: 0% or 14% battery BUT actively charging (is_charging: true) -> compile task ASSIGNED!
     let w_0_charging = make_mobile_worker(0, true);

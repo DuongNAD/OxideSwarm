@@ -464,7 +464,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-#[allow(clippy::chunks_exact_to_as_chunks)]
+#[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 pub(crate) fn hex_decode(text: &str) -> Option<Vec<u8>> {
     let raw = text.as_bytes();
     if raw.len() & 1 == 1 {

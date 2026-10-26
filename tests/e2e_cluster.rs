@@ -1808,6 +1808,7 @@ async fn test_tier3_pairwise_dynamic_load_backpressure_high_cpu() {
                     device_name: None,
                     error: None,
                     asset_bytes: None,
+                    artifacts: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -1973,6 +1974,7 @@ async fn test_tier3_pairwise_mobile_worker_thermal_throttling_constraint() {
         device_name: None,
         error: None,
         asset_bytes: None,
+        artifacts: Vec::new(),
     })
     .await
     .unwrap();
@@ -2038,6 +2040,7 @@ async fn test_tier3_pairwise_mobile_worker_low_battery_constraint() {
             device_name: None,
             error: None,
             asset_bytes: None,
+            artifacts: Vec::new(),
         })
         .await;
 }

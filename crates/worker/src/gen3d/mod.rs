@@ -46,7 +46,11 @@ where
 
     // Stage 1: Geometry Extraction (25%)
     let raw_mesh = marching_cubes::extract_isosurface(&preset, resolution)?;
-    on_progress(0.25, "sdf_geometry", "Isosurface extracted via Marching Cubes");
+    on_progress(
+        0.25,
+        "sdf_geometry",
+        "Isosurface extracted via Marching Cubes",
+    );
 
     // Stage 2: Manifold Mesh Cleanup & Conformal UV Parameterization (50%)
     let clean_mesh = repair_manifold_mesh(&raw_mesh);
@@ -57,12 +61,18 @@ where
     };
     let unwrapper = MultiChartBoxUnwrapper;
     let uv_mesh = unwrapper.unwrap(&clean_mesh, 4, atlas_size);
-    on_progress(0.50, "manifold_uv", "Manifold topology repaired and conformal UV charts mapped");
+    on_progress(
+        0.50,
+        "manifold_uv",
+        "Manifold topology repaired and conformal UV charts mapped",
+    );
 
     // Stage 3: Barycentric PBR Texture Atlas Baking (75%)
     let material = if spec.export_texture {
         let sampler = ProceduralPbrSampler;
-        Some(bake_texture_atlas(&uv_mesh, atlas_size, atlas_size, &sampler))
+        Some(bake_texture_atlas(
+            &uv_mesh, atlas_size, atlas_size, &sampler,
+        ))
     } else {
         None
     };
