@@ -64,6 +64,10 @@ pub struct MasterFileConfig {
     pub max_connections: Option<usize>,
     /// Connections allowed to sit in the pre-authentication handshake at once.
     pub max_pending_handshakes: Option<usize>,
+    /// Directory of the blob store of task input and output files (`master --blob-dir`).
+    pub blob_dir: Option<String>,
+    /// Megabytes the blob store may hold (`master --blob-store-mb`).
+    pub blob_store_mb: Option<u64>,
     /// Allow a master that is reachable beyond this machine to run without a cluster secret.
     pub insecure: Option<bool>,
     pub secret_file: Option<String>,
@@ -98,6 +102,10 @@ pub struct WorkerFileConfig {
     pub max_concurrency: Option<usize>,
     pub sandbox_base_dir: Option<String>,
     pub keep_sandboxes: Option<bool>,
+    /// Megabytes of task input and output files the worker caches (`worker --blob-cache-mb`).
+    pub blob_cache_mb: Option<u64>,
+    /// Megabytes of output files one task may bring back (`worker --output-limit-mb`).
+    pub output_limit_mb: Option<u64>,
     /// Leave out the standby portal on :8080 (`worker --no-portal`).
     pub no_portal: Option<bool>,
     pub cores: Option<usize>,

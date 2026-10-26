@@ -250,6 +250,7 @@ fn result_msg(worker_id: Uuid, task_id: TaskId, exit_code: i32, stdout: &[u8]) -
         error: None,
         artifacts: Vec::new(),
         asset_bytes: None,
+        outputs: Vec::new(),
     }
 }
 
@@ -647,6 +648,7 @@ async fn test_client_cancel_reaches_the_worker_and_wakes_waiting_clients() {
             error: Some("Cancelled: by master".into()),
             artifacts: Vec::new(),
             asset_bytes: None,
+            outputs: Vec::new(),
         })
         .await;
     worker.sync().await;
@@ -1179,6 +1181,7 @@ async fn test_a_worker_that_rejects_tasks_instantly_does_not_swallow_the_work() 
             error: Some("Battery critically low (<15% discharging)".into()),
             artifacts: Vec::new(),
             asset_bytes: None,
+            outputs: Vec::new(),
         })
         .await;
 

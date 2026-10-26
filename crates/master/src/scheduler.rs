@@ -198,7 +198,7 @@ pub struct ScheduleReport {
 struct Shape {
     requires_gpu: bool,
     heavy: bool,
-    requires_file_staging: bool,
+    required_features: ProtocolCapabilities,
     cpu_cores: usize,
     ram_mb: u64,
     placement: Placement,
@@ -209,12 +209,24 @@ impl Shape {
         Self {
             requires_gpu: view.requires_gpu,
             heavy: view.heavy,
-            requires_file_staging: view.requires_file_staging,
+            required_features: view.required_features,
             cpu_cores: view.requirements.cpu_cores,
             ram_mb: view.requirements.ram_mb,
             placement: placement.clone(),
         }
     }
+}
+
+/// The names of the file-moving features in `features`, for "cluster lacks ..." messages.
+fn feature_names(features: ProtocolCapabilities) -> String {
+    let mut names = Vec::new();
+    if features.contains(ProtocolCapabilities::FILE_STAGING) {
+        names.push("FILE_STAGING");
+    }
+    if features.contains(ProtocolCapabilities::BLOB_TRANSFER) {
+        names.push("BLOB_TRANSFER");
+    }
+    names.join(" and ")
 }
 
 /// True if `worker` could run a task with `requirements` when idle (static capability check).
@@ -404,17 +416,16 @@ impl<'a> Engine<'a> {
         if view.requires_gpu && self.config.fail_unfulfillable_tasks && !self.any_gpu_worker {
             return Verdict::Unfulfillable("Cluster lacks workers with GPU capabilities".into());
         }
-        if view.requires_file_staging
-            && self.config.fail_unfulfillable_tasks
-            && !self.seats.iter().any(|seat| {
-                seat.worker
-                    .features
-                    .contains(ProtocolCapabilities::FILE_STAGING)
-            })
-        {
-            return Verdict::Unfulfillable(
-                "Cluster lacks workers with FILE_STAGING capability".into(),
-            );
+        let nobody_has_features = !view.required_features.is_empty()
+            && !self
+                .seats
+                .iter()
+                .any(|seat| seat.worker.features.contains(view.required_features));
+        if nobody_has_features && self.config.fail_unfulfillable_tasks {
+            return Verdict::Unfulfillable(format!(
+                "Cluster lacks workers with {} capability",
+                feature_names(view.required_features)
+            ));
         }
         let nobody_matches = !placement.is_empty()
             && !self
@@ -428,16 +439,11 @@ impl<'a> Engine<'a> {
         }
         let skip_reason = if view.requires_gpu {
             ScheduleSkipReason::NoGpuWorkersAvailable
-        } else if view.requires_file_staging
-            && !self.seats.iter().any(|seat| {
-                seat.worker
-                    .features
-                    .contains(ProtocolCapabilities::FILE_STAGING)
-            })
-        {
-            ScheduleSkipReason::ClusterLacksCapability(
-                "cluster lacks workers with FILE_STAGING capability".into(),
-            )
+        } else if nobody_has_features {
+            ScheduleSkipReason::ClusterLacksCapability(format!(
+                "cluster lacks workers with {} capability",
+                feature_names(view.required_features)
+            ))
         } else if nobody_matches {
             ScheduleSkipReason::ClusterLacksCapability(format!(
                 "no worker matches the placement constraints ({placement})"
@@ -550,10 +556,8 @@ impl<'a> Engine<'a> {
                 continue;
             }
 
-            // Stage 3b: File Staging capability gating (Requirement R2)
-            if view.requires_file_staging
-                && !worker.features.contains(ProtocolCapabilities::FILE_STAGING)
-            {
+            // Stage 3b: file staging / blob transfer capability gating (Requirement R2)
+            if !worker.features.contains(view.required_features) {
                 continue;
             }
 

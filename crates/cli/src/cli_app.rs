@@ -54,6 +54,9 @@ use crate::secret_cmd::{
     run_secret, PeerRole, PeerSecretOutcome, SecretCliArgs, SecretOpts,
 };
 
+/// Bytes in a MiB, for the `*-mb` options.
+const MIB: u64 = 1024 * 1024;
+
 /// Help text of `--insecure` on the commands that connect to a master (worker and clients).
 const INSECURE_PEER_HELP: &str = "Continue WITHOUT a cluster secret although the master is remote, found by 'auto' discovery, or reached through a P2P ticket. The master is then not authenticated: a rogue host can run commands on a worker or receive what a client submits. Without this flag such a connection is refused when no secret is configured.";
 
@@ -290,6 +293,20 @@ pub struct MasterArgs {
 
     #[arg(
         long,
+        value_name = "DIR",
+        help = "Directory of the blob store that keeps task input and output files (default ~/.oxideswarm/blobs; env RUSTY_GRID_BLOB_DIR)"
+    )]
+    pub blob_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "MB",
+        help = "Megabytes the blob store may hold before it evicts the least recently used files no queued or running task needs (default 4096; env RUSTY_GRID_BLOB_STORE_MB)"
+    )]
+    pub blob_store_mb: Option<u64>,
+
+    #[arg(
+        long,
         value_name = "N",
         help = "Tasks of one mapreduce job in flight at once; keep it above the cluster's total slots (default 256)"
     )]
@@ -419,6 +436,20 @@ pub struct WorkerArgs {
 
     #[arg(long, help = "Retain task sandbox directories after execution")]
     pub keep_sandboxes: bool,
+
+    #[arg(
+        long,
+        value_name = "MB",
+        help = "Megabytes of task input and output files the worker caches in <sandbox base dir>/cache/blobs, least recently used evicted first (default 2048; env RUSTY_GRID_BLOB_CACHE_MB)"
+    )]
+    pub blob_cache_mb: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "MB",
+        help = "Megabytes of output files (submit --output) one task may bring back; more fails the task (default 1024; env RUSTY_GRID_OUTPUT_LIMIT_MB)"
+    )]
+    pub output_limit_mb: Option<u64>,
 
     #[arg(
         long,
@@ -648,24 +679,25 @@ pub struct SubmitArgs {
     pub work_group_size: Option<u32>,
 
     #[arg(
-        long = "file",
+        long = "input",
+        visible_alias = "file",
         value_name = "LOCAL[:SANDBOX]",
-        help = "Stage a local file into the task sandbox (repeatable, at most 32 MiB total). Syntax: PATH or LOCAL_PATH:SANDBOX_PATH"
+        help = "Command, shell and compile tasks: place a local file or directory in the task sandbox (repeatable; LOCAL:. puts a directory's content at the sandbox root). Content is deduplicated: files the master already holds are not sent again"
     )]
-    pub files: Vec<String>,
+    pub inputs: Vec<String>,
 
     #[arg(
         long = "output",
         alias = "expected-output",
-        value_name = "PATH",
-        help = "Declare an output artifact path to retrieve from the sandbox upon task completion (repeatable)"
+        value_name = "PATTERN",
+        help = "Bring back the sandbox files this pattern selects after the run (repeatable): a path, a directory (all files below it), or a pattern with * ? and ** such as 'target/release/*' or '**/*.log'. Implies --wait"
     )]
     pub outputs: Vec<String>,
 
     #[arg(
         long = "output-dir",
         value_name = "DIR",
-        help = "Local directory where retrieved output artifacts are written upon task completion (default: current directory)"
+        help = "Local directory the output files are written to, at their sandbox paths (default: current directory)"
     )]
     pub output_dir: Option<PathBuf>,
 
@@ -1035,6 +1067,30 @@ async fn run_master(
         .with_mapreduce_parallelism(mapreduce_parallelism)
         .with_max_connections(max_connections)
         .with_max_pending_handshakes(max_pending_handshakes);
+
+    // Task input and output files live in a bounded, content-addressed store on disk.
+    let blob_store_mb = resolve_u64(
+        args.blob_store_mb,
+        &["RUSTY_GRID_BLOB_STORE_MB"],
+        master_cfg.as_ref().and_then(|m| m.blob_store_mb),
+        rusty_grid_master::DEFAULT_BLOB_STORE_MAX_BYTES / MIB,
+    );
+    let blob_dir = resolve_opt_string(
+        args.blob_dir.map(|p| p.display().to_string()),
+        &["RUSTY_GRID_BLOB_DIR"],
+        master_cfg.as_ref().and_then(|m| m.blob_dir.clone()),
+    )
+    .map(PathBuf::from)
+    .or_else(|| crate::config::default_oxideswarm_dir().map(|dir| dir.join("blobs")));
+    match &blob_dir {
+        Some(dir) => {
+            server_config =
+                server_config.with_blob_store(dir, blob_store_mb.saturating_mul(MIB));
+        }
+        None => eprintln!(
+            "Warning: no home directory to keep the blob store in; tasks with input or output files will be refused (pass --blob-dir DIR)"
+        ),
+    }
 
     // Cluster secret policy: a master reachable beyond this machine (non-loopback listener, or
     // the P2P listener, since an iroh ticket is an address and not a credential) must
@@ -1565,6 +1621,21 @@ async fn run_worker(
         config = config.with_process_priority(priority);
     }
     config = config.with_keep_sandboxes(keep_sandboxes);
+    let blob_cache_mb = resolve_u64(
+        args.blob_cache_mb,
+        &["RUSTY_GRID_BLOB_CACHE_MB"],
+        worker_cfg.as_ref().and_then(|w| w.blob_cache_mb),
+        rusty_grid_worker::DEFAULT_BLOB_CACHE_MAX_BYTES / MIB,
+    );
+    let output_limit_mb = resolve_u64(
+        args.output_limit_mb,
+        &["RUSTY_GRID_OUTPUT_LIMIT_MB"],
+        worker_cfg.as_ref().and_then(|w| w.output_limit_mb),
+        rusty_grid_worker::DEFAULT_OUTPUT_LIMIT_BYTES / MIB,
+    );
+    config = config
+        .with_blob_cache_bytes(blob_cache_mb.saturating_mul(MIB))
+        .with_output_limit_bytes(output_limit_mb.saturating_mul(MIB));
     config = config.with_redirection_portal(!no_portal);
     // A restarted worker is the same machine, not a new one: keep its id (see `identity`), when it
     // knows which machine it is. Otherwise every unnamed worker under this HOME would share one
@@ -2229,29 +2300,42 @@ async fn run_submit_with_secret(
 
     let is_asset_task = matches!(spec, TaskSpec::Generative3D(_) | TaskSpec::AutoRig(_));
 
-    let staged_files = if !args.files.is_empty() {
-        match crate::connect::prepare_staged_files(&args.files) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::FAILURE;
-            }
+    // Inputs are hashed (and directories listed) before connecting, so a typo in a path never
+    // reaches the master.
+    let inputs = match crate::blobs::scan_inputs(&args.inputs) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
         }
-    } else {
-        Vec::new()
     };
+    for skipped in &inputs.skipped {
+        eprintln!("Warning: --input skips {skipped}");
+    }
 
-    let expected_outputs = if !args.outputs.is_empty() && !is_asset_task {
-        match crate::connect::validate_output_paths(&args.outputs) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::FAILURE;
-            }
+    let output_globs = if !args.outputs.is_empty() && !is_asset_task {
+        if let Err(e) = rusty_grid_core::blob::validate_output_patterns(&args.outputs) {
+            eprintln!("--output: {e}");
+            return ExitCode::FAILURE;
         }
+        args.outputs.clone()
     } else {
         Vec::new()
     };
+    if (!inputs.inputs.is_empty() || !output_globs.is_empty())
+        && !matches!(
+            spec,
+            TaskSpec::Command { .. }
+                | TaskSpec::ShellScript { .. }
+                | TaskSpec::RustCompilation { .. }
+        )
+    {
+        eprintln!(
+            "--input and --output work with command and shell tasks, not --type {}",
+            args.task_type
+        );
+        return ExitCode::FAILURE;
+    }
 
     let submit_cfg = config_file.as_ref().and_then(|c| c.submit.clone());
     let master_addr = resolve_string(
@@ -2308,10 +2392,40 @@ async fn run_submit_with_secret(
         max_retries: args.max_retries,
     };
 
-    let mut task = Task::new(spec, requirements).with_placement(&placement);
-    task.staged_files = staged_files;
-    task.expected_outputs = expected_outputs.clone();
-    let wait = args.wait || args.output.is_some() || !expected_outputs.is_empty();
+    // Only the input blobs the master lacks are sent, on a connection of their own.
+    let upload = if inputs.inputs.is_empty() {
+        None
+    } else {
+        let uploaded =
+            match crate::blobs::BlobConnection::connect(&master_addr, secret.as_ref()).await {
+                Ok(connection) => crate::blobs::upload_inputs(&connection, &inputs).await,
+                Err(e) => Err(e.to_string()),
+            };
+        match uploaded {
+            Ok(report) => {
+                eprintln!(
+                    "Inputs: {} files ({}); sent {} of {} blobs ({}), {} already on the master",
+                    inputs.files,
+                    rusty_grid_worker::staging::human_bytes(inputs.bytes),
+                    report.uploaded,
+                    report.blobs,
+                    rusty_grid_worker::staging::human_bytes(report.bytes),
+                    report.blobs - report.uploaded
+                );
+                Some(report)
+            }
+            Err(e) => {
+                eprintln!("Uploading the input files failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    let task = Task::new(spec, requirements)
+        .with_placement(&placement)
+        .with_inputs(inputs.inputs)
+        .with_output_globs(output_globs.clone());
+    let wait = args.wait || args.output.is_some() || !output_globs.is_empty();
     let submit_msg = ClientMessage::SubmitTask { task, wait };
 
     let response = match exchange(
@@ -2380,6 +2494,29 @@ async fn run_submit_with_secret(
             }
 
             let output_dir = args.output_dir.as_deref().unwrap_or(Path::new("."));
+            let saved_outputs = if result.outputs.is_empty() {
+                None
+            } else {
+                let downloaded = match crate::blobs::BlobConnection::connect(
+                    &master_addr,
+                    secret.as_ref(),
+                )
+                .await
+                {
+                    Ok(connection) => {
+                        crate::blobs::download_outputs(&connection, &result.outputs, output_dir)
+                            .await
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                match downloaded {
+                    Ok(saved) => Some(saved),
+                    Err(e) => {
+                        eprintln!("Downloading the output files failed: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            };
             let saved_artifacts = if !result.artifacts.is_empty() {
                 match crate::connect::save_output_artifacts(&result.artifacts, output_dir) {
                     Ok(saved) => Some(saved),
@@ -2400,6 +2537,14 @@ async fn run_submit_with_secret(
                         let saved_strs: Vec<String> =
                             saved.iter().map(|p| p.display().to_string()).collect();
                         obj.insert("saved_artifacts".to_string(), serde_json::json!(saved_strs));
+                    }
+                    if let Some(ref saved) = saved_outputs {
+                        let saved_strs: Vec<String> =
+                            saved.iter().map(|p| p.display().to_string()).collect();
+                        obj.insert("saved_outputs".to_string(), serde_json::json!(saved_strs));
+                    }
+                    if let Some(report) = upload {
+                        obj.insert("input_upload".to_string(), serde_json::json!(report));
                     }
                 }
                 println!("{}", serde_json::to_string_pretty(&value).unwrap());
@@ -2423,6 +2568,22 @@ async fn run_submit_with_secret(
                             artifact.path,
                             artifact.size,
                             artifact.sha256_hex(),
+                            path.display()
+                        );
+                    }
+                }
+                if let Some(ref saved) = saved_outputs {
+                    println!(
+                        "Output files ({} saved to {}):",
+                        saved.len(),
+                        output_dir.display()
+                    );
+                    for (output, path) in result.outputs.iter().zip(saved.iter()) {
+                        println!(
+                            "  - {} ({} bytes, blake3: {}) -> {}",
+                            output.path,
+                            output.size,
+                            output.id.short(),
                             path.display()
                         );
                     }

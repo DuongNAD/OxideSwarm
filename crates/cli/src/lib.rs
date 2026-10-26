@@ -1,5 +1,6 @@
 //! Library exports for `rusty_grid_cli`.
 
+pub mod blobs;
 pub mod cli_app;
 pub mod config;
 pub mod connect;

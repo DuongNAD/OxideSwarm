@@ -463,6 +463,7 @@ fn test_adv_03_auto_rig_32mb_payload_bincode_and_wire_framing() {
         error: None,
         asset_bytes: Some(original_task_bytes.clone()),
         artifacts: Vec::new(),
+        outputs: Vec::new(),
     };
 
     let t_frame = Instant::now();
@@ -541,6 +542,7 @@ async fn test_adv_04_wire_framing_transport_32mb_duplex() {
         error: None,
         asset_bytes: Some(asset_bytes.clone()),
         artifacts: Vec::new(),
+        outputs: Vec::new(),
     };
 
     // Client sends message concurrently, server receives message
@@ -611,6 +613,7 @@ async fn test_adv_04_wire_framing_transport_32mb_duplex() {
             error: None,
             asset_bytes: Some(asset_bytes),
             artifacts: Vec::new(),
+            outputs: Vec::new(),
         },
         WireCodec::Json,
     );
@@ -645,6 +648,7 @@ async fn test_adv_04_wire_framing_transport_32mb_duplex() {
             error: None,
             asset_bytes: Some(small_asset.clone()),
             artifacts: Vec::new(),
+            outputs: Vec::new(),
         },
         WireCodec::Json,
     );
@@ -701,6 +705,7 @@ fn test_adv_05_zero_copy_pointer_identity_and_latency() {
         error: None,
         asset_bytes: Some(original_task_bytes.clone()),
         artifacts: Vec::new(),
+        outputs: Vec::new(),
     };
 
     // Check pointer inside TaskResult
@@ -986,6 +991,7 @@ fn test_adv_08_concurrent_multithreaded_zero_copy_access() {
         error: None,
         asset_bytes: Some(original_bytes.clone()),
         artifacts: Vec::new(),
+        outputs: Vec::new(),
     });
 
     let num_threads = 8;

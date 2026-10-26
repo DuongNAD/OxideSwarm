@@ -90,7 +90,7 @@ Documentation index and writing standard: [docs/README.md](docs/README.md). A ma
 | **17. Agent Mesh ↔ Grid bridge** | `AgentGridBridge` lets `agent-mesh hub` run a Master Grid of its own (`--grid-master <ADDR>` starts an embedded master; off loopback it needs a cluster secret or `--insecure`) and routes `grid_compute` / `grid_compile` / `grid_submit` / `grid_status` envelopes to it. When unconfigured, returns `ERR_BRIDGE_NOT_CONFIGURED`. | Implemented + tests |
 | **18. Task placement & cluster check** | Workers advertise `os:` and `arch:` tags plus user tags (`worker --tag`); `submit --os`, `--arch`, `--worker`, `--require-tag` pin a task through `require:` task tags, so the wire format is unchanged. `submit --stdin-file`, `--script-file`, `--interpreter` and `--env` send input with the task; `--matrix-dim` sizes a GPU task. `oxideswarm doctor` checks connection, every worker, process start-up, every GPU and spreading. Design: [docs/design/0001-two-node-readiness.md](docs/design/0001-two-node-readiness.md). | Implemented + tests |
 | **19. Mobile coordination & battery governance** | Multi-tier throttling $C_{\text{eff}} = \min(C_{\text{bat}}, C_{\text{therm}})$, RRC adaptive keepalive (10s/25s/60s), 5-rule refusal matrix, authenticated candidate score election $S_{\text{auth}}$, cryptographic lease tickets, and pre-sleep evacuation. Design: [docs/design/0002-mobile-coordination.md](docs/design/0002-mobile-coordination.md). | Implemented + tests |
-| **20. Distributed file staging** | Content-addressed file transfer with SHA-256 worker caching, atomic staging, sandbox execution, and artifact collection (`submit --file`, `--output`, `--output-dir`). Design: [docs/design/0003-distributed-file-staging.md](docs/design/0003-distributed-file-staging.md). | Implemented + tests |
+| **20. Task input and output files** | `submit --input LOCAL[:SANDBOX]` sends files and whole directories, `--output PATTERN` (`*`, `?`, `**`) brings files back into `--output-dir`. Files move as BLAKE3-named blobs through a bounded store on the master (`~/.oxideswarm/blobs`, `master --blob-dir` / `--blob-store-mb`) in 4 MiB chunks: a client uploads only the blobs the master lacks, a worker fetches only the blobs its cache lacks (`worker --blob-cache-mb`), so an unchanged file is not sent twice. Outputs are capped per task (`worker --output-limit-mb`); `RustCompilation` returns the library or binary it built. Design: [docs/design/0005-content-addressed-data-plane.md](docs/design/0005-content-addressed-data-plane.md). The older inline staging (at most 32 MiB, used by the MCP server) is [design 0003](docs/design/0003-distributed-file-staging.md). | Implemented + tests |
 | **21. Model Context Protocol (MCP) server** | Standard JSON-RPC 2.0 stdio MCP server (`oxideswarm mcp`) exposing 5 core cluster tools (`oxideswarm_status`, `oxideswarm_workers`, `oxideswarm_submit`, `oxideswarm_task_status`, `oxideswarm_cancel`) to LLM coding agents with strict stdout hygiene. Design: [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md). | Implemented + tests |
 
 ---
@@ -104,7 +104,7 @@ Documentation index and writing standard: [docs/README.md](docs/README.md). A ma
 | **3** | MCP server for AI agents | Completed | Standard JSON-RPC 2.0 stdio Model Context Protocol (MCP) server (`oxideswarm mcp`) exposing `oxideswarm_status`, `oxideswarm_workers`, `oxideswarm_submit`, `oxideswarm_task_status`, and `oxideswarm_cancel` tools to LLM coding agents with strict stdout transport hygiene. Documented in [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md). |
 | **4** | Real GPU scheduler preference | Completed | Master scheduler strictly prioritizes idle hardware GPU (`wgpu`) workers over simulated GPU (`--simulate-gpu`) workers for `requires_gpu` tasks, dispatching to simulated workers only when no hardware GPU is available. |
 | **5** | Android app cluster secret auth | Completed | `crates/android_bridge` exposes `nativeSetClusterSecret` and `nativeStartWorkerWithSecret` JNI exports, and Kotlin `WorkerEngine` accepts `clusterSecret` to authenticate against protected masters. |
-| **6** | Distributed file staging | Completed | Content-addressed distributed file staging (`submit --file <PATH>`, `--output <PATH>`, `--output-dir <DIR>`) with SHA-256 worker caching, atomic hardlinks/copies into task sandboxes, and output artifact collection. Documented in [docs/design/0003-distributed-file-staging.md](docs/design/0003-distributed-file-staging.md). |
+| **6** | Task input and output files | Partial | Files and directories move as content-addressed blobs (master store, worker cache, 4 MiB chunks, nothing sent twice; [design 0005](docs/design/0005-content-addressed-data-plane.md)). Not yet: compression, pipelined uploads from the CLI (one request in flight per connection, slow for thousands of small files over a high-latency link), `.gitignore`-aware selection (send `src` and `Cargo.toml` rather than a whole project with its `target/`), symbolic links and empty directories inside input trees, and MCP-server support (it still uses the inline staging of design 0003). |
 | **7** | UDP discovery on isolated subnets | Completed | 3-tier discovery fallback: Tier 1 LAN UDP beacon (:8089), Tier 2 authenticated HTTP probe (`GET /api/discovery/probe?nonce=<hex>`), Tier 3 signed rendezvous registry (`--rendezvous <URL>` / `OXIDESWARM_RENDEZVOUS`) for cross-subnet and AP isolation environments. Documented in [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md). |
 | **8** | Mid-task checkpointing | Done | See feature 14. |
 | **9** | OS child process containment | Hardened | Spawned task child processes are atomically bound to OS-level containment handles: Windows Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` with `CREATE_SUSPENDED`) and Linux `PR_SET_PDEATHSIG(SIGKILL)` guarantee child tree cleanup on worker termination. |
@@ -275,9 +275,11 @@ or `~/.oxideswarm/cluster.secret`.
 ./target/release/oxideswarm submit --master 127.0.0.1:8088 --command sha256sum --wait -- /path/present/on/the/worker
 ./target/release/oxideswarm submit --master 127.0.0.1:8088 --type gpu --gpu --wait   # routed to a worker that advertises a GPU
 
-# Distributed file staging (stage input files to worker sandbox; collect output artifacts to coordinator)
-./target/release/oxideswarm submit --file input.dat --output results.csv --command process_data -- --input input.dat --output results.csv
-./target/release/oxideswarm submit --file weights.bin --output-dir outputs/ --command run_eval -- --weights weights.bin --outdir outputs/
+# Input and output files: send a file or a directory, bring back what the patterns select
+# (files the master already holds are not sent again; outputs land in --output-dir at their sandbox paths)
+./target/release/oxideswarm submit --input input.dat --output results.csv --command process_data -- input.dat results.csv
+./target/release/oxideswarm submit --input ./my-crate:. --output 'target/release/my-crate' --output-dir out/ --timeout-secs 600 --command cargo -- build --release
+./target/release/oxideswarm submit --input data/ --output 'reports/**/*.json' --type shell --script-file analyse.sh
 
 # Worker with user tags (matched by `submit --require-tag`); os:/arch: tags are added automatically
 ./target/release/oxideswarm worker --master <MASTER_IP>:8088 --tag laptop --tag office
@@ -359,6 +361,8 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_MAX_RETRIES` | Master | Secondary alias for default task retry ceiling |
 | `RUSTY_GRID_MAX_RETAINED_TASKS` | Master | Maximum count of finished tasks retained in memory |
 | `RUSTY_GRID_MAX_RETAINED_MB` | Master | Maximum megabytes of finished task payloads retained |
+| `RUSTY_GRID_BLOB_DIR` | Master | Directory of the blob store of task input and output files (`--blob-dir`; default `~/.oxideswarm/blobs`) |
+| `RUSTY_GRID_BLOB_STORE_MB` | Master | Megabytes the blob store holds before evicting least recently used files (`--blob-store-mb`; default 4096) |
 | `RUSTY_GRID_MAPREDUCE_PARALLELISM` | Master | Maximum concurrent in-flight map/reduce chunk tasks |
 | `RUSTY_GRID_MAX_CONNECTIONS` | Master | Maximum concurrent TCP connections allowed on grid port |
 | `RUSTY_GRID_MAX_PENDING_HANDSHAKES` | Master | Maximum connections permitted in pre-auth handshake state |
@@ -400,6 +404,8 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_SANDBOX_BASE_DIR` | Worker | Base filesystem directory for task execution sandboxes |
 | `RUSTY_GRID_TASK_PRIORITY` | Worker | Process scheduling priority: `normal`, `below-normal`, or `idle` |
 | `RUSTY_GRID_KEEP_SANDBOXES` | Worker | Retains task working directories upon completion |
+| `RUSTY_GRID_BLOB_CACHE_MB` | Worker | Megabytes of task input and output files cached in `<sandbox base>/cache/blobs` (`--blob-cache-mb`; default 2048) |
+| `RUSTY_GRID_OUTPUT_LIMIT_MB` | Worker | Megabytes of output files one task may bring back; more fails the task (`--output-limit-mb`; default 1024) |
 | `RUSTY_GRID_NO_PORTAL` | Worker | Leaves out the standby portal on `0.0.0.0:8080` (`--no-portal`), e.g. for a second worker on one machine |
 
 #### Tier D: Task Child Process Injection Environment

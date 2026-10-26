@@ -1,6 +1,7 @@
 //! Master node server, worker registry, task queue, scheduler, and heartbeat reaper for `rusty_grid`.
 
 pub mod auth;
+pub mod blob_store;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
 pub mod liveness;
@@ -18,6 +19,7 @@ pub use auth::{
     DevBypass,
 };
 
+pub use blob_store::{BlobStore, BlobStoreConfig, BlobStoreStats, DEFAULT_BLOB_STORE_MAX_BYTES};
 pub use liveness::{RxClock, StampedStream};
 pub use mapreduce::MapReduceEngine;
 pub use queue::{

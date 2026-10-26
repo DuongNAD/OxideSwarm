@@ -65,6 +65,9 @@ impl ProtocolCapabilities {
     pub const ROLE_ARBITRAGE: Self = Self(1 << 7);
     /// Cellular RRC-aware adaptive keepalive intervals.
     pub const ADAPTIVE_KEEPALIVE: Self = Self(1 << 8);
+    /// Content-addressed task inputs and output files moved through the Master's blob store
+    /// (`Task::inputs`, `Task::output_globs`, see `crate::blob`).
+    pub const BLOB_TRANSFER: Self = Self(1 << 9);
 
     pub const fn all_supported() -> Self {
         Self(
@@ -76,7 +79,8 @@ impl ProtocolCapabilities {
                 | Self::BATCH_DISPATCH.0
                 | Self::FILE_STAGING.0
                 | Self::ROLE_ARBITRAGE.0
-                | Self::ADAPTIVE_KEEPALIVE.0,
+                | Self::ADAPTIVE_KEEPALIVE.0
+                | Self::BLOB_TRANSFER.0,
         )
     }
 
@@ -448,6 +452,7 @@ pub enum WorkerMessage {
         error: Option<String>,
         asset_bytes: Option<TaskBytes>,
         artifacts: Vec<crate::task::OutputArtifact>,
+        outputs: Vec<crate::blob::BlobFile>,
     },
     /// Incremental computational snapshot checkpoint emitted during task execution.
     Checkpoint {
@@ -475,6 +480,14 @@ pub enum WorkerMessage {
     },
     /// Forward-compatible fallback variant for unrecognized messages from future protocol versions.
     UnknownVariant { tag: u32, raw_bytes: Vec<u8> },
+    /// A blob request (`crate::blob_transfer`), answered by `MasterMessage::BlobReply` with the
+    /// same `request_id`. Sent only to a Master that announced [`master_features::BLOBS`] (an
+    /// older one cannot decode it). Appended after `UnknownVariant` so that existing positional
+    /// (bincode) variant indices do not move.
+    BlobRequest {
+        request_id: u64,
+        request: crate::blob_transfer::BlobRequest,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -522,6 +535,8 @@ enum HumanWorkerMessage {
         asset_bytes: Option<TaskBytes>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         artifacts: Vec<crate::task::OutputArtifact>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        outputs: Vec<crate::blob::BlobFile>,
     },
     Checkpoint {
         task_id: TaskId,
@@ -556,6 +571,10 @@ enum HumanWorkerMessage {
     UnknownVariant {
         tag: u32,
         raw_bytes: Vec<u8>,
+    },
+    BlobRequest {
+        request_id: u64,
+        request: crate::blob_transfer::BlobRequest,
     },
 }
 
@@ -595,6 +614,8 @@ enum BinaryWorkerMessage {
         asset_bytes: Option<TaskBytes>,
         #[serde(default)]
         artifacts: Vec<crate::task::OutputArtifact>,
+        #[serde(default)]
+        outputs: Vec<crate::blob::BlobFile>,
     },
     Checkpoint {
         task_id: TaskId,
@@ -625,6 +646,10 @@ enum BinaryWorkerMessage {
     UnknownVariant {
         tag: u32,
         raw_bytes: Vec<u8>,
+    },
+    BlobRequest {
+        request_id: u64,
+        request: crate::blob_transfer::BlobRequest,
     },
 }
 
@@ -730,6 +755,7 @@ impl From<LegacyBinaryWorkerMessage> for WorkerMessage {
                 error,
                 asset_bytes: None,
                 artifacts: Vec::new(),
+                outputs: Vec::new(),
             },
             LegacyBinaryWorkerMessage::Checkpoint {
                 task_id,
@@ -810,6 +836,7 @@ impl From<WorkerMessage> for HumanWorkerMessage {
                 error,
                 asset_bytes,
                 artifacts,
+                outputs,
             } => HumanWorkerMessage::TaskResult {
                 worker_id,
                 task_id,
@@ -822,6 +849,7 @@ impl From<WorkerMessage> for HumanWorkerMessage {
                 error,
                 asset_bytes,
                 artifacts,
+                outputs,
             },
             WorkerMessage::Checkpoint {
                 task_id,
@@ -860,6 +888,13 @@ impl From<WorkerMessage> for HumanWorkerMessage {
             WorkerMessage::UnknownVariant { tag, raw_bytes } => {
                 HumanWorkerMessage::UnknownVariant { tag, raw_bytes }
             }
+            WorkerMessage::BlobRequest {
+                request_id,
+                request,
+            } => HumanWorkerMessage::BlobRequest {
+                request_id,
+                request,
+            },
         }
     }
 }
@@ -912,6 +947,7 @@ impl From<HumanWorkerMessage> for WorkerMessage {
                 error,
                 asset_bytes,
                 artifacts,
+                outputs,
             } => WorkerMessage::TaskResult {
                 worker_id,
                 task_id,
@@ -924,6 +960,7 @@ impl From<HumanWorkerMessage> for WorkerMessage {
                 error,
                 asset_bytes,
                 artifacts,
+                outputs,
             },
             HumanWorkerMessage::Checkpoint {
                 task_id,
@@ -962,6 +999,13 @@ impl From<HumanWorkerMessage> for WorkerMessage {
             HumanWorkerMessage::UnknownVariant { tag, raw_bytes } => {
                 WorkerMessage::UnknownVariant { tag, raw_bytes }
             }
+            HumanWorkerMessage::BlobRequest {
+                request_id,
+                request,
+            } => WorkerMessage::BlobRequest {
+                request_id,
+                request,
+            },
         }
     }
 }
@@ -1014,6 +1058,7 @@ impl From<WorkerMessage> for BinaryWorkerMessage {
                 error,
                 asset_bytes,
                 artifacts,
+                outputs,
             } => BinaryWorkerMessage::TaskResult {
                 worker_id,
                 task_id,
@@ -1026,6 +1071,7 @@ impl From<WorkerMessage> for BinaryWorkerMessage {
                 error,
                 asset_bytes,
                 artifacts,
+                outputs,
             },
             WorkerMessage::Checkpoint {
                 task_id,
@@ -1064,6 +1110,13 @@ impl From<WorkerMessage> for BinaryWorkerMessage {
             WorkerMessage::UnknownVariant { tag, raw_bytes } => {
                 BinaryWorkerMessage::UnknownVariant { tag, raw_bytes }
             }
+            WorkerMessage::BlobRequest {
+                request_id,
+                request,
+            } => BinaryWorkerMessage::BlobRequest {
+                request_id,
+                request,
+            },
         }
     }
 }
@@ -1116,6 +1169,7 @@ impl From<BinaryWorkerMessage> for WorkerMessage {
                 error,
                 asset_bytes,
                 artifacts,
+                outputs,
             } => WorkerMessage::TaskResult {
                 worker_id,
                 task_id,
@@ -1128,6 +1182,7 @@ impl From<BinaryWorkerMessage> for WorkerMessage {
                 error,
                 asset_bytes,
                 artifacts,
+                outputs,
             },
             BinaryWorkerMessage::Checkpoint {
                 task_id,
@@ -1166,6 +1221,13 @@ impl From<BinaryWorkerMessage> for WorkerMessage {
             BinaryWorkerMessage::UnknownVariant { tag, raw_bytes } => {
                 WorkerMessage::UnknownVariant { tag, raw_bytes }
             }
+            BinaryWorkerMessage::BlobRequest {
+                request_id,
+                request,
+            } => WorkerMessage::BlobRequest {
+                request_id,
+                request,
+            },
         }
     }
 }
@@ -1213,6 +1275,7 @@ impl WorkerMessage {
             Self::MobileTelemetry { .. } => "MobileTelemetry",
             Self::ClaimMasterRole { .. } => "ClaimMasterRole",
             Self::UnknownVariant { .. } => "UnknownVariant",
+            Self::BlobRequest { .. } => "BlobRequest",
         }
     }
 
@@ -1228,6 +1291,7 @@ impl WorkerMessage {
             Self::MobileTelemetry { worker_id, .. } => *worker_id,
             Self::ClaimMasterRole { ticket } => ticket.master_id,
             Self::UnknownVariant { .. } => Uuid::nil(),
+            Self::BlobRequest { .. } => Uuid::nil(),
         }
     }
 }
@@ -1246,6 +1310,7 @@ impl From<TaskResult> for WorkerMessage {
             error: r.error,
             asset_bytes: r.asset_bytes,
             artifacts: r.artifacts,
+            outputs: r.outputs,
         }
     }
 }
@@ -1290,6 +1355,12 @@ pub enum MasterMessage {
     },
     /// Forward-compatible fallback variant for unrecognized messages from future protocol versions.
     UnknownVariant { tag: u32, raw_bytes: Vec<u8> },
+    /// The answer to the `WorkerMessage::BlobRequest` with the same `request_id`. Appended after
+    /// `UnknownVariant` so that existing positional (bincode) variant indices do not move.
+    BlobReply {
+        request_id: u64,
+        reply: crate::blob_transfer::BlobReply,
+    },
 }
 
 /// Features a Master announces in the `message` of an accepted `RegisterAck`
@@ -1303,7 +1374,12 @@ pub mod master_features {
     /// Understands `WorkerMessage::MobileTelemetry` (live battery / thermal reports).
     pub const MOBILE_TELEMETRY: &str = "mobile-telemetry";
 
-    /// Every feature this build of the Master supports.
+    /// Has a blob store and answers `WorkerMessage::BlobRequest` (task inputs and output files,
+    /// see `crate::blob`). Announced only by a Master that runs with a blob store, so it is not
+    /// part of [`SUPPORTED`].
+    pub const BLOBS: &str = "blobs";
+
+    /// Every feature this build of the Master supports unconditionally.
     pub const SUPPORTED: &[&str] = &[MOBILE_TELEMETRY];
 
     const PREFIX: &str = "features=";
@@ -1370,6 +1446,10 @@ enum HumanMasterMessage {
         tag: u32,
         raw_bytes: Vec<u8>,
     },
+    BlobReply {
+        request_id: u64,
+        reply: crate::blob_transfer::BlobReply,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1411,6 +1491,10 @@ enum BinaryMasterMessage {
     UnknownVariant {
         tag: u32,
         raw_bytes: Vec<u8>,
+    },
+    BlobReply {
+        request_id: u64,
+        reply: crate::blob_transfer::BlobReply,
     },
 }
 
@@ -1536,6 +1620,9 @@ impl From<MasterMessage> for HumanMasterMessage {
             MasterMessage::UnknownVariant { tag, raw_bytes } => {
                 HumanMasterMessage::UnknownVariant { tag, raw_bytes }
             }
+            MasterMessage::BlobReply { request_id, reply } => {
+                HumanMasterMessage::BlobReply { request_id, reply }
+            }
         }
     }
 }
@@ -1592,6 +1679,9 @@ impl From<HumanMasterMessage> for MasterMessage {
             },
             HumanMasterMessage::UnknownVariant { tag, raw_bytes } => {
                 MasterMessage::UnknownVariant { tag, raw_bytes }
+            }
+            HumanMasterMessage::BlobReply { request_id, reply } => {
+                MasterMessage::BlobReply { request_id, reply }
             }
         }
     }
@@ -1650,6 +1740,9 @@ impl From<MasterMessage> for BinaryMasterMessage {
             MasterMessage::UnknownVariant { tag, raw_bytes } => {
                 BinaryMasterMessage::UnknownVariant { tag, raw_bytes }
             }
+            MasterMessage::BlobReply { request_id, reply } => {
+                BinaryMasterMessage::BlobReply { request_id, reply }
+            }
         }
     }
 }
@@ -1707,6 +1800,9 @@ impl From<BinaryMasterMessage> for MasterMessage {
             BinaryMasterMessage::UnknownVariant { tag, raw_bytes } => {
                 MasterMessage::UnknownVariant { tag, raw_bytes }
             }
+            BinaryMasterMessage::BlobReply { request_id, reply } => {
+                MasterMessage::BlobReply { request_id, reply }
+            }
         }
     }
 }
@@ -1761,6 +1857,7 @@ impl MasterMessage {
             Self::Shutdown { .. } => "Shutdown",
             Self::RoleHandoverAck { .. } => "RoleHandoverAck",
             Self::UnknownVariant { .. } => "UnknownVariant",
+            Self::BlobReply { .. } => "BlobReply",
         }
     }
 }
@@ -1788,6 +1885,13 @@ pub enum ClientMessage {
     /// for an id the master does not know. Appended last so existing positional (bincode)
     /// variant indices do not move.
     GetTaskResult { task_id: TaskId },
+    /// A blob request (`crate::blob_transfer`: upload task inputs, download output files),
+    /// answered by `ClientResponse::BlobReply`; requests on one connection are answered in order.
+    /// A Master built before this variant cannot decode it and closes the connection: restart
+    /// the Master first when upgrading. Appended last so existing variant indices do not move.
+    BlobRequest {
+        request: crate::blob_transfer::BlobRequest,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1812,6 +1916,9 @@ enum HumanClientMessage {
     GetTaskResult {
         task_id: TaskId,
     },
+    BlobRequest {
+        request: crate::blob_transfer::BlobRequest,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1834,6 +1941,9 @@ enum BinaryClientMessage {
     GetTaskResult {
         task_id: TaskId,
     },
+    BlobRequest {
+        request: crate::blob_transfer::BlobRequest,
+    },
 }
 
 impl From<ClientMessage> for HumanClientMessage {
@@ -1852,6 +1962,7 @@ impl From<ClientMessage> for HumanClientMessage {
             ClientMessage::GetTaskResult { task_id } => {
                 HumanClientMessage::GetTaskResult { task_id }
             }
+            ClientMessage::BlobRequest { request } => HumanClientMessage::BlobRequest { request },
         }
     }
 }
@@ -1872,6 +1983,7 @@ impl From<HumanClientMessage> for ClientMessage {
             HumanClientMessage::GetTaskResult { task_id } => {
                 ClientMessage::GetTaskResult { task_id }
             }
+            HumanClientMessage::BlobRequest { request } => ClientMessage::BlobRequest { request },
         }
     }
 }
@@ -1892,6 +2004,7 @@ impl From<ClientMessage> for BinaryClientMessage {
             ClientMessage::GetTaskResult { task_id } => {
                 BinaryClientMessage::GetTaskResult { task_id }
             }
+            ClientMessage::BlobRequest { request } => BinaryClientMessage::BlobRequest { request },
         }
     }
 }
@@ -1912,6 +2025,7 @@ impl From<BinaryClientMessage> for ClientMessage {
             BinaryClientMessage::GetTaskResult { task_id } => {
                 ClientMessage::GetTaskResult { task_id }
             }
+            BinaryClientMessage::BlobRequest { request } => ClientMessage::BlobRequest { request },
         }
     }
 }
@@ -1977,6 +2091,11 @@ pub enum ClientResponse {
     Error {
         message: String,
     },
+    /// The answer to `ClientMessage::BlobRequest`. Appended last so existing variant indices do
+    /// not move.
+    BlobReply {
+        reply: crate::blob_transfer::BlobReply,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2020,6 +2139,11 @@ enum HumanClientResponse {
     Error {
         message: String,
     },
+    /// The answer to `ClientMessage::BlobRequest`. Appended last so existing variant indices do
+    /// not move.
+    BlobReply {
+        reply: crate::blob_transfer::BlobReply,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2061,6 +2185,11 @@ enum BinaryClientResponse {
     },
     Error {
         message: String,
+    },
+    /// The answer to `ClientMessage::BlobRequest`. Appended last so existing variant indices do
+    /// not move.
+    BlobReply {
+        reply: crate::blob_transfer::BlobReply,
     },
 }
 
@@ -2112,6 +2241,7 @@ impl From<ClientResponse> for HumanClientResponse {
                 HumanClientResponse::MapReduceCompleted { result }
             }
             ClientResponse::Error { message } => HumanClientResponse::Error { message },
+            ClientResponse::BlobReply { reply } => HumanClientResponse::BlobReply { reply },
         }
     }
 }
@@ -2164,6 +2294,7 @@ impl From<HumanClientResponse> for ClientResponse {
                 ClientResponse::MapReduceCompleted { result }
             }
             HumanClientResponse::Error { message } => ClientResponse::Error { message },
+            HumanClientResponse::BlobReply { reply } => ClientResponse::BlobReply { reply },
         }
     }
 }
@@ -2216,6 +2347,7 @@ impl From<ClientResponse> for BinaryClientResponse {
                 BinaryClientResponse::MapReduceCompleted { result }
             }
             ClientResponse::Error { message } => BinaryClientResponse::Error { message },
+            ClientResponse::BlobReply { reply } => BinaryClientResponse::BlobReply { reply },
         }
     }
 }
@@ -2268,6 +2400,7 @@ impl From<BinaryClientResponse> for ClientResponse {
                 ClientResponse::MapReduceCompleted { result }
             }
             BinaryClientResponse::Error { message } => ClientResponse::Error { message },
+            BinaryClientResponse::BlobReply { reply } => ClientResponse::BlobReply { reply },
         }
     }
 }
@@ -3063,6 +3196,7 @@ mod tests {
                 error: None,
                 asset_bytes: None,
                 artifacts: Vec::new(),
+                outputs: Vec::new(),
             },
             WorkerMessage::Checkpoint {
                 task_id,
@@ -3128,6 +3262,8 @@ mod tests {
                     latest_checkpoint: None,
                     staged_files: Vec::new(),
                     expected_outputs: Vec::new(),
+                    inputs: Vec::new(),
+                    output_globs: Vec::new(),
                 },
             },
             MasterMessage::AssignTaskWithCheckpoint {
@@ -3152,6 +3288,8 @@ mod tests {
                     latest_checkpoint: None,
                     staged_files: Vec::new(),
                     expected_outputs: Vec::new(),
+                    inputs: Vec::new(),
+                    output_globs: Vec::new(),
                 },
                 latest_checkpoint: Some(CheckpointData::new(
                     5,

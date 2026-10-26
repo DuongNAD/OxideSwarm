@@ -69,10 +69,12 @@ use rusty_grid_core::task::{
     TaskSpec, MAX_AGGREGATE_ARTIFACT_BYTES, MAX_OUTPUT_ARTIFACT_BYTES,
 };
 
+use crate::blob_cache::{BlobCache, DEFAULT_BLOB_CACHE_MAX_BYTES};
 use crate::cpu_simd;
 use crate::gpu::{check_gemm_request, DeviceLimits, GpuError};
 use crate::process_tree::{configure_command, ProcessPriority, ProcessTree};
 use crate::sandbox::{sanitize_relative_path, Sandbox, SandboxConfig, SandboxError};
+use crate::staging::{collect_outputs, materialize_inputs, OutputLimits};
 
 /// Exit code emitted on successful completion.
 pub const EXIT_CODE_SUCCESS: i32 = 0;
@@ -122,6 +124,10 @@ pub struct RunnerConfig {
     pub pipe_drain_grace: Duration,
     /// See [`DEFAULT_STOP_GRACE`].
     pub stop_grace: Duration,
+    /// Bound of the blob cache in `<sandbox base>/cache/blobs` (see [`crate::blob_cache`]).
+    pub blob_cache_bytes: u64,
+    /// Caps on the files a task's output patterns may bring back (see [`crate::staging`]).
+    pub output_limits: OutputLimits,
 }
 
 impl Default for RunnerConfig {
@@ -138,7 +144,19 @@ impl RunnerConfig {
             process_priority: ProcessPriority::from_env().unwrap_or_default(),
             pipe_drain_grace: DEFAULT_PIPE_DRAIN_GRACE,
             stop_grace: DEFAULT_STOP_GRACE,
+            blob_cache_bytes: DEFAULT_BLOB_CACHE_MAX_BYTES,
+            output_limits: OutputLimits::default(),
         }
+    }
+
+    pub fn with_blob_cache_bytes(mut self, bytes: u64) -> Self {
+        self.blob_cache_bytes = bytes;
+        self
+    }
+
+    pub fn with_output_limits(mut self, limits: OutputLimits) -> Self {
+        self.output_limits = limits;
+        self
     }
 
     pub fn with_max_output_bytes(mut self, bytes: usize) -> Self {
@@ -415,7 +433,7 @@ impl Drop for OutputReaders {
 /// worker itself). It never resolves when there is no cancel channel, or when the sender was
 /// dropped without sending: a sender that vanishes is not a cancellation, and treating it as one
 /// used to kill healthy tasks and report them as cancelled.
-async fn cancellation(slot: &mut Option<oneshot::Receiver<String>>) -> String {
+pub(crate) async fn cancellation(slot: &mut Option<oneshot::Receiver<String>>) -> String {
     let Some(receiver) = slot.as_mut() else {
         return std::future::pending().await;
     };
@@ -570,6 +588,8 @@ pub struct TaskRunner {
     worker_id: Uuid,
     capabilities: WorkerCapabilities,
     config: RunnerConfig,
+    /// The blob cache, opened on first use (see [`TaskRunner::blob_cache`]).
+    blob_cache: std::sync::OnceLock<Result<Arc<BlobCache>, String>>,
     /// Where GPU-class tasks get their engine; rebuilds it after a device loss.
     #[cfg(feature = "gpu-wgpu")]
     gpu_engine: Arc<crate::wgpu_engine::EngineProvider>,
@@ -581,6 +601,7 @@ impl TaskRunner {
             worker_id,
             capabilities,
             config,
+            blob_cache: std::sync::OnceLock::new(),
             #[cfg(feature = "gpu-wgpu")]
             gpu_engine: crate::wgpu_engine::EngineProvider::shared(),
         }
@@ -607,6 +628,22 @@ impl TaskRunner {
 
     pub fn config(&self) -> &RunnerConfig {
         &self.config
+    }
+
+    /// The worker's blob cache in `<sandbox base>/cache/blobs`, opened on first use.
+    pub fn blob_cache(&self) -> Result<Arc<BlobCache>, String> {
+        self.blob_cache
+            .get_or_init(|| {
+                let dir = self
+                    .config
+                    .sandbox_config
+                    .base_dir
+                    .join("cache")
+                    .join("blobs");
+                BlobCache::open(&dir, self.config.blob_cache_bytes)
+                    .map_err(|e| format!("cannot open the blob cache in '{}': {e}", dir.display()))
+            })
+            .clone()
     }
 
     /// Primary execution dispatcher with checkpoint resumption and mid-task checkpoint emission.
@@ -646,6 +683,7 @@ impl TaskRunner {
                     error: Some("Worker lacks GPU capability".to_string()),
                     asset_bytes: None,
                     artifacts: Vec::new(),
+                    outputs: Vec::new(),
                 };
             }
         }
@@ -1033,6 +1071,7 @@ impl TaskRunner {
                     error: None,
                     asset_bytes: None,
                     artifacts: Vec::new(),
+                    outputs: Vec::new(),
                 },
                 Ok(Err(err)) => self.gpu_failure(task_id, &err, timeout, start_time),
                 Err(join_error) => {
@@ -1275,6 +1314,73 @@ impl TaskRunner {
         sandbox.stage_files(&task.staged_files, &cache_base).await
     }
 
+    /// Places the task's blob inputs (`Task::inputs`) into the sandbox from the blob cache. The
+    /// worker fetched them before the run; a blob that is not cached fails the task.
+    pub async fn prepare_blob_inputs(&self, sandbox: &Sandbox, task: &Task) -> Result<(), String> {
+        if task.inputs.is_empty() {
+            return Ok(());
+        }
+        let cache = self.blob_cache()?;
+        let root = sandbox.path().to_path_buf();
+        let inputs = task.inputs.clone();
+        let placed =
+            tokio::task::spawn_blocking(move || materialize_inputs(&root, &inputs, &cache))
+                .await
+                .map_err(|e| e.to_string())??;
+        debug!(task_id = %task.id, files = placed, "Placed input files into the sandbox");
+        Ok(())
+    }
+
+    /// Collects the files `Task::output_globs` and `extra_patterns` select into the blob cache
+    /// and lists them in `result.outputs`. A cancelled run brings nothing back; a failure to
+    /// collect fails the task, with the reason in its error and stderr.
+    pub async fn collect_blob_outputs(
+        &self,
+        sandbox: &Sandbox,
+        task: &Task,
+        mut result: TaskResult,
+        extra_patterns: &[String],
+    ) -> TaskResult {
+        let patterns: Vec<String> = task
+            .output_globs
+            .iter()
+            .chain(extra_patterns)
+            .cloned()
+            .collect();
+        if patterns.is_empty() || result.exit_code == EXIT_CODE_CANCELLED {
+            return result;
+        }
+        let collected = match self.blob_cache() {
+            Ok(cache) => {
+                let root = sandbox.path().to_path_buf();
+                let limits = self.config.output_limits;
+                let process_failed = !result.is_success();
+                tokio::task::spawn_blocking(move || {
+                    collect_outputs(&root, &patterns, &cache, limits, process_failed)
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            }
+            Err(e) => Err(e),
+        };
+        match collected {
+            Ok(outputs) => result.outputs = outputs,
+            Err(e) => {
+                let message = format!("Output files: {e}");
+                warn!(task_id = %task.id, error = %e, "Collecting output files failed");
+                if result.exit_code == EXIT_CODE_SUCCESS {
+                    result.exit_code = EXIT_CODE_GENERAL_ERROR;
+                }
+                result.stderr = append_note(result.stderr, &format!("[rusty_grid: {message}]\n"));
+                result.error = Some(match result.error.take() {
+                    Some(error) => format!("{error}; {message}"),
+                    None => message,
+                });
+            }
+        }
+        result
+    }
+
     /// Executes `TaskSpec::Command` inside an isolated sandbox directory.
     #[allow(clippy::too_many_arguments)]
     async fn execute_command_workload(
@@ -1315,6 +1421,19 @@ impl TaskRunner {
                 format!("Failed to stage input files: {e}"),
                 start_time.elapsed().as_millis() as u64,
                 Some(format!("File staging error: {e}")),
+            );
+        }
+
+        if let Err(e) = self.prepare_blob_inputs(&sandbox, task).await {
+            let _ = sandbox.destroy().await;
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_GENERAL_ERROR,
+                "",
+                format!("Failed to place input files: {e}"),
+                start_time.elapsed().as_millis() as u64,
+                Some(format!("Input files: {e}")),
             );
         }
 
@@ -1365,6 +1484,7 @@ impl TaskRunner {
         };
         let mut result = result;
         result.artifacts = artifacts;
+        let result = self.collect_blob_outputs(&sandbox, task, result, &[]).await;
         let _ = sandbox.destroy().await;
         result
     }
@@ -1407,6 +1527,19 @@ impl TaskRunner {
                 format!("Failed to stage input files: {e}"),
                 start_time.elapsed().as_millis() as u64,
                 Some(format!("File staging error: {e}")),
+            );
+        }
+
+        if let Err(e) = self.prepare_blob_inputs(&sandbox, task).await {
+            let _ = sandbox.destroy().await;
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_GENERAL_ERROR,
+                "",
+                format!("Failed to place input files: {e}"),
+                start_time.elapsed().as_millis() as u64,
+                Some(format!("Input files: {e}")),
             );
         }
 
@@ -1494,6 +1627,7 @@ impl TaskRunner {
         };
         let mut result = result;
         result.artifacts = artifacts;
+        let result = self.collect_blob_outputs(&sandbox, task, result, &[]).await;
         let _ = sandbox.destroy().await;
         result
     }
@@ -1537,6 +1671,19 @@ impl TaskRunner {
                 format!("Failed to stage input files: {e}"),
                 start_time.elapsed().as_millis() as u64,
                 Some(format!("File staging error: {e}")),
+            );
+        }
+
+        if let Err(e) = self.prepare_blob_inputs(&sandbox, task).await {
+            let _ = sandbox.destroy().await;
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_GENERAL_ERROR,
+                "",
+                format!("Failed to place input files: {e}"),
+                start_time.elapsed().as_millis() as u64,
+                Some(format!("Input files: {e}")),
             );
         }
 
@@ -1634,8 +1781,18 @@ impl TaskRunner {
             )
             .await;
 
-        // On successful compilation, check for generated library / binary artifact
+        // On successful compilation, check for generated library / binary artifact; everything
+        // rustc wrote directly into the output directory is returned as an output file.
+        let mut artifact_patterns = Vec::new();
         if res.is_success() {
+            if let Some(rel_out_dir) = out_dir
+                .strip_prefix(sandbox.path())
+                .ok()
+                .and_then(|rel| rel.to_str())
+                .filter(|rel| !rel.is_empty())
+            {
+                artifact_patterns.push(format!("{}/*", rel_out_dir.replace('\\', "/")));
+            }
             let mut found_artifacts = Vec::new();
             if let Ok(mut entries) = tokio::fs::read_dir(&out_dir).await {
                 while let Ok(Some(entry)) = entries.next_entry().await {
@@ -1670,6 +1827,9 @@ impl TaskRunner {
         };
         let mut res = res;
         res.artifacts = artifacts;
+        let res = self
+            .collect_blob_outputs(&sandbox, task, res, &artifact_patterns)
+            .await;
         let _ = sandbox.destroy().await;
         res
     }
@@ -2587,7 +2747,7 @@ impl Drop for AbortOnDrop {
 
 /// `bytes` followed by `note`; a newline first when `bytes` is non-empty and does not end in one
 /// and `note` does not start with one.
-fn append_note(bytes: Bytes, note: &str) -> Bytes {
+pub(crate) fn append_note(bytes: Bytes, note: &str) -> Bytes {
     let mut combined = BytesMut::from(bytes.as_bytes());
     if !combined.is_empty() && !combined.ends_with(b"\n") && !note.starts_with('\n') {
         combined.extend_from_slice(b"\n");
