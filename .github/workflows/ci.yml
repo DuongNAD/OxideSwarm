@@ -76,6 +76,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --lib --locked
 
+  agent-bridge:
+    # The bridge also runs on the owner's Windows machine, and this is the only check of that path.
+    name: agent bridge (${{ matrix.os }})
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - run: python tests/test_agent_bridge.py
+
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
