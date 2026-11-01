@@ -34,9 +34,11 @@ for p in [current_dir, parent_dir]:
 try:
     from test_agent_mesh_simulation import run_simulation_tests
     from test_agent_mesh_data_loss import run_data_loss_tests
+    from test_sec6_mesh_sandbox import run_sec6_tests
 except ImportError:
     from tests.test_agent_mesh_simulation import run_simulation_tests
     from tests.test_agent_mesh_data_loss import run_data_loss_tests
+    from tests.test_sec6_mesh_sandbox import run_sec6_tests
 
 
 def print_banner():
@@ -85,6 +87,23 @@ async def main_async():
         suite2_passed = False
     suite2_duration = time.time() - suite2_start
     results.append(("Suite 2: Bidirectional Zero-Data-Loss & Burst", suite2_passed, suite2_duration))
+
+    # Small pause between suites
+    await asyncio.sleep(0.2)
+
+    # --------------------------------------------------------------------------
+    # Suite 3: SEC-6 Command Hardening & Process Controls
+    # --------------------------------------------------------------------------
+    print("\n>>> Executing Suite 3: SEC-6 Command Hardening & Process Controls")
+    suite3_start = time.time()
+    suite3_passed = False
+    try:
+        suite3_passed = await run_sec6_tests()
+    except Exception as e:
+        print(f"[FAILED] Suite 3 raised exception: {e}")
+        suite3_passed = False
+    suite3_duration = time.time() - suite3_start
+    results.append(("Suite 3: SEC-6 Command Hardening & Process Controls", suite3_passed, suite3_duration))
 
     total_duration = time.time() - overall_start
 

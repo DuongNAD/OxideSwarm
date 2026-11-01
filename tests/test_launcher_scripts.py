@@ -390,6 +390,32 @@ class ShellLauncherTests(unittest.TestCase):
                          "no master address / ticket in the world-readable plist")
         self.assertNotIn(":8080", out)
 
+    def test_agent_mesh_launchers_propagate_no_shell_option(self):
+        """Verifies that ubuntu and macos launchers propagate --no-shell to the agent."""
+        fake_python = os.path.join(self.repo, "fake_python")
+        with open(fake_python, "w") as f:
+            f.write('#!/bin/bash\necho "$*" >> "${FAKE_ARGS_LOG:?}"\nexit 0\n')
+        os.chmod(fake_python, 0o755)
+
+        # 1. Test Ubuntu launcher with OXIDE_MESH_NO_SHELL=1
+        ub_script = self.copy_script("packaging/agent_mesh/ubuntu/run_agent_node.sh")
+        self.run_script(
+            ["bash", ub_script, "ws://127.0.0.1:8088/ws", "node-ub"],
+            OXIDE_MESH_NO_SHELL="1",
+            PATH=self.repo + os.pathsep + os.environ.get("PATH", ""),
+        )
+        lines = self.fake_args()
+        self.assertTrue(any("--no-shell" in l for l in lines), f"Ubuntu launcher did not pass --no-shell: {lines}")
+
+        # 2. Test macOS launcher with --no-shell CLI argument
+        mac_script = self.copy_script("packaging/agent_mesh/macos/run_agent_node.sh")
+        self.run_script(
+            ["bash", mac_script, "ws://127.0.0.1:8088/ws", "node-mac", "--no-shell"],
+            PATH=self.repo + os.pathsep + os.environ.get("PATH", ""),
+        )
+        lines = self.fake_args()
+        self.assertTrue(any("node-mac" in l and "--no-shell" in l for l in lines), f"macOS launcher did not pass --no-shell: {lines}")
+
 
 class StaticRepositoryChecks(unittest.TestCase):
     def test_gitattributes_pins_line_endings(self):
@@ -493,6 +519,19 @@ class StaticRepositoryChecks(unittest.TestCase):
             self.assertNotIn('"verified_integrity": true', text, name)
         bench = read(os.path.join(ROOT, "benchmarks", "interconnect", "run_comparative_benchmark.sh"))
         self.assertNotIn("outperforms alternative solutions across all major axes", bench)
+
+    def test_agent_mesh_launchers_support_no_shell(self):
+        """Static verification that ubuntu, macos, android, and windows launchers support --no-shell."""
+        launchers = [
+            os.path.join(ROOT, "packaging", "agent_mesh", "ubuntu", "run_agent_node.sh"),
+            os.path.join(ROOT, "packaging", "agent_mesh", "macos", "run_agent_node.sh"),
+            os.path.join(ROOT, "packaging", "agent_mesh", "android", "run_agent_node_termux.sh"),
+            os.path.join(ROOT, "packaging", "agent_mesh", "windows", "run_agent_node.cmd"),
+        ]
+        for path in launchers:
+            text = read(path)
+            self.assertIn("OXIDE_MESH_NO_SHELL", text, f"{path} must support OXIDE_MESH_NO_SHELL")
+            self.assertIn("--no-shell", text, f"{path} must support --no-shell")
 
 
 if __name__ == "__main__":

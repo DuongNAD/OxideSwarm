@@ -82,7 +82,13 @@ implemented.
 | **8089/udp** | Master broadcasts / answers on the LAN | Discovery beacon (`--master auto`): the master's cluster address and, only if the dashboard listens on a non-loopback address, its URL (empty otherwise). | With a secret the beacon carries a MAC and workers/clients ignore beacons without a valid one. Not encrypted. |
 | iroh QUIC (UDP, random port) + HTTPS to the public n0 relay servers | Outbound from master and workers when `--p2p` is on | The P2P transport used for machines on different networks. The master identity key is `~/.oxideswarm/master_key.bin`. | TLS from iroh **plus** the cluster-secret handshake inside the stream. Needs outbound Internet. |
 | **8085/tcp** | `scripts/sync_network` only | An HTTP `/ping` reachability probe. Not part of the grid. | None. Stop it when you are done. |
-| agent-mesh hub (**127.0.0.1:8088** by default) | Loopback unless `--listen` says otherwise | WebSocket relay that lets any registered node run commands on any other node (`shell_exec`). | Shared hub token (`--token` / `OXIDE_MESH_TOKEN`). A non-loopback `--listen` without a token is refused unless `--insecure`. `ws://` is not encrypted. |
+| agent-mesh hub (**127.0.0.1:8088** by default) | Loopback unless `--listen` says otherwise | WebSocket relay that lets registered nodes run advertised commands (`echo`, `ping`, `system_info`, `sha256_verify`, `shell_exec`). | Shared hub token (`--token` / `OXIDE_MESH_TOKEN`). A non-loopback `--listen` without a token is refused unless `--insecure`. `ws://` is not encrypted. Nodes can disable shell execution via `--no-shell`. |
+
+### Agent Mesh Security Boundaries and Limitations
+
+- **No OS Sandboxing**: Agent mesh nodes run commands with the privileges of the node's OS user. Commands have access to the local filesystem and network.
+- **Environment Sanitization vs File Access**: Child processes do not inherit 5 sensitive variables (`OXIDESWARM_SECRET`, `OXIDESWARM_SECRET_FILE`, `OXIDE_MESH_TOKEN`, `RUSTY_GRID_SECRET`, `RUSTY_GRID_SECRET_FILE`). However, environment stripping only blocks inheritance from the parent process; a command run via `shell_exec` can still read `~/.oxideswarm/cluster.secret` or inspect `/proc`. Only `--no-shell` closes the arbitrary command execution path.
+- **Embedded Master Integration (`--grid-master`)**: Starting a hub with `--grid-master` enables `grid_submit` task dispatching. The `--no-shell` flag on a mesh node does not disable grid compute/shell tasks dispatched to grid workers.
 
 The agent-mesh hub and the grid master both default to port 8088. Run them on the same machine only with
 different ports (for example `agent-mesh hub --listen 127.0.0.1:8090`).

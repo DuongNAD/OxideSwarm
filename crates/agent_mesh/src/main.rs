@@ -330,7 +330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("Hub URL:  {}", hub);
             println!("Platform: {}", plat);
             if no_shell {
-                println!("Sandbox:  --no-shell active (shell_exec disabled)");
+                println!("Shell:    disabled (--no-shell active)");
             }
             println!();
 

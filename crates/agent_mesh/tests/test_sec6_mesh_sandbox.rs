@@ -1,4 +1,4 @@
-//! Integration Tests for SEC-6: Mesh Sandbox Hardening (Rust Agent Mesh)
+//! Integration Tests for SEC-6: Mesh Command Hardening (Rust Agent Mesh)
 //!
 //! Verifies:
 //! 1. Rejection of unadvertised commands (/bin/ls) returning exit code 127 and status "failed".
@@ -6,7 +6,7 @@
 //! 3. --no-shell refusal: sending shell_exec to no-shell node returns exit code 127.
 //! 4. Built-in commands (echo, ping, system_info) succeed on no-shell node.
 //! 5. Cross-platform secret stripping from subprocess environment.
-//! 6. Output capping at 1 MiB with truncation marker.
+//! 6. Real CLI --no-shell flag execution on spawned binary (kills mutant R6).
 
 use agent_mesh::{AgentMeshClient, AgentMeshEnvelope, AgentMeshHub};
 use std::time::Duration;
@@ -221,7 +221,28 @@ keys = ['OXIDESWARM_SECRET', 'OXIDESWARM_SECRET_FILE', 'OXIDE_MESH_TOKEN', 'RUST
 print(' '.join(k + '=' + os.environ.get(k, 'UNSET') for k in keys))
 "#;
     std::fs::write(&script_path, script_content).expect("Failed to write test script");
+    #[cfg(windows)]
     let probe_cmd = format!("python {}", script_name);
+    #[cfg(not(windows))]
+    let probe_cmd = {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            format!("python3 {}", script_name)
+        } else if std::process::Command::new("python")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            format!("python {}", script_name)
+        } else {
+            format!(
+                "sh -c 'echo \"OXIDESWARM_SECRET=${{OXIDESWARM_SECRET:-UNSET}} OXIDESWARM_SECRET_FILE=${{OXIDESWARM_SECRET_FILE:-UNSET}} OXIDE_MESH_TOKEN=${{OXIDE_MESH_TOKEN:-UNSET}} RUSTY_GRID_SECRET=${{RUSTY_GRID_SECRET:-UNSET}} RUSTY_GRID_SECRET_FILE=${{RUSTY_GRID_SECRET_FILE:-UNSET}}\"'"
+            )
+        }
+    };
 
     let res = caller
         .send_command(
@@ -270,6 +291,59 @@ print(' '.join(k + '=' + os.environ.get(k, 'UNSET') for k in keys))
     }
 
     worker.close().await;
+    caller.close().await;
+    hub.stop().await;
+}
+
+#[tokio::test]
+async fn test_sec6_real_cli_no_shell_flag_execution() {
+    const BIN: &str = env!("CARGO_BIN_EXE_agent-mesh");
+    let hub = AgentMeshHub::new();
+    let port = hub.start("127.0.0.1:0").await.expect("Failed to start hub");
+    let hub_url = format!("ws://127.0.0.1:{}/ws", port);
+
+    let mut child = tokio::process::Command::new(BIN)
+        .args([
+            "node",
+            "--hub",
+            &hub_url,
+            "--id",
+            "cli-noshell-rust",
+            "--no-shell",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .expect("Failed to spawn agent-mesh CLI binary with --no-shell");
+
+    let caller = AgentMeshClient::new(&hub_url, "cli-caller-rust", "windows");
+    caller.connect().await.expect("caller connect failed");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let res = caller
+        .send_command(
+            "cli-noshell-rust",
+            "shell_exec",
+            serde_json::json!({ "cmd": "echo should_fail" }),
+            Some(4000),
+        )
+        .await
+        .expect("Command send failed");
+
+    match res {
+        AgentMeshEnvelope::CommandResponse {
+            status,
+            exit_code,
+            stderr,
+            ..
+        } => {
+            assert_eq!(status, "failed");
+            assert_eq!(exit_code, 127);
+            assert!(stderr.contains("shell_exec is disabled by --no-shell"));
+        }
+        other => panic!("Expected CommandResponse, got: {:?}", other),
+    }
+
+    let _ = child.kill().await;
     caller.close().await;
     hub.stop().await;
 }

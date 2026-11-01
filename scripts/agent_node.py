@@ -74,20 +74,89 @@ def detect_platform_tag() -> str:
     return sys_plat
 
 
+def collect_descendants(root_pid: int) -> list:
+    """Collects all transitive descendant PIDs of root_pid."""
+    try:
+        import psutil
+        parent = psutil.Process(root_pid)
+        return [child.pid for child in parent.children(recursive=True)]
+    except Exception:
+        pass
+
+    if os.name == "posix":
+        try:
+            if os.path.exists("/proc"):
+                parent_map = {}
+                for entry in os.listdir("/proc"):
+                    if entry.isdigit():
+                        try:
+                            with open(f"/proc/{entry}/stat", "r") as f:
+                                data = f.read()
+                            rparen = data.rfind(")")
+                            if rparen != -1:
+                                fields = data[rparen + 1:].split()
+                                ppid = int(fields[1])
+                                pid = int(entry)
+                                parent_map.setdefault(ppid, []).append(pid)
+                        except Exception:
+                            continue
+                descendants = []
+                queue = [root_pid]
+                while queue:
+                    curr = queue.pop(0)
+                    for child in parent_map.get(curr, []):
+                        if child not in descendants:
+                            descendants.append(child)
+                            queue.append(child)
+                return descendants
+            else:
+                res = subprocess.run(["ps", "-axo", "pid,ppid"], capture_output=True, text=True, check=False)
+                parent_map = {}
+                for line in res.stdout.strip().splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                        pid, ppid = int(parts[0]), int(parts[1])
+                        parent_map.setdefault(ppid, []).append(pid)
+                descendants = []
+                queue = [root_pid]
+                while queue:
+                    curr = queue.pop(0)
+                    for child in parent_map.get(curr, []):
+                        if child not in descendants:
+                            descendants.append(child)
+                            queue.append(child)
+                return descendants
+        except Exception:
+            pass
+    return []
+
+
 def kill_process_tree(proc) -> None:
     """Kills a command started by `shell_exec` together with everything it spawned.
 
     On POSIX the command runs in its own session (see `start_new_session` below), so its process
     group id is its PID and one `killpg` reaches the grandchildren too. Without that, a grandchild
     that inherited the output pipes keeps them open and even `proc.wait()` blocks until it exits.
+    To catch processes that detached from the process group (setsid), descendant PIDs are collected
+    prior to signalling the group, matching Rust's executor behavior.
     """
+    pid = getattr(proc, "pid", None)
+    escaped = collect_descendants(pid) if pid else []
     try:
         if platform.system().lower() == "windows":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
         else:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(pid, signal.SIGKILL)
     except Exception:
         pass
+    for desc_pid in escaped:
+        try:
+            if platform.system().lower() == "windows":
+                subprocess.run(["taskkill", "/F", "/PID", str(desc_pid)], capture_output=True)
+            else:
+                os.kill(desc_pid, signal.SIGKILL)
+        except Exception:
+            pass
     try:
         proc.kill()
     except Exception:
@@ -103,6 +172,8 @@ SECRET_ENV_VARS = (
     "RUSTY_GRID_SECRET",
     "RUSTY_GRID_SECRET_FILE",
 )
+
+_UNSET_TIMEOUT = object()
 
 
 async def _read_capped_stream(stream: asyncio.StreamReader, cap: int = MAX_CAPTURED_OUTPUT_BYTES) -> tuple:
@@ -400,7 +471,9 @@ class OxideAgentNode:
                         cmd_str = " ".join(str(x) for x in args)
                     else:
                         cmd_str = str(args)
-                    timeout_s = req.get("timeout_ms", 15000) / 1000.0
+                    raw_timeout = req.get("timeout_ms")
+                    timeout_ms = raw_timeout if (isinstance(raw_timeout, (int, float)) and raw_timeout > 0) else 15000
+                    timeout_s = float(timeout_ms) / 1000.0
 
                     # 1. Environment sanitization
                     child_env = os.environ.copy()
@@ -414,11 +487,12 @@ class OxideAgentNode:
                     cwd = None
                     if isinstance(args, dict):
                         raw_cwd = args.get("cwd")
-                        if raw_cwd and os.path.exists(raw_cwd) and os.path.isdir(raw_cwd):
+                        if isinstance(raw_cwd, str) and os.path.isdir(raw_cwd):
                             cwd = raw_cwd
 
                     proc = await asyncio.create_subprocess_shell(
                         cmd_str,
+                        stdin=asyncio.subprocess.DEVNULL,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                         cwd=cwd,
@@ -430,17 +504,19 @@ class OxideAgentNode:
                     err_task = asyncio.create_task(_read_capped_stream(proc.stderr, MAX_CAPTURED_OUTPUT_BYTES))
 
                     try:
-                        (stdout, _), (stderr, _) = await asyncio.wait_for(
-                            asyncio.gather(out_task, err_task),
+                        (stdout, _), (stderr, _), _ = await asyncio.wait_for(
+                            asyncio.gather(out_task, err_task, proc.wait()),
                             timeout=timeout_s,
                         )
-                        await asyncio.wait_for(proc.wait(), timeout=5.0)
                         exit_code = proc.returncode
                         status = "success" if exit_code == 0 else "failed"
                     except asyncio.TimeoutError:
                         kill_process_tree(proc)
-                        out_task.cancel()
-                        err_task.cancel()
+                        try:
+                            await asyncio.wait_for(asyncio.gather(out_task, err_task), timeout=0.5)
+                        except Exception:
+                            out_task.cancel()
+                            err_task.cancel()
                         results = await asyncio.gather(out_task, err_task, return_exceptions=True)
                         try:
                             await asyncio.wait_for(proc.wait(), timeout=0.5)
@@ -452,7 +528,7 @@ class OxideAgentNode:
                         stderr_tail = err_res[0]
                         status = "timeout"
                         exit_code = 124
-                        stderr = f"Command timed out after {req.get('timeout_ms', 15000)} ms"
+                        stderr = f"Command timed out after {int(timeout_ms)} ms"
                         if stderr_tail:
                             stderr += "\n" + stderr_tail
 
@@ -470,7 +546,9 @@ class OxideAgentNode:
                     pass
             status = "timeout"
             exit_code = 124
-            stderr = f"Command timed out after {req.get('timeout_ms', 15000)} ms"
+            raw_t = req.get("timeout_ms") if isinstance(req, dict) else None
+            t_ms = int(raw_t) if isinstance(raw_t, (int, float)) and raw_t > 0 else 15000
+            stderr = f"Command timed out after {t_ms} ms"
         except Exception as e:
             status = "failed"
             exit_code = 1
@@ -541,13 +619,21 @@ class OxideAgentNode:
             if not fut.done():
                 fut.set_result(msg)
 
-    async def send_command(self, target_id: str, command: str, args: dict, timeout: float = 15.0) -> dict:
+    async def send_command(
+        self,
+        target_id: str,
+        command: str,
+        args: dict,
+        timeout: float = 15.0,
+        timeout_ms: object = _UNSET_TIMEOUT,
+    ) -> dict:
         """Sends command to target node and awaits execution response."""
         corr_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
         self.pending_commands[corr_id] = fut
 
+        wire_timeout_ms = int(timeout * 1000) if timeout_ms is _UNSET_TIMEOUT else timeout_ms
         req = {
             "version": "1.0",
             "correlation_id": corr_id,
@@ -557,7 +643,7 @@ class OxideAgentNode:
             "command": command,
             "args": args,
             "require_ack": True,
-            "timeout_ms": int(timeout * 1000),
+            "timeout_ms": wire_timeout_ms,
             "timestamp": int(time.time() * 1000),
         }
         try:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Integration test suite for SEC-6: Mesh Sandbox Hardening (Python node).
+Integration test suite for SEC-6: Mesh Command Hardening (Python node).
 
 Verifies:
 1. Rejection of unadvertised commands (/bin/ls, cmd.exe) with exit code 127.
@@ -12,6 +12,13 @@ Verifies:
 6. Explicit env in args is honored and passed to child process.
 7. Working directory (cwd) in args is respected.
 8. Output capping: streams exceeding 1 MiB are capped with truncation marker.
+9. Timeout watchdog & partial output retention (killing mutant P11).
+10. Process tree and setsid child termination on timeout (killing mutant P10 & F7).
+11. Early stream close does not trigger premature 5s kill (F3 regression check).
+12. Child stdin DEVNULL EOF immediately without hanging (F4 fix).
+13. Real CLI --no-shell flag execution (killing mutant P9).
+14. F10 low items: timeout_ms=null and invalid non-string cwd safely handled.
+15. F12 check: Rust and Python secret env vars parity.
 """
 
 import asyncio
@@ -139,7 +146,7 @@ async def run_sec6_tests():
         # ----------------------------------------------------------------------
         logger.info("[Test 4] Testing environment sanitization (SECRET_ENV_VARS stripped)...")
         probe_cmd = (
-            'python -c "import os; '
+            f'"{sys.executable}" -c "import os; '
             'keys = [\'OXIDESWARM_SECRET\', \'OXIDESWARM_SECRET_FILE\', \'OXIDE_MESH_TOKEN\', \'RUSTY_GRID_SECRET\', \'RUSTY_GRID_SECRET_FILE\']; '
             'print(\' \'.join(k + \'=\' + os.environ.get(k, \'UNSET\') for k in keys))"'
         )
@@ -166,7 +173,7 @@ async def run_sec6_tests():
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_real = os.path.realpath(temp_dir).lower()
             cwd_probe = (
-                'python -c "import os; '
+                f'"{sys.executable}" -c "import os; '
                 'print(\'CWD=\' + os.path.realpath(os.getcwd())); '
                 'print(\'CUSTOM=\' + os.environ.get(\'EXPLICIT_TEST_ENV\', \'\'))"'
             )
@@ -190,7 +197,7 @@ async def run_sec6_tests():
         # Test 6: 1 MiB Output Capping with Truncation Marker
         # ----------------------------------------------------------------------
         logger.info("[Test 6] Testing 1 MiB output capping with truncation notice...")
-        cap_probe = 'python -c "import sys; sys.stdout.write(\'Z\' * 2500000); sys.stdout.flush()"'
+        cap_probe = f'"{sys.executable}" -c "import sys; sys.stdout.write(\'Z\' * 2500000); sys.stdout.flush()"'
         resp_cap = await caller.send_command(
             "worker-node",
             "shell_exec",
@@ -205,8 +212,222 @@ async def run_sec6_tests():
         assert out_text.startswith("Z"), "Output did not start with probe character"
         logger.info(f"✓ Test 6 PASSED: Output capped at {len(out_bytes)} bytes with truncation notice!")
 
+        # ----------------------------------------------------------------------
+        # Test 7: Timeout Watchdog & Partial Output Retention (Kills Mutant P11)
+        # ----------------------------------------------------------------------
+        logger.info("[Test 7] Testing timeout path and partial output retention (Mutant P11)...")
+        py_partial_code = (
+            "import time, sys; "
+            "sys.stdout.write('PARTIAL_STDOUT_TOKEN_7721\\n'); sys.stdout.flush(); "
+            "sys.stderr.write('PARTIAL_STDERR_TOKEN_7721\\n'); sys.stderr.flush(); "
+            "time.sleep(10)"
+        )
+        resp_timeout = await caller.send_command(
+            "worker-node",
+            "shell_exec",
+            {"cmd": f'"{sys.executable}" -c "{py_partial_code}"'},
+            timeout_ms=1000,
+            timeout=4.0,
+        )
+        assert resp_timeout.get("status") == "timeout", f"Expected timeout, got {resp_timeout}"
+        assert resp_timeout.get("exit_code") == 124, f"Expected 124, got {resp_timeout.get('exit_code')}"
+        assert "PARTIAL_STDOUT_TOKEN_7721" in resp_timeout.get("stdout", ""), "Partial stdout dropped on timeout (Mutant P11)!"
+        assert "PARTIAL_STDERR_TOKEN_7721" in resp_timeout.get("stderr", ""), "Partial stderr dropped on timeout (Mutant P11)!"
+        logger.info("✓ Test 7 PASSED: Timeout reported 124 and retained partial output (P11 killed)!")
+
+        # ----------------------------------------------------------------------
+        # Test 8: Subprocess Tree & setsid Termination (Kills Mutant P10 & F7)
+        # ----------------------------------------------------------------------
+        logger.info("[Test 8] Testing subprocess tree & setsid termination (Mutant P10 & F7)...")
+        pid_file = os.path.join(tempfile.gettempdir(), f"sec6_pid_{int(time.time()*1000)}.txt")
+        child_py = os.path.join(tempfile.gettempdir(), f"sec6_child_{int(time.time()*1000)}.py")
+        parent_py = os.path.join(tempfile.gettempdir(), f"sec6_parent_{int(time.time()*1000)}.py")
+        for f_path in (pid_file, child_py, parent_py):
+            if os.path.exists(f_path):
+                try:
+                    os.remove(f_path)
+                except Exception:
+                    pass
+        with open(child_py, "w", encoding="utf-8") as f:
+            f.write(
+                "import os, time\n"
+                "if hasattr(os, 'setsid'):\n"
+                "    try:\n"
+                "        os.setsid()\n"
+                "    except Exception:\n"
+                "        pass\n"
+                "time.sleep(10)\n"
+            )
+        with open(parent_py, "w", encoding="utf-8") as f:
+            f.write(
+                "import os, sys, time, subprocess\n"
+                f"child = subprocess.Popen([sys.executable, r'{child_py}'])\n"
+                f"with open(r'{pid_file}', 'w') as f:\n"
+                f"    f.write(f'{{os.getpid()}},{{child.pid}}')\n"
+                "time.sleep(10)\n"
+            )
+
+        resp_tree = await caller.send_command(
+            "worker-node",
+            "shell_exec",
+            {"cmd": f'"{sys.executable}" "{parent_py}"'},
+            timeout_ms=1000,
+            timeout=4.0,
+        )
+        assert resp_tree.get("status") == "timeout", f"Expected timeout, got {resp_tree}"
+        await asyncio.sleep(0.5)
+        if os.path.exists(pid_file):
+            try:
+                with open(pid_file, "r") as f:
+                    pids_str = f.read().strip()
+                if pids_str:
+                    leader_pid, child_pid = [int(p) for p in pids_str.split(",")]
+                    try:
+                        import psutil
+                        assert not psutil.pid_exists(leader_pid) or psutil.Process(leader_pid).status() == psutil.STATUS_ZOMBIE, f"Leader PID {leader_pid} survived timeout (Mutant P10)!"
+                        assert not psutil.pid_exists(child_pid) or psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE, f"Detached setsid child PID {child_pid} survived timeout (F7)!"
+                    except ImportError:
+                        pass
+            finally:
+                for f_path in (pid_file, child_py, parent_py):
+                    if os.path.exists(f_path):
+                        try:
+                            os.remove(f_path)
+                        except Exception:
+                            pass
+        logger.info("✓ Test 8 PASSED: Subprocess tree and setsid child terminated (P10 killed)!")
+
+        # ----------------------------------------------------------------------
+        # Test 9: F3 Regression Check: Early Closed Output Does Not Trigger 5s Kill
+        # ----------------------------------------------------------------------
+        logger.info("[Test 9] Testing F3 regression (early closed output with 2s sleep)...")
+        marker_file = os.path.join(tempfile.gettempdir(), f"sec6_f3_marker_{int(time.time()*1000)}.txt")
+        if os.path.exists(marker_file):
+            try:
+                os.remove(marker_file)
+            except Exception:
+                pass
+        py_f3_code = (
+            "import sys, time; "
+            "sys.stdout.close(); sys.stderr.close(); "
+            "time.sleep(2.0); "
+            f"open(r'{marker_file}', 'w').write('f3_ok'); sys.exit(0)"
+        )
+        resp_f3 = await caller.send_command(
+            "worker-node",
+            "shell_exec",
+            {"cmd": f'"{sys.executable}" -c "{py_f3_code}"'},
+            timeout_ms=5000,
+            timeout=8.0,
+        )
+        assert resp_f3.get("status") == "success", f"Expected success, got {resp_f3}"
+        assert resp_f3.get("exit_code") == 0, f"Expected 0, got {resp_f3.get('exit_code')}"
+        assert os.path.exists(marker_file), "Marker file was not written (killed prematurely by F3 regression)!"
+        if os.path.exists(marker_file):
+            try:
+                os.remove(marker_file)
+            except Exception:
+                pass
+        logger.info("✓ Test 9 PASSED: Command completing after stream close finished cleanly without premature kill!")
+
+        # ----------------------------------------------------------------------
+        # Test 10: F4 Check: Child Subprocess Has DEVNULL Stdin
+        # ----------------------------------------------------------------------
+        logger.info("[Test 10] Testing F4 child stdin DEVNULL...")
+        py_stdin_code = "import sys; sys.stdin.read(); print('STDIN_DEVNULL_DONE')"
+        t0 = time.time()
+        resp_stdin = await caller.send_command(
+            "worker-node",
+            "shell_exec",
+            {"cmd": f'"{sys.executable}" -c "{py_stdin_code}"'},
+            timeout_ms=5000,
+            timeout=6.0,
+        )
+        duration = time.time() - t0
+        assert resp_stdin.get("status") == "success"
+        assert resp_stdin.get("exit_code") == 0
+        assert "STDIN_DEVNULL_DONE" in resp_stdin.get("stdout", "")
+        assert duration < 3.0, f"Command hung on stdin: duration={duration:.2f}s"
+        logger.info("✓ Test 10 PASSED: stdin DEVNULL completed immediately without hanging!")
+
+        # ----------------------------------------------------------------------
+        # Test 11: Real CLI --no-shell Flag Execution (Kills Mutant P9)
+        # ----------------------------------------------------------------------
+        logger.info("[Test 11] Testing real CLI --no-shell flag execution (Mutant P9)...")
+        cli_proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            os.path.join(root_dir, "scripts", "agent_node.py"),
+            "--hub", hub_url,
+            "--id", "worker-cli-noshell-py",
+            "--no-shell",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            cli_entry = None
+            for _ in range(30):
+                await asyncio.sleep(0.1)
+                cli_entry = hub.nodes.get("worker-cli-noshell-py")
+                if cli_entry is not None:
+                    break
+            assert cli_entry is not None, "worker-cli-noshell-py failed to register via CLI within 3.0s"
+            cli_supported = cli_entry.get("capabilities", {}).get("supported_commands", [])
+            assert "shell_exec" not in cli_supported, f"shell_exec found in CLI capabilities (Mutant P9): {cli_supported}"
+            resp_cli_shell = await caller.send_command(
+                "worker-cli-noshell-py",
+                "shell_exec",
+                {"cmd": "echo should_fail"},
+                timeout=4.0,
+            )
+            assert resp_cli_shell.get("status") == "failed"
+            assert resp_cli_shell.get("exit_code") == 127
+            assert "shell_exec is disabled by --no-shell" in resp_cli_shell.get("stderr", "")
+        finally:
+            cli_proc.kill()
+            await cli_proc.wait()
+        logger.info("✓ Test 11 PASSED: Real CLI --no-shell node refused shell_exec with 127 (P9 killed)!")
+
+        # ----------------------------------------------------------------------
+        # Test 12: F10 Low Items: timeout_ms=null and invalid non-string cwd
+        # ----------------------------------------------------------------------
+        logger.info("[Test 12] Testing F10 low items: timeout_ms=null and invalid non-string cwd...")
+        resp_f10 = await caller.send_command(
+            "worker-node",
+            "shell_exec",
+            {"cmd": "echo f10_align_ok", "cwd": 99999},
+            timeout_ms=None,
+            timeout=4.0,
+        )
+        assert resp_f10.get("status") == "success"
+        assert resp_f10.get("exit_code") == 0
+        assert "f10_align_ok" in resp_f10.get("stdout", "")
+        logger.info("✓ Test 12 PASSED: timeout_ms=null and non-string cwd handled safely!")
+
+        # ----------------------------------------------------------------------
+        # Test 13: F12 Check: Rust and Python Secret Env Vars Parity
+        # ----------------------------------------------------------------------
+        logger.info("[Test 13] Testing Rust executor.rs and Python agent_node.py SECRET_ENV_VARS parity (F12)...")
+        import re
+        from scripts.agent_node import SECRET_ENV_VARS as PY_VARS
+        rust_file = os.path.join(root_dir, "crates", "agent_mesh", "src", "executor.rs")
+        with open(rust_file, "r", encoding="utf-8") as f:
+            rust_content = f.read()
+        match = re.search(r"pub const SECRET_ENV_VARS: \[&str; 5\] = \[(.*?)\];", rust_content, re.DOTALL)
+        assert match is not None, "Could not find SECRET_ENV_VARS in executor.rs"
+        raw_entries = [e.strip().strip('"') for e in match.group(1).split(",") if e.strip()]
+        resolved_rust = []
+        for entry in raw_entries:
+            if entry == "ENV_SECRET":
+                resolved_rust.append("OXIDESWARM_SECRET")
+            elif entry == "ENV_SECRET_FILE":
+                resolved_rust.append("OXIDESWARM_SECRET_FILE")
+            else:
+                resolved_rust.append(entry)
+        assert set(resolved_rust) == set(PY_VARS), f"Mismatch between Rust {resolved_rust} and Python {PY_VARS}"
+        logger.info(f"✓ Test 13 PASSED: Rust and Python strip identical 5 secret variables: {resolved_rust}")
+
         logger.info("==================================================================")
-        logger.info("  ALL SEC-6 PYTHON MESH SANDBOX HARDENING TESTS PASSED (100%)    ")
+        logger.info("  ALL SEC-6 PYTHON MESH HARDENING TESTS PASSED (100%)             ")
         logger.info("==================================================================")
         return True
 

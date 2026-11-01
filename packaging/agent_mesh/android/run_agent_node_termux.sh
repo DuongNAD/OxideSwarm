@@ -12,12 +12,25 @@ HUB_URL="${1:?Usage: run_agent_node_termux.sh <ws://HUB_HOST:PORT/ws> [NODE_ID] 
 DEFAULT_NODE_ID="node-android-termux"
 NODE_ID="${2:-$DEFAULT_NODE_ID}"
 
+NO_SHELL_FLAG=""
+if [[ "${OXIDE_MESH_NO_SHELL:-0}" == "1" ]]; then
+    NO_SHELL_FLAG="--no-shell"
+fi
+for arg in "$@"; do
+    if [[ "$arg" == "--no-shell" ]]; then
+        NO_SHELL_FLAG="--no-shell"
+    fi
+done
+
 echo "========================================================"
 echo "   OxideSwarm Android (Termux) Agent Node Runner        "
 echo "========================================================"
 echo "Hub URL:  $HUB_URL"
 echo "Node ID:  $NODE_ID"
 echo "Platform: Android (Termux userspace, $(uname -m))"
+if [[ -n "$NO_SHELL_FLAG" ]]; then
+    echo "Shell:    disabled (--no-shell active)"
+fi
 echo ""
 
 # A hub that is reachable beyond this machine requires its token (OXIDE_MESH_TOKEN, or --token).
@@ -54,7 +67,7 @@ fi
 # 3. Execution loop
 while true; do
     echo "[INFO] Launching OxideSwarm Agent Node..."
-    python scripts/agent_node.py --hub "$HUB_URL" --id "$NODE_ID" --platform android || true
+    python scripts/agent_node.py --hub "$HUB_URL" --id "$NODE_ID" --platform android ${NO_SHELL_FLAG:+"$NO_SHELL_FLAG"} || true
     echo "[WARN] Agent stopped or disconnected. Reconnecting in 3 seconds..."
     sleep 3
 done
