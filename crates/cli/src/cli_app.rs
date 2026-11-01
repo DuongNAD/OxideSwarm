@@ -546,7 +546,7 @@ pub struct SubmitArgs {
     #[arg(
         long,
         value_name = "ENGINE",
-        help = "Preferred 3D generation engine: sdf, triposr, auto (default: auto)"
+        help = "Preferred 3D generation engine: auto, sdf, triposr, trellis (default: auto)"
     )]
     pub engine: Option<String>,
 
@@ -2013,9 +2013,9 @@ fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
                 .to_lowercase();
             let engine_preference = args
                 .engine
-                .as_ref()
-                .map(|e| e.to_lowercase())
-                .filter(|e| e != "auto");
+                .as_deref()
+                .map(str::parse::<rusty_grid_core::task::Engine3D>)
+                .transpose()?;
             let _ = args.export_texture;
             let export_texture = !args.no_export_texture;
             let spec = TaskSpec::Generative3D(rusty_grid_core::task::Generative3DSpec {
@@ -2383,7 +2383,7 @@ async fn run_submit_with_secret(
         }
     }
 
-    let is_gpu = args.gpu || args.task_type.eq_ignore_ascii_case("gpu");
+    let is_gpu = args.gpu || args.task_type.eq_ignore_ascii_case("gpu") || spec.requires_gpu();
     let requirements = TaskRequirements {
         cpu_cores: args.cores.max(1),
         ram_mb: args.ram_mb,

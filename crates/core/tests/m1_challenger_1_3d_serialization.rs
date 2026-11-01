@@ -255,8 +255,8 @@ fn test_adv_01_generative_3d_extreme_inputs_and_fuzzing() {
 
     let auto_spec = TaskSpec::Generative3D(Generative3DSpec::new_prompt("cube"));
     assert!(
-        auto_spec.requires_gpu(),
-        "Default/auto engine MUST require GPU"
+        !auto_spec.requires_gpu(),
+        "Default/auto engine must NOT require GPU"
     );
     println!("  [+] Verified engine preferences and GPU requirement rules.");
 }

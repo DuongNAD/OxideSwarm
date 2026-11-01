@@ -10,7 +10,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 use rusty_grid_core::task::{
-    AutoRigSpec, Bytes, Generative3DSpec, Task, TaskId, TaskRequirements, TaskResult, TaskSpec,
+    AutoRigSpec, Bytes, Engine3D, Generative3DSpec, Task, TaskId, TaskRequirements, TaskResult,
+    TaskSpec,
 };
 use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::server::MasterHandle;
@@ -565,8 +566,8 @@ impl AgentGridBridge {
             .get("engine")
             .or_else(|| args.get("engine_preference"))
             .and_then(|v| v.as_str())
-            .map(|s| s.to_lowercase())
-            .filter(|s| s != "auto");
+            .and_then(|s| s.parse::<Engine3D>().ok())
+            .filter(|e| *e != Engine3D::Auto);
 
         let export_texture = args
             .get("export_texture")
@@ -604,14 +605,7 @@ impl AgentGridBridge {
             req_gpu
         } else {
             match spec {
-                TaskSpec::Generative3D(ref s) => {
-                    let is_sdf = s
-                        .engine_preference
-                        .as_deref()
-                        .map(|e| e == "sdf" || e == "tier0_sdf" || e == "procedural")
-                        .unwrap_or(false);
-                    !is_sdf
-                }
+                TaskSpec::Generative3D(ref s) => s.engine().requires_gpu(),
                 _ => true,
             }
         };

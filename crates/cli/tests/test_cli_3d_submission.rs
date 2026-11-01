@@ -12,6 +12,7 @@ use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 #[tokio::test]
 async fn test_cli_3d_sdf_submission_and_export() {
     let temp_dir = TempDir::new().unwrap();
+    std::env::set_var("OXIDESWARM_HOME", temp_dir.path());
     let out_glb_path = temp_dir.path().join("exported_cube.glb");
 
     // 1. Spawn in-process Master
@@ -86,6 +87,7 @@ async fn test_cli_3d_sdf_submission_and_export() {
 #[tokio::test]
 async fn test_cli_autorig_submission_and_export() {
     let temp_dir = TempDir::new().unwrap();
+    std::env::set_var("OXIDESWARM_HOME", temp_dir.path());
     let input_mesh_path = temp_dir.path().join("input_cylinder.glb");
     let out_rigged_path = temp_dir.path().join("rigged_cylinder.glb");
 
@@ -228,4 +230,69 @@ async fn test_cli_negative_validations() {
     };
     let exit_code = run_submit(args_mesh, None).await;
     assert_eq!(exit_code, ExitCode::FAILURE);
+}
+
+#[tokio::test]
+async fn test_cli_3d_default_submit_succeeds_on_cpu_worker() {
+    let temp_dir = TempDir::new().unwrap();
+    std::env::set_var("OXIDESWARM_HOME", temp_dir.path());
+    let out_glb_path = temp_dir.path().join("default_robot.glb");
+
+    // 1. Spawn in-process Master
+    let master = MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        SchedulerConfig::default(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("MasterServer::spawn failed");
+    let master_addr = master.server_addr();
+
+    // 2. Spawn in-process Worker (CPU only, 0 GPU capabilities)
+    let worker_temp = TempDir::new().unwrap();
+    let worker_cfg = WorkerConfig::new(master_addr.to_string())
+        .with_name("worker-cpu-3d")
+        .with_cores(2)
+        .with_ram_mb(4096)
+        .with_sandbox_base_dir(worker_temp.path());
+
+    let mut client = WorkerClient::new(worker_cfg);
+    let (tx, rx) = watch::channel(false);
+    let worker_handle = tokio::spawn(async move {
+        let _ = client.run(rx).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 3. Construct SubmitArgs for default 3D submission (no --gpu, no --engine)
+    let args = SubmitArgs {
+        master: Some(master_addr.to_string()),
+        task_type: "generic".to_string(),
+        prompt: Some("robot".to_string()),
+        wait: true,
+        output: Some(out_glb_path.clone()),
+        ..Default::default()
+    };
+
+    // 4. Run submit command
+    let exit_code = run_submit(args, None).await;
+    assert_eq!(
+        exit_code,
+        ExitCode::SUCCESS,
+        "Default 3D submit must succeed on CPU worker"
+    );
+
+    // 5. Verify glTF model was generated and validated
+    assert!(out_glb_path.is_file(), "Exported glTF file must exist");
+    let data = std::fs::read(&out_glb_path).unwrap();
+    assert!(data.len() > 100);
+    assert!(
+        validate_glb_header(&data).is_ok(),
+        "Exported asset must have valid glTF 2.0 header"
+    );
+
+    // 6. Teardown
+    let _ = tx.send(true);
+    let _ = worker_handle.await;
+    let _ = master.shutdown();
 }

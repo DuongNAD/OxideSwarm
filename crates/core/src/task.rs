@@ -569,6 +569,148 @@ fn default_export_texture() -> bool {
     true
 }
 
+/// Unified enumeration of supported 3D generative and procedural engines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Engine3D {
+    /// Automatic engine selection based on available worker capabilities.
+    ///
+    /// CPU-capable: on CPU-only nodes or when neural model weights/Python environment
+    /// are absent, gracefully executes via Tier 0 pure-Rust Procedural SDF.
+    #[default]
+    #[serde(alias = "AUTO", alias = "Auto")]
+    Auto,
+
+    /// Tier 0 pure-Rust Procedural Signed Distance Function (SDF) Marching Cubes engine.
+    ///
+    /// Executes fully in-process on CPU in < 50ms with zero Python or CUDA dependencies.
+    #[serde(
+        rename = "sdf",
+        alias = "SDF",
+        alias = "Sdf",
+        alias = "tier0_sdf",
+        alias = "tier0",
+        alias = "tier-0",
+        alias = "procedural",
+        alias = "procedural_sdf"
+    )]
+    Sdf,
+
+    /// TripoSR feed-forward neural 3D reconstruction engine via Python subprocess.
+    ///
+    /// Requires GPU hardware acceleration and local model weights.
+    #[serde(
+        rename = "triposr",
+        alias = "TripoSR",
+        alias = "Triposr",
+        alias = "tripo_sr",
+        alias = "triposr-cuda",
+        alias = "triposr-cpu",
+        alias = "tripo"
+    )]
+    TripoSr,
+
+    /// Trellis structured neural radiance/mesh reconstruction engine.
+    ///
+    /// Requires GPU hardware acceleration.
+    #[serde(rename = "trellis", alias = "TRELLIS", alias = "Trellis")]
+    Trellis,
+}
+
+pub type Generative3DEngine = Engine3D;
+
+impl Engine3D {
+    /// Canonical lowercase string slice representing the engine.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Sdf => "sdf",
+            Self::TripoSr => "triposr",
+            Self::Trellis => "trellis",
+        }
+    }
+
+    /// Returns true if this engine strictly requires GPU hardware execution.
+    ///
+    /// Note: `Auto` is CPU-capable (degrades gracefully to Tier 0 SDF), so returns `false`.
+    pub const fn requires_gpu(&self) -> bool {
+        match self {
+            Self::Auto => false,
+            Self::Sdf => false,
+            Self::TripoSr => true,
+            Self::Trellis => true,
+        }
+    }
+
+    /// Returns true if this engine can execute on a CPU-only worker node.
+    pub const fn is_cpu_capable(&self) -> bool {
+        !self.requires_gpu()
+    }
+
+    /// Returns true if this is the Tier 0 procedural SDF engine.
+    pub const fn is_procedural(&self) -> bool {
+        matches!(self, Self::Sdf)
+    }
+
+    /// Returns true if this engine invokes an external Python runtime.
+    pub const fn requires_python(&self) -> bool {
+        matches!(self, Self::TripoSr | Self::Trellis)
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" | "" => Some(Self::Auto),
+            "sdf" | "tier0_sdf" | "tier0" | "tier-0" | "procedural" | "procedural_sdf" => {
+                Some(Self::Sdf)
+            }
+            "triposr" | "tripo_sr" | "triposr-cuda" | "triposr-cpu" | "tripo" => {
+                Some(Self::TripoSr)
+            }
+            "trellis" => Some(Self::Trellis),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Engine3D {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::ops::Deref for Engine3D {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl std::str::FromStr for Engine3D {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| {
+            format!(
+                "unknown 3D engine '{}'; valid engines are: auto, sdf, triposr, trellis",
+                s.trim()
+            )
+        })
+    }
+}
+
+impl From<&str> for Engine3D {
+    fn from(s: &str) -> Self {
+        s.parse().unwrap_or(Self::Auto)
+    }
+}
+
+impl From<String> for Engine3D {
+    fn from(s: String) -> Self {
+        s.as_str().into()
+    }
+}
+
 /// Specification for local on-device 3D mesh generation from text prompt or input image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Generative3DSpec {
@@ -578,8 +720,8 @@ pub struct Generative3DSpec {
     pub image_data: Option<Bytes>,
     /// Generation fidelity / quality preset ("fast", "standard", "high"). Defaults to "standard".
     pub quality: String,
-    /// Preferred generation engine ("sdf", "triposr", "auto"). Defaults to None ("auto").
-    pub engine_preference: Option<String>,
+    /// Preferred generation engine ("sdf", "triposr", "auto", "trellis"). Defaults to None ("auto").
+    pub engine_preference: Option<Engine3D>,
     /// Whether to generate and bake PBR UV texture maps into the output glTF asset. Defaults to true.
     pub export_texture: bool,
 }
@@ -597,7 +739,7 @@ struct HumanGenerative3DSpec {
     #[serde(default = "default_3d_quality")]
     quality: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    engine_preference: Option<String>,
+    engine_preference: Option<Engine3D>,
     #[serde(default = "default_export_texture")]
     pub export_texture: bool,
 }
@@ -622,7 +764,7 @@ impl From<&Generative3DSpec> for HumanGenerative3DSpec {
             prompt: s.prompt.clone(),
             image_data: s.image_data.clone(),
             quality: s.quality.clone(),
-            engine_preference: s.engine_preference.clone(),
+            engine_preference: s.engine_preference,
             export_texture: s.export_texture,
         }
     }
@@ -646,7 +788,7 @@ impl From<&Generative3DSpec> for BinaryGenerative3DSpec {
             prompt: s.prompt.clone(),
             image_data: s.image_data.clone(),
             quality: s.quality.clone(),
-            engine_preference: s.engine_preference.clone(),
+            engine_preference: s.engine_preference.map(|e| e.as_str().to_string()),
             export_texture: s.export_texture,
         }
     }
@@ -658,7 +800,7 @@ impl From<BinaryGenerative3DSpec> for Generative3DSpec {
             prompt: s.prompt,
             image_data: s.image_data,
             quality: s.quality,
-            engine_preference: s.engine_preference,
+            engine_preference: s.engine_preference.and_then(|str| str.parse().ok()),
             export_texture: s.export_texture,
         }
     }
@@ -713,8 +855,13 @@ impl Generative3DSpec {
         self
     }
 
-    /// Sets the engine preference ("sdf", "triposr", "auto").
-    pub fn with_engine(mut self, engine: impl Into<String>) -> Self {
+    /// Returns the effective 3D engine, defaulting to Engine3D::Auto if unset.
+    pub fn engine(&self) -> Engine3D {
+        self.engine_preference.unwrap_or_default()
+    }
+
+    /// Sets the engine preference ("sdf", "triposr", "auto", "trellis").
+    pub fn with_engine(mut self, engine: impl Into<Engine3D>) -> Self {
         self.engine_preference = Some(engine.into());
         self
     }
@@ -1482,13 +1629,7 @@ impl TaskSpec {
         match self {
             TaskSpec::GpuCompute { .. } => true,
             TaskSpec::BuiltinTest { require_gpu, .. } => *require_gpu,
-            TaskSpec::Generative3D(spec) => {
-                // Procedural SDF engine runs on CPU; neural or auto engines require GPU
-                !matches!(
-                    spec.engine_preference.as_deref(),
-                    Some("sdf") | Some("procedural")
-                )
-            }
+            TaskSpec::Generative3D(spec) => spec.engine().requires_gpu(),
             TaskSpec::AutoRig(_) => false,
             _ => false,
         }
@@ -2889,14 +3030,20 @@ mod tests {
 
     #[test]
     fn test_task_spec_3d_requires_gpu() {
-        // Standard / triposr engine requires GPU
-        let gen_gpu = TaskSpec::new_generative_3d("mech");
-        assert!(gen_gpu.requires_gpu());
+        // Default / auto engine does NOT require GPU (CPU CI safe)
+        let gen_auto = TaskSpec::new_generative_3d("mech");
+        assert!(!gen_auto.requires_gpu());
 
         // Procedural SDF engine does NOT require GPU (CPU CI safe)
         let gen_cpu =
             TaskSpec::Generative3D(Generative3DSpec::new_prompt("cube").with_engine("sdf"));
         assert!(!gen_cpu.requires_gpu());
+
+        // TripoSR engine DOES require GPU
+        let gen_gpu = TaskSpec::Generative3D(
+            Generative3DSpec::new_prompt("mech").with_engine(Engine3D::TripoSr),
+        );
+        assert!(gen_gpu.requires_gpu());
 
         // AutoRig does NOT require GPU
         let rig = TaskSpec::new_auto_rig(Bytes::from_static(b"mesh"), "biped");

@@ -65,8 +65,8 @@ use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::cluster_auth::{ENV_SECRET, ENV_SECRET_FILE};
 use rusty_grid_core::protocol::WorkerMessage;
 use rusty_grid_core::task::{
-    sha256_digest, Bytes, BytesMut, CheckpointData, OutputArtifact, Task, TaskId, TaskResult,
-    TaskSpec, MAX_AGGREGATE_ARTIFACT_BYTES, MAX_OUTPUT_ARTIFACT_BYTES,
+    sha256_digest, Bytes, BytesMut, CheckpointData, Engine3D, OutputArtifact, Task, TaskId,
+    TaskResult, TaskSpec, MAX_AGGREGATE_ARTIFACT_BYTES, MAX_OUTPUT_ARTIFACT_BYTES,
 };
 
 use crate::blob_cache::{BlobCache, DEFAULT_BLOB_CACHE_MAX_BYTES};
@@ -1859,14 +1859,10 @@ impl TaskRunner {
         mut cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
     ) -> TaskResult {
-        let pref = spec
-            .engine_preference
-            .as_deref()
-            .unwrap_or("auto")
-            .to_lowercase();
+        let engine = spec.engine();
 
         // 1. If explicit SDF requested, execute Tier 0 directly in-process (< 50ms)
-        if pref == "sdf" {
+        if engine == Engine3D::Sdf {
             info!(task_id = %task.id, "Executing Tier 0 Procedural SDF engine");
             return self
                 .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
@@ -1878,7 +1874,7 @@ impl TaskRunner {
         let script = crate::gen3d::runner::resolve_entrypoint_script();
 
         if py_bin.is_none() || script.is_none() {
-            if pref == "auto" {
+            if engine == Engine3D::Auto {
                 info!(task_id = %task.id, "Local Python 3D engine not found; degrading gracefully to Tier 0 SDF");
                 return self
                     .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
@@ -2000,7 +1996,7 @@ impl TaskRunner {
             Ok(c) => c,
             Err(e) => {
                 let _ = sandbox.destroy().await;
-                if pref == "auto" {
+                if engine == Engine3D::Auto {
                     info!(task_id = %task.id, "Failed to spawn Python process ({e}); degrading gracefully to Tier 0 SDF");
                     return self
                         .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
@@ -2121,7 +2117,7 @@ impl TaskRunner {
                                     )
                                 }
                             }
-                        } else if pref == "auto" {
+                        } else if engine == Engine3D::Auto {
                             warn!("Subprocess exited 0 but output.glb missing; falling back to Tier 0 SDF");
                             self.execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time).await
                         } else {
@@ -2138,7 +2134,7 @@ impl TaskRunner {
                     }
                     Ok(status) => {
                         let code = status.code().unwrap_or(EXIT_CODE_GENERAL_ERROR);
-                        if pref == "auto" {
+                        if engine == Engine3D::Auto {
                             warn!("Tier 1 engine exited with error code {code}; falling back to Tier 0 SDF");
                             self.execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time).await
                         } else {
