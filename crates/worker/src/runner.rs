@@ -877,7 +877,12 @@ impl TaskRunner {
         }
 
         let compute_fut = async {
-            if test_name == "sleep"
+            if test_name == "oversized_result" {
+                if duration_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(duration_ms)).await;
+                }
+                "x".repeat(rusty_grid_core::protocol::MAX_FRAME_SIZE)
+            } else if test_name == "sleep"
                 || test_name == "duration"
                 || (duration_ms > 0
                     && test_name != "checkpoint"

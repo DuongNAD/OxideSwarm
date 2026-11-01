@@ -685,6 +685,60 @@ async fn lane_writer<W: AsyncWrite + Unpin>(
             }
         };
         if let Err(e) = writer.send_msg(&msg).await {
+            if let ProtocolError::FrameTooLarge { size, max } = e {
+                match msg {
+                    WorkerMessage::TaskResult {
+                        worker_id,
+                        task_id,
+                        execution_time_ms,
+                        is_gpu_executed,
+                        device_name,
+                        ..
+                    } => {
+                        warn!(
+                            %worker_id,
+                            %task_id,
+                            size,
+                            max,
+                            "Task result exceeds maximum frame size; failing only this task"
+                        );
+                        let fallback = WorkerMessage::TaskResult {
+                            worker_id,
+                            task_id,
+                            exit_code: EXIT_CODE_GENERAL_ERROR,
+                            stdout: rusty_grid_core::task::Bytes::new(),
+                            stderr: rusty_grid_core::task::Bytes::new(),
+                            execution_time_ms,
+                            is_gpu_executed,
+                            device_name: device_name.filter(|d| d.len() <= 256),
+                            error: Some(format!(
+                                "Task result size ({size} bytes) exceeds maximum frame limit ({max} bytes)"
+                            )),
+                            asset_bytes: None,
+                            artifacts: Vec::new(),
+                            outputs: Vec::new(),
+                        };
+                        if let Err(fallback_err) = writer.send_msg(&fallback).await {
+                            let _ = events.send(Inbound::Failed(lane, fallback_err)).await;
+                            return;
+                        }
+                        continue;
+                    }
+                    WorkerMessage::Checkpoint {
+                        task_id, sequence, ..
+                    } => {
+                        warn!(
+                            %task_id,
+                            sequence,
+                            size,
+                            max,
+                            "Checkpoint exceeds maximum frame size; dropping oversized checkpoint"
+                        );
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             let _ = events.send(Inbound::Failed(lane, e)).await;
             return;
         }
@@ -3732,6 +3786,203 @@ mod tests {
             .await
             .expect("the writer exits once the control queue is flushed")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_lane_writer_fails_only_oversized_task_result_and_keeps_session_alive() {
+        let mut lane = spawn_lane(64 * 1024);
+        let worker_id = Uuid::new_v4();
+        let oversized_id = TaskId::new();
+        let normal_id = TaskId::new();
+
+        lane.data_tx
+            .send(WorkerMessage::from(TaskResult::success(
+                worker_id,
+                oversized_id,
+                "x".repeat(rusty_grid_core::protocol::MAX_FRAME_SIZE),
+                12,
+                false,
+            )))
+            .await
+            .unwrap();
+        lane.data_tx
+            .send(WorkerMessage::from(TaskResult::success(
+                worker_id, normal_id, "ok", 5, false,
+            )))
+            .await
+            .unwrap();
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            lane.peer.recv_msg::<WorkerMessage>(),
+        )
+        .await
+        .expect("oversized fallback frame in time")
+        .unwrap()
+        .expect("first frame");
+        match first {
+            WorkerMessage::TaskResult {
+                task_id,
+                exit_code,
+                stdout,
+                error,
+                ..
+            } => {
+                assert_eq!(task_id, oversized_id);
+                assert_ne!(exit_code, 0);
+                assert!(stdout.0.is_empty());
+                assert!(
+                    error.as_deref().unwrap_or_default().contains("exceeds"),
+                    "unexpected error: {error:?}"
+                );
+            }
+            other => panic!("expected failed TaskResult for oversized task, got {other:?}"),
+        }
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(5),
+            lane.peer.recv_msg::<WorkerMessage>(),
+        )
+        .await
+        .expect("subsequent frame in time")
+        .unwrap()
+        .expect("second frame");
+        match second {
+            WorkerMessage::TaskResult {
+                task_id,
+                exit_code,
+                stdout,
+                ..
+            } => {
+                assert_eq!(task_id, normal_id);
+                assert_eq!(exit_code, 0);
+                assert_eq!(stdout.0.as_ref(), b"ok");
+            }
+            other => panic!("expected normal TaskResult for second task, got {other:?}"),
+        }
+        assert!(
+            lane.events_rx.try_recv().is_err(),
+            "oversized TaskResult must not report a lane failure"
+        );
+        lane.task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_oversized_task_result_fails_only_its_task_while_other_tasks_on_worker_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client = WorkerClient::new(
+            WorkerConfig::new(addr.to_string())
+                .with_cores(2)
+                .with_sandbox_base_dir(dir.path())
+                .with_redirection_portal(false),
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let worker = tokio::spawn(async move { client.run(stop_rx).await });
+
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("worker connects")
+            .unwrap();
+        let mut master = MessageTransport::new(stream);
+        let Some(WorkerMessage::Register { worker_id, .. }) =
+            master.recv_msg::<WorkerMessage>().await.unwrap()
+        else {
+            panic!("expected Register");
+        };
+        master
+            .send_msg(&MasterMessage::RegisterAck {
+                accepted: true,
+                worker_id,
+                heartbeat_interval_secs: 5,
+                message: None,
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+
+        let oversized_task = Task::new(
+            rusty_grid_core::task::TaskSpec::BuiltinTest {
+                test_name: "oversized_result".into(),
+                iterations: 1,
+                duration_ms: 20,
+                should_fail: false,
+                require_gpu: false,
+            },
+            TaskRequirements::generic(1, 10),
+        );
+        let oversized_id = oversized_task.id;
+
+        let sibling_task = Task::new(
+            rusty_grid_core::task::TaskSpec::BuiltinTest {
+                test_name: "sleep".into(),
+                iterations: 1,
+                duration_ms: 200,
+                should_fail: false,
+                require_gpu: false,
+            },
+            TaskRequirements::generic(1, 10),
+        );
+        let sibling_id = sibling_task.id;
+
+        master
+            .send_msg(&MasterMessage::AssignTask {
+                task: oversized_task,
+            })
+            .await
+            .unwrap();
+        master
+            .send_msg(&MasterMessage::AssignTask { task: sibling_task })
+            .await
+            .unwrap();
+
+        let mut oversized_outcome = None;
+        let mut sibling_outcome = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while oversized_outcome.is_none() || sibling_outcome.is_none() {
+            match tokio::time::timeout_at(deadline, master.recv_msg::<WorkerMessage>())
+                .await
+                .expect("both tasks finish on the same session")
+                .expect("stream stays open without protocol error")
+            {
+                Some(WorkerMessage::TaskResult {
+                    task_id,
+                    exit_code,
+                    error,
+                    ..
+                }) => {
+                    if task_id == oversized_id {
+                        oversized_outcome = Some((exit_code, error));
+                    } else if task_id == sibling_id {
+                        sibling_outcome = Some((exit_code, error));
+                    }
+                }
+                Some(_) => {}
+                None => panic!("worker disconnected instead of keeping the session alive"),
+            }
+        }
+
+        let (oversized_code, oversized_err) = oversized_outcome.unwrap();
+        assert_ne!(oversized_code, 0, "oversized task must fail");
+        assert!(
+            oversized_err
+                .as_deref()
+                .unwrap_or_default()
+                .contains("exceeds"),
+            "unexpected oversized error: {oversized_err:?}"
+        );
+
+        let (sibling_code, sibling_err) = sibling_outcome.unwrap();
+        assert_eq!(
+            sibling_code, 0,
+            "sibling task on the same worker must finish successfully (err: {sibling_err:?})"
+        );
+
+        let _ = stop_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
     }
 
     // ------------------------------------------------------------------------------------------

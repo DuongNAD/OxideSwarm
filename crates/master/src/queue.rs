@@ -378,6 +378,9 @@ pub const DEFAULT_MAX_TERMINAL_TASKS: usize = 10_000;
 /// stream would be 200 GB.
 pub const DEFAULT_MAX_TERMINAL_BYTES: usize = 256 * 1024 * 1024;
 
+/// Default byte cap for active (non-terminal) tasks (256 MiB): payloads, checkpoints and history.
+pub const DEFAULT_MAX_ACTIVE_BYTES: usize = 256 * 1024 * 1024;
+
 /// Fixed bookkeeping cost charged to every retained task on top of its payload.
 const RETAINED_ENTRY_OVERHEAD_BYTES: usize = 1024;
 
@@ -537,11 +540,16 @@ struct TaskQueueInner {
     capacity: Option<usize>,
     max_terminal_tasks: usize,
     max_terminal_bytes: usize,
+    max_active_bytes: usize,
     terminal_order: std::collections::VecDeque<TaskId>,
     /// Bytes each retained terminal task was charged when it finished (see `retained_bytes`).
     terminal_sizes: HashMap<TaskId, usize>,
     /// Sum of `terminal_sizes`.
     terminal_bytes: usize,
+    /// Bytes each active (non-terminal) task is currently charged (see `retained_bytes`).
+    active_sizes: HashMap<TaskId, usize>,
+    /// Sum of `active_sizes`.
+    active_bytes: usize,
 }
 
 /// Bytes one blob reference (id, size, flags) is charged in addition to its path.
@@ -628,6 +636,7 @@ fn retained_bytes(entry: &TaskEntry) -> usize {
             + r.stderr.0.len()
             + r.error.as_ref().map_or(0, String::len)
             + r.device_name.as_ref().map_or(0, String::len)
+            + r.asset_bytes.as_ref().map_or(0, |b| b.0.len())
             + r.artifacts
                 .iter()
                 .map(|a| a.path.len() + a.data.len())
@@ -655,9 +664,25 @@ fn retained_bytes(entry: &TaskEntry) -> usize {
 }
 
 impl TaskQueueInner {
+    fn untrack_active_task(&mut self, task_id: &TaskId) {
+        if let Some(size) = self.active_sizes.remove(task_id) {
+            self.active_bytes = self.active_bytes.saturating_sub(size);
+        }
+    }
+
+    fn update_active_task(&mut self, task_id: TaskId) {
+        self.untrack_active_task(&task_id);
+        if let Some(entry) = self.tasks.get(&task_id).filter(|e| !e.state.is_terminal()) {
+            let size = retained_bytes(entry);
+            self.active_sizes.insert(task_id, size);
+            self.active_bytes = self.active_bytes.saturating_add(size);
+        }
+    }
+
     /// Drops a retained terminal task and its byte charge.
     fn remove_retained(&mut self, task_id: &TaskId) {
         self.tasks.remove(task_id);
+        self.untrack_active_task(task_id);
         if let Some(size) = self.terminal_sizes.remove(task_id) {
             self.terminal_bytes = self.terminal_bytes.saturating_sub(size);
         }
@@ -697,6 +722,7 @@ impl TaskQueueInner {
     }
 
     fn track_terminal_task(&mut self, task_id: TaskId) {
+        self.untrack_active_task(&task_id);
         if self.terminal_sizes.contains_key(&task_id) {
             return;
         }
@@ -822,9 +848,12 @@ impl TaskQueue {
                 capacity,
                 max_terminal_tasks,
                 max_terminal_bytes,
+                max_active_bytes: DEFAULT_MAX_ACTIVE_BYTES,
                 terminal_order: std::collections::VecDeque::new(),
                 terminal_sizes: HashMap::new(),
                 terminal_bytes: 0,
+                active_sizes: HashMap::new(),
+                active_bytes: 0,
             })),
         }
     }
@@ -893,7 +922,16 @@ impl TaskQueue {
             error_message: None,
         };
 
+        let entry_bytes = retained_bytes(&entry);
+        if inner.active_bytes.saturating_add(entry_bytes) > inner.max_active_bytes {
+            return Err(GridError::QueueFull {
+                capacity: inner.max_active_bytes,
+            });
+        }
+
         inner.tasks.insert(task_id, entry);
+        inner.active_sizes.insert(task_id, entry_bytes);
+        inner.active_bytes = inner.active_bytes.saturating_add(entry_bytes);
         inner.ready_queue.insert(QueueOrderKey {
             priority_rev: Reverse(priority),
             sequence,
@@ -1362,6 +1400,8 @@ impl TaskQueue {
         checkpoint: CheckpointData,
     ) -> Result<(), GridError> {
         let mut inner = self.inner.write().await;
+        let max_active = inner.max_active_bytes;
+        let active_bytes = inner.active_bytes;
         let entry = inner
             .tasks
             .get_mut(&task_id)
@@ -1371,7 +1411,15 @@ impl TaskQueue {
             return Ok(());
         }
 
-        Self::apply_checkpoint(entry, checkpoint);
+        if Self::checkpoint_exceeds_active_cap(entry, &checkpoint, active_bytes, max_active) {
+            return Err(GridError::QueueFull {
+                capacity: max_active,
+            });
+        }
+
+        if Self::apply_checkpoint(entry, checkpoint) {
+            inner.update_active_task(task_id);
+        }
         Ok(())
     }
 
@@ -1388,6 +1436,8 @@ impl TaskQueue {
         checkpoint: CheckpointData,
     ) -> Result<bool, GridError> {
         let mut inner = self.inner.write().await;
+        let max_active = inner.max_active_bytes;
+        let active_bytes = inner.active_bytes;
         let entry = inner
             .tasks
             .get_mut(&task_id)
@@ -1403,7 +1453,40 @@ impl TaskQueue {
             return Ok(false);
         }
 
-        Ok(Self::apply_checkpoint(entry, checkpoint))
+        if Self::checkpoint_exceeds_active_cap(entry, &checkpoint, active_bytes, max_active) {
+            return Err(GridError::QueueFull {
+                capacity: max_active,
+            });
+        }
+
+        let applied = Self::apply_checkpoint(entry, checkpoint);
+        if applied {
+            inner.update_active_task(task_id);
+        }
+        Ok(applied)
+    }
+
+    fn checkpoint_exceeds_active_cap(
+        entry: &TaskEntry,
+        checkpoint: &CheckpointData,
+        active_bytes: usize,
+        max_active_bytes: usize,
+    ) -> bool {
+        let is_newer = match &entry.task.latest_checkpoint {
+            Some(existing) => checkpoint.sequence > existing.sequence,
+            None => true,
+        };
+        if !is_newer {
+            return false;
+        }
+        let old_cp = entry
+            .task
+            .latest_checkpoint
+            .as_ref()
+            .map_or(0, |c| c.delta_state.0.len());
+        let new_cp = checkpoint.delta_state.0.len();
+        let projected = active_bytes.saturating_sub(old_cp).saturating_add(new_cp);
+        projected > max_active_bytes
     }
 
     fn apply_checkpoint(entry: &mut TaskEntry, checkpoint: CheckpointData) -> bool {
@@ -1602,6 +1685,8 @@ impl TaskQueue {
 
         if res_state.is_terminal() {
             inner.track_terminal_task(task_id);
+        } else {
+            inner.update_active_task(task_id);
         }
 
         Ok(ResultOutcome {
@@ -1768,10 +1853,14 @@ impl TaskQueue {
         }
 
         for key in delays_to_insert {
+            let tid = key.task_id;
             inner.delayed_retries.insert(key);
+            inner.update_active_task(tid);
         }
         for key in ready_to_insert {
+            let tid = key.task_id;
             inner.ready_queue.insert(key);
+            inner.update_active_task(tid);
         }
         for tid in terminal_to_track {
             inner.track_terminal_task(tid);
@@ -2031,6 +2120,17 @@ impl TaskQueue {
     /// Bytes currently charged for retained terminal tasks.
     pub async fn terminal_retained_bytes(&self) -> usize {
         self.inner.read().await.terminal_bytes
+    }
+
+    /// Dynamically adjusts the byte cap for active (non-terminal) tasks.
+    pub async fn set_max_active_bytes(&self, limit: usize) {
+        let mut inner = self.inner.write().await;
+        inner.max_active_bytes = limit;
+    }
+
+    /// Bytes currently charged for active (non-terminal) tasks.
+    pub async fn active_retained_bytes(&self) -> usize {
+        self.inner.read().await.active_bytes
     }
 
     /// Evicts oldest terminal tasks until at most `max_retained` terminal tasks remain.
@@ -3128,6 +3228,112 @@ mod tests {
         );
         finish_with_output(&queue, task, worker, 1).await;
         assert!(queue.terminal_retained_bytes().await >= 3 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_asset_bytes_are_charged_to_terminal_retention_budget() {
+        const MIB: usize = 1024 * 1024;
+        let queue =
+            TaskQueue::with_retention_limits(RetryPolicy::default(), None, 10_000, 5 * MIB / 2);
+        let worker = Uuid::new_v4();
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let id = submit_and_assign(&queue, echo_task(&format!("asset-{i}")), worker, 1).await;
+            let mut result = TaskResult::success(worker, id, "", 1, false);
+            result.asset_bytes = Some(rusty_grid_core::task::Bytes::from(vec![0u8; MIB]));
+            queue
+                .record_result_from(worker, Some(1), result)
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+
+        assert!(
+            queue.get_task(&ids[0]).await.is_none(),
+            "oldest task with 1 MiB asset_bytes must be evicted once the 2.5 MiB budget is exceeded"
+        );
+        assert!(
+            queue.get_task(&ids[1]).await.is_none(),
+            "second oldest task with 1 MiB asset_bytes must also be evicted"
+        );
+        assert!(queue.get_task(&ids[2]).await.is_some());
+        assert!(queue.get_task(&ids[3]).await.is_some());
+        assert!(queue.terminal_retained_bytes().await >= 2 * MIB);
+        assert!(queue.terminal_retained_bytes().await <= 5 * MIB / 2);
+    }
+
+    #[tokio::test]
+    async fn test_active_task_byte_cap_bounds_non_terminal_tasks_and_releases_on_completion() {
+        const MIB: usize = 1024 * 1024;
+        let queue = TaskQueue::new();
+        queue.set_max_active_bytes(5 * MIB / 2).await;
+        let worker = Uuid::new_v4();
+
+        let make_heavy_task = |label: &str, bytes: usize| {
+            Task::new(
+                TaskSpec::Command {
+                    program: "cat".into(),
+                    args: vec![label.to_string()],
+                    env: Default::default(),
+                    working_dir: None,
+                    stdin: Some(vec![b'a'; bytes]),
+                },
+                TaskRequirements::generic(1, 10),
+            )
+        };
+
+        let id1 = queue.submit(make_heavy_task("t1", MIB)).await.unwrap();
+        let id2 = queue.submit(make_heavy_task("t2", MIB)).await.unwrap();
+        assert!(
+            queue.active_retained_bytes().await >= 2 * MIB,
+            "active tasks must be charged toward active_retained_bytes"
+        );
+
+        let err = queue.submit(make_heavy_task("t3", MIB)).await.unwrap_err();
+        assert!(
+            matches!(err, GridError::QueueFull { .. }),
+            "third 1 MiB task must be rejected when active byte cap is 2.5 MiB, got {err:?}"
+        );
+
+        // Schedule id1 and verify an oversized checkpoint is also rejected by the active byte cap.
+        let scheduled = queue
+            .schedule_tasks_batch_in_sessions(&[(id1, worker, 1)])
+            .await;
+        assert_eq!(scheduled.len(), 1);
+        let cp_err = queue
+            .record_checkpoint_from(
+                worker,
+                Some(1),
+                id1,
+                CheckpointData::new(1, rusty_grid_core::task::Bytes::from(vec![0u8; MIB])),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(cp_err, GridError::QueueFull { .. }),
+            "checkpoint exceeding active byte cap must be rejected, got {cp_err:?}"
+        );
+
+        // Finishing id1 moves its charge from active to terminal, freeing room for t3.
+        queue
+            .record_result_from(
+                worker,
+                Some(1),
+                TaskResult::success(worker, id1, "done", 1, false),
+            )
+            .await
+            .unwrap();
+        assert!(queue.active_retained_bytes().await < 2 * MIB);
+
+        let id3 = queue
+            .submit(make_heavy_task("t3-after-finish", MIB))
+            .await
+            .expect("room freed after id1 completed");
+
+        // Cancelling id2 and id3 releases the remaining active byte charge completely.
+        queue.cancel_task(&id2, None).await.unwrap();
+        queue.cancel_task(&id3, None).await.unwrap();
+        assert_eq!(queue.active_retained_bytes().await, 0);
     }
 
     #[tokio::test]
