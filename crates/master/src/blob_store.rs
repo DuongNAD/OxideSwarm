@@ -6,9 +6,12 @@
 //!   BLAKE3 hash matches the id they were announced under. `tmp/` is emptied at start-up. The
 //!   directories are created (private to the owner) when the first blob arrives, so a master that
 //!   never stores a blob leaves no trace on disk.
-//! * **Bound.** The store keeps at most `max_bytes`, evicting the least recently used blobs when
-//!   a new one is stored. Blobs that a queued or running task needs are pinned and never evicted,
-//!   so the store can exceed its bound while pinned blobs alone fill it. The index lives in memory
+//! * **Bound.** The store keeps at most `max_bytes` across stored objects and uploads in progress,
+//!   evicting the least recently used blobs when a new one is uploaded or stored. Blobs that a
+//!   queued or running task needs are pinned and never evicted, so the store can exceed its bound
+//!   while pinned blobs alone fill it. Output blobs of finished tasks stay pinned for
+//!   `output_pin_retention`, bounded in total size by `max_bytes` (releasing the oldest terminal
+//!   output pins early when exceeded, never those of the newest task). The index lives in memory
 //!   and is rebuilt from the directory (oldest modification time first) when the Master starts.
 //! * **Trust.** Only authenticated peers reach the store; still, every upload is verified against
 //!   its id, every chunk is size-checked, and nothing a peer sends names a path: files are named
@@ -40,6 +43,9 @@ pub const STALE_UPLOAD_AFTER: Duration = Duration::from_secs(600);
 
 /// How long output blobs of a finished task stay pinned so the client can download them: 10 minutes.
 pub const DEFAULT_OUTPUT_PIN_RETENTION: Duration = Duration::from_secs(600);
+
+/// Maximum number of evicted blob files deleted per lock hold.
+const EVICTION_BATCH_SIZE: usize = 64;
 
 /// Where the blob store lives and how large it may grow.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +109,26 @@ struct Upload {
     last_chunk: Instant,
 }
 
+enum UploadSlot {
+    Idle(Upload),
+    Writing { total: u64 },
+}
+
+impl UploadSlot {
+    fn total(&self) -> u64 {
+        match self {
+            Self::Idle(u) => u.total,
+            Self::Writing { total } => *total,
+        }
+    }
+}
+
+struct OutputPinEntry {
+    pinned_at: Instant,
+    seq: u64,
+    ids: Vec<BlobId>,
+}
+
 #[derive(Default)]
 struct Inner {
     entries: HashMap<BlobId, Entry>,
@@ -110,10 +136,13 @@ struct Inner {
     lru: BTreeMap<u64, BlobId>,
     tick: u64,
     total_bytes: u64,
+    upload_bytes: u64,
     pins: HashMap<TaskId, (Instant, Vec<BlobId>)>,
-    output_pins: HashMap<TaskId, (Instant, Vec<BlobId>)>,
+    output_pins: HashMap<TaskId, OutputPinEntry>,
+    output_pin_counts: HashMap<BlobId, u32>,
+    output_pin_seq: u64,
     pin_counts: HashMap<BlobId, u32>,
-    uploads: HashMap<(u64, BlobId), Upload>,
+    uploads: HashMap<(u64, BlobId), UploadSlot>,
 }
 
 impl Inner {
@@ -155,11 +184,19 @@ impl Inner {
         Some(entry.size)
     }
 
+    fn output_pinned_bytes(&self) -> u64 {
+        self.output_pin_counts
+            .keys()
+            .filter_map(|id| self.entries.get(id).map(|e| e.size))
+            .sum()
+    }
+
     /// Unpinned blobs to drop, least recently used first, until the store fits `max_bytes`.
     /// Never drops `keep` (the blob just committed).
     fn eviction_victims(&mut self, max_bytes: u64, keep: Option<&BlobId>) -> Vec<BlobId> {
         let mut victims = Vec::new();
-        let mut excess = self.total_bytes.saturating_sub(max_bytes);
+        let used = self.total_bytes.saturating_add(self.upload_bytes);
+        let mut excess = used.saturating_sub(max_bytes);
         if excess == 0 {
             return victims;
         }
@@ -429,12 +466,15 @@ impl BlobStore {
                 self.max_bytes
             ));
         }
-        let upload = {
+        let (upload, need_evict) = {
             let mut inner = self.lock();
             if inner.touch(&id) {
                 // Already here (another peer uploaded it, or it was never missing).
                 if let Some(stale) = inner.uploads.remove(&(owner, id)) {
-                    let _ = std::fs::remove_file(&stale.tmp);
+                    inner.upload_bytes = inner.upload_bytes.saturating_sub(stale.total());
+                    if let UploadSlot::Idle(u) = stale {
+                        let _ = std::fs::remove_file(&u.tmp);
+                    }
                 }
                 return BlobReply::Written {
                     id,
@@ -444,13 +484,54 @@ impl BlobStore {
             }
             let existing = inner.uploads.remove(&(owner, id));
             match existing {
-                Some(upload) if offset != 0 => Some(upload),
-                Some(stale) => {
-                    // Starting over: drop the old attempt.
-                    let _ = std::fs::remove_file(&stale.tmp);
-                    None
+                Some(UploadSlot::Writing { total }) => {
+                    inner
+                        .uploads
+                        .insert((owner, id), UploadSlot::Writing { total });
+                    return failed(format!(
+                        "an upload of blob {id} is already writing a chunk on this connection"
+                    ));
                 }
-                None if offset == 0 => None,
+                Some(UploadSlot::Idle(upload)) if offset != 0 => {
+                    inner.uploads.insert(
+                        (owner, id),
+                        UploadSlot::Writing {
+                            total: upload.total,
+                        },
+                    );
+                    (Some(upload), false)
+                }
+                Some(UploadSlot::Idle(stale)) => {
+                    // Starting over: drop the old attempt.
+                    inner.upload_bytes = inner.upload_bytes.saturating_sub(stale.total);
+                    let _ = std::fs::remove_file(&stale.tmp);
+                    if inner.upload_bytes.saturating_add(total_size) > self.max_bytes {
+                        return failed(format!(
+                            "cannot upload blob {id} ({total_size} bytes): uploads in progress \
+                             already reserve {} of {} bytes; retry or raise `master --blob-store-mb`",
+                            inner.upload_bytes, self.max_bytes
+                        ));
+                    }
+                    inner.upload_bytes = inner.upload_bytes.saturating_add(total_size);
+                    inner
+                        .uploads
+                        .insert((owner, id), UploadSlot::Writing { total: total_size });
+                    (None, true)
+                }
+                None if offset == 0 => {
+                    if inner.upload_bytes.saturating_add(total_size) > self.max_bytes {
+                        return failed(format!(
+                            "cannot upload blob {id} ({total_size} bytes): uploads in progress \
+                             already reserve {} of {} bytes; retry or raise `master --blob-store-mb`",
+                            inner.upload_bytes, self.max_bytes
+                        ));
+                    }
+                    inner.upload_bytes = inner.upload_bytes.saturating_add(total_size);
+                    inner
+                        .uploads
+                        .insert((owner, id), UploadSlot::Writing { total: total_size });
+                    (None, true)
+                }
                 None => {
                     return failed(format!(
                         "no upload of blob {id} in progress here; start at offset 0"
@@ -458,6 +539,9 @@ impl BlobStore {
                 }
             }
         };
+        if need_evict {
+            self.evict_to_fit(None);
+        }
 
         let store = Arc::clone(self);
         let outcome = tokio::task::spawn_blocking(move || {
@@ -466,7 +550,13 @@ impl BlobStore {
         .await;
         match outcome {
             Ok(reply) => reply,
-            Err(e) => failed(format!("storing blob {id} failed: {e}")),
+            Err(e) => {
+                let mut inner = self.lock();
+                if let Some(slot) = inner.uploads.remove(&(owner, id)) {
+                    inner.upload_bytes = inner.upload_bytes.saturating_sub(slot.total());
+                }
+                failed(format!("storing blob {id} failed: {e}"))
+            }
         }
     }
 
@@ -481,6 +571,12 @@ impl BlobStore {
         data: &[u8],
         upload: Option<Upload>,
     ) -> BlobReply {
+        let abandon_slot = |this: &Self| {
+            let mut inner = this.lock();
+            if let Some(slot) = inner.uploads.remove(&(owner, id)) {
+                inner.upload_bytes = inner.upload_bytes.saturating_sub(slot.total());
+            }
+        };
         let mut upload = match upload {
             Some(upload) => upload,
             None => {
@@ -494,11 +590,16 @@ impl BlobStore {
                         total: total_size,
                         last_chunk: Instant::now(),
                     },
-                    Err(e) => return failed(format!("cannot store blob {id}: {e}")),
+                    Err(e) => {
+                        abandon_slot(self);
+                        return failed(format!("cannot store blob {id}: {e}"));
+                    }
                 }
             }
         };
         let abandon = |upload: Upload, reply: BlobReply| {
+            abandon_slot(self);
+            drop(upload.file);
             let _ = std::fs::remove_file(&upload.tmp);
             reply
         };
@@ -528,49 +629,74 @@ impl BlobStore {
 
         if upload.received < total_size {
             let received = upload.received;
-            self.lock().uploads.insert((owner, id), upload);
-            return BlobReply::Written {
-                id,
-                received,
-                complete: false,
-            };
+            let mut inner = self.lock();
+            if let Some(slot @ UploadSlot::Writing { .. }) = inner.uploads.get_mut(&(owner, id)) {
+                *slot = UploadSlot::Idle(upload);
+                return BlobReply::Written {
+                    id,
+                    received,
+                    complete: false,
+                };
+            }
+            drop(inner);
+            drop(upload.file);
+            let _ = std::fs::remove_file(&upload.tmp);
+            return failed(format!("upload of blob {id} was aborted"));
         }
-        self.commit(id, upload)
+        self.commit(owner, id, upload)
     }
 
-    fn commit(&self, id: BlobId, upload: Upload) -> BlobReply {
+    fn commit(&self, owner: u64, id: BlobId, upload: Upload) -> BlobReply {
+        let abandon_slot = |this: &Self| {
+            let mut inner = this.lock();
+            if let Some(slot) = inner.uploads.remove(&(owner, id)) {
+                inner.upload_bytes = inner.upload_bytes.saturating_sub(slot.total());
+            }
+        };
         let actual = upload.hasher.finish();
         if actual != id {
+            abandon_slot(self);
+            drop(upload.file);
             let _ = std::fs::remove_file(&upload.tmp);
             return failed(format!(
                 "the uploaded content of blob {id} hashes to {actual} (did the file change during the upload?)"
             ));
         }
         if let Err(e) = upload.file.sync_all() {
+            abandon_slot(self);
+            drop(upload.file);
             let _ = std::fs::remove_file(&upload.tmp);
             return failed(format!("cannot store blob {id}: {e}"));
         }
         drop(upload.file);
         let dest = object_path(&self.objects, &id);
-        let placed = dest
-            .parent()
-            .map_or(Ok(()), create_private_dir_all)
-            .and_then(|()| std::fs::rename(&upload.tmp, &dest));
-        if let Err(e) = placed {
-            let _ = std::fs::remove_file(&upload.tmp);
-            if !dest.exists() {
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = create_private_dir_all(parent) {
+                abandon_slot(self);
+                let _ = std::fs::remove_file(&upload.tmp);
                 return failed(format!("cannot store blob {id}: {e}"));
             }
+        }
+        {
+            let mut inner = self.lock();
+            let Some(slot) = inner.uploads.remove(&(owner, id)) else {
+                drop(inner);
+                let _ = std::fs::remove_file(&upload.tmp);
+                return failed(format!("upload of blob {id} was aborted"));
+            };
+            inner.upload_bytes = inner.upload_bytes.saturating_sub(slot.total());
+            if let Err(e) = std::fs::rename(&upload.tmp, &dest) {
+                let _ = std::fs::remove_file(&upload.tmp);
+                if !dest.exists() {
+                    return failed(format!("cannot store blob {id}: {e}"));
+                }
+            }
+            inner.insert(id, upload.total);
         }
         self.blobs_received.fetch_add(1, Ordering::Relaxed);
         self.bytes_received
             .fetch_add(upload.total, Ordering::Relaxed);
-        let victims = {
-            let mut inner = self.lock();
-            inner.insert(id, upload.total);
-            inner.eviction_victims(self.max_bytes, Some(&id))
-        };
-        self.delete_objects(&victims);
+        self.evict_to_fit(Some(&id));
         debug!(blob = %id, bytes = upload.total, "Blob stored");
         BlobReply::Written {
             id,
@@ -579,21 +705,55 @@ impl BlobStore {
         }
     }
 
-    fn delete_objects(&self, victims: &[BlobId]) {
-        if victims.is_empty() {
-            return;
-        }
-        self.evictions
-            .fetch_add(victims.len() as u64, Ordering::Relaxed);
-        for id in victims {
-            if let Err(e) = std::fs::remove_file(object_path(&self.objects, id)) {
-                debug!(blob = %id, error = %e, "Could not delete an evicted blob");
+    /// Evicts least recently used unpinned blobs, at most [`EVICTION_BATCH_SIZE`] files per lock
+    /// hold, until `total_bytes + upload_bytes <= max_bytes`. Never drops `keep`.
+    fn evict_to_fit(&self, keep: Option<&BlobId>) -> usize {
+        let mut total_evicted = 0;
+        loop {
+            let batch = {
+                let mut inner = self.lock();
+                let used = inner.total_bytes.saturating_add(inner.upload_bytes);
+                let mut excess = used.saturating_sub(self.max_bytes);
+                if excess == 0 {
+                    break;
+                }
+                let mut victims = Vec::with_capacity(EVICTION_BATCH_SIZE);
+                for id in inner.lru.values() {
+                    if excess == 0 || victims.len() >= EVICTION_BATCH_SIZE {
+                        break;
+                    }
+                    if inner.pin_counts.contains_key(id) || keep == Some(id) {
+                        continue;
+                    }
+                    let size = inner.entries[id].size;
+                    excess = excess.saturating_sub(size.max(1));
+                    victims.push(*id);
+                }
+                if victims.is_empty() {
+                    break;
+                }
+                for id in &victims {
+                    inner.remove(id);
+                    if let Err(e) = std::fs::remove_file(object_path(&self.objects, id)) {
+                        debug!(blob = %id, error = %e, "Could not delete an evicted blob");
+                    }
+                }
+                victims.len()
+            };
+            total_evicted += batch;
+            if batch < EVICTION_BATCH_SIZE {
+                break;
             }
         }
-        info!(
-            evicted = victims.len(),
-            "Blob store over its bound; evicted the least recently used blobs"
-        );
+        if total_evicted > 0 {
+            self.evictions
+                .fetch_add(total_evicted as u64, Ordering::Relaxed);
+            info!(
+                evicted = total_evicted,
+                "Blob store over its bound; evicted the least recently used blobs"
+            );
+        }
+        total_evicted
     }
 
     /// Stores `data` as a blob (for in-process callers such as tests); returns its id.
@@ -649,10 +809,18 @@ impl BlobStore {
                 .copied()
                 .collect();
             keys.into_iter()
-                .filter_map(|key| inner.uploads.remove(&key))
+                .filter_map(|key| {
+                    let slot = inner.uploads.remove(&key)?;
+                    inner.upload_bytes = inner.upload_bytes.saturating_sub(slot.total());
+                    match slot {
+                        UploadSlot::Idle(upload) => Some(upload),
+                        UploadSlot::Writing { .. } => None,
+                    }
+                })
                 .collect()
         };
         for upload in dropped {
+            drop(upload.file);
             let _ = std::fs::remove_file(&upload.tmp);
         }
     }
@@ -664,15 +832,24 @@ impl BlobStore {
             let keys: Vec<_> = inner
                 .uploads
                 .iter()
-                .filter(|(_, u)| u.last_chunk.elapsed() > STALE_UPLOAD_AFTER)
-                .map(|(k, _)| *k)
+                .filter_map(|(k, slot)| match slot {
+                    UploadSlot::Idle(u) if u.last_chunk.elapsed() > STALE_UPLOAD_AFTER => Some(*k),
+                    _ => None,
+                })
                 .collect();
             keys.into_iter()
-                .filter_map(|key| inner.uploads.remove(&key))
+                .filter_map(|key| match inner.uploads.remove(&key)? {
+                    UploadSlot::Idle(u) => {
+                        inner.upload_bytes = inner.upload_bytes.saturating_sub(u.total);
+                        Some(u)
+                    }
+                    UploadSlot::Writing { .. } => None,
+                })
                 .collect()
         };
         for upload in stale {
             warn!(tmp = %upload.tmp.display(), "Abandoning a blob upload that stalled");
+            drop(upload.file);
             let _ = std::fs::remove_file(&upload.tmp);
         }
     }
@@ -748,16 +925,18 @@ impl BlobStore {
 
     /// Releases the pins of `task_id` (it finished, failed or was cancelled).
     pub fn unpin_task(&self, task_id: &TaskId) {
-        let victims = {
+        let released = {
             let mut inner = self.lock();
             if let Some((_, ids)) = inner.pins.remove(task_id) {
                 release_pins(&mut inner, ids);
-                inner.eviction_victims(self.max_bytes, None)
+                true
             } else {
-                Vec::new()
+                false
             }
         };
-        self.delete_objects(&victims);
+        if released {
+            self.evict_to_fit(None);
+        }
     }
 
     /// Tasks that currently pin blobs, with when they pinned them.
@@ -805,26 +984,28 @@ impl BlobStore {
     /// Releases output pins of terminal tasks that have been held for at least
     /// [`BlobStore::output_pin_retention`].
     pub fn sweep_expired_output_pins(&self) {
-        let victims = {
+        let released = {
             let mut inner = self.lock();
             let expired: Vec<TaskId> = inner
                 .output_pins
                 .iter()
-                .filter(|(_, (pinned_at, _))| pinned_at.elapsed() >= self.output_pin_retention)
+                .filter(|(_, entry)| entry.pinned_at.elapsed() >= self.output_pin_retention)
                 .map(|(task_id, _)| *task_id)
                 .collect();
             if expired.is_empty() {
-                Vec::new()
+                false
             } else {
                 for task_id in expired {
-                    if let Some((_, ids)) = inner.output_pins.remove(&task_id) {
-                        release_pins(&mut inner, ids);
+                    if let Some(entry) = inner.output_pins.remove(&task_id) {
+                        release_output_pins(&mut inner, entry.ids);
                     }
                 }
-                inner.eviction_victims(self.max_bytes, None)
+                true
             }
         };
-        self.delete_objects(&victims);
+        if released {
+            self.evict_to_fit(None);
+        }
     }
 }
 
@@ -838,16 +1019,47 @@ pub struct OutputPinGuard {
 
 impl OutputPinGuard {
     /// Binds the pinned output blobs to `task_id` for [`BlobStore::output_pin_retention`] after
-    /// the task reached a terminal state.
+    /// the task reached a terminal state. When total pinned output bytes exceed `max_bytes`,
+    /// releases the oldest terminal output pins early, never those of `task_id`.
     pub fn commit_terminal(mut self, task_id: TaskId) {
         let ids = std::mem::take(&mut self.ids);
         if ids.is_empty() {
             return;
         }
-        let mut inner = self.store.lock();
-        if let Some((_, previous)) = inner.output_pins.insert(task_id, (Instant::now(), ids)) {
-            release_pins(&mut inner, previous);
+        {
+            let mut inner = self.store.lock();
+            for &id in &ids {
+                *inner.output_pin_counts.entry(id).or_insert(0) += 1;
+            }
+            inner.output_pin_seq += 1;
+            let seq = inner.output_pin_seq;
+            if let Some(previous) = inner.output_pins.insert(
+                task_id,
+                OutputPinEntry {
+                    pinned_at: Instant::now(),
+                    seq,
+                    ids,
+                },
+            ) {
+                release_output_pins(&mut inner, previous.ids);
+            }
+            while inner.output_pins.len() > 1 && inner.output_pinned_bytes() > self.store.max_bytes
+            {
+                let Some(oldest_task) = inner
+                    .output_pins
+                    .iter()
+                    .filter(|(&tid, _)| tid != task_id)
+                    .min_by_key(|(_, entry)| entry.seq)
+                    .map(|(&tid, _)| tid)
+                else {
+                    break;
+                };
+                if let Some(removed) = inner.output_pins.remove(&oldest_task) {
+                    release_output_pins(&mut inner, removed.ids);
+                }
+            }
         }
+        self.store.evict_to_fit(None);
     }
 }
 
@@ -883,6 +1095,18 @@ fn release_pins(inner: &mut Inner, ids: Vec<BlobId>) {
             }
         }
     }
+}
+
+fn release_output_pins(inner: &mut Inner, ids: Vec<BlobId>) {
+    for &id in &ids {
+        if let Some(count) = inner.output_pin_counts.get_mut(&id) {
+            *count -= 1;
+            if *count == 0 {
+                inner.output_pin_counts.remove(&id);
+            }
+        }
+    }
+    release_pins(inner, ids);
 }
 
 #[cfg(test)]
@@ -1146,5 +1370,229 @@ mod tests {
             std::fs::read_dir(dir.path().join("tmp")).unwrap().count(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn uploads_in_progress_count_towards_max_bytes_and_cannot_exceed_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path(), 3000);
+        let a = store.put(&vec![1u8; 1000]).await.unwrap();
+        let b = store.put(&vec![2u8; 1000]).await.unwrap();
+        assert!(store.contains(&a) && store.contains(&b));
+
+        // Starting a 2000-byte upload in `tmp/` brings `bytes + upload_bytes` to 4000 > 3000,
+        // so the oldest unpinned blob `a` must be evicted immediately.
+        let c_data = vec![3u8; 2000];
+        let c_id = BlobId::of(&c_data);
+        let owner1 = store.new_owner();
+        let reply1 = store
+            .handle(
+                owner1,
+                BlobRequest::Write {
+                    id: c_id,
+                    total_size: 2000,
+                    offset: 0,
+                    data: Bytes::from(c_data[..1000].to_vec()),
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                reply1,
+                BlobReply::Written {
+                    complete: false,
+                    ..
+                }
+            ),
+            "{reply1:?}"
+        );
+        assert!(
+            !store.contains(&a),
+            "in-progress upload in tmp/ must evict oldest unpinned blob to stay within max_bytes"
+        );
+        assert!(store.contains(&b));
+
+        // A second concurrent 2000-byte upload while 2000 bytes are already reserved in `tmp/`
+        // would push `tmp/` alone to 4000 > 3000 and must be refused.
+        let d_data = vec![4u8; 2000];
+        let d_id = BlobId::of(&d_data);
+        let owner2 = store.new_owner();
+        let reply2 = store
+            .handle(
+                owner2,
+                BlobRequest::Write {
+                    id: d_id,
+                    total_size: 2000,
+                    offset: 0,
+                    data: Bytes::from(d_data[..1000].to_vec()),
+                },
+            )
+            .await;
+        assert!(
+            matches!(reply2, BlobReply::Failed { .. }),
+            "concurrent uploads exceeding max_bytes must fail, got {reply2:?}"
+        );
+
+        store.abort_uploads(owner1);
+    }
+
+    #[tokio::test]
+    async fn abort_uploads_while_chunk_is_in_flight_does_not_reinsert_or_leak_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path(), 1 << 30);
+        let data = vec![7u8; BLOB_CHUNK_BYTES * 2];
+        let id = BlobId::of(&data);
+        let owner = store.new_owner();
+
+        // Simulate the state while `write_chunk` has handed chunk 0 to `spawn_blocking(append)`:
+        // if `abort_uploads(owner)` runs before `append` finishes, `append` must not put the
+        // upload back into `inner.uploads` or leave its `.part` file in `tmp/`.
+        store.abort_uploads(owner);
+        let reply = store.append(
+            owner,
+            id,
+            data.len() as u64,
+            0,
+            &data[..BLOB_CHUNK_BYTES],
+            None,
+        );
+        assert!(
+            matches!(reply, BlobReply::Failed { .. }),
+            "append for an aborted owner must fail instead of re-inserting, got {reply:?}"
+        );
+        assert_eq!(store.stats().uploads, 0);
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("tmp"))
+                .map(|d| d.count())
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn output_pins_exceeding_max_bytes_release_oldest_terminal_pins_early_but_keep_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path(), 3000);
+        let out1 = store.put(&vec![1u8; 1200]).await.unwrap();
+        store
+            .check_and_pin_outputs(&[out1])
+            .unwrap()
+            .commit_terminal(TaskId::new());
+        let out2 = store.put(&vec![2u8; 1200]).await.unwrap();
+        store
+            .check_and_pin_outputs(&[out2])
+            .unwrap()
+            .commit_terminal(TaskId::new());
+        assert_eq!(store.stats().pinned_blobs, 2);
+        assert!(store.contains(&out1) && store.contains(&out2));
+
+        // Third 1200-byte output brings pinned output bytes to 3600 > 3000 (max_bytes):
+        // the oldest terminal output pin (`out1`) must be released early and evicted.
+        let out3 = store.put(&vec![3u8; 1200]).await.unwrap();
+        store
+            .check_and_pin_outputs(&[out3])
+            .unwrap()
+            .commit_terminal(TaskId::new());
+        assert!(
+            !store.contains(&out1),
+            "oldest terminal output pin must be released early and evicted when output pins exceed max_bytes"
+        );
+        assert!(store.contains(&out2) && store.contains(&out3));
+        assert_eq!(store.stats().pinned_blobs, 2);
+        assert!(store.stats().bytes <= 3000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn eviction_and_concurrent_commit_of_same_blob_never_leaves_index_without_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path(), 8000);
+        let mut pinned = Vec::new();
+        for i in 0..7u8 {
+            pinned.push(store.put(&vec![i + 10; 1000]).await.unwrap());
+        }
+        store.pin_task(TaskId::new(), pinned);
+
+        let a_data = vec![0x41u8; 1000];
+        let a_id = BlobId::of(&a_data);
+
+        for round in 0..200u32 {
+            // Prepare 7 connections that have already sent the first 500 bytes of `a` while `a`
+            // is not yet in `entries`, so their second chunk will run `append -> commit(a)`.
+            store.lock().remove(&a_id);
+            let _ = std::fs::remove_file(object_path(&store.objects, &a_id));
+            let mut owners = Vec::with_capacity(7);
+            for _ in 0..7 {
+                let owner = store.new_owner();
+                let r = store
+                    .handle(
+                        owner,
+                        BlobRequest::Write {
+                            id: a_id,
+                            total_size: 1000,
+                            offset: 0,
+                            data: Bytes::from(a_data[..500].to_vec()),
+                        },
+                    )
+                    .await;
+                assert!(
+                    matches!(
+                        r,
+                        BlobReply::Written {
+                            complete: false,
+                            ..
+                        }
+                    ),
+                    "{r:?}"
+                );
+                owners.push(owner);
+            }
+            // Commit `a` once so it is the eviction victim when `b` commits.
+            let first = owners.pop().unwrap();
+            let r = store
+                .handle(
+                    first,
+                    BlobRequest::Write {
+                        id: a_id,
+                        total_size: 1000,
+                        offset: 500,
+                        data: Bytes::from(a_data[500..].to_vec()),
+                    },
+                )
+                .await;
+            assert!(matches!(r, BlobReply::Written { complete: true, .. }));
+
+            let mut b_data = vec![0x42u8; 1000];
+            b_data[..4].copy_from_slice(&round.to_le_bytes());
+            let store_b = Arc::clone(&store);
+            let evictor = tokio::spawn(async move {
+                let _ = store_b.put(&b_data).await;
+            });
+            let mut committers = Vec::new();
+            for owner in owners {
+                let store_a = Arc::clone(&store);
+                let tail = Bytes::from(a_data[500..].to_vec());
+                let upload = match store_a
+                    .lock()
+                    .uploads
+                    .insert((owner, a_id), UploadSlot::Writing { total: 1000 })
+                {
+                    Some(UploadSlot::Idle(u)) => Some(u),
+                    _ => None,
+                };
+                committers.push(tokio::task::spawn_blocking(move || {
+                    let _ = store_a.append(owner, a_id, 1000, 500, tail.as_bytes(), upload);
+                }));
+            }
+            let _ = evictor.await;
+            for c in committers {
+                let _ = c.await;
+            }
+            if store.contains(&a_id) {
+                assert!(
+                    object_path(&store.objects, &a_id).exists(),
+                    "round {round}: index contains {a_id} after concurrent eviction+commit, but its file was deleted from disk"
+                );
+            }
+        }
     }
 }

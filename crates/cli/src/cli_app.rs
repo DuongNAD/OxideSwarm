@@ -2456,6 +2456,7 @@ async fn run_submit_with_secret(
             }
 
             let output_dir = args.output_dir.as_deref().unwrap_or(Path::new("."));
+            let mut download_failed = false;
             let saved_outputs = if result.outputs.is_empty() {
                 None
             } else {
@@ -2475,7 +2476,8 @@ async fn run_submit_with_secret(
                     Ok(saved) => Some(saved),
                     Err(e) => {
                         eprintln!("Downloading the output files failed: {e}");
-                        return ExitCode::FAILURE;
+                        download_failed = true;
+                        None
                     }
                 }
             };
@@ -2511,7 +2513,11 @@ async fn run_submit_with_secret(
                 }
                 println!("{}", serde_json::to_string_pretty(&value).unwrap());
             } else {
-                println!("Task {task_id} completed successfully.");
+                if result.is_success() {
+                    println!("Task {task_id} completed successfully.");
+                } else {
+                    println!("Task {task_id} failed.");
+                }
                 match &worker_name {
                     Some(name) => println!("Worker: {name} ({})", result.worker_id),
                     None => println!("Worker: {}", result.worker_id),
@@ -2556,11 +2562,18 @@ async fn run_submit_with_secret(
                 if !result.stderr.is_empty() {
                     eprintln!("Stderr:\n{}", result.stderr_str().trim());
                 }
+                if let Some(ref error) = result.error {
+                    eprintln!("Error: {error}");
+                }
             }
-            if result.exit_code == 0 {
+            if download_failed {
+                ExitCode::FAILURE
+            } else if result.is_success() {
                 ExitCode::SUCCESS
-            } else {
+            } else if result.exit_code != 0 {
                 ExitCode::from(result.exit_code.min(255) as u8)
+            } else {
+                ExitCode::FAILURE
             }
         }
         ClientResponse::Error { message } => {

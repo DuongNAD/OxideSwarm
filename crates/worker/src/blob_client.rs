@@ -184,26 +184,36 @@ async fn fetch_missing(
     Ok(())
 }
 
+struct TempPartFile {
+    path: std::path::PathBuf,
+    adopted: bool,
+}
+
+impl Drop for TempPartFile {
+    fn drop(&mut self) {
+        if !self.adopted {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 async fn fetch_one(
     client: &BlobClient,
     cache: &Arc<BlobCache>,
     id: BlobId,
     size: u64,
 ) -> Result<u64, BlobError> {
-    let tmp = cache.temp_path();
-    let outcome = async {
-        let mut file = tokio::fs::File::create(&tmp).await?;
-        let bytes = download_blob(client, id, Some(size), &mut file).await?;
-        file.sync_all().await?;
-        drop(file);
-        cache.adopt(&tmp, id, size)?;
-        Ok(bytes)
-    }
-    .await;
-    if outcome.is_err() {
-        let _ = tokio::fs::remove_file(&tmp).await;
-    }
-    outcome
+    let mut tmp = TempPartFile {
+        path: cache.temp_path(),
+        adopted: false,
+    };
+    let mut file = tokio::fs::File::create(&tmp.path).await?;
+    let bytes = download_blob(client, id, Some(size), &mut file).await?;
+    file.sync_all().await?;
+    drop(file);
+    cache.adopt(&tmp.path, id, size)?;
+    tmp.adopted = true;
+    Ok(bytes)
 }
 
 /// Uploads the output blobs of `result` that the Master lacks, from `cache`. Without a client
@@ -685,6 +695,75 @@ mod tests {
         assert!(
             peak <= MAX_IN_FLIGHT_REQUESTS,
             "saw {peak} concurrent requests in flight, limit is {MAX_IN_FLIGHT_REQUESTS}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_fetch_task_inputs_removes_partial_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(dir.path(), 1 << 30).unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let client = BlobClient::new(tx);
+
+        let data = vec![0x5au8; rusty_grid_core::blob_transfer::BLOB_CHUNK_BYTES + 1024];
+        let id = BlobId::of(&data);
+        let (first_chunk_written_tx, first_chunk_written_rx) = oneshot::channel::<()>();
+
+        let responder_client = Arc::clone(&client);
+        let responder_data = data.clone();
+        tokio::spawn(async move {
+            let mut held_second_request = None;
+            let mut notify = Some(first_chunk_written_tx);
+            while let Some(WorkerMessage::BlobRequest {
+                request_id,
+                request,
+            }) = rx.recv().await
+            {
+                if let BlobRequest::Read {
+                    id,
+                    offset,
+                    max_len,
+                } = request
+                {
+                    if offset == 0 {
+                        let end = (max_len as usize).min(responder_data.len());
+                        responder_client.deliver(
+                            request_id,
+                            BlobReply::Chunk {
+                                id,
+                                offset: 0,
+                                total_size: responder_data.len() as u64,
+                                data: responder_data[..end].to_vec().into(),
+                            },
+                        );
+                    } else {
+                        // Chunk 0 has been written to `.part`; hold chunk 1 so cancellation drops `fetch_one`.
+                        held_second_request = Some(request_id);
+                        if let Some(tx) = notify.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                }
+            }
+            let _ = held_second_request;
+        });
+
+        let task = task_with(vec![TaskInput::file(
+            "large.bin",
+            id,
+            data.len() as u64,
+            false,
+        )]);
+        let fetch = fetch_task_inputs(&task, Some(&client), &cache);
+        tokio::select! {
+            res = fetch => panic!("fetch should not complete before cancellation: {res:?}"),
+            _ = first_chunk_written_rx => {}
+        }
+
+        let remaining_tmp = std::fs::read_dir(dir.path().join("tmp")).unwrap().count();
+        assert_eq!(
+            remaining_tmp, 0,
+            "cancelling a fetch must remove its partial .part file from tmp/"
         );
     }
 }
