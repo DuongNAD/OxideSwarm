@@ -23,11 +23,11 @@ import json
 import os
 import platform
 import re
+import select
 import shutil
 import socket
 import subprocess
 import sys
-import threading
 import time
 import unicodedata
 
@@ -47,6 +47,7 @@ PYTHON_CMD = "python" if SELF_SHORT == "win" else "python3"
 
 # Claude Code wakes the model when an `asyncRewake` hook exits with this code.
 HOOK_WAKE_EXIT_CODE = 2
+GIT_TIMEOUT_SECS = 20
 MAX_TITLE_CHARS = 120
 PEER_STALE_MINUTES = 5
 STATE_RETENTION_SECS = 30 * 24 * 3600
@@ -228,19 +229,25 @@ def find_repo_dir(explicit_repo=None):
     return None
 
 
+def git_output(repo_dir, *args):
+    """Runs git without our stdin and with a time limit, so it cannot outlast `watch --max-wait`."""
+    return subprocess.check_output(
+        ["git", *args],
+        cwd=repo_dir,
+        stdin=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=GIT_TIMEOUT_SECS,
+    ).strip()
+
+
 def get_git_info(repo_dir):
     if not repo_dir:
         return {"found": False}
     try:
-        head = subprocess.check_output(
-            ["git", "rev-parse", "--short=12", "HEAD"], cwd=repo_dir, stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        branch = subprocess.check_output(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_dir, stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        status_out = subprocess.check_output(
-            ["git", "status", "--porcelain"], cwd=repo_dir, stderr=subprocess.DEVNULL, text=True
-        ).strip()
+        head = git_output(repo_dir, "rev-parse", "--short=12", "HEAD")
+        branch = git_output(repo_dir, "rev-parse", "--abbrev-ref", "HEAD")
+        status_out = git_output(repo_dir, "status", "--porcelain")
         dirty_files = [line.strip() for line in status_out.splitlines() if line.strip()]
         return {
             "found": True,
@@ -687,18 +694,41 @@ def acquire_watch_lock(consumer, session):
     return handle
 
 
-def read_hook_session_id():
-    """Reads the session id from the hook input on stdin, without blocking on a stdin that stays open."""
+def stdin_is_readable(fd):
+    """True when a read returns at once: data is waiting, or the writer is gone."""
+    if os.name != "nt":
+        return bool(select.select([fd], [], [], 0)[0])
+    import _winapi
+    import msvcrt
+
+    try:
+        return _winapi.PeekNamedPipe(msvcrt.get_osfhandle(fd))[0] > 0
+    except OSError:
+        # The writer closed the pipe, or stdin is a file.
+        return True
+
+
+def read_hook_session_id(timeout=1.0):
+    """Reads the session id from the hook input on stdin, which a host may leave open.
+
+    It polls and reads only what is there. A blocking read would stay pending, and on Windows a
+    pending read can block every process that inherits the handle.
+    """
     if sys.stdin is None or sys.stdin.isatty():
         return None
-    received = []
-    reader = threading.Thread(target=lambda: received.append(sys.stdin.read()), daemon=True)
-    reader.start()
-    reader.join(1.0)
-    if not received:
-        return None
+    fd = sys.stdin.fileno()
+    received = b""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not stdin_is_readable(fd):
+            time.sleep(0.02)
+            continue
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        received += chunk
     try:
-        return json.loads(received[0]).get("session_id")
+        return json.loads(received).get("session_id")
     except (ValueError, AttributeError):
         return None
 

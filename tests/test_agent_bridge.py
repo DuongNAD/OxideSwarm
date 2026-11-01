@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.environ.get("OX_SCRIPT_ROOT") or os.path.join(HERE, ".."))
@@ -301,6 +302,53 @@ class ClaudeCodeHook(BridgeCase):
         self.write_message()
         child.wait(timeout=WAIT)
         self.assertEqual(child.returncode, 2)
+
+    def read_session_id(self, hook_input):
+        """Returns the session id a process reads while its stdin stays open, and its live threads."""
+        code = (
+            "import importlib.util, json, sys, threading\n"
+            "spec = importlib.util.spec_from_file_location('agent_bridge', sys.argv[1])\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(module)\n"
+            "print(json.dumps([module.read_hook_session_id(), threading.active_count()]))\n"
+        )
+        child = subprocess.Popen(
+            [sys.executable, "-c", code, SCRIPT],
+            cwd=self.tmp,
+            env=self.env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.children.append(child)
+        child.stdin.write(hook_input)
+        child.stdin.flush()
+        child.wait(timeout=WAIT)
+        stdout, stderr = child.communicate()
+        self.assertEqual(child.returncode, 0, stderr)
+        return json.loads(stdout)
+
+    def test_no_read_stays_pending_on_a_stdin_that_stays_open(self):
+        # On Windows a pending read can block any process that inherits stdin, such as git.
+        self.assertEqual(self.read_session_id(b""), [None, 1])
+
+    def test_the_session_id_arrives_on_a_stdin_that_stays_open(self):
+        self.assertEqual(self.read_session_id(b'{"session_id": "s1"}'), ["s1", 1])
+
+
+class GitCalls(unittest.TestCase):
+    def test_a_stuck_git_cannot_hold_the_watcher_past_its_deadline(self):
+        stuck = subprocess.TimeoutExpired("git", 1)
+        with mock.patch.object(bridge_module.subprocess, "check_output", side_effect=stuck) as git:
+            self.assertFalse(bridge_module.get_git_info("repo")["found"])
+        self.assertGreater(git.call_args.kwargs["timeout"], 0)
+
+    def test_git_does_not_inherit_the_stdin_of_the_hook(self):
+        with mock.patch.object(bridge_module.subprocess, "check_output", return_value="") as git:
+            bridge_module.get_git_info("repo")
+        self.assertEqual(git.call_count, 3)
+        for call in git.call_args_list:
+            self.assertEqual(call.kwargs["stdin"], subprocess.DEVNULL)
 
 
 @unittest.skipIf(os.path.exists("G:\\"), "a real Google Drive is mounted on this machine")

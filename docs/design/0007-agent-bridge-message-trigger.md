@@ -79,6 +79,10 @@ uses an OS file lock, which ends with the process. Later hooks exit at once.
 - `--heartbeat-every` (default 60 s) separates writes to the hub from polling.
 - `--auto-pull` runs `git pull --ff-only` on the checked-out branch.
 - `send` reports how long ago the peer published state, because a stale peer has no watcher.
+- `read_hook_session_id` polls stdin and leaves no read pending. An earlier version read in a
+  background thread, and it hung on Windows, past `--max-wait`, when stdin stayed open.
+- `get_git_info` runs git without stdin and with a limit of 20 s, so a stuck git cannot outlast
+  `--max-wait`.
 
 ## Compatibility
 
@@ -101,7 +105,8 @@ claims exist yet. `scripts/agent_bridge.py` is mirrored in the hub, so that copy
 
 - `tests/test_agent_bridge.py` runs the real script against a temporary hub on Linux, macOS and
   Windows in CI: delivery, restart, concurrent watchers, consumers, incidents, outage, code page,
-  empty files, heartbeat rate, `--on-event` injection, hook mode, inert behaviour without a hub.
+  empty files, heartbeat rate, `--on-event` injection, hook mode, a stdin left open, a stuck git,
+  inert behaviour without a hub.
 - Targeted mutations of the script were caught by those tests.
 - A headless Claude Code 2.1.308 session on macOS was woken twice while idle, by two files written to
   a temporary hub. The watcher had rearmed itself after the first wake.
@@ -122,3 +127,5 @@ claims exist yet. `scripts/agent_bridge.py` is mirrored in the hub, so that copy
 
 - 2026-11-01: W1, W2 and W4 implemented. W3 is Partial because the Windows toast has not run. W5
   waits for the two machines.
+- 2026-11-01: `watch --hook` no longer leaves a read pending on stdin, and git calls have a time
+  limit, after `agent bridge (windows-latest)` timed out on pull request 7.
