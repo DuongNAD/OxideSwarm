@@ -61,6 +61,7 @@ impl Drop for EnvLock {
 }
 
 /// Resolves python executable for tests.
+#[allow(dead_code)]
 fn get_python_exe() -> PathBuf {
     if let Ok(custom) = std::env::var("OXIDESWARM_PYTHON") {
         let p = PathBuf::from(custom);
@@ -475,13 +476,7 @@ time.sleep(60.0)
     let child_pid_clone = Arc::clone(&child_pid);
     let task_handle = tokio::spawn(async move {
         runner_clone
-            .execute_task_with_checkpoint(
-                &task,
-                None,
-                None,
-                Some(child_pid_clone),
-                Some(cancel_rx),
-            )
+            .execute_task_with_checkpoint(&task, None, None, Some(child_pid_clone), Some(cancel_rx))
             .await
     });
 

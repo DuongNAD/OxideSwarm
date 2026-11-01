@@ -151,9 +151,9 @@ impl BlenderRigProvider {
             anim_arg,
         ];
 
-        let runner_config = crate::runner::RunnerConfig::new(
-            crate::sandbox::SandboxConfig::new(temp_dir.path().to_path_buf()),
-        );
+        let runner_config = crate::runner::RunnerConfig::new(crate::sandbox::SandboxConfig::new(
+            temp_dir.path().to_path_buf(),
+        ));
         let runner = crate::runner::TaskRunner::new(
             uuid::Uuid::nil(),
             rusty_grid_core::capabilities::WorkerCapabilities::default(),
@@ -190,9 +190,12 @@ impl BlenderRigProvider {
                 .map(|b| b.as_slice().to_vec())
                 .ok_or_else(|| "Blender output .glb missing".to_string())
         } else {
-            Err(res
-                .error
-                .unwrap_or_else(|| format!("Blender process exited with error status: {}", res.exit_code)))
+            Err(res.error.unwrap_or_else(|| {
+                format!(
+                    "Blender process exited with error status: {}",
+                    res.exit_code
+                )
+            }))
         }
     }
 }
