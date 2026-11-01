@@ -1917,7 +1917,7 @@ pub fn validate_glb_header(raw: &[u8]) -> Result<(), String> {
 /// An explicit program with no arguments runs with no arguments; the demo greeting is only a
 /// default for a completely empty command line.
 pub fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
-    let mut kind = args.task_type.to_lowercase();
+    let mut kind = args.task_type.to_lowercase().replace('-', "_");
     if (kind == "generic" || kind == "command" || kind.is_empty())
         && (args.prompt.is_some() || args.image.is_some())
     {
