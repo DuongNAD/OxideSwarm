@@ -614,11 +614,12 @@ async fn test_adversarial_cancel_queued_pre_dispatch() {
 }
 
 /// Test 5: Cancellation while task is waiting in worker's queue for concurrency permits (throttle).
-/// Configures Master with `core_concurrency_multiplier: 2.0` so Master allows 2 concurrent tasks
-/// on a 1-core worker, while the worker's internal semaphore restricts execution to 1 permit.
-/// Task A is Running; Task B is dispatched (Scheduled) and throttled in worker's semaphore.
-/// Task B is cancelled while throttled. Verifies worker returns exit code 130 before permit acquisition,
-/// no semaphore leak occurs, and Task C executes without stalling after Task A completes.
+/// Note: `core_concurrency_multiplier: 2.0` scales the worker's CPU-core budget (`max_slots`) on
+/// the Master, whereas a current `WorkerClient` also advertises `slots:1` (`max_tasks = 1`), which
+/// prevents the Master from dispatching a second task until the first completes unless the worker
+/// omits `slots:<n>` or advertises a higher slot count.
+/// Task A is Running; Task B is submitted and cancelled. Verifies cancellation handling and that
+/// Task C executes without stalling after Task A completes.
 #[tokio::test]
 async fn test_adversarial_cancel_worker_queued_concurrency_throttle() {
     let sched_cfg = SchedulerConfig {

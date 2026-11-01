@@ -4046,6 +4046,7 @@ mod tests {
                 .with_tags(vec![
                     "laptop".into(),
                     format!("os:{}", std::env::consts::OS),
+                    "slots:99".into(),
                 ])
                 .with_redirection_portal(false),
         );
@@ -4057,7 +4058,7 @@ mod tests {
                 "slots:3".to_string(),
                 "laptop".to_string(),
             ],
-            "system tags and slots:<n> first, a user tag equal to one of them is not repeated"
+            "system tags and slots:<n> first, a user tag equal to one of them or starting with slots: is not repeated"
         );
     }
 
