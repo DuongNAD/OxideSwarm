@@ -110,7 +110,7 @@ struct Upload {
 }
 
 enum UploadSlot {
-    Idle(Upload),
+    Idle(Box<Upload>),
     Writing { total: u64 },
 }
 
@@ -499,7 +499,7 @@ impl BlobStore {
                             total: upload.total,
                         },
                     );
-                    (Some(upload), false)
+                    (Some(*upload), false)
                 }
                 Some(UploadSlot::Idle(stale)) => {
                     // Starting over: drop the old attempt.
@@ -631,7 +631,7 @@ impl BlobStore {
             let received = upload.received;
             let mut inner = self.lock();
             if let Some(slot @ UploadSlot::Writing { .. }) = inner.uploads.get_mut(&(owner, id)) {
-                *slot = UploadSlot::Idle(upload);
+                *slot = UploadSlot::Idle(Box::new(upload));
                 return BlobReply::Written {
                     id,
                     received,
@@ -813,7 +813,7 @@ impl BlobStore {
                     let slot = inner.uploads.remove(&key)?;
                     inner.upload_bytes = inner.upload_bytes.saturating_sub(slot.total());
                     match slot {
-                        UploadSlot::Idle(upload) => Some(upload),
+                        UploadSlot::Idle(upload) => Some(*upload),
                         UploadSlot::Writing { .. } => None,
                     }
                 })
@@ -841,7 +841,7 @@ impl BlobStore {
                 .filter_map(|key| match inner.uploads.remove(&key)? {
                     UploadSlot::Idle(u) => {
                         inner.upload_bytes = inner.upload_bytes.saturating_sub(u.total);
-                        Some(u)
+                        Some(*u)
                     }
                     UploadSlot::Writing { .. } => None,
                 })
@@ -1576,7 +1576,7 @@ mod tests {
                     .uploads
                     .insert((owner, a_id), UploadSlot::Writing { total: 1000 })
                 {
-                    Some(UploadSlot::Idle(u)) => Some(u),
+                    Some(UploadSlot::Idle(u)) => Some(*u),
                     _ => None,
                 };
                 committers.push(tokio::task::spawn_blocking(move || {
