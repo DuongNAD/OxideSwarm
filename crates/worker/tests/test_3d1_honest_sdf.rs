@@ -166,8 +166,7 @@ async fn test_3d1_sdf_tier_rejects_image_input_honestly() {
     );
 
     // Also test with "tier0_sdf" engine name
-    let mut tier0_spec =
-        Generative3DSpec::new_prompt("stylized creature").with_engine("tier0_sdf");
+    let mut tier0_spec = Generative3DSpec::new_prompt("stylized creature").with_engine("tier0_sdf");
     tier0_spec.image_data = Some(Bytes::from_static(b"fake_image_data_bytes"));
     let tier0_task_spec = TaskSpec::Generative3D(tier0_spec);
     let val_err2 = tier0_task_spec
