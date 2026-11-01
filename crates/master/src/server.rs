@@ -14,7 +14,7 @@ use tokio::task::AbortHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use rusty_grid_core::blob_transfer::{BlobReply, BlobRequest};
+use rusty_grid_core::blob_transfer::{BlobReply, BlobRequest, MAX_IN_FLIGHT_REQUESTS};
 use rusty_grid_core::capabilities::MobileLiveStatus;
 use rusty_grid_core::cluster_auth::{
     send_reject, server_handshake, ClusterSecret, REJECT_NO_SECRET, WIRE_FORMAT_AUTH,
@@ -1782,8 +1782,10 @@ impl Drop for UploadOwner {
     }
 }
 
-/// Answers one worker connection's `BlobRequest`s in arrival order, off its inbound loop, so a
-/// chunk being read from or written to disk never holds up the worker's heartbeats.
+/// Answers one worker connection's `BlobRequest`s in arrival order, off its inbound loop. A
+/// worker caps its requests in flight per session at [`MAX_IN_FLIGHT_REQUESTS`], smaller than
+/// this queue, so a cooperative worker never fills the queue and blocks its own heartbeats or
+/// results; the bounded channel still caps buffered requests if a peer ignores that limit.
 struct BlobService {
     requests: mpsc::Sender<(u64, BlobRequest)>,
     _task: AbortOnDrop,
@@ -1791,7 +1793,8 @@ struct BlobService {
 
 impl BlobService {
     fn spawn(store: Arc<BlobStore>, replies: mpsc::Sender<MasterMessage>) -> Self {
-        let (requests, mut incoming) = mpsc::channel::<(u64, BlobRequest)>(32);
+        let (requests, mut incoming) =
+            mpsc::channel::<(u64, BlobRequest)>(MAX_IN_FLIGHT_REQUESTS * 2);
         let task = tokio::spawn(async move {
             let uploads = UploadOwner::new(Arc::clone(&store));
             while let Some((request_id, request)) = incoming.recv().await {

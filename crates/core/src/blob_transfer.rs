@@ -33,6 +33,9 @@ pub const MAX_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_MISSING_QUERY: usize = 65_536;
 /// Blobs a peer moves at the same time (each one chunk at a time).
 pub const TRANSFER_CONCURRENCY: usize = 8;
+/// Most [`BlobRequest`]s one worker session keeps in flight at the same time (smaller than the
+/// Master's per-session queue, so a cooperative worker never fills it).
+pub const MAX_IN_FLIGHT_REQUESTS: usize = 16;
 
 /// Checks a received chunk: not longer than [`MAX_CHUNK_BYTES`] or than the `remaining` bytes
 /// of its blob, and not empty while bytes remain.

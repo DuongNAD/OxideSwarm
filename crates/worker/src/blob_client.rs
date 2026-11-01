@@ -13,13 +13,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::debug;
 
 use rusty_grid_core::blob::{BlobId, InputSource, TreeManifest, MAX_MANIFEST_BYTES};
 use rusty_grid_core::blob_transfer::{
     download_blob, for_each_concurrently, missing_blobs, upload_blob, BlobChannel, BlobError,
-    BlobReply, BlobRequest,
+    BlobReply, BlobRequest, MAX_IN_FLIGHT_REQUESTS,
 };
 use rusty_grid_core::protocol::WorkerMessage;
 use rusty_grid_core::task::{Task, TaskResult};
@@ -33,6 +33,7 @@ pub const BLOB_REPLY_TIMEOUT: Duration = Duration::from_secs(120);
 /// Sends blob requests to the Master over one session and matches the replies.
 pub struct BlobClient {
     outbound: mpsc::Sender<WorkerMessage>,
+    in_flight: Semaphore,
     pending: Mutex<HashMap<u64, oneshot::Sender<BlobReply>>>,
     next_id: AtomicU64,
     closed: AtomicBool,
@@ -43,6 +44,7 @@ impl BlobClient {
     pub fn new(outbound: mpsc::Sender<WorkerMessage>) -> Arc<Self> {
         Arc::new(Self {
             outbound,
+            in_flight: Semaphore::new(MAX_IN_FLIGHT_REQUESTS),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
@@ -65,12 +67,17 @@ impl BlobClient {
     /// Fails every request still waiting, and every later one (the session ended).
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        self.in_flight.close();
         self.pending().clear();
     }
 }
 
 impl BlobChannel for BlobClient {
     async fn call(&self, request: BlobRequest) -> Result<BlobReply, BlobError> {
+        let _permit =
+            self.in_flight.acquire().await.map_err(|_| {
+                BlobError::Transport("the connection to the master ended".to_string())
+            })?;
         if self.closed.load(Ordering::Acquire) {
             return Err(BlobError::Transport(
                 "the connection to the master ended".to_string(),
@@ -633,6 +640,51 @@ mod tests {
         assert!(
             cache.evict_to_fit() >= 2,
             "output pin must be released when result is suppressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_limits_concurrent_requests_in_flight() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (tx, mut rx) = mpsc::channel(128);
+        let client = BlobClient::new(tx);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let responder_client = Arc::clone(&client);
+        let responder_in_flight = Arc::clone(&in_flight);
+        let responder_peak = Arc::clone(&peak_in_flight);
+        tokio::spawn(async move {
+            while let Some(WorkerMessage::BlobRequest { request_id, .. }) = rx.recv().await {
+                let current = responder_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                responder_peak.fetch_max(current, Ordering::SeqCst);
+                let client = Arc::clone(&responder_client);
+                let in_flight = Arc::clone(&responder_in_flight);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    client.deliver(request_id, BlobReply::Missing { ids: vec![] });
+                });
+            }
+        });
+
+        let mut handles = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let client = Arc::clone(&client);
+            handles.push(tokio::spawn(async move {
+                client.call(BlobRequest::Missing { ids: vec![] }).await
+            }));
+        }
+        for handle in handles {
+            let reply = handle.await.unwrap().expect("request finishes");
+            assert_eq!(reply, BlobReply::Missing { ids: vec![] });
+        }
+
+        let peak = peak_in_flight.load(Ordering::SeqCst);
+        assert!(
+            peak <= MAX_IN_FLIGHT_REQUESTS,
+            "saw {peak} concurrent requests in flight, limit is {MAX_IN_FLIGHT_REQUESTS}"
         );
     }
 }
