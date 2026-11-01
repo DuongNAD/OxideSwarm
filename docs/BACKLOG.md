@@ -16,7 +16,7 @@ beyond that path are partial, and several documents mark them as finished.
 | Task queue, scheduler, placement, worker failover | Implemented | Integration and chaos scripts pass |
 | Secret handshake and AEAD on TCP | Implemented | Hardening waits on a branch (INT-3) |
 | Inline file staging | Partial | A task can corrupt the cache (BUG-1). Declared outputs can vanish silently (BUG-2) |
-| Content-addressed file transfer | Partial | Complete on a branch, not merged (INT-4) |
+| Content-addressed file transfer | Partial | On a branch, not merged. Review fixes are open (INT-4, INT-5) |
 | MCP server | Partial | Runs short commands. Security gaps (SEC-1, SEC-2). Cannot offload a build (MCP-1, FEAT-4) |
 | Master restart and master failover | Design only | Nothing survives a restart (FEAT-1). Nothing sends the claim message (FEAT-6) |
 | Mobile coordination | Partial | Battery tiers work. Thermal tiers and keepalive are wrong (MOB-1, MOB-2) |
@@ -130,7 +130,8 @@ merge.
 | INT-1 | Merge pull request 3 | P0 | S | | Yes | Implemented |
 | INT-2 | Close superseded pull requests and branches | P0 | S | INT-1 | Yes | Implemented |
 | INT-3 | Land the AEAD hardening branch | P0 | S | INT-1 | Yes | Implemented |
-| INT-4 | Land the content-addressed file branch | P0 | M | INT-3 | Yes | Implemented |
+| INT-4 | Land the content-addressed file branch | P0 | M | INT-3, INT-5 | Yes | Partial |
+| INT-5 | Fix the review findings of pull request 6 | P0 | M | INT-3 | | Planned |
 | SEC-1 | Remove `mcp --sse` | P0 | S | INT-4 | | Planned |
 | SEC-2 | Make MCP refuse a remote master without a secret | P0 | S | INT-4 | | Planned |
 | SEC-3 | Delete the Android stub master | P0 | M | INT-4 | D2 | Planned |
@@ -142,6 +143,7 @@ merge.
 | BUG-2 | Fail a task when a declared output is missing | P0 | S | INT-4 | | Planned |
 | BUG-3 | Fix the default 3D submit | P0 | S | INT-4 | | Planned |
 | BUG-4 | Fail only the task when a result is too large | P1 | S | INT-4 | | Planned |
+| BUG-5 | Close the remaining gaps in the blob store and cache | P1 | M | INT-4 | | Planned |
 | 3D-1 | Stop reporting the stub as TripoSR | P0 | S | INT-4 | D3 | Planned |
 | TEST-1 | Gate host-bound tests | P1 | M | INT-4 | | Planned |
 | TEST-2 | Isolate tests from the host battery | P1 | M | INT-4 | | Planned |
@@ -248,6 +250,122 @@ Do this phase first. Later items assume its result.
      the same build and the master restarts first.
 - **Done when:** The pull request is merged, the gates pass, and `tests/blob_transfer_e2e.rs`
   passes.
+
+### INT-5: Fix the review findings of pull request 6
+
+- **Evidence:** Reproduced at commit `e1215ee`, except F5, which is Read. The runs used real
+  binaries on loopback with a temporary `HOME`. Line numbers in this item refer to that commit.
+- **Problem:** Pull request 6 is not ready to merge. CI fails on Windows, and a task can move files
+  from outside its sandbox. F1 to F6 describe each problem.
+- **Do:** Work through F1 to F6 in order. Commit every fix on branch
+  `int-4-content-addressed-data-plane`, so pull request 6 carries it. This item has no pull request
+  of its own. Write the failing test first for F2 to F6. Do not merge, and do not start SEC-1.
+- **Done when:** Each fix meets its check. `cargo test -p rusty_grid_cli --test blob_transfer_e2e`
+  passes. Every check of pull request 6 is green. The owner has then been asked to approve the
+  merge under INT-4.
+
+#### F1: Make clippy pass on Windows
+
+- **Evidence:** Reproduced. CI run `41277852801`, job `clippy (windows-latest)`, fails with
+  `large_enum_variant` at `crates/core/src/protocol.rs:1867`, `:1899` and `:1925`. On Windows
+  `SubmitTask` holds 385 bytes and the next variant 184 bytes. The same check passes on Linux and
+  macOS.
+- **Problem:** Clippy stopped at `rusty_grid_core`, so the other crates were not linted on Windows.
+- **Do:** Add `#[allow(clippy::large_enum_variant)]` to `ClientMessage`, `HumanClientMessage` and
+  `BinaryClientMessage`, as `crates/cli/src/cli_app.rs:124` does. Do not box `Task`, because that
+  changes every caller. Then fix whatever the next CI run reports for the other crates.
+- **Done when:** `clippy (windows-latest)` is green on pull request 6.
+
+#### F2: Never follow a symbolic link in an output path
+
+- **Evidence:** Reproduced. A task ran `ln -s <OUTSIDE> link` with `--output link/important.txt`.
+  The task succeeded, `<OUTSIDE>/important.txt` was gone, and the client received the file.
+  `--output 'link/sub/*.txt'` moved every matching file of `<OUTSIDE>/sub` in the same way. A trial
+  patch left both directories unchanged.
+- **Problem:** `collect_outputs` (`crates/worker/src/staging.rs:150`) calls `symlink_metadata` on the
+  whole path, so links in parent directories are followed. `insert_file(path, true)` then renames
+  the file into the cache. This breaks goal G6 of design 0006 and the module documentation of
+  `staging.rs`. A task that links a shared directory loses files there.
+- **Do:**
+  1. Before `symlink_metadata(&start)`, check every directory on the way to the literal prefix,
+     one component at a time, from the canonical sandbox root. Use `file_type().is_symlink()`.
+  2. A link on the way fails a literal pattern with an error that names the pattern.
+  3. A link on the way makes a wildcard pattern select nothing.
+  4. Add unit tests in `staging.rs` and an end-to-end test in `tests/blob_transfer_e2e.rs`. A Windows
+     test skips when the system refuses to create a link.
+- **Done when:** Both commands above leave `<OUTSIDE>` unchanged. The literal form fails the task
+  with a message that names the pattern. `--output '**/*.txt'` still returns the files of the
+  sandbox and nothing from `<OUTSIDE>`.
+
+#### F3: Keep output blobs until the client can fetch them
+
+- **Evidence:** Reproduced. With `master --blob-store-mb 3`, task A wrote a 2 MiB output while its
+  client was stopped with `SIGSTOP`. A second task then stored a 2 MiB output. The resumed client of
+  task A failed with `output 'a.bin' ... is no longer on the master`.
+- **Problem:** `apply_task_result` (`crates/master/src/server.rs:1963`) checks that the outputs exist,
+  but nothing pins them. Any later upload can evict them before the client downloads them.
+- **Do:**
+  1. Pin the output blobs in the same store call that checks them, so the check cannot go stale.
+  2. Keep that pin for 10 minutes after the task reaches a terminal state. Release it from
+     `spawn_blob_store_sweeper` (`crates/master/src/server.rs:1839`), which today unpins every
+     terminal task at once.
+  3. Keep the input pins of a task that is retried. Drop the new pin for a stale result.
+  4. Put the duration in `BlobStoreConfig`, so a test can shorten it. Add no CLI flag.
+  5. State in design 0006 D3 that pinned outputs can hold the store above its bound for that time.
+- **Done when:** A test runs the scenario above and the client receives the file. A second test
+  shows that the blob can be evicted after the pin ends.
+
+#### F4: Pin output files from the moment they enter the worker cache
+
+- **Evidence:** Reproduced. With `worker --blob-cache-mb 1 --max-concurrency 8`, one task wrote 4000
+  files of 1 KiB with `--output 'out/*'` while four clients kept running tasks with small outputs.
+  The first attempt failed with `output blob ... is no longer in the worker's cache`.
+- **Problem:** `collect_outputs` moves files into the cache (`crates/worker/src/staging.rs:210`). The
+  pin comes later, in `upload_task_outputs` (`crates/worker/src/blob_client.rs:236`). Between the
+  two, `evict_to_fit` of another task can delete them, and the sandbox copy is already gone.
+  `crates/worker/src/blob_cache.rs:14` promises that this never happens.
+- **Do:**
+  1. Hold a pin from the moment a file enters the cache until its upload ends or is skipped.
+  2. `TaskResult` is a wire type and cannot carry the pin, so keep it in the cache or the runner,
+     keyed by task id.
+  3. Release it on every path, including a suppressed result, a failed collection and a failed
+     upload.
+- **Done when:** A unit test calls `evict_to_fit` between collection and upload, and the files
+  survive. The scenario above passes 20 runs in a row.
+
+#### F5: Keep the blob queue from blocking the master's inbound loop
+
+- **Evidence:** Read. No run showed a visible failure, so this is the lowest risk of the six.
+- **Problem:** `serve_worker_blob_request` (`crates/master/src/server.rs:1814`) awaits a send into a
+  queue of 32 requests. A worker with five transferring tasks can have 40 requests in flight,
+  because `TRANSFER_CONCURRENCY` is 8. The inbound loop then waits for the disk, and so do the
+  heartbeats and results of that worker. The wait is short on a healthy disk and long on a stalled
+  one. The comment at `crates/master/src/server.rs:1775` says this never happens.
+- **Do:**
+  1. Add a limit of requests in flight per session to `crates/core/src/blob_transfer.rs`, smaller
+     than the queue. Build the master queue from that constant.
+  2. Enforce the limit in `BlobClient` with a semaphore. Start `BLOB_REPLY_TIMEOUT` after the permit
+     is taken.
+  3. Keep the bounded queue for a peer that ignores the limit, and correct the comment.
+- **Done when:** A unit test starts 100 concurrent `BlobClient` calls against a fake session. It
+  never sees more requests in flight than the limit, and every call finishes.
+
+#### F6: Refuse a mismatched worker and master at registration
+
+- **Evidence:** Reproduced with binaries from `e1215ee` and `ee2d13b`. A new worker on an old master
+  registered, and the first task ended the connection with
+  `Bincode error: io error: unexpected end of file`. The task failed and the worker reconnected. A
+  trial patch with both constants at 2 made each side refuse the other with a message that names
+  the versions. The unit tests of `rusty_grid_core` passed on that patch.
+- **Problem:** `Task` and `TaskResult` changed layout, but `PROTOCOL_VERSION_CURRENT` and
+  `PROTOCOL_VERSION_MIN_COMPATIBLE` (`crates/core/src/protocol.rs:31`) stay at 1. `DEPLOYMENT.md` 3.5
+  still says that a worker newer than its master keeps working. An old worker on a new master ran a
+  plain command only because bincode ignores trailing bytes. `AssignTaskWithCheckpoint` has a field
+  after `task`, so that worker can misread a checkpoint (Read).
+- **Do:** Set both constants to 2. Correct `DEPLOYMENT.md` 3.5 and the Compatibility section of
+  design 0006: all nodes run one build. Update FEAT-8 to match, and leave the rest of it for later.
+- **Done when:** A test shows that the master refuses a version 1 worker. A test shows that the
+  worker refuses a `RegisterAck` with version 1.
 
 ## Phase 1: stop the harm
 
@@ -419,6 +537,31 @@ These items remove ways to lose data or to run code without authorisation.
 - **Done when:** `--engine triposr` without a model fails and names the cause.
   `--engine sdf --image <PATH>` fails clearly. A test asserts that no `device_name` contains TripoSR
   unless a model ran.
+
+### BUG-5: Close the remaining gaps in the blob store and cache
+
+- **Evidence:** Read at commit `e1215ee`, except defect 6, which is Reproduced. If a line has moved,
+  search for the named symbol.
+- **Problem:** The review of pull request 6 found these smaller defects. None of them blocks the
+  merge.
+  1. Eviction removes a blob from the index under the lock and deletes its file after the lock
+     (`delete_objects`, `crates/master/src/blob_store.rs:563`). A concurrent commit of the same id
+     can lose its new file while the index still lists it.
+  2. Uploads in `tmp/` do not count towards `max_bytes` (`crates/master/src/blob_store.rs:9`), so
+     concurrent uploads can exceed the bound.
+  3. `walk` skips selected names that are not UTF-8 or not valid blob paths, and it hides read
+     errors (`crates/worker/src/staging.rs:234`). The task still succeeds.
+  4. A cancelled fetch leaves its `.part` file in the cache `tmp/` directory
+     (`crates/worker/src/client.rs:1449`). The file is outside the size accounting, and only a
+     worker start removes it, after 24 hours.
+  5. `abort_uploads` (`crates/master/src/blob_store.rs:623`) cannot see an upload whose chunk is
+     being written, and `append` puts that upload back afterwards. Its file stays until the
+     10-minute sweep.
+  6. When an output download fails, `submit` returns before it prints the exit code, stdout and
+     stderr of the task (`run_submit_with_secret`, `crates/cli/src/cli_app.rs`).
+- **Do:** Confirm each defect against the code. Write a failing test for it, then fix it.
+- **Done when:** Each defect has a test that failed before the fix.
+  `cargo test -p rusty_grid_cli --test blob_transfer_e2e` passes.
 
 ## Phase 2: make the tests trustworthy
 
@@ -1038,8 +1181,10 @@ Each item below needs a design record before code.
 - **Evidence:** Read. `PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE` are both 1.
 - **Problem:** Only pre-version workers are refused. `Task` and `TaskResult` changed layout without a
   bump. The worker ignores the acknowledged feature bits, and only `FILE_STAGING` is read.
-  `ClientMessage` has no version, so a client cannot learn the master's version. `bincode` 1.x is
-  unmaintained (RUSTSEC-2025-0141).
+  `ClientMessage` has no version, so a client cannot learn the master's version. A client from
+  `e1215ee` on a master from `ee2d13b` lost `--wait` without an error. A client from `ee2d13b` on a
+  master from `e1215ee` was disconnected with a hint about the cluster secret (both reproduced).
+  `bincode` 1.x is unmaintained (RUSTSEC-2025-0141).
 - **Do:** Bump on every layout change, enforced by golden-bytes tests. Use the acknowledged bits. Add
   a version to the client path. Plan the move away from `bincode` 1.x.
 - **Done when:** A changed `Task` layout fails CI without a bump. Mismatched peers refuse with a clear
@@ -1114,3 +1259,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-01: INT-2 completed; closed pull requests 1 and 2, deleted merged remote branches, and copied PR 2 CI details into TEST-6 (`origin/claude/trusting-wing-d9a27c` kept until TEST-6).
 - 2026-11-01: INT-3 completed; rebased `d0dddb8` (cluster auth v2 and record-layer hardening) onto `master` and verified all gates plus `tests/cluster_record_layer_e2e.rs`.
 - 2026-11-01: INT-4 completed; rebased `fae2622` (content-addressed data plane, design 0006) onto `master` after `INT-3` and verified all gates plus `tests/blob_transfer_e2e.rs`.
+- 2026-11-01: INT-4 reopened. Pull request 6 is open at `e1215ee`, and `clippy (windows-latest)` fails. INT-5 holds the review findings to fix before the merge, and BUG-5 holds the smaller ones.
