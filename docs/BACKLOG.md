@@ -880,11 +880,11 @@ The standard in `docs/README.md` requires "only what the code does". These items
 
 - **Evidence:** Read.
 - **Problem:** `diagnose` prints `HEALTHY` when peer state is missing, never checks its age, and
-  always exits 0. Identity comes from the platform, so two Macs overwrite one state file.
-  `--auto-pull` always pulls `master`. Owner paths and a private gateway address are hard-coded. The
-  script has no tests.
+  always exits 0. Identity comes from the platform, so two Macs overwrite one state file. Owner
+  paths and a private gateway address are hard-coded. `tests/test_agent_bridge.py` covers `watch`,
+  `peek` and `send`, but not `diagnose`.
 - **Do:** Report `UNKNOWN` for missing or stale peers, and exit non-zero on problems. Add
-  `--agent-id`. Pull the current branch's upstream. Remove owner paths. Add a test file.
+  `--agent-id`. Remove owner paths. Add tests for `diagnose`.
 - **Done when:** `diagnose` without a peer exits non-zero, and two simulated agents on one platform
   do not collide.
 
@@ -1113,3 +1113,5 @@ Add one dated line per finished item, newest last.
 - 2026-11-01: INT-1 completed; pull request 3 merged (`b76d85b`) and `master` CI run `41276400780` passed.
 - 2026-11-01: INT-2 completed; closed pull requests 1 and 2, deleted merged remote branches, and copied PR 2 CI details into TEST-6 (`origin/claude/trusting-wing-d9a27c` kept until TEST-6).
 - 2026-11-01: INT-3 completed; rebased `d0dddb8` (cluster auth v2 and record-layer hardening) onto `master` and verified all gates plus `tests/cluster_record_layer_e2e.rs`.
+- 2026-11-01: `agent_bridge.py watch` gained once-only delivery and a Claude Code wake (design 0007),
+  which also fixed the `--auto-pull` part of BRIDGE-1. This needs no backlog item of its own.

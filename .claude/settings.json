@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/scripts/agent_bridge_hook.sh\" peek",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/scripts/agent_bridge_hook.sh\" watch --hook --max-wait 86400",
+            "asyncRewake": true,
+            "timeout": 90000
+          }
+        ]
+      }
+    ]
+  }
+}
