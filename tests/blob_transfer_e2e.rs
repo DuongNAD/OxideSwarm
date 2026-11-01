@@ -687,9 +687,7 @@ async fn test_worker_pins_output_files_from_collection_through_upload() {
             "out".into(),
         ],
     );
-    let big_task = Task::new(big_spec, TaskRequirements::generic(1, 60))
-        .with_priority(rusty_grid_core::task::TaskPriority::High)
-        .with_output_glob("out/*");
+    let big_task = Task::new(big_spec, TaskRequirements::generic(1, 60)).with_output_glob("out/*");
     let result = cluster.run(big_task).await.unwrap();
 
     running.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -703,6 +701,83 @@ async fn test_worker_pins_output_files_from_collection_through_upload() {
         result.error
     );
     assert_eq!(result.outputs.len(), 4000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_master_and_worker_refuse_protocol_version_1_at_registration() {
+    use rusty_grid_core::capabilities::WorkerCapabilities;
+    use rusty_grid_core::protocol::{
+        MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage,
+        PROTOCOL_VERSION_CURRENT,
+    };
+
+    let cluster = Cluster::start(true).await;
+
+    // 1. Master refuses a version 1 worker at registration.
+    let stream = tokio::net::TcpStream::connect(&cluster.addr)
+        .await
+        .expect("connect to master");
+    let mut transport = MessageTransport::new(stream);
+    let worker_id = uuid::Uuid::new_v4();
+    transport
+        .send_msg(&WorkerMessage::Register {
+            worker_id,
+            capabilities: WorkerCapabilities::new("v1-worker", 1, 1024, false, false, None),
+            protocol_version: 1,
+            features: ProtocolCapabilities::all_supported(),
+        })
+        .await
+        .expect("send Register");
+    let reply = transport
+        .recv_msg::<MasterMessage>()
+        .await
+        .expect("read RegisterAck")
+        .expect("RegisterAck frame");
+    match reply {
+        MasterMessage::RegisterAck {
+            accepted,
+            message,
+            protocol_version,
+            ..
+        } => {
+            assert!(!accepted, "master must refuse a version 1 worker");
+            assert_eq!(protocol_version, PROTOCOL_VERSION_CURRENT);
+            let msg = message.unwrap_or_default();
+            assert!(msg.contains("1") && msg.contains("2"), "{msg}");
+        }
+        other => panic!("expected RegisterAck, got {other:?}"),
+    }
+
+    // 2. Worker refuses a RegisterAck with protocol version 1.
+    let (client_io, master_io) = tokio::io::duplex(4096);
+    let worker = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999"));
+    let wid = worker.worker_id();
+    tokio::spawn(async move {
+        let mut master_transport = MessageTransport::new(master_io);
+        let _ = master_transport
+            .recv_msg::<WorkerMessage>()
+            .await
+            .unwrap()
+            .unwrap();
+        master_transport
+            .send_msg(&MasterMessage::RegisterAck {
+                accepted: true,
+                worker_id: wid,
+                heartbeat_interval_secs: 3,
+                message: None,
+                protocol_version: 1,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+    });
+    let mut client_transport = MessageTransport::new(client_io);
+    let err = worker
+        .perform_handshake(&mut client_transport)
+        .await
+        .expect_err("worker must refuse a version 1 RegisterAck");
+    let msg = err.to_string();
+    assert!(msg.contains("1") && msg.contains("2"), "{msg}");
 }
 
 // ---------------------------------------------------------------------------------------------

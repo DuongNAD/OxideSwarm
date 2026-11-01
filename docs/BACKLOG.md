@@ -131,7 +131,7 @@ merge.
 | INT-2 | Close superseded pull requests and branches | P0 | S | INT-1 | Yes | Implemented |
 | INT-3 | Land the AEAD hardening branch | P0 | S | INT-1 | Yes | Implemented |
 | INT-4 | Land the content-addressed file branch | P0 | M | INT-3, INT-5 | Yes | Partial |
-| INT-5 | Fix the review findings of pull request 6 | P0 | M | INT-3 | | Planned |
+| INT-5 | Fix the review findings of pull request 6 | P0 | M | INT-3 | | Implemented |
 | SEC-1 | Remove `mcp --sse` | P0 | S | INT-4 | | Planned |
 | SEC-2 | Make MCP refuse a remote master without a secret | P0 | S | INT-4 | | Planned |
 | SEC-3 | Delete the Android stub master | P0 | M | INT-4 | D2 | Planned |
@@ -1178,13 +1178,14 @@ Each item below needs a design record before code.
 
 ### FEAT-8: Real protocol versioning
 
-- **Evidence:** Read. `PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE` are both 1.
-- **Problem:** Only pre-version workers are refused. `Task` and `TaskResult` changed layout without a
-  bump. The worker ignores the acknowledged feature bits, and only `FILE_STAGING` is read.
-  `ClientMessage` has no version, so a client cannot learn the master's version. A client from
-  `e1215ee` on a master from `ee2d13b` lost `--wait` without an error. A client from `ee2d13b` on a
-  master from `e1215ee` was disconnected with a hint about the cluster secret (both reproduced).
-  `bincode` 1.x is unmaintained (RUSTSEC-2025-0141).
+- **Evidence:** Read. `PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE` were bumped to 2
+  in INT-5 F6.
+- **Problem:** Before INT-5 F6, `Task` and `TaskResult` changed layout without a version bump. There are
+  no golden-bytes tests to catch future unbumped layout changes. The worker ignores the acknowledged
+  feature bits, and only `FILE_STAGING` is read. `ClientMessage` has no version, so a client cannot
+  learn the master's version. A client from `e1215ee` on a master from `ee2d13b` lost `--wait` without
+  an error. A client from `ee2d13b` on a master from `e1215ee` was disconnected with a hint about the
+  cluster secret (both reproduced). `bincode` 1.x is unmaintained (RUSTSEC-2025-0141).
 - **Do:** Bump on every layout change, enforced by golden-bytes tests. Use the acknowledged bits. Add
   a version to the client path. Plan the move away from `bincode` 1.x.
 - **Done when:** A changed `Task` layout fails CI without a bump. Mismatched peers refuse with a clear
@@ -1259,4 +1260,5 @@ Add one dated line per finished item, newest last.
 - 2026-11-01: INT-2 completed; closed pull requests 1 and 2, deleted merged remote branches, and copied PR 2 CI details into TEST-6 (`origin/claude/trusting-wing-d9a27c` kept until TEST-6).
 - 2026-11-01: INT-3 completed; rebased `d0dddb8` (cluster auth v2 and record-layer hardening) onto `master` and verified all gates plus `tests/cluster_record_layer_e2e.rs`.
 - 2026-11-01: INT-4 completed; rebased `fae2622` (content-addressed data plane, design 0006) onto `master` after `INT-3` and verified all gates plus `tests/blob_transfer_e2e.rs`.
+- 2026-11-01: INT-5 completed; implemented F1 to F6 on `int-4-content-addressed-data-plane` (Windows clippy, symlinked output parent rejection, output blob pin retention on Master, immediate output file pinning in worker cache, bounded in-flight blob requests per session, and protocol version 2 enforcement).
 - 2026-11-01: INT-4 reopened. Pull request 6 is open at `e1215ee`, and `clippy (windows-latest)` fails. INT-5 holds the review findings to fix before the merge, and BUG-5 holds the smaller ones.

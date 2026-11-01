@@ -28,9 +28,9 @@ pub const WIRE_FORMAT_AUTH: u8 = 0x03;
 pub const WIRE_FORMAT_ENCRYPTED: u8 = 0x04;
 
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION_CURRENT: u32 = 1;
+pub const PROTOCOL_VERSION_CURRENT: u32 = 2;
 /// Minimum wire protocol version compatible with this build.
-pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 1;
+pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 2;
 
 /// Default protocol version used in deserialization fallbacks.
 pub const fn default_protocol_version() -> u32 {

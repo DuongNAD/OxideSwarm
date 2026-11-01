@@ -256,14 +256,12 @@ This app runs the **compute-grid worker** (not the agent-mesh node) in-process v
 - Supports cluster secret authentication via native JNI configuration (`nativeSetClusterSecret`, `nativeStartWorkerWithSecret`).
 
 ### 3.5 Upgrading a running grid (master and workers)
-Workers send a protocol version and feature bits when they register, and the master refuses a worker below
-`PROTOCOL_VERSION_MIN_COMPATIBLE`; client commands (`submit`, `status`, `doctor`, ...) send no version. Messages
-are still encoded positionally, so a message type that an older peer does not know is treated as a corrupt frame
-and the sender is disconnected (and its running tasks failed over). Always **restart the master first**, then the
-workers and CLIs. A worker newer than its master keeps working for the messages a master announces in its
-registration reply (the live battery report is one); a client command newer than the master (`GetTaskResult`) is
-not guarded. Placement constraints (`submit --os`, `--arch`, `--worker`, `--require-tag`) travel in task tags: an
-older master ignores them and may run the task on any worker, which `oxideswarm doctor` reports.
+All nodes in a cluster (`master`, `worker`, and CLI commands) must run one build: `Task`, `TaskResult`, and message
+frames are encoded positionally with bincode. Workers and the master exchange `PROTOCOL_VERSION_CURRENT` during
+registration, and each side refuses a peer below `PROTOCOL_VERSION_MIN_COMPATIBLE` (currently version 2); client
+commands (`submit`, `status`, `doctor`, ...) send no version, and a message type or layout from another build is
+treated as a corrupt frame and disconnects the peer (failing over any running tasks). Always **restart the master
+first**, then the workers and CLIs, so every node runs the same build.
 With a cluster secret, nodes must also speak the same cluster authentication version: a release with version 2
 (encrypted record layer, `docs/design/0005-cluster-auth-v2-record-layer.md`) and an older one refuse each other
 during the handshake (the newer side reports that the master speaks another cluster authentication version, the

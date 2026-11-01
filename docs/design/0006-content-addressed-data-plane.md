@@ -162,11 +162,12 @@ Behaviour before this change (design record 0003, inline staging):
 
 ## Compatibility
 
-- `Task` and `TaskResult` gained fields and bincode is positional, so every component must run the
-  same build. Restart the Master first, then workers and clients (as in `DEPLOYMENT.md` 3.5).
+- `Task` and `TaskResult` gained fields and bincode is positional, so all nodes (Master, workers,
+  and clients) must run one build (`PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE`
+  are bumped to 2, so the Master and worker refuse a version 1 peer at registration). Restart the
+  Master first, then workers and clients (as in `DEPLOYMENT.md` 3.5).
 - A Master built before this change cannot decode `ClientMessage::BlobRequest` and closes the
-  connection; the CLI then says the Master may be older. A worker never sends
-  `WorkerMessage::BlobRequest` to a Master that did not announce `blobs`.
+  connection; the CLI then says the Master may be older.
 - Inline staging is unchanged, but the CLI's `--file` now uses blobs, so it needs a Master with a
   blob store (every `oxideswarm master` has one unless it has no home directory and no
   `--blob-dir`).

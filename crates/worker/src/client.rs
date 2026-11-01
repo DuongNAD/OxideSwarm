@@ -3212,6 +3212,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_worker_refuses_register_ack_with_protocol_version_1() {
+        let (client_io, master_io) = tokio::io::duplex(4096);
+        let client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999"));
+        let worker_id = client.worker_id();
+
+        tokio::spawn(async move {
+            let mut master_transport = MessageTransport::new(master_io);
+            let _ = master_transport
+                .recv_msg::<WorkerMessage>()
+                .await
+                .unwrap()
+                .unwrap();
+            master_transport
+                .send_msg(&MasterMessage::RegisterAck {
+                    accepted: true,
+                    worker_id,
+                    heartbeat_interval_secs: 3,
+                    message: None,
+                    protocol_version: 1,
+                    features: ProtocolCapabilities::all_supported(),
+                })
+                .await
+                .unwrap();
+        });
+
+        let mut client_transport = MessageTransport::new(client_io);
+        let err = client
+            .perform_handshake(&mut client_transport)
+            .await
+            .expect_err("worker must refuse a version 1 RegisterAck");
+        let msg = err.to_string();
+        assert!(msg.contains("1") && msg.contains("2"), "{msg}");
+    }
+
+    #[tokio::test]
     async fn test_worker_redirection_portal() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
