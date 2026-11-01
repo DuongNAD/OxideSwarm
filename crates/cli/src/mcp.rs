@@ -18,7 +18,8 @@
 //! 3. `submit`: Submit general commands, shell scripts, or GPU tasks with full placement constraints,
 //!    environment variables, staged files, expected outputs, and synchronous wait options.
 //! 4. `task_result`: Query task outcome, logs, exit code, and artifacts with optional blocking poll.
-//! 5. `doctor`: Run cluster diagnostics (checks C1-C6) and return a structured report.
+//! 5. `cancel`: Cancel a queued or running task by its UUID.
+//! 6. `doctor`: Run cluster diagnostics (checks C1-C6) and return a structured report.
 //!
 //! # Stdout Hygiene
 //!
@@ -35,7 +36,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, watch, Mutex};
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use rusty_grid_core::cluster_auth::ClusterSecret;
@@ -373,9 +375,13 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "description": "Task timeout in seconds (default: 60)"
                     },
+                    "wait_secs": {
+                        "type": "integer",
+                        "description": "Client wait deadline in seconds when wait is true (default: timeout_secs)"
+                    },
                     "max_retries": {
                         "type": "integer",
-                        "description": "Maximum execution retries (default: 0)"
+                        "description": "Maximum execution retries (default: cluster default)"
                     },
                     "wait": {
                         "type": "boolean",
@@ -419,6 +425,24 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                     "timeout_secs": {
                         "type": "integer",
                         "description": "Max polling duration when waiting in seconds (default: 60)"
+                    },
+                    "wait_secs": {
+                        "type": "integer",
+                        "description": "Alias for timeout_secs: client wait deadline in seconds when waiting"
+                    }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "cancel",
+            description: "Cancel a queued or running task by its UUID.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task UUID to cancel"
                     }
                 },
                 "required": ["task_id"]
@@ -461,15 +485,74 @@ pub fn available_tools() -> Vec<ToolDefinition> {
 }
 
 // ============================================================================
-// Tool Dispatcher
+// Tool Execution Context & Dispatcher
 // ============================================================================
 
+#[derive(Clone)]
+pub struct ToolCallContext {
+    pub cancel_rx: watch::Receiver<bool>,
+    pub submitted_task_id: Arc<Mutex<Option<TaskId>>>,
+    pub progress_token: Option<Value>,
+    pub out_tx: Option<mpsc::UnboundedSender<String>>,
+}
+
+impl Default for ToolCallContext {
+    fn default() -> Self {
+        let (_tx, rx) = watch::channel(false);
+        Self {
+            cancel_rx: rx,
+            submitted_task_id: Arc::new(Mutex::new(None)),
+            progress_token: None,
+            out_tx: None,
+        }
+    }
+}
+
+impl ToolCallContext {
+    pub fn is_cancelled(&self) -> bool {
+        *self.cancel_rx.borrow()
+    }
+
+    pub fn send_progress(&self, progress: u64, total: Option<u64>, message: impl Into<String>) {
+        let (Some(token), Some(tx)) = (self.progress_token.as_ref(), self.out_tx.as_ref()) else {
+            return;
+        };
+        let mut params = json!({
+            "progressToken": token,
+            "progress": progress,
+            "message": message.into(),
+        });
+        if let Some(t) = total {
+            params["total"] = json!(t);
+        }
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": params,
+        });
+        if let Ok(line) = serde_json::to_string(&notification) {
+            let _ = tx.send(line);
+        }
+    }
+}
+
 pub async fn call_tool(state: &McpState, name: &str, args: &Value) -> ToolCallResult {
+    let mut ctx = ToolCallContext::default();
+    call_tool_with_context(state, name, args, &mut ctx).await
+}
+
+pub async fn call_tool_with_context(
+    state: &McpState,
+    name: &str,
+    args: &Value,
+    ctx: &mut ToolCallContext,
+) -> ToolCallResult {
     match name {
         "status" => tool_status(state, args).await,
         "workers" => tool_workers(state, args).await,
-        "submit" => tool_submit(state, args).await,
-        "task_result" => tool_task_result(state, args).await,
+        "submit" => tool_submit(state, args, ctx).await,
+        "task_result" => tool_task_result(state, args, ctx).await,
+        "cancel" => tool_cancel(state, args).await,
         "doctor" => tool_doctor(state, args).await,
         other => ToolCallResult::error(format!("Unknown tool: '{other}'")),
     }
@@ -640,7 +723,42 @@ async fn tool_workers(state: &McpState, args: &Value) -> ToolCallResult {
 // Tool: submit
 // ----------------------------------------------------------------------------
 
-async fn tool_submit(state: &McpState, args: &Value) -> ToolCallResult {
+async fn check_matching_worker_warning(
+    state: &McpState,
+    placement: &Placement,
+    requirements: &TaskRequirements,
+) -> Option<String> {
+    let Ok(ClientResponse::WorkerList { workers }) =
+        state.request(&ClientMessage::ListWorkers).await
+    else {
+        return None;
+    };
+
+    let any_matches = workers.iter().any(|w| {
+        let connected = tag_value(&w.tags, STATE_TAG_PREFIX) != Some("disconnected");
+        connected
+            && placement.matches_listed(w)
+            && (!requirements.gpu_required || w.has_gpu)
+            && w.cpu_cores >= requirements.cpu_cores
+            && w.ram_mb >= requirements.ram_mb
+    });
+
+    if any_matches {
+        None
+    } else {
+        let msg = if !placement.is_empty() {
+            format!(
+                "Warning: no connected worker matches the placement constraints ({placement}); the task waits in the queue until one does"
+            )
+        } else {
+            "Warning: no connected worker matches the task resource requirements; the task waits in the queue until one does".to_string()
+        };
+        eprintln!("[mcp] {msg}");
+        Some(msg)
+    }
+}
+
+async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) -> ToolCallResult {
     let task_type = args
         .get("type")
         .and_then(Value::as_str)
@@ -747,10 +865,15 @@ async fn tool_submit(state: &McpState, args: &Value) -> ToolCallResult {
         .get("timeout_secs")
         .and_then(Value::as_u64)
         .unwrap_or(60);
-    let max_retries = args.get("max_retries").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let wait_secs = args
+        .get("wait_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(timeout_secs);
 
-    let requirements =
-        TaskRequirements::new(cores, ram_mb, gpu, timeout_secs).with_max_retries(max_retries);
+    let mut requirements = TaskRequirements::new(cores, ram_mb, gpu, timeout_secs);
+    if let Some(retries) = args.get("max_retries").and_then(Value::as_u64) {
+        requirements = requirements.with_max_retries(retries as u32);
+    }
 
     // Placement
     let mut placement_tags = Vec::new();
@@ -806,6 +929,8 @@ async fn tool_submit(state: &McpState, args: &Value) -> ToolCallResult {
         }
     }
 
+    let warning = check_matching_worker_warning(state, &placement, &requirements).await;
+
     let mut task = Task::new(spec, requirements).with_placement(&placement);
     if !staged_files.is_empty() {
         task = task.with_staged_files(staged_files);
@@ -813,9 +938,10 @@ async fn tool_submit(state: &McpState, args: &Value) -> ToolCallResult {
     if !expected_outputs.is_empty() {
         task = task.with_expected_outputs(expected_outputs);
     }
+    let task_id = task.id;
+    *ctx.submitted_task_id.lock().await = Some(task_id);
 
     if wait {
-        // Submit and wait synchronously on a dedicated connection
         let mut transport = match state.connect_dedicated().await {
             Ok(t) => t,
             Err(e) => return ToolCallResult::error(e),
@@ -826,8 +952,49 @@ async fn tool_submit(state: &McpState, args: &Value) -> ToolCallResult {
             return ToolCallResult::error(format!("Failed to submit task: {e}"));
         }
 
-        match transport.recv_msg::<ClientResponse>().await {
-            Ok(Some(ClientResponse::TaskCompleted { result, .. })) => {
+        ctx.send_progress(
+            0,
+            None,
+            format!("Task {task_id} submitted; waiting for completion"),
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs);
+        let mut cancel_rx = ctx.cancel_rx.clone();
+        let mut progress_tick = tokio::time::interval(Duration::from_millis(500));
+        // Skip immediate first tick since we already sent progress 0 above.
+        progress_tick.tick().await;
+        let mut step = 0u64;
+
+        let recv_outcome = loop {
+            tokio::select! {
+                biased;
+                _ = cancel_rx.changed() => {
+                    if *cancel_rx.borrow() {
+                        drop(transport);
+                        let _ = state.request(&ClientMessage::CancelTask { task_id }).await;
+                        return ToolCallResult::error(format!("Task {task_id} cancelled by client"));
+                    }
+                }
+                res = transport.recv_msg::<ClientResponse>() => {
+                    break Some(res);
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    break None;
+                }
+                _ = progress_tick.tick() => {
+                    step += 1;
+                    ctx.send_progress(step, None, format!("Waiting for task {task_id}"));
+                }
+            }
+        };
+
+        match recv_outcome {
+            Some(Ok(Some(ClientResponse::TaskCompleted { result, .. }))) => {
+                ctx.send_progress(
+                    step + 1,
+                    Some(step + 1),
+                    format!("Task {task_id} completed"),
+                );
                 let out_artifacts: Vec<Value> = result
                     .artifacts
                     .iter()
@@ -847,7 +1014,7 @@ async fn tool_submit(state: &McpState, args: &Value) -> ToolCallResult {
                     "failed"
                 };
 
-                ToolCallResult::ok_json(&json!({
+                let mut body = json!({
                     "task_id": result.task_id.to_string(),
                     "status": status_str,
                     "exit_code": result.exit_code,
@@ -856,23 +1023,58 @@ async fn tool_submit(state: &McpState, args: &Value) -> ToolCallResult {
                     "duration_ms": result.execution_time_ms,
                     "error": result.error,
                     "artifacts": out_artifacts,
-                }))
+                });
+                if let Some(w) = warning {
+                    body["warning"] = Value::String(w);
+                }
+                ToolCallResult::ok_json(&body)
             }
-            Ok(Some(ClientResponse::Error { message })) => ToolCallResult::error(message),
-            Ok(Some(other)) => {
+            Some(Ok(Some(ClientResponse::Error { message }))) => ToolCallResult::error(message),
+            Some(Ok(Some(other))) => {
                 ToolCallResult::error(format!("Unexpected Master response: {other:?}"))
             }
-            Ok(None) => ToolCallResult::error("Master closed connection while waiting for task"),
-            Err(e) => ToolCallResult::error(format!("Communication error: {e}")),
+            Some(Ok(None)) => {
+                ToolCallResult::error("Master closed connection while waiting for task")
+            }
+            Some(Err(e)) => ToolCallResult::error(format!("Communication error: {e}")),
+            None => {
+                drop(transport);
+                let (status_str, state_name) = match state
+                    .request(&ClientMessage::GetTaskStatus { task_id })
+                    .await
+                {
+                    Ok(ClientResponse::TaskStatusInfo {
+                        status, state_name, ..
+                    }) => (format!("{:?}", status), state_name),
+                    _ => ("Queued".to_string(), "queued".to_string()),
+                };
+                let mut body = json!({
+                    "task_id": task_id.to_string(),
+                    "status": status_str,
+                    "state": state_name,
+                    "timed_out": true,
+                });
+                if let Some(w) = warning {
+                    body["warning"] = Value::String(w);
+                }
+                ToolCallResult::ok_json(&body)
+            }
         }
     } else {
         // Submit asynchronously
         let msg = ClientMessage::SubmitTask { task, wait: false };
         match state.request(&msg).await {
-            Ok(ClientResponse::TaskSubmitted { task_id }) => ToolCallResult::ok_json(&json!({
-                "task_id": task_id.to_string(),
-                "status": "submitted",
-            })),
+            Ok(ClientResponse::TaskSubmitted { task_id }) => {
+                ctx.send_progress(1, Some(1), format!("Task {task_id} submitted"));
+                let mut body = json!({
+                    "task_id": task_id.to_string(),
+                    "status": "submitted",
+                });
+                if let Some(w) = warning {
+                    body["warning"] = Value::String(w);
+                }
+                ToolCallResult::ok_json(&body)
+            }
             Ok(ClientResponse::Error { message }) => ToolCallResult::error(message),
             Ok(other) => ToolCallResult::error(format!("Unexpected Master response: {other:?}")),
             Err(e) => ToolCallResult::error(e),
@@ -881,10 +1083,43 @@ async fn tool_submit(state: &McpState, args: &Value) -> ToolCallResult {
 }
 
 // ----------------------------------------------------------------------------
+// Tool: cancel
+// ----------------------------------------------------------------------------
+
+async fn tool_cancel(state: &McpState, args: &Value) -> ToolCallResult {
+    let task_id_str = match args.get("task_id").and_then(Value::as_str) {
+        Some(s) => s,
+        None => return ToolCallResult::error("Missing required property 'task_id'"),
+    };
+
+    let task_uuid = match Uuid::parse_str(task_id_str) {
+        Ok(u) => u,
+        Err(e) => {
+            return ToolCallResult::error(format!("Invalid task_id UUID '{task_id_str}': {e}"))
+        }
+    };
+    let task_id = TaskId(task_uuid);
+
+    match state.request(&ClientMessage::CancelTask { task_id }).await {
+        Ok(ClientResponse::TaskCancelled { task_id, success }) => ToolCallResult::ok_json(&json!({
+            "task_id": task_id.to_string(),
+            "cancelled": success,
+        })),
+        Ok(ClientResponse::Error { message }) => ToolCallResult::error(message),
+        Ok(other) => ToolCallResult::error(format!("Unexpected Master response: {other:?}")),
+        Err(e) => ToolCallResult::error(e),
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Tool: task_result
 // ----------------------------------------------------------------------------
 
-async fn tool_task_result(state: &McpState, args: &Value) -> ToolCallResult {
+async fn tool_task_result(
+    state: &McpState,
+    args: &Value,
+    ctx: &mut ToolCallContext,
+) -> ToolCallResult {
     let task_id_str = match args.get("task_id").and_then(Value::as_str) {
         Some(s) => s,
         None => return ToolCallResult::error("Missing required property 'task_id'"),
@@ -900,7 +1135,8 @@ async fn tool_task_result(state: &McpState, args: &Value) -> ToolCallResult {
 
     let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(false);
     let timeout_secs = args
-        .get("timeout_secs")
+        .get("wait_secs")
+        .or_else(|| args.get("timeout_secs"))
         .and_then(Value::as_u64)
         .unwrap_or(60);
 
@@ -910,8 +1146,14 @@ async fn tool_task_result(state: &McpState, args: &Value) -> ToolCallResult {
             Ok(t) => t,
             Err(e) => return ToolCallResult::error(e),
         };
+        let mut cancel_rx = ctx.cancel_rx.clone();
+        let mut step = 0u64;
 
         loop {
+            if *cancel_rx.borrow() {
+                return ToolCallResult::error(format!("Wait for task {task_id} cancelled"));
+            }
+
             let msg = ClientMessage::GetTaskResult { task_id };
             if let Err(e) = transport.send_msg(&msg).await {
                 return ToolCallResult::error(format!("Failed to query task result: {e}"));
@@ -919,6 +1161,11 @@ async fn tool_task_result(state: &McpState, args: &Value) -> ToolCallResult {
 
             match transport.recv_msg::<ClientResponse>().await {
                 Ok(Some(ClientResponse::TaskCompleted { result, .. })) => {
+                    ctx.send_progress(
+                        step + 1,
+                        Some(step + 1),
+                        format!("Task {task_id} completed"),
+                    );
                     let out_artifacts: Vec<Value> = result
                         .artifacts
                         .iter()
@@ -964,7 +1211,16 @@ async fn tool_task_result(state: &McpState, args: &Value) -> ToolCallResult {
                             "timed_out": true,
                         }));
                     }
-                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    step += 1;
+                    ctx.send_progress(step, None, format!("Task {task_id} state: {state_name}"));
+                    tokio::select! {
+                        _ = cancel_rx.changed() => {
+                            if *cancel_rx.borrow() {
+                                return ToolCallResult::error(format!("Wait for task {task_id} cancelled"));
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+                    }
                 }
                 Ok(Some(ClientResponse::Error { message })) => {
                     return ToolCallResult::error(message)
@@ -1072,11 +1328,54 @@ async fn tool_doctor(state: &McpState, args: &Value) -> ToolCallResult {
 // Stdio Server Loop
 // ============================================================================
 
-/// Runs the MCP server in stdio mode, reading requests from stdin and responding to stdout.
+struct InFlightCall {
+    cancel_tx: watch::Sender<bool>,
+    submitted_task_id: Arc<Mutex<Option<TaskId>>>,
+}
+
+fn request_id_key(id: &Value) -> Option<String> {
+    if id.is_null() {
+        None
+    } else {
+        serde_json::to_string(id).ok()
+    }
+}
+
+fn extract_progress_token(params: &Value, arguments: &Value) -> Option<Value> {
+    params
+        .get("_meta")
+        .and_then(|m| m.get("progressToken"))
+        .or_else(|| params.get("progressToken"))
+        .or_else(|| arguments.get("_meta").and_then(|m| m.get("progressToken")))
+        .or_else(|| arguments.get("progressToken"))
+        .filter(|v| !v.is_null())
+        .cloned()
+}
+
+fn send_response_line(out_tx: &mpsc::UnboundedSender<String>, response: &JsonRpcResponse) {
+    if let Ok(serialized) = serde_json::to_string(response) {
+        let _ = out_tx.send(serialized);
+    }
+}
+
+/// Runs the MCP server in stdio mode, using a reader loop, a dedicated writer task, and one
+/// spawned task per `tools/call`.
 pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
-    let mut stdout = tokio::io::stdout();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+
+    let writer_handle = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(line) = out_rx.recv().await {
+            let _ = stdout.write_all(line.as_bytes()).await;
+            let _ = stdout.write_all(b"\n").await;
+            let _ = stdout.flush().await;
+        }
+    });
+
+    let in_flight: Arc<Mutex<HashMap<String, InFlightCall>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut call_tasks: JoinSet<()> = JoinSet::new();
 
     eprintln!(
         "[mcp] OxideSwarm MCP Server v{} initialized (protocol: {}). Waiting for client frames on stdio...",
@@ -1098,7 +1397,7 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                     format!("Invalid JSON-RPC frame: {e}"),
                     None,
                 );
-                send_response(&mut stdout, &err_resp).await;
+                send_response_line(&out_tx, &err_resp);
                 continue;
             }
         };
@@ -1110,7 +1409,7 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                 "Protocol version must be '2.0'",
                 None,
             );
-            send_response(&mut stdout, &err_resp).await;
+            send_response_line(&out_tx, &err_resp);
             continue;
         }
 
@@ -1132,39 +1431,96 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                         }
                     }),
                 );
-                send_response(&mut stdout, &resp).await;
+                send_response_line(&out_tx, &resp);
             }
             "notifications/initialized" => {
                 // Initialized notification has no response
                 eprintln!("[mcp] Client handshake completed: notifications/initialized received");
             }
+            "notifications/cancelled" => {
+                let params = request.params.unwrap_or(Value::Null);
+                if let Some(req_id) = params.get("requestId").or_else(|| params.get("id")) {
+                    if let Some(key) = request_id_key(req_id) {
+                        let entry = in_flight.lock().await.remove(&key);
+                        if let Some(call) = entry {
+                            let _ = call.cancel_tx.send(true);
+                            let maybe_tid = *call.submitted_task_id.lock().await;
+                            if let Some(task_id) = maybe_tid {
+                                let state_clone = Arc::clone(&state);
+                                tokio::spawn(async move {
+                                    let _ = state_clone
+                                        .request(&ClientMessage::CancelTask { task_id })
+                                        .await;
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             "ping" => {
                 let resp = JsonRpcResponse::success(id, json!({}));
-                send_response(&mut stdout, &resp).await;
+                send_response_line(&out_tx, &resp);
             }
             "tools/list" => {
                 let tools = available_tools();
                 let resp = JsonRpcResponse::success(id, json!({ "tools": tools }));
-                send_response(&mut stdout, &resp).await;
+                send_response_line(&out_tx, &resp);
             }
             "tools/call" => {
                 let params = request.params.unwrap_or(Value::Null);
-                let tool_name = params.get("name").and_then(Value::as_str);
+                let tool_name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
                 match tool_name {
                     Some(name) => {
-                        let tool_result = call_tool(&state, name, &arguments).await;
-                        let resp = match serde_json::to_value(&tool_result) {
-                            Ok(val) => JsonRpcResponse::success(id, val),
-                            Err(e) => JsonRpcResponse::error(
-                                id,
-                                INTERNAL_ERROR,
-                                format!("Serialization error: {e}"),
-                                None,
-                            ),
+                        let (cancel_tx, cancel_rx) = watch::channel(false);
+                        let submitted_task_id = Arc::new(Mutex::new(None));
+                        let id_key = id.as_ref().and_then(request_id_key);
+                        if let Some(ref key) = id_key {
+                            in_flight.lock().await.insert(
+                                key.clone(),
+                                InFlightCall {
+                                    cancel_tx,
+                                    submitted_task_id: Arc::clone(&submitted_task_id),
+                                },
+                            );
+                        }
+
+                        let progress_token = extract_progress_token(&params, &arguments);
+                        let mut ctx = ToolCallContext {
+                            cancel_rx,
+                            submitted_task_id,
+                            progress_token,
+                            out_tx: Some(out_tx.clone()),
                         };
-                        send_response(&mut stdout, &resp).await;
+                        let state_clone = Arc::clone(&state);
+                        let in_flight_clone = Arc::clone(&in_flight);
+                        let out_tx_clone = out_tx.clone();
+
+                        call_tasks.spawn(async move {
+                            let tool_result =
+                                call_tool_with_context(&state_clone, &name, &arguments, &mut ctx)
+                                    .await;
+                            if let Some(ref key) = id_key {
+                                in_flight_clone.lock().await.remove(key);
+                            }
+                            if ctx.is_cancelled() {
+                                return;
+                            }
+                            let resp = match serde_json::to_value(&tool_result) {
+                                Ok(val) => JsonRpcResponse::success(id, val),
+                                Err(e) => JsonRpcResponse::error(
+                                    id,
+                                    INTERNAL_ERROR,
+                                    format!("Serialization error: {e}"),
+                                    None,
+                                ),
+                            };
+                            send_response_line(&out_tx_clone, &resp);
+                        });
                     }
                     None => {
                         let resp = JsonRpcResponse::error(
@@ -1173,7 +1529,7 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                             "Missing 'name' in tools/call parameters",
                             None,
                         );
-                        send_response(&mut stdout, &resp).await;
+                        send_response_line(&out_tx, &resp);
                     }
                 }
             }
@@ -1185,21 +1541,17 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                     format!("Method not found: '{other}'"),
                     None,
                 );
-                send_response(&mut stdout, &resp).await;
+                send_response_line(&out_tx, &resp);
             }
         }
     }
 
+    while call_tasks.join_next().await.is_some() {}
+    drop(out_tx);
+    let _ = writer_handle.await;
+
     eprintln!("[mcp] Stdio stream closed, exiting cleanly");
     ExitCode::SUCCESS
-}
-
-async fn send_response(stdout: &mut tokio::io::Stdout, response: &JsonRpcResponse) {
-    if let Ok(serialized) = serde_json::to_string(response) {
-        let _ = stdout.write_all(serialized.as_bytes()).await;
-        let _ = stdout.write_all(b"\n").await;
-        let _ = stdout.flush().await;
-    }
 }
 
 // ============================================================================
