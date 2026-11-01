@@ -92,7 +92,7 @@ OxideSwarm/
 | **Worker Engine** | Execution Runner | Bounded stdout/stderr capture, cancellation, configurable process priority | Implemented |
 | **Worker Engine** | Child Containment | Atomic Windows Job Objects (`kill-on-close` via `CREATE_SUSPENDED`) and Linux `PR_SET_PDEATHSIG` process tree binding | Implemented |
 | **Worker Engine** | GPU Acceleration | Hardware `wgpu` compute engine (Metal, Vulkan, DX12) and simulated CPU SIMD fallback | Implemented |
-| **Android Bridge** | In-Process JNI | `liboxideworker.so` cdylib running worker/master inside Tokio runtime threads | Implemented |
+| **Android Bridge** | In-Process JNI | `liboxideworker.so` cdylib running the Android worker inside Tokio runtime threads (the Android app is a worker only) | Implemented |
 | **Android Bridge** | Cluster Secret Auth | Native secret injection (`nativeSetClusterSecret`, `nativeStartWorkerWithSecret`) | Implemented |
 | **Agent Mesh** | Relay Hub | Axum WebSocket hub routing envelopes with token authentication and SHA-256 validation | Implemented |
 | **Agent Mesh** | Grid Bridge | `--grid-master` CLI integration routing `grid_*` commands to live master | Implemented |
