@@ -14,9 +14,9 @@ beyond that path are partial, and several documents mark them as finished.
 | Area | Status | State at the snapshot |
 |---|---|---|
 | Task queue, scheduler, placement, worker failover | Implemented | Integration and chaos scripts pass |
-| Secret handshake and AEAD on TCP | Implemented | Hardening waits on a local branch (INT-3) |
+| Secret handshake and AEAD on TCP | Implemented | Hardening waits on a branch (INT-3) |
 | Inline file staging | Partial | A task can corrupt the cache (BUG-1). Declared outputs can vanish silently (BUG-2) |
-| Content-addressed file transfer | Partial | Complete on a local branch, not merged (INT-4) |
+| Content-addressed file transfer | Partial | Complete on a branch, not merged (INT-4) |
 | MCP server | Partial | Runs short commands. Security gaps (SEC-1, SEC-2). Cannot offload a build (MCP-1, FEAT-4) |
 | Master restart and master failover | Design only | Nothing survives a restart (FEAT-1). Nothing sends the claim message (FEAT-6) |
 | Mobile coordination | Partial | Battery tiers work. Thermal tiers and keepalive are wrong (MOB-1, MOB-2) |
@@ -198,8 +198,7 @@ merge.
 
 ## Phase 0: integrate open work
 
-Do this phase first. Later items assume its result, and two of its branches exist on one machine
-only.
+Do this phase first. Later items assume its result.
 
 ### INT-1: Merge pull request 3
 
@@ -222,13 +221,11 @@ only.
 ### INT-3: Land the AEAD hardening branch
 
 - **Evidence:** Reproduced. The trial merge with INT-1 is clean.
-- **Problem:** Commit `d0dddb8` on branch `claude/compassionate-mestorf-b58176` is not pushed. It
-  exists only in the worktree `.claude/worktrees/compassionate-mestorf-b58176` on the owner's Mac.
-  It adds auth version 2, a fail-closed record reader, and tamper and injection tests.
+- **Problem:** Commit `d0dddb8` on branch `claude/compassionate-mestorf-b58176` has no pull request
+  yet. It adds auth version 2, a fail-closed record reader, and tamper and injection tests.
 - **Do:**
-  1. Ask the owner to push the branch if you work on another machine.
-  2. Rebase it on `master`, and open a pull request.
-  3. State in the pull request that a version 1 peer is refused, so all nodes upgrade together.
+  1. Rebase it on `master`, and open a pull request.
+  2. State in the pull request that a version 1 peer is refused, so all nodes upgrade together.
 - **Done when:** The pull request is merged and the gates pass. `tests/cluster_record_layer_e2e.rs`
   passes.
 
@@ -237,8 +234,8 @@ only.
 - **Evidence:** Reproduced. A trial merge of INT-1, INT-3 and INT-4 passed clippy, the
   `--no-default-features` check, all unit tests, `blob_transfer_e2e`, `cluster_record_layer_e2e` and
   `file_staging_e2e`. The full suite was not run on the merged tree.
-- **Problem:** Commit `fae2622` on branch `claude/dreamy-kilby-6adcea` is not pushed. It adds BLAKE3
-  blobs, a master blob store, a worker blob cache, `submit --input` and glob outputs. It adds about
+- **Problem:** Commit `fae2622` on branch `claude/dreamy-kilby-6adcea` has no pull request yet. It
+  adds BLAKE3 blobs, a master blob store, a worker blob cache, `submit --input` and glob outputs. It adds about
   6,400 lines in one commit.
 - **Do:**
   1. Rebase it on `master` after INT-3.
