@@ -759,16 +759,32 @@ pub struct MapReduceArgs {
     #[arg(
         long,
         default_value = "word_count",
-        help = "Mapper name (e.g. word_count, uppercase) or script path"
+        conflicts_with = "map_cmd",
+        help = "Mapper built-in name (word_count, line_count, identity) or path to a local shell script"
     )]
     pub mapper: String,
 
     #[arg(
         long,
+        conflicts_with = "mapper",
+        help = "Command line to run as the mapper (receives chunk on stdin, writes key/value lines to stdout)"
+    )]
+    pub map_cmd: Option<String>,
+
+    #[arg(
+        long,
         default_value = "sum",
-        help = "Reducer name (e.g. sum, count) or script path"
+        conflicts_with = "reduce_cmd",
+        help = "Reducer built-in name (sum, count, max, min, concat) or path to a local shell script"
     )]
     pub reducer: String,
+
+    #[arg(
+        long,
+        conflicts_with = "reducer",
+        help = "Command line to run as the reducer (receives grouped JSON on stdin, writes reduced value to stdout)"
+    )]
+    pub reduce_cmd: Option<String>,
 
     #[arg(
         long,
@@ -2831,6 +2847,67 @@ async fn run_workers(
     run_status(status_args, config_file, secret_opts).await
 }
 
+fn looks_like_script_path(s: &str) -> bool {
+    s.contains('/') || s.contains('\\') || s.ends_with(".sh") || Path::new(s).exists()
+}
+
+fn split_command_line(cmd: &str) -> Result<(String, Vec<String>), String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut token_started = false;
+
+    for ch in cmd.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            token_started = true;
+            continue;
+        }
+        match ch {
+            '\\' if !in_single => {
+                escaped = true;
+                token_started = true;
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                token_started = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                token_started = true;
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if token_started {
+                    tokens.push(std::mem::take(&mut current));
+                    token_started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                token_started = true;
+            }
+        }
+    }
+    if in_single || in_double {
+        return Err("unclosed quote in command string".to_string());
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if token_started {
+        tokens.push(current);
+    }
+    let mut iter = tokens.into_iter();
+    let program = iter
+        .next()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| "command cannot be empty".to_string())?;
+    Ok((program, iter.collect()))
+}
+
 async fn run_mapreduce(
     args: MapReduceArgs,
     config_file: Option<ConfigFile>,
@@ -2898,12 +2975,24 @@ async fn run_mapreduce(
         }
     }
 
-    let mapper_spec = if args.mapper.contains('/')
-        || args.mapper.contains('\\')
-        || Path::new(&args.mapper).exists()
-    {
-        MapFunctionSpec::ShellScript {
-            script: args.mapper,
+    let mapper_spec = if let Some(ref cmd) = args.map_cmd {
+        match split_command_line(cmd) {
+            Ok((program, cmd_args)) => MapFunctionSpec::Command {
+                program,
+                args: cmd_args,
+            },
+            Err(e) => {
+                eprintln!("Invalid --map-cmd '{cmd}': {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if looks_like_script_path(&args.mapper) {
+        match std::fs::read_to_string(&args.mapper) {
+            Ok(script) => MapFunctionSpec::ShellScript { script },
+            Err(e) => {
+                eprintln!("Failed to read mapper script '{}': {e}", args.mapper);
+                return ExitCode::FAILURE;
+            }
         }
     } else {
         MapFunctionSpec::Builtin {
@@ -2911,12 +3000,24 @@ async fn run_mapreduce(
         }
     };
 
-    let reducer_spec = if args.reducer.contains('/')
-        || args.reducer.contains('\\')
-        || Path::new(&args.reducer).exists()
-    {
-        ReduceFunctionSpec::ShellScript {
-            script: args.reducer,
+    let reducer_spec = if let Some(ref cmd) = args.reduce_cmd {
+        match split_command_line(cmd) {
+            Ok((program, cmd_args)) => ReduceFunctionSpec::Command {
+                program,
+                args: cmd_args,
+            },
+            Err(e) => {
+                eprintln!("Invalid --reduce-cmd '{cmd}': {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if looks_like_script_path(&args.reducer) {
+        match std::fs::read_to_string(&args.reducer) {
+            Ok(script) => ReduceFunctionSpec::ShellScript { script },
+            Err(e) => {
+                eprintln!("Failed to read reducer script '{}': {e}", args.reducer);
+                return ExitCode::FAILURE;
+            }
         }
     } else {
         ReduceFunctionSpec::Builtin {
