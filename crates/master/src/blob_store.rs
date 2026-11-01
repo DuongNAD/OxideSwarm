@@ -38,11 +38,15 @@ pub const DEFAULT_BLOB_STORE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// An upload that has not received a chunk for this long is abandoned and its file removed.
 pub const STALE_UPLOAD_AFTER: Duration = Duration::from_secs(600);
 
+/// How long output blobs of a finished task stay pinned so the client can download them: 10 minutes.
+pub const DEFAULT_OUTPUT_PIN_RETENTION: Duration = Duration::from_secs(600);
+
 /// Where the blob store lives and how large it may grow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobStoreConfig {
     pub dir: PathBuf,
     pub max_bytes: u64,
+    pub output_pin_retention: Duration,
 }
 
 impl BlobStoreConfig {
@@ -50,7 +54,13 @@ impl BlobStoreConfig {
         Self {
             dir: dir.into(),
             max_bytes,
+            output_pin_retention: DEFAULT_OUTPUT_PIN_RETENTION,
         }
+    }
+
+    pub fn with_output_pin_retention(mut self, retention: Duration) -> Self {
+        self.output_pin_retention = retention;
+        self
     }
 }
 
@@ -101,6 +111,7 @@ struct Inner {
     tick: u64,
     total_bytes: u64,
     pins: HashMap<TaskId, (Instant, Vec<BlobId>)>,
+    output_pins: HashMap<TaskId, (Instant, Vec<BlobId>)>,
     pin_counts: HashMap<BlobId, u32>,
     uploads: HashMap<(u64, BlobId), Upload>,
 }
@@ -145,7 +156,8 @@ impl Inner {
     }
 
     /// Unpinned blobs to drop, least recently used first, until the store fits `max_bytes`.
-    fn eviction_victims(&mut self, max_bytes: u64) -> Vec<BlobId> {
+    /// Never drops `keep` (the blob just committed).
+    fn eviction_victims(&mut self, max_bytes: u64, keep: Option<&BlobId>) -> Vec<BlobId> {
         let mut victims = Vec::new();
         let mut excess = self.total_bytes.saturating_sub(max_bytes);
         if excess == 0 {
@@ -155,7 +167,7 @@ impl Inner {
             if excess == 0 {
                 break;
             }
-            if self.pin_counts.contains_key(id) {
+            if self.pin_counts.contains_key(id) || keep == Some(id) {
                 continue;
             }
             let size = self.entries[id].size;
@@ -174,6 +186,7 @@ pub struct BlobStore {
     objects: PathBuf,
     tmp: PathBuf,
     max_bytes: u64,
+    output_pin_retention: Duration,
     inner: Mutex<Inner>,
     next_owner: AtomicU64,
     blobs_received: AtomicU64,
@@ -238,7 +251,7 @@ impl BlobStore {
         for (_, id, size) in found {
             inner.insert(id, size);
         }
-        let victims = inner.eviction_victims(config.max_bytes);
+        let victims = inner.eviction_victims(config.max_bytes, None);
         for id in &victims {
             let _ = std::fs::remove_file(object_path(&objects, id));
         }
@@ -254,6 +267,7 @@ impl BlobStore {
             objects,
             tmp,
             max_bytes: config.max_bytes,
+            output_pin_retention: config.output_pin_retention,
             inner: Mutex::new(inner),
             next_owner: AtomicU64::new(1),
             blobs_received: AtomicU64::new(0),
@@ -271,6 +285,11 @@ impl BlobStore {
     /// The bound in bytes.
     pub fn max_bytes(&self) -> u64 {
         self.max_bytes
+    }
+
+    /// How long output blobs of a finished task stay pinned for client downloads.
+    pub fn output_pin_retention(&self) -> Duration {
+        self.output_pin_retention
     }
 
     /// A fresh token naming one connection's uploads ([`BlobStore::abort_uploads`] drops them).
@@ -549,7 +568,7 @@ impl BlobStore {
         let victims = {
             let mut inner = self.lock();
             inner.insert(id, upload.total);
-            inner.eviction_victims(self.max_bytes)
+            inner.eviction_victims(self.max_bytes, Some(&id))
         };
         self.delete_objects(&victims);
         debug!(blob = %id, bytes = upload.total, "Blob stored");
@@ -729,10 +748,16 @@ impl BlobStore {
 
     /// Releases the pins of `task_id` (it finished, failed or was cancelled).
     pub fn unpin_task(&self, task_id: &TaskId) {
-        let mut inner = self.lock();
-        if let Some((_, ids)) = inner.pins.remove(task_id) {
-            release_pins(&mut inner, ids);
-        }
+        let victims = {
+            let mut inner = self.lock();
+            if let Some((_, ids)) = inner.pins.remove(task_id) {
+                release_pins(&mut inner, ids);
+                inner.eviction_victims(self.max_bytes, None)
+            } else {
+                Vec::new()
+            }
+        };
+        self.delete_objects(&victims);
     }
 
     /// Tasks that currently pin blobs, with when they pinned them.
@@ -742,6 +767,97 @@ impl BlobStore {
             .iter()
             .map(|(task_id, (pinned_at, _))| (*task_id, *pinned_at))
             .collect()
+    }
+
+    /// Checks that every blob in `ids` is in the store (marking each as recently used) and pins
+    /// them atomically under one lock acquisition. If any blob in `ids` is absent, nothing is
+    /// pinned and the missing ids are returned in `Err`.
+    pub fn check_and_pin_outputs(
+        self: &Arc<Self>,
+        ids: &[BlobId],
+    ) -> Result<OutputPinGuard, Vec<BlobId>> {
+        let mut inner = self.lock();
+        let mut unique = Vec::with_capacity(ids.len());
+        let mut seen = HashSet::with_capacity(ids.len());
+        let mut missing = Vec::new();
+        for &id in ids {
+            if !seen.insert(id) {
+                continue;
+            }
+            if inner.touch(&id) {
+                unique.push(id);
+            } else {
+                missing.push(id);
+            }
+        }
+        if !missing.is_empty() {
+            return Err(missing);
+        }
+        for &id in &unique {
+            *inner.pin_counts.entry(id).or_insert(0) += 1;
+        }
+        Ok(OutputPinGuard {
+            store: Arc::clone(self),
+            ids: unique,
+        })
+    }
+
+    /// Releases output pins of terminal tasks that have been held for at least
+    /// [`BlobStore::output_pin_retention`].
+    pub fn sweep_expired_output_pins(&self) {
+        let victims = {
+            let mut inner = self.lock();
+            let expired: Vec<TaskId> = inner
+                .output_pins
+                .iter()
+                .filter(|(_, (pinned_at, _))| pinned_at.elapsed() >= self.output_pin_retention)
+                .map(|(task_id, _)| *task_id)
+                .collect();
+            if expired.is_empty() {
+                Vec::new()
+            } else {
+                for task_id in expired {
+                    if let Some((_, ids)) = inner.output_pins.remove(&task_id) {
+                        release_pins(&mut inner, ids);
+                    }
+                }
+                inner.eviction_victims(self.max_bytes, None)
+            }
+        };
+        self.delete_objects(&victims);
+    }
+}
+
+/// Temporary pin on a task result's output blobs, held from the atomic check in
+/// [`BlobStore::check_and_pin_outputs`] until [`OutputPinGuard::commit_terminal`] binds it to
+/// the terminal task (or until dropped on a stale or retried result).
+pub struct OutputPinGuard {
+    store: Arc<BlobStore>,
+    ids: Vec<BlobId>,
+}
+
+impl OutputPinGuard {
+    /// Binds the pinned output blobs to `task_id` for [`BlobStore::output_pin_retention`] after
+    /// the task reached a terminal state.
+    pub fn commit_terminal(mut self, task_id: TaskId) {
+        let ids = std::mem::take(&mut self.ids);
+        if ids.is_empty() {
+            return;
+        }
+        let mut inner = self.store.lock();
+        if let Some((_, previous)) = inner.output_pins.insert(task_id, (Instant::now(), ids)) {
+            release_pins(&mut inner, previous);
+        }
+    }
+}
+
+impl Drop for OutputPinGuard {
+    fn drop(&mut self) {
+        let ids = std::mem::take(&mut self.ids);
+        if !ids.is_empty() {
+            let mut inner = self.store.lock();
+            release_pins(&mut inner, ids);
+        }
     }
 }
 
@@ -920,6 +1036,37 @@ mod tests {
         store.unpin_task(&t2);
         assert_eq!(store.stats().pinned_blobs, 0);
         assert!(store.pinned_tasks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn output_pin_guard_releases_on_stale_or_retry_and_retains_when_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(
+            &BlobStoreConfig::new(dir.path(), 2000)
+                .with_output_pin_retention(Duration::from_millis(30)),
+        )
+        .unwrap();
+        let input = store.put(&vec![1u8; 800]).await.unwrap();
+        let out_stale = store.put(&vec![2u8; 800]).await.unwrap();
+        let task_id = TaskId::new();
+        store.pin_task(task_id, vec![input]);
+
+        // Stale or retried result: dropping the guard releases the output pin while keeping input pins.
+        let guard = store.check_and_pin_outputs(&[out_stale]).unwrap();
+        assert_eq!(store.stats().pinned_blobs, 2);
+        drop(guard);
+        assert_eq!(store.stats().pinned_blobs, 1);
+
+        // Terminal result: input pins are released and output pins stay until retention expires.
+        let out_final = store.put(&vec![3u8; 800]).await.unwrap();
+        let guard = store.check_and_pin_outputs(&[out_final]).unwrap();
+        store.unpin_task(&task_id);
+        guard.commit_terminal(task_id);
+        assert_eq!(store.stats().pinned_blobs, 1);
+
+        std::thread::sleep(Duration::from_millis(50));
+        store.sweep_expired_output_pins();
+        assert_eq!(store.stats().pinned_blobs, 0);
     }
 
     #[tokio::test]

@@ -1728,28 +1728,39 @@ async fn admit_blob_task(blob_store: Option<&Arc<BlobStore>>, task: &Task) -> Re
     Ok(())
 }
 
-/// Why a result's output files cannot be handed to clients, if they cannot: the blobs must be in
-/// the store (a worker uploads them before it sends the result).
-fn missing_outputs(blob_store: Option<&Arc<BlobStore>>, result: &TaskResult) -> Option<String> {
+/// Checks that a result's output files are in the store and pins them atomically if present,
+/// returning either the pin guard or an error naming the first missing output.
+fn pin_result_outputs(
+    blob_store: Option<&Arc<BlobStore>>,
+    result: &TaskResult,
+) -> Result<Option<crate::blob_store::OutputPinGuard>, String> {
     if result.outputs.is_empty() {
-        return None;
+        return Ok(None);
     }
     let Some(store) = blob_store else {
-        return Some(format!(
+        return Err(format!(
             "the worker reported {} output files, but {NO_BLOB_STORE}",
             result.outputs.len()
         ));
     };
     let ids: Vec<_> = result.outputs.iter().map(|f| f.id).collect();
-    let missing = store.missing_ids(&ids);
-    let first = result.outputs.iter().find(|f| missing.contains(&f.id))?;
-    Some(format!(
-        "output '{}' (blob {}) is not in the master's blob store ({} of {} outputs missing)",
-        first.path,
-        first.id,
-        missing.len(),
-        result.outputs.len()
-    ))
+    match store.check_and_pin_outputs(&ids) {
+        Ok(pin) => Ok(Some(pin)),
+        Err(missing) => {
+            let first = result
+                .outputs
+                .iter()
+                .find(|f| missing.contains(&f.id))
+                .expect("missing id comes from result.outputs");
+            Err(format!(
+                "output '{}' (blob {}) is not in the master's blob store ({} of {} outputs missing)",
+                first.path,
+                first.id,
+                missing.len(),
+                result.outputs.len()
+            ))
+        }
+    }
 }
 
 /// Drops the unfinished uploads of one connection when the connection ends.
@@ -1834,20 +1845,25 @@ fn feature_announcement(blob_store: Option<&Arc<BlobStore>>) -> String {
     master_features::announcement(&features)
 }
 
-/// Releases the blob pins of tasks that finished without a result that released them (failover
-/// out of retries, the reaper, a cancellation), and drops uploads that stalled.
+/// Releases the input blob pins of tasks that finished without a result that released them
+/// (failover out of retries, the reaper, a cancellation), releases terminal output pins once
+/// their retention period has elapsed, and drops uploads that stalled.
 fn spawn_blob_store_sweeper(
     store: Arc<BlobStore>,
     queue: TaskQueue,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let sweep_interval = BLOB_SWEEP_INTERVAL
+        .min(store.output_pin_retention())
+        .max(Duration::from_millis(20));
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(BLOB_SWEEP_INTERVAL);
+        let mut ticker = tokio::time::interval(sweep_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
                     store.sweep_stale_uploads();
+                    store.sweep_expired_output_pins();
                     for (task_id, pinned_at) in store.pinned_tasks() {
                         let release = match queue.get_task(&task_id).await {
                             Some(info) => info.state.is_terminal(),
@@ -1959,14 +1975,19 @@ async fn apply_task_result(
         "Task execution result received"
     );
 
-    // Output files a client cannot download would turn a success into a silent loss.
-    if let Some(problem) = missing_outputs(blob_store, &result) {
-        warn!(task_id = %task_id, problem = %problem, "Result refers to output files the master does not hold");
-        result.error = Some(match result.error.take() {
-            Some(error) => format!("{error}; {problem}"),
-            None => problem,
-        });
-    }
+    // Output files a client cannot download would turn a success into a silent loss; check and
+    // pin them atomically so no upload can evict them before the task outcome is recorded.
+    let output_pin = match pin_result_outputs(blob_store, &result) {
+        Ok(pin) => pin,
+        Err(problem) => {
+            warn!(task_id = %task_id, problem = %problem, "Result refers to output files the master does not hold");
+            result.error = Some(match result.error.take() {
+                Some(error) => format!("{error}; {problem}"),
+                None => problem,
+            });
+            None
+        }
+    };
 
     // 1. Record outcome in TaskQueue FSM
     let outcome = match queue
@@ -2011,10 +2032,15 @@ async fn apply_task_result(
     }
 
     // 3. Notify awaiting clients, but only once the task is really finished: a requeued
-    //    task (rejection, execution retry) will still produce its real result.
+    //    task (rejection, execution retry) will still produce its real result and keeps its
+    //    input pins. When terminal, input pins are released and output pins stay held for
+    //    `output_pin_retention` so the client can download them.
     if outcome.disposition == ResultDisposition::Terminal {
         if let Some(store) = blob_store {
             store.unpin_task(&task_id);
+        }
+        if let Some(pin) = output_pin {
+            pin.commit_terminal(task_id);
         }
         let mut lock = waiters.write().await;
         if let Some(senders) = lock.remove(&task_id) {

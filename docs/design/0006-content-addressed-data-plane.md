@@ -105,14 +105,18 @@ Behaviour before this change (design record 0003, inline staging):
   `master --blob-dir` / `--blob-store-mb` (or `RUSTY_GRID_BLOB_DIR` / `RUSTY_GRID_BLOB_STORE_MB`,
   or `blob_dir` / `blob_store_mb` in the config file) say otherwise. A library `ServerConfig` has no
   store unless `with_blob_store` is called.
-- A stored blob makes the store evict least recently used blobs down to its bound. Blobs of a task
-  between admission and its terminal state are pinned and never evicted. A sweeper (every 30 s)
-  releases the pins of finished tasks that no result released and drops uploads idle for 10 minutes.
+- A stored blob makes the store evict least recently used blobs down to its bound. Input blobs of a
+  task between admission and its terminal state are pinned and never evicted, and output blobs of a
+  finished task stay pinned for 10 minutes (`BlobStoreConfig::output_pin_retention`) so the client
+  can download them; pinned inputs and outputs can hold the store above its bound for that time. A
+  sweeper (every 30 s) releases the input pins of finished tasks, releases output pins past their
+  10-minute retention window, and drops uploads idle for 10 minutes.
 - Admission (`admit_blob_task`): every input blob, and every file of every input tree, must be in
   the store with the announced size; they are pinned for the task. Otherwise the submission gets a
   `ClientResponse::Error` naming the input. A Master without a store refuses tasks with inputs or
   output patterns.
-- A result whose outputs are not all in the store gets an error naming the first missing one.
+- A result whose outputs are not all in the store gets an error naming the first missing one; when
+  present, they are pinned in the same store call that checks them.
 - Each worker connection has a `BlobService` task that answers its requests in order, off the
   inbound loop. On QUIC the replies are routed to the data stream; client requests are answered
   inline on their own connection.

@@ -72,6 +72,10 @@ impl Cluster {
         if with_blob_store {
             config = config.with_blob_store(store_dir.path(), 256 * 1024 * 1024);
         }
+        Self::start_with_config(config, store_dir).await
+    }
+
+    async fn start_with_config(config: ServerConfig, store_dir: TempDir) -> Self {
         let master = MasterServer::spawn(config).await.expect("master starts");
         let addr = master.server_addr().to_string();
 
@@ -462,6 +466,123 @@ async fn test_output_patterns_never_follow_symlinked_parent_directories_or_steal
         b"sub-secret",
         "external subdirectory file must not be moved or modified"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_output_blobs_stay_pinned_for_delayed_client_download() {
+    let store_dir = tempfile::tempdir().unwrap();
+    // 3 MiB blob store bound: two 2 MiB outputs cannot both fit without eviction unless pinned.
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_blob_store(store_dir.path(), 3 * 1024 * 1024);
+    let cluster = Cluster::start_with_config(config, store_dir).await;
+
+    let write_2mib_task = |name: &str, byte: u8| -> (Task, Vec<u8>) {
+        let data = vec![byte; 2 * 1024 * 1024];
+        let shared_src = cluster._dirs[0].path().join(format!("src_{name}"));
+        std::fs::write(&shared_src, &data).unwrap();
+        #[cfg(unix)]
+        let spec = TaskSpec::command(
+            "cp",
+            vec![shared_src.to_string_lossy().into_owned(), name.to_string()],
+        );
+        #[cfg(windows)]
+        let spec = TaskSpec::command(
+            "cmd",
+            vec![
+                "/C".into(),
+                format!("copy /Y \"{}\" \"{}\"", shared_src.display(), name),
+            ],
+        );
+        (
+            Task::new(spec, TaskRequirements::generic(1, 30)).with_output_glob(name),
+            data,
+        )
+    };
+
+    let (task_a, expected_a) = write_2mib_task("a.bin", 0x41);
+    let result_a = cluster.run(task_a).await.unwrap();
+    assert!(result_a.is_success(), "{:?}", result_a.error);
+    assert_eq!(result_a.outputs.len(), 1);
+
+    // Before client A downloads `a.bin`, task B runs and stores a 2 MiB output `b.bin`.
+    let (task_b, _expected_b) = write_2mib_task("b.bin", 0x42);
+    let result_b = cluster.run(task_b).await.unwrap();
+    assert!(result_b.is_success(), "{:?}", result_b.error);
+
+    // Client A now resumes and downloads `a.bin`.
+    let out_dir = tempfile::tempdir().unwrap();
+    let connection = BlobConnection::connect(&cluster.addr, None).await.unwrap();
+    download_outputs(&connection, &result_a.outputs, out_dir.path())
+        .await
+        .expect("task A output must remain pinned until client A downloads it");
+    assert_eq!(
+        std::fs::read(out_dir.path().join("a.bin")).unwrap(),
+        expected_a
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_output_blobs_can_be_evicted_after_output_pin_retention_expires() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let mut config = ServerConfig::new("127.0.0.1:0".parse().unwrap());
+    config.blob_store = Some(
+        rusty_grid_master::BlobStoreConfig::new(store_dir.path(), 3 * 1024 * 1024)
+            .with_output_pin_retention(Duration::from_millis(100)),
+    );
+    let cluster = Cluster::start_with_config(config, store_dir).await;
+
+    let write_2mib_task = |name: &str, byte: u8| -> Task {
+        let data = vec![byte; 2 * 1024 * 1024];
+        let shared_src = cluster._dirs[0].path().join(format!("src_{name}"));
+        std::fs::write(&shared_src, &data).unwrap();
+        #[cfg(unix)]
+        let spec = TaskSpec::command(
+            "cp",
+            vec![shared_src.to_string_lossy().into_owned(), name.to_string()],
+        );
+        #[cfg(windows)]
+        let spec = TaskSpec::command(
+            "cmd",
+            vec![
+                "/C".into(),
+                format!("copy /Y \"{}\" \"{}\"", shared_src.display(), name),
+            ],
+        );
+        Task::new(spec, TaskRequirements::generic(1, 30)).with_output_glob(name)
+    };
+
+    let result_a = cluster
+        .run(write_2mib_task("a.bin", 0x51))
+        .await
+        .unwrap();
+    assert!(result_a.is_success(), "{:?}", result_a.error);
+    let a_id = result_a.outputs[0].id;
+    let store = cluster.master.blob_store().expect("blob store");
+    assert!(store.contains(&a_id));
+    assert_eq!(store.stats().pinned_blobs, 1);
+
+    // Wait for `output_pin_retention` (100 ms) and the sweeper to release the output pin.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while store.stats().pinned_blobs > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        store.stats().pinned_blobs,
+        0,
+        "sweeper must release expired output pins"
+    );
+
+    // Now storing another 2 MiB output evicts `a.bin` to fit the 3 MiB bound.
+    let result_b = cluster
+        .run(write_2mib_task("b.bin", 0x52))
+        .await
+        .unwrap();
+    assert!(result_b.is_success(), "{:?}", result_b.error);
+    assert!(
+        !store.contains(&a_id),
+        "expired output blob must be evictable once its pin ends"
+    );
+    assert!(store.stats().evictions >= 1);
 }
 
 // ---------------------------------------------------------------------------------------------

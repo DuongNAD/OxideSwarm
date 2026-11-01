@@ -19,7 +19,10 @@ pub use auth::{
     DevBypass,
 };
 
-pub use blob_store::{BlobStore, BlobStoreConfig, BlobStoreStats, DEFAULT_BLOB_STORE_MAX_BYTES};
+pub use blob_store::{
+    BlobStore, BlobStoreConfig, BlobStoreStats, OutputPinGuard, DEFAULT_BLOB_STORE_MAX_BYTES,
+    DEFAULT_OUTPUT_PIN_RETENTION,
+};
 pub use liveness::{RxClock, StampedStream};
 pub use mapreduce::MapReduceEngine;
 pub use queue::{
