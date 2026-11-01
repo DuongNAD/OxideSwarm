@@ -1865,8 +1865,9 @@ impl TaskRunner {
             .unwrap_or("auto")
             .to_lowercase();
 
-        // 1. If explicit SDF requested, execute Tier 0 directly in-process (< 50ms)
-        if pref == "sdf" {
+        // 1. Under D3: "sdf" and default "auto" use the Tier 0 procedural SDF engine directly
+        let is_custom_script = std::env::var("OXIDESWARM_GEN3D_SCRIPT").is_ok();
+        if pref == "sdf" || pref == "tier0_sdf" || (pref == "auto" && !is_custom_script) {
             info!(task_id = %task.id, "Executing Tier 0 Procedural SDF engine");
             return self
                 .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
@@ -2232,6 +2233,23 @@ impl TaskRunner {
         start_time: Instant,
     ) -> TaskResult {
         let task_id = task.id;
+
+        // Reject image input on SDF tier
+        if spec.image_data.is_some() {
+            let elapsed = start_time.elapsed().as_millis() as u64;
+            return TaskResult::failure(
+                self.worker_id,
+                task_id,
+                EXIT_CODE_GENERAL_ERROR,
+                Bytes::new(),
+                Bytes::from_static(
+                    b"Tier 0 procedural SDF engine does not support image input (text prompt only)\n",
+                ),
+                elapsed,
+                Some("Tier 0 procedural SDF engine does not support image input (text prompt only)".to_string()),
+            );
+        }
+
         let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel();
         let spec_clone = spec.clone();
 

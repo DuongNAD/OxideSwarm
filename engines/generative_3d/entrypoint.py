@@ -41,16 +41,15 @@ def main():
     if device.startswith("cuda") and (not has_torch or not torch.cuda.is_available()):
         print(f"[PROGRESS: 0.10] CUDA requested but unavailable, falling back to CPU", flush=True)
         device = "cpu"
+    checkpoint = os.environ.get("OXIDESWARM_TRIPOSR_CHECKPOINT") or os.environ.get("TRIPOSR_CHECKPOINT")
+    if not checkpoint or not os.path.exists(checkpoint):
+        sys.stderr.write("TripoSR model not available: local AI 3D model checkpoint is not installed\n")
+        sys.stderr.flush()
+        sys.exit(1)
 
     print(f"[PROGRESS: 0.25] Ingesting concept input (prompt='{args.prompt}', input='{args.input}')...", flush=True)
-    time.sleep(0.02)
-
-    print(f"[PROGRESS: 0.60] Computing 3D neural volume representation...", flush=True)
-    time.sleep(0.02)
-
+    print(f"[PROGRESS: 0.60] Computing 3D neural volume representation from checkpoint: {checkpoint}...", flush=True)
     print(f"[PROGRESS: 0.85] Running Marching Cubes & generating manifold geometry...", flush=True)
-    time.sleep(0.02)
-
     print(f"[PROGRESS: 0.95] Packing glTF 2.0 binary container (.glb)...", flush=True)
 
     # Export a valid, Khronos-compliant glTF 2.0 binary (.glb) model

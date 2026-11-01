@@ -1464,6 +1464,17 @@ impl TaskSpec {
                 if spec.quality.trim().is_empty() {
                     return Err("Generative3D quality cannot be empty".to_string());
                 }
+                let engine = spec
+                    .engine_preference
+                    .as_deref()
+                    .unwrap_or("auto")
+                    .to_lowercase();
+                if (engine == "sdf" || engine == "tier0_sdf") && has_image {
+                    return Err(
+                        "Tier 0 procedural SDF engine does not support image input (text prompt only)"
+                            .to_string(),
+                    );
+                }
             }
             TaskSpec::AutoRig(spec) => {
                 if spec.input_mesh.is_empty() {

@@ -1,16 +1,77 @@
 //! Subprocess 3D engine runner utilities and Python environment discovery (Feature F5).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// Resolves the optimal Python executable for executing local 3D models.
+/// Converts a path to an absolute, normalized path without Windows verbatim prefix (`\\?\`).
+pub fn to_clean_absolute_path(path: &Path) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        #[cfg(windows)]
+        {
+            let s = canon.to_string_lossy();
+            if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
+                return Some(PathBuf::from(format!(r"\\{stripped}")));
+            } else if let Some(stripped) = s.strip_prefix(r"\\?\") {
+                return Some(PathBuf::from(stripped));
+            }
+        }
+        return Some(canon);
+    }
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else if let Ok(cwd) = std::env::current_dir() {
+        Some(cwd.join(path))
+    } else {
+        Some(path.to_path_buf())
+    }
+}
+
+/// Probes whether an executable name exists on PATH, responds to `--version`,
+/// and returns its clean absolute path.
+fn probe_executable_in_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var("PATH").ok()?;
+    for dir in std::env::split_paths(&path_var) {
+        #[cfg(windows)]
+        let exts: &[&str] = &[".exe", ".cmd", ".bat", ""];
+        #[cfg(not(windows))]
+        let exts: &[&str] = &[""];
+
+        for ext in exts {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                let mut cmd = std::process::Command::new(&candidate);
+                cmd.arg("--version");
+                for var in crate::runner::SECRET_ENV_VARS {
+                    cmd.env_remove(var);
+                }
+                if let Ok(output) = cmd.output() {
+                    if output.status.success() {
+                        return to_clean_absolute_path(&candidate);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolves the optimal Python executable for executing local 3D models as an absolute path.
 pub fn resolve_python_runtime() -> Option<PathBuf> {
     // 1. Explicit environment variable override
     if let Ok(custom) =
         std::env::var("OXIDESWARM_PYTHON").or_else(|_| std::env::var("RUSTY_GRID_PYTHON"))
     {
-        let p = PathBuf::from(custom);
-        if p.is_file() {
-            return Some(p);
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            if let Some(abs) = to_clean_absolute_path(&p) {
+                return Some(abs);
+            }
+            if let Some(abs) = probe_executable_in_path(trimmed) {
+                return Some(abs);
+            }
         }
     }
 
@@ -31,38 +92,30 @@ pub fn resolve_python_runtime() -> Option<PathBuf> {
     ];
 
     for candidate in &venv_candidates {
-        if candidate.is_file() {
-            return Some(candidate.clone());
+        if let Some(abs) = to_clean_absolute_path(candidate) {
+            return Some(abs);
         }
     }
 
     // 3. Fallback: check if standard python executable is available on PATH
-    if let Ok(output) = std::process::Command::new("python")
-        .arg("--version")
-        .output()
-    {
-        if output.status.success() {
-            return Some(PathBuf::from("python"));
-        }
-    }
-    if let Ok(output) = std::process::Command::new("python3")
-        .arg("--version")
-        .output()
-    {
-        if output.status.success() {
-            return Some(PathBuf::from("python3"));
+    for name in &["python", "python3"] {
+        if let Some(abs) = probe_executable_in_path(name) {
+            return Some(abs);
         }
     }
 
     None
 }
 
-/// Resolves the file path to the 3D generation entrypoint script.
+/// Resolves the file path to the 3D generation entrypoint script as an absolute path.
 pub fn resolve_entrypoint_script() -> Option<PathBuf> {
     if let Ok(custom) = std::env::var("OXIDESWARM_GEN3D_SCRIPT") {
-        let p = PathBuf::from(custom);
-        if p.is_file() {
-            return Some(p);
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            if let Some(abs) = to_clean_absolute_path(&p) {
+                return Some(abs);
+            }
         }
     }
 
@@ -73,8 +126,8 @@ pub fn resolve_entrypoint_script() -> Option<PathBuf> {
     ];
 
     for c in &candidates {
-        if c.is_file() {
-            return Some(c.clone());
+        if let Some(abs) = to_clean_absolute_path(c) {
+            return Some(abs);
         }
     }
 
