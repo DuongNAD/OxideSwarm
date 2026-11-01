@@ -1023,11 +1023,11 @@ The standard in `docs/README.md` requires "only what the code does". These items
 
 - **Evidence:** Read.
 - **Problem:** `diagnose` prints `HEALTHY` when peer state is missing, never checks its age, and
-  always exits 0. Identity comes from the platform, so two Macs overwrite one state file.
-  `--auto-pull` always pulls `master`. Owner paths and a private gateway address are hard-coded. The
-  script has no tests.
+  always exits 0. Identity comes from the platform, so two Macs overwrite one state file. Owner
+  paths and a private gateway address are hard-coded. `tests/test_agent_bridge.py` covers `watch`,
+  `peek` and `send`, but not `diagnose`.
 - **Do:** Report `UNKNOWN` for missing or stale peers, and exit non-zero on problems. Add
-  `--agent-id`. Pull the current branch's upstream. Remove owner paths. Add a test file.
+  `--agent-id`. Remove owner paths. Add tests for `diagnose`.
 - **Done when:** `diagnose` without a peer exits non-zero, and two simulated agents on one platform
   do not collide.
 
@@ -1260,5 +1260,7 @@ Add one dated line per finished item, newest last.
 - 2026-11-01: INT-2 completed; closed pull requests 1 and 2, deleted merged remote branches, and copied PR 2 CI details into TEST-6 (`origin/claude/trusting-wing-d9a27c` kept until TEST-6).
 - 2026-11-01: INT-3 completed; rebased `d0dddb8` (cluster auth v2 and record-layer hardening) onto `master` and verified all gates plus `tests/cluster_record_layer_e2e.rs`.
 - 2026-11-01: INT-4 completed; rebased `fae2622` (content-addressed data plane, design 0006) onto `master` after `INT-3` and verified all gates plus `tests/blob_transfer_e2e.rs`.
-- 2026-11-01: INT-5 completed; implemented F1 to F6 on `int-4-content-addressed-data-plane` (Windows clippy, symlinked output parent rejection, output blob pin retention on Master, immediate output file pinning in worker cache, bounded in-flight blob requests per session, and protocol version 2 enforcement).
 - 2026-11-01: INT-4 reopened. Pull request 6 is open at `e1215ee`, and `clippy (windows-latest)` fails. INT-5 holds the review findings to fix before the merge, and BUG-5 holds the smaller ones.
+- 2026-11-01: `agent_bridge.py watch` gained once-only delivery and a Claude Code wake (design 0007),
+  which also fixed the `--auto-pull` part of BRIDGE-1. This needs no backlog item of its own.
+- 2026-11-01: INT-5 completed; implemented F1 to F6 on `int-4-content-addressed-data-plane` (Windows clippy, symlinked output parent rejection, output blob pin retention on Master, immediate output file pinning in worker cache, bounded in-flight blob requests per session, and protocol version 2 enforcement).
