@@ -24,8 +24,8 @@ use clap::{Parser, Subcommand};
 use rusty_grid_core::cluster_auth::{ClusterSecret, ENV_SECRET, ENV_SECRET_FILE};
 use rusty_grid_core::error::{GridError, GridResult};
 
-use crate::config::{ConfigFile, SecretSection, SecretText};
-use crate::connect::master_requires_secret;
+use crate::config::{resolve_bool, ConfigFile, SecretSection, SecretText};
+use crate::connect::{master_requires_secret, AUTH_EXIT_CODE};
 
 /// The secret-related command line flags, as given.
 #[derive(Debug, Clone, Default)]
@@ -423,6 +423,50 @@ pub fn announce_peer_secret(outcome: PeerSecretOutcome, role: PeerRole, master_a
         tracing::warn!("{banner}");
     }
     eprintln!("!!! {banner}");
+}
+
+/// Resolves `--insecure` for a worker or client command: the flag, then `RUSTY_GRID_INSECURE`,
+/// then the command's config-file key, else off.
+pub fn peer_insecure(flag: bool, config_value: Option<bool>) -> bool {
+    resolve_bool(
+        if flag { Some(true) } else { None },
+        &["RUSTY_GRID_INSECURE"],
+        config_value,
+        false,
+    )
+}
+
+/// Resolves the cluster secret for a client command and applies the fail-closed policy for
+/// `master_addr` (see [`decide_peer_secret`]), printing the error on failure: a configuration
+/// problem exits with 1, a refusal to talk to an unauthenticated remote / `auto` master without
+/// `--insecure` with the authentication exit code (6).
+pub fn client_secret(
+    secret_opts: &SecretOpts,
+    config_file: Option<&ConfigFile>,
+    section: SecretSection,
+    master_addr: &str,
+    insecure: bool,
+) -> Result<Option<ClusterSecret>, ExitCode> {
+    let secret = secret_opts.resolve(config_file, section).map_err(|e| {
+        eprintln!("{e}");
+        ExitCode::FAILURE
+    })?;
+    match decide_peer_secret(
+        secret.as_ref(),
+        master_addr,
+        false,
+        insecure,
+        PeerRole::Client,
+    ) {
+        Ok(outcome) => {
+            announce_peer_secret(outcome, PeerRole::Client, master_addr);
+            Ok(secret)
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            Err(ExitCode::from(AUTH_EXIT_CODE))
+        }
+    }
 }
 
 /// Prints what the Master decided, once at startup. Never prints the secret itself.

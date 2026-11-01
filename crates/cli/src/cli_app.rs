@@ -50,8 +50,9 @@ use crate::connect::{
 use crate::doctor::{run_doctor, DoctorOptions};
 use crate::mode_cli;
 use crate::secret_cmd::{
-    announce_master_secret, announce_peer_secret, decide_master_secret, decide_peer_secret,
-    run_secret, PeerRole, PeerSecretOutcome, SecretCliArgs, SecretOpts,
+    announce_master_secret, announce_peer_secret, client_secret, decide_master_secret,
+    decide_peer_secret, peer_insecure, run_secret, PeerRole, PeerSecretOutcome, SecretCliArgs,
+    SecretOpts,
 };
 
 /// Bytes in a MiB, for the `*-mb` options.
@@ -857,13 +858,18 @@ pub async fn run_cli() -> ExitCode {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_log_filter(log_level))),
     );
-    let _ = if matches!(cli.command, Commands::Mcp(_)) {
+    let is_mcp = matches!(cli.command, Commands::Mcp(_));
+    let _ = if is_mcp {
         builder.with_writer(std::io::stderr).try_init()
     } else {
         builder.try_init()
     };
 
-    let config_file = match load_config_file(cli.config.as_deref()) {
+    let config_file = match if is_mcp {
+        crate::config::load_mcp_config_file(cli.config.as_deref())
+    } else {
+        load_config_file(cli.config.as_deref())
+    } {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("Configuration error: {e}");
@@ -1798,50 +1804,6 @@ async fn exchange(
             "Communication error with Master",
             &GridError::from(e),
         )),
-    }
-}
-
-/// Resolves `--insecure` for a worker or client command: the flag, then `RUSTY_GRID_INSECURE`,
-/// then the command's config-file key, else off.
-fn peer_insecure(flag: bool, config_value: Option<bool>) -> bool {
-    resolve_bool(
-        if flag { Some(true) } else { None },
-        &["RUSTY_GRID_INSECURE"],
-        config_value,
-        false,
-    )
-}
-
-/// Resolves the cluster secret for a client command and applies the fail-closed policy for
-/// `master_addr` (see [`decide_peer_secret`]), printing the error on failure: a configuration
-/// problem exits with 1, a refusal to talk to an unauthenticated remote / `auto` master without
-/// `--insecure` with the authentication exit code (6).
-fn client_secret(
-    secret_opts: &SecretOpts,
-    config_file: Option<&ConfigFile>,
-    section: SecretSection,
-    master_addr: &str,
-    insecure: bool,
-) -> Result<Option<ClusterSecret>, ExitCode> {
-    let secret = secret_opts.resolve(config_file, section).map_err(|e| {
-        eprintln!("{e}");
-        ExitCode::FAILURE
-    })?;
-    match decide_peer_secret(
-        secret.as_ref(),
-        master_addr,
-        false,
-        insecure,
-        PeerRole::Client,
-    ) {
-        Ok(outcome) => {
-            announce_peer_secret(outcome, PeerRole::Client, master_addr);
-            Ok(secret)
-        }
-        Err(e) => {
-            eprintln!("{e}");
-            Err(ExitCode::from(AUTH_EXIT_CODE))
-        }
     }
 }
 

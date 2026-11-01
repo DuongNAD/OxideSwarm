@@ -1,7 +1,7 @@
 # 0004: Model Context Protocol server and subnet-isolated discovery fallback
 
 Status: Implemented
-Created: 2026-10-23    Updated: 2026-10-23
+Created: 2026-10-23    Updated: 2026-11-01
 
 ## Summary
 
@@ -58,7 +58,9 @@ Supported lifecycle endpoints:
 
 Connection resilience: `McpState` reuses `crates/cli/src/connect.rs::connect_master` with lazy connection caching and transparent reconnection if the socket drops.
 
-Implemented in `crates/cli/src/mcp.rs`.
+Configuration resolution: `oxideswarm mcp` takes `master`, `secret` / `secret_file` (falling back to top-level keys), and `insecure` from the `[status]` section of the configuration file for all its tools (`status`, `workers`, `submit`, `task_result`, and `doctor`). Unlike other CLI subcommands, `mcp` loads its configuration file from `--config`, then `RUSTY_GRID_CONFIG`, then `~/.oxideswarm/rusty-grid.toml`, skipping `./rusty-grid.toml` and `./rusty-grid.json` in the working directory and printing a one-line notice on `stderr` when one is skipped.
+
+Implemented in `crates/cli/src/mcp.rs` and `crates/cli/src/config.rs`.
 
 ### D2 Five core tools
 
@@ -138,7 +140,7 @@ Implemented in `crates/core/src/discovery.rs` and `crates/master/src/server.rs`.
 
 - All discovery probes and rendezvous leases require HMAC-SHA256 validation using `cluster.secret`. Malicious actors on the network cannot impersonate the master.
 - Fresh 16-byte nonces ensure that discovery probes are single-use and cannot be replayed.
-- The MCP server strictly forbids unauthenticated connections to non-loopback addresses unless `--insecure` is explicitly passed.
+- The MCP server strictly forbids unauthenticated connections to non-loopback or auto-discovered addresses (exiting with code `6` before reading standard input) unless `--insecure`, `RUSTY_GRID_INSECURE=1`, or `[status] insecure = true` is set (`RUSTY_GRID_INSECURE=0` overrides `[status] insecure = true`). Skipping any config file in the working directory prevents a cloned repository from steering `mcp` to a remote host or waiving authentication.
 
 ## Test plan
 
@@ -163,3 +165,4 @@ Implemented in `crates/core/src/discovery.rs` and `crates/master/src/server.rs`.
 - 2026-10-23: Created and accepted for Milestone M5C.
 - 2026-10-23: Implemented W1–W6 on branch `feat/m5c-mcp-and-discovery`.
 - 2026-10-23: Verified via `cargo test -p rusty_grid_cli --test mcp_server_e2e` and `discovery_fallback_e2e` (5 passing tests). Status marked Implemented.
+- 2026-11-01: Removed the unauthenticated `--sse` HTTP surface (`SEC-1`) and enforced startup secret validation via `client_secret` using `[status]` for `master`, `secret`, and `insecure` while skipping working-directory config files (`SEC-2`).
