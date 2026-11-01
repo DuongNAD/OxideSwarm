@@ -370,6 +370,100 @@ async fn test_inputs_that_were_never_uploaded_are_refused_at_submission() {
     assert!(err.contains("not on the master"), "{err}");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_output_patterns_never_follow_symlinked_parent_directories_or_steal_external_files() {
+    let cluster = Cluster::start(true).await;
+    let outside = tempfile::tempdir().unwrap();
+    let sub = outside.path().join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(outside.path().join("important.txt"), b"precious").unwrap();
+    std::fs::write(sub.join("secret.txt"), b"sub-secret").unwrap();
+
+    #[cfg(unix)]
+    let can_symlink = {
+        let probe = outside.path().join("probe_link");
+        let ok = std::os::unix::fs::symlink(&sub, &probe).is_ok();
+        let _ = std::fs::remove_file(&probe);
+        ok
+    };
+    #[cfg(windows)]
+    let can_symlink = {
+        let probe = outside.path().join("probe_link");
+        let ok = std::os::windows::fs::symlink_dir(&sub, &probe).is_ok();
+        let _ = std::fs::remove_dir(&probe);
+        ok
+    };
+    if !can_symlink {
+        eprintln!("skipping: host refused to create a directory symlink");
+        return;
+    }
+
+    #[cfg(unix)]
+    let make_link_task = |outputs: Vec<&str>| {
+        let script = format!(
+            "ln -s '{}' link && printf 'sandbox-ok' > keep.txt",
+            outside.path().display()
+        );
+        let mut task = Task::new(
+            TaskSpec::command("sh", vec!["-c".into(), script]),
+            TaskRequirements::generic(1, 30),
+        );
+        for pat in outputs {
+            task = task.with_output_glob(pat);
+        }
+        task
+    };
+    #[cfg(windows)]
+    let make_link_task = |outputs: Vec<&str>| {
+        let script = format!(
+            "mklink /D link \"{}\" && echo sandbox-ok>keep.txt",
+            outside.path().display()
+        );
+        let mut task = Task::new(
+            TaskSpec::command("cmd", vec!["/C".into(), script]),
+            TaskRequirements::generic(1, 30),
+        );
+        for pat in outputs {
+            task = task.with_output_glob(pat);
+        }
+        task
+    };
+
+    // 1. Literal output through a symlinked directory fails and names the pattern.
+    let res_literal = cluster
+        .run(make_link_task(vec!["link/important.txt"]))
+        .await
+        .unwrap();
+    assert!(
+        !res_literal.is_success(),
+        "literal output through symlinked directory must fail"
+    );
+    let err_msg = res_literal.error.as_deref().unwrap_or("");
+    assert!(
+        err_msg.contains("link/important.txt"),
+        "expected error naming pattern, got: {err_msg}"
+    );
+    assert_eq!(
+        std::fs::read(outside.path().join("important.txt")).unwrap(),
+        b"precious",
+        "external file must not be moved or modified"
+    );
+
+    // 2. Wildcard through symlinked prefix selects nothing, while '**/*.txt' returns sandbox files only.
+    let res_glob = cluster
+        .run(make_link_task(vec!["link/sub/*.txt", "**/*.txt"]))
+        .await
+        .unwrap();
+    assert!(res_glob.is_success(), "{:?}", res_glob.error);
+    let paths: Vec<&str> = res_glob.outputs.iter().map(|o| o.path.as_str()).collect();
+    assert_eq!(paths, ["keep.txt"]);
+    assert_eq!(
+        std::fs::read(sub.join("secret.txt")).unwrap(),
+        b"sub-secret",
+        "external subdirectory file must not be moved or modified"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // The real binary: `rusty-grid master` and `rusty-grid submit` as separate processes (the worker
 // runs in this process, see the module docs)

@@ -137,7 +137,7 @@ pub fn collect_outputs(
     let mut found: BTreeMap<String, Found> = BTreeMap::new();
     let mut not_produced = Vec::new();
     let mut visited = 0usize;
-    for pattern in &patterns {
+    'patterns: for pattern in &patterns {
         let prefix = pattern.literal_prefix();
         let start = if prefix.is_empty() {
             root.clone()
@@ -147,6 +147,24 @@ pub fn collect_outputs(
                 Err(_) => continue,
             }
         };
+        if !prefix.is_empty() {
+            let parts: Vec<&str> = prefix.split('/').collect();
+            let mut ancestor = root.clone();
+            for part in &parts[..parts.len() - 1] {
+                ancestor.push(part);
+                if let Ok(meta) = std::fs::symlink_metadata(&ancestor) {
+                    if meta.file_type().is_symlink() {
+                        if pattern.is_literal() {
+                            return Err(format!(
+                                "output '{}' traverses a symbolic link (symbolic links are never returned)",
+                                pattern.as_str()
+                            ));
+                        }
+                        continue 'patterns;
+                    }
+                }
+            }
+        }
         let meta = match std::fs::symlink_metadata(&start) {
             Ok(meta) => meta,
             Err(_) => {
@@ -156,6 +174,15 @@ pub fn collect_outputs(
                 continue;
             }
         };
+        if meta.file_type().is_symlink() {
+            if pattern.is_literal() {
+                return Err(format!(
+                    "output '{}' is not a regular file or directory (symbolic links are never returned)",
+                    pattern.as_str()
+                ));
+            }
+            continue;
+        }
         if meta.is_file() {
             if pattern.selects(&prefix) {
                 found.entry(prefix.clone()).or_insert(Found {
@@ -448,6 +475,60 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("symbolic links"), "{err}");
+    }
+
+    #[test]
+    fn symbolic_link_in_parent_directory_of_output_pattern_is_never_followed() {
+        let (dir, sandbox, cache) = setup();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        std::fs::write(outside.join("important.txt"), b"do not steal").unwrap();
+        std::fs::write(outside.join("sub/other.txt"), b"also outside").unwrap();
+        write(&sandbox, "inside.txt", b"inside");
+
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, sandbox.join("link")).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&outside, sandbox.join("link")).is_ok();
+        if !linked {
+            eprintln!("skipping: host refused to create a directory symlink");
+            return;
+        }
+
+        // Literal pattern through a symlinked parent directory fails and names the pattern.
+        let err = collect_outputs(
+            &sandbox,
+            &["link/important.txt".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("link/important.txt"), "{err}");
+        assert!(err.contains("symbolic link"), "{err}");
+        assert_eq!(
+            std::fs::read(outside.join("important.txt")).unwrap(),
+            b"do not steal",
+            "outside file must remain untouched"
+        );
+
+        // Wildcard pattern with a symlinked directory in its literal prefix selects nothing,
+        // while '**/*.txt' still returns files inside the sandbox and nothing from outside.
+        let outputs = collect_outputs(
+            &sandbox,
+            &["link/sub/*.txt".to_string(), "**/*.txt".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        )
+        .unwrap();
+        let paths: Vec<&str> = outputs.iter().map(|o| o.path.as_str()).collect();
+        assert_eq!(paths, ["inside.txt"]);
+        assert_eq!(
+            std::fs::read(outside.join("sub/other.txt")).unwrap(),
+            b"also outside",
+            "outside subfile must remain untouched"
+        );
     }
 
     #[test]
