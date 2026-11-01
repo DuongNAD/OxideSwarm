@@ -510,7 +510,8 @@ mod middleware {
     /// Axum middleware function validating credentials and enforcing RBAC.
     ///
     /// Every route of the dashboard router sits behind this layer (REST, `/ws`, `/api/stream`,
-    /// SSE, POSTs and the fallback); the only exempt request is `GET /` (the static SPA shell).
+    /// SSE, POSTs and the fallback); the only exempt routes are `GET /` (the static SPA shell),
+    /// `GET /api/discovery/probe`, `GET /api/rendezvous/master`, and `POST /api/rendezvous/register`.
     pub async fn rbac_auth_middleware(
         State(config): State<Arc<AuthConfig>>,
         mut req: Request,
@@ -963,8 +964,20 @@ mod tests {
 
         #[test]
         fn test_route_required_scope_covers_every_dashboard_route() {
-            // Only the static SPA shell is public.
+            // Only the static SPA shell and discovery/rendezvous routes are public.
             assert_eq!(route_required_scope(&Method::GET, "/"), None);
+            assert_eq!(
+                route_required_scope(&Method::GET, "/api/discovery/probe"),
+                None
+            );
+            assert_eq!(
+                route_required_scope(&Method::GET, "/api/rendezvous/master"),
+                None
+            );
+            assert_eq!(
+                route_required_scope(&Method::POST, "/api/rendezvous/register"),
+                None
+            );
             for path in [
                 "/api/status",
                 "/api/workers",
