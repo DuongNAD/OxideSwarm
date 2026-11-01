@@ -1,6 +1,6 @@
 //! Model Context Protocol (MCP) server for OxideSwarm AI Agent integration.
 //!
-//! Provides a standard stdio JSON-RPC 2.0 server interface (and optional lightweight HTTP SSE mode)
+//! Provides a standard stdio JSON-RPC 2.0 server interface
 //! allowing external AI coding agents (Claude Desktop, Cline, Cursor, custom agents) to directly
 //! inspect, orchestrate, and execute workloads on an OxideSwarm cluster.
 //!
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -69,19 +69,6 @@ pub struct McpArgs {
         help = "Address of the Master's grid port (default 127.0.0.1:8088); a bare host gets :8088; 'auto' discovers it on the LAN"
     )]
     pub master: Option<String>,
-
-    #[arg(
-        long,
-        help = "Run in SSE (Server-Sent Events) HTTP mode instead of stdio"
-    )]
-    pub sse: bool,
-
-    #[arg(
-        long,
-        default_value = "127.0.0.1:8085",
-        help = "HTTP bind address for SSE mode"
-    )]
-    pub sse_bind: String,
 
     #[arg(
         long,
@@ -1218,108 +1205,6 @@ async fn send_response(stdout: &mut tokio::io::Stdout, response: &JsonRpcRespons
 }
 
 // ============================================================================
-// Lightweight SSE HTTP Server Mode (Optional)
-// ============================================================================
-
-pub async fn run_sse_server(state: Arc<McpState>, bind_addr: &str) -> ExitCode {
-    eprintln!("[mcp] Starting MCP HTTP server on http://{bind_addr}...");
-    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[mcp] Failed to bind HTTP listener on {bind_addr}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    loop {
-        let (mut socket, _peer_addr) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                eprintln!("[mcp] Accept error: {e}");
-                continue;
-            }
-        };
-
-        let state_clone = Arc::clone(&state);
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 8192];
-            let n = match socket.read(&mut buf).await {
-                Ok(n) if n > 0 => n,
-                _ => return,
-            };
-
-            let req_str = String::from_utf8_lossy(&buf[..n]);
-            // Simple HTTP header splitting
-            if let Some((headers, body)) = req_str.split_once("\r\n\r\n") {
-                if headers.starts_with("POST") {
-                    let request_json: Result<JsonRpcRequest, _> = serde_json::from_str(body.trim());
-                    let resp_body = match request_json {
-                        Ok(req) => {
-                            let id = req.id.clone();
-                            let resp = match req.method.as_str() {
-                                "initialize" => JsonRpcResponse::success(
-                                    id,
-                                    json!({
-                                        "protocolVersion": MCP_PROTOCOL_VERSION,
-                                        "capabilities": { "tools": {} },
-                                        "serverInfo": { "name": MCP_SERVER_NAME, "version": MCP_SERVER_VERSION }
-                                    }),
-                                ),
-                                "ping" => JsonRpcResponse::success(id, json!({})),
-                                "tools/list" => JsonRpcResponse::success(
-                                    id,
-                                    json!({ "tools": available_tools() }),
-                                ),
-                                "tools/call" => {
-                                    let params = req.params.unwrap_or(Value::Null);
-                                    let name =
-                                        params.get("name").and_then(Value::as_str).unwrap_or("");
-                                    let args =
-                                        params.get("arguments").cloned().unwrap_or(json!({}));
-                                    let tool_res = call_tool(&state_clone, name, &args).await;
-                                    JsonRpcResponse::success(
-                                        id,
-                                        serde_json::to_value(tool_res).unwrap(),
-                                    )
-                                }
-                                other => JsonRpcResponse::error(
-                                    id,
-                                    METHOD_NOT_FOUND,
-                                    format!("Method not found: '{other}'"),
-                                    None,
-                                ),
-                            };
-                            serde_json::to_string(&resp).unwrap_or_default()
-                        }
-                        Err(e) => serde_json::to_string(&JsonRpcResponse::error(
-                            None,
-                            PARSE_ERROR,
-                            format!("Parse error: {e}"),
-                            None,
-                        ))
-                        .unwrap_or_default(),
-                    };
-
-                    let http_resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        resp_body.len(),
-                        resp_body
-                    );
-                    let _ = socket.write_all(http_resp.as_bytes()).await;
-                } else if headers.starts_with("GET /sse") {
-                    let sse_header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\nevent: endpoint\r\ndata: /messages\r\n\r\n";
-                    let _ = socket.write_all(sse_header.as_bytes()).await;
-                } else {
-                    let not_found =
-                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                    let _ = socket.write_all(not_found.as_bytes()).await;
-                }
-            }
-        });
-    }
-}
-
-// ============================================================================
 // Top-Level Entrypoint
 // ============================================================================
 
@@ -1347,9 +1232,21 @@ pub async fn run_mcp(
 
     let state = Arc::new(McpState::new(master_addr, secret, args.insecure));
 
-    if args.sse {
-        run_sse_server(state, &args.sse_bind).await
-    } else {
-        run_stdio_server(state).await
+    run_stdio_server(state).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_mcp_args_rejects_sse_flags() {
+        assert!(McpArgs::try_parse_from(["mcp", "--sse"]).is_err());
+        assert!(McpArgs::try_parse_from(["mcp", "--sse-bind", "127.0.0.1:8085"]).is_err());
+        let ok = McpArgs::try_parse_from(["mcp", "--master", "127.0.0.1:8088"])
+            .expect("valid mcp args should parse");
+        assert_eq!(ok.master.as_deref(), Some("127.0.0.1:8088"));
+        assert!(!ok.insecure);
     }
 }
