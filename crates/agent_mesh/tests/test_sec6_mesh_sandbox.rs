@@ -238,9 +238,7 @@ print(' '.join(k + '=' + os.environ.get(k, 'UNSET') for k in keys))
         {
             format!("python {}", script_name)
         } else {
-            format!(
-                "sh -c 'echo \"OXIDESWARM_SECRET=${{OXIDESWARM_SECRET:-UNSET}} OXIDESWARM_SECRET_FILE=${{OXIDESWARM_SECRET_FILE:-UNSET}} OXIDE_MESH_TOKEN=${{OXIDE_MESH_TOKEN:-UNSET}} RUSTY_GRID_SECRET=${{RUSTY_GRID_SECRET:-UNSET}} RUSTY_GRID_SECRET_FILE=${{RUSTY_GRID_SECRET_FILE:-UNSET}}\"'"
-            )
+            "sh -c 'echo \"OXIDESWARM_SECRET=${OXIDESWARM_SECRET:-UNSET} OXIDESWARM_SECRET_FILE=${OXIDESWARM_SECRET_FILE:-UNSET} OXIDE_MESH_TOKEN=${OXIDE_MESH_TOKEN:-UNSET} RUSTY_GRID_SECRET=${RUSTY_GRID_SECRET:-UNSET} RUSTY_GRID_SECRET_FILE=${RUSTY_GRID_SECRET_FILE:-UNSET}\"'".to_string()
         }
     };
 
