@@ -96,7 +96,7 @@ impl MobileCapabilities {
 /// (or pushed by the platform, e.g. Android's `BatteryManager`) to keep scheduling decisions fresh.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MobileLiveStatus {
-    /// Battery charge percentage (0-100), `None` when unknown or on AC power.
+    /// Battery charge percentage (0-100), or `None` if no battery could be read.
     pub battery_pct: Option<u8>,
     /// Whether the device is drawing external power, `None` when unknown.
     pub is_charging: Option<bool>,
@@ -961,38 +961,48 @@ fn detect_battery() -> (Option<u8>, Option<bool>) {
     (None, None)
 }
 
+/// Returns whether a sysfs `/sys/class/power_supply/<entry>/type` value names an external
+/// power source (`Mains`, `USB*`, or `Wireless`) rather than a battery.
+fn is_external_power_supply_type(kind: &str) -> bool {
+    let k = kind.trim();
+    k.eq_ignore_ascii_case("Mains")
+        || k.eq_ignore_ascii_case("Wireless")
+        || (k.len() >= 3 && k[..3].eq_ignore_ascii_case("USB"))
+}
+
 /// Parses a Linux/Android `/sys/class/power_supply` directory into `(battery_pct, is_charging)`.
 ///
-/// The `online` attribute of any power supply whose `type` is `Mains` is the primary source of
-/// `is_charging` (`1` -> `Some(true)`, `0` -> `Some(false)`). The battery `status` attribute
-/// (`Charging`, `Full`, `Discharging`, `Not charging`) is used only as a fallback when no
-/// `Mains` supply reports `online`.
+/// The `online` attribute of any external power supply (`Mains`, `USB*`, `Wireless`) is the
+/// primary source of `is_charging` (`1` on any external supply -> `Some(true)`, all present
+/// external supplies `0` -> `Some(false)`). The battery `status` attribute (`Charging`, `Full`,
+/// `Discharging`, `Not charging`) is used only as a fallback when no external power supply
+/// reports `online`.
 fn parse_sysfs_power_supply(power_supply: &std::path::Path) -> (Option<u8>, Option<bool>) {
     if !power_supply.is_dir() {
         return (None, None);
     }
 
-    let mut mains_online: Option<bool> = None;
+    let mut external_online: Option<bool> = None;
     if let Ok(entries) = std::fs::read_dir(power_supply) {
         for entry in entries.flatten() {
             let dir = entry.path();
             if !dir.is_dir() {
                 continue;
             }
-            let is_mains = std::fs::read_to_string(dir.join("type"))
-                .map(|t| t.trim().eq_ignore_ascii_case("Mains"))
+            let is_external = std::fs::read_to_string(dir.join("type"))
+                .map(|t| is_external_power_supply_type(&t))
                 .unwrap_or(false);
-            if !is_mains {
+            if !is_external {
                 continue;
             }
             if let Ok(online) = std::fs::read_to_string(dir.join("online")) {
                 match online.trim() {
                     "1" => {
-                        mains_online = Some(true);
+                        external_online = Some(true);
                         break;
                     }
                     "0" => {
-                        mains_online.get_or_insert(false);
+                        external_online.get_or_insert(false);
                     }
                     _ => {}
                 }
@@ -1016,7 +1026,7 @@ fn parse_sysfs_power_supply(power_supply: &std::path::Path) -> (Option<u8>, Opti
                 None
             };
             if capacity.is_some() {
-                return (capacity, mains_online.or(status_charging));
+                return (capacity, external_online.or(status_charging));
             }
         }
     }
@@ -2137,6 +2147,9 @@ Now drawing from 'AC Power'
                 let bat = dir.path().join("BAT0");
                 std::fs::create_dir_all(&bat).unwrap();
                 std::fs::write(bat.join("type"), "Battery\n").unwrap();
+                // A `Battery` device's own `online` attribute must never be mistaken for an
+                // external adapter (`R3`).
+                std::fs::write(bat.join("online"), "1\n").unwrap();
                 std::fs::write(bat.join("capacity"), format!("{cap}\n")).unwrap();
                 std::fs::write(bat.join("status"), format!("{bat_status}\n")).unwrap();
             }
@@ -2152,13 +2165,14 @@ Now drawing from 'AC Power'
         // AC online ("1") across all four statuses: Charging, Full, Discharging, Not charging
         for status in ["Charging", "Full", "Discharging", "Not charging"] {
             let sysfs = write_sysfs(Some(10), status, Some("1"));
+            let (pct, charging) = parse_sysfs_power_supply(sysfs.path());
             assert_eq!(
-                parse_sysfs_power_supply(sysfs.path()),
+                (pct, charging),
                 (Some(10), Some(true)),
                 "AC online with status '{status}' must report is_charging = Some(true)"
             );
             assert_eq!(
-                MobileLiveStatus::compute_battery_tier(Some(10), Some(true)),
+                MobileLiveStatus::compute_battery_tier(pct, charging),
                 BatteryTier::Normal
             );
         }
@@ -2170,6 +2184,42 @@ Now drawing from 'AC Power'
                 parse_sysfs_power_supply(sysfs.path()),
                 (Some(45), Some(false)),
                 "AC offline with status '{status}' must report is_charging = Some(false)"
+            );
+        }
+
+        // USB / USB-C supplies count as external power even when a barrel `Mains` adapter is
+        // offline (`F1`), and multiple adapters in any `read_dir` order report `Some(true)` as
+        // soon as any one external supply is online (`R4`).
+        {
+            let sysfs = write_sysfs(Some(40), "Charging", Some("0"));
+            let usb = sysfs.path().join("usb");
+            std::fs::create_dir_all(&usb).unwrap();
+            std::fs::write(usb.join("type"), "USB\n").unwrap();
+            std::fs::write(usb.join("online"), "1\n").unwrap();
+            let (pct, charging) = parse_sysfs_power_supply(sysfs.path());
+            assert_eq!((pct, charging), (Some(40), Some(true)));
+            assert_eq!(
+                MobileLiveStatus::compute_battery_tier(pct, charging),
+                BatteryTier::Normal
+            );
+        }
+        {
+            let sysfs = write_sysfs(Some(20), "Not charging", Some("0"));
+            for (name, kind, online) in [
+                ("AA_ADP0", "Mains", "0"),
+                ("ucsi-source-psy", "USB_Type_C", "1"),
+                ("ZZ_ADP1", "Mains", "0"),
+            ] {
+                let d = sysfs.path().join(name);
+                std::fs::create_dir_all(&d).unwrap();
+                std::fs::write(d.join("type"), format!("{kind}\n")).unwrap();
+                std::fs::write(d.join("online"), format!("{online}\n")).unwrap();
+            }
+            let (pct, charging) = parse_sysfs_power_supply(sysfs.path());
+            assert_eq!((pct, charging), (Some(20), Some(true)));
+            assert_eq!(
+                MobileLiveStatus::compute_battery_tier(pct, charging),
+                BatteryTier::Normal
             );
         }
 
