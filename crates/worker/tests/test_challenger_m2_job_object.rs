@@ -50,6 +50,7 @@ fn create_test_runner() -> (TaskRunner, TempDir) {
 }
 
 /// Polls `pids_file` until `expected_count` distinct PIDs have been recorded.
+#[cfg(windows)]
 fn poll_pids(pids_file: &Path, expected_count: usize, timeout: Duration) -> Vec<u32> {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -86,6 +87,7 @@ fn assert_all_alive(sys: &mut sysinfo::System, pids: &[u32]) {
 }
 
 /// Polls until all given PIDs are absent from the OS process table.
+#[cfg(windows)]
 fn assert_all_dead(sys: &mut sysinfo::System, pids: &[u32], timeout: Duration) {
     let start = Instant::now();
     while start.elapsed() < timeout {
