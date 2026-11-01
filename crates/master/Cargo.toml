@@ -155,3 +155,8 @@ required-features = ["p2p"]
 name = "m3_challenger_1_wire_encryption_stress"
 path = "../../tests/m3_challenger_1_wire_encryption_stress.rs"
 
+[[test]]
+name = "test_challenger_m4_scheduler_runner"
+path = "../../tests/test_challenger_m4_scheduler_runner.rs"
+
+
