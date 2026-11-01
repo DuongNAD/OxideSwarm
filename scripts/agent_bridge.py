@@ -764,7 +764,7 @@ def deliver_event(event, args):
 
 
 def state_is_fresh_for_hook(path):
-    """True when `nodes/<self>_state.json` has an `updated_at_utc` at most HOOK_STATE_MAX_AGE_SECS old."""
+    """True when `nodes/<self>_state.json` has an `updated_at_utc` between 0 and HOOK_STATE_MAX_AGE_SECS old."""
     existing = safe_read_json(path)
     if not isinstance(existing, dict) or "updated_at_utc" not in existing:
         return False
@@ -773,7 +773,7 @@ def state_is_fresh_for_hook(path):
     except (ValueError, TypeError):
         return False
     age = (datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - seen).total_seconds()
-    return age <= HOOK_STATE_MAX_AGE_SECS
+    return 0 <= age <= HOOK_STATE_MAX_AGE_SECS
 
 
 def refresh_heartbeat(hub_dir, repo_dir, args, last_peer_head):
@@ -782,8 +782,10 @@ def refresh_heartbeat(hub_dir, repo_dir, args, last_peer_head):
     if args.hook:
         if state_is_fresh_for_hook(out_path):
             return last_peer_head
-        existing = safe_read_json(out_path)
-        if isinstance(existing, dict):
+        if os.path.exists(out_path):
+            existing = safe_read_json(out_path)
+            if not isinstance(existing, dict):
+                return last_peer_head
             existing["updated_at_utc"] = utc_now_iso()
             state = existing
         else:

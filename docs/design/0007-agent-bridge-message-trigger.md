@@ -84,10 +84,13 @@ uses an OS file lock, which ends with the process. Later hooks exit at once.
 - `get_git_info` runs git without stdin and with a limit of 20 s, so a stuck git cannot outlast
   `--max-wait`.
 - `watch --hook` checks the age of `nodes/<self>_state.json` from `updated_at_utc` alone. It writes
-  the full state file only when the file is missing; when `updated_at_utc` is older than 150 s it
-  updates only `updated_at_utc` and keeps the existing `git` block, so a hook watcher in another
-  worktree never overwrites the active agent's branch while a machine with only Claude Code still
-  stays fresher than `PEER_STALE_MINUTES`.
+  the full state file only when the file is missing (leaving an existing unreadable or truncated
+  state file untouched); when `updated_at_utc` is older than 150 s (or in the future) it updates
+  only `updated_at_utc` and keeps the existing `git` block and all other fields, so a hook watcher
+  in another worktree never overwrites the active agent's branch. On a machine running only Claude
+  Code hooks (with no full `heartbeat`, `diagnose`, or non-hook `watch`), `updated_at_utc` shows
+  liveness while `git`, `lan_ip`, and `security_and_config` (the secret fingerprint) stay frozen at
+   the values from the last full write.
 
 ## Compatibility
 

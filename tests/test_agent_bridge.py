@@ -373,11 +373,12 @@ class ClaudeCodeHook(BridgeCase):
         )
 
         # 3. Old state file (`updated_at_utc` > 150 s old): hook watcher updates only
-        #    `updated_at_utc` and keeps the `git` block untouched.
+        #    `updated_at_utc` and keeps the `git` block and all other fields untouched (F8 / P7).
         stale_ts = (now - datetime.timedelta(seconds=151)).strftime("%Y-%m-%dT%H:%M:%SZ")
         stale_marker = {
             "updated_at_utc": stale_ts,
             "git": {"git_branch": "agent-active-branch", "git_head": "abc123456789"},
+            "lan_ip": "192.0.2.42",
         }
         with open(state_path, "w", encoding="utf-8") as f:
             json.dump(stale_marker, f)
@@ -389,15 +390,42 @@ class ClaudeCodeHook(BridgeCase):
             stale_ts,
             "hook watcher must refresh updated_at_utc on a state file older than 150 s",
         )
+        expected_preserved = dict(stale_marker)
+        expected_preserved.pop("updated_at_utc")
+        actual_preserved = dict(after_stale)
+        actual_preserved.pop("updated_at_utc", None)
         self.assertEqual(
-            after_stale.get("git", {}).get("git_branch"),
-            "agent-active-branch",
-            "hook watcher must keep the existing git block when refreshing an old state file",
+            actual_preserved,
+            expected_preserved,
+            "hook watcher must keep all non-timestamp fields intact when refreshing an old state file",
         )
-        self.assertEqual(
-            after_stale.get("git", {}).get("git_head"),
-            "abc123456789",
+
+        # 4. Future timestamp (`updated_at_utc` ahead of now, F7): must not count as fresh forever.
+        future_ts = (now + datetime.timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        future_marker = dict(stale_marker, updated_at_utc=future_ts)
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(future_marker, f)
+        self.assertEqual(self.run_bridge(*hook_once, stdin='{"session_id": "s1"}').returncode, 0)
+        with open(state_path, encoding="utf-8") as f:
+            after_future = json.load(f)
+        self.assertNotEqual(
+            after_future.get("updated_at_utc"),
+            future_ts,
+            "hook watcher must refresh a future updated_at_utc timestamp",
         )
+
+        # 5. Truncated / unreadable existing state file (F5): hook watcher must not overwrite it
+        #    with `collect_state(repo_dir)`.
+        truncated_bytes = b'{"updated_at_utc": "2026-11-01T00:00:00Z", "git": {"git_branch": "agent-active-branch"'
+        with open(state_path, "wb") as f:
+            f.write(truncated_bytes)
+        self.assertEqual(self.run_bridge(*hook_once, stdin='{"session_id": "s1"}').returncode, 0)
+        with open(state_path, "rb") as f:
+            self.assertEqual(
+                f.read(),
+                truncated_bytes,
+                "hook watcher must leave an existing unreadable/truncated state file untouched",
+            )
 
     def test_a_normal_watcher_rewrites_a_10s_old_state_file(self):
         state_path = os.path.join(self.nodes, f"{SELF}_state.json")
