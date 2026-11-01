@@ -1974,6 +1974,19 @@ pub fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
         return only_for("--input (or --file)", "command and shell");
     }
     if !args.outputs.is_empty() && !is_command && kind != "shell" {
+        if matches!(
+            kind.as_str(),
+            "3d" | "gen3d" | "3d_generate" | "generative_3d" | "autorig" | "auto_rig" | "rig"
+        ) {
+            let target = if args.task_type == "generic" || args.task_type.is_empty() {
+                "3d or rigging".to_string()
+            } else {
+                args.task_type.clone()
+            };
+            return Err(format!(
+                "--output applies to command and shell tasks, not to {target} tasks (use --output-asset or -o for 3D/rigging assets)"
+            ));
+        }
         return only_for("--output", "command and shell");
     }
     if args.output_dir.is_some() && !is_command && kind != "shell" {

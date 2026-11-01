@@ -116,6 +116,76 @@ async fn test_missing_expected_output_fails_task() {
 }
 
 #[tokio::test]
+async fn test_missing_expected_output_fails_shell_task() {
+    let (runner, _tmp) = make_test_runner();
+    let spec = TaskSpec::ShellScript {
+        script: "echo ok".into(),
+        interpreter: None,
+        env: HashMap::new(),
+    };
+    let mut task = Task::new(spec, TaskRequirements::generic(1, 10));
+    task.expected_outputs
+        .push("missing_shell_output.txt".into());
+
+    let result = runner.execute_task(&task, None, None).await;
+
+    assert!(
+        !result.is_success(),
+        "Shell task must not be marked success when declared output is missing"
+    );
+    assert_ne!(
+        result.exit_code, 0,
+        "Exit code must be non-zero when declared output is missing on shell task"
+    );
+    let err = result
+        .error
+        .as_deref()
+        .expect("result.error must be populated");
+    assert!(
+        err.contains("missing_shell_output.txt"),
+        "result.error should name the missing path, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_missing_expected_output_fails_compile_task() {
+    let (runner, _tmp) = make_test_runner();
+    let mut source_files = HashMap::new();
+    source_files.insert(
+        "src/lib.rs".to_string(),
+        "pub fn hello() -> &'static str { \"hello\" }".to_string(),
+    );
+    let spec = TaskSpec::RustCompilation {
+        crate_name: "test_crate".into(),
+        source_files,
+        compiler_flags: vec![],
+        target_dir: None,
+    };
+    let mut task = Task::new(spec, TaskRequirements::generic(1, 10));
+    task.expected_outputs
+        .push("missing_compile_output.txt".into());
+
+    let result = runner.execute_task(&task, None, None).await;
+
+    assert!(
+        !result.is_success(),
+        "Compile task must not be marked success when declared output is missing"
+    );
+    assert_ne!(
+        result.exit_code, 0,
+        "Exit code must be non-zero when declared output is missing on compile task"
+    );
+    let err = result
+        .error
+        .as_deref()
+        .expect("result.error must be populated");
+    assert!(
+        err.contains("missing_compile_output.txt"),
+        "result.error should name the missing path, got: {err}"
+    );
+}
+
+#[tokio::test]
 async fn test_oversize_11mib_output_fails_task() {
     let (runner, tmp) = make_test_runner();
     let sb_cfg = SandboxConfig::new(tmp.path());
@@ -172,6 +242,10 @@ async fn test_aggregate_oversize_output_fails_task() {
     assert!(
         err.contains("32 MiB") || err.contains("aggregate"),
         "Error must mention 32 MiB aggregate limit: {err}"
+    );
+    assert!(
+        err.contains("part_4.bin"),
+        "Error must name the file that crossed aggregate limit: {err}"
     );
 }
 

@@ -297,19 +297,35 @@ async fn test_symlink_escape_prevention_in_harvest() {
         "data:stream.txt".to_string(),
     ];
 
-    let res_traversal = runner
-        .harvest_output_artifacts(
-            &sandbox,
-            &adversarial_traversal_paths,
-            sandbox.task_id(),
-            false,
-        )
-        .await;
+    for bad_path in &adversarial_traversal_paths {
+        let res = runner
+            .harvest_output_artifacts(
+                &sandbox,
+                std::slice::from_ref(bad_path),
+                sandbox.task_id(),
+                false,
+            )
+            .await;
 
-    assert!(
-        res_traversal.is_err(),
-        "All path traversal attempts in expected_outputs must be rejected"
-    );
+        match res {
+            Ok(collected) => {
+                panic!(
+                    "Security vulnerability: harvest_output_artifacts must reject hostile path '{bad_path}', but collected {} files!",
+                    collected.len()
+                );
+            }
+            Err(err) => {
+                assert!(
+                    err.contains("resolves outside sandbox root"),
+                    "Refusal error for '{bad_path}' must explicitly indicate resolution outside sandbox root, got: {err}"
+                );
+                assert!(
+                    !err.contains("did not produce"),
+                    "Hostile path '{bad_path}' was incorrectly treated as a missing produced file: {err}"
+                );
+            }
+        }
+    }
 
     // 4. Verify legitimate regular file is still harvested correctly
     let legit_path = sandbox.path().join("results.json");

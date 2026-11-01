@@ -113,6 +113,25 @@ fn test_3d_task_refuses_output_flag() {
 }
 
 #[test]
+fn test_3d_task_inferred_with_output_suggests_output_asset() {
+    let args = SubmitArgs {
+        prompt: Some("a robotic companion".to_string()),
+        outputs: vec!["robot.glb".to_string()],
+        ..Default::default()
+    };
+    let res = build_task_spec(&args);
+    assert!(
+        res.is_err(),
+        "--prompt with --output must be rejected and suggest --output-asset / -o"
+    );
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("--output-asset") && err.contains("-o"),
+        "Error message must point user to --output-asset / -o, got: {err}"
+    );
+}
+
+#[test]
 fn test_3d_task_refuses_file_flag() {
     let args = SubmitArgs {
         task_type: "3d".to_string(),

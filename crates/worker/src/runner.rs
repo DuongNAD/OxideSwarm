@@ -1253,9 +1253,7 @@ impl TaskRunner {
                 Ok(m) => m,
                 Err(_) => {
                     if !process_failed {
-                        return Err(format!(
-                            "the task did not produce '{expected}' (declared with --output; use a wildcard pattern for optional outputs)"
-                        ));
+                        return Err(format!("the task did not produce '{expected}'"));
                     }
                     debug!(task_id = %task_id, path = %expected, "Declared output artifact was not produced by failed task");
                     continue;
@@ -1287,7 +1285,9 @@ impl TaskRunner {
 
             if total_bytes + size > MAX_AGGREGATE_ARTIFACT_BYTES {
                 warn!(task_id = %task_id, path = %expected, size = size, "Halting artifact collection: aggregate size exceeds 32 MiB limit");
-                return Err("output artifacts exceed aggregate size limit of 32 MiB".to_string());
+                return Err(format!(
+                    "output artifact '{expected}' causes aggregate size to exceed limit of 32 MiB"
+                ));
             }
 
             // Ensure canonical path resolves strictly within the sandbox root
@@ -1325,6 +1325,44 @@ impl TaskRunner {
         }
 
         Ok(collected)
+    }
+
+    /// Harvests declared expected output artifacts from the sandbox and updates `TaskResult`.
+    ///
+    /// If harvesting fails (e.g. missing artifact, oversize, symlink, traversal), marks `result`
+    /// as failed with `EXIT_CODE_GENERAL_ERROR`, appends diagnostic notes to stderr and error.
+    async fn harvest_and_apply_artifacts(
+        &self,
+        sandbox: &Sandbox,
+        task: &Task,
+        mut result: TaskResult,
+        process_failed: bool,
+    ) -> TaskResult {
+        if task.expected_outputs.is_empty() {
+            return result;
+        }
+
+        match self
+            .harvest_output_artifacts(sandbox, &task.expected_outputs, task.id, process_failed)
+            .await
+        {
+            Ok(artifacts) => {
+                result.artifacts = artifacts;
+            }
+            Err(e) => {
+                let message = format!("Output files: {e}");
+                warn!(task_id = %task.id, error = %e, "Harvesting output artifacts failed");
+                if result.exit_code == EXIT_CODE_SUCCESS {
+                    result.exit_code = EXIT_CODE_GENERAL_ERROR;
+                }
+                result.stderr = append_note(result.stderr, &format!("[rusty_grid: {message}]\n"));
+                result.error = Some(match result.error.take() {
+                    Some(error) => format!("{error}; {message}"),
+                    None => message,
+                });
+            }
+        }
+        result
     }
 
     /// Helper to stage files into sandbox before task execution.
@@ -1507,30 +1545,9 @@ impl TaskRunner {
             .await;
 
         let process_failed = !result.is_success();
-        let artifacts_res = if !task.expected_outputs.is_empty() {
-            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id, process_failed)
-                .await
-        } else {
-            Ok(Vec::new())
-        };
-        let mut result = result;
-        match artifacts_res {
-            Ok(artifacts) => {
-                result.artifacts = artifacts;
-            }
-            Err(e) => {
-                let message = format!("Output files: {e}");
-                warn!(task_id = %task.id, error = %e, "Harvesting output artifacts failed");
-                if result.exit_code == EXIT_CODE_SUCCESS {
-                    result.exit_code = EXIT_CODE_GENERAL_ERROR;
-                }
-                result.stderr = append_note(result.stderr, &format!("[rusty_grid: {message}]\n"));
-                result.error = Some(match result.error.take() {
-                    Some(error) => format!("{error}; {message}"),
-                    None => message,
-                });
-            }
-        }
+        let result = self
+            .harvest_and_apply_artifacts(&sandbox, task, result, process_failed)
+            .await;
         let result = self.collect_blob_outputs(&sandbox, task, result, &[]).await;
         let _ = sandbox.destroy().await;
         result
@@ -1667,30 +1684,9 @@ impl TaskRunner {
             .await;
 
         let process_failed = !result.is_success();
-        let artifacts_res = if !task.expected_outputs.is_empty() {
-            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id, process_failed)
-                .await
-        } else {
-            Ok(Vec::new())
-        };
-        let mut result = result;
-        match artifacts_res {
-            Ok(artifacts) => {
-                result.artifacts = artifacts;
-            }
-            Err(e) => {
-                let message = format!("Output files: {e}");
-                warn!(task_id = %task.id, error = %e, "Harvesting output artifacts failed");
-                if result.exit_code == EXIT_CODE_SUCCESS {
-                    result.exit_code = EXIT_CODE_GENERAL_ERROR;
-                }
-                result.stderr = append_note(result.stderr, &format!("[rusty_grid: {message}]\n"));
-                result.error = Some(match result.error.take() {
-                    Some(error) => format!("{error}; {message}"),
-                    None => message,
-                });
-            }
-        }
+        let result = self
+            .harvest_and_apply_artifacts(&sandbox, task, result, process_failed)
+            .await;
         let result = self.collect_blob_outputs(&sandbox, task, result, &[]).await;
         let _ = sandbox.destroy().await;
         result
@@ -1884,30 +1880,9 @@ impl TaskRunner {
         }
 
         let process_failed = !res.is_success();
-        let artifacts_res = if !task.expected_outputs.is_empty() {
-            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id, process_failed)
-                .await
-        } else {
-            Ok(Vec::new())
-        };
-        let mut res = res;
-        match artifacts_res {
-            Ok(artifacts) => {
-                res.artifacts = artifacts;
-            }
-            Err(e) => {
-                let message = format!("Output files: {e}");
-                warn!(task_id = %task.id, error = %e, "Harvesting output artifacts failed");
-                if res.exit_code == EXIT_CODE_SUCCESS {
-                    res.exit_code = EXIT_CODE_GENERAL_ERROR;
-                }
-                res.stderr = append_note(res.stderr, &format!("[rusty_grid: {message}]\n"));
-                res.error = Some(match res.error.take() {
-                    Some(error) => format!("{error}; {message}"),
-                    None => message,
-                });
-            }
-        }
+        let res = self
+            .harvest_and_apply_artifacts(&sandbox, task, res, process_failed)
+            .await;
         let res = self
             .collect_blob_outputs(&sandbox, task, res, &artifact_patterns)
             .await;
