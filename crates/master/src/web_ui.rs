@@ -255,8 +255,9 @@ pub fn create_web_ui_router_with_auth(
 /// Full constructor for creating the unified Web UI router with streaming and auth.
 ///
 /// Every route (REST, `/ws`, `/api/stream`, SSE, POST handlers and the fallback) is wrapped by the
-/// RBAC middleware; only `GET /` (the static SPA shell) is public. Cross-origin browser access is
-/// denied unless the origin is listed in [`AuthConfig::allowed_origins`].
+/// RBAC middleware; only `GET /` (the static SPA shell), `GET /api/discovery/probe`,
+/// `GET /api/rendezvous/master`, and `POST /api/rendezvous/register` are public. Cross-origin
+/// browser access is denied unless the origin is listed in [`AuthConfig::allowed_origins`].
 #[allow(clippy::too_many_arguments)]
 pub fn create_web_ui_router_full(
     registry: WorkerRegistry,
@@ -1652,6 +1653,8 @@ pub async fn api_rendezvous_register(
 
 pub async fn api_rendezvous_master(
     State(state): State<WebUiState>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
 ) -> Result<Json<rusty_grid_core::discovery::RendezvousLease>, StatusCode> {
     let guard = state.rendezvous_registry.read().await;
     if let Some(ref lease) = *guard {
@@ -1662,7 +1665,19 @@ pub async fn api_rendezvous_master(
                 .saturating_add(lease.ttl_secs)
                 .saturating_add(30)
         {
-            return Ok(Json(lease.clone()));
+            let mut lease = lease.clone();
+            let is_authenticated = crate::auth::extract_credential(&headers, uri.query())
+                .and_then(|token| crate::auth::find_token(&state.auth_config, &token))
+                .is_some_and(|registered| {
+                    registered
+                        .scopes
+                        .iter()
+                        .any(|s| s.allows(crate::auth::AuthScope::Observer))
+                });
+            if !is_authenticated {
+                lease.p2p_ticket = None;
+            }
+            return Ok(Json(lease));
         }
     }
     Err(StatusCode::NOT_FOUND)
@@ -2218,5 +2233,58 @@ mod tests {
         assert!(anonymous_local_request_is_admitted("127.0.0.1:8080".parse().unwrap()).await);
         assert!(!anonymous_local_request_is_admitted("192.168.1.20:8080".parse().unwrap()).await);
         assert!(!anonymous_local_request_is_admitted("0.0.0.0:8080".parse().unwrap()).await);
+    }
+
+    #[tokio::test]
+    async fn test_anonymous_rendezvous_lease_read_redacts_p2p_ticket() {
+        let mut state = test_state();
+        state.auth_config = Arc::new(AuthConfig::new().with_token(
+            "obs-token",
+            "observer",
+            &[crate::auth::AuthScope::Observer],
+        ));
+        let stored_lease = rusty_grid_core::discovery::RendezvousLease::new(
+            "127.0.0.1:8088",
+            "http://127.0.0.1:8080",
+            "test-master",
+            Some("secret-iroh-ticket-value".to_string()),
+            2,
+            120,
+        );
+        *state.rendezvous_registry.write().await = Some(stored_lease);
+
+        let anon_resp = api_rendezvous_master(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            "/api/rendezvous/master".parse().unwrap(),
+        )
+        .await
+        .expect("anonymous lease read must succeed");
+        assert_eq!(
+            anon_resp.0.p2p_ticket, None,
+            "anonymous lease response must not include p2p_ticket"
+        );
+        let anon_json = serde_json::to_string(&anon_resp.0).unwrap();
+        assert!(
+            !anon_json.contains("p2p_ticket") && !anon_json.contains("secret-iroh-ticket-value"),
+            "serialized anonymous lease must omit p2p_ticket: {anon_json}"
+        );
+
+        let mut auth_headers = axum::http::HeaderMap::new();
+        auth_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer obs-token".parse().unwrap(),
+        );
+        let auth_resp = api_rendezvous_master(
+            State(state),
+            auth_headers,
+            "/api/rendezvous/master".parse().unwrap(),
+        )
+        .await
+        .expect("authenticated lease read must succeed");
+        assert_eq!(
+            auth_resp.0.p2p_ticket.as_deref(),
+            Some("secret-iroh-ticket-value")
+        );
     }
 }

@@ -23,7 +23,7 @@ neither read the traffic nor alter, inject, replay or reorder it. P2P/QUIC (`--p
 | Another host on the same LAN / Wi-Fi sends `SubmitTask` to the cluster port | Refused: the handshake runs before the first message and a peer without the secret gets a generic `authentication failed/required` reply. |
 | A rogue host answers `--master auto` (UDP beacon) or sits at the master's address | The worker/CLI verifies the master's proof of the secret. Without a secret they refuse to connect to a remote, auto-discovered or P2P-ticket master unless `--insecure` is given. |
 | Someone learns a P2P ticket (it is an address, not a credential) | The same handshake runs inside the QUIC stream; the ticket alone is not enough. |
-| A web page in your browser calls `http://127.0.0.1:8080` (CSRF / DNS rebinding) | The dashboard is same-origin only (no permissive CORS), every route needs a token, and the dev bypass checks the peer, the `Host` header, `X-Forwarded-*` and `Origin`. |
+| A web page in your browser calls `http://127.0.0.1:8080` (CSRF / DNS rebinding) | The dashboard is same-origin only (no permissive CORS), every route except the public shell and discovery/rendezvous routes (`GET /`, `GET /api/discovery/probe`, `GET /api/rendezvous/master`, and `POST /api/rendezvous/register`; see section 6) needs a token, and the dev bypass checks the peer, the `Host` header, `X-Forwarded-*` and `Origin`. |
 | A leaked dashboard / agent-mesh token | Rotate it (section 5). Dashboard tokens derived from the cluster secret change when the secret changes. |
 | Someone on the network path reads, alters or injects cluster traffic (for example an `AssignTask` to a worker) | Every frame after the handshake is an AEAD record (`0x04`) with its own key per direction and a sequence number. A forged, altered, injected, replayed, reordered or reflected frame makes the receiver drop the connection, and nothing in it is acted on (`AeadReaderSession`). Over `--p2p` iroh's TLS comes on top. |
 | A peer that runs an older release (cluster authentication version 1, which does not guarantee the record layer) | Refused during the handshake (`unsupported auth version`); there is no unencrypted fallback. Upgrade every node, master first (`DEPLOYMENT.md` section 3.5). |
@@ -77,8 +77,8 @@ implemented.
 | Port | Where it listens | What it exposes | Protection |
 | :--- | :--- | :--- | :--- |
 | **8088/tcp** (cluster) | `127.0.0.1` by default; `0.0.0.0` only with `--listen 0.0.0.0:8088` (what `switch_role.sh master` and `windows\start_master.cmd` pass) | Worker registration, task submission, status. This is the port that runs code on your workers. | Mutual cluster-secret handshake (version 2; a version 1 peer is refused); post-handshake traffic is encrypted via ChaCha20-Poly1305 (`0x04`) using directional session keys (unauthenticated loopback fallback uses plaintext `0x01`/`0x02`). |
-| **8080/tcp** (dashboard) | Loopback unless `--web-ui-addr` says otherwise (the launchers pass `--web-ui-addr 127.0.0.1:8080`, or `0.0.0.0:8080` only when you ask for phone / LAN access) | Web UI, REST (`/api/*`), WebSocket `/ws`, SSE. Can submit and cancel tasks. | Bearer token / `X-API-Key` / `?token=` (section 6); same-origin only. |
-| **8080/tcp** on a *worker* | All interfaces (`0.0.0.0`); the CLI has no switch to turn it off. If the port is taken, e.g. by a master on the same machine, the portal just does not start. | A tiny "standby" page and `/api/status` that say which master this worker follows and redirect browsers to it. | None. It only reveals the master's address. |
+| **8080/tcp** (dashboard) | Loopback unless `--web-ui-addr` says otherwise (the launchers pass `--web-ui-addr 127.0.0.1:8080`, or `0.0.0.0:8080` only when you ask for phone / LAN access) | Web UI, REST (`/api/*`), WebSocket `/ws`, SSE. Can submit and cancel tasks. | Bearer token / `X-API-Key` / `?token=` for all routes except `GET /`, `GET /api/discovery/probe`, `GET /api/rendezvous/master`, and `POST /api/rendezvous/register` (section 6); same-origin only. |
+| **8080/tcp** on a *worker* | All interfaces (`0.0.0.0`) by default; disable with `oxideswarm worker --no-portal` (`RUSTY_GRID_NO_PORTAL=1` or `no_portal = true` under `[worker]`). If the port is taken, e.g. by a master on the same machine, the portal just does not start. | A tiny "standby" page and `/api/status` that say which master this worker follows and redirect browsers to it. | None. It only reveals the master's address. |
 | **8089/udp** | Master broadcasts / answers on the LAN | Discovery beacon (`--master auto`): the master's cluster address and, only if the dashboard listens on a non-loopback address, its URL (empty otherwise). | With a secret the beacon carries a MAC and workers/clients ignore beacons without a valid one. Not encrypted. |
 | iroh QUIC (UDP, random port) + HTTPS to the public n0 relay servers | Outbound from master and workers when `--p2p` is on | The P2P transport used for machines on different networks. The master identity key is `~/.oxideswarm/master_key.bin`. | TLS from iroh **plus** the cluster-secret handshake inside the stream. Needs outbound Internet. |
 | **8085/tcp** | `scripts/sync_network` only | An HTTP `/ping` reachability probe. Not part of the grid. | None. Stop it when you are done. |
@@ -113,6 +113,18 @@ the token there (kept in `sessionStorage`, sent as `Authorization: Bearer`). The
 Extra tokens with a narrower scope can be registered when starting the master:
 `--auth-token <token>:<name>:<scopes>` where scopes are a comma-separated list of `observer`, `worker`,
 `submitter`, `admin` (for example `--auth-token phone123:phone:observer` for a read-only phone view).
+
+Public routes on the dashboard listener (`8080/tcp`) that do not require a dashboard token:
+
+* `GET /`: serves the static SPA shell HTML (contains no cluster state).
+* `GET /api/discovery/probe`: HTTP discovery fallback returning a `MasterBeacon` (cluster address, web UI URL,
+  hostname, worker count; signed with the cluster secret when a secret and `nonce` query parameter are present).
+* `GET /api/rendezvous/master`: returns the active `RendezvousLease` (cluster address, web UI URL, hostname,
+  worker count, TTL, and HMAC signature). Unauthenticated reads redact `p2p_ticket` (`None`); callers presenting
+  a valid `observer` (or higher) token receive the full lease.
+* `POST /api/rendezvous/register`: updates the rendezvous lease. When the master has a cluster secret, the lease
+  must carry a valid `ClusterSecret` HMAC signature; a master started without a cluster secret accepts unsigned
+  lease writes.
 
 Listener and bypass policy:
 
