@@ -43,10 +43,10 @@ pub struct MobileCapabilities {
     /// System-on-Chip descriptor (e.g. "Snapdragon 8 Gen 2", "Apple M2 Max").
     pub soc_model: String,
     /// Battery charge percentage (0-100), or `None` if running on AC power or emulator.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub battery_pct: Option<u8>,
     /// Whether the device is actively drawing external power / charging.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub is_charging: Option<bool>,
     /// Whether the device is currently experiencing CPU/GPU thermal throttling.
     #[serde(default)]
@@ -932,22 +932,7 @@ fn detect_battery() -> (Option<u8>, Option<bool>) {
             .output()
         {
             let text = String::from_utf8_lossy(&output.stdout);
-            let mut pct: Option<u8> = None;
-            let mut charging: Option<bool> = None;
-
-            for part in text.split(';') {
-                let p = part.trim();
-                if p.ends_with('%') {
-                    if let Some(num_str) = p.split_whitespace().last() {
-                        let clean = num_str.trim_end_matches('%');
-                        pct = clean.parse::<u8>().ok();
-                    }
-                } else if p.eq_ignore_ascii_case("charging") || p.eq_ignore_ascii_case("charged") {
-                    charging = Some(true);
-                } else if p.eq_ignore_ascii_case("discharging") {
-                    charging = Some(false);
-                }
-            }
+            let (pct, charging) = parse_pmset_batt(&text);
             if pct.is_some() {
                 return (pct, charging);
             }
@@ -993,6 +978,58 @@ fn detect_battery() -> (Option<u8>, Option<bool>) {
     }
 
     (None, None)
+}
+
+/// Parses the output of `pmset -g batt` into `(battery_pct, is_charging)`.
+///
+/// The power source line (`Now drawing from 'AC Power'` or `'Battery Power'`) is the primary
+/// source of `is_charging`. The semicolon-separated state words on the battery line (`charging`,
+/// `charged`, `finishing charge`, `AC attached`, `discharging`, `not charging`) are used only as
+/// a fallback when the power source header line is absent.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_pmset_batt(text: &str) -> (Option<u8>, Option<bool>) {
+    let mut pct: Option<u8> = None;
+    let mut source_charging: Option<bool> = None;
+    let mut state_charging: Option<bool> = None;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("'AC Power'") {
+            source_charging = Some(true);
+        } else if trimmed.contains("'Battery Power'") {
+            source_charging = Some(false);
+        }
+
+        for part in trimmed.split(';') {
+            let p = part.trim();
+            if p.ends_with('%') {
+                if let Some(num_str) = p.split_whitespace().last() {
+                    let clean = num_str.trim_end_matches('%');
+                    if let Ok(val) = clean.parse::<u8>() {
+                        pct = Some(val);
+                    }
+                }
+            } else if p.eq_ignore_ascii_case("charging")
+                || p.eq_ignore_ascii_case("charged")
+                || p.eq_ignore_ascii_case("finishing charge")
+                || p.eq_ignore_ascii_case("ac attached")
+            {
+                state_charging = Some(true);
+            } else if p.eq_ignore_ascii_case("discharging")
+                || (state_charging.is_none()
+                    && (p.eq_ignore_ascii_case("not charging")
+                        || p.to_ascii_lowercase().starts_with("not charging ")))
+            {
+                state_charging = Some(false);
+            }
+        }
+    }
+
+    if pct.is_some() {
+        (pct, source_charging.or(state_charging))
+    } else {
+        (None, None)
+    }
 }
 
 fn detect_thermal_throttling() -> bool {
@@ -1903,5 +1940,145 @@ mod tests {
         if has_blender {
             assert!(ver.is_some());
         }
+    }
+
+    #[test]
+    fn test_register_bincode_roundtrip_all_mobile_battery_combinations() {
+        use crate::protocol::{
+            deserialize_message, serialize_message, InboundMessage, ProtocolCapabilities,
+            WireCodec, WorkerMessage, PROTOCOL_VERSION_CURRENT,
+        };
+        use uuid::Uuid;
+
+        let worker_id = Uuid::new_v4();
+        let combinations = [
+            (None, None),
+            (Some(80), None),
+            (None, Some(true)),
+            (Some(100), Some(false)),
+            (Some(80), Some(true)),
+        ];
+
+        for (battery_pct, is_charging) in combinations {
+            let caps = WorkerCapabilities::new(
+                "mac-worker",
+                10,
+                16384,
+                true,
+                false,
+                Some("Apple M2 Pro".into()),
+            )
+            .with_mobile(Some(MobileCapabilities {
+                os_version: "macOS 15.1".into(),
+                soc_model: "Apple M2 Pro".into(),
+                battery_pct,
+                is_charging,
+                thermal_throttled: false,
+            }))
+            .with_3d_capabilities(
+                true,
+                Some("Blender 4.5.4 LTS".into()),
+                Some(16384),
+                false,
+            );
+
+            let msg = WorkerMessage::Register {
+                worker_id,
+                capabilities: caps,
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            };
+
+            let bytes = serialize_message(&msg, WireCodec::Bincode)
+                .expect("bincode serialization of WorkerMessage::Register failed");
+
+            let (decoded_worker, codec) = deserialize_message::<WorkerMessage>(&bytes)
+                .expect("bincode deserialization of WorkerMessage::Register failed");
+            assert_eq!(codec, WireCodec::Bincode);
+            assert_eq!(decoded_worker, msg);
+
+            let (decoded_inbound, inbound_codec) = deserialize_message::<InboundMessage>(&bytes)
+                .expect("bincode deserialization of InboundMessage::Worker(Register) failed");
+            assert_eq!(inbound_codec, WireCodec::Bincode);
+            assert_eq!(decoded_inbound, InboundMessage::Worker(msg));
+        }
+    }
+
+    #[test]
+    fn test_parse_pmset_batt_all_five_states() {
+        // 1. charging
+        let charging = "\
+Now drawing from 'AC Power'
+ -InternalBattery-0 (id=23658595)\t65%; charging; 1:15 remaining present: true";
+        assert_eq!(parse_pmset_batt(charging), (Some(65), Some(true)));
+
+        // 2. charged
+        let charged = "\
+Now drawing from 'AC Power'
+ -InternalBattery-0 (id=23658595)\t100%; charged; 0:00 remaining present: true";
+        assert_eq!(parse_pmset_batt(charged), (Some(100), Some(true)));
+
+        // 3. discharging
+        let discharging = "\
+Now drawing from 'Battery Power'
+ -InternalBattery-0 (id=23658595)\t72%; discharging; 3:40 remaining present: true";
+        assert_eq!(parse_pmset_batt(discharging), (Some(72), Some(false)));
+
+        // 4. 100%; finishing charge
+        let finishing_charge = "\
+Now drawing from 'AC Power'
+ -InternalBattery-0 (id=23658595)\t100%; finishing charge; 0:00 remaining present: true";
+        assert_eq!(parse_pmset_batt(finishing_charge), (Some(100), Some(true)));
+
+        // 5. 80%; AC attached; not charging
+        let ac_attached_not_charging = "\
+Now drawing from 'AC Power'
+ -InternalBattery-0 (id=23658595)\t80%; AC attached; not charging present: true";
+        assert_eq!(
+            parse_pmset_batt(ac_attached_not_charging),
+            (Some(80), Some(true))
+        );
+
+        // Fallback when the "Now drawing from ..." header line is absent
+        assert_eq!(
+            parse_pmset_batt(" -InternalBattery-0\t65%; charging; 1:15 remaining"),
+            (Some(65), Some(true))
+        );
+        assert_eq!(
+            parse_pmset_batt(" -InternalBattery-0\t100%; charged; 0:00 remaining"),
+            (Some(100), Some(true))
+        );
+        assert_eq!(
+            parse_pmset_batt(" -InternalBattery-0\t72%; discharging; 3:40 remaining"),
+            (Some(72), Some(false))
+        );
+        assert_eq!(
+            parse_pmset_batt(" -InternalBattery-0\t100%; finishing charge; 0:00 remaining"),
+            (Some(100), Some(true))
+        );
+        assert_eq!(
+            parse_pmset_batt(" -InternalBattery-0\t80%; AC attached; not charging present: true"),
+            (Some(80), Some(true))
+        );
+
+        // Power source header takes precedence over unknown or conflicting state words
+        assert_eq!(
+            parse_pmset_batt(
+                "Now drawing from 'AC Power'\n -InternalBattery-0\t80%; not charging present: true"
+            ),
+            (Some(80), Some(true))
+        );
+        assert_eq!(
+            parse_pmset_batt(
+                "Now drawing from 'Battery Power'\n -InternalBattery-0\t80%; unknown state"
+            ),
+            (Some(80), Some(false))
+        );
+
+        // Desktop Mac on AC power without an internal battery returns (None, None)
+        assert_eq!(
+            parse_pmset_batt("Now drawing from 'AC Power'\n"),
+            (None, None)
+        );
     }
 }
