@@ -79,11 +79,11 @@ mod tests {
 
         for (idx, raw_line) in src.lines().enumerate() {
             let line_no = idx + 1;
-            let trimmed = raw_line.trim();
-            if trimmed.starts_with("#[cfg(test)]") {
+            let code = strip_line_comment(raw_line);
+            let trimmed = code.trim();
+            if trimmed == "mod tests {" || trimmed.starts_with("mod tests {") {
                 break;
             }
-            let code = strip_line_comment(raw_line);
             if current_type.is_none() {
                 if let Some(type_name) = parse_type_decl(code.trim_start()) {
                     current_type = Some((type_name.to_string(), brace_depth));
@@ -111,6 +111,13 @@ mod tests {
                         brace_depth -= 1;
                         if let Some((_, start_depth)) = &current_type {
                             if brace_depth <= *start_depth {
+                                current_type = None;
+                            }
+                        }
+                    }
+                    ';' => {
+                        if let Some((_, start_depth)) = &current_type {
+                            if brace_depth == *start_depth {
                                 current_type = None;
                             }
                         }
@@ -163,5 +170,12 @@ mod tests {
             "struct HumanTaskResult {\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub error: Option<String>,\n}\n",
         );
         assert!(allowed.is_empty());
+
+        let after_cfg_test_fn_and_tuple_struct = find_disallowed_skip_serializing_if(
+            "protocol.rs",
+            "#[cfg(test)]\nfn starting_at() {}\nstruct HumanTuple(u8);\nenum BinaryWorkerMessage {\n    Register {\n        #[serde(skip_serializing_if = \"Uuid::is_nil\")]\n        worker_id: Uuid,\n    },\n}\n",
+        );
+        assert_eq!(after_cfg_test_fn_and_tuple_struct.len(), 1);
+        assert!(after_cfg_test_fn_and_tuple_struct[0].contains("BinaryWorkerMessage"));
     }
 }
