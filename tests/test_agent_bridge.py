@@ -335,6 +335,46 @@ class ClaudeCodeHook(BridgeCase):
     def test_the_session_id_arrives_on_a_stdin_that_stays_open(self):
         self.assertEqual(self.read_session_id(b'{"session_id": "s1"}'), ["s1", 1])
 
+    def test_the_hook_watcher_leaves_a_fresh_state_file_and_refreshes_an_old_one(self):
+        state_path = os.path.join(self.nodes, f"{SELF}_state.json")
+        hook_once = self.watch_args("--hook", "--max-wait", "1")
+
+        # 1. Missing state file: hook watcher publishes initial state.
+        self.assertEqual(self.run_bridge(*hook_once, stdin='{"session_id": "s1"}').returncode, 0)
+        self.assertTrue(os.path.exists(state_path), "hook watcher must create a missing state file")
+
+        # 2. Fresh state file (< 150 s old): hook watcher leaves it untouched.
+        fresh_marker = {
+            "updated_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "git": {"git_branch": "agent-active-branch"},
+        }
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(fresh_marker, f)
+        fresh_mtime = time.time() - 60
+        os.utime(state_path, (fresh_mtime, fresh_mtime))
+
+        self.assertEqual(self.run_bridge(*hook_once, stdin='{"session_id": "s1"}').returncode, 0)
+        with open(state_path, encoding="utf-8") as f:
+            after_fresh = json.load(f)
+        self.assertEqual(
+            after_fresh.get("git", {}).get("git_branch"),
+            "agent-active-branch",
+            "hook watcher must not overwrite a state file <= 150 s old",
+        )
+
+        # 3. Old state file (> 150 s old): hook watcher refreshes it.
+        stale_mtime = time.time() - 151
+        os.utime(state_path, (stale_mtime, stale_mtime))
+        self.assertEqual(self.run_bridge(*hook_once, stdin='{"session_id": "s1"}').returncode, 0)
+        with open(state_path, encoding="utf-8") as f:
+            after_stale = json.load(f)
+        self.assertNotEqual(
+            after_stale.get("git", {}).get("git_branch"),
+            "agent-active-branch",
+            "hook watcher must refresh a state file older than 150 s",
+        )
+        self.assertGreater(os.path.getmtime(state_path), stale_mtime)
+
 
 class GitCalls(unittest.TestCase):
     def test_a_stuck_git_cannot_hold_the_watcher_past_its_deadline(self):
@@ -417,6 +457,12 @@ class Send(BridgeCase):
         output = self.send()
         self.assertIn("[INFO]", output)
         self.assertNotIn("[WARN]", output)
+
+    def test_plain_http_secret_subcommands_are_absent(self):
+        for verb in ("serve" + "-secret", "pull" + "-secret"):
+            res = self.run_bridge(verb)
+            self.assertNotEqual(res.returncode, 0, f"{verb} must not be accepted")
+            self.assertIn("invalid choice", res.stderr.decode("utf-8"))
 
 
 if __name__ == "__main__":

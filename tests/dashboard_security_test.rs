@@ -3,7 +3,9 @@
 //! Validates, against a real `MasterServer` dashboard listener:
 //! 1. Deny by default: with no credentials configured every route (REST, `/ws`, `/api/stream`,
 //!    SSE, POST/PUT/DELETE, unknown paths) answers 401 and nothing is queued; only the static SPA
-//!    shell (`GET /`) is public.
+//!    shell (`GET /`) and the discovery/rendezvous routes (`GET /api/discovery/probe`,
+//!    `GET /api/rendezvous/master`, `POST /api/rendezvous/register`) are public, and anonymous
+//!    reads of `GET /api/rendezvous/master` redact `p2p_ticket`.
 //! 2. A browser on another origin cannot drive a dev-mode dashboard: an `Origin: https://evil.example`
 //!    POST is denied even with dev mode on, as are spoofed `Host` headers (DNS rebinding), proxy
 //!    forwarding headers and cross-site fetch metadata, while genuine local requests still work.
@@ -852,4 +854,71 @@ async fn test_the_dashboard_stays_on_loopback_when_the_grid_listens_on_a_lan_add
 
     let _ = master.shutdown();
     let _ = master2.shutdown();
+}
+
+#[tokio::test]
+async fn test_anonymous_rendezvous_lease_response_has_no_ticket() {
+    let secret = ClusterSecret::from_bytes(&[0x42; 32]).unwrap();
+    let admin_token = dashboard_admin_token(&secret);
+    let auth = strict().with_cluster_secret(&secret);
+    let (master, addr) = spawn_dashboard(auth, Some(secret.clone())).await;
+    let base = format!("http://{addr}");
+    let client = http_client();
+
+    let mut lease = rusty_grid_core::discovery::RendezvousLease::new(
+        master.server_addr().to_string(),
+        base.clone(),
+        "sec7-master",
+        Some("iroh-ticket-should-be-redacted".to_string()),
+        1,
+        120,
+    );
+    lease.sign(&secret);
+
+    let reg = client
+        .post(format!("{base}/api/rendezvous/register"))
+        .json(&lease)
+        .send()
+        .await
+        .expect("register lease");
+    assert_eq!(reg.status(), StatusCode::OK);
+
+    // Anonymous read: succeeds (public route) and verifies, but p2p_ticket is redacted.
+    let anon_resp = client
+        .get(format!("{base}/api/rendezvous/master"))
+        .send()
+        .await
+        .expect("anonymous get lease");
+    assert_eq!(anon_resp.status(), StatusCode::OK);
+    let anon_body = anon_resp.text().await.expect("anonymous lease body");
+    assert!(
+        !anon_body.contains("p2p_ticket") && !anon_body.contains("iroh-ticket-should-be-redacted"),
+        "anonymous lease JSON must not expose p2p_ticket: {anon_body}"
+    );
+    let parsed_anon: rusty_grid_core::discovery::RendezvousLease =
+        serde_json::from_str(&anon_body).expect("deserialize anonymous lease");
+    assert_eq!(parsed_anon.p2p_ticket, None);
+    assert!(
+        parsed_anon.verify(&secret, 30),
+        "redacting p2p_ticket must keep the lease HMAC valid"
+    );
+
+    // Authenticated read with a valid token keeps p2p_ticket.
+    let auth_resp = client
+        .get(format!("{base}/api/rendezvous/master"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("authenticated get lease");
+    assert_eq!(auth_resp.status(), StatusCode::OK);
+    let parsed_auth: rusty_grid_core::discovery::RendezvousLease = auth_resp
+        .json()
+        .await
+        .expect("deserialize authenticated lease");
+    assert_eq!(
+        parsed_auth.p2p_ticket.as_deref(),
+        Some("iroh-ticket-should-be-redacted")
+    );
+
+    let _ = master.shutdown();
 }

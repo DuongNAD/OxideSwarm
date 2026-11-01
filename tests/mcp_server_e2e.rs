@@ -496,3 +496,24 @@ async fn test_mcp_server_authentication_failure_handling() {
         "Tool call with invalid cluster secret must report an error"
     );
 }
+
+#[test]
+fn test_mcp_cli_rejects_sse_flags() {
+    let home = tempfile::tempdir().expect("temp home");
+    for extra in [&["--sse"][..], &["--sse-bind", "127.0.0.1:8085"][..]] {
+        let out = Command::new(BIN)
+            .arg("mcp")
+            .args(extra)
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env_remove("OXIDESWARM_HOME")
+            .output()
+            .expect("spawn oxideswarm mcp");
+        assert!(
+            !out.status.success(),
+            "expected clap to reject {:?}, got exit {:?}",
+            extra,
+            out.status
+        );
+    }
+}
