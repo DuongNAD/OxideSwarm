@@ -317,7 +317,7 @@ or `~/.oxideswarm/cluster.secret`.
 ```
 
 Exit code `6` means authentication failed. Remote or auto-discovered masters are refused without a secret unless
-you pass `--insecure`.
+you pass `--insecure` (`RUSTY_GRID_INSECURE=1` or `insecure = true` in `rusty-grid.toml`).
 
 ### Network Port Topology
 
@@ -366,7 +366,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_MAPREDUCE_PARALLELISM` | Master | Maximum concurrent in-flight map/reduce chunk tasks |
 | `RUSTY_GRID_MAX_CONNECTIONS` | Master | Maximum concurrent TCP connections allowed on grid port |
 | `RUSTY_GRID_MAX_PENDING_HANDSHAKES` | Master | Maximum connections permitted in pre-auth handshake state |
-| `RUSTY_GRID_INSECURE` | Master | Allows coordinator to bind non-loopback without requiring cluster secret |
+| `RUSTY_GRID_INSECURE` | Master, Worker, CLI & MCP | Allows the master to bind non-loopback or a worker, client, or `mcp` server to connect to a remote or auto-discovered master without a cluster secret |
 | `RUSTY_GRID_DASHBOARD_PORT` | Master | HTTP listener port for embedded web dashboard |
 | `OXIDE_SWARM_DASHBOARD_PORT` | Master | Alternative alias for dashboard HTTP port |
 | `RUSTY_GRID_DASHBOARD_PORT_FILE` | Master | File path where bound dashboard HTTP port is written |

@@ -118,6 +118,23 @@ impl Drop for TestCluster {
     }
 }
 
+/// Returns a `Command` for `oxideswarm` isolated in `home` (both `HOME`/`USERPROFILE` and `.current_dir`).
+fn mcp_command(home: &Path) -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.current_dir(home)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env_remove("OXIDESWARM_HOME")
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_CONFIG")
+        .env_remove("RUSTY_GRID_MASTER")
+        .env_remove("RUSTY_GRID_MASTER_ADDR")
+        .env_remove("RUSTY_GRID_INSECURE")
+        .env("NO_COLOR", "1");
+    cmd
+}
+
 /// Helper to run child process with piped stdio and isolated environment.
 struct McpProcess {
     child: Child,
@@ -127,20 +144,10 @@ struct McpProcess {
 
 impl McpProcess {
     fn spawn(home: &Path, master_addr: &str, secret_hex: Option<&str>) -> Self {
-        let mut cmd = Command::new(BIN);
+        let mut cmd = mcp_command(home);
         cmd.arg("mcp")
             .arg("--master")
             .arg(master_addr)
-            .env("HOME", home)
-            .env("USERPROFILE", home)
-            .env_remove("OXIDESWARM_HOME")
-            .env_remove("OXIDESWARM_SECRET")
-            .env_remove("OXIDESWARM_SECRET_FILE")
-            .env_remove("RUSTY_GRID_CONFIG")
-            .env_remove("RUSTY_GRID_MASTER")
-            .env_remove("RUSTY_GRID_MASTER_ADDR")
-            .env_remove("RUSTY_GRID_INSECURE")
-            .env("NO_COLOR", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -501,12 +508,9 @@ async fn test_mcp_server_authentication_failure_handling() {
 fn test_mcp_cli_rejects_sse_flags() {
     let home = tempfile::tempdir().expect("temp home");
     for extra in [&["--sse"][..], &["--sse-bind", "127.0.0.1:8085"][..]] {
-        let out = Command::new(BIN)
+        let out = mcp_command(home.path())
             .arg("mcp")
             .args(extra)
-            .env("HOME", home.path())
-            .env("USERPROFILE", home.path())
-            .env_remove("OXIDESWARM_HOME")
             .output()
             .expect("spawn oxideswarm mcp");
         assert!(
@@ -516,4 +520,267 @@ fn test_mcp_cli_rejects_sse_flags() {
             out.status
         );
     }
+}
+
+fn wait_for_exit_with_open_stdin(child: &mut Child) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            return s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mcp should exit before reading from open stdin"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn run_mcp_initialize_and_exit(mut child: Child) -> (String, String) {
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1.0" }
+            }
+        });
+        writeln!(stdin, "{req}").expect("write initialize");
+        stdin.flush().expect("flush");
+    }
+    drop(child.stdin.take());
+
+    let out = child
+        .wait_with_output()
+        .expect("wait_with_output for mcp child");
+    assert!(
+        out.status.success(),
+        "mcp should exit 0 after EOF, got {:?}",
+        out.status
+    );
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn test_mcp_refuses_remote_master_without_secret_and_allows_insecure() {
+    let home = tempfile::tempdir().expect("temp home");
+
+    // 1. Without a secret or --insecure, `mcp --master 192.0.2.10:8088` exits 6 before reading stdin
+    let mut child = mcp_command(home.path())
+        .args(["mcp", "--master", "192.0.2.10:8088"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp without secret");
+
+    let status = wait_for_exit_with_open_stdin(&mut child);
+    assert_eq!(
+        status.code(),
+        Some(6),
+        "mcp without secret to remote master must exit with code 6"
+    );
+
+    // 2. With --insecure, it starts, warns on stderr, and answers initialize
+    let child_insecure = mcp_command(home.path())
+        .args(["mcp", "--master", "192.0.2.10:8088", "--insecure"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp with --insecure");
+
+    let (stdout_str, stderr_str) = run_mcp_initialize_and_exit(child_insecure);
+    assert!(
+        stdout_str.contains("\"protocolVersion\":\"2024-11-05\""),
+        "expected initialize response on stdout, got: {stdout_str}"
+    );
+    assert!(
+        stderr_str.contains("WARNING: --insecure"),
+        "expected --insecure warning on stderr, got: {stderr_str}"
+    );
+}
+
+#[test]
+fn test_mcp_skips_working_directory_config_file_unless_explicitly_pointed_to() {
+    let home = tempfile::tempdir().expect("temp home");
+    let cwd_cfg = home.path().join("rusty-grid.toml");
+    std::fs::write(
+        &cwd_cfg,
+        r#"[status]
+master = "192.0.2.10:8088"
+insecure = true
+"#,
+    )
+    .expect("write working-dir rusty-grid.toml");
+
+    // 1. Bare `oxideswarm mcp` started in a folder holding ./rusty-grid.toml skips it,
+    // logs a one-line notice on stderr, has no --insecure warning, and targets 127.0.0.1:8088.
+    let mut child = mcp_command(home.path())
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp in working dir with rusty-grid.toml");
+
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        let init_req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1.0" }
+            }
+        });
+        let status_req = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "status",
+                "arguments": {}
+            }
+        });
+        writeln!(stdin, "{init_req}").expect("write initialize");
+        writeln!(stdin, "{status_req}").expect("write status call");
+        stdin.flush().expect("flush");
+    }
+    drop(child.stdin.take());
+
+    let out = child
+        .wait_with_output()
+        .expect("wait_with_output for bare mcp");
+    assert!(
+        out.status.success(),
+        "bare mcp should exit 0 after EOF, got {:?}",
+        out.status
+    );
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr_str.contains("Skipping config file ./rusty-grid.toml in the working directory"),
+        "expected working-directory skip line on stderr, got: {stderr_str}"
+    );
+    assert!(
+        !stderr_str.contains("WARNING: --insecure"),
+        "working-directory insecure = true must not be applied, stderr: {stderr_str}"
+    );
+    assert!(
+        stdout_str.contains("127.0.0.1:8088") && !stdout_str.contains("192.0.2.10:8088"),
+        "status tool call must target 127.0.0.1:8088 rather than the skipped working-dir config, stdout: {stdout_str}"
+    );
+
+    // 2. With RUSTY_GRID_CONFIG pointing to the same file, mcp uses it and starts with --insecure warning.
+    let child_with_env_cfg = mcp_command(home.path())
+        .arg("mcp")
+        .env("RUSTY_GRID_CONFIG", &cwd_cfg)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp with RUSTY_GRID_CONFIG");
+
+    let (stdout_env, stderr_env) = run_mcp_initialize_and_exit(child_with_env_cfg);
+    assert!(
+        stdout_env.contains("\"protocolVersion\":\"2024-11-05\""),
+        "expected initialize response on stdout, got: {stdout_env}"
+    );
+    assert!(
+        stderr_env.contains("WARNING: --insecure"),
+        "expected --insecure warning when RUSTY_GRID_CONFIG is set, got: {stderr_env}"
+    );
+    assert!(
+        !stderr_env.contains("Skipping config file"),
+        "explicit RUSTY_GRID_CONFIG must not print the skip notice, got: {stderr_env}"
+    );
+}
+
+#[test]
+fn test_mcp_insecure_env_and_status_config_precedence() {
+    let home = tempfile::tempdir().expect("temp home");
+
+    // Case 1: RUSTY_GRID_INSECURE=1 starts mcp against a remote master with the warning.
+    let child_env_insecure = mcp_command(home.path())
+        .args(["mcp", "--master", "192.0.2.10:8088"])
+        .env("RUSTY_GRID_INSECURE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp with RUSTY_GRID_INSECURE=1");
+
+    let (stdout_str, stderr_str) = run_mcp_initialize_and_exit(child_env_insecure);
+    assert!(
+        stdout_str.contains("\"protocolVersion\":\"2024-11-05\""),
+        "expected initialize response on stdout, got: {stdout_str}"
+    );
+    assert!(
+        stderr_str.contains("WARNING: --insecure"),
+        "expected --insecure warning with RUSTY_GRID_INSECURE=1, got: {stderr_str}"
+    );
+
+    // Case 2: RUSTY_GRID_INSECURE=0 with [status] insecure = true exits 6.
+    let cfg_insecure_true = home.path().join("status-insecure.toml");
+    std::fs::write(
+        &cfg_insecure_true,
+        r#"[status]
+master = "192.0.2.10:8088"
+insecure = true
+"#,
+    )
+    .expect("write status-insecure.toml");
+
+    let mut child_env_zero = mcp_command(home.path())
+        .arg("mcp")
+        .env("RUSTY_GRID_CONFIG", &cfg_insecure_true)
+        .env("RUSTY_GRID_INSECURE", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp with RUSTY_GRID_INSECURE=0 and [status] insecure = true");
+
+    let status_env_zero = wait_for_exit_with_open_stdin(&mut child_env_zero);
+    assert_eq!(
+        status_env_zero.code(),
+        Some(6),
+        "RUSTY_GRID_INSECURE=0 must override [status] insecure = true and exit 6"
+    );
+
+    // Case 3: [status] master without --master (and without insecure) exits 6.
+    let cfg_remote_only = home.path().join("status-remote.toml");
+    std::fs::write(
+        &cfg_remote_only,
+        r#"[status]
+master = "192.0.2.10:8088"
+"#,
+    )
+    .expect("write status-remote.toml");
+
+    let mut child_status_master = mcp_command(home.path())
+        .arg("mcp")
+        .env("RUSTY_GRID_CONFIG", &cfg_remote_only)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp with [status] master");
+
+    let status_remote = wait_for_exit_with_open_stdin(&mut child_status_master);
+    assert_eq!(
+        status_remote.code(),
+        Some(6),
+        "[status] master without --master or a secret must exit 6"
+    );
 }
