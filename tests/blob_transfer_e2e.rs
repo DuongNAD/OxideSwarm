@@ -419,12 +419,20 @@ async fn test_output_patterns_never_follow_symlinked_parent_directories_or_steal
     };
     #[cfg(windows)]
     let make_link_task = |outputs: Vec<&str>| {
-        let script = format!(
-            "mklink /D link \"{}\" && echo sandbox-ok>keep.txt",
-            outside.path().display()
-        );
         let mut task = Task::new(
-            TaskSpec::command("cmd", vec!["/C".into(), script]),
+            TaskSpec::command(
+                "cmd",
+                vec![
+                    "/C".into(),
+                    "mklink".into(),
+                    "/D".into(),
+                    "link".into(),
+                    outside.path().to_string_lossy().into_owned(),
+                    "&&".into(),
+                    "echo".into(),
+                    "sandbox-ok>keep.txt".into(),
+                ],
+            ),
             TaskRequirements::generic(1, 30),
         );
         for pat in outputs {
@@ -490,7 +498,10 @@ async fn test_output_blobs_stay_pinned_for_delayed_client_download() {
             "cmd",
             vec![
                 "/C".into(),
-                format!("copy /Y \"{}\" \"{}\"", shared_src.display(), name),
+                "copy".into(),
+                "/Y".into(),
+                shared_src.to_string_lossy().into_owned(),
+                name.to_string(),
             ],
         );
         (
@@ -545,7 +556,10 @@ async fn test_output_blobs_can_be_evicted_after_output_pin_retention_expires() {
             "cmd",
             vec![
                 "/C".into(),
-                format!("copy /Y \"{}\" \"{}\"", shared_src.display(), name),
+                "copy".into(),
+                "/Y".into(),
+                shared_src.to_string_lossy().into_owned(),
+                name.to_string(),
             ],
         );
         Task::new(spec, TaskRequirements::generic(1, 30)).with_output_glob(name)
@@ -648,7 +662,10 @@ async fn test_worker_pins_output_files_from_collection_through_upload() {
                     "cmd",
                     vec![
                         "/C".into(),
-                        format!("copy /Y \"{}\" small.bin", src.display()),
+                        "copy".into(),
+                        "/Y".into(),
+                        src.to_string_lossy().into_owned(),
+                        "small.bin".into(),
                     ],
                 );
                 let task =
