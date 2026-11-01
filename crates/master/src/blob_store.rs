@@ -10,9 +10,11 @@
 //!   evicting the least recently used blobs when a new one is uploaded or stored. Blobs that a
 //!   queued or running task needs are pinned and never evicted, so the store can exceed its bound
 //!   while pinned blobs alone fill it. Output blobs of finished tasks stay pinned for
-//!   `output_pin_retention`, bounded in total size by `max_bytes` (releasing the oldest terminal
-//!   output pins early when exceeded, never those of the newest task). The index lives in memory
-//!   and is rebuilt from the directory (oldest modification time first) when the Master starts.
+//!   `output_pin_retention`, releasing the oldest terminal output pins early when total pinned
+//!   output bytes exceed `max_bytes`, but never those of the newest task (so a single task whose
+//!   outputs exceed `max_bytes` can also hold the store above its bound during the retention
+//!   window). The index lives in memory and is rebuilt from the directory (oldest modification
+//!   time first) when the Master starts.
 //! * **Trust.** Only authenticated peers reach the store; still, every upload is verified against
 //!   its id, every chunk is size-checked, and nothing a peer sends names a path: files are named
 //!   by the hex form of their id only.
@@ -508,7 +510,7 @@ impl BlobStore {
                     if inner.upload_bytes.saturating_add(total_size) > self.max_bytes {
                         return failed(format!(
                             "cannot upload blob {id} ({total_size} bytes): uploads in progress \
-                             already reserve {} of {} bytes; retry or raise `master --blob-store-mb`",
+                             already reserve {} of {} bytes; raise `master --blob-store-mb`",
                             inner.upload_bytes, self.max_bytes
                         ));
                     }
@@ -522,7 +524,7 @@ impl BlobStore {
                     if inner.upload_bytes.saturating_add(total_size) > self.max_bytes {
                         return failed(format!(
                             "cannot upload blob {id} ({total_size} bytes): uploads in progress \
-                             already reserve {} of {} bytes; retry or raise `master --blob-store-mb`",
+                             already reserve {} of {} bytes; raise `master --blob-store-mb`",
                             inner.upload_bytes, self.max_bytes
                         ));
                     }
@@ -539,12 +541,12 @@ impl BlobStore {
                 }
             }
         };
-        if need_evict {
-            self.evict_to_fit(None);
-        }
 
         let store = Arc::clone(self);
         let outcome = tokio::task::spawn_blocking(move || {
+            if need_evict {
+                store.evict_to_fit(None);
+            }
             store.append(owner, id, total_size, offset, data.as_bytes(), upload)
         })
         .await;
@@ -924,18 +926,19 @@ impl BlobStore {
     }
 
     /// Releases the pins of `task_id` (it finished, failed or was cancelled).
-    pub fn unpin_task(&self, task_id: &TaskId) {
-        let released = {
+    pub async fn unpin_task(self: &Arc<Self>, task_id: &TaskId) {
+        let need_evict = {
             let mut inner = self.lock();
             if let Some((_, ids)) = inner.pins.remove(task_id) {
                 release_pins(&mut inner, ids);
-                true
+                inner.total_bytes.saturating_add(inner.upload_bytes) > self.max_bytes
             } else {
                 false
             }
         };
-        if released {
-            self.evict_to_fit(None);
+        if need_evict {
+            let store = Arc::clone(self);
+            let _ = tokio::task::spawn_blocking(move || store.evict_to_fit(None)).await;
         }
     }
 
@@ -983,8 +986,8 @@ impl BlobStore {
 
     /// Releases output pins of terminal tasks that have been held for at least
     /// [`BlobStore::output_pin_retention`].
-    pub fn sweep_expired_output_pins(&self) {
-        let released = {
+    pub async fn sweep_expired_output_pins(self: &Arc<Self>) {
+        let need_evict = {
             let mut inner = self.lock();
             let expired: Vec<TaskId> = inner
                 .output_pins
@@ -1000,11 +1003,12 @@ impl BlobStore {
                         release_output_pins(&mut inner, entry.ids);
                     }
                 }
-                true
+                inner.total_bytes.saturating_add(inner.upload_bytes) > self.max_bytes
             }
         };
-        if released {
-            self.evict_to_fit(None);
+        if need_evict {
+            let store = Arc::clone(self);
+            let _ = tokio::task::spawn_blocking(move || store.evict_to_fit(None)).await;
         }
     }
 }
@@ -1021,12 +1025,12 @@ impl OutputPinGuard {
     /// Binds the pinned output blobs to `task_id` for [`BlobStore::output_pin_retention`] after
     /// the task reached a terminal state. When total pinned output bytes exceed `max_bytes`,
     /// releases the oldest terminal output pins early, never those of `task_id`.
-    pub fn commit_terminal(mut self, task_id: TaskId) {
+    pub async fn commit_terminal(mut self, task_id: TaskId) {
         let ids = std::mem::take(&mut self.ids);
         if ids.is_empty() {
             return;
         }
-        {
+        let need_evict = {
             let mut inner = self.store.lock();
             for &id in &ids {
                 *inner.output_pin_counts.entry(id).or_insert(0) += 1;
@@ -1058,8 +1062,12 @@ impl OutputPinGuard {
                     release_output_pins(&mut inner, removed.ids);
                 }
             }
+            inner.total_bytes.saturating_add(inner.upload_bytes) > self.store.max_bytes
+        };
+        if need_evict {
+            let store = Arc::clone(&self.store);
+            let _ = tokio::task::spawn_blocking(move || store.evict_to_fit(None)).await;
         }
-        self.store.evict_to_fit(None);
     }
 }
 
@@ -1255,9 +1263,9 @@ mod tests {
         let (t1, t2) = (TaskId::new(), TaskId::new());
         store.pin_task(t1, vec![shared]);
         store.pin_task(t2, vec![shared]);
-        store.unpin_task(&t1);
+        store.unpin_task(&t1).await;
         assert_eq!(store.stats().pinned_blobs, 1);
-        store.unpin_task(&t2);
+        store.unpin_task(&t2).await;
         assert_eq!(store.stats().pinned_blobs, 0);
         assert!(store.pinned_tasks().is_empty());
     }
@@ -1284,12 +1292,12 @@ mod tests {
         // Terminal result: input pins are released and output pins stay until retention expires.
         let out_final = store.put(&vec![3u8; 800]).await.unwrap();
         let guard = store.check_and_pin_outputs(&[out_final]).unwrap();
-        store.unpin_task(&task_id);
-        guard.commit_terminal(task_id);
+        store.unpin_task(&task_id).await;
+        guard.commit_terminal(task_id).await;
         assert_eq!(store.stats().pinned_blobs, 1);
 
         std::thread::sleep(Duration::from_millis(50));
-        store.sweep_expired_output_pins();
+        store.sweep_expired_output_pins().await;
         assert_eq!(store.stats().pinned_blobs, 0);
     }
 
@@ -1439,28 +1447,102 @@ mod tests {
     #[tokio::test]
     async fn abort_uploads_while_chunk_is_in_flight_does_not_reinsert_or_leak_tmp_file() {
         let dir = tempfile::tempdir().unwrap();
-        let store = open(dir.path(), 1 << 30);
         let data = vec![7u8; BLOB_CHUNK_BYTES * 2];
+        let total = data.len() as u64;
+        let store = open(dir.path(), total);
         let id = BlobId::of(&data);
         let owner = store.new_owner();
 
-        // Simulate the state while `write_chunk` has handed chunk 0 to `spawn_blocking(append)`:
-        // if `abort_uploads(owner)` runs before `append` finishes, `append` must not put the
-        // upload back into `inner.uploads` or leave its `.part` file in `tmp/`.
+        // 1. Mid-upload abort while chunk 0 is in flight (`UploadSlot::Writing`):
+        //    `abort_uploads(owner)` must release `upload_bytes` (M5c), and `append` must not
+        //    put the upload back into `inner.uploads` or leave its `.part` file in `tmp/` (M5a).
+        {
+            let mut inner = store.lock();
+            inner.upload_bytes = total;
+            inner
+                .uploads
+                .insert((owner, id), UploadSlot::Writing { total });
+        }
+        assert_eq!(store.lock().upload_bytes, total);
         store.abort_uploads(owner);
-        let reply = store.append(
-            owner,
-            id,
-            data.len() as u64,
+        assert_eq!(
+            store.lock().upload_bytes,
             0,
-            &data[..BLOB_CHUNK_BYTES],
-            None,
+            "abort_uploads must release upload_bytes reservation for Writing slots"
         );
+        let reply = store.append(owner, id, total, 0, &data[..BLOB_CHUNK_BYTES], None);
         assert!(
             matches!(reply, BlobReply::Failed { .. }),
             "append for an aborted owner must fail instead of re-inserting, got {reply:?}"
         );
         assert_eq!(store.stats().uploads, 0);
+        assert_eq!(store.lock().upload_bytes, 0);
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("tmp"))
+                .map(|d| d.count())
+                .unwrap_or(0),
+            0
+        );
+
+        // 2. Abort during the last chunk (`commit`, M5b) and `upload_bytes` release (M5c):
+        //    send chunk 0 normally (so `upload_bytes == total`), transition the slot to
+        //    `Writing` as `write_chunk` does for chunk 1, abort `owner2`, and run `append`
+        //    for the final chunk (which calls `self.commit`).
+        let owner2 = store.new_owner();
+        let r0 = store
+            .handle(
+                owner2,
+                BlobRequest::Write {
+                    id,
+                    total_size: total,
+                    offset: 0,
+                    data: Bytes::from(data[..BLOB_CHUNK_BYTES].to_vec()),
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                r0,
+                BlobReply::Written {
+                    complete: false,
+                    ..
+                }
+            ),
+            "{r0:?}"
+        );
+        assert_eq!(store.lock().upload_bytes, total);
+        let in_flight_upload = match store
+            .lock()
+            .uploads
+            .insert((owner2, id), UploadSlot::Writing { total })
+        {
+            Some(UploadSlot::Idle(u)) => *u,
+            _ => panic!("expected Idle upload after chunk 0"),
+        };
+        store.abort_uploads(owner2);
+        assert_eq!(
+            store.lock().upload_bytes,
+            0,
+            "abort_uploads must release upload_bytes before last-chunk commit finishes"
+        );
+        let r1 = store.append(
+            owner2,
+            id,
+            total,
+            BLOB_CHUNK_BYTES as u64,
+            &data[BLOB_CHUNK_BYTES..],
+            Some(in_flight_upload),
+        );
+        assert!(
+            matches!(r1, BlobReply::Failed { .. }),
+            "commit for an aborted owner must fail, got {r1:?}"
+        );
+        assert!(
+            !store.contains(&id),
+            "aborted last-chunk upload must not insert the blob into the store"
+        );
+        assert_eq!(store.stats().uploads, 0);
+        assert_eq!(store.lock().upload_bytes, 0);
         assert_eq!(
             std::fs::read_dir(dir.path().join("tmp"))
                 .map(|d| d.count())
@@ -1477,12 +1559,14 @@ mod tests {
         store
             .check_and_pin_outputs(&[out1])
             .unwrap()
-            .commit_terminal(TaskId::new());
+            .commit_terminal(TaskId::new())
+            .await;
         let out2 = store.put(&vec![2u8; 1200]).await.unwrap();
         store
             .check_and_pin_outputs(&[out2])
             .unwrap()
-            .commit_terminal(TaskId::new());
+            .commit_terminal(TaskId::new())
+            .await;
         assert_eq!(store.stats().pinned_blobs, 2);
         assert!(store.contains(&out1) && store.contains(&out2));
 
@@ -1492,7 +1576,8 @@ mod tests {
         store
             .check_and_pin_outputs(&[out3])
             .unwrap()
-            .commit_terminal(TaskId::new());
+            .commit_terminal(TaskId::new())
+            .await;
         assert!(
             !store.contains(&out1),
             "oldest terminal output pin must be released early and evicted when output pins exceed max_bytes"

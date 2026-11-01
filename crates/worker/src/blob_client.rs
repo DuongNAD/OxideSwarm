@@ -207,7 +207,7 @@ async fn fetch_one(
         path: cache.temp_path(),
         adopted: false,
     };
-    let mut file = tokio::fs::File::create(&tmp.path).await?;
+    let mut file = tokio::fs::File::from_std(std::fs::File::create(&tmp.path)?);
     let bytes = download_blob(client, id, Some(size), &mut file).await?;
     file.sync_all().await?;
     drop(file);
@@ -754,6 +754,28 @@ mod tests {
             data.len() as u64,
             false,
         )]);
+
+        // 1. Polling `fetch_task_inputs` once and dropping it immediately (before any reply)
+        //    must not leak empty `.part` files in `tmp/` (F5).
+        let (noop_tx, mut noop_rx) = mpsc::channel(256);
+        let noop_client = BlobClient::new(noop_tx);
+        for _ in 0..100 {
+            let mut fut = Box::pin(fetch_task_inputs(&task, Some(&noop_client), &cache));
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            let _ = std::future::Future::poll(fut.as_mut(), &mut cx);
+            drop(fut);
+            while noop_rx.try_recv().is_ok() {}
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("tmp")).unwrap().count(),
+            0,
+            "dropping fetch_task_inputs after one poll must not leak .part files in tmp/"
+        );
+
+        // 2. Cancelling after chunk 0 is written to `.part` while chunk 1 is in flight must
+        //    also remove the partial `.part` file from `tmp/`.
         let fetch = fetch_task_inputs(&task, Some(&client), &cache);
         tokio::select! {
             res = fetch => panic!("fetch should not complete before cancellation: {res:?}"),

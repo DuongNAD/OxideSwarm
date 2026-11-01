@@ -106,12 +106,15 @@ Behaviour before this change (design record 0003, inline staging):
   or `blob_dir` / `blob_store_mb` in the config file) say otherwise. A library `ServerConfig` has no
   store unless `with_blob_store` is called.
 - A stored blob makes the store evict least recently used blobs down to its bound, and uploads in
-  progress in `tmp/` count against `max_bytes` as well. Input blobs of a
+  progress in `tmp/` count against `max_bytes` as well. When concurrent uploads in progress would
+  together exceed `max_bytes` (even for the same blob), the new upload is refused with an error
+  and callers do not automatically retry. Input blobs of a
   task between admission and its terminal state are pinned and never evicted, and output blobs of a
   finished task stay pinned for 10 minutes (`BlobStoreConfig::output_pin_retention`) so the client
   can download them; pinned inputs can hold the store above its bound for that time. When total
   pinned output bytes exceed `max_bytes`, the store releases the oldest terminal output pins early,
-  and never those of the newest task. A
+  and never those of the newest task (so a single task whose outputs exceed `max_bytes` can also
+  hold the store above its bound during the retention window). A
   sweeper (every 30 s) releases the input pins of finished tasks, releases output pins past their
   10-minute retention window, and drops uploads idle for 10 minutes.
 - Admission (`admit_blob_task`): every input blob, and every file of every input tree, must be in

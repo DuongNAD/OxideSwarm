@@ -201,7 +201,12 @@ fn collect_outputs_inner(
         }
         let meta = match std::fs::symlink_metadata(&start) {
             Ok(meta) => meta,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
                 if pattern.is_literal() {
                     not_produced.push(pattern.as_str().to_string());
                 }
@@ -619,6 +624,42 @@ mod tests {
         let outputs =
             collect_outputs(&sandbox, &patterns, &cache, OutputLimits::default(), true).unwrap();
         assert!(outputs.is_empty());
+
+        // A pattern whose literal prefix passes through a regular file (`a/b/*.txt` where `a`
+        // is a regular file) produces `NotADirectory` on `symlink_metadata(&start)`: a glob
+        // must skip it just like `NotFound`, while a literal pattern reports "did not produce".
+        write(&sandbox, "a", b"regular file");
+        let glob_below_file = collect_outputs(
+            &sandbox,
+            &["a/b/*.txt".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        )
+        .expect("a glob below a regular file must not fail a successful task");
+        assert!(glob_below_file.is_empty());
+
+        let literal_err = collect_outputs(
+            &sandbox,
+            &["a/b/c.txt".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            literal_err.contains("did not produce 'a/b/c.txt'"),
+            "{literal_err}"
+        );
+        assert!(collect_outputs(
+            &sandbox,
+            &["a/b/c.txt".to_string()],
+            &cache,
+            OutputLimits::default(),
+            true,
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
@@ -675,7 +716,51 @@ mod tests {
             let _ = std::fs::remove_file(&non_utf8);
         }
 
-        // 3. An unreadable directory below a pattern must fail rather than being silently skipped.
+        // 3. A real stat error at `&start` (e.g. an unreadable ancestor directory `locked_parent`
+        //    for pattern `locked_parent/sub/*.txt`) must fail collection (catches M3b).
+        let locked_parent = sandbox.join("locked_parent");
+        std::fs::create_dir_all(locked_parent.join("sub")).unwrap();
+        std::fs::write(locked_parent.join("sub/file.txt"), b"secret").unwrap();
+        std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let start_res = collect_outputs(
+            &sandbox,
+            &["locked_parent/sub/*.txt".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        );
+        std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let start_err =
+            start_res.expect_err("unreadable ancestor at start path must fail collection");
+        assert!(
+            start_err.contains("cannot read output 'locked_parent/sub/*.txt'"),
+            "{start_err}"
+        );
+
+        // 4. A directory with read permission (`0o400`) but no search/execute permission (`+x`)
+        //    lets `read_dir` and `entry.file_type()` succeed on Unix while `entry.metadata()`
+        //    fails with `PermissionDenied`; `walk` and `collect_outputs` must fail (catches M3d).
+        let no_search = sandbox.join("out/no_search");
+        std::fs::create_dir_all(&no_search).unwrap();
+        std::fs::write(no_search.join("file.txt"), b"secret").unwrap();
+        std::fs::set_permissions(&no_search, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let meta_res = collect_outputs(
+            &sandbox,
+            &["out/**".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        );
+        std::fs::set_permissions(&no_search, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let meta_err =
+            meta_res.expect_err("metadata failure on a selected file must fail collection");
+        assert!(
+            meta_err.contains("cannot read output 'out/no_search/file.txt'"),
+            "{meta_err}"
+        );
+        std::fs::remove_dir_all(&no_search).unwrap();
+
+        // 5. An unreadable directory (`0o000`) below a pattern must fail at `read_dir`.
         let locked = sandbox.join("out/locked");
         std::fs::create_dir_all(&locked).unwrap();
         std::fs::write(locked.join("file.txt"), b"secret").unwrap();
@@ -689,6 +774,9 @@ mod tests {
         );
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         let err = res.expect_err("unreadable directory must fail output collection");
-        assert!(err.contains("cannot read"), "{err}");
+        assert!(
+            err.contains("cannot read output directory 'out/locked'"),
+            "{err}"
+        );
     }
 }

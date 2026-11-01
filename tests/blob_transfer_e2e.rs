@@ -547,6 +547,17 @@ async fn test_output_blobs_stay_pinned_for_delayed_client_download() {
         std::fs::read(out_dir.path().join("c.bin")).unwrap(),
         expected_c
     );
+
+    // Because `a.bin`'s output pin was released early when `c.bin` pushed pinned outputs over
+    // `max_bytes`, `a.bin` has now been evicted to fit `c.bin` within the 3 MiB store (F3 / M7a).
+    let retry_a_dir = tempfile::tempdir().unwrap();
+    let retry_a_err = download_outputs(&connection, &result_a.outputs, retry_a_dir.path())
+        .await
+        .expect_err("older output a.bin must be released early and evicted when pinned outputs exceed max_bytes");
+    assert!(
+        retry_a_err.contains("no longer on the master"),
+        "expected missing blob error for evicted a.bin, got: {retry_a_err}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1719,7 +1719,7 @@ async fn admit_blob_task(blob_store: Option<&Arc<BlobStore>>, task: &Task) -> Re
     }
     let gone = store.pin_task(task.id, ids);
     if let Some(id) = gone.first() {
-        store.unpin_task(&task.id);
+        store.unpin_task(&task.id).await;
         return Err(format!(
             "input blob {id} was evicted from the master's blob store while the task was being \
              submitted; upload the inputs again (or raise `master --blob-store-mb`)"
@@ -1866,7 +1866,7 @@ fn spawn_blob_store_sweeper(
             tokio::select! {
                 _ = ticker.tick() => {
                     store.sweep_stale_uploads();
-                    store.sweep_expired_output_pins();
+                    store.sweep_expired_output_pins().await;
                     for (task_id, pinned_at) in store.pinned_tasks() {
                         let release = match queue.get_task(&task_id).await {
                             Some(info) => info.state.is_terminal(),
@@ -1874,7 +1874,7 @@ fn spawn_blob_store_sweeper(
                             None => pinned_at.elapsed() > BLOB_SWEEP_INTERVAL,
                         };
                         if release {
-                            store.unpin_task(&task_id);
+                            store.unpin_task(&task_id).await;
                         }
                     }
                 }
@@ -2040,10 +2040,10 @@ async fn apply_task_result(
     //    `output_pin_retention` so the client can download them.
     if outcome.disposition == ResultDisposition::Terminal {
         if let Some(store) = blob_store {
-            store.unpin_task(&task_id);
+            store.unpin_task(&task_id).await;
         }
         if let Some(pin) = output_pin {
-            pin.commit_terminal(task_id);
+            pin.commit_terminal(task_id).await;
         }
         let mut lock = waiters.write().await;
         if let Some(senders) = lock.remove(&task_id) {
@@ -2653,7 +2653,7 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     drop(rx);
                     prune_closed_waiters(&waiters, &task_id).await;
                     if let (false, Some(store)) = (known, blob_store.as_ref()) {
-                        store.unpin_task(&task_id);
+                        store.unpin_task(&task_id).await;
                     }
                     warn!(task_id = %task_id, error = %e, "SubmitTask rejected");
                     let resp = ClientResponse::Error {
@@ -4374,9 +4374,9 @@ impl MasterHandle {
     }
 
     /// Releases the pins taken by [`MasterHandle::admit`] for a task the queue refused.
-    fn release_admission(&self, task_id: &TaskId, admitted: bool) {
+    async fn release_admission(&self, task_id: &TaskId, admitted: bool) {
         if let (true, Some(store)) = (admitted, self.blob_store.as_ref()) {
-            store.unpin_task(task_id);
+            store.unpin_task(task_id).await;
         }
     }
 
@@ -4446,7 +4446,7 @@ impl MasterHandle {
         let id = match self.queue.submit(task).await {
             Ok(id) => id,
             Err(e) => {
-                self.release_admission(&task_id, admitted);
+                self.release_admission(&task_id, admitted).await;
                 return Err(e);
             }
         };
@@ -4472,7 +4472,7 @@ impl MasterHandle {
         let id = match self.queue.submit_with_priority(task, priority).await {
             Ok(id) => id,
             Err(e) => {
-                self.release_admission(&task_id, admitted);
+                self.release_admission(&task_id, admitted).await;
                 return Err(e);
             }
         };
