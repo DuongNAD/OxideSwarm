@@ -112,6 +112,19 @@ async fn test_cli_cancel_stops_running_sleep_task() {
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
 
+    // F30-4: `result <ID>` without `--wait` on a still-running task exits with code 3
+    // (distinct from exit 1 for a failed task).
+    let running_res = cli_cmd(home)
+        .args(["result", &task_id_str, "--master", &master_addr])
+        .output()
+        .expect("spawn result without --wait on running task");
+    assert_eq!(
+        running_res.status.code(),
+        Some(3),
+        "expected exit code 3 for still-running task, got {:?}",
+        running_res.status
+    );
+
     let cancel_start = Instant::now();
     let cancel_out = cli_cmd(home)
         .args(["cancel", &task_id_str, "--master", &master_addr])
@@ -138,7 +151,7 @@ async fn test_cli_cancel_stops_running_sleep_task() {
         serde_json::from_slice(&second_cancel.stdout).expect("parse second cancel json");
     assert_eq!(second_json["cancelled"], false);
 
-    // `result --wait` on the cancelled task reports failure without waiting 30s.
+    // `result --wait` on the cancelled task reports cancellation without waiting 30s.
     let res_out = cli_cmd(home)
         .args(["result", &task_id_str, "--master", &master_addr, "--wait"])
         .output()
@@ -147,6 +160,15 @@ async fn test_cli_cancel_stops_running_sleep_task() {
     assert!(
         cancel_start.elapsed() < Duration::from_secs(10),
         "cancelled sleep task must stop well before 30s"
+    );
+    let res_stdout = String::from_utf8_lossy(&res_out.stdout);
+    assert!(
+        res_stdout.contains("cancelled") || res_stdout.contains("Cancelled"),
+        "expected cancelled message in result stdout, got: {res_stdout}"
+    );
+    assert!(
+        !res_stdout.contains("00000000-0000-0000-0000-000000000000"),
+        "must not print nil worker UUID: {res_stdout}"
     );
 
     let _ = shutdown_tx.send(true);
@@ -275,6 +297,176 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
     let downloaded = std::fs::read_to_string(out_dir.join("async_out.txt"))
         .expect("async_out.txt must be downloaded by `oxideswarm result --output-dir`");
     assert_eq!(downloaded, "payload-42");
+
+    // 3. F30-5: Verify that a failed blob download (e.g. `--output-dir` is a regular file)
+    // exits non-zero and reports `output_download_error` in `--json`.
+    let not_a_dir = home.join("regular_file_not_dir");
+    std::fs::write(&not_a_dir, "blocker").expect("write regular_file_not_dir");
+    let bad_blob_dl = cli_cmd(home)
+        .args([
+            "result",
+            &task_id_str,
+            "--master",
+            &master_addr,
+            "--output-dir",
+            not_a_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("spawn result with bad --output-dir for blob");
+    assert!(
+        !bad_blob_dl.status.success(),
+        "failed blob download must exit non-zero"
+    );
+    let bad_blob_json: serde_json::Value =
+        serde_json::from_slice(&bad_blob_dl.stdout).expect("parse bad_blob_dl json");
+    assert!(
+        bad_blob_json.get("output_download_error").is_some(),
+        "expected output_download_error in json: {bad_blob_json}"
+    );
+
+    // 4. F30-5: Verify that `result` preserves the task's non-1 exit code (e.g. exit 7).
+    let exit7_sub = cli_cmd(home)
+        .args([
+            "submit",
+            "--master",
+            &master_addr,
+            "--type",
+            "shell",
+            "--interpreter",
+            "python3",
+            "--command",
+            "import sys; sys.exit(7)",
+            "--json",
+        ])
+        .output()
+        .expect("spawn exit 7 submit");
+    let exit7_json: serde_json::Value =
+        serde_json::from_slice(&exit7_sub.stdout).expect("parse exit7_sub json");
+    let exit7_id = exit7_json["task_id"].as_str().expect("exit7_id");
+
+    let exit7_res = cli_cmd(home)
+        .args(["result", exit7_id, "--master", &master_addr, "--wait"])
+        .output()
+        .expect("spawn result --wait for exit 7");
+    assert_eq!(
+        exit7_res.status.code(),
+        Some(7),
+        "expected exit code 7 from task, got {:?}",
+        exit7_res.status
+    );
+
+    // 5. F30-1, F30-2, F30-5: Submit a task producing an inline `OutputArtifact` (`expected_outputs`),
+    // verify saving it to a directory succeeds, refusing to write through a symlink leaves the victim
+    // untouched and exits non-zero, and failing to save to a regular-file `--output-dir` exits non-zero
+    // with `artifact_save_error` in `--json`.
+    let inline_task = rusty_grid_core::Task::new(
+        rusty_grid_core::TaskSpec::ShellScript {
+            script: "import pathlib; pathlib.Path('rep.txt').write_text('TASK_PAYLOAD')".into(),
+            interpreter: Some("python3".into()),
+            env: Default::default(),
+        },
+        rusty_grid_core::TaskRequirements::default(),
+    )
+    .with_expected_outputs(vec!["rep.txt".into()]);
+    let inline_id = inline_task.id.to_string();
+    let mut transport = rusty_grid_cli::connect::connect_master(&master_addr, None)
+        .await
+        .expect("connect_master");
+    transport
+        .send_msg(&rusty_grid_core::protocol::ClientMessage::SubmitTask {
+            task: inline_task,
+            wait: true,
+        })
+        .await
+        .expect("send inline task");
+    let _ = transport
+        .recv_msg::<rusty_grid_core::protocol::ClientResponse>()
+        .await
+        .expect("recv inline task completion");
+
+    let inline_ok_dir = home.join("inline_ok");
+    let inline_ok = cli_cmd(home)
+        .args([
+            "result",
+            &inline_id,
+            "--master",
+            &master_addr,
+            "--output-dir",
+            inline_ok_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("spawn result for inline artifact");
+    assert!(
+        inline_ok.status.success(),
+        "inline artifact save failed: {}",
+        String::from_utf8_lossy(&inline_ok.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(inline_ok_dir.join("rep.txt")).expect("read rep.txt"),
+        "TASK_PAYLOAD"
+    );
+
+    #[cfg(unix)]
+    {
+        let symlink_dir = home.join("symlink_dir");
+        std::fs::create_dir_all(&symlink_dir).expect("create symlink_dir");
+        let victim = home.join("victim.txt");
+        std::fs::write(&victim, "SAFE_ORIGINAL").expect("write victim");
+        std::os::unix::fs::symlink(&victim, symlink_dir.join("rep.txt")).expect("create symlink");
+
+        let symlink_res = cli_cmd(home)
+            .args([
+                "result",
+                &inline_id,
+                "--master",
+                &master_addr,
+                "--output-dir",
+                symlink_dir.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .expect("spawn result into symlink dir");
+        assert!(
+            !symlink_res.status.success(),
+            "result must exit non-zero when artifact target is a symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read victim after symlink refusal"),
+            "SAFE_ORIGINAL",
+            "victim file targeted by symlink must remain untouched"
+        );
+        let symlink_json: serde_json::Value =
+            serde_json::from_slice(&symlink_res.stdout).expect("parse symlink_res json");
+        assert!(
+            symlink_json.get("artifact_save_error").is_some(),
+            "expected artifact_save_error in json: {symlink_json}"
+        );
+    }
+
+    let bad_inline_dl = cli_cmd(home)
+        .args([
+            "result",
+            &inline_id,
+            "--master",
+            &master_addr,
+            "--output-dir",
+            not_a_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("spawn result with file as --output-dir for inline artifact");
+    assert!(
+        !bad_inline_dl.status.success(),
+        "failed inline artifact save must exit non-zero"
+    );
+    let bad_inline_json: serde_json::Value =
+        serde_json::from_slice(&bad_inline_dl.stdout).expect("parse bad_inline_dl json");
+    assert!(
+        bad_inline_json.get("artifact_save_error").is_some(),
+        "expected artifact_save_error in json: {bad_inline_json}"
+    );
 
     let _ = shutdown_tx.send(true);
     worker_handle.abort();

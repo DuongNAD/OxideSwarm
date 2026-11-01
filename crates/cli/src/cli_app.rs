@@ -2537,11 +2537,12 @@ async fn run_submit_with_secret(
                     }
                 }
             };
+            let mut artifact_save_error: Option<String> = None;
             let saved_artifacts = if !result.artifacts.is_empty() {
                 match crate::connect::save_output_artifacts(&result.artifacts, output_dir) {
                     Ok(saved) => Some(saved),
                     Err(e) => {
-                        eprintln!("Failed to save output artifacts: {e}");
+                        artifact_save_error = Some(e);
                         None
                     }
                 }
@@ -2557,6 +2558,9 @@ async fn run_submit_with_secret(
                         let saved_strs: Vec<String> =
                             saved.iter().map(|p| p.display().to_string()).collect();
                         obj.insert("saved_artifacts".to_string(), serde_json::json!(saved_strs));
+                    }
+                    if let Some(ref err) = artifact_save_error {
+                        obj.insert("artifact_save_error".to_string(), serde_json::json!(err));
                     }
                     if let Some(ref saved) = saved_outputs {
                         let saved_strs: Vec<String> =
@@ -2614,6 +2618,10 @@ async fn run_submit_with_secret(
                 if !result.stderr.is_empty() {
                     eprintln!("Stderr:\n{}", result.stderr_str().trim());
                 }
+            }
+            if let Some(err) = artifact_save_error {
+                eprintln!("Failed to save output artifacts: {err}");
+                return ExitCode::FAILURE;
             }
             if result.exit_code == 0 {
                 ExitCode::SUCCESS
@@ -3028,11 +3036,12 @@ pub async fn run_result(
                         }
                     }
                 };
+                let mut artifact_save_error: Option<String> = None;
                 let saved_artifacts = if !result.artifacts.is_empty() {
                     match crate::connect::save_output_artifacts(&result.artifacts, output_dir) {
                         Ok(saved) => Some(saved),
                         Err(e) => {
-                            eprintln!("Failed to save output artifacts: {e}");
+                            artifact_save_error = Some(e);
                             None
                         }
                     }
@@ -3051,6 +3060,9 @@ pub async fn run_result(
                                 serde_json::json!(saved_strs),
                             );
                         }
+                        if let Some(ref err) = artifact_save_error {
+                            obj.insert("artifact_save_error".to_string(), serde_json::json!(err));
+                        }
                         if let Some(ref saved) = saved_outputs {
                             let saved_strs: Vec<String> =
                                 saved.iter().map(|p| p.display().to_string()).collect();
@@ -3064,10 +3076,14 @@ pub async fn run_result(
                 } else {
                     if result.is_success() {
                         println!("Task {task_id} completed successfully.");
+                    } else if result.exit_code == 130 {
+                        println!("Task {task_id} was cancelled.");
                     } else {
                         println!("Task {task_id} failed.");
                     }
-                    println!("Worker: {}", result.worker_id);
+                    if !result.worker_id.is_nil() {
+                        println!("Worker: {}", result.worker_id);
+                    }
                     println!("Exit Code: {}", result.exit_code);
                     println!("Execution Time: {}ms", result.execution_time_ms);
                     if let Some(ref saved) = saved_artifacts {
@@ -3114,6 +3130,10 @@ pub async fn run_result(
                 }
                 if let Some(err) = output_download_error {
                     eprintln!("Downloading the output files failed: {err}");
+                    return ExitCode::FAILURE;
+                }
+                if let Some(err) = artifact_save_error {
+                    eprintln!("Failed to save output artifacts: {err}");
                     return ExitCode::FAILURE;
                 }
                 return if result.is_success() {
@@ -3163,6 +3183,8 @@ pub async fn run_result(
                 }
                 return if status == rusty_grid_core::TaskStatus::Completed {
                     ExitCode::SUCCESS
+                } else if !is_terminal {
+                    ExitCode::from(3)
                 } else {
                     ExitCode::FAILURE
                 };
