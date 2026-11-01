@@ -81,13 +81,13 @@ A session is covered from the end of its first turn. If several sessions run on 
 On the Mac (Terminal, repository root):
 
 ```bash
-python3 scripts/agent_bridge.py watch --once-on-message --auto-pull
+python3 scripts/agent_bridge.py watch --once-on-message --consumer agy
 ```
 
 On Windows (PowerShell, repository root):
 
 ```powershell
-python scripts/agent_bridge.py watch --once-on-message --auto-pull
+python scripts/agent_bridge.py watch --once-on-message --consumer agy
 ```
 
 **To be told yourself**, keep a second watcher running in a spare terminal. Its own delivery group means that it takes nothing from the agent.
@@ -130,7 +130,7 @@ Expected output when both nodes are synchronized:
 | Symptom | Cause | Fix |
 |---|---|---|
 | `[GIT DRIFT] Commit mismatch` | One machine has not pulled the latest commit | Run `git pull` and rebuild release binaries on the behind node |
-| `[AUTH MISMATCH] cluster.secret SHA-256 fingerprint differs` | `~/.oxideswarm/cluster.secret` differs between Master and Worker | Run `python3 scripts/agent_bridge.py serve-secret` on Master and `python scripts/agent_bridge.py pull-secret` on Worker over LAN TCP (never via Google Drive) |
+| `[AUTH MISMATCH] cluster.secret SHA-256 fingerprint differs` | `~/.oxideswarm/cluster.secret` differs between Master and Worker | Copy `~/.oxideswarm/cluster.secret` from the Master to the Worker over `scp` or another authenticated channel you trust (never via Google Drive or plain HTTP) |
 | `[LOCAL CRITICAL] .../rusty-grid.toml contains an active p2p_ticket` | A leftover `p2p_ticket` in `rusty-grid.toml` overrides `--master` | Remove or comment out `p2p_ticket` in `rusty-grid.toml` |
 | `[NETWORK BLOCKED] Peer Master is listening on <MASTER_IP>:8088, but TCP connection failed` | Host firewall or Wi-Fi client isolation blocks TCP `8088` | Allow inbound TCP `8088` on the Master host or start the Master with `--p2p` |
 | A Claude Code session does not wake | The session started before the hooks existed, or it has not finished a turn yet | Pull the latest commit, start a new session, and send it one prompt |

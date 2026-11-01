@@ -458,6 +458,12 @@ class Send(BridgeCase):
         self.assertIn("[INFO]", output)
         self.assertNotIn("[WARN]", output)
 
+    def test_plain_http_secret_subcommands_are_absent(self):
+        for verb in ("serve" + "-secret", "pull" + "-secret"):
+            res = self.run_bridge(verb)
+            self.assertNotEqual(res.returncode, 0, f"{verb} must not be accepted")
+            self.assertIn("invalid choice", res.stderr.decode("utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
