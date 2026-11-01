@@ -736,6 +736,22 @@ async fn test_rapid_repeated_detection_concurrent_stress() {
 // PART 5: End-to-End CLI Binary Wire Protocol Verification
 // =========================================================================
 
+fn isolate_command(cmd: &mut std::process::Command, home: &std::path::Path) {
+    cmd.env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("OXIDESWARM_HOME", home.join(".oxideswarm"))
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_CONFIG")
+        .env_remove("RUSTY_GRID_MASTER")
+        .env_remove("RUSTY_GRID_MASTER_ADDR")
+        .env_remove("RUSTY_GRID_WORKER_NAME")
+        .env_remove("RUSTY_GRID_NAME")
+        .env_remove("RUSTY_GRID_WORKER_ID_FILE")
+        .env_remove("RUSTY_GRID_INSECURE")
+        .current_dir(home);
+}
+
 #[tokio::test]
 async fn test_cli_e2e_conflicting_flags_no_gpu_wire_domination() {
     // 1. Bind an ephemeral TCP listener representing MasterServer
@@ -765,7 +781,10 @@ async fn test_cli_e2e_conflicting_flags_no_gpu_wire_domination() {
     }
 
     // 3. Spawn oxideswarm worker with conflicting flags: --no-gpu alongside --cuda and --vram-mb 16000
-    let mut child = std::process::Command::new(&bin_path)
+    let temp_dir = tempfile::TempDir::new().expect("create isolated test home");
+    let mut cmd = std::process::Command::new(&bin_path);
+    isolate_command(&mut cmd, temp_dir.path());
+    let mut child = cmd
         .arg("worker")
         .arg("--master")
         .arg(master_addr.to_string())
@@ -875,7 +894,10 @@ async fn test_cli_e2e_conflicting_flags_no_blender_wire_domination() {
     }
 
     // Spawn with --no-blender alongside --blender-path and --blender-version
-    let mut child = std::process::Command::new(&bin_path)
+    let temp_dir = tempfile::TempDir::new().expect("create isolated test home");
+    let mut cmd = std::process::Command::new(&bin_path);
+    isolate_command(&mut cmd, temp_dir.path());
+    let mut child = cmd
         .arg("worker")
         .arg("--master")
         .arg(master_addr.to_string())

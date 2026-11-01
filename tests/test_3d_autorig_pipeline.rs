@@ -1299,11 +1299,91 @@ async fn test_e2e_agent_mesh_bridge_3d_and_autorig() {
     cluster.shutdown().await;
 }
 
+static TEST_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[allow(dead_code)]
+struct TestEnvGuard {
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+    temp_dir: TempDir,
+    orig_home: Option<std::ffi::OsString>,
+    orig_userprofile: Option<std::ffi::OsString>,
+    orig_oxideswarm_home: Option<std::ffi::OsString>,
+    orig_secret: Option<std::ffi::OsString>,
+    orig_secret_file: Option<std::ffi::OsString>,
+    orig_config: Option<std::ffi::OsString>,
+}
+
+#[allow(dead_code)]
+impl TestEnvGuard {
+    async fn isolate() -> Self {
+        let lock = TEST_ENV_MUTEX.lock().await;
+        let temp_dir = TempDir::new().expect("create test temp dir");
+        let orig_home = std::env::var_os("HOME");
+        let orig_userprofile = std::env::var_os("USERPROFILE");
+        let orig_oxideswarm_home = std::env::var_os("OXIDESWARM_HOME");
+        let orig_secret = std::env::var_os("OXIDESWARM_SECRET");
+        let orig_secret_file = std::env::var_os("OXIDESWARM_SECRET_FILE");
+        let orig_config = std::env::var_os("RUSTY_GRID_CONFIG");
+
+        std::env::set_var("HOME", temp_dir.path());
+        std::env::set_var("USERPROFILE", temp_dir.path());
+        std::env::set_var("OXIDESWARM_HOME", temp_dir.path().join(".oxideswarm"));
+        std::env::remove_var("OXIDESWARM_SECRET");
+        std::env::remove_var("OXIDESWARM_SECRET_FILE");
+        std::env::remove_var("RUSTY_GRID_CONFIG");
+
+        Self {
+            _lock: lock,
+            temp_dir,
+            orig_home,
+            orig_userprofile,
+            orig_oxideswarm_home,
+            orig_secret,
+            orig_secret_file,
+            orig_config,
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.temp_dir.path()
+    }
+}
+
+impl Drop for TestEnvGuard {
+    fn drop(&mut self) {
+        match &self.orig_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match &self.orig_userprofile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+        match &self.orig_oxideswarm_home {
+            Some(v) => std::env::set_var("OXIDESWARM_HOME", v),
+            None => std::env::remove_var("OXIDESWARM_HOME"),
+        }
+        match &self.orig_secret {
+            Some(v) => std::env::set_var("OXIDESWARM_SECRET", v),
+            None => std::env::remove_var("OXIDESWARM_SECRET"),
+        }
+        match &self.orig_secret_file {
+            Some(v) => std::env::set_var("OXIDESWARM_SECRET_FILE", v),
+            None => std::env::remove_var("OXIDESWARM_SECRET_FILE"),
+        }
+        match &self.orig_config {
+            Some(v) => std::env::set_var("RUSTY_GRID_CONFIG", v),
+            None => std::env::remove_var("RUSTY_GRID_CONFIG"),
+        }
+    }
+}
+
 /// 4. `test_e2e_cli_submit_3d_and_disk_export`:
-/// Exercises run_submit with --prompt, --quality fast, --engine sdf, --wait, --output <temp_dir>/output.glb,
-/// verifies file written to disk, validate_glb_header pass, and full glTF validation pass.
+///    Exercises run_submit with --prompt, --quality fast, --engine sdf, --wait, --output <temp_dir>/output.glb,
+///    verifies file written to disk, validate_glb_header pass, and full glTF validation pass.
 #[tokio::test]
 async fn test_e2e_cli_submit_3d_and_disk_export() {
+    let _env_guard = TestEnvGuard::isolate().await;
     let cluster = PipelineCluster::spawn(1).await;
     let temp_dir = TempDir::new().expect("tempdir");
 
@@ -1575,6 +1655,7 @@ async fn test_boundary_and_corrupted_mesh_rejection() {
     assert_eq!(res4.exit_code, EXIT_CODE_GENERAL_ERROR);
 
     // Case 5: Zero-byte file to CLI
+    let _env_guard = TestEnvGuard::isolate().await;
     let temp_dir = TempDir::new().unwrap();
     let empty_file = temp_dir.path().join("zero.glb");
     std::fs::write(&empty_file, b"").unwrap();
