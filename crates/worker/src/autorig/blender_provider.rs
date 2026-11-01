@@ -1,13 +1,11 @@
 //! Feature F16: Headless Blender 4.5.4 LTS Auto-Rig Provider.
 //!
-//! Executes host Blender in headless mode supervised by Win32 Job Object
-//! (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), with automatic fallback to the built-in Rust rigging engine.
+//! Executes host Blender in headless mode supervised by the hardened runner
+//! (`ProcessTree` with `CREATE_SUSPENDED` on Windows / process group on Unix),
+//! with automatic fallback to the built-in Rust rigging engine.
 
-use crate::job_object::JobObject;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 pub const EMBEDDED_BLENDER_RIG_SCRIPT: &str =
     include_str!("../../../../engines/autorig/blender_rig.py");
@@ -102,7 +100,7 @@ pub struct BlenderRigProvider;
 impl BlenderRigProvider {
     /// Executes automated rigging via host Blender in headless mode.
     ///
-    /// Supervised under Win32 Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+    /// Supervised under the hardened runner (`ProcessTree`).
     pub async fn execute_rigging(
         blender_bin: &Path,
         input_mesh_bytes: &[u8],
@@ -135,98 +133,66 @@ impl BlenderRigProvider {
             .await
             .map_err(|e| format!("Failed to write blender_rig.py: {e}"))?;
 
-        // Initialize Win32 Job Object for process tree containment
-        let mut job_object = match JobObject::create() {
-            Ok(job) => Some(job),
-            Err(e) => {
-                warn!("Failed to create Win32 Job Object for Blender: {e}");
-                None
-            }
-        };
-
         let anim_arg = animations.join(",");
 
-        let mut cmd = tokio::process::Command::new(blender_bin);
-        cmd.arg("--background");
-        cmd.arg("--factory-startup");
-        cmd.arg("--python");
-        cmd.arg(&script_path);
-        cmd.arg("--");
-        cmd.arg("--input");
-        cmd.arg(&input_path);
-        cmd.arg("--output");
-        cmd.arg(&output_path);
-        cmd.arg("--preset");
-        cmd.arg(preset);
-        cmd.arg("--animations");
-        cmd.arg(&anim_arg);
+        let cmd_args = vec![
+            "--background".to_string(),
+            "--factory-startup".to_string(),
+            "--python".to_string(),
+            script_path.to_string_lossy().to_string(),
+            "--".to_string(),
+            "--input".to_string(),
+            input_path.to_string_lossy().to_string(),
+            "--output".to_string(),
+            output_path.to_string_lossy().to_string(),
+            "--preset".to_string(),
+            preset.to_string(),
+            "--animations".to_string(),
+            anim_arg,
+        ];
 
-        cmd.current_dir(temp_dir.path());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        cmd.stdin(Stdio::null());
-        cmd.kill_on_drop(true);
+        let runner_config = crate::runner::RunnerConfig::new(
+            crate::sandbox::SandboxConfig::new(temp_dir.path().to_path_buf()),
+        );
+        let runner = crate::runner::TaskRunner::new(
+            uuid::Uuid::nil(),
+            rusty_grid_core::capabilities::WorkerCapabilities::default(),
+            runner_config,
+        );
 
-        #[cfg(unix)]
-        {
-            cmd.process_group(0);
-        }
+        let res = runner
+            .execute_process_supervised(
+                rusty_grid_core::task::TaskId::new(),
+                temp_dir.path(),
+                &blender_bin.to_string_lossy(),
+                &cmd_args,
+                temp_dir.path(),
+                &std::collections::HashMap::new(),
+                None,
+                std::time::Duration::from_secs(timeout_secs),
+                None,
+                None,
+                std::time::Instant::now(),
+                Some(&output_path),
+            )
+            .await;
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn Blender subprocess: {e}"))?;
-
-        // Assign PID to Job Object immediately
-        if let Some(pid) = child.id() {
-            if let Some(ref mut job) = job_object {
-                let _ = job.assign_pid(pid);
+        let stdout_str = String::from_utf8_lossy(res.stdout.as_slice());
+        for line in stdout_str.lines() {
+            debug!("[BLENDER] {line}");
+            if let Some((progress, msg)) = crate::gen3d::runner::parse_progress_marker(line) {
+                info!(progress = progress, message = %msg, "Blender auto-rigging progress");
             }
         }
 
-        // Stream output
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or("Failed to capture Blender stdout")?;
-        let mut reader = BufReader::new(stdout).lines();
-
-        let execution = async {
-            while let Ok(Some(line)) = reader.next_line().await {
-                debug!("[BLENDER] {line}");
-                if let Some((progress, msg)) = crate::gen3d::runner::parse_progress_marker(&line) {
-                    info!(progress = progress, message = %msg, "Blender auto-rigging progress");
-                }
-            }
-            child.wait().await
-        };
-
-        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), execution).await {
-            Ok(Ok(status)) if status.success() => {
-                if output_path.is_file() {
-                    let glb_bytes = tokio::fs::read(&output_path)
-                        .await
-                        .map_err(|e| format!("Failed to read Blender output .glb: {e}"))?;
-                    Ok(glb_bytes)
-                } else {
-                    Err(
-                        "Blender process finished with success but output .glb is missing"
-                            .to_string(),
-                    )
-                }
-            }
-            Ok(Ok(status)) => Err(format!(
-                "Blender process exited with error status: {status}"
-            )),
-            Ok(Err(e)) => Err(format!("I/O error during Blender execution: {e}")),
-            Err(_) => {
-                // Timeout: enforce termination
-                if let Some(ref job) = job_object {
-                    let _ = job.terminate(1);
-                }
-                Err(format!(
-                    "Blender auto-rigging timed out after {timeout_secs}s"
-                ))
-            }
+        if res.is_success() {
+            res.asset_bytes
+                .map(|b| b.as_slice().to_vec())
+                .ok_or_else(|| "Blender output .glb missing".to_string())
+        } else {
+            Err(res
+                .error
+                .unwrap_or_else(|| format!("Blender process exited with error status: {}", res.exit_code)))
         }
     }
 }

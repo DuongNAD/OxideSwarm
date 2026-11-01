@@ -1485,6 +1485,7 @@ impl TaskRunner {
                 child_pid,
                 cancel_rx,
                 start_time,
+                None,
             )
             .await;
 
@@ -1628,6 +1629,7 @@ impl TaskRunner {
                 child_pid,
                 cancel_rx,
                 start_time,
+                None,
             )
             .await;
 
@@ -1790,6 +1792,7 @@ impl TaskRunner {
                 child_pid,
                 cancel_rx,
                 start_time,
+                None,
             )
             .await;
 
@@ -1856,7 +1859,7 @@ impl TaskRunner {
         checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
         timeout: Duration,
         child_pid: Option<Arc<AtomicU32>>,
-        mut cancel_rx: Option<oneshot::Receiver<String>>,
+        cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
     ) -> TaskResult {
         let pref = spec
@@ -1966,260 +1969,100 @@ impl TaskRunner {
 
         cmd_args.push("--offline".to_string());
 
-        // 5. Initialize Win32 Job Object for kernel process tree supervision
-        let mut job_object = match crate::job_object::JobObject::create() {
-            Ok(job) => Some(job),
-            Err(e) => {
-                warn!(
-                    "Failed to create Win32 Job Object (falling back to standard supervision): {e}"
-                );
-                None
+        // 5. Prepare environment and route through hardened process runner
+        let mut child_env = HashMap::new();
+        child_env.insert("HF_HUB_OFFLINE".to_string(), "1".to_string());
+        child_env.insert("TRANSFORMERS_OFFLINE".to_string(), "1".to_string());
+
+        let mut res = self
+            .execute_process_supervised(
+                task.id,
+                sandbox.path(),
+                &py_bin.to_string_lossy(),
+                &cmd_args,
+                sandbox.path(),
+                &child_env,
+                None,
+                timeout,
+                child_pid,
+                cancel_rx,
+                start_time,
+                Some(&output_glb_path),
+            )
+            .await;
+
+        // Process progress checkpoints from stdout if checkpoint_tx provided
+        if let Some(ref tx) = checkpoint_tx {
+            let stdout_str = String::from_utf8_lossy(res.stdout.as_slice());
+            let mut seq = 1u64;
+            for line in stdout_str.lines() {
+                if let Some((frac, msg)) = crate::gen3d::runner::parse_progress_marker(line) {
+                    let delta = serde_json::json!({
+                        "progress": frac,
+                        "message": msg,
+                        "stage": "generative_3d",
+                    });
+                    let _ = tx
+                        .send(WorkerMessage::Checkpoint {
+                            task_id: task.id,
+                            sequence: seq,
+                            delta_state: Bytes::from(delta.to_string().into_bytes()),
+                        })
+                        .await;
+                    seq += 1;
+                }
             }
-        };
-
-        // 6. Build Tokio Command
-        let mut cmd = tokio::process::Command::new(&py_bin);
-        cmd.args(&cmd_args);
-        cmd.current_dir(sandbox.path());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd.stdin(std::process::Stdio::null());
-        cmd.kill_on_drop(true);
-
-        #[cfg(unix)]
-        {
-            cmd.process_group(0);
         }
 
-        cmd.env("HF_HUB_OFFLINE", "1");
-        cmd.env("TRANSFORMERS_OFFLINE", "1");
-        cmd.env("RUSTY_GRID_TASK_ID", task.id.to_string());
-        cmd.env("RUSTY_GRID_WORKER_ID", self.worker_id.to_string());
+        // On cancellation or timeout, return failure immediately
+        if res.exit_code == EXIT_CODE_CANCELLED || res.exit_code == EXIT_CODE_TIMEOUT {
+            let _ = sandbox.destroy().await;
+            return res;
+        }
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = sandbox.destroy().await;
+        // Validate glTF 2.0 binary header if execution succeeded
+        if res.is_success() {
+            let valid = res
+                .asset_bytes
+                .as_ref()
+                .map(|d| d.as_slice().len() >= 12 && d.as_slice().starts_with(b"glTF"))
+                .unwrap_or(false);
+            if !valid {
                 if pref == "auto" {
-                    info!(task_id = %task.id, "Failed to spawn Python process ({e}); degrading gracefully to Tier 0 SDF");
+                    warn!(task_id = %task.id, "Generated .glb file has invalid glTF header; falling back to Tier 0 SDF");
+                    let _ = sandbox.destroy().await;
                     return self
                         .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
                         .await;
                 }
-                return TaskResult::failure(
-                    self.worker_id,
-                    task.id,
-                    EXIT_CODE_GENERAL_ERROR,
-                    Bytes::new(),
-                    format!("Failed to spawn 3D engine subprocess: {e}"),
-                    start_time.elapsed().as_millis() as u64,
-                    Some(format!("Spawn error: {e}")),
-                );
+                res.exit_code = EXIT_CODE_GENERAL_ERROR;
+                res.error = Some("Generated .glb file has invalid glTF 2.0 header".to_string());
+            } else {
+                res = res.with_device_name(if self.capabilities.has_cuda {
+                    "TripoSR-CUDA"
+                } else {
+                    "TripoSR-CPU"
+                });
+                res.is_gpu_executed = self.capabilities.has_cuda;
             }
-        };
-
-        if let Some(pid) = child.id() {
-            if let Some(ref holder) = child_pid {
-                holder.store(pid, Ordering::Release);
-            }
-            if let Some(ref mut job) = job_object {
-                let _ = job.assign_pid(pid);
-            }
+        } else if pref == "auto" {
+            warn!(task_id = %task.id, "Subprocess exited {}; falling back to Tier 0 SDF", res.exit_code);
+            let _ = sandbox.destroy().await;
+            return self
+                .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
+                .await;
         }
 
-        // 7. Supervised execution with streaming stdout, stderr, and cancellation
-        let child_stdout = child.stdout.take();
-        let child_stderr = child.stderr.take();
-        let max_output = self.config.max_output_bytes;
-
-        let stdout_fut = async move {
-            if let Some(pipe) = child_stdout {
-                read_bounded_stream(pipe, max_output).await
-            } else {
-                (Bytes::new(), false)
-            }
+        let artifacts = if !task.expected_outputs.is_empty() {
+            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id)
+                .await
+        } else {
+            Vec::new()
         };
-
-        let stderr_fut = async move {
-            if let Some(pipe) = child_stderr {
-                read_bounded_stream(pipe, max_output).await
-            } else {
-                (Bytes::new(), false)
-            }
-        };
-
-        let execution_fut = async {
-            let ((stdout_bytes, _), (stderr_bytes, _), status_res) =
-                tokio::join!(stdout_fut, stderr_fut, child.wait());
-            (stdout_bytes, stderr_bytes, status_res)
-        };
-
-        let result = tokio::select! {
-            (stdout_bytes, stderr_bytes, status_res) = execution_fut => {
-                let elapsed = start_time.elapsed().as_millis() as u64;
-
-                // Process progress checkpoints from stdout if checkpoint_tx provided
-                if let Some(ref tx) = checkpoint_tx {
-                    let stdout_str = String::from_utf8_lossy(stdout_bytes.as_slice());
-                    let mut seq = 1u64;
-                    for line in stdout_str.lines() {
-                        if let Some((frac, msg)) = crate::gen3d::runner::parse_progress_marker(line) {
-                            let delta = serde_json::json!({
-                                "progress": frac,
-                                "message": msg,
-                                "stage": "generative_3d",
-                            });
-                            let _ = tx.send(WorkerMessage::Checkpoint {
-                                task_id: task.id,
-                                sequence: seq,
-                                delta_state: Bytes::from(delta.to_string().into_bytes()),
-                            }).await;
-                            seq += 1;
-                        }
-                    }
-                }
-
-                match status_res {
-                    Ok(status) if status.success() => {
-                        if output_glb_path.is_file() {
-                            match tokio::fs::read(&output_glb_path).await {
-                                Ok(data) => {
-                                    if data.len() >= 12 && &data[0..4] == b"glTF" {
-                                        let asset_bytes = Bytes::from(data);
-                                        let mut res = TaskResult::success(
-                                            self.worker_id,
-                                            task.id,
-                                            stdout_bytes,
-                                            elapsed,
-                                            self.capabilities.has_cuda,
-                                        );
-                                        res.stderr = stderr_bytes;
-                                        res = res.with_asset_bytes(asset_bytes);
-                                        res = res.with_device_name(if self.capabilities.has_cuda { "TripoSR-CUDA" } else { "TripoSR-CPU" });
-                                        res
-                                    } else {
-                                        TaskResult::failure(
-                                            self.worker_id,
-                                            task.id,
-                                            EXIT_CODE_GENERAL_ERROR,
-                                            stdout_bytes,
-                                            stderr_bytes,
-                                            elapsed,
-                                            Some("Generated .glb file has invalid glTF 2.0 header".to_string()),
-                                        )
-                                    }
-                                }
-                                Err(e) => {
-                                    TaskResult::failure(
-                                        self.worker_id,
-                                        task.id,
-                                        EXIT_CODE_GENERAL_ERROR,
-                                        stdout_bytes,
-                                        stderr_bytes,
-                                        elapsed,
-                                        Some(format!("Failed to read generated .glb asset: {e}")),
-                                    )
-                                }
-                            }
-                        } else if pref == "auto" {
-                            warn!("Subprocess exited 0 but output.glb missing; falling back to Tier 0 SDF");
-                            self.execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time).await
-                        } else {
-                            TaskResult::failure(
-                                self.worker_id,
-                                task.id,
-                                EXIT_CODE_GENERAL_ERROR,
-                                stdout_bytes,
-                                stderr_bytes,
-                                elapsed,
-                                Some("Subprocess succeeded but output_model.glb was not produced".to_string()),
-                            )
-                        }
-                    }
-                    Ok(status) => {
-                        let code = status.code().unwrap_or(EXIT_CODE_GENERAL_ERROR);
-                        if pref == "auto" {
-                            warn!("Tier 1 engine exited with error code {code}; falling back to Tier 0 SDF");
-                            self.execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time).await
-                        } else {
-                            TaskResult::failure(
-                                self.worker_id,
-                                task.id,
-                                code,
-                                stdout_bytes,
-                                stderr_bytes,
-                                elapsed,
-                                Some(format!("3D engine subprocess failed with exit code {code}")),
-                            )
-                        }
-                    }
-                    Err(e) => {
-                        TaskResult::failure(
-                            self.worker_id,
-                            task.id,
-                            EXIT_CODE_GENERAL_ERROR,
-                            stdout_bytes,
-                            stderr_bytes,
-                            elapsed,
-                            Some(format!("Process wait error: {e}")),
-                        )
-                    }
-                }
-            }
-
-            cancel_msg = async {
-                if let Some(ref mut rx) = cancel_rx {
-                    rx.await.ok()
-                } else {
-                    std::future::pending().await
-                }
-            } => {
-                info!(task_id = %task.id, "Cancelling 3D engine subprocess");
-                if let Some(ref job) = job_object {
-                    let _ = job.terminate(EXIT_CODE_CANCELLED as u32);
-                } else if let Some(pid) = child.id() {
-                    Self::terminate_process_tree(pid);
-                }
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                let elapsed = start_time.elapsed().as_millis() as u64;
-                let reason = cancel_msg.unwrap_or_else(|| "Task cancelled by master".to_string());
-                TaskResult::failure(
-                    self.worker_id,
-                    task.id,
-                    EXIT_CODE_CANCELLED,
-                    Bytes::new(),
-                    Bytes::new(),
-                    elapsed,
-                    Some(format!("Cancelled: {reason}")),
-                )
-            }
-
-            _ = tokio::time::sleep(timeout) => {
-                warn!(task_id = %task.id, "3D engine subprocess timed out after {}s", timeout.as_secs());
-                if let Some(ref job) = job_object {
-                    let _ = job.terminate(EXIT_CODE_TIMEOUT as u32);
-                } else if let Some(pid) = child.id() {
-                    Self::terminate_process_tree(pid);
-                }
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                let elapsed = start_time.elapsed().as_millis() as u64;
-                let msg = format!("3D generation timed out after {}s", timeout.as_secs());
-                TaskResult::failure(
-                    self.worker_id,
-                    task.id,
-                    EXIT_CODE_TIMEOUT,
-                    Bytes::new(),
-                    msg.clone(),
-                    elapsed,
-                    Some(msg),
-                )
-            }
-        };
-
+        res.artifacts = artifacts;
+        let res = self.collect_blob_outputs(&sandbox, task, res, &[]).await;
         let _ = sandbox.destroy().await;
-        result
+        res
     }
 
     /// Direct Tier 0 Procedural Signed Distance Function mesh generator (< 50 ms)
@@ -2483,7 +2326,7 @@ impl TaskRunner {
     /// output has been drained for at most `pipe_drain_grace`: a background process that kept the
     /// output pipes open cannot turn a finished task into a timeout.
     #[allow(clippy::too_many_arguments)]
-    async fn execute_process_supervised(
+    pub(crate) async fn execute_process_supervised(
         &self,
         task_id: TaskId,
         sandbox_path: &Path,
@@ -2496,6 +2339,7 @@ impl TaskRunner {
         child_pid: Option<Arc<AtomicU32>>,
         mut cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
+        output_file: Option<&Path>,
     ) -> TaskResult {
         let effective_path = match env.get("PATH") {
             Some(p) => {
@@ -2653,6 +2497,51 @@ impl TaskRunner {
                             false,
                         );
                         res.stderr = stderr_bytes;
+
+                        // Output file collection step (SEC-5)
+                        if let Some(out_path) = output_file {
+                            let resolved = if out_path.is_absolute() {
+                                out_path.to_path_buf()
+                            } else {
+                                cwd.join(out_path)
+                            };
+
+                            if resolved.is_file() {
+                                match tokio::fs::read(&resolved).await {
+                                    Ok(data) => {
+                                        res.asset_bytes = Some(Bytes::from(data));
+                                    }
+                                    Err(e) => {
+                                        return TaskResult::failure(
+                                            self.worker_id,
+                                            task_id,
+                                            EXIT_CODE_GENERAL_ERROR,
+                                            res.stdout,
+                                            res.stderr,
+                                            elapsed,
+                                            Some(format!(
+                                                "Failed to read output file '{}': {e}",
+                                                resolved.display()
+                                            )),
+                                        );
+                                    }
+                                }
+                            } else {
+                                return TaskResult::failure(
+                                    self.worker_id,
+                                    task_id,
+                                    EXIT_CODE_GENERAL_ERROR,
+                                    res.stdout,
+                                    res.stderr,
+                                    elapsed,
+                                    Some(format!(
+                                        "Process succeeded but expected output file '{}' was not produced",
+                                        resolved.display()
+                                    )),
+                                );
+                            }
+                        }
+
                         res
                     }
                     Ok(status) => {
@@ -2728,7 +2617,7 @@ impl TaskRunner {
         let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
     }
 
-    /// Fallback process-tree terminator for subprocesses when JobObject is unavailable.
+    /// Fallback process-tree terminator for subprocesses.
     pub fn terminate_process_tree(pid: u32) {
         #[cfg(windows)]
         {
