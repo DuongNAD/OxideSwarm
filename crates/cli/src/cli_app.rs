@@ -2015,7 +2015,8 @@ fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
                 .engine
                 .as_deref()
                 .map(str::parse::<rusty_grid_core::task::Engine3D>)
-                .transpose()?;
+                .transpose()?
+                .map(|e| e.as_str().to_string());
             let _ = args.export_texture;
             let export_texture = !args.no_export_texture;
             let spec = TaskSpec::Generative3D(rusty_grid_core::task::Generative3DSpec {
@@ -2593,6 +2594,11 @@ async fn run_submit_with_secret(
                 }
                 if !result.stderr.is_empty() {
                     eprintln!("Stderr:\n{}", result.stderr_str().trim());
+                }
+                if let Some(ref err) = result.error {
+                    if result.stderr.is_empty() || !result.stderr_str().contains(err) {
+                        eprintln!("Error:\n{}", err.trim());
+                    }
                 }
             }
             if result.exit_code == 0 {

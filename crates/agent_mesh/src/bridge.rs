@@ -361,6 +361,16 @@ impl AgentGridBridge {
             }
         };
 
+        if let Err(e) = spec.validate() {
+            return make_error_response(
+                from,
+                correlation_id,
+                command,
+                1,
+                &format!("Invalid task specification: {e}"),
+            );
+        }
+
         let reqs = if let Some(reqs_val) = args.get("requirements") {
             serde_json::from_value(reqs_val.clone())
                 .unwrap_or_else(|_| TaskRequirements::generic(1, timeout_secs))
@@ -562,12 +572,29 @@ impl AgentGridBridge {
             .unwrap_or("standard")
             .to_lowercase();
 
-        let engine_preference = args
+        let engine_preference = if let Some(raw) = args
             .get("engine")
             .or_else(|| args.get("engine_preference"))
             .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<Engine3D>().ok())
-            .filter(|e| *e != Engine3D::Auto);
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            match raw.parse::<Engine3D>() {
+                Ok(Engine3D::Auto) => None,
+                Ok(engine) => Some(engine.as_str().to_string()),
+                Err(_) => {
+                    return make_error_response(
+                        from,
+                        correlation_id,
+                        command,
+                        1,
+                        &format!("Invalid 3D generation specification: unknown 3D engine '{raw}'"),
+                    );
+                }
+            }
+        } else {
+            None
+        };
 
         let export_texture = args
             .get("export_texture")
@@ -1053,6 +1080,42 @@ mod tests {
                 assert_eq!(exit_code, 0);
                 assert_eq!(stdout, "Volume in drive C is Syst\u{fffd}me\r\n");
                 assert_eq!(stderr, "w\u{fffd}n");
+            }
+            other => panic!("expected CommandResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bridge_refuses_unknown_engine_envelope() {
+        let master = rusty_grid_master::server::MasterServer::spawn(
+            rusty_grid_master::server::ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        )
+        .await
+        .expect("spawn master");
+        let bridge = AgentGridBridge::new(master);
+
+        let req = AgentMeshEnvelope::new_command_request(
+            "agent-1",
+            "grid",
+            "grid_3d_generate",
+            serde_json::json!({
+                "prompt": "robot",
+                "engine": "rodin",
+            }),
+            Some(5000),
+        );
+
+        let resp = bridge.handle_command(&req).await;
+        match resp {
+            AgentMeshEnvelope::CommandResponse {
+                exit_code,
+                stderr,
+                status,
+                ..
+            } => {
+                assert_eq!(status, "failed");
+                assert_ne!(exit_code, 0);
+                assert!(stderr.contains("unknown 3D engine 'rodin'"));
             }
             other => panic!("expected CommandResponse, got {other:?}"),
         }

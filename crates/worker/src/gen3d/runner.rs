@@ -32,7 +32,14 @@ pub fn resolve_python_runtime() -> Option<PathBuf> {
 
     for candidate in &venv_candidates {
         if candidate.is_file() {
-            return Some(candidate.clone());
+            let abs = if candidate.is_absolute() {
+                candidate.clone()
+            } else if let Ok(cwd) = std::env::current_dir() {
+                cwd.join(candidate)
+            } else {
+                candidate.clone()
+            };
+            return Some(abs);
         }
     }
 
@@ -62,7 +69,14 @@ pub fn resolve_entrypoint_script() -> Option<PathBuf> {
     if let Ok(custom) = std::env::var("OXIDESWARM_GEN3D_SCRIPT") {
         let p = PathBuf::from(custom);
         if p.is_file() {
-            return Some(p);
+            let abs = if p.is_absolute() {
+                p
+            } else if let Ok(cwd) = std::env::current_dir() {
+                cwd.join(p)
+            } else {
+                p
+            };
+            return Some(abs);
         }
     }
 
@@ -74,7 +88,21 @@ pub fn resolve_entrypoint_script() -> Option<PathBuf> {
 
     for c in &candidates {
         if c.is_file() {
-            return Some(c.clone());
+            let abs = if c.is_absolute() {
+                c.clone()
+            } else if let Ok(cwd) = std::env::current_dir() {
+                cwd.join(c)
+            } else {
+                c.clone()
+            };
+            return Some(abs);
+        }
+    }
+
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let p = PathBuf::from(manifest_dir).join("../../engines/generative_3d/entrypoint.py");
+        if p.is_file() {
+            return Some(p);
         }
     }
 

@@ -570,50 +570,28 @@ fn default_export_texture() -> bool {
 }
 
 /// Unified enumeration of supported 3D generative and procedural engines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Engine3D {
     /// Automatic engine selection based on available worker capabilities.
     ///
     /// CPU-capable: on CPU-only nodes or when neural model weights/Python environment
     /// are absent, gracefully executes via Tier 0 pure-Rust Procedural SDF.
     #[default]
-    #[serde(alias = "AUTO", alias = "Auto")]
     Auto,
 
     /// Tier 0 pure-Rust Procedural Signed Distance Function (SDF) Marching Cubes engine.
     ///
     /// Executes fully in-process on CPU in < 50ms with zero Python or CUDA dependencies.
-    #[serde(
-        rename = "sdf",
-        alias = "SDF",
-        alias = "Sdf",
-        alias = "tier0_sdf",
-        alias = "tier0",
-        alias = "tier-0",
-        alias = "procedural",
-        alias = "procedural_sdf"
-    )]
     Sdf,
 
     /// TripoSR feed-forward neural 3D reconstruction engine via Python subprocess.
     ///
-    /// Requires GPU hardware acceleration and local model weights.
-    #[serde(
-        rename = "triposr",
-        alias = "TripoSR",
-        alias = "Triposr",
-        alias = "tripo_sr",
-        alias = "triposr-cuda",
-        alias = "triposr-cpu",
-        alias = "tripo"
-    )]
+    /// CPU-capable: executes on CPU nodes via TripoSR-CPU or GPU with hardware acceleration.
     TripoSr,
 
     /// Trellis structured neural radiance/mesh reconstruction engine.
     ///
     /// Requires GPU hardware acceleration.
-    #[serde(rename = "trellis", alias = "TRELLIS", alias = "Trellis")]
     Trellis,
 }
 
@@ -637,7 +615,7 @@ impl Engine3D {
         match self {
             Self::Auto => false,
             Self::Sdf => false,
-            Self::TripoSr => true,
+            Self::TripoSr => false,
             Self::Trellis => true,
         }
     }
@@ -657,17 +635,18 @@ impl Engine3D {
         matches!(self, Self::TripoSr | Self::Trellis)
     }
 
-    pub fn parse(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "auto" | "" => Some(Self::Auto),
+            "auto" | "" => Ok(Self::Auto),
             "sdf" | "tier0_sdf" | "tier0" | "tier-0" | "procedural" | "procedural_sdf" => {
-                Some(Self::Sdf)
+                Ok(Self::Sdf)
             }
-            "triposr" | "tripo_sr" | "triposr-cuda" | "triposr-cpu" | "tripo" => {
-                Some(Self::TripoSr)
-            }
-            "trellis" => Some(Self::Trellis),
-            _ => None,
+            "triposr" | "tripo_sr" | "triposr-cuda" | "triposr-cpu" | "tripo" => Ok(Self::TripoSr),
+            "trellis" => Ok(Self::Trellis),
+            _ => Err(format!(
+                "unknown 3D engine '{}'; valid engines are: auto, sdf, triposr",
+                s.trim()
+            )),
         }
     }
 }
@@ -690,24 +669,48 @@ impl std::str::FromStr for Engine3D {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse(s).ok_or_else(|| {
-            format!(
-                "unknown 3D engine '{}'; valid engines are: auto, sdf, triposr, trellis",
-                s.trim()
-            )
-        })
+        Self::parse(s)
     }
 }
 
-impl From<&str> for Engine3D {
-    fn from(s: &str) -> Self {
-        s.parse().unwrap_or(Self::Auto)
+impl TryFrom<&str> for Engine3D {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
     }
 }
 
-impl From<String> for Engine3D {
-    fn from(s: String) -> Self {
-        s.as_str().into()
+impl TryFrom<String> for Engine3D {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.as_str().parse()
+    }
+}
+
+impl From<Engine3D> for String {
+    fn from(e: Engine3D) -> Self {
+        e.as_str().to_string()
+    }
+}
+
+impl From<&Engine3D> for String {
+    fn from(e: &Engine3D) -> Self {
+        e.as_str().to_string()
+    }
+}
+
+impl Serialize for Engine3D {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Engine3D {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse::<Engine3D>().map_err(serde::de::Error::custom)
     }
 }
 
@@ -721,7 +724,7 @@ pub struct Generative3DSpec {
     /// Generation fidelity / quality preset ("fast", "standard", "high"). Defaults to "standard".
     pub quality: String,
     /// Preferred generation engine ("sdf", "triposr", "auto", "trellis"). Defaults to None ("auto").
-    pub engine_preference: Option<Engine3D>,
+    pub engine_preference: Option<String>,
     /// Whether to generate and bake PBR UV texture maps into the output glTF asset. Defaults to true.
     pub export_texture: bool,
 }
@@ -739,7 +742,7 @@ struct HumanGenerative3DSpec {
     #[serde(default = "default_3d_quality")]
     quality: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    engine_preference: Option<Engine3D>,
+    engine_preference: Option<String>,
     #[serde(default = "default_export_texture")]
     pub export_texture: bool,
 }
@@ -764,7 +767,7 @@ impl From<&Generative3DSpec> for HumanGenerative3DSpec {
             prompt: s.prompt.clone(),
             image_data: s.image_data.clone(),
             quality: s.quality.clone(),
-            engine_preference: s.engine_preference,
+            engine_preference: s.engine_preference.clone(),
             export_texture: s.export_texture,
         }
     }
@@ -788,7 +791,7 @@ impl From<&Generative3DSpec> for BinaryGenerative3DSpec {
             prompt: s.prompt.clone(),
             image_data: s.image_data.clone(),
             quality: s.quality.clone(),
-            engine_preference: s.engine_preference.map(|e| e.as_str().to_string()),
+            engine_preference: s.engine_preference.clone(),
             export_texture: s.export_texture,
         }
     }
@@ -800,7 +803,7 @@ impl From<BinaryGenerative3DSpec> for Generative3DSpec {
             prompt: s.prompt,
             image_data: s.image_data,
             quality: s.quality,
-            engine_preference: s.engine_preference.and_then(|str| str.parse().ok()),
+            engine_preference: s.engine_preference,
             export_texture: s.export_texture,
         }
     }
@@ -855,13 +858,21 @@ impl Generative3DSpec {
         self
     }
 
-    /// Returns the effective 3D engine, defaulting to Engine3D::Auto if unset.
+    /// Attempts to parse the effective 3D engine, returning an error for unknown engine names.
+    pub fn try_engine(&self) -> Result<Engine3D, String> {
+        match &self.engine_preference {
+            Some(raw) => raw.parse::<Engine3D>(),
+            None => Ok(Engine3D::Auto),
+        }
+    }
+
+    /// Returns the effective 3D engine, defaulting to Engine3D::Auto if unset or unparsable.
     pub fn engine(&self) -> Engine3D {
-        self.engine_preference.unwrap_or_default()
+        self.try_engine().unwrap_or(Engine3D::Auto)
     }
 
     /// Sets the engine preference ("sdf", "triposr", "auto", "trellis").
-    pub fn with_engine(mut self, engine: impl Into<Engine3D>) -> Self {
+    pub fn with_engine(mut self, engine: impl Into<String>) -> Self {
         self.engine_preference = Some(engine.into());
         self
     }
@@ -1610,6 +1621,9 @@ impl TaskSpec {
                 }
                 if spec.quality.trim().is_empty() {
                     return Err("Generative3D quality cannot be empty".to_string());
+                }
+                if let Some(ref raw_engine) = spec.engine_preference {
+                    raw_engine.parse::<Engine3D>()?;
                 }
             }
             TaskSpec::AutoRig(spec) => {
@@ -3039,15 +3053,45 @@ mod tests {
             TaskSpec::Generative3D(Generative3DSpec::new_prompt("cube").with_engine("sdf"));
         assert!(!gen_cpu.requires_gpu());
 
-        // TripoSR engine DOES require GPU
-        let gen_gpu = TaskSpec::Generative3D(
+        // TripoSR engine is CPU-capable (does NOT require GPU)
+        let gen_triposr = TaskSpec::Generative3D(
             Generative3DSpec::new_prompt("mech").with_engine(Engine3D::TripoSr),
         );
-        assert!(gen_gpu.requires_gpu());
+        assert!(!gen_triposr.requires_gpu());
+
+        // Trellis engine DOES require GPU
+        let gen_trellis = TaskSpec::Generative3D(
+            Generative3DSpec::new_prompt("mech").with_engine(Engine3D::Trellis),
+        );
+        assert!(gen_trellis.requires_gpu());
 
         // AutoRig does NOT require GPU
         let rig = TaskSpec::new_auto_rig(Bytes::from_static(b"mesh"), "biped");
         assert!(!rig.requires_gpu());
+    }
+
+    #[test]
+    fn test_engine_3d_parsing_and_validation() {
+        assert_eq!("auto".parse::<Engine3D>().unwrap(), Engine3D::Auto);
+        assert_eq!("sdf".parse::<Engine3D>().unwrap(), Engine3D::Sdf);
+        assert_eq!("SDF".parse::<Engine3D>().unwrap(), Engine3D::Sdf);
+        assert_eq!("triposr".parse::<Engine3D>().unwrap(), Engine3D::TripoSr);
+        assert_eq!("TRIPOSR".parse::<Engine3D>().unwrap(), Engine3D::TripoSr);
+        assert_eq!("trellis".parse::<Engine3D>().unwrap(), Engine3D::Trellis);
+
+        let err = "rodin".parse::<Engine3D>().unwrap_err();
+        assert!(err.contains("unknown 3D engine 'rodin'"));
+
+        // Builder preserves raw string without falling back to Auto
+        let spec = Generative3DSpec::new_prompt("robot").with_engine("rodin");
+        assert_eq!(spec.engine_preference.as_deref(), Some("rodin"));
+        assert!(spec.try_engine().is_err());
+        assert_eq!(spec.engine(), Engine3D::Auto);
+
+        // Validation rejects unknown engine
+        let task = TaskSpec::Generative3D(spec);
+        let val_err = task.validate().unwrap_err();
+        assert!(val_err.contains("unknown 3D engine 'rodin'"));
     }
 
     #[test]

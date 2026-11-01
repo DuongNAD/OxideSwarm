@@ -1859,9 +1859,37 @@ impl TaskRunner {
         mut cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
     ) -> TaskResult {
-        let engine = spec.engine();
+        let engine = match spec.try_engine() {
+            Ok(e) => e,
+            Err(e) => {
+                return TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    Bytes::new(),
+                    Bytes::from(format!("Invalid 3D generation engine: {e}")),
+                    start_time.elapsed().as_millis() as u64,
+                    Some(format!("unknown 3D engine: {e}")),
+                );
+            }
+        };
 
-        // 1. If explicit SDF requested, execute Tier 0 directly in-process (< 50ms)
+        // 1. Intercept Trellis before spawning Python and fail with explicit unsupported error
+        if engine == Engine3D::Trellis {
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_GENERAL_ERROR,
+                Bytes::new(),
+                Bytes::from_static(
+                    b"Trellis 3D neural engine is not supported; use sdf or triposr",
+                ),
+                start_time.elapsed().as_millis() as u64,
+                Some("Trellis 3D neural engine is not supported; use sdf or triposr".to_string()),
+            );
+        }
+
+        // 2. If explicit SDF requested, execute Tier 0 directly in-process (< 50ms)
         if engine == Engine3D::Sdf {
             info!(task_id = %task.id, "Executing Tier 0 Procedural SDF engine");
             return self
@@ -1869,7 +1897,7 @@ impl TaskRunner {
                 .await;
         }
 
-        // 2. Check for Python & Entrypoint availability
+        // 3. Check for Python & Entrypoint availability
         let py_bin = crate::gen3d::runner::resolve_python_runtime();
         let script = crate::gen3d::runner::resolve_entrypoint_script();
 
@@ -1885,9 +1913,9 @@ impl TaskRunner {
                     task.id,
                     EXIT_CODE_GENERAL_ERROR,
                     Bytes::new(),
-                    Bytes::from_static(b"Local 3D engine script or Python runtime not found"),
+                    Bytes::from_static(b"TripoSR model not available: missing Python or engines/generative_3d/entrypoint.py"),
                     start_time.elapsed().as_millis() as u64,
-                    Some("Missing Python or engines/generative_3d/entrypoint.py".to_string()),
+                    Some("TripoSR model not available: missing Python or engines/generative_3d/entrypoint.py".to_string()),
                 );
             }
         }
