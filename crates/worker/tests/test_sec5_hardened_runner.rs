@@ -779,12 +779,12 @@ import os, sys
 
 log_file = "{log_path}"
 with open(log_file, "a") as f:
+    f.write("probe_invoked\n")
     for k, v in os.environ.items():
         if "OXIDE" in k:
             f.write(f"{{k}}={{v}}\n")
-    f.flush()
 
-if "blender" in sys.argv[0].lower():
+if any("blender" in a.lower() for a in sys.argv):
     print("Blender 4.5.4 LTS")
 else:
     print("Python 3.11.0")
@@ -819,72 +819,81 @@ sys.exit(0)
     };
 
     #[cfg(windows)]
-    {
+    let (fake_blender, fake_python) = {
         let cmd_blender = format!(
-            "@echo off\r\n\"{}\" \"{}\" %*\r\n",
+            "@echo off\r\n\"{}\" \"{}\" blender %*\r\n",
             real_py.display(),
             script_py.display()
         );
         let cmd_python = format!(
-            "@echo off\r\n\"{}\" \"{}\" %*\r\n",
+            "@echo off\r\n\"{}\" \"{}\" python %*\r\n",
             real_py.display(),
             script_py.display()
         );
-        std::fs::write(temp_dir.path().join("blender.cmd"), cmd_blender)
-            .expect("write blender.cmd");
-        std::fs::write(temp_dir.path().join("python.cmd"), cmd_python).expect("write python.cmd");
-    }
+        let b_path = temp_dir.path().join("blender.cmd");
+        let p_path = temp_dir.path().join("python.cmd");
+        std::fs::write(&b_path, cmd_blender).expect("write blender.cmd");
+        std::fs::write(&p_path, cmd_python).expect("write python.cmd");
+        (b_path, p_path)
+    };
     #[cfg(not(windows))]
-    {
+    let (fake_blender, fake_python) = {
         use std::os::unix::fs::PermissionsExt;
         let sh_blender = format!(
-            "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
+            "#!/bin/sh\nexec \"{}\" \"{}\" blender \"$@\"\n",
             real_py.display(),
             script_py.display()
         );
         let sh_python = format!(
-            "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
+            "#!/bin/sh\nexec \"{}\" \"{}\" python \"$@\"\n",
             real_py.display(),
             script_py.display()
         );
-        let b_path = temp_dir.path().join("blender");
-        let p_path = temp_dir.path().join("python");
+        let b_path = temp_dir.path().join("blender.sh");
+        let p_path = temp_dir.path().join("python.sh");
         std::fs::write(&b_path, sh_blender).expect("write blender");
         std::fs::write(&p_path, sh_python).expect("write python");
         let _ = std::fs::set_permissions(&b_path, std::fs::Permissions::from_mode(0o755));
         let _ = std::fs::set_permissions(&p_path, std::fs::Permissions::from_mode(0o755));
-    }
+        (b_path, p_path)
+    };
 
     let mut env = EnvLock::lock().await;
     env.set("OXIDESWARM_SECRET", "sentinel-cluster-secret-sec5");
     env.set("OXIDESWARM_SECRET_FILE", "sentinel-secret-file-sec5");
     env.set("OXIDE_MESH_TOKEN", "sentinel-mesh-token-sec5");
 
-    let current_path = std::env::var("PATH").unwrap_or_default();
-    let sep = if cfg!(windows) { ";" } else { ":" };
-    let new_path = format!("{}{sep}{}", temp_dir.path().display(), current_path);
-    env.set("PATH", &new_path);
-
-    // 1. Probe Blender in blender_provider
-    let blender_bin = rusty_grid_worker::autorig::blender_provider::resolve_blender_binary();
+    // Invoke each probe directly with the full fake binary path (no PATH modification)
     assert!(
-        blender_bin.is_some(),
-        "Blender probe must succeed on fake binary"
+        rusty_grid_worker::autorig::blender_provider::probe_blender(&fake_blender),
+        "blender_provider::probe_blender must succeed on fake binary"
+    );
+    assert!(
+        rusty_grid_worker::gen3d::runner::probe_python(&fake_python),
+        "gen3d::runner::probe_python must succeed on fake binary"
+    );
+    let (has_blender, _ver) = rusty_grid_core::capabilities::probe_blender_binary(&fake_blender);
+    assert!(
+        has_blender,
+        "capabilities::probe_blender_binary must succeed on fake binary"
+    );
+    assert!(
+        rusty_grid_core::capabilities::query_blender_version(&fake_blender).is_some(),
+        "capabilities::query_blender_version must succeed on fake binary"
     );
 
-    // 2. Probe Python in gen3d::runner
-    let python_bin = rusty_grid_worker::gen3d::runner::resolve_python_runtime();
-    assert!(
-        python_bin.is_some(),
-        "Python probe must succeed on fake binary"
+    // Read log with expect and verify exactly 4 probe executions (1 line per probe)
+    let logged = std::fs::read_to_string(&log_file).expect("probe log file was not created");
+    let lines: Vec<&str> = logged.lines().collect();
+    assert_eq!(
+        lines.len(),
+        4,
+        "Expected exactly 4 probe executions (1 line per probe), got {}: {:?}",
+        lines.len(),
+        lines
     );
 
-    // 3. Probe Blender in capabilities
-    let (has_blender, _ver) = rusty_grid_core::capabilities::detect_blender(None);
-    assert!(has_blender, "detect_blender must succeed on fake binary");
-
-    // 4. Verify logged environment has zero secrets
-    let logged = std::fs::read_to_string(&log_file).unwrap_or_default();
+    // Verify zero leaked secret variables
     assert!(
         !logged.contains("sentinel-cluster-secret-sec5"),
         "OXIDESWARM_SECRET leaked to probe: {logged}"
@@ -1044,14 +1053,21 @@ async fn test_sec5_cancelled_dead_run_sends_zero_checkpoints() {
     let (runner, _dir) = create_test_runner();
     let temp_dir = tempfile::tempdir().expect("tempdir");
 
+    let marker_file = temp_dir.path().join("progress_emitted.marker");
+    let marker_str = marker_file.display().to_string().replace('\\', "/");
+
     let prog_script = temp_dir.path().join("progress_then_hang.py");
-    let script_content = r#"
+    let script_content = format!(
+        r#"
 import sys, time
 for i in range(3):
-    print(f"[PROGRESS:{(i+1)*25}%] Step {i+1}", flush=True)
-    time.sleep(0.05)
+    print(f"[PROGRESS:{{(i+1)*25}}%] Step {{i+1}}", flush=True)
+    time.sleep(0.02)
+with open("{marker_str}", "w") as f:
+    f.write("ready")
 time.sleep(30)
-"#;
+"#
+    );
     std::fs::write(&prog_script, script_content).expect("write");
 
     let mut env = EnvLock::lock().await;
@@ -1067,9 +1083,13 @@ time.sleep(30)
     let spec = Generative3DSpec::new_prompt("Cancelled Progress").with_engine("triposr");
     let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
 
-    // Trigger cancel shortly after start
+    // Trigger cancel only after the fake process writes its progress marker file
+    let marker_clone = marker_file.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let start = std::time::Instant::now();
+        while !marker_clone.exists() && start.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let _ = cancel_tx.send("User cancellation requested".to_string());
     });
 
@@ -1078,6 +1098,11 @@ time.sleep(30)
         .await;
 
     assert_eq!(res.exit_code, EXIT_CODE_CANCELLED);
+    let stdout_str = String::from_utf8_lossy(res.stdout.as_slice());
+    assert!(
+        stdout_str.contains("[PROGRESS:"),
+        "stdout must contain progress lines emitted prior to cancellation, got: {stdout_str}"
+    );
 
     let mut checkpoints = Vec::new();
     while let Ok(ckpt) = ckpt_rx.try_recv() {
@@ -1108,6 +1133,8 @@ if "--output" in sys.argv:
     out_path = sys.argv[out_idx + 1]
     with open(out_path, "wb") as f:
         f.write(b"glTF\x02\x00\x00\x00\x0c\x00\x00\x00")
+with open("extra_artifact.txt", "w") as f:
+    f.write("extra artifact")
 sys.exit(0)
 "#;
     std::fs::write(&valid_script, script_content).expect("write");
@@ -1128,8 +1155,101 @@ sys.exit(0)
         res.artifacts.is_empty(),
         "Artifacts must be empty for 3D path"
     );
-    assert!(
-        res.outputs.is_empty(),
-        "Blob outputs must be empty for 3D path"
+}
+
+// ============================================================================
+// Test 14: Unreadable Output Directory Fails For Both Engines (Review Item 1)
+// ============================================================================
+
+#[tokio::test]
+async fn test_sec5_unreadable_output_directory_fails_for_both_engines() {
+    let (runner, _dir) = create_test_runner();
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+
+    let mock_script = temp_dir.path().join("dir_output_engine.py");
+    let script_content = r#"
+import os
+import sys
+if "--output" in sys.argv:
+    out_idx = sys.argv.index("--output")
+    out_path = sys.argv[out_idx + 1]
+    os.mkdir(out_path)
+sys.exit(0)
+"#;
+    std::fs::write(&mock_script, script_content).expect("write mock script");
+
+    let mut env = EnvLock::lock().await;
+    env.set(
+        "OXIDESWARM_GEN3D_SCRIPT",
+        mock_script.to_str().expect("path"),
     );
+
+    for engine in ["triposr", "auto"] {
+        let spec = Generative3DSpec::new_prompt("Dir Output Test").with_engine(engine);
+        let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
+        let res = runner.execute_task(&task, None, None).await;
+
+        assert_eq!(
+            res.exit_code, EXIT_CODE_GENERAL_ERROR,
+            "Exit code must be 1 for engine {engine}"
+        );
+        let err = res.error.as_deref().unwrap_or("");
+        assert!(
+            err.starts_with("Failed to read generated .glb asset"),
+            "Error for engine {engine} must start with 'Failed to read generated .glb asset', got: '{err}'"
+        );
+        assert!(
+            res.asset_bytes.is_none(),
+            "asset_bytes must be None for engine {engine}"
+        );
+    }
+}
+
+// ============================================================================
+// Test 15: Missing Output File Falls Back Under Auto and Fails Under Explicit
+// ============================================================================
+
+#[tokio::test]
+async fn test_sec5_missing_output_file_falls_back_under_auto_and_fails_under_explicit() {
+    let (runner, _dir) = create_test_runner();
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+
+    let mock_script = temp_dir.path().join("missing_output_engine.py");
+    let script_content = "import sys\nsys.exit(0)\n";
+    std::fs::write(&mock_script, script_content).expect("write mock script");
+
+    let mut env = EnvLock::lock().await;
+    env.set(
+        "OXIDESWARM_GEN3D_SCRIPT",
+        mock_script.to_str().expect("path"),
+    );
+
+    // Explicit engine 'triposr' must fail with missing file error
+    {
+        let spec = Generative3DSpec::new_prompt("Missing Output Explicit").with_engine("triposr");
+        let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
+        let res = runner.execute_task(&task, None, None).await;
+
+        assert_eq!(res.exit_code, EXIT_CODE_GENERAL_ERROR);
+        let err = res.error.as_deref().unwrap_or("");
+        assert!(
+            err.starts_with("Process succeeded but expected output file"),
+            "Expected missing file error, got: '{err}'"
+        );
+        assert!(res.asset_bytes.is_none());
+    }
+
+    // Engine 'auto' must fall back to Tier 0 SDF and succeed
+    {
+        let spec = Generative3DSpec::new_prompt("Missing Output Auto").with_engine("auto");
+        let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
+        let res = runner.execute_task(&task, None, None).await;
+
+        assert!(
+            res.is_success(),
+            "Auto must fall back to Tier 0 SDF on missing output"
+        );
+        assert!(res.asset_bytes.is_some());
+        assert!(res.asset_bytes.unwrap().as_slice().starts_with(b"glTF"));
+    }
 }

@@ -1484,7 +1484,6 @@ impl TaskRunner {
                 child_pid,
                 cancel_rx,
                 start_time,
-                None,
             )
             .await;
 
@@ -1628,7 +1627,6 @@ impl TaskRunner {
                 child_pid,
                 cancel_rx,
                 start_time,
-                None,
             )
             .await;
 
@@ -1791,7 +1789,6 @@ impl TaskRunner {
                 child_pid,
                 cancel_rx,
                 start_time,
-                None,
             )
             .await;
 
@@ -1986,7 +1983,6 @@ impl TaskRunner {
                 child_pid,
                 cancel_rx,
                 start_time,
-                Some(&output_glb_path),
             )
             .await;
 
@@ -2023,29 +2019,67 @@ impl TaskRunner {
 
         // Validate glTF 2.0 binary header if execution succeeded
         if res.is_success() {
-            let valid = res
-                .asset_bytes
-                .as_ref()
-                .map(|d| d.as_slice().len() >= 12 && d.as_slice().starts_with(b"glTF"))
-                .unwrap_or(false);
-            if !valid {
-                let _ = sandbox.destroy().await;
-                return TaskResult::failure(
-                    self.worker_id,
-                    task.id,
-                    EXIT_CODE_GENERAL_ERROR,
-                    res.stdout,
-                    res.stderr,
-                    start_time.elapsed().as_millis() as u64,
-                    Some("Generated .glb file has invalid glTF 2.0 header".to_string()),
-                );
-            } else {
-                res = res.with_device_name(if self.capabilities.has_cuda {
-                    "TripoSR-CUDA"
-                } else {
-                    "TripoSR-CPU"
-                });
-                res.is_gpu_executed = self.capabilities.has_cuda;
+            match read_output_file(&output_glb_path).await {
+                Ok(Some(data)) => {
+                    if data.len() >= 12 && data.starts_with(b"glTF") {
+                        res.asset_bytes = Some(Bytes::from(data));
+                        res = res.with_device_name(if self.capabilities.has_cuda {
+                            "TripoSR-CUDA"
+                        } else {
+                            "TripoSR-CPU"
+                        });
+                        res.is_gpu_executed = self.capabilities.has_cuda;
+                    } else {
+                        let _ = sandbox.destroy().await;
+                        return TaskResult::failure(
+                            self.worker_id,
+                            task.id,
+                            EXIT_CODE_GENERAL_ERROR,
+                            res.stdout,
+                            res.stderr,
+                            start_time.elapsed().as_millis() as u64,
+                            Some("Generated .glb file has invalid glTF 2.0 header".to_string()),
+                        );
+                    }
+                }
+                Ok(None) => {
+                    if pref == "auto" {
+                        warn!(
+                            task_id = %task.id,
+                            "Subprocess exited 0 but output_model.glb missing; falling back to Tier 0 SDF"
+                        );
+                        let _ = sandbox.destroy().await;
+                        return self
+                            .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
+                            .await;
+                    } else {
+                        let _ = sandbox.destroy().await;
+                        return TaskResult::failure(
+                            self.worker_id,
+                            task.id,
+                            EXIT_CODE_GENERAL_ERROR,
+                            res.stdout,
+                            res.stderr,
+                            start_time.elapsed().as_millis() as u64,
+                            Some(format!(
+                                "Process succeeded but expected output file '{}' was not produced",
+                                output_glb_path.display()
+                            )),
+                        );
+                    }
+                }
+                Err(e) => {
+                    let _ = sandbox.destroy().await;
+                    return TaskResult::failure(
+                        self.worker_id,
+                        task.id,
+                        EXIT_CODE_GENERAL_ERROR,
+                        res.stdout,
+                        res.stderr,
+                        start_time.elapsed().as_millis() as u64,
+                        Some(format!("Failed to read generated .glb asset: {e}")),
+                    );
+                }
             }
         } else if pref == "auto" {
             warn!(task_id = %task.id, "Subprocess exited {}; falling back to Tier 0 SDF", res.exit_code);
@@ -2340,7 +2374,6 @@ impl TaskRunner {
         child_pid: Option<Arc<AtomicU32>>,
         mut cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
-        output_file: Option<&Path>,
     ) -> TaskResult {
         let effective_path = match env.get("PATH") {
             Some(p) => {
@@ -2498,51 +2531,6 @@ impl TaskRunner {
                             false,
                         );
                         res.stderr = stderr_bytes;
-
-                        // Output file collection step (SEC-5)
-                        if let Some(out_path) = output_file {
-                            let resolved = if out_path.is_absolute() {
-                                out_path.to_path_buf()
-                            } else {
-                                cwd.join(out_path)
-                            };
-
-                            if resolved.is_file() {
-                                match tokio::fs::read(&resolved).await {
-                                    Ok(data) => {
-                                        res.asset_bytes = Some(Bytes::from(data));
-                                    }
-                                    Err(e) => {
-                                        return TaskResult::failure(
-                                            self.worker_id,
-                                            task_id,
-                                            EXIT_CODE_GENERAL_ERROR,
-                                            res.stdout,
-                                            res.stderr,
-                                            elapsed,
-                                            Some(format!(
-                                                "Failed to read output file '{}': {e}",
-                                                resolved.display()
-                                            )),
-                                        );
-                                    }
-                                }
-                            } else {
-                                return TaskResult::failure(
-                                    self.worker_id,
-                                    task_id,
-                                    EXIT_CODE_GENERAL_ERROR,
-                                    res.stdout,
-                                    res.stderr,
-                                    elapsed,
-                                    Some(format!(
-                                        "Process succeeded but expected output file '{}' was not produced",
-                                        resolved.display()
-                                    )),
-                                );
-                            }
-                        }
-
                         res
                     }
                     Ok(status) => {
@@ -2637,6 +2625,19 @@ pub(crate) fn append_note(bytes: Bytes, note: &str) -> Bytes {
     }
     combined.extend_from_slice(note.as_bytes());
     combined.freeze().into()
+}
+
+/// Reads an output file produced by a task process.
+///
+/// Returns `Ok(Some(Vec<u8>))` if the file exists and is read successfully.
+/// Returns `Ok(None)` only if the file was not found (`ErrorKind::NotFound`).
+/// Returns `Err(io::Error)` if reading failed for any other reason (e.g. permission denied, path is a directory).
+pub(crate) async fn read_output_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match tokio::fs::read(path).await {
+        Ok(data) => Ok(Some(data)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]

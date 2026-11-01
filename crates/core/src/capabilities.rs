@@ -1292,12 +1292,15 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
     }
 
     // 4. PATH lookup fallback (e.g. `blender --version`)
-    let mut cmd = std::process::Command::new("blender");
-    cmd.arg("--version");
-    for var in crate::cluster_auth::SECRET_ENV_VARS {
-        cmd.env_remove(var);
-    }
-    if let Ok(output) = cmd.output() {
+    probe_blender_binary("blender")
+}
+
+/// Probes a Blender executable candidate by running `<program> --version` with secrets stripped.
+pub fn probe_blender_binary<P: AsRef<std::ffi::OsStr>>(program: P) -> (bool, Option<String>) {
+    if let Ok(output) = crate::cluster_auth::probe_command(program)
+        .arg("--version")
+        .output()
+    {
         if output.status.success() {
             if let Ok(text) = std::str::from_utf8(&output.stdout) {
                 if let Some(first_line) = text.lines().next() {
@@ -1310,17 +1313,14 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
             return (true, Some("Blender".to_string()));
         }
     }
-
     (false, None)
 }
 
-fn query_blender_version(exe_path: &std::path::Path) -> Option<String> {
-    let mut cmd = std::process::Command::new(exe_path);
-    cmd.arg("--version");
-    for var in crate::cluster_auth::SECRET_ENV_VARS {
-        cmd.env_remove(var);
-    }
-    let output = cmd.output().ok()?;
+pub fn query_blender_version<P: AsRef<std::ffi::OsStr>>(program: P) -> Option<String> {
+    let output = crate::cluster_auth::probe_command(program)
+        .arg("--version")
+        .output()
+        .ok()?;
     if output.status.success() {
         let text = std::str::from_utf8(&output.stdout).ok()?;
         let first_line = text.lines().next()?.trim();

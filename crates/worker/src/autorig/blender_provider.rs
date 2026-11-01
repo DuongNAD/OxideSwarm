@@ -65,18 +65,21 @@ pub fn resolve_blender_binary() -> Option<PathBuf> {
     }
 
     // 3. Fallback check for "blender" on PATH
-    let mut cmd = std::process::Command::new("blender");
-    cmd.arg("--version");
-    for var in rusty_grid_core::cluster_auth::SECRET_ENV_VARS {
-        cmd.env_remove(var);
-    }
-    if let Ok(output) = cmd.output() {
-        if output.status.success() {
-            return Some(PathBuf::from("blender"));
-        }
+    if probe_blender("blender") {
+        return Some(PathBuf::from("blender"));
     }
 
     None
+}
+
+/// Probes whether a Blender executable candidate is runnable by invoking `<program> --version`
+/// with sensitive environment variables stripped.
+pub fn probe_blender<P: AsRef<std::ffi::OsStr>>(program: P) -> bool {
+    rusty_grid_core::cluster_auth::probe_command(program)
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
 }
 
 /// Resolves the path to `engines/autorig/blender_rig.py`.
@@ -168,7 +171,6 @@ impl BlenderRigProvider {
                 None,
                 None,
                 std::time::Instant::now(),
-                Some(&output_path),
             )
             .await;
 
@@ -181,9 +183,11 @@ impl BlenderRigProvider {
         }
 
         if res.is_success() {
-            res.asset_bytes
-                .map(|b| b.as_slice().to_vec())
-                .ok_or_else(|| "Blender output .glb missing".to_string())
+            match crate::runner::read_output_file(&output_path).await {
+                Ok(Some(bytes)) => Ok(bytes),
+                Ok(None) => Err("Blender output .glb missing".to_string()),
+                Err(e) => Err(format!("Failed to read Blender output .glb: {e}")),
+            }
         } else {
             Err(res.error.unwrap_or_else(|| {
                 format!(

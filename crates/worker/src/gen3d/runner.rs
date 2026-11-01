@@ -37,28 +37,24 @@ pub fn resolve_python_runtime() -> Option<PathBuf> {
     }
 
     // 3. Fallback: check if standard python executable is available on PATH
-    let mut cmd = std::process::Command::new("python");
-    cmd.arg("--version");
-    for var in rusty_grid_core::cluster_auth::SECRET_ENV_VARS {
-        cmd.env_remove(var);
+    if probe_python("python") {
+        return Some(PathBuf::from("python"));
     }
-    if let Ok(output) = cmd.output() {
-        if output.status.success() {
-            return Some(PathBuf::from("python"));
-        }
-    }
-    let mut cmd = std::process::Command::new("python3");
-    cmd.arg("--version");
-    for var in rusty_grid_core::cluster_auth::SECRET_ENV_VARS {
-        cmd.env_remove(var);
-    }
-    if let Ok(output) = cmd.output() {
-        if output.status.success() {
-            return Some(PathBuf::from("python3"));
-        }
+    if probe_python("python3") {
+        return Some(PathBuf::from("python3"));
     }
 
     None
+}
+
+/// Probes whether a Python executable candidate is runnable by invoking `<program> --version`
+/// with sensitive environment variables stripped.
+pub fn probe_python<P: AsRef<std::ffi::OsStr>>(program: P) -> bool {
+    rusty_grid_core::cluster_auth::probe_command(program)
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
 }
 
 /// Resolves the file path to the 3D generation entrypoint script.

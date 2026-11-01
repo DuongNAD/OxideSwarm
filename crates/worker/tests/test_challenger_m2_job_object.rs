@@ -4,7 +4,7 @@
 //! (Windows Job Objects and Unix process groups).
 //!
 //! Objectives:
-//! 1. Verify abrupt worker crash or termination cleans up all descendants.
+//! 1. Verify OS-level abrupt process termination cleanup via Python Job Object harness (exercises OS kernel semantics, running no repository code).
 //! 2. Verify cancellation during active 3D workloads terminates the full process tree (leader + grandchildren).
 //! 3. Verify watchdog timeouts terminate hung process trees with exit code 124.
 //! 4. Verify aborting a running task future triggers RAII cleanup of all subprocesses without zombies.
@@ -556,7 +556,7 @@ time.sleep(30.0)
     task_handle.abort();
     let _ = task_handle.await;
 
-    // RAII JobObject drop in the unwound async stack must trigger kernel auto-reap
+    // RAII ProcessTree drop in the unwound async stack must trigger kernel auto-reap
     assert_all_dead_async(&mut sys, &pids, Duration::from_secs(4)).await;
     println!("Verified complete tree cleanup on TaskRunner future abort/drop!");
 }

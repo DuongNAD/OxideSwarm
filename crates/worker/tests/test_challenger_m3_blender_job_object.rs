@@ -4,7 +4,6 @@
 //! 1. Host Blender headless execution exporting rigged `.glb` assets.
 //! 2. Supervised process tree termination on mid-task cancellation without orphaned processes.
 //! 3. Graceful fallback to pure-Rust auto-rigging when Blender is missing or exits abnormally.
-//! 4. Priority and environment inheritance with cluster secret stripping.
 
 #![allow(clippy::field_reassign_with_default)]
 
@@ -501,16 +500,75 @@ async fn test_graceful_fallback_when_blender_path_is_invalid_or_missing() {
     );
 }
 
+fn create_crashing_fake_blender(
+    dir: &std::path::Path,
+    marker_path: &std::path::Path,
+    exit_code: i32,
+) -> std::path::PathBuf {
+    let logic_path = dir.join(format!("fake_crash_{}.py", exit_code));
+    let marker_str = marker_path.display().to_string().replace('\\', "/");
+    let script = format!(
+        "import sys\nwith open(\"{marker_str}\", \"w\") as f:\n    f.write(\"ran\")\nprint(\"[ERROR] Simulated crash\", file=sys.stderr)\nsys.exit({exit_code})\n"
+    );
+    std::fs::write(&logic_path, script).expect("write logic");
+
+    let py_exe = if let Ok(custom) = std::env::var("OXIDESWARM_PYTHON") {
+        std::path::PathBuf::from(custom)
+    } else {
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("where.exe")
+                .arg("python.exe")
+                .output()
+                .ok();
+            output
+                .and_then(|out| {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    text.lines()
+                        .next()
+                        .map(|line| std::path::PathBuf::from(line.trim()))
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from("python"))
+        }
+        #[cfg(not(windows))]
+        {
+            std::path::PathBuf::from("python3")
+        }
+    };
+
+    #[cfg(windows)]
+    {
+        let cmd_path = dir.join(format!("fake_blender_{}.cmd", exit_code));
+        let content = format!(
+            "@echo off\r\n\"{}\" \"{}\" %*\r\n",
+            py_exe.display(),
+            logic_path.display()
+        );
+        std::fs::write(&cmd_path, content).expect("write .cmd");
+        cmd_path
+    }
+
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let sh_path = dir.join(format!("fake_blender_{}.sh", exit_code));
+        let content = format!(
+            "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
+            py_exe.display(),
+            logic_path.display()
+        );
+        std::fs::write(&sh_path, content).expect("write .sh");
+        let _ = std::fs::set_permissions(&sh_path, std::fs::Permissions::from_mode(0o755));
+        sh_path
+    }
+}
+
 #[tokio::test]
 async fn test_graceful_fallback_when_blender_binary_crashes() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
 
-    // Create a dummy batch script or executable that exits with error code 1
-    let fake_blender = temp_dir.path().join("fake_blender.bat");
-    let content = "@echo off\r\necho [ERROR] Simulated Blender crash >&2\r\nexit /b 1\r\n";
-    let mut f = File::create(&fake_blender).expect("Failed to write fake blender");
-    f.write_all(content.as_bytes()).expect("Write error");
-    drop(f);
+    let marker_file = temp_dir.path().join("crash_marker.txt");
+    let fake_blender = create_crashing_fake_blender(temp_dir.path(), &marker_file, 1);
 
     // Point BLENDER_PATH to the crashing binary
     let _env = ScopedEnvVar::set("BLENDER_PATH", fake_blender.to_str().unwrap()).await;
@@ -528,6 +586,10 @@ async fn test_graceful_fallback_when_blender_binary_crashes() {
     println!("Crash fallback completed in {:?}", elapsed);
 
     assert!(
+        marker_file.exists(),
+        "Fake Blender executable must have executed and written the marker file"
+    );
+    assert!(
         result.is_ok(),
         "auto_rig_mesh_async failed to fallback after Blender crash: {:?}",
         result.err()
@@ -544,12 +606,8 @@ async fn test_graceful_fallback_via_task_runner_on_blender_failure() {
     let (runner, _dir) = create_test_runner();
     let temp_dir = tempfile::tempdir().expect("tempdir");
 
-    // Dummy failing blender binary
-    let fake_blender = temp_dir.path().join("fake_blender.bat");
-    let content = "@echo off\r\nexit /b 42\r\n";
-    let mut f = File::create(&fake_blender).expect("create fake");
-    f.write_all(content.as_bytes()).expect("write fake");
-    drop(f);
+    let marker_file = temp_dir.path().join("failure_marker.txt");
+    let fake_blender = create_crashing_fake_blender(temp_dir.path(), &marker_file, 42);
 
     let _env = ScopedEnvVar::set("BLENDER_PATH", fake_blender.to_str().unwrap()).await;
 
@@ -566,7 +624,10 @@ async fn test_graceful_fallback_via_task_runner_on_blender_failure() {
         .execute_task_with_checkpoint(&task, None, None, None, None)
         .await;
 
-    // TaskRunner must succeed via fallback!
+    assert!(
+        marker_file.exists(),
+        "Fake Blender executable must have executed and written the marker file"
+    );
     assert!(
         result.is_success(),
         "TaskRunner should succeed via fallback when Blender fails: {:?}",
