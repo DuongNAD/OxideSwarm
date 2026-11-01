@@ -2629,10 +2629,26 @@ pub(crate) fn append_note(bytes: Bytes, note: &str) -> Bytes {
 
 /// Reads an output file produced by a task process.
 ///
+/// Verifies that the target path exists and is a regular file before reading to prevent
+/// hanging on special non-regular files (such as FIFOs, character devices, or directories).
+///
 /// Returns `Ok(Some(Vec<u8>))` if the file exists and is read successfully.
 /// Returns `Ok(None)` only if the file was not found (`ErrorKind::NotFound`).
-/// Returns `Err(io::Error)` if reading failed for any other reason (e.g. permission denied, path is a directory).
+/// Returns `Err(io::Error)` if reading failed for any other reason (e.g. not a regular file, permission denied).
 pub(crate) async fn read_output_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let meta = match tokio::fs::metadata(path).await {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("output path is not a regular file: {}", path.display()),
+        ));
+    }
+
     match tokio::fs::read(path).await {
         Ok(data) => Ok(Some(data)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -3720,5 +3736,32 @@ mod process_tree_tests {
             "[unset][unset][given-on-purpose]",
             "{res:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_output_file_regular_missing_and_directory() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("model.glb");
+        let non_existent = temp_dir.path().join("missing.glb");
+        let dir_path = temp_dir.path().join("subdir");
+        tokio::fs::create_dir(&dir_path).await.expect("create dir");
+
+        // Missing file -> Ok(None)
+        let res = read_output_file(&non_existent).await.expect("read missing");
+        assert!(res.is_none());
+
+        // Regular file -> Ok(Some(data))
+        tokio::fs::write(&file_path, b"glTF test content")
+            .await
+            .expect("write file");
+        let res = read_output_file(&file_path).await.expect("read file");
+        assert_eq!(res, Some(b"glTF test content".to_vec()));
+
+        // Directory -> Err
+        let err = read_output_file(&dir_path).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("output path is not a regular file"));
     }
 }

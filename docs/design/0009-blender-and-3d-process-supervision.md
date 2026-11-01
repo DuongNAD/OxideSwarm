@@ -62,7 +62,7 @@ deleted as dead code. Primary output asset loading is decoupled into `read_outpu
 
 ### D2: Post-execution progress checkpointing
 
-Captured stdout is capped at `max_output_bytes` (default 2 MiB), so it is not captured in full if a
+Captured stdout is capped at `max_output_bytes` (default 10 MiB), so it is not captured in full if a
 process generates voluminous output.
 - In the generative 3D path, captured stdout is parsed following process completion for
   `[PROGRESS: <val>]` markers, which are dispatched as `WorkerMessage::Checkpoint` deltas via
@@ -72,8 +72,9 @@ process generates voluminous output.
 
 ### D3: Environment isolation and secret stripping
 
-Subprocess execution environments and version inspection probes for Python and Blender are stripped of all
-cluster authentication tokens (`OXIDESWARM_SECRET`, `OXIDESWARM_SECRET_FILE`, `OXIDE_MESH_TOKEN`) via
+Subprocess environments for task executions are stripped of all cluster authentication tokens
+(`OXIDESWARM_SECRET`, `OXIDESWARM_SECRET_FILE`, `OXIDE_MESH_TOKEN`) via the `env_remove` loop in
+`execute_process_supervised`, while version inspection probes for Python and Blender use
 `rusty_grid_core::cluster_auth::probe_command`. Other host capability discovery probes (`nvcc`,
 `nvidia-smi`, `sysctl`, `pmset`, `sw_vers`, `dumpsys`, `getprop`) inherit the process environment
 unchanged. Tasks receive standard environment variables:
@@ -84,8 +85,9 @@ unchanged. Tasks receive standard environment variables:
 ## Known limits
 
 - **Uncapped output reads and wire frame limit**: The output model file is read into memory via
-  `tokio::fs::read` without an arbitrary size cap, following symbolic links via `Path::is_file()`,
-  matching behavior on `master` (BUG-10). However, wire protocol frames are limited to 64 MiB
+  `tokio::fs::read` without an arbitrary size cap after `tokio::fs::metadata` verifies the path is a
+  regular file (preventing hangs on non-regular files like FIFOs), following symbolic links to regular
+  files, matching behavior on `master` (BUG-10). However, wire protocol frames are limited to 64 MiB
   (`MAX_FRAME_SIZE` in `rusty_grid_core::protocol`), so any result above 64 MiB will fail transmission
   and cannot reach the client intact.
 - **Worker crash on Unix**: On Unix, task processes run under process groups (`killpg`). Normal
@@ -130,12 +132,14 @@ a task process can still read the worker account's secret file on disk, as docum
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
 | W1 | Hardened process runner integration | `runner.rs`, `blender_provider.rs` | Blender and 3D use `execute_process_supervised` | Implemented |
-| W2 | Secret stripping on probes | `cluster_auth.rs`, `blender_provider.rs`, `runner.rs` | Python/Blender probes stripped via `probe_command` | Implemented |
+| W2 | Secret stripping on probes | `cluster_auth.rs`, `capabilities.rs`, `blender_provider.rs`, `gen3d/runner.rs` | Python/Blender probes stripped via `probe_command` | Implemented |
 | W3 | Output file reading helper | `runner.rs` | `read_output_file` reads asset without size cap | Implemented |
 | W4 | Clean up dead code & update headers | `runner.rs`, `*_job_object.rs` | `terminate_process_tree` removed; headers updated | Implemented |
-| W5 | Test suite verification | `test_sec5_*.rs`, `test_challenger_*.rs` | All suites pass on Windows and CI matrix | Implemented |
+| W5 | Test suite verification | `test_sec5_*.rs`, `test_challenger_*.rs` | All suites pass on Windows; CI runs `test_sec5_hardened_runner` on Linux and macOS | Implemented |
 
 ## Status log
 
 - 2026-11-01: Implemented process supervision for 3D and Blender workloads via TaskRunner (SEC-5).
 - 2026-11-01: Updated design record for second round review: corrected master baseline, Unix crash semantics, probe secret isolation, and output frame limit.
+- 2026-11-01: Updated design record for round 3 review: corrected default output buffer limit, metadata regular file check, task env stripping vs probe_command distinction, CI scope, and W2 file list.
+

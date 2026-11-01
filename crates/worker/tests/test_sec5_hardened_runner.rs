@@ -434,22 +434,37 @@ sys.exit(0)
 }
 
 // ============================================================================
-// Test 4: 3D Task Grandchildren Die on Abort Cross-Platform
+// Test 4: 3D Task Grandchildren Die on Abort or Cancel Cross-Platform (Review Item 4)
 // ============================================================================
 
 #[tokio::test]
-async fn test_sec5_3d_task_grandchildren_die_on_abort_cross_platform() {
+async fn test_sec5_3d_task_child_and_grandchild_die_on_abort_or_cancel() {
     let (runner, _dir) = create_test_runner();
     let temp_dir = tempfile::tempdir().expect("tempdir");
-    let pids_file = temp_dir.path().join("pids_gen3d_tree.txt");
+    let runner = Arc::new(runner);
 
-    let pids_path = pids_file.display().to_string().replace('\\', "/");
-    let script = temp_dir.path().join("gen3d_spawner.py");
-    let content = format!(
+    let spec = Generative3DSpec::new_prompt("adversarial grandchild abort test")
+        .with_quality("standard")
+        .with_engine("triposr");
+    let requirements = TaskRequirements {
+        timeout_secs: 60,
+        ..Default::default()
+    };
+    let task = Task::new(TaskSpec::Generative3D(spec), requirements);
+
+    let mut env = EnvLock::lock().await;
+
+    // ------------------------------------------------------------------------
+    // Phase 1: Verify child and grandchild cleanup on explicit cancellation channel
+    // ------------------------------------------------------------------------
+    let pids_file_cancel = temp_dir.path().join("pids_gen3d_tree_cancel.txt");
+    let pids_path_cancel = pids_file_cancel.display().to_string().replace('\\', "/");
+    let script_cancel = temp_dir.path().join("gen3d_spawner_cancel.py");
+    let content_cancel = format!(
         r#"
 import os, sys, time, subprocess
 
-pids_file = "{pids_path}"
+pids_file = "{pids_path_cancel}"
 my_pid = os.getpid()
 with open(pids_file, "a") as f:
     f.write(f"PID:{{my_pid}}\n")
@@ -464,61 +479,125 @@ with open(pids_file, "a") as f:
 time.sleep(60.0)
 "#
     );
-    let mut f = File::create(&script).expect("create script");
-    f.write_all(content.as_bytes()).expect("write script");
+    let mut f = File::create(&script_cancel).expect("create cancel script");
+    f.write_all(content_cancel.as_bytes())
+        .expect("write cancel script");
     drop(f);
 
-    let mut env = EnvLock::lock().await;
-    env.set("OXIDESWARM_GEN3D_SCRIPT", script.to_str().expect("path"));
-
-    let spec = Generative3DSpec::new_prompt("adversarial grandchild abort test")
-        .with_quality("standard")
-        .with_engine("triposr");
-    let requirements = TaskRequirements {
-        timeout_secs: 60,
-        ..Default::default()
-    };
-    let task = Task::new(TaskSpec::Generative3D(spec), requirements);
+    env.set(
+        "OXIDESWARM_GEN3D_SCRIPT",
+        script_cancel.to_str().expect("path"),
+    );
 
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let child_pid = Arc::new(AtomicU32::new(0));
 
-    let runner = Arc::new(runner);
     let runner_clone = Arc::clone(&runner);
     let child_pid_clone = Arc::clone(&child_pid);
-    let task_handle = tokio::spawn(async move {
+    let task_clone = task.clone();
+    let task_handle_cancel = tokio::spawn(async move {
         runner_clone
-            .execute_task_with_checkpoint(&task, None, None, Some(child_pid_clone), Some(cancel_rx))
+            .execute_task_with_checkpoint(
+                &task_clone,
+                None,
+                None,
+                Some(child_pid_clone),
+                Some(cancel_rx),
+            )
             .await
     });
 
-    // Wait until both child and grandchild processes are alive
-    let pids = poll_pids_async(&pids_file, 2, Duration::from_secs(20)).await;
+    let pids_cancel = poll_pids_async(&pids_file_cancel, 2, Duration::from_secs(20)).await;
     assert_eq!(
-        pids.len(),
+        pids_cancel.len(),
         2,
-        "Expected 2 processes (parent and grandchild), found {:?}",
-        pids
+        "Expected 2 processes (parent and grandchild) for cancel test, found {:?}",
+        pids_cancel
     );
 
     let mut sys = sysinfo::System::new();
     sys.refresh_processes();
-    for &pid in &pids {
+    for &pid in &pids_cancel {
         assert!(
             sys.process(sysinfo::Pid::from(pid as usize)).is_some(),
             "PID {pid} must be running before cancellation"
         );
     }
 
-    // Act: Send cancellation signal
     let _ = cancel_tx.send("task cancelled by operator".to_string());
-    let res = task_handle.await.expect("task join failed");
-
+    let res = task_handle_cancel.await.expect("task join failed");
     assert_eq!(res.exit_code, EXIT_CODE_CANCELLED);
+    assert_all_dead_async(&pids_cancel, Duration::from_secs(4)).await;
+    println!("Verified complete 3D tree cleanup on cancellation channel!");
 
-    // Assert: Both child and grandchild must be terminated within 4s
-    assert_all_dead_async(&pids, Duration::from_secs(4)).await;
-    println!("Verified complete 3D tree cleanup on cancellation!");
+    // ------------------------------------------------------------------------
+    // Phase 2: Verify child and grandchild cleanup on real Tokio future abort (task_handle.abort())
+    // ------------------------------------------------------------------------
+    let pids_file_abort = temp_dir.path().join("pids_gen3d_tree_abort.txt");
+    let pids_path_abort = pids_file_abort.display().to_string().replace('\\', "/");
+    let script_abort = temp_dir.path().join("gen3d_spawner_abort.py");
+    let content_abort = format!(
+        r#"
+import os, sys, time, subprocess
+
+pids_file = "{pids_path_abort}"
+my_pid = os.getpid()
+with open(pids_file, "a") as f:
+    f.write(f"PID:{{my_pid}}\n")
+    f.flush()
+
+# Spawn grandchild process that sleeps for 60 seconds
+gc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+with open(pids_file, "a") as f:
+    f.write(f"PID:{{gc.pid}}\n")
+    f.flush()
+
+time.sleep(60.0)
+"#
+    );
+    let mut f = File::create(&script_abort).expect("create abort script");
+    f.write_all(content_abort.as_bytes())
+        .expect("write abort script");
+    drop(f);
+
+    env.set(
+        "OXIDESWARM_GEN3D_SCRIPT",
+        script_abort.to_str().expect("path"),
+    );
+
+    let runner_clone2 = Arc::clone(&runner);
+    let task_clone2 = task.clone();
+    let task_handle_abort =
+        tokio::spawn(async move { runner_clone2.execute_task(&task_clone2, None, None).await });
+
+    let pids_abort = poll_pids_async(&pids_file_abort, 2, Duration::from_secs(20)).await;
+    assert_eq!(
+        pids_abort.len(),
+        2,
+        "Expected 2 processes for abort test, found {:?}",
+        pids_abort
+    );
+
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes();
+    for &pid in &pids_abort {
+        assert!(
+            sys.process(sysinfo::Pid::from(pid as usize)).is_some(),
+            "PID {pid} must be running before future abort"
+        );
+    }
+
+    // Act: Abort the Tokio future directly
+    task_handle_abort.abort();
+    let join_res = task_handle_abort.await;
+    assert!(
+        join_res.is_err() && join_res.unwrap_err().is_cancelled(),
+        "task_handle must be aborted and report cancelled"
+    );
+
+    // Assert: Both child and grandchild must be terminated within 4s due to ProcessTree RAII drop
+    assert_all_dead_async(&pids_abort, Duration::from_secs(4)).await;
+    println!("Verified complete 3D tree cleanup on future abort!");
 }
 
 // ============================================================================
@@ -1251,5 +1330,68 @@ async fn test_sec5_missing_output_file_falls_back_under_auto_and_fails_under_exp
         );
         assert!(res.asset_bytes.is_some());
         assert!(res.asset_bytes.unwrap().as_slice().starts_with(b"glTF"));
+    }
+}
+
+// ============================================================================
+// Test 16: FIFO or Non-Regular Output File Fails For Both Engines (Review Item 1)
+// ============================================================================
+
+#[tokio::test]
+async fn test_sec5_fifo_or_non_regular_output_fails_for_both_engines() {
+    let (runner, _dir) = create_test_runner();
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+
+    let mock_script = temp_dir.path().join("fifo_output_engine.py");
+    let script_content = r#"
+import os
+import sys
+if "--output" in sys.argv:
+    out_idx = sys.argv.index("--output")
+    out_path = sys.argv[out_idx + 1]
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(out_path)
+    else:
+        os.mkdir(out_path)
+sys.exit(0)
+"#;
+    std::fs::write(&mock_script, script_content).expect("write mock script");
+
+    let mut env = EnvLock::lock().await;
+    env.set(
+        "OXIDESWARM_GEN3D_SCRIPT",
+        mock_script.to_str().expect("path"),
+    );
+
+    for engine in ["triposr", "auto"] {
+        let spec = Generative3DSpec::new_prompt("FIFO Output Test").with_engine(engine);
+        let task = Task::new(
+            TaskSpec::Generative3D(spec),
+            TaskRequirements {
+                timeout_secs: 5,
+                ..Default::default()
+            },
+        );
+        let start = Instant::now();
+        let res = runner.execute_task(&task, None, None).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "Task with FIFO output must fail promptly without hanging, took {elapsed:?}"
+        );
+        assert_eq!(
+            res.exit_code, EXIT_CODE_GENERAL_ERROR,
+            "Exit code must be 1 for engine {engine}"
+        );
+        let err = res.error.as_deref().unwrap_or("");
+        assert!(
+            err.starts_with("Failed to read generated .glb asset"),
+            "Error for engine {engine} must start with 'Failed to read generated .glb asset', got: '{err}'"
+        );
+        assert!(
+            res.asset_bytes.is_none(),
+            "asset_bytes must be None for engine {engine}"
+        );
     }
 }
