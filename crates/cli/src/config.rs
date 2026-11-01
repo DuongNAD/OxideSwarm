@@ -245,15 +245,39 @@ pub fn default_oxideswarm_dir() -> Option<PathBuf> {
 
 /// Attempts to load configuration file from explicit path, environment variable, or standard locations.
 pub fn load_config_file(explicit_path: Option<&Path>) -> GridResult<Option<ConfigFile>> {
+    load_config_file_with_options(explicit_path, true)
+}
+
+/// Attempts to load configuration file for `oxideswarm mcp` (`--config`, `RUSTY_GRID_CONFIG`,
+/// then `~/.oxideswarm/rusty-grid.toml`). Skips `./rusty-grid.toml` and `./rusty-grid.json`
+/// in the working directory and prints one line on stderr when a working-directory file is skipped.
+pub fn load_mcp_config_file(explicit_path: Option<&Path>) -> GridResult<Option<ConfigFile>> {
+    load_config_file_with_options(explicit_path, false)
+}
+
+fn load_config_file_with_options(
+    explicit_path: Option<&Path>,
+    allow_working_dir: bool,
+) -> GridResult<Option<ConfigFile>> {
     let path_to_load = if let Some(p) = explicit_path {
         Some(p.to_path_buf())
     } else if let Ok(env_path) = std::env::var("RUSTY_GRID_CONFIG") {
         Some(PathBuf::from(env_path))
-    } else if Path::new("rusty-grid.toml").exists() {
+    } else if allow_working_dir && Path::new("rusty-grid.toml").exists() {
         Some(PathBuf::from("rusty-grid.toml"))
-    } else if Path::new("rusty-grid.json").exists() {
+    } else if allow_working_dir && Path::new("rusty-grid.json").exists() {
         Some(PathBuf::from("rusty-grid.json"))
     } else {
+        if !allow_working_dir {
+            for candidate in ["rusty-grid.toml", "rusty-grid.json"] {
+                if Path::new(candidate).exists() {
+                    eprintln!(
+                        "[mcp] Skipping config file ./{candidate} in the working directory (pass --config or RUSTY_GRID_CONFIG to load it)."
+                    );
+                    break;
+                }
+            }
+        }
         default_oxideswarm_dir()
             .map(|d| d.join("rusty-grid.toml"))
             .filter(|user_config| user_config.exists())
