@@ -14,6 +14,7 @@ use tokio::task::AbortHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use rusty_grid_core::blob_transfer::{BlobReply, BlobRequest, MAX_IN_FLIGHT_REQUESTS};
 use rusty_grid_core::capabilities::MobileLiveStatus;
 use rusty_grid_core::cluster_auth::{
     send_reject, server_handshake, ClusterSecret, REJECT_NO_SECRET, WIRE_FORMAT_AUTH,
@@ -32,6 +33,7 @@ use rusty_grid_core::{
 };
 
 use crate::auth::DevBypass;
+use crate::blob_store::{BlobStore, BlobStoreConfig};
 use crate::liveness::{RxClock, StampedStream};
 use crate::mapreduce::{MapReduceEngine, DEFAULT_MAPREDUCE_PARALLELISM};
 use crate::queue::{
@@ -126,6 +128,11 @@ pub struct ServerConfig {
     pub implicit_local_dashboard: bool,
     /// Optional URL of rendezvous registry for cross-subnet discovery (or set OXIDESWARM_RENDEZVOUS).
     pub rendezvous_url: Option<String>,
+    /// Where the blob store of task inputs and output files lives and how large it may grow (see
+    /// [`crate::blob_store`]). `None` (the default) runs without one: tasks with inputs or output
+    /// patterns are refused and workers are not told that blobs can be fetched. The CLI keeps one
+    /// under `~/.oxideswarm/blobs`.
+    pub blob_store: Option<BlobStoreConfig>,
 }
 
 impl Default for ServerConfig {
@@ -167,6 +174,7 @@ impl Default for ServerConfig {
             mapreduce_parallelism: DEFAULT_MAPREDUCE_PARALLELISM,
             implicit_local_dashboard: false,
             rendezvous_url: None,
+            blob_store: None,
         }
     }
 }
@@ -363,6 +371,12 @@ impl ServerConfig {
         self.rendezvous_url = Some(url.into());
         self
     }
+
+    /// Keeps task inputs and output files in a blob store at `dir` that holds at most `max_bytes`.
+    pub fn with_blob_store(mut self, dir: impl Into<PathBuf>, max_bytes: u64) -> Self {
+        self.blob_store = Some(BlobStoreConfig::new(dir, max_bytes));
+        self
+    }
 }
 
 /// Atomically writes the bound port number to `path` using a sibling temporary file.
@@ -421,6 +435,8 @@ pub struct MasterServer {
         Option<tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>>,
     /// Master's active P2P ticket, if enabled.
     pub p2p_ticket: Option<String>,
+    /// The blob store, when `ServerConfig::blob_store` names one.
+    blob_store: Option<Arc<BlobStore>>,
 }
 
 impl MasterServer {
@@ -440,6 +456,24 @@ impl MasterServer {
         scheduler_notify: Arc<tokio::sync::Notify>,
         waiters: WaiterMap,
     ) -> GridResult<Self> {
+        // Opened first: a store that cannot be used must not leave a ticket or port file behind.
+        let blob_store = match config.blob_store.clone() {
+            Some(store_config) => {
+                let opened = tokio::task::spawn_blocking(move || {
+                    BlobStore::open(&store_config).map_err(|e| (store_config.dir, e))
+                })
+                .await
+                .map_err(|e| GridError::Config(format!("Blob store start-up failed: {e}")))?;
+                Some(opened.map_err(|(dir, e)| {
+                    GridError::Config(format!(
+                        "Cannot use the blob store directory '{}': {e}",
+                        dir.display()
+                    ))
+                })?)
+            }
+            None => None,
+        };
+
         #[cfg(feature = "p2p")]
         let p2p_active_conns = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         #[cfg(feature = "p2p")]
@@ -557,6 +591,7 @@ impl MasterServer {
             #[cfg(feature = "dashboard")]
             broadcast_tx: None,
             p2p_ticket,
+            blob_store,
         })
     }
 
@@ -616,6 +651,7 @@ impl MasterServer {
         #[cfg(feature = "p2p")]
         let p2p_active_conns = Arc::clone(&server.p2p_active_conns);
         let p2p_ticket = server.p2p_ticket.clone();
+        let blob_store = server.blob_store.clone();
 
         #[cfg(feature = "dashboard")]
         let (dashboard_server_opt, broadcast_tx) = if enable_web_ui
@@ -817,7 +853,14 @@ impl MasterServer {
             p2p_active_conns,
             p2p_ticket: p2p_ticket.clone(),
             cluster_secret: config.cluster_secret.clone(),
+            blob_store: blob_store.clone(),
         };
+
+        // Pins of finished tasks are released here when no result released them (failover out of
+        // retries, the reaper, a cancellation), and stalled uploads are dropped.
+        if let Some(store) = blob_store {
+            spawn_blob_store_sweeper(store, handle.queue().clone(), shutdown_rx.clone());
+        }
 
         // 4. Spawn Unified Web Observability & Control Dashboard (if enabled)
         #[cfg(feature = "dashboard")]
@@ -1249,6 +1292,7 @@ impl MasterServer {
             let p2p_conns = Arc::clone(&self.p2p_active_conns);
             let p2p_secret = self.config.cluster_secret.clone();
             let p2p_limits = limits.clone();
+            let p2p_blob_store = self.blob_store.clone();
 
             tokio::spawn(async move {
                 let mut p2p_shutdown = p2p_shutdown_rx;
@@ -1275,6 +1319,7 @@ impl MasterServer {
                             let c_codec = p2p_codec;
                             let c_conns = Arc::clone(&p2p_conns);
                             let c_secret = p2p_secret.clone();
+                            let c_blob_store = p2p_blob_store.clone();
                             #[cfg(feature = "dashboard")]
                             let c_bcast = p2p_broadcast_tx.clone();
 
@@ -1380,6 +1425,7 @@ impl MasterServer {
                                             c_codec,
                                             c_secret,
                                             Some(handshake_permit),
+                                            c_blob_store,
                                             #[cfg(feature = "dashboard")]
                                             c_bcast,
                                             #[cfg(feature = "p2p")]
@@ -1432,6 +1478,7 @@ impl MasterServer {
                             let conn_wire_codec = self.config.wire_codec;
                             let conn_secret = self.config.cluster_secret.clone();
                             let conn_mapreduce_parallelism = self.config.mapreduce_parallelism;
+                            let conn_blob_store = self.blob_store.clone();
                             #[cfg(feature = "dashboard")]
                             let conn_broadcast_tx = self.broadcast_tx.clone();
                             #[cfg(feature = "p2p")]
@@ -1456,6 +1503,7 @@ impl MasterServer {
                                     conn_secret,
                                     Some(handshake_permit),
                                     conn_mapreduce_parallelism,
+                                    conn_blob_store,
                                     #[cfg(feature = "dashboard")]
                                     conn_broadcast_tx,
                                     #[cfg(feature = "p2p")]
@@ -1642,6 +1690,204 @@ pub(crate) async fn cancel_task_and_notify(
     Ok(true)
 }
 
+/// The reason a request that needs the blob store fails on a master that runs without one.
+const NO_BLOB_STORE: &str = "this master has no blob store, so it cannot move task input or \
+     output files; start it with `oxideswarm master` (which keeps one under ~/.oxideswarm/blobs) \
+     or `oxideswarm master --blob-dir DIR`";
+
+/// How often the blob store sweeper releases the pins of finished tasks.
+const BLOB_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Admits a task that moves files through the blob store: every input blob (and every file of
+/// every input tree) must already be in the store, and they are pinned there until the task
+/// finishes, so the bound cannot evict them before a worker fetched them. Tasks without inputs
+/// or output patterns pass untouched.
+async fn admit_blob_task(blob_store: Option<&Arc<BlobStore>>, task: &Task) -> Result<(), String> {
+    if !task.uses_blobs() {
+        return Ok(());
+    }
+    let Some(store) = blob_store else {
+        return Err(format!(
+            "Task {} has input or output files, but {NO_BLOB_STORE}",
+            task.id
+        ));
+    };
+    task.validate()?;
+    let ids = store.resolve_inputs(&task.inputs).await?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let gone = store.pin_task(task.id, ids);
+    if let Some(id) = gone.first() {
+        store.unpin_task(&task.id);
+        return Err(format!(
+            "input blob {id} was evicted from the master's blob store while the task was being \
+             submitted; upload the inputs again (or raise `master --blob-store-mb`)"
+        ));
+    }
+    Ok(())
+}
+
+/// Checks that a result's output files are in the store and pins them atomically if present,
+/// returning either the pin guard or an error naming the first missing output.
+fn pin_result_outputs(
+    blob_store: Option<&Arc<BlobStore>>,
+    result: &TaskResult,
+) -> Result<Option<crate::blob_store::OutputPinGuard>, String> {
+    if result.outputs.is_empty() {
+        return Ok(None);
+    }
+    let Some(store) = blob_store else {
+        return Err(format!(
+            "the worker reported {} output files, but {NO_BLOB_STORE}",
+            result.outputs.len()
+        ));
+    };
+    let ids: Vec<_> = result.outputs.iter().map(|f| f.id).collect();
+    match store.check_and_pin_outputs(&ids) {
+        Ok(pin) => Ok(Some(pin)),
+        Err(missing) => {
+            let first = result
+                .outputs
+                .iter()
+                .find(|f| missing.contains(&f.id))
+                .expect("missing id comes from result.outputs");
+            Err(format!(
+                "output '{}' (blob {}) is not in the master's blob store ({} of {} outputs missing)",
+                first.path,
+                first.id,
+                missing.len(),
+                result.outputs.len()
+            ))
+        }
+    }
+}
+
+/// Drops the unfinished uploads of one connection when the connection ends.
+struct UploadOwner {
+    store: Arc<BlobStore>,
+    owner: u64,
+}
+
+impl UploadOwner {
+    fn new(store: Arc<BlobStore>) -> Self {
+        let owner = store.new_owner();
+        Self { store, owner }
+    }
+}
+
+impl Drop for UploadOwner {
+    fn drop(&mut self) {
+        self.store.abort_uploads(self.owner);
+    }
+}
+
+/// Answers one worker connection's `BlobRequest`s in arrival order, off its inbound loop. A
+/// worker caps its requests in flight per session at [`MAX_IN_FLIGHT_REQUESTS`], smaller than
+/// this queue, so a cooperative worker never fills the queue and blocks its own heartbeats or
+/// results; the bounded channel still caps buffered requests if a peer ignores that limit.
+struct BlobService {
+    requests: mpsc::Sender<(u64, BlobRequest)>,
+    _task: AbortOnDrop,
+}
+
+impl BlobService {
+    fn spawn(store: Arc<BlobStore>, replies: mpsc::Sender<MasterMessage>) -> Self {
+        let (requests, mut incoming) =
+            mpsc::channel::<(u64, BlobRequest)>(MAX_IN_FLIGHT_REQUESTS * 2);
+        let task = tokio::spawn(async move {
+            let uploads = UploadOwner::new(Arc::clone(&store));
+            while let Some((request_id, request)) = incoming.recv().await {
+                let reply = store.handle(uploads.owner, request).await;
+                if replies
+                    .send(MasterMessage::BlobReply { request_id, reply })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            requests,
+            _task: AbortOnDrop(task.abort_handle()),
+        }
+    }
+}
+
+/// Hands a worker's `BlobRequest` to its connection's [`BlobService`], or answers it with a
+/// refusal on a master without a blob store.
+async fn serve_worker_blob_request(
+    service: Option<&BlobService>,
+    replies: &mpsc::Sender<MasterMessage>,
+    request_id: u64,
+    request: BlobRequest,
+) {
+    match service {
+        Some(service) => {
+            let _ = service.requests.send((request_id, request)).await;
+        }
+        None => {
+            let reply = BlobReply::Failed {
+                message: NO_BLOB_STORE.to_string(),
+            };
+            let _ = replies
+                .send(MasterMessage::BlobReply { request_id, reply })
+                .await;
+        }
+    }
+}
+
+/// The `RegisterAck` message announcing the optional features of this master.
+fn feature_announcement(blob_store: Option<&Arc<BlobStore>>) -> String {
+    use rusty_grid_core::protocol::master_features;
+    let mut features = master_features::SUPPORTED.to_vec();
+    if blob_store.is_some() {
+        features.push(master_features::BLOBS);
+    }
+    master_features::announcement(&features)
+}
+
+/// Releases the input blob pins of tasks that finished without a result that released them
+/// (failover out of retries, the reaper, a cancellation), releases terminal output pins once
+/// their retention period has elapsed, and drops uploads that stalled.
+fn spawn_blob_store_sweeper(
+    store: Arc<BlobStore>,
+    queue: TaskQueue,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let sweep_interval = BLOB_SWEEP_INTERVAL
+        .min(store.output_pin_retention())
+        .max(Duration::from_millis(20));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(sweep_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    store.sweep_stale_uploads();
+                    store.sweep_expired_output_pins();
+                    for (task_id, pinned_at) in store.pinned_tasks() {
+                        let release = match queue.get_task(&task_id).await {
+                            Some(info) => info.state.is_terminal(),
+                            // Pinned just before it entered the queue, or gone long ago.
+                            None => pinned_at.elapsed() > BLOB_SWEEP_INTERVAL,
+                        };
+                        if release {
+                            store.unpin_task(&task_id);
+                        }
+                    }
+                }
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Handles incoming `WorkerMessage::TaskResult` messages.
 ///
 /// The sender is taken from `result.worker_id`; the connection handlers attribute results to the
@@ -1662,6 +1908,7 @@ pub async fn handle_task_result(
         worker_id,
         None,
         result,
+        None,
         #[cfg(feature = "dashboard")]
         None,
     )
@@ -1689,6 +1936,7 @@ pub async fn handle_task_result_with_broadcast(
         worker_id,
         None,
         result,
+        None,
         broadcast_tx,
     )
     .await;
@@ -1709,6 +1957,7 @@ async fn apply_task_result(
     worker_id: Uuid,
     session_id: Option<u64>,
     mut result: TaskResult,
+    blob_store: Option<&Arc<BlobStore>>,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<&DashboardTx>,
 ) {
     let task_id = result.task_id;
@@ -1728,6 +1977,20 @@ async fn apply_task_result(
         exit_code = result.exit_code,
         "Task execution result received"
     );
+
+    // Output files a client cannot download would turn a success into a silent loss; check and
+    // pin them atomically so no upload can evict them before the task outcome is recorded.
+    let output_pin = match pin_result_outputs(blob_store, &result) {
+        Ok(pin) => pin,
+        Err(problem) => {
+            warn!(task_id = %task_id, problem = %problem, "Result refers to output files the master does not hold");
+            result.error = Some(match result.error.take() {
+                Some(error) => format!("{error}; {problem}"),
+                None => problem,
+            });
+            None
+        }
+    };
 
     // 1. Record outcome in TaskQueue FSM
     let outcome = match queue
@@ -1772,8 +2035,16 @@ async fn apply_task_result(
     }
 
     // 3. Notify awaiting clients, but only once the task is really finished: a requeued
-    //    task (rejection, execution retry) will still produce its real result.
+    //    task (rejection, execution retry) will still produce its real result and keeps its
+    //    input pins. When terminal, input pins are released and output pins stay held for
+    //    `output_pin_retention` so the client can download them.
     if outcome.disposition == ResultDisposition::Terminal {
+        if let Some(store) = blob_store {
+            store.unpin_task(&task_id);
+        }
+        if let Some(pin) = output_pin {
+            pin.commit_terminal(task_id);
+        }
         let mut lock = waiters.write().await;
         if let Some(senders) = lock.remove(&task_id) {
             for tx in senders {
@@ -1908,6 +2179,7 @@ async fn handle_session_task_message(
     waiters: &WaiterMap,
     worker_id: Uuid,
     session_id: u64,
+    blob_store: Option<&Arc<BlobStore>>,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<&DashboardTx>,
 ) {
     match msg {
@@ -1942,6 +2214,7 @@ async fn handle_session_task_message(
             error,
             asset_bytes,
             artifacts,
+            outputs,
         } => {
             if claimed != worker_id {
                 warn!(worker_id = %worker_id, claimed = %claimed, task_id = %task_id, "Result names a different worker than its connection");
@@ -1958,6 +2231,7 @@ async fn handle_session_task_message(
                 error,
                 asset_bytes,
                 artifacts,
+                outputs,
             };
             // Once a result starts being applied it must finish, even if this connection is
             // aborted meanwhile (reaper, or the worker re-registering): the queue transition and
@@ -1967,6 +2241,7 @@ async fn handle_session_task_message(
             let queue = queue.clone();
             let scheduler_notify = Arc::clone(scheduler_notify);
             let waiters = Arc::clone(waiters);
+            let blob_store = blob_store.cloned();
             #[cfg(feature = "dashboard")]
             let broadcast_tx = broadcast_tx.cloned();
             let _ = tokio::spawn(async move {
@@ -1978,6 +2253,7 @@ async fn handle_session_task_message(
                     worker_id,
                     Some(session_id),
                     result,
+                    blob_store.as_ref(),
                     #[cfg(feature = "dashboard")]
                     broadcast_tx.as_ref(),
                 )
@@ -2320,6 +2596,7 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     scheduler_notify: Arc<tokio::sync::Notify>,
     waiters: WaiterMap,
     mapreduce_parallelism: usize,
+    blob_store: Option<Arc<BlobStore>>,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<
         tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
     >,
@@ -2328,6 +2605,10 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     >,
 ) -> GridResult<()> {
     let mut next_msg = Some(first_msg);
+    // Uploads this connection leaves unfinished are dropped when it ends.
+    let uploads = blob_store
+        .as_ref()
+        .map(|store| UploadOwner::new(Arc::clone(store)));
     let mapreduce = MapReduceEngine::new(queue.clone(), scheduler_notify.clone(), waiters.clone())
         .with_registry(registry.clone())
         .with_parallelism(mapreduce_parallelism);
@@ -2344,6 +2625,18 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         match msg {
             ClientMessage::SubmitTask { task, wait } => {
                 let task_id = task.id;
+                // A task id the queue already knows is refused by `submit` below; its pins
+                // belong to the original task and must stay untouched.
+                let known = queue.get_task(&task_id).await.is_some();
+                if !known {
+                    if let Err(message) = admit_blob_task(blob_store.as_ref(), &task).await {
+                        warn!(task_id = %task_id, error = %message, "SubmitTask rejected");
+                        transport
+                            .send_msg(&ClientResponse::Error { message })
+                            .await?;
+                        continue;
+                    }
+                }
                 let rx = if wait {
                     let (tx, rx) = oneshot::channel();
                     let mut lock = waiters.write().await;
@@ -2359,6 +2652,9 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     // (it must never be resolved by the result of another task with the same id).
                     drop(rx);
                     prune_closed_waiters(&waiters, &task_id).await;
+                    if let (false, Some(store)) = (known, blob_store.as_ref()) {
+                        store.unpin_task(&task_id);
+                    }
                     warn!(task_id = %task_id, error = %e, "SubmitTask rejected");
                     let resp = ClientResponse::Error {
                         message: e.to_string(),
@@ -2504,6 +2800,17 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     _ => task_status_response(&queue, task_id).await,
                 };
                 transport.send_msg(&resp).await?;
+            }
+            ClientMessage::BlobRequest { request } => {
+                let reply = match (&blob_store, &uploads) {
+                    (Some(store), Some(uploads)) => store.handle(uploads.owner, request).await,
+                    _ => BlobReply::Failed {
+                        message: NO_BLOB_STORE.to_string(),
+                    },
+                };
+                transport
+                    .send_msg(&ClientResponse::BlobReply { reply })
+                    .await?;
             }
         }
     }
@@ -2679,6 +2986,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     cluster_secret: Option<ClusterSecret>,
     handshake_permit: Option<OwnedSemaphorePermit>,
     mapreduce_parallelism: usize,
+    blob_store: Option<Arc<BlobStore>>,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<
         tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
     >,
@@ -2718,6 +3026,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 scheduler_notify,
                 waiters,
                 mapreduce_parallelism,
+                blob_store,
                 #[cfg(feature = "dashboard")]
                 broadcast_tx,
                 #[cfg(feature = "p2p")]
@@ -2933,9 +3242,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         heartbeat_interval_secs,
         protocol_version: PROTOCOL_VERSION_CURRENT,
         features: negotiated_features,
-        message: Some(rusty_grid_core::protocol::master_features::announcement(
-            rusty_grid_core::protocol::master_features::SUPPORTED,
-        )),
+        message: Some(feature_announcement(blob_store.as_ref())),
     };
     if let Err(e) = transport.send_msg(&ack).await {
         // Tasks may already have been assigned to this session; sweep them, not just unregister.
@@ -2984,6 +3291,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     });
 
     let _writer_guard = AbortOnDrop(writer_task.abort_handle());
+    let blob_service = blob_store
+        .clone()
+        .map(|store| BlobService::spawn(store, outbound_tx.clone()));
 
     // Allow newly connected worker to complete handshake acknowledgement, split its transport,
     // and enter its inbound message loop before tasks are dispatched to it.
@@ -3072,9 +3382,13 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                     &waiters,
                                     worker_id,
                                     session_id,
+                                    blob_store.as_ref(),
                                     #[cfg(feature = "dashboard")]
                                     broadcast_tx.as_ref(),
                                 ).await;
+                            }
+                            WorkerMessage::BlobRequest { request_id, request } => {
+                                serve_worker_blob_request(blob_service.as_ref(), &outbound_tx, request_id, request).await;
                             }
                             WorkerMessage::MobileTelemetry {
                                 worker_id: claimed,
@@ -3300,6 +3614,7 @@ async fn handle_multiplexed_connection<
     wire_codec: WireCodec,
     cluster_secret: Option<ClusterSecret>,
     handshake_permit: Option<OwnedSemaphorePermit>,
+    blob_store: Option<Arc<BlobStore>>,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<
         tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
     >,
@@ -3472,9 +3787,7 @@ async fn handle_multiplexed_connection<
         heartbeat_interval_secs,
         protocol_version: PROTOCOL_VERSION_CURRENT,
         features: negotiated_features,
-        message: Some(rusty_grid_core::protocol::master_features::announcement(
-            rusty_grid_core::protocol::master_features::SUPPORTED,
-        )),
+        message: Some(feature_announcement(blob_store.as_ref())),
     };
     if let Err(e) = ctrl_transport.send_msg(&ack).await {
         handle_worker_disconnect_with_broadcast(
@@ -3531,7 +3844,8 @@ async fn handle_multiplexed_connection<
                     Some(msg) => match msg {
                         MasterMessage::AssignTask { .. }
                         | MasterMessage::AssignTaskWithCheckpoint { .. }
-                        | MasterMessage::CancelTask { .. } => match data_out_tx.try_send(msg) {
+                        | MasterMessage::CancelTask { .. }
+                        | MasterMessage::BlobReply { .. } => match data_out_tx.try_send(msg) {
                             Ok(()) => {}
                             Err(tokio::sync::mpsc::error::TrySendError::Full(data_msg)) => {
                                 pending_data.push_back(data_msg);
@@ -3563,7 +3877,8 @@ async fn handle_multiplexed_connection<
                             Some(msg) => match msg {
                                 MasterMessage::AssignTask { .. }
                                 | MasterMessage::AssignTaskWithCheckpoint { .. }
-                                | MasterMessage::CancelTask { .. } => {
+                                | MasterMessage::CancelTask { .. }
+                                | MasterMessage::BlobReply { .. } => {
                                     pending_data.push_back(msg);
                                 }
 
@@ -3613,6 +3928,10 @@ async fn handle_multiplexed_connection<
     let _router_guard = AbortOnDrop(router_task.abort_handle());
     let _ctrl_writer_guard = AbortOnDrop(ctrl_writer_task.abort_handle());
     let _data_writer_guard = AbortOnDrop(data_writer_task.abort_handle());
+    // Blob replies go out through the router, which puts them on the data stream.
+    let blob_service = blob_store
+        .clone()
+        .map(|store| BlobService::spawn(store, outbound_tx.clone()));
 
     let sched_notify = scheduler_notify.clone();
     tokio::spawn(async move {
@@ -3798,6 +4117,9 @@ async fn handle_multiplexed_connection<
                                     }
                                 }
                             }
+                            WorkerMessage::BlobRequest { request_id, request } => {
+                                serve_worker_blob_request(blob_service.as_ref(), &outbound_tx, request_id, request).await;
+                            }
                             other => {
                                 warn!(worker_id = %worker_id, message = %other.variant_name(), "Unexpected message on control stream");
                             }
@@ -3852,9 +4174,13 @@ async fn handle_multiplexed_connection<
                                     &waiters,
                                     worker_id,
                                     session_id,
+                                    blob_store.as_ref(),
                                     #[cfg(feature = "dashboard")]
                                     broadcast_tx.as_ref(),
                                 ).await;
+                            }
+                            WorkerMessage::BlobRequest { request_id, request } => {
+                                serve_worker_blob_request(blob_service.as_ref(), &outbound_tx, request_id, request).await;
                             }
                             other => {
                                 warn!(worker_id = %worker_id, message = %other.variant_name(), "Unexpected message on data stream");
@@ -4026,9 +4352,34 @@ pub struct MasterHandle {
     /// Master's active P2P ticket, if enabled.
     pub p2p_ticket: Option<String>,
     pub cluster_secret: Option<ClusterSecret>,
+    blob_store: Option<Arc<BlobStore>>,
 }
 
 impl MasterHandle {
+    /// The blob store of task inputs and output files, if this master runs one.
+    pub fn blob_store(&self) -> Option<&Arc<BlobStore>> {
+        self.blob_store.as_ref()
+    }
+
+    /// Admits a task for submission through this handle (see `admit_blob_task`); returns
+    /// whether the task id was new, so a refused submission can release its pins.
+    async fn admit(&self, task: &Task) -> GridResult<bool> {
+        if self.queue.get_task(&task.id).await.is_some() {
+            return Ok(false);
+        }
+        admit_blob_task(self.blob_store.as_ref(), task)
+            .await
+            .map_err(GridError::Config)?;
+        Ok(true)
+    }
+
+    /// Releases the pins taken by [`MasterHandle::admit`] for a task the queue refused.
+    fn release_admission(&self, task_id: &TaskId, admitted: bool) {
+        if let (true, Some(store)) = (admitted, self.blob_store.as_ref()) {
+            store.unpin_task(task_id);
+        }
+    }
+
     /// Returns the shared cluster secret, if configured.
     pub fn cluster_secret(&self) -> Option<&ClusterSecret> {
         self.cluster_secret.as_ref()
@@ -4090,7 +4441,15 @@ impl MasterHandle {
 
     /// Submits a task with default priority (0).
     pub async fn submit_task(&self, task: Task) -> GridResult<TaskId> {
-        let id = self.queue.submit(task).await?;
+        let task_id = task.id;
+        let admitted = self.admit(&task).await?;
+        let id = match self.queue.submit(task).await {
+            Ok(id) => id,
+            Err(e) => {
+                self.release_admission(&task_id, admitted);
+                return Err(e);
+            }
+        };
         self.scheduler_notify.notify_one();
         #[cfg(feature = "dashboard")]
         if let Some(ref b_tx) = self.broadcast_tx {
@@ -4108,7 +4467,15 @@ impl MasterHandle {
 
     /// Submits a task with explicit priority.
     pub async fn submit_task_with_priority(&self, task: Task, priority: u32) -> GridResult<TaskId> {
-        let id = self.queue.submit_with_priority(task, priority).await?;
+        let task_id = task.id;
+        let admitted = self.admit(&task).await?;
+        let id = match self.queue.submit_with_priority(task, priority).await {
+            Ok(id) => id,
+            Err(e) => {
+                self.release_admission(&task_id, admitted);
+                return Err(e);
+            }
+        };
         self.scheduler_notify.notify_one();
         #[cfg(feature = "dashboard")]
         if let Some(ref b_tx) = self.broadcast_tx {

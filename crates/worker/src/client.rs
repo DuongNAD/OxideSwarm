@@ -49,6 +49,8 @@ use rusty_grid_core::protocol::{
 use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus};
 
 use crate::backoff::{BackoffConfig, ExponentialBackoff};
+use crate::blob_cache::DEFAULT_BLOB_CACHE_MAX_BYTES;
+use crate::blob_client::{fetch_task_inputs, upload_task_outputs, BlobClient};
 use crate::gpu::{apply_gpu_policy, probe_real_gpu, GpuNotice, GpuRequest, NoticeLevel};
 use crate::heartbeat::{
     current_epoch_secs, spawn_adaptive_heartbeat_task, spawn_mobile_poller, HeartbeatTracker,
@@ -56,8 +58,12 @@ use crate::heartbeat::{
 };
 use crate::identity::{default_worker_id_path, load_or_create_worker_id};
 use crate::process_tree::ProcessPriority;
-use crate::runner::{RunnerConfig, TaskRunner, DEFAULT_MAX_OUTPUT_BYTES, EXIT_CODE_CANCELLED};
+use crate::runner::{
+    cancellation, RunnerConfig, TaskRunner, DEFAULT_MAX_OUTPUT_BYTES, EXIT_CODE_CANCELLED,
+    EXIT_CODE_GENERAL_ERROR,
+};
 use crate::sandbox::SandboxConfig;
+use crate::staging::{OutputLimits, DEFAULT_OUTPUT_LIMIT_BYTES};
 
 /// Execution handle for an actively running task on this worker.
 pub struct TaskExecutionHandle {
@@ -167,18 +173,22 @@ async fn remove_active(table: &ActiveTaskTable, task_id: TaskId, attempt: u64) {
     }
 }
 
-/// RAII guard ensuring active task counter is decremented and table entry is pruned on completion or abort.
+/// RAII guard ensuring active task counter is decremented, output pins are released, and table entry is pruned on completion or abort.
 struct ActiveTaskGuard {
     task_id: TaskId,
     attempt: u64,
     heartbeat_tracker: Arc<HeartbeatTracker>,
     active_task_table: ActiveTaskTable,
+    runner: Option<Arc<TaskRunner>>,
     _permit: OwnedSemaphorePermit,
 }
 
 impl Drop for ActiveTaskGuard {
     fn drop(&mut self) {
         self.heartbeat_tracker.decrement_active_tasks();
+        if let Some(ref runner) = self.runner {
+            runner.release_task_outputs(self.task_id);
+        }
         let table = Arc::clone(&self.active_task_table);
         let (task_id, attempt) = (self.task_id, self.attempt);
         tokio::spawn(async move {
@@ -271,6 +281,12 @@ pub struct WorkerConfig {
     pub keep_sandboxes: bool,
     /// Maximum bytes to buffer for stdout and stderr before truncation.
     pub max_output_bytes: usize,
+    /// Bound of the blob cache of task input and output files in
+    /// `<sandbox base>/cache/blobs` (default: [`DEFAULT_BLOB_CACHE_MAX_BYTES`]).
+    pub blob_cache_bytes: u64,
+    /// Most bytes of output files (`Task::output_globs`) one task may bring back (default:
+    /// [`DEFAULT_OUTPUT_LIMIT_BYTES`]).
+    pub output_limit_bytes: u64,
     /// Whether to enable standby HTTP redirection portal on worker node (default: true).
     pub enable_redirection_portal: bool,
     /// Port for standby HTTP redirection portal (default: 8080).
@@ -328,6 +344,8 @@ impl WorkerConfig {
             sandbox_base_dir: None,
             keep_sandboxes: false,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            blob_cache_bytes: DEFAULT_BLOB_CACHE_MAX_BYTES,
+            output_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
             enable_redirection_portal: true,
             redirection_portal_port: 8080,
             wire_codec: WireCodec::default(),
@@ -504,6 +522,16 @@ impl WorkerConfig {
         self
     }
 
+    pub fn with_blob_cache_bytes(mut self, bytes: u64) -> Self {
+        self.blob_cache_bytes = bytes;
+        self
+    }
+
+    pub fn with_output_limit_bytes(mut self, bytes: u64) -> Self {
+        self.output_limit_bytes = bytes;
+        self
+    }
+
     pub fn with_wire_codec(mut self, codec: WireCodec) -> Self {
         self.wire_codec = codec;
         self
@@ -581,6 +609,11 @@ pub struct WorkerClient {
     /// `WorkerMessage::MobileTelemetry` (see `rusty_grid_core::protocol::master_features`). A
     /// Master built before that variant existed treats it as a corrupt frame and drops the worker.
     master_takes_mobile_telemetry: AtomicBool,
+    /// Whether the Master of the current connection announced a blob store
+    /// (`master_features::BLOBS`): only then are task inputs fetched and outputs uploaded.
+    master_has_blobs: AtomicBool,
+    /// The blob requester of the current session, if its Master has a blob store.
+    blob_client: Arc<std::sync::RwLock<Option<Arc<BlobClient>>>>,
     #[cfg(feature = "p2p")]
     p2p_endpoint: Arc<tokio::sync::Mutex<Option<iroh::Endpoint>>>,
     #[cfg(feature = "p2p")]
@@ -864,8 +897,13 @@ impl WorkerClient {
         sandbox_cfg.keep_sandboxes = config.keep_sandboxes;
         let sandbox_base_dir = sandbox_cfg.base_dir.clone();
 
-        let mut runner_cfg =
-            RunnerConfig::new(sandbox_cfg).with_max_output_bytes(config.max_output_bytes);
+        let mut runner_cfg = RunnerConfig::new(sandbox_cfg)
+            .with_max_output_bytes(config.max_output_bytes)
+            .with_blob_cache_bytes(config.blob_cache_bytes)
+            .with_output_limits(OutputLimits {
+                max_bytes: config.output_limit_bytes,
+                ..OutputLimits::default()
+            });
         if let Some(priority) = config.process_priority {
             runner_cfg = runner_cfg.with_process_priority(priority);
         }
@@ -934,6 +972,8 @@ impl WorkerClient {
             cancelled_unseen: std::sync::Mutex::new(VecDeque::new()),
             master_shutdown_announced: false,
             master_takes_mobile_telemetry: AtomicBool::new(false),
+            master_has_blobs: AtomicBool::new(false),
+            blob_client: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(feature = "p2p")]
             p2p_endpoint: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "p2p")]
@@ -1333,6 +1373,11 @@ impl WorkerClient {
         let runner = Arc::clone(&self.runner);
         let child_pid_clone = Arc::clone(&child_pid);
         let suppress = Arc::clone(&suppress_result);
+        let blob_client = self
+            .blob_client
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
 
         // The table lock is held from before the spawn until the handle is inserted, so the run's
         // own cleanup (which needs the lock) can never overtake the insertion and leave a stale
@@ -1369,6 +1414,7 @@ impl WorkerClient {
                 attempt,
                 heartbeat_tracker: Arc::clone(&tracker),
                 active_task_table: Arc::clone(&table),
+                runner: Some(Arc::clone(&runner)),
                 _permit: permit,
             };
 
@@ -1383,16 +1429,81 @@ impl WorkerClient {
                 return;
             }
 
+            // Every blob the inputs need is in the cache (and pinned) before the run starts.
+            let mut cancel_slot = Some(cancel_rx);
+            let _inputs = if task.inputs.is_empty() {
+                None
+            } else {
+                let fetch = async {
+                    let cache = runner.blob_cache()?;
+                    fetch_task_inputs(&task, blob_client.as_deref(), &cache).await
+                };
+                let failure = tokio::select! {
+                    fetched = fetch => match fetched {
+                        Ok(pin) => Ok(pin),
+                        Err(e) => Err(TaskResult::failure(
+                            worker_id,
+                            task_id,
+                            EXIT_CODE_GENERAL_ERROR,
+                            "",
+                            format!("Fetching input files failed: {e}"),
+                            0,
+                            Some(format!("Input files: {e}")),
+                        )),
+                    },
+                    reason = cancellation(&mut cancel_slot) => Err(TaskResult::failure(
+                        worker_id,
+                        task_id,
+                        EXIT_CODE_CANCELLED,
+                        "",
+                        "",
+                        0,
+                        Some(format!("Cancelled: {reason}")),
+                    )),
+                };
+                match failure {
+                    Ok(pin) => Some(pin),
+                    Err(result) => {
+                        if !suppress.load(Ordering::Acquire) {
+                            let _ = outbound_tx.send(WorkerMessage::from(result)).await;
+                        }
+                        return;
+                    }
+                }
+            };
+
             let effective_checkpoint = checkpoint.or_else(|| task.latest_checkpoint.clone());
-            let result = runner
+            let mut result = runner
                 .execute_task_with_checkpoint(
                     &task,
                     effective_checkpoint.as_ref(),
                     Some(outbound_tx.clone()),
                     Some(child_pid_clone),
-                    Some(cancel_rx),
+                    cancel_slot,
                 )
                 .await;
+
+            // Output files reach the Master's blob store before the result that names them.
+            let used_blobs = _inputs.is_some() || !result.outputs.is_empty();
+            if !result.outputs.is_empty() && !suppress.load(Ordering::Acquire) {
+                match runner.blob_cache() {
+                    Ok(cache) => {
+                        upload_task_outputs(&task, &mut result, blob_client.as_deref(), &cache)
+                            .await
+                    }
+                    Err(e) => {
+                        result.outputs.clear();
+                        result.error = Some(e);
+                    }
+                }
+            }
+            runner.release_task_outputs(task.id);
+            drop(_inputs);
+            if used_blobs {
+                if let Ok(cache) = runner.blob_cache() {
+                    cache.evict_to_fit();
+                }
+            }
 
             if !suppress.load(Ordering::Acquire) {
                 let _ = outbound_tx.send(WorkerMessage::from(result)).await;
@@ -1951,6 +2062,12 @@ impl WorkerClient {
         // Only to a Master that said it can read the report (an older one would drop us for it).
         let report_telemetry = self.master_takes_mobile_telemetry.load(Ordering::Acquire);
         let mut farewell: Option<WorkerMessage> = None;
+        // Blob requests ride the data queue: the QUIC data stream, never the control stream.
+        let blob_client = self
+            .master_has_blobs
+            .load(Ordering::Acquire)
+            .then(|| BlobClient::new(session.data_tx.clone()));
+        *self.blob_client.write().unwrap_or_else(|e| e.into_inner()) = blob_client.clone();
 
         let outcome: GridResult<()> = loop {
             tokio::select! {
@@ -1993,6 +2110,14 @@ impl WorkerClient {
                             }
                             MasterMessage::UnknownVariant { tag, ref raw_bytes } => {
                                 warn!(tag, bytes_len = raw_bytes.len(), "Ignoring unknown MasterMessage variant");
+                            }
+                            MasterMessage::BlobReply { request_id, reply } => {
+                                let delivered = blob_client
+                                    .as_ref()
+                                    .is_some_and(|client| client.deliver(request_id, reply));
+                                if !delivered {
+                                    debug!(request_id, "Blob reply for a request nobody waits for");
+                                }
                             }
                         },
                         Some(Inbound::Closed(lane)) => {
@@ -2066,6 +2191,14 @@ impl WorkerClient {
 
         // Cleanly terminate heartbeat task and the lanes
         heartbeat_handle.stop().await;
+        if let Some(client) = self
+            .blob_client
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            client.close();
+        }
         session.close(farewell).await;
         #[cfg(feature = "p2p")]
         {
@@ -2109,6 +2242,7 @@ impl WorkerClient {
         // Whatever the previous connection's Master could do says nothing about this one.
         self.master_takes_mobile_telemetry
             .store(false, Ordering::Release);
+        self.master_has_blobs.store(false, Ordering::Release);
         let mut capabilities = self.capabilities.clone();
         capabilities.mobile = self.mobile.snapshot();
         let register_msg = WorkerMessage::Register {
@@ -2182,6 +2316,10 @@ impl WorkerClient {
                 );
                 self.master_takes_mobile_telemetry
                     .store(takes_telemetry, Ordering::Release);
+                self.master_has_blobs.store(
+                    master_features::announced(message.as_deref(), master_features::BLOBS),
+                    Ordering::Release,
+                );
                 if !takes_telemetry && self.mobile.live_status().is_some() {
                     info!(
                         worker_id = %self.worker_id,
@@ -3074,6 +3212,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_worker_refuses_register_ack_with_protocol_version_1() {
+        let (client_io, master_io) = tokio::io::duplex(4096);
+        let client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999"));
+        let worker_id = client.worker_id();
+
+        tokio::spawn(async move {
+            let mut master_transport = MessageTransport::new(master_io);
+            let _ = master_transport
+                .recv_msg::<WorkerMessage>()
+                .await
+                .unwrap()
+                .unwrap();
+            master_transport
+                .send_msg(&MasterMessage::RegisterAck {
+                    accepted: true,
+                    worker_id,
+                    heartbeat_interval_secs: 3,
+                    message: None,
+                    protocol_version: 1,
+                    features: ProtocolCapabilities::all_supported(),
+                })
+                .await
+                .unwrap();
+        });
+
+        let mut client_transport = MessageTransport::new(client_io);
+        let err = client
+            .perform_handshake(&mut client_transport)
+            .await
+            .expect_err("worker must refuse a version 1 RegisterAck");
+        let msg = err.to_string();
+        assert!(msg.contains("1") && msg.contains("2"), "{msg}");
+    }
+
+    #[tokio::test]
     async fn test_worker_redirection_portal() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -3236,6 +3409,7 @@ mod tests {
             attempt: 1,
             heartbeat_tracker: Arc::new(HeartbeatTracker::new(Arc::new(AtomicUsize::new(1)))),
             active_task_table: Arc::clone(&table),
+            runner: None,
             _permit: permit,
         });
         tokio::time::sleep(Duration::from_millis(100)).await;

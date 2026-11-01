@@ -101,6 +101,10 @@ name = "cluster_record_layer_e2e"
 path = "../../tests/cluster_record_layer_e2e.rs"
 
 [[test]]
+name = "blob_transfer_e2e"
+path = "../../tests/blob_transfer_e2e.rs"
+
+[[test]]
 name = "cli_worker_signals_e2e"
 path = "../../tests/cli_worker_signals_e2e.rs"
 

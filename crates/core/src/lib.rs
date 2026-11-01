@@ -1,6 +1,8 @@
 //! Core protocol wire types, framing codecs, capabilities, task schemas, and error hierarchy for `rusty_grid`.
 
 pub mod arbitrage;
+pub mod blob;
+pub mod blob_transfer;
 pub mod capabilities;
 pub mod cluster_auth;
 pub mod discovery;

@@ -133,6 +133,7 @@ fn test_binary_non_utf8_stdout_stderr_slicing_and_cow() {
         error: None,
         asset_bytes: None,
         artifacts: Vec::new(),
+        outputs: Vec::new(),
     };
 
     let cow_stdout = result.stdout_str();
@@ -188,6 +189,7 @@ fn test_large_payload_5mb_bincode_and_json_roundtrip() {
         error: None,
         asset_bytes: None,
         artifacts: Vec::new(),
+        outputs: Vec::new(),
     };
 
     // --- Bincode Wire Codec Roundtrip ---
@@ -231,6 +233,7 @@ fn test_large_payload_5mb_bincode_and_json_roundtrip() {
         error: None,
         asset_bytes: None,
         artifacts: Vec::new(),
+        outputs: Vec::new(),
     };
 
     let json_bytes = serialize_message(&json_msg, WireCodec::Json)

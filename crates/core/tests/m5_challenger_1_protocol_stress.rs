@@ -335,6 +335,7 @@ fn test_adv_worker_message_all_variants_bincode_inbound() {
                 error: None,
                 asset_bytes: None,
                 artifacts: Vec::new(),
+                outputs: Vec::new(),
             },
         ),
         (

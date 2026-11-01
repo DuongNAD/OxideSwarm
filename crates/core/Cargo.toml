@@ -26,6 +26,9 @@ iroh = { workspace = true, optional = true }
 ring = "0.17"
 socket2 = { version = "0.6", features = ["all"] }
 
+# Content-addressed blob ids (already in Cargo.lock via iroh).
+blake3 = "1.8"
+
 [features]
 default = ["p2p"]
 p2p = ["dep:iroh"]
