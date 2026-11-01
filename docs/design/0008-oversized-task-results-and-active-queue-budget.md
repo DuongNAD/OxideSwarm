@@ -38,7 +38,7 @@ Behaviour before this change:
 ## Non-goals
 
 - Raising `MAX_FRAME_SIZE` above 64 MiB or streaming inline `asset_bytes` across multiple frames.
-  Large files should use the content-addressed blob store (`docs/design/0006-content-addressed-task-files.md`).
+  Large files should use the content-addressed blob store (`docs/design/0006-content-addressed-data-plane.md`).
 - Persisting active or terminal tasks to disk.
 
 ## Design
@@ -51,13 +51,16 @@ When `MessageWriter::send_msg` returns `ProtocolError::FrameTooLarge { size, max
 
 1. It keeps a non-zero `exit_code` from the original result, or uses `EXIT_CODE_GENERAL_ERROR` (1)
    when the original `exit_code` was 0.
-2. It always keeps `outputs` (content-addressed blob references) and `device_name`.
+2. It always keeps `outputs` (content-addressed blob references), `device_name`, and
+   `is_gpu_executed`.
 3. It drops payload fields in order and stops at the first step whose serialized `WorkerMessage`
-   fits within `MAX_FRAME_SIZE` (including the 17-byte AEAD overhead when the lane is encrypted):
+   fits within `MAX_FRAME_SIZE` (including the 25-byte `AEAD_RECORD_OVERHEAD` when the lane is
+   encrypted):
    - first `asset_bytes`,
    - then `artifacts`,
    - then `stdout` and `stderr`.
-4. It records the reason — naming `size`, `max`, and the fields that were dropped — in `error` and
+4. It records the reason — naming `size`, `max`, and the fields that were dropped — in `error`
+   (preserving up to 4096 bytes of any existing `result.error` text ahead of the reason) and
    appends it to `stderr` (or sets `stderr` to the reason when `stdout` and `stderr` themselves had
    to be dropped). When only `asset_bytes` is too large, the client receives the engine's `stdout`
    and `stderr` together with the reason.
@@ -113,12 +116,15 @@ returns `GridError::QueueByteLimitExceeded` or `GridError::QueueFull`:
 - Otherwise, `submit_and_await` waits in 25 ms steps and retries until room opens up or the job's
   idle timeout expires. On timeout it returns `GridError::Timeout` naming the queue-limit error
   that prevented submission.
+- `MapReduceEngine::execute` honours positive `spec.timeout_secs` values directly (including values
+  under 60 s, such as `--timeout-secs 1`), falling back to 60 s only when `spec.timeout_secs == 0`.
 
 ## Compatibility
 
 No wire format tags or message layouts changed. `GridError::QueueByteLimitExceeded` is a library
 error variant serialized into existing `ClientResponse::Error { message }` and HTTP 503 JSON error
-responses.
+responses. Map/Reduce jobs with an explicit positive `timeout_secs` under 60 s now time out after
+`timeout_secs` rather than being clamped up to a 60 s minimum.
 
 ## Security
 

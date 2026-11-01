@@ -877,12 +877,7 @@ impl TaskRunner {
         }
 
         let compute_fut = async {
-            if cfg!(test) && test_name == "oversized_result" {
-                if duration_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(duration_ms)).await;
-                }
-                "x".repeat(rusty_grid_core::protocol::MAX_FRAME_SIZE)
-            } else if cfg!(test) && test_name == "oversized_asset" {
+            if cfg!(test) && test_name == "oversized_asset" {
                 if duration_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(duration_ms)).await;
                 }

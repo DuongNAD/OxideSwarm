@@ -1324,6 +1324,85 @@ mod tests {
         assert_eq!(result.output["alpha"].as_i64(), Some(1));
         assert_eq!(result.output["beta"].as_i64(), Some(2));
         assert_eq!(result.output["gamma"].as_i64(), Some(1));
+
+        // 3. Task-count capacity: `capacity: Some(0)` fails immediately with `QueueFull { capacity: 0 }`
+        //    (M2b), while `capacity: Some(1)` waits for a queued blocker to finish (M2c).
+        let zero_cap_queue = TaskQueue::with_retention_limits(
+            crate::queue::RetryPolicy::default(),
+            Some(0),
+            crate::queue::DEFAULT_MAX_TERMINAL_TASKS,
+            crate::queue::DEFAULT_MAX_TERMINAL_BYTES,
+            crate::queue::DEFAULT_MAX_ACTIVE_BYTES,
+        );
+        let zero_engine = MapReduceEngine::new(
+            zero_cap_queue,
+            Arc::new(Notify::new()),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
+        let zero_err = zero_engine
+            .execute(word_job(vec!["alpha".into()], 1, sum_reducer()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(zero_err, GridError::QueueFull { capacity: 0 }),
+            "expected immediate QueueFull {{ capacity: 0 }}, got {zero_err:?}"
+        );
+
+        let one_cap_queue = TaskQueue::with_retention_limits(
+            crate::queue::RetryPolicy::default(),
+            Some(1),
+            crate::queue::DEFAULT_MAX_TERMINAL_TASKS,
+            crate::queue::DEFAULT_MAX_TERMINAL_BYTES,
+            crate::queue::DEFAULT_MAX_ACTIVE_BYTES,
+        );
+        let one_waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let one_engine = MapReduceEngine::new(
+            one_cap_queue.clone(),
+            Arc::new(Notify::new()),
+            Arc::clone(&one_waiters),
+        );
+        let cap_blocker = Task::new(
+            TaskSpec::Command {
+                program: "sleep".into(),
+                args: vec!["10".into()],
+                env: Default::default(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 60),
+        );
+        let cap_blocker_id = one_cap_queue.submit(cap_blocker).await.unwrap();
+        let one_worker = spawn_mock_worker(
+            one_cap_queue.clone(),
+            Arc::clone(&one_waiters),
+            |_| true,
+            move |task| {
+                if task.id == cap_blocker_id {
+                    return None;
+                }
+                word_count_answer(task)
+            },
+        );
+        let one_releaser = {
+            let q = one_cap_queue.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                q.cancel_task(&cap_blocker_id, Some("free slot".into()))
+                    .await
+                    .unwrap();
+            })
+        };
+        let one_res = tokio::time::timeout(
+            Duration::from_secs(5),
+            one_engine.execute(word_job(vec!["alpha beta".into()], 1, sum_reducer())),
+        )
+        .await
+        .expect("job completes after capacity slot is freed")
+        .unwrap();
+        one_releaser.abort();
+        one_worker.abort();
+        assert_eq!(one_res.status, "Completed");
+        assert_eq!(one_res.output["alpha"].as_i64(), Some(1));
     }
 
     #[tokio::test]

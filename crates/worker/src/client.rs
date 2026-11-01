@@ -649,6 +649,18 @@ fn closed_queue() -> mpsc::Receiver<WorkerMessage> {
     rx
 }
 
+/// Truncates `text` to at most `max_bytes` on a UTF-8 character boundary.
+fn truncate_utf8_prefix(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// Rewrites an oversized `TaskResult` into a failed `WorkerMessage::TaskResult` that fits within
 /// `MAX_FRAME_SIZE` by dropping `asset_bytes` first, then `artifacts`, and then `stdout` and
 /// `stderr`, stopping as soon as the serialized frame fits.
@@ -659,12 +671,18 @@ fn rewrite_oversized_task_result(
     codec: WireCodec,
     encrypted: bool,
 ) -> WorkerMessage {
+    const MAX_PRESERVED_ERROR_BYTES: usize = 4096;
+
     let exit_code = if result.exit_code != 0 {
         result.exit_code
     } else {
         EXIT_CODE_GENERAL_ERROR
     };
-    let overhead = if encrypted { 17 } else { 0 };
+    let overhead = if encrypted {
+        rusty_grid_core::protocol::AEAD_RECORD_OVERHEAD
+    } else {
+        0
+    };
     let fits = |msg: &WorkerMessage| {
         rusty_grid_core::protocol::serialize_message(msg, codec)
             .is_ok_and(|bytes| bytes.len().saturating_add(overhead) <= max)
@@ -693,6 +711,13 @@ fn rewrite_oversized_task_result(
             "Task result size ({size} bytes) exceeds maximum frame limit ({max} bytes); dropped {}",
             dropped.join(", ")
         );
+        let combined_error = match result.error.as_deref().filter(|s| !s.is_empty()) {
+            Some(orig) => {
+                let prefix = truncate_utf8_prefix(orig, MAX_PRESERVED_ERROR_BYTES);
+                format!("{prefix}; {reason}")
+            }
+            None => reason.clone(),
+        };
         let (stdout, stderr) = if keep_streams {
             let mut err_bytes = result.stderr.0.to_vec();
             if !err_bytes.is_empty() && !err_bytes.ends_with(b"\n") {
@@ -706,7 +731,7 @@ fn rewrite_oversized_task_result(
         } else {
             (
                 rusty_grid_core::task::Bytes::new(),
-                rusty_grid_core::task::Bytes::from(reason.clone()),
+                rusty_grid_core::task::Bytes::from(reason),
             )
         };
         let mut candidate = TaskResult::failure(
@@ -716,7 +741,7 @@ fn rewrite_oversized_task_result(
             stdout,
             stderr,
             result.execution_time_ms,
-            Some(reason),
+            Some(combined_error),
         );
         candidate.is_gpu_executed = result.is_gpu_executed;
         candidate.device_name = result.device_name.clone();
@@ -4047,7 +4072,7 @@ mod tests {
             rusty_grid_core::task::OutputArtifact::new("inline.txt", b"small-artifact".to_vec());
 
         // 1. 70 MiB asset_bytes: drops only asset_bytes, keeping artifacts, stdout, stderr,
-        //    outputs, device_name, and non-zero exit_code.
+        //    outputs, device_name, non-zero exit_code, and original error text.
         let mut r1 = TaskResult::failure(
             worker_id,
             task_id,
@@ -4055,7 +4080,7 @@ mod tests {
             "engine stdout",
             "engine stderr",
             42,
-            None,
+            Some("ORIGINAL ENGINE ERROR".to_string()),
         );
         r1.device_name = Some("long-device-".repeat(30));
         r1.asset_bytes = Some(rusty_grid_core::task::Bytes::from(vec![
@@ -4093,6 +4118,10 @@ mod tests {
                 assert!(stderr_str.contains("engine stderr"), "{stderr_str}");
                 assert!(stderr_str.contains("dropped asset_bytes"), "{stderr_str}");
                 let err_str = error.unwrap();
+                assert!(
+                    err_str.contains("ORIGINAL ENGINE ERROR"),
+                    "original error text must be preserved: {err_str}"
+                );
                 assert!(err_str.contains("dropped asset_bytes"), "{err_str}");
                 assert!(!err_str.contains("artifacts"), "{err_str}");
             }
@@ -4135,6 +4164,125 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_lane_writer_accounts_for_full_25_byte_aead_overhead() {
+        use rusty_grid_core::protocol::{
+            serialize_message, AeadReaderSession, AeadWriterSession, AEAD_RECORD_OVERHEAD,
+            MAX_FRAME_SIZE,
+        };
+
+        let key = [0x42u8; 32];
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let mut writer = MessageWriter::new(a);
+        writer.enable_encryption(AeadWriterSession::new(&key));
+        let mut peer = MessageReader::new(b);
+        peer.enable_encryption(AeadReaderSession::new(&key));
+
+        let (_control_tx, control_rx) = mpsc::channel(8);
+        let (data_tx, data_rx) = mpsc::channel(8);
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let (_closing_tx, closing_rx) = watch::channel(false);
+        let lane_task = tokio::spawn(lane_writer(
+            writer, control_rx, data_rx, "enc-test", closing_rx, events_tx,
+        ));
+
+        let worker_id = Uuid::new_v4();
+        let oversized_id = TaskId::new();
+        let normal_id = TaskId::new();
+
+        // Measure the base serialized size of `build(true, true)` with empty stdout and an
+        // 8-digit `size` (matching the ~67_110_000-byte oversized frame) so we can size `stdout`
+        // to place the `build(true, true)` plaintext frame at `MAX_FRAME_SIZE - 20` bytes
+        // (inside the 8-byte window `MAX_FRAME_SIZE - 25 < len <= MAX_FRAME_SIZE - 17`).
+        let mut probe = TaskResult::success(worker_id, oversized_id, "", 5, false);
+        probe.asset_bytes = Some(rusty_grid_core::task::Bytes::from(vec![0u8; 1024]));
+        let base_rewritten = rewrite_oversized_task_result(
+            probe,
+            67_110_000,
+            MAX_FRAME_SIZE,
+            WireCodec::Bincode,
+            false,
+        );
+        let base_len = serialize_message(&base_rewritten, WireCodec::Bincode)
+            .unwrap()
+            .len();
+        let target_plaintext_len = MAX_FRAME_SIZE - 20;
+        assert!(
+            target_plaintext_len + AEAD_RECORD_OVERHEAD > MAX_FRAME_SIZE
+                && target_plaintext_len + 17 <= MAX_FRAME_SIZE
+        );
+        let stdout_len = target_plaintext_len - base_len;
+
+        let mut window_result = TaskResult::success(
+            worker_id,
+            oversized_id,
+            String::from_utf8(vec![b's'; stdout_len]).unwrap(),
+            5,
+            false,
+        );
+        window_result.asset_bytes = Some(rusty_grid_core::task::Bytes::from(vec![0u8; 1024]));
+
+        data_tx
+            .send(WorkerMessage::from(window_result))
+            .await
+            .unwrap();
+        data_tx
+            .send(WorkerMessage::from(TaskResult::success(
+                worker_id,
+                normal_id,
+                "still-alive",
+                2,
+                false,
+            )))
+            .await
+            .unwrap();
+
+        let first = tokio::time::timeout(Duration::from_secs(5), peer.recv_msg::<WorkerMessage>())
+            .await
+            .expect("rewritten frame arrives on encrypted lane")
+            .expect("encrypted frame must not fail AEAD limit")
+            .expect("first message");
+        match first {
+            WorkerMessage::TaskResult {
+                task_id,
+                exit_code,
+                stdout,
+                error,
+                ..
+            } => {
+                assert_eq!(task_id, oversized_id);
+                assert_ne!(exit_code, 0);
+                assert!(
+                    stdout.0.is_empty(),
+                    "frame at MAX_FRAME_SIZE - 20 must drop stdout on an encrypted lane"
+                );
+                let err_str = error.unwrap_or_default();
+                assert!(err_str.contains("dropped asset_bytes, stdout"), "{err_str}");
+            }
+            other => panic!("expected rewritten TaskResult, got {other:?}"),
+        }
+
+        let second = tokio::time::timeout(Duration::from_secs(5), peer.recv_msg::<WorkerMessage>())
+            .await
+            .expect("second frame arrives on encrypted lane")
+            .unwrap()
+            .expect("second message");
+        match second {
+            WorkerMessage::TaskResult {
+                task_id, stdout, ..
+            } => {
+                assert_eq!(task_id, normal_id);
+                assert_eq!(stdout.0.as_ref(), b"still-alive");
+            }
+            other => panic!("expected normal second TaskResult, got {other:?}"),
+        }
+        assert!(
+            events_rx.try_recv().is_err(),
+            "encrypted lane must not emit Inbound::Failed"
+        );
+        lane_task.abort();
     }
 
     #[tokio::test]
