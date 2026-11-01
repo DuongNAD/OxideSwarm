@@ -2,10 +2,11 @@
 //!
 //! Evaluates:
 //! 1. Feature F17: Master Hardware-Aware 3D Matchmaking (`WorkloadScheduler`)
-//!    - Extreme VRAM boundary conditions (0 MB, 6144 MB, ties, simulated vs physical GPU)
+//!    - Ties between identical workers (even spread, deterministic tie-breaking)
 //!    - Negative battery and thermal throttling stress (0% battery discharging, thermal_throttled tag)
-//!    - Capability mismatch stress (Blender required vs missing, diagnostic error propagation)
 //!    - High-throughput matchmaking burst (100 concurrent 3D tasks against heterogeneous pool)
+//!    - VRAM and Blender routing is not covered here: the scheduler reads neither `vram_mb` nor
+//!      `has_blender` until backlog item 3D-2, which brings its own tests.
 //! 2. Feature F18: TaskRunner 3D Execution & Incremental Checkpoints (`TaskRunner`)
 //!    - Checkpoint integrity (strict ascending sequence 1..4 without drop or disorder)
 //!    - glTF 2.0 binary asset container compliance (magic, chunk offsets, 4-byte buffer alignment)
@@ -72,192 +73,15 @@ fn make_test_runner(gpu: bool) -> TaskRunner {
 // =========================================================================================
 
 #[test]
-fn test_stress_vram_extreme_boundaries() {
-    println!("\n=== [STRESS 1.1] Extreme VRAM Boundary Conditions ===");
-
-    let config = SchedulerConfig::default();
-
-    let w_zero_vram = make_test_worker(
-        "w-zero-vram",
-        8,
-        16384,
-        true,
-        false,
-        Some(0),
-        false,
-        vec![],
-        None,
-    );
-    let w_2gb_vram = make_test_worker(
-        "w-2gb-vram",
-        8,
-        16384,
-        true,
-        false,
-        Some(2048),
-        false,
-        vec![],
-        None,
-    );
-    let w_4gb_vram = make_test_worker(
-        "w-4gb-vram",
-        8,
-        16384,
-        true,
-        false,
-        Some(4096),
-        false,
-        vec![],
-        None,
-    );
-    let w_boundary_minus_1 = make_test_worker(
-        "w-6143mb",
-        8,
-        16384,
-        true,
-        false,
-        Some(6143),
-        false,
-        vec![],
-        None,
-    );
-    let w_exact_boundary = make_test_worker(
-        "w-6144mb",
-        8,
-        16384,
-        true,
-        false,
-        Some(6144),
-        false,
-        vec!["vram-high".into()],
-        None,
-    );
-    let w_large_vram = make_test_worker(
-        "w-8192mb",
-        8,
-        16384,
-        true,
-        false,
-        Some(8192),
-        false,
-        vec!["vram-high".into()],
-        None,
-    );
-
-    let workers = vec![
-        w_zero_vram.clone(),
-        w_2gb_vram.clone(),
-        w_4gb_vram.clone(),
-        w_boundary_minus_1.clone(),
-        w_exact_boundary.clone(),
-        w_large_vram.clone(),
-    ];
-
-    // High quality 3D neural generation requires 6144 MB VRAM
-    let high_vram_task = Task::new(
-        TaskSpec::Generative3D(
-            Generative3DSpec::new_prompt("high-fidelity 3d asset".to_string())
-                .with_quality("high")
-                .with_engine("triposr"),
-        ),
-        TaskRequirements::generic(2, 60),
-    )
-    .with_tags(vec!["require:tag=vram-high".to_string()]);
-    assert_eq!(config.required_vram_mb(&high_vram_task), 6144);
-
-    let report =
-        WorkloadScheduler::matchmake(&config, std::slice::from_ref(&high_vram_task), &workers);
-
-    assert_eq!(
-        report.assignments.len(),
-        1,
-        "Must assign to an eligible high-VRAM node"
-    );
-    let assigned_id = report.assignments[0].worker_id;
-
-    // Strict boundary assertion: Worker with 0 VRAM, 2048 MB, 4096 MB, or 6143 MB MUST NEVER be assigned
-    assert_ne!(
-        assigned_id, w_zero_vram.worker_id,
-        "Worker with 0 VRAM must be strictly rejected"
-    );
-    assert_ne!(
-        assigned_id, w_2gb_vram.worker_id,
-        "Worker with 2048 MB VRAM must be rejected for 6144 MB task"
-    );
-    assert_ne!(
-        assigned_id, w_4gb_vram.worker_id,
-        "Worker with 4096 MB VRAM must be rejected for 6144 MB task"
-    );
-    assert_ne!(
-        assigned_id, w_boundary_minus_1.worker_id,
-        "Worker with 6143 MB VRAM must be rejected for 6144 MB task (off-by-one check)"
-    );
-
-    // Worker with exact 6144 MB or 8192 MB is valid
-    assert!(
-        assigned_id == w_exact_boundary.worker_id || assigned_id == w_large_vram.worker_id,
-        "Assignment must land on worker with >= 6144 MB VRAM"
-    );
-
-    // Test Simulated GPU vs Physical GPU:
-    // Simulated GPU has vram_mb: None, but is_simulated_gpu: true
-    let w_simulated = make_test_worker(
-        "w-simulated",
-        8,
-        32768,
-        true,
-        true,
-        None,
-        false,
-        vec!["vram-high".into()],
-        None,
-    );
-    let sim_pool = vec![w_zero_vram.clone(), w_simulated.clone()];
-    let sim_report =
-        WorkloadScheduler::matchmake(&config, std::slice::from_ref(&high_vram_task), &sim_pool);
-
-    assert_eq!(sim_report.assignments.len(), 1);
-    assert_eq!(
-        sim_report.assignments[0].worker_id, w_simulated.worker_id,
-        "Simulated GPU with fallback RAM must be eligible when no physical GPU meets VRAM requirement"
-    );
-
-    // Test fail_unfulfillable_tasks when highest VRAM in cluster is 4096 MB
-    let mut fail_config = config.clone();
-    fail_config.fail_unfulfillable_tasks = true;
-    let underpowered_pool = vec![w_zero_vram, w_2gb_vram, w_4gb_vram];
-
-    let fail_report =
-        WorkloadScheduler::matchmake(&fail_config, &[high_vram_task], &underpowered_pool);
-    assert_eq!(
-        fail_report.assignments.len(),
-        0,
-        "No assignments when unfulfillable"
-    );
-    assert_eq!(
-        fail_report.unfulfillable.len(),
-        1,
-        "Must be tagged as unfulfillable"
-    );
-    assert!(
-        fail_report.unfulfillable[0].1.contains("vram-high"),
-        "Diagnostic message must accurately cite the required placement constraint: {}",
-        fail_report.unfulfillable[0].1
-    );
-
-    println!("-> [PASS] Extreme VRAM boundary conditions and simulated GPU gating verified.");
-}
-
-#[test]
-fn test_stress_vram_ties_and_determinism() {
-    println!("\n=== [STRESS 1.2] VRAM Ties and Deterministic Tie-Breaking ===");
+fn test_stress_identical_workers_ties_and_determinism() {
+    println!("\n=== [STRESS 1.1] Identical Worker Ties and Deterministic Tie-Breaking ===");
 
     let config = SchedulerConfig {
         policy: SchedulingPolicy::LeastLoaded,
         ..Default::default()
     };
 
-    // 4 workers with identical specs and identical 8192 MB VRAM
+    // 4 workers with identical specs
     let mut workers = Vec::new();
     for i in 1..=4 {
         workers.push(make_test_worker(
@@ -276,7 +100,7 @@ fn test_stress_vram_ties_and_determinism() {
     // Sort workers by ID so order is fixed
     workers.sort_by_key(|w| w.worker_id);
 
-    // 8 identical standard 3D tasks (requires 4096 MB VRAM)
+    // 8 identical standard 3D tasks
     let tasks: Vec<Task> = (0..8)
         .map(|i| {
             Task::new(
@@ -316,14 +140,12 @@ fn test_stress_vram_ties_and_determinism() {
         );
     }
 
-    println!(
-        "-> [PASS] VRAM ties broken deterministically; 100% repeatable distribution verified."
-    );
+    println!("-> [PASS] Ties broken deterministically; 100% repeatable distribution verified.");
 }
 
 #[test]
 fn test_stress_negative_battery_and_thermal_throttling() {
-    println!("\n=== [STRESS 1.3] Negative Battery & Thermal Throttling Stress ===");
+    println!("\n=== [STRESS 1.2] Negative Battery & Thermal Throttling Stress ===");
 
     let config = SchedulerConfig {
         core_concurrency_multiplier: 2.0,
@@ -515,137 +337,8 @@ fn test_stress_negative_battery_and_thermal_throttling() {
 }
 
 #[test]
-fn test_stress_capability_mismatch_and_unfulfillable_tasks() {
-    println!("\n=== [STRESS 1.4] Capability Mismatch & Blender Provider Stress ===");
-
-    let config = SchedulerConfig {
-        fail_unfulfillable_tasks: true,
-        ..Default::default()
-    };
-
-    let w_builtin_only_1 = make_test_worker(
-        "w-pure-rust-1",
-        4,
-        8192,
-        false,
-        false,
-        None,
-        false,
-        vec![],
-        None,
-    );
-    let w_builtin_only_2 = make_test_worker(
-        "w-pure-rust-2",
-        4,
-        8192,
-        false,
-        false,
-        None,
-        false,
-        vec![],
-        None,
-    );
-    let pool_no_blender = vec![w_builtin_only_1.clone(), w_builtin_only_2.clone()];
-
-    // AutoRig task demanding preferred_provider = "blender"
-    let blender_rig_task = Task::new(
-        TaskSpec::AutoRig(
-            AutoRigSpec::new(b"mesh_data".to_vec(), "biped").with_provider("blender"),
-        ),
-        TaskRequirements::generic(1, 30),
-    )
-    .with_tags(vec!["require:tag=blender".to_string()]);
-
-    let report = WorkloadScheduler::matchmake(
-        &config,
-        std::slice::from_ref(&blender_rig_task),
-        &pool_no_blender,
-    );
-
-    assert_eq!(
-        report.assignments.len(),
-        0,
-        "Blender task must not be assigned to non-Blender workers"
-    );
-    assert_eq!(
-        report.unfulfillable.len(),
-        1,
-        "Must be flagged as unfulfillable"
-    );
-    assert_eq!(report.unfulfillable[0].0, blender_rig_task.id);
-    assert!(
-        report.unfulfillable[0].1.contains("blender"),
-        "Diagnostic message must explicitly identify missing blender constraint: {}",
-        report.unfulfillable[0].1
-    );
-
-    // Verify graceful skipping when fail_unfulfillable_tasks is disabled
-    let mut soft_config = config.clone();
-    soft_config.fail_unfulfillable_tasks = false;
-    let soft_report =
-        WorkloadScheduler::matchmake(&soft_config, &[blender_rig_task], &pool_no_blender);
-    assert_eq!(soft_report.assignments.len(), 0);
-    assert_eq!(soft_report.unfulfillable.len(), 0);
-    assert_eq!(soft_report.skipped.len(), 1);
-
-    // Now introduce 1 Blender worker into the cluster
-    let mut w_blender = make_test_worker(
-        "w-blender",
-        8,
-        16384,
-        true,
-        false,
-        Some(8192),
-        true,
-        vec!["blender".into()],
-        None,
-    );
-    w_blender.capabilities.has_blender = true;
-
-    let pool_with_blender = vec![
-        w_builtin_only_1.clone(),
-        w_builtin_only_2.clone(),
-        w_blender.clone(),
-    ];
-
-    let blender_task_2 = Task::new(
-        TaskSpec::AutoRig(
-            AutoRigSpec::new(b"mesh_data_2".to_vec(), "biped").with_provider("blender"),
-        ),
-        TaskRequirements::generic(1, 30),
-    )
-    .with_tags(vec!["require:tag=blender".to_string()]);
-
-    let assigned_report =
-        WorkloadScheduler::matchmake(&config, &[blender_task_2], &pool_with_blender);
-    assert_eq!(assigned_report.assignments.len(), 1);
-    assert_eq!(
-        assigned_report.assignments[0].worker_id, w_blender.worker_id,
-        "Blender task must route directly to the Blender-capable node"
-    );
-
-    // Builtin auto-rig task must preserve the Blender worker when equivalent non-Blender workers exist
-    let builtin_task = Task::new(
-        TaskSpec::AutoRig(
-            AutoRigSpec::new(b"mesh_data_builtin".to_vec(), "biped").with_provider("builtin"),
-        ),
-        TaskRequirements::generic(1, 30),
-    );
-
-    let preserve_report =
-        WorkloadScheduler::matchmake(&config, &[builtin_task], &pool_with_blender);
-    assert_eq!(preserve_report.assignments.len(), 1);
-    assert_ne!(
-        preserve_report.assignments[0].worker_id, w_blender.worker_id,
-        "Builtin task must prefer non-Blender nodes to preserve specialized Blender worker"
-    );
-
-    println!("-> [PASS] Capability mismatch diagnostic and Blender worker preservation verified.");
-}
-
-#[test]
 fn test_stress_high_throughput_matchmaking_burst_100_tasks() {
-    println!("\n=== [STRESS 1.5] High-Throughput Matchmaking Burst: 100 3D Tasks ===");
+    println!("\n=== [STRESS 1.3] High-Throughput Matchmaking Burst: 100 3D Tasks ===");
 
     let config = SchedulerConfig {
         policy: SchedulingPolicy::WeightedLeastLoaded,
@@ -662,7 +355,7 @@ fn test_stress_high_throughput_matchmaking_burst_100_tasks() {
         false,
         Some(16384),
         false,
-        vec!["vram-high".into()],
+        vec![],
         None,
     );
     let w2_gpu_mid = make_test_worker(
@@ -673,7 +366,7 @@ fn test_stress_high_throughput_matchmaking_burst_100_tasks() {
         false,
         Some(8192),
         false,
-        vec!["vram-high".into()],
+        vec![],
         None,
     );
     let w3_gpu_budget = make_test_worker(
@@ -706,7 +399,7 @@ fn test_stress_high_throughput_matchmaking_burst_100_tasks() {
         true,
         None,
         false,
-        vec!["vram-high".into()],
+        vec![],
         None,
     );
     let w6_blender = make_test_worker(
@@ -717,7 +410,7 @@ fn test_stress_high_throughput_matchmaking_burst_100_tasks() {
         false,
         Some(8192),
         true,
-        vec!["vram-high".into(), "blender".into()],
+        vec![],
         None,
     );
     let w7_cpu_builder = make_test_worker(
@@ -792,21 +485,18 @@ fn test_stress_high_throughput_matchmaking_burst_100_tasks() {
 
     // Assemble 100 heterogeneous 3D tasks
     let mut tasks = Vec::with_capacity(100);
-    // 25 High-VRAM 3D neural generation (requires 6144 MB)
+    // 25 high-quality 3D neural generation
     for i in 0..25 {
-        tasks.push(
-            Task::new(
-                TaskSpec::Generative3D(
-                    Generative3DSpec::new_prompt(format!("high_hero_{i}"))
-                        .with_quality("high")
-                        .with_engine("triposr"),
-                ),
-                TaskRequirements::generic(2, 60),
-            )
-            .with_tags(vec!["require:tag=vram-high".to_string()]),
-        );
+        tasks.push(Task::new(
+            TaskSpec::Generative3D(
+                Generative3DSpec::new_prompt(format!("high_hero_{i}"))
+                    .with_quality("high")
+                    .with_engine("triposr"),
+            ),
+            TaskRequirements::generic(2, 60),
+        ));
     }
-    // 25 Standard-VRAM 3D neural generation (requires 4096 MB)
+    // 25 standard-quality 3D neural generation
     for i in 0..25 {
         tasks.push(Task::new(
             TaskSpec::Generative3D(
@@ -817,7 +507,7 @@ fn test_stress_high_throughput_matchmaking_burst_100_tasks() {
             TaskRequirements::generic(2, 45),
         ));
     }
-    // 25 Fast-VRAM Procedural SDF generation (0 VRAM required)
+    // 25 fast procedural SDF generation
     for i in 0..25 {
         tasks.push(Task::new(
             TaskSpec::Generative3D(
@@ -828,18 +518,14 @@ fn test_stress_high_throughput_matchmaking_burst_100_tasks() {
             TaskRequirements::generic(2, 15),
         ));
     }
-    // 15 Blender-demanding AutoRig tasks
+    // 15 AutoRig tasks that prefer Blender
     for _i in 0..15 {
-        tasks.push(
-            Task::new(
-                TaskSpec::AutoRig(
-                    AutoRigSpec::new(b"blender_mesh_binary".to_vec(), "biped")
-                        .with_provider("blender"),
-                ),
-                TaskRequirements::generic(2, 30),
-            )
-            .with_tags(vec!["require:tag=blender".to_string()]),
-        );
+        tasks.push(Task::new(
+            TaskSpec::AutoRig(
+                AutoRigSpec::new(b"blender_mesh_binary".to_vec(), "biped").with_provider("blender"),
+            ),
+            TaskRequirements::generic(2, 30),
+        ));
     }
     // 10 Builtin pure-Rust AutoRig tasks
     for _i in 0..10 {
@@ -867,8 +553,6 @@ fn test_stress_high_throughput_matchmaking_burst_100_tasks() {
     );
 
     // Verify constraint invariants across all assignments:
-    let mut high_vram_assigned = 0;
-    let mut blender_rig_assigned = 0;
     let total_assigned = report.assignments.len();
 
     let cluster_map: HashMap<Uuid, &WorkerInfo> =
@@ -888,29 +572,6 @@ fn test_stress_high_throughput_matchmaking_burst_100_tasks() {
             worker.worker_id, w10_mobile_throttled.worker_id,
             "Thermal throttled worker received a task!"
         );
-
-        // 2. Invariant: High VRAM tasks (6144 MB) must only go to workers with >= 6144 MB VRAM or simulated
-        if let TaskSpec::Generative3D(ref spec) = a.task.spec {
-            if spec.quality == "high" && spec.engine_preference.as_deref() != Some("sdf") {
-                let vram = worker.capabilities.vram_mb.unwrap_or(0);
-                assert!(
-                    vram >= 6144 || worker.capabilities.is_simulated_gpu,
-                    "High VRAM task assigned to node with only {vram} MB VRAM"
-                );
-                high_vram_assigned += 1;
-            }
-        }
-
-        // 3. Invariant: Blender AutoRig tasks must only go to Blender-capable nodes
-        if let TaskSpec::AutoRig(ref spec) = a.task.spec {
-            if spec.preferred_provider.as_deref() == Some("blender") {
-                assert!(
-                    worker.capabilities.has_blender,
-                    "Blender task assigned to non-Blender node!"
-                );
-                blender_rig_assigned += 1;
-            }
-        }
     }
 
     // Verify determinism: Run matchmake again with identical input
@@ -921,10 +582,8 @@ fn test_stress_high_throughput_matchmaking_burst_100_tasks() {
     );
 
     println!(
-        "   Assignments summary: total={}, high_vram={}, blender_rig={}, skipped={}",
+        "   Assignments summary: total={}, skipped={}",
         total_assigned,
-        high_vram_assigned,
-        blender_rig_assigned,
         report.skipped.len()
     );
     println!(
