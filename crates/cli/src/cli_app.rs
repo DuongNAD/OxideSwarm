@@ -858,13 +858,18 @@ pub async fn run_cli() -> ExitCode {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_log_filter(log_level))),
     );
-    let _ = if matches!(cli.command, Commands::Mcp(_)) {
+    let is_mcp = matches!(cli.command, Commands::Mcp(_));
+    let _ = if is_mcp {
         builder.with_writer(std::io::stderr).try_init()
     } else {
         builder.try_init()
     };
 
-    let config_file = match load_config_file(cli.config.as_deref()) {
+    let config_file = match if is_mcp {
+        crate::config::load_mcp_config_file(cli.config.as_deref())
+    } else {
+        load_config_file(cli.config.as_deref())
+    } {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("Configuration error: {e}");
