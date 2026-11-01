@@ -65,7 +65,9 @@ class OxideRelayHub:
 
     async def start(self):
         """Start the hub on the configured host and ephemeral port."""
-        self.server = await websockets.serve(self._handle_client, self.host, self.port)
+        self.server = await websockets.serve(
+            self._handle_client, self.host, self.port, max_size=16 * 1024 * 1024
+        )
         self.actual_port = self.server.sockets[0].getsockname()[1]
         logger.info(f"OxideRelay Hub started on ws://{self.host}:{self.actual_port}")
         return self.actual_port

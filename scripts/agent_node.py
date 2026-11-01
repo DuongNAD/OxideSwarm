@@ -94,6 +94,41 @@ def kill_process_tree(proc) -> None:
         pass
 
 
+MAX_CAPTURED_OUTPUT_BYTES = 1024 * 1024  # 1 MiB
+
+SECRET_ENV_VARS = (
+    "OXIDESWARM_SECRET",
+    "OXIDESWARM_SECRET_FILE",
+    "OXIDE_MESH_TOKEN",
+    "RUSTY_GRID_SECRET",
+    "RUSTY_GRID_SECRET_FILE",
+)
+
+
+async def _read_capped_stream(stream: asyncio.StreamReader, cap: int = MAX_CAPTURED_OUTPUT_BYTES) -> tuple:
+    """Reads from stream up to cap bytes, draining the remainder to EOF so the child never blocks."""
+    kept = bytearray()
+    truncated = False
+    try:
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                break
+            room = cap - len(kept)
+            if len(chunk) <= room:
+                kept.extend(chunk)
+            else:
+                if room > 0:
+                    kept.extend(chunk[:room])
+                truncated = True
+    except asyncio.CancelledError:
+        pass
+    text = kept.decode("utf-8", errors="replace")
+    if truncated:
+        text += f"\n[agent_node: output truncated after {cap} bytes]\n"
+    return text, truncated
+
+
 def collect_telemetry(platform_tag: str) -> dict:
     """Collects system hardware and OS capabilities."""
     return {
@@ -108,13 +143,22 @@ def collect_telemetry(platform_tag: str) -> dict:
 
 
 class OxideAgentNode:
-    def __init__(self, hub_url: str, node_id: str, platform_name: str, hostname: str = None, token: str = None):
+    def __init__(
+        self,
+        hub_url: str,
+        node_id: str,
+        platform_name: str,
+        hostname: str = None,
+        token: str = None,
+        no_shell: bool = False,
+    ):
         self.hub_url = hub_url
         self.node_id = node_id
         self.platform_name = platform_name
         self.hostname = hostname or platform.node() or "unknown-host"
         # Hub token (OXIDE_MESH_TOKEN / --token); an empty string means "no token".
         self.token = token or None
+        self.no_shell = bool(no_shell)
         # (error_code, reason) when the hub answered the last registration with a NACK.
         self.registration_error = None
         self.ws = None
@@ -140,7 +184,10 @@ class OxideAgentNode:
         self.registration_error = None
         logger.info(f"Connected! Registering as '{self.node_id}' ({self.platform_name})...")
 
-        # Send NodeRegistration
+        supported_cmds = ["echo", "ping", "system_info", "sha256_verify"]
+        if not self.no_shell:
+            supported_cmds.insert(2, "shell_exec")
+
         reg_msg = {
             "version": "1.0",
             "correlation_id": str(uuid.uuid4()),
@@ -151,13 +198,7 @@ class OxideAgentNode:
             "hostname": self.hostname,
             "capabilities": {
                 "system": collect_telemetry(self.platform_name),
-                "supported_commands": [
-                    "echo",
-                    "ping",
-                    "shell_exec",
-                    "system_info",
-                    "sha256_verify",
-                ],
+                "supported_commands": supported_cmds,
             },
             "timestamp": int(time.time() * 1000),
         }
@@ -348,25 +389,72 @@ class OxideAgentNode:
                 status = "success" if matches else "failed"
 
             elif cmd_name == "shell_exec":
-                if isinstance(args, dict):
-                    cmd_str = args.get("cmd") or args.get("command") or ""
-                elif isinstance(args, list):
-                    cmd_str = " ".join(str(x) for x in args)
+                if self.no_shell:
+                    status = "failed"
+                    exit_code = 127
+                    stderr = "shell_exec is disabled by --no-shell"
                 else:
-                    cmd_str = str(args)
-                timeout_s = req.get("timeout_ms", 15000) / 1000.0
+                    if isinstance(args, dict):
+                        cmd_str = args.get("cmd") or args.get("command") or ""
+                    elif isinstance(args, list):
+                        cmd_str = " ".join(str(x) for x in args)
+                    else:
+                        cmd_str = str(args)
+                    timeout_s = req.get("timeout_ms", 15000) / 1000.0
 
-                proc = await asyncio.create_subprocess_shell(
-                    cmd_str,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    start_new_session=(os.name == "posix"),
-                )
-                out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-                stdout = out.decode("utf-8", errors="replace")
-                stderr = err.decode("utf-8", errors="replace")
-                exit_code = proc.returncode
-                status = "success" if exit_code == 0 else "failed"
+                    # 1. Environment sanitization
+                    child_env = os.environ.copy()
+                    for secret_var in SECRET_ENV_VARS:
+                        child_env.pop(secret_var, None)
+                    if isinstance(args, dict) and isinstance(args.get("env"), dict):
+                        for k, v in args["env"].items():
+                            child_env[str(k)] = str(v)
+
+                    # 2. Working directory
+                    cwd = None
+                    if isinstance(args, dict):
+                        raw_cwd = args.get("cwd")
+                        if raw_cwd and os.path.exists(raw_cwd) and os.path.isdir(raw_cwd):
+                            cwd = raw_cwd
+
+                    proc = await asyncio.create_subprocess_shell(
+                        cmd_str,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=cwd,
+                        env=child_env,
+                        start_new_session=(os.name == "posix"),
+                    )
+
+                    out_task = asyncio.create_task(_read_capped_stream(proc.stdout, MAX_CAPTURED_OUTPUT_BYTES))
+                    err_task = asyncio.create_task(_read_capped_stream(proc.stderr, MAX_CAPTURED_OUTPUT_BYTES))
+
+                    try:
+                        (stdout, _), (stderr, _) = await asyncio.wait_for(
+                            asyncio.gather(out_task, err_task),
+                            timeout=timeout_s,
+                        )
+                        await asyncio.wait_for(proc.wait(), timeout=5.0)
+                        exit_code = proc.returncode
+                        status = "success" if exit_code == 0 else "failed"
+                    except asyncio.TimeoutError:
+                        kill_process_tree(proc)
+                        out_task.cancel()
+                        err_task.cancel()
+                        results = await asyncio.gather(out_task, err_task, return_exceptions=True)
+                        try:
+                            await asyncio.wait_for(proc.wait(), timeout=0.5)
+                        except Exception:
+                            pass
+                        out_res = results[0] if (isinstance(results[0], tuple) and len(results[0]) == 2) else ("", False)
+                        err_res = results[1] if (isinstance(results[1], tuple) and len(results[1]) == 2) else ("", False)
+                        stdout = out_res[0]
+                        stderr_tail = err_res[0]
+                        status = "timeout"
+                        exit_code = 124
+                        stderr = f"Command timed out after {req.get('timeout_ms', 15000)} ms"
+                        if stderr_tail:
+                            stderr += "\n" + stderr_tail
 
             else:
                 status = "failed"
@@ -667,6 +755,12 @@ def main():
         help="Hub token (default: $OXIDE_MESH_TOKEN). Needed when the hub was started with --token; "
         "visible in the process list, so prefer the environment variable",
     )
+    parser.add_argument(
+        "--no-shell",
+        action="store_true",
+        default=False,
+        help="Disable shell execution command (refuse shell_exec)",
+    )
 
     # Command submission options (flags & subcommands supported)
     parser.add_argument(
@@ -757,7 +851,14 @@ def main():
 
     args = parser.parse_args()
 
-    node = OxideAgentNode(args.hub, args.id, args.platform, args.hostname, token=args.token)
+    node = OxideAgentNode(
+        args.hub,
+        args.id,
+        args.platform,
+        args.hostname,
+        token=args.token,
+        no_shell=args.no_shell,
+    )
 
     async def execute():
         is_compute = (

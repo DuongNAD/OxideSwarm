@@ -56,6 +56,7 @@ pub struct AgentMeshClient {
     received_payloads: Arc<RwLock<Vec<AgentMeshEnvelope>>>,
     executed_count: Arc<AtomicUsize>,
     running: Arc<AtomicBool>,
+    no_shell: bool,
 }
 
 impl AgentMeshClient {
@@ -76,6 +77,7 @@ impl AgentMeshClient {
             received_payloads: Arc::new(RwLock::new(Vec::new())),
             executed_count: Arc::new(AtomicUsize::new(0)),
             running: Arc::new(AtomicBool::new(false)),
+            no_shell: false,
         }
     }
 
@@ -84,6 +86,16 @@ impl AgentMeshClient {
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
         self
+    }
+
+    /// Disables shell command execution on this client node.
+    pub fn with_no_shell(mut self, no_shell: bool) -> Self {
+        self.no_shell = no_shell;
+        self
+    }
+
+    pub fn is_no_shell(&self) -> bool {
+        self.no_shell
     }
 
     pub fn node_id(&self) -> &str {
@@ -126,6 +138,12 @@ impl AgentMeshClient {
         // Send registration message
         let reg_corr_id = uuid::Uuid::new_v4().to_string();
         let (reg_tx, reg_rx) = oneshot::channel::<AgentMeshEnvelope>();
+        let supported_commands = if self.no_shell {
+            vec!["echo", "ping", "system_info", "sha256_verify"]
+        } else {
+            vec!["echo", "ping", "system_info", "shell_exec", "sha256_verify"]
+        };
+
         let reg = AgentMeshEnvelope::NodeRegistration {
             version: "1.0".to_string(),
             correlation_id: reg_corr_id.clone(),
@@ -136,7 +154,7 @@ impl AgentMeshClient {
             capabilities: serde_json::json!({
                 "os": self.platform,
                 "arch": std::env::consts::ARCH,
-                "supported_commands": ["echo", "ping", "system_info", "shell_exec", "sha256_verify"],
+                "supported_commands": supported_commands,
             }),
             token: self.token.clone(),
             timestamp: SystemTime::now()
@@ -156,6 +174,7 @@ impl AgentMeshClient {
         let exec_counter = self.executed_count.clone();
         let out_tx = outbound_tx.clone();
         let running_flag = self.running.clone();
+        let no_shell = self.no_shell;
         let mut reg_waiter = Some(reg_tx);
 
         tokio::spawn(async move {
@@ -222,8 +241,10 @@ impl AgentMeshClient {
                                         "[{}] Executing command '{}' from '{}'",
                                         node_id, cmd, sender
                                     );
-                                    let exec_res =
-                                        CommandExecutor::execute(&cmd, &cmd_args, timeout_ms).await;
+                                    let exec_res = CommandExecutor::execute_guarded(
+                                        &cmd, &cmd_args, timeout_ms, no_shell,
+                                    )
+                                    .await;
 
                                     let resp = AgentMeshEnvelope::new_command_response(
                                         node_id,

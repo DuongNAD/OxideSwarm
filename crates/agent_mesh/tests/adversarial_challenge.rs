@@ -135,14 +135,14 @@ time.sleep(10)
 async fn test_rust_executor_direct_hung_command_kill() {
     #[cfg(target_os = "windows")]
     let (cmd, args) = (
-        "powershell",
+        "shell_exec",
         serde_json::json!({
-            "args": ["-NoProfile", "-Command", "Start-Sleep -Seconds 10"]
+            "cmd": "powershell -NoProfile -Command Start-Sleep -Seconds 10"
         }),
     );
 
     #[cfg(not(target_os = "windows"))]
-    let (cmd, args) = ("sleep", serde_json::json!(["10"]));
+    let (cmd, args) = ("shell_exec", serde_json::json!({"cmd": "sleep 10"}));
 
     let t0 = std::time::Instant::now();
     let res = CommandExecutor::execute(cmd, &args, Some(1000)).await;
