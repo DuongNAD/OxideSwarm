@@ -16,13 +16,14 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rusty_grid_core::blob::{
     join_blob_path, validate_blob_path, BlobFile, InputSource, OutputPattern, TaskInput,
     TreeManifest, MAX_MANIFEST_BYTES,
 };
 
-use crate::blob_cache::BlobCache;
+use crate::blob_cache::{BlobCache, CachePin};
 
 /// Default cap on the total size of a task's output files: 1 GiB.
 pub const DEFAULT_OUTPUT_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
@@ -125,6 +126,39 @@ pub fn collect_outputs(
     cache: &BlobCache,
     limits: OutputLimits,
     process_failed: bool,
+) -> Result<Vec<BlobFile>, String> {
+    collect_outputs_inner(root, patterns, cache, limits, process_failed, None)
+}
+
+/// Like [`collect_outputs`], and pins each file in `cache` at the moment it enters the cache so
+/// a concurrent [`BlobCache::evict_to_fit`] cannot evict it before its upload finishes. If
+/// collection fails partway through, the partial pin is dropped before returning.
+pub fn collect_outputs_pinned(
+    root: &Path,
+    patterns: &[String],
+    cache: &Arc<BlobCache>,
+    limits: OutputLimits,
+    process_failed: bool,
+) -> Result<(Vec<BlobFile>, CachePin), String> {
+    let mut pin = cache.pin(std::iter::empty());
+    let outputs = collect_outputs_inner(
+        root,
+        patterns,
+        cache,
+        limits,
+        process_failed,
+        Some(&mut pin),
+    )?;
+    Ok((outputs, pin))
+}
+
+fn collect_outputs_inner(
+    root: &Path,
+    patterns: &[String],
+    cache: &BlobCache,
+    limits: OutputLimits,
+    process_failed: bool,
+    mut pin: Option<&mut CachePin>,
 ) -> Result<Vec<BlobFile>, String> {
     let patterns = patterns
         .iter()
@@ -233,9 +267,11 @@ pub fn collect_outputs(
     let mut outputs = Vec::with_capacity(found.len());
     for (rel, file) in found {
         let executable = is_executable(&file.path);
-        let (id, size) = cache
-            .insert_file(&file.path, true)
-            .map_err(|e| format!("output '{rel}': {e}"))?;
+        let (id, size) = match pin.as_deref_mut() {
+            Some(pin) => cache.insert_file_pinned(&file.path, true, pin),
+            None => cache.insert_file(&file.path, true),
+        }
+        .map_err(|e| format!("output '{rel}': {e}"))?;
         outputs.push(BlobFile {
             path: rel,
             id,

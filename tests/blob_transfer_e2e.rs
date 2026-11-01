@@ -551,10 +551,7 @@ async fn test_output_blobs_can_be_evicted_after_output_pin_retention_expires() {
         Task::new(spec, TaskRequirements::generic(1, 30)).with_output_glob(name)
     };
 
-    let result_a = cluster
-        .run(write_2mib_task("a.bin", 0x51))
-        .await
-        .unwrap();
+    let result_a = cluster.run(write_2mib_task("a.bin", 0x51)).await.unwrap();
     assert!(result_a.is_success(), "{:?}", result_a.error);
     let a_id = result_a.outputs[0].id;
     let store = cluster.master.blob_store().expect("blob store");
@@ -573,16 +570,139 @@ async fn test_output_blobs_can_be_evicted_after_output_pin_retention_expires() {
     );
 
     // Now storing another 2 MiB output evicts `a.bin` to fit the 3 MiB bound.
-    let result_b = cluster
-        .run(write_2mib_task("b.bin", 0x52))
-        .await
-        .unwrap();
+    let result_b = cluster.run(write_2mib_task("b.bin", 0x52)).await.unwrap();
     assert!(result_b.is_success(), "{:?}", result_b.error);
     assert!(
         !store.contains(&a_id),
         "expired output blob must be evictable once its pin ends"
     );
     assert!(store.stats().evictions >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_worker_pins_output_files_from_collection_through_upload() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_blob_store(store_dir.path(), 256 * 1024 * 1024);
+    let master = MasterServer::spawn(config).await.expect("master starts");
+    let addr = master.server_addr().to_string();
+
+    let sandbox_dir = tempfile::tempdir().unwrap();
+    let worker_config = WorkerConfig::new(addr.clone())
+        .with_name("blob-e2e-pin-worker")
+        .with_cores(8)
+        .with_max_concurrency(8)
+        .with_ram_mb(4096)
+        .with_blob_cache_bytes(1024 * 1024)
+        .with_sandbox_base_dir(sandbox_dir.path())
+        .with_mobile_telemetry(plugged_in())
+        .with_redirection_portal(false);
+    let mut worker_client = WorkerClient::new(worker_config);
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let worker_handle = tokio::spawn(async move {
+        let _ = worker_client.run(stop_rx).await;
+    });
+    let cluster = Cluster {
+        master,
+        addr: addr.clone(),
+        worker: Some((stop_tx, worker_handle)),
+        _dirs: vec![store_dir, sandbox_dir],
+    };
+    cluster.wait_for_worker().await;
+
+    // Prepare 4000 distinct 1 KiB files (4 MiB total > 1 MiB worker blob cache).
+    let template_dir = tempfile::tempdir().unwrap();
+    let src_out = template_dir.path().join("out");
+    std::fs::create_dir_all(&src_out).unwrap();
+    for i in 0..4000u32 {
+        let mut buf = vec![0u8; 1024];
+        for chunk in buf.chunks_exact_mut(4) {
+            chunk.copy_from_slice(&i.to_le_bytes());
+        }
+        std::fs::write(src_out.join(format!("f{i:04}.bin")), &buf).unwrap();
+    }
+
+    // Four clients continuously run tasks with small outputs to trigger worker `evict_to_fit`.
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut churn_handles = Vec::new();
+    for client_idx in 0..4u32 {
+        let addr = addr.clone();
+        let running = std::sync::Arc::clone(&running);
+        let dir = tempfile::tempdir().unwrap();
+        churn_handles.push(tokio::spawn(async move {
+            let mut seq = 0u32;
+            while running.load(std::sync::atomic::Ordering::Relaxed) {
+                seq += 1;
+                let src = dir.path().join("small.bin");
+                let mut payload = vec![0u8; 1024];
+                payload[..4].copy_from_slice(&client_idx.to_le_bytes());
+                payload[4..8].copy_from_slice(&seq.to_le_bytes());
+                std::fs::write(&src, &payload).unwrap();
+                #[cfg(unix)]
+                let spec = TaskSpec::command(
+                    "cp",
+                    vec![src.to_string_lossy().into_owned(), "small.bin".into()],
+                );
+                #[cfg(windows)]
+                let spec = TaskSpec::command(
+                    "cmd",
+                    vec![
+                        "/C".into(),
+                        format!("copy /Y \"{}\" small.bin", src.display()),
+                    ],
+                );
+                let task =
+                    Task::new(spec, TaskRequirements::generic(1, 30)).with_output_glob("small.bin");
+                if let Ok(mut transport) = rusty_grid_cli::connect_master(&addr, None).await {
+                    let _ = transport
+                        .send_msg(&ClientMessage::SubmitTask { task, wait: true })
+                        .await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        transport.recv_msg::<ClientResponse>(),
+                    )
+                    .await;
+                }
+            }
+        }));
+    }
+
+    #[cfg(unix)]
+    let big_spec = TaskSpec::command(
+        "cp",
+        vec![
+            "-R".into(),
+            src_out.to_string_lossy().into_owned(),
+            "out".into(),
+        ],
+    );
+    #[cfg(windows)]
+    let big_spec = TaskSpec::command(
+        "xcopy",
+        vec![
+            "/E".into(),
+            "/I".into(),
+            "/Q".into(),
+            src_out.to_string_lossy().into_owned(),
+            "out".into(),
+        ],
+    );
+    let big_task = Task::new(big_spec, TaskRequirements::generic(1, 60))
+        .with_priority(rusty_grid_core::task::TaskPriority::High)
+        .with_output_glob("out/*");
+    let result = cluster.run(big_task).await.unwrap();
+
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    for h in churn_handles {
+        h.abort();
+    }
+
+    assert!(
+        result.is_success(),
+        "4000-file task failed: {:?}",
+        result.error
+    );
+    assert_eq!(result.outputs.len(), 4000);
 }
 
 // ---------------------------------------------------------------------------------------------

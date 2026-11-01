@@ -209,6 +209,7 @@ pub async fn upload_task_outputs(
     client: Option<&BlobClient>,
     cache: &Arc<BlobCache>,
 ) {
+    let _task_pin = cache.take_task_outputs(task.id);
     if result.outputs.is_empty() {
         return;
     }
@@ -503,5 +504,135 @@ mod tests {
         .await
         .expect("a closed client answers at once");
         assert!(later.is_err());
+    }
+
+    #[tokio::test]
+    async fn output_files_remain_pinned_between_collection_and_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel(32);
+        let client = BlobClient::new(tx);
+        spawn_master(
+            rx,
+            Arc::clone(&client),
+            Arc::clone(&blobs),
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        let mut runner_cfg = crate::runner::RunnerConfig::default();
+        runner_cfg.sandbox_config.base_dir = dir.path().to_path_buf();
+        // Bound the worker cache at 1 KiB while the task produces 4 files of 512 B (2 KiB total).
+        runner_cfg.blob_cache_bytes = 1024;
+        let runner = crate::runner::TaskRunner::new(
+            Uuid::new_v4(),
+            rusty_grid_core::capabilities::WorkerCapabilities::new(
+                "test", 1, 1024, false, false, None,
+            ),
+            runner_cfg.clone(),
+        );
+        let cache = runner.blob_cache().unwrap();
+
+        let task = task_with(vec![]).with_output_glob("out/*");
+        let mut sandbox = crate::sandbox::Sandbox::create(&runner_cfg.sandbox_config, task.id)
+            .await
+            .unwrap();
+        std::fs::create_dir_all(sandbox.path().join("out")).unwrap();
+        for i in 0..4u8 {
+            std::fs::write(
+                sandbox.path().join("out").join(format!("f{i}.bin")),
+                vec![i + 1; 512],
+            )
+            .unwrap();
+        }
+
+        let initial = TaskResult::success(runner.worker_id(), task.id, "", 1, false);
+        let mut result = runner
+            .collect_blob_outputs(&sandbox, &task, initial, &[])
+            .await;
+        let _ = sandbox.destroy().await;
+        assert_eq!(result.outputs.len(), 4);
+
+        // Another task finishing on the worker calls `evict_to_fit` before `upload_task_outputs`.
+        assert_eq!(
+            cache.evict_to_fit(),
+            0,
+            "collected output files must stay pinned until their upload finishes"
+        );
+
+        upload_task_outputs(&task, &mut result, Some(&client), &cache).await;
+        assert!(result.is_success(), "{:?}", result.error);
+        assert_eq!(blobs.lock().unwrap().len(), 4);
+
+        // Once the upload is complete, the output pin is released and `evict_to_fit` can reclaim space.
+        assert!(
+            cache.evict_to_fit() >= 2,
+            "output pin must be released after upload finishes"
+        );
+
+        // A failed upload (closed session) also releases the output pin on return.
+        let failed_task = task_with(vec![]).with_output_glob("out/*");
+        let mut sandbox =
+            crate::sandbox::Sandbox::create(&runner_cfg.sandbox_config, failed_task.id)
+                .await
+                .unwrap();
+        std::fs::create_dir_all(sandbox.path().join("out")).unwrap();
+        for i in 0..4u8 {
+            std::fs::write(
+                sandbox.path().join("out").join(format!("g{i}.bin")),
+                vec![i + 10; 512],
+            )
+            .unwrap();
+        }
+        let initial = TaskResult::success(runner.worker_id(), failed_task.id, "", 1, false);
+        let mut failed_res = runner
+            .collect_blob_outputs(&sandbox, &failed_task, initial, &[])
+            .await;
+        let _ = sandbox.destroy().await;
+        cache.evict_to_fit();
+        for out in &failed_res.outputs {
+            assert!(
+                cache.contains(&out.id),
+                "pinned output of failed_task must survive evict_to_fit"
+            );
+        }
+        client.close();
+        upload_task_outputs(&failed_task, &mut failed_res, Some(&client), &cache).await;
+        assert!(!failed_res.is_success());
+        assert!(
+            cache.evict_to_fit() >= 2,
+            "output pin must be released even when upload fails"
+        );
+
+        // A suppressed result (where upload is skipped) releases the pin via `release_task_outputs`.
+        let suppressed_task = task_with(vec![]).with_output_glob("out/*");
+        let mut sandbox =
+            crate::sandbox::Sandbox::create(&runner_cfg.sandbox_config, suppressed_task.id)
+                .await
+                .unwrap();
+        std::fs::create_dir_all(sandbox.path().join("out")).unwrap();
+        for i in 0..4u8 {
+            std::fs::write(
+                sandbox.path().join("out").join(format!("h{i}.bin")),
+                vec![i + 20; 512],
+            )
+            .unwrap();
+        }
+        let initial = TaskResult::success(runner.worker_id(), suppressed_task.id, "", 1, false);
+        let suppressed_res = runner
+            .collect_blob_outputs(&sandbox, &suppressed_task, initial, &[])
+            .await;
+        let _ = sandbox.destroy().await;
+        cache.evict_to_fit();
+        for out in &suppressed_res.outputs {
+            assert!(
+                cache.contains(&out.id),
+                "pinned output of suppressed_task must survive evict_to_fit"
+            );
+        }
+        runner.release_task_outputs(suppressed_task.id);
+        assert!(
+            cache.evict_to_fit() >= 2,
+            "output pin must be released when result is suppressed"
+        );
     }
 }

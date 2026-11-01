@@ -28,6 +28,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use rusty_grid_core::blob::{hash_file, BlobHasher, BlobId};
+use rusty_grid_core::task::TaskId;
 
 /// Default bound of the worker's blob cache: 2 GiB.
 pub const DEFAULT_BLOB_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -48,6 +49,7 @@ struct Inner {
     tick: u64,
     total_bytes: u64,
     pins: HashMap<BlobId, usize>,
+    task_pins: HashMap<TaskId, Vec<BlobId>>,
 }
 
 impl Inner {
@@ -84,6 +86,17 @@ impl Inner {
         if let Some(entry) = self.entries.remove(id) {
             self.lru.remove(&entry.tick);
             self.total_bytes -= entry.size;
+        }
+    }
+
+    fn unpin_ids(&mut self, ids: impl IntoIterator<Item = BlobId>) {
+        for id in ids {
+            if let Some(count) = self.pins.get_mut(&id) {
+                *count -= 1;
+                if *count == 0 {
+                    self.pins.remove(&id);
+                }
+            }
         }
     }
 }
@@ -193,6 +206,38 @@ impl BlobCache {
         pin
     }
 
+    /// Transfers the blobs pinned by `pin` to `task_id`, keeping them pinned in the cache until
+    /// [`BlobCache::take_task_outputs`] or [`BlobCache::release_task_outputs`] is called for
+    /// `task_id`.
+    pub fn keep_task_outputs(&self, task_id: TaskId, mut pin: CachePin) {
+        let ids = std::mem::take(&mut pin.ids);
+        if ids.is_empty() {
+            return;
+        }
+        let mut inner = self.lock();
+        if let Some(previous) = inner.task_pins.insert(task_id, ids) {
+            inner.unpin_ids(previous);
+        }
+    }
+
+    /// Takes back the output pin held for `task_id` as a [`CachePin`] guard (dropping the
+    /// returned guard releases the pin).
+    pub fn take_task_outputs(self: &Arc<Self>, task_id: TaskId) -> Option<CachePin> {
+        let ids = self.lock().task_pins.remove(&task_id)?;
+        Some(CachePin {
+            cache: Arc::clone(self),
+            ids,
+        })
+    }
+
+    /// Releases any output blobs pinned for `task_id`.
+    pub fn release_task_outputs(&self, task_id: TaskId) {
+        let mut inner = self.lock();
+        if let Some(ids) = inner.task_pins.remove(&task_id) {
+            inner.unpin_ids(ids);
+        }
+    }
+
     /// A fresh path in the cache's temporary directory, for a blob being written.
     pub fn temp_path(&self) -> PathBuf {
         self.tmp.join(format!("{}.part", Uuid::new_v4()))
@@ -201,10 +246,21 @@ impl BlobCache {
     /// Takes over the temporary file `tmp`, which holds blob `id` (`size` bytes), already
     /// verified by whoever wrote it.
     pub fn adopt(&self, tmp: &Path, id: BlobId, size: u64) -> io::Result<()> {
+        self.adopt_inner(tmp, id, size, None)
+    }
+
+    fn adopt_inner(
+        &self,
+        tmp: &Path,
+        id: BlobId,
+        size: u64,
+        pin: Option<&mut CachePin>,
+    ) -> io::Result<()> {
         let dest = self.object_path(&id);
         if let Some(parent) = dest.parent() {
             create_private_dir_all(parent)?;
         }
+        let mut inner = self.lock();
         if let Err(e) = std::fs::rename(tmp, &dest) {
             // Windows does not replace an existing file: another task stored the same blob first.
             if !dest.exists() {
@@ -212,7 +268,11 @@ impl BlobCache {
             }
             let _ = std::fs::remove_file(tmp);
         }
-        self.lock().insert(id, size);
+        inner.insert(id, size);
+        if let Some(pin) = pin {
+            *inner.pins.entry(id).or_insert(0) += 1;
+            pin.ids.push(id);
+        }
         Ok(())
     }
 
@@ -220,9 +280,37 @@ impl BlobCache {
     /// `allow_move` the file is moved in when that is safe (a single link on the same file
     /// system), otherwise copied.
     pub fn insert_file(&self, path: &Path, allow_move: bool) -> io::Result<(BlobId, u64)> {
+        self.insert_file_inner(path, allow_move, None)
+    }
+
+    /// Stores the file at `path` like [`BlobCache::insert_file`] and adds it to `pin` under the
+    /// same cache lock that records or refreshes the entry, so a concurrent
+    /// [`BlobCache::evict_to_fit`] can never evict it before the caller receives its id.
+    pub fn insert_file_pinned(
+        &self,
+        path: &Path,
+        allow_move: bool,
+        pin: &mut CachePin,
+    ) -> io::Result<(BlobId, u64)> {
+        self.insert_file_inner(path, allow_move, Some(pin))
+    }
+
+    fn insert_file_inner(
+        &self,
+        path: &Path,
+        allow_move: bool,
+        mut pin: Option<&mut CachePin>,
+    ) -> io::Result<(BlobId, u64)> {
         let (id, size) = hash_file(path)?;
-        if self.contains(&id) && self.object_path(&id).exists() {
-            return Ok((id, size));
+        {
+            let mut inner = self.lock();
+            if inner.touch(&id) && self.object_path(&id).exists() {
+                if let Some(pin) = pin.as_deref_mut() {
+                    *inner.pins.entry(id).or_insert(0) += 1;
+                    pin.ids.push(id);
+                }
+                return Ok((id, size));
+            }
         }
         let tmp = self.temp_path();
         let moved = allow_move && single_link(path) && std::fs::rename(path, &tmp).is_ok();
@@ -232,7 +320,7 @@ impl BlobCache {
                 return Err(e);
             }
         }
-        if let Err(e) = self.adopt(&tmp, id, size) {
+        if let Err(e) = self.adopt_inner(&tmp, id, size, pin) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
@@ -284,8 +372,9 @@ impl BlobCache {
 
     fn drop_corrupt(&self, id: &BlobId) {
         warn!(blob = %id, "Cached blob no longer matches its id; dropping it");
+        let mut inner = self.lock();
         let _ = std::fs::remove_file(self.object_path(id));
-        self.lock().remove(id);
+        inner.remove(id);
     }
 
     /// Evicts least recently used blobs that nothing pins until the cache fits its bound.
@@ -307,14 +396,12 @@ impl BlobCache {
             }
             for id in &victims {
                 inner.remove(id);
+                if let Err(e) = std::fs::remove_file(self.object_path(id)) {
+                    debug!(blob = %id, error = %e, "Could not delete an evicted blob");
+                }
             }
             victims
         };
-        for id in &victims {
-            if let Err(e) = std::fs::remove_file(self.object_path(id)) {
-                debug!(blob = %id, error = %e, "Could not delete an evicted blob");
-            }
-        }
         if !victims.is_empty() {
             info!(
                 evicted = victims.len(),
@@ -350,15 +437,11 @@ impl CachePin {
 
 impl Drop for CachePin {
     fn drop(&mut self) {
-        let mut inner = self.cache.lock();
-        for id in self.ids.drain(..) {
-            if let Some(count) = inner.pins.get_mut(&id) {
-                *count -= 1;
-                if *count == 0 {
-                    inner.pins.remove(&id);
-                }
-            }
+        if self.ids.is_empty() {
+            return;
         }
+        let mut inner = self.cache.lock();
+        inner.unpin_ids(self.ids.drain(..));
     }
 }
 

@@ -74,7 +74,7 @@ use crate::cpu_simd;
 use crate::gpu::{check_gemm_request, DeviceLimits, GpuError};
 use crate::process_tree::{configure_command, ProcessPriority, ProcessTree};
 use crate::sandbox::{sanitize_relative_path, Sandbox, SandboxConfig, SandboxError};
-use crate::staging::{collect_outputs, materialize_inputs, OutputLimits};
+use crate::staging::{collect_outputs_pinned, materialize_inputs, OutputLimits};
 
 /// Exit code emitted on successful completion.
 pub const EXIT_CODE_SUCCESS: i32 = 0;
@@ -644,6 +644,14 @@ impl TaskRunner {
                     .map_err(|e| format!("cannot open the blob cache in '{}': {e}", dir.display()))
             })
             .clone()
+    }
+
+    /// Releases any output blobs pinned in the cache for `task_id`, without opening the cache if
+    /// it was never used.
+    pub fn release_task_outputs(&self, task_id: TaskId) {
+        if let Some(Ok(cache)) = self.blob_cache.get() {
+            cache.release_task_outputs(task_id);
+        }
     }
 
     /// Primary execution dispatcher with checkpoint resumption and mid-task checkpoint emission.
@@ -1355,8 +1363,12 @@ impl TaskRunner {
                 let root = sandbox.path().to_path_buf();
                 let limits = self.config.output_limits;
                 let process_failed = !result.is_success();
+                let task_id = task.id;
                 tokio::task::spawn_blocking(move || {
-                    collect_outputs(&root, &patterns, &cache, limits, process_failed)
+                    let (outputs, pin) =
+                        collect_outputs_pinned(&root, &patterns, &cache, limits, process_failed)?;
+                    cache.keep_task_outputs(task_id, pin);
+                    Ok(outputs)
                 })
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()))

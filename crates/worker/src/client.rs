@@ -173,18 +173,22 @@ async fn remove_active(table: &ActiveTaskTable, task_id: TaskId, attempt: u64) {
     }
 }
 
-/// RAII guard ensuring active task counter is decremented and table entry is pruned on completion or abort.
+/// RAII guard ensuring active task counter is decremented, output pins are released, and table entry is pruned on completion or abort.
 struct ActiveTaskGuard {
     task_id: TaskId,
     attempt: u64,
     heartbeat_tracker: Arc<HeartbeatTracker>,
     active_task_table: ActiveTaskTable,
+    runner: Option<Arc<TaskRunner>>,
     _permit: OwnedSemaphorePermit,
 }
 
 impl Drop for ActiveTaskGuard {
     fn drop(&mut self) {
         self.heartbeat_tracker.decrement_active_tasks();
+        if let Some(ref runner) = self.runner {
+            runner.release_task_outputs(self.task_id);
+        }
         let table = Arc::clone(&self.active_task_table);
         let (task_id, attempt) = (self.task_id, self.attempt);
         tokio::spawn(async move {
@@ -1410,6 +1414,7 @@ impl WorkerClient {
                 attempt,
                 heartbeat_tracker: Arc::clone(&tracker),
                 active_task_table: Arc::clone(&table),
+                runner: Some(Arc::clone(&runner)),
                 _permit: permit,
             };
 
@@ -1492,6 +1497,7 @@ impl WorkerClient {
                     }
                 }
             }
+            runner.release_task_outputs(task.id);
             drop(_inputs);
             if used_blobs {
                 if let Ok(cache) = runner.blob_cache() {
@@ -3368,6 +3374,7 @@ mod tests {
             attempt: 1,
             heartbeat_tracker: Arc::new(HeartbeatTracker::new(Arc::new(AtomicUsize::new(1)))),
             active_task_table: Arc::clone(&table),
+            runner: None,
             _permit: permit,
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
