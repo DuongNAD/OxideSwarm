@@ -37,18 +37,22 @@ pub fn resolve_python_runtime() -> Option<PathBuf> {
     }
 
     // 3. Fallback: check if standard python executable is available on PATH
-    if let Ok(output) = std::process::Command::new("python")
-        .arg("--version")
-        .output()
-    {
+    let mut cmd = std::process::Command::new("python");
+    cmd.arg("--version");
+    for var in rusty_grid_core::cluster_auth::SECRET_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    if let Ok(output) = cmd.output() {
         if output.status.success() {
             return Some(PathBuf::from("python"));
         }
     }
-    if let Ok(output) = std::process::Command::new("python3")
-        .arg("--version")
-        .output()
-    {
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg("--version");
+    for var in rusty_grid_core::cluster_auth::SECRET_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    if let Ok(output) = cmd.output() {
         if output.status.success() {
             return Some(PathBuf::from("python3"));
         }

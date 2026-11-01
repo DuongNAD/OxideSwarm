@@ -1,15 +1,13 @@
-//! Adversarial Stress-Testing Suite for Milestone 2:
-//! Win32 Job Object Process Tree Supervision, Grandchild Cleanup & Zombie Prevention.
-//! Author: challenger_m2_2 (EMPIRICAL CHALLENGER)
+//! Process Tree Supervision and Descendant Cleanup Stress Suite.
+//!
+//! Verifies cross-platform task process tree supervision via `TaskRunner` and `ProcessTree`
+//! (Windows Job Objects and Unix process groups).
 //!
 //! Objectives:
-//! 1. Multi-level grandchild process tree termination via JobObject::terminate.
-//! 2. Implicit kernel-level cleanup on JobObject handle drop (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE).
-//! 3. Abrupt worker process crash/exit simulation: ensuring OS kernel reaps all descendants.
-//! 4. Adversarial breakaway attempt: verify child processes cannot escape Job Object containment.
-//! 5. TaskRunner Generative3D cancellation during active workload: verify complete process tree teardown.
-//! 6. TaskRunner Generative3D watchdog timeout: verify exit code 124 and zero orphaned descendants.
-//! 7. TaskRunner future drop/abort mid-execution: verify RAII JobObject cleanup.
+//! 1. Verify abrupt worker crash or termination cleans up all descendants.
+//! 2. Verify cancellation during active 3D workloads terminates the full process tree (leader + grandchildren).
+//! 3. Verify watchdog timeouts terminate hung process trees with exit code 124.
+//! 4. Verify aborting a running task future triggers RAII cleanup of all subprocesses without zombies.
 
 #![allow(clippy::field_reassign_with_default)]
 

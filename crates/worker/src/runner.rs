@@ -62,7 +62,6 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
-use rusty_grid_core::cluster_auth::{ENV_SECRET, ENV_SECRET_FILE};
 use rusty_grid_core::protocol::WorkerMessage;
 use rusty_grid_core::task::{
     sha256_digest, Bytes, BytesMut, CheckpointData, OutputArtifact, Task, TaskId, TaskResult,
@@ -110,7 +109,7 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Variables of the worker's own environment that task processes must never inherit: they hold
 /// the cluster secret or the agent-mesh token. (A task can still be handed one explicitly through
 /// its own `env`.)
-pub const SECRET_ENV_VARS: [&str; 3] = [ENV_SECRET, ENV_SECRET_FILE, "OXIDE_MESH_TOKEN"];
+pub use rusty_grid_core::cluster_auth::SECRET_ENV_VARS;
 
 /// Configuration options for the TaskRunner.
 #[derive(Debug, Clone)]
@@ -1991,6 +1990,14 @@ impl TaskRunner {
             )
             .await;
 
+        // On cancellation or watchdog timeout, return failure immediately without sending checkpoints
+        if res.exit_code == EXIT_CODE_CANCELLED
+            || (res.exit_code == EXIT_CODE_TIMEOUT && res.error.is_some())
+        {
+            let _ = sandbox.destroy().await;
+            return res;
+        }
+
         // Process progress checkpoints from stdout if checkpoint_tx provided
         if let Some(ref tx) = checkpoint_tx {
             let stdout_str = String::from_utf8_lossy(res.stdout.as_slice());
@@ -2014,12 +2021,6 @@ impl TaskRunner {
             }
         }
 
-        // On cancellation or timeout, return failure immediately
-        if res.exit_code == EXIT_CODE_CANCELLED || res.exit_code == EXIT_CODE_TIMEOUT {
-            let _ = sandbox.destroy().await;
-            return res;
-        }
-
         // Validate glTF 2.0 binary header if execution succeeded
         if res.is_success() {
             let valid = res
@@ -2028,15 +2029,16 @@ impl TaskRunner {
                 .map(|d| d.as_slice().len() >= 12 && d.as_slice().starts_with(b"glTF"))
                 .unwrap_or(false);
             if !valid {
-                if pref == "auto" {
-                    warn!(task_id = %task.id, "Generated .glb file has invalid glTF header; falling back to Tier 0 SDF");
-                    let _ = sandbox.destroy().await;
-                    return self
-                        .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
-                        .await;
-                }
-                res.exit_code = EXIT_CODE_GENERAL_ERROR;
-                res.error = Some("Generated .glb file has invalid glTF 2.0 header".to_string());
+                let _ = sandbox.destroy().await;
+                return TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    res.stdout,
+                    res.stderr,
+                    start_time.elapsed().as_millis() as u64,
+                    Some("Generated .glb file has invalid glTF 2.0 header".to_string()),
+                );
             } else {
                 res = res.with_device_name(if self.capabilities.has_cuda {
                     "TripoSR-CUDA"
@@ -2051,16 +2053,13 @@ impl TaskRunner {
             return self
                 .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
                 .await;
+        } else if res.error.as_deref().unwrap_or("").is_empty() {
+            res.error = Some(format!(
+                "3D engine subprocess failed with exit code {}",
+                res.exit_code
+            ));
         }
 
-        let artifacts = if !task.expected_outputs.is_empty() {
-            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id)
-                .await
-        } else {
-            Vec::new()
-        };
-        res.artifacts = artifacts;
-        let res = self.collect_blob_outputs(&sandbox, task, res, &[]).await;
         let _ = sandbox.destroy().await;
         res
     }
@@ -2209,6 +2208,8 @@ impl TaskRunner {
                             .await;
                     }
                     match crate::autorig::BlenderRigProvider::execute_rigging(
+                        self,
+                        task_id,
                         &blender_bin,
                         spec_clone.input_mesh.as_bytes(),
                         &spec_clone.rig_preset,
@@ -2615,25 +2616,6 @@ impl TaskRunner {
         // The leader at least, even where no tree could be tracked.
         let _ = child.start_kill();
         let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
-    }
-
-    /// Fallback process-tree terminator for subprocesses.
-    pub fn terminate_process_tree(pid: u32) {
-        #[cfg(windows)]
-        {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
-        #[cfg(unix)]
-        {
-            unsafe {
-                let _ = libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
-        }
     }
 }
 

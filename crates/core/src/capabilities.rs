@@ -1292,10 +1292,12 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
     }
 
     // 4. PATH lookup fallback (e.g. `blender --version`)
-    if let Ok(output) = std::process::Command::new("blender")
-        .arg("--version")
-        .output()
-    {
+    let mut cmd = std::process::Command::new("blender");
+    cmd.arg("--version");
+    for var in crate::cluster_auth::SECRET_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    if let Ok(output) = cmd.output() {
         if output.status.success() {
             if let Ok(text) = std::str::from_utf8(&output.stdout) {
                 if let Some(first_line) = text.lines().next() {
@@ -1313,10 +1315,12 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
 }
 
 fn query_blender_version(exe_path: &std::path::Path) -> Option<String> {
-    let output = std::process::Command::new(exe_path)
-        .arg("--version")
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new(exe_path);
+    cmd.arg("--version");
+    for var in crate::cluster_auth::SECRET_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    let output = cmd.output().ok()?;
     if output.status.success() {
         let text = std::str::from_utf8(&output.stdout).ok()?;
         let first_line = text.lines().next()?.trim();

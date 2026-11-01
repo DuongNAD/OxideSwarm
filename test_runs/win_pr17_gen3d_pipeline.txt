@@ -1,0 +1,15 @@
+﻿
+running 9 tests
+test test_sdf_primitives_analytical_correctness ... ok
+test test_manifold_deduplication_and_zero_area_filtering ... ok
+Marching Cubes 48^3 extracted: 2286 vertices, 4568 triangles in 34.9913ms
+test test_marching_cubes_watertightness_and_speed ... ok
+test test_glb_container_compliance ... ok
+test test_uv_unwrapper_bounds_and_split ... ok
+test test_texture_baking_and_png_encoding ... ok
+test test_task_runner_generative3d_sdf_execution ... ok
+test test_task_runner_generative3d_cancellation ... ok
+test test_task_runner_generative3d_auto_degradation ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+

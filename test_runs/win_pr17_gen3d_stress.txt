@@ -1,0 +1,70 @@
+﻿
+running 7 tests
+test test_adversarial_prompt_resolution_edge_cases ... ok
+test test_png_encoder_crc32_and_adler32_correctness ... ok
+[MATRIX] Preset: Humanoid   | Tier: fast     (res=32) | Verts: 994    | Tris: 1976   | Time: 16.9035ms
+[MANIFOLD CHECK] Preset HumanoidDummy: raw_non_manifold=0, clean_non_manifold=0
+[MANIFOLD CHECK] Preset RobotTorso: raw_non_manifold=0, clean_non_manifold=0
+[MATRIX] Preset: Humanoid   | Tier: standard (res=48) | Verts: 2278   | Tris: 4552   | Time: 45.3469ms
+[MANIFOLD CHECK] Preset StylizedCharacter: raw_non_manifold=0, clean_non_manifold=0
+[MANIFOLD CHECK] Preset TestOrb: raw_non_manifold=0, clean_non_manifold=0
+[MANIFOLD CHECK] Preset HumanoidDummy: raw_non_manifold=0, clean_non_manifold=0
+[MATRIX] Preset: Humanoid   | Tier: high     (res=64) | Verts: 4013   | Tris: 8022   | Time: 112.5929ms
+[MATRIX] Preset: Robot      | Tier: fast     (res=32) | Verts: 1034   | Tris: 2056   | Time: 19.9477ms
+[MANIFOLD CHECK] Preset RobotTorso: raw_non_manifold=0, clean_non_manifold=0
+[MATRIX] Preset: Robot      | Tier: standard (res=48) | Verts: 2592   | Tris: 5172   | Time: 57.7454ms
+[MANIFOLD CHECK] Preset StylizedCharacter: raw_non_manifold=0, clean_non_manifold=0
+[MANIFOLD CHECK] Preset TestOrb: raw_non_manifold=0, clean_non_manifold=0
+[MATRIX] Preset: Robot      | Tier: high     (res=64) | Verts: 4484   | Tris: 8964   | Time: 110.6521ms
+[MATRIX] Preset: Stylized   | Tier: fast     (res=32) | Verts: 2154   | Tris: 4304   | Time: 22.0248ms
+[MANIFOLD CHECK] Preset HumanoidDummy: raw_non_manifold=0, clean_non_manifold=0
+[MATRIX] Preset: Stylized   | Tier: standard (res=48) | Verts: 4802   | Tris: 9600   | Time: 53.3613ms
+[MANIFOLD CHECK] Preset RobotTorso: raw_non_manifold=0, clean_non_manifold=0
+test test_strict_gltf_binary_conformance_and_min_max_matching ... ok
+[MANIFOLD CHECK] Preset StylizedCharacter: raw_non_manifold=0, clean_non_manifold=0
+[MATRIX] Preset: Stylized   | Tier: high     (res=64) | Verts: 8633   | Tris: 17262  | Time: 117.6077ms
+[MATRIX] Preset: Orb        | Tier: fast     (res=32) | Verts: 2850   | Tris: 5720   | Time: 22.2562ms
+[MATRIX] Preset: Orb        | Tier: standard (res=48) | Verts: 7602   | Tris: 15224  | Time: 66.2774ms
+[MANIFOLD CHECK] Preset TestOrb: raw_non_manifold=0, clean_non_manifold=0
+[MATRIX] Preset: Orb        | Tier: high     (res=64) | Verts: 12498  | Tris: 25016  | Time: 127.9166ms
+test test_multi_resolution_and_preset_matrix ... ok
+[MANIFOLD CHECK] Preset HumanoidDummy: raw_non_manifold=0, clean_non_manifold=0
+[BLENDER IMPORT] Preset: humanoid (stats: GenerationStats { vertex_count: 1571, triangle_count: 1976, execution_time_ms: 135, aabb_min: [-0.8471581, -0.0014531799, -0.17636971], aabb_max: [0.8471581, 1.76, 0.17636971] })
+Stdout: 22:24:44 | INFO: Data are loaded, start creating Blender stuff
+22:24:44 | INFO: Blender create Mesh node GeneratedMesh
+22:24:44 | INFO: glTF import finished in 0.01s
+Blender 4.5.4 LTS (hash b3efe983cc58 built 2025-10-28 14:22:47)
+BLENDER_PRESET_OK: humanoid Objects: 1 Meshes: 1
+[MANIFOLD CHECK] Preset RobotTorso: raw_non_manifold=0, clean_non_manifold=0
+[LATENCY BENCHMARK - MARCHING CUBES 48^3] avg = 35.93 ms (budget < 50 ms)
+[LATENCY BENCHMARK - FULL PIPELINE 48^3] avg = 56.73 ms, max = 62.93 ms (profile: debug)
+[NOTICE] In unoptimized debug mode, full pipeline with spatial hashing HashMap took 56.73 ms (release mode is ~14.4 ms)
+[MANIFOLD CHECK] Preset StylizedCharacter: raw_non_manifold=0, clean_non_manifold=0
+[MANIFOLD CHECK] Preset TestOrb: raw_non_manifold=0, clean_non_manifold=0
+
+[TOTAL TOPOLOGICAL MANIFOLD VIOLATIONS FOUND]: 0
+test test_topological_manifoldness_and_no_degenerates ... ok
+[LATENCY BENCHMARK - FULL WITH 1024 TEXTURE] Standard: 507.8709ms, GLB size: 4343052 bytes, stats: GenerationStats { vertex_count: 3586, triangle_count: 5172, execution_time_ms: 507, aabb_min: [-0.46646675, 0.0, -0.17], aabb_max: [0.46646675, 1.68, 0.17] }
+test test_tier0_latency_benchmark_under_50ms ... ok
+[BLENDER IMPORT] Preset: robot (stats: GenerationStats { vertex_count: 1754, triangle_count: 2056, execution_time_ms: 124, aabb_min: [-0.45817447, 0.0, -0.17], aabb_max: [0.4581745, 1.68, 0.17] })
+Stdout: 22:24:45 | INFO: Data are loaded, start creating Blender stuff
+22:24:45 | INFO: Blender create Mesh node GeneratedMesh
+22:24:45 | INFO: glTF import finished in 0.00s
+Blender 4.5.4 LTS (hash b3efe983cc58 built 2025-10-28 14:22:47)
+BLENDER_PRESET_OK: robot Objects: 1 Meshes: 1
+[BLENDER IMPORT] Preset: chibi (stats: GenerationStats { vertex_count: 2706, triangle_count: 4304, execution_time_ms: 132, aabb_min: [-0.6180868, -0.019669425, -0.45], aabb_max: [0.6180868, 1.1887016, 0.45] })
+Stdout: 22:24:46 | INFO: Data are loaded, start creating Blender stuff
+22:24:46 | INFO: Blender create Mesh node GeneratedMesh
+22:24:46 | INFO: glTF import finished in 0.01s
+Blender 4.5.4 LTS (hash b3efe983cc58 built 2025-10-28 14:22:47)
+BLENDER_PRESET_OK: chibi Objects: 1 Meshes: 1
+[BLENDER IMPORT] Preset: orb (stats: GenerationStats { vertex_count: 4386, triangle_count: 5720, execution_time_ms: 142, aabb_min: [-0.67, 0.13000003, -0.67], aabb_max: [0.67, 1.47, 0.67] })
+Stdout: 22:24:47 | INFO: Data are loaded, start creating Blender stuff
+22:24:47 | INFO: Blender create Mesh node GeneratedMesh
+22:24:47 | INFO: glTF import finished in 0.01s
+Blender 4.5.4 LTS (hash b3efe983cc58 built 2025-10-28 14:22:47)
+BLENDER_PRESET_OK: orb Objects: 1 Meshes: 1
+test test_blender_headless_import_of_all_presets ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.55s
+

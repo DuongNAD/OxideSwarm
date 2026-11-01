@@ -117,6 +117,12 @@ const REJECT_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 pub const ENV_SECRET: &str = "OXIDESWARM_SECRET";
 /// Environment variable holding the path of a secret file.
 pub const ENV_SECRET_FILE: &str = "OXIDESWARM_SECRET_FILE";
+/// Environment variable holding the agent mesh hub token.
+pub const ENV_MESH_TOKEN: &str = "OXIDE_MESH_TOKEN";
+
+/// Sensitive environment variables that must never be inherited by spawned child processes
+/// (task processes, version probes, or third-party executables).
+pub const SECRET_ENV_VARS: [&str; 3] = [ENV_SECRET, ENV_SECRET_FILE, ENV_MESH_TOKEN];
 
 /// Generic REJECT reasons. Peers only ever see these exact strings.
 pub const REJECT_AUTH_FAILED: &str = "authentication failed";

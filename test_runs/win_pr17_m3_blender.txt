@@ -1,0 +1,39 @@
+﻿
+running 9 tests
+test test_adversarial_corrupt_mesh_input_error_reporting ... ok
+Resolved Blender executable: C:\Program Files\Blender Foundation\Blender 4.5\blender.exe
+Blender version output:
+Blender 4.5.4 LTS
+	build date: 2025-10-28
+	build time: 14:22:47
+	build commit date: 2025-10-27
+	build commit time: 12:46
+	build hash: b3efe983cc58
+	build branch: blender-v4.5-release
+	build platform: Windows
+	build type: Release
+	build c flags: /W3 /w34062 /w34100 /w34115 /w34189 /w35038 /wd4018 /wd4146 /wd4065 /wd4127 /wd4181 /wd4200 /wd4244 /wd4267 /wd4305 /wd4800 /wd4828 /wd4996 /wd4661 /wd4848 /we4013 /we4133 /we4431 /we4033 /DWIN32 /D_WINDOWS /W3 /nologo /J /Gd /MP /bigobj /Zc:inline  
+	build c++ flags: /W3 /w34062 /w34100 /w34115 /w34189 /w35038 /wd4018 /wd4146 /wd4065 /wd4127 /wd4181 /wd4200 /wd4244 /wd4267 /wd4305 /wd4800 /wd4828 /wd4996 /wd4661 /wd4848 /we4013 /we4133 /we4431 /we4033 /DWIN32 /D_WINDOWS /W3  /EHsc /nologo /J /Gd /MP /EHsc /bigobj /permissive- /Zc:__cplusplus /Zc:inline  
+	build link flags: /MACHINE:X64  /SUBSYSTEM:CONSOLE /STACK:2097152 /ignore:4049 /ignore:4217 /ignore:4221
+	build system: CMake
+
+test test_verify_host_blender_installation_and_version ... ok
+Cancellation task result: exit_code=130, error=Some("Cancelled: Adversarial cancellation midway through auto-rig")
+test test_task_runner_autorig_midway_cancellation_cleans_subprocesses ... ok
+TaskRunner AutoRig with Blender executed in 1.3724713s
+Received checkpoints: [(1, "analyzing_mesh"), (2, "completed")]
+test test_verify_task_runner_autorig_execution_with_blender ... ok
+Fallback execution completed in 1.4653675s
+test test_graceful_fallback_when_blender_path_is_invalid_or_missing ... ok
+Executing BlenderRigProvider::execute_rigging with host Blender (input size: 1225476 bytes)...
+Blender headless auto-rig completed in 1.4116059s
+Generated rigged .glb size: 1336780 bytes
+test test_verify_host_blender_headless_autorig_execution_glb ... ok
+auto_rig_mesh_async with preferred_provider=blender took 1.3143498s
+test test_verify_autorig_async_with_preferred_provider_blender ... ok
+Crash fallback completed in 48.7164ms
+test test_graceful_fallback_when_blender_binary_crashes ... ok
+test test_graceful_fallback_via_task_runner_on_blender_failure ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.56s
+

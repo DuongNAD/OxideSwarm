@@ -19,10 +19,14 @@ use tempfile::TempDir;
 use tokio::sync::oneshot;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
-use rusty_grid_core::task::{Generative3DSpec, Task, TaskRequirements, TaskSpec};
+use rusty_grid_core::protocol::WorkerMessage;
+use rusty_grid_core::task::{Generative3DSpec, Task, TaskId, TaskRequirements, TaskSpec};
 use rusty_grid_worker::autorig::BlenderRigProvider;
 use rusty_grid_worker::sandbox::SandboxConfig;
-use rusty_grid_worker::{RunnerConfig, TaskRunner, EXIT_CODE_CANCELLED};
+use rusty_grid_worker::{
+    ProcessPriority, RunnerConfig, TaskRunner, EXIT_CODE_CANCELLED, EXIT_CODE_GENERAL_ERROR,
+    EXIT_CODE_TIMEOUT,
+};
 
 static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -345,8 +349,12 @@ sys.exit(0)
     env.set("OXIDESWARM_SECRET_FILE", "sentinel-secret-file-sec5");
     env.set("OXIDE_MESH_TOKEN", "sentinel-mesh-token-sec5");
 
+    let (runner, _dir) = create_test_runner();
+    let task_id = TaskId::new();
     let dummy_input = b"glTF\x02\x00\x00\x00\x0c\x00\x00\x00";
     let res = BlenderRigProvider::execute_rigging(
+        &runner,
+        task_id,
         &fake_blender_path,
         dummy_input,
         "biped",
@@ -394,8 +402,12 @@ sys.exit(0)
 
     let fake_blender_path = create_fake_blender_executable(temp_dir.path(), logic);
 
+    let (runner, _dir) = create_test_runner();
+    let task_id = TaskId::new();
     let t0 = Instant::now();
     let res = BlenderRigProvider::execute_rigging(
+        &runner,
+        task_id,
         &fake_blender_path,
         b"glTF\x02\x00\x00\x00\x0c\x00\x00\x00",
         "biped",
@@ -540,9 +552,15 @@ time.sleep(60.0)
 
     let fake_blender_path = create_fake_blender_executable(temp_dir.path(), &logic);
 
+    let (runner, _dir) = create_test_runner();
+    let runner = Arc::new(runner);
+    let r = Arc::clone(&runner);
+    let task_id = TaskId::new();
     let fake_bin = fake_blender_path.clone();
     let task_handle = tokio::spawn(async move {
         BlenderRigProvider::execute_rigging(
+            &r,
+            task_id,
             &fake_bin,
             b"glTF\x02\x00\x00\x00\x0c\x00\x00\x00",
             "biped",
@@ -572,4 +590,546 @@ time.sleep(60.0)
     // Both processes must be dead within 4s due to ProcessTree RAII drop
     assert_all_dead_async(&pids, Duration::from_secs(4)).await;
     println!("Verified complete Blender tree cleanup on future abort!");
+}
+
+// ============================================================================
+// Test 6: Blender Watchdog Timeout Cleans Grandchild Process Tree (Item 8)
+// ============================================================================
+
+#[tokio::test]
+async fn test_sec5_blender_watchdog_timeout_cleans_grandchild_tree() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let pids_file = temp_dir.path().join("pids_timeout_tree.txt");
+    let pids_path = pids_file.display().to_string().replace('\\', "/");
+    let logic = format!(
+        r#"
+import os, sys, time, subprocess
+
+pids_file = "{pids_path}"
+my_pid = os.getpid()
+with open(pids_file, "a") as f:
+    f.write(f"PID:{{my_pid}}\n")
+    f.flush()
+
+# Spawn grandchild process that sleeps indefinitely
+gc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+with open(pids_file, "a") as f:
+    f.write(f"PID:{{gc.pid}}\n")
+    f.flush()
+
+# Parent sleeps past the watchdog timeout
+time.sleep(60.0)
+"#
+    );
+
+    let fake_blender_path = create_fake_blender_executable(temp_dir.path(), &logic);
+    let (runner, _dir) = create_test_runner();
+    let task_id = TaskId::new();
+
+    let t0 = Instant::now();
+    let res = BlenderRigProvider::execute_rigging(
+        &runner,
+        task_id,
+        &fake_blender_path,
+        b"glTF\x02\x00\x00\x00\x0c\x00\x00\x00",
+        "biped",
+        &[],
+        2, // 2s timeout
+    )
+    .await;
+
+    let elapsed = t0.elapsed();
+    println!("Blender timeout test elapsed: {:?}", elapsed);
+
+    // 1. Must fail with timeout error
+    assert!(res.is_err(), "Expected timeout failure, got: {:?}", res);
+    let err_msg = res.unwrap_err();
+    assert!(
+        err_msg.contains("timed out") || err_msg.contains("124"),
+        "Expected timeout message, got: {err_msg}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(2),
+        "Execution must have waited for at least the 2s timeout limit"
+    );
+
+    // 2. Poll recorded PIDs
+    let pids = poll_pids_async(&pids_file, 2, Duration::from_secs(10)).await;
+    assert_eq!(
+        pids.len(),
+        2,
+        "Expected parent and grandchild PIDs, found {:?}",
+        pids
+    );
+
+    // 3. Assert both parent and grandchild are terminated
+    assert_all_dead_async(&pids, Duration::from_secs(4)).await;
+    println!("Verified complete Blender process tree termination on timeout!");
+}
+
+// ============================================================================
+// Test 7: Blender Runner ProcessPriority::Idle & Task/Worker Identity (Items 2 & 8)
+// ============================================================================
+
+#[tokio::test]
+async fn test_sec5_blender_runner_priority_idle_and_task_identity() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let sandbox_config = SandboxConfig::new(temp_dir.path().to_path_buf());
+    let mut runner_config = RunnerConfig::new(sandbox_config);
+    runner_config.process_priority = ProcessPriority::Idle;
+    let worker_id = uuid::Uuid::new_v4();
+    let task_id = TaskId::new();
+    let caps = WorkerCapabilities::default();
+    let runner = TaskRunner::new(worker_id, caps, runner_config);
+
+    let logic = format!(
+        r#"
+import os, sys
+
+# 1. Verify secrets are stripped
+secrets = ["OXIDESWARM_SECRET", "OXIDESWARM_SECRET_FILE", "OXIDE_MESH_TOKEN"]
+leaks = [s for s in secrets if s in os.environ]
+if leaks:
+    sys.stderr.write(f"SECRET_LEAK:{{','.join(leaks)}}\n")
+    sys.exit(42)
+
+# 2. Verify process priority (Idle: 64 on Windows, nice 19 on Unix)
+if sys.platform == "win32":
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.GetPriorityClass.argtypes = [ctypes.c_void_p]
+    pclass = kernel32.GetPriorityClass(kernel32.GetCurrentProcess())
+    # IDLE_PRIORITY_CLASS is 0x00000040 = 64
+    if pclass != 64:
+        sys.stderr.write(f"BAD_PRIORITY:{{pclass}}\n")
+        sys.exit(43)
+else:
+    nice_val = os.nice(0)
+    if nice_val < 19:
+        sys.stderr.write(f"BAD_NICE:{{nice_val}}\n")
+        sys.exit(43)
+
+# 3. Verify task ID and worker ID match runner and task
+expected_task_id = "{task_id}"
+expected_worker_id = "{worker_id}"
+actual_task_id = os.environ.get("RUSTY_GRID_TASK_ID", "")
+actual_worker_id = os.environ.get("RUSTY_GRID_WORKER_ID", "")
+
+if actual_task_id != expected_task_id:
+    sys.stderr.write(f"BAD_TASK_ID: expected {{expected_task_id}}, got {{actual_task_id}}\n")
+    sys.exit(44)
+
+if actual_worker_id != expected_worker_id:
+    sys.stderr.write(f"BAD_WORKER_ID: expected {{expected_worker_id}}, got {{actual_worker_id}}\n")
+    sys.exit(45)
+
+# 4. Write valid glTF output
+if "--output" in sys.argv:
+    out_idx = sys.argv.index("--output")
+    out_path = sys.argv[out_idx + 1]
+    with open(out_path, "wb") as f:
+        f.write(b"glTF\x02\x00\x00\x00\x0c\x00\x00\x00")
+
+sys.exit(0)
+"#
+    );
+
+    let fake_blender_path = create_fake_blender_executable(temp_dir.path(), &logic);
+
+    let mut env = EnvLock::lock().await;
+    env.set("OXIDESWARM_SECRET", "sentinel-cluster-secret-sec5");
+    env.set("OXIDESWARM_SECRET_FILE", "sentinel-secret-file-sec5");
+    env.set("OXIDE_MESH_TOKEN", "sentinel-mesh-token-sec5");
+
+    let dummy_input = b"glTF\x02\x00\x00\x00\x0c\x00\x00\x00";
+    let res = BlenderRigProvider::execute_rigging(
+        &runner,
+        task_id,
+        &fake_blender_path,
+        dummy_input,
+        "biped",
+        &["walk".to_string()],
+        30,
+    )
+    .await;
+
+    assert!(
+        res.is_ok(),
+        "Fake Blender execution failed: {:?}",
+        res.err()
+    );
+    let output_glb = res.unwrap();
+    assert!(output_glb.starts_with(b"glTF"));
+}
+
+// ============================================================================
+// Test 8: Version Probes Strip Secrets (Items 6 & 8)
+// ============================================================================
+
+#[tokio::test]
+async fn test_sec5_version_probes_strip_secrets() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let log_file = temp_dir.path().join("probe_env.log");
+    let log_path = log_file.display().to_string().replace('\\', "/");
+
+    let probe_logic = format!(
+        r#"
+import os, sys
+
+log_file = "{log_path}"
+with open(log_file, "a") as f:
+    for k, v in os.environ.items():
+        if "OXIDE" in k:
+            f.write(f"{{k}}={{v}}\n")
+    f.flush()
+
+if "blender" in sys.argv[0].lower():
+    print("Blender 4.5.4 LTS")
+else:
+    print("Python 3.11.0")
+
+sys.exit(0)
+"#
+    );
+
+    let script_py = temp_dir.path().join("probe_mock.py");
+    std::fs::write(&script_py, &probe_logic).expect("write mock script");
+
+    let real_py = if let Ok(custom) = std::env::var("OXIDESWARM_PYTHON") {
+        PathBuf::from(custom)
+    } else {
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("where.exe")
+                .arg("python.exe")
+                .output()
+                .ok();
+            output
+                .and_then(|out| {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    text.lines().next().map(|line| PathBuf::from(line.trim()))
+                })
+                .unwrap_or_else(|| PathBuf::from("python"))
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from("python3")
+        }
+    };
+
+    #[cfg(windows)]
+    {
+        let cmd_blender = format!(
+            "@echo off\r\n\"{}\" \"{}\" %*\r\n",
+            real_py.display(),
+            script_py.display()
+        );
+        let cmd_python = format!(
+            "@echo off\r\n\"{}\" \"{}\" %*\r\n",
+            real_py.display(),
+            script_py.display()
+        );
+        std::fs::write(temp_dir.path().join("blender.cmd"), cmd_blender)
+            .expect("write blender.cmd");
+        std::fs::write(temp_dir.path().join("python.cmd"), cmd_python).expect("write python.cmd");
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let sh_blender = format!(
+            "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
+            real_py.display(),
+            script_py.display()
+        );
+        let sh_python = format!(
+            "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
+            real_py.display(),
+            script_py.display()
+        );
+        let b_path = temp_dir.path().join("blender");
+        let p_path = temp_dir.path().join("python");
+        std::fs::write(&b_path, sh_blender).expect("write blender");
+        std::fs::write(&p_path, sh_python).expect("write python");
+        let _ = std::fs::set_permissions(&b_path, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(&p_path, std::fs::Permissions::from_mode(0o755));
+    }
+
+    let mut env = EnvLock::lock().await;
+    env.set("OXIDESWARM_SECRET", "sentinel-cluster-secret-sec5");
+    env.set("OXIDESWARM_SECRET_FILE", "sentinel-secret-file-sec5");
+    env.set("OXIDE_MESH_TOKEN", "sentinel-mesh-token-sec5");
+
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let new_path = format!("{}{sep}{}", temp_dir.path().display(), current_path);
+    env.set("PATH", &new_path);
+
+    // 1. Probe Blender in blender_provider
+    let blender_bin = rusty_grid_worker::autorig::blender_provider::resolve_blender_binary();
+    assert!(
+        blender_bin.is_some(),
+        "Blender probe must succeed on fake binary"
+    );
+
+    // 2. Probe Python in gen3d::runner
+    let python_bin = rusty_grid_worker::gen3d::runner::resolve_python_runtime();
+    assert!(
+        python_bin.is_some(),
+        "Python probe must succeed on fake binary"
+    );
+
+    // 3. Probe Blender in capabilities
+    let (has_blender, _ver) = rusty_grid_core::capabilities::detect_blender(None);
+    assert!(has_blender, "detect_blender must succeed on fake binary");
+
+    // 4. Verify logged environment has zero secrets
+    let logged = std::fs::read_to_string(&log_file).unwrap_or_default();
+    assert!(
+        !logged.contains("sentinel-cluster-secret-sec5"),
+        "OXIDESWARM_SECRET leaked to probe: {logged}"
+    );
+    assert!(
+        !logged.contains("sentinel-secret-file-sec5"),
+        "OXIDESWARM_SECRET_FILE leaked to probe: {logged}"
+    );
+    assert!(
+        !logged.contains("sentinel-mesh-token-sec5"),
+        "OXIDE_MESH_TOKEN leaked to probe: {logged}"
+    );
+}
+
+// ============================================================================
+// Test 9: glTF Header Validation Failure Fails For Every Engine (Items 1 & 8)
+// ============================================================================
+
+#[tokio::test]
+async fn test_sec5_gltf_header_validation_failure_for_both_engines() {
+    let (runner, _dir) = create_test_runner();
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+
+    let mock_script = temp_dir.path().join("junk_glb_engine.py");
+    let script_content = r#"
+import sys
+if "--output" in sys.argv:
+    out_idx = sys.argv.index("--output")
+    out_path = sys.argv[out_idx + 1]
+    with open(out_path, "wb") as f:
+        f.write(b"CORRUPT_NOT_A_VALID_GLTF_HEADER")
+sys.exit(0)
+"#;
+    std::fs::write(&mock_script, script_content).expect("write mock script");
+
+    let mut env = EnvLock::lock().await;
+    env.set(
+        "OXIDESWARM_GEN3D_SCRIPT",
+        mock_script.to_str().expect("path"),
+    );
+
+    for engine in ["triposr", "auto"] {
+        let spec = Generative3DSpec::new_prompt("Bad glTF Test").with_engine(engine);
+        let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
+        let res = runner.execute_task(&task, None, None).await;
+
+        assert_eq!(
+            res.exit_code, EXIT_CODE_GENERAL_ERROR,
+            "Failed for engine {engine}"
+        );
+        assert_eq!(
+            res.error.as_deref(),
+            Some("Generated .glb file has invalid glTF 2.0 header"),
+            "Error mismatch for engine {engine}"
+        );
+        assert!(
+            res.asset_bytes.is_none(),
+            "asset_bytes must be None for engine {engine}"
+        );
+    }
+}
+
+// ============================================================================
+// Test 10: Explicit Engine Exit Code Described When Error Empty (Items 3 & 8)
+// ============================================================================
+
+#[tokio::test]
+async fn test_sec5_explicit_engine_exit_code_3_named_in_error() {
+    let (runner, _dir) = create_test_runner();
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+
+    let mock_script = temp_dir.path().join("exit_3_engine.py");
+    let script_content = "import sys\nsys.exit(3)\n";
+    std::fs::write(&mock_script, script_content).expect("write mock script");
+
+    let mut env = EnvLock::lock().await;
+    env.set(
+        "OXIDESWARM_GEN3D_SCRIPT",
+        mock_script.to_str().expect("path"),
+    );
+
+    let spec = Generative3DSpec::new_prompt("Exit 3 Test").with_engine("triposr");
+    let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
+    let res = runner.execute_task(&task, None, None).await;
+
+    assert_eq!(res.exit_code, 3);
+    assert_eq!(
+        res.error.as_deref(),
+        Some("3D engine subprocess failed with exit code 3")
+    );
+}
+
+// ============================================================================
+// Test 11: Exit 124 Falls Back Under Auto vs Watchdog Timeout (Items 4 & 8)
+// ============================================================================
+
+#[tokio::test]
+async fn test_sec5_exit_124_falls_back_under_auto_while_watchdog_fails() {
+    let (runner, _dir) = create_test_runner();
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+
+    // Engine's own exit 124
+    let exit_124_script = temp_dir.path().join("exit_124_engine.py");
+    std::fs::write(&exit_124_script, "import sys\nsys.exit(124)\n").expect("write");
+
+    let mut env = EnvLock::lock().await;
+    env.set(
+        "OXIDESWARM_GEN3D_SCRIPT",
+        exit_124_script.to_str().expect("path"),
+    );
+
+    let spec = Generative3DSpec::new_prompt("Exit 124 Auto Fallback").with_engine("auto");
+    let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
+    let res = runner.execute_task(&task, None, None).await;
+
+    assert!(
+        res.is_success(),
+        "Exit 124 under auto must fall back to Tier 0 SDF"
+    );
+    assert!(res.asset_bytes.is_some());
+    assert!(res.asset_bytes.unwrap().as_slice().starts_with(b"glTF"));
+
+    // Real timeout via watchdog
+    let hang_script = temp_dir.path().join("hang_engine.py");
+    std::fs::write(&hang_script, "import time\ntime.sleep(30)\n").expect("write");
+    env.set(
+        "OXIDESWARM_GEN3D_SCRIPT",
+        hang_script.to_str().expect("path"),
+    );
+
+    let reqs = TaskRequirements {
+        timeout_secs: 1,
+        ..Default::default()
+    };
+    let spec_timeout = Generative3DSpec::new_prompt("Timeout Engine").with_engine("auto");
+    let task_timeout = Task::new(TaskSpec::Generative3D(spec_timeout), reqs);
+    let res_timeout = runner.execute_task(&task_timeout, None, None).await;
+
+    assert_eq!(res_timeout.exit_code, EXIT_CODE_TIMEOUT);
+    assert!(
+        res_timeout
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Task timed out after 1s"),
+        "Expected timeout error, got: {:?}",
+        res_timeout.error
+    );
+}
+
+// ============================================================================
+// Test 12: Cancelled Run Sends Zero Checkpoints (Items 5 & 8)
+// ============================================================================
+
+#[tokio::test]
+async fn test_sec5_cancelled_dead_run_sends_zero_checkpoints() {
+    let (runner, _dir) = create_test_runner();
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+
+    let prog_script = temp_dir.path().join("progress_then_hang.py");
+    let script_content = r#"
+import sys, time
+for i in range(3):
+    print(f"[PROGRESS:{(i+1)*25}%] Step {i+1}", flush=True)
+    time.sleep(0.05)
+time.sleep(30)
+"#;
+    std::fs::write(&prog_script, script_content).expect("write");
+
+    let mut env = EnvLock::lock().await;
+    env.set(
+        "OXIDESWARM_GEN3D_SCRIPT",
+        prog_script.to_str().expect("path"),
+    );
+
+    let (ckpt_tx, mut ckpt_rx) = tokio::sync::mpsc::channel::<WorkerMessage>(32);
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let child_pid = Arc::new(AtomicU32::new(0));
+
+    let spec = Generative3DSpec::new_prompt("Cancelled Progress").with_engine("triposr");
+    let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
+
+    // Trigger cancel shortly after start
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let _ = cancel_tx.send("User cancellation requested".to_string());
+    });
+
+    let res = runner
+        .execute_task_with_checkpoint(&task, None, Some(ckpt_tx), Some(child_pid), Some(cancel_rx))
+        .await;
+
+    assert_eq!(res.exit_code, EXIT_CODE_CANCELLED);
+
+    let mut checkpoints = Vec::new();
+    while let Ok(ckpt) = ckpt_rx.try_recv() {
+        checkpoints.push(ckpt);
+    }
+    assert_eq!(
+        checkpoints.len(),
+        0,
+        "Cancelled dead run must send 0 checkpoints, received {}",
+        checkpoints.len()
+    );
+}
+
+// ============================================================================
+// Test 13: 3D Workload Omits Output Artifact Collection (Items 7 & 8)
+// ============================================================================
+
+#[tokio::test]
+async fn test_sec5_3d_workload_omits_output_artifacts() {
+    let (runner, _dir) = create_test_runner();
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+
+    let valid_script = temp_dir.path().join("valid_engine.py");
+    let script_content = r#"
+import sys
+if "--output" in sys.argv:
+    out_idx = sys.argv.index("--output")
+    out_path = sys.argv[out_idx + 1]
+    with open(out_path, "wb") as f:
+        f.write(b"glTF\x02\x00\x00\x00\x0c\x00\x00\x00")
+sys.exit(0)
+"#;
+    std::fs::write(&valid_script, script_content).expect("write");
+
+    let mut env = EnvLock::lock().await;
+    env.set(
+        "OXIDESWARM_GEN3D_SCRIPT",
+        valid_script.to_str().expect("path"),
+    );
+
+    let spec = Generative3DSpec::new_prompt("Output test").with_engine("triposr");
+    let mut task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
+    task.expected_outputs = vec!["extra_artifact.txt".to_string()];
+
+    let res = runner.execute_task(&task, None, None).await;
+    assert!(res.is_success());
+    assert!(
+        res.artifacts.is_empty(),
+        "Artifacts must be empty for 3D path"
+    );
+    assert!(
+        res.outputs.is_empty(),
+        "Blob outputs must be empty for 3D path"
+    );
 }

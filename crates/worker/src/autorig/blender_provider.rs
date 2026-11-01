@@ -65,10 +65,12 @@ pub fn resolve_blender_binary() -> Option<PathBuf> {
     }
 
     // 3. Fallback check for "blender" on PATH
-    if let Ok(output) = std::process::Command::new("blender")
-        .arg("--version")
-        .output()
-    {
+    let mut cmd = std::process::Command::new("blender");
+    cmd.arg("--version");
+    for var in rusty_grid_core::cluster_auth::SECRET_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    if let Ok(output) = cmd.output() {
         if output.status.success() {
             return Some(PathBuf::from("blender"));
         }
@@ -102,6 +104,8 @@ impl BlenderRigProvider {
     ///
     /// Supervised under the hardened runner (`ProcessTree`).
     pub async fn execute_rigging(
+        runner: &crate::runner::TaskRunner,
+        task_id: rusty_grid_core::task::TaskId,
         blender_bin: &Path,
         input_mesh_bytes: &[u8],
         preset: &str,
@@ -151,18 +155,9 @@ impl BlenderRigProvider {
             anim_arg,
         ];
 
-        let runner_config = crate::runner::RunnerConfig::new(crate::sandbox::SandboxConfig::new(
-            temp_dir.path().to_path_buf(),
-        ));
-        let runner = crate::runner::TaskRunner::new(
-            uuid::Uuid::nil(),
-            rusty_grid_core::capabilities::WorkerCapabilities::default(),
-            runner_config,
-        );
-
         let res = runner
             .execute_process_supervised(
-                rusty_grid_core::task::TaskId::new(),
+                task_id,
                 temp_dir.path(),
                 &blender_bin.to_string_lossy(),
                 &cmd_args,
