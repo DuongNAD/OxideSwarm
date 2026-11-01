@@ -432,9 +432,12 @@ fn test_mapreduce_exits_non_zero_when_the_job_fails() {
     assert!(ok.status.success(), "stderr: {}", text(&ok.stderr));
     assert!(text(&ok.stdout).contains("a: 2"), "{}", text(&ok.stdout));
 
-    // A mapper that cannot run (its script does not exist on the worker): the master answers with a
+    // A mapper script that runs on the worker and exits non-zero: the master answers with a
     // Failed job, and the command must say so and exit non-zero instead of printing "Completed".
-    let failed = mapreduce(&["--mapper", "./no-such-mapper.sh"]);
+    let bad_mapper = home.path().join("bad-mapper.sh");
+    fs::write(&bad_mapper, "echo 'mapper boom' >&2\nexit 1\n").expect("write bad-mapper.sh");
+    let bad_mapper_arg = bad_mapper.to_string_lossy().to_string();
+    let failed = mapreduce(&["--mapper", &bad_mapper_arg]);
     assert!(
         !failed.status.success(),
         "a failed job must not exit 0; stdout: {} stderr: {}",
@@ -451,6 +454,18 @@ fn test_mapreduce_exits_non_zero_when_the_job_fails() {
         !text(&failed.stdout).contains("Job Completed"),
         "{}",
         text(&failed.stdout)
+    );
+
+    // A local mapper script path that does not exist on the client is rejected before dispatch.
+    let missing_local = mapreduce(&["--mapper", "./no-such-mapper.sh"]);
+    assert!(
+        !missing_local.status.success(),
+        "missing local mapper script must exit non-zero"
+    );
+    assert!(
+        text(&missing_local.stderr).contains("Failed to read mapper script './no-such-mapper.sh'"),
+        "expected local read error, got: {}",
+        text(&missing_local.stderr)
     );
 
     // --chunks 0 used to panic with a division by zero; it is a usage error now.

@@ -458,14 +458,27 @@ fn task_failure_detail(result: &TaskResult, uses_sh: bool) -> String {
     } else {
         result.error.as_deref().unwrap_or("unknown error")
     };
-    let spawn_failed = result.exit_code == -1
-        || detail.contains("Failed to spawn process 'sh'")
+    let is_sh_spawn_error = detail.contains("Failed to spawn process 'sh'")
         || detail.contains("Failed to spawn command 'sh'")
         || result
             .error
             .as_deref()
             .is_some_and(|e| e.contains("Process spawn error"));
-    if uses_sh && spawn_failed {
+    let lower_detail = detail.to_ascii_lowercase();
+    let lower_err = result
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let is_not_found = lower_detail.contains("not found")
+        || lower_detail.contains("no such file")
+        || lower_detail.contains("cannot find the file")
+        || lower_detail.contains("os error 2")
+        || lower_err.contains("not found")
+        || lower_err.contains("no such file")
+        || lower_err.contains("cannot find the file")
+        || lower_err.contains("os error 2");
+    if uses_sh && is_sh_spawn_error && is_not_found {
         format!(
             "{detail} (worker does not have 'sh' on PATH; install a POSIX shell such as Git for Windows or pass --map-cmd / --reduce-cmd)"
         )
@@ -611,20 +624,27 @@ fn reduce_builtin(operator: &str, values: &[serde_json::Value]) -> GridResult<se
             for val in values {
                 if let Some(n) = val.as_i64() {
                     sum_i += n;
-                } else if let Some(f) = val.as_f64() {
+                } else if let Some(f) = val.as_f64().filter(|f| f.is_finite()) {
                     is_float = true;
                     sum_f += f;
                 } else if let Some(s) = val.as_str() {
                     if let Ok(n) = s.parse::<i64>() {
                         sum_i += n;
                     } else if let Ok(f) = s.parse::<f64>() {
-                        is_float = true;
-                        sum_f += f;
+                        if f.is_finite() {
+                            is_float = true;
+                            sum_f += f;
+                        }
                     }
                 }
             }
             if is_float {
-                serde_json::json!(sum_f + sum_i as f64)
+                let total = sum_f + sum_i as f64;
+                if total.is_finite() {
+                    serde_json::json!(total)
+                } else {
+                    serde_json::json!(sum_i)
+                }
             } else {
                 serde_json::json!(sum_i)
             }
@@ -639,7 +659,7 @@ fn reduce_builtin(operator: &str, values: &[serde_json::Value]) -> GridResult<se
                     max_i = Some(max_i.map_or(n, |m| m.max(n)));
                     let f = n as f64;
                     max_f = Some(max_f.map_or(f, |m| m.max(f)));
-                } else if let Some(f) = val.as_f64() {
+                } else if let Some(f) = val.as_f64().filter(|f| f.is_finite()) {
                     is_float = true;
                     max_f = Some(max_f.map_or(f, |m| m.max(f)));
                 } else if let Some(s) = val.as_str() {
@@ -648,8 +668,10 @@ fn reduce_builtin(operator: &str, values: &[serde_json::Value]) -> GridResult<se
                         let f = n as f64;
                         max_f = Some(max_f.map_or(f, |m| m.max(f)));
                     } else if let Ok(f) = s.parse::<f64>() {
-                        is_float = true;
-                        max_f = Some(max_f.map_or(f, |m| m.max(f)));
+                        if f.is_finite() {
+                            is_float = true;
+                            max_f = Some(max_f.map_or(f, |m| m.max(f)));
+                        }
                     }
                 }
             }
@@ -668,7 +690,7 @@ fn reduce_builtin(operator: &str, values: &[serde_json::Value]) -> GridResult<se
                     min_i = Some(min_i.map_or(n, |m| m.min(n)));
                     let f = n as f64;
                     min_f = Some(min_f.map_or(f, |m| m.min(f)));
-                } else if let Some(f) = val.as_f64() {
+                } else if let Some(f) = val.as_f64().filter(|f| f.is_finite()) {
                     is_float = true;
                     min_f = Some(min_f.map_or(f, |m| m.min(f)));
                 } else if let Some(s) = val.as_str() {
@@ -677,8 +699,10 @@ fn reduce_builtin(operator: &str, values: &[serde_json::Value]) -> GridResult<se
                         let f = n as f64;
                         min_f = Some(min_f.map_or(f, |m| m.min(f)));
                     } else if let Ok(f) = s.parse::<f64>() {
-                        is_float = true;
-                        min_f = Some(min_f.map_or(f, |m| m.min(f)));
+                        if f.is_finite() {
+                            is_float = true;
+                            min_f = Some(min_f.map_or(f, |m| m.min(f)));
+                        }
                     }
                 }
             }

@@ -2847,8 +2847,41 @@ async fn run_workers(
     run_status(status_args, config_file, secret_opts).await
 }
 
+const MAX_MAPREDUCE_SCRIPT_BYTES: usize = 64 * 1024;
+
+fn is_builtin_mapper(s: &str) -> bool {
+    matches!(s, "word_count" | "line_count" | "identity")
+}
+
+fn is_builtin_reducer(s: &str) -> bool {
+    matches!(s, "sum" | "count" | "max" | "min" | "concat")
+}
+
 fn looks_like_script_path(s: &str) -> bool {
-    s.contains('/') || s.contains('\\') || s.ends_with(".sh") || Path::new(s).exists()
+    s.contains('/') || s.contains('\\') || s.ends_with(".sh")
+}
+
+fn read_mapreduce_script(kind: &str, path_str: &str) -> Result<String, String> {
+    let path = Path::new(path_str);
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("Failed to read {kind} script '{path_str}': {e}"))?;
+    if meta.len() > MAX_MAPREDUCE_SCRIPT_BYTES as u64 {
+        return Err(format!(
+            "Failed to read {kind} script '{path_str}': script size ({} bytes) exceeds maximum inline MapReduce script size ({} bytes); use --{kind}-cmd or stage the script onto workers",
+            meta.len(),
+            MAX_MAPREDUCE_SCRIPT_BYTES
+        ));
+    }
+    let script = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {kind} script '{path_str}': {e}"))?;
+    if script.len() > MAX_MAPREDUCE_SCRIPT_BYTES {
+        return Err(format!(
+            "Failed to read {kind} script '{path_str}': script size ({} bytes) exceeds maximum inline MapReduce script size ({} bytes); use --{kind}-cmd or stage the script onto workers",
+            script.len(),
+            MAX_MAPREDUCE_SCRIPT_BYTES
+        ));
+    }
+    Ok(script)
 }
 
 fn split_command_line(cmd: &str) -> Result<(String, Vec<String>), String> {
@@ -2856,19 +2889,26 @@ fn split_command_line(cmd: &str) -> Result<(String, Vec<String>), String> {
     let mut current = String::new();
     let mut in_single = false;
     let mut in_double = false;
-    let mut escaped = false;
     let mut token_started = false;
+    let mut chars = cmd.chars().peekable();
 
-    for ch in cmd.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            token_started = true;
-            continue;
-        }
+    while let Some(ch) = chars.next() {
         match ch {
             '\\' if !in_single => {
-                escaped = true;
+                let should_escape = if in_double {
+                    matches!(chars.peek(), Some('"' | '\\'))
+                } else {
+                    chars.peek().is_some_and(|next| {
+                        *next == '"' || *next == '\'' || *next == '\\' || next.is_whitespace()
+                    })
+                };
+                if should_escape {
+                    if let Some(escaped_ch) = chars.next() {
+                        current.push(escaped_ch);
+                    }
+                } else {
+                    current.push('\\');
+                }
                 token_started = true;
             }
             '\'' if !in_double => {
@@ -2893,9 +2933,6 @@ fn split_command_line(cmd: &str) -> Result<(String, Vec<String>), String> {
     }
     if in_single || in_double {
         return Err("unclosed quote in command string".to_string());
-    }
-    if escaped {
-        current.push('\\');
     }
     if token_started {
         tokens.push(current);
@@ -2986,11 +3023,15 @@ async fn run_mapreduce(
                 return ExitCode::FAILURE;
             }
         }
+    } else if is_builtin_mapper(&args.mapper) {
+        MapFunctionSpec::Builtin {
+            operator: args.mapper,
+        }
     } else if looks_like_script_path(&args.mapper) {
-        match std::fs::read_to_string(&args.mapper) {
+        match read_mapreduce_script("mapper", &args.mapper) {
             Ok(script) => MapFunctionSpec::ShellScript { script },
-            Err(e) => {
-                eprintln!("Failed to read mapper script '{}': {e}", args.mapper);
+            Err(msg) => {
+                eprintln!("{msg}");
                 return ExitCode::FAILURE;
             }
         }
@@ -3011,11 +3052,15 @@ async fn run_mapreduce(
                 return ExitCode::FAILURE;
             }
         }
+    } else if is_builtin_reducer(&args.reducer) {
+        ReduceFunctionSpec::Builtin {
+            operator: args.reducer,
+        }
     } else if looks_like_script_path(&args.reducer) {
-        match std::fs::read_to_string(&args.reducer) {
+        match read_mapreduce_script("reducer", &args.reducer) {
             Ok(script) => ReduceFunctionSpec::ShellScript { script },
-            Err(e) => {
-                eprintln!("Failed to read reducer script '{}': {e}", args.reducer);
+            Err(msg) => {
+                eprintln!("{msg}");
                 return ExitCode::FAILURE;
             }
         }
