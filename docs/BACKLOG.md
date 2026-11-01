@@ -127,9 +127,9 @@ merge.
 
 | ID | Item | Priority | Size | Needs | Owner | Status |
 |---|---|---|---|---|---|---|
-| INT-1 | Merge pull request 3 | P0 | S | | Yes | Planned |
-| INT-2 | Close superseded pull requests and branches | P0 | S | INT-1 | Yes | Planned |
-| INT-3 | Land the AEAD hardening branch | P0 | S | INT-1 | Yes | Planned |
+| INT-1 | Merge pull request 3 | P0 | S | | Yes | Implemented |
+| INT-2 | Close superseded pull requests and branches | P0 | S | INT-1 | Yes | Implemented |
+| INT-3 | Land the AEAD hardening branch | P0 | S | INT-1 | Yes | Implemented |
 | INT-4 | Land the content-addressed file branch | P0 | M | INT-3 | Yes | Planned |
 | SEC-1 | Remove `mcp --sse` | P0 | S | INT-4 | | Planned |
 | SEC-2 | Make MCP refuse a remote master without a secret | P0 | S | INT-4 | | Planned |
@@ -513,13 +513,15 @@ The full suite must pass on a clean machine before CI can require it.
   the launcher tests. The only CI run of the full suite was in pull request 2, at an old base, and
   it failed.
 - **Do:**
-  1. Add a job for `cargo test --workspace --locked --no-fail-fast` on Linux, macOS and Windows.
+  1. Add a job for `cargo test --workspace --locked --no-fail-fast` on Linux, macOS and Windows (`timeout-minutes: 90`).
   2. Add a launcher job on Ubuntu and macOS that does not build anything, because
-     `tests/test_launcher_scripts.py` also scans `target/`. On macOS it runs under `/bin/bash` 3.2.
-  3. Add `setup-python` with `websockets` for `tests/test_ecosystem_convergence.rs`.
-  4. Add `CARGO_PROFILE_DEV_DEBUG=line-tables-only` to keep test binaries small.
-  5. Add a clippy and `--lib` job with `-p rusty_grid_cli --features gpu-wgpu`.
-  6. Add `tests/test_agent_mesh_rust_hub_cross_interop.py`, which tests the Rust hub.
+     `tests/test_launcher_scripts.py` also scans `target/`. On macOS it sets `export PATH="/bin:$PATH"` so it runs under `/bin/bash` 3.2 instead of Homebrew bash.
+  3. Add `actions/setup-python@v7` (`python-version: '3.12'`) with `python -m pip install --disable-pip-version-check websockets` for `tests/test_ecosystem_convergence.rs`.
+  4. Add `CARGO_PROFILE_DEV_DEBUG=line-tables-only` to keep test binaries small, and configure `Swatinem/rust-cache@v2` with `save-if: ${{ github.ref == 'refs/heads/master' }}` and `cache-on-failure: true`.
+  5. Set `concurrency` to `group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}` and `cancel-in-progress: ${{ github.event_name == 'pull_request' }}` so pushes to `master` are never cancelled.
+  6. Add a clippy and `--lib` job with `-p rusty_grid_cli --features gpu-wgpu`.
+  7. Add `tests/test_agent_mesh_rust_hub_cross_interop.py`, which tests the Rust hub.
+  8. Delete `origin/claude/trusting-wing-d9a27c` once the full CI file is in place.
 - **Done when:** All jobs are required and green on `master`.
 
 ### TEST-7: Run or delete the orphan Python tests
@@ -1108,3 +1110,6 @@ Each item below needs a design record before code.
 Add one dated line per finished item, newest last.
 
 - 2026-11-01: Backlog written from a code audit and the runs in the test baseline.
+- 2026-11-01: INT-1 completed; pull request 3 merged (`b76d85b`) and `master` CI run `41276400780` passed.
+- 2026-11-01: INT-2 completed; closed pull requests 1 and 2, deleted merged remote branches, and copied PR 2 CI details into TEST-6 (`origin/claude/trusting-wing-d9a27c` kept until TEST-6).
+- 2026-11-01: INT-3 completed; rebased `d0dddb8` (cluster auth v2 and record-layer hardening) onto `master` and verified all gates plus `tests/cluster_record_layer_e2e.rs`.
