@@ -82,23 +82,14 @@ async fn test_cache_deduplication_and_hardlink_acceleration() {
         .await
         .expect("stage files task 1");
 
-    let cache_obj_a = objects_dir.join(&sha256_a_hex);
-    assert!(
-        cache_obj_a.exists(),
-        "Cache object must exist at <sandbox_base>/cache/objects/<sha256>"
-    );
-    let cached_bytes = tokio::fs::read(&cache_obj_a)
-        .await
-        .expect("read cached object A");
-    assert_eq!(cached_bytes, content_a);
-
     let staged_file_1 = sandbox_1.path().join("models").join("weights.bin");
     assert!(
         staged_file_1.exists(),
         "Staged file must exist in sandbox 1"
     );
+    assert_eq!(tokio::fs::read(&staged_file_1).await.unwrap(), content_a);
 
-    // --- Task 2: Consecutive staging with identical content reuses cache ---
+    // --- Task 2: Consecutive staging with identical content gets an independent copy ---
     let task_id_2 = TaskId::new();
     let sandbox_2 = Sandbox::create(&sb_cfg, task_id_2)
         .await
@@ -118,28 +109,18 @@ async fn test_cache_deduplication_and_hardlink_acceleration() {
         .expect("read staged file 2");
     assert_eq!(read_file_2, content_a);
 
-    // Verify hardlink or copy fallback:
-    // If the filesystem supports hardlinks, the link count of the cache object should be >= 2.
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::metadata(&cache_obj_a).expect("metadata of cache obj");
-        if meta.nlink() >= 2 {
-            println!(
-                "Confirmed hardlink deduplication on Unix (nlink = {})",
-                meta.nlink()
-            );
-        }
+        assert_eq!(std::fs::metadata(&staged_file_1).unwrap().nlink(), 1);
+        assert_eq!(std::fs::metadata(&staged_file_2).unwrap().nlink(), 1);
     }
-    #[cfg(windows)]
-    {
-        // On Windows, verify cache object metadata exists and matches expected size
-        if let Ok(meta) = std::fs::metadata(&cache_obj_a) {
-            assert_eq!(meta.len(), content_a.len() as u64);
-        }
-    }
+    assert!(
+        !objects_dir.exists(),
+        "Inline stage_files must not create shared cache/objects"
+    );
 
-    // --- Task 3: Modified content produces distinct SHA-256 and separate cache entry ---
+    // --- Task 3: Modified content produces distinct SHA-256 and independent sandbox file ---
     let content_b = b"OXIDE_SWARM_IMMUTABLE_MODEL_WEIGHTS_V2_MUTATED_DATA";
     let sha256_b = sha256_digest(content_b);
     let sha256_b_hex = hex_encode(&sha256_b);
@@ -163,21 +144,9 @@ async fn test_cache_deduplication_and_hardlink_acceleration() {
         .await
         .expect("stage files task 3");
 
-    let cache_obj_b = objects_dir.join(&sha256_b_hex);
-    assert!(
-        cache_obj_b.exists(),
-        "Mutated content must create a distinct cache entry at <sandbox_base>/cache/objects/<sha256_b>"
-    );
-    let cached_bytes_b = tokio::fs::read(&cache_obj_b)
-        .await
-        .expect("read cached object B");
-    assert_eq!(cached_bytes_b, content_b);
-
-    // Verify object A remains untouched and uncorrupted
-    let cached_bytes_a_after = tokio::fs::read(&cache_obj_a)
-        .await
-        .expect("read cached object A after B");
-    assert_eq!(cached_bytes_a_after, content_a);
+    let staged_file_3 = sandbox_3.path().join("models").join("weights.bin");
+    assert_eq!(tokio::fs::read(&staged_file_3).await.unwrap(), content_b);
+    assert_eq!(tokio::fs::read(&staged_file_1).await.unwrap(), content_a);
 }
 
 #[tokio::test]
@@ -209,6 +178,11 @@ async fn test_concurrent_cache_staging_race_conditions() {
             let target = sandbox.path().join("shared.dat");
             let read_back = tokio::fs::read(&target).await.expect("read back file");
             assert_eq!(read_back, content);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(std::fs::metadata(&target).unwrap().nlink(), 1);
+            }
             i
         });
         handles.push(handle);
@@ -219,12 +193,7 @@ async fn test_concurrent_cache_staging_race_conditions() {
         assert!(i < 10);
     }
 
-    // Verify cache object exists and is intact
-    let sha256_hex = hex_encode(&sha256_digest(content));
-    let cache_obj = cache_dir.join("objects").join(&sha256_hex);
-    assert!(cache_obj.exists());
-    let cached_content = tokio::fs::read(&cache_obj).await.expect("read cache obj");
-    assert_eq!(cached_content, content);
+    assert!(!cache_dir.join("objects").exists());
 }
 
 // ============================================================================

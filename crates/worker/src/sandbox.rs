@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use tracing::{debug, warn};
 
 use rusty_grid_core::task::{
-    hex_encode, StagedFile, TaskId, TaskSpec, MAX_AGGREGATE_STAGED_BYTES, MAX_STAGED_FILE_BYTES,
+    StagedFile, TaskId, TaskSpec, MAX_AGGREGATE_STAGED_BYTES, MAX_STAGED_FILE_BYTES,
 };
 
 /// Windows reserved DOS device names that cannot be created or accessed as files.
@@ -411,12 +411,14 @@ impl Sandbox {
         Ok(())
     }
 
-    /// Materializes staged files into the sandbox directory, utilizing the worker's
-    /// content-hash cache for deduplication and hardlink acceleration.
+    /// Materializes staged files directly into the sandbox directory.
+    ///
+    /// Each sandbox receives its own independent file (`nlink == 1`) written from `staged.data`
+    /// so in-place edits or permission changes by a task never affect subsequent tasks.
     pub async fn stage_files(
         &self,
         staged_files: &[StagedFile],
-        cache_base_dir: &Path,
+        _cache_base_dir: &Path,
     ) -> Result<(), SandboxError> {
         let mut total_bytes: u64 = 0;
         for staged in staged_files {
@@ -444,12 +446,6 @@ impl Sandbox {
             }
         }
 
-        let objects_dir = cache_base_dir.join("objects");
-        let tmp_cache_dir = cache_base_dir.join("tmp");
-
-        let _ = tokio::fs::create_dir_all(&objects_dir).await;
-        let _ = tokio::fs::create_dir_all(&tmp_cache_dir).await;
-
         for staged in staged_files {
             let rel_path = normalize_relative_path_str(&staged.path).map_err(|mut err| {
                 if let SandboxError::PathTraversal {
@@ -471,39 +467,12 @@ impl Sandbox {
                     })?;
             }
 
-            let sha256_hex = hex_encode(&staged.sha256);
-            let cache_obj_path = objects_dir.join(&sha256_hex);
-
-            let mut linked_from_cache = false;
-            if tokio::fs::try_exists(&cache_obj_path)
+            tokio::fs::write(&target, staged.data.as_bytes())
                 .await
-                .unwrap_or(false)
-            {
-                // Try hard-link first (zero disk duplication), then fallback to copy
-                if tokio::fs::hard_link(&cache_obj_path, &target).await.is_ok()
-                    || tokio::fs::copy(&cache_obj_path, &target).await.is_ok()
-                {
-                    linked_from_cache = true;
-                }
-            }
-
-            if !linked_from_cache {
-                tokio::fs::write(&target, staged.data.as_bytes())
-                    .await
-                    .map_err(|e| SandboxError::Io {
-                        task_id: self.task_id,
-                        source: e,
-                    })?;
-
-                // Asynchronously / atomically populate cache
-                let tmp_file = tmp_cache_dir.join(format!("{}_{}", self.task_id, sha256_hex));
-                if tokio::fs::write(&tmp_file, staged.data.as_bytes())
-                    .await
-                    .is_ok()
-                {
-                    let _ = tokio::fs::rename(&tmp_file, &cache_obj_path).await;
-                }
-            }
+                .map_err(|e| SandboxError::Io {
+                    task_id: self.task_id,
+                    source: e,
+                })?;
 
             // Apply executable permissions
             let mode = if staged.executable { 0o755 } else { 0o644 };
@@ -792,6 +761,78 @@ mod tests {
             sb_path.exists(),
             "Sandbox should be kept when keep_sandboxes is true"
         );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_staged_file_in_place_mutation_does_not_corrupt_subsequent_tasks() {
+        use rusty_grid_core::task::Bytes;
+        use tokio::io::AsyncWriteExt;
+
+        let temp_dir = std::env::temp_dir().join(format!("test_sb_bug1_{}", TaskId::new()));
+        let cache_dir = temp_dir.join("cache");
+        let config = SandboxConfig::new(&temp_dir);
+
+        let original = b"original\n";
+        let staged = StagedFile::new("input.txt", Bytes::from_static(original), false);
+
+        // Task 1 stages and reads the file
+        let mut sb1 = Sandbox::create(&config, TaskId::new()).await.unwrap();
+        sb1.stage_files(std::slice::from_ref(&staged), &cache_dir)
+            .await
+            .unwrap();
+        let file1 = sb1.path().join("input.txt");
+        assert_eq!(tokio::fs::read(&file1).await.unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(&file1).unwrap().nlink(), 1);
+        }
+
+        // Task 2 stages the same file and appends in place
+        let mut sb2 = Sandbox::create(&config, TaskId::new()).await.unwrap();
+        sb2.stage_files(std::slice::from_ref(&staged), &cache_dir)
+            .await
+            .unwrap();
+        let file2 = sb2.path().join("input.txt");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(&file2).unwrap().nlink(), 1);
+        }
+        let mut f = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&file2)
+            .await
+            .unwrap();
+        f.write_all(b"appended\n").await.unwrap();
+        f.flush().await.unwrap();
+        drop(f);
+        assert_eq!(
+            tokio::fs::read(&file2).await.unwrap(),
+            b"original\nappended\n"
+        );
+
+        // Task 3 stages the same file and must still read the original bytes with nlink == 1
+        let mut sb3 = Sandbox::create(&config, TaskId::new()).await.unwrap();
+        sb3.stage_files(std::slice::from_ref(&staged), &cache_dir)
+            .await
+            .unwrap();
+        let file3 = sb3.path().join("input.txt");
+        assert_eq!(tokio::fs::read(&file3).await.unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(&file3).unwrap().nlink(), 1);
+        }
+        assert!(
+            !cache_dir.join("objects").exists(),
+            "inline stage_files must not populate cache/objects"
+        );
+
+        sb1.destroy().await.unwrap();
+        sb2.destroy().await.unwrap();
+        sb3.destroy().await.unwrap();
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

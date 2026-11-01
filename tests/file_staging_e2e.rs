@@ -22,8 +22,8 @@ use rusty_grid_core::protocol::{
     deserialize_message, serialize_message, ClientMessage, ClientResponse, WireCodec, WorkerMessage,
 };
 use rusty_grid_core::task::{
-    hex_encode, sha256_digest, Bytes, OutputArtifact, StagedFile, Task, TaskId, TaskRequirements,
-    TaskResult, TaskSpec, MAX_AGGREGATE_ARTIFACT_BYTES, MAX_OUTPUT_ARTIFACT_BYTES,
+    sha256_digest, Bytes, OutputArtifact, StagedFile, Task, TaskId, TaskRequirements, TaskResult,
+    TaskSpec, MAX_AGGREGATE_ARTIFACT_BYTES, MAX_OUTPUT_ARTIFACT_BYTES,
 };
 use rusty_grid_master::{MasterServer, ServerConfig};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
@@ -167,49 +167,62 @@ async fn test_multi_file_staging_nested_directories() {
 async fn test_worker_content_hash_cache_deduplication() {
     let (runner, tmp) = make_test_runner();
 
-    let payload = vec![0x42u8; 64 * 1024]; // 64 KiB
-    let digest = sha256_digest(&payload);
-    let digest_hex = hex_encode(&digest);
+    let payload = b"original\n".to_vec();
+    let staged = StagedFile::new("input.txt", Bytes::copy_from_slice(&payload), false);
 
-    let staged1 = StagedFile::new("data1.bin", Bytes::copy_from_slice(&payload), false);
+    // Task 1: reads original bytes
     let mut task1 = Task::new(
-        TaskSpec::command("cmd.exe", vec!["/C".into(), "echo task1".into()]),
+        #[cfg(windows)]
+        TaskSpec::command("cmd.exe", vec!["/C".into(), "type input.txt".into()]),
+        #[cfg(not(windows))]
+        TaskSpec::command("cat", vec!["input.txt".into()]),
         TaskRequirements::generic(1, 10),
     );
-    #[cfg(not(windows))]
-    {
-        task1.spec = TaskSpec::command("echo", vec!["task1".into()]);
-    }
-    task1.staged_files.push(staged1);
-
+    task1.staged_files.push(staged.clone());
     let res1 = runner.execute_task(&task1, None, None).await;
     assert!(res1.is_success());
+    assert_eq!(res1.stdout_str().replace("\r\n", "\n"), "original\n");
 
-    // Verify cache entry was written to <sandbox_base>/cache/objects/<sha256>
-    let cache_obj = tmp.path().join("cache").join("objects").join(&digest_hex);
-    assert!(
-        cache_obj.exists(),
-        "Cache object must exist on disk: {:?}",
-        cache_obj
-    );
-    let cached_bytes = tokio::fs::read(&cache_obj).await.unwrap();
-    assert_eq!(cached_bytes.len(), 64 * 1024);
-    assert_eq!(cached_bytes, payload);
-
-    // Run Task 2 with identical payload
-    let staged2 = StagedFile::new("data2.bin", Bytes::copy_from_slice(&payload), false);
+    // Task 2: appends to input.txt in place
     let mut task2 = Task::new(
-        TaskSpec::command("cmd.exe", vec!["/C".into(), "echo task2".into()]),
+        #[cfg(windows)]
+        TaskSpec::command(
+            "cmd.exe",
+            vec![
+                "/C".into(),
+                "echo appended>> input.txt && type input.txt".into(),
+            ],
+        ),
+        #[cfg(not(windows))]
+        TaskSpec::command(
+            "sh",
+            vec![
+                "-c".into(),
+                "printf 'appended\\n' >> input.txt && cat input.txt".into(),
+            ],
+        ),
         TaskRequirements::generic(1, 10),
     );
-    #[cfg(not(windows))]
-    {
-        task2.spec = TaskSpec::command("echo", vec!["task2".into()]);
-    }
-    task2.staged_files.push(staged2);
-
+    task2.staged_files.push(staged.clone());
     let res2 = runner.execute_task(&task2, None, None).await;
     assert!(res2.is_success());
+    assert!(res2.stdout_str().contains("appended"));
+
+    // Task 3: stages the same file and must still read only the original bytes
+    let mut task3 = Task::new(
+        #[cfg(windows)]
+        TaskSpec::command("cmd.exe", vec!["/C".into(), "type input.txt".into()]),
+        #[cfg(not(windows))]
+        TaskSpec::command("cat", vec!["input.txt".into()]),
+        TaskRequirements::generic(1, 10),
+    );
+    task3.staged_files.push(staged);
+    let res3 = runner.execute_task(&task3, None, None).await;
+    assert!(res3.is_success());
+    assert_eq!(res3.stdout_str().replace("\r\n", "\n"), "original\n");
+
+    // Verify inline stage_files does not create a shared cache/objects directory
+    assert!(!tmp.path().join("cache").join("objects").exists());
 }
 
 // ============================================================================
