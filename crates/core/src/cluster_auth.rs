@@ -1,4 +1,4 @@
-//! Shared-secret cluster authentication ("OXS-AUTH v1").
+//! Shared-secret cluster authentication ("OXS-AUTH v2").
 //!
 //! Only holders of the cluster secret may drive or join the grid, and workers only obey masters
 //! that prove they hold it. The module provides:
@@ -7,7 +7,8 @@
 //!   flags/environment/default file, HMAC key derivation). It never prints or logs its value.
 //! * [`client_handshake`] / [`server_handshake`]: a mutual challenge-response that runs on a
 //!   [`MessageTransport`] before any `Register`/`ClientMessage` is exchanged, for TCP and for
-//!   QUIC (iroh) streams alike.
+//!   QUIC (iroh) streams alike. The session key it yields keys the AEAD record layer that
+//!   protects everything after it.
 //!
 //! # Wire format
 //!
@@ -16,34 +17,57 @@
 //!
 //! | kind | name      | body                                                              |
 //! |------|-----------|-------------------------------------------------------------------|
-//! | 0x01 | HELLO     | `version u8 (=1)`, `client_nonce[32]`                             |
+//! | 0x01 | HELLO     | `version u8 (=2)`, `client_nonce[32]`                             |
 //! | 0x02 | CHALLENGE | `server_nonce[32]`, `server_mac[32]`                              |
 //! | 0x03 | PROOF     | `client_mac[32]`                                                  |
 //! | 0x04 | OK        | empty                                                             |
 //! | 0x05 | REJECT    | UTF-8 reason, at most 128 bytes, generic text only                |
 //!
-//! `server_mac = HMAC(secret, "oxs1-srv" || client_nonce || server_nonce)` and
-//! `client_mac = HMAC(secret, "oxs1-cli" || server_nonce || client_nonce)`. Both MACs bind both
+//! `server_mac = HMAC(secret, "oxs2-srv" || client_nonce || server_nonce)` and
+//! `client_mac = HMAC(secret, "oxs2-cli" || server_nonce || client_nonce)`. Both MACs bind both
 //! nonces and a direction label, so a MAC cannot be replayed on another connection or reflected
 //! back in the other direction. The client verifies `server_mac` first and aborts without
 //! revealing anything if it is wrong (the peer is not our master). All MAC comparisons go through
 //! `ring::hmac::verify`, which is constant time.
 //!
+//! Every label names the version (`oxs2-`), so the version in the HELLO is bound to the MACs and
+//! the session key: a HELLO rewritten to another version on the way yields a CHALLENGE the client
+//! does not accept.
+//!
+//! # Record layer
+//!
+//! After OK both sides hold the session key `HMAC(secret, "oxs2-key" || client_nonce ||
+//! server_nonce)`, and the caller switches the transport to the AEAD record layer with it
+//! ([`MessageTransport::enable_encryption`]): from then on every frame in both directions is a
+//! ChaCha20-Poly1305 record (`WIRE_FORMAT_ENCRYPTED = 0x04`) with its own key per direction and a
+//! per-direction sequence number, and the first record that is forged, altered, replayed,
+//! reordered or reflected ends the connection (`crate::protocol::AeadReaderSession`).
+//!
+//! # Versions
+//!
+//! Version 2 is the only one accepted. A version 1 peer (an older build, whether it had the record
+//! layer or not: the version did not say) gets `REJECT("unsupported auth version")`, and the server's
+//! log says that the peer must be upgraded; a v2 client that meets a v1 master reports the same
+//! REJECT as "the master speaks another cluster authentication version". There is deliberately no
+//! fallback to an unencrypted session and no flag that allows one (`--insecure` only waives the
+//! requirement to have a secret at all).
+//!
 //! # What this does and does not give you
 //!
-//! The handshake authenticates both peers. It does **not** encrypt or integrity-protect the
-//! traffic that follows: over plain TCP an on-path attacker can still read the stream or hijack
-//! an already authenticated connection. Over untrusted networks use the P2P/QUIC transport
-//! (iroh, already TLS) or tunnel TCP. Both handshake functions return a per-connection session
-//! key (`HMAC(secret, "oxs1-key" || client_nonce || server_nonce)`) so an AEAD record layer can
-//! be added later without changing the handshake; nothing uses it yet.
+//! The handshake authenticates both peers and the record layer keeps the connection confidential
+//! and tamper-proof against an on-path attacker. It does not hide frame sizes or timing, it cannot
+//! stop an attacker from cutting the connection (the peer sees a disconnect), and it has no
+//! forward secrecy: all keys derive from the long-term secret and the nonces, which travel in
+//! clear, so whoever later obtains the secret can decrypt a recorded session.
 //!
 //! # Caller duties
 //!
 //! * Wrap the handshake in the connection's handshake timeout (default 5 s); the functions
 //!   themselves wait for the peer indefinitely.
 //! * On `Err` from [`server_handshake`] log the peer address plus the error text at `warn`
-//!   (the error text never contains MACs or the secret) and drop the connection.
+//!   (the error text never contains MACs, keys or the secret) and drop the connection.
+//! * On `Ok(session_key)` call `t.enable_encryption(&session_key, role)` (`Client` or `Server`)
+//!   before the first message, and never log the key.
 //! * A server that has **no** secret cannot call [`server_handshake`]. If its first typed read
 //!   fails with `ProtocolError::InvalidFormatTag(WIRE_FORMAT_AUTH)` the peer sent a HELLO, and
 //!   the server should answer with `send_reject(t, REJECT_NO_SECRET)` and close.
@@ -63,8 +87,11 @@ use crate::protocol::{MessageTransport, ProtocolError};
 
 pub use crate::protocol::WIRE_FORMAT_AUTH;
 
-/// Handshake protocol version carried in HELLO.
-pub const AUTH_VERSION: u8 = 1;
+/// Handshake protocol version carried in HELLO. Version 2 is the first one that guarantees the
+/// AEAD record layer after the handshake; it is the only version accepted.
+pub const AUTH_VERSION: u8 = 2;
+/// The previous version, used by builds with and without the record layer alike; refused.
+const AUTH_VERSION_V1: u8 = 1;
 /// Minimum accepted secret length in bytes (32 hex characters).
 pub const MIN_SECRET_BYTES: usize = 16;
 /// Length in bytes of secrets produced by [`ClusterSecret::generate`].
@@ -106,9 +133,10 @@ const KIND_PROOF: u8 = 0x03;
 const KIND_OK: u8 = 0x04;
 const KIND_REJECT: u8 = 0x05;
 
-const LABEL_SERVER: &[u8] = b"oxs1-srv";
-const LABEL_CLIENT: &[u8] = b"oxs1-cli";
-const LABEL_KEY: &[u8] = b"oxs1-key";
+// Version 2 labels; version 1 used the same scheme with an `oxs1-` prefix.
+const LABEL_SERVER: &[u8] = b"oxs2-srv";
+const LABEL_CLIENT: &[u8] = b"oxs2-cli";
+const LABEL_KEY: &[u8] = b"oxs2-key";
 
 /// File name of the default secret file inside the OxideSwarm home directory.
 const DEFAULT_SECRET_FILE_NAME: &str = "cluster.secret";
@@ -569,9 +597,11 @@ fn error_from_reject(body: &[u8]) -> GridError {
              use the same secret"
                 .to_string(),
         ),
-        REJECT_UNSUPPORTED_VERSION => GridError::AuthFailed(
-            "the master does not support this authentication protocol version".to_string(),
-        ),
+        REJECT_UNSUPPORTED_VERSION => GridError::AuthFailed(format!(
+            "the master speaks another cluster authentication version (this node speaks version \
+             {AUTH_VERSION}, with an encrypted connection); run the same OxideSwarm release on \
+             the master and on this node"
+        )),
         other => GridError::AuthFailed(format!("the master rejected authentication: {other}")),
     }
 }
@@ -586,11 +616,12 @@ fn handshake_read_error(e: ProtocolError) -> GridError {
     }
 }
 
-/// Runs the client side of the handshake. On success returns the session key.
+/// Runs the client side of the handshake. On success returns the session key, for
+/// `MessageTransport::enable_encryption(&key, EndpointRole::Client)`.
 ///
-/// Errors: `AuthFailed` when the master is not ours (wrong `server_mac`) or rejects us,
-/// `AuthRequired` when the master says authentication is required, `HandshakeFailed` when the
-/// connection is closed before the master answers.
+/// Errors: `AuthFailed` when the master is not ours (wrong `server_mac`), rejects us or speaks
+/// another version, `AuthRequired` when the master says authentication is required,
+/// `HandshakeFailed` when the connection is closed before the master answers.
 pub async fn client_handshake<T>(
     t: &mut MessageTransport<T>,
     secret: &ClusterSecret,
@@ -667,13 +698,14 @@ where
     }
 }
 
-/// Runs the server side of the handshake. On success returns the session key.
+/// Runs the server side of the handshake. On success returns the session key, for
+/// `MessageTransport::enable_encryption(&key, EndpointRole::Server)`.
 ///
-/// The first frame must be a HELLO of version 1. Every failure waits [`FAILURE_DELAY`], sends a
-/// generic REJECT ("authentication failed", "authentication required", "unsupported auth
-/// version") and returns `Err(GridError::AuthFailed(detail))`; `detail` is for the caller's
-/// `warn` log and never contains MACs or secret material. If the peer disappears the plain
-/// `ConnectionClosed`/`Io` error is returned without a REJECT. Frames are limited to
+/// The first frame must be a HELLO of version [`AUTH_VERSION`]. Every failure waits
+/// [`FAILURE_DELAY`], sends a generic REJECT ("authentication failed", "authentication required",
+/// "unsupported auth version") and returns `Err(GridError::AuthFailed(detail))`; `detail` is for
+/// the caller's `warn` log and never contains MACs or secret material. If the peer disappears the
+/// plain `ConnectionClosed`/`Io` error is returned without a REJECT. Frames are limited to
 /// [`PRE_AUTH_MAX_FRAME`] bytes until this returns `Ok`; the transport's normal limit is in force
 /// again afterwards.
 pub async fn server_handshake<T>(
@@ -710,11 +742,26 @@ where
     };
     match body.first() {
         Some(&AUTH_VERSION) => {}
+        Some(&AUTH_VERSION_V1) => {
+            return Err(reject_peer(
+                t,
+                REJECT_UNSUPPORTED_VERSION,
+                format!(
+                    "peer speaks cluster authentication version {AUTH_VERSION_V1}, which does not \
+                     guarantee an encrypted connection; upgrade it to an OxideSwarm release that \
+                     speaks version {AUTH_VERSION}"
+                ),
+            )
+            .await)
+        }
         Some(version) => {
             return Err(reject_peer(
                 t,
                 REJECT_UNSUPPORTED_VERSION,
-                format!("peer requested unsupported auth version {version}"),
+                format!(
+                    "peer requested unsupported auth version {version} (this build speaks \
+                     version {AUTH_VERSION})"
+                ),
             )
             .await)
         }
@@ -1165,6 +1212,63 @@ mod tests {
         assert_eq!(
             server.recv_raw_frame().await.unwrap().unwrap().len(),
             50_000
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_hello_is_refused_with_an_upgrade_hint() {
+        let s = secret(1);
+        let (mut client, mut server) = pair();
+        let srv_secret = s.clone();
+        let srv = tokio::spawn(async move { server_handshake(&mut server, &srv_secret).await });
+        client
+            .send_raw_frame(hello(AUTH_VERSION_V1, &[4u8; NONCE_LEN]))
+            .await
+            .unwrap();
+        assert_eq!(expect_reject(&mut client).await, REJECT_UNSUPPORTED_VERSION);
+        match srv.await.unwrap().unwrap_err() {
+            GridError::AuthFailed(detail) => {
+                assert!(detail.contains("version 1"), "{detail}");
+                assert!(detail.contains("upgrade"), "{detail}");
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+
+        // What an upgraded client prints when it meets a master that still speaks version 1.
+        let err = error_from_reject(REJECT_UNSUPPORTED_VERSION.as_bytes());
+        assert!(
+            matches!(err, GridError::AuthFailed(ref m) if m.contains("same OxideSwarm release")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn challenge_made_with_version_1_labels_is_not_accepted() {
+        // The labels bind the version: a master that answered with the old MAC (or a relay that
+        // rewrote our HELLO to version 1 for an old master) cannot complete a v2 handshake.
+        let (mut client, mut old_master) = pair();
+        let s = secret(1);
+        let master_secret = s.clone();
+        let master = tokio::spawn(async move {
+            let hello = old_master.recv_raw_frame().await.unwrap().unwrap();
+            let (_, body) = split_auth_frame(&hello).unwrap();
+            assert_eq!(body[0], AUTH_VERSION);
+            let client_nonce = &body[1..];
+            let server_nonce = [8u8; NONCE_LEN];
+            let v1_mac = master_secret.mac(&[b"oxs1-srv", client_nonce, &server_nonce]);
+            old_master
+                .send_raw_frame(auth_frame(KIND_CHALLENGE, &[&server_nonce, &v1_mac]))
+                .await
+                .unwrap();
+            old_master.recv_raw_frame().await
+        });
+        let err = client_handshake(&mut client, &s).await.unwrap_err();
+        assert!(matches!(err, GridError::AuthFailed(_)), "got {err:?}");
+        assert!(!client.is_encrypted());
+        drop(client);
+        assert!(
+            master.await.unwrap().unwrap().is_none(),
+            "no PROOF for a v1 MAC"
         );
     }
 

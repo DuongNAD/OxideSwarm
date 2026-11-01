@@ -264,6 +264,11 @@ workers and CLIs. A worker newer than its master keeps working for the messages 
 registration reply (the live battery report is one); a client command newer than the master (`GetTaskResult`) is
 not guarded. Placement constraints (`submit --os`, `--arch`, `--worker`, `--require-tag`) travel in task tags: an
 older master ignores them and may run the task on any worker, which `oxideswarm doctor` reports.
+With a cluster secret, nodes must also speak the same cluster authentication version: a release with version 2
+(encrypted record layer, `docs/design/0005-cluster-auth-v2-record-layer.md`) and an older one refuse each other
+during the handshake (the newer side reports that the master speaks another cluster authentication version, the
+older one that the master does not support its version), and a refused worker retries at most every 30 s until
+both sides run the same release.
 The Agent Mesh hub in this guide uses its own JSON envelopes and is unaffected.
 
 ---
