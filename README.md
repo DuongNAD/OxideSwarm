@@ -298,9 +298,11 @@ or `~/.oxideswarm/cluster.secret`.
 # GPU task of a chosen size (default 64; up to 8192 on a real GPU, 2048 on the simulated one)
 ./target/release/oxideswarm submit --type gpu --matrix-dim 2048 --wait
 
-# Inspect the grid
+# Inspect the grid, fetch task results, or cancel a task
 ./target/release/oxideswarm workers --master 127.0.0.1:8088
 ./target/release/oxideswarm status --master 127.0.0.1:8088 --json
+./target/release/oxideswarm result <TASK_ID> --wait --output-dir out/
+./target/release/oxideswarm cancel <TASK_ID>
 ./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --mapper word_count --reducer sum
 
 # Model Context Protocol (MCP) stdio server for AI coding assistants
