@@ -1864,6 +1864,7 @@ impl MasterMessage {
 
 /// Messages sent from CLI client (or external RPC) to the Master node.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ClientMessage {
     /// Submits a task for execution.
     SubmitTask { task: Task, wait: bool },
@@ -1896,6 +1897,7 @@ pub enum ClientMessage {
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)]
 enum HumanClientMessage {
     SubmitTask {
         task: Task,
@@ -1922,6 +1924,7 @@ enum HumanClientMessage {
 }
 
 #[derive(Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 enum BinaryClientMessage {
     SubmitTask {
         task: Task,

@@ -125,6 +125,7 @@ impl Cluster {
         }
     }
 
+    #[cfg(unix)]
     fn store_stats(&self) -> rusty_grid_master::BlobStoreStats {
         self.master.blob_store().expect("blob store").stats()
     }
@@ -141,6 +142,7 @@ impl Drop for Cluster {
 }
 
 /// Deterministic bytes that do not compress or repeat.
+#[cfg(unix)]
 fn noise(len: usize, mut state: u64) -> Vec<u8> {
     (0..len)
         .map(|_| {
@@ -154,6 +156,7 @@ fn noise(len: usize, mut state: u64) -> Vec<u8> {
 
 /// The input project: nested text files, an executable script and a file larger than one
 /// transfer chunk (4 MiB).
+#[cfg(unix)]
 fn write_project(root: &Path) -> HashMap<&'static str, Vec<u8>> {
     let files: HashMap<&'static str, Vec<u8>> = HashMap::from([
         ("hello.txt", b"hello from the client\n".to_vec()),
@@ -176,11 +179,13 @@ fn write_project(root: &Path) -> HashMap<&'static str, Vec<u8>> {
 }
 
 /// Reads the project, writes `out/` from it.
+#[cfg(unix)]
 const PROCESS_SCRIPT: &str = "set -e; mkdir -p out; \
      cat project/hello.txt project/nested/deeper/data.csv > out/combined.txt; \
      cp project/big.bin out/big-copy.bin; \
      ./project/tool.sh > out/tool-output.txt";
 
+#[cfg(unix)]
 fn processing_task(inputs: Vec<rusty_grid_core::blob::TaskInput>) -> Task {
     Task::new(
         TaskSpec::command("sh", vec!["-c".into(), PROCESS_SCRIPT.into()]),
