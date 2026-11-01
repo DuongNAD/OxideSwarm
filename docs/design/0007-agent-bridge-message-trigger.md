@@ -83,6 +83,9 @@ uses an OS file lock, which ends with the process. Later hooks exit at once.
   background thread, and it hung on Windows, past `--max-wait`, when stdin stayed open.
 - `get_git_info` runs git without stdin and with a limit of 20 s, so a stuck git cannot outlast
   `--max-wait`.
+- `watch --hook` writes `nodes/<self>_state.json` only when the state file is missing or older than
+  150 s, so a normal watcher (writing every 60 s) always wins while a machine with only Claude Code
+  still stays fresher than `PEER_STALE_MINUTES`.
 
 ## Compatibility
 
@@ -129,3 +132,6 @@ claims exist yet. `scripts/agent_bridge.py` is mirrored in the hub, so that copy
   waits for the two machines.
 - 2026-11-01: `watch --hook` no longer leaves a read pending on stdin, and git calls have a time
   limit, after `agent bridge (windows-latest)` timed out on pull request 7.
+- 2026-11-01: `watch --hook` now publishes `nodes/<self>_state.json` only when the state file is
+  missing or older than 150 s (`BRIDGE-2`), preventing a hook watcher in another worktree from
+  overwriting the active agent watcher's state.

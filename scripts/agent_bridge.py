@@ -47,6 +47,7 @@ PYTHON_CMD = "python" if SELF_SHORT == "win" else "python3"
 
 # Claude Code wakes the model when an `asyncRewake` hook exits with this code.
 HOOK_WAKE_EXIT_CODE = 2
+HOOK_STATE_MAX_AGE_SECS = 150
 GIT_TIMEOUT_SECS = 20
 MAX_TITLE_CHARS = 120
 PEER_STALE_MINUTES = 5
@@ -844,10 +845,31 @@ def deliver_event(event, args):
         run_event_command(args.on_event, event)
 
 
+def state_is_fresh_for_hook(path):
+    """True when `nodes/<self>_state.json` exists and is at most HOOK_STATE_MAX_AGE_SECS old."""
+    try:
+        if time.time() - os.path.getmtime(path) > HOOK_STATE_MAX_AGE_SECS:
+            return False
+    except OSError:
+        return False
+    existing = safe_read_json(path)
+    if isinstance(existing, dict) and "updated_at_utc" in existing:
+        try:
+            seen = datetime.datetime.strptime(existing["updated_at_utc"], "%Y-%m-%dT%H:%M:%SZ")
+            age = (datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - seen).total_seconds()
+            if age > HOOK_STATE_MAX_AGE_SECS:
+                return False
+        except (ValueError, TypeError):
+            return False
+    return True
+
+
 def refresh_heartbeat(hub_dir, repo_dir, args, last_peer_head):
     """Publishes this node's state and reports a new peer commit. Returns the peer commit it saw."""
-    state = collect_state(repo_dir)
     out_path = os.path.join(hub_dir, "nodes", f"{SELF_SHORT}_state.json")
+    if args.hook and state_is_fresh_for_hook(out_path):
+        return last_peer_head
+    state = collect_state(repo_dir)
     atomic_write(out_path, json.dumps(state, indent=2, ensure_ascii=False) + "\n")
 
     peer_state = safe_read_json(os.path.join(hub_dir, "nodes", f"{PEER_SHORT}_state.json"))
