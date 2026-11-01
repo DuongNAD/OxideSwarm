@@ -1,5 +1,5 @@
 //! End-to-end tests of content-addressed task inputs and output files
-//! (`docs/design/0005-content-addressed-data-plane.md`).
+//! (`docs/design/0006-content-addressed-data-plane.md`).
 //!
 //! * An input directory goes from a client to a worker through the master's blob store, the
 //!   worker's command reads it and writes output files, and the client gets them back byte for

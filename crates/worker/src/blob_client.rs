@@ -1,6 +1,6 @@
 //! The worker's side of blob transfer (`rusty_grid_core::blob_transfer`): fetching the input
 //! blobs of a task that its cache lacks before the run, and uploading the output blobs the Master
-//! lacks after it. Design record: `docs/design/0005-content-addressed-data-plane.md`.
+//! lacks after it. Design record: `docs/design/0006-content-addressed-data-plane.md`.
 //!
 //! A [`BlobClient`] belongs to one session: it exists only while the worker is connected to a
 //! Master that announced `master_features::BLOBS`, its requests go out on the session's data

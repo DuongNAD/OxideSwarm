@@ -3,7 +3,7 @@
 //! A blob is the content of one file, named by its BLAKE3 hash ([`BlobId`]). The Master keeps
 //! blobs in a bounded on-disk store, every worker keeps a bounded cache, and a blob that a peer
 //! already holds is never sent to it again. Design record:
-//! `docs/design/0005-content-addressed-data-plane.md`.
+//! `docs/design/0006-content-addressed-data-plane.md`.
 //!
 //! * **Directories** travel as a [`TreeManifest`] (relative path -> blob id, size, executable
 //!   bit), which is itself stored as a blob, plus the blobs of its files.

@@ -1,4 +1,4 @@
-# 0005: Content-addressed task inputs and output files
+# 0006: Content-addressed task inputs and output files
 
 Status: Implemented
 Created: 2026-10-26    Updated: 2026-10-26

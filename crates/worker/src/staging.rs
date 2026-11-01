@@ -1,6 +1,6 @@
 //! Placing a task's blob inputs into its sandbox and collecting its output files from it
 //! (`Task::inputs`, `Task::output_globs`; design record
-//! `docs/design/0005-content-addressed-data-plane.md`).
+//! `docs/design/0006-content-addressed-data-plane.md`).
 //!
 //! Both directions treat the paths as untrusted:
 //!

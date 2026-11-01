@@ -130,7 +130,7 @@ merge.
 | INT-1 | Merge pull request 3 | P0 | S | | Yes | Implemented |
 | INT-2 | Close superseded pull requests and branches | P0 | S | INT-1 | Yes | Implemented |
 | INT-3 | Land the AEAD hardening branch | P0 | S | INT-1 | Yes | Implemented |
-| INT-4 | Land the content-addressed file branch | P0 | M | INT-3 | Yes | Planned |
+| INT-4 | Land the content-addressed file branch | P0 | M | INT-3 | Yes | Implemented |
 | SEC-1 | Remove `mcp --sse` | P0 | S | INT-4 | | Planned |
 | SEC-2 | Make MCP refuse a remote master without a secret | P0 | S | INT-4 | | Planned |
 | SEC-3 | Delete the Android stub master | P0 | M | INT-4 | D2 | Planned |
@@ -374,7 +374,7 @@ These items remove ways to lose data or to run code without authorisation.
   only (`crates/worker/src/runner.rs:1204-1231`). `--file` and `--output` are ignored by GPU,
   `BuiltinTest`, 3D and rig tasks. `README.md:280` shows `--output-dir` without `--output`, which
   collects nothing.
-- **Do:** Fail the task with the path and the reason, as design 0005 does for the blob path. Refuse
+- **Do:** Fail the task with the path and the reason, as design 0006 does for the blob path. Refuse
   these flags on task kinds that ignore them. Correct `README.md:280`.
 - **Done when:** A missing or 11 MiB `--output` gives a non-zero result naming the path.
   `--type gpu --file <PATH>` fails before submit.
@@ -1113,3 +1113,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-01: INT-1 completed; pull request 3 merged (`b76d85b`) and `master` CI run `41276400780` passed.
 - 2026-11-01: INT-2 completed; closed pull requests 1 and 2, deleted merged remote branches, and copied PR 2 CI details into TEST-6 (`origin/claude/trusting-wing-d9a27c` kept until TEST-6).
 - 2026-11-01: INT-3 completed; rebased `d0dddb8` (cluster auth v2 and record-layer hardening) onto `master` and verified all gates plus `tests/cluster_record_layer_e2e.rs`.
+- 2026-11-01: INT-4 completed; rebased `fae2622` (content-addressed data plane, design 0006) onto `master` after `INT-3` and verified all gates plus `tests/blob_transfer_e2e.rs`.

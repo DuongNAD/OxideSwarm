@@ -1,5 +1,5 @@
 //! The Master's blob store: task inputs and output files, kept on disk by content
-//! (`rusty_grid_core::blob`, design record `docs/design/0005-content-addressed-data-plane.md`).
+//! (`rusty_grid_core::blob`, design record `docs/design/0006-content-addressed-data-plane.md`).
 //!
 //! * **Layout.** `<dir>/objects/<first two hex digits>/<64 hex digits>` holds one verified blob
 //!   per file; uploads in progress live in `<dir>/tmp/` and are renamed into place once their

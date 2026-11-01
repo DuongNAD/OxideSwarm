@@ -1,6 +1,6 @@
 //! The worker's blob cache: task input and output files kept on disk by content
 //! (`rusty_grid_core::blob`), so a file that did not change is fetched from the Master once, not
-//! once per task. Design record: `docs/design/0005-content-addressed-data-plane.md`.
+//! once per task. Design record: `docs/design/0006-content-addressed-data-plane.md`.
 //!
 //! * **Layout.** `<sandbox base>/cache/blobs/objects/<first two hex digits>/<64 hex digits>`, one
 //!   verified blob per file, and `<sandbox base>/cache/blobs/tmp/` for blobs being written. Task

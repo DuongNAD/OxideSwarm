@@ -1,7 +1,7 @@
 //! The client side of task input and output files (`submit --input`, `--output`,
 //! `--output-dir`): hashing local files and directories into blobs, uploading the blobs the Master
 //! lacks, and downloading a task's output files. Design record:
-//! `docs/design/0005-content-addressed-data-plane.md`.
+//! `docs/design/0006-content-addressed-data-plane.md`.
 //!
 //! * A directory becomes a `TreeManifest` of its regular files. Symbolic links, special files and
 //!   names that cannot be a portable relative path are skipped and listed in
