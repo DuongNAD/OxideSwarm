@@ -42,7 +42,7 @@ pub struct MobileCapabilities {
     pub os_version: String,
     /// System-on-Chip descriptor (e.g. "Snapdragon 8 Gen 2", "Apple M2 Max").
     pub soc_model: String,
-    /// Battery charge percentage (0-100), or `None` if running on AC power or emulator.
+    /// Battery charge percentage (0-100), or `None` if no battery could be read.
     #[serde(default)]
     pub battery_pct: Option<u8>,
     /// Whether the device is actively drawing external power / charging.
@@ -898,29 +898,10 @@ fn is_android_env() -> bool {
 
 fn detect_battery() -> (Option<u8>, Option<bool>) {
     // 1. Linux/Android sysfs: /sys/class/power_supply
-    let power_supply = std::path::Path::new("/sys/class/power_supply");
-    if power_supply.is_dir() {
-        for name in &["battery", "BAT0", "BAT1"] {
-            let bat_dir = power_supply.join(name);
-            if bat_dir.is_dir() {
-                let capacity = std::fs::read_to_string(bat_dir.join("capacity"))
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u8>().ok());
-                let status_str =
-                    std::fs::read_to_string(bat_dir.join("status")).unwrap_or_default();
-                let status_trim = status_str.trim().to_lowercase();
-                let is_charging = if status_trim == "charging" || status_trim == "full" {
-                    Some(true)
-                } else if status_trim == "discharging" || status_trim == "not charging" {
-                    Some(false)
-                } else {
-                    None
-                };
-                if capacity.is_some() {
-                    return (capacity, is_charging);
-                }
-            }
-        }
+    let (sysfs_pct, sysfs_charging) =
+        parse_sysfs_power_supply(std::path::Path::new("/sys/class/power_supply"));
+    if sysfs_pct.is_some() {
+        return (sysfs_pct, sysfs_charging);
     }
 
     // 2. macOS pmset fallback
@@ -973,6 +954,69 @@ fn detect_battery() -> (Option<u8>, Option<bool>) {
             }
             if level.is_some() {
                 return (level, is_charging);
+            }
+        }
+    }
+
+    (None, None)
+}
+
+/// Parses a Linux/Android `/sys/class/power_supply` directory into `(battery_pct, is_charging)`.
+///
+/// The `online` attribute of any power supply whose `type` is `Mains` is the primary source of
+/// `is_charging` (`1` -> `Some(true)`, `0` -> `Some(false)`). The battery `status` attribute
+/// (`Charging`, `Full`, `Discharging`, `Not charging`) is used only as a fallback when no
+/// `Mains` supply reports `online`.
+fn parse_sysfs_power_supply(power_supply: &std::path::Path) -> (Option<u8>, Option<bool>) {
+    if !power_supply.is_dir() {
+        return (None, None);
+    }
+
+    let mut mains_online: Option<bool> = None;
+    if let Ok(entries) = std::fs::read_dir(power_supply) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let is_mains = std::fs::read_to_string(dir.join("type"))
+                .map(|t| t.trim().eq_ignore_ascii_case("Mains"))
+                .unwrap_or(false);
+            if !is_mains {
+                continue;
+            }
+            if let Ok(online) = std::fs::read_to_string(dir.join("online")) {
+                match online.trim() {
+                    "1" => {
+                        mains_online = Some(true);
+                        break;
+                    }
+                    "0" => {
+                        mains_online.get_or_insert(false);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    for name in &["battery", "BAT0", "BAT1"] {
+        let bat_dir = power_supply.join(name);
+        if bat_dir.is_dir() {
+            let capacity = std::fs::read_to_string(bat_dir.join("capacity"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u8>().ok());
+            let status_str = std::fs::read_to_string(bat_dir.join("status")).unwrap_or_default();
+            let status_trim = status_str.trim().to_lowercase();
+            let status_charging = if status_trim == "charging" || status_trim == "full" {
+                Some(true)
+            } else if status_trim == "discharging" || status_trim == "not charging" {
+                Some(false)
+            } else {
+                None
+            };
+            if capacity.is_some() {
+                return (capacity, mains_online.or(status_charging));
             }
         }
     }
@@ -2080,5 +2124,73 @@ Now drawing from 'AC Power'
             parse_pmset_batt("Now drawing from 'AC Power'\n"),
             (None, None)
         );
+    }
+
+    #[test]
+    fn test_parse_sysfs_power_supply_mains_and_status_fallback() {
+        let write_sysfs = |bat_capacity: Option<u8>,
+                           bat_status: &str,
+                           mains_online: Option<&str>|
+         -> tempfile::TempDir {
+            let dir = tempfile::tempdir().expect("temp sysfs");
+            if let Some(cap) = bat_capacity {
+                let bat = dir.path().join("BAT0");
+                std::fs::create_dir_all(&bat).unwrap();
+                std::fs::write(bat.join("type"), "Battery\n").unwrap();
+                std::fs::write(bat.join("capacity"), format!("{cap}\n")).unwrap();
+                std::fs::write(bat.join("status"), format!("{bat_status}\n")).unwrap();
+            }
+            if let Some(online) = mains_online {
+                let ac = dir.path().join("AC0");
+                std::fs::create_dir_all(&ac).unwrap();
+                std::fs::write(ac.join("type"), "Mains\n").unwrap();
+                std::fs::write(ac.join("online"), format!("{online}\n")).unwrap();
+            }
+            dir
+        };
+
+        // AC online ("1") across all four statuses: Charging, Full, Discharging, Not charging
+        for status in ["Charging", "Full", "Discharging", "Not charging"] {
+            let sysfs = write_sysfs(Some(10), status, Some("1"));
+            assert_eq!(
+                parse_sysfs_power_supply(sysfs.path()),
+                (Some(10), Some(true)),
+                "AC online with status '{status}' must report is_charging = Some(true)"
+            );
+            assert_eq!(
+                MobileLiveStatus::compute_battery_tier(Some(10), Some(true)),
+                BatteryTier::Normal
+            );
+        }
+
+        // AC offline ("0") across all four statuses: Charging, Full, Discharging, Not charging
+        for status in ["Charging", "Full", "Discharging", "Not charging"] {
+            let sysfs = write_sysfs(Some(45), status, Some("0"));
+            assert_eq!(
+                parse_sysfs_power_supply(sysfs.path()),
+                (Some(45), Some(false)),
+                "AC offline with status '{status}' must report is_charging = Some(false)"
+            );
+        }
+
+        // Fallback when no Mains supply is present: status alone determines is_charging
+        for (status, expected) in [
+            ("Charging", Some(true)),
+            ("Full", Some(true)),
+            ("Discharging", Some(false)),
+            ("Not charging", Some(false)),
+            ("Unknown", None),
+        ] {
+            let sysfs = write_sysfs(Some(60), status, None);
+            assert_eq!(
+                parse_sysfs_power_supply(sysfs.path()),
+                (Some(60), expected),
+                "fallback without Mains for status '{status}'"
+            );
+        }
+
+        // Desktop with Mains online but no battery returns (None, None)
+        let desktop = write_sysfs(None, "", Some("1"));
+        assert_eq!(parse_sysfs_power_supply(desktop.path()), (None, None));
     }
 }
