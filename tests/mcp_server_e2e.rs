@@ -517,3 +517,99 @@ fn test_mcp_cli_rejects_sse_flags() {
         );
     }
 }
+
+#[test]
+fn test_mcp_refuses_remote_master_without_secret_and_allows_insecure() {
+    let home = tempfile::tempdir().expect("temp home");
+
+    // 1. Without a secret or --insecure, `mcp --master 192.0.2.10:8088` exits 6 before reading stdin
+    let mut child = Command::new(BIN)
+        .args(["mcp", "--master", "192.0.2.10:8088"])
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env_remove("OXIDESWARM_HOME")
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_CONFIG")
+        .env_remove("RUSTY_GRID_MASTER")
+        .env_remove("RUSTY_GRID_MASTER_ADDR")
+        .env_remove("RUSTY_GRID_INSECURE")
+        .stdin(Stdio::piped()) // keep stdin open to verify it exits before reading stdin
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp without secret");
+
+    // Wait for child to exit without closing stdin
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            break s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mcp should exit 6 before reading from open stdin"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        status.code(),
+        Some(6),
+        "mcp without secret to remote master must exit with code 6"
+    );
+
+    // 2. With --insecure, it starts, warns on stderr, and answers initialize
+    let mut child_insecure = Command::new(BIN)
+        .args(["mcp", "--master", "192.0.2.10:8088", "--insecure"])
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env_remove("OXIDESWARM_HOME")
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_CONFIG")
+        .env_remove("RUSTY_GRID_MASTER")
+        .env_remove("RUSTY_GRID_MASTER_ADDR")
+        .env_remove("RUSTY_GRID_INSECURE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp with --insecure");
+
+    {
+        let stdin = child_insecure.stdin.as_mut().expect("stdin");
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1.0" }
+            }
+        });
+        writeln!(stdin, "{req}").expect("write initialize");
+        stdin.flush().expect("flush");
+    }
+    // Close stdin so stdio loop exits cleanly after handling initialize
+    drop(child_insecure.stdin.take());
+
+    let out = child_insecure
+        .wait_with_output()
+        .expect("wait_with_output for --insecure mcp");
+    assert!(
+        out.status.success(),
+        "mcp --insecure should exit 0 after EOF, got {:?}",
+        out.status
+    );
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout_str.contains("\"protocolVersion\":\"2024-11-05\""),
+        "expected initialize response on stdout, got: {stdout_str}"
+    );
+    assert!(
+        stderr_str.contains("WARNING: --insecure"),
+        "expected --insecure warning on stderr, got: {stderr_str}"
+    );
+}

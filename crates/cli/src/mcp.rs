@@ -200,16 +200,14 @@ pub struct ToolDefinition {
 pub struct McpState {
     pub master_addr: String,
     pub secret: Option<ClusterSecret>,
-    pub insecure: bool,
     transport: Mutex<Option<MessageTransport<TcpStream>>>,
 }
 
 impl McpState {
-    pub fn new(master_addr: String, secret: Option<ClusterSecret>, insecure: bool) -> Self {
+    pub fn new(master_addr: String, secret: Option<ClusterSecret>) -> Self {
         Self {
             master_addr,
             secret,
-            insecure,
             transport: Mutex::new(None),
         }
     }
@@ -1213,24 +1211,30 @@ pub async fn run_mcp(
     config_file: Option<ConfigFile>,
     secret_opts: SecretOpts,
 ) -> ExitCode {
+    let status_cfg = config_file.as_ref().and_then(|c| c.status.clone());
     let master_addr = normalize_master_addr(&crate::config::resolve_string(
         args.master,
         &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
-        None,
+        status_cfg.as_ref().and_then(|s| s.master.clone()),
         DEFAULT_MASTER_ADDR,
     ));
 
-    // Secret resolution: client role
-    let secret =
-        match secret_opts.resolve(config_file.as_ref(), crate::config::SecretSection::Status) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[mcp] Configuration error: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
+    // Secret resolution and fail-closed client policy (same as `status`)
+    let secret = match crate::secret_cmd::client_secret(
+        &secret_opts,
+        config_file.as_ref(),
+        crate::config::SecretSection::Status,
+        &master_addr,
+        crate::secret_cmd::peer_insecure(
+            args.insecure,
+            status_cfg.as_ref().and_then(|s| s.insecure),
+        ),
+    ) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
 
-    let state = Arc::new(McpState::new(master_addr, secret, args.insecure));
+    let state = Arc::new(McpState::new(master_addr, secret));
 
     run_stdio_server(state).await
 }
