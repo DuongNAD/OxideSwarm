@@ -124,10 +124,19 @@ impl Default for SchedulerConfig {
 
 impl SchedulerConfig {
     /// Computes the maximum concurrent tasks allowed for a given worker.
+    ///
+    /// Honours a worker's advertised `slots:<n>` tag (`--max-concurrency` or default headroom) when
+    /// present, falling back to `(cpu_cores * core_concurrency_multiplier).ceil().max(1)`.
     pub fn effective_max_concurrency(&self, worker: &WorkerInfo) -> usize {
-        let cores = worker.capabilities.cpu_cores.max(1);
-        let by_multiplier = (cores as f64 * self.core_concurrency_multiplier).ceil() as usize;
-        let limit = by_multiplier.max(1);
+        let limit = match rusty_grid_core::placement::advertised_slots(&worker.capabilities) {
+            Some(slots) => slots,
+            None => {
+                let cores = worker.capabilities.cpu_cores.max(1);
+                let by_multiplier =
+                    (cores as f64 * self.core_concurrency_multiplier).ceil() as usize;
+                by_multiplier.max(1)
+            }
+        };
         match self.max_tasks_per_worker {
             Some(cap) => limit.min(cap),
             None => limit,
@@ -2750,6 +2759,50 @@ mod tests {
             critical_report.assignments.len(),
             0,
             "Unplugged laptop below 15% critical battery must refuse GPU tasks"
+        );
+    }
+
+    #[test]
+    fn test_worker_slots_tag_caps_concurrency_and_spills_overflow_to_idle_peer() {
+        let config = SchedulerConfig::default();
+
+        // An 8-core worker capped with `slots:2` (--max-concurrency 2) and an idle 4-core peer.
+        let mut capped_worker = make_worker("worker-8c-slots2", 8, 16384, false, false);
+        capped_worker.capabilities.tags.push("slots:2".into());
+        let idle_peer = make_worker("worker-4c-peer", 4, 16384, false, false);
+        assert_eq!(config.effective_max_concurrency(&capped_worker), 2);
+        assert_eq!(config.effective_max_concurrency(&idle_peer), 4);
+
+        let workers = vec![capped_worker.clone(), idle_peer.clone()];
+        let tasks: Vec<Task> = (0..6)
+            .map(|i| {
+                Task::new(
+                    TaskSpec::shell_script(format!("echo {i}")),
+                    TaskRequirements::generic(1, 30),
+                )
+            })
+            .collect();
+
+        let report = WorkloadScheduler::matchmake(&config, &tasks, &workers);
+        assert_eq!(report.assignments.len(), 6);
+
+        let capped_count = report
+            .assignments
+            .iter()
+            .filter(|a| a.worker_id == capped_worker.worker_id)
+            .count();
+        let peer_count = report
+            .assignments
+            .iter()
+            .filter(|a| a.worker_id == idle_peer.worker_id)
+            .count();
+        assert_eq!(
+            capped_count, 2,
+            "worker with slots:2 on 8 cores must receive at most 2 tasks"
+        );
+        assert_eq!(
+            peer_count, 4,
+            "overflow tasks must spill to the idle peer worker"
         );
     }
 }

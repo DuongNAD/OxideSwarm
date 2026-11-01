@@ -814,11 +814,17 @@ impl Drop for Session {
 }
 
 /// What the worker advertises in `WorkerCapabilities::tags`: its system tags (`os:`, `arch:`, see
-/// `rusty_grid_core::placement`), then the configured user tags that are not among them.
-fn advertised_tags(user_tags: &[String]) -> Vec<String> {
+/// `rusty_grid_core::placement`), its effective task concurrency (`slots:<n>`), then the
+/// configured user tags that are not among them.
+fn advertised_tags(user_tags: &[String], slots: usize) -> Vec<String> {
     let mut tags = rusty_grid_core::placement::system_tags();
+    tags.push(format!(
+        "{}{}",
+        rusty_grid_core::placement::SLOTS_TAG_PREFIX,
+        slots.max(1)
+    ));
     for tag in user_tags {
-        if !tags.contains(tag) {
+        if !tags.contains(tag) && !tag.starts_with(rusty_grid_core::placement::SLOTS_TAG_PREFIX) {
             tags.push(tag.clone());
         }
     }
@@ -851,8 +857,20 @@ impl WorkerClient {
             cuda: config.cuda,
             no_cuda: config.no_cuda,
         };
-        let mut capabilities = WorkerCapabilities::detect_with_overrides(overrides)
-            .with_tags(advertised_tags(&config.tags));
+        let mut capabilities = WorkerCapabilities::detect_with_overrides(overrides);
+        let concurrency_permits = config
+            .max_concurrency
+            .unwrap_or_else(|| {
+                // Cores the owner named (`--cores`) are capacity they chose to offer; only the
+                // detected count gets the headroom.
+                if config.cores.is_some() {
+                    capabilities.cpu_cores
+                } else {
+                    default_max_concurrency(capabilities.cpu_cores)
+                }
+            })
+            .max(1);
+        capabilities = capabilities.with_tags(advertised_tags(&config.tags, concurrency_permits));
         // A real GPU is advertised only if this binary can compute on one (see `gpu`).
         let gpu_request = GpuRequest {
             no_gpu: config.no_gpu,
@@ -909,18 +927,6 @@ impl WorkerClient {
         }
         let runner = Arc::new(TaskRunner::new(worker_id, capabilities.clone(), runner_cfg));
         let active_task_table = Arc::new(RwLock::new(HashMap::new()));
-        let concurrency_permits = config
-            .max_concurrency
-            .unwrap_or_else(|| {
-                // Cores the owner named (`--cores`) are capacity they chose to offer; only the
-                // detected count gets the headroom.
-                if config.cores.is_some() {
-                    capabilities.cpu_cores
-                } else {
-                    default_max_concurrency(capabilities.cpu_cores)
-                }
-            })
-            .max(1);
         let concurrency_semaphore = Arc::new(Semaphore::new(concurrency_permits));
 
         let initial_beacon = if !config.master_addr.is_empty()
@@ -4036,6 +4042,7 @@ mod tests {
     fn test_worker_advertises_system_tags_then_user_tags() {
         let client = WorkerClient::new(
             WorkerConfig::new("127.0.0.1:9")
+                .with_max_concurrency(3)
                 .with_tags(vec![
                     "laptop".into(),
                     format!("os:{}", std::env::consts::OS),
@@ -4047,9 +4054,10 @@ mod tests {
             vec![
                 format!("os:{}", std::env::consts::OS),
                 format!("arch:{}", std::env::consts::ARCH),
+                "slots:3".to_string(),
                 "laptop".to_string(),
             ],
-            "system tags first, a user tag equal to one of them is not repeated"
+            "system tags and slots:<n> first, a user tag equal to one of them is not repeated"
         );
     }
 
