@@ -3624,7 +3624,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let handle = MobileTelemetryHandle::default();
+        // A fixed starting reading: an empty handle would take this host's own battery (or none),
+        // and with it the outcome of the test.
+        let handle =
+            MobileTelemetryHandle::new(Some(rusty_grid_core::capabilities::MobileCapabilities {
+                os_version: "Android 14".into(),
+                soc_model: "Snapdragon 8 Gen 3".into(),
+                battery_pct: Some(80),
+                is_charging: Some(true),
+                thermal_throttled: false,
+            }));
         let mut client = WorkerClient::new(
             WorkerConfig::new(addr.to_string())
                 .with_cores(1)
@@ -3656,16 +3665,26 @@ mod tests {
             })
             .await
             .unwrap();
-        // The first heartbeat proves the session is running (and has read the battery already, so
-        // what follows is a change).
+        // A mobile worker heartbeats on its adaptive keepalive (a minute on Wi-Fi), so a heartbeat
+        // cannot pace this test. The answer to a task it cannot take proves the session loop is
+        // running, and so has read the battery already: what follows is a change.
+        let probe = Task::new(
+            rusty_grid_core::task::TaskSpec::builtin_test("sleep", 0),
+            TaskRequirements::generic(64, 10),
+        );
+        let probe_id = probe.id;
+        master
+            .send_msg(&MasterMessage::AssignTask { task: probe })
+            .await
+            .unwrap();
         loop {
             match tokio::time::timeout(Duration::from_secs(5), master.recv_msg::<WorkerMessage>())
                 .await
-                .expect("a heartbeat")
+                .expect("an answer to the probe task")
             {
-                Ok(Some(WorkerMessage::Heartbeat { .. })) => break,
+                Ok(Some(WorkerMessage::TaskResult { task_id, .. })) if task_id == probe_id => break,
                 Ok(Some(_)) => {}
-                other => panic!("worker went away before its first heartbeat: {other:?}"),
+                other => panic!("worker went away before answering the probe task: {other:?}"),
             }
         }
         handle.update(MobileLiveStatus {
