@@ -297,7 +297,6 @@ async fn test_output_artifact_harvesting_and_sha256() {
     let task_spec = create_output_spec("summary.txt", "ComputationResults2026");
     let mut task = Task::new(task_spec, TaskRequirements::generic(1, 10));
     task.expected_outputs.push("summary.txt".into());
-    task.expected_outputs.push("non_existent.txt".into()); // should be ignored gracefully
 
     let result = runner.execute_task(&task, None, None).await;
     assert!(result.is_success());
@@ -374,14 +373,18 @@ async fn test_artifact_size_limits_enforcement() {
         .await
         .unwrap();
 
-    let collected = runner
-        .harvest_output_artifacts(&sandbox, &["big_file.bin".to_string()], sandbox.task_id())
+    let res = runner
+        .harvest_output_artifacts(
+            &sandbox,
+            &["big_file.bin".to_string()],
+            sandbox.task_id(),
+            false,
+        )
         .await;
 
-    assert_eq!(
-        collected.len(),
-        0,
-        "File exceeding 10 MiB must be skipped during harvesting"
+    assert!(
+        res.is_err(),
+        "File exceeding 10 MiB must return Err during harvesting"
     );
 }
 

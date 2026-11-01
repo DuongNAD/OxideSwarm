@@ -266,18 +266,18 @@ async fn test_symlink_escape_prevention_in_harvest() {
 
     if symlink_created {
         // Symlink was created: harvest_output_artifacts MUST detect and reject it!
-        let collected = runner
+        let res = runner
             .harvest_output_artifacts(
                 &sandbox,
                 &["stolen_secret.pem".to_string()],
                 sandbox.task_id(),
+                false,
             )
             .await;
 
-        assert_eq!(
-            collected.len(),
-            0,
-            "Security vulnerability: harvest_output_artifacts harvested an external symlink!"
+        assert!(
+            res.is_err(),
+            "Security vulnerability: harvest_output_artifacts must fail on external symlink!"
         );
     } else {
         println!(
@@ -297,13 +297,17 @@ async fn test_symlink_escape_prevention_in_harvest() {
         "data:stream.txt".to_string(),
     ];
 
-    let collected_traversal = runner
-        .harvest_output_artifacts(&sandbox, &adversarial_traversal_paths, sandbox.task_id())
+    let res_traversal = runner
+        .harvest_output_artifacts(
+            &sandbox,
+            &adversarial_traversal_paths,
+            sandbox.task_id(),
+            false,
+        )
         .await;
 
-    assert_eq!(
-        collected_traversal.len(),
-        0,
+    assert!(
+        res_traversal.is_err(),
         "All path traversal attempts in expected_outputs must be rejected"
     );
 
@@ -313,10 +317,16 @@ async fn test_symlink_escape_prevention_in_harvest() {
         .await
         .expect("write legit output");
 
-    let collected_legit = runner
-        .harvest_output_artifacts(&sandbox, &["results.json".to_string()], sandbox.task_id())
+    let res_legit = runner
+        .harvest_output_artifacts(
+            &sandbox,
+            &["results.json".to_string()],
+            sandbox.task_id(),
+            false,
+        )
         .await;
 
+    let collected_legit = res_legit.expect("legit output harvesting should succeed");
     assert_eq!(collected_legit.len(), 1);
     assert_eq!(collected_legit[0].path, "results.json");
     assert_eq!(collected_legit[0].data.as_bytes(), b"{\"computation\": 42}");

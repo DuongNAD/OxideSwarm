@@ -276,8 +276,8 @@ or `~/.oxideswarm/cluster.secret`.
 ./target/release/oxideswarm submit --master 127.0.0.1:8088 --type gpu --gpu --wait   # routed to a worker that advertises a GPU
 
 # Input and output files: send a file or a directory, bring back what the patterns select
-# (files the master already holds are not sent again; outputs land in --output-dir at their sandbox paths)
-./target/release/oxideswarm submit --input input.dat --output results.csv --command process_data -- input.dat results.csv
+# (files the master already holds are not sent again; outputs land in --output-dir at their sandbox paths; --output-dir requires --output)
+./target/release/oxideswarm submit --input input.dat --output results.csv --output-dir out/ --command process_data -- input.dat results.csv
 ./target/release/oxideswarm submit --input ./my-crate:. --output 'target/release/my-crate' --output-dir out/ --timeout-secs 600 --command cargo -- build --release
 ./target/release/oxideswarm submit --input data/ --output 'reports/**/*.json' --type shell --script-file analyse.sh
 

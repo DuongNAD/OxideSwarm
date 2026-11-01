@@ -1916,7 +1916,7 @@ pub fn validate_glb_header(raw: &[u8]) -> Result<(), String> {
 ///
 /// An explicit program with no arguments runs with no arguments; the demo greeting is only a
 /// default for a completely empty command line.
-fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
+pub fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
     let mut kind = args.task_type.to_lowercase();
     if (kind == "generic" || kind == "command" || kind.is_empty())
         && (args.prompt.is_some() || args.image.is_some())
@@ -1939,6 +1939,8 @@ fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
             | "autorig"
             | "auto_rig"
             | "rig"
+            | "builtin_test"
+            | "builtintest"
     );
     let only_for = |flag: &str, kinds: &str| {
         Err(format!(
@@ -1967,6 +1969,18 @@ fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
         if args.work_group_size.is_some() {
             return only_for("--work-group-size", "gpu");
         }
+    }
+    if !args.inputs.is_empty() && !is_command && kind != "shell" {
+        return only_for("--input (or --file)", "command and shell");
+    }
+    if !args.outputs.is_empty() && !is_command && kind != "shell" {
+        return only_for("--output", "command and shell");
+    }
+    if args.output_dir.is_some() && !is_command && kind != "shell" {
+        return only_for("--output-dir", "command and shell");
+    }
+    if args.output_dir.is_some() && args.outputs.is_empty() {
+        return Err("--output-dir requires at least one --output pattern".to_string());
     }
     let env = parse_env_pairs(&args.env)?;
 
@@ -2298,8 +2312,6 @@ async fn run_submit_with_secret(
         }
     };
 
-    let is_asset_task = matches!(spec, TaskSpec::Generative3D(_) | TaskSpec::AutoRig(_));
-
     // Inputs are hashed (and directories listed) before connecting, so a typo in a path never
     // reaches the master.
     let inputs = match crate::blobs::scan_inputs(&args.inputs) {
@@ -2313,7 +2325,7 @@ async fn run_submit_with_secret(
         eprintln!("Warning: --input skips {skipped}");
     }
 
-    let output_globs = if !args.outputs.is_empty() && !is_asset_task {
+    let output_globs = if !args.outputs.is_empty() {
         if let Err(e) = rusty_grid_core::blob::validate_output_patterns(&args.outputs) {
             eprintln!("--output: {e}");
             return ExitCode::FAILURE;
@@ -2461,13 +2473,7 @@ async fn run_submit_with_secret(
                 .await
                 .and_then(|workers| listed_worker_name(&workers, result.worker_id));
 
-            let asset_output_path = args.output.clone().or_else(|| {
-                if is_asset_task && args.outputs.len() == 1 {
-                    Some(PathBuf::from(&args.outputs[0]))
-                } else {
-                    None
-                }
-            });
+            let asset_output_path = args.output.clone();
 
             if let (Some(ref out_path), Some(ref asset_bytes)) =
                 (&asset_output_path, &result.asset_bytes)

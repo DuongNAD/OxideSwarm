@@ -1232,7 +1232,8 @@ impl TaskRunner {
         sandbox: &Sandbox,
         expected_outputs: &[String],
         task_id: TaskId,
-    ) -> Vec<OutputArtifact> {
+        process_failed: bool,
+    ) -> Result<Vec<OutputArtifact>, String> {
         let mut collected = Vec::new();
         let mut total_bytes: usize = 0;
 
@@ -1241,7 +1242,9 @@ impl TaskRunner {
                 Ok(p) => p,
                 Err(err) => {
                     warn!(task_id = %task_id, path = %expected, error = %err, "Ignoring illegal expected output path");
-                    continue;
+                    return Err(format!(
+                        "output artifact '{expected}' resolves outside sandbox root"
+                    ));
                 }
             };
 
@@ -1249,8 +1252,12 @@ impl TaskRunner {
             let meta = match tokio::fs::symlink_metadata(&target).await {
                 Ok(m) => m,
                 Err(_) => {
-                    // File was not produced by task; silently skip
-                    debug!(task_id = %task_id, path = %expected, "Declared output artifact was not produced");
+                    if !process_failed {
+                        return Err(format!(
+                            "the task did not produce '{expected}' (declared with --output; use a wildcard pattern for optional outputs)"
+                        ));
+                    }
+                    debug!(task_id = %task_id, path = %expected, "Declared output artifact was not produced by failed task");
                     continue;
                 }
             };
@@ -1258,23 +1265,29 @@ impl TaskRunner {
             // Strictly reject symlinks to prevent sandbox exfiltration
             if meta.is_symlink() {
                 warn!(task_id = %task_id, path = %expected, "Skipping output artifact: symlinks are prohibited for security isolation");
-                continue;
+                return Err(format!(
+                    "output artifact '{expected}' is a symbolic link (symbolic links are prohibited for security isolation)"
+                ));
             }
 
             if !meta.is_file() {
                 warn!(task_id = %task_id, path = %expected, "Skipping output artifact: path is not a regular file");
-                continue;
+                return Err(format!(
+                    "output artifact '{expected}' is not a regular file"
+                ));
             }
 
             let size = meta.len() as usize;
             if size > MAX_OUTPUT_ARTIFACT_BYTES {
                 warn!(task_id = %task_id, path = %expected, size = size, "Skipping output artifact: exceeds single file limit");
-                continue;
+                return Err(format!(
+                    "output artifact '{expected}' is {size} bytes; exceeds single file limit of 10 MiB"
+                ));
             }
 
             if total_bytes + size > MAX_AGGREGATE_ARTIFACT_BYTES {
                 warn!(task_id = %task_id, path = %expected, size = size, "Halting artifact collection: aggregate size exceeds 32 MiB limit");
-                break;
+                return Err("output artifacts exceed aggregate size limit of 32 MiB".to_string());
             }
 
             // Ensure canonical path resolves strictly within the sandbox root
@@ -1284,7 +1297,9 @@ impl TaskRunner {
             ) {
                 if !canonical_target.starts_with(&canonical_sandbox) {
                     warn!(task_id = %task_id, path = %expected, "Skipping output artifact: path resolves outside sandbox root");
-                    continue;
+                    return Err(format!(
+                        "output artifact '{expected}' resolves outside sandbox root"
+                    ));
                 }
             }
 
@@ -1302,11 +1317,14 @@ impl TaskRunner {
                 }
                 Err(err) => {
                     warn!(task_id = %task_id, path = %expected, error = %err, "Failed to read output artifact file");
+                    return Err(format!(
+                        "failed to read output artifact '{expected}': {err}"
+                    ));
                 }
             }
         }
 
-        collected
+        Ok(collected)
     }
 
     /// Helper to stage files into sandbox before task execution.
@@ -1488,14 +1506,31 @@ impl TaskRunner {
             )
             .await;
 
-        let artifacts = if !task.expected_outputs.is_empty() {
-            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id)
+        let process_failed = !result.is_success();
+        let artifacts_res = if !task.expected_outputs.is_empty() {
+            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id, process_failed)
                 .await
         } else {
-            Vec::new()
+            Ok(Vec::new())
         };
         let mut result = result;
-        result.artifacts = artifacts;
+        match artifacts_res {
+            Ok(artifacts) => {
+                result.artifacts = artifacts;
+            }
+            Err(e) => {
+                let message = format!("Output files: {e}");
+                warn!(task_id = %task.id, error = %e, "Harvesting output artifacts failed");
+                if result.exit_code == EXIT_CODE_SUCCESS {
+                    result.exit_code = EXIT_CODE_GENERAL_ERROR;
+                }
+                result.stderr = append_note(result.stderr, &format!("[rusty_grid: {message}]\n"));
+                result.error = Some(match result.error.take() {
+                    Some(error) => format!("{error}; {message}"),
+                    None => message,
+                });
+            }
+        }
         let result = self.collect_blob_outputs(&sandbox, task, result, &[]).await;
         let _ = sandbox.destroy().await;
         result
@@ -1631,14 +1666,31 @@ impl TaskRunner {
             )
             .await;
 
-        let artifacts = if !task.expected_outputs.is_empty() {
-            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id)
+        let process_failed = !result.is_success();
+        let artifacts_res = if !task.expected_outputs.is_empty() {
+            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id, process_failed)
                 .await
         } else {
-            Vec::new()
+            Ok(Vec::new())
         };
         let mut result = result;
-        result.artifacts = artifacts;
+        match artifacts_res {
+            Ok(artifacts) => {
+                result.artifacts = artifacts;
+            }
+            Err(e) => {
+                let message = format!("Output files: {e}");
+                warn!(task_id = %task.id, error = %e, "Harvesting output artifacts failed");
+                if result.exit_code == EXIT_CODE_SUCCESS {
+                    result.exit_code = EXIT_CODE_GENERAL_ERROR;
+                }
+                result.stderr = append_note(result.stderr, &format!("[rusty_grid: {message}]\n"));
+                result.error = Some(match result.error.take() {
+                    Some(error) => format!("{error}; {message}"),
+                    None => message,
+                });
+            }
+        }
         let result = self.collect_blob_outputs(&sandbox, task, result, &[]).await;
         let _ = sandbox.destroy().await;
         result
@@ -1831,14 +1883,31 @@ impl TaskRunner {
             }
         }
 
-        let artifacts = if !task.expected_outputs.is_empty() {
-            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id)
+        let process_failed = !res.is_success();
+        let artifacts_res = if !task.expected_outputs.is_empty() {
+            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id, process_failed)
                 .await
         } else {
-            Vec::new()
+            Ok(Vec::new())
         };
         let mut res = res;
-        res.artifacts = artifacts;
+        match artifacts_res {
+            Ok(artifacts) => {
+                res.artifacts = artifacts;
+            }
+            Err(e) => {
+                let message = format!("Output files: {e}");
+                warn!(task_id = %task.id, error = %e, "Harvesting output artifacts failed");
+                if res.exit_code == EXIT_CODE_SUCCESS {
+                    res.exit_code = EXIT_CODE_GENERAL_ERROR;
+                }
+                res.stderr = append_note(res.stderr, &format!("[rusty_grid: {message}]\n"));
+                res.error = Some(match res.error.take() {
+                    Some(error) => format!("{error}; {message}"),
+                    None => message,
+                });
+            }
+        }
         let res = self
             .collect_blob_outputs(&sandbox, task, res, &artifact_patterns)
             .await;
