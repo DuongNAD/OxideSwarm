@@ -14,7 +14,7 @@ treat every section as a specification unless the table below says it exists.
 
 | Area | Status in this repository |
 |---|---|
-| In-process JNI worker (`crates/android_bridge`, `liboxideworker.so`), `nativeStartWorker` / `nativeStopWorker` / `nativeStartMaster` / `nativeStopMaster`, live telemetry injection (`nativeUpdateTelemetry`), P2P ticket wiring | **Implemented** (section 3.3 and 6.1 phases 1-3). `packaging/android/build_android_jni.sh` builds the library; the Gradle project does not. |
+| In-process JNI worker (`crates/android_bridge`, `liboxideworker.so`), `nativeStartWorker` / `nativeStopWorker`, live telemetry injection (`nativeUpdateTelemetry`), P2P ticket wiring | **Implemented** (section 3.3 and 6.1 phases 1-3). The Android app is a worker only. `packaging/android/build_android_jni.sh` builds the library; the Gradle project does not. |
 | Kotlin foreground service, wake/Wi-Fi locks, boot receiver, battery-optimization helper | **Implemented** (`packaging/android/app`), not exercised by any automated test |
 | Termux worker daemon | **Implemented** (`packaging/android/termux`); it is the only Android path that can hold the cluster secret today |
 | Cluster-secret authentication for the app | **Implemented**: `crates/android_bridge` exposes `nativeSetClusterSecret` and `nativeStartWorkerWithSecret` JNI functions, and Kotlin `WorkerEngine` accepts `clusterSecret` configuring `WorkerConfig.with_cluster_secret` to authenticate against protected masters |
@@ -818,7 +818,7 @@ Android Worker                          Master Node
 
 | Phase | Milestone | Key Architectural Deliverables |
 |---|---|---|
-| **Phase 1** | **JNI Bridge & Wire Protocol Extensions** | - Wire `p2p_ticket` into `crates/android_bridge::start_worker_impl`<br>- Add JNI `nativeUpdateTelemetry` for live battery and thermal injection<br>- Add JNI `nativeStartMaster` and `nativeStopMaster`<br>- Expose helper query functions for testing |
+| **Phase 1** | **JNI Bridge & Wire Protocol Extensions** | - Wire `p2p_ticket` into `crates/android_bridge::start_worker_impl`<br>- Add JNI `nativeUpdateTelemetry` for live battery and thermal injection<br>- Expose helper query functions for testing |
 | **Phase 2** | **Android App & Service Modernization** | - Update `OxideWorkerBridge.kt` and `WorkerEngine.kt`<br>- Register `ACTION_BATTERY_CHANGED` receiver in `OxideWorkerService.kt`<br>- Register `OnThermalStatusChangedListener` in `OxideWorkerService.kt`<br>- Connect UI role switch and ticket input in `MainActivity.kt` |
 | **Phase 3** | **Automated Cross-Compilation Toolchain** | - Implement `packaging/android/build_android_jni.sh`<br>- Automate NDK cross-compilation for `aarch64-linux-android`<br>- Automatically deploy `liboxideworker.so` to `jniLibs/arm64-v8a/` |
 | **Phase 4** | **Testing & Verification** | - Unit and integration tests in `crates/android_bridge/tests/`<br>- Verify clean `cargo check --workspace` and `cargo test -p rusty_grid_android_bridge`<br>- Multi-agent review and forensic integrity audit |
@@ -841,8 +841,6 @@ Verification follows a strict 6-point test matrix:
            │ (Battery %, Charging, Thermal) │ Assert atomic telemetry cache updated
   TC-03    │ In-Process Worker Lifecycle    │ `cargo test test_worker_lifecycle`
            │ (Start, Status, Graceful Stop) │ Assert transitions: STOPPED->RUNNING->STOPPED
-  TC-04    │ Mobile Coordinator Lifecycle   │ `cargo test test_master_lifecycle`
-           │ (Start Master, Stop Master)    │ Assert bind, ticket returned, and clean stop
   TC-05    │ Compilation & Lints            │ `cargo check --workspace`
            │ (Zero compiler errors/warnings)│ Exit code 0
   TC-06    │ Full Bridge Test Suite         │ `cargo test -p rusty_grid_android_bridge`

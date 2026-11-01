@@ -156,26 +156,6 @@ object OxideWorkerBridge : WorkerEngine {
         }
     }
 
-    fun startMaster(bindPort: Int = 8088, dashboardPort: Int = 8080, enableP2p: Boolean = true): String {
-        if (!isLibraryAvailable) return "{\"error\":\"Native library unavailable\"}"
-        return try {
-            nativeStartMaster(bindPort, dashboardPort, enableP2p)
-        } catch (e: Throwable) {
-            Log.e(TAG, "Exception in nativeStartMaster", e)
-            "{\"error\":\"${e.message}\"}"
-        }
-    }
-
-    fun stopMaster(): Boolean {
-        if (!isLibraryAvailable) return false
-        return try {
-            nativeStopMaster()
-        } catch (e: Throwable) {
-            Log.e(TAG, "Exception in nativeStopMaster", e)
-            false
-        }
-    }
-
     fun getWorkerStatus(): String {
         if (!isLibraryAvailable) return "{}"
         return try {
@@ -244,12 +224,4 @@ object OxideWorkerBridge : WorkerEngine {
         batteryTemperature: Float,
         networkType: String
     ): Boolean
-
-    private external fun nativeStartMaster(
-        bindPort: Int,
-        dashboardPort: Int,
-        enableP2p: Boolean
-    ): String
-
-    private external fun nativeStopMaster(): Boolean
 }
