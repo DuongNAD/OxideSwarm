@@ -165,7 +165,12 @@ impl MapReduceEngine {
         }
         let chunks: Vec<Vec<String>> = chunks.into_iter().filter(|c| !c.is_empty()).collect();
         let map_tasks_total = chunks.len();
-        let timeout = Duration::from_secs(spec.timeout_secs.max(60));
+        let timeout_secs = if spec.timeout_secs == 0 {
+            60
+        } else {
+            spec.timeout_secs
+        };
+        let timeout = Duration::from_secs(timeout_secs);
         let progress = JobProgress::new();
 
         // 2. Dispatch Map Tasks: all partitions at once (bounded by `parallelism`). They finish in
@@ -179,7 +184,7 @@ impl MapReduceEngine {
                 .map(|(idx, chunk)| {
                     let task = Task::new(
                         map_task_spec(&spec.mapper, map_script, chunk.join("\n")),
-                        TaskRequirements::generic(1, spec.timeout_secs.max(60)),
+                        TaskRequirements::generic(1, timeout_secs),
                     );
                     let progress = &progress;
                     async move {
@@ -253,10 +258,7 @@ impl MapReduceEngine {
                     .map(|(key, values)| {
                         let built =
                             reduce_task_spec(&spec.reducer, &key, &values).map(|task_spec| {
-                                Task::new(
-                                    task_spec,
-                                    TaskRequirements::generic(1, spec.timeout_secs.max(60)),
-                                )
+                                Task::new(task_spec, TaskRequirements::generic(1, timeout_secs))
                             });
                         let progress = &progress;
                         async move {
@@ -340,24 +342,63 @@ impl MapReduceEngine {
         progress: Option<&JobProgress>,
     ) -> GridResult<TaskResult> {
         let task_id = task.id;
+        let task_bytes = crate::queue::task_active_bytes(&task);
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut lock = self.waiters.write().await;
             lock.entry(task_id).or_default().push(tx);
         }
-        if let Err(e) = self.queue.submit(task).await {
-            drop(rx);
-            prune_closed_waiters(&self.waiters, &task_id).await;
-            return Err(e);
-        }
-        self.scheduler_notify.notify_one();
-
         let mut guard = AbandonGuard {
             engine: self.clone(),
             task_id,
             armed: true,
         };
         let own_start = Instant::now();
+        loop {
+            match self.queue.submit(task.clone()).await {
+                Ok(_) => break,
+                Err(e @ GridError::QueueByteLimitExceeded { max_bytes, .. })
+                    if task_bytes > max_bytes =>
+                {
+                    guard.armed = false;
+                    drop(rx);
+                    prune_closed_waiters(&self.waiters, &task_id).await;
+                    return Err(e);
+                }
+                Err(e @ GridError::QueueFull { capacity: 0 }) => {
+                    guard.armed = false;
+                    drop(rx);
+                    prune_closed_waiters(&self.waiters, &task_id).await;
+                    return Err(e);
+                }
+                Err(
+                    e @ (GridError::QueueByteLimitExceeded { .. } | GridError::QueueFull { .. }),
+                ) => {
+                    let idle_since = progress.map_or(own_start, |p| p.last().max(own_start));
+                    let remaining = timeout.saturating_sub(idle_since.elapsed());
+                    if remaining.is_zero() {
+                        guard.armed = false;
+                        drop(rx);
+                        prune_closed_waiters(&self.waiters, &task_id).await;
+                        return Err(GridError::Timeout {
+                            operation: format!(
+                                "MapReduce task {task_id} waiting for queue room ({e})"
+                            ),
+                            duration_secs: timeout.as_secs(),
+                        });
+                    }
+                    tokio::time::sleep(remaining.min(Duration::from_millis(25))).await;
+                }
+                Err(e) => {
+                    guard.armed = false;
+                    drop(rx);
+                    prune_closed_waiters(&self.waiters, &task_id).await;
+                    return Err(e);
+                }
+            }
+        }
+        self.scheduler_notify.notify_one();
+
         let mut rx = rx;
         loop {
             let idle_since = progress.map_or(own_start, |p| p.last().max(own_start));
@@ -1191,6 +1232,146 @@ mod tests {
         assert!(
             outcome.is_ok(),
             "job-level progress keeps a queued task's wait alive: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mapreduce_job_waits_for_queue_room_and_completes_when_room_is_freed() {
+        let queue = TaskQueue::with_retention_limits(
+            crate::queue::RetryPolicy::default(),
+            None,
+            crate::queue::DEFAULT_MAX_TERMINAL_TASKS,
+            crate::queue::DEFAULT_MAX_TERMINAL_BYTES,
+            4_000,
+        );
+        let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let engine =
+            MapReduceEngine::new(queue.clone(), Arc::new(Notify::new()), Arc::clone(&waiters));
+
+        // 1. A task that alone exceeds the 4_000-byte cap fails at once without waiting.
+        let impossible_job = MapReduceJobSpec::new(
+            "too_large_alone",
+            vec!["x".repeat(5_000)],
+            MapFunctionSpec::Builtin {
+                operator: "word_count".into(),
+            },
+            sum_reducer(),
+            1,
+            1,
+            10,
+        );
+        let started = Instant::now();
+        let err = engine.execute(impossible_job).await.unwrap_err();
+        assert!(
+            matches!(err, GridError::QueueByteLimitExceeded { .. }),
+            "expected immediate QueueByteLimitExceeded when task alone exceeds cap, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must fail at once without waiting for timeout"
+        );
+
+        // 2. Fill the 4_000-byte cap with a blocker task, start the Map/Reduce job, then free
+        //    the blocker after 100 ms and verify the job completes.
+        let blocker = Task::new(
+            TaskSpec::Command {
+                program: "sleep".into(),
+                args: vec!["10".into()],
+                env: Default::default(),
+                working_dir: None,
+                stdin: Some(vec![b'b'; 2_500]),
+            },
+            TaskRequirements::generic(1, 60),
+        );
+        let blocker_id = queue.submit(blocker).await.unwrap();
+
+        let worker = spawn_mock_worker(
+            queue.clone(),
+            Arc::clone(&waiters),
+            |_| true,
+            move |task| {
+                if task.id == blocker_id {
+                    return None;
+                }
+                word_count_answer(task)
+            },
+        );
+
+        let releaser = {
+            let queue = queue.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                queue
+                    .cancel_task(&blocker_id, Some("free room".into()))
+                    .await
+                    .unwrap();
+            })
+        };
+
+        let job = word_job(
+            vec!["alpha beta".into(), "beta gamma".into()],
+            2,
+            sum_reducer(),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), engine.execute(job))
+            .await
+            .expect("job completes after room is freed")
+            .unwrap();
+        releaser.abort();
+        worker.abort();
+
+        assert_eq!(result.status, "Completed");
+        assert_eq!(result.output["alpha"].as_i64(), Some(1));
+        assert_eq!(result.output["beta"].as_i64(), Some(2));
+        assert_eq!(result.output["gamma"].as_i64(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_mapreduce_job_times_out_when_queue_stays_full_and_reports_why() {
+        let queue = TaskQueue::with_retention_limits(
+            crate::queue::RetryPolicy::default(),
+            None,
+            crate::queue::DEFAULT_MAX_TERMINAL_TASKS,
+            crate::queue::DEFAULT_MAX_TERMINAL_BYTES,
+            4_000,
+        );
+        let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let engine =
+            MapReduceEngine::new(queue.clone(), Arc::new(Notify::new()), Arc::clone(&waiters));
+
+        // Keep the queue full for the entire 1-second job timeout.
+        let blocker = Task::new(
+            TaskSpec::Command {
+                program: "sleep".into(),
+                args: vec!["60".into()],
+                env: Default::default(),
+                working_dir: None,
+                stdin: Some(vec![b'b'; 2_500]),
+            },
+            TaskRequirements::generic(1, 60),
+        );
+        let _blocker_id = queue.submit(blocker).await.unwrap();
+
+        let job = MapReduceJobSpec::new(
+            "full_queue_timeout",
+            vec!["hello world".into()],
+            MapFunctionSpec::Builtin {
+                operator: "word_count".into(),
+            },
+            sum_reducer(),
+            1,
+            1,
+            1,
+        );
+        let err = tokio::time::timeout(Duration::from_secs(5), engine.execute(job))
+            .await
+            .expect("job ends at its 1s timeout")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, GridError::Timeout { .. }), "got {err:?}");
+        assert!(
+            msg.contains("waiting for queue room") && msg.contains("--max-active-mb"),
+            "timeout message must explain why the task could not be queued: {msg}"
         );
     }
 }

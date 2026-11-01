@@ -877,11 +877,16 @@ impl TaskRunner {
         }
 
         let compute_fut = async {
-            if test_name == "oversized_result" {
+            if cfg!(test) && test_name == "oversized_result" {
                 if duration_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(duration_ms)).await;
                 }
                 "x".repeat(rusty_grid_core::protocol::MAX_FRAME_SIZE)
+            } else if cfg!(test) && test_name == "oversized_asset" {
+                if duration_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(duration_ms)).await;
+                }
+                "engine stdout line\n".to_string()
             } else if test_name == "sleep"
                 || test_name == "duration"
                 || (duration_ms > 0
@@ -978,7 +983,13 @@ impl TaskRunner {
         tokio::select! {
             output = compute_fut => {
                 let elapsed = start_time.elapsed().as_millis() as u64;
-                TaskResult::success(self.worker_id, task_id, output, elapsed, require_gpu)
+                let mut res =
+                    TaskResult::success(self.worker_id, task_id, output, elapsed, require_gpu);
+                if cfg!(test) && test_name == "oversized_asset" {
+                    res.stderr = Bytes::from_static(b"engine stderr line\n");
+                    res = res.with_asset_bytes(Bytes::from(vec![0u8; 70 * 1024 * 1024]));
+                }
+                res
             }
 
             reason = cancellation(&mut cancel_rx) => {

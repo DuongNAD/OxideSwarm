@@ -33,7 +33,7 @@ Behaviour before this change:
 - **G3** Verify staged file payloads by SHA-256 digest and write an independent copy (`nlink == 1`) into each task sandbox.
 - **G4** Enforce strict sandbox isolation, rejecting traversal components, root paths, reserved Windows device names, and symlinks resolving outside the sandbox.
 - **G5** Maintain wire compatibility across JSON (`0x01`), Bincode (`0x02`), and AEAD (`0x04`) codecs via protocol capability negotiation.
-- **G6** Cap total master retained memory for staged files and artifacts at 256 MiB using LRU eviction.
+- **G6** Bound master queue memory at 256 MiB for active tasks (`--max-active-mb` / `RUSTY_GRID_MAX_ACTIVE_MB`) and 256 MiB for retained finished tasks (`--max-retained-mb` / `RUSTY_GRID_MAX_RETAINED_MB`, using oldest-first eviction).
 
 ## Non-goals
 
@@ -133,10 +133,11 @@ Implemented in `crates/core/src/protocol.rs` and `crates/core/src/task.rs`.
 
 ### D6 Master queue memory accounting and LRU budget
 
-The master queue tracks retained payload memory in `crates/master/src/queue.rs`:
-- Retained memory budget defaults to 256 MiB (`DEFAULT_MAX_RETAINED_MB = 256`), configurable via `--max-retained-mb` or `OXIDESWARM_MAX_RETAINED_MB`.
-- Each completed task accounts for the size of its stored `TaskSpec` (including `StagedFile` bytes) and execution `TaskResult` (including `OutputArtifact` bytes).
-- When total memory exceeds 256 MiB, terminal tasks are evicted in LRU order (oldest finished tasks first) until memory falls within budget.
+The master queue tracks active and retained payload memory in `crates/master/src/queue.rs` (see also `docs/design/0008-oversized-task-results-and-active-queue-budget.md`):
+- Active (non-terminal) task memory defaults to 256 MiB (`DEFAULT_MAX_ACTIVE_BYTES`), configurable via `--max-active-mb`, `RUSTY_GRID_MAX_ACTIVE_MB`, or `max_active_mb` in `[master]`. Submissions and checkpoint increases that would exceed this cap are refused with `GridError::QueueByteLimitExceeded`.
+- Retained finished-task memory defaults to 256 MiB (`DEFAULT_MAX_TERMINAL_BYTES`), configurable via `--max-retained-mb`, `RUSTY_GRID_MAX_RETAINED_MB`, or `max_retained_mb` in `[master]`.
+- Each task entry accounts for the size of its stored `TaskSpec` (including `StagedFile` bytes), checkpoint, and execution `TaskResult` (including `OutputArtifact` and `asset_bytes`).
+- When retained terminal memory exceeds `max_terminal_bytes`, finished tasks are evicted oldest-first until memory falls within budget (always keeping at least the newest finished task).
 
 ## Compatibility
 
@@ -176,3 +177,4 @@ The master queue tracks retained payload memory in `crates/master/src/queue.rs`:
 - 2026-10-23: Verified via `cargo test -p rusty_grid_cli --test file_staging_e2e`, `m5b_challenger_1_stress`, and `m5b_challenger_2_stress` (31 passing tests). Status marked Implemented.
 - 2026-10-26: The CLI moved to the content-addressed files of design record 0006: `submit --file` is an alias of `--input` and `--output` takes patterns, both through the master's blob store. The inline staging described here (`Task::staged_files`, `expected_outputs`, `TaskResult::artifacts`) is unchanged and still used by the MCP server and library callers.
 - 2026-11-01: Removed `cache/objects` hard-linking from `Sandbox::stage_files` (BUG-1) so each task sandbox gets an independent file (`nlink == 1`) written from `staged.data`, preventing in-place mutations or permission changes from affecting subsequent tasks.
+- 2026-11-01: Corrected G6 and D6 to name `DEFAULT_MAX_TERMINAL_BYTES` (`--max-retained-mb` / `RUSTY_GRID_MAX_RETAINED_MB`) and added the 256 MiB active task byte cap `DEFAULT_MAX_ACTIVE_BYTES` (`--max-active-mb` / `RUSTY_GRID_MAX_ACTIVE_MB`) from design record 0008 (BUG-4).

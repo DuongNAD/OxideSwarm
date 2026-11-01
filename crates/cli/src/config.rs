@@ -58,6 +58,8 @@ pub struct MasterFileConfig {
     pub max_retained_tasks: Option<usize>,
     /// Megabytes of finished-task payload and output the master keeps (default 256).
     pub max_retained_mb: Option<u64>,
+    /// Megabytes of active (non-terminal) task payloads the master queue holds at once (default 256).
+    pub max_active_mb: Option<u64>,
     /// Tasks of one `mapreduce` job in flight at once.
     pub mapreduce_parallelism: Option<usize>,
     /// Open connections the grid port accepts at once.

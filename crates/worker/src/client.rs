@@ -649,12 +649,107 @@ fn closed_queue() -> mpsc::Receiver<WorkerMessage> {
     rx
 }
 
+/// Rewrites an oversized `TaskResult` into a failed `WorkerMessage::TaskResult` that fits within
+/// `MAX_FRAME_SIZE` by dropping `asset_bytes` first, then `artifacts`, and then `stdout` and
+/// `stderr`, stopping as soon as the serialized frame fits.
+fn rewrite_oversized_task_result(
+    result: TaskResult,
+    size: usize,
+    max: usize,
+    codec: WireCodec,
+    encrypted: bool,
+) -> WorkerMessage {
+    let exit_code = if result.exit_code != 0 {
+        result.exit_code
+    } else {
+        EXIT_CODE_GENERAL_ERROR
+    };
+    let overhead = if encrypted { 17 } else { 0 };
+    let fits = |msg: &WorkerMessage| {
+        rusty_grid_core::protocol::serialize_message(msg, codec)
+            .is_ok_and(|bytes| bytes.len().saturating_add(overhead) <= max)
+    };
+
+    let build = |keep_artifacts: bool, keep_streams: bool| -> WorkerMessage {
+        let mut dropped = Vec::new();
+        if result.asset_bytes.is_some() {
+            dropped.push("asset_bytes");
+        }
+        if !keep_artifacts && !result.artifacts.is_empty() {
+            dropped.push("artifacts");
+        }
+        if !keep_streams {
+            if !result.stdout.is_empty() {
+                dropped.push("stdout");
+            }
+            if !result.stderr.is_empty() {
+                dropped.push("stderr");
+            }
+        }
+        if dropped.is_empty() {
+            dropped.push("stdout, stderr");
+        }
+        let reason = format!(
+            "Task result size ({size} bytes) exceeds maximum frame limit ({max} bytes); dropped {}",
+            dropped.join(", ")
+        );
+        let (stdout, stderr) = if keep_streams {
+            let mut err_bytes = result.stderr.0.to_vec();
+            if !err_bytes.is_empty() && !err_bytes.ends_with(b"\n") {
+                err_bytes.push(b'\n');
+            }
+            err_bytes.extend_from_slice(reason.as_bytes());
+            (
+                result.stdout.clone(),
+                rusty_grid_core::task::Bytes::from(err_bytes),
+            )
+        } else {
+            (
+                rusty_grid_core::task::Bytes::new(),
+                rusty_grid_core::task::Bytes::from(reason.clone()),
+            )
+        };
+        let mut candidate = TaskResult::failure(
+            result.worker_id,
+            result.task_id,
+            exit_code,
+            stdout,
+            stderr,
+            result.execution_time_ms,
+            Some(reason),
+        );
+        candidate.is_gpu_executed = result.is_gpu_executed;
+        candidate.device_name = result.device_name.clone();
+        if keep_artifacts {
+            candidate.artifacts = result.artifacts.clone();
+        }
+        candidate.outputs = result.outputs.clone();
+        WorkerMessage::from(candidate)
+    };
+
+    if result.asset_bytes.is_some() {
+        let candidate = build(true, true);
+        if fits(&candidate) {
+            return candidate;
+        }
+    }
+    if !result.artifacts.is_empty() {
+        let candidate = build(false, true);
+        if fits(&candidate) {
+            return candidate;
+        }
+    }
+    build(false, false)
+}
+
 /// Writes queued messages to one lane until told to close or until a write fails.
 ///
 /// The control queue (heartbeats, telemetry, the farewell) is always drained before the next data
 /// message (progress, results, checkpoints) is started, so a burst of results can never push a
-/// heartbeat back by more than the one frame already on the wire. A write failure is reported
-/// through `events`. On `closing` the writer first flushes the control queue and then returns.
+/// heartbeat back by more than the one frame already on the wire. An oversized `TaskResult` is
+/// rewritten into a failure that fits (`rewrite_oversized_task_result`) and an oversized
+/// `Checkpoint` is dropped with a warning; any other write failure is reported through `events`.
+/// On `closing` the writer first flushes the control queue and then returns.
 async fn lane_writer<W: AsyncWrite + Unpin>(
     mut writer: MessageWriter<W>,
     mut control_rx: mpsc::Receiver<WorkerMessage>,
@@ -690,10 +785,16 @@ async fn lane_writer<W: AsyncWrite + Unpin>(
                     WorkerMessage::TaskResult {
                         worker_id,
                         task_id,
+                        exit_code,
+                        stdout,
+                        stderr,
                         execution_time_ms,
                         is_gpu_executed,
                         device_name,
-                        ..
+                        error,
+                        asset_bytes,
+                        artifacts,
+                        outputs,
                     } => {
                         warn!(
                             %worker_id,
@@ -702,22 +803,26 @@ async fn lane_writer<W: AsyncWrite + Unpin>(
                             max,
                             "Task result exceeds maximum frame size; failing only this task"
                         );
-                        let fallback = WorkerMessage::TaskResult {
-                            worker_id,
-                            task_id,
-                            exit_code: EXIT_CODE_GENERAL_ERROR,
-                            stdout: rusty_grid_core::task::Bytes::new(),
-                            stderr: rusty_grid_core::task::Bytes::new(),
-                            execution_time_ms,
-                            is_gpu_executed,
-                            device_name: device_name.filter(|d| d.len() <= 256),
-                            error: Some(format!(
-                                "Task result size ({size} bytes) exceeds maximum frame limit ({max} bytes)"
-                            )),
-                            asset_bytes: None,
-                            artifacts: Vec::new(),
-                            outputs: Vec::new(),
-                        };
+                        let fallback = rewrite_oversized_task_result(
+                            TaskResult {
+                                worker_id,
+                                task_id,
+                                exit_code,
+                                stdout,
+                                stderr,
+                                execution_time_ms,
+                                is_gpu_executed,
+                                device_name,
+                                error,
+                                asset_bytes,
+                                artifacts,
+                                outputs,
+                            },
+                            size,
+                            max,
+                            writer.codec(),
+                            writer.is_encrypted(),
+                        );
                         if let Err(fallback_err) = writer.send_msg(&fallback).await {
                             let _ = events.send(Inbound::Failed(lane, fallback_err)).await;
                             return;
@@ -3825,15 +3930,22 @@ mod tests {
                 task_id,
                 exit_code,
                 stdout,
+                stderr,
                 error,
                 ..
             } => {
                 assert_eq!(task_id, oversized_id);
                 assert_ne!(exit_code, 0);
                 assert!(stdout.0.is_empty());
+                let err_text = error.as_deref().unwrap_or_default();
+                let stderr_text = String::from_utf8_lossy(&stderr.0);
                 assert!(
-                    error.as_deref().unwrap_or_default().contains("exceeds"),
+                    err_text.contains("exceeds") && err_text.contains("dropped stdout"),
                     "unexpected error: {error:?}"
+                );
+                assert!(
+                    stderr_text.contains("exceeds") && stderr_text.contains("dropped stdout"),
+                    "unexpected stderr: {stderr_text}"
                 );
             }
             other => panic!("expected failed TaskResult for oversized task, got {other:?}"),
@@ -3865,6 +3977,164 @@ mod tests {
             "oversized TaskResult must not report a lane failure"
         );
         lane.task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_lane_writer_oversized_checkpoint_is_dropped_and_keeps_lane_alive() {
+        let mut lane = spawn_lane(1024 * 1024);
+        let worker_id = Uuid::new_v4();
+        let cp_task_id = TaskId::new();
+        let normal_id = TaskId::new();
+
+        lane.data_tx
+            .send(WorkerMessage::Checkpoint {
+                task_id: cp_task_id,
+                sequence: 7,
+                delta_state: rusty_grid_core::task::Bytes::from(vec![
+                    b'c';
+                    rusty_grid_core::protocol::MAX_FRAME_SIZE
+                ]),
+            })
+            .await
+            .unwrap();
+        lane.data_tx
+            .send(WorkerMessage::from(TaskResult::success(
+                worker_id, normal_id, "after-cp", 3, false,
+            )))
+            .await
+            .unwrap();
+
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            lane.peer.recv_msg::<WorkerMessage>(),
+        )
+        .await
+        .expect("subsequent frame in time after oversized checkpoint")
+        .unwrap()
+        .expect("frame after dropped checkpoint");
+        match next {
+            WorkerMessage::TaskResult {
+                task_id,
+                exit_code,
+                stdout,
+                ..
+            } => {
+                assert_eq!(task_id, normal_id);
+                assert_eq!(exit_code, 0);
+                assert_eq!(stdout.0.as_ref(), b"after-cp");
+            }
+            other => panic!("expected normal TaskResult after dropped checkpoint, got {other:?}"),
+        }
+        assert!(
+            lane.events_rx.try_recv().is_err(),
+            "oversized Checkpoint must not report a lane failure"
+        );
+        lane.task.abort();
+    }
+
+    #[test]
+    fn test_rewrite_oversized_task_result_drops_in_order_and_keeps_what_fits() {
+        let worker_id = Uuid::new_v4();
+        let task_id = TaskId::new();
+        let max = rusty_grid_core::protocol::MAX_FRAME_SIZE;
+        let sample_output = rusty_grid_core::blob::BlobFile {
+            path: "out/report.json".into(),
+            id: rusty_grid_core::blob::BlobId::of(b"report"),
+            size: 6,
+            executable: false,
+        };
+        let sample_artifact =
+            rusty_grid_core::task::OutputArtifact::new("inline.txt", b"small-artifact".to_vec());
+
+        // 1. 70 MiB asset_bytes: drops only asset_bytes, keeping artifacts, stdout, stderr,
+        //    outputs, device_name, and non-zero exit_code.
+        let mut r1 = TaskResult::failure(
+            worker_id,
+            task_id,
+            7,
+            "engine stdout",
+            "engine stderr",
+            42,
+            None,
+        );
+        r1.device_name = Some("long-device-".repeat(30));
+        r1.asset_bytes = Some(rusty_grid_core::task::Bytes::from(vec![
+            0u8;
+            70 * 1024 * 1024
+        ]));
+        r1.artifacts = vec![sample_artifact.clone()];
+        r1.outputs = vec![sample_output.clone()];
+
+        match rewrite_oversized_task_result(
+            r1.clone(),
+            70 * 1024 * 1024 + 500,
+            max,
+            WireCodec::Bincode,
+            false,
+        ) {
+            WorkerMessage::TaskResult {
+                exit_code,
+                stdout,
+                stderr,
+                device_name,
+                error,
+                asset_bytes,
+                artifacts,
+                outputs,
+                ..
+            } => {
+                assert_eq!(exit_code, 7, "non-zero exit code must be kept");
+                assert!(asset_bytes.is_none());
+                assert_eq!(artifacts, vec![sample_artifact]);
+                assert_eq!(outputs, vec![sample_output.clone()]);
+                assert_eq!(device_name, r1.device_name);
+                assert_eq!(stdout.0.as_ref(), b"engine stdout");
+                let stderr_str = String::from_utf8_lossy(&stderr.0);
+                assert!(stderr_str.contains("engine stderr"), "{stderr_str}");
+                assert!(stderr_str.contains("dropped asset_bytes"), "{stderr_str}");
+                let err_str = error.unwrap();
+                assert!(err_str.contains("dropped asset_bytes"), "{err_str}");
+                assert!(!err_str.contains("artifacts"), "{err_str}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // 2. Oversized artifacts (no asset_bytes): drops artifacts, keeping stdout, stderr, outputs.
+        let mut r2 = TaskResult::success(worker_id, task_id, "stdout kept", 10, false);
+        r2.stderr = rusty_grid_core::task::Bytes::from_static(b"stderr kept");
+        r2.artifacts = vec![rusty_grid_core::task::OutputArtifact::new(
+            "huge.bin",
+            vec![0u8; 70 * 1024 * 1024],
+        )];
+        r2.outputs = vec![sample_output];
+
+        match rewrite_oversized_task_result(
+            r2,
+            70 * 1024 * 1024 + 500,
+            max,
+            WireCodec::Bincode,
+            false,
+        ) {
+            WorkerMessage::TaskResult {
+                exit_code,
+                stdout,
+                stderr,
+                error,
+                artifacts,
+                outputs,
+                ..
+            } => {
+                assert_eq!(exit_code, EXIT_CODE_GENERAL_ERROR);
+                assert!(artifacts.is_empty());
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(stdout.0.as_ref(), b"stdout kept");
+                let stderr_str = String::from_utf8_lossy(&stderr.0);
+                assert!(stderr_str.contains("stderr kept"), "{stderr_str}");
+                assert!(stderr_str.contains("dropped artifacts"), "{stderr_str}");
+                assert!(error.unwrap().contains("dropped artifacts"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3906,7 +4176,7 @@ mod tests {
 
         let oversized_task = Task::new(
             rusty_grid_core::task::TaskSpec::BuiltinTest {
-                test_name: "oversized_result".into(),
+                test_name: "oversized_asset".into(),
                 iterations: 1,
                 duration_ms: 20,
                 should_fail: false,
@@ -3939,6 +4209,7 @@ mod tests {
             .await
             .unwrap();
 
+        let mut arrival_order = Vec::new();
         let mut oversized_outcome = None;
         let mut sibling_outcome = None;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -3951,11 +4222,15 @@ mod tests {
                 Some(WorkerMessage::TaskResult {
                     task_id,
                     exit_code,
+                    stdout,
+                    stderr,
                     error,
+                    asset_bytes,
                     ..
                 }) => {
+                    arrival_order.push(task_id);
                     if task_id == oversized_id {
-                        oversized_outcome = Some((exit_code, error));
+                        oversized_outcome = Some((exit_code, stdout, stderr, error, asset_bytes));
                     } else if task_id == sibling_id {
                         sibling_outcome = Some((exit_code, error));
                     }
@@ -3965,13 +4240,29 @@ mod tests {
             }
         }
 
-        let (oversized_code, oversized_err) = oversized_outcome.unwrap();
+        assert_eq!(
+            arrival_order,
+            vec![oversized_id, sibling_id],
+            "oversized result must arrive first before the slower sibling task finishes"
+        );
+
+        let (oversized_code, oversized_stdout, oversized_stderr, oversized_err, oversized_asset) =
+            oversized_outcome.unwrap();
         assert_ne!(oversized_code, 0, "oversized task must fail");
+        assert!(oversized_asset.is_none(), "70 MiB asset must be dropped");
+        assert_eq!(
+            String::from_utf8_lossy(&oversized_stdout.0),
+            "engine stdout line\n",
+            "engine stdout must be preserved when only asset_bytes is dropped"
+        );
+        let stderr_str = String::from_utf8_lossy(&oversized_stderr.0);
         assert!(
-            oversized_err
-                .as_deref()
-                .unwrap_or_default()
-                .contains("exceeds"),
+            stderr_str.contains("engine stderr line") && stderr_str.contains("dropped asset_bytes"),
+            "stderr must contain engine stderr and the drop reason: {stderr_str}"
+        );
+        let err_str = oversized_err.as_deref().unwrap_or_default();
+        assert!(
+            err_str.contains("exceeds") && err_str.contains("dropped asset_bytes"),
             "unexpected oversized error: {oversized_err:?}"
         );
 

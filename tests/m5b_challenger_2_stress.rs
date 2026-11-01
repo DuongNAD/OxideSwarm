@@ -561,7 +561,13 @@ async fn test_master_queue_lru_retention_accounting_and_eviction() {
     //    Each task with a 30 KiB staged file + 10 KiB artifact charges > 40 KiB.
     //    Thus, two completed tasks exceed 60 KiB, forcing the oldest to be evicted!
     let budget_bytes = 60 * 1024;
-    let queue = TaskQueue::with_retention_limits(RetryPolicy::default(), None, 1000, budget_bytes);
+    let queue = TaskQueue::with_retention_limits(
+        RetryPolicy::default(),
+        None,
+        1000,
+        budget_bytes,
+        rusty_grid_master::DEFAULT_MAX_ACTIVE_BYTES,
+    );
     let worker_id = Uuid::new_v4();
 
     // Task 1: Staged file (25 KB) + Artifact (15 KB) => ~41 KB
@@ -712,6 +718,7 @@ async fn test_active_tasks_never_evicted_by_terminal_budget() {
         None,
         1, // only 1 terminal task retained
         1000,
+        rusty_grid_master::DEFAULT_MAX_ACTIVE_BYTES,
     );
     let worker_id = Uuid::new_v4();
 
