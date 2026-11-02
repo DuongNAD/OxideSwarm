@@ -506,6 +506,24 @@ async fn test_mcp1_cancel_tool_cancelled_notification_and_progress_tokens() {
         "cancelled task_result (id 51) must not emit a response: {ping52}"
     );
 
+    // Reusing id 51 on a new `tools/call` must succeed immediately (not -32600 duplicate id),
+    // proving `tool_task_result` actually exited its wait loop upon `notifications/cancelled`.
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 51,
+        "method": "tools/call",
+        "params": {
+            "name": "status",
+            "arguments": {}
+        }
+    }));
+    let reused51 = mcp.recv_timeout(Duration::from_secs(5));
+    assert_eq!(reused51["id"], 51);
+    assert!(
+        reused51.get("error").is_none(),
+        "reusing id 51 after cancelling task_result must succeed (proving task_result exited on cancel), got: {reused51}"
+    );
+
     let _ = shutdown_tx.send(true);
     worker_handle.abort();
     let _ = master.shutdown();
@@ -609,7 +627,15 @@ async fn test_mcp1_no_id_and_duplicate_id_do_not_spin_and_exit_on_eof() {
     .expect("ok_frame json");
     assert_eq!(ok_body["timed_out"], true);
 
-    // Case 3 (F31-4): Start a 12s wait, close stdin (EOF), and assert the process exits within 2s.
+    // Case 3 (F31-4): Start a 12s wait, close stdin (EOF), and assert the process exits within
+    // the 2s grace + 500ms cancel window AND cancels the waited task on the master.
+    let tasks_before_eof: std::collections::HashSet<rusty_grid_core::TaskId> = master
+        .queue()
+        .list_tasks()
+        .await
+        .into_iter()
+        .map(|t| t.task_id)
+        .collect();
     mcp.send(&json!({
         "jsonrpc": "2.0",
         "id": 100,
@@ -626,10 +652,28 @@ async fn test_mcp1_no_id_and_duplicate_id_do_not_spin_and_exit_on_eof() {
             }
         }
     }));
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    let eof_task_id = {
+        let q_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(t) = master
+                .queue()
+                .list_tasks()
+                .await
+                .into_iter()
+                .find(|t| !tasks_before_eof.contains(&t.task_id))
+            {
+                break t.task_id;
+            }
+            assert!(
+                Instant::now() < q_deadline,
+                "eof-wait task did not appear in master queue"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
     let eof_start = Instant::now();
     drop(mcp.stdin.take());
-    let exit_deadline = Instant::now() + Duration::from_secs(2);
+    let exit_deadline = Instant::now() + Duration::from_millis(3500);
     loop {
         if let Some(status) = mcp.child.try_wait().expect("try_wait") {
             assert!(status.success(), "expected exit 0 on EOF, got {status:?}");
@@ -637,11 +681,22 @@ async fn test_mcp1_no_id_and_duplicate_id_do_not_spin_and_exit_on_eof() {
         }
         assert!(
             Instant::now() < exit_deadline,
-            "mcp did not exit within 2s of EOF while a 12s wait was in flight (elapsed {:?})",
+            "mcp did not exit within 3.5s of EOF while a 12s wait was in flight (elapsed {:?})",
             eof_start.elapsed()
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+
+    let eof_task_info = master
+        .queue()
+        .get_task(&eof_task_id)
+        .await
+        .expect("eof_task_id in master queue");
+    assert!(
+        format!("{:?}", eof_task_info.state).contains("Cancelled"),
+        "EOF shutdown must send CancelTask for in-flight submit {{wait: true}}, got state: {:?}",
+        eof_task_info.state
+    );
 
     let _ = shutdown_tx.send(true);
     worker_handle.abort();
@@ -824,14 +879,20 @@ async fn test_mcp1_silent_master_bounded_by_wait_secs_and_exits_on_eof() {
                 saw_submit = true;
                 let text = frame["result"]["content"][0]["text"].as_str().unwrap_or("");
                 let is_err = frame["result"]["isError"].as_bool().unwrap_or(false);
-                let timed_out = serde_json::from_str::<Value>(text)
-                    .ok()
+                let parsed = serde_json::from_str::<Value>(text).ok();
+                let timed_out = parsed
+                    .as_ref()
                     .and_then(|v| v["timed_out"].as_bool())
                     .unwrap_or(false);
                 assert!(
                     is_err || timed_out,
                     "expected error or timed_out against silent master, got: {frame}"
                 );
+                if timed_out {
+                    let v = parsed.as_ref().unwrap();
+                    assert_eq!(v["status"], "Unknown");
+                    assert_eq!(v["state"], "unknown");
+                }
             }
             Some(11) => {
                 saw_cancel = true;
@@ -860,4 +921,442 @@ async fn test_mcp1_silent_master_bounded_by_wait_secs_and_exits_on_eof() {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_secs() {
+    let (master, master_addr, shutdown_tx, worker_handle, temp) = spawn_cluster().await;
+    let home = temp.path();
+
+    // 1. N1 + N4: Bind a silent UDP port (so UDP discovery times out after 1.5s) and a local HTTP
+    // rendezvous server serving a RendezvousLease for `master_addr`.
+    let silent_udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent udp");
+    let disc_port = silent_udp.local_addr().expect("udp local_addr").port();
+
+    let rv_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rv listener");
+    let rv_addr = rv_listener.local_addr().expect("rv local_addr");
+    let lease = rusty_grid_core::discovery::RendezvousLease::new(
+        &master_addr,
+        "http://127.0.0.1:8080",
+        "mcp1-rv-host",
+        None,
+        1,
+        60,
+    );
+    let lease_json = serde_json::to_string(&lease).expect("serialize lease");
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = rv_listener.accept() {
+            let mut req_buf = [0u8; 512];
+            let _ = std::io::Read::read(&mut stream, &mut req_buf);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                lease_json.len(),
+                lease_json
+            );
+            let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+        }
+    });
+
+    let mut auto_child = Command::new(BIN)
+        .current_dir(home)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("OXIDESWARM_HOME", home.join(".oxideswarm"))
+        .env("OXIDESWARM_RENDEZVOUS", format!("http://{rv_addr}"))
+        .env("OXIDESWARM_DISCOVERY_CANDIDATES", "127.0.0.1:9")
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_CONFIG")
+        .env_remove("RUSTY_GRID_MASTER")
+        .env_remove("RUSTY_GRID_MASTER_ADDR")
+        .args([
+            "mcp",
+            "--master",
+            &format!("auto:{disc_port}"),
+            "--insecure",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxideswarm mcp --master auto");
+
+    let mut auto_stdin = auto_child.stdin.take().expect("auto stdin");
+    let auto_stdout = auto_child.stdout.take().expect("auto stdout");
+    let (auto_tx, auto_rx) = std::sync::mpsc::channel::<Value>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(auto_stdout).lines() {
+            let Ok(l) = line else { break };
+            if let Ok(v) = serde_json::from_str::<Value>(l.trim()) {
+                let _ = auto_tx.send(v);
+            }
+        }
+    });
+
+    for msg in [
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "mcp1-rv", "version": "1.0" }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "status", "arguments": {} }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "submit",
+                "arguments": {
+                    "type": "command",
+                    "command": "echo",
+                    "args": ["wait-zero-over-auto"],
+                    "require_tags": ["absent"],
+                    "wait": true,
+                    "wait_secs": 0
+                }
+            }
+        }),
+    ] {
+        let s = serde_json::to_string(&msg).unwrap();
+        auto_stdin.write_all(format!("{s}\n").as_bytes()).unwrap();
+    }
+    auto_stdin.flush().unwrap();
+
+    let mut saw_status = false;
+    let mut saw_wait_zero = false;
+    for _ in 0..3 {
+        let frame = auto_rx
+            .recv_timeout(Duration::from_secs(8))
+            .expect("recv frame from auto mcp");
+        match frame["id"].as_i64() {
+            Some(1) => {}
+            Some(2) => {
+                assert_eq!(
+                    frame["result"]["isError"], false,
+                    "status over --master auto rendezvous failed: {frame}"
+                );
+                let body: Value =
+                    serde_json::from_str(frame["result"]["content"][0]["text"].as_str().unwrap())
+                        .unwrap();
+                assert_eq!(body["cluster_status"], "ok");
+                saw_status = true;
+            }
+            Some(3) => {
+                assert_eq!(
+                    frame["result"]["isError"], false,
+                    "submit {{wait:true, wait_secs:0}} failed: {frame}"
+                );
+                let body: Value =
+                    serde_json::from_str(frame["result"]["content"][0]["text"].as_str().unwrap())
+                        .unwrap();
+                assert_eq!(body["timed_out"], true);
+                assert!(
+                    body["warning"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("no connected worker matches"),
+                    "expected placement warning under --master auto, got: {body}"
+                );
+                let tid = Uuid::parse_str(body["task_id"].as_str().unwrap()).unwrap();
+                assert!(
+                    master
+                        .queue()
+                        .get_task(&rusty_grid_core::TaskId(tid))
+                        .await
+                        .is_some(),
+                    "submit {{wait:true, wait_secs:0}} must submit the task to the master"
+                );
+                saw_wait_zero = true;
+            }
+            other => panic!("unexpected frame id {other:?}: {frame}"),
+        }
+    }
+    assert!(saw_status && saw_wait_zero);
+    drop(auto_stdin);
+    let _ = auto_child.kill();
+    let _ = auto_child.wait();
+
+    // 2. N2: Pipe `doctor` and a 1s `submit {wait: true}` followed immediately by EOF,
+    // and assert BOTH replies are written to stdout before the server exits.
+    let mut piped_child = Command::new(BIN)
+        .current_dir(home)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("OXIDESWARM_HOME", home.join(".oxideswarm"))
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_CONFIG")
+        .env_remove("RUSTY_GRID_MASTER")
+        .env_remove("RUSTY_GRID_MASTER_ADDR")
+        .env_remove("RUSTY_GRID_INSECURE")
+        .args(["mcp", "--master", &master_addr])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn piped mcp");
+
+    {
+        let mut p_stdin = piped_child.stdin.take().expect("piped stdin");
+        for msg in [
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": { "name": "mcp1-piped", "version": "1.0" }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "doctor",
+                    "arguments": {
+                        "expect_workers": 1,
+                        "skip_gpu": true,
+                        "skip_spread": true
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "submit",
+                    "arguments": {
+                        "type": "shell",
+                        "interpreter": "python3",
+                        "script": "import time; time.sleep(1); print('piped-1s-ok')",
+                        "wait": true
+                    }
+                }
+            }),
+        ] {
+            let s = serde_json::to_string(&msg).unwrap();
+            p_stdin.write_all(format!("{s}\n").as_bytes()).unwrap();
+        }
+        p_stdin.flush().unwrap();
+        // Drop `p_stdin` immediately to send EOF while `doctor` and 1s `submit` are in flight.
+    }
+
+    let piped_out = piped_child.wait_with_output().expect("wait piped mcp");
+    assert!(piped_out.status.success());
+    let stdout_str = String::from_utf8_lossy(&piped_out.stdout);
+    let frames: Vec<Value> = stdout_str
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).expect("valid json line"))
+        .collect();
+    let doc_frame = frames
+        .iter()
+        .find(|f| f["id"] == 2)
+        .expect("doctor reply (id 2) must be written before EOF exit");
+    assert_eq!(doc_frame["result"]["isError"], false);
+    let sub_frame = frames
+        .iter()
+        .find(|f| f["id"] == 3)
+        .expect("1s submit reply (id 3) must be written before EOF exit");
+    assert_eq!(sub_frame["result"]["isError"], false);
+    assert!(
+        sub_frame["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("piped-1s-ok"),
+        "expected piped-1s-ok in submit reply: {sub_frame}"
+    );
+
+    let _ = shutdown_tx.send(true);
+    worker_handle.abort();
+    let _ = master.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_mcp1_slow_6mb_response_succeeds_and_post_submit_cancel_check_fires() {
+    use rusty_grid_core::protocol::{
+        serialize_message, ClientMessage, ClientResponse, MessageTransport, WireCodec,
+    };
+    use rusty_grid_core::task::{TaskId, TaskResult};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock master");
+    let mock_addr = listener.local_addr().expect("mock_addr").to_string();
+
+    let submitted_sent = Arc::new(AtomicBool::new(false));
+    let cancel_after_submitted = Arc::new(AtomicBool::new(false));
+    let submitted_sent_srv = Arc::clone(&submitted_sent);
+    let cancel_after_srv = Arc::clone(&cancel_after_submitted);
+
+    let srv_handle = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let sub_sent = Arc::clone(&submitted_sent_srv);
+            let cancel_after = Arc::clone(&cancel_after_srv);
+            tokio::spawn(async move {
+                let mut transport = MessageTransport::new(stream);
+                while let Ok(Some(msg)) = transport.recv_msg::<ClientMessage>().await {
+                    match msg {
+                        ClientMessage::ListWorkers => {
+                            let _ = transport
+                                .send_msg(&ClientResponse::WorkerList {
+                                    workers: Vec::new(),
+                                })
+                                .await;
+                        }
+                        ClientMessage::GetTaskResult { task_id } => {
+                            // N3: Build a 6 MB TaskCompleted response and stream it at ~1.5 MB/s
+                            // (~4 seconds total, > 2s DEFAULT_MASTER_RPC_TIMEOUT, with continuous
+                            // progress every 40ms).
+                            let big_stdout = "A".repeat(6 * 1024 * 1024);
+                            let resp = ClientResponse::TaskCompleted {
+                                task_id,
+                                result: TaskResult::success(
+                                    Uuid::new_v4(),
+                                    task_id,
+                                    big_stdout.into_bytes(),
+                                    10,
+                                    false,
+                                ),
+                            };
+                            let payload =
+                                serialize_message(&resp, WireCodec::Bincode).expect("serialize");
+                            let mut framed = Vec::with_capacity(4 + payload.len());
+                            framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                            framed.extend_from_slice(&payload);
+                            let raw_stream = transport.get_mut();
+                            for chunk in framed.chunks(64 * 1024) {
+                                if raw_stream.write_all(chunk).await.is_err() {
+                                    break;
+                                }
+                                let _ = raw_stream.flush().await;
+                                tokio::time::sleep(Duration::from_millis(35)).await;
+                            }
+                        }
+                        ClientMessage::SubmitTask { task, wait: false } => {
+                            // Delay TaskSubmitted by 200ms so notifications/cancelled arrives at 50ms
+                            // while SubmitTask is in flight, exercising the post-TaskSubmitted cancel
+                            // check at mcp.rs:1174.
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            sub_sent.store(true, Ordering::SeqCst);
+                            let _ = transport
+                                .send_msg(&ClientResponse::TaskSubmitted { task_id: task.id })
+                                .await;
+                        }
+                        ClientMessage::CancelTask { task_id } => {
+                            if sub_sent.load(Ordering::SeqCst) {
+                                cancel_after.store(true, Ordering::SeqCst);
+                            }
+                            let _ = transport
+                                .send_msg(&ClientResponse::TaskCancelled {
+                                    task_id,
+                                    success: true,
+                                })
+                                .await;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+
+    let mut mcp = McpHarness::spawn(temp.path(), &mock_addr);
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "mcp1-n3-mutant", "version": "1.0" }
+        }
+    }));
+    let _ = mcp.recv_timeout(Duration::from_secs(5));
+
+    // 1. N3: 6 MB `task_result` without wait over a ~1.8 MB/s link (~3.5s > 2s) must succeed.
+    let tid = TaskId::new();
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {
+            "name": "task_result",
+            "arguments": {
+                "task_id": tid.to_string(),
+                "wait": false
+            }
+        }
+    }));
+    let big_resp = mcp.recv_timeout(Duration::from_secs(12));
+    assert_eq!(big_resp["id"], 10);
+    assert_eq!(
+        big_resp["result"]["isError"], false,
+        "6 MB task_result over slow link must succeed: {big_resp}"
+    );
+    let big_body: Value = serde_json::from_str(
+        big_resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("big text"),
+    )
+    .expect("parse big json");
+    assert_eq!(
+        big_body["stdout"].as_str().map(str::len),
+        Some(6 * 1024 * 1024),
+        "expected full 6 MB stdout"
+    );
+
+    // 2. Mutant B (mcp.rs:1174): Cancel an in-flight `submit {wait: false}` at 50ms while
+    // `SubmitTask` takes 200ms, and assert that `CancelTask` is sent AFTER `TaskSubmitted`.
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 20,
+        "method": "tools/call",
+        "params": {
+            "name": "submit",
+            "arguments": {
+                "type": "command",
+                "command": "echo",
+                "args": ["delayed-submit"],
+                "wait": false
+            }
+        }
+    }));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {
+            "requestId": 20,
+            "reason": "cancel while SubmitTask in flight"
+        }
+    }));
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !cancel_after_submitted.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "expected CancelTask to be sent after TaskSubmitted (mcp.rs:1174)"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    srv_handle.abort();
 }

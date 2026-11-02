@@ -208,6 +208,7 @@ pub const DEFAULT_WAIT_MARGIN_SECS: u64 = 5;
 pub struct McpState {
     pub master_addr: String,
     pub secret: Option<ClusterSecret>,
+    resolved_master_addr: Mutex<Option<String>>,
     transport: Mutex<Option<MessageTransport<TcpStream>>>,
 }
 
@@ -216,8 +217,27 @@ impl McpState {
         Self {
             master_addr,
             secret,
+            resolved_master_addr: Mutex::new(None),
             transport: Mutex::new(None),
         }
+    }
+
+    /// Resolves `self.master_addr` (running 3-tier LAN/HTTP/rendezvous discovery when `auto`)
+    /// outside the per-RPC timeout, caching the resolved `host:port` so subsequent RPCs do not
+    /// repeat discovery unless a connection fails.
+    pub async fn resolve_target_addr(&self) -> Result<String, String> {
+        if let Some(cached) = self.resolved_master_addr.lock().await.clone() {
+            return Ok(cached);
+        }
+        let resolved = crate::connect::resolve_master_addr(&self.master_addr, self.secret.as_ref())
+            .await
+            .map_err(|e| format!("Failed to connect to Master at {}: {e}", self.master_addr))?;
+        *self.resolved_master_addr.lock().await = Some(resolved.clone());
+        Ok(resolved)
+    }
+
+    async fn invalidate_resolved_addr(&self) {
+        *self.resolved_master_addr.lock().await = None;
     }
 
     /// Sends a client request to the master bounded by [`DEFAULT_MASTER_RPC_TIMEOUT`].
@@ -226,14 +246,14 @@ impl McpState {
             .await
     }
 
-    /// Sends a client request to the master bounded by `timeout`, without holding the pooled
-    /// transport lock across network I/O.
+    /// Sends a client request to the master with progress bounded by `timeout`, without holding
+    /// the pooled transport lock across network I/O and resolving `--master auto` outside the
+    /// per-RPC timeout.
     pub async fn request_with_timeout(
         &self,
         message: &ClientMessage,
         timeout: Duration,
     ) -> Result<ClientResponse, String> {
-        let deadline = tokio::time::Instant::now() + timeout;
         let pooled = {
             let mut guard = self.transport.lock().await;
             guard.take()
@@ -241,42 +261,51 @@ impl McpState {
 
         // Try existing pooled transport outside the lock
         if let Some(mut transport) = pooled {
-            if let Ok(Ok(Some(resp))) = tokio::time::timeout_at(deadline, async {
-                transport.send_msg(message).await?;
-                transport.recv_msg::<ClientResponse>().await
-            })
-            .await
+            if transport
+                .send_msg_with_idle_timeout(message, timeout)
+                .await
+                .is_ok()
             {
-                let mut guard = self.transport.lock().await;
-                if guard.is_none() {
-                    *guard = Some(transport);
+                if let Ok(Some(resp)) = transport
+                    .recv_msg_with_idle_timeout::<ClientResponse>(timeout)
+                    .await
+                {
+                    let mut guard = self.transport.lock().await;
+                    if guard.is_none() {
+                        *guard = Some(transport);
+                    }
+                    return Ok(resp);
                 }
-                return Ok(resp);
             }
         }
 
-        // Fresh connection bounded by the remaining deadline
-        let mut transport = self.connect_dedicated_until(deadline).await?;
+        // Fresh connection (discovery runs outside `timeout`, connect/handshake bounded by `timeout`)
+        let mut transport = self.connect_dedicated_with_timeout(timeout).await?;
 
-        tokio::time::timeout_at(deadline, transport.send_msg(message))
+        transport
+            .send_msg_with_idle_timeout(message, timeout)
             .await
-            .map_err(|_| {
-                format!(
-                    "Timed out sending request to Master at {}",
-                    self.master_addr
-                )
-            })?
-            .map_err(|e| format!("Failed to send request to Master: {e}"))?;
+            .map_err(|e| {
+                if matches!(e, rusty_grid_core::protocol::ProtocolError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::TimedOut) {
+                    format!("Timed out sending request to Master at {}", self.master_addr)
+                } else {
+                    format!("Failed to send request to Master: {e}")
+                }
+            })?;
 
-        let response = tokio::time::timeout_at(deadline, transport.recv_msg::<ClientResponse>())
+        let response = transport
+            .recv_msg_with_idle_timeout::<ClientResponse>(timeout)
             .await
-            .map_err(|_| {
-                format!(
-                    "Timed out waiting for response from Master at {}",
-                    self.master_addr
-                )
+            .map_err(|e| {
+                if matches!(e, rusty_grid_core::protocol::ProtocolError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::TimedOut) {
+                    format!(
+                        "Timed out waiting for response from Master at {}",
+                        self.master_addr
+                    )
+                } else {
+                    format!("Failed to receive response from Master: {e}")
+                }
             })?
-            .map_err(|e| format!("Failed to receive response from Master: {e}"))?
             .ok_or_else(|| "Master closed connection unexpectedly".to_string())?;
 
         let mut guard = self.transport.lock().await;
@@ -288,8 +317,51 @@ impl McpState {
 
     /// Obtains a dedicated one-off connection (e.g. for long-running streaming/waiting operations).
     pub async fn connect_dedicated(&self) -> Result<MessageTransport<TcpStream>, String> {
-        self.connect_dedicated_until(tokio::time::Instant::now() + DEFAULT_MASTER_RPC_TIMEOUT)
+        self.connect_dedicated_with_timeout(DEFAULT_MASTER_RPC_TIMEOUT)
             .await
+    }
+
+    /// Obtains a dedicated one-off connection with TCP connect + handshake bounded by `timeout`,
+    /// resolving `--master auto` outside `timeout`.
+    pub async fn connect_dedicated_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<MessageTransport<TcpStream>, String> {
+        let had_cached = self.resolved_master_addr.lock().await.is_some();
+        let target_addr = self.resolve_target_addr().await?;
+        match tokio::time::timeout(timeout, connect_master(&target_addr, self.secret.as_ref()))
+            .await
+        {
+            Ok(Ok(transport)) => Ok(transport),
+            Ok(Err(e)) => {
+                self.invalidate_resolved_addr().await;
+                if had_cached {
+                    if let Ok(fresh_addr) = self.resolve_target_addr().await {
+                        if fresh_addr != target_addr {
+                            if let Ok(Ok(t)) = tokio::time::timeout(
+                                timeout,
+                                connect_master(&fresh_addr, self.secret.as_ref()),
+                            )
+                            .await
+                            {
+                                return Ok(t);
+                            }
+                        }
+                    }
+                }
+                Err(format!(
+                    "Failed to connect to Master at {}: {e}",
+                    self.master_addr
+                ))
+            }
+            Err(_) => {
+                self.invalidate_resolved_addr().await;
+                Err(format!(
+                    "Timed out connecting to Master at {}",
+                    self.master_addr
+                ))
+            }
+        }
     }
 
     /// Obtains a dedicated one-off connection bounded by `deadline`.
@@ -297,13 +369,8 @@ impl McpState {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<MessageTransport<TcpStream>, String> {
-        tokio::time::timeout_at(
-            deadline,
-            connect_master(&self.master_addr, self.secret.as_ref()),
-        )
-        .await
-        .map_err(|_| format!("Timed out connecting to Master at {}", self.master_addr))?
-        .map_err(|e| format!("Failed to connect to Master at {}: {e}", self.master_addr))
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        self.connect_dedicated_with_timeout(timeout).await
     }
 }
 
@@ -542,6 +609,8 @@ pub fn available_tools() -> Vec<ToolDefinition> {
 pub struct ToolCallContext {
     pub cancel_tx: watch::Sender<bool>,
     pub cancel_rx: watch::Receiver<bool>,
+    pub client_cancelled: Arc<std::sync::atomic::AtomicBool>,
+    pub aborted_by_cancel: bool,
     pub submitted_task_id: Arc<Mutex<Option<TaskId>>>,
     pub progress_token: Option<Value>,
     pub out_tx: Option<mpsc::UnboundedSender<String>>,
@@ -553,6 +622,8 @@ impl Default for ToolCallContext {
         Self {
             cancel_tx: tx,
             cancel_rx: rx,
+            client_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            aborted_by_cancel: false,
             submitted_task_id: Arc::new(Mutex::new(None)),
             progress_token: None,
             out_tx: None,
@@ -563,6 +634,11 @@ impl Default for ToolCallContext {
 impl ToolCallContext {
     pub fn is_cancelled(&self) -> bool {
         *self.cancel_rx.borrow()
+    }
+
+    pub fn is_client_cancelled(&self) -> bool {
+        self.client_cancelled
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn send_progress(&self, progress: u64, total: Option<u64>, message: impl Into<String>) {
@@ -994,6 +1070,16 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
     *ctx.submitted_task_id.lock().await = Some(task_id);
 
     if ctx.is_cancelled() {
+        ctx.aborted_by_cancel = true;
+        return ToolCallResult::error(format!("Task {task_id} cancelled by client"));
+    }
+
+    if let Err(e) = state.resolve_target_addr().await {
+        return ToolCallResult::error(e);
+    }
+
+    if ctx.is_cancelled() {
+        ctx.aborted_by_cancel = true;
         return ToolCallResult::error(format!("Task {task_id} cancelled by client"));
     }
 
@@ -1004,25 +1090,35 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         check_matching_worker_warning(state, &placement, &requirements, preflight_timeout).await;
 
     if ctx.is_cancelled() {
+        ctx.aborted_by_cancel = true;
         return ToolCallResult::error(format!("Task {task_id} cancelled by client"));
     }
 
     if wait {
-        let mut transport = match state.connect_dedicated_until(deadline).await {
+        let submit_rpc_timeout =
+            Duration::from_secs(wait_secs.max(1)).min(DEFAULT_MASTER_RPC_TIMEOUT);
+        let mut transport = match state
+            .connect_dedicated_with_timeout(submit_rpc_timeout)
+            .await
+        {
             Ok(t) => t,
             Err(e) => return ToolCallResult::error(e),
         };
 
         let msg = ClientMessage::SubmitTask { task, wait: true };
-        match tokio::time::timeout_at(deadline, transport.send_msg(&msg)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return ToolCallResult::error(format!("Failed to submit task: {e}")),
-            Err(_) => {
-                return ToolCallResult::error(format!(
+        if let Err(e) = transport
+            .send_msg_with_idle_timeout(&msg, submit_rpc_timeout)
+            .await
+        {
+            return if matches!(e, rusty_grid_core::protocol::ProtocolError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::TimedOut)
+            {
+                ToolCallResult::error(format!(
                     "Timed out submitting task to Master at {}",
                     state.master_addr
                 ))
-            }
+            } else {
+                ToolCallResult::error(format!("Failed to submit task: {e}"))
+            };
         }
 
         ctx.send_progress(
@@ -1040,6 +1136,7 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
 
         let recv_outcome = loop {
             if *cancel_rx.borrow() {
+                ctx.aborted_by_cancel = true;
                 drop(transport);
                 let _ = state
                     .request_with_timeout(
@@ -1058,6 +1155,7 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                         continue;
                     }
                     if *cancel_rx.borrow() {
+                        ctx.aborted_by_cancel = true;
                         drop(transport);
                         let _ = state
                             .request_with_timeout(
@@ -1172,6 +1270,7 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         match state.request_with_timeout(&msg, remaining).await {
             Ok(ClientResponse::TaskSubmitted { task_id }) => {
                 if ctx.is_cancelled() {
+                    ctx.aborted_by_cancel = true;
                     let _ = state
                         .request_with_timeout(
                             &ClientMessage::CancelTask { task_id },
@@ -1256,6 +1355,9 @@ async fn tool_task_result(
         .unwrap_or(60);
 
     if wait {
+        if let Err(e) = state.resolve_target_addr().await {
+            return ToolCallResult::error(e);
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
         let mut transport = match state.connect_dedicated_until(deadline).await {
             Ok(t) => t,
@@ -1267,6 +1369,7 @@ async fn tool_task_result(
 
         loop {
             if *cancel_rx.borrow() {
+                ctx.aborted_by_cancel = true;
                 return ToolCallResult::error(format!("Wait for task {task_id} cancelled"));
             }
 
@@ -1279,6 +1382,7 @@ async fn tool_task_result(
                         continue;
                     }
                     if *cancel_rx.borrow() {
+                        ctx.aborted_by_cancel = true;
                         return ToolCallResult::error(format!("Wait for task {task_id} cancelled"));
                     }
                     continue;
@@ -1308,6 +1412,7 @@ async fn tool_task_result(
                         continue;
                     }
                     if *cancel_rx.borrow() {
+                        ctx.aborted_by_cancel = true;
                         return ToolCallResult::error(format!("Wait for task {task_id} cancelled"));
                     }
                     continue;
@@ -1389,6 +1494,7 @@ async fn tool_task_result(
                             if res.is_err() {
                                 cancel_closed = true;
                             } else if *cancel_rx.borrow() {
+                                ctx.aborted_by_cancel = true;
                                 return ToolCallResult::error(format!("Wait for task {task_id} cancelled"));
                             }
                         }
@@ -1500,7 +1606,11 @@ async fn tool_doctor(state: &McpState, args: &Value) -> ToolCallResult {
         options.skip_spread = skip_spread;
     }
 
-    let report = run_doctor(&state.master_addr, state.secret.as_ref(), &options).await;
+    let target_addr = state
+        .resolve_target_addr()
+        .await
+        .unwrap_or_else(|_| state.master_addr.clone());
+    let report = run_doctor(&target_addr, state.secret.as_ref(), &options).await;
     match serde_json::to_value(&report) {
         Ok(val) => ToolCallResult::ok_json(&val),
         Err(e) => ToolCallResult::error(format!("Failed to serialize doctor report: {e}")),
@@ -1513,6 +1623,7 @@ async fn tool_doctor(state: &McpState, args: &Value) -> ToolCallResult {
 
 struct InFlightCall {
     cancel_tx: watch::Sender<bool>,
+    client_cancelled: Arc<std::sync::atomic::AtomicBool>,
     submitted_task_id: Arc<Mutex<Option<TaskId>>>,
 }
 
@@ -1641,11 +1752,20 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                 let params = request.params.unwrap_or(Value::Null);
                 if let Some(req_id) = params.get("requestId").or_else(|| params.get("id")) {
                     if let Some(key) = request_id_key(req_id) {
-                        let entry = in_flight.lock().await.remove(&key);
-                        if let Some(call) = entry {
-                            let _ = call.cancel_tx.send(true);
-                            let maybe_tid = *call.submitted_task_id.lock().await;
-                            if let Some(task_id) = maybe_tid {
+                        let maybe_tid = {
+                            let guard = in_flight.lock().await;
+                            if let Some(call) = guard.get(&key) {
+                                call.client_cancelled
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                let _ = call.cancel_tx.send(true);
+                                Some(Arc::clone(&call.submitted_task_id))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(tid_mutex) = maybe_tid {
+                            let maybe_tid_val = *tid_mutex.lock().await;
+                            if let Some(task_id) = maybe_tid_val {
                                 let state_clone = Arc::clone(&state);
                                 tokio::spawn(async move {
                                     let _ = state_clone
@@ -1693,6 +1813,7 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                         }
 
                         let (cancel_tx, cancel_rx) = watch::channel(false);
+                        let client_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
                         let submitted_task_id = Arc::new(Mutex::new(None));
                         let call_seq = next_call_seq;
                         next_call_seq = next_call_seq.wrapping_add(1);
@@ -1706,6 +1827,7 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                                 key.clone(),
                                 InFlightCall {
                                     cancel_tx: cancel_tx.clone(),
+                                    client_cancelled: Arc::clone(&client_cancelled),
                                     submitted_task_id: Arc::clone(&submitted_task_id),
                                 },
                             );
@@ -1715,6 +1837,8 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                         let mut ctx = ToolCallContext {
                             cancel_tx,
                             cancel_rx,
+                            client_cancelled,
+                            aborted_by_cancel: false,
                             submitted_task_id,
                             progress_token,
                             out_tx: Some(out_tx.clone()),
@@ -1732,7 +1856,7 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                             if let Some(ref key) = id_key {
                                 in_flight_clone.lock().await.remove(key);
                             }
-                            if ctx.is_cancelled() {
+                            if ctx.is_client_cancelled() || ctx.aborted_by_cancel {
                                 return;
                             }
                             let resp = match serde_json::to_value(&tool_result) {
@@ -1771,9 +1895,10 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
         }
     }
 
-    // Give fast in-flight calls (such as piped batch RPCs) a short 250ms grace window to finish,
-    // then cancel any remaining long-running waits and bound shutdown to 500ms before aborting.
-    let grace_deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    // Give in-flight calls (such as piped one-shot `doctor` or short `submit {wait: true}` calls)
+    // a 2s grace window to finish naturally and emit their JSON-RPC replies, then cancel any
+    // remaining long-running waits and bound cleanup to 500ms before aborting.
+    let grace_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while !call_tasks.is_empty() {
         match tokio::time::timeout_at(grace_deadline, call_tasks.join_next()).await {
             Ok(Some(_)) => continue,
