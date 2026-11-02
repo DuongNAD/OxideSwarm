@@ -78,6 +78,21 @@ jobs:
       - name: run agent mesh integration tests
         run: cargo test -p agent_mesh --test test_sec6_mesh_sandbox --locked
 
+  sec5-hardened-runner:
+    name: sec5 hardened runner (${{ matrix.os }})
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p rusty_grid_worker --test test_sec5_hardened_runner --locked
+
   agent-bridge:
     # The bridge also runs on the owner's Windows machine, and this is the only check of that path.
     name: agent bridge (${{ matrix.os }})

@@ -58,6 +58,8 @@ pub struct MasterFileConfig {
     pub max_retained_tasks: Option<usize>,
     /// Megabytes of finished-task payload and output the master keeps (default 256).
     pub max_retained_mb: Option<u64>,
+    /// Megabytes of active (non-terminal) task payloads the master queue holds at once (default 256).
+    pub max_active_mb: Option<u64>,
     /// Tasks of one `mapreduce` job in flight at once.
     pub mapreduce_parallelism: Option<usize>,
     /// Open connections the grid port accepts at once.
@@ -255,6 +257,13 @@ pub fn load_mcp_config_file(explicit_path: Option<&Path>) -> GridResult<Option<C
     load_config_file_with_options(explicit_path, false)
 }
 
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
 fn load_config_file_with_options(
     explicit_path: Option<&Path>,
     allow_working_dir: bool,
@@ -268,19 +277,26 @@ fn load_config_file_with_options(
     } else if allow_working_dir && Path::new("rusty-grid.json").exists() {
         Some(PathBuf::from("rusty-grid.json"))
     } else {
+        let user_config = default_oxideswarm_dir()
+            .map(|d| d.join("rusty-grid.toml"))
+            .filter(|user_config| user_config.exists());
         if !allow_working_dir {
             for candidate in ["rusty-grid.toml", "rusty-grid.json"] {
-                if Path::new(candidate).exists() {
-                    eprintln!(
-                        "[mcp] Skipping config file ./{candidate} in the working directory (pass --config or RUSTY_GRID_CONFIG to load it)."
-                    );
+                let candidate_path = Path::new(candidate);
+                if candidate_path.exists() {
+                    let same_as_loaded = user_config
+                        .as_deref()
+                        .is_some_and(|loaded| is_same_file(candidate_path, loaded));
+                    if !same_as_loaded {
+                        eprintln!(
+                            "[mcp] Skipping config file ./{candidate} in the working directory (pass --config or RUSTY_GRID_CONFIG to load it)."
+                        );
+                    }
                     break;
                 }
             }
         }
-        default_oxideswarm_dir()
-            .map(|d| d.join("rusty-grid.toml"))
-            .filter(|user_config| user_config.exists())
+        user_config
     };
 
     let path = match path_to_load {
