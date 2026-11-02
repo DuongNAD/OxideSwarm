@@ -546,7 +546,7 @@ pub struct SubmitArgs {
     #[arg(
         long,
         value_name = "ENGINE",
-        help = "Preferred 3D generation engine: auto, sdf, triposr, trellis (default: auto)"
+        help = "Preferred 3D generation engine: auto, sdf, triposr (default: auto)"
     )]
     pub engine: Option<String>,
 

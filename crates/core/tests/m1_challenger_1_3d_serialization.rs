@@ -256,8 +256,8 @@ fn test_adv_01_generative_3d_extreme_inputs_and_fuzzing() {
     let trellis_spec =
         TaskSpec::Generative3D(Generative3DSpec::new_prompt("cube").with_engine("trellis"));
     assert!(
-        trellis_spec.requires_gpu(),
-        "Trellis engine MUST require GPU"
+        !trellis_spec.requires_gpu(),
+        "Trellis engine does NOT require GPU (N21-1: eligible for CPU worker fast rejection)"
     );
 
     let auto_spec = TaskSpec::Generative3D(Generative3DSpec::new_prompt("cube"));
@@ -928,12 +928,12 @@ fn test_adv_07_full_task_spec_interchange_and_checkpoint_zero_copy() {
     assert!(task_triposr_cpu.validate().is_ok());
 
     // Mismatched requirement validation check:
-    // Trellis requires GPU, so pairing it with generic (gpu_required = false) must fail validation
-    let task_3d_mismatched = Task::new(
-        TaskSpec::Generative3D(Generative3DSpec::new_prompt("dragon").with_engine("trellis")),
+    // GpuCompute requires GPU, so pairing it with generic (gpu_required = false) must fail validation
+    let task_gpu_mismatched = Task::new(
+        TaskSpec::gpu_compute("kernel", 64),
         TaskRequirements::generic(4, 60), // gpu_required = false
     );
-    let mismatch_err = task_3d_mismatched.validate();
+    let mismatch_err = task_gpu_mismatched.validate();
     assert!(
         mismatch_err.is_err(),
         "Mismatched GPU requirements must fail validation"
@@ -941,6 +941,24 @@ fn test_adv_07_full_task_spec_interchange_and_checkpoint_zero_copy() {
     println!(
         "  [+] GPU requirement mismatch correctly caught: {:?}",
         mismatch_err.unwrap_err()
+    );
+
+    // Unsupported engine validation check:
+    // Trellis is not supported and fails TaskSpec validation
+    let task_3d_mismatched = Task::new(
+        TaskSpec::Generative3D(Generative3DSpec::new_prompt("dragon").with_engine("trellis")),
+        TaskRequirements::generic(4, 60),
+    );
+    let trellis_err = task_3d_mismatched.validate();
+    assert!(
+        trellis_err.is_err(),
+        "Trellis task must fail TaskSpec validation"
+    );
+    assert!(
+        trellis_err
+            .unwrap_err()
+            .contains("Trellis 3D neural engine is not supported; use sdf or triposr"),
+        "Error message must specify Trellis is unsupported"
     );
 
     // Attach 1MB CheckpointData to task

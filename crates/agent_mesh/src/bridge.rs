@@ -572,6 +572,29 @@ impl AgentGridBridge {
             .unwrap_or("standard")
             .to_lowercase();
 
+        if let Some(v) = args.get("engine") {
+            if !v.is_string() {
+                return make_error_response(
+                    from,
+                    correlation_id,
+                    command,
+                    1,
+                    "Invalid 3D generation specification: 'engine' must be a string",
+                );
+            }
+        }
+        if let Some(v) = args.get("engine_preference") {
+            if !v.is_string() {
+                return make_error_response(
+                    from,
+                    correlation_id,
+                    command,
+                    1,
+                    "Invalid 3D generation specification: 'engine' must be a string",
+                );
+            }
+        }
+
         let engine_preference = if let Some(raw) = args
             .get("engine")
             .or_else(|| args.get("engine_preference"))
@@ -1116,6 +1139,76 @@ mod tests {
                 assert_eq!(status, "failed");
                 assert_ne!(exit_code, 0);
                 assert!(stderr.contains("unknown 3D engine 'rodin'"));
+            }
+            other => panic!("expected CommandResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bridge_refuses_non_string_engine_envelope() {
+        let master = rusty_grid_master::server::MasterServer::spawn(
+            rusty_grid_master::server::ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        )
+        .await
+        .expect("spawn master");
+        let bridge = AgentGridBridge::new(master);
+
+        // Non-string 'engine' (integer 5)
+        let req_num = AgentMeshEnvelope::new_command_request(
+            "agent-1",
+            "grid",
+            "grid_3d_generate",
+            serde_json::json!({
+                "prompt": "robot",
+                "engine": 5,
+            }),
+            Some(5000),
+        );
+
+        let resp_num = bridge.handle_command(&req_num).await;
+        match resp_num {
+            AgentMeshEnvelope::CommandResponse {
+                exit_code,
+                stderr,
+                status,
+                ..
+            } => {
+                assert_eq!(status, "failed");
+                assert_ne!(exit_code, 0);
+                assert!(
+                    stderr.contains("'engine' must be a string"),
+                    "Expected non-string engine error, got: {stderr}"
+                );
+            }
+            other => panic!("expected CommandResponse, got {other:?}"),
+        }
+
+        // Non-string 'engine_preference' (boolean true)
+        let req_bool = AgentMeshEnvelope::new_command_request(
+            "agent-1",
+            "grid",
+            "grid_3d_generate",
+            serde_json::json!({
+                "prompt": "robot",
+                "engine_preference": true,
+            }),
+            Some(5000),
+        );
+
+        let resp_bool = bridge.handle_command(&req_bool).await;
+        match resp_bool {
+            AgentMeshEnvelope::CommandResponse {
+                exit_code,
+                stderr,
+                status,
+                ..
+            } => {
+                assert_eq!(status, "failed");
+                assert_ne!(exit_code, 0);
+                assert!(
+                    stderr.contains("'engine' must be a string"),
+                    "Expected non-string engine error, got: {stderr}"
+                );
             }
             other => panic!("expected CommandResponse, got {other:?}"),
         }

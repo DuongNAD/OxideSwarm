@@ -404,7 +404,7 @@ async fn test_cli_3d_triposr_fails_honestly_on_cpu_worker() {
 }
 
 #[tokio::test]
-async fn test_cli_3d_explicit_gpu_engine_without_gpu_flag() {
+async fn test_cli_3d_trellis_rejected_immediately_on_cpu_worker() {
     let temp_dir = TempDir::new().unwrap();
 
     // 1. Spawn in-process Master
@@ -417,13 +417,12 @@ async fn test_cli_3d_explicit_gpu_engine_without_gpu_flag() {
     .expect("MasterServer::spawn failed");
     let master_addr = master.server_addr();
 
-    // 2. Spawn in-process Worker with GPU capability enabled (simulated GPU worker)
+    // 2. Spawn in-process standard CPU Worker (CPU-only cluster)
     let worker_temp = TempDir::new().unwrap();
     let worker_cfg = WorkerConfig::new(master_addr.to_string())
-        .with_name("worker-gpu-3d")
+        .with_name("worker-cpu-3d")
         .with_cores(4)
         .with_ram_mb(8192)
-        .with_simulate_gpu(true)
         .with_sandbox_base_dir(worker_temp.path());
 
     let mut client = WorkerClient::new(worker_cfg);
@@ -434,9 +433,7 @@ async fn test_cli_3d_explicit_gpu_engine_without_gpu_flag() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // 3. Submit explicit GPU engine (trellis) WITHOUT the --gpu flag
-    // Spec requires GPU (Engine3D::Trellis.requires_gpu() == true), so || spec.requires_gpu()
-    // at cli_app.rs:2386 ensures task.requirements.gpu_required is set to true.
+    // 3. Submit unsupported trellis engine on CPU cluster
     let submit_future = tokio::task::spawn_blocking({
         let home = temp_dir.path().to_path_buf();
         let master_str = master_addr.to_string();
@@ -451,7 +448,6 @@ async fn test_cli_3d_explicit_gpu_engine_without_gpu_flag() {
                 .arg("mech")
                 .arg("--engine")
                 .arg("trellis")
-                // NOTE: Explicitly NO --gpu flag passed!
                 .arg("--wait")
                 .output()
                 .expect("run trellis submit")
@@ -460,7 +456,7 @@ async fn test_cli_3d_explicit_gpu_engine_without_gpu_flag() {
 
     let output = tokio::time::timeout(Duration::from_secs(15), submit_future)
         .await
-        .expect("Explicit GPU engine submit timed out!")
+        .expect("Trellis submit hung waiting on CPU cluster!")
         .expect("Task join error");
 
     assert!(!output.status.success());

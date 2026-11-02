@@ -44,25 +44,27 @@ Behaviour before this change:
 ### D1. CPU-Capable Default 3D Execution Semantics
 In `crates/core/src/task.rs` and `crates/cli/src/cli_app.rs`:
 - `Generative3DSpec::default()` selects `Engine3D::Auto`, which maps to CPU procedural SDF generation.
-- `requires_gpu()` returns `false` for `Engine3D::Auto`, `Engine3D::Sdf`, and `Engine3D::TripoSr` (CPU mode supported).
-- In `crates/cli/src/cli_app.rs`, `requirements.gpu_required` is `false` unless explicitly requested via `--gpu` or `--type gpu`, or required by spec (`Engine3D::Trellis`).
+- `requires_gpu()` returns `false` for `Engine3D::Auto`, `Engine3D::Sdf`, `Engine3D::TripoSr` (CPU mode supported), and `Engine3D::Trellis` (so tasks are not stalled in queue on CPU clusters).
+- In `crates/cli/src/cli_app.rs`, `requirements.gpu_required` is `false` unless explicitly requested via `--gpu` or `--type gpu`.
 - Default 3D tasks are immediately matched and executed by standard CPU workers, producing a valid glTF 2.0 binary asset.
 
 ### D2. Strict Engine Name Validation and Fallback Elimination
 - Remove `impl From<&str> for Engine3D` that defaulted unmatched strings to `Auto`.
 - Implement `std::str::FromStr` and `TryFrom<&str>` for `Engine3D`:
-  - Valid strings: `"auto"`, `"sdf"`, `"triposr"` (case-insensitive ASCII).
-  - Invalid strings (e.g. `"rodin"`): return `Err("unknown 3D engine '{name}'; valid engines are: auto, sdf, triposr")`.
+  - Supported parsable strings: `"auto"`, `"sdf"`, `"triposr"`, and `"trellis"` (case-insensitive ASCII).
+  - Unknown strings (e.g. `"rodin"`): return `Err("unknown 3D engine '{name}'; valid engines are: auto, sdf, triposr")`.
 - Store `engine_preference: Option<String>` in `Generative3DSpec`, preserving raw input string so validation fails with explicit error.
-- Update `TaskSpec::validate()` to ensure engine names are verified before queue admission.
+- Enforce in `TaskSpec::validate()`: unknown engine names fail with unknown engine error, and `"trellis"` fails with `"Trellis 3D neural engine is not supported; use sdf or triposr"`.
 
 ### D3. Wire Codec Parity Between JSON and Bincode
-- Both human-readable (JSON) and binary (Bincode) codecs serialize `Engine3D` consistently.
-- Invalid engine names in incoming frames fail deserialization immediately, preventing corrupted tasks from entering the queue or silently changing engine semantics.
+- Both human-readable (JSON) and binary (Bincode) codecs preserve raw engine names consistently during serialization and deserialization.
+- Invalid or unknown engine names are preserved through deserialization and fail validation during `TaskSpec::validate()`, preventing unverified tasks from entering the queue or silently changing engine semantics.
 
 ### D4. Interception and Diagnostics for Unsupported Engines
-- Intercept `Engine3D::Trellis` at worker execution and return explicit failure: `Trellis 3D neural engine is not supported; use sdf or triposr`.
-- CLI help strings in `crates/cli/src/cli_app.rs`: `--engine: auto, sdf, triposr (default: auto)`.
+- Reject `Engine3D::Trellis` at `TaskSpec::validate()` (and worker runner) with explicit failure: `Trellis 3D neural engine is not supported; use sdf or triposr`.
+- Set `Engine3D::Trellis.requires_gpu()` to `false` so CPU workers are eligible to evaluate it rather than the scheduler withholding it indefinitely.
+- CLI help strings in `crates/cli/src/cli_app.rs`: `--engine <ENGINE>: Preferred 3D generation engine: auto, sdf, triposr (default: auto)`.
+- CLI choices in `scripts/agent_node.py`: `choices=["auto", "sdf", "triposr"]`.
 
 ### D5. CPU Execution & Diagnostic Reporting for TripoSR
 - Update worker runner so that `Engine3D::TripoSr` tasks routed to CPU workers run `entrypoint.py` in CPU mode.
@@ -86,19 +88,19 @@ In `crates/core/src/task.rs` and `crates/cli/src/cli_app.rs`:
 
 ## Test Plan
 
-- `crates/core/src/task.rs` unit tests:
-  - `test_engine_from_str_valid`: verifies `sdf`, `triposr`, `auto`.
-  - `test_engine_from_str_invalid`: asserts `rodin` returns error.
-  - `test_engine_codec_parity`: verifies JSON and Bincode agree on valid variants and reject unknown variants.
+- `crates/core/src/task.rs` and `crates/core/tests/m1_challenger_1_3d_serialization.rs` unit tests:
+  - `test_engine_3d_parsing_and_validation`: verifies valid engine variants, case-insensitivity, unknown engine rejection, and Trellis validation rejection.
+  - `test_adv_10_unknown_engine_and_codec_parity`: verifies JSON and Bincode wire codecs preserve unknown engine strings and fail during `TaskSpec::validate()`.
 - `crates/cli/tests/test_cli_3d_submission.rs`:
   - `test_cli_3d_sdf_submission_and_export` (child process CLI).
   - `test_cli_autorig_submission_and_export` (child process CLI).
   - `test_cli_negative_validations` (rejection of bad inputs).
   - `test_cli_3d_default_submit_succeeds_on_cpu_worker` (wrapped in 15s timeout).
   - `test_cli_3d_triposr_fails_honestly_on_cpu_worker` (fails fast on CPU cluster).
-  - `test_cli_3d_explicit_gpu_engine_without_gpu_flag` (trellis triggers GPU requirement).
+  - `test_cli_3d_trellis_rejected_immediately_on_cpu_worker` (fails fast on CPU cluster with clear diagnostic).
 - `crates/agent_mesh/src/bridge.rs` integration tests:
-  - `test_bridge_refuses_unknown_engine_envelope`: verifies `grid_submit` with `rodin` returns error.
+  - `test_bridge_refuses_unknown_engine_envelope`: verifies `grid_3d_generate` with `rodin` returns error.
+  - `test_bridge_refuses_non_string_engine_envelope`: verifies `grid_3d_generate` with non-string engine returns error.
 
 ## Work items
 

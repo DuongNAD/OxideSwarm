@@ -610,13 +610,15 @@ impl Engine3D {
 
     /// Returns true if this engine strictly requires GPU hardware execution.
     ///
-    /// Note: `Auto` is CPU-capable (degrades gracefully to Tier 0 SDF), so returns `false`.
+    /// Note: `Auto`, `Sdf`, and `TripoSr` are CPU-capable. `Trellis` also returns `false`
+    /// so CPU workers are eligible to evaluate and reject it immediately rather than
+    /// stalling the task in queue on CPU-only clusters.
     pub const fn requires_gpu(&self) -> bool {
         match self {
             Self::Auto => false,
             Self::Sdf => false,
             Self::TripoSr => false,
-            Self::Trellis => true,
+            Self::Trellis => false,
         }
     }
 
@@ -1623,7 +1625,13 @@ impl TaskSpec {
                     return Err("Generative3D quality cannot be empty".to_string());
                 }
                 if let Some(ref raw_engine) = spec.engine_preference {
-                    raw_engine.parse::<Engine3D>()?;
+                    let engine = raw_engine.parse::<Engine3D>()?;
+                    if engine == Engine3D::Trellis {
+                        return Err(
+                            "Trellis 3D neural engine is not supported; use sdf or triposr"
+                                .to_string(),
+                        );
+                    }
                 }
             }
             TaskSpec::AutoRig(spec) => {
@@ -3059,11 +3067,11 @@ mod tests {
         );
         assert!(!gen_triposr.requires_gpu());
 
-        // Trellis engine DOES require GPU
+        // Trellis engine does NOT require GPU (allows fast CPU cluster diagnostic rejection)
         let gen_trellis = TaskSpec::Generative3D(
             Generative3DSpec::new_prompt("mech").with_engine(Engine3D::Trellis),
         );
-        assert!(gen_trellis.requires_gpu());
+        assert!(!gen_trellis.requires_gpu());
 
         // AutoRig does NOT require GPU
         let rig = TaskSpec::new_auto_rig(Bytes::from_static(b"mesh"), "biped");
@@ -3092,6 +3100,14 @@ mod tests {
         let task = TaskSpec::Generative3D(spec);
         let val_err = task.validate().unwrap_err();
         assert!(val_err.contains("unknown 3D engine 'rodin'"));
+
+        // Validation rejects unsupported trellis engine
+        let trellis_spec = Generative3DSpec::new_prompt("robot").with_engine(Engine3D::Trellis);
+        let trellis_task = TaskSpec::Generative3D(trellis_spec);
+        let trellis_err = trellis_task.validate().unwrap_err();
+        assert!(
+            trellis_err.contains("Trellis 3D neural engine is not supported; use sdf or triposr")
+        );
     }
 
     #[test]

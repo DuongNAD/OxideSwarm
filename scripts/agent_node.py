@@ -718,7 +718,7 @@ def main():
     parser.add_argument("--prompt", default=None, help="Text prompt for 3D generation")
     parser.add_argument("--image", default=None, help="Image file path for image-to-3D generation")
     parser.add_argument("--quality", default="standard", choices=["fast", "standard", "high"], help="3D quality tier")
-    parser.add_argument("--engine", default="auto", choices=["auto", "sdf", "triposr", "trellis"], help="3D generative engine (auto, sdf, triposr, trellis)")
+    parser.add_argument("--engine", default="auto", choices=["auto", "sdf", "triposr"], help="3D generative engine (auto, sdf, triposr)")
     parser.add_argument("--export-texture", dest="export_texture", action="store_true", default=True, help="Export textures in generated 3D asset")
     parser.add_argument("--no-export-texture", dest="export_texture", action="store_false", help="Disable texture export")
     parser.add_argument("--input-mesh", "--mesh", dest="input_mesh", default=None, help="Input mesh file path for AutoRig")
