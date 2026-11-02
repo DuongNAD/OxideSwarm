@@ -34,7 +34,7 @@ Behaviour before this change:
 
 ## Non-goals
 
-- Applying the 10 MiB inline limit to the content-addressed blob data plane (`--output PATTERN`), which is governed separately by `--output-limit-mb` (default 500 MiB) under design 0006.
+- Applying the 10 MiB inline limit to the content-addressed blob data plane (`--output PATTERN`), which is governed separately by `--output-limit-mb` (default 1 GiB per task, `staging.rs:29`, `:249`) under design 0006.
 - Supporting wildcard glob patterns for inline harvest (`expected_outputs` are literal sandbox relative paths; glob patterns are supported exclusively by the blob plane).
 - Allowing symlinks inside inline task artifacts.
 
@@ -72,8 +72,8 @@ OxideSwarm maintains two distinct output retrieval mechanisms:
 | Primary Callers | MCP Server (`oxideswarm mcp`), direct library callers | CLI (`oxideswarm submit --output PATTERN --output-dir DIR`) |
 | Transport Framing | Serialized directly within wire protocol frames (`MAX_FRAME_SIZE = 64 MiB`) | Streamed in 4 MiB content-addressed chunks over QUIC data stream or TCP |
 | Selection Semantics | Exact literal relative path | Glob patterns (`*`, `?`, `**`) |
-| Per-File Limit | 10 MiB (`MAX_OUTPUT_ARTIFACT_BYTES`) | `--output-limit-mb` (default 500 MiB) |
-| Aggregate Limit | 32 MiB (`MAX_AGGREGATE_ARTIFACT_BYTES`) | Bound by worker and master blob store budgets |
+| Per-File Limit | 10 MiB (`MAX_OUTPUT_ARTIFACT_BYTES`) | No separate per-file limit (governed by 1 GiB per-task limit) |
+| Aggregate Limit | 32 MiB (`MAX_AGGREGATE_ARTIFACT_BYTES`) | 1 GiB per task (`--output-limit-mb`, `staging.rs:29`, `:249`) |
 | Missing File Behavior | Task fails with exit code 1 naming missing path | Staging warns / skips non-matching patterns; exits 1 if declared exact blob missing |
 
 ### D4. CLI Staging Flag Validation and Suggestion
