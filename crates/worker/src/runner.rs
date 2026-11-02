@@ -1865,9 +1865,8 @@ impl TaskRunner {
             .unwrap_or("auto")
             .to_lowercase();
 
-        // 1. Under D3: "sdf" and default "auto" use the Tier 0 procedural SDF engine directly
-        let is_custom_script = std::env::var("OXIDESWARM_GEN3D_SCRIPT").is_ok();
-        if pref == "sdf" || pref == "tier0_sdf" || (pref == "auto" && !is_custom_script) {
+        // 1. Under D3: "sdf" and default "auto" always use the Tier 0 procedural SDF engine directly
+        if pref == "sdf" || pref == "tier0_sdf" || pref == "auto" {
             info!(task_id = %task.id, "Executing Tier 0 Procedural SDF engine");
             return self
                 .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
@@ -2059,9 +2058,18 @@ impl TaskRunner {
             (stdout_bytes, stderr_bytes, status_res) = execution_fut => {
                 let elapsed = start_time.elapsed().as_millis() as u64;
 
+                let stdout_str = String::from_utf8_lossy(stdout_bytes.as_slice());
+
+                // Extract reported engine or device label from stdout
+                let mut engine_label = None;
+                for line in stdout_str.lines() {
+                    if let Some(label) = crate::gen3d::runner::parse_engine_marker(line) {
+                        engine_label = Some(label);
+                    }
+                }
+
                 // Process progress checkpoints from stdout if checkpoint_tx provided
                 if let Some(ref tx) = checkpoint_tx {
-                    let stdout_str = String::from_utf8_lossy(stdout_bytes.as_slice());
                     let mut seq = 1u64;
                     for line in stdout_str.lines() {
                         if let Some((frac, msg)) = crate::gen3d::runner::parse_progress_marker(line) {
@@ -2096,7 +2104,9 @@ impl TaskRunner {
                                         );
                                         res.stderr = stderr_bytes;
                                         res = res.with_asset_bytes(asset_bytes);
-                                        res = res.with_device_name(if self.capabilities.has_cuda { "TripoSR-CUDA" } else { "TripoSR-CPU" });
+                                        if let Some(device) = engine_label {
+                                            res = res.with_device_name(device);
+                                        }
                                         res
                                     } else {
                                         TaskResult::failure(
@@ -2143,6 +2153,17 @@ impl TaskRunner {
                             warn!("Tier 1 engine exited with error code {code}; falling back to Tier 0 SDF");
                             self.execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time).await
                         } else {
+                            let last_err_line = String::from_utf8_lossy(stderr_bytes.as_slice())
+                                .lines()
+                                .map(|l| l.trim())
+                                .rfind(|l| !l.is_empty())
+                                .map(|s| s.to_string());
+
+                            let err_msg = match last_err_line {
+                                Some(line) => format!("3D engine subprocess failed with exit code {code}: {line}"),
+                                None => format!("3D engine subprocess failed with exit code {code}"),
+                            };
+
                             TaskResult::failure(
                                 self.worker_id,
                                 task.id,
@@ -2150,7 +2171,7 @@ impl TaskRunner {
                                 stdout_bytes,
                                 stderr_bytes,
                                 elapsed,
-                                Some(format!("3D engine subprocess failed with exit code {code}")),
+                                Some(err_msg),
                             )
                         }
                     }

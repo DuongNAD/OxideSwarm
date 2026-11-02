@@ -702,7 +702,7 @@ impl Generative3DSpec {
             prompt: None,
             image_data: Some(image_data.into()),
             quality: default_3d_quality(),
-            engine_preference: None,
+            engine_preference: Some("triposr".to_string()),
             export_texture: true,
         }
     }
@@ -1469,6 +1469,12 @@ impl TaskSpec {
                     .as_deref()
                     .unwrap_or("auto")
                     .to_lowercase();
+                if (engine == "auto" || engine == "procedural") && has_image {
+                    return Err(
+                        "Image input is only supported with neural 3D engines (e.g. triposr); auto and procedural engines do not accept images"
+                            .to_string(),
+                    );
+                }
                 if (engine == "sdf" || engine == "tier0_sdf") && has_image {
                     return Err(
                         "Tier 0 procedural SDF engine does not support image input (text prompt only)"

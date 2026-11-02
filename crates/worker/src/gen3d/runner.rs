@@ -3,29 +3,34 @@
 use std::path::{Path, PathBuf};
 
 /// Converts a path to an absolute, normalized path without Windows verbatim prefix (`\\?\`).
+///
+/// Uses `std::path::absolute` instead of `std::fs::canonicalize` to avoid resolving
+/// symbolic links in virtual environments (`<venv>/bin/python`), preserving `sys.prefix`
+/// and virtualenv package discovery.
 pub fn to_clean_absolute_path(path: &Path) -> Option<PathBuf> {
     if !path.is_file() {
         return None;
     }
-    if let Ok(canon) = std::fs::canonicalize(path) {
-        #[cfg(windows)]
-        {
-            let s = canon.to_string_lossy();
-            if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
-                return Some(PathBuf::from(format!(r"\\{stripped}")));
-            } else if let Some(stripped) = s.strip_prefix(r"\\?\") {
-                return Some(PathBuf::from(stripped));
-            }
-        }
-        return Some(canon);
-    }
-    if path.is_absolute() {
-        Some(path.to_path_buf())
+    let abs = if let Ok(abs) = std::path::absolute(path) {
+        abs
+    } else if path.is_absolute() {
+        path.to_path_buf()
     } else if let Ok(cwd) = std::env::current_dir() {
-        Some(cwd.join(path))
+        cwd.join(path)
     } else {
-        Some(path.to_path_buf())
+        path.to_path_buf()
+    };
+
+    #[cfg(windows)]
+    {
+        let s = abs.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
+            return Some(PathBuf::from(format!(r"\\{stripped}")));
+        } else if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return Some(PathBuf::from(stripped));
+        }
     }
+    Some(abs)
 }
 
 /// Probes whether an executable name exists on PATH, responds to `--version`,
@@ -155,6 +160,38 @@ pub fn parse_progress_marker(line: &str) -> Option<(f32, String)> {
     None
 }
 
+/// Parses engine or device label markers in stdout, e.g.:
+/// `[ENGINE: TripoSR-CUDA]` or `[DEVICE: TripoSR-CPU]` or `[ENGINE] MyModel`
+/// or `[TripoSR] Initializing TripoSR-PyTorch-v1.0...`
+pub fn parse_engine_marker(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    for prefix in &["[ENGINE:", "[DEVICE:"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            if let Some(end_bracket) = rest.find(']') {
+                let label = rest[..end_bracket].trim();
+                if !label.is_empty() {
+                    return Some(label.to_string());
+                }
+            }
+        }
+    }
+    for prefix in &["[ENGINE]", "[DEVICE]"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let label = rest.trim();
+            if !label.is_empty() {
+                return Some(label.to_string());
+            }
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("[TripoSR] Initializing ") {
+        let label = rest.trim_end_matches('.').trim();
+        if !label.is_empty() {
+            return Some(label.to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +219,26 @@ mod tests {
             Some((0.85, "Texturing...".to_string()))
         );
         assert_eq!(parse_progress_marker("Random output without marker"), None);
+    }
+
+    #[test]
+    fn test_parse_engine_marker_formats() {
+        assert_eq!(
+            parse_engine_marker("[ENGINE: Custom-Inference-Model]"),
+            Some("Custom-Inference-Model".to_string())
+        );
+        assert_eq!(
+            parse_engine_marker("[DEVICE: TripoSR-CUDA] ready"),
+            Some("TripoSR-CUDA".to_string())
+        );
+        assert_eq!(
+            parse_engine_marker("[DEVICE: Custom-Mock-Engine-v2]"),
+            Some("Custom-Mock-Engine-v2".to_string())
+        );
+        assert_eq!(
+            parse_engine_marker("[TripoSR] Initializing TripoSR-PyTorch-v1.0..."),
+            Some("TripoSR-PyTorch-v1.0".to_string())
+        );
+        assert_eq!(parse_engine_marker("No engine marker here"), None);
     }
 }

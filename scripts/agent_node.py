@@ -31,9 +31,11 @@ import uuid
 
 try:
     import websockets
+    import websockets.exceptions
+    _WS_CLOSED_EXC = (websockets.exceptions.ConnectionClosed,)
 except ImportError:
-    print("[ERROR] 'websockets' library is required. Install via: pip install websockets")
-    sys.exit(1)
+    websockets = None
+    _WS_CLOSED_EXC = ()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -220,7 +222,7 @@ class OxideAgentNode:
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 1.5, 15.0)
 
-            except (websockets.exceptions.ConnectionClosed, ConnectionRefusedError, OSError) as e:
+            except (_WS_CLOSED_EXC + (ConnectionRefusedError, OSError)) as e:
                 if self.registration_error:
                     delay = self._rejection_delay()
                     logger.error(f"Connection closed after the hub rejected the registration. Retrying in {delay:.0f}s...")
@@ -475,7 +477,7 @@ class OxideAgentNode:
         try:
             try:
                 await self.ws.send(json.dumps(req))
-            except websockets.exceptions.ConnectionClosed:
+            except _WS_CLOSED_EXC:
                 if self.registration_error:
                     # The hub already hung up on us after refusing the registration.
                     code, reason = self.registration_error
@@ -756,6 +758,10 @@ def main():
     autorig_sub.add_argument("--timeout", type=float, default=60.0)
 
     args = parser.parse_args()
+
+    if websockets is None:
+        print("[ERROR] 'websockets' library is required. Install via: pip install websockets", file=sys.stderr)
+        sys.exit(1)
 
     node = OxideAgentNode(args.hub, args.id, args.platform, args.hostname, token=args.token)
 

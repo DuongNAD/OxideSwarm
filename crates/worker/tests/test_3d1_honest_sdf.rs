@@ -87,12 +87,21 @@ async fn test_3d1_triposr_without_model_fails_honestly() {
     // Must report descriptive diagnostic error from entrypoint.py or missing runtime
     let stderr_str = String::from_utf8_lossy(result.stderr.as_slice());
     let err_str = result.error.as_deref().unwrap_or("");
-    assert!(
-        stderr_str.contains("TripoSR model not available")
-            || err_str.contains("Missing Python")
-            || err_str.contains("3D engine subprocess failed"),
-        "Failure must name cause; stderr: {stderr_str}, error: {err_str}"
-    );
+    if resolve_python_runtime().is_some() && resolve_entrypoint_script().is_some() {
+        assert!(
+            stderr_str.contains("TripoSR model not available"),
+            "Failure must explicitly name cause 'TripoSR model not available'; got stderr: {stderr_str}"
+        );
+        assert!(
+            err_str.contains("TripoSR model not available"),
+            "result.error must contain diagnostic cause; got: {err_str}"
+        );
+    } else {
+        assert!(
+            err_str.contains("Missing Python") || err_str.contains("Local Python 3D engine"),
+            "Failure must name missing runtime; got error: {err_str}"
+        );
+    }
 
     // Device name must not falsely claim TripoSR ran
     let device_name = result.device_name.as_deref().unwrap_or("");
@@ -101,6 +110,25 @@ async fn test_3d1_triposr_without_model_fails_honestly() {
         "Device name must not claim TripoSR on failure: {:?}",
         device_name
     );
+}
+
+#[tokio::test]
+async fn test_3d1_triposr_with_arbitrary_checkpoint_still_fails_honestly() {
+    let _lock = ENV_MUTEX.lock().await;
+    let _guard = EnvGuard::new(&["OXIDESWARM_TRIPOSR_CHECKPOINT", "OXIDESWARM_GEN3D_SCRIPT"]);
+    std::env::set_var("OXIDESWARM_TRIPOSR_CHECKPOINT", "Cargo.toml");
+    std::env::remove_var("OXIDESWARM_GEN3D_SCRIPT");
+
+    let runner = create_test_runner();
+    let spec = Generative3DSpec::new_prompt("test model").with_engine("triposr");
+    let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
+    let result = runner.execute_task(&task, None, None).await;
+
+    assert!(!result.is_success());
+    assert_ne!(result.exit_code, 0);
+    assert!(result.asset_bytes.is_none());
+    let dev = result.device_name.as_deref().unwrap_or("");
+    assert!(!dev.contains("TripoSR"));
 }
 
 // ============================================================================
@@ -145,6 +173,73 @@ async fn test_3d1_auto_engine_defaults_to_sdf_tier() {
     );
 }
 
+#[tokio::test]
+async fn test_3d1_auto_engine_never_invokes_python_runtime() {
+    let _lock = ENV_MUTEX.lock().await;
+    let temp_dir = tempfile::tempdir().expect("Failed to create tempdir");
+    let sentinel_file = temp_dir.path().join("sentinel_python_ran.txt");
+    let trap_script = temp_dir.path().join("trap_entrypoint.py");
+
+    let script_code = format!(
+        "import sys, pathlib\npathlib.Path(r'{}').write_text('TRAP_EXECUTED')\nsys.exit(1)\n",
+        sentinel_file.display()
+    );
+    std::fs::write(&trap_script, script_code).unwrap();
+
+    let _guard = EnvGuard::new(&["OXIDESWARM_GEN3D_SCRIPT"]);
+    std::env::set_var("OXIDESWARM_GEN3D_SCRIPT", &trap_script);
+
+    let runner = create_test_runner();
+    let spec = Generative3DSpec::new_prompt("drone").with_engine("auto");
+    let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
+
+    let result = runner.execute_task(&task, None, None).await;
+
+    // 1. Task must succeed via procedural SDF
+    assert!(
+        result.is_success(),
+        "Auto engine must succeed directly via pure Rust SDF: {:?}",
+        result.error
+    );
+    assert_eq!(
+        result.device_name.as_deref(),
+        Some("Procedural-SDF-PureRust"),
+        "Device label must be Procedural-SDF-PureRust"
+    );
+
+    // 2. Python trap script must NEVER have been executed
+    assert!(
+        !sentinel_file.exists(),
+        "Python entrypoint must NEVER be executed for auto engine"
+    );
+}
+
+#[tokio::test]
+async fn test_3d1_auto_engine_defaults_to_sdf_tier_even_with_custom_script() {
+    let _lock = ENV_MUTEX.lock().await;
+    let temp_dir = tempfile::tempdir().expect("Failed to create tempdir");
+    let dummy_script = temp_dir.path().join("mock_engine.py");
+    std::fs::write(&dummy_script, "import sys\nsys.exit(0)\n").unwrap();
+
+    let _guard = EnvGuard::new(&["OXIDESWARM_GEN3D_SCRIPT"]);
+    std::env::set_var("OXIDESWARM_GEN3D_SCRIPT", dummy_script.to_str().unwrap());
+
+    let runner = create_test_runner();
+    let spec = Generative3DSpec::new_prompt("procedural humanoid drone")
+        .with_quality("fast")
+        .with_engine("auto");
+
+    let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
+    let result = runner.execute_task(&task, None, None).await;
+
+    assert!(result.is_success());
+    assert_eq!(
+        result.device_name.as_deref(),
+        Some("Procedural-SDF-PureRust"),
+        "Auto must always use Procedural-SDF-PureRust even if OXIDESWARM_GEN3D_SCRIPT is set"
+    );
+}
+
 // ============================================================================
 // Test 3: SDF tier rejects image input honestly at both validation and runtime
 // ============================================================================
@@ -175,6 +270,42 @@ async fn test_3d1_sdf_tier_rejects_image_input_honestly() {
     assert_eq!(
         val_err2,
         "Tier 0 procedural SDF engine does not support image input (text prompt only)"
+    );
+
+    // Also test with "auto" engine name
+    let mut auto_spec = Generative3DSpec::new_prompt("stylized creature").with_engine("auto");
+    auto_spec.image_data = Some(Bytes::from_static(b"fake_image_data_bytes"));
+    let auto_task_spec = TaskSpec::Generative3D(auto_spec);
+    let val_err_auto = auto_task_spec
+        .validate()
+        .expect_err("TaskSpec::validate must reject image on auto");
+    assert_eq!(
+        val_err_auto,
+        "Image input is only supported with neural 3D engines (e.g. triposr); auto and procedural engines do not accept images"
+    );
+
+    // Also test with "procedural" engine name
+    let mut proc_spec = Generative3DSpec::new_prompt("stylized creature").with_engine("procedural");
+    proc_spec.image_data = Some(Bytes::from_static(b"fake_image_data_bytes"));
+    let proc_task_spec = TaskSpec::Generative3D(proc_spec);
+    let val_err_proc = proc_task_spec
+        .validate()
+        .expect_err("TaskSpec::validate must reject image on procedural");
+    assert_eq!(
+        val_err_proc,
+        "Image input is only supported with neural 3D engines (e.g. triposr); auto and procedural engines do not accept images"
+    );
+
+    // Also test with default engine (None)
+    let mut default_spec = Generative3DSpec::new_prompt("stylized creature");
+    default_spec.image_data = Some(Bytes::from_static(b"fake_image_data_bytes"));
+    let default_task_spec = TaskSpec::Generative3D(default_spec);
+    let val_err_def = default_task_spec
+        .validate()
+        .expect_err("TaskSpec::validate must reject image on default engine");
+    assert_eq!(
+        val_err_def,
+        "Image input is only supported with neural 3D engines (e.g. triposr); auto and procedural engines do not accept images"
     );
 
     // 2. Worker runner execute_tier0_sdf honest rejection
@@ -367,9 +498,11 @@ async fn test_3d1_agent_node_engine_options_trimmed() {
                 "agent_node.py must reject --engine rodin"
             );
             let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let combined = format!("{stderr}\n{stdout}");
             assert!(
-                stderr.contains("invalid choice: 'rodin'"),
-                "stderr must report invalid choice: {stderr}"
+                combined.contains("invalid choice: 'rodin'"),
+                "Output must report invalid choice: {combined}"
             );
         }
     }
@@ -381,13 +514,134 @@ async fn test_3d1_agent_node_engine_options_trimmed() {
 #[tokio::test]
 async fn test_3d1_to_clean_absolute_path_prefix_stripping() {
     let cargo_toml = PathBuf::from("Cargo.toml");
-    if let Some(clean) = to_clean_absolute_path(&cargo_toml) {
-        assert!(clean.is_absolute());
+    let clean = to_clean_absolute_path(&cargo_toml)
+        .expect("Cargo.toml must resolve to clean absolute path");
+    assert!(clean.is_absolute());
+    #[cfg(windows)]
+    {
+        let s = clean.to_string_lossy();
+        assert!(!s.starts_with(r"\\?\"));
+        assert!(!s.starts_with(r"\\?\UNC\"));
+    }
+}
+
+// ============================================================================
+// Test 9: Success path dynamically extracts engine label from subprocess stdout
+// ============================================================================
+#[tokio::test]
+async fn test_3d1_success_path_device_name_comes_from_engine() {
+    let _lock = ENV_MUTEX.lock().await;
+    let temp_dir = tempfile::tempdir().expect("Failed to create tempdir");
+    let mock_script = temp_dir.path().join("mock_success_engine.py");
+
+    let python_code = r#"
+import sys, argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("--output", required=True)
+parser.add_argument("--input", default=None)
+parser.add_argument("--prompt", default=None)
+parser.add_argument("--device", default="cpu")
+parser.add_argument("--quality", default="standard")
+parser.add_argument("--export-texture", action="store_true")
+parser.add_argument("--no-texture", action="store_false", dest="export_texture")
+parser.add_argument("--offline", action="store_true")
+args = parser.parse_args()
+
+print("[DEVICE: Custom-Mock-Engine-v2]", flush=True)
+
+with open(args.output, "wb") as f:
+    f.write(b"glTF\x02\x00\x00\x00\x14\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+sys.exit(0)
+"#;
+    std::fs::write(&mock_script, python_code).unwrap();
+
+    let _guard = EnvGuard::new(&["OXIDESWARM_GEN3D_SCRIPT"]);
+    std::env::set_var("OXIDESWARM_GEN3D_SCRIPT", mock_script.to_str().unwrap());
+
+    let runner = create_test_runner();
+    let spec = Generative3DSpec::new_prompt("test prompt")
+        .with_quality("standard")
+        .with_engine("triposr");
+
+    let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
+    let result = runner.execute_task(&task, None, None).await;
+
+    if resolve_python_runtime().is_some() {
+        assert!(
+            result.is_success(),
+            "Task should succeed: {:?}",
+            result.error
+        );
+        assert_eq!(
+            result.device_name.as_deref(),
+            Some("Custom-Mock-Engine-v2"),
+            "Device name must come dynamically from the engine output"
+        );
+    }
+}
+
+// ============================================================================
+// Test 10: resolve_python_runtime preserves virtualenv symlink sys.prefix
+// ============================================================================
+#[tokio::test]
+async fn test_3d1_resolve_python_preserves_venv_sys_prefix() {
+    let _lock = ENV_MUTEX.lock().await;
+
+    let base_py = match resolve_python_runtime() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let out_raw = std::process::Command::new(&base_py)
+        .args(["-c", "import sys; print(sys.prefix)"])
+        .output();
+    let raw_prefix = match out_raw {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => return,
+    };
+
+    let temp_dir = tempfile::tempdir().expect("Failed to create tempdir");
+    let link_name = if cfg!(windows) {
+        "python_sym.exe"
+    } else {
+        "python_sym"
+    };
+    let symlink_path = temp_dir.path().join(link_name);
+
+    let created_symlink = {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&base_py, &symlink_path).is_ok()
+        }
         #[cfg(windows)]
         {
-            let s = clean.to_string_lossy();
-            assert!(!s.starts_with(r"\\?\"));
-            assert!(!s.starts_with(r"\\?\UNC\"));
+            std::os::windows::fs::symlink_file(&base_py, &symlink_path).is_ok()
+        }
+    };
+
+    if created_symlink && symlink_path.is_file() {
+        let _guard = EnvGuard::new(&["OXIDESWARM_PYTHON"]);
+        std::env::set_var("OXIDESWARM_PYTHON", &symlink_path);
+
+        let resolved = resolve_python_runtime().expect("Should resolve OXIDESWARM_PYTHON");
+        // Must NOT resolve symlink to base_py target path
+        assert_eq!(
+            resolved, symlink_path,
+            "Resolved path must preserve symlink, not canonical target"
+        );
+
+        let out_resolved = std::process::Command::new(&resolved)
+            .args(["-c", "import sys; print(sys.prefix)"])
+            .output()
+            .expect("Failed to run resolved symlink");
+        if out_resolved.status.success() {
+            let resolved_prefix = String::from_utf8_lossy(&out_resolved.stdout)
+                .trim()
+                .to_string();
+            assert_eq!(
+                resolved_prefix, raw_prefix,
+                "sys.prefix before ({raw_prefix}) and after ({resolved_prefix}) resolving must match"
+            );
         }
     }
 }
