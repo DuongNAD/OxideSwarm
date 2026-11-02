@@ -115,13 +115,15 @@ impl Cluster {
             .send_msg(&ClientMessage::SubmitTask { task, wait: true })
             .await
             .expect("send");
-        let reply = tokio::time::timeout(
-            Duration::from_secs(240),
-            transport.recv_msg::<ClientResponse>(),
-        )
-        .await
-        .expect("task finishes in time")
-        .expect("read reply");
+        let reply_timeout = if cfg!(windows) {
+            Duration::from_secs(240)
+        } else {
+            Duration::from_secs(60)
+        };
+        let reply = tokio::time::timeout(reply_timeout, transport.recv_msg::<ClientResponse>())
+            .await
+            .expect("task finishes in time")
+            .expect("read reply");
         match reply {
             Some(ClientResponse::TaskCompleted { result, .. }) => Ok(result),
             Some(ClientResponse::Error { message }) => Err(message),
@@ -730,6 +732,7 @@ async fn test_worker_pins_output_files_from_collection_through_upload() {
                     )
                     .await;
                 }
+                #[cfg(windows)]
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }));
@@ -1022,6 +1025,23 @@ mod cli {
 
         // Defect 8: a failed task (`exit 7`) prints `Task <ID> failed.`, not `completed successfully.`,
         // and when `result.error` is set (missing declared output), prints `Error: <text>` to stderr.
+        #[cfg(unix)]
+        let failed_args = [
+            "--command",
+            "sh",
+            "--",
+            "-c",
+            "echo fail-stdout; echo fail-stderr >&2; exit 7",
+        ];
+        #[cfg(windows)]
+        let failed_args = [
+            "--command",
+            "cmd",
+            "--",
+            "/C",
+            "echo fail-stdout& echo fail-stderr 1>&2& exit 7",
+        ];
+
         let failed_run = cli(home)
             .args([
                 "submit",
@@ -1030,12 +1050,8 @@ mod cli {
                 "--wait",
                 "--timeout-secs",
                 "30",
-                "--command",
-                "sh",
-                "--",
-                "-c",
-                "echo fail-stdout; echo fail-stderr >&2; exit 7",
             ])
+            .args(failed_args)
             .output()
             .expect("run failing submit");
         assert_eq!(failed_run.status.code(), Some(7));
@@ -1049,6 +1065,11 @@ mod cli {
         assert!(failed_stdout.contains("fail-stdout"), "{failed_stdout}");
         assert!(failed_stderr.contains("fail-stderr"), "{failed_stderr}");
 
+        #[cfg(unix)]
+        let missing_args = ["--command", "sh", "--", "-c", "echo ran-ok"];
+        #[cfg(windows)]
+        let missing_args = ["--command", "cmd", "--", "/C", "echo ran-ok"];
+
         let missing_output_run = cli(home)
             .args([
                 "submit",
@@ -1058,12 +1079,8 @@ mod cli {
                 "never-created.bin",
                 "--timeout-secs",
                 "30",
-                "--command",
-                "sh",
-                "--",
-                "-c",
-                "echo ran-ok",
             ])
+            .args(missing_args)
             .output()
             .expect("run missing-output submit");
         assert!(!missing_output_run.status.success());
@@ -1082,10 +1099,33 @@ mod cli {
         // Defect 6: when downloading an output file fails (destination traverses a symlink),
         // `submit` still prints the task's exit code, stdout and stderr before returning failure.
         let bad_out_dir = home.join("bad-out");
-        let outside_dir = home.join("outside-target");
         std::fs::create_dir_all(&bad_out_dir).unwrap();
-        std::fs::create_dir_all(&outside_dir).unwrap();
-        std::os::unix::fs::symlink(&outside_dir, bad_out_dir.join("sub")).unwrap();
+        #[cfg(unix)]
+        {
+            let outside_dir = home.join("outside-target");
+            std::fs::create_dir_all(&outside_dir).unwrap();
+            std::os::unix::fs::symlink(&outside_dir, bad_out_dir.join("sub")).unwrap();
+        }
+        #[cfg(windows)]
+        std::fs::write(bad_out_dir.join("sub"), b"not-a-directory").unwrap();
+
+        #[cfg(unix)]
+        let dl_fail_args = [
+            "--command",
+            "sh",
+            "--",
+            "-c",
+            "mkdir -p sub && echo data > sub/produced.txt && echo dl-stdout && echo dl-stderr >&2",
+        ];
+        #[cfg(windows)]
+        let dl_fail_args = [
+            "--command",
+            "cmd",
+            "--",
+            "/C",
+            "mkdir sub && echo data> sub\\produced.txt && echo dl-stdout && echo dl-stderr 1>&2",
+        ];
+
         let download_fail_run = cli(home)
             .args([
                 "submit",
@@ -1097,12 +1137,8 @@ mod cli {
                 &bad_out_dir.to_string_lossy(),
                 "--timeout-secs",
                 "30",
-                "--command",
-                "sh",
-                "--",
-                "-c",
-                "mkdir -p sub && echo data > sub/produced.txt && echo dl-stdout && echo dl-stderr >&2",
             ])
+            .args(dl_fail_args)
             .output()
             .expect("run download-fail submit");
         assert!(!download_fail_run.status.success());
