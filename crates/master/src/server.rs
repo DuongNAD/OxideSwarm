@@ -37,8 +37,8 @@ use crate::blob_store::{BlobStore, BlobStoreConfig};
 use crate::liveness::{RxClock, StampedStream};
 use crate::mapreduce::{MapReduceEngine, DEFAULT_MAPREDUCE_PARALLELISM};
 use crate::queue::{
-    QueueStats, ResultDisposition, TaskInfo, TaskQueue, TaskState, DEFAULT_MAX_TERMINAL_BYTES,
-    DEFAULT_MAX_TERMINAL_TASKS,
+    QueueStats, ResultDisposition, TaskInfo, TaskQueue, TaskState, DEFAULT_MAX_ACTIVE_BYTES,
+    DEFAULT_MAX_TERMINAL_BYTES, DEFAULT_MAX_TERMINAL_TASKS,
 };
 #[allow(unused_imports)]
 use crate::reaper::spawn_reaper_with_queue;
@@ -118,6 +118,9 @@ pub struct ServerConfig {
     /// Byte budget for the retained finished tasks, oldest evicted first
     /// (default: [`DEFAULT_MAX_TERMINAL_BYTES`], 256 MiB).
     pub max_terminal_bytes: usize,
+    /// Byte cap for active (non-terminal) tasks in the queue
+    /// (default: [`DEFAULT_MAX_ACTIVE_BYTES`], 256 MiB).
+    pub max_active_bytes: usize,
     /// Tasks of one Map/Reduce job submitted at once (default: [`DEFAULT_MAPREDUCE_PARALLELISM`]);
     /// keep it above the cluster's total slots so every device works.
     pub mapreduce_parallelism: usize,
@@ -171,6 +174,7 @@ impl Default for ServerConfig {
             max_pending_handshakes: DEFAULT_MAX_PENDING_HANDSHAKES,
             max_terminal_tasks: DEFAULT_MAX_TERMINAL_TASKS,
             max_terminal_bytes: DEFAULT_MAX_TERMINAL_BYTES,
+            max_active_bytes: DEFAULT_MAX_ACTIVE_BYTES,
             mapreduce_parallelism: DEFAULT_MAPREDUCE_PARALLELISM,
             implicit_local_dashboard: false,
             rendezvous_url: None,
@@ -353,6 +357,12 @@ impl ServerConfig {
         self
     }
 
+    /// Sets the byte cap of active (non-terminal) tasks in the queue.
+    pub fn with_max_active_bytes(mut self, max: usize) -> Self {
+        self.max_active_bytes = max;
+        self
+    }
+
     /// Sets how many tasks of one Map/Reduce job may be in flight at once (at least 1).
     pub fn with_mapreduce_parallelism(mut self, parallelism: usize) -> Self {
         self.mapreduce_parallelism = parallelism.max(1);
@@ -442,7 +452,13 @@ pub struct MasterServer {
 impl MasterServer {
     /// Binds TCP listener with provided registry, allocating default task queue and notify triggers.
     pub async fn bind(config: ServerConfig, registry: WorkerRegistry) -> GridResult<Self> {
-        let queue = TaskQueue::new();
+        let queue = TaskQueue::with_retention_limits(
+            crate::queue::RetryPolicy::default(),
+            None,
+            config.max_terminal_tasks,
+            config.max_terminal_bytes,
+            config.max_active_bytes,
+        );
         let scheduler_notify = Arc::new(tokio::sync::Notify::new());
         let waiters = Arc::new(RwLock::new(HashMap::new()));
         Self::bind_full(config, registry, queue, scheduler_notify, waiters).await
@@ -625,6 +641,7 @@ impl MasterServer {
             None,
             config.max_terminal_tasks,
             config.max_terminal_bytes,
+            config.max_active_bytes,
         );
         let scheduler_notify = Arc::new(tokio::sync::Notify::new());
         let waiters = Arc::new(RwLock::new(HashMap::new()));
@@ -1719,7 +1736,7 @@ async fn admit_blob_task(blob_store: Option<&Arc<BlobStore>>, task: &Task) -> Re
     }
     let gone = store.pin_task(task.id, ids);
     if let Some(id) = gone.first() {
-        store.unpin_task(&task.id);
+        store.unpin_task(&task.id).await;
         return Err(format!(
             "input blob {id} was evicted from the master's blob store while the task was being \
              submitted; upload the inputs again (or raise `master --blob-store-mb`)"
@@ -1866,7 +1883,7 @@ fn spawn_blob_store_sweeper(
             tokio::select! {
                 _ = ticker.tick() => {
                     store.sweep_stale_uploads();
-                    store.sweep_expired_output_pins();
+                    store.sweep_expired_output_pins().await;
                     for (task_id, pinned_at) in store.pinned_tasks() {
                         let release = match queue.get_task(&task_id).await {
                             Some(info) => info.state.is_terminal(),
@@ -1874,7 +1891,7 @@ fn spawn_blob_store_sweeper(
                             None => pinned_at.elapsed() > BLOB_SWEEP_INTERVAL,
                         };
                         if release {
-                            store.unpin_task(&task_id);
+                            store.unpin_task(&task_id).await;
                         }
                     }
                 }
@@ -2040,10 +2057,10 @@ async fn apply_task_result(
     //    `output_pin_retention` so the client can download them.
     if outcome.disposition == ResultDisposition::Terminal {
         if let Some(store) = blob_store {
-            store.unpin_task(&task_id);
+            store.unpin_task(&task_id).await;
         }
         if let Some(pin) = output_pin {
-            pin.commit_terminal(task_id);
+            pin.commit_terminal(task_id).await;
         }
         let mut lock = waiters.write().await;
         if let Some(senders) = lock.remove(&task_id) {
@@ -2653,7 +2670,7 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     drop(rx);
                     prune_closed_waiters(&waiters, &task_id).await;
                     if let (false, Some(store)) = (known, blob_store.as_ref()) {
-                        store.unpin_task(&task_id);
+                        store.unpin_task(&task_id).await;
                     }
                     warn!(task_id = %task_id, error = %e, "SubmitTask rejected");
                     let resp = ClientResponse::Error {
@@ -4374,9 +4391,9 @@ impl MasterHandle {
     }
 
     /// Releases the pins taken by [`MasterHandle::admit`] for a task the queue refused.
-    fn release_admission(&self, task_id: &TaskId, admitted: bool) {
+    async fn release_admission(&self, task_id: &TaskId, admitted: bool) {
         if let (true, Some(store)) = (admitted, self.blob_store.as_ref()) {
-            store.unpin_task(task_id);
+            store.unpin_task(task_id).await;
         }
     }
 
@@ -4446,7 +4463,7 @@ impl MasterHandle {
         let id = match self.queue.submit(task).await {
             Ok(id) => id,
             Err(e) => {
-                self.release_admission(&task_id, admitted);
+                self.release_admission(&task_id, admitted).await;
                 return Err(e);
             }
         };
@@ -4472,7 +4489,7 @@ impl MasterHandle {
         let id = match self.queue.submit_with_priority(task, priority).await {
             Ok(id) => id,
             Err(e) => {
-                self.release_admission(&task_id, admitted);
+                self.release_admission(&task_id, admitted).await;
                 return Err(e);
             }
         };
@@ -5150,5 +5167,112 @@ mod tests {
             !config.implicit_local_dashboard,
             "the library default stays strict"
         );
+    }
+
+    #[tokio::test]
+    async fn test_master_with_larger_max_active_bytes_accepts_what_default_refuses_and_reports_bytes(
+    ) {
+        let make_task = |stdin_len: usize| {
+            Task::new(
+                rusty_grid_core::task::TaskSpec::Command {
+                    program: "echo".into(),
+                    args: vec!["ok".into()],
+                    env: Default::default(),
+                    working_dir: None,
+                    stdin: Some(vec![b'x'; stdin_len]),
+                },
+                rusty_grid_core::task::TaskRequirements::generic(1, 30),
+            )
+        };
+
+        // 1. Over TCP (`ClientMessage::SubmitTask`): a tight cap accepts the first task and
+        //    refuses the second with a message naming the bytes in use, limit in bytes, and
+        //    `--max-active-mb`, whereas a MasterServer with a larger `max_active_bytes` accepts both.
+        let tight = MasterServer::spawn(
+            ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_active_bytes(1_500),
+        )
+        .await
+        .unwrap();
+        let stream = TcpStream::connect(tight.server_addr()).await.unwrap();
+        let mut client = MessageTransport::new(stream);
+
+        client
+            .send_msg(&ClientMessage::SubmitTask {
+                task: make_task(100),
+                wait: false,
+            })
+            .await
+            .unwrap();
+        match client.recv_msg::<ClientResponse>().await.unwrap() {
+            Some(ClientResponse::TaskSubmitted { .. }) => {}
+            other => panic!("expected first task to be accepted, got {other:?}"),
+        }
+
+        client
+            .send_msg(&ClientMessage::SubmitTask {
+                task: make_task(600),
+                wait: false,
+            })
+            .await
+            .unwrap();
+        match client.recv_msg::<ClientResponse>().await.unwrap() {
+            Some(ClientResponse::Error { message }) => {
+                assert!(message.contains("bytes in use"), "got: {message}");
+                assert!(message.contains("limit 1500 bytes"), "got: {message}");
+                assert!(message.contains("--max-active-mb"), "got: {message}");
+            }
+            other => panic!("expected byte-limit refusal on second task, got {other:?}"),
+        }
+        let _ = tight.shutdown();
+
+        let roomy = MasterServer::spawn(
+            ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_active_bytes(4_000),
+        )
+        .await
+        .unwrap();
+        let stream = TcpStream::connect(roomy.server_addr()).await.unwrap();
+        let mut client = MessageTransport::new(stream);
+        for len in [100, 600] {
+            client
+                .send_msg(&ClientMessage::SubmitTask {
+                    task: make_task(len),
+                    wait: false,
+                })
+                .await
+                .unwrap();
+            match client.recv_msg::<ClientResponse>().await.unwrap() {
+                Some(ClientResponse::TaskSubmitted { .. }) => {}
+                other => panic!("expected roomy master to accept task ({len}), got {other:?}"),
+            }
+        }
+        let _ = roomy.shutdown();
+
+        // 2. Default `ServerConfig` (`DEFAULT_MAX_ACTIVE_BYTES`) refuses a submission that exceeds
+        //    the default 256 MiB active byte cap, while a `MasterServer` started with a larger
+        //    `max_active_bytes` accepts it.
+        let default_master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
+            .await
+            .unwrap();
+        let err = default_master
+            .submit_task(make_task(crate::queue::DEFAULT_MAX_ACTIVE_BYTES))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GridError::QueueByteLimitExceeded { .. }),
+            "default master must refuse task exceeding DEFAULT_MAX_ACTIVE_BYTES, got {err:?}"
+        );
+        let _ = default_master.shutdown();
+
+        let larger_master = MasterServer::spawn(
+            ServerConfig::new("127.0.0.1:0".parse().unwrap())
+                .with_max_active_bytes(crate::queue::DEFAULT_MAX_ACTIVE_BYTES + 8 * 1024 * 1024),
+        )
+        .await
+        .unwrap();
+        larger_master
+            .submit_task(make_task(crate::queue::DEFAULT_MAX_ACTIVE_BYTES))
+            .await
+            .expect("master with larger max_active_bytes must accept the submission");
+        let _ = larger_master.shutdown();
     }
 }

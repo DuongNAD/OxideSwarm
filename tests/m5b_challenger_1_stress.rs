@@ -12,7 +12,7 @@ use uuid::Uuid;
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::task::{
     validate_relative_sandbox_path, Bytes, StagedFile, Task, TaskId, TaskRequirements, TaskSpec,
-    MAX_AGGREGATE_ARTIFACT_BYTES, MAX_STAGED_FILE_BYTES,
+    MAX_STAGED_FILE_BYTES,
 };
 use rusty_grid_worker::runner::{RunnerConfig, TaskRunner};
 use rusty_grid_worker::sandbox::{normalize_relative_path_str, Sandbox, SandboxConfig};
@@ -547,18 +547,18 @@ async fn test_output_artifact_single_limit_harvesting() {
     file.flush().await.unwrap();
     drop(file);
 
-    let collected = runner
+    let res = runner
         .harvest_output_artifacts(
             &sandbox,
             &["oversized_artifact.dat".to_string()],
             sandbox.task_id(),
+            false,
         )
         .await;
 
-    assert_eq!(
-        collected.len(),
-        0,
-        "Single output artifact exceeding 10 MiB MUST NOT be collected"
+    assert!(
+        res.is_err(),
+        "Single output artifact exceeding 10 MiB MUST return Err"
     );
 }
 
@@ -585,21 +585,13 @@ async fn test_output_artifact_aggregate_limit_harvesting() {
         expected_names.push(name);
     }
 
-    let collected = runner
-        .harvest_output_artifacts(&sandbox, &expected_names, sandbox.task_id())
+    let res = runner
+        .harvest_output_artifacts(&sandbox, &expected_names, sandbox.task_id(), false)
         .await;
 
-    // First 3 files = 27 MiB (fits within 32 MiB). 4th file would be 36 MiB (> 32 MiB), so it must be stopped.
     assert!(
-        collected.len() <= 3,
-        "Aggregate collection must halt when exceeding 32 MiB aggregate limit. Collected: {}",
-        collected.len()
-    );
-
-    let total_collected: u64 = collected.iter().map(|a| a.size).sum();
-    assert!(
-        total_collected <= MAX_AGGREGATE_ARTIFACT_BYTES as u64,
-        "Total harvested artifacts bytes ({total_collected}) must not exceed 32 MiB ({MAX_AGGREGATE_ARTIFACT_BYTES})"
+        res.is_err(),
+        "Aggregate collection must fail when exceeding 32 MiB aggregate limit"
     );
 }
 

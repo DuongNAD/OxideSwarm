@@ -519,6 +519,12 @@ fn test_mcp_cli_rejects_sse_flags() {
             extra,
             out.status
         );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("unexpected argument"),
+            "expected clap 'unexpected argument' in stderr for {:?}, got: {stderr}",
+            extra
+        );
     }
 }
 
@@ -677,8 +683,8 @@ insecure = true
         "working-directory insecure = true must not be applied, stderr: {stderr_str}"
     );
     assert!(
-        stdout_str.contains("127.0.0.1:8088") && !stdout_str.contains("192.0.2.10:8088"),
-        "status tool call must target 127.0.0.1:8088 rather than the skipped working-dir config, stdout: {stdout_str}"
+        !stdout_str.contains("192.0.2.10") && !stderr_str.contains("192.0.2.10"),
+        "status tool call must not target the skipped working-dir config host 192.0.2.10, stdout: {stdout_str}, stderr: {stderr_str}"
     );
 
     // 2. With RUSTY_GRID_CONFIG pointing to the same file, mcp uses it and starts with --insecure warning.
@@ -703,6 +709,120 @@ insecure = true
     assert!(
         !stderr_env.contains("Skipping config file"),
         "explicit RUSTY_GRID_CONFIG must not print the skip notice, got: {stderr_env}"
+    );
+
+    // 3. With `--config` pointing to the file, mcp uses it without printing the skip notice.
+    let child_with_flag_cfg = mcp_command(home.path())
+        .args(["--config", cwd_cfg.to_str().unwrap(), "mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp with --config");
+
+    let (stdout_flag, stderr_flag) = run_mcp_initialize_and_exit(child_with_flag_cfg);
+    assert!(
+        stdout_flag.contains("\"protocolVersion\":\"2024-11-05\""),
+        "expected initialize response on stdout, got: {stdout_flag}"
+    );
+    assert!(
+        stderr_flag.contains("WARNING: --insecure"),
+        "expected --insecure warning when --config is passed, got: {stderr_flag}"
+    );
+    assert!(
+        !stderr_flag.contains("Skipping config file"),
+        "explicit --config must not print the skip notice, got: {stderr_flag}"
+    );
+
+    // 4. Bare `oxideswarm mcp` in a working directory holding `./rusty-grid.json` skips it too.
+    std::fs::remove_file(&cwd_cfg).expect("remove rusty-grid.toml");
+    let cwd_json = home.path().join("rusty-grid.json");
+    std::fs::write(
+        &cwd_json,
+        r#"{"status": {"master": "192.0.2.10:8088", "insecure": true}}"#,
+    )
+    .expect("write working-dir rusty-grid.json");
+
+    let child_json = mcp_command(home.path())
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp in working dir with rusty-grid.json");
+
+    let (stdout_json, stderr_json) = run_mcp_initialize_and_exit(child_json);
+    assert!(
+        stdout_json.contains("\"protocolVersion\":\"2024-11-05\""),
+        "expected initialize response on stdout, got: {stdout_json}"
+    );
+    assert!(
+        stderr_json.contains("Skipping config file ./rusty-grid.json in the working directory"),
+        "expected working-directory skip line for ./rusty-grid.json on stderr, got: {stderr_json}"
+    );
+    assert!(
+        !stderr_json.contains("WARNING: --insecure"),
+        "working-directory rusty-grid.json insecure = true must not be applied, stderr: {stderr_json}"
+    );
+    std::fs::remove_file(&cwd_json).expect("remove rusty-grid.json");
+
+    // 5. `~/.oxideswarm/rusty-grid.toml` is loaded automatically, and when the working directory
+    // IS `~/.oxideswarm`, no misleading skip notice is printed for the file that gets loaded next.
+    let ox_dir = home.path().join(".oxideswarm");
+    std::fs::create_dir_all(&ox_dir).expect("create ~/.oxideswarm");
+    let user_cfg = ox_dir.join("rusty-grid.toml");
+    std::fs::write(
+        &user_cfg,
+        r#"[status]
+master = "192.0.2.10:8088"
+insecure = true
+"#,
+    )
+    .expect("write ~/.oxideswarm/rusty-grid.toml");
+
+    let child_user_cfg = mcp_command(home.path())
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp loading ~/.oxideswarm/rusty-grid.toml");
+
+    let (stdout_user, stderr_user) = run_mcp_initialize_and_exit(child_user_cfg);
+    assert!(
+        stdout_user.contains("\"protocolVersion\":\"2024-11-05\""),
+        "expected initialize response on stdout, got: {stdout_user}"
+    );
+    assert!(
+        stderr_user.contains("WARNING: --insecure"),
+        "expected ~/.oxideswarm/rusty-grid.toml to be loaded, got stderr: {stderr_user}"
+    );
+    assert!(
+        !stderr_user.contains("Skipping config file"),
+        "expected no skip notice when working dir has no config file, got: {stderr_user}"
+    );
+
+    let child_in_ox_dir = mcp_command(home.path())
+        .current_dir(&ox_dir)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp with cwd = ~/.oxideswarm");
+
+    let (stdout_ox_cwd, stderr_ox_cwd) = run_mcp_initialize_and_exit(child_in_ox_dir);
+    assert!(
+        stdout_ox_cwd.contains("\"protocolVersion\":\"2024-11-05\""),
+        "expected initialize response on stdout, got: {stdout_ox_cwd}"
+    );
+    assert!(
+        stderr_ox_cwd.contains("WARNING: --insecure"),
+        "expected ~/.oxideswarm/rusty-grid.toml to be loaded when cwd is ~/.oxideswarm, got: {stderr_ox_cwd}"
+    );
+    assert!(
+        !stderr_ox_cwd.contains("Skipping config file"),
+        "must not print skip notice when ./rusty-grid.toml is the ~/.oxideswarm/rusty-grid.toml loaded next, got: {stderr_ox_cwd}"
     );
 }
 
