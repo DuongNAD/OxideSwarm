@@ -222,7 +222,8 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
     let wait_stdout = String::from_utf8_lossy(&wait_out.stdout);
     assert!(
         wait_stdout.contains("completed successfully.")
-            && wait_stdout.contains("hello-from-async-submit"),
+            && wait_stdout.contains("hello-from-async-submit")
+            && wait_stdout.contains("Worker: "),
         "unexpected result stdout: {wait_stdout}"
     );
 
@@ -356,6 +357,48 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
         exit7_res.status
     );
 
+    // 4b. N1: Verify that a task exiting with code 3 maps to process exit code 1 in `result`
+    // (so exit code 3 is reserved unambiguously for a still-running/non-terminal task),
+    // while `--json` preserves `"exit_code": 3`.
+    let exit3_sub = cli_cmd(home)
+        .args([
+            "submit",
+            "--master",
+            &master_addr,
+            "--type",
+            "shell",
+            "--interpreter",
+            "python3",
+            "--command",
+            "import sys; sys.exit(3)",
+            "--json",
+        ])
+        .output()
+        .expect("spawn exit 3 submit");
+    let exit3_json: serde_json::Value =
+        serde_json::from_slice(&exit3_sub.stdout).expect("parse exit3_sub json");
+    let exit3_id = exit3_json["task_id"].as_str().expect("exit3_id");
+
+    let exit3_res = cli_cmd(home)
+        .args([
+            "result",
+            exit3_id,
+            "--master",
+            &master_addr,
+            "--wait",
+            "--json",
+        ])
+        .output()
+        .expect("spawn result --wait --json for exit 3");
+    assert_eq!(
+        exit3_res.status.code(),
+        Some(1),
+        "task exit code 3 must map to process exit code 1 so 3 stays reserved for in-progress tasks"
+    );
+    let exit3_res_json: serde_json::Value =
+        serde_json::from_slice(&exit3_res.stdout).expect("parse exit3_res json");
+    assert_eq!(exit3_res_json["exit_code"], 3);
+
     // 5. F30-1, F30-2, F30-5: Submit a task producing an inline `OutputArtifact` (`expected_outputs`),
     // verify saving it to a directory succeeds, refusing to write through a symlink leaves the victim
     // untouched and exits non-zero, and failing to save to a regular-file `--output-dir` exits non-zero
@@ -442,6 +485,38 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
         assert!(
             symlink_json.get("artifact_save_error").is_some(),
             "expected artifact_save_error in json: {symlink_json}"
+        );
+
+        // N2: Verify that a symlinked `--output-dir` root directory (such as `/tmp` -> `private/tmp`
+        // on macOS) IS accepted for inline artifacts as long as its target is a directory and no
+        // component below `--output-dir` is a symlink.
+        let real_root_dir = home.join("real_output_root");
+        std::fs::create_dir_all(&real_root_dir).expect("create real_output_root");
+        let symlink_root_dir = home.join("symlink_output_root");
+        std::os::unix::fs::symlink(&real_root_dir, &symlink_root_dir)
+            .expect("create symlink_output_root");
+
+        let symlink_root_res = cli_cmd(home)
+            .args([
+                "result",
+                &inline_id,
+                "--master",
+                &master_addr,
+                "--output-dir",
+                symlink_root_dir.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .expect("spawn result into symlinked root output-dir");
+        assert!(
+            symlink_root_res.status.success(),
+            "symlinked --output-dir root directory must be accepted: {}",
+            String::from_utf8_lossy(&symlink_root_res.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(real_root_dir.join("rep.txt"))
+                .expect("read rep.txt through symlinked root output-dir"),
+            "TASK_PAYLOAD"
         );
     }
 

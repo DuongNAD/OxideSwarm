@@ -41,8 +41,8 @@ Behaviour before this change:
 - When the master answers `ClientResponse::TaskCompleted { task_id, result }`, the CLI downloads any content-addressed `result.outputs` via `BlobConnection` and saves any inline `result.artifacts` into `--output-dir` (default `.`), prints the outcome in human or `--json` format (printing `"was cancelled."` when `exit_code == 130` and omitting `Worker:` when `worker_id` is nil), and exits with:
   - `1` (`ExitCode::FAILURE`) if downloading blob outputs or saving inline artifacts failed (also recording `"output_download_error"` or `"artifact_save_error"` in `--json`);
   - `0` on `result.is_success()`;
-  - `result.exit_code.clamp(1, 255)` otherwise.
-- When the master answers `ClientResponse::TaskStatusInfo` for a non-terminal task (`Submitted`, `Queued`, `Scheduled`, `Running`, or `Retrying`) and `--wait` is set, the CLI sleeps `100 ms` and polls again on the same connection. Without `--wait`, it prints the status and exits with code `3` so callers can distinguish a task that is still in progress (`3`) from a task that failed (`1` or its non-zero exit code). When `TaskStatusInfo` is already terminal (`Cancelled` or `Failed` without a `TaskResult`), it prints the status and exits `1` (`0` if `Completed`).
+  - `result.exit_code.clamp(1, 255)` otherwise, except that a task exit code of `3` is mapped to process exit code `1` so that process exit code `3` is reserved exclusively for a non-terminal task (`--json` always preserves the exact integer `exit_code`).
+- When the master answers `ClientResponse::TaskStatusInfo` for a non-terminal task (`Submitted`, `Queued`, `Scheduled`, `Running`, or `Retrying`) and `--wait` is set, the CLI sleeps `100 ms` and polls again on the same connection. Without `--wait`, it prints the status and exits with code `3` so callers can unambiguously distinguish a task that is still in progress (`3`) from a task that failed (`1` or its non-zero exit code). When `TaskStatusInfo` is already terminal (`Cancelled` or `Failed` without a `TaskResult`), it prints the status and exits `1` (`0` if `Completed`).
 
 ## Compatibility
 

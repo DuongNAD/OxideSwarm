@@ -3139,7 +3139,8 @@ pub async fn run_result(
                 return if result.is_success() {
                     ExitCode::SUCCESS
                 } else {
-                    ExitCode::from(result.exit_code.clamp(1, 255) as u8)
+                    let code = result.exit_code.clamp(1, 255) as u8;
+                    ExitCode::from(if code == 3 { 1 } else { code })
                 };
             }
             ClientResponse::TaskStatusInfo {
