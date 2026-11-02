@@ -515,20 +515,48 @@ async fn test_output_blobs_stay_pinned_for_delayed_client_download() {
     assert!(result_a.is_success(), "{:?}", result_a.error);
     assert_eq!(result_a.outputs.len(), 1);
 
-    // Before client A downloads `a.bin`, task B runs and stores a 2 MiB output `b.bin`.
-    let (task_b, _expected_b) = write_2mib_task("b.bin", 0x42);
-    let result_b = cluster.run(task_b).await.unwrap();
-    assert!(result_b.is_success(), "{:?}", result_b.error);
+    // Before client A downloads `a.bin`, another client uploads a 2 MiB input blob `b.bin`.
+    // Because `a.bin` (2 MiB <= 3 MiB bound) is pinned in `output_pins`, it must not be evicted.
+    let connection = BlobConnection::connect(&cluster.addr, None).await.unwrap();
+    let b_dir = tempfile::tempdir().unwrap();
+    std::fs::write(b_dir.path().join("b.bin"), vec![0x42u8; 2 * 1024 * 1024]).unwrap();
+    let prepared_b =
+        scan_inputs(&[format!("{}:b.bin", b_dir.path().join("b.bin").display())]).unwrap();
+    upload_inputs(&connection, &prepared_b).await.unwrap();
 
     // Client A now resumes and downloads `a.bin`.
     let out_dir = tempfile::tempdir().unwrap();
-    let connection = BlobConnection::connect(&cluster.addr, None).await.unwrap();
     download_outputs(&connection, &result_a.outputs, out_dir.path())
         .await
         .expect("task A output must remain pinned until client A downloads it");
     assert_eq!(
         std::fs::read(out_dir.path().join("a.bin")).unwrap(),
         expected_a
+    );
+
+    // When a second terminal task produces another 2 MiB output `c.bin`, pinned output bytes
+    // (2 MiB + 2 MiB = 4 MiB) exceed `max_bytes` (3 MiB), so `a.bin`'s older output pin is
+    // released early while the newest task's output `c.bin` stays pinned.
+    let (task_c, expected_c) = write_2mib_task("c.bin", 0x43);
+    let result_c = cluster.run(task_c).await.unwrap();
+    assert!(result_c.is_success(), "{:?}", result_c.error);
+    download_outputs(&connection, &result_c.outputs, out_dir.path())
+        .await
+        .expect("newest task output must stay pinned");
+    assert_eq!(
+        std::fs::read(out_dir.path().join("c.bin")).unwrap(),
+        expected_c
+    );
+
+    // Because `a.bin`'s output pin was released early when `c.bin` pushed pinned outputs over
+    // `max_bytes`, `a.bin` has now been evicted to fit `c.bin` within the 3 MiB store (F3 / M7a).
+    let retry_a_dir = tempfile::tempdir().unwrap();
+    let retry_a_err = download_outputs(&connection, &result_a.outputs, retry_a_dir.path())
+        .await
+        .expect_err("older output a.bin must be released early and evicted when pinned outputs exceed max_bytes");
+    assert!(
+        retry_a_err.contains("no longer on the master"),
+        "expected missing blob error for evicted a.bin, got: {retry_a_err}"
     );
 }
 
@@ -964,6 +992,108 @@ mod cli {
             std::fs::read(out2.join("out/combined.txt")).unwrap(),
             std::fs::read(out1.join("out/combined.txt")).unwrap()
         );
+
+        // Defect 8: a failed task (`exit 7`) prints `Task <ID> failed.`, not `completed successfully.`,
+        // and when `result.error` is set (missing declared output), prints `Error: <text>` to stderr.
+        let failed_run = cli(home)
+            .args([
+                "submit",
+                "--master",
+                &master,
+                "--wait",
+                "--timeout-secs",
+                "30",
+                "--command",
+                "sh",
+                "--",
+                "-c",
+                "echo fail-stdout; echo fail-stderr >&2; exit 7",
+            ])
+            .output()
+            .expect("run failing submit");
+        assert_eq!(failed_run.status.code(), Some(7));
+        let failed_stdout = String::from_utf8_lossy(&failed_run.stdout);
+        let failed_stderr = String::from_utf8_lossy(&failed_run.stderr);
+        assert!(
+            failed_stdout.contains("failed.") && !failed_stdout.contains("completed successfully."),
+            "failed task must not print 'completed successfully.': {failed_stdout}"
+        );
+        assert!(failed_stdout.contains("Exit Code: 7"), "{failed_stdout}");
+        assert!(failed_stdout.contains("fail-stdout"), "{failed_stdout}");
+        assert!(failed_stderr.contains("fail-stderr"), "{failed_stderr}");
+
+        let missing_output_run = cli(home)
+            .args([
+                "submit",
+                "--master",
+                &master,
+                "--output",
+                "never-created.bin",
+                "--timeout-secs",
+                "30",
+                "--command",
+                "sh",
+                "--",
+                "-c",
+                "echo ran-ok",
+            ])
+            .output()
+            .expect("run missing-output submit");
+        assert!(!missing_output_run.status.success());
+        let missing_stdout = String::from_utf8_lossy(&missing_output_run.stdout);
+        let missing_stderr = String::from_utf8_lossy(&missing_output_run.stderr);
+        assert!(
+            missing_stdout.contains("failed.")
+                && !missing_stdout.contains("completed successfully."),
+            "{missing_stdout}"
+        );
+        assert!(
+            missing_stderr.contains("Error:") && missing_stderr.contains("never-created.bin"),
+            "stderr must include Error: <result.error>, got: {missing_stderr}"
+        );
+
+        // Defect 6: when downloading an output file fails (destination traverses a symlink),
+        // `submit` still prints the task's exit code, stdout and stderr before returning failure.
+        let bad_out_dir = home.join("bad-out");
+        let outside_dir = home.join("outside-target");
+        std::fs::create_dir_all(&bad_out_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, bad_out_dir.join("sub")).unwrap();
+        let download_fail_run = cli(home)
+            .args([
+                "submit",
+                "--master",
+                &master,
+                "--output",
+                "sub/produced.txt",
+                "--output-dir",
+                &bad_out_dir.to_string_lossy(),
+                "--timeout-secs",
+                "30",
+                "--command",
+                "sh",
+                "--",
+                "-c",
+                "mkdir -p sub && echo data > sub/produced.txt && echo dl-stdout && echo dl-stderr >&2",
+            ])
+            .output()
+            .expect("run download-fail submit");
+        assert!(!download_fail_run.status.success());
+        let dl_stdout = String::from_utf8_lossy(&download_fail_run.stdout);
+        let dl_stderr = String::from_utf8_lossy(&download_fail_run.stderr);
+        assert!(
+            dl_stderr.contains("Downloading the output files failed:"),
+            "{dl_stderr}"
+        );
+        assert!(
+            dl_stdout.contains("Exit Code: 0") && dl_stdout.contains("dl-stdout"),
+            "submit must still print exit code and stdout when output download fails: {dl_stdout}"
+        );
+        assert!(
+            dl_stderr.contains("dl-stderr"),
+            "submit must still print stderr when output download fails: {dl_stderr}"
+        );
+
         let _ = stop_worker.send(true);
         worker.abort();
     }

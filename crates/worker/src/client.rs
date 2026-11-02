@@ -1501,7 +1501,7 @@ impl WorkerClient {
             drop(_inputs);
             if used_blobs {
                 if let Ok(cache) = runner.blob_cache() {
-                    cache.evict_to_fit();
+                    let _ = tokio::task::spawn_blocking(move || cache.evict_to_fit()).await;
                 }
             }
 

@@ -178,7 +178,7 @@ fn collect_outputs_inner(
         } else {
             match sandbox_path(&root, &prefix) {
                 Ok(path) => path,
-                Err(_) => continue,
+                Err(e) => return Err(format!("output '{}': {e}", pattern.as_str())),
             }
         };
         if !prefix.is_empty() {
@@ -201,11 +201,19 @@ fn collect_outputs_inner(
         }
         let meta = match std::fs::symlink_metadata(&start) {
             Ok(meta) => meta,
-            Err(_) => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
                 if pattern.is_literal() {
                     not_produced.push(pattern.as_str().to_string());
                 }
                 continue;
+            }
+            Err(e) => {
+                return Err(format!("cannot read output '{}': {e}", pattern.as_str()));
             }
         };
         if meta.file_type().is_symlink() {
@@ -290,36 +298,39 @@ fn walk(
     found: &mut BTreeMap<String, Found>,
     visited: &mut usize,
 ) -> Result<(), String> {
-    let mut stack = vec![(dir.to_path_buf(), rel_dir.to_string())];
-    while let Some((dir, rel_dir)) = stack.pop() {
+    let mut stack = vec![(dir.to_path_buf(), rel_dir.to_string(), true)];
+    while let Some((dir, rel_dir, dir_utf8)) = stack.pop() {
         let entries = std::fs::read_dir(&dir)
             .map_err(|e| format!("cannot read output directory '{rel_dir}': {e}"))?;
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| format!("cannot read output directory '{rel_dir}': {e}"))?;
             *visited += 1;
             if *visited > MAX_WALK_ENTRIES {
                 return Err(format!(
                     "the task sandbox has more than {MAX_WALK_ENTRIES} entries below the output patterns; narrow them"
                 ));
             }
-            // A name that is not UTF-8 or not a valid blob path cannot be returned.
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("cannot read output '{}': {e}", entry.path().display()))?;
+            let file_name = entry.file_name();
+            let name_utf8 = file_name.to_str().is_some();
+            let lossy_name = file_name.to_string_lossy();
             let rel = if rel_dir.is_empty() {
-                name
+                lossy_name.into_owned()
             } else {
-                format!("{rel_dir}/{name}")
+                format!("{rel_dir}/{lossy_name}")
             };
-            if validate_blob_path(&rel).is_err() {
-                continue;
-            }
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
+            let entry_utf8 = dir_utf8 && name_utf8;
             if file_type.is_dir() {
-                stack.push((entry.path(), rel));
+                stack.push((entry.path(), rel, entry_utf8));
             } else if file_type.is_file() && pattern.selects(&rel) {
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                check_selected_entry_path(&rel, entry_utf8)?;
+                let size = entry
+                    .metadata()
+                    .map_err(|e| format!("cannot read output '{rel}': {e}"))?
+                    .len();
                 found.entry(rel).or_insert(Found {
                     path: entry.path(),
                     size,
@@ -328,6 +339,13 @@ fn walk(
         }
     }
     Ok(())
+}
+
+fn check_selected_entry_path(rel: &str, entry_utf8: bool) -> Result<(), String> {
+    if !entry_utf8 {
+        return Err(format!("output '{rel}' has a name that is not valid UTF-8"));
+    }
+    validate_blob_path(rel).map_err(|e| format!("output '{rel}': {e}"))
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -606,6 +624,42 @@ mod tests {
         let outputs =
             collect_outputs(&sandbox, &patterns, &cache, OutputLimits::default(), true).unwrap();
         assert!(outputs.is_empty());
+
+        // A pattern whose literal prefix passes through a regular file (`a/b/*.txt` where `a`
+        // is a regular file) produces `NotADirectory` on `symlink_metadata(&start)`: a glob
+        // must skip it just like `NotFound`, while a literal pattern reports "did not produce".
+        write(&sandbox, "a", b"regular file");
+        let glob_below_file = collect_outputs(
+            &sandbox,
+            &["a/b/*.txt".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        )
+        .expect("a glob below a regular file must not fail a successful task");
+        assert!(glob_below_file.is_empty());
+
+        let literal_err = collect_outputs(
+            &sandbox,
+            &["a/b/c.txt".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            literal_err.contains("did not produce 'a/b/c.txt'"),
+            "{literal_err}"
+        );
+        assert!(collect_outputs(
+            &sandbox,
+            &["a/b/c.txt".to_string()],
+            &cache,
+            OutputLimits::default(),
+            true,
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
@@ -613,5 +667,116 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");
         assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_fails_on_selected_invalid_blob_path_non_utf8_name_or_unreadable_directory() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, sandbox, cache) = setup();
+        std::fs::create_dir_all(sandbox.join("out")).unwrap();
+
+        // 1. A file with ':' in its name is not a valid blob path; if selected, it must fail.
+        write(&sandbox, "out/bad:colon.txt", b"colon");
+        let err = collect_outputs(
+            &sandbox,
+            &["out/*.txt".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("bad:colon.txt"), "{err}");
+        std::fs::remove_file(sandbox.join("out/bad:colon.txt")).unwrap();
+
+        // 2. A file with a non-UTF-8 name selected by the pattern must fail (APFS refuses
+        //    creating non-UTF-8 filenames with EILSEQ, so test on disk when the filesystem
+        //    permits it and always verify `check_selected_entry_path`).
+        let non_utf8_os = OsStr::from_bytes(b"bad-\xff.txt");
+        assert!(check_selected_entry_path(
+            &format!("out/{}", non_utf8_os.to_string_lossy()),
+            false
+        )
+        .unwrap_err()
+        .contains("UTF-8"));
+        let non_utf8 = sandbox.join("out").join(non_utf8_os);
+        if std::fs::write(&non_utf8, b"bytes").is_ok() {
+            let err = collect_outputs(
+                &sandbox,
+                &["out/*.txt".to_string()],
+                &cache,
+                OutputLimits::default(),
+                false,
+            )
+            .unwrap_err();
+            assert!(err.contains("UTF-8"), "{err}");
+            let _ = std::fs::remove_file(&non_utf8);
+        }
+
+        // 3. A real stat error at `&start` (e.g. an unreadable ancestor directory `locked_parent`
+        //    for pattern `locked_parent/sub/*.txt`) must fail collection (catches M3b).
+        let locked_parent = sandbox.join("locked_parent");
+        std::fs::create_dir_all(locked_parent.join("sub")).unwrap();
+        std::fs::write(locked_parent.join("sub/file.txt"), b"secret").unwrap();
+        std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let start_res = collect_outputs(
+            &sandbox,
+            &["locked_parent/sub/*.txt".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        );
+        std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let start_err =
+            start_res.expect_err("unreadable ancestor at start path must fail collection");
+        assert!(
+            start_err.contains("cannot read output 'locked_parent/sub/*.txt'"),
+            "{start_err}"
+        );
+
+        // 4. A directory with read permission (`0o400`) but no search/execute permission (`+x`)
+        //    lets `read_dir` and `entry.file_type()` succeed on Unix while `entry.metadata()`
+        //    fails with `PermissionDenied`; `walk` and `collect_outputs` must fail (catches M3d).
+        let no_search = sandbox.join("out/no_search");
+        std::fs::create_dir_all(&no_search).unwrap();
+        std::fs::write(no_search.join("file.txt"), b"secret").unwrap();
+        std::fs::set_permissions(&no_search, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let meta_res = collect_outputs(
+            &sandbox,
+            &["out/**".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        );
+        std::fs::set_permissions(&no_search, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let meta_err =
+            meta_res.expect_err("metadata failure on a selected file must fail collection");
+        assert!(
+            meta_err.contains("cannot read output 'out/no_search/file.txt'"),
+            "{meta_err}"
+        );
+        std::fs::remove_dir_all(&no_search).unwrap();
+
+        // 5. An unreadable directory (`0o000`) below a pattern must fail at `read_dir`.
+        let locked = sandbox.join("out/locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("file.txt"), b"secret").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let res = collect_outputs(
+            &sandbox,
+            &["out/**".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = res.expect_err("unreadable directory must fail output collection");
+        assert!(
+            err.contains("cannot read output directory 'out/locked'"),
+            "{err}"
+        );
     }
 }
