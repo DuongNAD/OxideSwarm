@@ -13,7 +13,6 @@ pub mod gen3d;
 pub mod gpu;
 pub mod heartbeat;
 pub mod identity;
-pub mod job_object;
 pub mod process_tree;
 pub mod runner;
 pub mod sandbox;

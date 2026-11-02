@@ -33,6 +33,16 @@ pub fn to_clean_absolute_path(path: &Path) -> Option<PathBuf> {
     Some(abs)
 }
 
+/// Probes whether a Python executable candidate is runnable by invoking `<program> --version`
+/// with sensitive environment variables stripped.
+pub fn probe_python<P: AsRef<std::ffi::OsStr>>(program: P) -> bool {
+    rusty_grid_core::cluster_auth::probe_command(program)
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 /// Probes whether an executable name exists on PATH, responds to `--version`,
 /// and returns its clean absolute path.
 fn probe_executable_in_path(name: &str) -> Option<PathBuf> {
@@ -45,17 +55,8 @@ fn probe_executable_in_path(name: &str) -> Option<PathBuf> {
 
         for ext in exts {
             let candidate = dir.join(format!("{name}{ext}"));
-            if candidate.is_file() {
-                let mut cmd = std::process::Command::new(&candidate);
-                cmd.arg("--version");
-                for var in crate::runner::SECRET_ENV_VARS {
-                    cmd.env_remove(var);
-                }
-                if let Ok(output) = cmd.output() {
-                    if output.status.success() {
-                        return to_clean_absolute_path(&candidate);
-                    }
-                }
+            if candidate.is_file() && probe_python(&candidate) {
+                return to_clean_absolute_path(&candidate);
             }
         }
     }

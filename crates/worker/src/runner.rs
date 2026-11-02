@@ -62,7 +62,6 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
-use rusty_grid_core::cluster_auth::{ENV_SECRET, ENV_SECRET_FILE};
 use rusty_grid_core::protocol::WorkerMessage;
 use rusty_grid_core::task::{
     sha256_digest, Bytes, BytesMut, CheckpointData, OutputArtifact, Task, TaskId, TaskResult,
@@ -110,7 +109,7 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Variables of the worker's own environment that task processes must never inherit: they hold
 /// the cluster secret or the agent-mesh token. (A task can still be handed one explicitly through
 /// its own `env`.)
-pub const SECRET_ENV_VARS: [&str; 3] = [ENV_SECRET, ENV_SECRET_FILE, "OXIDE_MESH_TOKEN"];
+pub use rusty_grid_core::cluster_auth::SECRET_ENV_VARS;
 
 /// Configuration options for the TaskRunner.
 #[derive(Debug, Clone)]
@@ -877,7 +876,12 @@ impl TaskRunner {
         }
 
         let compute_fut = async {
-            if test_name == "sleep"
+            if cfg!(test) && test_name == "oversized_asset" {
+                if duration_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(duration_ms)).await;
+                }
+                "engine stdout line\n".to_string()
+            } else if test_name == "sleep"
                 || test_name == "duration"
                 || (duration_ms > 0
                     && test_name != "checkpoint"
@@ -973,7 +977,13 @@ impl TaskRunner {
         tokio::select! {
             output = compute_fut => {
                 let elapsed = start_time.elapsed().as_millis() as u64;
-                TaskResult::success(self.worker_id, task_id, output, elapsed, require_gpu)
+                let mut res =
+                    TaskResult::success(self.worker_id, task_id, output, elapsed, require_gpu);
+                if cfg!(test) && test_name == "oversized_asset" {
+                    res.stderr = Bytes::from_static(b"engine stderr line\n");
+                    res = res.with_asset_bytes(Bytes::from(vec![0u8; 70 * 1024 * 1024]));
+                }
+                res
             }
 
             reason = cancellation(&mut cancel_rx) => {
@@ -1232,7 +1242,8 @@ impl TaskRunner {
         sandbox: &Sandbox,
         expected_outputs: &[String],
         task_id: TaskId,
-    ) -> Vec<OutputArtifact> {
+        process_failed: bool,
+    ) -> Result<Vec<OutputArtifact>, String> {
         let mut collected = Vec::new();
         let mut total_bytes: usize = 0;
 
@@ -1241,7 +1252,9 @@ impl TaskRunner {
                 Ok(p) => p,
                 Err(err) => {
                     warn!(task_id = %task_id, path = %expected, error = %err, "Ignoring illegal expected output path");
-                    continue;
+                    return Err(format!(
+                        "output artifact '{expected}' resolves outside sandbox root"
+                    ));
                 }
             };
 
@@ -1249,8 +1262,10 @@ impl TaskRunner {
             let meta = match tokio::fs::symlink_metadata(&target).await {
                 Ok(m) => m,
                 Err(_) => {
-                    // File was not produced by task; silently skip
-                    debug!(task_id = %task_id, path = %expected, "Declared output artifact was not produced");
+                    if !process_failed {
+                        return Err(format!("the task did not produce '{expected}'"));
+                    }
+                    debug!(task_id = %task_id, path = %expected, "Declared output artifact was not produced by failed task");
                     continue;
                 }
             };
@@ -1258,23 +1273,31 @@ impl TaskRunner {
             // Strictly reject symlinks to prevent sandbox exfiltration
             if meta.is_symlink() {
                 warn!(task_id = %task_id, path = %expected, "Skipping output artifact: symlinks are prohibited for security isolation");
-                continue;
+                return Err(format!(
+                    "output artifact '{expected}' is a symbolic link (symbolic links are prohibited for security isolation)"
+                ));
             }
 
             if !meta.is_file() {
                 warn!(task_id = %task_id, path = %expected, "Skipping output artifact: path is not a regular file");
-                continue;
+                return Err(format!(
+                    "output artifact '{expected}' is not a regular file"
+                ));
             }
 
             let size = meta.len() as usize;
             if size > MAX_OUTPUT_ARTIFACT_BYTES {
                 warn!(task_id = %task_id, path = %expected, size = size, "Skipping output artifact: exceeds single file limit");
-                continue;
+                return Err(format!(
+                    "output artifact '{expected}' is {size} bytes; exceeds single file limit of 10 MiB"
+                ));
             }
 
             if total_bytes + size > MAX_AGGREGATE_ARTIFACT_BYTES {
                 warn!(task_id = %task_id, path = %expected, size = size, "Halting artifact collection: aggregate size exceeds 32 MiB limit");
-                break;
+                return Err(format!(
+                    "output artifact '{expected}' causes aggregate size to exceed limit of 32 MiB"
+                ));
             }
 
             // Ensure canonical path resolves strictly within the sandbox root
@@ -1284,7 +1307,9 @@ impl TaskRunner {
             ) {
                 if !canonical_target.starts_with(&canonical_sandbox) {
                     warn!(task_id = %task_id, path = %expected, "Skipping output artifact: path resolves outside sandbox root");
-                    continue;
+                    return Err(format!(
+                        "output artifact '{expected}' resolves outside sandbox root"
+                    ));
                 }
             }
 
@@ -1302,11 +1327,52 @@ impl TaskRunner {
                 }
                 Err(err) => {
                     warn!(task_id = %task_id, path = %expected, error = %err, "Failed to read output artifact file");
+                    return Err(format!(
+                        "failed to read output artifact '{expected}': {err}"
+                    ));
                 }
             }
         }
 
-        collected
+        Ok(collected)
+    }
+
+    /// Harvests declared expected output artifacts from the sandbox and updates `TaskResult`.
+    ///
+    /// If harvesting fails (e.g. missing artifact, oversize, symlink, traversal), marks `result`
+    /// as failed with `EXIT_CODE_GENERAL_ERROR`, appends diagnostic notes to stderr and error.
+    async fn harvest_and_apply_artifacts(
+        &self,
+        sandbox: &Sandbox,
+        task: &Task,
+        mut result: TaskResult,
+        process_failed: bool,
+    ) -> TaskResult {
+        if task.expected_outputs.is_empty() {
+            return result;
+        }
+
+        match self
+            .harvest_output_artifacts(sandbox, &task.expected_outputs, task.id, process_failed)
+            .await
+        {
+            Ok(artifacts) => {
+                result.artifacts = artifacts;
+            }
+            Err(e) => {
+                let message = format!("Output files: {e}");
+                warn!(task_id = %task.id, error = %e, "Harvesting output artifacts failed");
+                if result.exit_code == EXIT_CODE_SUCCESS {
+                    result.exit_code = EXIT_CODE_GENERAL_ERROR;
+                }
+                result.stderr = append_note(result.stderr, &format!("[rusty_grid: {message}]\n"));
+                result.error = Some(match result.error.take() {
+                    Some(error) => format!("{error}; {message}"),
+                    None => message,
+                });
+            }
+        }
+        result
     }
 
     /// Helper to stage files into sandbox before task execution.
@@ -1488,14 +1554,10 @@ impl TaskRunner {
             )
             .await;
 
-        let artifacts = if !task.expected_outputs.is_empty() {
-            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id)
-                .await
-        } else {
-            Vec::new()
-        };
-        let mut result = result;
-        result.artifacts = artifacts;
+        let process_failed = !result.is_success();
+        let result = self
+            .harvest_and_apply_artifacts(&sandbox, task, result, process_failed)
+            .await;
         let result = self.collect_blob_outputs(&sandbox, task, result, &[]).await;
         let _ = sandbox.destroy().await;
         result
@@ -1631,14 +1693,10 @@ impl TaskRunner {
             )
             .await;
 
-        let artifacts = if !task.expected_outputs.is_empty() {
-            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id)
-                .await
-        } else {
-            Vec::new()
-        };
-        let mut result = result;
-        result.artifacts = artifacts;
+        let process_failed = !result.is_success();
+        let result = self
+            .harvest_and_apply_artifacts(&sandbox, task, result, process_failed)
+            .await;
         let result = self.collect_blob_outputs(&sandbox, task, result, &[]).await;
         let _ = sandbox.destroy().await;
         result
@@ -1831,14 +1889,10 @@ impl TaskRunner {
             }
         }
 
-        let artifacts = if !task.expected_outputs.is_empty() {
-            self.harvest_output_artifacts(&sandbox, &task.expected_outputs, task.id)
-                .await
-        } else {
-            Vec::new()
-        };
-        let mut res = res;
-        res.artifacts = artifacts;
+        let process_failed = !res.is_success();
+        let res = self
+            .harvest_and_apply_artifacts(&sandbox, task, res, process_failed)
+            .await;
         let res = self
             .collect_blob_outputs(&sandbox, task, res, &artifact_patterns)
             .await;
@@ -1856,7 +1910,7 @@ impl TaskRunner {
         checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
         timeout: Duration,
         child_pid: Option<Arc<AtomicU32>>,
-        mut cancel_rx: Option<oneshot::Receiver<String>>,
+        cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
     ) -> TaskResult {
         let pref = spec
@@ -1966,282 +2020,155 @@ impl TaskRunner {
 
         cmd_args.push("--offline".to_string());
 
-        // 5. Initialize Win32 Job Object for kernel process tree supervision
-        let mut job_object = match crate::job_object::JobObject::create() {
-            Ok(job) => Some(job),
-            Err(e) => {
-                warn!(
-                    "Failed to create Win32 Job Object (falling back to standard supervision): {e}"
-                );
-                None
-            }
-        };
+        // 5. Prepare environment and route through hardened process runner
+        let mut child_env = HashMap::new();
+        child_env.insert("HF_HUB_OFFLINE".to_string(), "1".to_string());
+        child_env.insert("TRANSFORMERS_OFFLINE".to_string(), "1".to_string());
 
-        // 6. Build Tokio Command
-        let mut cmd = tokio::process::Command::new(&py_bin);
-        cmd.args(&cmd_args);
-        cmd.current_dir(sandbox.path());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd.stdin(std::process::Stdio::null());
-        cmd.kill_on_drop(true);
+        let mut res = self
+            .execute_process_supervised(
+                task.id,
+                sandbox.path(),
+                &py_bin.to_string_lossy(),
+                &cmd_args,
+                sandbox.path(),
+                &child_env,
+                None,
+                timeout,
+                child_pid,
+                cancel_rx,
+                start_time,
+            )
+            .await;
 
-        #[cfg(unix)]
+        // On cancellation or watchdog timeout, return failure immediately without sending checkpoints
+        if res.exit_code == EXIT_CODE_CANCELLED
+            || (res.exit_code == EXIT_CODE_TIMEOUT && res.error.is_some())
         {
-            cmd.process_group(0);
+            let _ = sandbox.destroy().await;
+            return res;
         }
 
-        cmd.env("HF_HUB_OFFLINE", "1");
-        cmd.env("TRANSFORMERS_OFFLINE", "1");
-        cmd.env("RUSTY_GRID_TASK_ID", task.id.to_string());
-        cmd.env("RUSTY_GRID_WORKER_ID", self.worker_id.to_string());
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = sandbox.destroy().await;
-                if pref == "auto" {
-                    info!(task_id = %task.id, "Failed to spawn Python process ({e}); degrading gracefully to Tier 0 SDF");
-                    return self
-                        .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
+        // Process progress checkpoints from stdout if checkpoint_tx provided
+        if let Some(ref tx) = checkpoint_tx {
+            let stdout_str = String::from_utf8_lossy(res.stdout.as_slice());
+            let mut seq = 1u64;
+            for line in stdout_str.lines() {
+                if let Some((frac, msg)) = crate::gen3d::runner::parse_progress_marker(line) {
+                    let delta = serde_json::json!({
+                        "progress": frac,
+                        "message": msg,
+                        "stage": "generative_3d",
+                    });
+                    let _ = tx
+                        .send(WorkerMessage::Checkpoint {
+                            task_id: task.id,
+                            sequence: seq,
+                            delta_state: Bytes::from(delta.to_string().into_bytes()),
+                        })
                         .await;
+                    seq += 1;
                 }
-                return TaskResult::failure(
-                    self.worker_id,
-                    task.id,
-                    EXIT_CODE_GENERAL_ERROR,
-                    Bytes::new(),
-                    format!("Failed to spawn 3D engine subprocess: {e}"),
-                    start_time.elapsed().as_millis() as u64,
-                    Some(format!("Spawn error: {e}")),
-                );
-            }
-        };
-
-        if let Some(pid) = child.id() {
-            if let Some(ref holder) = child_pid {
-                holder.store(pid, Ordering::Release);
-            }
-            if let Some(ref mut job) = job_object {
-                let _ = job.assign_pid(pid);
             }
         }
 
-        // 7. Supervised execution with streaming stdout, stderr, and cancellation
-        let child_stdout = child.stdout.take();
-        let child_stderr = child.stderr.take();
-        let max_output = self.config.max_output_bytes;
-
-        let stdout_fut = async move {
-            if let Some(pipe) = child_stdout {
-                read_bounded_stream(pipe, max_output).await
-            } else {
-                (Bytes::new(), false)
-            }
-        };
-
-        let stderr_fut = async move {
-            if let Some(pipe) = child_stderr {
-                read_bounded_stream(pipe, max_output).await
-            } else {
-                (Bytes::new(), false)
-            }
-        };
-
-        let execution_fut = async {
-            let ((stdout_bytes, _), (stderr_bytes, _), status_res) =
-                tokio::join!(stdout_fut, stderr_fut, child.wait());
-            (stdout_bytes, stderr_bytes, status_res)
-        };
-
-        let result = tokio::select! {
-            (stdout_bytes, stderr_bytes, status_res) = execution_fut => {
-                let elapsed = start_time.elapsed().as_millis() as u64;
-
-                let stdout_str = String::from_utf8_lossy(stdout_bytes.as_slice());
-
-                // Extract reported engine or device label from stdout
-                let mut engine_label = None;
-                for line in stdout_str.lines() {
-                    if let Some(label) = crate::gen3d::runner::parse_engine_marker(line) {
-                        engine_label = Some(label);
-                    }
-                }
-
-                // Process progress checkpoints from stdout if checkpoint_tx provided
-                if let Some(ref tx) = checkpoint_tx {
-                    let mut seq = 1u64;
-                    for line in stdout_str.lines() {
-                        if let Some((frac, msg)) = crate::gen3d::runner::parse_progress_marker(line) {
-                            let delta = serde_json::json!({
-                                "progress": frac,
-                                "message": msg,
-                                "stage": "generative_3d",
-                            });
-                            let _ = tx.send(WorkerMessage::Checkpoint {
-                                task_id: task.id,
-                                sequence: seq,
-                                delta_state: Bytes::from(delta.to_string().into_bytes()),
-                            }).await;
-                            seq += 1;
-                        }
-                    }
-                }
-
-                match status_res {
-                    Ok(status) if status.success() => {
-                        if output_glb_path.is_file() {
-                            match tokio::fs::read(&output_glb_path).await {
-                                Ok(data) => {
-                                    if data.len() >= 12 && &data[0..4] == b"glTF" {
-                                        let asset_bytes = Bytes::from(data);
-                                        let mut res = TaskResult::success(
-                                            self.worker_id,
-                                            task.id,
-                                            stdout_bytes,
-                                            elapsed,
-                                            self.capabilities.has_cuda,
-                                        );
-                                        res.stderr = stderr_bytes;
-                                        res = res.with_asset_bytes(asset_bytes);
-                                        if let Some(device) = engine_label {
-                                            res = res.with_device_name(device);
-                                        }
-                                        res
-                                    } else {
-                                        TaskResult::failure(
-                                            self.worker_id,
-                                            task.id,
-                                            EXIT_CODE_GENERAL_ERROR,
-                                            stdout_bytes,
-                                            stderr_bytes,
-                                            elapsed,
-                                            Some("Generated .glb file has invalid glTF 2.0 header".to_string()),
-                                        )
-                                    }
-                                }
-                                Err(e) => {
-                                    TaskResult::failure(
-                                        self.worker_id,
-                                        task.id,
-                                        EXIT_CODE_GENERAL_ERROR,
-                                        stdout_bytes,
-                                        stderr_bytes,
-                                        elapsed,
-                                        Some(format!("Failed to read generated .glb asset: {e}")),
-                                    )
-                                }
+        // Validate glTF 2.0 binary header if execution succeeded
+        if res.is_success() {
+            match read_output_file(&output_glb_path).await {
+                Ok(Some(data)) => {
+                    if data.len() >= 12 && data.starts_with(b"glTF") {
+                        let stdout_str = String::from_utf8_lossy(res.stdout.as_slice());
+                        let mut engine_label = None;
+                        for line in stdout_str.lines() {
+                            if let Some(label) = crate::gen3d::runner::parse_engine_marker(line) {
+                                engine_label = Some(label);
                             }
-                        } else if pref == "auto" {
-                            warn!("Subprocess exited 0 but output.glb missing; falling back to Tier 0 SDF");
-                            self.execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time).await
-                        } else {
-                            TaskResult::failure(
-                                self.worker_id,
-                                task.id,
-                                EXIT_CODE_GENERAL_ERROR,
-                                stdout_bytes,
-                                stderr_bytes,
-                                elapsed,
-                                Some("Subprocess succeeded but output_model.glb was not produced".to_string()),
-                            )
                         }
-                    }
-                    Ok(status) => {
-                        let code = status.code().unwrap_or(EXIT_CODE_GENERAL_ERROR);
-                        if pref == "auto" {
-                            warn!("Tier 1 engine exited with error code {code}; falling back to Tier 0 SDF");
-                            self.execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time).await
-                        } else {
-                            let last_err_line = String::from_utf8_lossy(stderr_bytes.as_slice())
-                                .lines()
-                                .map(|l| l.trim())
-                                .rfind(|l| !l.is_empty())
-                                .map(|s| s.to_string());
-
-                            let err_msg = match last_err_line {
-                                Some(line) => format!("3D engine subprocess failed with exit code {code}: {line}"),
-                                None => format!("3D engine subprocess failed with exit code {code}"),
-                            };
-
-                            TaskResult::failure(
-                                self.worker_id,
-                                task.id,
-                                code,
-                                stdout_bytes,
-                                stderr_bytes,
-                                elapsed,
-                                Some(err_msg),
-                            )
+                        res.asset_bytes = Some(Bytes::from(data));
+                        if let Some(device) = engine_label {
+                            res = res.with_device_name(device);
                         }
-                    }
-                    Err(e) => {
-                        TaskResult::failure(
+                        res.is_gpu_executed = self.capabilities.has_cuda;
+                    } else {
+                        let _ = sandbox.destroy().await;
+                        return TaskResult::failure(
                             self.worker_id,
                             task.id,
                             EXIT_CODE_GENERAL_ERROR,
-                            stdout_bytes,
-                            stderr_bytes,
-                            elapsed,
-                            Some(format!("Process wait error: {e}")),
-                        )
+                            res.stdout,
+                            res.stderr,
+                            start_time.elapsed().as_millis() as u64,
+                            Some("Generated .glb file has invalid glTF 2.0 header".to_string()),
+                        );
                     }
                 }
+                Ok(None) => {
+                    if pref == "auto" {
+                        warn!(
+                            task_id = %task.id,
+                            "Subprocess exited 0 but output_model.glb missing; falling back to Tier 0 SDF"
+                        );
+                        let _ = sandbox.destroy().await;
+                        return self
+                            .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
+                            .await;
+                    } else {
+                        let _ = sandbox.destroy().await;
+                        return TaskResult::failure(
+                            self.worker_id,
+                            task.id,
+                            EXIT_CODE_GENERAL_ERROR,
+                            res.stdout,
+                            res.stderr,
+                            start_time.elapsed().as_millis() as u64,
+                            Some(format!(
+                                "Process succeeded but expected output file '{}' was not produced",
+                                output_glb_path.display()
+                            )),
+                        );
+                    }
+                }
+                Err(e) => {
+                    let _ = sandbox.destroy().await;
+                    return TaskResult::failure(
+                        self.worker_id,
+                        task.id,
+                        EXIT_CODE_GENERAL_ERROR,
+                        res.stdout,
+                        res.stderr,
+                        start_time.elapsed().as_millis() as u64,
+                        Some(format!("Failed to read generated .glb asset: {e}")),
+                    );
+                }
             }
+        } else if pref == "auto" {
+            warn!(task_id = %task.id, "Subprocess exited {}; falling back to Tier 0 SDF", res.exit_code);
+            let _ = sandbox.destroy().await;
+            return self
+                .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
+                .await;
+        } else if res.error.as_deref().unwrap_or("").is_empty() {
+            let last_err_line = String::from_utf8_lossy(res.stderr.as_slice())
+                .lines()
+                .map(|l| l.trim())
+                .rfind(|l| !l.is_empty())
+                .map(|s| s.to_string());
 
-            cancel_msg = async {
-                if let Some(ref mut rx) = cancel_rx {
-                    rx.await.ok()
-                } else {
-                    std::future::pending().await
-                }
-            } => {
-                info!(task_id = %task.id, "Cancelling 3D engine subprocess");
-                if let Some(ref job) = job_object {
-                    let _ = job.terminate(EXIT_CODE_CANCELLED as u32);
-                } else if let Some(pid) = child.id() {
-                    Self::terminate_process_tree(pid);
-                }
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                let elapsed = start_time.elapsed().as_millis() as u64;
-                let reason = cancel_msg.unwrap_or_else(|| "Task cancelled by master".to_string());
-                TaskResult::failure(
-                    self.worker_id,
-                    task.id,
-                    EXIT_CODE_CANCELLED,
-                    Bytes::new(),
-                    Bytes::new(),
-                    elapsed,
-                    Some(format!("Cancelled: {reason}")),
-                )
-            }
-
-            _ = tokio::time::sleep(timeout) => {
-                warn!(task_id = %task.id, "3D engine subprocess timed out after {}s", timeout.as_secs());
-                if let Some(ref job) = job_object {
-                    let _ = job.terminate(EXIT_CODE_TIMEOUT as u32);
-                } else if let Some(pid) = child.id() {
-                    Self::terminate_process_tree(pid);
-                }
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                let elapsed = start_time.elapsed().as_millis() as u64;
-                let msg = format!("3D generation timed out after {}s", timeout.as_secs());
-                TaskResult::failure(
-                    self.worker_id,
-                    task.id,
-                    EXIT_CODE_TIMEOUT,
-                    Bytes::new(),
-                    msg.clone(),
-                    elapsed,
-                    Some(msg),
-                )
-            }
-        };
+            let err_msg = match last_err_line {
+                Some(line) => format!(
+                    "3D engine subprocess failed with exit code {}: {line}",
+                    res.exit_code
+                ),
+                None => format!(
+                    "3D engine subprocess failed with exit code {}",
+                    res.exit_code
+                ),
+            };
+            res.error = Some(err_msg);
+        }
 
         let _ = sandbox.destroy().await;
-        result
+        res
     }
 
     /// Direct Tier 0 Procedural Signed Distance Function mesh generator (< 50 ms)
@@ -2405,6 +2332,8 @@ impl TaskRunner {
                             .await;
                     }
                     match crate::autorig::BlenderRigProvider::execute_rigging(
+                        self,
+                        task_id,
                         &blender_bin,
                         spec_clone.input_mesh.as_bytes(),
                         &spec_clone.rig_preset,
@@ -2522,7 +2451,7 @@ impl TaskRunner {
     /// output has been drained for at most `pipe_drain_grace`: a background process that kept the
     /// output pipes open cannot turn a finished task into a timeout.
     #[allow(clippy::too_many_arguments)]
-    async fn execute_process_supervised(
+    pub(crate) async fn execute_process_supervised(
         &self,
         task_id: TaskId,
         sandbox_path: &Path,
@@ -2766,25 +2695,6 @@ impl TaskRunner {
         let _ = child.start_kill();
         let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
     }
-
-    /// Fallback process-tree terminator for subprocesses when JobObject is unavailable.
-    pub fn terminate_process_tree(pid: u32) {
-        #[cfg(windows)]
-        {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
-        #[cfg(unix)]
-        {
-            unsafe {
-                let _ = libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
-        }
-    }
 }
 
 /// Aborts the wrapped task when dropped.
@@ -2805,6 +2715,35 @@ pub(crate) fn append_note(bytes: Bytes, note: &str) -> Bytes {
     }
     combined.extend_from_slice(note.as_bytes());
     combined.freeze().into()
+}
+
+/// Reads an output file produced by a task process.
+///
+/// Verifies that the target path exists and is a regular file before reading to prevent
+/// hanging on special non-regular files (such as FIFOs, character devices, or directories).
+///
+/// Returns `Ok(Some(Vec<u8>))` if the file exists and is read successfully.
+/// Returns `Ok(None)` only if the file was not found (`ErrorKind::NotFound`).
+/// Returns `Err(io::Error)` if reading failed for any other reason (e.g. not a regular file, permission denied).
+pub(crate) async fn read_output_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let meta = match tokio::fs::metadata(path).await {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("output path is not a regular file: {}", path.display()),
+        ));
+    }
+
+    match tokio::fs::read(path).await {
+        Ok(data) => Ok(Some(data)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -3887,5 +3826,32 @@ mod process_tree_tests {
             "[unset][unset][given-on-purpose]",
             "{res:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_output_file_regular_missing_and_directory() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("model.glb");
+        let non_existent = temp_dir.path().join("missing.glb");
+        let dir_path = temp_dir.path().join("subdir");
+        tokio::fs::create_dir(&dir_path).await.expect("create dir");
+
+        // Missing file -> Ok(None)
+        let res = read_output_file(&non_existent).await.expect("read missing");
+        assert!(res.is_none());
+
+        // Regular file -> Ok(Some(data))
+        tokio::fs::write(&file_path, b"glTF test content")
+            .await
+            .expect("write file");
+        let res = read_output_file(&file_path).await.expect("read file");
+        assert_eq!(res, Some(b"glTF test content".to_vec()));
+
+        // Directory -> Err
+        let err = read_output_file(&dir_path).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("output path is not a regular file"));
     }
 }
