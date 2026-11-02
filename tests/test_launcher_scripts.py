@@ -391,30 +391,62 @@ class ShellLauncherTests(unittest.TestCase):
         self.assertNotIn(":8080", out)
 
     def test_agent_mesh_launchers_propagate_no_shell_option(self):
-        """Verifies that ubuntu and macos launchers propagate --no-shell to the agent."""
-        fake_python = os.path.join(self.repo, "fake_python")
-        with open(fake_python, "w") as f:
-            f.write('#!/bin/bash\necho "$*" >> "${FAKE_ARGS_LOG:?}"\nexit 0\n')
-        os.chmod(fake_python, 0o755)
+        """Verifies that ubuntu, macos, and termux launchers propagate --no-shell to the agent."""
+        fake_sh = (
+            "#!/bin/bash\n"
+            'if [ "$1" = "-c" ]; then\n'
+            "    exit 0\n"
+            "fi\n"
+            'echo "$*" >> "${FAKE_ARGS_LOG:?}"\n'
+            "kill -9 $PPID 2>/dev/null || true\n"
+            "exit 0\n"
+        )
+        fake_cmd = (
+            "@echo off\r\n"
+            'if "%~1"=="-c" exit /b 0\r\n'
+            'echo %* >> "%FAKE_ARGS_LOG%"\r\n'
+            "exit /b 0\r\n"
+        )
+        for name in ("python3", "python"):
+            p = os.path.join(self.repo, name)
+            with open(p, "w", newline="\n") as f:
+                f.write(fake_sh)
+            os.chmod(p, 0o755)
+
+        for name in ("python3.cmd", "python.cmd", "python3.bat", "python.bat"):
+            p = os.path.join(self.repo, name)
+            with open(p, "w", newline="\r\n") as f:
+                f.write(fake_cmd)
+
+        test_path = self.repo + os.pathsep + os.environ.get("PATH", "")
 
         # 1. Test Ubuntu launcher with OXIDE_MESH_NO_SHELL=1
         ub_script = self.copy_script("packaging/agent_mesh/ubuntu/run_agent_node.sh")
         self.run_script(
             ["bash", ub_script, "ws://127.0.0.1:8088/ws", "node-ub"],
             OXIDE_MESH_NO_SHELL="1",
-            PATH=self.repo + os.pathsep + os.environ.get("PATH", ""),
+            PATH=test_path,
         )
         lines = self.fake_args()
-        self.assertTrue(any("--no-shell" in l for l in lines), f"Ubuntu launcher did not pass --no-shell: {lines}")
+        self.assertTrue(any("node-ub" in l and "--no-shell" in l for l in lines), f"Ubuntu launcher did not pass --no-shell: {lines}")
 
         # 2. Test macOS launcher with --no-shell CLI argument
         mac_script = self.copy_script("packaging/agent_mesh/macos/run_agent_node.sh")
         self.run_script(
             ["bash", mac_script, "ws://127.0.0.1:8088/ws", "node-mac", "--no-shell"],
-            PATH=self.repo + os.pathsep + os.environ.get("PATH", ""),
+            PATH=test_path,
         )
         lines = self.fake_args()
         self.assertTrue(any("node-mac" in l and "--no-shell" in l for l in lines), f"macOS launcher did not pass --no-shell: {lines}")
+
+        # 3. Test Termux launcher with --no-shell CLI argument
+        termux_script = self.copy_script("packaging/agent_mesh/android/run_agent_node_termux.sh")
+        self.run_script(
+            ["bash", termux_script, "ws://127.0.0.1:8088/ws", "node-termux", "--no-shell"],
+            PATH=test_path,
+        )
+        lines = self.fake_args()
+        self.assertTrue(any("node-termux" in l and "--no-shell" in l for l in lines), f"Termux launcher did not pass --no-shell: {lines}")
 
 
 class StaticRepositoryChecks(unittest.TestCase):

@@ -300,7 +300,7 @@ async def run_sec6_tests():
         # ----------------------------------------------------------------------
         # Test 9: F3 Regression Check: Early Closed Output Does Not Trigger 5s Kill
         # ----------------------------------------------------------------------
-        logger.info("[Test 9] Testing F3 regression (early closed output with 2s sleep)...")
+        logger.info("[Test 9] Testing F3 regression (early closed output with 6s sleep)...")
         marker_file = os.path.join(tempfile.gettempdir(), f"sec6_f3_marker_{int(time.time()*1000)}.txt")
         if os.path.exists(marker_file):
             try:
@@ -308,17 +308,17 @@ async def run_sec6_tests():
             except Exception:
                 pass
         py_f3_code = (
-            "import sys, time; "
-            "sys.stdout.close(); sys.stderr.close(); "
-            "time.sleep(2.0); "
+            "import os, sys, time; "
+            "os.close(1); os.close(2); "
+            "time.sleep(6.0); "
             f"open(r'{marker_file}', 'w').write('f3_ok'); sys.exit(0)"
         )
         resp_f3 = await caller.send_command(
             "worker-node",
             "shell_exec",
             {"cmd": f'"{sys.executable}" -c "{py_f3_code}"'},
-            timeout_ms=5000,
-            timeout=8.0,
+            timeout_ms=9000,
+            timeout=12.0,
         )
         assert resp_f3.get("status") == "success", f"Expected success, got {resp_f3}"
         assert resp_f3.get("exit_code") == 0, f"Expected 0, got {resp_f3.get('exit_code')}"

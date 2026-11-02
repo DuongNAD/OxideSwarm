@@ -110,7 +110,7 @@ grid variables. A shared test validates that Rust and Python lists remain identi
 
 - Wire envelopes (`CommandRequest`, `CommandResponse`) are unchanged.
 - Nodes without `--no-shell` maintain existing execution capabilities.
-- Hubs inspect advertised capabilities before routing commands.
+- Hubs route commands without inspecting capabilities, and the mesh node itself inspects capabilities and refuses unauthorized commands (such as `shell_exec`).
 
 ## Security
 

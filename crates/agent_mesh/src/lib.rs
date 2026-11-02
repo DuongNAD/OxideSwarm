@@ -1,7 +1,7 @@
 //! OxideSwarm Cross-Platform Coding Agent Communication Framework
 //!
 //! Provides the core primitives, relay hub, native WebSocket client,
-//! execution sandbox, and protocol envelopes for multi-platform agent communication.
+//! command executor, and protocol envelopes for multi-platform agent communication.
 
 pub mod bridge;
 pub mod client;
