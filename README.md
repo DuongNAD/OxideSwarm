@@ -75,7 +75,7 @@ Documentation index and writing standard: [docs/README.md](docs/README.md). A ma
 | **2. Master coordinator & scheduler** | 8-state FSM (`Submitted` ➔ `Queued` ➔ `Scheduled` ➔ `Running` ➔ `Completed` / `Failed` / `Retrying` / `Cancelled`), batch-spread scheduling, fast-path recovery when a worker's socket drops (asserted below 200 ms in `tests/m2_challenger_2_stress.rs`), 10 s heartbeat reaper. | Implemented + tests |
 | **3. GPU workload routing** | Tasks that require a GPU go only to workers that **advertise** one. A worker advertises a *real* GPU only if its binary was built with `--features gpu-wgpu` **and** the compute engine started on an adapter (looked for automatically at start-up unless `--no-gpu`; `--gpu` insists and prints a warning when that is not possible); a build without wgpu advertises none. `--simulate-gpu` advertises a labelled **simulated** GPU (a CPU multiplication, for testing) and is eligible as well; the master scheduler strictly prioritizes idle hardware GPU (`wgpu`) workers over simulated GPU (`--simulate-gpu`) workers for GPU tasks. | Implemented + tests |
 | **4. Anti-stuttering backpressure** | Host CPU/RAM telemetry via `sysinfo`; above 85 % CPU (`--max-host-cpu-pct`) the master defers dispatches to that worker. | Implemented + tests |
-| **5. In-memory Map/Reduce** | Chunking, built-in `word_count` / `line_count` kernels or your own mapper/reducer. | Implemented + tests |
+| **5. In-memory Map/Reduce** | Chunking, built-in `word_count` / `line_count` / `identity` and `sum` / `count` / `max` / `min` / `concat` kernels, local script shipping (`--mapper ./map.sh`, `--reducer ./reduce.sh`), or worker commands (`--map-cmd`, `--reduce-cmd`). Design: [docs/design/0016-mapreduce-cli-script-shipping.md](docs/design/0016-mapreduce-cli-script-shipping.md). | Implemented + tests |
 | **6. Heterogeneous hardware** | macOS, Linux, Android (ARM64), and Windows (x86_64) supported. Windows binaries cross-compile (`build_windows_worker.sh`); Windows launchers run under PowerShell 5.1+ and cmd. | Hardware-verified |
 | **7. Headless Windows worker** | [windows/run_worker_silent.vbs](windows/run_worker_silent.vbs) starts a worker without console windows (it needs the master's `cluster.secret` first); [windows/status_worker.cmd](windows/status_worker.cmd) shows the real working set; [windows/stop_worker.cmd](windows/stop_worker.cmd) stops only the process it started. | Implemented + launcher tests |
 | **8. Role swapping** | [switch_role.sh](switch_role.sh) (macOS/Linux) and [windows/switch_role.cmd](windows/switch_role.cmd): stop whatever this launcher started, start the new role, wait until it is up (the macOS/Linux script also checks that a worker registered) and print the next steps. Takes a few seconds. There is **no automatic failover or election**; a person (or script) decides. | Implemented |
@@ -304,6 +304,8 @@ or `~/.oxideswarm/cluster.secret`.
 ./target/release/oxideswarm workers --master 127.0.0.1:8088
 ./target/release/oxideswarm status --master 127.0.0.1:8088 --json
 ./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --mapper word_count --reducer sum
+./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --mapper ./map.sh --reducer ./reduce.sh
+./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --map-cmd "python3 map.py" --reduce-cmd "python3 reduce.py"
 
 # Model Context Protocol (MCP) stdio server for AI coding assistants
 ./target/release/oxideswarm mcp --master 127.0.0.1:8088

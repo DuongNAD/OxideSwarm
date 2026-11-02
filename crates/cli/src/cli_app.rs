@@ -766,16 +766,32 @@ pub struct MapReduceArgs {
     #[arg(
         long,
         default_value = "word_count",
-        help = "Mapper name (e.g. word_count, uppercase) or script path"
+        conflicts_with = "map_cmd",
+        help = "Mapper built-in name (word_count, line_count, identity) or path to a local shell script"
     )]
     pub mapper: String,
 
     #[arg(
         long,
+        conflicts_with = "mapper",
+        help = "Command line to run as the mapper (receives chunk on stdin, writes key/value lines to stdout)"
+    )]
+    pub map_cmd: Option<String>,
+
+    #[arg(
+        long,
         default_value = "sum",
-        help = "Reducer name (e.g. sum, count) or script path"
+        conflicts_with = "reduce_cmd",
+        help = "Reducer built-in name (sum, count, max, min, concat) or path to a local shell script"
     )]
     pub reducer: String,
+
+    #[arg(
+        long,
+        conflicts_with = "reducer",
+        help = "Command line to run as the reducer (receives grouped JSON on stdin, writes reduced value to stdout)"
+    )]
+    pub reduce_cmd: Option<String>,
 
     #[arg(
         long,
@@ -2860,6 +2876,104 @@ async fn run_workers(
     run_status(status_args, config_file, secret_opts).await
 }
 
+const MAX_MAPREDUCE_SCRIPT_BYTES: usize = 64 * 1024;
+
+fn is_builtin_mapper(s: &str) -> bool {
+    matches!(s, "word_count" | "line_count" | "identity")
+}
+
+fn is_builtin_reducer(s: &str) -> bool {
+    matches!(s, "sum" | "count" | "max" | "min" | "concat")
+}
+
+fn looks_like_script_path(s: &str) -> bool {
+    s.contains('/') || s.contains('\\') || s.ends_with(".sh")
+}
+
+fn read_mapreduce_script(kind: &str, path_str: &str) -> Result<String, String> {
+    let path = Path::new(path_str);
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("Failed to read {kind} script '{path_str}': {e}"))?;
+    if meta.len() > MAX_MAPREDUCE_SCRIPT_BYTES as u64 {
+        return Err(format!(
+            "Failed to read {kind} script '{path_str}': script size ({} bytes) exceeds maximum inline MapReduce script size ({} bytes); use --{kind}-cmd or stage the script onto workers",
+            meta.len(),
+            MAX_MAPREDUCE_SCRIPT_BYTES
+        ));
+    }
+    let script = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {kind} script '{path_str}': {e}"))?;
+    if script.len() > MAX_MAPREDUCE_SCRIPT_BYTES {
+        return Err(format!(
+            "Failed to read {kind} script '{path_str}': script size ({} bytes) exceeds maximum inline MapReduce script size ({} bytes); use --{kind}-cmd or stage the script onto workers",
+            script.len(),
+            MAX_MAPREDUCE_SCRIPT_BYTES
+        ));
+    }
+    Ok(script)
+}
+
+fn split_command_line(cmd: &str) -> Result<(String, Vec<String>), String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut token_started = false;
+    let mut chars = cmd.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if !in_single => {
+                let should_escape = if in_double {
+                    matches!(chars.peek(), Some('"' | '\\'))
+                } else {
+                    chars.peek().is_some_and(|next| {
+                        *next == '"' || *next == '\'' || *next == '\\' || next.is_whitespace()
+                    })
+                };
+                if should_escape {
+                    if let Some(escaped_ch) = chars.next() {
+                        current.push(escaped_ch);
+                    }
+                } else {
+                    current.push('\\');
+                }
+                token_started = true;
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                token_started = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                token_started = true;
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if token_started {
+                    tokens.push(std::mem::take(&mut current));
+                    token_started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                token_started = true;
+            }
+        }
+    }
+    if in_single || in_double {
+        return Err("unclosed quote in command string".to_string());
+    }
+    if token_started {
+        tokens.push(current);
+    }
+    let mut iter = tokens.into_iter();
+    let program = iter
+        .next()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| "command cannot be empty".to_string())?;
+    Ok((program, iter.collect()))
+}
+
 async fn run_mapreduce(
     args: MapReduceArgs,
     config_file: Option<ConfigFile>,
@@ -2927,12 +3041,28 @@ async fn run_mapreduce(
         }
     }
 
-    let mapper_spec = if args.mapper.contains('/')
-        || args.mapper.contains('\\')
-        || Path::new(&args.mapper).exists()
-    {
-        MapFunctionSpec::ShellScript {
-            script: args.mapper,
+    let mapper_spec = if let Some(ref cmd) = args.map_cmd {
+        match split_command_line(cmd) {
+            Ok((program, cmd_args)) => MapFunctionSpec::Command {
+                program,
+                args: cmd_args,
+            },
+            Err(e) => {
+                eprintln!("Invalid --map-cmd '{cmd}': {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if is_builtin_mapper(&args.mapper) {
+        MapFunctionSpec::Builtin {
+            operator: args.mapper,
+        }
+    } else if looks_like_script_path(&args.mapper) {
+        match read_mapreduce_script("mapper", &args.mapper) {
+            Ok(script) => MapFunctionSpec::ShellScript { script },
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::FAILURE;
+            }
         }
     } else {
         MapFunctionSpec::Builtin {
@@ -2940,12 +3070,28 @@ async fn run_mapreduce(
         }
     };
 
-    let reducer_spec = if args.reducer.contains('/')
-        || args.reducer.contains('\\')
-        || Path::new(&args.reducer).exists()
-    {
-        ReduceFunctionSpec::ShellScript {
-            script: args.reducer,
+    let reducer_spec = if let Some(ref cmd) = args.reduce_cmd {
+        match split_command_line(cmd) {
+            Ok((program, cmd_args)) => ReduceFunctionSpec::Command {
+                program,
+                args: cmd_args,
+            },
+            Err(e) => {
+                eprintln!("Invalid --reduce-cmd '{cmd}': {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if is_builtin_reducer(&args.reducer) {
+        ReduceFunctionSpec::Builtin {
+            operator: args.reducer,
+        }
+    } else if looks_like_script_path(&args.reducer) {
+        match read_mapreduce_script("reducer", &args.reducer) {
+            Ok(script) => ReduceFunctionSpec::ShellScript { script },
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::FAILURE;
+            }
         }
     } else {
         ReduceFunctionSpec::Builtin {
