@@ -671,29 +671,27 @@ async fn test_adversarial_cancel_worker_queued_concurrency_throttle() {
     .await;
     assert!(a_running, "Task A must be Running");
 
-    // Submit Task B (multiplier allows Master to dispatch, but worker semaphore throttles it)
+    // Submit Task B: even with `core_concurrency_multiplier: 2.0`, the 1-core worker advertises
+    // `slots:1` (`max_tasks = 1`), so the Master holds Task B in `Queued` while Task A runs.
     let task_b = Task::new(
         TaskSpec::command("sleep", vec!["2.0".into()]),
         TaskRequirements::generic(1, 10),
     );
     let task_b_id = master.submit_task(task_b).await.expect("submit B");
 
-    // Wait until Task B is Scheduled on Master
-    let b_dispatched = wait_for(
-        Duration::from_secs(3),
-        Duration::from_millis(20),
-        || async {
-            if let Ok(info) = master.get_task_info(task_b_id).await {
-                info.state == TaskState::Scheduled
-            } else {
-                false
-            }
-        },
-    )
-    .await;
-    assert!(b_dispatched, "Task B must be Scheduled to worker");
+    // Allow a scheduler cycle to run and verify Task B remains `Queued` on the Master.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let b_info = master
+        .get_task_info(task_b_id)
+        .await
+        .expect("get_task_info B");
+    assert_eq!(
+        b_info.state,
+        TaskState::Queued,
+        "Task B must stay Queued on the Master while the worker's slots:1 limit is full"
+    );
 
-    // Immediately cancel Task B while it's waiting for permit on worker
+    // Cancel Task B while it is Queued behind Task A
     master.cancel_task(task_b_id).await.expect("cancel B");
 
     let res_b = master

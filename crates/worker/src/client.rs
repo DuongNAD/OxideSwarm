@@ -3708,6 +3708,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_cancel_task_stops_task_waiting_for_a_permit_and_reports_130() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = test_client(dir.path(), 1);
+        let (tx, mut rx) = mpsc::channel(32);
+
+        let running = Task::new(
+            rusty_grid_core::task::TaskSpec::command("sleep", vec!["0.5".into()]),
+            TaskRequirements::generic(1, 60),
+        );
+        let queued = Task::new(
+            rusty_grid_core::task::TaskSpec::command("sleep", vec!["30".into()]),
+            TaskRequirements::generic(1, 60),
+        );
+        let running_id = running.id;
+        let queued_id = queued.id;
+
+        client.handle_assign_task(running, tx.clone()).await;
+        wait_running(&mut rx, running_id).await;
+
+        // Assign second task while the single permit is held by `running`.
+        client.handle_assign_task(queued, tx.clone()).await;
+        assert_eq!(client.active_task_table().read().await.len(), 2);
+
+        // Cancel the permit-waiting task via `handle_cancel_task`.
+        client
+            .handle_cancel_task(queued_id, Some("cancelled while waiting for permit".into()))
+            .await;
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("cancelled permit-waiting task must report promptly")
+            .expect("channel open");
+        match msg {
+            WorkerMessage::TaskResult {
+                task_id,
+                exit_code,
+                error,
+                ..
+            } => {
+                assert_eq!(task_id, queued_id);
+                assert_eq!(exit_code, EXIT_CODE_CANCELLED);
+                assert!(
+                    error.as_deref().unwrap_or("").contains("Cancelled"),
+                    "expected Cancelled error message, got: {error:?}"
+                );
+            }
+            other => panic!("expected TaskResult for cancelled queued task, got {other:?}"),
+        }
+
+        // Wait for `running` to complete naturally, then verify permit is released and a third task runs.
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(WorkerMessage::TaskResult {
+                    task_id, exit_code, ..
+                })) if task_id == running_id => {
+                    assert_eq!(exit_code, 0);
+                    break;
+                }
+                Ok(Some(_)) => {}
+                other => panic!("running task did not finish: {other:?}"),
+            }
+        }
+
+        let follow_up = Task::new(
+            rusty_grid_core::task::TaskSpec::command("echo", vec!["permit_ok".into()]),
+            TaskRequirements::generic(1, 30),
+        );
+        let follow_id = follow_up.id;
+        client.handle_assign_task(follow_up, tx).await;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(WorkerMessage::TaskResult {
+                    task_id,
+                    exit_code,
+                    stdout,
+                    ..
+                })) if task_id == follow_id => {
+                    assert_eq!(exit_code, 0);
+                    assert!(String::from_utf8_lossy(&stdout.0).contains("permit_ok"));
+                    break;
+                }
+                Ok(Some(_)) => {}
+                other => panic!("follow_up task did not finish: {other:?}"),
+            }
+        }
+        assert_eq!(client.concurrency_semaphore().available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn test_a_leftover_sandbox_directory_does_not_fail_the_assignment() {
         let dir = tempfile::tempdir().unwrap();
         let client = test_client(dir.path(), 2);
