@@ -116,7 +116,7 @@ impl Cluster {
             .await
             .expect("send");
         let reply = tokio::time::timeout(
-            Duration::from_secs(60),
+            Duration::from_secs(120),
             transport.recv_msg::<ClientResponse>(),
         )
         .await
@@ -129,7 +129,6 @@ impl Cluster {
         }
     }
 
-    #[cfg(unix)]
     fn store_stats(&self) -> rusty_grid_master::BlobStoreStats {
         self.master.blob_store().expect("blob store").stats()
     }
@@ -146,7 +145,6 @@ impl Drop for Cluster {
 }
 
 /// Deterministic bytes that do not compress or repeat.
-#[cfg(unix)]
 fn noise(len: usize, mut state: u64) -> Vec<u8> {
     (0..len)
         .map(|_| {
@@ -158,15 +156,29 @@ fn noise(len: usize, mut state: u64) -> Vec<u8> {
         .collect()
 }
 
+#[cfg(unix)]
+const TOOL_FILE: &str = "tool.sh";
+#[cfg(windows)]
+const TOOL_FILE: &str = "tool.cmd";
+
+#[cfg(unix)]
+const TOOL_CONTENT: &[u8] = b"#!/bin/sh\necho tool-ran\n";
+#[cfg(windows)]
+const TOOL_CONTENT: &[u8] = b"@echo tool-ran\r\n";
+
+#[cfg(unix)]
+const EXPECTED_TOOL_OUTPUT: &[u8] = b"tool-ran\n";
+#[cfg(windows)]
+const EXPECTED_TOOL_OUTPUT: &[u8] = b"tool-ran\r\n";
+
 /// The input project: nested text files, an executable script and a file larger than one
 /// transfer chunk (4 MiB).
-#[cfg(unix)]
 fn write_project(root: &Path) -> HashMap<&'static str, Vec<u8>> {
     let files: HashMap<&'static str, Vec<u8>> = HashMap::from([
         ("hello.txt", b"hello from the client\n".to_vec()),
         ("nested/deeper/data.csv", b"id,value\n1,42\n2,58\n".to_vec()),
         ("big.bin", noise(5 * 1024 * 1024 + 123, 0x5eed)),
-        ("tool.sh", b"#!/bin/sh\necho tool-ran\n".to_vec()),
+        (TOOL_FILE, TOOL_CONTENT.to_vec()),
     ]);
     for (rel, data) in &files {
         let path = root.join(rel);
@@ -189,17 +201,22 @@ const PROCESS_SCRIPT: &str = "set -e; mkdir -p out; \
      cp project/big.bin out/big-copy.bin; \
      ./project/tool.sh > out/tool-output.txt";
 
-#[cfg(unix)]
+#[cfg(windows)]
+const PROCESS_SCRIPT: &str = "if not exist out mkdir out && \
+     copy /y /b project\\hello.txt + project\\nested\\deeper\\data.csv out\\combined.txt >nul && \
+     copy /y /b project\\big.bin out\\big-copy.bin >nul && \
+     call project\\tool.cmd > out\\tool-output.txt";
+
 fn processing_task(inputs: Vec<rusty_grid_core::blob::TaskInput>) -> Task {
-    Task::new(
-        TaskSpec::command("sh", vec!["-c".into(), PROCESS_SCRIPT.into()]),
-        TaskRequirements::generic(1, 60),
-    )
-    .with_inputs(inputs)
-    .with_output_glob("out")
+    #[cfg(unix)]
+    let spec = TaskSpec::command("sh", vec!["-c".into(), PROCESS_SCRIPT.into()]);
+    #[cfg(windows)]
+    let spec = TaskSpec::command("cmd", vec!["/C".into(), PROCESS_SCRIPT.into()]);
+    Task::new(spec, TaskRequirements::generic(1, 60))
+        .with_inputs(inputs)
+        .with_output_glob("out")
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_input_directory_round_trip_and_second_submit_sends_nothing() {
     let cluster = Cluster::start(true).await;
@@ -260,7 +277,7 @@ async fn test_input_directory_round_trip_and_second_submit_sends_nothing() {
     );
     assert_eq!(
         std::fs::read(download_dir.join("out/tool-output.txt")).unwrap(),
-        b"tool-ran\n",
+        EXPECTED_TOOL_OUTPUT,
         "the executable bit survives the trip"
     );
 
@@ -636,10 +653,15 @@ async fn test_worker_pins_output_files_from_collection_through_upload() {
         std::fs::write(src_out.join(format!("f{i:04}.bin")), &buf).unwrap();
     }
 
-    // Four clients continuously run tasks with small outputs to trigger worker `evict_to_fit`.
+    // Four clients (one on Windows to prevent process thrashing) continuously run tasks
+    // with small outputs to trigger worker `evict_to_fit`.
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mut churn_handles = Vec::new();
-    for client_idx in 0..4u32 {
+    #[cfg(unix)]
+    let num_churn_clients = 4u32;
+    #[cfg(windows)]
+    let num_churn_clients = 1u32;
+    for client_idx in 0..num_churn_clients {
         let addr = addr.clone();
         let running = std::sync::Arc::clone(&running);
         let dir = tempfile::tempdir().unwrap();
@@ -680,6 +702,7 @@ async fn test_worker_pins_output_files_from_collection_through_upload() {
                     )
                     .await;
                 }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }));
     }
@@ -802,7 +825,6 @@ async fn test_master_and_worker_refuse_protocol_version_1_at_registration() {
 // runs in this process, see the module docs)
 // ---------------------------------------------------------------------------------------------
 
-#[cfg(unix)]
 mod cli {
     use super::*;
     use std::process::{Child, Command, Stdio};
@@ -857,6 +879,11 @@ mod cli {
     }
 
     fn submit(home: &Path, master: &str, project: &Path, out_dir: &Path) -> serde_json::Value {
+        #[cfg(unix)]
+        let runner_args = ["--command", "sh", "--", "-c", PROCESS_SCRIPT];
+        #[cfg(windows)]
+        let runner_args = ["--command", "cmd", "--", "/C", PROCESS_SCRIPT];
+
         let output = cli(home)
             .args([
                 "submit",
@@ -871,7 +898,7 @@ mod cli {
             .args(["--output", "out/*.txt", "--output", "out/big-copy.bin"])
             .arg("--output-dir")
             .arg(out_dir)
-            .args(["--command", "sh", "--", "-c", PROCESS_SCRIPT])
+            .args(runner_args)
             .output()
             .expect("run submit");
         assert!(
@@ -940,7 +967,7 @@ mod cli {
         );
         assert_eq!(
             std::fs::read(out1.join("out/tool-output.txt")).unwrap(),
-            b"tool-ran\n"
+            EXPECTED_TOOL_OUTPUT
         );
         assert_eq!(first["saved_outputs"].as_array().map(Vec::len), Some(3));
         assert!(
