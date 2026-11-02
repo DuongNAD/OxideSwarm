@@ -799,12 +799,6 @@ fn find_oxideswarm_binary() -> std::path::PathBuf {
             return p_debug;
         }
         candidates.push(p_debug);
-
-        let p_release = base.join("release").join(exe_name);
-        if p_release.is_file() {
-            return p_release;
-        }
-        candidates.push(p_release);
     }
 
     // 4. Fallback to workspace root target directory (<root>/crates/core/../../target)
@@ -815,12 +809,6 @@ fn find_oxideswarm_binary() -> std::path::PathBuf {
             return p_debug;
         }
         candidates.push(p_debug);
-
-        let p_release = workspace_root.join("target").join("release").join(exe_name);
-        if p_release.is_file() {
-            return p_release;
-        }
-        candidates.push(p_release);
     }
 
     let mut unique_candidates: Vec<std::path::PathBuf> = Vec::new();
