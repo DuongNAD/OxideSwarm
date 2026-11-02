@@ -258,6 +258,8 @@ or `~/.oxideswarm/cluster.secret`.
 ```bash
 # Master. Default listen is 127.0.0.1:8088 (this machine only); other machines need 0.0.0.0:8088.
 ./target/release/oxideswarm master --listen 0.0.0.0:8088
+# Raise active and finished-task memory budgets (each defaults to 256 MiB):
+./target/release/oxideswarm master --listen 0.0.0.0:8088 --max-active-mb 512 --max-retained-mb 512
 # Dashboard on the LAN as well (explicit; default is loopback):
 ./target/release/oxideswarm master --listen 0.0.0.0:8088 --web-ui-addr 0.0.0.0:8080
 # Register with Tier 3 HTTP rendezvous registry:
@@ -359,8 +361,9 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_WIRE_CODEC` | Master | Serialization wire codec (`bincode` or `json`) |
 | `RUSTY_GRID_DEFAULT_RETRY_MAX` | Master | Default task retry ceiling on failure |
 | `RUSTY_GRID_MAX_RETRIES` | Master | Secondary alias for default task retry ceiling |
-| `RUSTY_GRID_MAX_RETAINED_TASKS` | Master | Maximum count of finished tasks retained in memory |
-| `RUSTY_GRID_MAX_RETAINED_MB` | Master | Maximum megabytes of finished task payloads retained |
+| `RUSTY_GRID_MAX_RETAINED_TASKS` | Master | Maximum count of finished tasks retained in memory (`--max-retained-tasks`; default 10000) |
+| `RUSTY_GRID_MAX_RETAINED_MB` | Master | Maximum megabytes of finished task payloads and output retained (`--max-retained-mb`; default 256) |
+| `RUSTY_GRID_MAX_ACTIVE_MB` | Master | Maximum megabytes of active (non-terminal) task payloads held in the queue (`--max-active-mb`; default 256) |
 | `RUSTY_GRID_BLOB_DIR` | Master | Directory of the blob store of task input and output files (`--blob-dir`; default `~/.oxideswarm/blobs`) |
 | `RUSTY_GRID_BLOB_STORE_MB` | Master | Megabytes the blob store holds before evicting least recently used files (`--blob-store-mb`; default 4096) |
 | `RUSTY_GRID_MAPREDUCE_PARALLELISM` | Master | Maximum concurrent in-flight map/reduce chunk tasks |

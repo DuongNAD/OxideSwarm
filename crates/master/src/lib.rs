@@ -28,7 +28,8 @@ pub use mapreduce::MapReduceEngine;
 pub use queue::{
     is_worker_rejection, AssignedLoad, CancelOutcome, DelayedRetryKey, QueueOrderKey, QueueStats,
     ResultDisposition, ResultOutcome, RetryAttempt, RetryPolicy, TaskEntry, TaskInfo, TaskQueue,
-    TaskState, TaskView, DEFAULT_MAX_TERMINAL_BYTES, DEFAULT_MAX_TERMINAL_TASKS,
+    TaskState, TaskView, DEFAULT_MAX_ACTIVE_BYTES, DEFAULT_MAX_TERMINAL_BYTES,
+    DEFAULT_MAX_TERMINAL_TASKS,
 };
 pub use reaper::{spawn_reaper, spawn_reaper_with_queue, ReaperConfig};
 pub use registry::{

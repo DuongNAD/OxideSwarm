@@ -2524,15 +2524,17 @@ pub fn default_codec() -> LengthDelimitedCodec {
 pub fn serialize_message<M: Serialize>(msg: &M, codec: WireCodec) -> Result<Bytes, ProtocolError> {
     match codec {
         WireCodec::Bincode => {
-            let mut buf = Vec::with_capacity(128);
-            buf.push(WIRE_FORMAT_BINCODE);
-            bincode::serialize_into(&mut buf, msg)?;
-            if buf.len() > MAX_FRAME_SIZE {
+            let payload_len = bincode::serialized_size(msg)? as usize;
+            let size = 1usize.saturating_add(payload_len);
+            if size > MAX_FRAME_SIZE {
                 return Err(ProtocolError::FrameTooLarge {
-                    size: buf.len(),
+                    size,
                     max: MAX_FRAME_SIZE,
                 });
             }
+            let mut buf = Vec::with_capacity(size);
+            buf.push(WIRE_FORMAT_BINCODE);
+            bincode::serialize_into(&mut buf, msg)?;
             Ok(Bytes::from(buf))
         }
         WireCodec::Json => {
