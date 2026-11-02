@@ -83,9 +83,14 @@ uses an OS file lock, which ends with the process. Later hooks exit at once.
   background thread, and it hung on Windows, past `--max-wait`, when stdin stayed open.
 - `get_git_info` runs git without stdin and with a limit of 20 s, so a stuck git cannot outlast
   `--max-wait`.
-- `watch --hook` writes `nodes/<self>_state.json` only when the state file is missing or older than
-  150 s, so a normal watcher (writing every 60 s) always wins while a machine with only Claude Code
-  still stays fresher than `PEER_STALE_MINUTES`.
+- `watch --hook` checks the age of `nodes/<self>_state.json` from `updated_at_utc` alone. It writes
+  the full state file only when the file is missing (leaving an existing unreadable or truncated
+  state file untouched); when `updated_at_utc` is older than 150 s (or in the future) it updates
+  only `updated_at_utc` and keeps the existing `git` block and all other fields, so a hook watcher
+  in another worktree never overwrites the active agent's branch. On a machine running only Claude
+  Code hooks (with no full `heartbeat`, `diagnose`, or non-hook `watch`), `updated_at_utc` shows
+  liveness while `git`, `lan_ip`, and `security_and_config` (the secret fingerprint) stay frozen at
+   the values from the last full write.
 
 ## Compatibility
 
@@ -135,3 +140,5 @@ claims exist yet. `scripts/agent_bridge.py` is mirrored in the hub, so that copy
 - 2026-11-01: `watch --hook` now publishes `nodes/<self>_state.json` only when the state file is
   missing or older than 150 s (`BRIDGE-2`), preventing a hook watcher in another worktree from
   overwriting the active agent watcher's state.
+- 2026-11-01: `watch --hook` now measures state age from `updated_at_utc` alone and updates only
+  `updated_at_utc` (preserving the `git` block) when refreshing an existing state file (`BRIDGE-3`).

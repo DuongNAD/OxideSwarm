@@ -117,6 +117,25 @@ const REJECT_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 pub const ENV_SECRET: &str = "OXIDESWARM_SECRET";
 /// Environment variable holding the path of a secret file.
 pub const ENV_SECRET_FILE: &str = "OXIDESWARM_SECRET_FILE";
+/// Environment variable holding the agent mesh hub token.
+pub const ENV_MESH_TOKEN: &str = "OXIDE_MESH_TOKEN";
+
+/// Sensitive environment variables stripped from task processes and capability version probes
+/// (Python and Blender) via [`probe_command`].
+///
+/// Note: system hardware and OS probes (`nvcc`, `nvidia-smi`, `sysctl`, `pmset`, `sw_vers`,
+/// `dumpsys`, `getprop`) still inherit these variables in this release.
+pub const SECRET_ENV_VARS: [&str; 3] = [ENV_SECRET, ENV_SECRET_FILE, ENV_MESH_TOKEN];
+
+/// Constructs a [`std::process::Command`] for version or capability probes,
+/// stripped of sensitive cluster authentication environment variables ([`SECRET_ENV_VARS`]).
+pub fn probe_command<P: AsRef<std::ffi::OsStr>>(program: P) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    for var in SECRET_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
 
 /// Generic REJECT reasons. Peers only ever see these exact strings.
 pub const REJECT_AUTH_FAILED: &str = "authentication failed";
@@ -1860,5 +1879,18 @@ mod tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), 16, "every connection needs its own session key");
+    }
+
+    #[test]
+    fn test_probe_command_strips_secret_env_vars() {
+        let cmd = probe_command("test-probe");
+        let envs: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        for var in SECRET_ENV_VARS {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(var)),
+                Some(&None),
+                "Variable {var} must be explicitly removed in probe_command"
+            );
+        }
     }
 }

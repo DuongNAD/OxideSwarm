@@ -75,7 +75,7 @@ Documentation index and writing standard: [docs/README.md](docs/README.md). A ma
 | **2. Master coordinator & scheduler** | 8-state FSM (`Submitted` ➔ `Queued` ➔ `Scheduled` ➔ `Running` ➔ `Completed` / `Failed` / `Retrying` / `Cancelled`), batch-spread scheduling, fast-path recovery when a worker's socket drops (asserted below 200 ms in `tests/m2_challenger_2_stress.rs`), 10 s heartbeat reaper. | Implemented + tests |
 | **3. GPU workload routing** | Tasks that require a GPU go only to workers that **advertise** one. A worker advertises a *real* GPU only if its binary was built with `--features gpu-wgpu` **and** the compute engine started on an adapter (looked for automatically at start-up unless `--no-gpu`; `--gpu` insists and prints a warning when that is not possible); a build without wgpu advertises none. `--simulate-gpu` advertises a labelled **simulated** GPU (a CPU multiplication, for testing) and is eligible as well; the master scheduler strictly prioritizes idle hardware GPU (`wgpu`) workers over simulated GPU (`--simulate-gpu`) workers for GPU tasks. | Implemented + tests |
 | **4. Anti-stuttering backpressure** | Host CPU/RAM telemetry via `sysinfo`; above 85 % CPU (`--max-host-cpu-pct`) the master defers dispatches to that worker. | Implemented + tests |
-| **5. In-memory Map/Reduce** | Chunking, built-in `word_count` / `line_count` kernels or your own mapper/reducer. | Implemented + tests |
+| **5. In-memory Map/Reduce** | Chunking, built-in `word_count` / `line_count` / `identity` and `sum` / `count` / `max` / `min` / `concat` kernels, local script shipping (`--mapper ./map.sh`, `--reducer ./reduce.sh`), or worker commands (`--map-cmd`, `--reduce-cmd`). Design: [docs/design/0016-mapreduce-cli-script-shipping.md](docs/design/0016-mapreduce-cli-script-shipping.md). | Implemented + tests |
 | **6. Heterogeneous hardware** | macOS, Linux, Android (ARM64), and Windows (x86_64) supported. Windows binaries cross-compile (`build_windows_worker.sh`); Windows launchers run under PowerShell 5.1+ and cmd. | Hardware-verified |
 | **7. Headless Windows worker** | [windows/run_worker_silent.vbs](windows/run_worker_silent.vbs) starts a worker without console windows (it needs the master's `cluster.secret` first); [windows/status_worker.cmd](windows/status_worker.cmd) shows the real working set; [windows/stop_worker.cmd](windows/stop_worker.cmd) stops only the process it started. | Implemented + launcher tests |
 | **8. Role swapping** | [switch_role.sh](switch_role.sh) (macOS/Linux) and [windows/switch_role.cmd](windows/switch_role.cmd): stop whatever this launcher started, start the new role, wait until it is up (the macOS/Linux script also checks that a worker registered) and print the next steps. Takes a few seconds. There is **no automatic failover or election**; a person (or script) decides. | Implemented |
@@ -90,7 +90,7 @@ Documentation index and writing standard: [docs/README.md](docs/README.md). A ma
 | **17. Agent Mesh ↔ Grid bridge** | `AgentGridBridge` lets `agent-mesh hub` run a Master Grid of its own (`--grid-master <ADDR>` starts an embedded master; off loopback it needs a cluster secret or `--insecure`) and routes `grid_compute` / `grid_compile` / `grid_submit` / `grid_status` envelopes to it. When unconfigured, returns `ERR_BRIDGE_NOT_CONFIGURED`. | Implemented + tests |
 | **18. Task placement & cluster check** | Workers advertise `os:` and `arch:` tags plus user tags (`worker --tag`); `submit --os`, `--arch`, `--worker`, `--require-tag` pin a task through `require:` task tags, so the wire format is unchanged. `submit --stdin-file`, `--script-file`, `--interpreter` and `--env` send input with the task; `--matrix-dim` sizes a GPU task. `oxideswarm doctor` checks connection, every worker, process start-up, every GPU and spreading. Design: [docs/design/0001-two-node-readiness.md](docs/design/0001-two-node-readiness.md). | Implemented + tests |
 | **19. Mobile coordination & battery governance** | Multi-tier throttling $C_{\text{eff}} = \min(C_{\text{bat}}, C_{\text{therm}})$, RRC adaptive keepalive (10s/25s/60s), 5-rule refusal matrix, authenticated candidate score election $S_{\text{auth}}$, cryptographic lease tickets, and pre-sleep evacuation. Design: [docs/design/0002-mobile-coordination.md](docs/design/0002-mobile-coordination.md). | Implemented + tests |
-| **20. Task input and output files** | `submit --input LOCAL[:SANDBOX]` sends files and whole directories, `--output PATTERN` (`*`, `?`, `**`) brings files back into `--output-dir`. Files move as BLAKE3-named blobs through a bounded store on the master (`~/.oxideswarm/blobs`, `master --blob-dir` / `--blob-store-mb`) in 4 MiB chunks: a client uploads only the blobs the master lacks, a worker fetches only the blobs its cache lacks (`worker --blob-cache-mb`), so an unchanged file is not sent twice. Outputs are capped per task (`worker --output-limit-mb`); `RustCompilation` returns the library or binary it built. Design: [docs/design/0006-content-addressed-data-plane.md](docs/design/0006-content-addressed-data-plane.md). The older inline staging (at most 32 MiB, used by the MCP server) is [design 0003](docs/design/0003-distributed-file-staging.md). | Implemented + tests |
+| **20. Task input and output files** | `submit --input LOCAL[:SANDBOX]` sends files and whole directories, `--output PATTERN` (`*`, `?`, `**`) brings files back into `--output-dir`. Files move as BLAKE3-named blobs through a bounded store on the master (`~/.oxideswarm/blobs`, `master --blob-dir` / `--blob-store-mb`) in 4 MiB chunks: a client uploads only the blobs the master lacks, a worker fetches only the blobs its cache lacks (`worker --blob-cache-mb`), so an unchanged file is not sent twice. Outputs are capped per task (`worker --output-limit-mb`); `RustCompilation` returns the library or binary it built. Design: [docs/design/0006-content-addressed-data-plane.md](docs/design/0006-content-addressed-data-plane.md). The older inline staging (at most 32 MiB, used by the MCP server) is [design 0003](docs/design/0003-distributed-file-staging.md). Task output validation and mandatory harvesting failure semantics are documented in [docs/design/0013-task-output-validation-and-harvesting.md](docs/design/0013-task-output-validation-and-harvesting.md). | Implemented + tests |
 | **21. Model Context Protocol (MCP) server** | Standard JSON-RPC 2.0 stdio MCP server (`oxideswarm mcp`) exposing 5 core cluster tools (`oxideswarm_status`, `oxideswarm_workers`, `oxideswarm_submit`, `oxideswarm_task_status`, `oxideswarm_cancel`) to LLM coding agents with strict stdout hygiene. Design: [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md). | Implemented + tests |
 | **22. 3D generative engine names & CPU fallback** | 3D generation tasks (`submit --prompt <PROMPT>`) default to CPU-capable procedural SDF generation and succeed on CPU-only worker nodes without requiring a GPU or `--gpu`. The `--engine` flag strictly enforces supported engines (`sdf`, `triposr`, `auto`), refusing unknown engine names with an informative error rather than silently falling back to `auto`. Design: [docs/design/0015-engine-names-and-cpu-fallback.md](docs/design/0015-engine-names-and-cpu-fallback.md). | Implemented + tests |
 
@@ -105,7 +105,7 @@ Documentation index and writing standard: [docs/README.md](docs/README.md). A ma
 | **3** | MCP server for AI agents | Completed | Standard JSON-RPC 2.0 stdio Model Context Protocol (MCP) server (`oxideswarm mcp`) exposing `oxideswarm_status`, `oxideswarm_workers`, `oxideswarm_submit`, `oxideswarm_task_status`, and `oxideswarm_cancel` tools to LLM coding agents with strict stdout transport hygiene. Documented in [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md). |
 | **4** | Real GPU scheduler preference | Completed | Master scheduler strictly prioritizes idle hardware GPU (`wgpu`) workers over simulated GPU (`--simulate-gpu`) workers for `requires_gpu` tasks, dispatching to simulated workers only when no hardware GPU is available. |
 | **5** | Android app cluster secret auth | Completed | `crates/android_bridge` exposes `nativeSetClusterSecret` and `nativeStartWorkerWithSecret` JNI exports, and Kotlin `WorkerEngine` accepts `clusterSecret` to authenticate against protected masters. |
-| **6** | Task input and output files | Partial | Files and directories move as content-addressed blobs (master store, worker cache, 4 MiB chunks, nothing sent twice; [design 0006](docs/design/0006-content-addressed-data-plane.md)). Not yet: compression, pipelined uploads from the CLI (one request in flight per connection, slow for thousands of small files over a high-latency link), `.gitignore`-aware selection (send `src` and `Cargo.toml` rather than a whole project with its `target/`), symbolic links and empty directories inside input trees, and MCP-server support (it still uses the inline staging of design 0003). |
+| **6** | Task input and output files | Partial | Files and directories move as content-addressed blobs (master store, worker cache, 4 MiB chunks, nothing sent twice; [design 0006](docs/design/0006-content-addressed-data-plane.md)). Not yet: compression, pipelined uploads from the CLI (one request in flight per connection, slow for thousands of small files over a high-latency link), `.gitignore`-aware selection (send `src` and `Cargo.toml` rather than a whole project with its `target/`), symbolic links and empty directories inside input trees, and MCP-server support (it still uses the inline staging of design 0003). Output validation, symlink rejection and mandatory harvest failure semantics are specified in [design 0013](docs/design/0013-task-output-validation-and-harvesting.md). |
 | **7** | UDP discovery on isolated subnets | Completed | 3-tier discovery fallback: Tier 1 LAN UDP beacon (:8089), Tier 2 authenticated HTTP probe (`GET /api/discovery/probe?nonce=<hex>`), Tier 3 signed rendezvous registry (`--rendezvous <URL>` / `OXIDESWARM_RENDEZVOUS`) for cross-subnet and AP isolation environments. Documented in [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md). |
 | **8** | Mid-task checkpointing | Done | See feature 14. |
 | **9** | OS child process containment | Hardened | Spawned task child processes are atomically bound to OS-level containment handles: Windows Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` with `CREATE_SUSPENDED`) and Linux `PR_SET_PDEATHSIG(SIGKILL)` guarantee child tree cleanup on worker termination. |
@@ -221,7 +221,7 @@ Start with `oxideswarm doctor --expect-workers <N>` on any machine that holds th
 | `Authentication required: ...` / `refusing to connect ... without a cluster secret` (exit code 6) | This machine has no (matching) secret. Copy `~/.oxideswarm/cluster.secret` from the master, or pass `--secret-file PATH`. `--insecure` skips the check and is only for networks you fully control. |
 | `Authentication failed` | The secrets differ, e.g. the master ran `secret generate --force`. Copy the master's file again and restart the worker. |
 | Worker logs `Connection refused` or times out | Wrong port (use the **cluster** port 8088, not the dashboard's 8080); the master listens on loopback only (the default; start it with `--listen 0.0.0.0:8088`); a firewall blocks 8088. |
-| A worker started with `--master HOST:8088` never registers and logs P2P or `Invalid P2P ticket` errors | A `p2p_ticket` sits in the config file the CLI auto-loads (`RUSTY_GRID_CONFIG`, `./rusty-grid.toml`, `~/.oxideswarm/rusty-grid.toml`) and may take precedence over `--master`. Remove that line. `connect_remote.sh` now writes `remote-worker.toml` instead and never touches `rusty-grid.toml`. |
+| A worker started with `--master HOST:8088` never registers and logs P2P or `Invalid P2P ticket` errors | A `p2p_ticket` sits in the config file the CLI auto-loads (`RUSTY_GRID_CONFIG`, `./rusty-grid.toml` or `./rusty-grid.json` — skipped by `mcp` — or `~/.oxideswarm/rusty-grid.toml`) and may take precedence over `--master`. Remove that line. `connect_remote.sh` now writes `remote-worker.toml` instead and never touches `rusty-grid.toml`. |
 | `--master auto` finds nothing | The UDP beacon (`:8089`) is not routed (Wi-Fi client isolation, another subnet, VPN) or the beacon's secret does not match. Use `HOST:8088`. |
 | Dashboard answers `401` or shows a login prompt | Paste the token from `oxideswarm secret show --dashboard-token` (on the master). A phone can only reach the dashboard if the master was started with `--web-ui-addr 0.0.0.0:8080` / `--dashboard-lan`. |
 | `Address already in use` on 8088 | Another master, or the agent-mesh hub (it also defaults to 8088). Stop it or choose another port (`OXIDESWARM_CLUSTER_PORT` for the launchers, `--listen` by hand). |
@@ -260,6 +260,8 @@ or `~/.oxideswarm/cluster.secret`.
 ```bash
 # Master. Default listen is 127.0.0.1:8088 (this machine only); other machines need 0.0.0.0:8088.
 ./target/release/oxideswarm master --listen 0.0.0.0:8088
+# Raise active and finished-task memory budgets (each defaults to 256 MiB):
+./target/release/oxideswarm master --listen 0.0.0.0:8088 --max-active-mb 512 --max-retained-mb 512
 # Dashboard on the LAN as well (explicit; default is loopback):
 ./target/release/oxideswarm master --listen 0.0.0.0:8088 --web-ui-addr 0.0.0.0:8080
 # Register with Tier 3 HTTP rendezvous registry:
@@ -278,8 +280,8 @@ or `~/.oxideswarm/cluster.secret`.
 ./target/release/oxideswarm submit --master 127.0.0.1:8088 --type gpu --gpu --wait   # routed to a worker that advertises a GPU
 
 # Input and output files: send a file or a directory, bring back what the patterns select
-# (files the master already holds are not sent again; outputs land in --output-dir at their sandbox paths)
-./target/release/oxideswarm submit --input input.dat --output results.csv --command process_data -- input.dat results.csv
+# (files the master already holds are not sent again; outputs land in --output-dir at their sandbox paths; --output-dir requires --output)
+./target/release/oxideswarm submit --input input.dat --output results.csv --output-dir out/ --command process_data -- input.dat results.csv
 ./target/release/oxideswarm submit --input ./my-crate:. --output 'target/release/my-crate' --output-dir out/ --timeout-secs 600 --command cargo -- build --release
 ./target/release/oxideswarm submit --input data/ --output 'reports/**/*.json' --type shell --script-file analyse.sh
 
@@ -308,6 +310,8 @@ or `~/.oxideswarm/cluster.secret`.
 ./target/release/oxideswarm workers --master 127.0.0.1:8088
 ./target/release/oxideswarm status --master 127.0.0.1:8088 --json
 ./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --mapper word_count --reducer sum
+./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --mapper ./map.sh --reducer ./reduce.sh
+./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --map-cmd "python3 map.py" --reduce-cmd "python3 reduce.py"
 
 # Model Context Protocol (MCP) stdio server for AI coding assistants
 ./target/release/oxideswarm mcp --master 127.0.0.1:8088
@@ -323,7 +327,7 @@ or `~/.oxideswarm/cluster.secret`.
 ```
 
 Exit code `6` means authentication failed. Remote or auto-discovered masters are refused without a secret unless
-you pass `--insecure`.
+you pass `--insecure` (`RUSTY_GRID_INSECURE=1`, or `insecure = true` under `[master]`, `[worker]`, `[submit]`, or `[status]` in `rusty-grid.toml`).
 
 ### Network Port Topology
 
@@ -365,14 +369,15 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_WIRE_CODEC` | Master | Serialization wire codec (`bincode` or `json`) |
 | `RUSTY_GRID_DEFAULT_RETRY_MAX` | Master | Default task retry ceiling on failure |
 | `RUSTY_GRID_MAX_RETRIES` | Master | Secondary alias for default task retry ceiling |
-| `RUSTY_GRID_MAX_RETAINED_TASKS` | Master | Maximum count of finished tasks retained in memory |
-| `RUSTY_GRID_MAX_RETAINED_MB` | Master | Maximum megabytes of finished task payloads retained |
+| `RUSTY_GRID_MAX_RETAINED_TASKS` | Master | Maximum count of finished tasks retained in memory (`--max-retained-tasks`; default 10000) |
+| `RUSTY_GRID_MAX_RETAINED_MB` | Master | Maximum megabytes of finished task payloads and output retained (`--max-retained-mb`; default 256) |
+| `RUSTY_GRID_MAX_ACTIVE_MB` | Master | Maximum megabytes of active (non-terminal) task payloads held in the queue (`--max-active-mb`; default 256) |
 | `RUSTY_GRID_BLOB_DIR` | Master | Directory of the blob store of task input and output files (`--blob-dir`; default `~/.oxideswarm/blobs`) |
 | `RUSTY_GRID_BLOB_STORE_MB` | Master | Megabytes the blob store holds before evicting least recently used files (`--blob-store-mb`; default 4096) |
 | `RUSTY_GRID_MAPREDUCE_PARALLELISM` | Master | Maximum concurrent in-flight map/reduce chunk tasks |
 | `RUSTY_GRID_MAX_CONNECTIONS` | Master | Maximum concurrent TCP connections allowed on grid port |
 | `RUSTY_GRID_MAX_PENDING_HANDSHAKES` | Master | Maximum connections permitted in pre-auth handshake state |
-| `RUSTY_GRID_INSECURE` | Master | Allows coordinator to bind non-loopback without requiring cluster secret |
+| `RUSTY_GRID_INSECURE` | Master, Worker, CLI & MCP | Allows the master to bind non-loopback or a worker, client, or `mcp` server to connect to a remote or auto-discovered master without a cluster secret |
 | `RUSTY_GRID_DASHBOARD_PORT` | Master | HTTP listener port for embedded web dashboard |
 | `OXIDE_SWARM_DASHBOARD_PORT` | Master | Alternative alias for dashboard HTTP port |
 | `RUSTY_GRID_DASHBOARD_PORT_FILE` | Master | File path where bound dashboard HTTP port is written |

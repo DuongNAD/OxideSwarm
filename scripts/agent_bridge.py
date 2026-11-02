@@ -764,30 +764,34 @@ def deliver_event(event, args):
 
 
 def state_is_fresh_for_hook(path):
-    """True when `nodes/<self>_state.json` exists and is at most HOOK_STATE_MAX_AGE_SECS old."""
-    try:
-        if time.time() - os.path.getmtime(path) > HOOK_STATE_MAX_AGE_SECS:
-            return False
-    except OSError:
-        return False
+    """True when `nodes/<self>_state.json` has an `updated_at_utc` between 0 and HOOK_STATE_MAX_AGE_SECS old."""
     existing = safe_read_json(path)
-    if isinstance(existing, dict) and "updated_at_utc" in existing:
-        try:
-            seen = datetime.datetime.strptime(existing["updated_at_utc"], "%Y-%m-%dT%H:%M:%SZ")
-            age = (datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - seen).total_seconds()
-            if age > HOOK_STATE_MAX_AGE_SECS:
-                return False
-        except (ValueError, TypeError):
-            return False
-    return True
+    if not isinstance(existing, dict) or "updated_at_utc" not in existing:
+        return False
+    try:
+        seen = datetime.datetime.strptime(existing["updated_at_utc"], "%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, TypeError):
+        return False
+    age = (datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - seen).total_seconds()
+    return 0 <= age <= HOOK_STATE_MAX_AGE_SECS
 
 
 def refresh_heartbeat(hub_dir, repo_dir, args, last_peer_head):
     """Publishes this node's state and reports a new peer commit. Returns the peer commit it saw."""
     out_path = os.path.join(hub_dir, "nodes", f"{SELF_SHORT}_state.json")
-    if args.hook and state_is_fresh_for_hook(out_path):
-        return last_peer_head
-    state = collect_state(repo_dir)
+    if args.hook:
+        if state_is_fresh_for_hook(out_path):
+            return last_peer_head
+        if os.path.exists(out_path):
+            existing = safe_read_json(out_path)
+            if not isinstance(existing, dict):
+                return last_peer_head
+            existing["updated_at_utc"] = utc_now_iso()
+            state = existing
+        else:
+            state = collect_state(repo_dir)
+    else:
+        state = collect_state(repo_dir)
     atomic_write(out_path, json.dumps(state, indent=2, ensure_ascii=False) + "\n")
 
     peer_state = safe_read_json(os.path.join(hub_dir, "nodes", f"{PEER_SHORT}_state.json"))

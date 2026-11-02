@@ -82,23 +82,14 @@ async fn test_cache_deduplication_and_hardlink_acceleration() {
         .await
         .expect("stage files task 1");
 
-    let cache_obj_a = objects_dir.join(&sha256_a_hex);
-    assert!(
-        cache_obj_a.exists(),
-        "Cache object must exist at <sandbox_base>/cache/objects/<sha256>"
-    );
-    let cached_bytes = tokio::fs::read(&cache_obj_a)
-        .await
-        .expect("read cached object A");
-    assert_eq!(cached_bytes, content_a);
-
     let staged_file_1 = sandbox_1.path().join("models").join("weights.bin");
     assert!(
         staged_file_1.exists(),
         "Staged file must exist in sandbox 1"
     );
+    assert_eq!(tokio::fs::read(&staged_file_1).await.unwrap(), content_a);
 
-    // --- Task 2: Consecutive staging with identical content reuses cache ---
+    // --- Task 2: Consecutive staging with identical content gets an independent copy ---
     let task_id_2 = TaskId::new();
     let sandbox_2 = Sandbox::create(&sb_cfg, task_id_2)
         .await
@@ -118,28 +109,18 @@ async fn test_cache_deduplication_and_hardlink_acceleration() {
         .expect("read staged file 2");
     assert_eq!(read_file_2, content_a);
 
-    // Verify hardlink or copy fallback:
-    // If the filesystem supports hardlinks, the link count of the cache object should be >= 2.
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::metadata(&cache_obj_a).expect("metadata of cache obj");
-        if meta.nlink() >= 2 {
-            println!(
-                "Confirmed hardlink deduplication on Unix (nlink = {})",
-                meta.nlink()
-            );
-        }
+        assert_eq!(std::fs::metadata(&staged_file_1).unwrap().nlink(), 1);
+        assert_eq!(std::fs::metadata(&staged_file_2).unwrap().nlink(), 1);
     }
-    #[cfg(windows)]
-    {
-        // On Windows, verify cache object metadata exists and matches expected size
-        if let Ok(meta) = std::fs::metadata(&cache_obj_a) {
-            assert_eq!(meta.len(), content_a.len() as u64);
-        }
-    }
+    assert!(
+        !objects_dir.exists(),
+        "Inline stage_files must not create shared cache/objects"
+    );
 
-    // --- Task 3: Modified content produces distinct SHA-256 and separate cache entry ---
+    // --- Task 3: Modified content produces distinct SHA-256 and independent sandbox file ---
     let content_b = b"OXIDE_SWARM_IMMUTABLE_MODEL_WEIGHTS_V2_MUTATED_DATA";
     let sha256_b = sha256_digest(content_b);
     let sha256_b_hex = hex_encode(&sha256_b);
@@ -163,21 +144,9 @@ async fn test_cache_deduplication_and_hardlink_acceleration() {
         .await
         .expect("stage files task 3");
 
-    let cache_obj_b = objects_dir.join(&sha256_b_hex);
-    assert!(
-        cache_obj_b.exists(),
-        "Mutated content must create a distinct cache entry at <sandbox_base>/cache/objects/<sha256_b>"
-    );
-    let cached_bytes_b = tokio::fs::read(&cache_obj_b)
-        .await
-        .expect("read cached object B");
-    assert_eq!(cached_bytes_b, content_b);
-
-    // Verify object A remains untouched and uncorrupted
-    let cached_bytes_a_after = tokio::fs::read(&cache_obj_a)
-        .await
-        .expect("read cached object A after B");
-    assert_eq!(cached_bytes_a_after, content_a);
+    let staged_file_3 = sandbox_3.path().join("models").join("weights.bin");
+    assert_eq!(tokio::fs::read(&staged_file_3).await.unwrap(), content_b);
+    assert_eq!(tokio::fs::read(&staged_file_1).await.unwrap(), content_a);
 }
 
 #[tokio::test]
@@ -209,6 +178,11 @@ async fn test_concurrent_cache_staging_race_conditions() {
             let target = sandbox.path().join("shared.dat");
             let read_back = tokio::fs::read(&target).await.expect("read back file");
             assert_eq!(read_back, content);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(std::fs::metadata(&target).unwrap().nlink(), 1);
+            }
             i
         });
         handles.push(handle);
@@ -219,12 +193,7 @@ async fn test_concurrent_cache_staging_race_conditions() {
         assert!(i < 10);
     }
 
-    // Verify cache object exists and is intact
-    let sha256_hex = hex_encode(&sha256_digest(content));
-    let cache_obj = cache_dir.join("objects").join(&sha256_hex);
-    assert!(cache_obj.exists());
-    let cached_content = tokio::fs::read(&cache_obj).await.expect("read cache obj");
-    assert_eq!(cached_content, content);
+    assert!(!cache_dir.join("objects").exists());
 }
 
 // ============================================================================
@@ -266,18 +235,18 @@ async fn test_symlink_escape_prevention_in_harvest() {
 
     if symlink_created {
         // Symlink was created: harvest_output_artifacts MUST detect and reject it!
-        let collected = runner
+        let res = runner
             .harvest_output_artifacts(
                 &sandbox,
                 &["stolen_secret.pem".to_string()],
                 sandbox.task_id(),
+                false,
             )
             .await;
 
-        assert_eq!(
-            collected.len(),
-            0,
-            "Security vulnerability: harvest_output_artifacts harvested an external symlink!"
+        assert!(
+            res.is_err(),
+            "Security vulnerability: harvest_output_artifacts must fail on external symlink!"
         );
     } else {
         println!(
@@ -297,15 +266,35 @@ async fn test_symlink_escape_prevention_in_harvest() {
         "data:stream.txt".to_string(),
     ];
 
-    let collected_traversal = runner
-        .harvest_output_artifacts(&sandbox, &adversarial_traversal_paths, sandbox.task_id())
-        .await;
+    for bad_path in &adversarial_traversal_paths {
+        let res = runner
+            .harvest_output_artifacts(
+                &sandbox,
+                std::slice::from_ref(bad_path),
+                sandbox.task_id(),
+                false,
+            )
+            .await;
 
-    assert_eq!(
-        collected_traversal.len(),
-        0,
-        "All path traversal attempts in expected_outputs must be rejected"
-    );
+        match res {
+            Ok(collected) => {
+                panic!(
+                    "Security vulnerability: harvest_output_artifacts must reject hostile path '{bad_path}', but collected {} files!",
+                    collected.len()
+                );
+            }
+            Err(err) => {
+                assert!(
+                    err.contains("resolves outside sandbox root"),
+                    "Refusal error for '{bad_path}' must explicitly indicate resolution outside sandbox root, got: {err}"
+                );
+                assert!(
+                    !err.contains("did not produce"),
+                    "Hostile path '{bad_path}' was incorrectly treated as a missing produced file: {err}"
+                );
+            }
+        }
+    }
 
     // 4. Verify legitimate regular file is still harvested correctly
     let legit_path = sandbox.path().join("results.json");
@@ -313,10 +302,16 @@ async fn test_symlink_escape_prevention_in_harvest() {
         .await
         .expect("write legit output");
 
-    let collected_legit = runner
-        .harvest_output_artifacts(&sandbox, &["results.json".to_string()], sandbox.task_id())
+    let res_legit = runner
+        .harvest_output_artifacts(
+            &sandbox,
+            &["results.json".to_string()],
+            sandbox.task_id(),
+            false,
+        )
         .await;
 
+    let collected_legit = res_legit.expect("legit output harvesting should succeed");
     assert_eq!(collected_legit.len(), 1);
     assert_eq!(collected_legit[0].path, "results.json");
     assert_eq!(collected_legit[0].data.as_bytes(), b"{\"computation\": 42}");
@@ -592,7 +587,13 @@ async fn test_master_queue_lru_retention_accounting_and_eviction() {
     //    Each task with a 30 KiB staged file + 10 KiB artifact charges > 40 KiB.
     //    Thus, two completed tasks exceed 60 KiB, forcing the oldest to be evicted!
     let budget_bytes = 60 * 1024;
-    let queue = TaskQueue::with_retention_limits(RetryPolicy::default(), None, 1000, budget_bytes);
+    let queue = TaskQueue::with_retention_limits(
+        RetryPolicy::default(),
+        None,
+        1000,
+        budget_bytes,
+        rusty_grid_master::DEFAULT_MAX_ACTIVE_BYTES,
+    );
     let worker_id = Uuid::new_v4();
 
     // Task 1: Staged file (25 KB) + Artifact (15 KB) => ~41 KB
@@ -743,6 +744,7 @@ async fn test_active_tasks_never_evicted_by_terminal_budget() {
         None,
         1, // only 1 terminal task retained
         1000,
+        rusty_grid_master::DEFAULT_MAX_ACTIVE_BYTES,
     );
     let worker_id = Uuid::new_v4();
 
