@@ -18,9 +18,11 @@
 //! 3. Output path boundary conditions:
 //!    - Deeply nested non-existent directory tree (auto-creation validation)
 
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::process::Command;
 use tokio::sync::watch;
 
 use rusty_grid_cli::cli_app::{run_submit, validate_glb_header, SubmitArgs};
@@ -494,90 +496,35 @@ async fn test_cli_malicious_image_and_prompt_inputs() {
 // 3. Output Path Boundary Conditions: Deeply Nested Directory Creation
 // =========================================================================
 
-static TEST_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+const BIN: &str = env!("CARGO_BIN_EXE_rusty-grid");
 
-#[allow(dead_code)]
-struct TestEnvGuard {
-    _lock: tokio::sync::MutexGuard<'static, ()>,
-    temp_dir: TempDir,
-    orig_home: Option<std::ffi::OsString>,
-    orig_userprofile: Option<std::ffi::OsString>,
-    orig_oxideswarm_home: Option<std::ffi::OsString>,
-    orig_secret: Option<std::ffi::OsString>,
-    orig_secret_file: Option<std::ffi::OsString>,
-    orig_config: Option<std::ffi::OsString>,
+fn cli_command(home: &Path) -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("OXIDESWARM_HOME", home.join(".oxideswarm"))
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_SECRET")
+        .env_remove("RUSTY_GRID_CONFIG")
+        .env_remove("RUSTY_GRID_MASTER")
+        .env_remove("RUSTY_GRID_MASTER_ADDR")
+        .env_remove("RUSTY_GRID_INSECURE")
+        .env_remove("RUSTY_GRID_WORKER_NAME")
+        .env_remove("RUSTY_GRID_NAME")
+        .env_remove("RUSTY_GRID_WORKER_ID_FILE")
+        .env("RUSTY_GRID_DISABLE_DISCOVERY", "1")
+        .env("RUSTY_GRID_DISABLE_WEB_UI", "1")
+        .env("NO_COLOR", "1")
+        .current_dir(home);
+    cmd
 }
 
-#[allow(dead_code)]
-impl TestEnvGuard {
-    async fn isolate() -> Self {
-        let lock = TEST_ENV_MUTEX.lock().await;
-        let temp_dir = TempDir::new().expect("create test temp dir");
-        let orig_home = std::env::var_os("HOME");
-        let orig_userprofile = std::env::var_os("USERPROFILE");
-        let orig_oxideswarm_home = std::env::var_os("OXIDESWARM_HOME");
-        let orig_secret = std::env::var_os("OXIDESWARM_SECRET");
-        let orig_secret_file = std::env::var_os("OXIDESWARM_SECRET_FILE");
-        let orig_config = std::env::var_os("RUSTY_GRID_CONFIG");
-
-        std::env::set_var("HOME", temp_dir.path());
-        std::env::set_var("USERPROFILE", temp_dir.path());
-        std::env::set_var("OXIDESWARM_HOME", temp_dir.path().join(".oxideswarm"));
-        std::env::remove_var("OXIDESWARM_SECRET");
-        std::env::remove_var("OXIDESWARM_SECRET_FILE");
-        std::env::remove_var("RUSTY_GRID_CONFIG");
-
-        Self {
-            _lock: lock,
-            temp_dir,
-            orig_home,
-            orig_userprofile,
-            orig_oxideswarm_home,
-            orig_secret,
-            orig_secret_file,
-            orig_config,
-        }
-    }
-
-    fn path(&self) -> &std::path::Path {
-        self.temp_dir.path()
-    }
-}
-
-impl Drop for TestEnvGuard {
-    fn drop(&mut self) {
-        match &self.orig_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match &self.orig_userprofile {
-            Some(v) => std::env::set_var("USERPROFILE", v),
-            None => std::env::remove_var("USERPROFILE"),
-        }
-        match &self.orig_oxideswarm_home {
-            Some(v) => std::env::set_var("OXIDESWARM_HOME", v),
-            None => std::env::remove_var("OXIDESWARM_HOME"),
-        }
-        match &self.orig_secret {
-            Some(v) => std::env::set_var("OXIDESWARM_SECRET", v),
-            None => std::env::remove_var("OXIDESWARM_SECRET"),
-        }
-        match &self.orig_secret_file {
-            Some(v) => std::env::set_var("OXIDESWARM_SECRET_FILE", v),
-            None => std::env::remove_var("OXIDESWARM_SECRET_FILE"),
-        }
-        match &self.orig_config {
-            Some(v) => std::env::set_var("RUSTY_GRID_CONFIG", v),
-            None => std::env::remove_var("RUSTY_GRID_CONFIG"),
-        }
-    }
-}
-
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_cli_deeply_nested_output_directory_creation() {
-    let env_guard = TestEnvGuard::isolate().await;
+    let temp_home = TempDir::new().expect("create test temp dir");
     // Deeply nested non-existent directory path
-    let deeply_nested_out = env_guard
+    let deeply_nested_out = temp_home
         .path()
         .join("level1")
         .join("level2")
@@ -613,38 +560,32 @@ async fn test_cli_deeply_nested_output_directory_creation() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // 3. Submit 3D task with deeply nested output path
-    let args = SubmitArgs {
-        master: Some(master_addr.to_string()),
-        task_type: "3d".to_string(),
-        command: None,
-        cores: 1,
-        ram_mb: 0,
-        gpu: false,
-        timeout_secs: 30,
-        max_retries: None,
-        wait: true,
-        json: true,
-        prompt: Some("an obsidian monolith".to_string()),
-        image: None,
-        quality: Some("fast".to_string()),
-        engine: Some("sdf".to_string()),
-        export_texture: true,
-        no_export_texture: false,
-        input_mesh: None,
-        rig_preset: None,
-        embed_animations: Vec::new(),
-        preferred_provider: None,
-        output: Some(deeply_nested_out.clone()),
-        args: Vec::new(),
-        ..Default::default()
-    };
+    // 3. Submit 3D task with deeply nested output path via spawned CLI binary
+    let output = cli_command(temp_home.path())
+        .arg("submit")
+        .arg("--master")
+        .arg(master_addr.to_string())
+        .arg("--type")
+        .arg("3d")
+        .arg("--prompt")
+        .arg("an obsidian monolith")
+        .arg("--quality")
+        .arg("fast")
+        .arg("--engine")
+        .arg("sdf")
+        .arg("--export-texture")
+        .arg("--wait")
+        .arg("--json")
+        .arg("-o")
+        .arg(&deeply_nested_out)
+        .output()
+        .await
+        .expect("spawn submit command");
 
-    let exit_code = run_submit(args, None).await;
-    assert_eq!(
-        exit_code,
-        ExitCode::SUCCESS,
-        "Task submission and export must succeed"
+    assert!(
+        output.status.success(),
+        "Task submission and export must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 
     // 4. Verify deeply nested parent dirs were created and file exists

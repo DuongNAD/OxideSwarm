@@ -741,6 +741,7 @@ fn isolate_command(cmd: &mut std::process::Command, home: &std::path::Path) {
         .env("USERPROFILE", home)
         .env("OXIDESWARM_HOME", home.join(".oxideswarm"))
         .env_remove("OXIDESWARM_SECRET")
+        .env_remove("RUSTY_GRID_SECRET")
         .env_remove("OXIDESWARM_SECRET_FILE")
         .env_remove("RUSTY_GRID_CONFIG")
         .env_remove("RUSTY_GRID_MASTER")
@@ -752,6 +753,95 @@ fn isolate_command(cmd: &mut std::process::Command, home: &std::path::Path) {
         .current_dir(home);
 }
 
+/// Locates the `oxideswarm` binary across candidate directories (CARGO_BIN_EXE,
+/// active test target dir, CARGO_TARGET_DIR, workspace root). Panics with diagnostic
+/// instructions if the binary cannot be found.
+fn find_oxideswarm_binary() -> std::path::PathBuf {
+    #[cfg(windows)]
+    let exe_name = "oxideswarm.exe";
+    #[cfg(not(windows))]
+    let exe_name = "oxideswarm";
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    // 1. Explicit environment variable (CARGO_BIN_EXE_oxideswarm)
+    if let Ok(val) = std::env::var("CARGO_BIN_EXE_oxideswarm") {
+        let p = std::path::PathBuf::from(val);
+        if p.is_file() {
+            return p;
+        }
+        candidates.push(p);
+    }
+
+    // 2. Relative to current test executable (target/[triple/]debug/deps/... -> target/[triple/]debug/...)
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(deps_dir) = current_exe.parent() {
+            if let Some(target_dir) = deps_dir.parent() {
+                let p = target_dir.join(exe_name);
+                if p.is_file() {
+                    return p;
+                }
+                candidates.push(p);
+            }
+            let p = deps_dir.join(exe_name);
+            if p.is_file() {
+                return p;
+            }
+            candidates.push(p);
+        }
+    }
+
+    // 3. CARGO_TARGET_DIR environment variable
+    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+        let base = std::path::PathBuf::from(target_dir);
+        let p_debug = base.join("debug").join(exe_name);
+        if p_debug.is_file() {
+            return p_debug;
+        }
+        candidates.push(p_debug);
+
+        let p_release = base.join("release").join(exe_name);
+        if p_release.is_file() {
+            return p_release;
+        }
+        candidates.push(p_release);
+    }
+
+    // 4. Fallback to workspace root target directory (<root>/crates/core/../../target)
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Some(workspace_root) = manifest_dir.parent().and_then(|p| p.parent()) {
+        let p_debug = workspace_root.join("target").join("debug").join(exe_name);
+        if p_debug.is_file() {
+            return p_debug;
+        }
+        candidates.push(p_debug);
+
+        let p_release = workspace_root.join("target").join("release").join(exe_name);
+        if p_release.is_file() {
+            return p_release;
+        }
+        candidates.push(p_release);
+    }
+
+    let mut unique_candidates: Vec<std::path::PathBuf> = Vec::new();
+    for c in candidates {
+        if !unique_candidates.contains(&c) {
+            unique_candidates.push(c);
+        }
+    }
+
+    let candidate_list = unique_candidates
+        .iter()
+        .map(|p| format!("  - {}", p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    panic!(
+        "OxideSwarm binary ('{exe_name}') not found at candidate paths:\n{candidate_list}\n\
+         Run 'cargo build --bin oxideswarm' before running this test."
+    );
+}
+
 #[tokio::test]
 async fn test_cli_e2e_conflicting_flags_no_gpu_wire_domination() {
     // 1. Bind an ephemeral TCP listener representing MasterServer
@@ -760,25 +850,8 @@ async fn test_cli_e2e_conflicting_flags_no_gpu_wire_domination() {
         .expect("Failed to bind ephemeral master listener");
     let master_addr = listener.local_addr().expect("Failed to get local addr");
 
-    // 2. Locate target/debug/oxideswarm.exe binary
-    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = manifest_dir
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("target")
-        .join("debug");
-
-    #[cfg(windows)]
-    let bin_path = target_dir.join("oxideswarm.exe");
-    #[cfg(not(windows))]
-    let bin_path = target_dir.join("oxideswarm");
-
-    if !bin_path.is_file() {
-        eprintln!("Binary not found at {:?}, skipping e2e CLI test", bin_path);
-        return;
-    }
+    // 2. Locate oxideswarm binary (panics if not found)
+    let bin_path = find_oxideswarm_binary();
 
     // 3. Spawn oxideswarm worker with conflicting flags: --no-gpu alongside --cuda and --vram-mb 16000
     let temp_dir = tempfile::TempDir::new().expect("create isolated test home");
@@ -874,24 +947,8 @@ async fn test_cli_e2e_conflicting_flags_no_blender_wire_domination() {
         .expect("Failed to bind ephemeral master listener");
     let master_addr = listener.local_addr().expect("Failed to get local addr");
 
-    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = manifest_dir
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("target")
-        .join("debug");
-
-    #[cfg(windows)]
-    let bin_path = target_dir.join("oxideswarm.exe");
-    #[cfg(not(windows))]
-    let bin_path = target_dir.join("oxideswarm");
-
-    if !bin_path.is_file() {
-        eprintln!("Binary not found at {:?}, skipping e2e CLI test", bin_path);
-        return;
-    }
+    // Locate oxideswarm binary (panics if not found)
+    let bin_path = find_oxideswarm_binary();
 
     // Spawn with --no-blender alongside --blender-path and --blender-version
     let temp_dir = tempfile::TempDir::new().expect("create isolated test home");
