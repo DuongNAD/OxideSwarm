@@ -903,6 +903,28 @@ async fn test_anonymous_rendezvous_lease_response_has_no_ticket() {
         "redacting p2p_ticket must keep the lease HMAC valid"
     );
 
+    // Request with a wrong token is treated as unauthenticated: p2p_ticket stays redacted.
+    let wrong_resp = client
+        .get(format!("{base}/api/rendezvous/master"))
+        .bearer_auth("wrong-dashboard-token")
+        .send()
+        .await
+        .expect("wrong-token get lease");
+    assert_eq!(wrong_resp.status(), StatusCode::OK);
+    let wrong_body = wrong_resp.text().await.expect("wrong-token lease body");
+    assert!(
+        !wrong_body.contains("p2p_ticket")
+            && !wrong_body.contains("iroh-ticket-should-be-redacted"),
+        "wrong-token lease JSON must not expose p2p_ticket: {wrong_body}"
+    );
+    let parsed_wrong: rusty_grid_core::discovery::RendezvousLease =
+        serde_json::from_str(&wrong_body).expect("deserialize wrong-token lease");
+    assert_eq!(parsed_wrong.p2p_ticket, None);
+    assert!(
+        parsed_wrong.verify(&secret, 30),
+        "redacting p2p_ticket for wrong-token caller must keep the lease HMAC valid"
+    );
+
     // Authenticated read with a valid token keeps p2p_ticket.
     let auth_resp = client
         .get(format!("{base}/api/rendezvous/master"))

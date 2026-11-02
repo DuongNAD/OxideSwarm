@@ -219,7 +219,7 @@ Start with `oxideswarm doctor --expect-workers <N>` on any machine that holds th
 | `Authentication required: ...` / `refusing to connect ... without a cluster secret` (exit code 6) | This machine has no (matching) secret. Copy `~/.oxideswarm/cluster.secret` from the master, or pass `--secret-file PATH`. `--insecure` skips the check and is only for networks you fully control. |
 | `Authentication failed` | The secrets differ, e.g. the master ran `secret generate --force`. Copy the master's file again and restart the worker. |
 | Worker logs `Connection refused` or times out | Wrong port (use the **cluster** port 8088, not the dashboard's 8080); the master listens on loopback only (the default; start it with `--listen 0.0.0.0:8088`); a firewall blocks 8088. |
-| A worker started with `--master HOST:8088` never registers and logs P2P or `Invalid P2P ticket` errors | A `p2p_ticket` sits in the config file the CLI auto-loads (`RUSTY_GRID_CONFIG`, `./rusty-grid.toml`, `~/.oxideswarm/rusty-grid.toml`) and may take precedence over `--master`. Remove that line. `connect_remote.sh` now writes `remote-worker.toml` instead and never touches `rusty-grid.toml`. |
+| A worker started with `--master HOST:8088` never registers and logs P2P or `Invalid P2P ticket` errors | A `p2p_ticket` sits in the config file the CLI auto-loads (`RUSTY_GRID_CONFIG`, `./rusty-grid.toml` or `./rusty-grid.json` — skipped by `mcp` — or `~/.oxideswarm/rusty-grid.toml`) and may take precedence over `--master`. Remove that line. `connect_remote.sh` now writes `remote-worker.toml` instead and never touches `rusty-grid.toml`. |
 | `--master auto` finds nothing | The UDP beacon (`:8089`) is not routed (Wi-Fi client isolation, another subnet, VPN) or the beacon's secret does not match. Use `HOST:8088`. |
 | Dashboard answers `401` or shows a login prompt | Paste the token from `oxideswarm secret show --dashboard-token` (on the master). A phone can only reach the dashboard if the master was started with `--web-ui-addr 0.0.0.0:8080` / `--dashboard-lan`. |
 | `Address already in use` on 8088 | Another master, or the agent-mesh hub (it also defaults to 8088). Stop it or choose another port (`OXIDESWARM_CLUSTER_PORT` for the launchers, `--listen` by hand). |
@@ -321,7 +321,7 @@ or `~/.oxideswarm/cluster.secret`.
 ```
 
 Exit code `6` means authentication failed. Remote or auto-discovered masters are refused without a secret unless
-you pass `--insecure` (`RUSTY_GRID_INSECURE=1` or `insecure = true` in `rusty-grid.toml`).
+you pass `--insecure` (`RUSTY_GRID_INSECURE=1`, or `insecure = true` under `[master]`, `[worker]`, `[submit]`, or `[status]` in `rusty-grid.toml`).
 
 ### Network Port Topology
 
