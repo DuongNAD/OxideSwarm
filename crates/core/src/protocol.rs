@@ -2080,6 +2080,8 @@ pub enum ClientResponse {
         running_tasks: usize,
         completed_tasks: usize,
         failed_tasks: usize,
+        active_bytes: usize,
+        max_active_bytes: usize,
         workers: Vec<WorkerCapabilities>,
     },
     WorkerList {
@@ -2128,6 +2130,10 @@ enum HumanClientResponse {
         running_tasks: usize,
         completed_tasks: usize,
         failed_tasks: usize,
+        #[serde(default)]
+        active_bytes: usize,
+        #[serde(default)]
+        max_active_bytes: usize,
         workers: Vec<WorkerCapabilities>,
     },
     WorkerList {
@@ -2175,6 +2181,8 @@ enum BinaryClientResponse {
         running_tasks: usize,
         completed_tasks: usize,
         failed_tasks: usize,
+        active_bytes: usize,
+        max_active_bytes: usize,
         workers: Vec<WorkerCapabilities>,
     },
     WorkerList {
@@ -2227,6 +2235,8 @@ impl From<ClientResponse> for HumanClientResponse {
                 running_tasks,
                 completed_tasks,
                 failed_tasks,
+                active_bytes,
+                max_active_bytes,
                 workers,
             } => HumanClientResponse::ClusterStatus {
                 total_tasks,
@@ -2234,6 +2244,8 @@ impl From<ClientResponse> for HumanClientResponse {
                 running_tasks,
                 completed_tasks,
                 failed_tasks,
+                active_bytes,
+                max_active_bytes,
                 workers,
             },
             ClientResponse::WorkerList { workers } => HumanClientResponse::WorkerList { workers },
@@ -2280,6 +2292,8 @@ impl From<HumanClientResponse> for ClientResponse {
                 running_tasks,
                 completed_tasks,
                 failed_tasks,
+                active_bytes,
+                max_active_bytes,
                 workers,
             } => ClientResponse::ClusterStatus {
                 total_tasks,
@@ -2287,6 +2301,8 @@ impl From<HumanClientResponse> for ClientResponse {
                 running_tasks,
                 completed_tasks,
                 failed_tasks,
+                active_bytes,
+                max_active_bytes,
                 workers,
             },
             HumanClientResponse::WorkerList { workers } => ClientResponse::WorkerList { workers },
@@ -2333,6 +2349,8 @@ impl From<ClientResponse> for BinaryClientResponse {
                 running_tasks,
                 completed_tasks,
                 failed_tasks,
+                active_bytes,
+                max_active_bytes,
                 workers,
             } => BinaryClientResponse::ClusterStatus {
                 total_tasks,
@@ -2340,6 +2358,8 @@ impl From<ClientResponse> for BinaryClientResponse {
                 running_tasks,
                 completed_tasks,
                 failed_tasks,
+                active_bytes,
+                max_active_bytes,
                 workers,
             },
             ClientResponse::WorkerList { workers } => BinaryClientResponse::WorkerList { workers },
@@ -2386,6 +2406,8 @@ impl From<BinaryClientResponse> for ClientResponse {
                 running_tasks,
                 completed_tasks,
                 failed_tasks,
+                active_bytes,
+                max_active_bytes,
                 workers,
             } => ClientResponse::ClusterStatus {
                 total_tasks,
@@ -2393,6 +2415,8 @@ impl From<BinaryClientResponse> for ClientResponse {
                 running_tasks,
                 completed_tasks,
                 failed_tasks,
+                active_bytes,
+                max_active_bytes,
                 workers,
             },
             BinaryClientResponse::WorkerList { workers } => ClientResponse::WorkerList { workers },

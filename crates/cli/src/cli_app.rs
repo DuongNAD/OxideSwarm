@@ -922,6 +922,27 @@ pub async fn run_cli() -> ExitCode {
     }
 }
 
+/// Resolve `--max-active-mb` / `RUSTY_GRID_MAX_ACTIVE_MB` / `[master].max_active_mb`
+/// and apply it to `ServerConfig`, refusing `0` because a 0-byte active cap rejects
+/// every task.
+fn apply_max_active_mb(
+    config: ServerConfig,
+    flag: Option<u64>,
+    cfg_val: Option<u64>,
+) -> Result<ServerConfig, String> {
+    let max_active_mb = resolve_u64(
+        flag,
+        &["RUSTY_GRID_MAX_ACTIVE_MB"],
+        cfg_val,
+        (rusty_grid_master::DEFAULT_MAX_ACTIVE_BYTES / (1024 * 1024)) as u64,
+    );
+    if max_active_mb == 0 {
+        return Err("--max-active-mb / max_active_mb must be at least 1 MiB (got 0)".to_string());
+    }
+    let bytes = usize::try_from(max_active_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX);
+    Ok(config.with_max_active_bytes(bytes))
+}
+
 async fn run_master(
     args: MasterArgs,
     config_file: Option<ConfigFile>,
@@ -1070,12 +1091,6 @@ async fn run_master(
         master_cfg.as_ref().and_then(|m| m.max_retained_mb),
         (rusty_grid_master::queue::DEFAULT_MAX_TERMINAL_BYTES / (1024 * 1024)) as u64,
     );
-    let max_active_mb = resolve_u64(
-        args.max_active_mb,
-        &["RUSTY_GRID_MAX_ACTIVE_MB"],
-        master_cfg.as_ref().and_then(|m| m.max_active_mb),
-        (rusty_grid_master::DEFAULT_MAX_ACTIVE_BYTES / (1024 * 1024)) as u64,
-    );
     let mapreduce_parallelism = resolve_usize(
         args.mapreduce_parallelism,
         &["RUSTY_GRID_MAPREDUCE_PARALLELISM"],
@@ -1094,13 +1109,21 @@ async fn run_master(
         master_cfg.as_ref().and_then(|m| m.max_pending_handshakes),
         rusty_grid_master::server::DEFAULT_MAX_PENDING_HANDSHAKES,
     );
+    server_config = match apply_max_active_mb(
+        server_config,
+        args.max_active_mb,
+        master_cfg.as_ref().and_then(|m| m.max_active_mb),
+    ) {
+        Ok(cfg) => cfg,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
     server_config = server_config
         .with_max_terminal_tasks(max_retained_tasks)
         .with_max_terminal_bytes(
             usize::try_from(max_retained_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX),
-        )
-        .with_max_active_bytes(
-            usize::try_from(max_active_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX),
         )
         .with_mapreduce_parallelism(mapreduce_parallelism)
         .with_max_connections(max_connections)
@@ -2808,6 +2831,8 @@ async fn run_status(
                 running_tasks,
                 completed_tasks,
                 failed_tasks,
+                active_bytes,
+                max_active_bytes,
                 workers,
             } => {
                 if args.json {
@@ -2832,6 +2857,8 @@ async fn run_status(
                             "running_tasks": running_tasks,
                             "completed_tasks": completed_tasks,
                             "failed_tasks": failed_tasks,
+                            "active_bytes": active_bytes,
+                            "max_active_bytes": max_active_bytes,
                             "worker_count": workers.len(),
                             "workers": enriched_workers
                         })
@@ -2844,6 +2871,13 @@ async fn run_status(
                     println!("Running Tasks:    {}", running_tasks);
                     println!("Completed Tasks:  {}", completed_tasks);
                     println!("Failed Tasks:     {}", failed_tasks);
+                    println!(
+                        "Active Budget:    {} / {} bytes ({:.2} / {:.2} MiB)",
+                        active_bytes,
+                        max_active_bytes,
+                        active_bytes as f64 / (1024.0 * 1024.0),
+                        max_active_bytes as f64 / (1024.0 * 1024.0),
+                    );
                     if !workers.is_empty() {
                         println!("\nWorkers:");
                         for w in &workers {
@@ -3800,116 +3834,52 @@ max_active_mb = 768
         )
         .unwrap();
         assert_eq!(parsed.master.unwrap().max_active_mb, Some(768));
+
+        let base = ServerConfig::new("127.0.0.1:0".parse().unwrap());
+        let default_cfg = apply_max_active_mb(base.clone(), None, None).unwrap();
+        assert_eq!(
+            default_cfg.max_active_bytes,
+            rusty_grid_master::DEFAULT_MAX_ACTIVE_BYTES
+        );
+        let from_config = apply_max_active_mb(base.clone(), None, Some(768)).unwrap();
+        assert_eq!(from_config.max_active_bytes, 768 * 1024 * 1024);
+        let from_flag = apply_max_active_mb(base.clone(), Some(512), Some(768)).unwrap();
+        assert_eq!(from_flag.max_active_bytes, 512 * 1024 * 1024);
+        let err = apply_max_active_mb(base, Some(0), None).unwrap_err();
+        assert!(err.contains("at least 1 MiB"), "unexpected error: {err}");
     }
 
     #[tokio::test]
     async fn test_master_with_larger_max_active_bytes_accepts_what_default_refuses_and_reports_bytes(
     ) {
-        use rusty_grid_core::protocol::MessageTransport;
-        use rusty_grid_master::{ReaperConfig, SchedulerConfig};
-
-        let make_30_mib_task = |i: usize| {
-            Task::new(
-                TaskSpec::Command {
-                    program: "cat".into(),
-                    args: vec![format!("t-{i}")],
-                    env: Default::default(),
-                    working_dir: None,
-                    stdin: Some(vec![b'x'; 30 * 1024 * 1024]),
-                },
-                TaskRequirements::generic(1, 60),
-            )
+        // 1. `--max-active-mb 0` is refused at startup with `ExitCode::FAILURE`.
+        let zero_cli = Cli::try_parse_from([
+            "oxideswarm",
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--max-active-mb",
+            "0",
+        ])
+        .unwrap();
+        let Commands::Master(zero_args) = zero_cli.command else {
+            panic!("expected Master subcommand");
         };
+        let test_secret = ClusterSecret::from_bytes(&[0x11; 32]).unwrap();
+        let secret_opts = SecretOpts {
+            value: Some(crate::config::SecretText(test_secret.to_hex())),
+            file: None,
+        };
+        assert_eq!(
+            run_master(zero_args, None, secret_opts.clone()).await,
+            ExitCode::FAILURE
+        );
 
-        // 1. Default master (256 MiB active cap) accepts eight 30 MiB tasks and refuses the ninth
-        //    with an error naming bytes in use, the limit in bytes, and `--max-active-mb`.
-        let default_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_web_ui(false);
-        let default_master = MasterServer::spawn_with_config(
-            default_cfg,
-            SchedulerConfig::default(),
-            ReaperConfig::default(),
-        )
-        .await
-        .unwrap();
-        let default_addr = default_master.server_addr().to_string();
-
-        let stream = tokio::net::TcpStream::connect(&default_addr).await.unwrap();
-        let mut transport = MessageTransport::new(stream);
-        for i in 0..8 {
-            let resp = exchange(
-                &mut transport,
-                &default_addr,
-                false,
-                &ClientMessage::SubmitTask {
-                    task: make_30_mib_task(i),
-                    wait: false,
-                },
-                "submit failed",
-            )
-            .await
-            .expect("first eight 30 MiB tasks fit in 256 MiB");
-            assert!(matches!(resp, ClientResponse::TaskSubmitted { .. }));
-        }
-        transport
-            .send_msg(&ClientMessage::SubmitTask {
-                task: make_30_mib_task(8),
-                wait: false,
-            })
-            .await
-            .unwrap();
-        match transport.recv_msg::<ClientResponse>().await.unwrap() {
-            Some(ClientResponse::Error { message }) => {
-                assert!(
-                    message.contains("bytes in use"),
-                    "unexpected CLI error message: {message}"
-                );
-                assert!(
-                    message.contains("limit 268435456 bytes"),
-                    "unexpected CLI error message: {message}"
-                );
-                assert!(
-                    message.contains("--max-active-mb"),
-                    "unexpected CLI error message: {message}"
-                );
-            }
-            other => panic!("expected ClientResponse::Error on 9th 30 MiB task, got {other:?}"),
-        }
-        let _ = default_master.shutdown();
-
-        // 2. A master started with a 512 MiB active cap accepts the ninth 30 MiB task.
-        let large_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
-            .with_web_ui(false)
-            .with_max_active_bytes(512 * 1024 * 1024);
-        let large_master = MasterServer::spawn_with_config(
-            large_cfg,
-            SchedulerConfig::default(),
-            ReaperConfig::default(),
-        )
-        .await
-        .unwrap();
-        let large_addr = large_master.server_addr().to_string();
-        let stream = tokio::net::TcpStream::connect(&large_addr).await.unwrap();
-        let mut transport = MessageTransport::new(stream);
-        for i in 0..9 {
-            let resp = exchange(
-                &mut transport,
-                &large_addr,
-                false,
-                &ClientMessage::SubmitTask {
-                    task: make_30_mib_task(i),
-                    wait: false,
-                },
-                "submit failed",
-            )
-            .await
-            .expect("all nine 30 MiB tasks fit when max_active_bytes is 512 MiB");
-            assert!(matches!(resp, ClientResponse::TaskSubmitted { .. }));
-        }
-        let _ = large_master.shutdown();
-
-        // 3. `run_master` wires `--max-active-mb` into `ServerConfig::with_max_active_bytes`
-        //    (F6 / M11): starting `run_master` with `--max-active-mb 1` accepts the first
-        //    600 KiB task and refuses the second with `limit 1048576 bytes`.
+        // 2. `run_master` wires `--max-active-mb` into `ServerConfig::with_max_active_bytes`:
+        //    starting `run_master` with `--max-active-mb 1` accepts the first 600 KiB task,
+        //    reports `active_bytes` and `max_active_bytes` in `ClusterStatus`, and refuses
+        //    the second 600 KiB task with `task requires ... bytes`, `bytes in use`,
+        //    `limit 1048576 bytes`, and `--max-active-mb`.
         let tmp_blob = tempfile::tempdir().unwrap();
         let probe_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let run_master_addr = probe_listener.local_addr().unwrap();
@@ -3931,11 +3901,6 @@ max_active_mb = 768
         .unwrap();
         let Commands::Master(master_args) = cli.command else {
             panic!("expected Master subcommand");
-        };
-        let test_secret = ClusterSecret::from_bytes(&[0x11; 32]).unwrap();
-        let secret_opts = SecretOpts {
-            value: Some(crate::config::SecretText(test_secret.to_hex())),
-            file: None,
         };
         let master_task = tokio::spawn(run_master(master_args, None, secret_opts));
 
@@ -3976,6 +3941,28 @@ max_active_mb = 768
         .expect("first 600 KiB task fits in 1 MiB cap");
         assert!(matches!(first_resp, ClientResponse::TaskSubmitted { .. }));
 
+        // Verify ClusterStatus includes active_bytes and max_active_bytes.
+        let status_resp = exchange(
+            &mut transport,
+            &run_master_addr_str,
+            false,
+            &ClientMessage::ClusterStatus,
+            "status failed",
+        )
+        .await
+        .expect("cluster status succeeded");
+        match status_resp {
+            ClientResponse::ClusterStatus {
+                active_bytes,
+                max_active_bytes,
+                ..
+            } => {
+                assert!(active_bytes >= 600 * 1024, "active_bytes={active_bytes}");
+                assert_eq!(max_active_bytes, 1024 * 1024);
+            }
+            other => panic!("expected ClusterStatus, got {other:?}"),
+        }
+
         transport
             .send_msg(&ClientMessage::SubmitTask {
                 task: make_600k_task(2),
@@ -3985,6 +3972,14 @@ max_active_mb = 768
             .unwrap();
         match transport.recv_msg::<ClientResponse>().await.unwrap() {
             Some(ClientResponse::Error { message }) => {
+                assert!(
+                    message.contains("task requires"),
+                    "error must state task requires N bytes, got: {message}"
+                );
+                assert!(
+                    message.contains("bytes in use"),
+                    "error must state bytes in use, got: {message}"
+                );
                 assert!(
                     message.contains("limit 1048576 bytes"),
                     "run_master --max-active-mb 1 must enforce 1 MiB limit, got: {message}"

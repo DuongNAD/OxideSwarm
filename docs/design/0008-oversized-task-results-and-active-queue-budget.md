@@ -1,7 +1,7 @@
 # 0008: Oversized task results and active queue byte budget
 
 Status: Implemented
-Created: 2026-11-01    Updated: 2026-11-01
+Created: 2026-11-01    Updated: 2026-11-02
 
 ## Summary
 
@@ -86,13 +86,26 @@ history, while the newest finished task is always kept so its waiter can read it
   `max_terminal_bytes`.
 - `ServerConfig::max_active_bytes` and `ServerConfig::with_max_active_bytes` pass the cap to the
   master's queue.
-- The CLI and configuration engine (`crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`)
-  expose `--max-active-mb <MB>`, `RUSTY_GRID_MAX_ACTIVE_MB`, and `max_active_mb` in `[master]`.
+- Both `oxideswarm master` (`crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`) and
+  `agent-mesh hub` (`crates/agent_mesh/src/main.rs`) expose `--max-active-mb <MB>` and
+  `RUSTY_GRID_MAX_ACTIVE_MB` (with `max_active_mb` in `[master]` for `oxideswarm`). Both binaries
+  refuse `--max-active-mb 0` (and `max_active_mb = 0`) at startup with a non-zero exit code because
+  a 0-byte active budget rejects every task.
+- `QueueStats` (`crates/master/src/queue.rs`), `ClientResponse::ClusterStatus`
+  (`crates/core/src/protocol.rs`), `oxideswarm status` (human and `--json`), and the Master
+  Coordinator card in the web dashboard (`crates/master/src/dashboard.html`) surface `active_bytes`
+  and `max_active_bytes`.
 - When a submission would push `active_bytes` above `max_active_bytes`, `TaskQueue::submit` returns
-  `GridError::QueueByteLimitExceeded { in_use_bytes, max_bytes }`, which names the bytes in use,
-  the limit in bytes, and `--max-active-mb`. `GridError::QueueFull { capacity }` remains for the
-  task-count limit. Both the CLI (`ClientResponse::Error`) and REST (`POST /api/tasks`, HTTP 503 in
-  `crates/master/src/web_ui.rs`) surface this message.
+  `GridError::QueueByteLimitExceeded { task_bytes, in_use_bytes, max_bytes }`, which names the task
+  size in bytes, the bytes in use, the limit in bytes, and `--max-active-mb`.
+  `GridError::QueueFull { capacity }` remains for the task-count limit.
+  - `GridError::is_transient()` returns `false` when `task_bytes > max_bytes || max_bytes == 0` (or
+    `QueueFull { capacity: 0 }`) because retrying can never fit the task without raising the limit,
+    and `true` when the task fits the cap on its own (`task_bytes <= max_bytes`) and is only blocked
+    by currently active tasks.
+  - `POST /api/tasks` in `crates/master/src/web_ui.rs` returns HTTP `413 Payload Too Large` when
+    `!e.is_transient()` (`task_bytes > max_bytes`) and HTTP `503 Service Unavailable` when
+    `e.is_transient()`.
 - When a task transitions to a terminal state (`Completed`, `Failed`, `Cancelled`) or is removed,
   its active byte charge is released.
 
@@ -106,16 +119,30 @@ replaces (`new_cp > old_cp`) and the resulting `active_bytes` would exceed `max_
 smaller newer checkpoint is still accepted so failover resumption is not stuck on an outdated
 snapshot.
 
-### D5: Map/Reduce backoff on a full queue
+### D5: Map/Reduce backoff on a full queue and disconnect cancellation
 
-In `MapReduceEngine::submit_and_await` (`crates/master/src/mapreduce.rs`), when `queue.submit`
+In `MapReduceEngine::submit_and_await` (`crates/master/src/mapreduce.rs`), when `TaskQueue::try_submit_slot`
 returns `GridError::QueueByteLimitExceeded` or `GridError::QueueFull`:
 
-- If the task alone is larger than `max_bytes` (`task_active_bytes(&task) > max_bytes`) or
-  `capacity == 0`, `submit_and_await` fails immediately because the task can never fit.
-- Otherwise, `submit_and_await` waits in 25 ms steps and retries until room opens up or the job's
-  idle timeout expires. On timeout it returns `GridError::Timeout` naming the queue-limit error
-  that prevented submission.
+- If `!e.is_transient()` (`task_bytes > max_bytes`, `max_bytes == 0`, or `capacity == 0`),
+  `submit_and_await` fails immediately because the task can never fit.
+- Otherwise, `TaskQueue::try_submit_slot` checks `TaskQueue::check_room(task_bytes)` before taking
+  the `Task` from `Option<Task>`, avoiding per-retry cloning of multi-megabyte partition payloads
+  and moving the single `Task` into the queue once room opens up (so `submit_and_await` does not
+  hold a duplicate copy while the partition executes).
+- Retries use exponential backoff starting at 25 ms and doubling up to 1 s
+  (`backoff = (backoff * 2).min(Duration::from_secs(1))`) until room opens up or the wait deadline
+  expires. On timeout it returns `GridError::Timeout` naming the queue-limit error that prevented
+  submission.
+- Once `try_submit_slot` succeeds, `submit_and_await` resets its execution clock
+  (`own_start = Instant::now()`) and arms `AbandonGuard`, so time spent waiting for queue room is
+  counted separately from the task's execution timeout and unsubmitted partitions never log false
+  `Task not found` warnings on cancellation.
+- In `handle_client_connection` (`crates/master/src/server.rs`), `mapreduce.execute(job)` runs inside
+  a `tokio::select!` alongside `transport.recv_msg::<ClientMessage>()`. If the client disconnects
+  while a Map/Reduce job is running or waiting for queue room, the master drops the execution
+  future, cancelling running tasks via `AbandonGuard` and stopping waiting partitions from
+  submitting further tasks.
 - `MapReduceEngine::execute` honours positive `spec.timeout_secs` values directly (including values
   under 60 s, such as `--timeout-secs 1`), falling back to 60 s only when `spec.timeout_secs == 0`.
 
@@ -158,3 +185,4 @@ or faulty task from disconnecting the worker and disrupting co-scheduled tasks.
 ## Status log
 
 - 2026-11-01: Implemented W1–W3 on branch `mac/bug-4-oversized-result-and-budget` (BUG-4).
+- 2026-11-02: Completed BUG-12 follow-up on branch `mac/bug-12-active-task-byte-cap`: reset Map/Reduce execution clock after queue admission, eliminated per-retry task cloning with `try_submit_slot` and exponential backoff (25 ms to 1 s), disarmed `AbandonGuard` until submission succeeds, cancelled Map/Reduce jobs on client disconnect, added `task_bytes` to `GridError::QueueByteLimitExceeded` (returning `is_transient() == false` and HTTP 413 when `task_bytes > max_bytes`), refused `--max-active-mb 0`, wired `--max-active-mb` / `RUSTY_GRID_MAX_ACTIVE_MB` into `agent-mesh hub`, and exposed `active_bytes` / `max_active_bytes` in `QueueStats`, `ClusterStatus`, `oxideswarm status`, and the web dashboard.
