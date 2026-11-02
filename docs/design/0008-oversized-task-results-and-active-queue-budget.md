@@ -148,10 +148,17 @@ returns `GridError::QueueByteLimitExceeded` or `GridError::QueueFull`:
 
 ## Compatibility
 
-No wire format tags or message layouts changed. `GridError::QueueByteLimitExceeded` is a library
-error variant serialized into existing `ClientResponse::Error { message }` and HTTP 503 JSON error
-responses. Map/Reduce jobs with an explicit positive `timeout_secs` under 60 s now time out after
-`timeout_secs` rather than being clamped up to a 60 s minimum.
+- `ClientResponse::ClusterStatus` appends `active_bytes` and `max_active_bytes` *after* `workers` in
+  `ClientResponse`, `HumanClientResponse` (`#[serde(default)]`), and `BinaryClientResponse`. Because
+  bincode decodes fields in declaration order via `bincode::deserialize_from` without requiring EOF,
+  an older client still decodes `ClusterStatus` from a newer master (ignoring the trailing 16 bytes),
+  even when tasks are queued (`active_bytes > 0`). A newer client expects the two trailing fields in
+  bincode and therefore requires an updated master ("restart the master first", `DEPLOYMENT.md` 3.5).
+- `GridError::QueueByteLimitExceeded` is a library error variant serialized into existing
+  `ClientResponse::Error { message }` and REST JSON error responses (`413 Payload Too Large` when
+  `task_bytes > max_bytes`, `503 Service Unavailable` when the task fits the cap on its own).
+- Map/Reduce jobs with an explicit positive `timeout_secs` under 60 s now time out after
+  `timeout_secs` rather than being clamped up to a 60 s minimum.
 
 ## Security
 

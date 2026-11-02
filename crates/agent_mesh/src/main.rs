@@ -226,6 +226,11 @@ fn grid_master_max_active_bytes(
     Ok(usize::try_from(mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX))
 }
 
+/// Builds the embedded `ServerConfig` for `hub --grid-master` with `max_active_bytes` applied.
+fn build_grid_master_server_config(bind_addr: SocketAddr, max_active_bytes: usize) -> ServerConfig {
+    ServerConfig::new(bind_addr).with_max_active_bytes(max_active_bytes)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let subscriber = FmtSubscriber::builder()
@@ -276,7 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     };
 
                 let mut server_config =
-                    ServerConfig::new(bind_addr).with_max_active_bytes(max_active_bytes);
+                    build_grid_master_server_config(bind_addr, max_active_bytes);
                 // `secret` already holds OXIDESWARM_SECRET when the flag is absent (clap `env`).
                 let default_secret_file = ClusterSecret::default_path();
                 match grid_master_secret(
@@ -529,10 +534,10 @@ mod tests {
             grid_master_max_active_bytes(None).unwrap(),
             rusty_grid_master::DEFAULT_MAX_ACTIVE_BYTES
         );
-        assert_eq!(
-            grid_master_max_active_bytes(Some(512)).unwrap(),
-            512 * 1024 * 1024
-        );
+        let scaled = grid_master_max_active_bytes(Some(512)).unwrap();
+        assert_eq!(scaled, 512 * 1024 * 1024);
+        let server_cfg = build_grid_master_server_config(addr("127.0.0.1:0"), scaled);
+        assert_eq!(server_cfg.max_active_bytes, 512 * 1024 * 1024);
         let err = grid_master_max_active_bytes(Some(0))
             .expect_err("0 MiB active cap must be refused at start");
         assert!(err.to_string().contains("at least 1 MiB"), "{err}");

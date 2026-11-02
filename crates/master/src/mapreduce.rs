@@ -97,6 +97,11 @@ impl Drop for AbandonGuard {
     }
 }
 
+/// Doubles the queue-wait backoff step up to the 1-second ceiling.
+fn next_queue_wait_backoff(current: Duration) -> Duration {
+    (current * 2).min(Duration::from_secs(1))
+}
+
 /// Lightweight in-memory Map/Reduce engine executing jobs across cluster workers.
 #[derive(Clone)]
 pub struct MapReduceEngine {
@@ -105,6 +110,8 @@ pub struct MapReduceEngine {
     waiters: WaiterMap,
     registry: Option<WorkerRegistry>,
     parallelism: usize,
+    #[cfg(test)]
+    cancel_abandoned_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MapReduceEngine {
@@ -120,7 +127,15 @@ impl MapReduceEngine {
             waiters,
             registry: None,
             parallelism: DEFAULT_MAPREDUCE_PARALLELISM,
+            #[cfg(test)]
+            cancel_abandoned_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    fn cancel_abandoned_count(&self) -> usize {
+        self.cancel_abandoned_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Maximum number of the job's tasks submitted and not yet finished at any time (at least 1).
@@ -405,7 +420,7 @@ impl MapReduceEngine {
                         });
                     }
                     tokio::time::sleep(remaining.min(backoff)).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(1));
+                    backoff = next_queue_wait_backoff(backoff);
                 }
                 Err(e) => {
                     guard.waiter_registered = false;
@@ -465,6 +480,9 @@ impl MapReduceEngine {
     /// Cancels `task_id` (telling its worker when the engine knows the registry) and removes its
     /// waiter entry.
     async fn cancel_abandoned(&self, task_id: rusty_grid_core::task::TaskId, reason: &str) {
+        #[cfg(test)]
+        self.cancel_abandoned_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         prune_closed_waiters(&self.waiters, &task_id).await;
         match &self.registry {
             Some(registry) => {
@@ -1675,7 +1693,8 @@ mod tests {
         );
 
         // Start `submit_and_await` and abort it after 60 ms while it is still waiting for room:
-        // the waiter entry must be cleaned up and the task must never have entered the queue.
+        // the waiter entry must be cleaned up, the task must never have entered the queue, and
+        // `cancel_abandoned` must NOT have been called (`armed == false`).
         let fut = engine.submit_and_await(waiting_task, Duration::from_secs(5), None);
         let _ = tokio::time::timeout(Duration::from_millis(60), fut).await;
         tokio::task::yield_now().await;
@@ -1686,6 +1705,11 @@ mod tests {
         assert!(
             queue.get_state(&waiting_id).await.is_none(),
             "unsubmitted task must not be present in the queue"
+        );
+        assert_eq!(
+            engine.cancel_abandoned_count(),
+            0,
+            "AbandonGuard must not call cancel_abandoned when dropped before submit succeeds"
         );
 
         // Once the blocker is cancelled, `try_submit_slot` moves `slot` into the queue (`None`).
@@ -1699,5 +1723,40 @@ mod tests {
             slot.is_none(),
             "try_submit_slot must take the task out of the caller's Option on acceptance"
         );
+        queue
+            .cancel_task(&submitted_id, Some("free again".into()))
+            .await
+            .unwrap();
+
+        // Now that the queue has room, a `submit_and_await` that succeeds in submitting and is
+        // then dropped while awaiting execution MUST arm `AbandonGuard` and call `cancel_abandoned`.
+        let admitted_task = Task::new(
+            TaskSpec::command("echo", vec!["admitted".into()]),
+            TaskRequirements::generic(1, 60),
+        );
+        let admitted_id = admitted_task.id;
+        let fut2 = engine.submit_and_await(admitted_task, Duration::from_secs(5), None);
+        let _ = tokio::time::timeout(Duration::from_millis(40), fut2).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            engine.cancel_abandoned_count(),
+            1,
+            "AbandonGuard must call cancel_abandoned when dropped after submit succeeds"
+        );
+        assert_eq!(
+            queue.get_state(&admitted_id).await,
+            Some(crate::queue::TaskState::Cancelled)
+        );
+    }
+
+    #[test]
+    fn test_next_queue_wait_backoff_doubles_from_25ms_up_to_1s() {
+        let mut b = Duration::from_millis(25);
+        let mut observed = Vec::new();
+        for _ in 0..8 {
+            observed.push(b.as_millis());
+            b = next_queue_wait_backoff(b);
+        }
+        assert_eq!(observed, vec![25, 50, 100, 200, 400, 800, 1000, 1000]);
     }
 }

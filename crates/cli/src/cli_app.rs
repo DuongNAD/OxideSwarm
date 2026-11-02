@@ -3870,10 +3870,13 @@ max_active_mb = 768
             value: Some(crate::config::SecretText(test_secret.to_hex())),
             file: None,
         };
-        assert_eq!(
-            run_master(zero_args, None, secret_opts.clone()).await,
-            ExitCode::FAILURE
-        );
+        let zero_exit = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_master(zero_args, None, secret_opts.clone()),
+        )
+        .await
+        .expect("run_master --max-active-mb 0 must exit immediately instead of serving");
+        assert_eq!(zero_exit, ExitCode::FAILURE);
 
         // 2. `run_master` wires `--max-active-mb` into `ServerConfig::with_max_active_bytes`:
         //    starting `run_master` with `--max-active-mb 1` accepts the first 600 KiB task,
