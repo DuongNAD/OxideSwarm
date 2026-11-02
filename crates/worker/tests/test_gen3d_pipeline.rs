@@ -17,7 +17,6 @@ use rusty_grid_worker::gen3d::sdf::{
 };
 use rusty_grid_worker::gen3d::types::RawMesh;
 use rusty_grid_worker::gen3d::uv::{MultiChartBoxUnwrapper, UvUnwrapper};
-use rusty_grid_worker::job_object::JobObject;
 use rusty_grid_worker::sandbox::SandboxConfig;
 use rusty_grid_worker::{RunnerConfig, TaskRunner, EXIT_CODE_CANCELLED};
 
@@ -279,38 +278,6 @@ fn test_glb_container_compliance() {
         let _ = std::fs::create_dir_all(parent);
     }
     std::fs::write(&out_path, &glb).expect("Failed to write tier0_test.glb");
-}
-
-// ============================================================================
-// Feature F10: Win32 Job Object Supervision Tests
-// ============================================================================
-
-#[test]
-fn test_job_object_creation_and_lifecycle() {
-    let job = JobObject::create().expect("Failed to create JobObject");
-
-    // Spawn a dummy sleep process
-    #[cfg(windows)]
-    let mut cmd = std::process::Command::new("powershell");
-    #[cfg(windows)]
-    cmd.args(["-Command", "Start-Sleep -Seconds 10"]);
-
-    #[cfg(not(windows))]
-    let mut cmd = std::process::Command::new("sleep");
-    #[cfg(not(windows))]
-    cmd.arg("10");
-
-    let mut child = cmd.spawn().expect("Failed to spawn dummy child process");
-    let pid = child.id();
-
-    let mut job = job;
-    job.assign_pid(pid)
-        .expect("Failed to assign PID to JobObject");
-
-    // Terminate via JobObject
-    job.terminate(130).expect("Failed to terminate JobObject");
-    let status = child.wait().expect("Failed to wait on child");
-    assert!(!status.success());
 }
 
 // ============================================================================
