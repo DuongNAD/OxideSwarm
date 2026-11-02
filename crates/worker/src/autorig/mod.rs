@@ -110,7 +110,11 @@ pub fn auto_rig_mesh(spec: &AutoRigSpec) -> Result<Vec<u8>, WorkerError> {
 /// Asynchronous entry point with provider routing:
 /// Supports headless Blender 4.5.4 LTS fallback (F16) when requested,
 /// with automatic deterministic fallback to the built-in pure-Rust rigging engine.
-pub async fn auto_rig_mesh_async(spec: &AutoRigSpec) -> Result<Vec<u8>, WorkerError> {
+pub async fn auto_rig_mesh_async(
+    runner: &crate::runner::TaskRunner,
+    task_id: rusty_grid_core::task::TaskId,
+    spec: &AutoRigSpec,
+) -> Result<Vec<u8>, WorkerError> {
     let pref = spec
         .preferred_provider
         .as_deref()
@@ -121,6 +125,8 @@ pub async fn auto_rig_mesh_async(spec: &AutoRigSpec) -> Result<Vec<u8>, WorkerEr
         if let Some(blender_bin) = blender_provider::resolve_blender_binary() {
             info!(bin = ?blender_bin, "Attempting Blender headless auto-rigging provider");
             match BlenderRigProvider::execute_rigging(
+                runner,
+                task_id,
                 &blender_bin,
                 spec.input_mesh.as_bytes(),
                 &spec.rig_preset,

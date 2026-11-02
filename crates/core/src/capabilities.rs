@@ -1351,7 +1351,12 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
     }
 
     // 4. PATH lookup fallback (e.g. `blender --version`)
-    if let Ok(output) = std::process::Command::new("blender")
+    probe_blender_binary("blender")
+}
+
+/// Probes a Blender executable candidate by running `<program> --version` with secrets stripped.
+pub fn probe_blender_binary<P: AsRef<std::ffi::OsStr>>(program: P) -> (bool, Option<String>) {
+    if let Ok(output) = crate::cluster_auth::probe_command(program)
         .arg("--version")
         .output()
     {
@@ -1367,12 +1372,11 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
             return (true, Some("Blender".to_string()));
         }
     }
-
     (false, None)
 }
 
-fn query_blender_version(exe_path: &std::path::Path) -> Option<String> {
-    let output = std::process::Command::new(exe_path)
+pub fn query_blender_version<P: AsRef<std::ffi::OsStr>>(program: P) -> Option<String> {
+    let output = crate::cluster_auth::probe_command(program)
         .arg("--version")
         .output()
         .ok()?;
