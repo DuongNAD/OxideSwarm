@@ -4,7 +4,6 @@
 //! execution duration measurement, timeout safety watchdogs,
 //! and native built-in commands (echo, system_info, ping, sha256_verify).
 
-use rusty_grid_core::cluster_auth::{ENV_SECRET, ENV_SECRET_FILE};
 use serde_json::Value;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -24,7 +23,7 @@ const READER_DRAIN_GRACE: Duration = Duration::from_secs(1);
 /// Variables of the node's own environment that a command must never inherit: they hold the
 /// cluster secret or the hub token (`--token` / `OXIDE_MESH_TOKEN`), and `shell_exec` runs
 /// whatever a remote peer sends. A command can still be given one in its own `env`.
-pub const SECRET_ENV_VARS: [&str; 3] = [ENV_SECRET, ENV_SECRET_FILE, "OXIDE_MESH_TOKEN"];
+pub use rusty_grid_core::cluster_auth::SECRET_ENV_VARS;
 
 #[derive(Debug, Clone)]
 pub struct CommandExecutionResult {

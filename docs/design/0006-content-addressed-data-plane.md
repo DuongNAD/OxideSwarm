@@ -105,10 +105,16 @@ Behaviour before this change (design record 0003, inline staging):
   `master --blob-dir` / `--blob-store-mb` (or `RUSTY_GRID_BLOB_DIR` / `RUSTY_GRID_BLOB_STORE_MB`,
   or `blob_dir` / `blob_store_mb` in the config file) say otherwise. A library `ServerConfig` has no
   store unless `with_blob_store` is called.
-- A stored blob makes the store evict least recently used blobs down to its bound. Input blobs of a
+- A stored blob makes the store evict least recently used blobs down to its bound, and uploads in
+  progress in `tmp/` count against `max_bytes` as well. When concurrent uploads in progress would
+  together exceed `max_bytes` (even for the same blob), the new upload is refused with an error
+  and callers do not automatically retry. Input blobs of a
   task between admission and its terminal state are pinned and never evicted, and output blobs of a
   finished task stay pinned for 10 minutes (`BlobStoreConfig::output_pin_retention`) so the client
-  can download them; pinned inputs and outputs can hold the store above its bound for that time. A
+  can download them; pinned inputs can hold the store above its bound for that time. When total
+  pinned output bytes exceed `max_bytes`, the store releases the oldest terminal output pins early,
+  and never those of the newest task (so a single task whose outputs exceed `max_bytes` can also
+  hold the store above its bound during the retention window). A
   sweeper (every 30 s) releases the input pins of finished tasks, releases output pins past their
   10-minute retention window, and drops uploads idle for 10 minutes.
 - Admission (`admit_blob_task`): every input blob, and every file of every input tree, must be in
@@ -217,3 +223,9 @@ Behaviour before this change (design record 0003, inline staging):
 
 - 2026-10-26: Created and implemented on branch `claude/dreamy-kilby-6adcea`; unit and
   `blob_transfer_e2e` tests pass.
+- 2026-11-02: BUG-5 follow-up on `mac/bug-5-blob-store-and-cache`: count in-progress uploads
+  towards `max_bytes`, cap pinned output bytes at `max_bytes` by releasing the oldest terminal
+  output pins early (never the newest task's), delete evicted blobs in bounded batches under the
+  store/cache locks, clean up cancelled `.part` fetches and aborted in-flight uploads, fail output
+  walks on selected invalid/non-UTF-8 paths or read errors, and print failure status/error details
+  and task output on CLI download failures.

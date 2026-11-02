@@ -36,6 +36,9 @@ pub const DEFAULT_BLOB_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Temporary files older than this are left-overs of a worker that died mid-write.
 const STALE_TMP_AGE: Duration = Duration::from_secs(24 * 3600);
 
+/// Maximum number of evicted blob files deleted per lock hold.
+const EVICTION_BATCH_SIZE: usize = 64;
+
 struct Entry {
     size: u64,
     tick: u64,
@@ -377,38 +380,51 @@ impl BlobCache {
         inner.remove(id);
     }
 
-    /// Evicts least recently used blobs that nothing pins until the cache fits its bound.
-    /// Returns how many were evicted.
+    /// Evicts least recently used blobs that nothing pins, at most [`EVICTION_BATCH_SIZE`] files
+    /// per lock hold, until the cache fits its bound. Returns how many were evicted.
     pub fn evict_to_fit(&self) -> usize {
-        let victims: Vec<BlobId> = {
-            let mut inner = self.lock();
-            let mut excess = inner.total_bytes.saturating_sub(self.max_bytes);
-            let mut victims = Vec::new();
-            for id in inner.lru.values() {
+        let mut total_evicted = 0;
+        loop {
+            let batch = {
+                let mut inner = self.lock();
+                let mut excess = inner.total_bytes.saturating_sub(self.max_bytes);
                 if excess == 0 {
                     break;
                 }
-                if inner.pins.contains_key(id) {
-                    continue;
+                let mut victims = Vec::with_capacity(EVICTION_BATCH_SIZE);
+                for id in inner.lru.values() {
+                    if excess == 0 || victims.len() >= EVICTION_BATCH_SIZE {
+                        break;
+                    }
+                    if inner.pins.contains_key(id) {
+                        continue;
+                    }
+                    excess = excess.saturating_sub(inner.entries[id].size.max(1));
+                    victims.push(*id);
                 }
-                excess = excess.saturating_sub(inner.entries[id].size.max(1));
-                victims.push(*id);
-            }
-            for id in &victims {
-                inner.remove(id);
-                if let Err(e) = std::fs::remove_file(self.object_path(id)) {
-                    debug!(blob = %id, error = %e, "Could not delete an evicted blob");
+                if victims.is_empty() {
+                    break;
                 }
+                for id in &victims {
+                    inner.remove(id);
+                    if let Err(e) = std::fs::remove_file(self.object_path(id)) {
+                        debug!(blob = %id, error = %e, "Could not delete an evicted blob");
+                    }
+                }
+                victims.len()
+            };
+            total_evicted += batch;
+            if batch < EVICTION_BATCH_SIZE {
+                break;
             }
-            victims
-        };
-        if !victims.is_empty() {
+        }
+        if total_evicted > 0 {
             info!(
-                evicted = victims.len(),
+                evicted = total_evicted,
                 "Worker blob cache over its bound; evicted the least recently used blobs"
             );
         }
-        victims.len()
+        total_evicted
     }
 }
 
@@ -619,5 +635,19 @@ mod tests {
                 "a linked file is copied, not moved"
             );
         }
+    }
+
+    #[test]
+    fn evict_to_fit_deletes_across_multiple_batches_and_ends_within_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path(), 500);
+        for i in 0..150u32 {
+            let mut data = vec![0u8; 100];
+            data[..4].copy_from_slice(&i.to_le_bytes());
+            put(&cache, dir.path(), &data);
+        }
+        assert_eq!(cache.usage(), (150, 15_000));
+        assert_eq!(cache.evict_to_fit(), 145);
+        assert_eq!(cache.usage(), (5, 500));
     }
 }

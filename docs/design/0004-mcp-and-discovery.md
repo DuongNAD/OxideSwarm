@@ -140,7 +140,7 @@ Implemented in `crates/core/src/discovery.rs` and `crates/master/src/server.rs`.
 
 - All discovery probes and rendezvous leases require HMAC-SHA256 validation using `cluster.secret`. Malicious actors on the network cannot impersonate the master.
 - Fresh 16-byte nonces ensure that discovery probes are single-use and cannot be replayed.
-- The MCP server strictly forbids unauthenticated connections to non-loopback or auto-discovered addresses (exiting with code `6` before reading standard input) unless `--insecure`, `RUSTY_GRID_INSECURE=1`, or `[status] insecure = true` is set (`RUSTY_GRID_INSECURE=0` overrides `[status] insecure = true`). Skipping any config file in the working directory prevents a cloned repository from steering `mcp` to a remote host or waiving authentication.
+- The MCP server strictly forbids unauthenticated connections to non-loopback or auto-discovered addresses (exiting with code `6` before reading standard input) unless `--insecure`, `RUSTY_GRID_INSECURE=1`, or `[status] insecure = true` is set (`RUSTY_GRID_INSECURE=0` overrides `[status] insecure = true`). Skipping `./rusty-grid.toml` and `./rusty-grid.json` in the working directory stops a cloned repository from auto-loading its own config file into a bare `oxideswarm mcp` invocation; however, a relative `--config`, `RUSTY_GRID_CONFIG`, `OXIDESWARM_HOME`, `--secret-file`, `OXIDESWARM_SECRET_FILE`, or `secret_file` configured by the user still resolves against the working directory.
 
 ## Test plan
 
