@@ -165,7 +165,12 @@ impl MapReduceEngine {
         }
         let chunks: Vec<Vec<String>> = chunks.into_iter().filter(|c| !c.is_empty()).collect();
         let map_tasks_total = chunks.len();
-        let timeout = Duration::from_secs(spec.timeout_secs.max(60));
+        let timeout_secs = if spec.timeout_secs == 0 {
+            60
+        } else {
+            spec.timeout_secs
+        };
+        let timeout = Duration::from_secs(timeout_secs);
         let progress = JobProgress::new();
 
         // 2. Dispatch Map Tasks: all partitions at once (bounded by `parallelism`). They finish in
@@ -179,7 +184,7 @@ impl MapReduceEngine {
                 .map(|(idx, chunk)| {
                     let task = Task::new(
                         map_task_spec(&spec.mapper, map_script, chunk.join("\n")),
-                        TaskRequirements::generic(1, spec.timeout_secs.max(60)),
+                        TaskRequirements::generic(1, timeout_secs),
                     );
                     let progress = &progress;
                     async move {
@@ -195,6 +200,7 @@ impl MapReduceEngine {
             while let Some((idx, outcome)) = results.next().await {
                 let result = outcome?;
                 if result.exit_code != 0 {
+                    let uses_sh = !matches!(spec.mapper, MapFunctionSpec::Command { .. });
                     return Ok(failed_result(
                         &spec,
                         start_time,
@@ -204,7 +210,7 @@ impl MapReduceEngine {
                             "Map partition {} failed with exit code {}: {}",
                             idx,
                             result.exit_code,
-                            result.stderr_str()
+                            task_failure_detail(&result, uses_sh)
                         ),
                     ));
                 }
@@ -253,10 +259,7 @@ impl MapReduceEngine {
                     .map(|(key, values)| {
                         let built =
                             reduce_task_spec(&spec.reducer, &key, &values).map(|task_spec| {
-                                Task::new(
-                                    task_spec,
-                                    TaskRequirements::generic(1, spec.timeout_secs.max(60)),
-                                )
+                                Task::new(task_spec, TaskRequirements::generic(1, timeout_secs))
                             });
                         let progress = &progress;
                         async move {
@@ -274,12 +277,17 @@ impl MapReduceEngine {
                 while let Some((key, outcome)) = results.next().await {
                     let result = outcome?;
                     if result.exit_code != 0 {
+                        let uses_sh =
+                            matches!(spec.reducer, ReduceFunctionSpec::ShellScript { .. });
                         return Ok(failed_result(
                             &spec,
                             start_time,
                             (map_tasks_total, map_tasks_completed),
                             (reduce_tasks_total, reduce_tasks_completed),
-                            format!("Reducer for key '{key}' failed: {}", result.stderr_str()),
+                            format!(
+                                "Reducer for key '{key}' failed: {}",
+                                task_failure_detail(&result, uses_sh)
+                            ),
                         ));
                     }
                     if stdout_was_truncated(&result) {
@@ -340,24 +348,63 @@ impl MapReduceEngine {
         progress: Option<&JobProgress>,
     ) -> GridResult<TaskResult> {
         let task_id = task.id;
+        let task_bytes = crate::queue::task_active_bytes(&task);
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut lock = self.waiters.write().await;
             lock.entry(task_id).or_default().push(tx);
         }
-        if let Err(e) = self.queue.submit(task).await {
-            drop(rx);
-            prune_closed_waiters(&self.waiters, &task_id).await;
-            return Err(e);
-        }
-        self.scheduler_notify.notify_one();
-
         let mut guard = AbandonGuard {
             engine: self.clone(),
             task_id,
             armed: true,
         };
         let own_start = Instant::now();
+        loop {
+            match self.queue.submit(task.clone()).await {
+                Ok(_) => break,
+                Err(e @ GridError::QueueByteLimitExceeded { max_bytes, .. })
+                    if task_bytes > max_bytes =>
+                {
+                    guard.armed = false;
+                    drop(rx);
+                    prune_closed_waiters(&self.waiters, &task_id).await;
+                    return Err(e);
+                }
+                Err(e @ GridError::QueueFull { capacity: 0 }) => {
+                    guard.armed = false;
+                    drop(rx);
+                    prune_closed_waiters(&self.waiters, &task_id).await;
+                    return Err(e);
+                }
+                Err(
+                    e @ (GridError::QueueByteLimitExceeded { .. } | GridError::QueueFull { .. }),
+                ) => {
+                    let idle_since = progress.map_or(own_start, |p| p.last().max(own_start));
+                    let remaining = timeout.saturating_sub(idle_since.elapsed());
+                    if remaining.is_zero() {
+                        guard.armed = false;
+                        drop(rx);
+                        prune_closed_waiters(&self.waiters, &task_id).await;
+                        return Err(GridError::Timeout {
+                            operation: format!(
+                                "MapReduce task {task_id} waiting for queue room ({e})"
+                            ),
+                            duration_secs: timeout.as_secs(),
+                        });
+                    }
+                    tokio::time::sleep(remaining.min(Duration::from_millis(25))).await;
+                }
+                Err(e) => {
+                    guard.armed = false;
+                    drop(rx);
+                    prune_closed_waiters(&self.waiters, &task_id).await;
+                    return Err(e);
+                }
+            }
+        }
+        self.scheduler_notify.notify_one();
+
         let mut rx = rx;
         loop {
             let idle_since = progress.map_or(own_start, |p| p.last().max(own_start));
@@ -442,6 +489,42 @@ fn failed_result(
         reduce_tasks_completed,
         execution_time_ms: start_time.elapsed().as_millis() as u64,
         error: Some(error),
+    }
+}
+
+fn task_failure_detail(result: &TaskResult, uses_sh: bool) -> String {
+    let stderr = result.stderr_str();
+    let detail = if !stderr.trim().is_empty() {
+        stderr.trim()
+    } else {
+        result.error.as_deref().unwrap_or("unknown error")
+    };
+    let is_sh_spawn_error = detail.contains("Failed to spawn process 'sh'")
+        || detail.contains("Failed to spawn command 'sh'")
+        || result
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("Process spawn error"));
+    let lower_detail = detail.to_ascii_lowercase();
+    let lower_err = result
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let is_not_found = lower_detail.contains("not found")
+        || lower_detail.contains("no such file")
+        || lower_detail.contains("cannot find the file")
+        || lower_detail.contains("os error 2")
+        || lower_err.contains("not found")
+        || lower_err.contains("no such file")
+        || lower_err.contains("cannot find the file")
+        || lower_err.contains("os error 2");
+    if uses_sh && is_sh_spawn_error && is_not_found {
+        format!(
+            "{detail} (worker does not have 'sh' on PATH; install a POSIX shell such as Git for Windows or pass --map-cmd / --reduce-cmd)"
+        )
+    } else {
+        detail.to_string()
     }
 }
 
@@ -582,42 +665,93 @@ fn reduce_builtin(operator: &str, values: &[serde_json::Value]) -> GridResult<se
             for val in values {
                 if let Some(n) = val.as_i64() {
                     sum_i += n;
-                } else if let Some(f) = val.as_f64() {
+                } else if let Some(f) = val.as_f64().filter(|f| f.is_finite()) {
                     is_float = true;
                     sum_f += f;
                 } else if let Some(s) = val.as_str() {
                     if let Ok(n) = s.parse::<i64>() {
                         sum_i += n;
                     } else if let Ok(f) = s.parse::<f64>() {
-                        is_float = true;
-                        sum_f += f;
+                        if f.is_finite() {
+                            is_float = true;
+                            sum_f += f;
+                        }
                     }
                 }
             }
             if is_float {
-                serde_json::json!(sum_f + sum_i as f64)
+                let total = sum_f + sum_i as f64;
+                if total.is_finite() {
+                    serde_json::json!(total)
+                } else {
+                    serde_json::json!(sum_i)
+                }
             } else {
                 serde_json::json!(sum_i)
             }
         }
         "count" => serde_json::json!(values.len()),
         "max" => {
-            let mut max_val = i64::MIN;
+            let mut max_i: Option<i64> = None;
+            let mut max_f: Option<f64> = None;
+            let mut is_float = false;
             for val in values {
                 if let Some(n) = val.as_i64() {
-                    max_val = max_val.max(n);
+                    max_i = Some(max_i.map_or(n, |m| m.max(n)));
+                    let f = n as f64;
+                    max_f = Some(max_f.map_or(f, |m| m.max(f)));
+                } else if let Some(f) = val.as_f64().filter(|f| f.is_finite()) {
+                    is_float = true;
+                    max_f = Some(max_f.map_or(f, |m| m.max(f)));
+                } else if let Some(s) = val.as_str() {
+                    if let Ok(n) = s.parse::<i64>() {
+                        max_i = Some(max_i.map_or(n, |m| m.max(n)));
+                        let f = n as f64;
+                        max_f = Some(max_f.map_or(f, |m| m.max(f)));
+                    } else if let Ok(f) = s.parse::<f64>() {
+                        if f.is_finite() {
+                            is_float = true;
+                            max_f = Some(max_f.map_or(f, |m| m.max(f)));
+                        }
+                    }
                 }
             }
-            serde_json::json!(max_val)
+            if is_float {
+                serde_json::json!(max_f.unwrap_or(f64::MIN))
+            } else {
+                serde_json::json!(max_i.unwrap_or(i64::MIN))
+            }
         }
         "min" => {
-            let mut min_val = i64::MAX;
+            let mut min_i: Option<i64> = None;
+            let mut min_f: Option<f64> = None;
+            let mut is_float = false;
             for val in values {
                 if let Some(n) = val.as_i64() {
-                    min_val = min_val.min(n);
+                    min_i = Some(min_i.map_or(n, |m| m.min(n)));
+                    let f = n as f64;
+                    min_f = Some(min_f.map_or(f, |m| m.min(f)));
+                } else if let Some(f) = val.as_f64().filter(|f| f.is_finite()) {
+                    is_float = true;
+                    min_f = Some(min_f.map_or(f, |m| m.min(f)));
+                } else if let Some(s) = val.as_str() {
+                    if let Ok(n) = s.parse::<i64>() {
+                        min_i = Some(min_i.map_or(n, |m| m.min(n)));
+                        let f = n as f64;
+                        min_f = Some(min_f.map_or(f, |m| m.min(f)));
+                    } else if let Ok(f) = s.parse::<f64>() {
+                        if f.is_finite() {
+                            is_float = true;
+                            min_f = Some(min_f.map_or(f, |m| m.min(f)));
+                        }
+                    }
                 }
             }
-            serde_json::json!(min_val)
+            if is_float {
+                serde_json::json!(min_f.unwrap_or(f64::MAX))
+            } else {
+                serde_json::json!(min_i.unwrap_or(i64::MAX))
+            }
         }
         "concat" => {
             let parts: Vec<String> = values.iter().map(|v| v.to_string()).collect();
@@ -1191,6 +1325,225 @@ mod tests {
         assert!(
             outcome.is_ok(),
             "job-level progress keeps a queued task's wait alive: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mapreduce_job_waits_for_queue_room_and_completes_when_room_is_freed() {
+        let queue = TaskQueue::with_retention_limits(
+            crate::queue::RetryPolicy::default(),
+            None,
+            crate::queue::DEFAULT_MAX_TERMINAL_TASKS,
+            crate::queue::DEFAULT_MAX_TERMINAL_BYTES,
+            4_000,
+        );
+        let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let engine =
+            MapReduceEngine::new(queue.clone(), Arc::new(Notify::new()), Arc::clone(&waiters));
+
+        // 1. A task that alone exceeds the 4_000-byte cap fails at once without waiting.
+        let impossible_job = MapReduceJobSpec::new(
+            "too_large_alone",
+            vec!["x".repeat(5_000)],
+            MapFunctionSpec::Builtin {
+                operator: "word_count".into(),
+            },
+            sum_reducer(),
+            1,
+            1,
+            10,
+        );
+        let started = Instant::now();
+        let err = engine.execute(impossible_job).await.unwrap_err();
+        assert!(
+            matches!(err, GridError::QueueByteLimitExceeded { .. }),
+            "expected immediate QueueByteLimitExceeded when task alone exceeds cap, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must fail at once without waiting for timeout"
+        );
+
+        // 2. Fill the 4_000-byte cap with a blocker task, start the Map/Reduce job, then free
+        //    the blocker after 100 ms and verify the job completes.
+        let blocker = Task::new(
+            TaskSpec::Command {
+                program: "sleep".into(),
+                args: vec!["10".into()],
+                env: Default::default(),
+                working_dir: None,
+                stdin: Some(vec![b'b'; 2_500]),
+            },
+            TaskRequirements::generic(1, 60),
+        );
+        let blocker_id = queue.submit(blocker).await.unwrap();
+
+        let worker = spawn_mock_worker(
+            queue.clone(),
+            Arc::clone(&waiters),
+            |_| true,
+            move |task| {
+                if task.id == blocker_id {
+                    return None;
+                }
+                word_count_answer(task)
+            },
+        );
+
+        let releaser = {
+            let queue = queue.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                queue
+                    .cancel_task(&blocker_id, Some("free room".into()))
+                    .await
+                    .unwrap();
+            })
+        };
+
+        let job = word_job(
+            vec!["alpha beta".into(), "beta gamma".into()],
+            2,
+            sum_reducer(),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), engine.execute(job))
+            .await
+            .expect("job completes after room is freed")
+            .unwrap();
+        releaser.abort();
+        worker.abort();
+
+        assert_eq!(result.status, "Completed");
+        assert_eq!(result.output["alpha"].as_i64(), Some(1));
+        assert_eq!(result.output["beta"].as_i64(), Some(2));
+        assert_eq!(result.output["gamma"].as_i64(), Some(1));
+
+        // 3. Task-count capacity: `capacity: Some(0)` fails immediately with `QueueFull { capacity: 0 }`
+        //    (M2b), while `capacity: Some(1)` waits for a queued blocker to finish (M2c).
+        let zero_cap_queue = TaskQueue::with_retention_limits(
+            crate::queue::RetryPolicy::default(),
+            Some(0),
+            crate::queue::DEFAULT_MAX_TERMINAL_TASKS,
+            crate::queue::DEFAULT_MAX_TERMINAL_BYTES,
+            crate::queue::DEFAULT_MAX_ACTIVE_BYTES,
+        );
+        let zero_engine = MapReduceEngine::new(
+            zero_cap_queue,
+            Arc::new(Notify::new()),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
+        let zero_err = zero_engine
+            .execute(word_job(vec!["alpha".into()], 1, sum_reducer()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(zero_err, GridError::QueueFull { capacity: 0 }),
+            "expected immediate QueueFull {{ capacity: 0 }}, got {zero_err:?}"
+        );
+
+        let one_cap_queue = TaskQueue::with_retention_limits(
+            crate::queue::RetryPolicy::default(),
+            Some(1),
+            crate::queue::DEFAULT_MAX_TERMINAL_TASKS,
+            crate::queue::DEFAULT_MAX_TERMINAL_BYTES,
+            crate::queue::DEFAULT_MAX_ACTIVE_BYTES,
+        );
+        let one_waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let one_engine = MapReduceEngine::new(
+            one_cap_queue.clone(),
+            Arc::new(Notify::new()),
+            Arc::clone(&one_waiters),
+        );
+        let cap_blocker = Task::new(
+            TaskSpec::Command {
+                program: "sleep".into(),
+                args: vec!["10".into()],
+                env: Default::default(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 60),
+        );
+        let cap_blocker_id = one_cap_queue.submit(cap_blocker).await.unwrap();
+        let one_worker = spawn_mock_worker(
+            one_cap_queue.clone(),
+            Arc::clone(&one_waiters),
+            |_| true,
+            move |task| {
+                if task.id == cap_blocker_id {
+                    return None;
+                }
+                word_count_answer(task)
+            },
+        );
+        let one_releaser = {
+            let q = one_cap_queue.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                q.cancel_task(&cap_blocker_id, Some("free slot".into()))
+                    .await
+                    .unwrap();
+            })
+        };
+        let one_res = tokio::time::timeout(
+            Duration::from_secs(5),
+            one_engine.execute(word_job(vec!["alpha beta".into()], 1, sum_reducer())),
+        )
+        .await
+        .expect("job completes after capacity slot is freed")
+        .unwrap();
+        one_releaser.abort();
+        one_worker.abort();
+        assert_eq!(one_res.status, "Completed");
+        assert_eq!(one_res.output["alpha"].as_i64(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_mapreduce_job_times_out_when_queue_stays_full_and_reports_why() {
+        let queue = TaskQueue::with_retention_limits(
+            crate::queue::RetryPolicy::default(),
+            None,
+            crate::queue::DEFAULT_MAX_TERMINAL_TASKS,
+            crate::queue::DEFAULT_MAX_TERMINAL_BYTES,
+            4_000,
+        );
+        let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let engine =
+            MapReduceEngine::new(queue.clone(), Arc::new(Notify::new()), Arc::clone(&waiters));
+
+        // Keep the queue full for the entire 1-second job timeout.
+        let blocker = Task::new(
+            TaskSpec::Command {
+                program: "sleep".into(),
+                args: vec!["60".into()],
+                env: Default::default(),
+                working_dir: None,
+                stdin: Some(vec![b'b'; 2_500]),
+            },
+            TaskRequirements::generic(1, 60),
+        );
+        let _blocker_id = queue.submit(blocker).await.unwrap();
+
+        let job = MapReduceJobSpec::new(
+            "full_queue_timeout",
+            vec!["hello world".into()],
+            MapFunctionSpec::Builtin {
+                operator: "word_count".into(),
+            },
+            sum_reducer(),
+            1,
+            1,
+            1,
+        );
+        let err = tokio::time::timeout(Duration::from_secs(5), engine.execute(job))
+            .await
+            .expect("job ends at its 1s timeout")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, GridError::Timeout { .. }), "got {err:?}");
+        assert!(
+            msg.contains("waiting for queue room") && msg.contains("--max-active-mb"),
+            "timeout message must explain why the task could not be queued: {msg}"
         );
     }
 }

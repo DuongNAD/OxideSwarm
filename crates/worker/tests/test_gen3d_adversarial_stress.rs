@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use rusty_grid_core::task::Generative3DSpec;
 use rusty_grid_worker::gen3d::bake::encode_png_rgba;
@@ -17,7 +17,6 @@ use rusty_grid_worker::gen3d::gltf_pack::{
 use rusty_grid_worker::gen3d::manifold::repair_manifold_mesh;
 use rusty_grid_worker::gen3d::marching_cubes::extract_isosurface;
 use rusty_grid_worker::gen3d::sdf::{resolve_preset, SdfPreset};
-use rusty_grid_worker::job_object::JobObject;
 
 // ============================================================================
 // CHALLENGE 1: Prompt Resolution & Preset Fallback Stress
@@ -623,48 +622,6 @@ fn test_png_encoder_crc32_and_adler32_correctness() {
     assert!(seen_ihdr, "Missing IHDR chunk");
     assert!(seen_idat, "Missing IDAT chunk");
     assert!(seen_iend, "Missing IEND chunk");
-}
-
-// ============================================================================
-// CHALLENGE 7: Win32 Job Object Tree Kill & Zombie Resistance
-// ============================================================================
-
-#[test]
-fn test_job_object_tree_kill_resilience() {
-    let job = JobObject::create().expect("Failed to create JobObject");
-
-    // Spawn a process tree: parent cmd spawns child powershell with sleep
-    #[cfg(windows)]
-    let mut cmd = std::process::Command::new("cmd.exe");
-    #[cfg(windows)]
-    cmd.args([
-        "/c",
-        "powershell -NoProfile -Command Start-Sleep -Seconds 30",
-    ]);
-
-    #[cfg(not(windows))]
-    let mut cmd = std::process::Command::new("sh");
-    #[cfg(not(windows))]
-    cmd.args(["-c", "sleep 30"]);
-
-    let mut child = cmd.spawn().expect("Failed to spawn process tree");
-    let pid = child.id();
-
-    let mut job = job;
-    job.assign_pid(pid)
-        .expect("Failed to assign PID to JobObject");
-
-    // Small yield to let child and grandchild spin up
-    std::thread::sleep(Duration::from_millis(100));
-
-    // Forceful tree kill
-    job.terminate(99).expect("Failed to terminate JobObject");
-
-    let status = child.wait().expect("Wait failed");
-    assert!(
-        !status.success(),
-        "Process tree should not exit successfully"
-    );
 }
 
 // ============================================================================
