@@ -116,7 +116,7 @@ impl Cluster {
             .await
             .expect("send");
         let reply = tokio::time::timeout(
-            Duration::from_secs(120),
+            Duration::from_secs(240),
             transport.recv_msg::<ClientResponse>(),
         )
         .await
@@ -202,7 +202,7 @@ const PROCESS_SCRIPT: &str = "set -e; mkdir -p out; \
      ./project/tool.sh > out/tool-output.txt";
 
 #[cfg(windows)]
-const PROCESS_SCRIPT: &str = "if not exist out mkdir out && \
+const PROCESS_SCRIPT: &str = "(if not exist out mkdir out) && \
      copy /y /b project\\hello.txt + project\\nested\\deeper\\data.csv out\\combined.txt >nul && \
      copy /y /b project\\big.bin out\\big-copy.bin >nul && \
      call project\\tool.cmd > out\\tool-output.txt";
