@@ -2708,18 +2708,32 @@ pub(crate) fn append_note(bytes: Bytes, note: &str) -> Bytes {
 
 /// Reads an output file produced by a task process.
 ///
-/// Verifies that the target path exists and is a regular file before reading to prevent
-/// hanging on special non-regular files (such as FIFOs, character devices, or directories).
+/// Queries `tokio::fs::symlink_metadata` first so symbolic links are refused without
+/// being followed, non-regular files (such as FIFOs, character devices, or directories)
+/// are refused without hanging, and files exceeding `MAX_FRAME_SIZE` (64 MiB) are
+/// refused before reading into memory.
 ///
-/// Returns `Ok(Some(Vec<u8>))` if the file exists and is read successfully.
+/// Returns `Ok(Some(Vec<u8>))` if the regular file exists, is within the frame limit,
+/// and is read successfully.
 /// Returns `Ok(None)` only if the file was not found (`ErrorKind::NotFound`).
-/// Returns `Err(io::Error)` if reading failed for any other reason (e.g. not a regular file, permission denied).
+/// Returns `Err(io::Error)` if reading failed for any other reason (e.g. symbolic link,
+/// not a regular file, exceeds `MAX_FRAME_SIZE`, or permission denied).
 pub(crate) async fn read_output_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-    let meta = match tokio::fs::metadata(path).await {
+    let meta = match tokio::fs::symlink_metadata(path).await {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
+
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "output path is a symbolic link (symbolic links are prohibited for security isolation): {}",
+                path.display()
+            ),
+        ));
+    }
 
     if !meta.is_file() {
         return Err(std::io::Error::new(
@@ -2728,11 +2742,48 @@ pub(crate) async fn read_output_file(path: &Path) -> std::io::Result<Option<Vec<
         ));
     }
 
-    match tokio::fs::read(path).await {
-        Ok(data) => Ok(Some(data)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+    let max_bytes = rusty_grid_core::protocol::MAX_FRAME_SIZE as u64;
+    let size = meta.len();
+    if size > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "output file '{}' is {} bytes, exceeding frame limit of {} bytes (64 MiB)",
+                path.display(),
+                size,
+                max_bytes
+            ),
+        ));
     }
+
+    let file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    let mut data = Vec::with_capacity(size as usize);
+    use tokio::io::AsyncReadExt;
+    file.take(max_bytes + 1).read_to_end(&mut data).await?;
+
+    if (data.len() as u64) > max_bytes {
+        let actual_size = tokio::fs::symlink_metadata(path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(data.len() as u64)
+            .max(data.len() as u64);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "output file '{}' is {} bytes, exceeding frame limit of {} bytes (64 MiB)",
+                path.display(),
+                actual_size,
+                max_bytes
+            ),
+        ));
+    }
+
+    Ok(Some(data))
 }
 
 #[cfg(test)]
@@ -3366,6 +3417,118 @@ mod outcome_tests {
         assert!(res.is_success(), "{res:?}");
         assert_eq!(res.stdout_str().trim(), "via-default-shell");
     }
+
+    #[tokio::test]
+    async fn test_read_output_file_regular_missing_and_directory() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("model.glb");
+        let non_existent = temp_dir.path().join("missing.glb");
+        let dir_path = temp_dir.path().join("subdir");
+        tokio::fs::create_dir(&dir_path).await.expect("create dir");
+
+        // Missing file -> Ok(None)
+        let res = read_output_file(&non_existent).await.expect("read missing");
+        assert!(res.is_none());
+
+        // Regular file -> Ok(Some(data))
+        tokio::fs::write(&file_path, b"glTF test content")
+            .await
+            .expect("write file");
+        let res = read_output_file(&file_path).await.expect("read file");
+        assert_eq!(res, Some(b"glTF test content".to_vec()));
+
+        // Directory -> Err
+        let err = read_output_file(&dir_path).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("output path is not a regular file"));
+    }
+
+    #[tokio::test]
+    async fn test_read_output_file_refuses_symlink_and_oversized_or_sparse_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let target_file = temp_dir.path().join("target.glb");
+        tokio::fs::write(&target_file, b"glTF\x02\x00\x00\x00\x0c\x00\x00\x00")
+            .await
+            .expect("write target file");
+
+        // 1. Symbolic link / junction must be refused via symlink_metadata
+        let link_path = temp_dir.path().join("link_model.glb");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target_file, &link_path).expect("create unix symlink");
+        }
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_file(&target_file, &link_path).is_err() {
+                let target_dir = temp_dir.path().join("target_dir");
+                std::fs::create_dir(&target_dir).expect("create target_dir");
+                let status = std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(&link_path)
+                    .arg(&target_dir)
+                    .status()
+                    .expect("run mklink /J");
+                assert!(status.success(), "mklink /J must succeed");
+            }
+        }
+
+        let link_err = read_output_file(&link_path)
+            .await
+            .expect_err("symlink output must be refused");
+        assert_eq!(link_err.kind(), std::io::ErrorKind::InvalidData);
+        let link_msg = link_err.to_string();
+        assert!(
+            link_msg.contains("symbolic link")
+                && link_msg.contains(&link_path.display().to_string()),
+            "expected symlink error naming path '{}', got: '{link_msg}'",
+            link_path.display()
+        );
+
+        // 2. File just above MAX_FRAME_SIZE (64 MiB + 1 byte) must be refused with path and size
+        let oversized_path = temp_dir.path().join("oversized.glb");
+        let oversized_len = (rusty_grid_core::protocol::MAX_FRAME_SIZE as u64) + 1;
+        {
+            let f = std::fs::File::create(&oversized_path).expect("create oversized file");
+            f.set_len(oversized_len).expect("set_len oversized");
+        }
+        let over_err = read_output_file(&oversized_path)
+            .await
+            .expect_err("file above MAX_FRAME_SIZE must be refused");
+        assert_eq!(over_err.kind(), std::io::ErrorKind::InvalidData);
+        let over_msg = over_err.to_string();
+        assert!(
+            over_msg.contains(&oversized_path.display().to_string())
+                && over_msg.contains(&oversized_len.to_string()),
+            "expected error naming path '{}' and size {oversized_len}, got: '{over_msg}'",
+            oversized_path.display()
+        );
+
+        // 3. Large 5 GiB sparse file must fail promptly without being read into memory
+        let sparse_path = temp_dir.path().join("sparse_5gib.glb");
+        let sparse_len: u64 = 5 * 1024 * 1024 * 1024;
+        {
+            let f = std::fs::File::create(&sparse_path).expect("create sparse file");
+            f.set_len(sparse_len).expect("set_len 5 GiB sparse");
+        }
+        let t0 = std::time::Instant::now();
+        let sparse_err = read_output_file(&sparse_path)
+            .await
+            .expect_err("5 GiB sparse file must be refused before reading");
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "5 GiB sparse file check took {elapsed:?}; must fail before reading"
+        );
+        let sparse_msg = sparse_err.to_string();
+        assert!(
+            sparse_msg.contains(&sparse_path.display().to_string())
+                && sparse_msg.contains(&sparse_len.to_string()),
+            "expected error naming path '{}' and size {sparse_len}, got: '{sparse_msg}'",
+            sparse_path.display()
+        );
+    }
 }
 
 /// Real process trees: every test here spawns grandchildren (`sh -c` with a background `sleep`)
@@ -3815,32 +3978,5 @@ mod process_tree_tests {
             "[unset][unset][given-on-purpose]",
             "{res:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn test_read_output_file_regular_missing_and_directory() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let file_path = temp_dir.path().join("model.glb");
-        let non_existent = temp_dir.path().join("missing.glb");
-        let dir_path = temp_dir.path().join("subdir");
-        tokio::fs::create_dir(&dir_path).await.expect("create dir");
-
-        // Missing file -> Ok(None)
-        let res = read_output_file(&non_existent).await.expect("read missing");
-        assert!(res.is_none());
-
-        // Regular file -> Ok(Some(data))
-        tokio::fs::write(&file_path, b"glTF test content")
-            .await
-            .expect("write file");
-        let res = read_output_file(&file_path).await.expect("read file");
-        assert_eq!(res, Some(b"glTF test content".to_vec()));
-
-        // Directory -> Err
-        let err = read_output_file(&dir_path).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(err
-            .to_string()
-            .contains("output path is not a regular file"));
     }
 }

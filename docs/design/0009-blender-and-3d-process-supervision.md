@@ -1,7 +1,7 @@
 # 0009: Process supervision for Blender and 3D workloads
 
 Status: Implemented
-Created: 2026-11-01    Updated: 2026-11-01
+Created: 2026-11-01    Updated: 2026-11-03
 
 ## Summary
 
@@ -58,7 +58,9 @@ This helper encapsulates:
 - Two-phase teardown: graceful termination followed by uncatchable tree kill on timeout or cancellation.
 
 The standalone `crates/worker/src/job_object.rs` module and `TaskRunner::terminate_process_tree` are
-deleted as dead code. Primary output asset loading is decoupled into `read_output_file(path)`.
+deleted as dead code. Primary output asset loading is decoupled into `read_output_file(path)`, which
+queries `tokio::fs::symlink_metadata` to refuse symbolic links, non-regular files, and files exceeding
+the 64 MiB wire protocol frame limit (`MAX_FRAME_SIZE`) before reading them into memory.
 
 ### D2: Post-execution progress checkpointing
 
@@ -84,12 +86,11 @@ unchanged. Tasks receive standard environment variables:
 
 ## Known limits
 
-- **Uncapped output reads and wire frame limit**: The output model file is read into memory via
-  `tokio::fs::read` without an arbitrary size cap after `tokio::fs::metadata` verifies the path is a
-  regular file (preventing hangs on non-regular files like FIFOs), following symbolic links to regular
-  files, matching behavior on `master` (BUG-10). However, wire protocol frames are limited to 64 MiB
-  (`MAX_FRAME_SIZE` in `rusty_grid_core::protocol`), so any result above 64 MiB will fail transmission
-  and cannot reach the client intact.
+- **Wire frame limit on output assets**: `read_output_file` queries `tokio::fs::symlink_metadata`
+  first, refusing symbolic links, non-regular files (such as FIFOs or directories), and files
+  exceeding the 64 MiB wire protocol frame limit (`MAX_FRAME_SIZE` in `rusty_grid_core::protocol`)
+  before reading them into memory (BUG-10). Assets larger than 64 MiB cannot be transmitted inline
+  in `TaskResult`.
 - **Worker crash on Unix**: On Unix, task processes run under process groups (`killpg`). Normal
   cancellation, watchdog timeout, or task drop terminates the process group. However, after an
   abrupt worker crash (SIGKILL/panic) on Unix, nothing kills the process groups; they are left
@@ -133,7 +134,7 @@ a task process can still read the worker account's secret file on disk, as docum
 |---|---|---|---|---|
 | W1 | Hardened process runner integration | `runner.rs`, `blender_provider.rs` | Blender and 3D use `execute_process_supervised` | Implemented |
 | W2 | Secret stripping on probes | `cluster_auth.rs`, `capabilities.rs`, `blender_provider.rs`, `gen3d/runner.rs` | Python/Blender probes stripped via `probe_command` | Implemented |
-| W3 | Output file reading helper | `runner.rs` | `read_output_file` reads asset without size cap | Implemented |
+| W3 | Output file reading helper | `runner.rs` | `read_output_file` refuses symlinks, non-regular files, and files above `MAX_FRAME_SIZE` | Implemented |
 | W4 | Clean up dead code & update headers | `runner.rs`, `*_job_object.rs` | `terminate_process_tree` removed; headers updated | Implemented |
 | W5 | Test suite verification | `test_sec5_*.rs`, `test_challenger_*.rs` | All suites pass on Windows; CI runs `test_sec5_hardened_runner` on Linux and macOS | Implemented |
 
@@ -142,4 +143,5 @@ a task process can still read the worker account's secret file on disk, as docum
 - 2026-11-01: Implemented process supervision for 3D and Blender workloads via TaskRunner (SEC-5).
 - 2026-11-01: Updated design record for second round review: corrected master baseline, Unix crash semantics, probe secret isolation, and output frame limit.
 - 2026-11-01: Updated design record for round 3 review: corrected default output buffer limit, metadata regular file check, task env stripping vs probe_command distinction, CI scope, and W2 file list.
+- 2026-11-03: Guarded `read_output_file` with `symlink_metadata` to refuse symbolic links and files exceeding `MAX_FRAME_SIZE` before reading (BUG-10).
 
