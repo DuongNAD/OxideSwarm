@@ -1872,6 +1872,13 @@ impl TaskQueue {
             .tasks
             .get_mut(&task_id)
             .ok_or(GridError::TaskNotFound(task_id.0))?;
+        if !entry.state.can_transition_to(TaskState::Failed) {
+            return Err(GridError::InvalidTaskState {
+                task_id: task_id.0,
+                current: format!("{:?}", entry.state),
+                attempted: "Failed".into(),
+            });
+        }
         entry.state = TaskState::Failed;
         entry.finished_instant = Some(Instant::now());
         entry.error_message = result.error.clone();

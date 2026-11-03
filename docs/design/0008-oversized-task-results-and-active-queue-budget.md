@@ -149,14 +149,16 @@ returns `GridError::QueueByteLimitExceeded` or `GridError::QueueFull`:
 ### D6: Oversized outbound frames from the master and single-copy checkpoint assignment
 
 1. **Master to worker (`AssignTask` / `AssignTaskWithCheckpoint`)**:
-   - In `handle_worker_connection` (TCP) and `handle_p2p_worker_connection` (QUIC)
+   - In `handle_connection` (TCP) and `handle_multiplexed_connection` (QUIC)
      (`crates/master/src/server.rs`), when `writer.send_msg(&msg)` returns
      `ProtocolError::FrameTooLarge { size, max }`, the writer task does not exit and the worker
      session stays open.
    - `handle_oversized_master_message` calls `TaskQueue::fail_unsendable_assignment` to transition
      only the oversized task directly to `TaskState::Failed` (without retrying) with the frame-limit
      reason in `error` and `stderr`, releases the worker's dispatch slot, unpins input blobs, and
-     wakes awaiting clients and the scheduler.
+     wakes awaiting clients and the scheduler. A task whose `AssignTaskWithCheckpoint` still exceeds
+     64 MiB (even with a single copy of the checkpoint) fails outright rather than falling back to
+     a plain `AssignTask` without its checkpoint.
 2. **Single-copy checkpoint in `AssignTaskWithCheckpoint`**:
    - `WorkloadScheduler::schedule_batch` (`crates/master/src/scheduler.rs`) moves
      `task.latest_checkpoint.take()` into `MasterMessage::AssignTaskWithCheckpoint::latest_checkpoint`
@@ -164,9 +166,9 @@ returns `GridError::QueueByteLimitExceeded` or `GridError::QueueFull`:
 3. **Master to client (`ClientResponse`)**:
    - `send_client_response` (`crates/master/src/server.rs`) catches
      `ProtocolError::FrameTooLarge { size, max }` when sending any `ClientResponse` (such as a
-     `ClientResponse::TaskCompleted` that is 16–24 bytes larger than the worker's
-     `WorkerMessage::TaskResult` frame) and replies with `ClientResponse::Error { message }` instead
-     of dropping the client connection.
+     `ClientResponse::TaskCompleted` that is 24 bytes larger in bincode than the worker's
+     `WorkerMessage::TaskResult` frame) and replies with `ClientResponse::Error { message }`
+     (naming the task ID and `--output`) instead of dropping the client connection.
 
 ## Compatibility
 
