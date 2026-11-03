@@ -5221,11 +5221,19 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("oxideswarm_worker_hung_blender_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("hung.pid");
         let script = dir.join("blender");
         {
             use std::io::Write;
             let mut file = std::fs::File::create(&script).unwrap();
-            file.write_all(b"#!/bin/sh\nsleep 60\n").unwrap();
+            file.write_all(
+                format!(
+                    "#!/bin/sh\nsleep 60 &\necho $! > '{}'\nwait\n",
+                    pid_file.display()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
             file.sync_all().unwrap();
         }
         let mut perms = std::fs::metadata(&script).unwrap().permissions();
@@ -5242,6 +5250,17 @@ mod tests {
                 .with_blender_path(script.to_string_lossy().to_string()),
         );
         let elapsed = started.elapsed();
+        if let Ok(raw) = std::fs::read_to_string(&pid_file) {
+            let pid: u32 = raw.trim().parse().expect("valid hung grandchild pid");
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            while process_alive(pid) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                !process_alive(pid),
+                "hung Blender probe grandchild {pid} survived WorkerClient::new"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(!client.capabilities().has_blender);
