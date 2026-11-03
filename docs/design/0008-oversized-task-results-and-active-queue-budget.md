@@ -1,7 +1,7 @@
 # 0008: Oversized task results and active queue byte budget
 
 Status: Implemented
-Created: 2026-11-01    Updated: 2026-11-02
+Created: 2026-11-01    Updated: 2026-11-04
 
 ## Summary
 
@@ -146,6 +146,28 @@ returns `GridError::QueueByteLimitExceeded` or `GridError::QueueFull`:
 - `MapReduceEngine::execute` honours positive `spec.timeout_secs` values directly (including values
   under 60 s, such as `--timeout-secs 1`), falling back to 60 s only when `spec.timeout_secs == 0`.
 
+### D6: Oversized outbound frames from the master and single-copy checkpoint assignment
+
+1. **Master to worker (`AssignTask` / `AssignTaskWithCheckpoint`)**:
+   - In `handle_worker_connection` (TCP) and `handle_p2p_worker_connection` (QUIC)
+     (`crates/master/src/server.rs`), when `writer.send_msg(&msg)` returns
+     `ProtocolError::FrameTooLarge { size, max }`, the writer task does not exit and the worker
+     session stays open.
+   - `handle_oversized_master_message` calls `TaskQueue::fail_unsendable_assignment` to transition
+     only the oversized task directly to `TaskState::Failed` (without retrying) with the frame-limit
+     reason in `error` and `stderr`, releases the worker's dispatch slot, unpins input blobs, and
+     wakes awaiting clients and the scheduler.
+2. **Single-copy checkpoint in `AssignTaskWithCheckpoint`**:
+   - `WorkloadScheduler::schedule_batch` (`crates/master/src/scheduler.rs`) moves
+     `task.latest_checkpoint.take()` into `MasterMessage::AssignTaskWithCheckpoint::latest_checkpoint`
+     on the outgoing clone so the checkpoint payload is serialized once on the wire instead of twice.
+3. **Master to client (`ClientResponse`)**:
+   - `send_client_response` (`crates/master/src/server.rs`) catches
+     `ProtocolError::FrameTooLarge { size, max }` when sending any `ClientResponse` (such as a
+     `ClientResponse::TaskCompleted` that is 16–24 bytes larger than the worker's
+     `WorkerMessage::TaskResult` frame) and replies with `ClientResponse::Error { message }` instead
+     of dropping the client connection.
+
 ## Compatibility
 
 - `ClientResponse::ClusterStatus` appends `active_bytes` and `max_active_bytes` *after* `workers` in
@@ -193,3 +215,4 @@ or faulty task from disconnecting the worker and disrupting co-scheduled tasks.
 
 - 2026-11-01: Implemented W1–W3 on branch `mac/bug-4-oversized-result-and-budget` (BUG-4).
 - 2026-11-02: Completed BUG-12 follow-up on branch `mac/bug-12-active-task-byte-cap`: reset Map/Reduce execution clock after queue admission, eliminated per-retry task cloning with `try_submit_slot` and exponential backoff (25 ms to 1 s), disarmed `AbandonGuard` until submission succeeds, cancelled Map/Reduce jobs on client disconnect, added `task_bytes` to `GridError::QueueByteLimitExceeded` (returning `is_transient() == false` and HTTP 413 when `task_bytes > max_bytes`), refused `--max-active-mb 0`, wired `--max-active-mb` / `RUSTY_GRID_MAX_ACTIVE_MB` into `agent-mesh hub`, and exposed `active_bytes` / `max_active_bytes` in `QueueStats`, `ClusterStatus`, `oxideswarm status`, and the web dashboard.
+- 2026-11-04: Completed BUG-11 on branch `mac/bug-11-refuse-oversized-master-frames`: failed only the task when an outbound `AssignTask` or `AssignTaskWithCheckpoint` exceeds `MAX_FRAME_SIZE` without terminating the worker session, sent `latest_checkpoint` once in `AssignTaskWithCheckpoint`, and returned `ClientResponse::Error` when a client reply exceeds `MAX_FRAME_SIZE`.
