@@ -1,7 +1,7 @@
 # 0012: Concurrent MCP server with client deadlines, cancellation, and progress
 
 Status: Implemented
-Created: 2026-11-02    Updated: 2026-11-02
+Created: 2026-11-02    Updated: 2026-11-04
 
 ## Summary
 
@@ -52,8 +52,8 @@ Behaviour before this change:
 - `--master auto` discovery (`resolve_master_addr` across UDP, HTTP, and rendezvous) runs before starting the per-RPC timeout or `wait_secs` deadline and caches the resolved `host:port` in `McpState` (invalidating the cache on connection failure).
 - `deadline = Instant::now() + Duration::from_secs(wait_secs)` is started after target resolution. On `submit {wait: true}`, connecting and sending `SubmitTask` use a minimum `1 s` RPC bound so `wait_secs: 0` still submits the task and immediately reports its state (`timed_out: true` if not yet complete).
 - When `deadline` expires during `submit {wait: true}`, the dedicated wait connection is dropped (leaving the task queued or running on the master), `GetTaskStatus` is queried with a `500 ms` timeout (falling back to `"status": "Unknown", "state": "unknown"` if the status query fails or times out), and `submit` returns `{"task_id", "status", "state", "timed_out": true}`.
-- `task_result` accepts `wait_secs` (or `timeout_secs`, default `60`) and bounds `connect_dedicated_until`, `send_msg`, `recv_msg`, and polling sleep by `deadline`.
-- `McpState::request_with_timeout` takes the pooled `MessageTransport` out of the `Mutex` before performing network I/O and restores it only on success, so a slow or silent master never blocks other concurrent tool calls. Frame reads and writes (`send_msg_with_idle_timeout` and `recv_msg_with_idle_timeout`) bound idle time between progress chunks (`2 s`) rather than total frame transfer duration so large responses (up to `64 MB`) over slow links succeed as long as bytes continue arriving. Non-idempotent requests (`SubmitTask`) are never resent on a new connection once the pooled write succeeds (falling back to a fresh connection only when the pooled write itself failed); on a receive timeout after sending `SubmitTask`, `submit {wait: false}` returns the `task_id` with `"timed_out": true` and its `GetTaskStatus` state, matching `submit {wait: true}`.
+- `task_result` accepts `wait_secs` (or `timeout_secs`, default `60`) and bounds `connect_dedicated_until`, `send_msg`, `recv_msg`, and polling sleep by `deadline` (treating a zero wait duration as a single non-waiting `GetTaskResult` query, like `wait: false`).
+- `McpState::request_with_timeout` takes the pooled `MessageTransport` out of the `Mutex` before performing network I/O and restores it only on success, so a slow or silent master never blocks other concurrent tool calls. Frame reads and writes (`send_msg_with_idle_timeout` and `recv_msg_with_idle_timeout`) bound idle time between progress chunks (`2 s`) rather than total frame transfer duration so large responses (up to `64 MB`) over slow links succeed as long as bytes continue arriving. Idempotent requests (`ClusterStatus`, `ListWorkers`, `CancelTask`, `GetTaskResult`, `GetTaskStatus`) fall back to opening a fresh connection if the pooled write or receive fails (including EOF, decode/I/O error, or receive timeout). Non-idempotent requests (`SubmitTask`) fall back to a fresh connection only when the pooled write itself fails and are never resent once the write succeeds; if receiving the `SubmitTask` reply fails (timeout, unexpected EOF, or decode/I/O error), `submit {wait: false}` checks cancellation, queries `GetTaskStatus`, and either returns the `task_id` with `"timed_out": true`, its current state, and advice to query its outcome (`isError: false`), or returns `"state": "not_submitted"` with `isError: true` when the master reports the task was not found.
 
 ### D3 `cancel` tool, `notifications/cancelled`, and stdio EOF shutdown
 
@@ -92,3 +92,4 @@ Behaviour before this change:
 ## Status log
 
 - 2026-11-02: Implemented concurrent MCP stdio server, `wait_secs` deadlines, `cancel` tool, `notifications/cancelled`, unmatched worker warning, default `max_retries = None`, and `notifications/progress` in `crates/cli/src/mcp.rs`; added integration tests in `crates/cli/tests/test_mcp_concurrent_and_deadlines.rs`.
+- 2026-11-04: Avoided resending `SubmitTask` after a pooled write succeeds while preserving fresh-connection fallback for idempotent requests on pooled EOF, error, or timeout; routed all post-write `SubmitTask` receive failures through `GetTaskStatus` recovery (reporting `not_submitted` with `isError: true` when the master answers not found).

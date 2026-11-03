@@ -248,8 +248,9 @@ impl McpState {
 
     /// Sends a client request to the master with progress bounded by `timeout`, without holding
     /// the pooled transport lock across network I/O and resolving `--master auto` outside the
-    /// per-RPC timeout. Non-idempotent requests (`SubmitTask`) are never resent after the pooled
-    /// write succeeds; only a failed pooled write falls back to a fresh connection.
+    /// per-RPC timeout. Idempotent requests fall back to a fresh connection if the pooled write
+    /// or receive fails (including EOF or timeout); non-idempotent requests (`SubmitTask`) fall
+    /// back only if the pooled write fails and are never resent after the pooled write succeeds.
     pub async fn request_with_timeout(
         &self,
         message: &ClientMessage,
@@ -280,7 +281,7 @@ impl McpState {
                         return Ok(resp);
                     }
                     Err(rusty_grid_core::protocol::ProtocolError::Io(ref io_err))
-                        if io_err.kind() == std::io::ErrorKind::TimedOut =>
+                        if !is_idempotent && io_err.kind() == std::io::ErrorKind::TimedOut =>
                     {
                         return Err(format!(
                             "Timed out waiting for response from Master at {}",
@@ -294,8 +295,8 @@ impl McpState {
                         return Err(format!("Failed to receive response from Master: {e}"));
                     }
                     Ok(None) | Err(_) => {
-                        // Pooled idle connection was closed or reset before replying to an
-                        // idempotent request; fall through to open a fresh connection.
+                        // Pooled idle connection was closed, reset, or timed out before replying
+                        // to an idempotent request; fall through to open a fresh connection.
                     }
                 }
             }
@@ -1313,7 +1314,11 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
             }
             Ok(ClientResponse::Error { message }) => ToolCallResult::error(message),
             Ok(other) => ToolCallResult::error(format!("Unexpected Master response: {other:?}")),
-            Err(e) if e.starts_with("Timed out waiting for response") => {
+            Err(e)
+                if e.starts_with("Timed out waiting for response")
+                    || e == "Master closed connection unexpectedly"
+                    || e.starts_with("Failed to receive response from Master") =>
+            {
                 if ctx.is_cancelled() {
                     ctx.aborted_by_cancel = true;
                     let _ = state
@@ -1324,7 +1329,7 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                         .await;
                     return ToolCallResult::error(format!("Task {task_id} cancelled by client"));
                 }
-                let (status_str, state_name) = match state
+                let (status_str, state_name, is_error, detail) = match state
                     .request_with_timeout(
                         &ClientMessage::GetTaskStatus { task_id },
                         Duration::from_millis(500),
@@ -1333,19 +1338,46 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                 {
                     Ok(ClientResponse::TaskStatusInfo {
                         status, state_name, ..
-                    }) => (format!("{:?}", status), state_name),
-                    _ => ("Unknown".to_string(), "unknown".to_string()),
+                    }) => (
+                        format!("{:?}", status),
+                        state_name,
+                        false,
+                        format!(
+                            "Task {task_id} was submitted ({e}); query its outcome with task_result or status"
+                        ),
+                    ),
+                    Ok(ClientResponse::Error { message }) if message.contains("not found") => (
+                        "NotSubmitted".to_string(),
+                        "not_submitted".to_string(),
+                        true,
+                        format!("Task {task_id} was not submitted ({e}): {message}"),
+                    ),
+                    _ => (
+                        "Unknown".to_string(),
+                        "unknown".to_string(),
+                        false,
+                        format!(
+                            "Task {task_id} may have been submitted ({e}); query its outcome with task_result or status"
+                        ),
+                    ),
                 };
                 let mut body = json!({
                     "task_id": task_id.to_string(),
                     "status": status_str,
                     "state": state_name,
                     "timed_out": true,
+                    "message": detail,
                 });
                 if let Some(w) = warning {
                     body["warning"] = Value::String(w);
                 }
-                ToolCallResult::ok_json(&body)
+                ToolCallResult {
+                    content: vec![ToolContent::Text {
+                        text: serde_json::to_string_pretty(&body)
+                            .unwrap_or_else(|_| body.to_string()),
+                    }],
+                    is_error,
+                }
             }
             Err(e) => ToolCallResult::error(e),
         }
@@ -1410,7 +1442,7 @@ async fn tool_task_result(
         .and_then(Value::as_u64)
         .unwrap_or(60);
 
-    if wait {
+    if wait && timeout_secs > 0 {
         if let Err(e) = state.resolve_target_addr().await {
             return ToolCallResult::error(e);
         }

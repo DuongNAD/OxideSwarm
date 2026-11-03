@@ -934,8 +934,8 @@ async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_sec
     std::fs::create_dir_all(&sandbox_dir).expect("create sandbox_dir");
 
     // Configure the master and worker with a ClusterSecret so `wait_secs: 0` (N31-3)
-    // must run the multi-step authenticated handshake (which fails if `.max(1)` at
-    // `mcp.rs:1099` is removed).
+    // must run the multi-step authenticated handshake (which fails if `.max(1)` in
+    // `tool_submit` is removed).
     let secret = rusty_grid_core::cluster_auth::ClusterSecret::generate().expect("generate secret");
     let secret_hex = secret.to_hex();
     let cfg = ServerConfig::from_addr("127.0.0.1:0")
@@ -973,7 +973,7 @@ async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_sec
 
     // Forwarder in front of `master_addr` with a 5ms handshake latency (> Tokio's 1ms timer
     // wheel tick) so `connect_master`'s authenticated handshake cannot complete inside a single
-    // sub-millisecond poll if `.max(1)` at `mcp.rs:1099` is removed.
+    // sub-millisecond poll if `.max(1)` in `tool_submit` is removed.
     let auth_proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind auth_proxy_listener");
@@ -1116,10 +1116,10 @@ async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_sec
     );
 
     // Step 1b (N31-2 + N31-3): Now send `submit {wait: true, wait_secs: 0}` (id 3) against the
-    // authenticated master. Because `resolved_master_addr` is cached (`mcp.rs:235`), it must NOT
-    // query the rendezvous server again and must answer well under the 1.5s UDP timeout; and
-    // because `.max(1)` at `mcp.rs:1099` gives the authenticated handshake a 1s floor, it must
-    // succeed despite `wait_secs: 0`.
+    // authenticated master. Because `resolved_master_addr` is cached in
+    // `McpState::resolve_target_addr`, it must NOT query the rendezvous server again and must
+    // answer well under the 1.5s UDP timeout; and because `.max(1)` in `tool_submit` gives the
+    // authenticated handshake a 1s floor, it must succeed despite `wait_secs: 0`.
     let cached_start = Instant::now();
     let wait_zero_msg = json!({
         "jsonrpc": "2.0",
@@ -1558,6 +1558,13 @@ async fn test_mcp1_pooled_slow_submit_reply_does_not_resend_and_returns_task_id(
     .expect("submit json");
     assert_eq!(body["timed_out"], true, "expected timed_out: true: {body}");
     assert_eq!(body["state"], "Queued", "expected Queued state: {body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("query its outcome"),
+        "expected advice to query task outcome: {body}"
+    );
     let tid = Uuid::parse_str(body["task_id"].as_str().expect("task_id")).expect("valid uuid");
     assert_eq!(
         submit_forwards.load(Ordering::SeqCst),
@@ -1571,6 +1578,426 @@ async fn test_mcp1_pooled_slow_submit_reply_does_not_resend_and_returns_task_id(
             .await
             .is_some(),
         "Master must hold the submitted task"
+    );
+
+    proxy_handle.abort();
+    let _ = shutdown_tx.send(true);
+    worker_handle.abort();
+    let _ = master.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_zero_timeout_result()
+{
+    use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
+    use rusty_grid_core::task::{TaskId, TaskSpec};
+    use rusty_grid_master::queue::TaskState;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
+
+    let (master, master_addr, shutdown_tx, worker_handle, temp) = spawn_cluster().await;
+
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let proxy_addr = proxy_listener.local_addr().expect("proxy_addr").to_string();
+    let eof_submits = Arc::new(AtomicUsize::new(0));
+    let corrupt_submits = Arc::new(AtomicUsize::new(0));
+    let stall_next_status = Arc::new(AtomicBool::new(false));
+    let cancelled_tid: Arc<tokio::sync::Mutex<Option<TaskId>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
+    let eof_submits_srv = Arc::clone(&eof_submits);
+    let corrupt_submits_srv = Arc::clone(&corrupt_submits);
+    let stall_status_srv = Arc::clone(&stall_next_status);
+    let cancelled_tid_srv = Arc::clone(&cancelled_tid);
+    let master_addr_srv = master_addr.clone();
+
+    let proxy_handle = tokio::spawn(async move {
+        while let Ok((client_stream, _)) = proxy_listener.accept().await {
+            let eof_s = Arc::clone(&eof_submits_srv);
+            let corrupt_s = Arc::clone(&corrupt_submits_srv);
+            let stall_st = Arc::clone(&stall_status_srv);
+            let cancel_tid = Arc::clone(&cancelled_tid_srv);
+            let upstream_addr = master_addr_srv.clone();
+            tokio::spawn(async move {
+                let Ok(upstream_stream) = tokio::net::TcpStream::connect(&upstream_addr).await
+                else {
+                    return;
+                };
+                let mut client_tx = MessageTransport::new(client_stream);
+                let mut upstream_tx = MessageTransport::new(upstream_stream);
+                while let Ok(Some(msg)) = client_tx.recv_msg::<ClientMessage>().await {
+                    if matches!(msg, ClientMessage::ClusterStatus)
+                        && stall_st.swap(false, Ordering::SeqCst)
+                    {
+                        // F2: Stall pooled connection past the 2s idle timeout so `status`
+                        // must recover on a fresh connection.
+                        tokio::time::sleep(Duration::from_millis(2400)).await;
+                        break;
+                    }
+                    if let ClientMessage::SubmitTask { ref task, .. } = msg {
+                        let tag = match &task.spec {
+                            TaskSpec::Command { args, .. } => {
+                                args.first().map(String::as_str).unwrap_or("")
+                            }
+                            _ => "",
+                        };
+                        match tag {
+                            "f1-eof" if eof_s.fetch_add(1, Ordering::SeqCst) == 0 => {
+                                if upstream_tx.send_msg(&msg).await.is_err() {
+                                    break;
+                                }
+                                let _ = upstream_tx.recv_msg::<ClientResponse>().await;
+                                // Close pooled client connection right after forwarding SubmitTask.
+                                break;
+                            }
+                            "f1-corrupt" if corrupt_s.fetch_add(1, Ordering::SeqCst) == 0 => {
+                                if upstream_tx.send_msg(&msg).await.is_err() {
+                                    break;
+                                }
+                                let _ = upstream_tx.recv_msg::<ClientResponse>().await;
+                                // Send undecodable frame header (> MAX_FRAME_LENGTH) after write.
+                                let mut raw = client_tx.into_inner().into_inner();
+                                let _ = raw.write_all(&[0xFF, 0xFF, 0xFF, 0xFF]).await;
+                                let _ = raw.flush().await;
+                                break;
+                            }
+                            "f3-drop" => {
+                                // Close pooled client connection WITHOUT forwarding SubmitTask so
+                                // the Master answers `Task ... not found` on GetTaskStatus.
+                                break;
+                            }
+                            "f4-cancel" => {
+                                *cancel_tid.lock().await = Some(task.id);
+                                // Delay forwarding SubmitTask by 200ms so notifications/cancelled
+                                // at 50ms arrives before the task exists on the Master, then
+                                // forward SubmitTask and close the client socket so only the
+                                // post-write cancel check in `tool_submit` cancels the task.
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                if upstream_tx.send_msg(&msg).await.is_err() {
+                                    break;
+                                }
+                                let _ = upstream_tx.recv_msg::<ClientResponse>().await;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if upstream_tx.send_msg(&msg).await.is_err() {
+                        break;
+                    }
+                    let Ok(Some(resp)) = upstream_tx.recv_msg::<ClientResponse>().await else {
+                        break;
+                    };
+                    if client_tx.send_msg(&resp).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut mcp = McpHarness::spawn(temp.path(), &proxy_addr);
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "mcp1-f1-f4", "version": "1.0" }
+        }
+    }));
+    let _ = mcp.recv_timeout(Duration::from_secs(5));
+
+    // 1. F1 (EOF on pooled connection right after forwarding SubmitTask):
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "submit",
+            "arguments": {
+                "type": "command",
+                "command": "echo",
+                "args": ["f1-eof"],
+                "require_tags": ["absent"],
+                "wait": false
+            }
+        }
+    }));
+    let eof_resp = mcp.recv_timeout(Duration::from_secs(5));
+    assert_eq!(eof_resp["id"], 2);
+    assert_eq!(
+        eof_resp["result"]["isError"], false,
+        "EOF after pooled SubmitTask write must recover via GetTaskStatus without resending: {eof_resp}"
+    );
+    let eof_body: Value = serde_json::from_str(
+        eof_resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("eof text"),
+    )
+    .expect("eof json");
+    assert_eq!(eof_body["timed_out"], true);
+    assert_eq!(eof_body["state"], "Queued");
+    assert!(
+        eof_body["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("query its outcome"),
+        "expected advice to query outcome: {eof_body}"
+    );
+    let eof_tid =
+        Uuid::parse_str(eof_body["task_id"].as_str().expect("task_id")).expect("valid uuid");
+    assert_eq!(
+        eof_submits.load(Ordering::SeqCst),
+        1,
+        "EOF on pooled connection must not resend SubmitTask"
+    );
+    assert_eq!(
+        master.queue().list_tasks().await.len(),
+        1,
+        "Master must hold exactly one task after f1-eof"
+    );
+    assert!(
+        master.queue().get_task(&TaskId(eof_tid)).await.is_some(),
+        "Master must hold the task from f1-eof"
+    );
+
+    // 2. F1 (Undecodable frame on pooled connection right after forwarding SubmitTask):
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "submit",
+            "arguments": {
+                "type": "command",
+                "command": "echo",
+                "args": ["f1-corrupt"],
+                "require_tags": ["absent"],
+                "wait": false
+            }
+        }
+    }));
+    let corrupt_resp = mcp.recv_timeout(Duration::from_secs(5));
+    assert_eq!(corrupt_resp["id"], 3);
+    assert_eq!(
+        corrupt_resp["result"]["isError"], false,
+        "Decode error after pooled SubmitTask write must recover via GetTaskStatus without resending: {corrupt_resp}"
+    );
+    let corrupt_body: Value = serde_json::from_str(
+        corrupt_resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("corrupt text"),
+    )
+    .expect("corrupt json");
+    assert_eq!(corrupt_body["timed_out"], true);
+    assert_eq!(corrupt_body["state"], "Queued");
+    let corrupt_tid =
+        Uuid::parse_str(corrupt_body["task_id"].as_str().expect("task_id")).expect("valid uuid");
+    assert_eq!(
+        corrupt_submits.load(Ordering::SeqCst),
+        1,
+        "Decode error on pooled connection must not resend SubmitTask"
+    );
+    assert!(
+        master
+            .queue()
+            .get_task(&TaskId(corrupt_tid))
+            .await
+            .is_some(),
+        "Master must hold the task from f1-corrupt"
+    );
+
+    // 3. F2: `status` on a pooled connection that stops answering (times out after 2s)
+    // must recover on a fresh connection.
+    stall_next_status.store(true, Ordering::SeqCst);
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+            "name": "status",
+            "arguments": {}
+        }
+    }));
+    let st_resp = mcp.recv_timeout(Duration::from_secs(6));
+    assert_eq!(st_resp["id"], 4);
+    assert_eq!(
+        st_resp["result"]["isError"], false,
+        "idempotent `status` must recover on a fresh connection after pooled timeout: {st_resp}"
+    );
+    let st_body: Value = serde_json::from_str(
+        st_resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("status text"),
+    )
+    .expect("status json");
+    assert_eq!(st_body["cluster_status"], "ok");
+
+    // 4. F3: When `GetTaskStatus` answers `Task ... not found` because the submit never reached
+    // the Master, `submit` must return `isError: true` and `state: "not_submitted"`.
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": {
+            "name": "submit",
+            "arguments": {
+                "type": "command",
+                "command": "echo",
+                "args": ["f3-drop"],
+                "require_tags": ["absent"],
+                "wait": false
+            }
+        }
+    }));
+    let drop_resp = mcp.recv_timeout(Duration::from_secs(5));
+    assert_eq!(drop_resp["id"], 5);
+    assert_eq!(
+        drop_resp["result"]["isError"], true,
+        "unsubmitted task must return isError: true: {drop_resp}"
+    );
+    let drop_body: Value = serde_json::from_str(
+        drop_resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("drop text"),
+    )
+    .expect("drop json");
+    assert_eq!(drop_body["state"], "not_submitted");
+    assert_eq!(drop_body["status"], "NotSubmitted");
+
+    // 5. F4: Cancel check in the post-write failure branch of `tool_submit`.
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/call",
+        "params": {
+            "name": "submit",
+            "arguments": {
+                "type": "command",
+                "command": "echo",
+                "args": ["f4-cancel"],
+                "require_tags": ["absent"],
+                "wait": false
+            }
+        }
+    }));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {
+            "requestId": 6,
+            "reason": "cancel while SubmitTask in flight before EOF"
+        }
+    }));
+
+    let cancel_deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        if let Some(tid) = *cancelled_tid.lock().await {
+            if let Some(info) = master.queue().get_task(&tid).await {
+                if info.state == TaskState::Cancelled {
+                    break;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < cancel_deadline,
+            "expected post-write cancel check in `tool_submit` to cancel the task on the Master"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // 6. `task_result` with `wait: true` and `timeout_secs: 0` on a missing task and a finished task.
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {
+            "name": "task_result",
+            "arguments": {
+                "task_id": "22222222-3333-4444-5555-666666666666",
+                "wait": true,
+                "timeout_secs": 0
+            }
+        }
+    }));
+    let missing_res = mcp.recv_timeout(Duration::from_secs(5));
+    assert_eq!(missing_res["id"], 7);
+    assert_eq!(
+        missing_res["result"]["isError"], true,
+        "task_result {{wait:true, timeout_secs:0}} on missing task must return isError: true: {missing_res}"
+    );
+    assert!(
+        missing_res["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not found"),
+        "expected not found error: {missing_res}"
+    );
+
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "tools/call",
+        "params": {
+            "name": "submit",
+            "arguments": {
+                "type": "command",
+                "command": "echo",
+                "args": ["zero-wait-done"],
+                "wait": true,
+                "wait_secs": 10
+            }
+        }
+    }));
+    let done_sub = mcp.recv_timeout(Duration::from_secs(10));
+    assert_eq!(done_sub["id"], 8);
+    assert_eq!(done_sub["result"]["isError"], false, "{done_sub}");
+    let done_sub_body: Value = serde_json::from_str(
+        done_sub["result"]["content"][0]["text"]
+            .as_str()
+            .expect("done_sub text"),
+    )
+    .expect("done_sub json");
+    let done_tid = done_sub_body["task_id"].as_str().expect("done task_id");
+
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {
+            "name": "task_result",
+            "arguments": {
+                "task_id": done_tid,
+                "wait": true,
+                "timeout_secs": 0
+            }
+        }
+    }));
+    let done_res = mcp.recv_timeout(Duration::from_secs(5));
+    assert_eq!(done_res["id"], 9);
+    assert_eq!(
+        done_res["result"]["isError"], false,
+        "task_result {{wait:true, timeout_secs:0}} on finished task must return result: {done_res}"
+    );
+    let done_res_body: Value = serde_json::from_str(
+        done_res["result"]["content"][0]["text"]
+            .as_str()
+            .expect("done_res text"),
+    )
+    .expect("done_res json");
+    assert_eq!(done_res_body["status"], "completed");
+    assert!(
+        done_res_body["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("zero-wait-done"),
+        "expected stdout from finished task: {done_res_body}"
     );
 
     proxy_handle.abort();
