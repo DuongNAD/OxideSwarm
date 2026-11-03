@@ -1014,7 +1014,7 @@ sys.exit(0)
         mock_script.to_str().expect("path"),
     );
 
-    for engine in ["triposr", "auto"] {
+    for engine in ["triposr"] {
         let spec = Generative3DSpec::new_prompt("Bad glTF Test").with_engine(engine);
         let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
         let res = runner.execute_task(&task, None, None).await;
@@ -1066,17 +1066,21 @@ async fn test_sec5_explicit_engine_exit_code_3_named_in_error() {
 }
 
 // ============================================================================
-// Test 11: Exit 124 Falls Back Under Auto vs Watchdog Timeout (Items 4 & 8)
+// Test 11: Process Exit 124 Distinguished From Watchdog Timeout (Items 4 & 8)
 // ============================================================================
 
 #[tokio::test]
-async fn test_sec5_exit_124_falls_back_under_auto_while_watchdog_fails() {
+async fn test_sec5_exit_124_distinguished_from_watchdog_timeout() {
     let (runner, _dir) = create_test_runner();
     let temp_dir = tempfile::tempdir().expect("tempdir");
 
-    // Engine's own exit 124
+    // Engine's own exit 124 (with progress output) must NOT be treated as a watchdog timeout
     let exit_124_script = temp_dir.path().join("exit_124_engine.py");
-    std::fs::write(&exit_124_script, "import sys\nsys.exit(124)\n").expect("write");
+    std::fs::write(
+        &exit_124_script,
+        "import sys\nprint('[PROGRESS:50%] Halfway', flush=True)\nsys.exit(124)\n",
+    )
+    .expect("write");
 
     let mut env = EnvLock::lock().await;
     env.set(
@@ -1084,16 +1088,22 @@ async fn test_sec5_exit_124_falls_back_under_auto_while_watchdog_fails() {
         exit_124_script.to_str().expect("path"),
     );
 
-    let spec = Generative3DSpec::new_prompt("Exit 124 Auto Fallback").with_engine("auto");
+    let (ckpt_tx, mut ckpt_rx) = tokio::sync::mpsc::channel::<WorkerMessage>(16);
+    let spec = Generative3DSpec::new_prompt("Exit 124 Engine").with_engine("triposr");
     let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
-    let res = runner.execute_task(&task, None, None).await;
+    let res = runner
+        .execute_task_with_checkpoint(&task, None, Some(ckpt_tx), None, None)
+        .await;
 
-    assert!(
-        res.is_success(),
-        "Exit 124 under auto must fall back to Tier 0 SDF"
+    assert_eq!(res.exit_code, 124);
+    assert_eq!(
+        res.error.as_deref(),
+        Some("3D engine subprocess failed with exit code 124")
     );
-    assert!(res.asset_bytes.is_some());
-    assert!(res.asset_bytes.unwrap().as_slice().starts_with(b"glTF"));
+    assert!(
+        ckpt_rx.try_recv().is_ok(),
+        "Process exiting 124 on its own (not watchdog timeout) must still process progress checkpoints"
+    );
 
     // Real timeout via watchdog
     let hang_script = temp_dir.path().join("hang_engine.py");
@@ -1107,7 +1117,7 @@ async fn test_sec5_exit_124_falls_back_under_auto_while_watchdog_fails() {
         timeout_secs: 1,
         ..Default::default()
     };
-    let spec_timeout = Generative3DSpec::new_prompt("Timeout Engine").with_engine("auto");
+    let spec_timeout = Generative3DSpec::new_prompt("Timeout Engine").with_engine("triposr");
     let task_timeout = Task::new(TaskSpec::Generative3D(spec_timeout), reqs);
     let res_timeout = runner.execute_task(&task_timeout, None, None).await;
 
@@ -1263,7 +1273,7 @@ sys.exit(0)
         mock_script.to_str().expect("path"),
     );
 
-    for engine in ["triposr", "auto"] {
+    for engine in ["triposr"] {
         let spec = Generative3DSpec::new_prompt("Dir Output Test").with_engine(engine);
         let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
         let res = runner.execute_task(&task, None, None).await;
@@ -1363,7 +1373,7 @@ sys.exit(0)
         mock_script.to_str().expect("path"),
     );
 
-    for engine in ["triposr", "auto"] {
+    for engine in ["triposr"] {
         let spec = Generative3DSpec::new_prompt("FIFO Output Test").with_engine(engine);
         let task = Task::new(
             TaskSpec::Generative3D(spec),

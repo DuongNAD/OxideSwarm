@@ -2944,13 +2944,13 @@ fn looks_like_script_path(s: &str) -> bool {
     s.contains('/') || s.contains('\\') || s.ends_with(".sh")
 }
 
-fn read_mapreduce_script(kind: &str, path_str: &str) -> Result<String, String> {
+fn read_mapreduce_script(kind: &str, cmd_flag: &str, path_str: &str) -> Result<String, String> {
     let path = Path::new(path_str);
     let meta = std::fs::metadata(path)
         .map_err(|e| format!("Failed to read {kind} script '{path_str}': {e}"))?;
     if meta.len() > MAX_MAPREDUCE_SCRIPT_BYTES as u64 {
         return Err(format!(
-            "Failed to read {kind} script '{path_str}': script size ({} bytes) exceeds maximum inline MapReduce script size ({} bytes); use --{kind}-cmd or stage the script onto workers",
+            "Failed to read {kind} script '{path_str}': script size ({} bytes) exceeds maximum inline MapReduce script size ({} bytes); use {cmd_flag} or stage the script onto workers",
             meta.len(),
             MAX_MAPREDUCE_SCRIPT_BYTES
         ));
@@ -2959,7 +2959,7 @@ fn read_mapreduce_script(kind: &str, path_str: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to read {kind} script '{path_str}': {e}"))?;
     if script.len() > MAX_MAPREDUCE_SCRIPT_BYTES {
         return Err(format!(
-            "Failed to read {kind} script '{path_str}': script size ({} bytes) exceeds maximum inline MapReduce script size ({} bytes); use --{kind}-cmd or stage the script onto workers",
+            "Failed to read {kind} script '{path_str}': script size ({} bytes) exceeds maximum inline MapReduce script size ({} bytes); use {cmd_flag} or stage the script onto workers",
             script.len(),
             MAX_MAPREDUCE_SCRIPT_BYTES
         ));
@@ -2978,6 +2978,12 @@ fn split_command_line(cmd: &str) -> Result<(String, Vec<String>), String> {
     while let Some(ch) = chars.next() {
         match ch {
             '\\' if !in_single => {
+                if !in_double && !token_started && chars.peek() == Some(&'\\') {
+                    chars.next();
+                    current.push_str(r"\\");
+                    token_started = true;
+                    continue;
+                }
                 let should_escape = if in_double {
                     matches!(chars.peek(), Some('"' | '\\'))
                 } else {
@@ -3111,7 +3117,7 @@ async fn run_mapreduce(
             operator: args.mapper,
         }
     } else if looks_like_script_path(&args.mapper) {
-        match read_mapreduce_script("mapper", &args.mapper) {
+        match read_mapreduce_script("mapper", "--map-cmd", &args.mapper) {
             Ok(script) => MapFunctionSpec::ShellScript { script },
             Err(msg) => {
                 eprintln!("{msg}");
@@ -3140,7 +3146,7 @@ async fn run_mapreduce(
             operator: args.reducer,
         }
     } else if looks_like_script_path(&args.reducer) {
-        match read_mapreduce_script("reducer", &args.reducer) {
+        match read_mapreduce_script("reducer", "--reduce-cmd", &args.reducer) {
             Ok(script) => ReduceFunctionSpec::ShellScript { script },
             Err(msg) => {
                 eprintln!("{msg}");
@@ -3993,5 +3999,34 @@ max_active_mb = 768
             other => panic!("expected ClientResponse::Error on second 600 KiB task, got {other:?}"),
         }
         master_task.abort();
+    }
+
+    #[test]
+    fn test_read_mapreduce_script_names_map_cmd_and_reduce_cmd_flags_and_split_unc_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let huge = dir.path().join("huge.sh");
+        std::fs::write(&huge, "x".repeat(MAX_MAPREDUCE_SCRIPT_BYTES + 1)).unwrap();
+
+        let map_err =
+            read_mapreduce_script("mapper", "--map-cmd", huge.to_str().unwrap()).unwrap_err();
+        assert!(
+            map_err.contains("use --map-cmd"),
+            "expected '--map-cmd' in mapper size error, got: {map_err}"
+        );
+        assert!(!map_err.contains("--mapper-cmd"), "{map_err}");
+
+        let reduce_err =
+            read_mapreduce_script("reducer", "--reduce-cmd", huge.to_str().unwrap()).unwrap_err();
+        assert!(
+            reduce_err.contains("use --reduce-cmd"),
+            "expected '--reduce-cmd' in reducer size error, got: {reduce_err}"
+        );
+        assert!(!reduce_err.contains("--reducer-cmd"), "{reduce_err}");
+
+        // Unquoted UNC paths keep their leading double backslash in both program and argument tokens.
+        let (prog, args) =
+            split_command_line(r"\\srv\share\m.exe \\srv\share\arg.txt --flag").unwrap();
+        assert_eq!(prog, r"\\srv\share\m.exe");
+        assert_eq!(args, vec![r"\\srv\share\arg.txt", "--flag"]);
     }
 }

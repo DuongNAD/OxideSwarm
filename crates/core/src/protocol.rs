@@ -2815,6 +2815,16 @@ impl<T> MessageTransport<T> {
     pub fn get_mut(&mut self) -> &mut T {
         self.inner.get_mut()
     }
+
+    /// Returns the number of unread bytes currently buffered in the framing reader.
+    pub fn read_buffer_len(&self) -> usize {
+        self.inner.read_buffer().len()
+    }
+
+    /// Returns the number of unwritten bytes currently buffered in the framing writer.
+    pub fn write_buffer_len(&self) -> usize {
+        self.inner.write_buffer().len()
+    }
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
@@ -2853,6 +2863,61 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
         Ok(())
     }
 
+    /// Serializes and sends a message framed with a 4-byte length prefix, requiring write progress
+    /// at least once every `idle_timeout` so large frames over slow links succeed as long as bytes
+    /// continue to drain.
+    pub async fn send_msg_with_idle_timeout<M: Serialize>(
+        &mut self,
+        msg: &M,
+        idle_timeout: std::time::Duration,
+    ) -> Result<(), ProtocolError> {
+        let payload = serialize_message(msg, self.codec)?;
+        let frame = match self.aead_writer.as_mut() {
+            Some(w) => w.encrypt_frame(&payload)?,
+            None => payload,
+        };
+        tokio::time::timeout(idle_timeout, self.inner.feed(frame))
+            .await
+            .map_err(|_| {
+                ProtocolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "write timed out",
+                ))
+            })?
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    ProtocolError::UnexpectedEof
+                } else {
+                    ProtocolError::Io(e)
+                }
+            })?;
+        let mut last_remaining = self.inner.write_buffer().len();
+        loop {
+            match tokio::time::timeout(idle_timeout, SinkExt::<Bytes>::flush(&mut self.inner)).await
+            {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(e)) => {
+                    return if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        Err(ProtocolError::UnexpectedEof)
+                    } else {
+                        Err(ProtocolError::Io(e))
+                    };
+                }
+                Err(_) => {
+                    let now_remaining = self.inner.write_buffer().len();
+                    if now_remaining < last_remaining {
+                        last_remaining = now_remaining;
+                        continue;
+                    }
+                    return Err(ProtocolError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "write timed out",
+                    )));
+                }
+            }
+        }
+    }
+
     /// Reads the next framed message from the stream.
     /// Returns `Ok(Some(msg))` on success, `Ok(None)` on clean EOF, or `Err`.
     pub async fn recv_msg<M: DeserializeOwned + 'static>(
@@ -2861,6 +2926,38 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
         match self.recv_msg_with_codec::<M>().await? {
             Some((msg, _codec)) => Ok(Some(msg)),
             None => Ok(None),
+        }
+    }
+
+    /// Reads the next framed message from the stream, requiring read progress at least once every
+    /// `idle_timeout` so large frames (up to 64 MB) over slow links succeed as long as bytes
+    /// continue arriving.
+    pub async fn recv_msg_with_idle_timeout<M: DeserializeOwned + 'static>(
+        &mut self,
+        idle_timeout: std::time::Duration,
+    ) -> Result<Option<M>, ProtocolError> {
+        let mut last_state = (
+            self.inner.read_buffer().len(),
+            self.inner.read_buffer().capacity(),
+        );
+        loop {
+            match tokio::time::timeout(idle_timeout, self.recv_msg::<M>()).await {
+                Ok(res) => return res,
+                Err(_) => {
+                    let now_state = (
+                        self.inner.read_buffer().len(),
+                        self.inner.read_buffer().capacity(),
+                    );
+                    if now_state.0 > last_state.0 || now_state.1 > last_state.1 {
+                        last_state = now_state;
+                        continue;
+                    }
+                    return Err(ProtocolError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "read timed out",
+                    )));
+                }
+            }
         }
     }
 

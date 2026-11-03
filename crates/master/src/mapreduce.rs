@@ -276,7 +276,9 @@ impl MapReduceEngine {
         match &spec.reducer {
             ReduceFunctionSpec::Builtin { operator } => {
                 for (key, values) in grouped {
-                    final_output.insert(key, reduce_builtin(operator, &values)?);
+                    if let Some(reduced) = reduce_builtin(operator, &values)? {
+                        final_output.insert(key, reduced);
+                    }
                     reduce_tasks_completed += 1;
                 }
             }
@@ -694,41 +696,54 @@ fn validate_builtin_reducer(operator: &str) -> GridResult<()> {
 }
 
 /// Applies a built-in reducer to the values of one key.
-fn reduce_builtin(operator: &str, values: &[serde_json::Value]) -> GridResult<serde_json::Value> {
+/// Returns `Ok(None)` when every value of the key is skipped (no usable finite numeric value
+/// for `"sum"`, `"max"`, or `"min"`), so the key is omitted from the output rather than
+/// reporting a bogus default (`0`, `i64::MIN`, `i64::MAX`, or `null`).
+fn reduce_builtin(
+    operator: &str,
+    values: &[serde_json::Value],
+) -> GridResult<Option<serde_json::Value>> {
     Ok(match operator {
         "sum" => {
             let mut sum_f = 0.0;
             let mut is_float = false;
             let mut sum_i: i64 = 0;
+            let mut has_usable = false;
             for val in values {
                 if let Some(n) = val.as_i64() {
-                    sum_i += n;
+                    sum_i = sum_i.saturating_add(n);
+                    has_usable = true;
                 } else if let Some(f) = val.as_f64().filter(|f| f.is_finite()) {
                     is_float = true;
                     sum_f += f;
+                    has_usable = true;
                 } else if let Some(s) = val.as_str() {
                     if let Ok(n) = s.parse::<i64>() {
-                        sum_i += n;
+                        sum_i = sum_i.saturating_add(n);
+                        has_usable = true;
                     } else if let Ok(f) = s.parse::<f64>() {
                         if f.is_finite() {
                             is_float = true;
                             sum_f += f;
+                            has_usable = true;
                         }
                     }
                 }
             }
-            if is_float {
+            if !has_usable {
+                None
+            } else if is_float {
                 let total = sum_f + sum_i as f64;
                 if total.is_finite() {
-                    serde_json::json!(total)
+                    Some(serde_json::json!(total))
                 } else {
-                    serde_json::json!(sum_i)
+                    None
                 }
             } else {
-                serde_json::json!(sum_i)
+                Some(serde_json::json!(sum_i))
             }
         }
-        "count" => serde_json::json!(values.len()),
+        "count" => Some(serde_json::json!(values.len())),
         "max" => {
             let mut max_i: Option<i64> = None;
             let mut max_f: Option<f64> = None;
@@ -755,9 +770,9 @@ fn reduce_builtin(operator: &str, values: &[serde_json::Value]) -> GridResult<se
                 }
             }
             if is_float {
-                serde_json::json!(max_f.unwrap_or(f64::MIN))
+                max_f.map(|v| serde_json::json!(v))
             } else {
-                serde_json::json!(max_i.unwrap_or(i64::MIN))
+                max_i.map(|v| serde_json::json!(v))
             }
         }
         "min" => {
@@ -786,14 +801,14 @@ fn reduce_builtin(operator: &str, values: &[serde_json::Value]) -> GridResult<se
                 }
             }
             if is_float {
-                serde_json::json!(min_f.unwrap_or(f64::MAX))
+                min_f.map(|v| serde_json::json!(v))
             } else {
-                serde_json::json!(min_i.unwrap_or(i64::MAX))
+                min_i.map(|v| serde_json::json!(v))
             }
         }
         "concat" => {
             let parts: Vec<String> = values.iter().map(|v| v.to_string()).collect();
-            serde_json::json!(parts.join(","))
+            Some(serde_json::json!(parts.join(",")))
         }
         other => {
             return Err(GridError::Config(format!(
@@ -1758,5 +1773,38 @@ mod tests {
             b = next_queue_wait_backoff(b);
         }
         assert_eq!(observed, vec![25, 50, 100, 200, 400, 800, 1000, 1000]);
+    }
+
+    #[test]
+    fn test_builtin_reducer_omits_keys_whose_values_are_all_skipped() {
+        let skipped = vec![
+            serde_json::json!("inf"),
+            serde_json::json!("-inf"),
+            serde_json::json!("NaN"),
+            serde_json::json!("1e999"),
+            serde_json::json!("abc"),
+        ];
+        for op in ["sum", "max", "min"] {
+            assert_eq!(
+                reduce_builtin(op, &skipped).unwrap(),
+                None,
+                "builtin reducer '{op}' must return None when every value of a key is skipped"
+            );
+        }
+
+        // A key with at least one usable value (including 0) keeps its reduced value.
+        let with_zero = vec![serde_json::json!("inf"), serde_json::json!(0)];
+        assert_eq!(
+            reduce_builtin("sum", &with_zero).unwrap(),
+            Some(serde_json::json!(0))
+        );
+        assert_eq!(
+            reduce_builtin("max", &with_zero).unwrap(),
+            Some(serde_json::json!(0))
+        );
+        assert_eq!(
+            reduce_builtin("min", &with_zero).unwrap(),
+            Some(serde_json::json!(0))
+        );
     }
 }

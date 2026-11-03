@@ -242,8 +242,41 @@ async fn test_cli_mapreduce_ships_local_mapper_and_reducer_scripts() {
     assert!(!huge_out.status.success());
     let huge_stderr = String::from_utf8_lossy(&huge_out.stderr);
     assert!(
-        huge_stderr.contains("exceeds maximum inline MapReduce script size"),
-        "expected size error for oversized script, got: {huge_stderr}"
+        huge_stderr.contains("exceeds maximum inline MapReduce script size")
+            && huge_stderr.contains("use --map-cmd"),
+        "expected size error with --map-cmd for oversized mapper script, got: {huge_stderr}"
+    );
+    assert!(!huge_stderr.contains("--mapper-cmd"), "{huge_stderr}");
+
+    // N33-1: Oversized reducer script (> 64 KiB) names `--reduce-cmd` (not `--reducer-cmd`).
+    let client_path = client_dir.path().to_path_buf();
+    let m_addr = master_addr.clone();
+    let huge_reduce_out = tokio::task::spawn_blocking(move || {
+        cli_cmd(&client_path)
+            .args([
+                "mapreduce",
+                "--master",
+                &m_addr,
+                "--input",
+                "input.txt",
+                "--reducer",
+                "./huge.sh",
+            ])
+            .output()
+            .expect("spawn oxideswarm mapreduce --reducer ./huge.sh")
+    })
+    .await
+    .unwrap();
+    assert!(!huge_reduce_out.status.success());
+    let huge_reduce_stderr = String::from_utf8_lossy(&huge_reduce_out.stderr);
+    assert!(
+        huge_reduce_stderr.contains("exceeds maximum inline MapReduce script size")
+            && huge_reduce_stderr.contains("use --reduce-cmd"),
+        "expected size error with --reduce-cmd for oversized reducer script, got: {huge_reduce_stderr}"
+    );
+    assert!(
+        !huge_reduce_stderr.contains("--reducer-cmd"),
+        "{huge_reduce_stderr}"
     );
 
     let _ = shutdown_tx.send(true);
@@ -257,11 +290,12 @@ async fn test_cli_mapreduce_map_cmd_and_reduce_cmd_and_float_max_min() {
     let client_dir = tempfile::tempdir().expect("client tempdir");
     let input_path = client_dir.path().join("floats.txt");
     // Include JSON-encoded string float values ("12.5" and "-5.5") to exercise the string-float
-    // branches in `reduce_builtin` (m12), plus non-finite "inf", "-inf", and "NaN" strings (F33-5)
-    // to verify they are skipped rather than producing `null`.
+    // branches in `reduce_builtin` (m12), non-finite "inf", "-inf", and "NaN" strings (F33-5),
+    // and a key `all_skipped` whose values ("inf", "NaN", "1e999", "abc") are all skipped (N33-3)
+    // to verify that key is omitted from `output` rather than reporting i64::MIN / i64::MAX / 0.
     std::fs::write(
         &input_path,
-        "sensor\t1.5\nsensor\t9.75\n{\"key\":\"sensor\",\"value\":\"12.5\"}\n{\"key\":\"sensor\",\"value\":\"-5.5\"}\nsensor\t-2.25\nsensor\t4.0\nsensor\tinf\nsensor\t-inf\nsensor\tNaN\n",
+        "sensor\t1.5\nsensor\t9.75\n{\"key\":\"sensor\",\"value\":\"12.5\"}\n{\"key\":\"sensor\",\"value\":\"-5.5\"}\nsensor\t-2.25\nsensor\t4.0\nsensor\tinf\nsensor\t-inf\nsensor\tNaN\nall_skipped\tinf\nall_skipped\tNaN\nall_skipped\t1e999\nall_skipped\tabc\n",
     )
     .expect("write floats.txt");
 
@@ -301,6 +335,11 @@ async fn test_cli_mapreduce_map_cmd_and_reduce_cmd_and_float_max_min() {
     let max_json: serde_json::Value = serde_json::from_slice(&max_out.stdout).unwrap();
     assert_eq!(max_json["status"], "Completed");
     assert_eq!(max_json["output"]["sensor"].as_f64(), Some(12.5));
+    assert!(
+        max_json["output"].get("all_skipped").is_none(),
+        "key with only skipped values must be omitted from max output, got: {:?}",
+        max_json["output"]
+    );
 
     // 2. Test --map-cmd with built-in min reducer on floating-point numbers & string floats
     let c_path = client_path.clone();
@@ -331,6 +370,45 @@ async fn test_cli_mapreduce_map_cmd_and_reduce_cmd_and_float_max_min() {
     let min_json: serde_json::Value = serde_json::from_slice(&min_out.stdout).unwrap();
     assert_eq!(min_json["status"], "Completed");
     assert_eq!(min_json["output"]["sensor"].as_f64(), Some(-5.5));
+    assert!(
+        min_json["output"].get("all_skipped").is_none(),
+        "key with only skipped values must be omitted from min output, got: {:?}",
+        min_json["output"]
+    );
+
+    // 2b. Test --map-cmd with built-in sum reducer omits `all_skipped` too
+    let c_path = client_path.clone();
+    let m_arg = master_addr.clone();
+    let sum_out = tokio::task::spawn_blocking(move || {
+        cli_cmd(&c_path)
+            .args([
+                "mapreduce",
+                "--master",
+                &m_arg,
+                "--json",
+                "--input",
+                "floats.txt",
+                "--map-cmd",
+                "sh -c 'cat'",
+                "--reducer",
+                "sum",
+                "--chunks",
+                "2",
+            ])
+            .output()
+            .expect("spawn oxideswarm mapreduce sum")
+    })
+    .await
+    .unwrap();
+    assert!(sum_out.status.success());
+    let sum_json: serde_json::Value = serde_json::from_slice(&sum_out.stdout).unwrap();
+    assert_eq!(sum_json["status"], "Completed");
+    assert_eq!(sum_json["output"]["sensor"].as_f64(), Some(20.0));
+    assert!(
+        sum_json["output"].get("all_skipped").is_none(),
+        "key with only skipped values must be omitted from sum output, got: {:?}",
+        sum_json["output"]
+    );
 
     // 3. Test --reduce-cmd
     let c_path = client_path.clone();
@@ -388,6 +466,34 @@ async fn test_cli_mapreduce_map_cmd_and_reduce_cmd_and_float_max_min() {
     assert!(
         win_stderr.contains(r"C:\Tools\mapper.exe"),
         "expected unquoted Windows path backslashes to be preserved, got: {win_stderr}"
+    );
+
+    // 5. N33-2: Verify unquoted Windows UNC path `\\srv\share\m.exe` preserves its leading double backslash.
+    let c_path = client_path.clone();
+    let m_arg = master_addr.clone();
+    let unc_out = tokio::task::spawn_blocking(move || {
+        cli_cmd(&c_path)
+            .args([
+                "mapreduce",
+                "--master",
+                &m_arg,
+                "--input",
+                "floats.txt",
+                "--map-cmd",
+                r"\\srv\share\m.exe --flag",
+                "--chunks",
+                "1",
+            ])
+            .output()
+            .expect("spawn oxideswarm mapreduce unc path")
+    })
+    .await
+    .unwrap();
+    assert!(!unc_out.status.success());
+    let unc_stderr = String::from_utf8_lossy(&unc_out.stderr);
+    assert!(
+        unc_stderr.contains(r"\\srv\share\m.exe"),
+        "expected unquoted UNC path leading double backslash to be preserved, got: {unc_stderr}"
     );
 
     let _ = shutdown_tx.send(true);
