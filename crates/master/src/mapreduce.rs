@@ -1366,6 +1366,83 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_submit_and_await_backs_off_queue_wait_sleep_at_call_site() {
+        let queue = TaskQueue::with_config(crate::queue::RetryPolicy::default(), Some(1));
+        let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let engine = Arc::new(MapReduceEngine::new(
+            queue.clone(),
+            Arc::new(Notify::new()),
+            Arc::clone(&waiters),
+        ));
+
+        let blocker = Task::new(
+            TaskSpec::command("sleep", vec!["10".into()]),
+            TaskRequirements::generic(1, 60),
+        );
+        let blocker_id = queue.submit(blocker).await.unwrap();
+
+        let task = Task::new(
+            TaskSpec::command("echo", vec!["after-backoff".into()]),
+            TaskRequirements::generic(1, 60),
+        );
+        let task_id = task.id;
+        let engine_task_handle = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move {
+                engine
+                    .submit_and_await(task, Duration::from_secs(30), None)
+                    .await
+            })
+        };
+
+        // Attempt 1 at t = 0 ms fails (QueueFull) and sleeps 25 ms.
+        tokio::task::yield_now().await;
+        assert!(queue.get_task(&task_id).await.is_none());
+
+        // At t = 25 ms, Attempt 2 fails and sleeps 50 ms.
+        tokio::time::advance(Duration::from_millis(25)).await;
+        tokio::task::yield_now().await;
+        assert!(queue.get_task(&task_id).await.is_none());
+
+        // At t = 75 ms (25 + 50), Attempt 3 fails and sleeps 100 ms.
+        tokio::time::advance(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+        assert!(queue.get_task(&task_id).await.is_none());
+
+        // Free queue room right after Attempt 3 enters its 100 ms sleep.
+        queue.cancel_task(&blocker_id, None).await.unwrap();
+
+        // 60 ms into the 100 ms sleep (which would have woken twice at a fixed 25 ms interval),
+        // the task must still be sleeping and not yet submitted to the queue.
+        tokio::time::advance(Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            queue.get_task(&task_id).await.is_none(),
+            "queue-wait sleep at mapreduce.rs:423 must back off to 100 ms on the 3rd wait, not stay at 25 ms"
+        );
+
+        // Completing the remaining 40 ms of the 100 ms sleep wakes `submit_and_await` and submits the task.
+        tokio::time::advance(Duration::from_millis(40)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            queue.get_task(&task_id).await.is_some(),
+            "task must be submitted once the 100 ms backoff sleep completes"
+        );
+
+        let result = TaskResult::success(Uuid::new_v4(), task_id, "done", 1, false);
+        if let Some(senders) = waiters.write().await.remove(&task_id) {
+            for tx in senders {
+                let _ = tx.send(result.clone());
+            }
+        }
+        let outcome = engine_task_handle.await.unwrap();
+        assert!(
+            outcome.is_ok(),
+            "expected Ok after queue wait, got {outcome:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_mapreduce_job_waits_for_queue_room_and_completes_when_room_is_freed() {
         let queue = TaskQueue::with_retention_limits(
