@@ -2462,8 +2462,8 @@ pub enum InboundMessage {
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum HumanInboundMessage {
-    Client(ClientMessage),
     Worker(WorkerMessage),
+    Client(ClientMessage),
 }
 
 #[derive(Serialize, Deserialize)]
