@@ -14,8 +14,8 @@ pub const EMBEDDED_BLENDER_RIG_SCRIPT: &str =
 ///
 /// Delegates to [`rusty_grid_core::capabilities::resolve_blender_binary`] so capability
 /// detection (`detect_blender`) and task execution share one resolution rule and search path list.
-pub fn resolve_blender_binary() -> Option<PathBuf> {
-    rusty_grid_core::capabilities::resolve_blender_binary(None)
+pub fn resolve_blender_binary(explicit_path: Option<&str>) -> Option<PathBuf> {
+    rusty_grid_core::capabilities::resolve_blender_binary(explicit_path)
 }
 
 /// Probes whether a Blender executable candidate is runnable by invoking `<program> --version`

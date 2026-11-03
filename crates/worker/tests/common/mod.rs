@@ -94,7 +94,7 @@ pub fn get_python_exe() -> PathBuf {
 /// When `RUSTY_GRID_REQUIRE_BLENDER=1` (or `true`) is set in the environment, a missing
 /// Blender installation panics instead of skipping.
 pub fn blender_binary_or_skip(test: &str) -> Option<PathBuf> {
-    if let Some(bin) = rusty_grid_worker::autorig::blender_provider::resolve_blender_binary() {
+    if let Some(bin) = rusty_grid_worker::autorig::blender_provider::resolve_blender_binary(None) {
         Some(bin)
     } else if std::env::var("RUSTY_GRID_REQUIRE_BLENDER")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))

@@ -443,7 +443,7 @@ async fn test_graceful_fallback_when_blender_path_is_invalid_or_missing() {
     // detection must return None / (false, None) even if the host has Blender installed.
     let _env = ScopedEnvVar::set("BLENDER_PATH", &missing_blender).await;
     assert!(
-        blender_provider::resolve_blender_binary().is_none(),
+        blender_provider::resolve_blender_binary(None).is_none(),
         "Explicit invalid BLENDER_PATH must not fall through to a host Blender installation in runner"
     );
     assert_eq!(
@@ -496,6 +496,117 @@ async fn test_graceful_fallback_when_blender_path_is_invalid_or_missing() {
     assert!(
         reloaded.is_ok(),
         "Fallback GLB must reload into RawMesh cleanly"
+    );
+}
+
+#[tokio::test]
+async fn test_runner_and_capabilities_honor_stale_and_valid_blender_path_flag() {
+    use rusty_grid_core::capabilities::HardwareOverrides;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let missing_blender = temp_dir.path().join("stale_flag_blender_404.exe");
+    let missing_str = missing_blender.to_string_lossy().to_string();
+
+    let env_marker = temp_dir.path().join("env_blender_ran.txt");
+    let env_fake_blender = create_crashing_fake_blender(temp_dir.path(), &env_marker, 1);
+
+    let flag_marker = temp_dir.path().join("flag_blender_ran.txt");
+    let flag_dir = temp_dir.path().join("flag_dir");
+    std::fs::create_dir_all(&flag_dir).expect("flag_dir");
+    let flag_fake_blender = create_crashing_fake_blender(&flag_dir, &flag_marker, 1);
+    let flag_valid_str = flag_fake_blender.to_string_lossy().to_string();
+
+    // Point BLENDER_PATH at a runnable fake Blender so any accidental fallthrough is caught.
+    let _env = ScopedEnvVar::set("BLENDER_PATH", &env_fake_blender).await;
+
+    let input_mesh = generate_test_glb_mesh();
+    let spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped")
+        .with_animations(vec!["idle".to_string()])
+        .with_provider("blender");
+
+    // 1. Stale `--blender-path` flag: capabilities report no Blender, and the runner must NOT
+    //    fall through to BLENDER_PATH or host Blender on either `auto_rig_mesh_async` or `execute_task`.
+    let stale_caps = WorkerCapabilities::detect_with_overrides(HardwareOverrides {
+        blender_path: Some(missing_str.clone()),
+        ..Default::default()
+    });
+    assert!(
+        !stale_caps.has_blender && stale_caps.blender_version.is_none(),
+        "stale --blender-path must report no Blender in WorkerCapabilities"
+    );
+
+    let stale_sandbox_dir = tempfile::tempdir().expect("stale sandbox");
+    let stale_runner_cfg = RunnerConfig::new(SandboxConfig::new(stale_sandbox_dir.path()))
+        .with_blender_path(Some(missing_str.clone()));
+    let stale_runner = TaskRunner::new(uuid::Uuid::new_v4(), stale_caps, stale_runner_cfg);
+
+    assert_eq!(
+        blender_provider::resolve_blender_binary(stale_runner.config().blender_path.as_deref()),
+        None,
+        "stale RunnerConfig.blender_path must resolve to None"
+    );
+
+    let direct_res = auto_rig_mesh_async(&stale_runner, TaskId::new(), &spec).await;
+    assert!(direct_res.is_ok(), "stale flag must fallback cleanly");
+    assert!(
+        !env_marker.exists(),
+        "stale --blender-path in auto_rig_mesh_async must NOT invoke fallback BLENDER_PATH binary"
+    );
+
+    let task = Task::new(
+        TaskSpec::AutoRig(spec.clone()),
+        TaskRequirements::generic(1, 30),
+    );
+    let task_res = stale_runner.execute_task(&task, None, None).await;
+    assert_eq!(task_res.exit_code, 0);
+    assert!(
+        !env_marker.exists(),
+        "stale --blender-path in TaskRunner::execute_task must NOT invoke fallback BLENDER_PATH binary"
+    );
+
+    // 2. Valid `--blender-path` flag: capabilities report has_blender, and the runner invokes
+    //    the flag's binary (not BLENDER_PATH) on both `auto_rig_mesh_async` and `execute_task`.
+    let valid_caps = WorkerCapabilities::detect_with_overrides(HardwareOverrides {
+        blender_path: Some(flag_valid_str.clone()),
+        ..Default::default()
+    });
+    assert!(
+        valid_caps.has_blender && valid_caps.blender_version.is_some(),
+        "valid --blender-path must report has_blender in WorkerCapabilities"
+    );
+
+    let valid_sandbox_dir = tempfile::tempdir().expect("valid sandbox");
+    let valid_runner_cfg = RunnerConfig::new(SandboxConfig::new(valid_sandbox_dir.path()))
+        .with_blender_path(Some(flag_valid_str.clone()));
+    let valid_runner = TaskRunner::new(uuid::Uuid::new_v4(), valid_caps, valid_runner_cfg);
+
+    assert_eq!(
+        blender_provider::resolve_blender_binary(valid_runner.config().blender_path.as_deref()),
+        Some(flag_fake_blender.clone()),
+        "valid RunnerConfig.blender_path must resolve to the flag path"
+    );
+
+    let _ = auto_rig_mesh_async(&valid_runner, TaskId::new(), &spec).await;
+    assert!(
+        flag_marker.exists(),
+        "valid --blender-path in auto_rig_mesh_async must invoke the flag binary"
+    );
+    assert!(
+        !env_marker.exists(),
+        "valid --blender-path must take precedence over BLENDER_PATH"
+    );
+
+    std::fs::remove_file(&flag_marker).expect("remove flag_marker");
+    let task2 = Task::new(TaskSpec::AutoRig(spec), TaskRequirements::generic(1, 30));
+    let task2_res = valid_runner.execute_task(&task2, None, None).await;
+    assert_eq!(task2_res.exit_code, 0);
+    assert!(
+        flag_marker.exists(),
+        "valid --blender-path in TaskRunner::execute_task must invoke the flag binary"
+    );
+    assert!(
+        !env_marker.exists(),
+        "valid --blender-path in TaskRunner::execute_task must take precedence over BLENDER_PATH"
     );
 }
 

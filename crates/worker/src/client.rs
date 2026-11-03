@@ -1102,6 +1102,7 @@ impl WorkerClient {
         let mut runner_cfg = RunnerConfig::new(sandbox_cfg)
             .with_max_output_bytes(config.max_output_bytes)
             .with_blob_cache_bytes(config.blob_cache_bytes)
+            .with_blender_path(config.blender_path.clone())
             .with_output_limits(OutputLimits {
                 max_bytes: config.output_limit_bytes,
                 ..OutputLimits::default()
