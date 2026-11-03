@@ -1353,6 +1353,13 @@
 
         function num(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
         function fmtGb(mb) { return (num(mb) / 1024).toFixed(1); }
+        function fmtBytes(b) {
+            const n = num(b);
+            if (n === 0) return '0 B';
+            if (n < 1024) return `${n} B`;
+            if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+            return `${(n / (1024 * 1024)).toFixed(1)} MiB`;
+        }
         function shortText(s, max) {
             const t = (s === null || s === undefined) ? '' : String(s);
             return t.length > max ? t.slice(0, max - 1) + '…' : t;
@@ -2132,6 +2139,11 @@
                 const tasks = data.tasks || {};
                 const masterRunning = num(tasks.running);
                 const masterQueued = num(tasks.queued);
+                const activeBytes = num(tasks.active_bytes);
+                const maxActiveBytes = num(tasks.max_active_bytes);
+                const budgetPill = maxActiveBytes > 0
+                    ? html`<div class="metric-pill" title="${activeBytes} / ${maxActiveBytes} bytes"><span class="m-label">Active Budget:</span><span>${fmtBytes(activeBytes)} / ${fmtBytes(maxActiveBytes)}</span></div>`
+                    : '';
                 cards.push(html`
                         <div class="device-card">
                             <div class="card-row-1">
@@ -2154,6 +2166,7 @@
                                     <span class="m-label">Queue:</span>
                                     <span>${masterQueued} pending</span>
                                 </div>
+                                ${budgetPill}
                             </div>
                         </div>
                     `);
@@ -2635,7 +2648,13 @@
                 const isOk = detail.state === 'Completed' && detail.exit_code === 0;
                 const matched = (workers || []).find(w => w.id === detail.worker_id);
                 const executor = matched ? matched.name : (detail.worker_id ? String(detail.worker_id).slice(0, 8) : 'cluster-node');
-                const out = String(detail.stdout || detail.stderr || detail.error || (detail.state === 'Cancelled' ? 'Task was cancelled' : '(Done, 0 output)'));
+                const streamOut = String(detail.stdout || detail.stderr || '').trim();
+                const errText = detail.error ? String(detail.error).trim() : '';
+                const fallbackOut = (!streamOut && !errText)
+                    ? (detail.state === 'Cancelled' ? 'Task was cancelled' : '(Done, 0 output)')
+                    : streamOut;
+                const outBlock = fallbackOut ? html`<div class="res-content">${fallbackOut}</div>` : '';
+                const errBlock = errText ? html`<div class="res-content" style="color: var(--dot-red);">${errText}</div>` : '';
                 const exitColor = isOk ? 'var(--dot-green)' : 'var(--dot-red)';
                 const exitLabel = detail.state === 'Cancelled' ? 'Cancelled' : `Exit ${detail.exit_code !== undefined && detail.exit_code !== null ? num(detail.exit_code) : (detail.state === 'Completed' ? 0 : 1)}`;
 
@@ -2644,7 +2663,8 @@
                         <span>[${executor}] • ${num(detail.execution_time_ms)}ms</span>
                         <span style="color: ${exitColor}; font-weight: 700;">${exitLabel}</span>
                     </div>
-                    <div class="res-content">${out.trim()}</div>
+                    ${outBlock}
+                    ${errBlock}
                 `);
                 feed.scrollTop = feed.scrollHeight;
             } catch (err) {
