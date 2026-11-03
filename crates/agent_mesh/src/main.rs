@@ -55,6 +55,11 @@ pub enum Commands {
         /// Shared cluster secret for Master Grid authentication (hex string or path to secret file)
         #[arg(long, env = "OXIDESWARM_SECRET", hide_env_values = true)]
         secret: Option<String>,
+
+        /// Maximum megabytes of active (non-terminal) task payloads held in the embedded Master
+        /// Grid queue (`--grid-master`; default 256).
+        #[arg(long, env = "RUSTY_GRID_MAX_ACTIVE_MB")]
+        max_active_mb: Option<u64>,
     },
 
     /// Run an agent node client connected to the Hub
@@ -209,6 +214,27 @@ fn grid_master_secret(
     .into())
 }
 
+/// Resolves the active task byte budget (`--max-active-mb` / `RUSTY_GRID_MAX_ACTIVE_MB`) for the
+/// embedded master of `hub --grid-master`. Refuses `0`, because a zero byte cap would reject every
+/// task.
+fn grid_master_max_active_bytes(
+    max_active_mb: Option<u64>,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let default_mb = (rusty_grid_master::DEFAULT_MAX_ACTIVE_BYTES / (1024 * 1024)) as u64;
+    let mb = max_active_mb.unwrap_or(default_mb);
+    if mb == 0 {
+        return Err(
+            "--max-active-mb / RUSTY_GRID_MAX_ACTIVE_MB must be at least 1 MiB (got 0)".into(),
+        );
+    }
+    Ok(usize::try_from(mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX))
+}
+
+/// Builds the embedded `ServerConfig` for `hub --grid-master` with `max_active_bytes` applied.
+fn build_grid_master_server_config(bind_addr: SocketAddr, max_active_bytes: usize) -> ServerConfig {
+    ServerConfig::new(bind_addr).with_max_active_bytes(max_active_bytes)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let subscriber = FmtSubscriber::builder()
@@ -225,6 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             insecure,
             grid_master,
             secret,
+            max_active_mb,
         } => {
             if token.as_deref() == Some("") {
                 return Err("--token / OXIDE_MESH_TOKEN is set but empty; an empty token would not protect the hub".into());
@@ -232,6 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if token.as_deref().is_some_and(|t| t.len() < 16) {
                 eprintln!("[HUB] WARNING: the hub token is shorter than 16 characters; use a long random one (e.g. `openssl rand -hex 24`).");
             }
+            let max_active_bytes = grid_master_max_active_bytes(max_active_mb)?;
             let authenticated = token.is_some();
 
             info!("Starting OxideRelay Hub on {}", listen);
@@ -256,7 +284,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             .map_err(|e| format!("Invalid grid master port '{spec}': {e}"))?
                     };
 
-                let mut server_config = ServerConfig::new(bind_addr);
+                let mut server_config =
+                    build_grid_master_server_config(bind_addr, max_active_bytes);
                 // `secret` already holds OXIDESWARM_SECRET when the flag is absent (clap `env`).
                 let default_secret_file = ClusterSecret::default_path();
                 match grid_master_secret(
@@ -495,5 +524,33 @@ mod tests {
             .expect("explicit secret");
         assert_eq!(used.to_hex(), explicit.to_hex());
         assert!(grid_master_secret(Some("neither-hex-nor-a-file"), lan, true, None).is_err());
+    }
+
+    #[test]
+    fn grid_master_max_active_mb_flag_parses_scales_and_refuses_zero() {
+        let cli = Cli::try_parse_from([
+            "agent-mesh",
+            "hub",
+            "--grid-master",
+            "127.0.0.1:0",
+            "--max-active-mb",
+            "512",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Hub { max_active_mb, .. } => assert_eq!(max_active_mb, Some(512)),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            grid_master_max_active_bytes(None).unwrap(),
+            rusty_grid_master::DEFAULT_MAX_ACTIVE_BYTES
+        );
+        let scaled = grid_master_max_active_bytes(Some(512)).unwrap();
+        assert_eq!(scaled, 512 * 1024 * 1024);
+        let server_cfg = build_grid_master_server_config(addr("127.0.0.1:0"), scaled);
+        assert_eq!(server_cfg.max_active_bytes, 512 * 1024 * 1024);
+        let err = grid_master_max_active_bytes(Some(0))
+            .expect_err("0 MiB active cap must be refused at start");
+        assert!(err.to_string().contains("at least 1 MiB"), "{err}");
     }
 }

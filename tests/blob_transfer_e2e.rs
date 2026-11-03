@@ -115,13 +115,15 @@ impl Cluster {
             .send_msg(&ClientMessage::SubmitTask { task, wait: true })
             .await
             .expect("send");
-        let reply = tokio::time::timeout(
-            Duration::from_secs(60),
-            transport.recv_msg::<ClientResponse>(),
-        )
-        .await
-        .expect("task finishes in time")
-        .expect("read reply");
+        let reply_timeout = if cfg!(windows) {
+            Duration::from_secs(240)
+        } else {
+            Duration::from_secs(60)
+        };
+        let reply = tokio::time::timeout(reply_timeout, transport.recv_msg::<ClientResponse>())
+            .await
+            .expect("task finishes in time")
+            .expect("read reply");
         match reply {
             Some(ClientResponse::TaskCompleted { result, .. }) => Ok(result),
             Some(ClientResponse::Error { message }) => Err(message),
@@ -129,7 +131,6 @@ impl Cluster {
         }
     }
 
-    #[cfg(unix)]
     fn store_stats(&self) -> rusty_grid_master::BlobStoreStats {
         self.master.blob_store().expect("blob store").stats()
     }
@@ -146,7 +147,6 @@ impl Drop for Cluster {
 }
 
 /// Deterministic bytes that do not compress or repeat.
-#[cfg(unix)]
 fn noise(len: usize, mut state: u64) -> Vec<u8> {
     (0..len)
         .map(|_| {
@@ -158,15 +158,29 @@ fn noise(len: usize, mut state: u64) -> Vec<u8> {
         .collect()
 }
 
+#[cfg(unix)]
+const TOOL_FILE: &str = "tool.sh";
+#[cfg(windows)]
+const TOOL_FILE: &str = "tool.cmd";
+
+#[cfg(unix)]
+const TOOL_CONTENT: &[u8] = b"#!/bin/sh\necho tool-ran\n";
+#[cfg(windows)]
+const TOOL_CONTENT: &[u8] = b"@echo tool-ran\r\n";
+
+#[cfg(unix)]
+const EXPECTED_TOOL_OUTPUT: &[u8] = b"tool-ran\n";
+#[cfg(windows)]
+const EXPECTED_TOOL_OUTPUT: &[u8] = b"tool-ran\r\n";
+
 /// The input project: nested text files, an executable script and a file larger than one
 /// transfer chunk (4 MiB).
-#[cfg(unix)]
 fn write_project(root: &Path) -> HashMap<&'static str, Vec<u8>> {
     let files: HashMap<&'static str, Vec<u8>> = HashMap::from([
         ("hello.txt", b"hello from the client\n".to_vec()),
         ("nested/deeper/data.csv", b"id,value\n1,42\n2,58\n".to_vec()),
         ("big.bin", noise(5 * 1024 * 1024 + 123, 0x5eed)),
-        ("tool.sh", b"#!/bin/sh\necho tool-ran\n".to_vec()),
+        (TOOL_FILE, TOOL_CONTENT.to_vec()),
     ]);
     for (rel, data) in &files {
         let path = root.join(rel);
@@ -189,17 +203,22 @@ const PROCESS_SCRIPT: &str = "set -e; mkdir -p out; \
      cp project/big.bin out/big-copy.bin; \
      ./project/tool.sh > out/tool-output.txt";
 
-#[cfg(unix)]
+#[cfg(windows)]
+const PROCESS_SCRIPT: &str = "(if not exist out mkdir out) && \
+     copy /y /b project\\hello.txt + project\\nested\\deeper\\data.csv out\\combined.txt >nul && \
+     copy /y /b project\\big.bin out\\big-copy.bin >nul && \
+     call project\\tool.cmd > out\\tool-output.txt";
+
 fn processing_task(inputs: Vec<rusty_grid_core::blob::TaskInput>) -> Task {
-    Task::new(
-        TaskSpec::command("sh", vec!["-c".into(), PROCESS_SCRIPT.into()]),
-        TaskRequirements::generic(1, 60),
-    )
-    .with_inputs(inputs)
-    .with_output_glob("out")
+    #[cfg(unix)]
+    let spec = TaskSpec::command("sh", vec!["-c".into(), PROCESS_SCRIPT.into()]);
+    #[cfg(windows)]
+    let spec = TaskSpec::command("cmd", vec!["/C".into(), PROCESS_SCRIPT.into()]);
+    Task::new(spec, TaskRequirements::generic(1, 60))
+        .with_inputs(inputs)
+        .with_output_glob("out")
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_input_directory_round_trip_and_second_submit_sends_nothing() {
     let cluster = Cluster::start(true).await;
@@ -260,7 +279,7 @@ async fn test_input_directory_round_trip_and_second_submit_sends_nothing() {
     );
     assert_eq!(
         std::fs::read(download_dir.join("out/tool-output.txt")).unwrap(),
-        b"tool-ran\n",
+        EXPECTED_TOOL_OUTPUT,
         "the executable bit survives the trip"
     );
 
@@ -664,10 +683,15 @@ async fn test_worker_pins_output_files_from_collection_through_upload() {
         std::fs::write(src_out.join(format!("f{i:04}.bin")), &buf).unwrap();
     }
 
-    // Four clients continuously run tasks with small outputs to trigger worker `evict_to_fit`.
+    // Four clients (one on Windows to prevent process thrashing) continuously run tasks
+    // with small outputs to trigger worker `evict_to_fit`.
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mut churn_handles = Vec::new();
-    for client_idx in 0..4u32 {
+    #[cfg(unix)]
+    let num_churn_clients = 4u32;
+    #[cfg(windows)]
+    let num_churn_clients = 1u32;
+    for client_idx in 0..num_churn_clients {
         let addr = addr.clone();
         let running = std::sync::Arc::clone(&running);
         let dir = tempfile::tempdir().unwrap();
@@ -708,6 +732,8 @@ async fn test_worker_pins_output_files_from_collection_through_upload() {
                     )
                     .await;
                 }
+                #[cfg(windows)]
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }));
     }
@@ -830,7 +856,6 @@ async fn test_master_and_worker_refuse_protocol_version_1_at_registration() {
 // runs in this process, see the module docs)
 // ---------------------------------------------------------------------------------------------
 
-#[cfg(unix)]
 mod cli {
     use super::*;
     use std::process::{Child, Command, Stdio};
@@ -885,6 +910,11 @@ mod cli {
     }
 
     fn submit(home: &Path, master: &str, project: &Path, out_dir: &Path) -> serde_json::Value {
+        #[cfg(unix)]
+        let runner_args = ["--command", "sh", "--", "-c", PROCESS_SCRIPT];
+        #[cfg(windows)]
+        let runner_args = ["--command", "cmd", "--", "/C", PROCESS_SCRIPT];
+
         let output = cli(home)
             .args([
                 "submit",
@@ -899,7 +929,7 @@ mod cli {
             .args(["--output", "out/*.txt", "--output", "out/big-copy.bin"])
             .arg("--output-dir")
             .arg(out_dir)
-            .args(["--command", "sh", "--", "-c", PROCESS_SCRIPT])
+            .args(runner_args)
             .output()
             .expect("run submit");
         assert!(
@@ -968,7 +998,7 @@ mod cli {
         );
         assert_eq!(
             std::fs::read(out1.join("out/tool-output.txt")).unwrap(),
-            b"tool-ran\n"
+            EXPECTED_TOOL_OUTPUT
         );
         assert_eq!(first["saved_outputs"].as_array().map(Vec::len), Some(3));
         assert!(
@@ -995,6 +1025,23 @@ mod cli {
 
         // Defect 8: a failed task (`exit 7`) prints `Task <ID> failed.`, not `completed successfully.`,
         // and when `result.error` is set (missing declared output), prints `Error: <text>` to stderr.
+        #[cfg(unix)]
+        let failed_args = [
+            "--command",
+            "sh",
+            "--",
+            "-c",
+            "echo fail-stdout; echo fail-stderr >&2; exit 7",
+        ];
+        #[cfg(windows)]
+        let failed_args = [
+            "--command",
+            "cmd",
+            "--",
+            "/C",
+            "echo fail-stdout& echo fail-stderr 1>&2& exit 7",
+        ];
+
         let failed_run = cli(home)
             .args([
                 "submit",
@@ -1003,12 +1050,8 @@ mod cli {
                 "--wait",
                 "--timeout-secs",
                 "30",
-                "--command",
-                "sh",
-                "--",
-                "-c",
-                "echo fail-stdout; echo fail-stderr >&2; exit 7",
             ])
+            .args(failed_args)
             .output()
             .expect("run failing submit");
         assert_eq!(failed_run.status.code(), Some(7));
@@ -1022,6 +1065,11 @@ mod cli {
         assert!(failed_stdout.contains("fail-stdout"), "{failed_stdout}");
         assert!(failed_stderr.contains("fail-stderr"), "{failed_stderr}");
 
+        #[cfg(unix)]
+        let missing_args = ["--command", "sh", "--", "-c", "echo ran-ok"];
+        #[cfg(windows)]
+        let missing_args = ["--command", "cmd", "--", "/C", "echo ran-ok"];
+
         let missing_output_run = cli(home)
             .args([
                 "submit",
@@ -1031,12 +1079,8 @@ mod cli {
                 "never-created.bin",
                 "--timeout-secs",
                 "30",
-                "--command",
-                "sh",
-                "--",
-                "-c",
-                "echo ran-ok",
             ])
+            .args(missing_args)
             .output()
             .expect("run missing-output submit");
         assert!(!missing_output_run.status.success());
@@ -1055,10 +1099,33 @@ mod cli {
         // Defect 6: when downloading an output file fails (destination traverses a symlink),
         // `submit` still prints the task's exit code, stdout and stderr before returning failure.
         let bad_out_dir = home.join("bad-out");
-        let outside_dir = home.join("outside-target");
         std::fs::create_dir_all(&bad_out_dir).unwrap();
-        std::fs::create_dir_all(&outside_dir).unwrap();
-        std::os::unix::fs::symlink(&outside_dir, bad_out_dir.join("sub")).unwrap();
+        #[cfg(unix)]
+        {
+            let outside_dir = home.join("outside-target");
+            std::fs::create_dir_all(&outside_dir).unwrap();
+            std::os::unix::fs::symlink(&outside_dir, bad_out_dir.join("sub")).unwrap();
+        }
+        #[cfg(windows)]
+        std::fs::write(bad_out_dir.join("sub"), b"not-a-directory").unwrap();
+
+        #[cfg(unix)]
+        let dl_fail_args = [
+            "--command",
+            "sh",
+            "--",
+            "-c",
+            "mkdir -p sub && echo data > sub/produced.txt && echo dl-stdout && echo dl-stderr >&2",
+        ];
+        #[cfg(windows)]
+        let dl_fail_args = [
+            "--command",
+            "cmd",
+            "--",
+            "/C",
+            "mkdir sub && echo data> sub\\produced.txt && echo dl-stdout && echo dl-stderr 1>&2",
+        ];
+
         let download_fail_run = cli(home)
             .args([
                 "submit",
@@ -1070,12 +1137,8 @@ mod cli {
                 &bad_out_dir.to_string_lossy(),
                 "--timeout-secs",
                 "30",
-                "--command",
-                "sh",
-                "--",
-                "-c",
-                "mkdir -p sub && echo data > sub/produced.txt && echo dl-stdout && echo dl-stderr >&2",
             ])
+            .args(dl_fail_args)
             .output()
             .expect("run download-fail submit");
         assert!(!download_fail_run.status.success());

@@ -88,11 +88,12 @@ Documentation index and writing standard: [docs/README.md](docs/README.md). A ma
 | **15. GPU compute (`wgpu`)** | `cargo build --release --bin oxideswarm --features gpu-wgpu` gives a worker that multiplies matrices on the machine's GPU (Metal on macOS, Vulkan / DirectX 12 on Windows and Linux; discrete GPU prioritized over integrated), checks the product against a sampled CPU recomputation and reports `Status: VERIFIED_OK` only if that check passed. A `GpuCompute` task is a **seeded `simulated_matrix_dim` x `simulated_matrix_dim` GEMM** tiled by `work_group_size`. A GPU error, device loss or driver panic fails that task with an explicit message and the engine is rebuilt for the next one. A worker never runs a real-GPU task on the CPU: the CPU path is the labelled `--simulate-gpu` test mode only. Run benchmark with `cargo run --release -p rusty_grid_worker --features gpu-wgpu --example gemm_bench -- 1024`. | Implemented + tests (verified on Metal & Vulkan) |
 | **16. Security** | Shared-secret mutual authentication on the cluster port (TCP and P2P) and on the UDP beacon; authenticated TCP stream encryption via ChaCha20-Poly1305 (`0x04`) with directional keys derived from `cluster.secret`; token-protected, same-origin dashboard; agent-mesh hub token. See [docs/SECURITY.md](docs/SECURITY.md). | Implemented + tests |
 | **17. Agent Mesh ↔ Grid bridge** | `AgentGridBridge` lets `agent-mesh hub` run a Master Grid of its own (`--grid-master <ADDR>` starts an embedded master; off loopback it needs a cluster secret or `--insecure`) and routes `grid_compute` / `grid_compile` / `grid_submit` / `grid_status` envelopes to it. When unconfigured, returns `ERR_BRIDGE_NOT_CONFIGURED`. | Implemented + tests |
-| **18. Task placement & cluster check** | Workers advertise `os:` and `arch:` tags plus user tags (`worker --tag`); `submit --os`, `--arch`, `--worker`, `--require-tag` pin a task through `require:` task tags, so the wire format is unchanged. `submit --stdin-file`, `--script-file`, `--interpreter` and `--env` send input with the task; `--matrix-dim` sizes a GPU task. `oxideswarm doctor` checks connection, every worker, process start-up, every GPU and spreading. Design: [docs/design/0001-two-node-readiness.md](docs/design/0001-two-node-readiness.md). | Implemented + tests |
+| **18. Task placement & cluster check** | Workers advertise `os:`, `arch:` and `slots:` (`--max-concurrency` or default headroom) tags plus user tags (`worker --tag`); `submit --os`, `--arch`, `--worker`, `--require-tag` pin a task through `require:` task tags, so the wire format is unchanged. `submit --stdin-file`, `--script-file`, `--interpreter` and `--env` send input with the task; `--matrix-dim` sizes a GPU task. `oxideswarm doctor` checks connection, every worker, process start-up, every GPU and spreading. Design: [docs/design/0001-two-node-readiness.md](docs/design/0001-two-node-readiness.md), [docs/design/0014-worker-max-concurrency-slots-tag.md](docs/design/0014-worker-max-concurrency-slots-tag.md). | Implemented + tests |
 | **19. Mobile coordination & battery governance** | Multi-tier throttling $C_{\text{eff}} = \min(C_{\text{bat}}, C_{\text{therm}})$, RRC adaptive keepalive (10s/25s/60s), 5-rule refusal matrix, authenticated candidate score election $S_{\text{auth}}$, cryptographic lease tickets, and pre-sleep evacuation. Design: [docs/design/0002-mobile-coordination.md](docs/design/0002-mobile-coordination.md). | Implemented + tests |
 | **20. Task input and output files** | `submit --input LOCAL[:SANDBOX]` sends files and whole directories, `--output PATTERN` (`*`, `?`, `**`) brings files back into `--output-dir`. Files move as BLAKE3-named blobs through a bounded store on the master (`~/.oxideswarm/blobs`, `master --blob-dir` / `--blob-store-mb`) in 4 MiB chunks: a client uploads only the blobs the master lacks, a worker fetches only the blobs its cache lacks (`worker --blob-cache-mb`), so an unchanged file is not sent twice. Outputs are capped per task (`worker --output-limit-mb`); `RustCompilation` returns the library or binary it built. Design: [docs/design/0006-content-addressed-data-plane.md](docs/design/0006-content-addressed-data-plane.md). The older inline staging (at most 32 MiB, used by the MCP server) is [design 0003](docs/design/0003-distributed-file-staging.md). Task output validation and mandatory harvesting failure semantics are documented in [docs/design/0013-task-output-validation-and-harvesting.md](docs/design/0013-task-output-validation-and-harvesting.md). | Implemented + tests |
 | **21. Model Context Protocol (MCP) server** | Standard JSON-RPC 2.0 stdio MCP server (`oxideswarm mcp`) exposing 5 core cluster tools (`oxideswarm_status`, `oxideswarm_workers`, `oxideswarm_submit`, `oxideswarm_task_status`, `oxideswarm_cancel`) to LLM coding agents with strict stdout hygiene. Design: [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md). | Implemented + tests |
-| **22. Agent Mesh command hardening & process controls** | Restricts mesh nodes to 5 advertised commands (`echo`, `ping`, `system_info`, `sha256_verify`, `shell_exec`); unadvertised commands return exit 127. `--no-shell` flag filters out `shell_exec` capability and rejects execution requests with 127. Child processes inherit no stdin (`DEVNULL`), output is capped at 1 MiB per stream, and 5 secret env vars are stripped from parent environment inheritance. Design: [docs/design/0011-agent-mesh-hardening.md](docs/design/0011-agent-mesh-hardening.md). | Implemented + tests |
+| **22. 3D generative engine names & CPU fallback** | 3D generation tasks (`submit --prompt <PROMPT>`) default to CPU-capable procedural SDF generation and succeed on CPU-only worker nodes without requiring a GPU or `--gpu`. The `--engine` flag strictly enforces supported engines (`sdf`, `triposr`, `auto`), refusing unknown engine names with an informative error rather than silently falling back to `auto`. Design: [docs/design/0015-engine-names-and-cpu-fallback.md](docs/design/0015-engine-names-and-cpu-fallback.md). | Implemented + tests |
+| **23. Agent Mesh command hardening & process controls** | Restricts mesh nodes to 5 advertised commands (`echo`, `ping`, `system_info`, `sha256_verify`, `shell_exec`); unadvertised commands return exit 127. `--no-shell` flag filters out `shell_exec` capability and rejects execution requests with 127. Child processes inherit no stdin (`DEVNULL`), output is capped at 1 MiB per stream, and 5 secret env vars are stripped from parent environment inheritance. Design: [docs/design/0011-agent-mesh-hardening.md](docs/design/0011-agent-mesh-hardening.md). | Implemented + tests |
 
 ---
 
@@ -110,6 +111,7 @@ Documentation index and writing standard: [docs/README.md](docs/README.md). A ma
 | **8** | Mid-task checkpointing | Done | See feature 14. |
 | **9** | OS child process containment | Hardened | Spawned task child processes are atomically bound to OS-level containment handles: Windows Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` with `CREATE_SUSPENDED`) and Linux `PR_SET_PDEATHSIG(SIGKILL)` guarantee child tree cleanup on worker termination. |
 | **10** | Protocol version & capability negotiation | Completed | Formal `PROTOCOL_VERSION` and `ProtocolCapabilities` handshake exchange prevents frame drops and enables graceful capability mismatch handling across master, worker, and CLI. |
+| **11** | 3D generative engine names and CPU fallback | Completed | Default 3D generation executes on CPU worker nodes via procedural SDF without GPU hardware. Strict validation refuses unknown engine names across CLI, core builder, Agent Mesh bridge, and wire codecs (JSON and bincode). Documented in [docs/design/0015-engine-names-and-cpu-fallback.md](docs/design/0015-engine-names-and-cpu-fallback.md). |
 
 ---
 
@@ -301,6 +303,10 @@ or `~/.oxideswarm/cluster.secret`.
 # GPU task of a chosen size (default 64; up to 8192 on a real GPU, 2048 on the simulated one)
 ./target/release/oxideswarm submit --type gpu --matrix-dim 2048 --wait
 
+# 3D mesh generation: default runs on CPU via procedural SDF and writes a glTF 2.0 binary asset
+./target/release/oxideswarm submit --prompt "a solid cube" -o cube.glb --wait
+./target/release/oxideswarm submit --prompt "robot" --engine sdf -o robot.glb --wait
+
 # Inspect the grid
 ./target/release/oxideswarm workers --master 127.0.0.1:8088
 ./target/release/oxideswarm status --master 127.0.0.1:8088 --json
@@ -366,7 +372,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_MAX_RETRIES` | Master | Secondary alias for default task retry ceiling |
 | `RUSTY_GRID_MAX_RETAINED_TASKS` | Master | Maximum count of finished tasks retained in memory (`--max-retained-tasks`; default 10000) |
 | `RUSTY_GRID_MAX_RETAINED_MB` | Master | Maximum megabytes of finished task payloads and output retained (`--max-retained-mb`; default 256) |
-| `RUSTY_GRID_MAX_ACTIVE_MB` | Master | Maximum megabytes of active (non-terminal) task payloads held in the queue (`--max-active-mb`; default 256) |
+| `RUSTY_GRID_MAX_ACTIVE_MB` | Master & Agent Mesh | Maximum megabytes of active (non-terminal) task payloads held in the queue (`--max-active-mb` on `oxideswarm master` and `agent-mesh hub`; default 256, minimum 1) |
 | `RUSTY_GRID_BLOB_DIR` | Master | Directory of the blob store of task input and output files (`--blob-dir`; default `~/.oxideswarm/blobs`) |
 | `RUSTY_GRID_BLOB_STORE_MB` | Master | Megabytes the blob store holds before evicting least recently used files (`--blob-store-mb`; default 4096) |
 | `RUSTY_GRID_MAPREDUCE_PARALLELISM` | Master | Maximum concurrent in-flight map/reduce chunk tasks |
@@ -507,11 +513,12 @@ python3 scripts/agent_node.py --hub ws://127.0.0.1:8090/ws --id node-android-3 -
 `--grid-master [ADDR]` makes the hub start its own embedded Master Grid coordinator on `ADDR`. It does not connect
 to a master that is already running, so give it a free port. A non-loopback `ADDR` needs a cluster secret
 (`--secret` / `OXIDESWARM_SECRET`, else the default `~/.oxideswarm/cluster.secret`) or an explicit `--insecure`:
-the hub refuses to start an unauthenticated master that the network can reach.
+the hub refuses to start an unauthenticated master that the network can reach. Pass `--max-active-mb <MB>` (or set
+`RUSTY_GRID_MAX_ACTIVE_MB`) to configure the embedded master's active queue byte budget (default 256 MiB, minimum 1 MiB).
 
 ```bash
 # Start the hub with an embedded master on 127.0.0.1:9088 (loopback, so no secret is needed):
-./target/release/agent-mesh hub --listen 127.0.0.1:8090 --grid-master 127.0.0.1:9088
+./target/release/agent-mesh hub --listen 127.0.0.1:8090 --grid-master 127.0.0.1:9088 --max-active-mb 512
 
 # When --grid-master is configured, agent mesh nodes can dispatch compute envelopes:
 # grid_compute, grid_compile, grid_submit, and grid_status execute end-to-end against the grid.
