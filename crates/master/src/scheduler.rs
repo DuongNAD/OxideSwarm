@@ -57,7 +57,10 @@ pub enum SchedulingPolicy {
 pub struct SchedulerConfig {
     /// Load balancing algorithm.
     pub policy: SchedulingPolicy,
-    /// Multiplier against worker CPU cores to calculate maximum concurrent tasks (default: 1.0).
+    /// Multiplier against worker CPU cores to calculate the CPU-core slot budget (default: 1.0).
+    /// Also provides the fallback concurrent-task limit when a worker does not advertise a
+    /// `slots:<n>` tag; current workers advertise `slots:<n>`, which caps concurrent task count
+    /// (`AssignedLoad::tasks`) via [`SchedulerConfig::effective_max_tasks`].
     pub core_concurrency_multiplier: f64,
     /// Hard cap on maximum tasks per worker, regardless of core count (None = unbounded by cap).
     pub max_tasks_per_worker: Option<usize>,
@@ -123,7 +126,10 @@ impl Default for SchedulerConfig {
 }
 
 impl SchedulerConfig {
-    /// Computes the maximum concurrent tasks allowed for a given worker.
+    /// Computes the CPU-core slot budget (`max_slots`) for a given worker.
+    ///
+    /// A task requiring `cpu_cores` occupies that many core slots on the worker, scaled by
+    /// `core_concurrency_multiplier` and bounded by `max_tasks_per_worker` when set.
     pub fn effective_max_concurrency(&self, worker: &WorkerInfo) -> usize {
         let cores = worker.capabilities.cpu_cores.max(1);
         let by_multiplier = (cores as f64 * self.core_concurrency_multiplier).ceil() as usize;
@@ -134,17 +140,36 @@ impl SchedulerConfig {
         }
     }
 
+    /// Computes the maximum concurrent task count (`max_tasks`) allowed for a given worker.
+    ///
+    /// Honours a worker's advertised `slots:<n>` tag (`--max-concurrency` or default headroom) when
+    /// present, falling back to [`Self::effective_max_concurrency`] for workers that do not
+    /// advertise `slots:<n>`.
+    pub fn effective_max_tasks(&self, worker: &WorkerInfo) -> usize {
+        let limit = match rusty_grid_core::placement::advertised_slots(&worker.capabilities) {
+            Some(slots) => slots,
+            None => self.effective_max_concurrency(worker),
+        };
+        match self.max_tasks_per_worker {
+            Some(cap) => limit.min(cap),
+            None => limit,
+        }
+    }
+
     /// Determines the required VRAM in MB for a given task.
     pub fn required_vram_mb(&self, task: &Task) -> u64 {
         match &task.spec {
-            TaskSpec::Generative3D(spec) => match spec.engine_preference.as_deref() {
-                Some("sdf") | Some("procedural") => 0,
-                _ => match spec.quality.as_str() {
-                    "fast" => self.min_vram_fast_mb,
-                    "high" => self.min_vram_high_mb,
-                    _ => self.min_vram_standard_mb,
-                },
-            },
+            TaskSpec::Generative3D(spec) => {
+                if spec.engine().is_cpu_capable() {
+                    0
+                } else {
+                    match spec.quality.as_str() {
+                        "fast" => self.min_vram_fast_mb,
+                        "high" => self.min_vram_high_mb,
+                        _ => self.min_vram_standard_mb,
+                    }
+                }
+            }
             _ => 0,
         }
     }
@@ -258,8 +283,11 @@ fn view_fits(view: &TaskView, worker: &WorkerInfo) -> bool {
 /// One worker as the placement engine tracks it during a pass.
 struct Seat<'a> {
     worker: &'a WorkerInfo,
-    /// Concurrency slots of the worker (`SchedulerConfig::effective_max_concurrency`).
+    /// CPU-core slot budget of the worker (`SchedulerConfig::effective_max_concurrency`).
     max_slots: usize,
+    /// Maximum concurrent task count of the worker (`SchedulerConfig::effective_max_tasks`,
+    /// from `slots:<n>` when advertised).
+    max_tasks: usize,
     /// Load from the master's books at the start of the pass.
     base: AssignedLoad,
     /// Load added by tasks placed during this pass.
@@ -273,6 +301,14 @@ impl Seat<'_> {
 
     fn load(&self) -> usize {
         self.base.tasks + self.placed.tasks
+    }
+
+    fn remaining_slots(&self) -> usize {
+        if self.load() >= self.max_tasks {
+            0
+        } else {
+            self.max_slots.saturating_sub(self.used_slots())
+        }
     }
 }
 
@@ -369,6 +405,7 @@ impl<'a> Engine<'a> {
                     },
                 };
                 let mut max_slots = config.effective_max_concurrency(worker);
+                let mut max_tasks = config.effective_max_tasks(worker);
                 if let Some(ref mobile) = worker.capabilities.mobile {
                     let live = mobile.live_status();
                     let bat = effective_scheduler_battery_tier(worker, mobile, &live);
@@ -381,10 +418,12 @@ impl<'a> Engine<'a> {
                     let eff =
                         calculate_effective_concurrency(worker.capabilities.cpu_cores, bat, therm);
                     max_slots = max_slots.min(eff);
+                    max_tasks = max_tasks.min(eff);
                 }
                 Seat {
                     worker,
                     max_slots,
+                    max_tasks,
                     base,
                     placed: AssignedLoad::default(),
                 }
@@ -393,7 +432,7 @@ impl<'a> Engine<'a> {
         let free_slots = seats
             .iter()
             .filter(|seat| seat.worker.status != WorkerStatus::Disconnected)
-            .map(|seat| seat.max_slots.saturating_sub(seat.base.slots))
+            .map(Seat::remaining_slots)
             .sum();
         Self {
             config,
@@ -473,11 +512,14 @@ impl<'a> Engine<'a> {
 
         let chosen = self.rank(view, &mut candidates);
         let seat = &mut self.seats[chosen];
-        let free_before = seat.max_slots.saturating_sub(seat.used_slots());
+        let free_before = seat.remaining_slots();
         seat.placed.tasks += 1;
         seat.placed.slots += weight;
         seat.placed.unstarted_ram_mb += view.requirements.ram_mb;
-        self.free_slots = self.free_slots.saturating_sub(weight.min(free_before));
+        let free_after = seat.remaining_slots();
+        self.free_slots = self
+            .free_slots
+            .saturating_sub(free_before.saturating_sub(free_after));
         Verdict::Placed(chosen)
     }
 
@@ -507,9 +549,7 @@ impl<'a> Engine<'a> {
         self.reserved[idx] = true;
         let seat = &self.seats[idx];
         // Its free slots are out of reach for the rest of the pass.
-        self.free_slots = self
-            .free_slots
-            .saturating_sub(seat.max_slots.saturating_sub(seat.used_slots()));
+        self.free_slots = self.free_slots.saturating_sub(seat.remaining_slots());
     }
 
     /// Indices of the workers that may run `view` right now. `full` is cleared and then receives
@@ -637,11 +677,15 @@ impl<'a> Engine<'a> {
                 }
             }
 
-            // Stage 5: Concurrency saturation, in slots: a task occupies as many as the cores it
-            // asks for, so eight 8-core builds cannot all land on a 16-core machine. An idle
-            // worker always takes a task it is capable of.
+            // Stage 5: Concurrency saturation:
+            // (a) Task-count cap (`max_tasks`, from `slots:<n>`): a worker can run at most
+            //     `max_tasks` tasks at once (one worker semaphore permit per task).
+            // (b) Core-slot budget (`max_slots`): a task occupies `cpu_cores` core slots, so
+            //     eight 8-core builds cannot all land on a 16-core machine. An idle worker
+            //     always takes a task it is capable of as long as `max_tasks >= 1`.
             let used = seat.used_slots();
-            if used > 0 && used + weight > seat.max_slots {
+            let tasks = seat.load();
+            if tasks >= seat.max_tasks || (used > 0 && used + weight > seat.max_slots) {
                 full.push(idx);
                 continue;
             }
@@ -667,8 +711,10 @@ impl<'a> Engine<'a> {
                     let seat = &self.seats[*idx];
                     let reserve = config
                         .gpu_reserved_slots
-                        .min(seat.max_slots.saturating_sub(1));
+                        .min(seat.max_slots.saturating_sub(1))
+                        .min(seat.max_tasks.saturating_sub(1));
                     seat.max_slots.saturating_sub(seat.used_slots() + weight) >= reserve
+                        && seat.max_tasks.saturating_sub(seat.load() + 1) >= reserve
                 });
             }
         }
@@ -2750,6 +2796,91 @@ mod tests {
             critical_report.assignments.len(),
             0,
             "Unplugged laptop below 15% critical battery must refuse GPU tasks"
+        );
+    }
+
+    #[test]
+    fn test_worker_slots_tag_caps_concurrency_and_spills_overflow_to_idle_peer() {
+        let config = SchedulerConfig::default();
+
+        // An 8-core worker capped with `slots:2` (--max-concurrency 2) and an idle 4-core peer.
+        let mut capped_worker = make_worker("worker-8c-slots2", 8, 16384, false, false);
+        capped_worker.capabilities.tags.push("slots:2".into());
+        let idle_peer = make_worker("worker-4c-peer", 4, 16384, false, false);
+        assert_eq!(config.effective_max_concurrency(&capped_worker), 8);
+        assert_eq!(config.effective_max_tasks(&capped_worker), 2);
+        assert_eq!(config.effective_max_concurrency(&idle_peer), 4);
+        assert_eq!(config.effective_max_tasks(&idle_peer), 4);
+
+        let workers = vec![capped_worker.clone(), idle_peer.clone()];
+        let tasks: Vec<Task> = (0..6)
+            .map(|i| {
+                Task::new(
+                    TaskSpec::shell_script(format!("echo {i}")),
+                    TaskRequirements::generic(1, 30),
+                )
+            })
+            .collect();
+
+        let report = WorkloadScheduler::matchmake(&config, &tasks, &workers);
+        assert_eq!(report.assignments.len(), 6);
+
+        let capped_count = report
+            .assignments
+            .iter()
+            .filter(|a| a.worker_id == capped_worker.worker_id)
+            .count();
+        let peer_count = report
+            .assignments
+            .iter()
+            .filter(|a| a.worker_id == idle_peer.worker_id)
+            .count();
+        assert_eq!(
+            capped_count, 2,
+            "worker with slots:2 on 8 cores must receive at most 2 tasks"
+        );
+        assert_eq!(
+            peer_count, 4,
+            "overflow tasks must spill to the idle peer worker"
+        );
+
+        // F34-1: A default 8-core worker advertises `slots:7` (cores - 1 headroom).
+        // Because `max_slots` stays in cores (8) while `max_tasks` is 7, two 4-core
+        // half-machine tasks fit and run concurrently on the worker in a single pass.
+        let mut default_8c = make_worker("worker-8c-default-slots7", 8, 16384, false, false);
+        default_8c.capabilities.tags.push("slots:7".into());
+        assert_eq!(config.effective_max_concurrency(&default_8c), 8);
+        assert_eq!(config.effective_max_tasks(&default_8c), 7);
+
+        let wide_tasks: Vec<Task> = (0..2)
+            .map(|i| {
+                Task::new(
+                    TaskSpec::shell_script(format!("echo wide-{i}")),
+                    TaskRequirements::generic(4, 30),
+                )
+            })
+            .collect();
+        let wide_report =
+            WorkloadScheduler::matchmake(&config, &wide_tasks, std::slice::from_ref(&default_8c));
+        assert_eq!(
+            wide_report.assignments.len(),
+            2,
+            "an 8-core worker with slots:7 must run two 4-core tasks side by side"
+        );
+
+        // Conversely, an 8-core worker with `slots:1` (--max-concurrency 1) takes only ONE
+        // 4-core task at a time even though 4 + 4 <= 8 cores.
+        let mut single_slot_8c = make_worker("worker-8c-slots1", 8, 16384, false, false);
+        single_slot_8c.capabilities.tags.push("slots:1".into());
+        let single_report = WorkloadScheduler::matchmake(
+            &config,
+            &wide_tasks,
+            std::slice::from_ref(&single_slot_8c),
+        );
+        assert_eq!(
+            single_report.assignments.len(),
+            1,
+            "an 8-core worker with slots:1 must take at most 1 task at a time"
         );
     }
 }

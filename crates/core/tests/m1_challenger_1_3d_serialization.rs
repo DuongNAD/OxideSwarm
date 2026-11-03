@@ -249,14 +249,21 @@ fn test_adv_01_generative_3d_extreme_inputs_and_fuzzing() {
     let triposr_spec =
         TaskSpec::Generative3D(Generative3DSpec::new_prompt("cube").with_engine("triposr"));
     assert!(
-        triposr_spec.requires_gpu(),
-        "TripoSR engine MUST require GPU"
+        !triposr_spec.requires_gpu(),
+        "TripoSR engine is CPU-capable (does NOT require GPU)"
+    );
+
+    let trellis_spec =
+        TaskSpec::Generative3D(Generative3DSpec::new_prompt("cube").with_engine("trellis"));
+    assert!(
+        !trellis_spec.requires_gpu(),
+        "Trellis engine does NOT require GPU (N21-1: eligible for CPU worker fast rejection)"
     );
 
     let auto_spec = TaskSpec::Generative3D(Generative3DSpec::new_prompt("cube"));
     assert!(
-        auto_spec.requires_gpu(),
-        "Default/auto engine MUST require GPU"
+        !auto_spec.requires_gpu(),
+        "Default/auto engine must NOT require GPU"
     );
     println!("  [+] Verified engine preferences and GPU requirement rules.");
 }
@@ -913,12 +920,20 @@ fn test_adv_07_full_task_spec_interchange_and_checkpoint_zero_copy() {
     // Validation must pass because TripoSR requires GPU and requirements say gpu_required = true
     assert!(task_3d.validate().is_ok());
 
-    // Mismatched requirement validation check:
-    let task_3d_mismatched = Task::new(
+    // TripoSR is CPU-capable, so generic reqs (gpu_required = false) pass validation
+    let task_triposr_cpu = Task::new(
         TaskSpec::Generative3D(Generative3DSpec::new_prompt("dragon").with_engine("triposr")),
+        TaskRequirements::generic(4, 60),
+    );
+    assert!(task_triposr_cpu.validate().is_ok());
+
+    // Mismatched requirement validation check:
+    // GpuCompute requires GPU, so pairing it with generic (gpu_required = false) must fail validation
+    let task_gpu_mismatched = Task::new(
+        TaskSpec::gpu_compute("kernel", 64),
         TaskRequirements::generic(4, 60), // gpu_required = false
     );
-    let mismatch_err = task_3d_mismatched.validate();
+    let mismatch_err = task_gpu_mismatched.validate();
     assert!(
         mismatch_err.is_err(),
         "Mismatched GPU requirements must fail validation"
@@ -926,6 +941,24 @@ fn test_adv_07_full_task_spec_interchange_and_checkpoint_zero_copy() {
     println!(
         "  [+] GPU requirement mismatch correctly caught: {:?}",
         mismatch_err.unwrap_err()
+    );
+
+    // Unsupported engine validation check:
+    // Trellis is not supported and fails TaskSpec validation
+    let task_3d_mismatched = Task::new(
+        TaskSpec::Generative3D(Generative3DSpec::new_prompt("dragon").with_engine("trellis")),
+        TaskRequirements::generic(4, 60),
+    );
+    let trellis_err = task_3d_mismatched.validate();
+    assert!(
+        trellis_err.is_err(),
+        "Trellis task must fail TaskSpec validation"
+    );
+    assert!(
+        trellis_err
+            .unwrap_err()
+            .contains("Trellis 3D neural engine is not supported; use sdf or triposr"),
+        "Error message must specify Trellis is unsupported"
     );
 
     // Attach 1MB CheckpointData to task
@@ -1075,4 +1108,73 @@ fn test_adv_09_bincode_invalid_enum_indices() {
         "  [+] Invalid WorkerMessage variant index cleanly rejected: {:?}",
         res_msg.unwrap_err()
     );
+}
+
+// =========================================================================
+// 10. Unknown Engine Rejection & Wire Codec Parity (BUG-3 Finding H2)
+// =========================================================================
+
+#[test]
+fn test_adv_10_unknown_engine_and_codec_parity() {
+    println!("\n=== [ADV-10] Unknown Engine Rejection & Codec Parity ===");
+
+    // 1. Builder preserves raw string without falling back to Auto
+    let spec_rodin = Generative3DSpec::new_prompt("robot").with_engine("rodin");
+    assert_eq!(spec_rodin.engine_preference.as_deref(), Some("rodin"));
+    assert!(spec_rodin.try_engine().is_err());
+    assert_eq!(
+        spec_rodin.engine(),
+        rusty_grid_core::task::Engine3D::Auto,
+        "engine() helper falls back for unparsable names"
+    );
+
+    // Validation strictly fails for unknown engine
+    let task_rodin = TaskSpec::Generative3D(spec_rodin.clone());
+    let val_err = task_rodin
+        .validate()
+        .expect_err("rodin must fail TaskSpec validation");
+    assert!(
+        val_err.contains("unknown 3D engine 'rodin'"),
+        "Error message must specify unknown 3D engine, got: {val_err}"
+    );
+
+    // 2. Both JSON and Bincode wire codecs preserve "rodin" and fail validation
+    let json_str = serde_json::to_string(&spec_rodin).expect("JSON serialize raw engine");
+    let deser_json: Generative3DSpec =
+        serde_json::from_str(&json_str).expect("JSON deserialize raw engine");
+    assert_eq!(deser_json.engine_preference.as_deref(), Some("rodin"));
+    assert!(TaskSpec::Generative3D(deser_json).validate().is_err());
+
+    let bincode_bytes = bincode::serialize(&spec_rodin).expect("bincode serialize raw engine");
+    let deser_bincode: Generative3DSpec =
+        bincode::deserialize(&bincode_bytes).expect("bincode deserialize raw engine");
+    assert_eq!(deser_bincode.engine_preference.as_deref(), Some("rodin"));
+    assert!(TaskSpec::Generative3D(deser_bincode).validate().is_err());
+
+    // 3. Case-insensitivity: both codecs accept uppercase "TRIPOSR"
+    let spec_upper = Generative3DSpec::new_prompt("robot").with_engine("TRIPOSR");
+    assert_eq!(
+        spec_upper.try_engine().unwrap(),
+        rusty_grid_core::task::Engine3D::TripoSr
+    );
+
+    let json_upper = serde_json::to_string(&spec_upper).expect("JSON serialize TRIPOSR");
+    let deser_upper_json: Generative3DSpec =
+        serde_json::from_str(&json_upper).expect("JSON deserialize TRIPOSR");
+    assert_eq!(
+        deser_upper_json.try_engine().unwrap(),
+        rusty_grid_core::task::Engine3D::TripoSr
+    );
+    assert!(TaskSpec::Generative3D(deser_upper_json).validate().is_ok());
+
+    let bin_upper = bincode::serialize(&spec_upper).expect("bincode serialize TRIPOSR");
+    let deser_upper_bin: Generative3DSpec =
+        bincode::deserialize(&bin_upper).expect("bincode deserialize TRIPOSR");
+    assert_eq!(
+        deser_upper_bin.try_engine().unwrap(),
+        rusty_grid_core::task::Engine3D::TripoSr
+    );
+    assert!(TaskSpec::Generative3D(deser_upper_bin).validate().is_ok());
+
+    println!("  [+] Codec parity and case-insensitive engine validation verified successfully.");
 }
