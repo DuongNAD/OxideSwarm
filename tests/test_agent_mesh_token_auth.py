@@ -149,13 +149,27 @@ async def test_missing_and_wrong_token_are_rejected(url, http):
     print("PASS missing / wrong token rejected, nothing registered")
 
 
-async def test_right_token_routes_commands(url):
+async def wait_for_registered_nodes(http: str, expected_ids: set[str], timeout: float = 5.0):
+    deadline = time.time() + timeout
+    last_ids: set[str] = set()
+    while time.time() < deadline:
+        status, body = http_get(f"{http}/api/nodes", bearer=TOKEN)
+        if status == 200:
+            last_ids = {n["node_id"] for n in json.loads(body)}
+            if expected_ids.issubset(last_ids):
+                return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"nodes {expected_ids} did not register within {timeout}s; active={last_ids}")
+
+
+async def test_right_token_routes_commands(url, http):
     a = OxideAgentNode(url, "py-alice", "linux", token=TOKEN)
     b = OxideAgentNode(url, "py-bob", "linux", token=TOKEN)
     await a.connect()
     await b.connect()
     la, lb = asyncio.create_task(a.listen()), asyncio.create_task(b.listen())
     try:
+        await wait_for_registered_nodes(http, {"py-alice", "py-bob"})
         resp = await a.send_command("py-bob", "echo", {"message": "authenticated"}, timeout=3.0)
         assert resp.get("type") == "CommandResponse", resp
         assert resp["stdout"] == "authenticated" and resp["from"] == "py-bob", resp
@@ -175,12 +189,13 @@ async def test_right_token_routes_commands(url):
         await b.close()
 
 
-async def test_forged_from_is_nacked(url):
+async def test_forged_from_is_nacked(url, http):
     victim = OxideAgentNode(url, "py-victim", "linux", token=TOKEN)
     await victim.connect()
     lv = asyncio.create_task(victim.listen())
     marker = os.path.join(tempfile.gettempdir(), f"forged_{uuid.uuid4().hex}")
     try:
+        await wait_for_registered_nodes(http, {"py-victim"})
         async with websockets.connect(url) as ws:
             await ws.send(json.dumps({
                 "version": "1.0", "correlation_id": str(uuid.uuid4()), "type": "NodeRegistration",
@@ -256,8 +271,8 @@ async def run_token_auth_tests() -> bool:
     proc, url, http = start_hub()
     try:
         await test_missing_and_wrong_token_are_rejected(url, http)
-        await test_right_token_routes_commands(url)
-        await test_forged_from_is_nacked(url)
+        await test_right_token_routes_commands(url, http)
+        await test_forged_from_is_nacked(url, http)
         await test_foreign_origin_is_refused(url)
         await test_rest_needs_token(http)
         await asyncio.get_running_loop().run_in_executor(None, test_cli_token_flag_and_environment, url)
