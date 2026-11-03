@@ -66,7 +66,7 @@ on Unix and `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS` on Windo
 links/reparse points, non-regular files, and files exceeding `MAX_FRAME_SIZE` (`64 * 1024 * 1024 = 67,108,864`
 bytes, 64 MiB) before reading, and reads through a capped reader (`file.take(MAX_FRAME_SIZE as u64 + 1)`)
 so a file that grows past `MAX_FRAME_SIZE` during the read is also refused (`"is more than 67108864 bytes"`).
-In the generative 3D path (`crates/worker/src/runner.rs:2126`), a `read_output_file` refusal fails the
+In the generative 3D path (`crates/worker/src/runner.rs:2100`, failing at `:2152`), a `read_output_file` refusal fails the
 task with `EXIT_CODE_GENERAL_ERROR`; in Blender auto-rigging (`crates/worker/src/runner.rs:2340-2366`),
 a `read_output_file` refusal logs a `warn!` and falls back to the built-in pure-Rust auto-rigging
 engine without telling the caller in `TaskResult`.
@@ -102,12 +102,12 @@ unchanged. Tasks receive standard environment variables:
   (`64 * 1024 * 1024 = 67,108,864` bytes, 64 MiB) before reading, and caps the read via
   `file.take(MAX_FRAME_SIZE as u64 + 1)` so files that grow past `MAX_FRAME_SIZE` while being read
   are refused with `"is more than 67108864 bytes"` (BUG-10). In Blender auto-rigging
-  (`crates/worker/src/runner.rs:2346`), a refusal from `read_output_file` logs a warning and falls
+  (`crates/worker/src/runner.rs:2364`), a refusal from `read_output_file` logs a warning and falls
   back to the pure-Rust auto-rigging engine without telling the caller. On the wire
   (`crates/worker/src/client.rs:667`), BUG-4's `rewrite_oversized_task_result` fails and rewrites
   `TaskResult` earlier whenever the entire serialized `WorkerMessage::TaskResult` frame — including
-  `TaskResult` envelope fields, `stdout`/`stderr`, `artifacts`, codec framing (bincode or JSON/base64),
-  and on encrypted lanes `AEAD_RECORD_OVERHEAD` (`29` bytes) — exceeds `MAX_FRAME_SIZE`
+  `TaskResult` envelope fields, `stdout`/`stderr`, `artifacts`, codec framing (bincode or JSON byte arrays),
+  and on encrypted lanes `AEAD_RECORD_OVERHEAD` (`25` bytes) — exceeds `MAX_FRAME_SIZE`
   (`67,108,864` bytes).
 - **Worker crash on Unix**: On Unix, task processes run under process groups (`killpg`). Normal
   cancellation, watchdog timeout, or task drop terminates the process group. However, after an
@@ -133,7 +133,7 @@ a task process can still read the worker account's secret file on disk, as docum
 
 ## Test plan
 
-- `crates/worker/src/runner.rs` (`mod tests`): Unit tests for `read_output_file`:
+- `crates/worker/src/runner.rs` (`mod outcome_tests`): Unit tests for `read_output_file`:
   - `test_read_output_file_regular_missing_and_directory`: missing path returns `Ok(None)`, regular file returns `Ok(Some(bytes))`, directory returns `Err(InvalidData)`.
   - `test_read_output_file_fifo_returns_error_immediately` (Unix): FIFO at output path returns `Err(InvalidData)` immediately via `O_NONBLOCK` without hanging.
   - `test_read_output_file_refuses_symlink_and_oversized_or_sparse_file`: refuses symbolic links/reparse points and concurrent symlink swaps (`O_NOFOLLOW` / `FILE_FLAG_OPEN_REPARSE_POINT`), refuses `MAX_FRAME_SIZE + 1` (`67,108,865` bytes) before reading (`"is 67108865 bytes"`), and refuses files that grow past `MAX_FRAME_SIZE` during the read via the `take(MAX_FRAME_SIZE as u64 + 1)` cap (`"is more than 67108864 bytes"`).
@@ -168,4 +168,5 @@ a task process can still read the worker account's secret file on disk, as docum
 - 2026-11-01: Updated design record for second round review: corrected master baseline, Unix crash semantics, probe secret isolation, and output frame limit.
 - 2026-11-01: Updated design record for round 3 review: corrected default output buffer limit, metadata regular file check, task env stripping vs probe_command distinction, CI scope, and W2 file list.
 - 2026-11-03: Guarded `read_output_file` by opening with `O_NOFOLLOW | O_NONBLOCK` (Unix) and `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS` (Windows) before inspecting `file.metadata()`, refusing symbolic links/reparse points, non-regular files, and files exceeding `MAX_FRAME_SIZE` (`67,108,864` bytes) before reading, and capping reads with `take(MAX_FRAME_SIZE as u64 + 1)` (BUG-10).
+- 2026-11-03: Corrected `runner.rs` line references (`:2100`/`:2152` and `:2364`), `AEAD_RECORD_OVERHEAD` (`25` bytes), JSON byte-array serialization description, and `mod outcome_tests` module name.
 

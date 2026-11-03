@@ -1634,7 +1634,7 @@ impl TaskSpec {
                     match engine {
                         Engine3D::Auto => {
                             return Err(
-                                "Image input is only supported with neural 3D engines (e.g. triposr); auto and procedural engines do not accept images"
+                                "Image input is only supported with neural 3D engines (e.g. triposr); the auto engine does not accept images"
                                     .to_string(),
                             );
                         }
@@ -3303,7 +3303,7 @@ mod tests {
                 .expect_err("Auto engine must reject image input");
             assert_eq!(
                 err,
-                "Image input is only supported with neural 3D engines (e.g. triposr); auto and procedural engines do not accept images"
+                "Image input is only supported with neural 3D engines (e.g. triposr); the auto engine does not accept images"
             );
         }
     }
