@@ -925,27 +925,95 @@ async fn test_mcp1_silent_master_bounded_by_wait_secs_and_exits_on_eof() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_secs() {
-    let (master, master_addr, shutdown_tx, worker_handle, temp) = spawn_cluster().await;
-    let home = temp.path();
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
-    // 1. N1 + N4: Bind a silent UDP port (so UDP discovery times out after 1.5s) and a local HTTP
-    // rendezvous server serving a RendezvousLease for `master_addr`.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path();
+    let sandbox_dir = home.join("sandboxes");
+    std::fs::create_dir_all(&sandbox_dir).expect("create sandbox_dir");
+
+    // Configure the master and worker with a ClusterSecret so `wait_secs: 0` (N31-3)
+    // must run the multi-step authenticated handshake (which fails if `.max(1)` at
+    // `mcp.rs:1099` is removed).
+    let secret = rusty_grid_core::cluster_auth::ClusterSecret::generate().expect("generate secret");
+    let secret_hex = secret.to_hex();
+    let cfg = ServerConfig::from_addr("127.0.0.1:0")
+        .expect("server cfg")
+        .with_cluster_secret(secret.clone());
+    let master = MasterServer::spawn(cfg).await.expect("spawn master");
+    let master_addr = master.server_addr().to_string();
+
+    let worker_cfg = WorkerConfig::new(&master_addr)
+        .with_name("mcp1-auth-worker")
+        .with_cores(4)
+        .with_ram_mb(4096)
+        .with_tags(vec!["present".to_string()])
+        .with_cluster_secret(secret.clone())
+        .with_sandbox_base_dir(&sandbox_dir);
+    let mut worker = WorkerClient::new(worker_cfg);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let worker_handle = tokio::spawn(async move {
+        let _ = worker.run(shutdown_rx).await;
+    });
+
+    let reg_deadline = Instant::now() + Duration::from_secs(5);
+    while master.registry().list_workers().await.is_empty() {
+        assert!(
+            Instant::now() < reg_deadline,
+            "worker did not register in time"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+
+    // 1. N1 + N31-2 + N31-3: Bind a silent UDP port (so UDP discovery times out after 1.5s) and a
+    // local HTTP rendezvous server serving a signed RendezvousLease for `master_addr`.
     let silent_udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent udp");
     let disc_port = silent_udp.local_addr().expect("udp local_addr").port();
 
+    // Forwarder in front of `master_addr` with a 5ms handshake latency (> Tokio's 1ms timer
+    // wheel tick) so `connect_master`'s authenticated handshake cannot complete inside a single
+    // sub-millisecond poll if `.max(1)` at `mcp.rs:1099` is removed.
+    let auth_proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind auth_proxy_listener");
+    let auth_proxy_addr = auth_proxy_listener
+        .local_addr()
+        .expect("auth_proxy_addr")
+        .to_string();
+    let master_addr_for_proxy = master_addr.clone();
+    let auth_proxy_handle = tokio::spawn(async move {
+        while let Ok((mut client_stream, _)) = auth_proxy_listener.accept().await {
+            let upstream = master_addr_for_proxy.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let Ok(mut upstream_stream) = tokio::net::TcpStream::connect(&upstream).await
+                else {
+                    return;
+                };
+                let _ =
+                    tokio::io::copy_bidirectional(&mut client_stream, &mut upstream_stream).await;
+            });
+        }
+    });
+
     let rv_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rv listener");
     let rv_addr = rv_listener.local_addr().expect("rv local_addr");
-    let lease = rusty_grid_core::discovery::RendezvousLease::new(
-        &master_addr,
+    let mut lease = rusty_grid_core::discovery::RendezvousLease::new(
+        &auth_proxy_addr,
         "http://127.0.0.1:8080",
         "mcp1-rv-host",
         None,
         1,
         60,
     );
+    lease.sign(&secret);
     let lease_json = serde_json::to_string(&lease).expect("serialize lease");
+    let rv_hits = Arc::new(AtomicUsize::new(0));
+    let rv_hits_srv = Arc::clone(&rv_hits);
     std::thread::spawn(move || {
         while let Ok((mut stream, _)) = rv_listener.accept() {
+            rv_hits_srv.fetch_add(1, Ordering::SeqCst);
             let mut req_buf = [0u8; 512];
             let _ = std::io::Read::read(&mut stream, &mut req_buf);
             let resp = format!(
@@ -973,7 +1041,8 @@ async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_sec
             "mcp",
             "--master",
             &format!("auto:{disc_port}"),
-            "--insecure",
+            "--secret",
+            &secret_hex,
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -993,6 +1062,8 @@ async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_sec
         }
     });
 
+    // Step 1a: Send `initialize` (id 1) and `status` (id 2), and wait for both replies so
+    // `resolved_master_addr` is populated in `McpState`.
     for msg in [
         json!({
             "jsonrpc": "2.0",
@@ -1010,22 +1081,6 @@ async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_sec
             "method": "tools/call",
             "params": { "name": "status", "arguments": {} }
         }),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {
-                "name": "submit",
-                "arguments": {
-                    "type": "command",
-                    "command": "echo",
-                    "args": ["wait-zero-over-auto"],
-                    "require_tags": ["absent"],
-                    "wait": true,
-                    "wait_secs": 0
-                }
-            }
-        }),
     ] {
         let s = serde_json::to_string(&msg).unwrap();
         auto_stdin.write_all(format!("{s}\n").as_bytes()).unwrap();
@@ -1033,11 +1088,10 @@ async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_sec
     auto_stdin.flush().unwrap();
 
     let mut saw_status = false;
-    let mut saw_wait_zero = false;
-    for _ in 0..3 {
+    for _ in 0..2 {
         let frame = auto_rx
             .recv_timeout(Duration::from_secs(8))
-            .expect("recv frame from auto mcp");
+            .expect("recv init/status from auto mcp");
         match frame["id"].as_i64() {
             Some(1) => {}
             Some(2) => {
@@ -1051,40 +1105,84 @@ async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_sec
                 assert_eq!(body["cluster_status"], "ok");
                 saw_status = true;
             }
-            Some(3) => {
-                assert_eq!(
-                    frame["result"]["isError"], false,
-                    "submit {{wait:true, wait_secs:0}} failed: {frame}"
-                );
-                let body: Value =
-                    serde_json::from_str(frame["result"]["content"][0]["text"].as_str().unwrap())
-                        .unwrap();
-                assert_eq!(body["timed_out"], true);
-                assert!(
-                    body["warning"]
-                        .as_str()
-                        .unwrap_or("")
-                        .contains("no connected worker matches"),
-                    "expected placement warning under --master auto, got: {body}"
-                );
-                let tid = Uuid::parse_str(body["task_id"].as_str().unwrap()).unwrap();
-                assert!(
-                    master
-                        .queue()
-                        .get_task(&rusty_grid_core::TaskId(tid))
-                        .await
-                        .is_some(),
-                    "submit {{wait:true, wait_secs:0}} must submit the task to the master"
-                );
-                saw_wait_zero = true;
-            }
             other => panic!("unexpected frame id {other:?}: {frame}"),
         }
     }
-    assert!(saw_status && saw_wait_zero);
+    assert!(saw_status);
+    assert_eq!(
+        rv_hits.load(Ordering::SeqCst),
+        1,
+        "initial status call must query rendezvous exactly once"
+    );
+
+    // Step 1b (N31-2 + N31-3): Now send `submit {wait: true, wait_secs: 0}` (id 3) against the
+    // authenticated master. Because `resolved_master_addr` is cached (`mcp.rs:235`), it must NOT
+    // query the rendezvous server again and must answer well under the 1.5s UDP timeout; and
+    // because `.max(1)` at `mcp.rs:1099` gives the authenticated handshake a 1s floor, it must
+    // succeed despite `wait_secs: 0`.
+    let cached_start = Instant::now();
+    let wait_zero_msg = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "submit",
+            "arguments": {
+                "type": "command",
+                "command": "echo",
+                "args": ["wait-zero-over-auto"],
+                "require_tags": ["absent"],
+                "wait": true,
+                "wait_secs": 0
+            }
+        }
+    });
+    auto_stdin
+        .write_all(format!("{}\n", serde_json::to_string(&wait_zero_msg).unwrap()).as_bytes())
+        .unwrap();
+    auto_stdin.flush().unwrap();
+
+    let frame = auto_rx
+        .recv_timeout(Duration::from_secs(4))
+        .expect("recv wait_secs:0 frame from auto mcp");
+    assert_eq!(frame["id"], 3);
+    assert_eq!(
+        frame["result"]["isError"], false,
+        "submit {{wait:true, wait_secs:0}} against authenticated master failed: {frame}"
+    );
+    assert!(
+        cached_start.elapsed() < Duration::from_millis(800),
+        "cached --master auto address must avoid repeating 1.5s discovery, took {:?}",
+        cached_start.elapsed()
+    );
+    assert_eq!(
+        rv_hits.load(Ordering::SeqCst),
+        1,
+        "subsequent RPCs must use cached resolved_master_addr without hitting rendezvous again"
+    );
+    let body: Value =
+        serde_json::from_str(frame["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["timed_out"], true);
+    assert!(
+        body["warning"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no connected worker matches"),
+        "expected placement warning under --master auto, got: {body}"
+    );
+    let tid = Uuid::parse_str(body["task_id"].as_str().unwrap()).unwrap();
+    assert!(
+        master
+            .queue()
+            .get_task(&rusty_grid_core::TaskId(tid))
+            .await
+            .is_some(),
+        "submit {{wait:true, wait_secs:0}} must submit the task to the master"
+    );
     drop(auto_stdin);
     let _ = auto_child.kill();
     let _ = auto_child.wait();
+    auth_proxy_handle.abort();
 
     // 2. N2: Pipe `doctor` and a 1s `submit {wait: true}` followed immediately by EOF,
     // and assert BOTH replies are written to stdout before the server exits.
@@ -1099,7 +1197,7 @@ async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_sec
         .env_remove("RUSTY_GRID_MASTER")
         .env_remove("RUSTY_GRID_MASTER_ADDR")
         .env_remove("RUSTY_GRID_INSECURE")
-        .args(["mcp", "--master", &master_addr])
+        .args(["mcp", "--master", &master_addr, "--secret", &secret_hex])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1359,4 +1457,124 @@ async fn test_mcp1_slow_6mb_response_succeeds_and_post_submit_cancel_check_fires
     }
 
     srv_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_mcp1_pooled_slow_submit_reply_does_not_resend_and_returns_task_id() {
+    use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let (master, master_addr, shutdown_tx, worker_handle, temp) = spawn_cluster().await;
+
+    // Proxy in front of the real MasterServer: on connection #0 (which is pooled after the
+    // pre-flight `ListWorkers`), delay the `TaskSubmitted` reply by 1.5s so the 1s `wait_secs: 1`
+    // receive bound fires after `SubmitTask` was already written to the Master.
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let proxy_addr = proxy_listener.local_addr().expect("proxy_addr").to_string();
+    let conn_counter = Arc::new(AtomicUsize::new(0));
+    let submit_forwards = Arc::new(AtomicUsize::new(0));
+    let conn_counter_srv = Arc::clone(&conn_counter);
+    let submit_forwards_srv = Arc::clone(&submit_forwards);
+    let master_addr_srv = master_addr.clone();
+
+    let proxy_handle = tokio::spawn(async move {
+        while let Ok((client_stream, _)) = proxy_listener.accept().await {
+            let conn_idx = conn_counter_srv.fetch_add(1, Ordering::SeqCst);
+            let submits = Arc::clone(&submit_forwards_srv);
+            let upstream_addr = master_addr_srv.clone();
+            tokio::spawn(async move {
+                let Ok(upstream_stream) = tokio::net::TcpStream::connect(&upstream_addr).await
+                else {
+                    return;
+                };
+                let mut client_tx = MessageTransport::new(client_stream);
+                let mut upstream_tx = MessageTransport::new(upstream_stream);
+                while let Ok(Some(msg)) = client_tx.recv_msg::<ClientMessage>().await {
+                    let is_submit = matches!(msg, ClientMessage::SubmitTask { .. });
+                    if is_submit {
+                        submits.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if upstream_tx.send_msg(&msg).await.is_err() {
+                        break;
+                    }
+                    let Ok(Some(resp)) = upstream_tx.recv_msg::<ClientResponse>().await else {
+                        break;
+                    };
+                    if conn_idx == 0 && is_submit {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                    }
+                    if client_tx.send_msg(&resp).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut mcp = McpHarness::spawn(temp.path(), &proxy_addr);
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "mcp1-n31-1", "version": "1.0" }
+        }
+    }));
+    let _ = mcp.recv_timeout(Duration::from_secs(5));
+
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "submit",
+            "arguments": {
+                "type": "command",
+                "command": "echo",
+                "args": ["n31-1-once"],
+                "require_tags": ["absent"],
+                "wait": false,
+                "wait_secs": 1
+            }
+        }
+    }));
+
+    let resp = mcp.recv_timeout(Duration::from_secs(5));
+    assert_eq!(resp["id"], 2);
+    assert_eq!(
+        resp["result"]["isError"], false,
+        "slow pooled SubmitTask reply must not resend and fail with already exists: {resp}"
+    );
+    let body: Value = serde_json::from_str(
+        resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("submit text"),
+    )
+    .expect("submit json");
+    assert_eq!(body["timed_out"], true, "expected timed_out: true: {body}");
+    assert_eq!(body["state"], "Queued", "expected Queued state: {body}");
+    let tid = Uuid::parse_str(body["task_id"].as_str().expect("task_id")).expect("valid uuid");
+    assert_eq!(
+        submit_forwards.load(Ordering::SeqCst),
+        1,
+        "SubmitTask must be sent to the Master only once"
+    );
+    assert!(
+        master
+            .queue()
+            .get_task(&rusty_grid_core::TaskId(tid))
+            .await
+            .is_some(),
+        "Master must hold the submitted task"
+    );
+
+    proxy_handle.abort();
+    let _ = shutdown_tx.send(true);
+    worker_handle.abort();
+    let _ = master.shutdown();
 }
