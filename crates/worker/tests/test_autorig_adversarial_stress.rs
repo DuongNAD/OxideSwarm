@@ -27,7 +27,6 @@
     clippy::manual_range_contains
 )]
 
-use std::path::PathBuf;
 use std::time::Instant;
 
 use rusty_grid_core::task::{AutoRigSpec, Bytes};
@@ -1202,17 +1201,16 @@ fn test_gltf_2_binary_chunk_and_skin_conformance() {
 // CHALLENGE 7: Headless Blender 4.5.4 LTS Live Skeletal & Animation Import
 // ============================================================================
 
+mod common;
+
 #[test]
 fn test_blender_headless_import_and_rig_validation() {
-    let blender_path =
-        PathBuf::from(r"C:\Program Files\Blender Foundation\Blender 4.5\blender.exe");
-    if !blender_path.is_file() {
-        println!(
-            "[SKIP] Blender 4.5 executable not found at {:?}",
-            blender_path
-        );
+    let _env_guard = common::ENV_MUTEX.blocking_lock();
+    let Some(blender_path) =
+        common::blender_binary_or_skip("test_blender_headless_import_and_rig_validation")
+    else {
         return;
-    }
+    };
 
     let mesh = create_standard_humanoid();
     let spec = AutoRigSpec::new(raw_mesh_to_obj_bytes(&mesh), "biped").with_animations(vec![
@@ -1223,8 +1221,8 @@ fn test_blender_headless_import_and_rig_validation() {
 
     let glb = auto_rig_mesh(&spec).expect("Auto-rigging failed");
 
-    let test_dir = PathBuf::from(r"E:\teamwork_projects\OxideSwarm\target\adversarial_autorig");
-    let _ = std::fs::create_dir_all(&test_dir);
+    let temp_dir = tempfile::tempdir().expect("Failed to create tempdir");
+    let test_dir = temp_dir.path();
     let glb_path = test_dir.join("humanoid_rigged.glb");
     std::fs::write(&glb_path, &glb).expect("Failed to write GLB");
 
@@ -1267,7 +1265,7 @@ sys.exit(0)
     );
     std::fs::write(&script_path, &py_script).expect("Failed to write python script");
 
-    let output = std::process::Command::new(&blender_path)
+    let output = common::command_in_own_process_group(&blender_path)
         .args(["--background", "--python", script_path.to_str().unwrap()])
         .output()
         .expect("Failed to run Blender");

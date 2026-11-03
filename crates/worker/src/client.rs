@@ -1102,6 +1102,7 @@ impl WorkerClient {
         let mut runner_cfg = RunnerConfig::new(sandbox_cfg)
             .with_max_output_bytes(config.max_output_bytes)
             .with_blob_cache_bytes(config.blob_cache_bytes)
+            .with_blender_path(config.blender_path.clone())
             .with_output_limits(OutputLimits {
                 max_bytes: config.output_limit_bytes,
                 ..OutputLimits::default()
@@ -5265,5 +5266,96 @@ mod tests {
             elapsed < Duration::from_secs(6),
             "WorkerClient::new took too long ({elapsed:?}) when blender_path hung"
         );
+    }
+
+    #[tokio::test]
+    async fn test_worker_client_with_blender_path_plumbs_override_to_runner() {
+        let dir = std::env::temp_dir().join(format!(
+            "oxideswarm_worker_blender_plumbing_{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker_file = dir.join("runner_invoked_blender.marker");
+        #[cfg(windows)]
+        let script = dir.join("fake_blender.cmd");
+        #[cfg(not(windows))]
+        let script = dir.join("fake_blender.sh");
+
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&script).unwrap();
+            #[cfg(windows)]
+            let body = format!(
+                "@echo off\r\necho %* | findstr /C:\"--version\" >nul\r\nif not errorlevel 1 (\r\n    echo Blender 4.5.4 LTS\r\n    exit /b 0\r\n)\r\necho invoked > \"{}\"\r\nexit /b 42\r\n",
+                marker_file.display()
+            );
+            #[cfg(not(windows))]
+            let body = format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *--version*)\n    echo \"Blender 4.5.4 LTS\"\n    exit 0\n    ;;\nesac\necho invoked > '{}'\nexit 42\n",
+                marker_file.display()
+            );
+            file.write_all(body.as_bytes()).unwrap();
+            file.sync_all().unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let script_str = script.to_string_lossy().to_string();
+        let client = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_name("blender-plumbing-worker")
+                .with_cores(2)
+                .with_no_gpu(true)
+                .with_no_cuda(true)
+                .with_sandbox_base_dir(dir.join("sandboxes"))
+                .with_blender_path(script_str.clone()),
+        );
+
+        assert!(client.capabilities().has_blender);
+        assert_eq!(
+            client.capabilities().blender_version.as_deref(),
+            Some("Blender 4.5.4 LTS")
+        );
+        assert_eq!(
+            client.runner.config().blender_path.as_deref(),
+            Some(script_str.as_str()),
+            "WorkerClient::new must forward WorkerConfig::blender_path to RunnerConfig"
+        );
+
+        let (glb_bytes, _) = crate::gen3d::generate_procedural_3d(
+            &rusty_grid_core::task::Generative3DSpec::new_prompt("test biped")
+                .with_quality("fast")
+                .with_engine("sdf"),
+        )
+        .expect("procedural 3d mesh");
+        let spec = rusty_grid_core::task::AutoRigSpec::new(
+            rusty_grid_core::task::Bytes::from(glb_bytes),
+            "biped",
+        )
+        .with_provider("blender");
+        let task = Task::new(
+            rusty_grid_core::task::TaskSpec::AutoRig(spec),
+            rusty_grid_core::task::TaskRequirements::generic(1, 30),
+        );
+        let result = client
+            .runner
+            .execute_task_with_checkpoint(&task, None, None, None, None)
+            .await;
+        assert!(
+            marker_file.exists(),
+            "TaskRunner constructed by WorkerClient must invoke the configured blender_path override"
+        );
+        assert!(
+            result.is_success(),
+            "AutoRig should fall back cleanly after fake Blender exits 42: {:?}",
+            result.error
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
