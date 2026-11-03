@@ -60,7 +60,7 @@ Behaviour before this change:
 - In `crates/core/src/task.rs`:
   - `Generative3DSpec::new_image` defaults `engine_preference` to `Some("triposr".to_string())` (`crates/core/src/task.rs:852`).
   - `TaskSpec::validate()` parses the engine into `Engine3D` via `spec.try_engine()?` and matches on it when `has_image` is true:
-    - For `Engine3D::Auto` (`None`, `""`, `"auto"`), returns `"Image input is only supported with neural 3D engines (e.g. triposr); auto and procedural engines do not accept images"`.
+    - For `Engine3D::Auto` (`None`, `""`, `"auto"`), returns `"Image input is only supported with neural 3D engines (e.g. triposr); the auto engine does not accept images"`.
     - For `Engine3D::Sdf` (`"sdf"`, `"tier0_sdf"`, `"tier0"`, `"tier-0"`, `"procedural"`, `"procedural_sdf"`), returns `"Tier 0 procedural SDF engine does not support image input (text prompt only)"`.
   - In `crates/cli/src/cli_app.rs`: `build_task_spec` invokes `spec.validate()?` before connecting to master.
 

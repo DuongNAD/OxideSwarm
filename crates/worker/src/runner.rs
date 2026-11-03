@@ -3664,17 +3664,41 @@ mod outcome_tests {
                 .expect("open growing file for write");
             writer.set_len(max_bytes).expect("reset to max_bytes");
 
-            let grown_len = max_bytes + 65_536;
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_writer = Arc::clone(&stop);
+            let max_sparse_len = 16 * 1024 * 1024 * 1024u64;
+            let step_bytes = 128 * 1024 * 1024u64;
             let handle = std::thread::spawn(move || {
                 if delay_us > 0 {
                     std::thread::sleep(std::time::Duration::from_micros(delay_us));
                 }
-                let _ = writer.set_len(grown_len);
+                let mut target_len = max_bytes + step_bytes;
+                let _ = writer.set_len(target_len);
+                // Keep advancing the sparse EOF until `read_output_file` returns.
+                // With `.take(max_bytes + 1)`, the reader stops immediately at `max_bytes + 1`
+                // bytes; if `.take(max_bytes + 1)` is removed, `read_to_end` chases the
+                // growing sparse file past `max_bytes + 1` until the timeout below fires.
+                while !stop_writer.load(std::sync::atomic::Ordering::Relaxed)
+                    && target_len < max_sparse_len
+                {
+                    target_len = (target_len + step_bytes).min(max_sparse_len);
+                    let _ = writer.set_len(target_len);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             });
 
-            match read_output_file(&growing_path).await {
+            let read_res = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                read_output_file(&growing_path),
+            )
+            .await;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = handle.join();
+
+            match read_res.expect(
+                "read_output_file timed out on a growing sparse file; read must be capped by .take(MAX_FRAME_SIZE + 1)",
+            ) {
                 Ok(Some(data)) => {
-                    let _ = handle.join();
                     assert!(
                         (data.len() as u64) <= max_bytes,
                         "read_output_file must never return more than MAX_FRAME_SIZE bytes (got {})",
@@ -3683,7 +3707,6 @@ mod outcome_tests {
                 }
                 Ok(None) => panic!("growing file must exist"),
                 Err(e) => {
-                    let _ = handle.join();
                     let msg = e.to_string();
                     if msg.contains(&format!("is more than {max_bytes} bytes")) {
                         assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);

@@ -285,7 +285,7 @@ async fn test_3d1_sdf_tier_rejects_image_input_honestly() {
         .expect_err("TaskSpec::validate must reject image on auto");
     assert_eq!(
         val_err_auto,
-        "Image input is only supported with neural 3D engines (e.g. triposr); auto and procedural engines do not accept images"
+        "Image input is only supported with neural 3D engines (e.g. triposr); the auto engine does not accept images"
     );
 
     // Also test all remaining Engine3D::Sdf aliases ("procedural", "tier0", "tier-0", "procedural_sdf")
@@ -293,9 +293,9 @@ async fn test_3d1_sdf_tier_rejects_image_input_honestly() {
         let mut alias_spec = Generative3DSpec::new_prompt("stylized creature").with_engine(alias);
         alias_spec.image_data = Some(Bytes::from_static(b"fake_image_data_bytes"));
         let alias_task_spec = TaskSpec::Generative3D(alias_spec);
-        let val_err_alias = alias_task_spec
-            .validate()
-            .expect_err("TaskSpec::validate must reject image on SDF alias");
+        let val_err_alias = alias_task_spec.validate().expect_err(&format!(
+            "TaskSpec::validate must reject image on SDF alias '{alias}'"
+        ));
         assert_eq!(
             val_err_alias,
             "Tier 0 procedural SDF engine does not support image input (text prompt only)",
@@ -312,7 +312,7 @@ async fn test_3d1_sdf_tier_rejects_image_input_honestly() {
         .expect_err("TaskSpec::validate must reject image on default engine");
     assert_eq!(
         val_err_def,
-        "Image input is only supported with neural 3D engines (e.g. triposr); auto and procedural engines do not accept images"
+        "Image input is only supported with neural 3D engines (e.g. triposr); the auto engine does not accept images"
     );
 
     // 2. Worker runner execute_tier0_sdf honest rejection
