@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-OxideSwarm is a zero-broker distributed compute grid in Rust (edition 2021, MSRV 1.75): a **Master** coordinator dispatches tasks to **Workers** (macOS, Windows, Linux, Android) over length-delimited TCP or iroh QUIC/P2P (NAT traversal). A separate **Agent Mesh** (WebSocket relay hub for coding agents) can submit work into the grid through an in-process bridge. All documentation and launchers are maintained in clean, open-source English; `PROJECT.md` holds the layer breakdown and design rationale.
+OxideSwarm is a zero-broker distributed compute grid in Rust (edition 2021, MSRV 1.91): a **Master** coordinator dispatches tasks to **Workers** (macOS, Windows, Linux, Android) over length-delimited TCP or iroh QUIC/P2P (NAT traversal). A separate **Agent Mesh** (WebSocket relay hub for coding agents) can submit work into the grid through an in-process bridge. All documentation and launchers are maintained in clean, open-source English; `PROJECT.md` holds the layer breakdown and design rationale.
 
 ## Commands
 
