@@ -113,6 +113,10 @@ async fn test_independent_sandbox_staging_and_content_isolation() {
         assert_eq!(std::fs::metadata(&staged_file_1).unwrap().nlink(), 1);
         assert_eq!(std::fs::metadata(&staged_file_2).unwrap().nlink(), 1);
     }
+    assert!(
+        !base_dir.join("cache").join("objects").exists(),
+        "Inline stage_files must not create shared cache/objects"
+    );
 
     // --- Task 3: Modified content produces distinct SHA-256 and independent sandbox file ---
     let content_b = b"OXIDE_SWARM_IMMUTABLE_MODEL_WEIGHTS_V2_MUTATED_DATA";
@@ -181,6 +185,8 @@ async fn test_concurrent_sandbox_staging_isolation() {
         let i = handle.await.expect("task thread join");
         assert!(i < 10);
     }
+
+    assert!(!base_dir.join("cache").join("objects").exists());
 }
 
 // ============================================================================

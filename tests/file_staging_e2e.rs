@@ -165,7 +165,7 @@ async fn test_multi_file_staging_nested_directories() {
 
 #[tokio::test]
 async fn test_staged_file_in_place_mutation_does_not_corrupt_subsequent_tasks() {
-    let (runner, _tmp) = make_test_runner();
+    let (runner, tmp) = make_test_runner();
 
     let payload = b"original\n".to_vec();
     let staged = StagedFile::new("input.txt", Bytes::copy_from_slice(&payload), false);
@@ -220,6 +220,9 @@ async fn test_staged_file_in_place_mutation_does_not_corrupt_subsequent_tasks() 
     let res3 = runner.execute_task(&task3, None, None).await;
     assert!(res3.is_success());
     assert_eq!(res3.stdout_str().replace("\r\n", "\n"), "original\n");
+
+    // Verify inline stage_files does not create a shared cache/objects directory
+    assert!(!tmp.path().join("cache").join("objects").exists());
 }
 
 // ============================================================================
