@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 tokio = { workspace = true, features = ["sync", "io-util", "macros", "process", "rt-multi-thread", "time", "net"] }
@@ -28,6 +29,14 @@ socket2 = { version = "0.6", features = ["all"] }
 
 # Content-addressed blob ids (already in Cargo.lock via iroh).
 blake3 = "1.8"
+
+[target.'cfg(unix)'.dependencies]
+# killpg() for probe process groups (already in Cargo.lock via tokio)
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Job Objects for probe process trees (already in Cargo.lock via tokio / mio)
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Threading"] }
 
 [features]
 default = ["p2p"]

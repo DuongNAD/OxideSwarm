@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["RustyGrid Contributors"]
 license = "MIT OR Apache-2.0"
-rust-version = "1.75"
+rust-version = "1.91"
 
 [workspace.dependencies]
 # Internal workspace crates

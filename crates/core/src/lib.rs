@@ -181,4 +181,43 @@ mod tests {
         assert_eq!(after_cfg_test_fn_and_tuple_struct.len(), 1);
         assert!(after_cfg_test_fn_and_tuple_struct[0].contains("BinaryWorkerMessage"));
     }
+
+    #[test]
+    fn workspace_and_all_crates_inherit_msrv_1_91() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+        let root_toml =
+            std::fs::read_to_string(workspace_root.join("Cargo.toml")).expect("read Cargo.toml");
+        assert!(
+            root_toml
+                .lines()
+                .any(|l| l.trim() == r#"rust-version = "1.91""#),
+            "workspace Cargo.toml must declare rust-version = \"1.91\""
+        );
+
+        let crates_dir = workspace_root.join("crates");
+        let mut checked_crates = 0usize;
+        for entry in std::fs::read_dir(&crates_dir).expect("read crates/") {
+            let entry = entry.expect("dir entry");
+            let manifest = entry.path().join("Cargo.toml");
+            if !manifest.is_file() {
+                continue;
+            }
+            checked_crates += 1;
+            let content = std::fs::read_to_string(&manifest).expect("read crate Cargo.toml");
+            assert!(
+                content
+                    .lines()
+                    .any(|l| l.trim() == "rust-version.workspace = true"),
+                "{} must inherit rust-version.workspace = true",
+                manifest.display()
+            );
+        }
+        assert!(
+            checked_crates >= 6,
+            "expected at least 6 workspace crates, found {checked_crates}"
+        );
+    }
 }

@@ -8,7 +8,7 @@ on either side.
 
 ## Prerequisites
 
-- On both machines: the Rust toolchain (1.75 or later) and a checkout of the **same commit** of this
+- On both machines: the Rust toolchain (1.91 or later) and a checkout of the **same commit** of this
   repository. Each machine builds its own binary; nothing is cross-compiled.
 - On Windows: [Git for Windows](https://git-scm.com/download/win). Shell tasks then run under its
   `sh`, as they do on macOS (without it they fall back to `cmd.exe`).
