@@ -1605,16 +1605,29 @@ async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_z
     let eof_submits = Arc::new(AtomicUsize::new(0));
     let corrupt_submits = Arc::new(AtomicUsize::new(0));
     let f3_submits = Arc::new(AtomicUsize::new(0));
+    let f3_lost_submits = Arc::new(AtomicUsize::new(0));
     let status_stalls = Arc::new(AtomicUsize::new(0));
     let stall_next_status = Arc::new(AtomicBool::new(false));
+    let drop_next_cancel_reply = Arc::new(AtomicBool::new(false));
+    let cancel_reply_drops = Arc::new(AtomicUsize::new(0));
+    let f3_held_tid: Arc<tokio::sync::Mutex<Option<TaskId>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let (f3_not_found_tx, f3_not_found_rx) = watch::channel(false);
+    let (f3_orig_landed_tx, f3_orig_landed_rx) = watch::channel(false);
     let cancelled_tid: Arc<tokio::sync::Mutex<Option<TaskId>>> =
         Arc::new(tokio::sync::Mutex::new(None));
 
     let eof_submits_srv = Arc::clone(&eof_submits);
     let corrupt_submits_srv = Arc::clone(&corrupt_submits);
     let f3_submits_srv = Arc::clone(&f3_submits);
+    let f3_lost_submits_srv = Arc::clone(&f3_lost_submits);
     let status_stalls_srv = Arc::clone(&status_stalls);
     let stall_status_srv = Arc::clone(&stall_next_status);
+    let drop_cancel_srv = Arc::clone(&drop_next_cancel_reply);
+    let cancel_drops_srv = Arc::clone(&cancel_reply_drops);
+    let f3_held_tid_srv = Arc::clone(&f3_held_tid);
+    let f3_not_found_tx_srv = Arc::new(f3_not_found_tx);
+    let f3_orig_landed_tx_srv = Arc::new(f3_orig_landed_tx);
     let cancelled_tid_srv = Arc::clone(&cancelled_tid);
     let master_addr_srv = master_addr.clone();
 
@@ -1623,8 +1636,16 @@ async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_z
             let eof_s = Arc::clone(&eof_submits_srv);
             let corrupt_s = Arc::clone(&corrupt_submits_srv);
             let f3_s = Arc::clone(&f3_submits_srv);
+            let f3_lost_s = Arc::clone(&f3_lost_submits_srv);
             let st_stalls = Arc::clone(&status_stalls_srv);
             let stall_st = Arc::clone(&stall_status_srv);
+            let drop_cancel = Arc::clone(&drop_cancel_srv);
+            let cancel_drops = Arc::clone(&cancel_drops_srv);
+            let f3_tid_slot = Arc::clone(&f3_held_tid_srv);
+            let nf_tx = Arc::clone(&f3_not_found_tx_srv);
+            let mut nf_rx = f3_not_found_rx.clone();
+            let orig_tx = Arc::clone(&f3_orig_landed_tx_srv);
+            let mut orig_rx = f3_orig_landed_rx.clone();
             let cancel_tid = Arc::clone(&cancelled_tid_srv);
             let upstream_addr = master_addr_srv.clone();
             tokio::spawn(async move {
@@ -1651,6 +1672,37 @@ async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_z
                         // Add a few ms of proxy latency on `GetTaskResult` so `timeout_secs: 0`
                         // deterministically exceeds Tokio's 1ms timer tick if the wait loop runs.
                         tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    if let ClientMessage::GetTaskStatus { task_id } = msg {
+                        if *f3_tid_slot.lock().await == Some(task_id) {
+                            if upstream_tx.send_msg(&msg).await.is_err() {
+                                break;
+                            }
+                            let Ok(Some(resp)) = upstream_tx.recv_msg::<ClientResponse>().await
+                            else {
+                                break;
+                            };
+                            if client_tx.send_msg(&resp).await.is_err() {
+                                break;
+                            }
+                            // Signal the held original `SubmitTask` to land on the Master right
+                            // after `GetTaskStatus` answered `not found` and before the resend.
+                            let _ = nf_tx.send(true);
+                            continue;
+                        }
+                    }
+                    if matches!(msg, ClientMessage::CancelTask { .. })
+                        && drop_cancel.swap(false, Ordering::SeqCst)
+                    {
+                        // Forward the pooled `CancelTask` so the Master cancels the task, then
+                        // drop the pooled client socket before returning `TaskCancelled` so
+                        // `McpState::request_with_retry_info` retries `CancelTask` on a fresh
+                        // connection (which gets `success: false` from the Master and exercises
+                        // the `GetTaskStatus` re-check in `tool_cancel`).
+                        cancel_drops.fetch_add(1, Ordering::SeqCst);
+                        let _ = upstream_tx.send_msg(&msg).await;
+                        let _ = upstream_tx.recv_msg::<ClientResponse>().await;
+                        break;
                     }
                     if let ClientMessage::SubmitTask { ref task, .. } = msg {
                         let tag = match &task.spec {
@@ -1679,14 +1731,41 @@ async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_z
                                 let _ = raw.flush().await;
                                 break;
                             }
-                            "f3-drop" if f3_s.fetch_add(1, Ordering::SeqCst) == 0 => {
-                                // Hold the first SubmitTask for 1.5s while wait_secs is 1s so
-                                // `GetTaskStatus` at 1.0s answers `not found`, triggering a
-                                // same-task_id resend on a fresh connection before this delayed
-                                // frame reaches the Master at 1.5s.
-                                tokio::time::sleep(Duration::from_millis(1500)).await;
-                                let _ = upstream_tx.send_msg(&msg).await;
-                                let _ = upstream_tx.recv_msg::<ClientResponse>().await;
+                            "f3-drop" => {
+                                if f3_s.fetch_add(1, Ordering::SeqCst) == 0 {
+                                    // Hold the original `SubmitTask` until `GetTaskStatus` at 1.0s
+                                    // has answered `not found`, then forward the held original to
+                                    // the Master FIRST so the subsequent resend receives
+                                    // `Task ... already exists in the queue` from the Master.
+                                    *f3_tid_slot.lock().await = Some(task.id);
+                                    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+                                        while !*nf_rx.borrow_and_update() {
+                                            if nf_rx.changed().await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    })
+                                    .await;
+                                    let _ = upstream_tx.send_msg(&msg).await;
+                                    let _ = upstream_tx.recv_msg::<ClientResponse>().await;
+                                    let _ = orig_tx.send(true);
+                                    break;
+                                }
+                                // Wait for the held original to land on the Master before
+                                // forwarding the resend so the Master answers `already exists`.
+                                let _ = tokio::time::timeout(Duration::from_secs(3), async {
+                                    while !*orig_rx.borrow_and_update() {
+                                        if orig_rx.changed().await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                })
+                                .await;
+                            }
+                            "f3-lost" if f3_lost_s.fetch_add(1, Ordering::SeqCst) == 0 => {
+                                // Drop the first `SubmitTask` without forwarding it to the Master
+                                // so `GetTaskStatus` answers `not found` and the resend lands first
+                                // (`ClientResponse::TaskSubmitted`).
                                 break;
                             }
                             "f4-cancel" => {
@@ -1863,11 +1942,10 @@ async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_z
         "status must have hit the pooled ListWorkers stall before recovering"
     );
 
-    // 4. F3: When the first `SubmitTask` is held for 1.5s while `wait_secs: 1`, `GetTaskStatus`
-    // at 1.0s answers `Task ... not found`. `submit` must resend the same `SubmitTask` (with the
-    // same `task_id`) once on a fresh connection, return a non-error response naming `task_id`,
-    // and leave exactly one task for that `task_id` on the Master even after the delayed first
-    // frame arrives at 1.5s.
+    // 4a. F3 (`already exists` arm): When the first `SubmitTask` is held until `GetTaskStatus`
+    // at 1.0s answers `Task ... not found` and then lands on the Master before the resend,
+    // the resend receives `already exists` from the Master and `submit` must treat it as
+    // `status: "submitted"` (`isError: false`), leaving exactly one task for that `task_id`.
     mcp.send(&json!({
         "jsonrpc": "2.0",
         "id": 5,
@@ -1888,7 +1966,7 @@ async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_z
     assert_eq!(drop_resp["id"], 5);
     assert_eq!(
         drop_resp["result"]["isError"], false,
-        "SubmitTask that gets not-found on GetTaskStatus must be resent with the same task_id and succeed: {drop_resp}"
+        "SubmitTask resend that hits `already exists` after held original lands must succeed: {drop_resp}"
     );
     let drop_body: Value = serde_json::from_str(
         drop_resp["result"]["content"][0]["text"]
@@ -1899,8 +1977,6 @@ async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_z
     assert_eq!(drop_body["status"], "submitted");
     let f3_tid =
         Uuid::parse_str(drop_body["task_id"].as_str().expect("f3 task_id")).expect("valid uuid");
-    // Wait past the 1.5s proxy hold so the delayed first frame also reaches the Master.
-    tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(
         f3_submits.load(Ordering::SeqCst),
         2,
@@ -1914,6 +1990,109 @@ async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_z
         master.queue().list_tasks().await.len(),
         3,
         "Master must hold exactly one task each from f1-eof, f1-corrupt, and f3-drop"
+    );
+
+    // 4b. F3 (`TaskSubmitted` arm): When the first `SubmitTask` is lost completely when the
+    // pooled connection closes, `GetTaskStatus` answers `not found` and the resend lands first
+    // (`ClientResponse::TaskSubmitted`).
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 50,
+        "method": "tools/call",
+        "params": {
+            "name": "submit",
+            "arguments": {
+                "type": "command",
+                "command": "echo",
+                "args": ["f3-lost"],
+                "require_tags": ["absent"],
+                "wait": false,
+                "wait_secs": 1
+            }
+        }
+    }));
+    let lost_resp = mcp.recv_timeout(Duration::from_secs(5));
+    assert_eq!(lost_resp["id"], 50);
+    assert_eq!(
+        lost_resp["result"]["isError"], false,
+        "SubmitTask resend that lands first must succeed: {lost_resp}"
+    );
+    let lost_body: Value = serde_json::from_str(
+        lost_resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("lost text"),
+    )
+    .expect("lost json");
+    assert_eq!(lost_body["status"], "submitted");
+    assert_eq!(f3_lost_submits.load(Ordering::SeqCst), 2);
+    assert_eq!(master.queue().list_tasks().await.len(), 4);
+
+    // 4c. `tool_cancel` pooled-retry re-check:
+    // Drop the pooled connection after forwarding the first `CancelTask` for `f3_tid` (so the
+    // Master cancels `f3_tid`, then answers `success: false` on the fresh-connection retry).
+    // `tool_cancel` must re-check `GetTaskStatus` on a pooled retry and report `cancelled: true`,
+    // whereas a subsequent ordinary `cancel` on that already-cancelled task (no pooled retry)
+    // must report `cancelled: false`.
+    drop_next_cancel_reply.store(true, Ordering::SeqCst);
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 51,
+        "method": "tools/call",
+        "params": {
+            "name": "cancel",
+            "arguments": {
+                "task_id": f3_tid.to_string()
+            }
+        }
+    }));
+    let cancel_retry_resp = mcp.recv_timeout(Duration::from_secs(5));
+    assert_eq!(cancel_retry_resp["id"], 51);
+    assert_eq!(
+        cancel_retry_resp["result"]["isError"], false,
+        "{cancel_retry_resp}"
+    );
+    let cancel_retry_body: Value = serde_json::from_str(
+        cancel_retry_resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("cancel_retry text"),
+    )
+    .expect("cancel_retry json");
+    assert_eq!(
+        cancel_retry_body["cancelled"], true,
+        "pooled-retry CancelTask must re-check GetTaskStatus and report cancelled: true: {cancel_retry_body}"
+    );
+    assert_eq!(
+        cancel_reply_drops.load(Ordering::SeqCst),
+        1,
+        "expected first pooled CancelTask reply to be dropped by proxy"
+    );
+
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 52,
+        "method": "tools/call",
+        "params": {
+            "name": "cancel",
+            "arguments": {
+                "task_id": f3_tid.to_string()
+            }
+        }
+    }));
+    let cancel_repeat_resp = mcp.recv_timeout(Duration::from_secs(5));
+    assert_eq!(cancel_repeat_resp["id"], 52);
+    assert_eq!(
+        cancel_repeat_resp["result"]["isError"], false,
+        "{cancel_repeat_resp}"
+    );
+    let cancel_repeat_body: Value = serde_json::from_str(
+        cancel_repeat_resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("cancel_repeat text"),
+    )
+    .expect("cancel_repeat json");
+    assert_eq!(
+        cancel_repeat_body["cancelled"], false,
+        "ordinary CancelTask on an already-cancelled task (without pooled retry) must report cancelled: false: {cancel_repeat_body}"
     );
 
     // 5. F4: Cancel check in the post-write failure branch of `tool_submit`.
