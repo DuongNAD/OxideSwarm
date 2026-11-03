@@ -8,7 +8,7 @@ Verifies:
 3. --no-shell execution refusal: incoming shell_exec returns exit code 127 and error message.
 4. Built-in commands (echo, ping, system_info, sha256_verify) still work under --no-shell.
 5. Environment sanitization: SECRET_ENV_VARS (OXIDESWARM_SECRET, OXIDESWARM_SECRET_FILE,
-   OXIDE_MESH_TOKEN, RUSTY_GRID_SECRET, RUSTY_GRID_SECRET_FILE) are stripped from child processes.
+   OXIDE_MESH_TOKEN) are stripped from child processes.
 6. Explicit env in args is honored and passed to child process.
 7. Working directory (cwd) in args is respected.
 8. Output capping: streams exceeding 1 MiB are capped with truncation marker.
@@ -68,8 +68,6 @@ async def run_sec6_tests():
         "OXIDESWARM_SECRET": "test-cluster-secret-value-12345",
         "OXIDESWARM_SECRET_FILE": "test-cluster-secret-file-67890",
         "OXIDE_MESH_TOKEN": "test-mesh-token-value-abcdef",
-        "RUSTY_GRID_SECRET": "test-rusty-grid-secret-value-999",
-        "RUSTY_GRID_SECRET_FILE": "test-rusty-grid-secret-file-888",
     }
     for k, v in sentinels.items():
         os.environ[k] = v
@@ -147,7 +145,7 @@ async def run_sec6_tests():
         logger.info("[Test 4] Testing environment sanitization (SECRET_ENV_VARS stripped)...")
         probe_cmd = (
             f'"{sys.executable}" -c "import os; '
-            'keys = [\'OXIDESWARM_SECRET\', \'OXIDESWARM_SECRET_FILE\', \'OXIDE_MESH_TOKEN\', \'RUSTY_GRID_SECRET\', \'RUSTY_GRID_SECRET_FILE\']; '
+            'keys = [\'OXIDESWARM_SECRET\', \'OXIDESWARM_SECRET_FILE\', \'OXIDE_MESH_TOKEN\']; '
             'print(\' \'.join(k + \'=\' + os.environ.get(k, \'UNSET\') for k in keys))"'
         )
         resp_env = await caller.send_command(
@@ -164,7 +162,7 @@ async def run_sec6_tests():
         for secret_name, secret_val in sentinels.items():
             assert f"{secret_name}=UNSET" in env_stdout, f"Secret {secret_name} was NOT stripped! Output: {env_stdout}"
             assert secret_val not in env_stdout, f"Secret value {secret_val} leaked into child process!"
-        logger.info("✓ Test 4 PASSED: All 5 secret environment variables were stripped!")
+        logger.info("✓ Test 4 PASSED: All 3 secret environment variables were stripped!")
 
         # ----------------------------------------------------------------------
         # Test 5: Working Directory (cwd) and Explicit env
@@ -406,14 +404,20 @@ async def run_sec6_tests():
         # ----------------------------------------------------------------------
         # Test 13: F12 Check: Rust and Python Secret Env Vars Parity
         # ----------------------------------------------------------------------
-        logger.info("[Test 13] Testing Rust executor.rs and Python agent_node.py SECRET_ENV_VARS parity (F12)...")
+        logger.info("[Test 13] Testing Rust cluster_auth.rs / executor.rs and Python agent_node.py SECRET_ENV_VARS parity (F12)...")
         import re
         from scripts.agent_node import SECRET_ENV_VARS as PY_VARS
-        rust_file = os.path.join(root_dir, "crates", "agent_mesh", "src", "executor.rs")
-        with open(rust_file, "r", encoding="utf-8") as f:
-            rust_content = f.read()
-        match = re.search(r"pub const SECRET_ENV_VARS: \[&str; 5\] = \[(.*?)\];", rust_content, re.DOTALL)
-        assert match is not None, "Could not find SECRET_ENV_VARS in executor.rs"
+        exec_file = os.path.join(root_dir, "crates", "agent_mesh", "src", "executor.rs")
+        with open(exec_file, "r", encoding="utf-8") as f:
+            exec_content = f.read()
+        assert "pub use rusty_grid_core::cluster_auth::SECRET_ENV_VARS;" in exec_content, (
+            "executor.rs must re-export pub use rusty_grid_core::cluster_auth::SECRET_ENV_VARS;"
+        )
+        core_file = os.path.join(root_dir, "crates", "core", "src", "cluster_auth.rs")
+        with open(core_file, "r", encoding="utf-8") as f:
+            core_content = f.read()
+        match = re.search(r"pub const SECRET_ENV_VARS: \[&str; 3\] = \[(.*?)\];", core_content, re.DOTALL)
+        assert match is not None, "Could not find SECRET_ENV_VARS in cluster_auth.rs"
         raw_entries = [e.strip().strip('"') for e in match.group(1).split(",") if e.strip()]
         resolved_rust = []
         for entry in raw_entries:
@@ -421,10 +425,12 @@ async def run_sec6_tests():
                 resolved_rust.append("OXIDESWARM_SECRET")
             elif entry == "ENV_SECRET_FILE":
                 resolved_rust.append("OXIDESWARM_SECRET_FILE")
+            elif entry == "ENV_MESH_TOKEN":
+                resolved_rust.append("OXIDE_MESH_TOKEN")
             else:
                 resolved_rust.append(entry)
         assert set(resolved_rust) == set(PY_VARS), f"Mismatch between Rust {resolved_rust} and Python {PY_VARS}"
-        logger.info(f"✓ Test 13 PASSED: Rust and Python strip identical 5 secret variables: {resolved_rust}")
+        logger.info(f"✓ Test 13 PASSED: Rust and Python strip identical 3 secret variables: {resolved_rust}")
 
         logger.info("==================================================================")
         logger.info("  ALL SEC-6 PYTHON MESH HARDENING TESTS PASSED (100%)             ")

@@ -448,6 +448,32 @@ class ShellLauncherTests(unittest.TestCase):
         lines = self.fake_args()
         self.assertTrue(any("node-termux" in l and "--no-shell" in l for l in lines), f"Termux launcher did not pass --no-shell: {lines}")
 
+        # 4. Test Ubuntu and macOS launchers when native binary ./target/debug/agent-mesh exists (line 61)
+        native_bin = os.path.join(self.repo, "target", "debug", "agent-mesh")
+        os.makedirs(os.path.dirname(native_bin), exist_ok=True)
+        with open(native_bin, "w", newline="\n") as f:
+            f.write(fake_sh)
+        os.chmod(native_bin, 0o755)
+
+        self.run_script(
+            ["bash", ub_script, "ws://127.0.0.1:8088/ws", "node-ub-native"],
+            OXIDE_MESH_NO_SHELL="1",
+            PATH=test_path,
+        )
+        self.run_script(
+            ["bash", mac_script, "ws://127.0.0.1:8088/ws", "node-mac-native", "--no-shell"],
+            PATH=test_path,
+        )
+        lines = self.fake_args()
+        self.assertTrue(
+            any("node --hub ws://127.0.0.1:8088/ws --id node-ub-native --platform ubuntu --no-shell" in l for l in lines),
+            f"Ubuntu launcher native binary path did not pass --no-shell: {lines}",
+        )
+        self.assertTrue(
+            any("node --hub ws://127.0.0.1:8088/ws --id node-mac-native --platform macos --no-shell" in l for l in lines),
+            f"macOS launcher native binary path did not pass --no-shell: {lines}",
+        )
+
 
 class StaticRepositoryChecks(unittest.TestCase):
     def test_gitattributes_pins_line_endings(self):
