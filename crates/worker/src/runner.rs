@@ -127,6 +127,8 @@ pub struct RunnerConfig {
     pub blob_cache_bytes: u64,
     /// Caps on the files a task's output patterns may bring back (see [`crate::staging`]).
     pub output_limits: OutputLimits,
+    /// Optional explicit path to the host Blender executable (`--blender-path`).
+    pub blender_path: Option<String>,
 }
 
 impl Default for RunnerConfig {
@@ -145,7 +147,13 @@ impl RunnerConfig {
             stop_grace: DEFAULT_STOP_GRACE,
             blob_cache_bytes: DEFAULT_BLOB_CACHE_MAX_BYTES,
             output_limits: OutputLimits::default(),
+            blender_path: None,
         }
+    }
+
+    pub fn with_blender_path(mut self, blender_path: Option<String>) -> Self {
+        self.blender_path = blender_path;
+        self
     }
 
     pub fn with_blob_cache_bytes(mut self, bytes: u64) -> Self {
@@ -1417,8 +1425,7 @@ impl TaskRunner {
         if task.staged_files.is_empty() {
             return Ok(());
         }
-        let cache_base = self.config.sandbox_config.base_dir.join("cache");
-        sandbox.stage_files(&task.staged_files, &cache_base).await
+        sandbox.stage_files(&task.staged_files).await
     }
 
     /// Places the task's blob inputs (`Task::inputs`) into the sandbox from the blob cache. The
@@ -2358,9 +2365,9 @@ impl TaskRunner {
 
         let compute_fut = async {
             if pref == "blender" {
-                if let Some(blender_bin) =
-                    crate::autorig::blender_provider::resolve_blender_binary()
-                {
+                if let Some(blender_bin) = crate::autorig::blender_provider::resolve_blender_binary(
+                    self.config.blender_path.as_deref(),
+                ) {
                     if let Some(ref tx) = tx_clone {
                         let _ = tx
                             .send(WorkerMessage::Checkpoint {

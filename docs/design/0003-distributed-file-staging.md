@@ -1,7 +1,7 @@
 # 0003: Distributed file staging and output artifact collection
 
 Status: Implemented
-Created: 2026-10-23    Updated: 2026-10-23
+Created: 2026-10-23    Updated: 2026-11-04
 
 ## Summary
 
@@ -153,7 +153,7 @@ The master queue tracks active and retained payload memory in `crates/master/src
 
 ## Test plan
 
-- **Unit:** path normalization, traversal rejection, DOS device name evasion, SHA-256 digest validation, and cache atomic placement (`crates/core`, `crates/worker`).
+- **Unit:** path normalization, traversal rejection, DOS device name evasion, SHA-256 digest validation, independent per-sandbox file placement (`nlink == 1`), and legacy staging cache removal at worker start-up (`crates/core`, `crates/worker`).
 - **Stress:** adversarial path traversal test suites, whitespace evasion generators, and combinatorial fuzzing (`tests/m5b_challenger_1_stress.rs`, `tests/m5b_challenger_2_stress.rs`).
 - **Integration:** end-to-end file staging, execution, output artifact collection, and oldest-first queue eviction over JSON and Bincode wire codecs (`tests/file_staging_e2e.rs`).
 - **Gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
@@ -178,3 +178,4 @@ The master queue tracks active and retained payload memory in `crates/master/src
 - 2026-10-26: The CLI moved to the content-addressed files of design record 0006: `submit --file` is an alias of `--input` and `--output` takes patterns, both through the master's blob store. The inline staging described here (`Task::staged_files`, `expected_outputs`, `TaskResult::artifacts`) is unchanged and still used by the MCP server and library callers.
 - 2026-11-01: Removed `cache/objects` hard-linking from `Sandbox::stage_files` (BUG-1) so each task sandbox gets an independent file (`nlink == 1`) written from `staged.data`, preventing in-place mutations or permission changes from affecting subsequent tasks.
 - 2026-11-01: Corrected G6 and D6 to name `DEFAULT_MAX_TERMINAL_BYTES` (`--max-retained-mb` / `RUSTY_GRID_MAX_RETAINED_MB`) and added the 256 MiB active task byte cap `DEFAULT_MAX_ACTIVE_BYTES` (`--max-active-mb` / `RUSTY_GRID_MAX_ACTIVE_MB`) from design record 0008 (BUG-4).
+- 2026-11-04: Removed the unused `_cache_base_dir` parameter from `Sandbox::stage_files` and added worker start-up cleanup of legacy `<sandbox_base>/cache/objects` and `<sandbox_base>/cache/tmp` directories while leaving `<sandbox_base>/cache/blobs` intact (BUG-8).

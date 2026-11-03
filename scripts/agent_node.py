@@ -292,17 +292,24 @@ class OxideAgentNode:
 
     async def listen(self):
         """Processes incoming messages from the WebSocket."""
-        async for raw_msg in self.ws:
-            try:
-                msg = json.loads(raw_msg)
-                if msg.get("type") == "DeliveryNack" and msg.get("error_code") in REGISTRATION_ERROR_CODES:
-                    # Handled inline: the hub closes the socket right behind this frame, and the
-                    # reconnect logic must already know why by the time the close is noticed.
-                    await self._dispatch_incoming(msg)
-                else:
-                    asyncio.create_task(self._dispatch_incoming(msg))
-            except Exception as e:
-                logger.error(f"Error handling incoming message: {e}")
+        try:
+            async for raw_msg in self.ws:
+                try:
+                    msg = json.loads(raw_msg)
+                    if msg.get("type") == "DeliveryNack" and msg.get("error_code") in REGISTRATION_ERROR_CODES:
+                        # Handled inline: the hub closes the socket right behind this frame, and the
+                        # reconnect logic must already know why by the time the close is noticed.
+                        await self._dispatch_incoming(msg)
+                    else:
+                        asyncio.create_task(self._dispatch_incoming(msg))
+                except Exception as e:
+                    logger.error(f"Error handling incoming message: {e}")
+        finally:
+            for futures in (self.pending_commands, self.pending_acks):
+                for corr_id in list(futures):
+                    fut = futures.pop(corr_id)
+                    if not fut.done():
+                        fut.set_exception(ConnectionError("WebSocket connection closed"))
 
     async def run(self):
         """Main client loop with automatic reconnection."""

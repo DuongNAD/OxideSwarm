@@ -68,7 +68,7 @@ OxideSwarm/
 │
 └── tests/                           # Multi-Tier Test Suites & Integration Harnesses
     ├── e2e_cluster.rs               # Master integration test suite
-    ├── run_all_mesh_tests.py        # [Layer 3] Master test runner for agent mesh
+    ├── run_mesh_simulation_tests.py # [Layer 3] Python reference-hub simulation test runner for agent mesh
     ├── test_launcher_scripts.py     # Static repository and launcher verification
     └── ...                          # Rust integration tests registered per crate
 ```

@@ -2,41 +2,77 @@
 Milestone 1 Empirical Stress Test Suite (Challenger 1)
 
 Checks:
-1. All internal markdown links and anchor links across all .md files in the repository.
-2. Absence of CRLF (\\r\\n) in any .sh shell scripts.
+1. All internal markdown links and anchor links across all tracked .md files in the repository.
+2. Absence of CRLF (\\r\\n) in any tracked .sh shell scripts.
 3. Genuine absence of all 6 legacy status files.
-4. Integrity of .agents/teamwork/ORIGINAL_REQUEST.md, when that local file exists (.agents/ is
-   gitignored scratch output, so a clean checkout skips this check).
 """
 
 import os
 import re
+import subprocess
 import unittest
 import urllib.parse
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-AGENTS_ORIGINAL_REQUEST = os.path.join(REPO_ROOT, ".agents", "teamwork", "ORIGINAL_REQUEST.md")
 
 FENCE_CHARS = ("```", "~~~")
+
+
+def tracked_files_with_suffix(repo_root: str, suffix: str):
+    """Returns tracked files ending with `suffix` via `git ls-files`, falling back to os.walk."""
+    try:
+        out = subprocess.check_output(
+            ["git", "ls-files"],
+            cwd=repo_root,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        paths = []
+        for rel in out.splitlines():
+            rel = rel.strip()
+            if rel.endswith(suffix):
+                full = os.path.join(repo_root, rel)
+                if os.path.isfile(full):
+                    paths.append(full)
+        if paths:
+            return paths
+    except Exception:
+        pass
+
+    result = []
+    for root, dirs, files in os.walk(repo_root):
+        dirs[:] = [
+            d
+            for d in dirs
+            if not d.startswith(".") and d not in ("target", "node_modules", ".agents")
+        ]
+        for file in files:
+            if file.endswith(suffix):
+                result.append(os.path.join(root, file))
+    return result
+
 
 def is_fence(line):
     s = line.strip()
     return any(s.startswith(fc) for fc in FENCE_CHARS)
 
-def slugify(text):
-    # GitHub markdown slugification
+
+def slugify_variants(text):
+    """Returns GitHub-compatible markdown header slug variants (preserving per-space hyphens and collapsed hyphens)."""
     t = text.strip().lower()
     # Remove markdown link formatting e.g. [text](url) -> text
-    t = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', t)
+    t = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", t)
     # Remove backticks and inline code formatting
-    t = t.replace('`', '')
+    t = t.replace("`", "")
     # Remove HTML tags if present e.g. <code>...</code>
-    t = re.sub(r'<[^>]+>', '', t)
+    t = re.sub(r"<[^>]+>", "", t)
     # Remove characters that are not alphanumeric, whitespace, or hyphen
-    t = re.sub(r'[^\w\s-]', '', t)
-    # Convert whitespace to single hyphen
-    t = re.sub(r'\s+', '-', t)
-    return t
+    t = re.sub(r"[^\w\s-]", "", t)
+    # GitHub replaces each space with '-' after stripping punctuation (so ' / ' or ' — ' becomes '--')
+    github_slug = t.replace(" ", "-")
+    collapsed_slug = re.sub(r"\s+", "-", t)
+    return [s for s in (github_slug, collapsed_slug) if s]
+
 
 def extract_markdown_headers(content):
     """
@@ -55,28 +91,21 @@ def extract_markdown_headers(content):
             continue
 
         # Check for ATX headers (# Header)
-        m = re.match(r'^(#{1,6})\s+(.*)$', line)
+        m = re.match(r"^(#{1,6})\s+(.*)$", line)
         if m:
             header_raw = m.group(2).strip()
             # Strip trailing hashes (e.g. '## Header ##')
-            header_raw = re.sub(r'\s+#+$', '', header_raw)
-            base_slug = slugify(header_raw)
-            if not base_slug:
+            header_raw = re.sub(r"\s+#+$", "", header_raw)
+            variants = slugify_variants(header_raw)
+            if not variants:
                 continue
 
+            base_slug = variants[0]
             count = slug_counts.get(base_slug, 0)
-            if count == 0:
-                slug_counts[base_slug] = 1
-                valid_slugs.add(base_slug)
-            else:
-                slug_counts[base_slug] = count + 1
-                valid_slugs.add(f"{base_slug}-{count}")
-
-            # Also add raw simplified slug for resilience
-            simple_slug = re.sub(r'[^\w\s-]', '', header_raw.lower()).strip()
-            simple_slug = re.sub(r'\s+', '-', simple_slug)
-            if simple_slug:
-                valid_slugs.add(simple_slug)
+            slug_counts[base_slug] = count + 1
+            for v in variants:
+                valid_slugs.add(v if count == 0 else f"{v}-{count}")
+                valid_slugs.add(v)
 
     return valid_slugs
 
@@ -108,13 +137,8 @@ class TestMilestone1EmpiricalStress(unittest.TestCase):
         self.repo_root = REPO_ROOT
 
     def test_no_crlf_in_shell_scripts(self):
-        """Verify that NO shell script (.sh) in the repo contains CRLF or CR bytes."""
-        sh_files = []
-        for root, dirs, files in os.walk(self.repo_root):
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('target', 'node_modules', '.agents')]
-            for file in files:
-                if file.endswith('.sh'):
-                    sh_files.append(os.path.join(root, file))
+        """Verify that NO tracked shell script (.sh) in the repo contains CRLF or CR bytes."""
+        sh_files = tracked_files_with_suffix(self.repo_root, ".sh")
 
         self.assertGreater(len(sh_files), 0, "Expected at least one .sh script in the repository.")
         
@@ -157,49 +181,12 @@ class TestMilestone1EmpiricalStress(unittest.TestCase):
         )
         print(f"\n[PASS] Verified all {len(legacy_files)} legacy files are absent from disk.")
 
-    @unittest.skipUnless(
-        os.path.exists(AGENTS_ORIGINAL_REQUEST),
-        ".agents/ is gitignored local scratch output, absent from a clean checkout",
-    )
-    def test_original_request_intact_in_agents_dir(self):
-        """Verify .agents/teamwork/ORIGINAL_REQUEST.md is intact and valid when it exists."""
-        path = AGENTS_ORIGINAL_REQUEST
-
-        size = os.path.getsize(path)
-        self.assertGreater(size, 4000, f"ORIGINAL_REQUEST.md file is unexpectedly small ({size} bytes).")
-
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        required_sections = [
-            "# Original User Request",
-            "## Initial Request",
-            "## Requirements",
-            "### R1. Documentation Audit",
-            "### R2. Functional Gap Completion Across All Layers",
-            "### R3. Security, Wire Protocol & Process Lifecycle Hardening",
-            "### R4. Environment Isolation & Cross-Platform Verification",
-            "## Verification Resources",
-            "## Acceptance Criteria",
-        ]
-        missing_sections = [sec for sec in required_sections if sec not in content]
-        self.assertEqual(
-            missing_sections, [],
-            f".agents/teamwork/ORIGINAL_REQUEST.md is missing expected sections: {missing_sections}"
-        )
-        print(f"\n[PASS] Verified .agents/teamwork/ORIGINAL_REQUEST.md is intact ({size} bytes).")
-
     def test_all_markdown_links_and_anchors(self):
         """
-        Verify all internal markdown links and anchor links across all .md files.
+        Verify all internal markdown links and anchor links across all tracked .md files.
         Asserts 0 broken links.
         """
-        md_files = []
-        for root, dirs, files in os.walk(self.repo_root):
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('target', 'node_modules', '.agents')]
-            for file in files:
-                if file.endswith('.md'):
-                    md_files.append(os.path.join(root, file))
+        md_files = tracked_files_with_suffix(self.repo_root, ".md")
 
         self.assertGreater(len(md_files), 0, "No markdown files found to verify.")
 

@@ -79,7 +79,7 @@ Results on an Apple Silicon Mac with Rust 1.96.0, at `3a1c120`, with a temporary
 | `./test_integration.sh` | Pass |
 | `./run_chaos_test.sh` | Pass |
 | `python3 tests/test_launcher_scripts.py` | Pass |
-| `python3 tests/run_all_mesh_tests.py` | Pass, but it tests a Python reference hub only |
+| `python3 tests/run_mesh_simulation_tests.py` | Pass, but it tests a Python reference hub only |
 | `cargo test --workspace --no-fail-fast` | 1392 passed, 19 failed in 9 test targets |
 | The same, with a dummy `cluster.secret` in `HOME` | Six more tests fail (TEST-4) |
 
@@ -153,7 +153,7 @@ merge.
 | TEST-6 | Extend CI to the full suite | P1 | M | TEST-1, TEST-2, TEST-3, TEST-4 | | Planned |
 | TEST-7 | Run or delete the orphan Python tests | P2 | M | INT-4 | | Planned |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 | | Planned |
-| DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 | | Planned |
+| DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 | | Implemented |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 | | Planned |
 | DOC-4 | Complete the CLI and environment reference | P2 | M | INT-4 | | Planned |
 | DOC-5 | Document the 3D subsystem | P2 | S | 3D-1 | | Planned |
@@ -1264,3 +1264,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-01: `agent_bridge.py watch` gained once-only delivery and a Claude Code wake (design 0007),
   which also fixed the `--auto-pull` part of BRIDGE-1. This needs no backlog item of its own.
 - 2026-11-01: INT-5 completed; implemented F1 to F6 on `int-4-content-addressed-data-plane` (Windows clippy, symlinked output parent rejection, output blob pin retention on Master, immediate output file pinning in worker cache, bounded in-flight blob requests per session, and protocol version 2 enforcement).
+- 2026-11-03: DOC-2 completed; removed unbacked throughput, scaling, and working-set RAM figures from `README.md` and `windows/README.md`.
