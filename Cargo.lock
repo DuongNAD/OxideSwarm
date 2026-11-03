@@ -3310,6 +3310,7 @@ dependencies = [
  "chrono",
  "futures",
  "iroh",
+ "libc",
  "ring",
  "serde",
  "serde_json",
@@ -3321,6 +3322,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
