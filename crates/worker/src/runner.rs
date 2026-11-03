@@ -64,8 +64,8 @@ use uuid::Uuid;
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::WorkerMessage;
 use rusty_grid_core::task::{
-    sha256_digest, Bytes, BytesMut, CheckpointData, OutputArtifact, Task, TaskId, TaskResult,
-    TaskSpec, MAX_AGGREGATE_ARTIFACT_BYTES, MAX_OUTPUT_ARTIFACT_BYTES,
+    sha256_digest, Bytes, BytesMut, CheckpointData, Engine3D, OutputArtifact, Task, TaskId,
+    TaskResult, TaskSpec, MAX_AGGREGATE_ARTIFACT_BYTES, MAX_OUTPUT_ARTIFACT_BYTES,
 };
 
 use crate::blob_cache::{BlobCache, DEFAULT_BLOB_CACHE_MAX_BYTES};
@@ -1913,41 +1913,64 @@ impl TaskRunner {
         cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
     ) -> TaskResult {
-        let pref = spec
-            .engine_preference
-            .as_deref()
-            .unwrap_or("auto")
-            .to_lowercase();
+        let engine = match spec.try_engine() {
+            Ok(e) => e,
+            Err(e) => {
+                return TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    Bytes::new(),
+                    Bytes::from(format!("Invalid 3D generation engine: {e}")),
+                    start_time.elapsed().as_millis() as u64,
+                    Some(format!("unknown 3D engine: {e}")),
+                );
+            }
+        };
 
-        // 1. Under D3: "sdf" and default "auto" always use the Tier 0 procedural SDF engine directly
-        if pref == "sdf" || pref == "tier0_sdf" || pref == "auto" {
+        // 1. Intercept Trellis before spawning Python and fail with explicit unsupported error
+        if engine == Engine3D::Trellis {
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_GENERAL_ERROR,
+                Bytes::new(),
+                Bytes::from_static(
+                    b"Trellis 3D neural engine is not supported; use sdf or triposr",
+                ),
+                start_time.elapsed().as_millis() as u64,
+                Some("Trellis 3D neural engine is not supported; use sdf or triposr".to_string()),
+            );
+        }
+
+        // 2. If explicit SDF requested, execute Tier 0 directly in-process (< 50ms)
+        // 3D-1 / D3: auto always runs the SDF tier
+        if engine == Engine3D::Sdf || engine == Engine3D::Auto {
             info!(task_id = %task.id, "Executing Tier 0 Procedural SDF engine");
             return self
                 .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
                 .await;
         }
 
-        // 2. Check for Python & Entrypoint availability
+        // 3. Check for Python & Entrypoint availability
         let py_bin = crate::gen3d::runner::resolve_python_runtime();
         let script = crate::gen3d::runner::resolve_entrypoint_script();
 
         if py_bin.is_none() || script.is_none() {
-            if pref == "auto" {
-                info!(task_id = %task.id, "Local Python 3D engine not found; degrading gracefully to Tier 0 SDF");
-                return self
-                    .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
-                    .await;
-            } else {
-                return TaskResult::failure(
-                    self.worker_id,
-                    task.id,
-                    EXIT_CODE_GENERAL_ERROR,
-                    Bytes::new(),
-                    Bytes::from_static(b"Local 3D engine script or Python runtime not found"),
-                    start_time.elapsed().as_millis() as u64,
-                    Some("Missing Python or engines/generative_3d/entrypoint.py".to_string()),
-                );
-            }
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_GENERAL_ERROR,
+                Bytes::new(),
+                Bytes::from_static(
+                    b"TripoSR model not available: missing Python or engines/generative_3d/entrypoint.py",
+                ),
+                start_time.elapsed().as_millis() as u64,
+                Some(
+                    "TripoSR model not available: missing Python or engines/generative_3d/entrypoint.py"
+                        .to_string(),
+                ),
+            );
         }
 
         let py_bin = py_bin.unwrap();
@@ -2103,30 +2126,19 @@ impl TaskRunner {
                     }
                 }
                 Ok(None) => {
-                    if pref == "auto" {
-                        warn!(
-                            task_id = %task.id,
-                            "Subprocess exited 0 but output_model.glb missing; falling back to Tier 0 SDF"
-                        );
-                        let _ = sandbox.destroy().await;
-                        return self
-                            .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
-                            .await;
-                    } else {
-                        let _ = sandbox.destroy().await;
-                        return TaskResult::failure(
-                            self.worker_id,
-                            task.id,
-                            EXIT_CODE_GENERAL_ERROR,
-                            res.stdout,
-                            res.stderr,
-                            start_time.elapsed().as_millis() as u64,
-                            Some(format!(
-                                "Process succeeded but expected output file '{}' was not produced",
-                                output_glb_path.display()
-                            )),
-                        );
-                    }
+                    let _ = sandbox.destroy().await;
+                    return TaskResult::failure(
+                        self.worker_id,
+                        task.id,
+                        EXIT_CODE_GENERAL_ERROR,
+                        res.stdout,
+                        res.stderr,
+                        start_time.elapsed().as_millis() as u64,
+                        Some(format!(
+                            "Process succeeded but expected output file '{}' was not produced",
+                            output_glb_path.display()
+                        )),
+                    );
                 }
                 Err(e) => {
                     let _ = sandbox.destroy().await;
@@ -2141,12 +2153,6 @@ impl TaskRunner {
                     );
                 }
             }
-        } else if pref == "auto" {
-            warn!(task_id = %task.id, "Subprocess exited {}; falling back to Tier 0 SDF", res.exit_code);
-            let _ = sandbox.destroy().await;
-            return self
-                .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
-                .await;
         } else if res.error.as_deref().unwrap_or("").is_empty() {
             let last_err_line = String::from_utf8_lossy(res.stderr.as_slice())
                 .lines()

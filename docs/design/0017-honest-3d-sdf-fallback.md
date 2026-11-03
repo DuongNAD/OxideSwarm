@@ -52,14 +52,16 @@ Behaviour before this change:
 
 ### D2. Deterministic Procedural SDF Routing
 - In `crates/worker/src/runner.rs`:
-  - `pref == "sdf" || pref == "tier0_sdf" || pref == "auto"` immediately executes `execute_tier0_sdf`.
+  - `engine == Engine3D::Sdf || engine == Engine3D::Auto` immediately executes `execute_tier0_sdf`.
   - Remove `!is_custom_script` condition so `auto` never branches to Python.
-  - Remove silent error-fallback at subprocess completion for `auto`.
+  - Remove unreachable `Engine3D::Auto` fallback branches when Python is missing, when `output_model.glb` is missing, and on non-zero subprocess exit.
 
 ### D3. Fast Pre-submission Validation for Image Inputs
-- In `crates/core/src/task.rs:1472`:
-  - `TaskSpec::validate()` checks if `engine` is `"sdf"`, `"tier0_sdf"`, `"auto"`, or `"procedural"`.
-  - If `has_image` is true, immediately return error: `Tier 0 procedural SDF engine does not support image input (text prompt only)`.
+- In `crates/core/src/task.rs`:
+  - `Generative3DSpec::new_image` defaults `engine_preference` to `Some("triposr".to_string())` (`crates/core/src/task.rs:852`).
+  - `TaskSpec::validate()` checks `engine` when `has_image` is true:
+    - For `"auto"` or `"procedural"`, returns `"Image input is only supported with neural 3D engines (e.g. triposr); auto and procedural engines do not accept images"`.
+    - For `"sdf"` or `"tier0_sdf"`, returns `"Tier 0 procedural SDF engine does not support image input (text prompt only)"`.
   - In `crates/cli/src/cli_app.rs`: `build_task_spec` invokes `spec.validate()?` before connecting to master.
 
 ### D4. Subprocess Diagnostic Stderr Extraction
@@ -71,10 +73,11 @@ Behaviour before this change:
 - In `crates/worker/src/gen3d/runner.rs`:
   - Replace `std::fs::canonicalize` with `std::path::absolute` (preserving verbatim prefix stripping on Windows without symlink traversal).
   - Preserves `sys.prefix` and virtual environment module resolution.
+  - Python on `PATH` (`probe_executable_in_path`) is found by walking `PATH` directories, probing each candidate with `probe_python` (`rusty_grid_core::cluster_auth::probe_command`), and returning a clean absolute path (`to_clean_absolute_path`) instead of a bare `"python"` or `"python3"`.
 
 ### D6. Dynamic Engine Device Reporting
 - In `crates/worker/src/runner.rs` and `gen3d/runner.rs`:
-  - Scan subprocess stdout for `[ENGINE: <label>]`, `[DEVICE: <label>]`, `[ENGINE] <label>`, `[DEVICE] <label>`, or `[TripoSR] Initializing <label>...`.
+  - Scan subprocess stdout for `[ENGINE: <label>]`, `[DEVICE: <label>]`, `[ENGINE] <label>`, or `[DEVICE] <label>`.
   - Report the extracted label in `result.device_name`. If absent, do not fabricate `TripoSR-*`.
 
 ## Compatibility

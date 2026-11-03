@@ -163,7 +163,6 @@ pub fn parse_progress_marker(line: &str) -> Option<(f32, String)> {
 
 /// Parses engine or device label markers in stdout, e.g.:
 /// `[ENGINE: TripoSR-CUDA]` or `[DEVICE: TripoSR-CPU]` or `[ENGINE] MyModel`
-/// or `[TripoSR] Initializing TripoSR-PyTorch-v1.0...`
 pub fn parse_engine_marker(line: &str) -> Option<String> {
     let trimmed = line.trim();
     for prefix in &["[ENGINE:", "[DEVICE:"] {
@@ -182,12 +181,6 @@ pub fn parse_engine_marker(line: &str) -> Option<String> {
             if !label.is_empty() {
                 return Some(label.to_string());
             }
-        }
-    }
-    if let Some(rest) = trimmed.strip_prefix("[TripoSR] Initializing ") {
-        let label = rest.trim_end_matches('.').trim();
-        if !label.is_empty() {
-            return Some(label.to_string());
         }
     }
     None
@@ -235,10 +228,6 @@ mod tests {
         assert_eq!(
             parse_engine_marker("[DEVICE: Custom-Mock-Engine-v2]"),
             Some("Custom-Mock-Engine-v2".to_string())
-        );
-        assert_eq!(
-            parse_engine_marker("[TripoSR] Initializing TripoSR-PyTorch-v1.0..."),
-            Some("TripoSR-PyTorch-v1.0".to_string())
         );
         assert_eq!(parse_engine_marker("No engine marker here"), None);
     }

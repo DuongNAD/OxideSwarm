@@ -249,6 +249,234 @@ async fn test_cli_negative_validations() {
 }
 
 #[tokio::test]
+async fn test_cli_3d_default_submit_succeeds_on_cpu_worker() {
+    let temp_dir = TempDir::new().unwrap();
+    let out_glb_path = temp_dir.path().join("default_robot.glb");
+
+    // 1. Spawn in-process Master
+    let master = MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        SchedulerConfig::default(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("MasterServer::spawn failed");
+    let master_addr = master.server_addr();
+
+    // 2. Spawn in-process Worker (CPU only, 0 GPU capabilities)
+    let worker_temp = TempDir::new().unwrap();
+    let worker_cfg = WorkerConfig::new(master_addr.to_string())
+        .with_name("worker-cpu-3d")
+        .with_cores(2)
+        .with_ram_mb(4096)
+        .with_sandbox_base_dir(worker_temp.path());
+
+    let mut client = WorkerClient::new(worker_cfg);
+    let (tx, rx) = watch::channel(false);
+    let worker_handle = tokio::spawn(async move {
+        let _ = client.run(rx).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 3. Construct Submit CLI invocation wrapped in a timeout (Finding M1)
+    let submit_future = tokio::task::spawn_blocking({
+        let home = temp_dir.path().to_path_buf();
+        let master_str = master_addr.to_string();
+        let out_path = out_glb_path.clone();
+        move || {
+            cli(&home)
+                .arg("submit")
+                .arg("--master")
+                .arg(&master_str)
+                .arg("--prompt")
+                .arg("robot")
+                .arg("-o")
+                .arg(&out_path)
+                .arg("--wait")
+                .status()
+                .expect("run default submit")
+        }
+    });
+
+    // Timeout guard: 15 seconds max (fast fail if hanging)
+    let status = tokio::time::timeout(Duration::from_secs(15), submit_future)
+        .await
+        .expect(
+            "Default 3D submit timed out! (Possible scheduler stall or GPU requirement regression)",
+        )
+        .expect("Task join error");
+
+    assert!(
+        status.success(),
+        "Default 3D submit must succeed on CPU worker"
+    );
+
+    // 4. Verify glTF model was generated and validated
+    assert!(out_glb_path.is_file(), "Exported glTF file must exist");
+    let data = std::fs::read(&out_glb_path).unwrap();
+    assert!(data.len() > 100);
+    assert!(
+        validate_glb_header(&data).is_ok(),
+        "Exported asset must have valid glTF 2.0 header"
+    );
+
+    // 5. Teardown
+    let _ = tx.send(true);
+    let _ = worker_handle.await;
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn test_cli_3d_triposr_fails_honestly_on_cpu_worker() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // 1. Spawn in-process Master
+    let master = MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        SchedulerConfig::default(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("MasterServer::spawn failed");
+    let master_addr = master.server_addr();
+
+    // 2. Spawn in-process Worker (CPU only)
+    let worker_temp = TempDir::new().unwrap();
+    let worker_cfg = WorkerConfig::new(master_addr.to_string())
+        .with_name("worker-cpu-triposr")
+        .with_cores(2)
+        .with_ram_mb(4096)
+        .with_sandbox_base_dir(worker_temp.path());
+
+    let mut client = WorkerClient::new(worker_cfg);
+    let (tx, rx) = watch::channel(false);
+    let worker_handle = tokio::spawn(async move {
+        let _ = client.run(rx).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 3. Submit triposr task without checkpoint
+    let submit_future = tokio::task::spawn_blocking({
+        let home = temp_dir.path().to_path_buf();
+        let master_str = master_addr.to_string();
+        move || {
+            cli(&home)
+                .arg("submit")
+                .arg("--master")
+                .arg(&master_str)
+                .arg("--type")
+                .arg("3d")
+                .arg("--prompt")
+                .arg("robot")
+                .arg("--engine")
+                .arg("triposr")
+                .arg("--wait")
+                .output()
+                .expect("run triposr submit")
+        }
+    });
+
+    let output = tokio::time::timeout(Duration::from_secs(15), submit_future)
+        .await
+        .expect("TripoSR submit hung waiting on CPU cluster!")
+        .expect("Task join error");
+
+    assert!(
+        !output.status.success(),
+        "TripoSR without checkpoint must fail"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("TripoSR model not available"),
+        "Expected failure message containing 'TripoSR model not available', got: {combined}"
+    );
+
+    // 4. Teardown
+    let _ = tx.send(true);
+    let _ = worker_handle.await;
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn test_cli_3d_trellis_rejected_immediately_on_cpu_worker() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // 1. Spawn in-process Master
+    let master = MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        SchedulerConfig::default(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("MasterServer::spawn failed");
+    let master_addr = master.server_addr();
+
+    // 2. Spawn in-process standard CPU Worker (CPU-only cluster)
+    let worker_temp = TempDir::new().unwrap();
+    let worker_cfg = WorkerConfig::new(master_addr.to_string())
+        .with_name("worker-cpu-3d")
+        .with_cores(4)
+        .with_ram_mb(8192)
+        .with_sandbox_base_dir(worker_temp.path());
+
+    let mut client = WorkerClient::new(worker_cfg);
+    let (tx, rx) = watch::channel(false);
+    let worker_handle = tokio::spawn(async move {
+        let _ = client.run(rx).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 3. Submit unsupported trellis engine on CPU cluster
+    let submit_future = tokio::task::spawn_blocking({
+        let home = temp_dir.path().to_path_buf();
+        let master_str = master_addr.to_string();
+        move || {
+            cli(&home)
+                .arg("submit")
+                .arg("--master")
+                .arg(&master_str)
+                .arg("--type")
+                .arg("3d")
+                .arg("--prompt")
+                .arg("mech")
+                .arg("--engine")
+                .arg("trellis")
+                .arg("--wait")
+                .output()
+                .expect("run trellis submit")
+        }
+    });
+
+    let output = tokio::time::timeout(Duration::from_secs(15), submit_future)
+        .await
+        .expect("Trellis submit hung waiting on CPU cluster!")
+        .expect("Task join error");
+
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Trellis 3D neural engine is not supported; use sdf or triposr"),
+        "Expected Trellis unsupported error, got: {combined}"
+    );
+
+    // 4. Teardown
+    let _ = tx.send(true);
+    let _ = worker_handle.await;
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
 async fn test_cli_3d_default_engine_with_image_fails_before_submit() {
     let temp_dir = TempDir::new().unwrap();
     let img_path = temp_dir.path().join("input.png");
