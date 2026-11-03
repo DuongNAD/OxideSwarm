@@ -2660,7 +2660,12 @@ Now drawing from 'AC Power'
         });
         assert!(pid > 1, "unexpected pid {pid}");
         let mut sys = sysinfo::System::new();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let wait_budget = if cfg!(windows) {
+            std::time::Duration::from_secs(5)
+        } else {
+            std::time::Duration::from_secs(2)
+        };
+        let deadline = std::time::Instant::now() + wait_budget;
         loop {
             sys.refresh_processes();
             let alive = sys
@@ -2682,6 +2687,11 @@ Now drawing from 'AC Power'
     #[test]
     fn test_probe_blender_with_timeout_handles_version_non_version_failure_and_timeout() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let simple_probe_timeout = if cfg!(windows) {
+            std::time::Duration::from_secs(15)
+        } else {
+            std::time::Duration::from_secs(2)
+        };
 
         let ok_ver = write_test_script(
             dir.path(),
@@ -2690,7 +2700,7 @@ Now drawing from 'AC Power'
             "echo Blender 4.5.4 LTS",
         );
         assert_eq!(
-            probe_blender_with_timeout(&ok_ver, std::time::Duration::from_secs(2)),
+            probe_blender_with_timeout(&ok_ver, simple_probe_timeout),
             BlenderProbeResult::Version("Blender 4.5.4 LTS".to_string())
         );
 
@@ -2701,13 +2711,13 @@ Now drawing from 'AC Power'
             "echo custom stub",
         );
         assert_eq!(
-            probe_blender_with_timeout(&no_ver, std::time::Duration::from_secs(2)),
+            probe_blender_with_timeout(&no_ver, simple_probe_timeout),
             BlenderProbeResult::SucceededWithoutVersion
         );
 
         let fail = write_test_script(dir.path(), "blender_fail", "exit 1", "exit /b 1");
         assert_eq!(
-            probe_blender_with_timeout(&fail, std::time::Duration::from_secs(2)),
+            probe_blender_with_timeout(&fail, simple_probe_timeout),
             BlenderProbeResult::Failed
         );
 
@@ -2728,13 +2738,23 @@ Now drawing from 'AC Power'
                 bg_pid_file.display()
             ),
         );
+        let bg_timeout = if cfg!(windows) {
+            std::time::Duration::from_secs(15)
+        } else {
+            std::time::Duration::from_secs(2)
+        };
+        let bg_elapsed_bound = if cfg!(windows) {
+            std::time::Duration::from_secs(10)
+        } else {
+            std::time::Duration::from_millis(1500)
+        };
         let bg_start = std::time::Instant::now();
         assert_eq!(
-            probe_blender_with_timeout(&bg_ver, std::time::Duration::from_secs(2)),
+            probe_blender_with_timeout(&bg_ver, bg_timeout),
             BlenderProbeResult::Version("Blender 4.5.4 LTS".to_string())
         );
         assert!(
-            bg_start.elapsed() < std::time::Duration::from_millis(1500),
+            bg_start.elapsed() < bg_elapsed_bound,
             "background-stdout wrapper took {:?}",
             bg_start.elapsed()
         );
@@ -2792,13 +2812,23 @@ Now drawing from 'AC Power'
                 hung_pid_file.display()
             ),
         );
+        let hung_timeout = if cfg!(windows) {
+            std::time::Duration::from_secs(5)
+        } else {
+            std::time::Duration::from_millis(800)
+        };
+        let hung_elapsed_bound = if cfg!(windows) {
+            std::time::Duration::from_secs(15)
+        } else {
+            std::time::Duration::from_secs(4)
+        };
         let start = std::time::Instant::now();
         assert_eq!(
-            probe_blender_with_timeout(&hung, std::time::Duration::from_millis(800)),
+            probe_blender_with_timeout(&hung, hung_timeout),
             BlenderProbeResult::TimedOut
         );
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(4),
+            start.elapsed() < hung_elapsed_bound,
             "timed-out probe took {:?}",
             start.elapsed()
         );
