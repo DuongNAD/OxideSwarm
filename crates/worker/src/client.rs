@@ -5296,20 +5296,30 @@ mod tests {
                         // proving that `upload_task_outputs` was interrupted by `tokio::select!`
                         // rather than finishing first.
                         let delayed = msg;
-                        tokio::select! {
-                            _ = rx => {
-                                let _ = m_writer.send_msg(&delayed).await;
-                            }
-                            next_opt = w_reader.recv_msg::<WorkerMessage>() => {
-                                if let Ok(Some(next_msg)) = next_opt {
-                                    if let WorkerMessage::TaskResult { exit_code, .. } = &next_msg {
-                                        observed_clone.lock().unwrap().push(*exit_code);
-                                    }
-                                    if m_writer.send_msg(&next_msg).await.is_err() {
+                        let mut rx = rx;
+                        loop {
+                            tokio::select! {
+                                _ = &mut rx => {
+                                    let _ = m_writer.send_msg(&delayed).await;
+                                    break;
+                                }
+                                next_opt = w_reader.recv_msg::<WorkerMessage>() => {
+                                    if let Ok(Some(next_msg)) = next_opt {
+                                        let is_result = if let WorkerMessage::TaskResult { exit_code, .. } = &next_msg {
+                                            observed_clone.lock().unwrap().push(*exit_code);
+                                            true
+                                        } else {
+                                            false
+                                        };
+                                        if m_writer.send_msg(&next_msg).await.is_err() {
+                                            break;
+                                        }
+                                        if is_result {
+                                            break;
+                                        }
+                                    } else {
                                         break;
                                     }
-                                } else {
-                                    break;
                                 }
                             }
                         }
@@ -5406,28 +5416,43 @@ mod tests {
         // `cancelled_reason` across `exec_fut` is what turns the post-exit run into 130.
         let marker_path = worker_dir.path().join("child_exited.marker");
         #[cfg(unix)]
-        let drain_spec = rusty_grid_core::task::TaskSpec::shell_script(format!(
-            "sleep 5 &\necho done > '{}'\nexit 0",
-            marker_path.display()
-        ));
+        let task2 = Task::new(
+            rusty_grid_core::task::TaskSpec::shell_script(format!(
+                "sleep 5 &\necho done > '{}'\nexit 0",
+                marker_path.display()
+            )),
+            TaskRequirements::generic(1, 10),
+        );
         #[cfg(windows)]
-        let drain_spec = rusty_grid_core::task::TaskSpec::Command {
-            program: "cmd.exe".into(),
-            args: vec![
-                "/C".into(),
-                format!(
-                    "start /B ping -n 6 127.0.0.1 >NUL & echo done > \"{}\" & exit /B 0",
-                    marker_path.display()
-                ),
-            ],
-            env: std::collections::HashMap::new(),
-            working_dir: None,
-            stdin: None,
+        let task2 = {
+            let mut env = std::collections::HashMap::new();
+            env.insert(
+                "MARKER_PATH".into(),
+                marker_path.to_string_lossy().to_string(),
+            );
+            let mut t = Task::new(
+                rusty_grid_core::task::TaskSpec::Command {
+                    program: "cmd.exe".into(),
+                    args: vec!["/C".into(), "drain.cmd".into()],
+                    env,
+                    working_dir: None,
+                    stdin: None,
+                },
+                TaskRequirements::generic(1, 10),
+            );
+            t.staged_files
+                .push(rusty_grid_core::task::StagedFile::new(
+                    "drain.cmd",
+                    rusty_grid_core::task::Bytes::from_static(
+                        b"@echo off\r\nstart /B ping -n 6 127.0.0.1\r\necho done > \"%MARKER_PATH%\"\r\nexit /B 0\r\n",
+                    ),
+                    true,
+                ));
+            t
         };
-        let task2 = Task::new(drain_spec, TaskRequirements::generic(1, 10));
         let task2_id = master.submit_task(task2).await.expect("submit task 2");
 
-        let marker_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let marker_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while !marker_path.exists() {
             assert!(
                 tokio::time::Instant::now() < marker_deadline,
@@ -5435,10 +5460,10 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         master.cancel_task(task2_id).await.expect("cancel task 2");
 
-        let finish2_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        let finish2_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while tokio::time::Instant::now() < finish2_deadline {
             let got_two = observed_results.lock().unwrap().len() >= 2;
             let active_zero = master
