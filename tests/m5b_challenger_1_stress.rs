@@ -461,8 +461,7 @@ async fn test_sandbox_stage_files_single_size_limit() {
         data: Bytes::new(),
     };
 
-    let cache_dir = temp_sb_dir.path().join("cache");
-    let res = sandbox.stage_files(&[oversized_staged], &cache_dir).await;
+    let res = sandbox.stage_files(&[oversized_staged]).await;
     assert!(
         res.is_err(),
         "Sandbox::stage_files must reject single file > 32 MiB"
@@ -515,8 +514,7 @@ async fn test_sandbox_stage_files_aggregate_limit() {
     let data2 = vec![0x22u8; 16 * 1024 * 1024];
     let file2 = StagedFile::new("part2.bin", data2, false);
 
-    let cache_dir = temp_sb_dir.path().join("cache");
-    let res = sandbox.stage_files(&[file1, file2], &cache_dir).await;
+    let res = sandbox.stage_files(&[file1, file2]).await;
     assert!(
         res.is_err(),
         "Sandbox::stage_files must reject aggregate staged files > 32 MiB"
