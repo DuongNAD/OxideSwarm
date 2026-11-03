@@ -5,8 +5,9 @@ Created: 2026-11-01    Updated: 2026-11-03
 
 ## Summary
 
-Generative 3D mesh workloads (the entrypoint `engines/generative_3d/entrypoint.py` loads no model and
-writes a fixed octahedron) and Blender mesh auto-rigging run as external subprocesses. Previously,
+Neural 3D mesh workloads (`triposr` via `engines/generative_3d/entrypoint.py`, which refuses execution
+when checkpoint weights are not installed, while `auto` and `sdf` execute in-process via pure-Rust Tier 0
+SDF per Design 0017) and Blender mesh auto-rigging run as external subprocesses. Previously,
 these workloads relied on ad-hoc runner logic and an isolated Win32 `JobObject` wrapper, bypassing
 the worker's unified task supervision. This design unifies 3D and Blender execution under
 `TaskRunner::execute_process_supervised`, standardizes process tree supervision across Windows and
@@ -59,8 +60,16 @@ This helper encapsulates:
 
 The standalone `crates/worker/src/job_object.rs` module and `TaskRunner::terminate_process_tree` are
 deleted as dead code. Primary output asset loading is decoupled into `read_output_file(path)`, which
-queries `tokio::fs::symlink_metadata` to refuse symbolic links, non-regular files, and files exceeding
-the 64 MiB wire protocol frame limit (`MAX_FRAME_SIZE`) before reading them into memory.
+opens the file first without following symbolic links or blocking on FIFOs (`O_NOFOLLOW | O_NONBLOCK`
+on Unix and `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS` on Windows via
+`OpenOptionsExt::custom_flags`), inspects `file.metadata()` on the open handle to refuse symbolic
+links/reparse points, non-regular files, and files exceeding `MAX_FRAME_SIZE` (`64 * 1024 * 1024 = 67,108,864`
+bytes, 64 MiB) before reading, and reads through a capped reader (`file.take(MAX_FRAME_SIZE as u64 + 1)`)
+so a file that grows past `MAX_FRAME_SIZE` during the read is also refused (`"is more than 67108864 bytes"`).
+In the generative 3D path (`crates/worker/src/runner.rs:2126`), a `read_output_file` refusal fails the
+task with `EXIT_CODE_GENERAL_ERROR`; in Blender auto-rigging (`crates/worker/src/runner.rs:2340-2366`),
+a `read_output_file` refusal logs a `warn!` and falls back to the built-in pure-Rust auto-rigging
+engine without telling the caller in `TaskResult`.
 
 ### D2: Post-execution progress checkpointing
 
@@ -86,11 +95,20 @@ unchanged. Tasks receive standard environment variables:
 
 ## Known limits
 
-- **Wire frame limit on output assets**: `read_output_file` queries `tokio::fs::symlink_metadata`
-  first, refusing symbolic links, non-regular files (such as FIFOs or directories), and files
-  exceeding the 64 MiB wire protocol frame limit (`MAX_FRAME_SIZE` in `rusty_grid_core::protocol`)
-  before reading them into memory (BUG-10). Assets larger than 64 MiB cannot be transmitted inline
-  in `TaskResult`.
+- **Wire frame limit on output assets**: `read_output_file` opens the output path first with
+  `O_NOFOLLOW | O_NONBLOCK` (Unix) or `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS`
+  (Windows), checks `file.metadata()` on the open handle to refuse symbolic links/reparse points,
+  non-regular files (such as FIFOs or directories), and files larger than `MAX_FRAME_SIZE`
+  (`64 * 1024 * 1024 = 67,108,864` bytes, 64 MiB) before reading, and caps the read via
+  `file.take(MAX_FRAME_SIZE as u64 + 1)` so files that grow past `MAX_FRAME_SIZE` while being read
+  are refused with `"is more than 67108864 bytes"` (BUG-10). In Blender auto-rigging
+  (`crates/worker/src/runner.rs:2346`), a refusal from `read_output_file` logs a warning and falls
+  back to the pure-Rust auto-rigging engine without telling the caller. On the wire
+  (`crates/worker/src/client.rs:667`), BUG-4's `rewrite_oversized_task_result` fails and rewrites
+  `TaskResult` earlier whenever the entire serialized `WorkerMessage::TaskResult` frame — including
+  `TaskResult` envelope fields, `stdout`/`stderr`, `artifacts`, codec framing (bincode or JSON/base64),
+  and on encrypted lanes `AEAD_RECORD_OVERHEAD` (`29` bytes) — exceeds `MAX_FRAME_SIZE`
+  (`67,108,864` bytes).
 - **Worker crash on Unix**: On Unix, task processes run under process groups (`killpg`). Normal
   cancellation, watchdog timeout, or task drop terminates the process group. However, after an
   abrupt worker crash (SIGKILL/panic) on Unix, nothing kills the process groups; they are left
@@ -115,9 +133,15 @@ a task process can still read the worker account's secret file on disk, as docum
 
 ## Test plan
 
+- `crates/worker/src/runner.rs` (`mod tests`): Unit tests for `read_output_file`:
+  - `test_read_output_file_regular_missing_and_directory`: missing path returns `Ok(None)`, regular file returns `Ok(Some(bytes))`, directory returns `Err(InvalidData)`.
+  - `test_read_output_file_fifo_returns_error_immediately` (Unix): FIFO at output path returns `Err(InvalidData)` immediately via `O_NONBLOCK` without hanging.
+  - `test_read_output_file_refuses_symlink_and_oversized_or_sparse_file`: refuses symbolic links/reparse points and concurrent symlink swaps (`O_NOFOLLOW` / `FILE_FLAG_OPEN_REPARSE_POINT`), refuses `MAX_FRAME_SIZE + 1` (`67,108,865` bytes) before reading (`"is 67108865 bytes"`), and refuses files that grow past `MAX_FRAME_SIZE` during the read via the `take(MAX_FRAME_SIZE as u64 + 1)` cap (`"is more than 67108864 bytes"`).
 - `crates/worker/tests/test_sec5_hardened_runner.rs`: Verifies priority inheritance (`nice` / Windows
   priority classes), cluster secret stripping from child environments and version probes, large stderr
-  non-blocking drain, and process group / tree termination on cancellation.
+  non-blocking drain, process group / tree termination on cancellation, and BUG-10 output file refusals
+  for both 3D (`triposr`) and `BlenderRigProvider` (`test_bug10_3d_and_blender_refuse_symlink_output`,
+  `test_bug10_3d_and_blender_refuse_oversized_sparse_output_without_reading`).
 - `crates/worker/tests/test_challenger_m2_job_object.rs`: Validates grandchild process tree cleanup
   under cancellation, watchdog timeout, and future drop via `TaskRunner` and `ProcessTree`, plus an
   OS-level abrupt process termination crash test via Python.
@@ -143,5 +167,5 @@ a task process can still read the worker account's secret file on disk, as docum
 - 2026-11-01: Implemented process supervision for 3D and Blender workloads via TaskRunner (SEC-5).
 - 2026-11-01: Updated design record for second round review: corrected master baseline, Unix crash semantics, probe secret isolation, and output frame limit.
 - 2026-11-01: Updated design record for round 3 review: corrected default output buffer limit, metadata regular file check, task env stripping vs probe_command distinction, CI scope, and W2 file list.
-- 2026-11-03: Guarded `read_output_file` with `symlink_metadata` to refuse symbolic links and files exceeding `MAX_FRAME_SIZE` before reading (BUG-10).
+- 2026-11-03: Guarded `read_output_file` by opening with `O_NOFOLLOW | O_NONBLOCK` (Unix) and `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS` (Windows) before inspecting `file.metadata()`, refusing symbolic links/reparse points, non-regular files, and files exceeding `MAX_FRAME_SIZE` (`67,108,864` bytes) before reading, and capping reads with `take(MAX_FRAME_SIZE as u64 + 1)` (BUG-10).
 

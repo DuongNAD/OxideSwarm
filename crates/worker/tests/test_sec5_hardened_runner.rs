@@ -1444,7 +1444,7 @@ sys.exit(0)
         mock_script.to_str().expect("path"),
     );
 
-    for engine in ["triposr", "auto"] {
+    for engine in ["triposr"] {
         let spec = Generative3DSpec::new_prompt("Symlink Output Test").with_engine(engine);
         let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
         let res = runner.execute_task(&task, None, None).await;
@@ -1494,7 +1494,7 @@ async fn test_bug10_3d_and_blender_refuse_oversized_sparse_output_without_readin
     let (runner, _dir) = create_test_runner();
     let temp_dir = tempfile::tempdir().expect("tempdir");
 
-    let sparse_bytes: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB sparse file
+    let sparse_bytes: u64 = (rusty_grid_core::protocol::MAX_FRAME_SIZE as u64) + 1; // 64 MiB + 1 byte
     let mock_script = temp_dir.path().join("sparse_output_engine.py");
     let script_content = format!(
         r#"
@@ -1505,17 +1505,17 @@ import sys
 if "--output" in sys.argv:
     out_idx = sys.argv.index("--output")
     out_path = sys.argv[out_idx + 1]
+    with open(out_path, "wb") as f:
+        pass
     if os.name == "nt":
-        if os.path.exists(out_path):
-            os.remove(out_path)
         subprocess.run(
-            ["fsutil", "file", "createnew", out_path, "{sparse_bytes}"],
-            check=True,
+            ["fsutil", "sparse", "setflag", out_path],
+            check=False,
             stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-    else:
-        with open(out_path, "wb") as f:
-            f.truncate({sparse_bytes})
+    with open(out_path, "r+b") as f:
+        f.truncate({sparse_bytes})
 sys.exit(0)
 "#
     );
@@ -1527,7 +1527,7 @@ sys.exit(0)
         mock_script.to_str().expect("path"),
     );
 
-    for engine in ["triposr", "auto"] {
+    for engine in ["triposr"] {
         let spec = Generative3DSpec::new_prompt("Sparse Output Test").with_engine(engine);
         let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
         let start = Instant::now();
@@ -1536,7 +1536,7 @@ sys.exit(0)
 
         assert!(
             elapsed < Duration::from_secs(5),
-            "5 GiB sparse file must fail without reading into memory, took {elapsed:?}"
+            "Oversized sparse file must fail without reading into memory, took {elapsed:?}"
         );
         assert_eq!(
             res.exit_code, EXIT_CODE_GENERAL_ERROR,
@@ -1544,8 +1544,10 @@ sys.exit(0)
         );
         let err = res.error.as_deref().unwrap_or("");
         assert!(
-            err.contains("output_model.glb") && err.contains(&sparse_bytes.to_string()),
-            "Error for engine {engine} must name output path and size {sparse_bytes}, got: '{err}'"
+            err.contains("output_model.glb")
+                && err.contains(&format!("is {sparse_bytes} bytes"))
+                && !err.contains("is more than"),
+            "Error for engine {engine} must name output path and exact size 'is {sparse_bytes} bytes', got: '{err}'"
         );
         assert!(
             res.asset_bytes.is_none(),
@@ -1567,15 +1569,16 @@ sys.exit(0)
         15,
     )
     .await
-    .expect_err("BlenderRigProvider must refuse 5 GiB sparse output");
+    .expect_err("BlenderRigProvider must refuse oversized sparse output");
     let elapsed = start.elapsed();
     assert!(
         elapsed < Duration::from_secs(5),
-        "Blender 5 GiB sparse file must fail without reading into memory, took {elapsed:?}"
+        "Blender oversized sparse file must fail without reading into memory, took {elapsed:?}"
     );
     assert!(
         blender_err.contains("rigged_output.glb")
-            && blender_err.contains(&sparse_bytes.to_string()),
-        "Blender error must name output path and size {sparse_bytes}, got: '{blender_err}'"
+            && blender_err.contains(&format!("is {sparse_bytes} bytes"))
+            && !blender_err.contains("is more than"),
+        "Blender error must name output path and exact size 'is {sparse_bytes} bytes', got: '{blender_err}'"
     );
 }
