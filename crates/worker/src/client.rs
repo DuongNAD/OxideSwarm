@@ -1664,23 +1664,49 @@ impl WorkerClient {
             };
 
             let effective_checkpoint = checkpoint.or_else(|| task.latest_checkpoint.clone());
-            let mut result = runner
-                .execute_task_with_checkpoint(
+            let (exec_cancel_tx, exec_cancel_rx) = oneshot::channel::<String>();
+            let mut exec_cancel_tx = Some(exec_cancel_tx);
+            let mut cancelled_reason: Option<String> = None;
+            let mut result = {
+                let exec_fut = runner.execute_task_with_checkpoint(
                     &task,
                     effective_checkpoint.as_ref(),
                     Some(outbound_tx.clone()),
                     Some(child_pid_clone),
-                    cancel_slot,
-                )
-                .await;
+                    Some(exec_cancel_rx),
+                );
+                tokio::pin!(exec_fut);
+                loop {
+                    tokio::select! {
+                        res = &mut exec_fut => break res,
+                        reason = cancellation(&mut cancel_slot) => {
+                            if let Some(tx) = exec_cancel_tx.take() {
+                                let _ = tx.send(reason.clone());
+                            }
+                            // Remember the cancellation even when `tx.send` succeeded: if the
+                            // child process already exited and `execute_process_supervised` is
+                            // draining pipes or collecting outputs, `exec_cancel_rx` is not
+                            // polled again and `exec_fut` returns the process's exit code.
+                            cancelled_reason = Some(reason);
+                        }
+                    }
+                }
+            };
 
             // Output files reach the Master's blob store before the result that names them.
             let used_blobs = _inputs.is_some() || !result.outputs.is_empty();
-            if !result.outputs.is_empty() && !suppress.load(Ordering::Acquire) {
+            if cancelled_reason.is_none()
+                && !result.outputs.is_empty()
+                && !suppress.load(Ordering::Acquire)
+            {
                 match runner.blob_cache() {
                     Ok(cache) => {
-                        upload_task_outputs(&task, &mut result, blob_client.as_deref(), &cache)
-                            .await
+                        tokio::select! {
+                            () = upload_task_outputs(&task, &mut result, blob_client.as_deref(), &cache) => {}
+                            reason = cancellation(&mut cancel_slot) => {
+                                cancelled_reason = Some(reason);
+                            }
+                        }
                     }
                     Err(e) => {
                         result.outputs.clear();
@@ -1696,9 +1722,20 @@ impl WorkerClient {
                 }
             }
 
+            if let Some(reason) = cancelled_reason {
+                if result.exit_code != EXIT_CODE_CANCELLED {
+                    result.exit_code = EXIT_CODE_CANCELLED;
+                    result.error = Some(format!("Cancelled: {reason}"));
+                }
+                result.outputs.clear();
+                result.artifacts.clear();
+                result.asset_bytes = None;
+            }
+
             if !suppress.load(Ordering::Acquire) {
                 let _ = outbound_tx.send(WorkerMessage::from(result)).await;
             }
+            drop(cancel_slot);
         });
 
         lock.insert(
@@ -5208,6 +5245,254 @@ mod tests {
             .expect("the surplus connection is closed promptly");
         assert!(matches!(n, Ok(0) | Err(_)));
         let _ = shutdown.send(true);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_during_output_upload_reports_result_and_decrements_master_active_tasks() {
+        use rusty_grid_master::server::{MasterServer, ServerConfig};
+
+        let master_dir = tempfile::tempdir().unwrap();
+        let worker_dir = tempfile::tempdir().unwrap();
+        let master = MasterServer::spawn(
+            ServerConfig::new("127.0.0.1:0".parse().unwrap())
+                .with_blob_store(master_dir.path(), 16 * 1024 * 1024)
+                .with_heartbeat_interval(30),
+        )
+        .await
+        .expect("spawn master");
+
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let master_addr = master.server_addr();
+
+        let (upload_started_tx, upload_started_rx) = oneshot::channel::<()>();
+        let (release_upload_tx, release_upload_rx) = oneshot::channel::<()>();
+        let observed_results: Arc<std::sync::Mutex<Vec<i32>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_clone = Arc::clone(&observed_results);
+
+        let proxy_task = tokio::spawn(async move {
+            let (worker_stream, _) = proxy_listener.accept().await.unwrap();
+            let master_stream = TcpStream::connect(master_addr).await.unwrap();
+            let (mut w_writer, mut w_reader) = MessageTransport::new(worker_stream).split();
+            let (mut m_writer, mut m_reader) = MessageTransport::new(master_stream).split();
+
+            let m_to_w = tokio::spawn(async move {
+                while let Ok(Some(msg)) = m_reader.recv_msg::<MasterMessage>().await {
+                    if w_writer.send_msg(&msg).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let mut upload_started_tx = Some(upload_started_tx);
+            let mut release_upload_rx = Some(release_upload_rx);
+            while let Ok(Some(msg)) = w_reader.recv_msg::<WorkerMessage>().await {
+                if matches!(msg, WorkerMessage::BlobRequest { .. }) {
+                    if let Some(tx) = upload_started_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = release_upload_rx.take() {
+                        // Hold the BlobRequest until the test sees the cancelled TaskResult,
+                        // proving that `upload_task_outputs` was interrupted by `tokio::select!`
+                        // rather than finishing first.
+                        let delayed = msg;
+                        let mut rx = rx;
+                        loop {
+                            tokio::select! {
+                                _ = &mut rx => {
+                                    let _ = m_writer.send_msg(&delayed).await;
+                                    break;
+                                }
+                                next_opt = w_reader.recv_msg::<WorkerMessage>() => {
+                                    if let Ok(Some(next_msg)) = next_opt {
+                                        let is_result = if let WorkerMessage::TaskResult { exit_code, .. } = &next_msg {
+                                            observed_clone.lock().unwrap().push(*exit_code);
+                                            true
+                                        } else {
+                                            false
+                                        };
+                                        if m_writer.send_msg(&next_msg).await.is_err() {
+                                            break;
+                                        }
+                                        if is_result {
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+                if let WorkerMessage::TaskResult { exit_code, .. } = &msg {
+                    observed_clone.lock().unwrap().push(*exit_code);
+                }
+                if m_writer.send_msg(&msg).await.is_err() {
+                    break;
+                }
+            }
+            m_to_w.abort();
+        });
+
+        let mut client = WorkerClient::new(
+            WorkerConfig::new(proxy_addr.to_string())
+                .with_cores(1)
+                .with_sandbox_base_dir(worker_dir.path())
+                .with_redirection_portal(false),
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let worker_task = tokio::spawn(async move { client.run(stop_rx).await });
+
+        let reg_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if master
+                .list_workers()
+                .await
+                .is_ok_and(|workers| workers.len() == 1)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < reg_deadline,
+                "worker did not register with master in time"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Case 1: Cancel arrives while `upload_task_outputs` is blocked on `BlobRequest`.
+        // The proxy holds `BlobRequest` until the worker sends `TaskResult`, so no fixed sleep is
+        // needed and removing the upload `tokio::select!` makes `upload_task_outputs` hang.
+        let mut task = Task::new(
+            rusty_grid_core::task::TaskSpec::shell_script("echo upload-payload > out.txt"),
+            TaskRequirements::generic(1, 10),
+        );
+        task.output_globs = vec!["out.txt".into()];
+        let task_id = master.submit_task(task).await.expect("submit task");
+
+        tokio::time::timeout(Duration::from_secs(5), upload_started_rx)
+            .await
+            .expect("task must reach upload_task_outputs and send BlobRequest")
+            .unwrap();
+
+        assert_eq!(
+            master.list_workers().await.unwrap()[0].active_tasks,
+            1,
+            "worker active_tasks on master must be 1 while uploading outputs"
+        );
+
+        master.cancel_task(task_id).await.expect("cancel task");
+
+        let finish_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < finish_deadline {
+            let got_result = !observed_results.lock().unwrap().is_empty();
+            let active_zero = master
+                .list_workers()
+                .await
+                .is_ok_and(|w| w.first().is_some_and(|info| info.active_tasks == 0));
+            if got_result && active_zero {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = release_upload_tx.send(());
+
+        let results = observed_results.lock().unwrap().clone();
+        assert_eq!(
+            results,
+            vec![EXIT_CODE_CANCELLED],
+            "master must receive exactly one cancelled TaskResult when cancelled during output upload"
+        );
+        let workers = master.list_workers().await.unwrap();
+        assert_eq!(
+            workers[0].active_tasks, 0,
+            "worker active_tasks on the master must return to 0 after cancellation during output upload"
+        );
+
+        // Case 2: Cancel arrives after the child process has exited (exit 0) while
+        // `execute_process_supervised` is draining pipes held open by a background child.
+        // `exec_cancel_tx.send` succeeds because `exec_cancel_rx` is still in scope, so keeping
+        // `cancelled_reason` across `exec_fut` is what turns the post-exit run into 130.
+        let marker_path = worker_dir.path().join("child_exited.marker");
+        #[cfg(unix)]
+        let task2 = Task::new(
+            rusty_grid_core::task::TaskSpec::shell_script(format!(
+                "sleep 5 &\necho done > '{}'\nexit 0",
+                marker_path.display()
+            )),
+            TaskRequirements::generic(1, 10),
+        );
+        #[cfg(windows)]
+        let task2 = {
+            let mut env = std::collections::HashMap::new();
+            env.insert(
+                "MARKER_PATH".into(),
+                marker_path.to_string_lossy().to_string(),
+            );
+            let mut t = Task::new(
+                rusty_grid_core::task::TaskSpec::Command {
+                    program: "cmd.exe".into(),
+                    args: vec!["/C".into(), "drain.cmd".into()],
+                    env,
+                    working_dir: None,
+                    stdin: None,
+                },
+                TaskRequirements::generic(1, 10),
+            );
+            t.staged_files
+                .push(rusty_grid_core::task::StagedFile::new(
+                    "drain.cmd",
+                    rusty_grid_core::task::Bytes::from_static(
+                        b"@echo off\r\nstart /B ping -n 6 127.0.0.1\r\necho done > \"%MARKER_PATH%\"\r\nexit /B 0\r\n",
+                    ),
+                    true,
+                ));
+            t
+        };
+        let task2_id = master.submit_task(task2).await.expect("submit task 2");
+
+        let marker_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !marker_path.exists() {
+            assert!(
+                tokio::time::Instant::now() < marker_deadline,
+                "task 2 did not write exit marker in time"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        master.cancel_task(task2_id).await.expect("cancel task 2");
+
+        let finish2_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < finish2_deadline {
+            let got_two = observed_results.lock().unwrap().len() >= 2;
+            let active_zero = master
+                .list_workers()
+                .await
+                .is_ok_and(|w| w.first().is_some_and(|info| info.active_tasks == 0));
+            if got_two && active_zero {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let results2 = observed_results.lock().unwrap().clone();
+        assert_eq!(
+            results2,
+            vec![EXIT_CODE_CANCELLED, EXIT_CODE_CANCELLED],
+            "worker must report 130 when cancelled while draining pipes after child exit"
+        );
+        let workers2 = master.list_workers().await.unwrap();
+        assert_eq!(
+            workers2[0].active_tasks, 0,
+            "worker active_tasks on the master must return to 0 after second cancellation"
+        );
+
+        let _ = stop_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), worker_task).await;
+        proxy_task.abort();
+        let _ = master.shutdown();
     }
 
     #[cfg(unix)]
