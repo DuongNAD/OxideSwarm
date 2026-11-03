@@ -50,8 +50,7 @@ use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
 
 use crate::config::ConfigFile;
 use crate::connect::{
-    connect_master, normalize_master_addr, prepare_staged_files, validate_output_paths,
-    DEFAULT_MASTER_ADDR,
+    connect_master, normalize_master_addr, save_output_artifacts, DEFAULT_MASTER_ADDR,
 };
 use crate::doctor::{run_doctor, DoctorOptions};
 use crate::secret_cmd::SecretOpts;
@@ -62,6 +61,8 @@ pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 pub const MCP_SERVER_NAME: &str = "oxideswarm";
 /// Server software version.
 pub const MCP_SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Default inline output capture budget (16 KiB per stream, head + tail) returned to LLM callers.
+pub const DEFAULT_MCP_MAX_OUTPUT_BYTES: usize = 16_384;
 
 /// CLI arguments for the `oxideswarm mcp` command.
 #[derive(Parser, Debug, Clone)]
@@ -552,12 +553,20 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                     "files": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Local files to stage into sandbox: 'LOCAL_PATH' or 'LOCAL_PATH:SANDBOX_PATH'"
+                        "description": "Local files or directories inside the working directory to stage into the sandbox via content-addressed blobs: 'LOCAL_PATH' or 'LOCAL_PATH:SANDBOX_PATH' (symbolic links and paths outside the working directory are refused)"
                     },
                     "outputs": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Declared output artifact paths to retrieve upon completion"
+                        "description": "Declared output file paths or glob patterns to retrieve upon completion"
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Local directory to download declared output files into when wait is true"
+                    },
+                    "max_output_bytes": {
+                        "type": "integer",
+                        "description": "Maximum bytes of stdout and stderr to return inline (head + tail, default: 16384)"
                     }
                 }
             }),
@@ -583,6 +592,14 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                     "wait_secs": {
                         "type": "integer",
                         "description": "Alias for timeout_secs: client wait deadline in seconds when waiting"
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Local directory to download task output files into"
+                    },
+                    "max_output_bytes": {
+                        "type": "integer",
+                        "description": "Maximum bytes of stdout and stderr to return inline (head + tail, default: 16384)"
                     }
                 },
                 "required": ["task_id"]
@@ -885,6 +902,326 @@ async fn tool_workers(state: &McpState, args: &Value) -> ToolCallResult {
 }
 
 // ----------------------------------------------------------------------------
+// MCP File Input Validation & Safe LLM Output Formatting
+// ----------------------------------------------------------------------------
+
+fn reject_symlinks_in_dir_tree(root: &std::path::Path) -> Result<(), String> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| format!("cannot read directory '{}': {e}", dir.display()))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| format!("cannot read directory '{}': {e}", dir.display()))?;
+            let path = entry.path();
+            let ft = entry
+                .file_type()
+                .map_err(|e| format!("cannot inspect '{}': {e}", path.display()))?;
+            if ft.is_symlink() {
+                return Err(format!(
+                    "'{}' is a symbolic link; symbolic links are refused in MCP submit files",
+                    path.display()
+                ));
+            }
+            if ft.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates that every `LOCAL[:SANDBOX]` spec in `specs` stays inside `cwd` and neither is nor
+/// traverses a symbolic link, then hashes the inputs via [`crate::blobs::scan_inputs`].
+pub fn scan_mcp_inputs_in_dir(
+    cwd: &std::path::Path,
+    specs: &[String],
+) -> Result<crate::blobs::PreparedInputs, String> {
+    use std::path::Component;
+
+    let canon_cwd = std::fs::canonicalize(cwd)
+        .map_err(|e| format!("cannot resolve working directory '{}': {e}", cwd.display()))?;
+
+    let mut rewritten_specs = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let (local, dest) = crate::blobs::parse_input_spec(spec)?;
+        if local.as_os_str().is_empty() {
+            return Err("input path cannot be empty".to_string());
+        }
+        if local
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
+            return Err(format!(
+                "path '{}' must not contain '..' or leave the working directory",
+                local.display()
+            ));
+        }
+
+        let rel_path = if local.is_absolute() {
+            local
+                .strip_prefix(cwd)
+                .or_else(|_| local.strip_prefix(&canon_cwd))
+                .map_err(|_| {
+                    format!(
+                        "path '{}' is outside the working directory '{}'",
+                        local.display(),
+                        cwd.display()
+                    )
+                })?
+                .to_path_buf()
+        } else {
+            local.clone()
+        };
+
+        let mut cur = cwd.to_path_buf();
+        let mut saw_normal = false;
+        for comp in rel_path.components() {
+            match comp {
+                Component::CurDir => {}
+                Component::Normal(part) => {
+                    saw_normal = true;
+                    cur.push(part);
+                    let meta = std::fs::symlink_metadata(&cur)
+                        .map_err(|e| format!("'{}': {e}", local.display()))?;
+                    if meta.file_type().is_symlink() {
+                        return Err(format!(
+                            "'{}' is or traverses a symbolic link ('{}'), which is refused in MCP submit files",
+                            local.display(),
+                            cur.display()
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "path '{}' is not a relative path inside the working directory",
+                        local.display()
+                    ));
+                }
+            }
+        }
+
+        let target_meta =
+            std::fs::symlink_metadata(&cur).map_err(|e| format!("'{}': {e}", local.display()))?;
+        if target_meta.file_type().is_symlink() {
+            return Err(format!(
+                "'{}' is a symbolic link, which is refused in MCP submit files",
+                local.display()
+            ));
+        }
+        let canon_target =
+            std::fs::canonicalize(&cur).map_err(|e| format!("'{}': {e}", local.display()))?;
+        if !canon_target.starts_with(&canon_cwd) {
+            return Err(format!(
+                "path '{}' resolves outside the working directory '{}'",
+                local.display(),
+                cwd.display()
+            ));
+        }
+        if target_meta.is_dir() {
+            reject_symlinks_in_dir_tree(&cur)?;
+        }
+
+        let effective_dest = match dest {
+            Some(d) => Some(d),
+            None if saw_normal => Some(rel_path.to_string_lossy().replace('\\', "/")),
+            None => None,
+        };
+        let rewritten = match effective_dest {
+            Some(d) => format!("{}:{d}", cur.display()),
+            None => cur.display().to_string(),
+        };
+        rewritten_specs.push(rewritten);
+    }
+
+    crate::blobs::scan_inputs(&rewritten_specs)
+}
+
+const WORKER_TRUNCATION_MARKER: &[u8] =
+    b"[rusty_grid: output truncated after exceeding size limit]";
+
+fn trim_utf8_end(slice: &[u8]) -> &[u8] {
+    match std::str::from_utf8(slice) {
+        Ok(_) => slice,
+        Err(e) => {
+            if e.error_len().is_none() {
+                &slice[..e.valid_up_to()]
+            } else {
+                slice
+            }
+        }
+    }
+}
+
+fn trim_utf8_start(slice: &[u8]) -> &[u8] {
+    let mut start = 0;
+    while start < slice.len() && start < 4 && (slice[start] & 0b1100_0000) == 0b1000_0000 {
+        start += 1;
+    }
+    &slice[start..]
+}
+
+/// Formats a raw output stream (`stdout` or `stderr`) for an LLM tool reply, keeping head + tail
+/// within `max_output_bytes` and reporting `(formatted_text, was_truncated, total_bytes)`.
+pub fn truncate_stream_for_llm(bytes: &[u8], max_output_bytes: usize) -> (String, bool, usize) {
+    let total_bytes = bytes.len();
+    let has_worker_notice = bytes
+        .windows(WORKER_TRUNCATION_MARKER.len())
+        .any(|w| w == WORKER_TRUNCATION_MARKER);
+
+    if total_bytes <= max_output_bytes {
+        return (
+            String::from_utf8_lossy(bytes).into_owned(),
+            has_worker_notice,
+            total_bytes,
+        );
+    }
+
+    if max_output_bytes == 0 {
+        return (String::new(), true, total_bytes);
+    }
+
+    let omitted = total_bytes.saturating_sub(max_output_bytes);
+    let notice = format!("\n...[truncated {omitted} bytes]...\n");
+    if max_output_bytes <= notice.len() + 2 {
+        let head_len = max_output_bytes / 2;
+        let tail_len = max_output_bytes - head_len;
+        let head = String::from_utf8_lossy(trim_utf8_end(&bytes[..head_len]));
+        let tail = String::from_utf8_lossy(trim_utf8_start(&bytes[total_bytes - tail_len..]));
+        return (format!("{head}{tail}"), true, total_bytes);
+    }
+
+    let budget = max_output_bytes - notice.len();
+    let head_len = budget / 2;
+    let tail_len = budget - head_len;
+    let head = String::from_utf8_lossy(trim_utf8_end(&bytes[..head_len]));
+    let tail = String::from_utf8_lossy(trim_utf8_start(&bytes[total_bytes - tail_len..]));
+    (format!("{head}{notice}{tail}"), true, total_bytes)
+}
+
+async fn format_completed_task_result(
+    state: &McpState,
+    result: &rusty_grid_core::task::TaskResult,
+    args: &Value,
+    warning: Option<String>,
+) -> ToolCallResult {
+    let output_dir_opt = args.get("output_dir").and_then(Value::as_str);
+    let max_output_bytes = args
+        .get("max_output_bytes")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_MCP_MAX_OUTPUT_BYTES);
+
+    let mut saved_outputs: Option<Vec<std::path::PathBuf>> = None;
+    let mut saved_artifacts: Option<Vec<std::path::PathBuf>> = None;
+
+    if let Some(out_dir_str) = output_dir_opt {
+        let out_dir = std::path::Path::new(out_dir_str);
+        if !result.outputs.is_empty() {
+            let target_addr = match state.resolve_target_addr().await {
+                Ok(addr) => addr,
+                Err(e) => return ToolCallResult::error(e),
+            };
+            let conn =
+                match crate::blobs::BlobConnection::connect(&target_addr, state.secret.as_ref())
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return ToolCallResult::error(format!(
+                            "Failed to connect to Master for output download: {e}"
+                        ))
+                    }
+                };
+            match crate::blobs::download_outputs(&conn, &result.outputs, out_dir).await {
+                Ok(paths) => saved_outputs = Some(paths),
+                Err(e) => {
+                    return ToolCallResult::error(format!(
+                        "Failed to download output files to '{}': {e}",
+                        out_dir.display()
+                    ))
+                }
+            }
+        }
+        if !result.artifacts.is_empty() {
+            match save_output_artifacts(&result.artifacts, out_dir) {
+                Ok(paths) => saved_artifacts = Some(paths),
+                Err(e) => {
+                    return ToolCallResult::error(format!(
+                        "Failed to save output artifacts to '{}': {e}",
+                        out_dir.display()
+                    ))
+                }
+            }
+        }
+    }
+
+    let mut out_artifacts: Vec<Value> = Vec::new();
+    for (idx, output) in result.outputs.iter().enumerate() {
+        let mut entry = json!({
+            "path": output.path,
+            "size_bytes": output.size,
+            "blob_id": output.id.to_hex(),
+            "checksum_blake3": output.id.to_hex(),
+            "executable": output.executable,
+        });
+        if let Some(ref paths) = saved_outputs {
+            if let Some(saved_path) = paths.get(idx) {
+                entry["saved_path"] = Value::String(saved_path.display().to_string());
+            }
+        }
+        out_artifacts.push(entry);
+    }
+    for (idx, artifact) in result.artifacts.iter().enumerate() {
+        let mut entry = json!({
+            "path": artifact.path,
+            "size_bytes": artifact.size,
+            "checksum_sha256": artifact.sha256_hex(),
+        });
+        if let Some(ref paths) = saved_artifacts {
+            if let Some(saved_path) = paths.get(idx) {
+                entry["saved_path"] = Value::String(saved_path.display().to_string());
+            }
+        }
+        out_artifacts.push(entry);
+    }
+
+    let (stdout_str, stdout_truncated, stdout_total_bytes) =
+        truncate_stream_for_llm(result.stdout.as_bytes(), max_output_bytes);
+    let (stderr_str, stderr_truncated, stderr_total_bytes) =
+        truncate_stream_for_llm(result.stderr.as_bytes(), max_output_bytes);
+    let truncated = stdout_truncated || stderr_truncated;
+    let total_bytes = stdout_total_bytes + stderr_total_bytes;
+
+    let status_str = if result.is_success() {
+        "completed"
+    } else {
+        "failed"
+    };
+
+    let mut body = json!({
+        "task_id": result.task_id.to_string(),
+        "status": status_str,
+        "exit_code": result.exit_code,
+        "stdout": stdout_str,
+        "stderr": stderr_str,
+        "truncated": truncated,
+        "total_bytes": total_bytes,
+        "stdout_truncated": stdout_truncated,
+        "stdout_total_bytes": stdout_total_bytes,
+        "stderr_truncated": stderr_truncated,
+        "stderr_total_bytes": stderr_total_bytes,
+        "duration_ms": result.execution_time_ms,
+        "error": result.error,
+        "artifacts": out_artifacts,
+    });
+    if let Some(w) = warning {
+        body["warning"] = Value::String(w);
+    }
+    ToolCallResult::ok_json(&body)
+}
+
+// ----------------------------------------------------------------------------
 // Tool: submit
 // ----------------------------------------------------------------------------
 
@@ -1064,8 +1401,8 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         Err(e) => return ToolCallResult::error(format!("Invalid placement constraints: {e}")),
     };
 
-    // Staged files
-    let mut staged_files = Vec::new();
+    // Staged files (content-addressed blobs, restricted to non-symlink paths inside the working directory)
+    let mut prepared_inputs = crate::blobs::PreparedInputs::default();
     if let Some(files_arr) = args.get("files").and_then(Value::as_array) {
         let string_paths: Vec<String> = files_arr
             .iter()
@@ -1073,15 +1410,23 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
             .map(str::to_string)
             .collect();
         if !string_paths.is_empty() {
-            match prepare_staged_files(&string_paths) {
-                Ok(files) => staged_files = files,
+            let cwd = match std::env::current_dir() {
+                Ok(dir) => dir,
+                Err(e) => {
+                    return ToolCallResult::error(format!(
+                        "Staged files error: cannot determine working directory: {e}"
+                    ))
+                }
+            };
+            match scan_mcp_inputs_in_dir(&cwd, &string_paths) {
+                Ok(inputs) => prepared_inputs = inputs,
                 Err(e) => return ToolCallResult::error(format!("Staged files error: {e}")),
             }
         }
     }
 
-    // Expected outputs
-    let mut expected_outputs = Vec::new();
+    // Expected outputs (blob output globs)
+    let mut output_globs = Vec::new();
     if let Some(outputs_arr) = args.get("outputs").and_then(Value::as_array) {
         let string_outputs: Vec<String> = outputs_arr
             .iter()
@@ -1089,19 +1434,19 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
             .map(str::to_string)
             .collect();
         if !string_outputs.is_empty() {
-            match validate_output_paths(&string_outputs) {
-                Ok(outs) => expected_outputs = outs,
-                Err(e) => return ToolCallResult::error(format!("Expected outputs error: {e}")),
+            if let Err(e) = rusty_grid_core::blob::validate_output_patterns(&string_outputs) {
+                return ToolCallResult::error(format!("Expected outputs error: {e}"));
             }
+            output_globs = string_outputs;
         }
     }
 
     let mut task = Task::new(spec, requirements.clone()).with_placement(&placement);
-    if !staged_files.is_empty() {
-        task = task.with_staged_files(staged_files);
+    if !prepared_inputs.inputs.is_empty() {
+        task = task.with_inputs(prepared_inputs.inputs.clone());
     }
-    if !expected_outputs.is_empty() {
-        task = task.with_expected_outputs(expected_outputs);
+    if !output_globs.is_empty() {
+        task = task.with_output_globs(output_globs);
     }
     let task_id = task.id;
     *ctx.submitted_task_id.lock().await = Some(task_id);
@@ -1111,13 +1456,30 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         return ToolCallResult::error(format!("Task {task_id} cancelled by client"));
     }
 
-    if let Err(e) = state.resolve_target_addr().await {
-        return ToolCallResult::error(e);
-    }
+    let target_addr = match state.resolve_target_addr().await {
+        Ok(addr) => addr,
+        Err(e) => return ToolCallResult::error(e),
+    };
 
     if ctx.is_cancelled() {
         ctx.aborted_by_cancel = true;
         return ToolCallResult::error(format!("Task {task_id} cancelled by client"));
+    }
+
+    if !prepared_inputs.inputs.is_empty() {
+        let conn = match crate::blobs::BlobConnection::connect(&target_addr, state.secret.as_ref())
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return ToolCallResult::error(format!(
+                    "Failed to connect to Master for input blob upload: {e}"
+                ))
+            }
+        };
+        if let Err(e) = crate::blobs::upload_inputs(&conn, &prepared_inputs).await {
+            return ToolCallResult::error(format!("Failed to upload input files: {e}"));
+        }
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs);
@@ -1223,39 +1585,7 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                     Some(step + 1),
                     format!("Task {task_id} completed"),
                 );
-                let out_artifacts: Vec<Value> = result
-                    .artifacts
-                    .iter()
-                    .map(|a| {
-                        json!({
-                            "path": a.path,
-                            "size_bytes": a.size,
-                            "checksum_sha256": a.sha256_hex(),
-                            "data_preview": a.content().to_string_lossy(),
-                        })
-                    })
-                    .collect();
-
-                let status_str = if result.is_success() {
-                    "completed"
-                } else {
-                    "failed"
-                };
-
-                let mut body = json!({
-                    "task_id": result.task_id.to_string(),
-                    "status": status_str,
-                    "exit_code": result.exit_code,
-                    "stdout": result.stdout_str(),
-                    "stderr": result.stderr_str(),
-                    "duration_ms": result.execution_time_ms,
-                    "error": result.error,
-                    "artifacts": out_artifacts,
-                });
-                if let Some(w) = warning {
-                    body["warning"] = Value::String(w);
-                }
-                ToolCallResult::ok_json(&body)
+                format_completed_task_result(state, &result, args, warning).await
             }
             Some(Ok(Some(ClientResponse::Error { message }))) => ToolCallResult::error(message),
             Some(Ok(Some(other))) => {
@@ -1628,34 +1958,7 @@ async fn tool_task_result(
                         Some(step + 1),
                         format!("Task {task_id} completed"),
                     );
-                    let out_artifacts: Vec<Value> = result
-                        .artifacts
-                        .iter()
-                        .map(|a| {
-                            json!({
-                                "path": a.path,
-                                "size_bytes": a.size,
-                                "checksum_sha256": a.sha256_hex(),
-                            })
-                        })
-                        .collect();
-
-                    let status_str = if result.is_success() {
-                        "completed"
-                    } else {
-                        "failed"
-                    };
-
-                    return ToolCallResult::ok_json(&json!({
-                        "task_id": result.task_id.to_string(),
-                        "status": status_str,
-                        "exit_code": result.exit_code,
-                        "stdout": result.stdout_str(),
-                        "stderr": result.stderr_str(),
-                        "duration_ms": result.execution_time_ms,
-                        "error": result.error,
-                        "artifacts": out_artifacts,
-                    }));
+                    return format_completed_task_result(state, &result, args, None).await;
                 }
                 Ok(Some(ClientResponse::TaskStatusInfo {
                     task_id: tid,
@@ -1720,34 +2023,7 @@ async fn tool_task_result(
             .await
         {
             Ok(ClientResponse::TaskCompleted { result, .. }) => {
-                let out_artifacts: Vec<Value> = result
-                    .artifacts
-                    .iter()
-                    .map(|a| {
-                        json!({
-                            "path": a.path,
-                            "size_bytes": a.size,
-                            "checksum_sha256": a.sha256_hex(),
-                        })
-                    })
-                    .collect();
-
-                let status_str = if result.is_success() {
-                    "completed"
-                } else {
-                    "failed"
-                };
-
-                ToolCallResult::ok_json(&json!({
-                    "task_id": result.task_id.to_string(),
-                    "status": status_str,
-                    "exit_code": result.exit_code,
-                    "stdout": result.stdout_str(),
-                    "stderr": result.stderr_str(),
-                    "duration_ms": result.execution_time_ms,
-                    "error": result.error,
-                    "artifacts": out_artifacts,
-                }))
+                format_completed_task_result(state, &result, args, None).await
             }
             Ok(ClientResponse::TaskStatusInfo {
                 task_id,
@@ -2170,5 +2446,75 @@ mod tests {
             .expect("valid mcp args should parse");
         assert_eq!(ok.master.as_deref(), Some("127.0.0.1:8088"));
         assert!(!ok.insecure);
+    }
+
+    #[test]
+    fn test_scan_mcp_inputs_refuses_outside_cwd_and_symlinks() {
+        let outer = tempfile::tempdir().unwrap();
+        let cwd = outer.path().join("workspace");
+        std::fs::create_dir_all(cwd.join("sub")).unwrap();
+        std::fs::write(cwd.join("sub/inside.txt"), b"hello-inside").unwrap();
+        let secret_outside = outer.path().join("outside_secret.txt");
+        std::fs::write(&secret_outside, b"do-not-exfiltrate").unwrap();
+
+        // 1. Valid relative file inside cwd succeeds and preserves relative destination.
+        let ok = scan_mcp_inputs_in_dir(&cwd, &["sub/inside.txt".to_string()])
+            .expect("relative file inside cwd must succeed");
+        assert_eq!(ok.inputs.len(), 1);
+        assert_eq!(ok.inputs[0].path, "sub/inside.txt");
+
+        // 2. Parent traversal (`..`) is refused.
+        let err_parent = scan_mcp_inputs_in_dir(&cwd, &["../outside_secret.txt".to_string()])
+            .err()
+            .expect("parent traversal must be refused");
+        assert!(err_parent.contains(".."), "{err_parent}");
+
+        // 3. Absolute path outside cwd is refused.
+        let err_abs = scan_mcp_inputs_in_dir(&cwd, &[secret_outside.to_string_lossy().to_string()])
+            .err()
+            .expect("absolute path outside cwd must be refused");
+        assert!(
+            err_abs.contains("outside the working directory"),
+            "{err_abs}"
+        );
+
+        // 4. Symbolic link (both direct file symlink and symlink inside a directory) is refused.
+        #[cfg(unix)]
+        {
+            let link_file = cwd.join("link_to_secret.txt");
+            std::os::unix::fs::symlink(&secret_outside, &link_file).unwrap();
+            let err_link = scan_mcp_inputs_in_dir(&cwd, &["link_to_secret.txt".to_string()])
+                .err()
+                .expect("symlink file must be refused");
+            assert!(err_link.contains("symbolic link"), "{err_link}");
+
+            let err_dir_with_link = scan_mcp_inputs_in_dir(&cwd, &[".".to_string()])
+                .err()
+                .expect("directory containing symlink must be refused");
+            assert!(
+                err_dir_with_link.contains("symbolic link"),
+                "{err_dir_with_link}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_truncate_stream_for_llm_keeps_head_and_tail_within_budget() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"START_BANNER\n");
+        raw.extend(std::iter::repeat_n(b'x', 20_000));
+        raw.extend_from_slice(b"\nFINAL_SUMMARY_MARKER\n");
+
+        let (formatted, truncated, total_bytes) = truncate_stream_for_llm(&raw, 4096);
+        assert!(truncated);
+        assert_eq!(total_bytes, raw.len());
+        assert!(
+            formatted.len() <= 4096,
+            "formatted output ({} bytes) must fit within max_output_bytes (4096)",
+            formatted.len()
+        );
+        assert!(formatted.starts_with("START_BANNER\n"));
+        assert!(formatted.ends_with("\nFINAL_SUMMARY_MARKER\n"));
+        assert!(formatted.contains("...[truncated "));
     }
 }

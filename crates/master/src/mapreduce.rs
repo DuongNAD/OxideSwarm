@@ -33,9 +33,21 @@ pub const OUTPUT_TRUNCATED_MARKER: &str =
 /// True if `result.stdout` was cut short by the worker's capture limit.
 pub fn stdout_was_truncated(result: &TaskResult) -> bool {
     let out = &result.stdout.0;
-    let tail = &out[out.len().saturating_sub(OUTPUT_TRUNCATED_MARKER.len() + 8)..];
-    tail.windows(OUTPUT_TRUNCATED_MARKER.len())
-        .any(|w| w == OUTPUT_TRUNCATED_MARKER.as_bytes())
+    let marker = OUTPUT_TRUNCATED_MARKER.as_bytes();
+    let tail = &out[out.len().saturating_sub(marker.len() + 8)..];
+    if tail.windows(marker.len()).any(|w| w == marker) {
+        return true;
+    }
+    let notice_len = marker.len() + 2; // leading and trailing '\n'
+    if out.len() >= notice_len {
+        let head_cap = (out.len() - notice_len) / 2;
+        if out.get(head_cap..head_cap + notice_len).is_some_and(|s| {
+            s[0] == b'\n' && &s[1..1 + marker.len()] == marker && s[1 + marker.len()] == b'\n'
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Shared "last sign of life" clock of one job, so a task's wait only times out when the job as a

@@ -34,11 +34,13 @@ use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport}
 use crate::connect::connect_master;
 
 /// Where the content of a blob to upload comes from.
+#[derive(Clone)]
 enum LocalSource {
     File(PathBuf),
     Bytes(Vec<u8>),
 }
 
+#[derive(Clone)]
 struct LocalBlob {
     size: u64,
     source: LocalSource,
@@ -331,14 +333,19 @@ pub async fn upload_inputs<C: BlobChannel>(
         .await
         .map_err(|e| e.to_string())?;
     let uploaded = missing.len();
-    let bytes = for_each_concurrently(missing, |id| async move {
-        let blob = &prepared.blobs[&id];
-        match &blob.source {
+    let jobs: Vec<(BlobId, LocalBlob)> = missing
+        .into_iter()
+        .map(|id| (id, prepared.blobs[&id].clone()))
+        .collect();
+    let bytes = for_each_concurrently(jobs, |(id, blob)| async move {
+        match blob.source {
             LocalSource::File(path) => {
                 let file = tokio::fs::File::open(path).await?;
                 upload_blob(channel, id, blob.size, file).await
             }
-            LocalSource::Bytes(bytes) => upload_blob(channel, id, blob.size, &bytes[..]).await,
+            LocalSource::Bytes(bytes) => {
+                upload_blob(channel, id, blob.size, std::io::Cursor::new(bytes)).await
+            }
         }
     })
     .await
@@ -423,7 +430,11 @@ pub async fn download_outputs<C: BlobChannel>(
     for output in outputs {
         targets.push(prepare_destination(dest_dir, &output.path)?);
     }
-    let jobs: Vec<(&BlobFile, &PathBuf)> = outputs.iter().zip(targets.iter()).collect();
+    let jobs: Vec<(BlobFile, PathBuf)> = outputs
+        .iter()
+        .cloned()
+        .zip(targets.iter().cloned())
+        .collect();
     for_each_concurrently(jobs, |(output, target)| async move {
         let name = target
             .file_name()
@@ -438,7 +449,7 @@ pub async fn download_outputs<C: BlobChannel>(
                 &tmp,
                 if output.executable { 0o755 } else { 0o644 },
             )?;
-            tokio::fs::rename(&tmp, target).await?;
+            tokio::fs::rename(&tmp, &target).await?;
             Ok::<u64, BlobError>(bytes)
         }
         .await;

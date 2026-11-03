@@ -68,8 +68,8 @@ Implemented in `crates/cli/src/mcp.rs` and `crates/cli/src/config.rs`.
 |---|---|---|
 | `status` | `task_id` (optional string), `workers` (optional bool) | Returns overall cluster status, active task counts, and worker counts, or execution state of a specific task. |
 | `workers` | `connected_only`, `os`, `arch`, `gpu_only` | Lists registered compute workers, hardware capabilities, and tags matching the given filters. |
-| `submit` | `type`, `command`, `args`, `script`, `interpreter`, `stdin`, `env`, `os`, `arch`, `worker`, `require_tags`, `gpu`, `matrix_dim`, `files`, `outputs`, `wait`, `timeout_secs`, `wait_secs`, `max_retries` | Submits a computation task to the grid with optional file staging, placement constraints, and client wait deadline (`wait_secs`). |
-| `task_result` | `task_id`, `wait`, `timeout_secs`, `wait_secs` | Retrieves execution outcome, exit code, stdout, stderr, execution duration, and output artifacts. |
+| `submit` | `type`, `command`, `args`, `script`, `interpreter`, `stdin`, `env`, `os`, `arch`, `worker`, `require_tags`, `gpu`, `matrix_dim`, `files`, `outputs`, `output_dir`, `max_output_bytes`, `wait`, `timeout_secs`, `wait_secs`, `max_retries` | Submits a computation task to the grid with content-addressed blob input staging (`files` restricted to non-symlink paths inside the working directory), output glob collection (`outputs`), optional download directory (`output_dir`) and inline stream budget (`max_output_bytes`, default 16 KiB head + tail), placement constraints, and client wait deadline (`wait_secs`). |
+| `task_result` | `task_id`, `wait`, `timeout_secs`, `wait_secs`, `output_dir`, `max_output_bytes` | Retrieves execution outcome, exit code, bounded head+tail `stdout` and `stderr` (default 16 KiB per stream), `truncated` and `total_bytes` metadata, execution duration, and output artifact metadata (downloading output blobs to `output_dir` when given, without inline `data_preview`). |
 | `cancel` | `task_id` | Cancels a queued or running task on the master by UUID. |
 | `doctor` | `expect_workers`, `timeout_secs`, `gpu_dim`, `spread_tasks`, `skip_gpu`, `skip_spread` | Runs cluster diagnostic checks C1–C6 and returns complete health check results. |
 
@@ -142,6 +142,7 @@ Implemented in `crates/core/src/discovery.rs` and `crates/master/src/server.rs`.
 - All discovery probes and rendezvous leases require HMAC-SHA256 validation using `cluster.secret`. Malicious actors on the network cannot impersonate the master.
 - Fresh 16-byte nonces ensure that discovery probes are single-use and cannot be replayed.
 - The MCP server strictly forbids unauthenticated connections to non-loopback or auto-discovered addresses (exiting with code `6` before reading standard input) unless `--insecure`, `RUSTY_GRID_INSECURE=1`, or `[status] insecure = true` is set (`RUSTY_GRID_INSECURE=0` overrides `[status] insecure = true`). Skipping `./rusty-grid.toml` and `./rusty-grid.json` in the working directory stops a cloned repository from auto-loading its own config file into a bare `oxideswarm mcp` invocation; however, a relative `--config`, `RUSTY_GRID_CONFIG`, `OXIDESWARM_HOME`, `--secret-file`, `OXIDESWARM_SECRET_FILE`, or `secret_file` configured by the user still resolves against the working directory.
+- `submit` `files` validates every local path against the MCP server's working directory with `symlink_metadata` before hashing blobs, refusing `..`, paths outside the working directory, and symbolic links (including symbolic links inside staged directories) so a repository cannot steer an agent into uploading files from outside the workspace.
 
 ## Test plan
 
@@ -167,3 +168,4 @@ Implemented in `crates/core/src/discovery.rs` and `crates/master/src/server.rs`.
 - 2026-10-23: Implemented W1–W6 on branch `feat/m5c-mcp-and-discovery`.
 - 2026-10-23: Verified via `cargo test -p rusty_grid_cli --test mcp_server_e2e` and `discovery_fallback_e2e` (5 passing tests). Status marked Implemented.
 - 2026-11-01: Removed the unauthenticated `--sse` HTTP surface (`SEC-1`) and enforced startup secret validation via `client_secret` using `[status]` for `master`, `secret`, and `insecure` while skipping working-directory config files (`SEC-2`).
+- 2026-11-04: Moved MCP `submit` / `task_result` file transfer to content-addressed blobs, refused symlinks and paths outside the working directory in `submit` `files`, added `output_dir` and `max_output_bytes` (16 KiB head + tail default), added `truncated` and `total_bytes`, and removed `data_preview` (`MCP-2`).
