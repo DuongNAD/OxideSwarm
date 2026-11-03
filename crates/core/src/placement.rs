@@ -4,10 +4,11 @@
 //! with `Task::tags`. Both fields have always been on the wire, so nothing here changes the
 //! protocol (design record `docs/design/0001-two-node-readiness.md`).
 //!
-//! * **Worker tags.** A worker adds [`system_tags`] (`os:<os>`, `arch:<arch>`) itself, and its
-//!   operator may add user tags ([`validate_user_tag`]). In `ListWorkers` / `ClusterStatus`
-//!   answers the master adds `link:<path>`, `id:<worker uuid>` and `state:<state>`. Those five
-//!   prefixes are [`RESERVED_TAG_PREFIXES`]: no user tag may start with one.
+//! * **Worker tags.** A worker adds [`system_tags`] (`os:<os>`, `arch:<arch>`) and `slots:<n>`
+//!   itself, and its operator may add user tags ([`validate_user_tag`]). In `ListWorkers` /
+//!   `ClusterStatus` answers the master adds `link:<path>`, `id:<worker uuid>` and
+//!   `state:<state>`. Those six prefixes are [`RESERVED_TAG_PREFIXES`]: no user tag may start
+//!   with one.
 //! * **Task constraints.** `require:<key>=<value>` entries of `Task::tags`, parsed into a
 //!   [`Placement`]. Keys: `os`, `arch`, `worker` (UUID or name) and `tag` (repeatable). Every
 //!   constraint must hold; other task tags are ignored.
@@ -24,6 +25,8 @@ pub const REQUIRE_PREFIX: &str = "require:";
 pub const OS_TAG_PREFIX: &str = "os:";
 /// Prefix of the CPU-architecture tag a worker adds itself (`arch:aarch64`).
 pub const ARCH_TAG_PREFIX: &str = "arch:";
+/// Prefix of the task-concurrency limit tag a worker adds itself (`slots:4`).
+pub const SLOTS_TAG_PREFIX: &str = "slots:";
 /// Prefix of the connection-path tag the master adds to worker listings (`link:TCP/LAN`).
 pub const LINK_TAG_PREFIX: &str = "link:";
 /// Prefix of the worker-id tag the master adds to worker listings.
@@ -31,9 +34,10 @@ pub const ID_TAG_PREFIX: &str = "id:";
 /// Prefix of the connection-state tag the master adds to worker listings (`state:busy`).
 pub const STATE_TAG_PREFIX: &str = "state:";
 /// Tag prefixes only the worker or the master may set.
-pub const RESERVED_TAG_PREFIXES: [&str; 5] = [
+pub const RESERVED_TAG_PREFIXES: [&str; 6] = [
     OS_TAG_PREFIX,
     ARCH_TAG_PREFIX,
+    SLOTS_TAG_PREFIX,
     LINK_TAG_PREFIX,
     ID_TAG_PREFIX,
     STATE_TAG_PREFIX,
@@ -86,6 +90,13 @@ pub fn tag_value<'a>(tags: &'a [String], prefix: &str) -> Option<&'a str> {
 /// The worker id the master put in a listed worker's tags (`id:<uuid>`), if any.
 pub fn listed_worker_id(caps: &WorkerCapabilities) -> Option<Uuid> {
     tag_value(&caps.tags, ID_TAG_PREFIX).and_then(|v| v.parse().ok())
+}
+
+/// The task concurrency limit (`slots:<n>`) a worker advertised in its tags, if any (`n >= 1`).
+pub fn advertised_slots(caps: &WorkerCapabilities) -> Option<usize> {
+    tag_value(&caps.tags, SLOTS_TAG_PREFIX)
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
 }
 
 /// Canonical operating-system name: lowercase, with `mac`, `darwin`, `osx`, `macosx` folded
@@ -299,12 +310,28 @@ mod tests {
             "a,b",
             "os:macos",
             "arch:x86_64",
+            "slots:4",
             "link:TCP/LAN",
             "id:123",
             "state:busy",
         ] {
             assert!(validate_user_tag(bad).is_err(), "{bad:?} must be refused");
         }
+    }
+
+    #[test]
+    fn test_advertised_slots_parses_positive_integer_only() {
+        let mut caps = WorkerCapabilities::new("w1", 8, 16384, false, false, None);
+        assert_eq!(advertised_slots(&caps), None);
+
+        caps.tags = vec!["os:linux".into(), "slots:2".into()];
+        assert_eq!(advertised_slots(&caps), Some(2));
+
+        caps.tags = vec!["slots:0".into()];
+        assert_eq!(advertised_slots(&caps), None);
+
+        caps.tags = vec!["slots:bad".into()];
+        assert_eq!(advertised_slots(&caps), None);
     }
 
     #[test]
