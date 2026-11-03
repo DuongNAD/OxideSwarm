@@ -12,7 +12,7 @@ Distribute input files to worker execution sandboxes and collect output artifact
 - define `StagedFile` and `OutputArtifact` data models with SHA-256 content verification;
 - write staged files directly into each worker task sandbox (`nlink == 1`) so in-place edits by one task never affect subsequent tasks;
 - isolate sandboxes against directory traversal (`..`), leading slashes, Windows DOS device names, and symlink escapes;
-- account for file staging payloads within the master queue 256 MiB LRU retention budget.
+- account for file staging payloads within the master queue 256 MiB oldest-first retention budget.
 
 ## Context
 
@@ -33,7 +33,7 @@ Behaviour before this change:
 - **G3** Verify staged file payloads by SHA-256 digest and write an independent copy (`nlink == 1`) into each task sandbox.
 - **G4** Enforce strict sandbox isolation, rejecting traversal components, root paths, reserved Windows device names, and symlinks resolving outside the sandbox.
 - **G5** Maintain wire compatibility across JSON (`0x01`), Bincode (`0x02`), and AEAD (`0x04`) codecs via protocol capability negotiation.
-- **G6** Cap total master retained memory for staged files and artifacts at 256 MiB using LRU eviction.
+- **G6** Bound master queue memory at 256 MiB for active tasks (`--max-active-mb` / `RUSTY_GRID_MAX_ACTIVE_MB`) and 256 MiB for retained finished tasks (`--max-retained-mb` / `RUSTY_GRID_MAX_RETAINED_MB`, using oldest-first eviction).
 
 ## Non-goals
 
@@ -131,12 +131,13 @@ To prevent directory traversal and host compromises, paths are validated by `val
 
 Implemented in `crates/core/src/protocol.rs` and `crates/core/src/task.rs`.
 
-### D6 Master queue memory accounting and LRU budget
+### D6 Master queue memory accounting and oldest-first retention budget
 
-The master queue tracks retained payload memory in `crates/master/src/queue.rs`:
-- Retained memory budget defaults to 256 MiB (`DEFAULT_MAX_RETAINED_MB = 256`), configurable via `--max-retained-mb` or `OXIDESWARM_MAX_RETAINED_MB`.
-- Each completed task accounts for the size of its stored `TaskSpec` (including `StagedFile` bytes) and execution `TaskResult` (including `OutputArtifact` bytes).
-- When total memory exceeds 256 MiB, terminal tasks are evicted in LRU order (oldest finished tasks first) until memory falls within budget.
+The master queue tracks active and retained payload memory in `crates/master/src/queue.rs` (see also `docs/design/0008-oversized-task-results-and-active-queue-budget.md`):
+- Active (non-terminal) task memory defaults to 256 MiB (`DEFAULT_MAX_ACTIVE_BYTES`), configurable via `--max-active-mb`, `RUSTY_GRID_MAX_ACTIVE_MB`, or `max_active_mb` in `[master]`. Submissions and checkpoint increases that would exceed this cap are refused with `GridError::QueueByteLimitExceeded`.
+- Retained finished-task memory defaults to 256 MiB (`DEFAULT_MAX_TERMINAL_BYTES`), configurable via `--max-retained-mb`, `RUSTY_GRID_MAX_RETAINED_MB`, or `max_retained_mb` in `[master]`.
+- Each task entry accounts for the size of its stored `TaskSpec` (including `StagedFile` bytes), checkpoint, and execution `TaskResult` (including `OutputArtifact` and `asset_bytes`).
+- When retained terminal memory exceeds `max_terminal_bytes`, finished tasks are evicted oldest-first until memory falls within budget (always keeping at least the newest finished task).
 
 ## Compatibility
 
@@ -154,7 +155,7 @@ The master queue tracks retained payload memory in `crates/master/src/queue.rs`:
 
 - **Unit:** path normalization, traversal rejection, DOS device name evasion, SHA-256 digest validation, and cache atomic placement (`crates/core`, `crates/worker`).
 - **Stress:** adversarial path traversal test suites, whitespace evasion generators, and combinatorial fuzzing (`tests/m5b_challenger_1_stress.rs`, `tests/m5b_challenger_2_stress.rs`).
-- **Integration:** end-to-end file staging, execution, output artifact collection, and LRU queue eviction over JSON and Bincode wire codecs (`tests/file_staging_e2e.rs`).
+- **Integration:** end-to-end file staging, execution, output artifact collection, and oldest-first queue eviction over JSON and Bincode wire codecs (`tests/file_staging_e2e.rs`).
 - **Gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 
 ## Work items
@@ -164,7 +165,7 @@ The master queue tracks retained payload memory in `crates/master/src/queue.rs`:
 | W1 | Staging data models and sanitization | `crates/core/src/task.rs` | `StagedFile`, `OutputArtifact`, and `validate_relative_sandbox_path` implemented | Implemented |
 | W2 | Worker sandbox staging | `crates/worker/src/sandbox.rs` | SHA-256 verification, independent per-sandbox placement (`nlink == 1`), and artifact collection | Implemented |
 | W3 | CLI staging options | `crates/cli/src/cli_app.rs` | `--file`, `--output`, `--output-dir` parsing and payload building | Implemented |
-| W4 | Master queue LRU budget | `crates/master/src/queue.rs` | 256 MiB retention budget and artifact eviction | Implemented |
+| W4 | Master queue retention budget | `crates/master/src/queue.rs` | 256 MiB oldest-first retention budget and artifact eviction | Implemented |
 | W5 | End-to-end integration tests | `tests/file_staging_e2e.rs` | Staging and artifact round-trip passes on JSON and Bincode | Implemented |
 | W6 | Adversarial path stress tests | `tests/m5b_challenger_1_stress.rs`, `tests/m5b_challenger_2_stress.rs` | Traversal fuzzing and DOS device evasion tests pass | Implemented |
 
@@ -176,3 +177,4 @@ The master queue tracks retained payload memory in `crates/master/src/queue.rs`:
 - 2026-10-23: Verified via `cargo test -p rusty_grid_cli --test file_staging_e2e`, `m5b_challenger_1_stress`, and `m5b_challenger_2_stress` (31 passing tests). Status marked Implemented.
 - 2026-10-26: The CLI moved to the content-addressed files of design record 0006: `submit --file` is an alias of `--input` and `--output` takes patterns, both through the master's blob store. The inline staging described here (`Task::staged_files`, `expected_outputs`, `TaskResult::artifacts`) is unchanged and still used by the MCP server and library callers.
 - 2026-11-01: Removed `cache/objects` hard-linking from `Sandbox::stage_files` (BUG-1) so each task sandbox gets an independent file (`nlink == 1`) written from `staged.data`, preventing in-place mutations or permission changes from affecting subsequent tasks.
+- 2026-11-01: Corrected G6 and D6 to name `DEFAULT_MAX_TERMINAL_BYTES` (`--max-retained-mb` / `RUSTY_GRID_MAX_RETAINED_MB`) and added the 256 MiB active task byte cap `DEFAULT_MAX_ACTIVE_BYTES` (`--max-active-mb` / `RUSTY_GRID_MAX_ACTIVE_MB`) from design record 0008 (BUG-4).

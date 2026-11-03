@@ -25,6 +25,13 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    checkpoint = os.environ.get("OXIDESWARM_TRIPOSR_CHECKPOINT") or os.environ.get("TRIPOSR_CHECKPOINT")
+    if not checkpoint or not os.path.exists(checkpoint):
+        sys.stderr.write("TripoSR model not available: local AI 3D model checkpoint is not installed\n")
+        sys.stderr.flush()
+        sys.exit(1)
+
     print(f"[PROGRESS: 0.05] Initializing local 3D engine on {args.device}...", flush=True)
 
     if args.offline:

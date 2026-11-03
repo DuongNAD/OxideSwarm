@@ -32,29 +32,36 @@ pub fn resolve_python_runtime() -> Option<PathBuf> {
 
     for candidate in &venv_candidates {
         if candidate.is_file() {
-            return Some(candidate.clone());
+            let abs = if candidate.is_absolute() {
+                candidate.clone()
+            } else if let Ok(cwd) = std::env::current_dir() {
+                cwd.join(candidate)
+            } else {
+                candidate.clone()
+            };
+            return Some(abs);
         }
     }
 
     // 3. Fallback: check if standard python executable is available on PATH
-    if let Ok(output) = std::process::Command::new("python")
-        .arg("--version")
-        .output()
-    {
-        if output.status.success() {
-            return Some(PathBuf::from("python"));
-        }
+    if probe_python("python") {
+        return Some(PathBuf::from("python"));
     }
-    if let Ok(output) = std::process::Command::new("python3")
-        .arg("--version")
-        .output()
-    {
-        if output.status.success() {
-            return Some(PathBuf::from("python3"));
-        }
+    if probe_python("python3") {
+        return Some(PathBuf::from("python3"));
     }
 
     None
+}
+
+/// Probes whether a Python executable candidate is runnable by invoking `<program> --version`
+/// with sensitive environment variables stripped.
+pub fn probe_python<P: AsRef<std::ffi::OsStr>>(program: P) -> bool {
+    rusty_grid_core::cluster_auth::probe_command(program)
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
 }
 
 /// Resolves the file path to the 3D generation entrypoint script.
@@ -62,7 +69,14 @@ pub fn resolve_entrypoint_script() -> Option<PathBuf> {
     if let Ok(custom) = std::env::var("OXIDESWARM_GEN3D_SCRIPT") {
         let p = PathBuf::from(custom);
         if p.is_file() {
-            return Some(p);
+            let abs = if p.is_absolute() {
+                p
+            } else if let Ok(cwd) = std::env::current_dir() {
+                cwd.join(p)
+            } else {
+                p
+            };
+            return Some(abs);
         }
     }
 
@@ -74,7 +88,21 @@ pub fn resolve_entrypoint_script() -> Option<PathBuf> {
 
     for c in &candidates {
         if c.is_file() {
-            return Some(c.clone());
+            let abs = if c.is_absolute() {
+                c.clone()
+            } else if let Ok(cwd) = std::env::current_dir() {
+                cwd.join(c)
+            } else {
+                c.clone()
+            };
+            return Some(abs);
+        }
+    }
+
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let p = PathBuf::from(manifest_dir).join("../../engines/generative_3d/entrypoint.py");
+        if p.is_file() {
+            return Some(p);
         }
     }
 

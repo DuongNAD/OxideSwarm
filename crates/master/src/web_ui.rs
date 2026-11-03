@@ -489,6 +489,10 @@ pub struct DashboardTasks {
     pub failed: usize,
     #[serde(default)]
     pub cancelled: usize,
+    #[serde(default)]
+    pub active_bytes: usize,
+    #[serde(default)]
+    pub max_active_bytes: usize,
     /// The newest non-finished tasks, at most [`STATUS_ACTIVE_LIST_LIMIT`]. `state` is spelled
     /// like everywhere else in the API (`TaskState::as_str`, snake_case).
     #[serde(default)]
@@ -654,6 +658,8 @@ async fn api_status(
         completed: stats.completed,
         failed: stats.failed,
         cancelled: stats.cancelled,
+        active_bytes: stats.active_bytes,
+        max_active_bytes: stats.max_active_bytes,
         active_list,
         active_total: pending + running,
     };
@@ -835,6 +841,14 @@ async fn api_submit_task(
             StatusCode::SERVICE_UNAVAILABLE,
             format!("task queue is full ({capacity} active tasks)"),
         ),
+        Err(e @ rusty_grid_core::GridError::QueueByteLimitExceeded { .. }) => {
+            let status = if e.is_transient() {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::PAYLOAD_TOO_LARGE
+            };
+            json_error(status, e.to_string())
+        }
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -2285,6 +2299,52 @@ mod tests {
         assert_eq!(
             auth_resp.0.p2p_ticket.as_deref(),
             Some("secret-iroh-ticket-value")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_submit_task_reports_active_byte_limit_in_bytes_with_flag_hint() {
+        let mut state = test_state();
+        state.queue = TaskQueue::with_retention_limits(
+            crate::queue::RetryPolicy::default(),
+            None,
+            crate::queue::DEFAULT_MAX_TERMINAL_TASKS,
+            crate::queue::DEFAULT_MAX_TERMINAL_BYTES,
+            1_500,
+        );
+
+        let first = api_submit_task(State(state.clone()), Ok(Json(payload("echo first"))))
+            .await
+            .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = api_submit_task(State(state.clone()), Ok(Json(payload("echo second"))))
+            .await
+            .into_response();
+        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(second.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("task requires "), "unexpected body: {text}");
+        assert!(text.contains("bytes in use"), "unexpected body: {text}");
+        assert!(text.contains("limit 1500 bytes"), "unexpected body: {text}");
+        assert!(text.contains("--max-active-mb"), "unexpected body: {text}");
+        assert!(
+            !text.contains("active tasks"),
+            "byte limit must not report a task count: {text}"
+        );
+
+        let too_large = api_submit_task(
+            State(state),
+            Ok(Json(payload(&format!("echo {}", "x".repeat(2_000))))),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            too_large.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a task larger than max_active_bytes can never fit and must return 413"
         );
     }
 }

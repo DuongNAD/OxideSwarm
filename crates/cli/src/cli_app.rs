@@ -294,6 +294,13 @@ pub struct MasterArgs {
 
     #[arg(
         long,
+        value_name = "MB",
+        help = "Megabytes of active (queued, scheduled, running, retrying) task payloads the master queue holds at once (default 256; env RUSTY_GRID_MAX_ACTIVE_MB)"
+    )]
+    pub max_active_mb: Option<u64>,
+
+    #[arg(
+        long,
         value_name = "DIR",
         help = "Directory of the blob store that keeps task input and output files (default ~/.oxideswarm/blobs; env RUSTY_GRID_BLOB_DIR)"
     )]
@@ -547,7 +554,7 @@ pub struct SubmitArgs {
     #[arg(
         long,
         value_name = "ENGINE",
-        help = "Preferred 3D generation engine: sdf, triposr, auto (default: auto)"
+        help = "Preferred 3D generation engine: auto, sdf, triposr (default: auto)"
     )]
     pub engine: Option<String>,
 
@@ -759,16 +766,32 @@ pub struct MapReduceArgs {
     #[arg(
         long,
         default_value = "word_count",
-        help = "Mapper name (e.g. word_count, uppercase) or script path"
+        conflicts_with = "map_cmd",
+        help = "Mapper built-in name (word_count, line_count, identity) or path to a local shell script"
     )]
     pub mapper: String,
 
     #[arg(
         long,
+        conflicts_with = "mapper",
+        help = "Command line to run as the mapper (receives chunk on stdin, writes key/value lines to stdout)"
+    )]
+    pub map_cmd: Option<String>,
+
+    #[arg(
+        long,
         default_value = "sum",
-        help = "Reducer name (e.g. sum, count) or script path"
+        conflicts_with = "reduce_cmd",
+        help = "Reducer built-in name (sum, count, max, min, concat) or path to a local shell script"
     )]
     pub reducer: String,
+
+    #[arg(
+        long,
+        conflicts_with = "reducer",
+        help = "Command line to run as the reducer (receives grouped JSON on stdin, writes reduced value to stdout)"
+    )]
+    pub reduce_cmd: Option<String>,
 
     #[arg(
         long,
@@ -897,6 +920,27 @@ pub async fn run_cli() -> ExitCode {
         }
         Commands::Mcp(args) => crate::mcp::run_mcp(args, config_file, secret_opts).await,
     }
+}
+
+/// Resolve `--max-active-mb` / `RUSTY_GRID_MAX_ACTIVE_MB` / `[master].max_active_mb`
+/// and apply it to `ServerConfig`, refusing `0` because a 0-byte active cap rejects
+/// every task.
+fn apply_max_active_mb(
+    config: ServerConfig,
+    flag: Option<u64>,
+    cfg_val: Option<u64>,
+) -> Result<ServerConfig, String> {
+    let max_active_mb = resolve_u64(
+        flag,
+        &["RUSTY_GRID_MAX_ACTIVE_MB"],
+        cfg_val,
+        (rusty_grid_master::DEFAULT_MAX_ACTIVE_BYTES / (1024 * 1024)) as u64,
+    );
+    if max_active_mb == 0 {
+        return Err("--max-active-mb / max_active_mb must be at least 1 MiB (got 0)".to_string());
+    }
+    let bytes = usize::try_from(max_active_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX);
+    Ok(config.with_max_active_bytes(bytes))
 }
 
 async fn run_master(
@@ -1065,6 +1109,17 @@ async fn run_master(
         master_cfg.as_ref().and_then(|m| m.max_pending_handshakes),
         rusty_grid_master::server::DEFAULT_MAX_PENDING_HANDSHAKES,
     );
+    server_config = match apply_max_active_mb(
+        server_config,
+        args.max_active_mb,
+        master_cfg.as_ref().and_then(|m| m.max_active_mb),
+    ) {
+        Ok(cfg) => cfg,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
     server_config = server_config
         .with_max_terminal_tasks(max_retained_tasks)
         .with_max_terminal_bytes(
@@ -1878,8 +1933,8 @@ pub fn validate_glb_header(raw: &[u8]) -> Result<(), String> {
 ///
 /// An explicit program with no arguments runs with no arguments; the demo greeting is only a
 /// default for a completely empty command line.
-fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
-    let mut kind = args.task_type.to_lowercase();
+pub fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
+    let mut kind = args.task_type.to_lowercase().replace('-', "_");
     if (kind == "generic" || kind == "command" || kind.is_empty())
         && (args.prompt.is_some() || args.image.is_some())
     {
@@ -1901,6 +1956,8 @@ fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
             | "autorig"
             | "auto_rig"
             | "rig"
+            | "builtin_test"
+            | "builtintest"
     );
     let only_for = |flag: &str, kinds: &str| {
         Err(format!(
@@ -1929,6 +1986,31 @@ fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
         if args.work_group_size.is_some() {
             return only_for("--work-group-size", "gpu");
         }
+    }
+    if !args.inputs.is_empty() && !is_command && kind != "shell" {
+        return only_for("--input (or --file)", "command and shell");
+    }
+    if !args.outputs.is_empty() && !is_command && kind != "shell" {
+        if matches!(
+            kind.as_str(),
+            "3d" | "gen3d" | "3d_generate" | "generative_3d" | "autorig" | "auto_rig" | "rig"
+        ) {
+            let target = if args.task_type == "generic" || args.task_type.is_empty() {
+                "3d or rigging".to_string()
+            } else {
+                args.task_type.clone()
+            };
+            return Err(format!(
+                "--output applies to command and shell tasks, not to {target} tasks (use --output-asset or -o for 3D/rigging assets)"
+            ));
+        }
+        return only_for("--output", "command and shell");
+    }
+    if args.output_dir.is_some() && !is_command && kind != "shell" {
+        return only_for("--output-dir", "command and shell");
+    }
+    if args.output_dir.is_some() && args.outputs.is_empty() {
+        return Err("--output-dir requires at least one --output pattern".to_string());
     }
     let env = parse_env_pairs(&args.env)?;
 
@@ -1975,9 +2057,10 @@ fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
                 .to_lowercase();
             let engine_preference = args
                 .engine
-                .as_ref()
-                .map(|e| e.to_lowercase())
-                .filter(|e| e != "auto");
+                .as_deref()
+                .map(str::parse::<rusty_grid_core::task::Engine3D>)
+                .transpose()?
+                .map(|e| e.as_str().to_string());
             let _ = args.export_texture;
             let export_texture = !args.no_export_texture;
             let spec = TaskSpec::Generative3D(rusty_grid_core::task::Generative3DSpec {
@@ -2260,8 +2343,6 @@ async fn run_submit_with_secret(
         }
     };
 
-    let is_asset_task = matches!(spec, TaskSpec::Generative3D(_) | TaskSpec::AutoRig(_));
-
     // Inputs are hashed (and directories listed) before connecting, so a typo in a path never
     // reaches the master.
     let inputs = match crate::blobs::scan_inputs(&args.inputs) {
@@ -2275,7 +2356,7 @@ async fn run_submit_with_secret(
         eprintln!("Warning: --input skips {skipped}");
     }
 
-    let output_globs = if !args.outputs.is_empty() && !is_asset_task {
+    let output_globs = if !args.outputs.is_empty() {
         if let Err(e) = rusty_grid_core::blob::validate_output_patterns(&args.outputs) {
             eprintln!("--output: {e}");
             return ExitCode::FAILURE;
@@ -2345,7 +2426,7 @@ async fn run_submit_with_secret(
         }
     }
 
-    let is_gpu = args.gpu || args.task_type.eq_ignore_ascii_case("gpu");
+    let is_gpu = args.gpu || args.task_type.eq_ignore_ascii_case("gpu") || spec.requires_gpu();
     let requirements = TaskRequirements {
         cpu_cores: args.cores.max(1),
         ram_mb: args.ram_mb,
@@ -2423,13 +2504,7 @@ async fn run_submit_with_secret(
                 .await
                 .and_then(|workers| listed_worker_name(&workers, result.worker_id));
 
-            let asset_output_path = args.output.clone().or_else(|| {
-                if is_asset_task && args.outputs.len() == 1 {
-                    Some(PathBuf::from(&args.outputs[0]))
-                } else {
-                    None
-                }
-            });
+            let asset_output_path = args.output.clone();
 
             if let (Some(ref out_path), Some(ref asset_bytes)) =
                 (&asset_output_path, &result.asset_bytes)
@@ -2456,6 +2531,7 @@ async fn run_submit_with_secret(
             }
 
             let output_dir = args.output_dir.as_deref().unwrap_or(Path::new("."));
+            let mut download_failed = false;
             let saved_outputs = if result.outputs.is_empty() {
                 None
             } else {
@@ -2475,7 +2551,8 @@ async fn run_submit_with_secret(
                     Ok(saved) => Some(saved),
                     Err(e) => {
                         eprintln!("Downloading the output files failed: {e}");
-                        return ExitCode::FAILURE;
+                        download_failed = true;
+                        None
                     }
                 }
             };
@@ -2511,7 +2588,11 @@ async fn run_submit_with_secret(
                 }
                 println!("{}", serde_json::to_string_pretty(&value).unwrap());
             } else {
-                println!("Task {task_id} completed successfully.");
+                if result.is_success() {
+                    println!("Task {task_id} completed successfully.");
+                } else {
+                    println!("Task {task_id} failed.");
+                }
                 match &worker_name {
                     Some(name) => println!("Worker: {name} ({})", result.worker_id),
                     None => println!("Worker: {}", result.worker_id),
@@ -2556,11 +2637,18 @@ async fn run_submit_with_secret(
                 if !result.stderr.is_empty() {
                     eprintln!("Stderr:\n{}", result.stderr_str().trim());
                 }
+                if let Some(ref error) = result.error {
+                    eprintln!("Error: {error}");
+                }
             }
-            if result.exit_code == 0 {
+            if download_failed {
+                ExitCode::FAILURE
+            } else if result.is_success() {
                 ExitCode::SUCCESS
-            } else {
+            } else if result.exit_code != 0 {
                 ExitCode::from(result.exit_code.min(255) as u8)
+            } else {
+                ExitCode::FAILURE
             }
         }
         ClientResponse::Error { message } => {
@@ -2744,6 +2832,8 @@ async fn run_status(
                 running_tasks,
                 completed_tasks,
                 failed_tasks,
+                active_bytes,
+                max_active_bytes,
                 workers,
             } => {
                 if args.json {
@@ -2768,6 +2858,8 @@ async fn run_status(
                             "running_tasks": running_tasks,
                             "completed_tasks": completed_tasks,
                             "failed_tasks": failed_tasks,
+                            "active_bytes": active_bytes,
+                            "max_active_bytes": max_active_bytes,
                             "worker_count": workers.len(),
                             "workers": enriched_workers
                         })
@@ -2780,6 +2872,13 @@ async fn run_status(
                     println!("Running Tasks:    {}", running_tasks);
                     println!("Completed Tasks:  {}", completed_tasks);
                     println!("Failed Tasks:     {}", failed_tasks);
+                    println!(
+                        "Active Budget:    {} / {} bytes ({:.2} / {:.2} MiB)",
+                        active_bytes,
+                        max_active_bytes,
+                        active_bytes as f64 / (1024.0 * 1024.0),
+                        max_active_bytes as f64 / (1024.0 * 1024.0),
+                    );
                     if !workers.is_empty() {
                         println!("\nWorkers:");
                         for w in &workers {
@@ -2829,6 +2928,104 @@ async fn run_workers(
         insecure: args.insecure,
     };
     run_status(status_args, config_file, secret_opts).await
+}
+
+const MAX_MAPREDUCE_SCRIPT_BYTES: usize = 64 * 1024;
+
+fn is_builtin_mapper(s: &str) -> bool {
+    matches!(s, "word_count" | "line_count" | "identity")
+}
+
+fn is_builtin_reducer(s: &str) -> bool {
+    matches!(s, "sum" | "count" | "max" | "min" | "concat")
+}
+
+fn looks_like_script_path(s: &str) -> bool {
+    s.contains('/') || s.contains('\\') || s.ends_with(".sh")
+}
+
+fn read_mapreduce_script(kind: &str, path_str: &str) -> Result<String, String> {
+    let path = Path::new(path_str);
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("Failed to read {kind} script '{path_str}': {e}"))?;
+    if meta.len() > MAX_MAPREDUCE_SCRIPT_BYTES as u64 {
+        return Err(format!(
+            "Failed to read {kind} script '{path_str}': script size ({} bytes) exceeds maximum inline MapReduce script size ({} bytes); use --{kind}-cmd or stage the script onto workers",
+            meta.len(),
+            MAX_MAPREDUCE_SCRIPT_BYTES
+        ));
+    }
+    let script = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {kind} script '{path_str}': {e}"))?;
+    if script.len() > MAX_MAPREDUCE_SCRIPT_BYTES {
+        return Err(format!(
+            "Failed to read {kind} script '{path_str}': script size ({} bytes) exceeds maximum inline MapReduce script size ({} bytes); use --{kind}-cmd or stage the script onto workers",
+            script.len(),
+            MAX_MAPREDUCE_SCRIPT_BYTES
+        ));
+    }
+    Ok(script)
+}
+
+fn split_command_line(cmd: &str) -> Result<(String, Vec<String>), String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut token_started = false;
+    let mut chars = cmd.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if !in_single => {
+                let should_escape = if in_double {
+                    matches!(chars.peek(), Some('"' | '\\'))
+                } else {
+                    chars.peek().is_some_and(|next| {
+                        *next == '"' || *next == '\'' || *next == '\\' || next.is_whitespace()
+                    })
+                };
+                if should_escape {
+                    if let Some(escaped_ch) = chars.next() {
+                        current.push(escaped_ch);
+                    }
+                } else {
+                    current.push('\\');
+                }
+                token_started = true;
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                token_started = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                token_started = true;
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if token_started {
+                    tokens.push(std::mem::take(&mut current));
+                    token_started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                token_started = true;
+            }
+        }
+    }
+    if in_single || in_double {
+        return Err("unclosed quote in command string".to_string());
+    }
+    if token_started {
+        tokens.push(current);
+    }
+    let mut iter = tokens.into_iter();
+    let program = iter
+        .next()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| "command cannot be empty".to_string())?;
+    Ok((program, iter.collect()))
 }
 
 async fn run_mapreduce(
@@ -2898,12 +3095,28 @@ async fn run_mapreduce(
         }
     }
 
-    let mapper_spec = if args.mapper.contains('/')
-        || args.mapper.contains('\\')
-        || Path::new(&args.mapper).exists()
-    {
-        MapFunctionSpec::ShellScript {
-            script: args.mapper,
+    let mapper_spec = if let Some(ref cmd) = args.map_cmd {
+        match split_command_line(cmd) {
+            Ok((program, cmd_args)) => MapFunctionSpec::Command {
+                program,
+                args: cmd_args,
+            },
+            Err(e) => {
+                eprintln!("Invalid --map-cmd '{cmd}': {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if is_builtin_mapper(&args.mapper) {
+        MapFunctionSpec::Builtin {
+            operator: args.mapper,
+        }
+    } else if looks_like_script_path(&args.mapper) {
+        match read_mapreduce_script("mapper", &args.mapper) {
+            Ok(script) => MapFunctionSpec::ShellScript { script },
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::FAILURE;
+            }
         }
     } else {
         MapFunctionSpec::Builtin {
@@ -2911,12 +3124,28 @@ async fn run_mapreduce(
         }
     };
 
-    let reducer_spec = if args.reducer.contains('/')
-        || args.reducer.contains('\\')
-        || Path::new(&args.reducer).exists()
-    {
-        ReduceFunctionSpec::ShellScript {
-            script: args.reducer,
+    let reducer_spec = if let Some(ref cmd) = args.reduce_cmd {
+        match split_command_line(cmd) {
+            Ok((program, cmd_args)) => ReduceFunctionSpec::Command {
+                program,
+                args: cmd_args,
+            },
+            Err(e) => {
+                eprintln!("Invalid --reduce-cmd '{cmd}': {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if is_builtin_reducer(&args.reducer) {
+        ReduceFunctionSpec::Builtin {
+            operator: args.reducer,
+        }
+    } else if looks_like_script_path(&args.reducer) {
+        match read_mapreduce_script("reducer", &args.reducer) {
+            Ok(script) => ReduceFunctionSpec::ShellScript { script },
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::FAILURE;
+            }
         }
     } else {
         ReduceFunctionSpec::Builtin {
@@ -3590,5 +3819,179 @@ insecure = false
         assert!(locked.contains("token is required") && !locked.contains("no login"));
         // Open access is never announced together with a secret-derived login hint.
         assert!(!text(DevBypass::Implicit, false).contains("secret show"));
+    }
+
+    #[test]
+    fn test_master_max_active_mb_flag_and_config_parse() {
+        match parse(&["master", "--max-active-mb", "512"]).command {
+            Commands::Master(a) => assert_eq!(a.max_active_mb, Some(512)),
+            other => panic!("unexpected {other:?}"),
+        }
+        let parsed: ConfigFile = toml::from_str(
+            r#"
+[master]
+max_active_mb = 768
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.master.unwrap().max_active_mb, Some(768));
+
+        let base = ServerConfig::new("127.0.0.1:0".parse().unwrap());
+        let default_cfg = apply_max_active_mb(base.clone(), None, None).unwrap();
+        assert_eq!(
+            default_cfg.max_active_bytes,
+            rusty_grid_master::DEFAULT_MAX_ACTIVE_BYTES
+        );
+        let from_config = apply_max_active_mb(base.clone(), None, Some(768)).unwrap();
+        assert_eq!(from_config.max_active_bytes, 768 * 1024 * 1024);
+        let from_flag = apply_max_active_mb(base.clone(), Some(512), Some(768)).unwrap();
+        assert_eq!(from_flag.max_active_bytes, 512 * 1024 * 1024);
+        let err = apply_max_active_mb(base, Some(0), None).unwrap_err();
+        assert!(err.contains("at least 1 MiB"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_master_with_larger_max_active_bytes_accepts_what_default_refuses_and_reports_bytes(
+    ) {
+        // 1. `--max-active-mb 0` is refused at startup with `ExitCode::FAILURE`.
+        let zero_cli = Cli::try_parse_from([
+            "oxideswarm",
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--max-active-mb",
+            "0",
+        ])
+        .unwrap();
+        let Commands::Master(zero_args) = zero_cli.command else {
+            panic!("expected Master subcommand");
+        };
+        let test_secret = ClusterSecret::from_bytes(&[0x11; 32]).unwrap();
+        let secret_opts = SecretOpts {
+            value: Some(crate::config::SecretText(test_secret.to_hex())),
+            file: None,
+        };
+        let zero_exit = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_master(zero_args, None, secret_opts.clone()),
+        )
+        .await
+        .expect("run_master --max-active-mb 0 must exit immediately instead of serving");
+        assert_eq!(zero_exit, ExitCode::FAILURE);
+
+        // 2. `run_master` wires `--max-active-mb` into `ServerConfig::with_max_active_bytes`:
+        //    starting `run_master` with `--max-active-mb 1` accepts the first 600 KiB task,
+        //    reports `active_bytes` and `max_active_bytes` in `ClusterStatus`, and refuses
+        //    the second 600 KiB task with `task requires ... bytes`, `bytes in use`,
+        //    `limit 1048576 bytes`, and `--max-active-mb`.
+        let tmp_blob = tempfile::tempdir().unwrap();
+        let probe_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let run_master_addr = probe_listener.local_addr().unwrap();
+        drop(probe_listener);
+        let run_master_addr_str = run_master_addr.to_string();
+        let blob_dir_str = tmp_blob.path().to_str().unwrap().to_string();
+        let cli = Cli::try_parse_from([
+            "oxideswarm",
+            "master",
+            "--listen",
+            &run_master_addr_str,
+            "--web-ui-addr",
+            "127.0.0.1:0",
+            "--max-active-mb",
+            "1",
+            "--blob-dir",
+            &blob_dir_str,
+        ])
+        .unwrap();
+        let Commands::Master(master_args) = cli.command else {
+            panic!("expected Master subcommand");
+        };
+        let master_task = tokio::spawn(run_master(master_args, None, secret_opts));
+
+        let mut connected = None;
+        for _ in 0..50 {
+            if let Ok(t) = connect_master(&run_master_addr_str, Some(&test_secret)).await {
+                connected = Some(t);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut transport = connected.expect("run_master bound and accepted connection");
+        let make_600k_task = |i: u8| {
+            let mut task = Task::new(
+                TaskSpec::Command {
+                    program: "echo".into(),
+                    args: vec![i.to_string()],
+                    env: Default::default(),
+                    working_dir: None,
+                    stdin: Some(vec![i; 600 * 1024]),
+                },
+                TaskRequirements::generic(1, 30),
+            );
+            task.id = rusty_grid_core::task::TaskId::new();
+            task
+        };
+        let first_resp = exchange(
+            &mut transport,
+            &run_master_addr_str,
+            false,
+            &ClientMessage::SubmitTask {
+                task: make_600k_task(1),
+                wait: false,
+            },
+            "submit failed",
+        )
+        .await
+        .expect("first 600 KiB task fits in 1 MiB cap");
+        assert!(matches!(first_resp, ClientResponse::TaskSubmitted { .. }));
+
+        // Verify ClusterStatus includes active_bytes and max_active_bytes.
+        let status_resp = exchange(
+            &mut transport,
+            &run_master_addr_str,
+            false,
+            &ClientMessage::ClusterStatus,
+            "status failed",
+        )
+        .await
+        .expect("cluster status succeeded");
+        match status_resp {
+            ClientResponse::ClusterStatus {
+                active_bytes,
+                max_active_bytes,
+                ..
+            } => {
+                assert!(active_bytes >= 600 * 1024, "active_bytes={active_bytes}");
+                assert_eq!(max_active_bytes, 1024 * 1024);
+            }
+            other => panic!("expected ClusterStatus, got {other:?}"),
+        }
+
+        transport
+            .send_msg(&ClientMessage::SubmitTask {
+                task: make_600k_task(2),
+                wait: false,
+            })
+            .await
+            .unwrap();
+        match transport.recv_msg::<ClientResponse>().await.unwrap() {
+            Some(ClientResponse::Error { message }) => {
+                assert!(
+                    message.contains("task requires"),
+                    "error must state task requires N bytes, got: {message}"
+                );
+                assert!(
+                    message.contains("bytes in use"),
+                    "error must state bytes in use, got: {message}"
+                );
+                assert!(
+                    message.contains("limit 1048576 bytes"),
+                    "run_master --max-active-mb 1 must enforce 1 MiB limit, got: {message}"
+                );
+                assert!(message.contains("--max-active-mb"), "{message}");
+            }
+            other => panic!("expected ClientResponse::Error on second 600 KiB task, got {other:?}"),
+        }
+        master_task.abort();
     }
 }

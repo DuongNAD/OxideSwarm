@@ -649,12 +649,132 @@ fn closed_queue() -> mpsc::Receiver<WorkerMessage> {
     rx
 }
 
+/// Truncates `text` to at most `max_bytes` on a UTF-8 character boundary.
+fn truncate_utf8_prefix(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Rewrites an oversized `TaskResult` into a failed `WorkerMessage::TaskResult` that fits within
+/// `MAX_FRAME_SIZE` by dropping `asset_bytes` first, then `artifacts`, and then `stdout` and
+/// `stderr`, stopping as soon as the serialized frame fits.
+fn rewrite_oversized_task_result(
+    result: TaskResult,
+    size: usize,
+    max: usize,
+    codec: WireCodec,
+    encrypted: bool,
+) -> WorkerMessage {
+    const MAX_PRESERVED_ERROR_BYTES: usize = 4096;
+
+    let exit_code = if result.exit_code != 0 {
+        result.exit_code
+    } else {
+        EXIT_CODE_GENERAL_ERROR
+    };
+    let overhead = if encrypted {
+        rusty_grid_core::protocol::AEAD_RECORD_OVERHEAD
+    } else {
+        0
+    };
+    let fits = |msg: &WorkerMessage| {
+        rusty_grid_core::protocol::serialize_message(msg, codec)
+            .is_ok_and(|bytes| bytes.len().saturating_add(overhead) <= max)
+    };
+
+    let build = |keep_artifacts: bool, keep_streams: bool| -> WorkerMessage {
+        let mut dropped = Vec::new();
+        if result.asset_bytes.is_some() {
+            dropped.push("asset_bytes");
+        }
+        if !keep_artifacts && !result.artifacts.is_empty() {
+            dropped.push("artifacts");
+        }
+        if !keep_streams {
+            if !result.stdout.is_empty() {
+                dropped.push("stdout");
+            }
+            if !result.stderr.is_empty() {
+                dropped.push("stderr");
+            }
+        }
+        if dropped.is_empty() {
+            dropped.push("stdout, stderr");
+        }
+        let reason = format!(
+            "Task result size ({size} bytes) exceeds maximum frame limit ({max} bytes); dropped {}",
+            dropped.join(", ")
+        );
+        let combined_error = match result.error.as_deref().filter(|s| !s.is_empty()) {
+            Some(orig) => {
+                let prefix = truncate_utf8_prefix(orig, MAX_PRESERVED_ERROR_BYTES);
+                format!("{prefix}; {reason}")
+            }
+            None => reason.clone(),
+        };
+        let (stdout, stderr) = if keep_streams {
+            let mut err_bytes = result.stderr.0.to_vec();
+            if !err_bytes.is_empty() && !err_bytes.ends_with(b"\n") {
+                err_bytes.push(b'\n');
+            }
+            err_bytes.extend_from_slice(reason.as_bytes());
+            (
+                result.stdout.clone(),
+                rusty_grid_core::task::Bytes::from(err_bytes),
+            )
+        } else {
+            (
+                rusty_grid_core::task::Bytes::new(),
+                rusty_grid_core::task::Bytes::from(reason),
+            )
+        };
+        let mut candidate = TaskResult::failure(
+            result.worker_id,
+            result.task_id,
+            exit_code,
+            stdout,
+            stderr,
+            result.execution_time_ms,
+            Some(combined_error),
+        );
+        candidate.is_gpu_executed = result.is_gpu_executed;
+        candidate.device_name = result.device_name.clone();
+        if keep_artifacts {
+            candidate.artifacts = result.artifacts.clone();
+        }
+        candidate.outputs = result.outputs.clone();
+        WorkerMessage::from(candidate)
+    };
+
+    if result.asset_bytes.is_some() {
+        let candidate = build(true, true);
+        if fits(&candidate) {
+            return candidate;
+        }
+    }
+    if !result.artifacts.is_empty() {
+        let candidate = build(false, true);
+        if fits(&candidate) {
+            return candidate;
+        }
+    }
+    build(false, false)
+}
+
 /// Writes queued messages to one lane until told to close or until a write fails.
 ///
 /// The control queue (heartbeats, telemetry, the farewell) is always drained before the next data
 /// message (progress, results, checkpoints) is started, so a burst of results can never push a
-/// heartbeat back by more than the one frame already on the wire. A write failure is reported
-/// through `events`. On `closing` the writer first flushes the control queue and then returns.
+/// heartbeat back by more than the one frame already on the wire. An oversized `TaskResult` is
+/// rewritten into a failure that fits (`rewrite_oversized_task_result`) and an oversized
+/// `Checkpoint` is dropped with a warning; any other write failure is reported through `events`.
+/// On `closing` the writer first flushes the control queue and then returns.
 async fn lane_writer<W: AsyncWrite + Unpin>(
     mut writer: MessageWriter<W>,
     mut control_rx: mpsc::Receiver<WorkerMessage>,
@@ -685,6 +805,70 @@ async fn lane_writer<W: AsyncWrite + Unpin>(
             }
         };
         if let Err(e) = writer.send_msg(&msg).await {
+            if let ProtocolError::FrameTooLarge { size, max } = e {
+                match msg {
+                    WorkerMessage::TaskResult {
+                        worker_id,
+                        task_id,
+                        exit_code,
+                        stdout,
+                        stderr,
+                        execution_time_ms,
+                        is_gpu_executed,
+                        device_name,
+                        error,
+                        asset_bytes,
+                        artifacts,
+                        outputs,
+                    } => {
+                        warn!(
+                            %worker_id,
+                            %task_id,
+                            size,
+                            max,
+                            "Task result exceeds maximum frame size; failing only this task"
+                        );
+                        let fallback = rewrite_oversized_task_result(
+                            TaskResult {
+                                worker_id,
+                                task_id,
+                                exit_code,
+                                stdout,
+                                stderr,
+                                execution_time_ms,
+                                is_gpu_executed,
+                                device_name,
+                                error,
+                                asset_bytes,
+                                artifacts,
+                                outputs,
+                            },
+                            size,
+                            max,
+                            writer.codec(),
+                            writer.is_encrypted(),
+                        );
+                        if let Err(fallback_err) = writer.send_msg(&fallback).await {
+                            let _ = events.send(Inbound::Failed(lane, fallback_err)).await;
+                            return;
+                        }
+                        continue;
+                    }
+                    WorkerMessage::Checkpoint {
+                        task_id, sequence, ..
+                    } => {
+                        warn!(
+                            %task_id,
+                            sequence,
+                            size,
+                            max,
+                            "Checkpoint exceeds maximum frame size; dropping oversized checkpoint"
+                        );
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             let _ = events.send(Inbound::Failed(lane, e)).await;
             return;
         }
@@ -814,11 +998,17 @@ impl Drop for Session {
 }
 
 /// What the worker advertises in `WorkerCapabilities::tags`: its system tags (`os:`, `arch:`, see
-/// `rusty_grid_core::placement`), then the configured user tags that are not among them.
-fn advertised_tags(user_tags: &[String]) -> Vec<String> {
+/// `rusty_grid_core::placement`), its effective task concurrency (`slots:<n>`), then the
+/// configured user tags that are not among them.
+fn advertised_tags(user_tags: &[String], slots: usize) -> Vec<String> {
     let mut tags = rusty_grid_core::placement::system_tags();
+    tags.push(format!(
+        "{}{}",
+        rusty_grid_core::placement::SLOTS_TAG_PREFIX,
+        slots.max(1)
+    ));
     for tag in user_tags {
-        if !tags.contains(tag) {
+        if !tags.contains(tag) && !tag.starts_with(rusty_grid_core::placement::SLOTS_TAG_PREFIX) {
             tags.push(tag.clone());
         }
     }
@@ -851,8 +1041,20 @@ impl WorkerClient {
             cuda: config.cuda,
             no_cuda: config.no_cuda,
         };
-        let mut capabilities = WorkerCapabilities::detect_with_overrides(overrides)
-            .with_tags(advertised_tags(&config.tags));
+        let mut capabilities = WorkerCapabilities::detect_with_overrides(overrides);
+        let concurrency_permits = config
+            .max_concurrency
+            .unwrap_or_else(|| {
+                // Cores the owner named (`--cores`) are capacity they chose to offer; only the
+                // detected count gets the headroom.
+                if config.cores.is_some() {
+                    capabilities.cpu_cores
+                } else {
+                    default_max_concurrency(capabilities.cpu_cores)
+                }
+            })
+            .max(1);
+        capabilities = capabilities.with_tags(advertised_tags(&config.tags, concurrency_permits));
         // A real GPU is advertised only if this binary can compute on one (see `gpu`).
         let gpu_request = GpuRequest {
             no_gpu: config.no_gpu,
@@ -909,18 +1111,6 @@ impl WorkerClient {
         }
         let runner = Arc::new(TaskRunner::new(worker_id, capabilities.clone(), runner_cfg));
         let active_task_table = Arc::new(RwLock::new(HashMap::new()));
-        let concurrency_permits = config
-            .max_concurrency
-            .unwrap_or_else(|| {
-                // Cores the owner named (`--cores`) are capacity they chose to offer; only the
-                // detected count gets the headroom.
-                if config.cores.is_some() {
-                    capabilities.cpu_cores
-                } else {
-                    default_max_concurrency(capabilities.cpu_cores)
-                }
-            })
-            .max(1);
         let concurrency_semaphore = Arc::new(Semaphore::new(concurrency_permits));
 
         let initial_beacon = if !config.master_addr.is_empty()
@@ -1501,7 +1691,7 @@ impl WorkerClient {
             drop(_inputs);
             if used_blobs {
                 if let Ok(cache) = runner.blob_cache() {
-                    cache.evict_to_fit();
+                    let _ = tokio::task::spawn_blocking(move || cache.evict_to_fit()).await;
                 }
             }
 
@@ -3518,6 +3708,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_cancel_task_stops_task_waiting_for_a_permit_and_reports_130() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = test_client(dir.path(), 1);
+        let (tx, mut rx) = mpsc::channel(32);
+
+        let running = Task::new(
+            rusty_grid_core::task::TaskSpec::command("sleep", vec!["0.5".into()]),
+            TaskRequirements::generic(1, 60),
+        );
+        let queued = Task::new(
+            rusty_grid_core::task::TaskSpec::command("sleep", vec!["30".into()]),
+            TaskRequirements::generic(1, 60),
+        );
+        let running_id = running.id;
+        let queued_id = queued.id;
+
+        client.handle_assign_task(running, tx.clone()).await;
+        wait_running(&mut rx, running_id).await;
+
+        // Assign second task while the single permit is held by `running`.
+        client.handle_assign_task(queued, tx.clone()).await;
+        assert_eq!(client.active_task_table().read().await.len(), 2);
+
+        // Cancel the permit-waiting task via `handle_cancel_task`.
+        client
+            .handle_cancel_task(queued_id, Some("cancelled while waiting for permit".into()))
+            .await;
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("cancelled permit-waiting task must report promptly")
+            .expect("channel open");
+        match msg {
+            WorkerMessage::TaskResult {
+                task_id,
+                exit_code,
+                error,
+                ..
+            } => {
+                assert_eq!(task_id, queued_id);
+                assert_eq!(exit_code, EXIT_CODE_CANCELLED);
+                assert!(
+                    error.as_deref().unwrap_or("").contains("Cancelled"),
+                    "expected Cancelled error message, got: {error:?}"
+                );
+            }
+            other => panic!("expected TaskResult for cancelled queued task, got {other:?}"),
+        }
+
+        // Wait for `running` to complete naturally, then verify permit is released and a third task runs.
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(WorkerMessage::TaskResult {
+                    task_id, exit_code, ..
+                })) if task_id == running_id => {
+                    assert_eq!(exit_code, 0);
+                    break;
+                }
+                Ok(Some(_)) => {}
+                other => panic!("running task did not finish: {other:?}"),
+            }
+        }
+
+        let follow_up = Task::new(
+            rusty_grid_core::task::TaskSpec::command("echo", vec!["permit_ok".into()]),
+            TaskRequirements::generic(1, 30),
+        );
+        let follow_id = follow_up.id;
+        client.handle_assign_task(follow_up, tx).await;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(WorkerMessage::TaskResult {
+                    task_id,
+                    exit_code,
+                    stdout,
+                    ..
+                })) if task_id == follow_id => {
+                    assert_eq!(exit_code, 0);
+                    assert!(String::from_utf8_lossy(&stdout.0).contains("permit_ok"));
+                    break;
+                }
+                Ok(Some(_)) => {}
+                other => panic!("follow_up task did not finish: {other:?}"),
+            }
+        }
+        assert_eq!(client.concurrency_semaphore().available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn test_a_leftover_sandbox_directory_does_not_fail_the_assignment() {
         let dir = tempfile::tempdir().unwrap();
         let client = test_client(dir.path(), 2);
@@ -3732,6 +4011,512 @@ mod tests {
             .await
             .expect("the writer exits once the control queue is flushed")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_lane_writer_fails_only_oversized_task_result_and_keeps_session_alive() {
+        let mut lane = spawn_lane(64 * 1024);
+        let worker_id = Uuid::new_v4();
+        let oversized_id = TaskId::new();
+        let normal_id = TaskId::new();
+
+        lane.data_tx
+            .send(WorkerMessage::from(TaskResult::success(
+                worker_id,
+                oversized_id,
+                "x".repeat(rusty_grid_core::protocol::MAX_FRAME_SIZE),
+                12,
+                false,
+            )))
+            .await
+            .unwrap();
+        lane.data_tx
+            .send(WorkerMessage::from(TaskResult::success(
+                worker_id, normal_id, "ok", 5, false,
+            )))
+            .await
+            .unwrap();
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            lane.peer.recv_msg::<WorkerMessage>(),
+        )
+        .await
+        .expect("oversized fallback frame in time")
+        .unwrap()
+        .expect("first frame");
+        match first {
+            WorkerMessage::TaskResult {
+                task_id,
+                exit_code,
+                stdout,
+                stderr,
+                error,
+                ..
+            } => {
+                assert_eq!(task_id, oversized_id);
+                assert_ne!(exit_code, 0);
+                assert!(stdout.0.is_empty());
+                let err_text = error.as_deref().unwrap_or_default();
+                let stderr_text = String::from_utf8_lossy(&stderr.0);
+                assert!(
+                    err_text.contains("exceeds") && err_text.contains("dropped stdout"),
+                    "unexpected error: {error:?}"
+                );
+                assert!(
+                    stderr_text.contains("exceeds") && stderr_text.contains("dropped stdout"),
+                    "unexpected stderr: {stderr_text}"
+                );
+            }
+            other => panic!("expected failed TaskResult for oversized task, got {other:?}"),
+        }
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(5),
+            lane.peer.recv_msg::<WorkerMessage>(),
+        )
+        .await
+        .expect("subsequent frame in time")
+        .unwrap()
+        .expect("second frame");
+        match second {
+            WorkerMessage::TaskResult {
+                task_id,
+                exit_code,
+                stdout,
+                ..
+            } => {
+                assert_eq!(task_id, normal_id);
+                assert_eq!(exit_code, 0);
+                assert_eq!(stdout.0.as_ref(), b"ok");
+            }
+            other => panic!("expected normal TaskResult for second task, got {other:?}"),
+        }
+        assert!(
+            lane.events_rx.try_recv().is_err(),
+            "oversized TaskResult must not report a lane failure"
+        );
+        lane.task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_lane_writer_oversized_checkpoint_is_dropped_and_keeps_lane_alive() {
+        let mut lane = spawn_lane(1024 * 1024);
+        let worker_id = Uuid::new_v4();
+        let cp_task_id = TaskId::new();
+        let normal_id = TaskId::new();
+
+        lane.data_tx
+            .send(WorkerMessage::Checkpoint {
+                task_id: cp_task_id,
+                sequence: 7,
+                delta_state: rusty_grid_core::task::Bytes::from(vec![
+                    b'c';
+                    rusty_grid_core::protocol::MAX_FRAME_SIZE
+                ]),
+            })
+            .await
+            .unwrap();
+        lane.data_tx
+            .send(WorkerMessage::from(TaskResult::success(
+                worker_id, normal_id, "after-cp", 3, false,
+            )))
+            .await
+            .unwrap();
+
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            lane.peer.recv_msg::<WorkerMessage>(),
+        )
+        .await
+        .expect("subsequent frame in time after oversized checkpoint")
+        .unwrap()
+        .expect("frame after dropped checkpoint");
+        match next {
+            WorkerMessage::TaskResult {
+                task_id,
+                exit_code,
+                stdout,
+                ..
+            } => {
+                assert_eq!(task_id, normal_id);
+                assert_eq!(exit_code, 0);
+                assert_eq!(stdout.0.as_ref(), b"after-cp");
+            }
+            other => panic!("expected normal TaskResult after dropped checkpoint, got {other:?}"),
+        }
+        assert!(
+            lane.events_rx.try_recv().is_err(),
+            "oversized Checkpoint must not report a lane failure"
+        );
+        lane.task.abort();
+    }
+
+    #[test]
+    fn test_rewrite_oversized_task_result_drops_in_order_and_keeps_what_fits() {
+        let worker_id = Uuid::new_v4();
+        let task_id = TaskId::new();
+        let max = rusty_grid_core::protocol::MAX_FRAME_SIZE;
+        let sample_output = rusty_grid_core::blob::BlobFile {
+            path: "out/report.json".into(),
+            id: rusty_grid_core::blob::BlobId::of(b"report"),
+            size: 6,
+            executable: false,
+        };
+        let sample_artifact =
+            rusty_grid_core::task::OutputArtifact::new("inline.txt", b"small-artifact".to_vec());
+
+        // 1. 70 MiB asset_bytes: drops only asset_bytes, keeping artifacts, stdout, stderr,
+        //    outputs, device_name, non-zero exit_code, and original error text.
+        let mut r1 = TaskResult::failure(
+            worker_id,
+            task_id,
+            7,
+            "engine stdout",
+            "engine stderr",
+            42,
+            Some("ORIGINAL ENGINE ERROR".to_string()),
+        );
+        r1.device_name = Some("long-device-".repeat(30));
+        r1.asset_bytes = Some(rusty_grid_core::task::Bytes::from(vec![
+            0u8;
+            70 * 1024 * 1024
+        ]));
+        r1.artifacts = vec![sample_artifact.clone()];
+        r1.outputs = vec![sample_output.clone()];
+
+        match rewrite_oversized_task_result(
+            r1.clone(),
+            70 * 1024 * 1024 + 500,
+            max,
+            WireCodec::Bincode,
+            false,
+        ) {
+            WorkerMessage::TaskResult {
+                exit_code,
+                stdout,
+                stderr,
+                device_name,
+                error,
+                asset_bytes,
+                artifacts,
+                outputs,
+                ..
+            } => {
+                assert_eq!(exit_code, 7, "non-zero exit code must be kept");
+                assert!(asset_bytes.is_none());
+                assert_eq!(artifacts, vec![sample_artifact]);
+                assert_eq!(outputs, vec![sample_output.clone()]);
+                assert_eq!(device_name, r1.device_name);
+                assert_eq!(stdout.0.as_ref(), b"engine stdout");
+                let stderr_str = String::from_utf8_lossy(&stderr.0);
+                assert!(stderr_str.contains("engine stderr"), "{stderr_str}");
+                assert!(stderr_str.contains("dropped asset_bytes"), "{stderr_str}");
+                let err_str = error.unwrap();
+                assert!(
+                    err_str.contains("ORIGINAL ENGINE ERROR"),
+                    "original error text must be preserved: {err_str}"
+                );
+                assert!(err_str.contains("dropped asset_bytes"), "{err_str}");
+                assert!(!err_str.contains("artifacts"), "{err_str}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // 2. Oversized artifacts (no asset_bytes): drops artifacts, keeping stdout, stderr, outputs.
+        let mut r2 = TaskResult::success(worker_id, task_id, "stdout kept", 10, false);
+        r2.stderr = rusty_grid_core::task::Bytes::from_static(b"stderr kept");
+        r2.artifacts = vec![rusty_grid_core::task::OutputArtifact::new(
+            "huge.bin",
+            vec![0u8; 70 * 1024 * 1024],
+        )];
+        r2.outputs = vec![sample_output];
+
+        match rewrite_oversized_task_result(
+            r2,
+            70 * 1024 * 1024 + 500,
+            max,
+            WireCodec::Bincode,
+            false,
+        ) {
+            WorkerMessage::TaskResult {
+                exit_code,
+                stdout,
+                stderr,
+                error,
+                artifacts,
+                outputs,
+                ..
+            } => {
+                assert_eq!(exit_code, EXIT_CODE_GENERAL_ERROR);
+                assert!(artifacts.is_empty());
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(stdout.0.as_ref(), b"stdout kept");
+                let stderr_str = String::from_utf8_lossy(&stderr.0);
+                assert!(stderr_str.contains("stderr kept"), "{stderr_str}");
+                assert!(stderr_str.contains("dropped artifacts"), "{stderr_str}");
+                assert!(error.unwrap().contains("dropped artifacts"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_lane_writer_accounts_for_full_25_byte_aead_overhead() {
+        use rusty_grid_core::protocol::{
+            serialize_message, AeadReaderSession, AeadWriterSession, AEAD_RECORD_OVERHEAD,
+            MAX_FRAME_SIZE,
+        };
+
+        let key = [0x42u8; 32];
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let mut writer = MessageWriter::new(a);
+        writer.enable_encryption(AeadWriterSession::new(&key));
+        let mut peer = MessageReader::new(b);
+        peer.enable_encryption(AeadReaderSession::new(&key));
+
+        let (_control_tx, control_rx) = mpsc::channel(8);
+        let (data_tx, data_rx) = mpsc::channel(8);
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let (_closing_tx, closing_rx) = watch::channel(false);
+        let lane_task = tokio::spawn(lane_writer(
+            writer, control_rx, data_rx, "enc-test", closing_rx, events_tx,
+        ));
+
+        let worker_id = Uuid::new_v4();
+        let oversized_id = TaskId::new();
+        let normal_id = TaskId::new();
+
+        // Measure the base serialized size of `build(true, true)` with empty stdout and an
+        // 8-digit `size` (matching the ~67_110_000-byte oversized frame) so we can size `stdout`
+        // to place the `build(true, true)` plaintext frame at `MAX_FRAME_SIZE - 20` bytes
+        // (inside the 8-byte window `MAX_FRAME_SIZE - 25 < len <= MAX_FRAME_SIZE - 17`).
+        let mut probe = TaskResult::success(worker_id, oversized_id, "", 5, false);
+        probe.asset_bytes = Some(rusty_grid_core::task::Bytes::from(vec![0u8; 1024]));
+        let base_rewritten = rewrite_oversized_task_result(
+            probe,
+            67_110_000,
+            MAX_FRAME_SIZE,
+            WireCodec::Bincode,
+            false,
+        );
+        let base_len = serialize_message(&base_rewritten, WireCodec::Bincode)
+            .unwrap()
+            .len();
+        let target_plaintext_len = MAX_FRAME_SIZE - 20;
+        assert!(
+            target_plaintext_len + AEAD_RECORD_OVERHEAD > MAX_FRAME_SIZE
+                && target_plaintext_len + 17 <= MAX_FRAME_SIZE
+        );
+        let stdout_len = target_plaintext_len - base_len;
+
+        let mut window_result = TaskResult::success(
+            worker_id,
+            oversized_id,
+            String::from_utf8(vec![b's'; stdout_len]).unwrap(),
+            5,
+            false,
+        );
+        window_result.asset_bytes = Some(rusty_grid_core::task::Bytes::from(vec![0u8; 1024]));
+
+        data_tx
+            .send(WorkerMessage::from(window_result))
+            .await
+            .unwrap();
+        data_tx
+            .send(WorkerMessage::from(TaskResult::success(
+                worker_id,
+                normal_id,
+                "still-alive",
+                2,
+                false,
+            )))
+            .await
+            .unwrap();
+
+        let first = tokio::time::timeout(Duration::from_secs(5), peer.recv_msg::<WorkerMessage>())
+            .await
+            .expect("rewritten frame arrives on encrypted lane")
+            .expect("encrypted frame must not fail AEAD limit")
+            .expect("first message");
+        match first {
+            WorkerMessage::TaskResult {
+                task_id,
+                exit_code,
+                stdout,
+                error,
+                ..
+            } => {
+                assert_eq!(task_id, oversized_id);
+                assert_ne!(exit_code, 0);
+                assert!(
+                    stdout.0.is_empty(),
+                    "frame at MAX_FRAME_SIZE - 20 must drop stdout on an encrypted lane"
+                );
+                let err_str = error.unwrap_or_default();
+                assert!(err_str.contains("dropped asset_bytes, stdout"), "{err_str}");
+            }
+            other => panic!("expected rewritten TaskResult, got {other:?}"),
+        }
+
+        let second = tokio::time::timeout(Duration::from_secs(5), peer.recv_msg::<WorkerMessage>())
+            .await
+            .expect("second frame arrives on encrypted lane")
+            .unwrap()
+            .expect("second message");
+        match second {
+            WorkerMessage::TaskResult {
+                task_id, stdout, ..
+            } => {
+                assert_eq!(task_id, normal_id);
+                assert_eq!(stdout.0.as_ref(), b"still-alive");
+            }
+            other => panic!("expected normal second TaskResult, got {other:?}"),
+        }
+        assert!(
+            events_rx.try_recv().is_err(),
+            "encrypted lane must not emit Inbound::Failed"
+        );
+        lane_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_oversized_task_result_fails_only_its_task_while_other_tasks_on_worker_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client = WorkerClient::new(
+            WorkerConfig::new(addr.to_string())
+                .with_cores(2)
+                .with_sandbox_base_dir(dir.path())
+                .with_redirection_portal(false),
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let worker = tokio::spawn(async move { client.run(stop_rx).await });
+
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("worker connects")
+            .unwrap();
+        let mut master = MessageTransport::new(stream);
+        let Some(WorkerMessage::Register { worker_id, .. }) =
+            master.recv_msg::<WorkerMessage>().await.unwrap()
+        else {
+            panic!("expected Register");
+        };
+        master
+            .send_msg(&MasterMessage::RegisterAck {
+                accepted: true,
+                worker_id,
+                heartbeat_interval_secs: 5,
+                message: None,
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+
+        let oversized_task = Task::new(
+            rusty_grid_core::task::TaskSpec::BuiltinTest {
+                test_name: "oversized_asset".into(),
+                iterations: 1,
+                duration_ms: 20,
+                should_fail: false,
+                require_gpu: false,
+            },
+            TaskRequirements::generic(1, 10),
+        );
+        let oversized_id = oversized_task.id;
+
+        let sibling_task = Task::new(
+            rusty_grid_core::task::TaskSpec::BuiltinTest {
+                test_name: "sleep".into(),
+                iterations: 1,
+                duration_ms: 200,
+                should_fail: false,
+                require_gpu: false,
+            },
+            TaskRequirements::generic(1, 10),
+        );
+        let sibling_id = sibling_task.id;
+
+        master
+            .send_msg(&MasterMessage::AssignTask {
+                task: oversized_task,
+            })
+            .await
+            .unwrap();
+        master
+            .send_msg(&MasterMessage::AssignTask { task: sibling_task })
+            .await
+            .unwrap();
+
+        let mut arrival_order = Vec::new();
+        let mut oversized_outcome = None;
+        let mut sibling_outcome = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while oversized_outcome.is_none() || sibling_outcome.is_none() {
+            match tokio::time::timeout_at(deadline, master.recv_msg::<WorkerMessage>())
+                .await
+                .expect("both tasks finish on the same session")
+                .expect("stream stays open without protocol error")
+            {
+                Some(WorkerMessage::TaskResult {
+                    task_id,
+                    exit_code,
+                    stdout,
+                    stderr,
+                    error,
+                    asset_bytes,
+                    ..
+                }) => {
+                    arrival_order.push(task_id);
+                    if task_id == oversized_id {
+                        oversized_outcome = Some((exit_code, stdout, stderr, error, asset_bytes));
+                    } else if task_id == sibling_id {
+                        sibling_outcome = Some((exit_code, error));
+                    }
+                }
+                Some(_) => {}
+                None => panic!("worker disconnected instead of keeping the session alive"),
+            }
+        }
+
+        assert_eq!(
+            arrival_order,
+            vec![oversized_id, sibling_id],
+            "oversized result must arrive first before the slower sibling task finishes"
+        );
+
+        let (oversized_code, oversized_stdout, oversized_stderr, oversized_err, oversized_asset) =
+            oversized_outcome.unwrap();
+        assert_ne!(oversized_code, 0, "oversized task must fail");
+        assert!(oversized_asset.is_none(), "70 MiB asset must be dropped");
+        assert_eq!(
+            String::from_utf8_lossy(&oversized_stdout.0),
+            "engine stdout line\n",
+            "engine stdout must be preserved when only asset_bytes is dropped"
+        );
+        let stderr_str = String::from_utf8_lossy(&oversized_stderr.0);
+        assert!(
+            stderr_str.contains("engine stderr line") && stderr_str.contains("dropped asset_bytes"),
+            "stderr must contain engine stderr and the drop reason: {stderr_str}"
+        );
+        let err_str = oversized_err.as_deref().unwrap_or_default();
+        assert!(
+            err_str.contains("exceeds") && err_str.contains("dropped asset_bytes"),
+            "unexpected oversized error: {oversized_err:?}"
+        );
+
+        let (sibling_code, sibling_err) = sibling_outcome.unwrap();
+        assert_eq!(
+            sibling_code, 0,
+            "sibling task on the same worker must finish successfully (err: {sibling_err:?})"
+        );
+
+        let _ = stop_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
     }
 
     // ------------------------------------------------------------------------------------------
@@ -4036,9 +4821,11 @@ mod tests {
     fn test_worker_advertises_system_tags_then_user_tags() {
         let client = WorkerClient::new(
             WorkerConfig::new("127.0.0.1:9")
+                .with_max_concurrency(3)
                 .with_tags(vec![
                     "laptop".into(),
                     format!("os:{}", std::env::consts::OS),
+                    "slots:99".into(),
                 ])
                 .with_redirection_portal(false),
         );
@@ -4047,9 +4834,10 @@ mod tests {
             vec![
                 format!("os:{}", std::env::consts::OS),
                 format!("arch:{}", std::env::consts::ARCH),
+                "slots:3".to_string(),
                 "laptop".to_string(),
             ],
-            "system tags first, a user tag equal to one of them is not repeated"
+            "system tags and slots:<n> first, a user tag equal to one of them or starting with slots: is not repeated"
         );
     }
 

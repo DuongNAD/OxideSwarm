@@ -155,6 +155,19 @@ pub enum GridError {
         capacity: usize,
     },
 
+    /// Active task byte budget reached (`--max-active-mb`).
+    #[error(
+        "Task queue active byte limit reached (task requires {task_bytes} bytes, {in_use_bytes} bytes in use, limit {max_bytes} bytes; raise --max-active-mb)"
+    )]
+    QueueByteLimitExceeded {
+        /// Bytes required by the task (or checkpoint update) that was rejected.
+        task_bytes: usize,
+        /// Bytes currently held by active (non-terminal) tasks in the queue.
+        in_use_bytes: usize,
+        /// Maximum active byte budget configured on the queue.
+        max_bytes: usize,
+    },
+
     /// Worker registration rejected by master.
     #[error("Worker registration rejected: {0}")]
     RegistrationRejected(String),
@@ -205,6 +218,7 @@ impl GridError {
             GridError::NoEligibleWorker { .. } => "NO_ELIGIBLE_WORKER",
             GridError::InvalidTaskState { .. } => "INVALID_TASK_STATE",
             GridError::QueueFull { .. } => "QUEUE_FULL",
+            GridError::QueueByteLimitExceeded { .. } => "QUEUE_BYTE_LIMIT_EXCEEDED",
             GridError::RegistrationRejected(_) => "REGISTRATION_REJECTED",
             GridError::AuthRequired(_) => "AUTH_REQUIRED",
             GridError::AuthFailed(_) => "AUTH_FAILED",
@@ -220,7 +234,12 @@ impl GridError {
             GridError::ConnectionFailed(_) => true,
             GridError::Timeout { .. } => true,
             GridError::HeartbeatTimeout { .. } => false,
-            GridError::QueueFull { .. } => true,
+            GridError::QueueFull { capacity } => *capacity > 0,
+            GridError::QueueByteLimitExceeded {
+                task_bytes,
+                max_bytes,
+                ..
+            } => *task_bytes <= *max_bytes && *max_bytes > 0,
             GridError::Io(err) => matches!(
                 err.kind(),
                 io::ErrorKind::ConnectionReset
@@ -345,6 +364,31 @@ mod tests {
 
         let q_full = GridError::QueueFull { capacity: 100 };
         assert!(q_full.is_transient());
+        let q_zero = GridError::QueueFull { capacity: 0 };
+        assert!(!q_zero.is_transient());
+
+        let q_bytes = GridError::QueueByteLimitExceeded {
+            task_bytes: 80_000_000,
+            in_use_bytes: 200_000_000,
+            max_bytes: 268_435_456,
+        };
+        assert!(q_bytes.is_transient());
+        assert_eq!(q_bytes.error_code(), "QUEUE_BYTE_LIMIT_EXCEEDED");
+        let msg = q_bytes.to_string();
+        assert!(msg.contains("task requires 80000000 bytes"), "{msg}");
+        assert!(msg.contains("200000000 bytes in use"), "{msg}");
+        assert!(msg.contains("limit 268435456 bytes"), "{msg}");
+        assert!(msg.contains("--max-active-mb"), "{msg}");
+
+        let q_bytes_too_large = GridError::QueueByteLimitExceeded {
+            task_bytes: 30 * 1024 * 1024,
+            in_use_bytes: 0,
+            max_bytes: 1024 * 1024,
+        };
+        assert!(
+            !q_bytes_too_large.is_transient(),
+            "a task larger than max_bytes can never fit by waiting"
+        );
     }
 
     #[test]
