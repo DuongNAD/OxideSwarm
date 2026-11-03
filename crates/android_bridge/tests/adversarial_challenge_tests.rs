@@ -523,9 +523,10 @@ async fn test_adversarial_worker_connect_via_master_p2p_ticket() {
     );
     assert!(started, "Worker supervisor should spawn");
 
-    // Settle connection (poll up to 5000ms)
+    // Settle connection. The ticket is dialled through iroh's public relays, which can take
+    // several seconds to answer, so poll for up to 30 s.
     let mut connected = false;
-    for _ in 0..100 {
+    for _ in 0..600 {
         if master.list_workers().await.map(|w| w.len()).unwrap_or(0) >= 1 {
             connected = true;
             break;
