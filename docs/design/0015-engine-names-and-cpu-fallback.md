@@ -43,7 +43,7 @@ Behaviour before this change:
 
 ### D1. CPU-Capable Default 3D Execution Semantics
 In `crates/core/src/task.rs` and `crates/cli/src/cli_app.rs`:
-- `Generative3DSpec::new_prompt` and `Generative3DSpec::new_image` initialize `engine_preference: None`, which `Engine3D::default()` and `Generative3DSpec::try_engine()` resolve to `Engine3D::Auto` (mapping to CPU procedural SDF generation).
+- `Generative3DSpec::new_prompt` initializes `engine_preference: None`, which `Engine3D::default()` and `Generative3DSpec::try_engine()` resolve to `Engine3D::Auto` (mapping to CPU procedural SDF generation). `Generative3DSpec::new_image` sets `engine_preference: Some("triposr".to_string())`, so an image task requests TripoSR unless the caller explicitly chooses another engine.
 - `requires_gpu()` returns `false` for `Engine3D::Auto`, `Engine3D::Sdf`, `Engine3D::TripoSr` (CPU mode supported), and `Engine3D::Trellis` (so tasks are not stalled in queue on CPU clusters).
 - In `crates/cli/src/cli_app.rs`, `requirements.gpu_required` is `false` unless explicitly requested via `--gpu` or `--type gpu`.
 - Default 3D tasks are immediately matched and executed by standard CPU workers, producing a valid glTF 2.0 binary asset.
