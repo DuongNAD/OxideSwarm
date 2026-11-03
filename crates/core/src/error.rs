@@ -157,9 +157,11 @@ pub enum GridError {
 
     /// Active task byte budget reached (`--max-active-mb`).
     #[error(
-        "Task queue active byte limit reached ({in_use_bytes} bytes in use, limit {max_bytes} bytes; raise --max-active-mb)"
+        "Task queue active byte limit reached (task requires {task_bytes} bytes, {in_use_bytes} bytes in use, limit {max_bytes} bytes; raise --max-active-mb)"
     )]
     QueueByteLimitExceeded {
+        /// Bytes required by the task (or checkpoint update) that was rejected.
+        task_bytes: usize,
         /// Bytes currently held by active (non-terminal) tasks in the queue.
         in_use_bytes: usize,
         /// Maximum active byte budget configured on the queue.
@@ -232,7 +234,12 @@ impl GridError {
             GridError::ConnectionFailed(_) => true,
             GridError::Timeout { .. } => true,
             GridError::HeartbeatTimeout { .. } => false,
-            GridError::QueueFull { .. } | GridError::QueueByteLimitExceeded { .. } => true,
+            GridError::QueueFull { capacity } => *capacity > 0,
+            GridError::QueueByteLimitExceeded {
+                task_bytes,
+                max_bytes,
+                ..
+            } => *task_bytes <= *max_bytes && *max_bytes > 0,
             GridError::Io(err) => matches!(
                 err.kind(),
                 io::ErrorKind::ConnectionReset
@@ -357,17 +364,31 @@ mod tests {
 
         let q_full = GridError::QueueFull { capacity: 100 };
         assert!(q_full.is_transient());
+        let q_zero = GridError::QueueFull { capacity: 0 };
+        assert!(!q_zero.is_transient());
 
         let q_bytes = GridError::QueueByteLimitExceeded {
+            task_bytes: 80_000_000,
             in_use_bytes: 200_000_000,
             max_bytes: 268_435_456,
         };
         assert!(q_bytes.is_transient());
         assert_eq!(q_bytes.error_code(), "QUEUE_BYTE_LIMIT_EXCEEDED");
         let msg = q_bytes.to_string();
+        assert!(msg.contains("task requires 80000000 bytes"), "{msg}");
         assert!(msg.contains("200000000 bytes in use"), "{msg}");
         assert!(msg.contains("limit 268435456 bytes"), "{msg}");
         assert!(msg.contains("--max-active-mb"), "{msg}");
+
+        let q_bytes_too_large = GridError::QueueByteLimitExceeded {
+            task_bytes: 30 * 1024 * 1024,
+            in_use_bytes: 0,
+            max_bytes: 1024 * 1024,
+        };
+        assert!(
+            !q_bytes_too_large.is_transient(),
+            "a task larger than max_bytes can never fit by waiting"
+        );
     }
 
     #[test]

@@ -2772,6 +2772,8 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     running_tasks: running,
                     completed_tasks: completed,
                     failed_tasks: failed,
+                    active_bytes: stats.active_bytes,
+                    max_active_bytes: stats.max_active_bytes,
                     workers,
                 };
                 transport.send_msg(&resp).await?;
@@ -2792,18 +2794,42 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 let resp = ClientResponse::WorkerList { workers };
                 transport.send_msg(&resp).await?;
             }
-            ClientMessage::SubmitMapReduce { job } => match mapreduce.execute(job).await {
-                Ok(result) => {
-                    let resp = ClientResponse::MapReduceCompleted { result };
-                    transport.send_msg(&resp).await?;
+            ClientMessage::SubmitMapReduce { job } => {
+                let job_id = job.job_id;
+                let mut exec = std::pin::pin!(mapreduce.execute(job));
+                let outcome = loop {
+                    tokio::select! {
+                        res = &mut exec => break Some(res),
+                        peer = transport.recv_msg::<ClientMessage>(), if next_msg.is_none() => {
+                            match peer {
+                                Ok(Some(later)) => {
+                                    next_msg = Some(later);
+                                }
+                                Ok(None) | Err(_) => {
+                                    info!(
+                                        job_id = %job_id,
+                                        "Client disconnected while MapReduce job was in flight; cancelling job"
+                                    );
+                                    break None;
+                                }
+                            }
+                        }
+                    }
+                };
+                match outcome {
+                    Some(Ok(result)) => {
+                        let resp = ClientResponse::MapReduceCompleted { result };
+                        transport.send_msg(&resp).await?;
+                    }
+                    Some(Err(e)) => {
+                        let resp = ClientResponse::Error {
+                            message: e.to_string(),
+                        };
+                        transport.send_msg(&resp).await?;
+                    }
+                    None => break,
                 }
-                Err(e) => {
-                    let resp = ClientResponse::Error {
-                        message: e.to_string(),
-                    };
-                    transport.send_msg(&resp).await?;
-                }
-            },
+            }
             ClientMessage::GetTaskResult { task_id } => {
                 // Non-blocking poll: the retained result of a finished task, its status while it is
                 // still in flight, an error for an id the master does not know (or no longer keeps).
@@ -5274,5 +5300,71 @@ mod tests {
             .await
             .expect("master with larger max_active_bytes must accept the submission");
         let _ = larger_master.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_mapreduce_cancelled_when_client_disconnects() {
+        // Item 4: when a client submitting `SubmitMapReduce` disconnects while partitions are
+        // running or waiting for room in the queue, `handle_client_connection` must cancel the
+        // MapReduce job so running partitions are cancelled and waiting partitions never enter
+        // the queue when room later opens.
+        let master = MasterServer::spawn(
+            ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_active_bytes(2_500),
+        )
+        .await
+        .unwrap();
+
+        let stream = TcpStream::connect(master.server_addr()).await.unwrap();
+        let mut client = MessageTransport::new(stream);
+        let job = rusty_grid_core::mapreduce::MapReduceJobSpec::new(
+            "disconnect_job",
+            vec!["x".repeat(1_200), "y".repeat(1_200), "z".repeat(1_200)],
+            rusty_grid_core::mapreduce::MapFunctionSpec::Builtin {
+                operator: "word_count".into(),
+            },
+            rusty_grid_core::mapreduce::ReduceFunctionSpec::Builtin {
+                operator: "sum".into(),
+            },
+            3,
+            1,
+            30,
+        );
+        client
+            .send_msg(&ClientMessage::SubmitMapReduce { job })
+            .await
+            .unwrap();
+
+        // Wait until at least one partition is queued (and the remaining partitions are waiting
+        // for active-byte room because 3 * ~1_400 bytes > 2_500 bytes).
+        let mut saw_queued = false;
+        for _ in 0..50 {
+            if master.queue().stats().await.queued > 0 {
+                saw_queued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(saw_queued, "at least one map partition should be queued");
+
+        // Disconnect the client while the MapReduce job is in flight.
+        drop(client);
+
+        // Wait briefly for `handle_client_connection` to notice EOF, drop `mapreduce.execute`,
+        // and let `AbandonGuard` cancel the queued partition without queuing the waiting ones.
+        let mut drained = false;
+        for _ in 0..50 {
+            let stats = master.queue().stats().await;
+            if stats.queued == 0 && stats.active_bytes == 0 {
+                drained = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let final_stats = master.queue().stats().await;
+        assert!(
+            drained,
+            "client disconnect must cancel running/queued partitions and queue no waiting ones, got {final_stats:?}"
+        );
+        let _ = master.shutdown();
     }
 }

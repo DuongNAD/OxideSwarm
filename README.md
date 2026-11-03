@@ -373,7 +373,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_MAX_RETRIES` | Master | Secondary alias for default task retry ceiling |
 | `RUSTY_GRID_MAX_RETAINED_TASKS` | Master | Maximum count of finished tasks retained in memory (`--max-retained-tasks`; default 10000) |
 | `RUSTY_GRID_MAX_RETAINED_MB` | Master | Maximum megabytes of finished task payloads and output retained (`--max-retained-mb`; default 256) |
-| `RUSTY_GRID_MAX_ACTIVE_MB` | Master | Maximum megabytes of active (non-terminal) task payloads held in the queue (`--max-active-mb`; default 256) |
+| `RUSTY_GRID_MAX_ACTIVE_MB` | Master & Agent Mesh | Maximum megabytes of active (non-terminal) task payloads held in the queue (`--max-active-mb` on `oxideswarm master` and `agent-mesh hub`; default 256, minimum 1) |
 | `RUSTY_GRID_BLOB_DIR` | Master | Directory of the blob store of task input and output files (`--blob-dir`; default `~/.oxideswarm/blobs`) |
 | `RUSTY_GRID_BLOB_STORE_MB` | Master | Megabytes the blob store holds before evicting least recently used files (`--blob-store-mb`; default 4096) |
 | `RUSTY_GRID_MAPREDUCE_PARALLELISM` | Master | Maximum concurrent in-flight map/reduce chunk tasks |
@@ -511,11 +511,12 @@ python3 scripts/agent_node.py --hub ws://127.0.0.1:8090/ws --id node-android-3 -
 `--grid-master [ADDR]` makes the hub start its own embedded Master Grid coordinator on `ADDR`. It does not connect
 to a master that is already running, so give it a free port. A non-loopback `ADDR` needs a cluster secret
 (`--secret` / `OXIDESWARM_SECRET`, else the default `~/.oxideswarm/cluster.secret`) or an explicit `--insecure`:
-the hub refuses to start an unauthenticated master that the network can reach.
+the hub refuses to start an unauthenticated master that the network can reach. Pass `--max-active-mb <MB>` (or set
+`RUSTY_GRID_MAX_ACTIVE_MB`) to configure the embedded master's active queue byte budget (default 256 MiB, minimum 1 MiB).
 
 ```bash
 # Start the hub with an embedded master on 127.0.0.1:9088 (loopback, so no secret is needed):
-./target/release/agent-mesh hub --listen 127.0.0.1:8090 --grid-master 127.0.0.1:9088
+./target/release/agent-mesh hub --listen 127.0.0.1:8090 --grid-master 127.0.0.1:9088 --max-active-mb 512
 
 # When --grid-master is configured, agent mesh nodes can dispatch compute envelopes:
 # grid_compute, grid_compile, grid_submit, and grid_status execute end-to-end against the grid.
