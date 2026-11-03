@@ -312,6 +312,7 @@ or `~/.oxideswarm/cluster.secret`.
 ./target/release/oxideswarm workers --master 127.0.0.1:8088
 ./target/release/oxideswarm status --master 127.0.0.1:8088 --json
 ./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --mapper word_count --reducer sum
+# `--mapper` / `--reducer` ship local .sh scripts to workers; `--map-cmd` / `--reduce-cmd` run scripts/binaries that are already on every worker
 ./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --mapper ./map.sh --reducer ./reduce.sh
 ./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --map-cmd "python3 /tmp/map.py" --reduce-cmd "python3 /tmp/reduce.py"
 

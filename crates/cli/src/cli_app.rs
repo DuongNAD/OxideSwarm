@@ -2973,26 +2973,37 @@ fn split_command_line(cmd: &str) -> Result<(String, Vec<String>), String> {
     let mut in_single = false;
     let mut in_double = false;
     let mut token_started = false;
-    let mut chars = cmd.chars().peekable();
+    let mut chars = cmd.char_indices().peekable();
 
-    while let Some(ch) = chars.next() {
+    while let Some((_, ch)) = chars.next() {
         match ch {
             '\\' if !in_single => {
-                if !in_double && !token_started && chars.peek() == Some(&'\\') {
-                    chars.next();
-                    current.push_str(r"\\");
-                    token_started = true;
-                    continue;
+                if let Some(&(second_idx, '\\')) = chars.peek() {
+                    let after_pair = &cmd[second_idx + 1..];
+                    let span = if in_double {
+                        after_pair.split('"').next().unwrap_or("")
+                    } else {
+                        after_pair.split_whitespace().next().unwrap_or("")
+                    };
+                    let is_unc_prefix = (current.is_empty() || current.ends_with('='))
+                        && !span.starts_with('\\')
+                        && span.contains('\\');
+                    if is_unc_prefix {
+                        chars.next();
+                        current.push_str(r"\\");
+                        token_started = true;
+                        continue;
+                    }
                 }
                 let should_escape = if in_double {
-                    matches!(chars.peek(), Some('"' | '\\'))
+                    matches!(chars.peek(), Some(&(_, '"' | '\\')))
                 } else {
-                    chars.peek().is_some_and(|next| {
-                        *next == '"' || *next == '\'' || *next == '\\' || next.is_whitespace()
+                    chars.peek().is_some_and(|&(_, next)| {
+                        next == '"' || next == '\'' || next == '\\' || next.is_whitespace()
                     })
                 };
                 if should_escape {
-                    if let Some(escaped_ch) = chars.next() {
+                    if let Some((_, escaped_ch)) = chars.next() {
                         current.push(escaped_ch);
                     }
                 } else {
@@ -4023,10 +4034,24 @@ max_active_mb = 768
         );
         assert!(!reduce_err.contains("--reducer-cmd"), "{reduce_err}");
 
-        // Unquoted UNC paths keep their leading double backslash in both program and argument tokens.
-        let (prog, args) =
-            split_command_line(r"\\srv\share\m.exe \\srv\share\arg.txt --flag").unwrap();
+        // Unquoted, double-quoted, and `--flag=\\...` UNC paths keep their leading double
+        // backslash, while `\\\\` escapes and non-UNC `\\r` escapes keep their traditional meaning.
+        let (prog, args) = split_command_line(
+            r#"\\srv\share\m.exe \\srv\share\arg.txt "\\my srv\share\m.exe" --in=\\srv\share\x"#,
+        )
+        .unwrap();
         assert_eq!(prog, r"\\srv\share\m.exe");
-        assert_eq!(args, vec![r"\\srv\share\arg.txt", "--flag"]);
+        assert_eq!(
+            args,
+            vec![
+                r"\\srv\share\arg.txt",
+                r"\\my srv\share\m.exe",
+                r"--in=\\srv\share\x"
+            ]
+        );
+
+        let (esc_prog, esc_args) = split_command_line(r"\\\\srv\\share\\m.exe tr -d \\r").unwrap();
+        assert_eq!(esc_prog, r"\\srv\share\m.exe");
+        assert_eq!(esc_args, vec!["tr", "-d", r"\r"]);
     }
 }

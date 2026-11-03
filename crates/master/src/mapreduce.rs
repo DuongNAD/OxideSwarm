@@ -278,6 +278,14 @@ impl MapReduceEngine {
                 for (key, values) in grouped {
                     if let Some(reduced) = reduce_builtin(operator, &values)? {
                         final_output.insert(key, reduced);
+                    } else {
+                        warn!(
+                            job_id = %spec.job_id,
+                            key = %key,
+                            operator = %operator,
+                            skipped_values = values.len(),
+                            "Dropping MapReduce key with no usable finite numeric values"
+                        );
                     }
                     reduce_tasks_completed += 1;
                 }
@@ -698,47 +706,60 @@ fn validate_builtin_reducer(operator: &str) -> GridResult<()> {
 /// Applies a built-in reducer to the values of one key.
 /// Returns `Ok(None)` when every value of the key is skipped (no usable finite numeric value
 /// for `"sum"`, `"max"`, or `"min"`), so the key is omitted from the output rather than
-/// reporting a bogus default (`0`, `i64::MIN`, `i64::MAX`, or `null`).
+/// reporting a bogus default (`0`, `i64::MIN`, `i64::MAX`, or `null`). Integer `"sum"`
+/// overflows promote to `f64`, and finite `f64` sums that overflow `f64` saturate to
+/// `f64::MAX` / `f64::MIN` so keys with usable values are always reported.
 fn reduce_builtin(
     operator: &str,
     values: &[serde_json::Value],
 ) -> GridResult<Option<serde_json::Value>> {
     Ok(match operator {
         "sum" => {
-            let mut sum_f = 0.0;
+            let mut sum_f: f64 = 0.0;
             let mut is_float = false;
             let mut sum_i: i64 = 0;
             let mut has_usable = false;
             for val in values {
-                if let Some(n) = val.as_i64() {
-                    sum_i = sum_i.saturating_add(n);
-                    has_usable = true;
-                } else if let Some(f) = val.as_f64().filter(|f| f.is_finite()) {
-                    is_float = true;
-                    sum_f += f;
-                    has_usable = true;
-                } else if let Some(s) = val.as_str() {
-                    if let Ok(n) = s.parse::<i64>() {
-                        sum_i = sum_i.saturating_add(n);
-                        has_usable = true;
-                    } else if let Ok(f) = s.parse::<f64>() {
-                        if f.is_finite() {
-                            is_float = true;
-                            sum_f += f;
-                            has_usable = true;
-                        }
+                let parsed_i = val
+                    .as_i64()
+                    .or_else(|| val.as_str().and_then(|s| s.parse::<i64>().ok()));
+                let parsed_f = if parsed_i.is_none() {
+                    val.as_f64()
+                        .or_else(|| val.as_str().and_then(|s| s.parse::<f64>().ok()))
+                        .filter(|f| f.is_finite())
+                } else {
+                    None
+                };
+                if let Some(n) = parsed_i {
+                    if is_float {
+                        sum_f = (sum_f + n as f64).clamp(f64::MIN, f64::MAX);
+                    } else if let Some(next) = sum_i.checked_add(n) {
+                        sum_i = next;
+                    } else {
+                        is_float = true;
+                        sum_f = (sum_f + (sum_i as f64) + (n as f64)).clamp(f64::MIN, f64::MAX);
+                        sum_i = 0;
                     }
+                    has_usable = true;
+                } else if let Some(f) = parsed_f {
+                    if !is_float {
+                        is_float = true;
+                        sum_f = sum_i as f64;
+                        sum_i = 0;
+                    }
+                    sum_f = (sum_f + f).clamp(f64::MIN, f64::MAX);
+                    has_usable = true;
                 }
             }
             if !has_usable {
+                warn!(
+                    operator = %operator,
+                    skipped_values = values.len(),
+                    "Dropping MapReduce key in reduce_builtin: all values were skipped"
+                );
                 None
             } else if is_float {
-                let total = sum_f + sum_i as f64;
-                if total.is_finite() {
-                    Some(serde_json::json!(total))
-                } else {
-                    None
-                }
+                Some(serde_json::json!(sum_f))
             } else {
                 Some(serde_json::json!(sum_i))
             }
@@ -769,11 +790,19 @@ fn reduce_builtin(
                     }
                 }
             }
-            if is_float {
+            let out = if is_float {
                 max_f.map(|v| serde_json::json!(v))
             } else {
                 max_i.map(|v| serde_json::json!(v))
+            };
+            if out.is_none() {
+                warn!(
+                    operator = %operator,
+                    skipped_values = values.len(),
+                    "Dropping MapReduce key in reduce_builtin: all values were skipped"
+                );
             }
+            out
         }
         "min" => {
             let mut min_i: Option<i64> = None;
@@ -800,11 +829,19 @@ fn reduce_builtin(
                     }
                 }
             }
-            if is_float {
+            let out = if is_float {
                 min_f.map(|v| serde_json::json!(v))
             } else {
                 min_i.map(|v| serde_json::json!(v))
+            };
+            if out.is_none() {
+                warn!(
+                    operator = %operator,
+                    skipped_values = values.len(),
+                    "Dropping MapReduce key in reduce_builtin: all values were skipped"
+                );
             }
+            out
         }
         "concat" => {
             let parts: Vec<String> = values.iter().map(|v| v.to_string()).collect();
@@ -1805,6 +1842,41 @@ mod tests {
         assert_eq!(
             reduce_builtin("min", &with_zero).unwrap(),
             Some(serde_json::json!(0))
+        );
+
+        // Integer sum overflow promotes via `checked_add` to `f64` instead of saturating at `i64::MAX`.
+        let int_overflow = vec![
+            serde_json::json!(i64::MAX),
+            serde_json::json!(i64::MAX.to_string()),
+        ];
+        let int_sum = reduce_builtin("sum", &int_overflow)
+            .unwrap()
+            .expect("overflowing i64 sum must be reported");
+        let int_sum_f = int_sum.as_f64().expect("promoted to f64");
+        assert!(
+            int_sum_f > (i64::MAX as f64) * 1.5,
+            "expected f64 sum > 1.5 * i64::MAX, got {int_sum_f}"
+        );
+        assert_eq!(
+            reduce_builtin("sum", &[serde_json::json!(0.5), serde_json::json!(10)]).unwrap(),
+            Some(serde_json::json!(10.5))
+        );
+        assert_eq!(
+            reduce_builtin("sum", &[serde_json::json!(10), serde_json::json!(0.5)]).unwrap(),
+            Some(serde_json::json!(10.5))
+        );
+
+        // Finite `f64` sum that overflows `f64` saturates to `f64::MAX` / `f64::MIN` rather than
+        // returning `None` or `null`.
+        let float_overflow = vec![serde_json::json!(1e308), serde_json::json!("1e308")];
+        assert_eq!(
+            reduce_builtin("sum", &float_overflow).unwrap(),
+            Some(serde_json::json!(f64::MAX))
+        );
+        let neg_float_overflow = vec![serde_json::json!(-1e308), serde_json::json!("-1e308")];
+        assert_eq!(
+            reduce_builtin("sum", &neg_float_overflow).unwrap(),
+            Some(serde_json::json!(f64::MIN))
         );
     }
 }

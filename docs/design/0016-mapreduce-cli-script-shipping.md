@@ -41,12 +41,13 @@ Fixes `oxideswarm mapreduce` (`MR-1`) so that local file paths passed to `--mapp
 ### 2. `--map-cmd` and `--reduce-cmd` (`crates/cli/src/cli_app.rs`)
 
 - Adds `--map-cmd <CMD>` (mutually exclusive with `--mapper`) and `--reduce-cmd <CMD>` (mutually exclusive with `--reducer`) to `MapReduceArgs`.
-- `split_command_line` splits the command string into `(program, args)` honouring single and double quotes. Outside single quotes, a backslash `\` acts as an escape only before `"`, `'`, `\`, or (when unquoted) whitespace; ordinary unquoted Windows path backslashes (e.g. `C:\Tools\mapper.exe --flag`) and a leading double backslash (`\\server\share\mapper.exe` UNC path) on an unquoted token are preserved literally.
+- `split_command_line` splits the command string into `(program, args)` honouring single and double quotes. Outside single quotes, a backslash `\` acts as an escape only before `"`, `'`, `\`, or (when unquoted) whitespace; ordinary Windows path backslashes (e.g. `C:\Tools\mapper.exe --flag`) and UNC path prefixes (`\\<server>\<share>...` at the start of an unquoted token, at the start of a double-quoted token `"\\srv\my share\m.exe"`, or after `=` in `--in=\\srv\share\x`) are preserved literally, while explicit four-backslash escapes (`\\\\srv\\share\\m.exe`) and non-UNC backslash escapes (`tr -d \\r` -> `\r`) keep their standard escape meaning.
 
 ### 3. Finite Floating-Point Support in Built-in Reducers (`crates/master/src/mapreduce.rs`)
 
 - `reduce_builtin` for `"sum"`, `"max"`, and `"min"` accepts integer (`i64`), finite floating-point (`f64`), and numeric string values (`s.parse::<i64>()` / `s.parse::<f64>()` with `f.is_finite()`).
-- Non-finite floating-point values (`inf`, `-inf`, `NaN`, `1e999`) and non-numeric strings (`abc`) are ignored so `serde_json::json!` never serializes a `null` output for a completed key. When every value of a key is skipped (so the key has no usable finite numeric value), `reduce_builtin` returns `Ok(None)` and the key is left out of `MapReduceResult::output` rather than reporting `0`, `i64::MIN`, `i64::MAX`, or `null`.
+- In `"sum"`, integer addition uses `i64::checked_add` and promotes to `f64` on overflow rather than saturating at `i64::MAX`, and finite `f64` sums that overflow `f64` (`1e308 + 1e308`) saturate to `f64::MAX` / `f64::MIN` so keys with usable values are always reported as finite JSON numbers.
+- Non-finite floating-point inputs (`inf`, `-inf`, `NaN`, `1e999`) and non-numeric strings (`abc`) are ignored so `serde_json::json!` never serializes a `null` output for a completed key. When every value of a key is skipped (so the key has no usable finite numeric value), `reduce_builtin` returns `Ok(None)`, logs a warning, and omits the key from `MapReduceResult::output` rather than reporting `0`, `i64::MIN`, `i64::MAX`, or `null`.
 
 ### 4. Missing-`sh` Diagnostic and Worker Placement (`crates/master/src/mapreduce.rs`)
 
@@ -71,6 +72,8 @@ Fixes `oxideswarm mapreduce` (`MR-1`) so that local file paths passed to `--mapp
   - `test_cli_mapreduce_ships_local_mapper_and_reducer_scripts` (local `./local.sh` and `./sum.sh` shipped from a separate client directory; planted `word_count` and `sum` in cwd ignored by default flags; oversized `> 64 KiB` script rejected with size error)
   - `test_cli_mapreduce_map_cmd_and_reduce_cmd_and_float_max_min` (`--map-cmd`, `--reduce-cmd`, float and string-float `max`/`min`, `inf`/`NaN` skipped without `null`, Windows backslash path preserved in `--map-cmd`)
   - `test_mapreduce_missing_sh_returns_clear_error` (missing-`sh` hint on `Builtin` map and `ShellScript` reduce; no hint on `Command` map or `E2BIG` spawn failure)
+- `cargo test -p rusty_grid_master --lib mapreduce::tests::test_builtin_reducer_omits_keys_whose_values_are_all_skipped` (omits all-skipped keys, preserves keys with `0`, promotes `i64` sum overflow via `checked_add` to `f64`, and saturates finite `f64` sum overflow to `f64::MAX` / `f64::MIN`)
+- `cargo test -p rusty_grid_cli --lib cli_app::tests::test_read_mapreduce_script_names_map_cmd_and_reduce_cmd_flags_and_split_unc_paths` (`--map-cmd` / `--reduce-cmd` named in script size errors; unquoted, double-quoted, and `--in=\\...` UNC paths preserved alongside `\\\\` and `\\r` escapes)
 - `cargo test -p rusty_grid_cli --test cli_dashboard_policy_e2e` (`test_mapreduce_exits_non_zero_when_the_job_fails`)
 
 ## Work items
