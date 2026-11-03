@@ -28,6 +28,7 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -70,12 +71,30 @@ def _find_binary() -> str:
     raise FileNotFoundError(f"agent-mesh binary not found in {target_dir}/debug")
 
 
-def _drain_stream(stream):
-    try:
-        for _ in stream:
+def _wait_for_hub_url(proc: subprocess.Popen, timeout_s: float = 15.0) -> str:
+    url_queue: queue.Queue = queue.Queue()
+
+    def _reader():
+        try:
+            for line in proc.stdout:
+                if "running at " in line:
+                    url_queue.put(line.split("running at ", 1)[1].strip())
+                    break
+            for _ in proc.stdout:
+                pass
+        except Exception:
             pass
-    except Exception:
-        pass
+        finally:
+            url_queue.put(None)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    try:
+        hub_url = url_queue.get(timeout=timeout_s)
+    except queue.Empty as exc:
+        raise TimeoutError(f"Rust Hub failed to report its bound address within {timeout_s}s") from exc
+    if not hub_url:
+        raise RuntimeError("Rust Hub exited before reporting its bound address")
+    return hub_url
 
 
 async def run_cross_interop_tests():
@@ -94,17 +113,7 @@ async def run_cross_interop_tests():
     )
 
     try:
-        hub_ws_url = None
-        deadline = time.time() + 15.0
-        while time.time() < deadline:
-            line = proc.stdout.readline()
-            if not line:
-                break
-            if "running at " in line:
-                hub_ws_url = line.split("running at ", 1)[1].strip()
-                break
-        assert hub_ws_url is not None, "Rust Hub failed to report its bound address"
-        threading.Thread(target=_drain_stream, args=(proc.stdout,), daemon=True).start()
+        hub_ws_url = _wait_for_hub_url(proc, timeout_s=15.0)
         hub_http_url = "http://" + hub_ws_url.split("://", 1)[1].rsplit("/ws", 1)[0]
 
         # Wait for hub to become healthy
@@ -208,11 +217,16 @@ async def run_cross_interop_tests():
 
 
 async def run_all_rust_hub_python_suites() -> bool:
-    assert await run_cross_interop_tests()
-    assert await run_token_auth_tests()
-    assert await run_adversarial_stress_tests()
-    assert await run_rapid_disconnect_stress()
-    assert await run_m5_ecosystem_stress_tests()
+    suites = [
+        ("run_cross_interop_tests", run_cross_interop_tests),
+        ("run_token_auth_tests", run_token_auth_tests),
+        ("run_adversarial_stress_tests", run_adversarial_stress_tests),
+        ("run_rapid_disconnect_stress", run_rapid_disconnect_stress),
+        ("run_m5_ecosystem_stress_tests", run_m5_ecosystem_stress_tests),
+    ]
+    for name, suite in suites:
+        if not await suite():
+            raise RuntimeError(f"Suite {name} returned False")
     logger.info("==================================================================")
     logger.info("  ALL 5 RUST HUB + PYTHON AGENT INTEROP SUITES PASSED (100%)      ")
     logger.info("==================================================================")

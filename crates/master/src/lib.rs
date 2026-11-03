@@ -32,7 +32,9 @@ pub use queue::{
     DEFAULT_MAX_TERMINAL_TASKS,
 };
 pub use reaper::{spawn_reaper, spawn_reaper_with_queue, ReaperConfig};
-pub use registry::{HeartbeatOutcome, Registration, WorkerEntry, WorkerInfo, WorkerStatus};
+pub use registry::{
+    HeartbeatOutcome, Registration, WorkerEntry, WorkerInfo, WorkerRegistry, WorkerStatus,
+};
 pub use scheduler::{
     ScheduleAssignment, ScheduleReport, ScheduleSkipReason, SchedulerConfig, SchedulingPolicy,
     WorkloadScheduler,
@@ -130,8 +132,66 @@ path = "../../tests/registered_e2e.rs"
         assert_eq!(orphans, vec!["orphan_e2e.rs".to_string()]);
     }
 
+    fn strip_comments_and_docstrings(src: &str) -> String {
+        let mut without_docstrings = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(start) = rest.find("\"\"\"") {
+            without_docstrings.push_str(&rest[..start]);
+            let after_open = &rest[start + 3..];
+            if let Some(end) = after_open.find("\"\"\"") {
+                rest = &after_open[end + 3..];
+            } else {
+                rest = "";
+                break;
+            }
+        }
+        without_docstrings.push_str(rest);
+
+        let mut out = String::with_capacity(without_docstrings.len());
+        for line in without_docstrings.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') || trimmed.starts_with("//") {
+                continue;
+            }
+            let code_part = line
+                .split_once(" #")
+                .map(|(code, _)| code)
+                .or_else(|| line.split_once(" //").map(|(code, _)| code))
+                .unwrap_or(line);
+            out.push_str(code_part);
+            out.push('\n');
+        }
+        out
+    }
+
+    fn tracked_tests_filenames(workspace_root: &Path) -> Option<BTreeSet<String>> {
+        if !workspace_root.join(".git").exists() {
+            return None;
+        }
+        let output = std::process::Command::new("git")
+            .args(["ls-files", "tests"])
+            .current_dir(workspace_root)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        let mut names = BTreeSet::new();
+        for line in stdout.lines() {
+            let path = Path::new(line.trim());
+            if path.parent() == Some(Path::new("tests")) {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+        Some(names)
+    }
+
     fn find_orphan_non_rust_tests(workspace_root: &Path) -> Vec<String> {
         let tests_dir = workspace_root.join("tests");
+        let tracked = tracked_tests_filenames(workspace_root);
         let mut non_rust_files = BTreeSet::new();
         for entry in std::fs::read_dir(&tests_dir).expect("read workspace tests/ directory") {
             let entry = entry.expect("dir entry");
@@ -140,19 +200,24 @@ path = "../../tests/registered_e2e.rs"
                 continue;
             }
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext == "rs" || ext == "pyc" {
+            if !matches!(ext, "py" | "sh" | "ps1" | "cmd" | "vbs") {
                 continue;
             }
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if !name.starts_with('.') {
-                    non_rust_files.insert(name.to_string());
+                if name.starts_with('.') {
+                    continue;
                 }
+                if let Some(ref tracked_set) = tracked {
+                    if !tracked_set.contains(name) {
+                        continue;
+                    }
+                }
+                non_rust_files.insert(name.to_string());
             }
         }
 
         const RUNNER_FILES: &[(&str, Option<&str>)] = &[
             (".github/workflows/ci.yml", None),
-            ("README.md", None),
             (
                 "tests/run_mesh_simulation_tests.py",
                 Some("run_mesh_simulation_tests.py"),
@@ -170,9 +235,10 @@ path = "../../tests/registered_e2e.rs"
         let mut referenced = BTreeSet::new();
         for (rel_path, self_name) in RUNNER_FILES {
             let full_path = workspace_root.join(rel_path);
-            let Ok(content) = std::fs::read_to_string(&full_path) else {
+            let Ok(raw_content) = std::fs::read_to_string(&full_path) else {
                 continue;
             };
+            let content = strip_comments_and_docstrings(&raw_content);
             for candidate in &non_rust_files {
                 if *self_name == Some(candidate.as_str()) {
                     continue;
@@ -216,12 +282,12 @@ path = "../../tests/registered_e2e.rs"
 
         std::fs::write(
             workflows_dir.join("ci.yml"),
-            "steps:\n  - run: python tests/run_mesh_simulation_tests.py\n",
+            "steps:\n  # comment mentioning verify_p2p_persistence.sh\n  - run: python tests/run_mesh_simulation_tests.py\n",
         )
         .unwrap();
         std::fs::write(
             tests_dir.join("run_mesh_simulation_tests.py"),
-            "from test_agent_mesh_simulation import run_simulation_tests\n",
+            "\"\"\"Docstring mentioning test_m7_empirical_challenge.py\"\"\"\nfrom test_agent_mesh_simulation import run_simulation_tests\n",
         )
         .unwrap();
         std::fs::write(
@@ -239,6 +305,7 @@ path = "../../tests/registered_e2e.rs"
             "#!/usr/bin/env bash\n",
         )
         .unwrap();
+        std::fs::write(tests_dir.join("m7_challenger_2_results.json"), "{}\n").unwrap();
 
         let orphans = find_orphan_non_rust_tests(tmp.path());
         assert_eq!(

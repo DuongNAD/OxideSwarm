@@ -74,9 +74,17 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - run: pip install websockets
       - run: cargo test --workspace --lib --locked
       - name: run agent mesh integration tests
         run: cargo test -p agent_mesh --test test_sec6_mesh_sandbox --locked
+      - name: build agent mesh hub binary for Python interop suites
+        run: cargo build -p agent_mesh --locked
+      - name: run Rust hub + Python agent interop suites
+        run: python tests/test_agent_mesh_rust_hub_cross_interop.py
 
   sec5-hardened-runner:
     name: sec5 hardened runner (${{ matrix.os }})
@@ -110,6 +118,8 @@ jobs:
           python-version: "3.x"
       - run: pip install websockets
       - run: python tests/test_agent_bridge.py
+      - run: python tests/test_launcher_scripts.py
+      - run: python tests/test_m1_challenger_hygiene.py
       - name: run agent mesh test suite
         run: python tests/run_mesh_simulation_tests.py
 

@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -54,12 +55,30 @@ def _find_binary() -> str:
     raise FileNotFoundError("agent-mesh binary not found; build target/debug first")
 
 
-def _drain_stream(stream):
-    try:
-        for _ in stream:
+def _wait_for_hub_url(proc: subprocess.Popen, timeout_s: float = 15.0) -> str:
+    url_queue: queue.Queue = queue.Queue()
+
+    def _reader():
+        try:
+            for line in proc.stdout:
+                if "running at " in line:
+                    url_queue.put(line.split("running at ", 1)[1].strip())
+                    break
+            for _ in proc.stdout:
+                pass
+        except Exception:
             pass
-    except Exception:
-        pass
+        finally:
+            url_queue.put(None)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    try:
+        hub_url = url_queue.get(timeout=timeout_s)
+    except queue.Empty as exc:
+        raise TimeoutError(f"Rust Hub failed to report its bound address within {timeout_s}s") from exc
+    if not hub_url:
+        raise RuntimeError("Rust Hub exited before reporting its bound address")
+    return hub_url
 
 
 # =========================================================================
@@ -79,17 +98,7 @@ async def test_unattached_hub_rejections():
     )
 
     try:
-        hub_url = None
-        deadline = time.time() + 15.0
-        while time.time() < deadline:
-            line = proc.stdout.readline()
-            if not line:
-                break
-            if "running at " in line:
-                hub_url = line.split("running at ", 1)[1].strip()
-                break
-        assert hub_url is not None, "Rust Hub failed to report its bound address"
-        threading.Thread(target=_drain_stream, args=(proc.stdout,), daemon=True).start()
+        hub_url = _wait_for_hub_url(proc, timeout_s=15.0)
         http_base = "http://" + hub_url.split("://", 1)[1].rsplit("/ws", 1)[0]
         health_url = f"{http_base}/api/health"
 
@@ -399,10 +408,13 @@ async def test_abrupt_socket_disconnection():
 
     try:
         # Node sends command; connection will be dropped mid-flight
+        caught = None
         try:
             await node.submit_grid_compute("matrix_multiply", matrix_dim=64, timeout_s=2.0)
-        except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError) as e:
+        except (websockets.exceptions.ConnectionClosed, ConnectionError) as e:
+            caught = e
             logger.info(f"✓ Caught expected exception on socket drop: {type(e).__name__}")
+        assert caught is not None, "Expected ConnectionClosed or ConnectionError on socket drop"
 
         # The listen task should exit cleanly on connection close without unhandled panic
         await asyncio.sleep(0.2)
