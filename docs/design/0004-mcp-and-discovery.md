@@ -8,7 +8,7 @@ Created: 2026-10-23    Updated: 2026-11-01
 Integrate AI agent tooling and cross-subnet coordinator discovery:
 
 - run a Model Context Protocol (MCP) server over JSON-RPC 2.0 stdio (`oxideswarm mcp`) compliant with specification `2024-11-05`;
-- expose five core tools: `status`, `workers`, `submit`, `task_result`, and `doctor`;
+- expose six core tools: `status`, `workers`, `submit`, `task_result`, `cancel`, and `doctor`;
 - enforce strict stdout hygiene by redirecting all tracing and logging exclusively to `stderr`;
 - provide authenticated HTTP discovery probing (`GET /api/discovery/probe?nonce=<hex>`) with HMAC-SHA256 nonce verification;
 - coordinate across isolated subnets via a signed rendezvous registry (`OXIDESWARM_RENDEZVOUS` / `--rendezvous`).
@@ -27,7 +27,7 @@ Behaviour before this change:
 ## Goals
 
 - **G1** Run an MCP server over standard input and output conforming to specification version `2024-11-05`.
-- **G2** Expose five cluster orchestration tools (`status`, `workers`, `submit`, `task_result`, `doctor`) with JSON schemas and structured outputs.
+- **G2** Expose six cluster orchestration tools (`status`, `workers`, `submit`, `task_result`, `cancel`, `doctor`) with JSON schemas and structured outputs.
 - **G3** Guarantee that all non-JSON tracing, logging, and diagnostics write strictly to standard error (`stderr`), keeping `stdout` reserved for protocol frames.
 - **G4** Authenticate cross-subnet discovery over HTTP using fresh random nonces and HMAC-SHA256 signatures derived from the shared cluster secret.
 - **G5** Register and query master lease records from a centralized rendezvous registry service when candidate hosts are unknown.
@@ -53,24 +53,25 @@ Supported lifecycle endpoints:
 - `initialize`: Returns protocol version (`2024-11-05`), server capabilities (`tools: {}`), and server info (`name: "oxideswarm-mcp"`, `version: "0.1.0"`).
 - `notifications/initialized`: Confirms client initialization.
 - `ping`: Liveness check responding with `{}`.
-- `tools/list`: Returns JSON schemas for all five tools.
+- `tools/list`: Returns JSON schemas for all six tools.
 - `tools/call`: Executes the requested tool against the master cluster.
 
 Connection resilience: `McpState` reuses `crates/cli/src/connect.rs::connect_master` with lazy connection caching and transparent reconnection if the socket drops.
 
-Configuration resolution: `oxideswarm mcp` takes `master`, `secret` / `secret_file` (falling back to top-level keys), and `insecure` from the `[status]` section of the configuration file for all its tools (`status`, `workers`, `submit`, `task_result`, and `doctor`). Unlike other CLI subcommands, `mcp` loads its configuration file from `--config`, then `RUSTY_GRID_CONFIG`, then `~/.oxideswarm/rusty-grid.toml`, skipping `./rusty-grid.toml` and `./rusty-grid.json` in the working directory and printing a one-line notice on `stderr` when one is skipped.
+Configuration resolution: `oxideswarm mcp` takes `master`, `secret` / `secret_file` (falling back to top-level keys), and `insecure` from the `[status]` section of the configuration file for all its tools (`status`, `workers`, `submit`, `task_result`, `cancel`, and `doctor`). Unlike other CLI subcommands, `mcp` loads its configuration file from `--config`, then `RUSTY_GRID_CONFIG`, then `~/.oxideswarm/rusty-grid.toml`, skipping `./rusty-grid.toml` and `./rusty-grid.json` in the working directory and printing a one-line notice on `stderr` when one is skipped.
 
 Implemented in `crates/cli/src/mcp.rs` and `crates/cli/src/config.rs`.
 
-### D2 Five core tools
+### D2 Six core tools
 
 | Tool | Parameters | Functionality |
 |---|---|---|
-| `status` | `task_id` (optional string) | Returns overall cluster status, active task counts, and worker counts, or execution state of a specific task. |
+| `status` | `task_id` (optional string), `workers` (optional bool) | Returns overall cluster status, active task counts, and worker counts, or execution state of a specific task. |
 | `workers` | `connected_only`, `os`, `arch`, `gpu_only` | Lists registered compute workers, hardware capabilities, and tags matching the given filters. |
-| `submit` | `task_type`, `command`, `args`, `script`, `interpreter`, `stdin`, `env`, `os`, `arch`, `worker`, `require_tags`, `gpu`, `matrix_dim`, `staged_files`, `wait`, `timeout_secs` | Submits a computation task to the grid with optional file staging and placement constraints. |
-| `task_result` | `task_id`, `wait`, `timeout_secs` | Retrieves execution outcome, exit code, stdout, stderr, execution duration, and output artifacts. |
-| `doctor` | `expect_workers`, `probe_timeout_secs`, `gpu_dim`, `spread_tasks`, `skip_gpu`, `skip_spread` | Runs cluster diagnostic checks C1–C6 and returns complete health check results. |
+| `submit` | `type`, `command`, `args`, `script`, `interpreter`, `stdin`, `env`, `os`, `arch`, `worker`, `require_tags`, `gpu`, `matrix_dim`, `files`, `outputs`, `wait`, `timeout_secs`, `wait_secs`, `max_retries` | Submits a computation task to the grid with optional file staging, placement constraints, and client wait deadline (`wait_secs`). |
+| `task_result` | `task_id`, `wait`, `timeout_secs`, `wait_secs` | Retrieves execution outcome, exit code, stdout, stderr, execution duration, and output artifacts. |
+| `cancel` | `task_id` | Cancels a queued or running task on the master by UUID. |
+| `doctor` | `expect_workers`, `timeout_secs`, `gpu_dim`, `spread_tasks`, `skip_gpu`, `skip_spread` | Runs cluster diagnostic checks C1–C6 and returns complete health check results. |
 
 Implemented in `crates/cli/src/mcp.rs`.
 
