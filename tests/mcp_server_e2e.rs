@@ -824,6 +824,39 @@ insecure = true
         !stderr_ox_cwd.contains("Skipping config file"),
         "must not print skip notice when ./rusty-grid.toml is the ~/.oxideswarm/rusty-grid.toml loaded next, got: {stderr_ox_cwd}"
     );
+
+    // 6. When the working directory is `~/.oxideswarm` and ALSO holds `./rusty-grid.json`,
+    // `mcp` loads `rusty-grid.toml` without a skip notice for the `.toml`, and still prints the
+    // skip notice for `./rusty-grid.json`.
+    let ox_json = ox_dir.join("rusty-grid.json");
+    std::fs::write(
+        &ox_json,
+        r#"{"status": {"master": "192.0.2.99:8088", "insecure": true}}"#,
+    )
+    .expect("write ~/.oxideswarm/rusty-grid.json");
+
+    let child_in_ox_dir_with_json = mcp_command(home.path())
+        .current_dir(&ox_dir)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp with cwd = ~/.oxideswarm containing both toml and json");
+
+    let (stdout_ox_both, stderr_ox_both) = run_mcp_initialize_and_exit(child_in_ox_dir_with_json);
+    assert!(
+        stdout_ox_both.contains("\"protocolVersion\":\"2024-11-05\""),
+        "expected initialize response on stdout, got: {stdout_ox_both}"
+    );
+    assert!(
+        stderr_ox_both.contains("Skipping config file ./rusty-grid.json in the working directory"),
+        "expected skip notice for ./rusty-grid.json when ./rusty-grid.toml is the loaded user config, got: {stderr_ox_both}"
+    );
+    assert!(
+        !stderr_ox_both.contains("Skipping config file ./rusty-grid.toml"),
+        "must not print skip notice for ./rusty-grid.toml, got: {stderr_ox_both}"
+    );
 }
 
 #[test]

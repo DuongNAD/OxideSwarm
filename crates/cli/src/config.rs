@@ -287,11 +287,12 @@ fn load_config_file_with_options(
                     let same_as_loaded = user_config
                         .as_deref()
                         .is_some_and(|loaded| is_same_file(candidate_path, loaded));
-                    if !same_as_loaded {
-                        eprintln!(
-                            "[mcp] Skipping config file ./{candidate} in the working directory (pass --config or RUSTY_GRID_CONFIG to load it)."
-                        );
+                    if same_as_loaded {
+                        continue;
                     }
+                    eprintln!(
+                        "[mcp] Skipping config file ./{candidate} in the working directory (pass --config or RUSTY_GRID_CONFIG to load it)."
+                    );
                     break;
                 }
             }

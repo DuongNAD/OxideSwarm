@@ -1944,7 +1944,8 @@ impl TaskRunner {
         }
 
         // 2. If explicit SDF requested, execute Tier 0 directly in-process (< 50ms)
-        if engine == Engine3D::Sdf {
+        // 3D-1 / D3: auto always runs the SDF tier
+        if engine == Engine3D::Sdf || engine == Engine3D::Auto {
             info!(task_id = %task.id, "Executing Tier 0 Procedural SDF engine");
             return self
                 .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
@@ -1956,22 +1957,20 @@ impl TaskRunner {
         let script = crate::gen3d::runner::resolve_entrypoint_script();
 
         if py_bin.is_none() || script.is_none() {
-            if engine == Engine3D::Auto {
-                info!(task_id = %task.id, "Local Python 3D engine not found; degrading gracefully to Tier 0 SDF");
-                return self
-                    .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
-                    .await;
-            } else {
-                return TaskResult::failure(
-                    self.worker_id,
-                    task.id,
-                    EXIT_CODE_GENERAL_ERROR,
-                    Bytes::new(),
-                    Bytes::from_static(b"TripoSR model not available: missing Python or engines/generative_3d/entrypoint.py"),
-                    start_time.elapsed().as_millis() as u64,
-                    Some("TripoSR model not available: missing Python or engines/generative_3d/entrypoint.py".to_string()),
-                );
-            }
+            return TaskResult::failure(
+                self.worker_id,
+                task.id,
+                EXIT_CODE_GENERAL_ERROR,
+                Bytes::new(),
+                Bytes::from_static(
+                    b"TripoSR model not available: missing Python or engines/generative_3d/entrypoint.py",
+                ),
+                start_time.elapsed().as_millis() as u64,
+                Some(
+                    "TripoSR model not available: missing Python or engines/generative_3d/entrypoint.py"
+                        .to_string(),
+                ),
+            );
         }
 
         let py_bin = py_bin.unwrap();
@@ -2101,12 +2100,17 @@ impl TaskRunner {
             match read_output_file(&output_glb_path).await {
                 Ok(Some(data)) => {
                     if data.len() >= 12 && data.starts_with(b"glTF") {
+                        let stdout_str = String::from_utf8_lossy(res.stdout.as_slice());
+                        let mut engine_label = None;
+                        for line in stdout_str.lines() {
+                            if let Some(label) = crate::gen3d::runner::parse_engine_marker(line) {
+                                engine_label = Some(label);
+                            }
+                        }
                         res.asset_bytes = Some(Bytes::from(data));
-                        res = res.with_device_name(if self.capabilities.has_cuda {
-                            "TripoSR-CUDA"
-                        } else {
-                            "TripoSR-CPU"
-                        });
+                        if let Some(device) = engine_label {
+                            res = res.with_device_name(device);
+                        }
                         res.is_gpu_executed = self.capabilities.has_cuda;
                     } else {
                         let _ = sandbox.destroy().await;
@@ -2122,30 +2126,19 @@ impl TaskRunner {
                     }
                 }
                 Ok(None) => {
-                    if engine == Engine3D::Auto {
-                        warn!(
-                            task_id = %task.id,
-                            "Subprocess exited 0 but output_model.glb missing; falling back to Tier 0 SDF"
-                        );
-                        let _ = sandbox.destroy().await;
-                        return self
-                            .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
-                            .await;
-                    } else {
-                        let _ = sandbox.destroy().await;
-                        return TaskResult::failure(
-                            self.worker_id,
-                            task.id,
-                            EXIT_CODE_GENERAL_ERROR,
-                            res.stdout,
-                            res.stderr,
-                            start_time.elapsed().as_millis() as u64,
-                            Some(format!(
-                                "Process succeeded but expected output file '{}' was not produced",
-                                output_glb_path.display()
-                            )),
-                        );
-                    }
+                    let _ = sandbox.destroy().await;
+                    return TaskResult::failure(
+                        self.worker_id,
+                        task.id,
+                        EXIT_CODE_GENERAL_ERROR,
+                        res.stdout,
+                        res.stderr,
+                        start_time.elapsed().as_millis() as u64,
+                        Some(format!(
+                            "Process succeeded but expected output file '{}' was not produced",
+                            output_glb_path.display()
+                        )),
+                    );
                 }
                 Err(e) => {
                     let _ = sandbox.destroy().await;
@@ -2160,17 +2153,24 @@ impl TaskRunner {
                     );
                 }
             }
-        } else if engine == Engine3D::Auto {
-            warn!(task_id = %task.id, "Subprocess exited {}; falling back to Tier 0 SDF", res.exit_code);
-            let _ = sandbox.destroy().await;
-            return self
-                .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
-                .await;
         } else if res.error.as_deref().unwrap_or("").is_empty() {
-            res.error = Some(format!(
-                "3D engine subprocess failed with exit code {}",
-                res.exit_code
-            ));
+            let last_err_line = String::from_utf8_lossy(res.stderr.as_slice())
+                .lines()
+                .map(|l| l.trim())
+                .rfind(|l| !l.is_empty())
+                .map(|s| s.to_string());
+
+            let err_msg = match last_err_line {
+                Some(line) => format!(
+                    "3D engine subprocess failed with exit code {}: {line}",
+                    res.exit_code
+                ),
+                None => format!(
+                    "3D engine subprocess failed with exit code {}",
+                    res.exit_code
+                ),
+            };
+            res.error = Some(err_msg);
         }
 
         let _ = sandbox.destroy().await;
@@ -2187,6 +2187,23 @@ impl TaskRunner {
         start_time: Instant,
     ) -> TaskResult {
         let task_id = task.id;
+
+        // Reject image input on SDF tier
+        if spec.image_data.is_some() {
+            let elapsed = start_time.elapsed().as_millis() as u64;
+            return TaskResult::failure(
+                self.worker_id,
+                task_id,
+                EXIT_CODE_GENERAL_ERROR,
+                Bytes::new(),
+                Bytes::from_static(
+                    b"Tier 0 procedural SDF engine does not support image input (text prompt only)\n",
+                ),
+                elapsed,
+                Some("Tier 0 procedural SDF engine does not support image input (text prompt only)".to_string()),
+            );
+        }
+
         let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel();
         let spec_clone = spec.clone();
 

@@ -1,8 +1,8 @@
 # 0016 — Ship Local Mapper/Reducer Scripts and Command Stages in `oxideswarm mapreduce`
 
-**Status:** Implemented (`MR-1`)  
+**Status:** Implemented (`MR-1`, `BUG-13`)  
 **Created:** 2026-11-02  
-**Updated:** 2026-11-02  
+**Updated:** 2026-11-04  
 
 ## Summary
 
@@ -41,12 +41,12 @@ Fixes `oxideswarm mapreduce` (`MR-1`) so that local file paths passed to `--mapp
 ### 2. `--map-cmd` and `--reduce-cmd` (`crates/cli/src/cli_app.rs`)
 
 - Adds `--map-cmd <CMD>` (mutually exclusive with `--mapper`) and `--reduce-cmd <CMD>` (mutually exclusive with `--reducer`) to `MapReduceArgs`.
-- `split_command_line` splits the command string into `(program, args)` honouring single and double quotes. Outside single quotes, a backslash `\` acts as an escape only before `"`, `'`, `\`, or (when unquoted) whitespace; ordinary unquoted Windows path backslashes (e.g. `C:\Tools\mapper.exe --flag`) are preserved literally.
+- `split_command_line` splits the command string into `(program, args)` honouring single and double quotes. Outside single quotes, a backslash `\` acts as an escape only before `"`, `'`, `\`, or (when unquoted) whitespace; ordinary unquoted Windows path backslashes (e.g. `C:\Tools\mapper.exe --flag`) and a leading double backslash (`\\server\share\mapper.exe` UNC path) on an unquoted token are preserved literally.
 
 ### 3. Finite Floating-Point Support in Built-in Reducers (`crates/master/src/mapreduce.rs`)
 
 - `reduce_builtin` for `"sum"`, `"max"`, and `"min"` accepts integer (`i64`), finite floating-point (`f64`), and numeric string values (`s.parse::<i64>()` / `s.parse::<f64>()` with `f.is_finite()`).
-- Non-finite floating-point values (`inf`, `-inf`, `NaN`) are ignored so `serde_json::json!` never serializes a `null` output for a completed key.
+- Non-finite floating-point values (`inf`, `-inf`, `NaN`, `1e999`) and non-numeric strings (`abc`) are ignored so `serde_json::json!` never serializes a `null` output for a completed key. When every value of a key is skipped (so the key has no usable finite numeric value), `reduce_builtin` returns `Ok(None)` and the key is left out of `MapReduceResult::output` rather than reporting `0`, `i64::MIN`, `i64::MAX`, or `null`.
 
 ### 4. Missing-`sh` Diagnostic and Worker Placement (`crates/master/src/mapreduce.rs`)
 
@@ -76,7 +76,9 @@ Fixes `oxideswarm mapreduce` (`MR-1`) so that local file paths passed to `--mapp
 ## Work items
 
 - `MR-1`: Ship local mapper and reducer scripts from `oxideswarm mapreduce`, add `--map-cmd` and `--reduce-cmd`, support float `max`/`min`, and surface missing-`sh` diagnostics.
+- `BUG-13`: Leave keys whose values are all skipped out of `MapReduceResult::output` for built-in `sum`/`max`/`min`, name `--map-cmd` and `--reduce-cmd` in script size errors, and preserve leading UNC `\\` in unquoted `--map-cmd` / `--reduce-cmd` tokens.
 
 ## Status log
 
 - 2026-11-02: Implemented `MR-1` in `crates/cli/src/cli_app.rs` and `crates/master/src/mapreduce.rs`; addressed review findings `F33-1` through `F33-8` and renumbered design record to `0016`.
+- 2026-11-04: Implemented `BUG-13` follow-ups (`N33-1`..`N33-4`): omit keys with no usable finite numeric values from built-in `sum`/`max`/`min` outputs, pass `--map-cmd` / `--reduce-cmd` into `read_mapreduce_script`, and preserve leading UNC `\\` in `split_command_line`.

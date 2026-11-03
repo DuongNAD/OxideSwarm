@@ -475,3 +475,50 @@ async fn test_cli_3d_trellis_rejected_immediately_on_cpu_worker() {
     let _ = worker_handle.await;
     let _ = master.shutdown();
 }
+
+#[tokio::test]
+async fn test_cli_3d_default_engine_with_image_fails_before_submit() {
+    let temp_dir = TempDir::new().unwrap();
+    let img_path = temp_dir.path().join("input.png");
+    std::fs::write(&img_path, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRtest").unwrap();
+
+    // Default engine (auto) with --image must fail validation before any network attempt
+    let submit = tokio::task::spawn_blocking({
+        let home = temp_dir.path().to_path_buf();
+        let img = img_path.clone();
+        move || {
+            cli(&home)
+                .arg("submit")
+                .arg("--master")
+                .arg("127.0.0.1:9999")
+                .arg("--type")
+                .arg("3d")
+                .arg("--prompt")
+                .arg("robot")
+                .arg("--image")
+                .arg(&img)
+                .arg("--wait")
+                .output()
+                .expect("run submit CLI")
+        }
+    });
+
+    let output = tokio::time::timeout(Duration::from_secs(15), submit)
+        .await
+        .expect("Submit timed out!")
+        .expect("Task join error");
+
+    assert!(
+        !output.status.success(),
+        "--image with default/auto engine must fail fast before submission"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Image input is only supported with neural 3D engines"),
+        "Expected validation error, got: {combined}"
+    );
+}

@@ -114,13 +114,13 @@ Expected output on `stdout` when the master is running (three JSON-RPC `2.0` lin
 ```text
 {"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"oxideswarm","version":"0.1.0"}}}
 {"jsonrpc":"2.0","id":2,"result":{"tools":[{"description":"Query cluster status, worker counts, or execution state of a specific task ID.","inputSchema":...,"name":"status"},...]}}
-{"jsonrpc":"2.0","id":3,"result":{"content":[{"text":"{\n  \"cluster_status\": \"ok\",\n  \"tasks\": ...,\n  \"workers_connected\": ...\n}","type":"text"}],"isError":false}}
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"text":"{\n  \"cluster_status\": \"ok\",\n  \"connected_workers\": 0,\n  \"master\": \"127.0.0.1:8088\",\n  \"total_workers\": 0\n}","type":"text"}],"isError":false}}
 ```
 
 If the master is stopped or unreachable, response `id: 3` reports `"isError": true`:
 
 ```text
-{"jsonrpc":"2.0","id":3,"result":{"content":[{"text":"Failed to connect to Master at 127.0.0.1:8088: Connection error: ...","type":"text"}],"isError":true}}
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"text":"Failed to connect to Master at 127.0.0.1:8088: Connection failed: ...","type":"text"}],"isError":true}}
 ```
 
 ## Troubleshooting
