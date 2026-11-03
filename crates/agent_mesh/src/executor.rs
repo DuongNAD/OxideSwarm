@@ -4,6 +4,7 @@
 //! execution duration measurement, timeout safety watchdogs,
 //! and native built-in commands (echo, system_info, ping, sha256_verify).
 
+use rusty_grid_core::cluster_auth::{ENV_SECRET, ENV_SECRET_FILE};
 use serde_json::Value;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -23,7 +24,13 @@ const READER_DRAIN_GRACE: Duration = Duration::from_secs(1);
 /// Variables of the node's own environment that a command must never inherit: they hold the
 /// cluster secret or the hub token (`--token` / `OXIDE_MESH_TOKEN`), and `shell_exec` runs
 /// whatever a remote peer sends. A command can still be given one in its own `env`.
-pub use rusty_grid_core::cluster_auth::SECRET_ENV_VARS;
+pub const SECRET_ENV_VARS: [&str; 5] = [
+    ENV_SECRET,
+    ENV_SECRET_FILE,
+    "OXIDE_MESH_TOKEN",
+    "RUSTY_GRID_SECRET",
+    "RUSTY_GRID_SECRET_FILE",
+];
 
 #[derive(Debug, Clone)]
 pub struct CommandExecutionResult {
@@ -43,6 +50,17 @@ impl CommandExecutor {
         args: &Value,
         timeout_ms: Option<u64>,
     ) -> CommandExecutionResult {
+        Self::execute_guarded(command, args, timeout_ms, false).await
+    }
+
+    /// Dispatches a command request, restricting execution to advertised commands and
+    /// refusing shell_exec when `no_shell` is true.
+    pub async fn execute_guarded(
+        command: &str,
+        args: &Value,
+        timeout_ms: Option<u64>,
+        no_shell: bool,
+    ) -> CommandExecutionResult {
         let start = Instant::now();
         let timeout_duration = Duration::from_millis(timeout_ms.unwrap_or(15000));
 
@@ -60,23 +78,23 @@ impl CommandExecutor {
                 };
 
                 let duration_ms = start.elapsed().as_millis() as u64;
-                return CommandExecutionResult {
+                CommandExecutionResult {
                     exit_code: 0,
                     stdout: msg,
                     stderr: String::new(),
                     duration_ms,
                     status: "success".to_string(),
-                };
+                }
             }
             "ping" => {
                 let duration_ms = start.elapsed().as_millis() as u64;
-                return CommandExecutionResult {
+                CommandExecutionResult {
                     exit_code: 0,
                     stdout: "pong".to_string(),
                     stderr: String::new(),
                     duration_ms,
                     status: "success".to_string(),
-                };
+                }
             }
             "system_info" => {
                 let mut sys = System::new_all();
@@ -94,13 +112,13 @@ impl CommandExecutor {
                 });
 
                 let duration_ms = start.elapsed().as_millis() as u64;
-                return CommandExecutionResult {
+                CommandExecutionResult {
                     exit_code: 0,
                     stdout: serde_json::to_string_pretty(&info).unwrap_or_default(),
                     stderr: String::new(),
                     duration_ms,
                     status: "success".to_string(),
-                };
+                }
             }
             "sha256_verify" => {
                 let data = args
@@ -115,7 +133,7 @@ impl CommandExecutor {
                 let matches = actual.eq_ignore_ascii_case(expected);
                 let duration_ms = start.elapsed().as_millis() as u64;
 
-                return CommandExecutionResult {
+                CommandExecutionResult {
                     exit_code: if matches { 0 } else { 1 },
                     stdout: if matches {
                         "VERIFIED_MATCH".to_string()
@@ -133,13 +151,33 @@ impl CommandExecutor {
                     } else {
                         "failed".to_string()
                     },
-                };
+                }
             }
-            _ => {}
+            "shell_exec" => {
+                if no_shell {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    CommandExecutionResult {
+                        exit_code: 127,
+                        stdout: String::new(),
+                        stderr: "shell_exec is disabled by --no-shell".to_string(),
+                        duration_ms,
+                        status: "failed".to_string(),
+                    }
+                } else {
+                    Self::execute_subprocess(command, args, timeout_duration).await
+                }
+            }
+            unsupported => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                CommandExecutionResult {
+                    exit_code: 127,
+                    stdout: String::new(),
+                    stderr: format!("Unsupported command: '{}'", unsupported),
+                    duration_ms,
+                    status: "failed".to_string(),
+                }
+            }
         }
-
-        // 2. Cross-platform subprocess execution
-        Self::execute_subprocess(command, args, timeout_duration).await
     }
 
     async fn execute_subprocess(
@@ -170,29 +208,14 @@ impl CommandExecutor {
 
             Self::create_shell_command(&cmd_str)
         } else {
-            let mut c = Command::new(command);
-            if let Some(arr) = args.as_array() {
-                for item in arr {
-                    if let Some(s) = item.as_str() {
-                        c.arg(s);
-                    } else {
-                        c.arg(item.to_string());
-                    }
-                }
-            } else if let Some(obj) = args.as_object() {
-                if let Some(arr) = obj.get("args").and_then(|v| v.as_array()) {
-                    for item in arr {
-                        if let Some(s) = item.as_str() {
-                            c.arg(s);
-                        } else {
-                            c.arg(item.to_string());
-                        }
-                    }
-                }
-            } else if let Some(s) = args.as_str() {
-                c.arg(s);
-            }
-            c
+            let duration_ms = start.elapsed().as_millis() as u64;
+            return CommandExecutionResult {
+                exit_code: 127,
+                stdout: String::new(),
+                stderr: format!("Unsupported command: '{}'", command),
+                duration_ms,
+                status: "failed".to_string(),
+            };
         };
 
         // CRITICAL: Ensure Tokio terminates the direct child process upon drop/cancellation
@@ -200,7 +223,7 @@ impl CommandExecutor {
 
         // Configure environment and working directory if specified
         if let Some(cwd) = args.get("cwd").and_then(|v| v.as_str()) {
-            if Path::new(cwd).exists() {
+            if Path::new(cwd).is_dir() {
                 cmd.current_dir(cwd);
             }
         }
@@ -637,10 +660,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_secrets_in_the_nodes_environment_are_not_inherited_by_commands() {
-        const SENTINELS: [(&str, &str); 3] = [
+        const SENTINELS: [(&str, &str); 5] = [
             ("OXIDESWARM_SECRET", "sentinel-cluster-secret"),
             ("OXIDESWARM_SECRET_FILE", "/sentinel/secret/file"),
             ("OXIDE_MESH_TOKEN", "sentinel-mesh-token"),
+            ("RUSTY_GRID_SECRET", "sentinel-grid-secret"),
+            ("RUSTY_GRID_SECRET_FILE", "/sentinel/grid-file"),
         ];
         // The node's own secrets live in this process's environment; remove them afterwards.
         struct Restore;
@@ -656,7 +681,7 @@ mod tests {
             std::env::set_var(name, value);
         }
 
-        let probe = "echo \"[${OXIDESWARM_SECRET-unset}][${OXIDESWARM_SECRET_FILE-unset}][${OXIDE_MESH_TOKEN-unset}]\"";
+        let probe = "echo \"[${OXIDESWARM_SECRET-unset}][${OXIDESWARM_SECRET_FILE-unset}][${OXIDE_MESH_TOKEN-unset}][${RUSTY_GRID_SECRET-unset}][${RUSTY_GRID_SECRET_FILE-unset}]\"";
         let res = CommandExecutor::execute(
             "shell_exec",
             &serde_json::json!({ "cmd": probe }),
@@ -664,12 +689,14 @@ mod tests {
         )
         .await;
         assert_eq!(res.status, "success");
-        assert_eq!(res.stdout.trim(), "[unset][unset][unset]");
+        assert_eq!(res.stdout.trim(), "[unset][unset][unset][unset][unset]");
 
-        // Also for a plain program, not only for the shell wrapper.
+        // Unadvertised command directly spawned must be rejected with 127
         let res =
             CommandExecutor::execute("sh", &serde_json::json!(["-c", probe]), Some(5000)).await;
-        assert_eq!(res.stdout.trim(), "[unset][unset][unset]");
+        assert_eq!(res.status, "failed");
+        assert_eq!(res.exit_code, 127);
+        assert!(res.stderr.contains("Unsupported command"));
 
         // What the peer passes explicitly is its own business and still arrives.
         let res = CommandExecutor::execute(
@@ -678,7 +705,10 @@ mod tests {
             Some(5000),
         )
         .await;
-        assert_eq!(res.stdout.trim(), "[unset][unset][given-on-purpose]");
+        assert_eq!(
+            res.stdout.trim(),
+            "[unset][unset][given-on-purpose][unset][unset]"
+        );
     }
 
     #[cfg(unix)]
@@ -740,14 +770,14 @@ mod tests {
     async fn test_command_timeout_kills_hung_process() {
         #[cfg(target_os = "windows")]
         let (cmd, args) = (
-            "powershell",
+            "shell_exec",
             serde_json::json!({
-                "args": ["-NoProfile", "-Command", "Start-Sleep -Seconds 10"]
+                "cmd": "powershell -NoProfile -Command Start-Sleep -Seconds 10"
             }),
         );
 
         #[cfg(not(target_os = "windows"))]
-        let (cmd, args) = ("sleep", serde_json::json!(["10"]));
+        let (cmd, args) = ("shell_exec", serde_json::json!({"cmd": "sleep 10"}));
 
         let start = std::time::Instant::now();
         let res = CommandExecutor::execute(cmd, &args, Some(1000)).await;
@@ -761,5 +791,34 @@ mod tests {
             "Expected timeout in ~1000ms, elapsed: {:?}",
             elapsed
         );
+    }
+
+    #[tokio::test]
+    async fn test_unadvertised_command_rejected_with_127() {
+        let res = CommandExecutor::execute("/bin/ls", &Value::Null, None).await;
+        assert_eq!(res.status, "failed");
+        assert_eq!(res.exit_code, 127);
+        assert!(res.stderr.contains("Unsupported command: '/bin/ls'"));
+    }
+
+    #[tokio::test]
+    async fn test_no_shell_refuses_shell_exec_with_127() {
+        let res = CommandExecutor::execute_guarded(
+            "shell_exec",
+            &serde_json::json!({"cmd": "echo hello"}),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(res.status, "failed");
+        assert_eq!(res.exit_code, 127);
+        assert_eq!(res.stderr, "shell_exec is disabled by --no-shell");
+
+        // Built-ins still succeed under no_shell
+        let res =
+            CommandExecutor::execute_guarded("echo", &serde_json::json!("hello"), None, true).await;
+        assert_eq!(res.status, "success");
+        assert_eq!(res.exit_code, 0);
+        assert_eq!(res.stdout, "hello");
     }
 }

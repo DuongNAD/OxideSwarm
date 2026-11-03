@@ -21,6 +21,12 @@ echo Target Hub: %HUB_URL%
 echo Node ID:    %NODE_ID%
 echo Platform:   windows
 echo.
+set "NO_SHELL_FLAG="
+if /i "%OXIDE_MESH_NO_SHELL%"=="1" set "NO_SHELL_FLAG=--no-shell"
+for %%A in (%*) do (
+    if /i "%%~A"=="--no-shell" set "NO_SHELL_FLAG=--no-shell"
+)
+if defined NO_SHELL_FLAG echo [INFO] Shell execution disabled (--no-shell active)
 if not defined OXIDE_MESH_TOKEN echo [INFO] OXIDE_MESH_TOKEN is not set: a hub bound beyond localhost will reject this node. Run "set OXIDE_MESH_TOKEN=your-hub-token" first.
 echo [INFO] ws:// is not encrypted. Do not use it across untrusted networks or the Internet.
 echo.
@@ -28,24 +34,24 @@ echo.
 :LOOP
 if exist "target\release\agent-mesh.exe" (
     echo [INFO] Running native release binary [agent-mesh]...
-    target\release\agent-mesh.exe node --hub "%HUB_URL%" --id "%NODE_ID%" --platform windows
+    target\release\agent-mesh.exe node --hub "%HUB_URL%" --id "%NODE_ID%" --platform windows %NO_SHELL_FLAG%
 ) else if exist "target\debug\agent-mesh.exe" (
     echo [INFO] Running native debug binary [agent-mesh]...
-    target\debug\agent-mesh.exe node --hub "%HUB_URL%" --id "%NODE_ID%" --platform windows
+    target\debug\agent-mesh.exe node --hub "%HUB_URL%" --id "%NODE_ID%" --platform windows %NO_SHELL_FLAG%
 ) else if exist "%~dp0..\..\target\release\agent-mesh.exe" (
     echo [INFO] Running native release binary [agent-mesh]...
-    "%~dp0..\..\target\release\agent-mesh.exe" node --hub "%HUB_URL%" --id "%NODE_ID%" --platform windows
+    "%~dp0..\..\target\release\agent-mesh.exe" node --hub "%HUB_URL%" --id "%NODE_ID%" --platform windows %NO_SHELL_FLAG%
 ) else if exist "%~dp0..\..\target\debug\agent-mesh.exe" (
     echo [INFO] Running native debug binary [agent-mesh]...
-    "%~dp0..\..\target\debug\agent-mesh.exe" node --hub "%HUB_URL%" --id "%NODE_ID%" --platform windows
+    "%~dp0..\..\target\debug\agent-mesh.exe" node --hub "%HUB_URL%" --id "%NODE_ID%" --platform windows %NO_SHELL_FLAG%
 ) else (
     echo [INFO] Native binary not found. Running Python fallback client...
     if exist "scripts\agent_node.py" (
-        python scripts\agent_node.py --hub "%HUB_URL%" --id "%NODE_ID%" --platform windows
+        python scripts\agent_node.py --hub "%HUB_URL%" --id "%NODE_ID%" --platform windows %NO_SHELL_FLAG%
     ) else if exist "%~dp0..\..\scripts\agent_node.py" (
-        python "%~dp0..\..\scripts\agent_node.py" --hub "%HUB_URL%" --id "%NODE_ID%" --platform windows
+        python "%~dp0..\..\scripts\agent_node.py" --hub "%HUB_URL%" --id "%NODE_ID%" --platform windows %NO_SHELL_FLAG%
     ) else (
-        python ..\..\scripts\agent_node.py --hub "%HUB_URL%" --id "%NODE_ID%" --platform windows
+        python ..\..\scripts\agent_node.py --hub "%HUB_URL%" --id "%NODE_ID%" --platform windows %NO_SHELL_FLAG%
     )
 )
 
@@ -61,6 +67,7 @@ echo.
 echo Usage: %~nx0 [HUB_URL] [NODE_ID]
 echo.
 echo Options:
+echo   --no-shell        Disable arbitrary shell_exec execution on this node
 echo   --help, -h, /?    Show this help message and exit.
 echo.
 echo Arguments:

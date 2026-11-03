@@ -94,6 +94,7 @@ Documentation index and writing standard: [docs/README.md](docs/README.md). A ma
 | **21. Model Context Protocol (MCP) server** | Concurrent JSON-RPC 2.0 stdio MCP server (`oxideswarm mcp`) exposing 6 core cluster tools (`status`, `workers`, `submit`, `task_result`, `cancel`, `doctor`) with client wait deadlines (`wait_secs`), `notifications/cancelled`, `notifications/progress`, and strict stdout hygiene. Design: [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md), [docs/design/0012-mcp-concurrent-deadlines-and-cancel.md](docs/design/0012-mcp-concurrent-deadlines-and-cancel.md). | Implemented + tests |
 | **22. 3D generative engine names & CPU fallback** | 3D generation tasks (`submit --prompt <PROMPT>`) default to CPU-capable procedural SDF generation and succeed on CPU-only worker nodes without requiring a GPU or `--gpu`. The `--engine` flag strictly enforces supported engines (`sdf`, `triposr`, `auto`), refusing unknown engine names with an informative error rather than silently falling back to `auto`. Design: [docs/design/0015-engine-names-and-cpu-fallback.md](docs/design/0015-engine-names-and-cpu-fallback.md). | Implemented + tests |
 | **23. Generative 3D & Procedural SDF** | Pure Rust procedural Signed Distance Field (SDF) mesh generation (`Procedural-SDF-PureRust`) for default (`auto`) and procedural (`sdf`) tiers, honest failure on missing neural model checkpoints, client-side pre-submission validation, and virtual environment isolation. Design: [docs/design/0017-honest-3d-sdf-fallback.md](docs/design/0017-honest-3d-sdf-fallback.md). | Implemented + tests |
+| **24. Agent Mesh command hardening & process controls** | Restricts mesh nodes to 5 advertised commands (`echo`, `ping`, `system_info`, `sha256_verify`, `shell_exec`); unadvertised commands return exit 127. `--no-shell` flag filters out `shell_exec` capability and rejects execution requests with 127. Child processes inherit no stdin (`DEVNULL`), output is capped at 1 MiB per stream, and 5 secret env vars are stripped from parent environment inheritance. Design: [docs/design/0011-agent-mesh-hardening.md](docs/design/0011-agent-mesh-hardening.md). | Implemented + tests |
 
 ---
 
@@ -440,6 +441,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
 | `OXIDE_MESH_TOKEN` | Agent Mesh | Bearer token for authenticating nodes and HTTP API requests against hub |
+| `OXIDE_MESH_NO_SHELL` | Agent Mesh / Launchers | When set to `1`, disables `shell_exec` command execution on node launchers |
 
 #### Tier G: Platform Packaging, Service Automation & Launchers
 | Variable | Component | Purpose |
@@ -461,8 +463,8 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 
 OxideSwarm also contains an agent-to-agent communication layer (`crates/agent_mesh`) that lets coding agents on
 **Windows, macOS, Ubuntu Linux and Android (Termux / ADB)** discover peers, transmit data payloads and route
-structured commands. A node can be told to run **any command, including `shell_exec`**, so treat the hub token
-like a password.
+structured commands. Nodes execute only 5 advertised commands (`echo`, `ping`, `system_info`, `sha256_verify`,
+`shell_exec`); `shell_exec` can be disabled with `--no-shell`. Treat the hub token like a password.
 
 ```text
                       ┌─────────────────────────────────┐
@@ -500,6 +502,8 @@ export OXIDE_MESH_TOKEN="$(openssl rand -hex 24)"
 # 3. Connect an agent node (Windows / Mac / Linux / Android); every command below reads OXIDE_MESH_TOKEN:
 ./target/release/agent-mesh node --hub ws://127.0.0.1:8090/ws --id node-mac-1 --platform macos
 python3 scripts/agent_node.py --hub ws://127.0.0.1:8090/ws --id node-android-3 --platform android
+# To disable shell command execution on untrusted nodes, add --no-shell:
+./target/release/agent-mesh node --hub ws://127.0.0.1:8090/ws --id node-mac-1 --platform macos --no-shell
 
 # 4. Route a command from any node or terminal:
 ./target/release/agent-mesh send --hub ws://127.0.0.1:8090/ws --to node-android-3 --command shell_exec --args '{"cmd": "uname -m"}'

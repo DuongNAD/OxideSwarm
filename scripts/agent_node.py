@@ -76,24 +76,130 @@ def detect_platform_tag() -> str:
     return sys_plat
 
 
+def collect_descendants(root_pid: int) -> list:
+    """Collects all transitive descendant PIDs of root_pid."""
+    try:
+        import psutil
+        parent = psutil.Process(root_pid)
+        return [child.pid for child in parent.children(recursive=True)]
+    except Exception:
+        pass
+
+    if os.name == "posix":
+        try:
+            if os.path.exists("/proc"):
+                parent_map = {}
+                for entry in os.listdir("/proc"):
+                    if entry.isdigit():
+                        try:
+                            with open(f"/proc/{entry}/stat", "r") as f:
+                                data = f.read()
+                            rparen = data.rfind(")")
+                            if rparen != -1:
+                                fields = data[rparen + 1:].split()
+                                ppid = int(fields[1])
+                                pid = int(entry)
+                                parent_map.setdefault(ppid, []).append(pid)
+                        except Exception:
+                            continue
+                descendants = []
+                queue = [root_pid]
+                while queue:
+                    curr = queue.pop(0)
+                    for child in parent_map.get(curr, []):
+                        if child not in descendants:
+                            descendants.append(child)
+                            queue.append(child)
+                return descendants
+            else:
+                res = subprocess.run(["ps", "-axo", "pid,ppid"], capture_output=True, text=True, check=False)
+                parent_map = {}
+                for line in res.stdout.strip().splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                        pid, ppid = int(parts[0]), int(parts[1])
+                        parent_map.setdefault(ppid, []).append(pid)
+                descendants = []
+                queue = [root_pid]
+                while queue:
+                    curr = queue.pop(0)
+                    for child in parent_map.get(curr, []):
+                        if child not in descendants:
+                            descendants.append(child)
+                            queue.append(child)
+                return descendants
+        except Exception:
+            pass
+    return []
+
+
 def kill_process_tree(proc) -> None:
     """Kills a command started by `shell_exec` together with everything it spawned.
 
     On POSIX the command runs in its own session (see `start_new_session` below), so its process
     group id is its PID and one `killpg` reaches the grandchildren too. Without that, a grandchild
     that inherited the output pipes keeps them open and even `proc.wait()` blocks until it exits.
+    To catch processes that detached from the process group (setsid), descendant PIDs are collected
+    prior to signalling the group, matching Rust's executor behavior.
     """
+    pid = getattr(proc, "pid", None)
+    escaped = collect_descendants(pid) if pid else []
     try:
         if platform.system().lower() == "windows":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
         else:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(pid, signal.SIGKILL)
     except Exception:
         pass
+    for desc_pid in escaped:
+        try:
+            if platform.system().lower() == "windows":
+                subprocess.run(["taskkill", "/F", "/PID", str(desc_pid)], capture_output=True)
+            else:
+                os.kill(desc_pid, signal.SIGKILL)
+        except Exception:
+            pass
     try:
         proc.kill()
     except Exception:
         pass
+
+
+MAX_CAPTURED_OUTPUT_BYTES = 1024 * 1024  # 1 MiB
+
+SECRET_ENV_VARS = (
+    "OXIDESWARM_SECRET",
+    "OXIDESWARM_SECRET_FILE",
+    "OXIDE_MESH_TOKEN",
+    "RUSTY_GRID_SECRET",
+    "RUSTY_GRID_SECRET_FILE",
+)
+
+_UNSET_TIMEOUT = object()
+
+
+async def _read_capped_stream(stream: asyncio.StreamReader, cap: int = MAX_CAPTURED_OUTPUT_BYTES) -> tuple:
+    """Reads from stream up to cap bytes, draining the remainder to EOF so the child never blocks."""
+    kept = bytearray()
+    truncated = False
+    try:
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                break
+            room = cap - len(kept)
+            if len(chunk) <= room:
+                kept.extend(chunk)
+            else:
+                if room > 0:
+                    kept.extend(chunk[:room])
+                truncated = True
+    except asyncio.CancelledError:
+        pass
+    text = kept.decode("utf-8", errors="replace")
+    if truncated:
+        text += f"\n[agent_node: output truncated after {cap} bytes]\n"
+    return text, truncated
 
 
 def collect_telemetry(platform_tag: str) -> dict:
@@ -110,13 +216,22 @@ def collect_telemetry(platform_tag: str) -> dict:
 
 
 class OxideAgentNode:
-    def __init__(self, hub_url: str, node_id: str, platform_name: str, hostname: str = None, token: str = None):
+    def __init__(
+        self,
+        hub_url: str,
+        node_id: str,
+        platform_name: str,
+        hostname: str = None,
+        token: str = None,
+        no_shell: bool = False,
+    ):
         self.hub_url = hub_url
         self.node_id = node_id
         self.platform_name = platform_name
         self.hostname = hostname or platform.node() or "unknown-host"
         # Hub token (OXIDE_MESH_TOKEN / --token); an empty string means "no token".
         self.token = token or None
+        self.no_shell = bool(no_shell)
         # (error_code, reason) when the hub answered the last registration with a NACK.
         self.registration_error = None
         self.ws = None
@@ -142,7 +257,10 @@ class OxideAgentNode:
         self.registration_error = None
         logger.info(f"Connected! Registering as '{self.node_id}' ({self.platform_name})...")
 
-        # Send NodeRegistration
+        supported_cmds = ["echo", "ping", "system_info", "sha256_verify"]
+        if not self.no_shell:
+            supported_cmds.insert(2, "shell_exec")
+
         reg_msg = {
             "version": "1.0",
             "correlation_id": str(uuid.uuid4()),
@@ -153,13 +271,7 @@ class OxideAgentNode:
             "hostname": self.hostname,
             "capabilities": {
                 "system": collect_telemetry(self.platform_name),
-                "supported_commands": [
-                    "echo",
-                    "ping",
-                    "shell_exec",
-                    "system_info",
-                    "sha256_verify",
-                ],
+                "supported_commands": supported_cmds,
             },
             "timestamp": int(time.time() * 1000),
         }
@@ -350,25 +462,77 @@ class OxideAgentNode:
                 status = "success" if matches else "failed"
 
             elif cmd_name == "shell_exec":
-                if isinstance(args, dict):
-                    cmd_str = args.get("cmd") or args.get("command") or ""
-                elif isinstance(args, list):
-                    cmd_str = " ".join(str(x) for x in args)
+                if self.no_shell:
+                    status = "failed"
+                    exit_code = 127
+                    stderr = "shell_exec is disabled by --no-shell"
                 else:
-                    cmd_str = str(args)
-                timeout_s = req.get("timeout_ms", 15000) / 1000.0
+                    if isinstance(args, dict):
+                        cmd_str = args.get("cmd") or args.get("command") or ""
+                    elif isinstance(args, list):
+                        cmd_str = " ".join(str(x) for x in args)
+                    else:
+                        cmd_str = str(args)
+                    raw_timeout = req.get("timeout_ms")
+                    timeout_ms = raw_timeout if (isinstance(raw_timeout, (int, float)) and raw_timeout > 0) else 15000
+                    timeout_s = float(timeout_ms) / 1000.0
 
-                proc = await asyncio.create_subprocess_shell(
-                    cmd_str,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    start_new_session=(os.name == "posix"),
-                )
-                out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-                stdout = out.decode("utf-8", errors="replace")
-                stderr = err.decode("utf-8", errors="replace")
-                exit_code = proc.returncode
-                status = "success" if exit_code == 0 else "failed"
+                    # 1. Environment sanitization
+                    child_env = os.environ.copy()
+                    for secret_var in SECRET_ENV_VARS:
+                        child_env.pop(secret_var, None)
+                    if isinstance(args, dict) and isinstance(args.get("env"), dict):
+                        for k, v in args["env"].items():
+                            child_env[str(k)] = str(v)
+
+                    # 2. Working directory
+                    cwd = None
+                    if isinstance(args, dict):
+                        raw_cwd = args.get("cwd")
+                        if isinstance(raw_cwd, str) and os.path.isdir(raw_cwd):
+                            cwd = raw_cwd
+
+                    proc = await asyncio.create_subprocess_shell(
+                        cmd_str,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=cwd,
+                        env=child_env,
+                        start_new_session=(os.name == "posix"),
+                    )
+
+                    out_task = asyncio.create_task(_read_capped_stream(proc.stdout, MAX_CAPTURED_OUTPUT_BYTES))
+                    err_task = asyncio.create_task(_read_capped_stream(proc.stderr, MAX_CAPTURED_OUTPUT_BYTES))
+
+                    try:
+                        (stdout, _), (stderr, _), _ = await asyncio.wait_for(
+                            asyncio.gather(out_task, err_task, proc.wait()),
+                            timeout=timeout_s,
+                        )
+                        exit_code = proc.returncode
+                        status = "success" if exit_code == 0 else "failed"
+                    except asyncio.TimeoutError:
+                        kill_process_tree(proc)
+                        try:
+                            await asyncio.wait_for(asyncio.gather(out_task, err_task), timeout=0.5)
+                        except Exception:
+                            out_task.cancel()
+                            err_task.cancel()
+                        results = await asyncio.gather(out_task, err_task, return_exceptions=True)
+                        try:
+                            await asyncio.wait_for(proc.wait(), timeout=0.5)
+                        except Exception:
+                            pass
+                        out_res = results[0] if (isinstance(results[0], tuple) and len(results[0]) == 2) else ("", False)
+                        err_res = results[1] if (isinstance(results[1], tuple) and len(results[1]) == 2) else ("", False)
+                        stdout = out_res[0]
+                        stderr_tail = err_res[0]
+                        status = "timeout"
+                        exit_code = 124
+                        stderr = f"Command timed out after {int(timeout_ms)} ms"
+                        if stderr_tail:
+                            stderr += "\n" + stderr_tail
 
             else:
                 status = "failed"
@@ -384,7 +548,9 @@ class OxideAgentNode:
                     pass
             status = "timeout"
             exit_code = 124
-            stderr = f"Command timed out after {req.get('timeout_ms', 15000)} ms"
+            raw_t = req.get("timeout_ms") if isinstance(req, dict) else None
+            t_ms = int(raw_t) if isinstance(raw_t, (int, float)) and raw_t > 0 else 15000
+            stderr = f"Command timed out after {t_ms} ms"
         except Exception as e:
             status = "failed"
             exit_code = 1
@@ -455,13 +621,21 @@ class OxideAgentNode:
             if not fut.done():
                 fut.set_result(msg)
 
-    async def send_command(self, target_id: str, command: str, args: dict, timeout: float = 15.0) -> dict:
+    async def send_command(
+        self,
+        target_id: str,
+        command: str,
+        args: dict,
+        timeout: float = 15.0,
+        timeout_ms: object = _UNSET_TIMEOUT,
+    ) -> dict:
         """Sends command to target node and awaits execution response."""
         corr_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
         self.pending_commands[corr_id] = fut
 
+        wire_timeout_ms = int(timeout * 1000) if timeout_ms is _UNSET_TIMEOUT else timeout_ms
         req = {
             "version": "1.0",
             "correlation_id": corr_id,
@@ -471,7 +645,7 @@ class OxideAgentNode:
             "command": command,
             "args": args,
             "require_ack": True,
-            "timeout_ms": int(timeout * 1000),
+            "timeout_ms": wire_timeout_ms,
             "timestamp": int(time.time() * 1000),
         }
         try:
@@ -669,6 +843,12 @@ def main():
         help="Hub token (default: $OXIDE_MESH_TOKEN). Needed when the hub was started with --token; "
         "visible in the process list, so prefer the environment variable",
     )
+    parser.add_argument(
+        "--no-shell",
+        action="store_true",
+        default=False,
+        help="Disable shell execution command (refuse shell_exec)",
+    )
 
     # Command submission options (flags & subcommands supported)
     parser.add_argument(
@@ -763,7 +943,14 @@ def main():
         print("[ERROR] 'websockets' library is required. Install via: pip install websockets", file=sys.stderr)
         sys.exit(1)
 
-    node = OxideAgentNode(args.hub, args.id, args.platform, args.hostname, token=args.token)
+    node = OxideAgentNode(
+        args.hub,
+        args.id,
+        args.platform,
+        args.hostname,
+        token=args.token,
+        no_shell=args.no_shell,
+    )
 
     async def execute():
         is_compute = (

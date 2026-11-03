@@ -80,6 +80,10 @@ pub enum Commands {
         /// Hub token (visible in `ps`; prefer the OXIDE_MESH_TOKEN environment variable)
         #[arg(long, env = "OXIDE_MESH_TOKEN", hide_env_values = true)]
         token: Option<String>,
+
+        /// Disable shell command execution (refuse shell_exec)
+        #[arg(long)]
+        no_shell: bool,
     },
 
     /// Send a structured command to a specific node
@@ -341,6 +345,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             id,
             platform,
             token,
+            no_shell,
         } => {
             let host_os = std::env::consts::OS.to_string();
             let hostname = sysinfo::System::host_name().unwrap_or_else(|| "device".to_string());
@@ -353,9 +358,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("Node ID:  {}", node_id);
             println!("Hub URL:  {}", hub);
             println!("Platform: {}", plat);
+            if no_shell {
+                println!("Shell:    disabled (--no-shell active)");
+            }
             println!();
 
-            let client = build_client(&hub, &node_id, &plat, token);
+            let mut client = build_client(&hub, &node_id, &plat, token);
+            if no_shell {
+                client = client.with_no_shell(true);
+            }
             client.run_daemon().await;
         }
 
