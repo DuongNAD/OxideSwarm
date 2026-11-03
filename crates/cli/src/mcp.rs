@@ -256,7 +256,20 @@ impl McpState {
         message: &ClientMessage,
         timeout: Duration,
     ) -> Result<ClientResponse, String> {
+        self.request_with_retry_info(message, timeout)
+            .await
+            .map(|(resp, _)| resp)
+    }
+
+    /// Like [`McpState::request_with_timeout`], also returning `true` when the request was retried
+    /// on a fresh connection after its write to the pooled connection had already succeeded.
+    pub async fn request_with_retry_info(
+        &self,
+        message: &ClientMessage,
+        timeout: Duration,
+    ) -> Result<(ClientResponse, bool), String> {
         let is_idempotent = !matches!(message, ClientMessage::SubmitTask { .. });
+        let mut retried_after_pooled_write = false;
         let pooled = {
             let mut guard = self.transport.lock().await;
             guard.take()
@@ -278,7 +291,7 @@ impl McpState {
                         if guard.is_none() {
                             *guard = Some(transport);
                         }
-                        return Ok(resp);
+                        return Ok((resp, false));
                     }
                     Err(rusty_grid_core::protocol::ProtocolError::Io(ref io_err))
                         if !is_idempotent && io_err.kind() == std::io::ErrorKind::TimedOut =>
@@ -297,6 +310,7 @@ impl McpState {
                     Ok(None) | Err(_) => {
                         // Pooled idle connection was closed, reset, or timed out before replying
                         // to an idempotent request; fall through to open a fresh connection.
+                        retried_after_pooled_write = true;
                     }
                 }
             }
@@ -335,7 +349,7 @@ impl McpState {
         if guard.is_none() {
             *guard = Some(transport);
         }
-        Ok(response)
+        Ok((response, retried_after_pooled_write))
     }
 
     /// Obtains a dedicated one-off connection (e.g. for long-running streaming/waiting operations).
@@ -1467,10 +1481,16 @@ async fn tool_cancel(state: &McpState, args: &Value) -> ToolCallResult {
     };
     let task_id = TaskId(task_uuid);
 
-    match state.request(&ClientMessage::CancelTask { task_id }).await {
-        Ok(ClientResponse::TaskCancelled { task_id, success }) => {
+    match state
+        .request_with_retry_info(
+            &ClientMessage::CancelTask { task_id },
+            DEFAULT_MASTER_RPC_TIMEOUT,
+        )
+        .await
+    {
+        Ok((ClientResponse::TaskCancelled { task_id, success }, retried_after_pooled_write)) => {
             let mut cancelled = success;
-            if !cancelled {
+            if !cancelled && retried_after_pooled_write {
                 if let Ok(ClientResponse::TaskStatusInfo { status, .. }) = state
                     .request_with_timeout(
                         &ClientMessage::GetTaskStatus { task_id },
@@ -1488,8 +1508,8 @@ async fn tool_cancel(state: &McpState, args: &Value) -> ToolCallResult {
                 "cancelled": cancelled,
             }))
         }
-        Ok(ClientResponse::Error { message }) => ToolCallResult::error(message),
-        Ok(other) => ToolCallResult::error(format!("Unexpected Master response: {other:?}")),
+        Ok((ClientResponse::Error { message }, _)) => ToolCallResult::error(message),
+        Ok((other, _)) => ToolCallResult::error(format!("Unexpected Master response: {other:?}")),
         Err(e) => ToolCallResult::error(e),
     }
 }
