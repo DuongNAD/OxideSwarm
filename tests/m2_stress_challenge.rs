@@ -200,12 +200,25 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
         let _ = master.run(master_shutdown_rx).await;
     });
 
+    // Build the legitimate worker client before the clock starts, without running Blender detection.
+    let (legit_shutdown_tx, legit_shutdown_rx) = watch::channel(false);
+    let mut legit_client = WorkerClient::new(
+        WorkerConfig::new(master_addr.to_string())
+            .with_name("legit-node")
+            .with_cores(4)
+            .with_no_blender(true)
+            .with_redirection_portal(false),
+    );
+    let legit_id = legit_client.worker_id();
+
     // 1. Rogue Socket 1: Send 0 bytes (open TCP connection, completely silent)
+    let rogue1_connect_start = Instant::now();
     let mut rogue_zero_bytes = TcpStream::connect(master_addr)
         .await
         .expect("connect rogue 1");
 
     // 2. Rogue Socket 2: Send partial 2-byte length prefix (need 4 bytes)
+    let rogue2_connect_start = Instant::now();
     let mut rogue_partial_prefix = TcpStream::connect(master_addr)
         .await
         .expect("connect rogue 2");
@@ -215,6 +228,7 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
         .expect("write partial prefix");
 
     // 3. Rogue Socket 3: Send full 4-byte length prefix (declares 64 bytes payload), but only 4 bytes body
+    let rogue3_connect_start = Instant::now();
     let mut rogue_partial_body = TcpStream::connect(master_addr)
         .await
         .expect("connect rogue 3");
@@ -231,15 +245,6 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
     // 4. Concurrency check: While all 3 rogue connections are hanging in handshake watchdog,
     // verify that a legitimate Worker CAN CONNECT AND COMPLETE HANDSHAKE IMMEDIATELY (<200ms).
     let legit_connect_start = Instant::now();
-    let (legit_shutdown_tx, legit_shutdown_rx) = watch::channel(false);
-    let mut legit_client = WorkerClient::from_options(
-        master_addr.to_string(),
-        Some("legit-node".into()),
-        Some(4),
-        false,
-    );
-    let legit_id = legit_client.worker_id();
-
     let legit_handle = tokio::spawn(async move {
         let _ = legit_client.run(legit_shutdown_rx).await;
     });
@@ -275,9 +280,13 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
         "Legitimate registration must complete in <{:?} despite Slowloris attacks",
         max_elapsed
     );
+    assert!(
+        rogue1_connect_start.elapsed() < Duration::from_millis(4500),
+        "Legitimate worker must register while the rogue connections are still waiting for their 5s timeout"
+    );
 
-    // 5. Verify that all 3 rogue sockets are dropped by Master within 5s (+ grace window)
-    let timeout_start = Instant::now();
+    // 5. Verify that all 3 rogue sockets are dropped by Master within 5s (+ grace window),
+    // measured from each rogue's own connect.
     let mut buf = [0u8; 32];
 
     #[cfg(windows)]
@@ -287,7 +296,7 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
 
     // Rogue 1: read should yield EOF (0 bytes read) or ConnectionReset
     let r1_res = tokio::time::timeout(rogue_timeout, rogue_zero_bytes.read(&mut buf)).await;
-    let r1_elapsed = timeout_start.elapsed();
+    let r1_elapsed = rogue1_connect_start.elapsed();
     println!(
         "[CHALLENGE SLOWLORIS] Rogue 1 (0 bytes) terminated after {:?}",
         r1_elapsed
@@ -307,23 +316,33 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
 
     // Rogue 2: read should yield EOF (0 bytes read)
     let r2_res = tokio::time::timeout(rogue_timeout, rogue_partial_prefix.read(&mut buf)).await;
-    let r2_elapsed = timeout_start.elapsed();
+    let r2_elapsed = rogue2_connect_start.elapsed();
     println!(
         "[CHALLENGE SLOWLORIS] Rogue 2 (partial prefix) terminated after {:?}",
         r2_elapsed
     );
     assert!(r2_res.is_ok(), "Rogue 2 must be closed within timeout");
     assert_eq!(r2_res.unwrap().unwrap_or(0), 0, "Rogue 2 must receive EOF");
+    assert!(
+        r2_elapsed >= Duration::from_millis(4500) && r2_elapsed <= max_r1,
+        "Rogue 2 timeout must be ~5s (actual: {:?})",
+        r2_elapsed
+    );
 
     // Rogue 3: read should yield EOF (0 bytes read)
     let r3_res = tokio::time::timeout(rogue_timeout, rogue_partial_body.read(&mut buf)).await;
-    let r3_elapsed = timeout_start.elapsed();
+    let r3_elapsed = rogue3_connect_start.elapsed();
     println!(
         "[CHALLENGE SLOWLORIS] Rogue 3 (partial body) terminated after {:?}",
         r3_elapsed
     );
     assert!(r3_res.is_ok(), "Rogue 3 must be closed within timeout");
     assert_eq!(r3_res.unwrap().unwrap_or(0), 0, "Rogue 3 must receive EOF");
+    assert!(
+        r3_elapsed >= Duration::from_millis(4500) && r3_elapsed <= max_r1,
+        "Rogue 3 timeout must be ~5s (actual: {:?})",
+        r3_elapsed
+    );
 
     // 6. Verify that registry has ONLY the legitimate worker (no rogue ghost entries)
     let all_workers = registry.list_all_workers().await;
