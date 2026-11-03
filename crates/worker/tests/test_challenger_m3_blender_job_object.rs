@@ -7,8 +7,6 @@
 
 #![allow(clippy::field_reassign_with_default)]
 
-use std::fs::File;
-use std::io::Write;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,37 +24,12 @@ use rusty_grid_worker::autorig::{
 use rusty_grid_worker::sandbox::SandboxConfig;
 use rusty_grid_worker::{RunnerConfig, TaskRunner, EXIT_CODE_CANCELLED};
 
-static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+mod common;
 
-/// Guard to safely set and restore environment variables in async tests.
-struct ScopedEnvVar {
-    _guard: tokio::sync::MutexGuard<'static, ()>,
-    key: &'static str,
-    original_val: Option<String>,
-}
-
-impl ScopedEnvVar {
-    pub async fn set(key: &'static str, val: &str) -> Self {
-        let guard = ENV_MUTEX.lock().await;
-        let original_val = std::env::var(key).ok();
-        std::env::set_var(key, val);
-        Self {
-            _guard: guard,
-            key,
-            original_val,
-        }
-    }
-}
-
-impl Drop for ScopedEnvVar {
-    fn drop(&mut self) {
-        if let Some(ref orig) = self.original_val {
-            std::env::set_var(self.key, orig);
-        } else {
-            std::env::remove_var(self.key);
-        }
-    }
-}
+use common::{
+    assert_all_alive, assert_all_dead_async, blender_binary_or_skip, command_in_own_process_group,
+    create_fake_blender_executable, get_python_exe, poll_pids_async, ScopedEnvVar, ENV_MUTEX,
+};
 
 /// Helper to create a standard test TaskRunner.
 fn create_test_runner() -> (TaskRunner, TempDir) {
@@ -126,23 +99,21 @@ fn validate_and_parse_glb(glb_bytes: &[u8]) -> serde_json::Value {
 }
 
 // ============================================================================
-// SUITE 1: Host Blender 4.5.4 LTS Headless Execution Verification
+// SUITE 1: Host Blender Headless Execution Verification
 // ============================================================================
 
 #[test]
 fn test_verify_host_blender_installation_and_version() {
     let _env_guard = ENV_MUTEX.blocking_lock();
-    let resolved = match blender_provider::resolve_blender_binary() {
-        Some(p) => p,
-        None => {
-            println!("Skipping host Blender test: Blender not found on system");
-            return;
-        }
+    let Some(resolved) =
+        blender_binary_or_skip("test_verify_host_blender_installation_and_version")
+    else {
+        return;
     };
     println!("Resolved Blender executable: {}", resolved.display());
 
-    // Execute --version and assert Blender 4.5.4 LTS
-    let output = std::process::Command::new(&resolved)
+    // Execute --version and assert valid Blender version output
+    let output = command_in_own_process_group(&resolved)
         .arg("--version")
         .output()
         .expect("Failed to execute blender --version");
@@ -151,8 +122,8 @@ fn test_verify_host_blender_installation_and_version() {
     let version_str = String::from_utf8_lossy(&output.stdout);
     println!("Blender version output:\n{}", version_str);
     assert!(
-        version_str.contains("Blender 4.5"),
-        "Expected Blender 4.5.x LTS, got:\n{}",
+        version_str.contains("Blender "),
+        "Expected Blender version banner, got:\n{}",
         version_str
     );
 }
@@ -160,12 +131,10 @@ fn test_verify_host_blender_installation_and_version() {
 #[tokio::test]
 async fn test_verify_host_blender_headless_autorig_execution_glb() {
     let _env_guard = ENV_MUTEX.lock().await;
-    let blender_bin = match blender_provider::resolve_blender_binary() {
-        Some(p) => p,
-        None => {
-            println!("Skipping host Blender auto-rig test: Blender not found on system");
-            return;
-        }
+    let Some(blender_bin) =
+        blender_binary_or_skip("test_verify_host_blender_headless_autorig_execution_glb")
+    else {
+        return;
     };
 
     let input_mesh = generate_test_glb_mesh();
@@ -278,6 +247,11 @@ async fn test_verify_host_blender_headless_autorig_execution_glb() {
 #[tokio::test]
 async fn test_verify_autorig_async_with_preferred_provider_blender() {
     let _env_guard = ENV_MUTEX.lock().await;
+    if blender_binary_or_skip("test_verify_autorig_async_with_preferred_provider_blender").is_none()
+    {
+        return;
+    }
+
     let input_mesh = generate_test_glb_mesh();
     let spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped")
         .with_animations(vec![
@@ -312,6 +286,10 @@ async fn test_verify_autorig_async_with_preferred_provider_blender() {
 #[tokio::test]
 async fn test_verify_task_runner_autorig_execution_with_blender() {
     let _env_guard = ENV_MUTEX.lock().await;
+    if blender_binary_or_skip("test_verify_task_runner_autorig_execution_with_blender").is_none() {
+        return;
+    }
+
     let (runner, _dir) = create_test_runner();
     let input_mesh = generate_test_glb_mesh();
 
@@ -373,14 +351,12 @@ async fn test_verify_task_runner_autorig_execution_with_blender() {
 
 #[tokio::test]
 async fn test_task_runner_autorig_midway_cancellation_cleans_subprocesses() {
-    let _env_guard = ENV_MUTEX.lock().await;
     let (runner, _dir) = create_test_runner();
     let temp_dir = tempfile::tempdir().expect("tempdir");
 
     let pids_file = temp_dir.path().join("pids_cancel.txt");
 
-    // Custom script simulating long auto-rig execution that records PID
-    let hang_script = temp_dir.path().join("mock_hang_rig.py");
+    // Custom script simulating long auto-rig execution that records leader and grandchild PIDs
     let content = format!(
         r#"
 import os, sys, time, subprocess
@@ -402,9 +378,8 @@ time.sleep(30.0)
         pids_file.display()
     );
 
-    let mut f = File::create(&hang_script).expect("Failed to write mock script");
-    f.write_all(content.as_bytes()).expect("Write error");
-    drop(f);
+    let fake_blender = create_fake_blender_executable(temp_dir.path(), &content);
+    let _env = ScopedEnvVar::set("RUSTY_GRID_BLENDER_PATH", &fake_blender).await;
 
     let input_mesh = generate_test_glb_mesh();
     let spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped").with_provider("blender");
@@ -426,8 +401,15 @@ time.sleep(30.0)
             .await
     });
 
-    // Wait a brief moment for execution to start
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait until both fake Blender and its grandchild have recorded their PIDs
+    let pids = poll_pids_async(&pids_file, 2, Duration::from_secs(20)).await;
+    assert_eq!(
+        pids.len(),
+        2,
+        "Expected fake Blender leader and grandchild PIDs to be recorded"
+    );
+    let mut sys = sysinfo::System::new();
+    assert_all_alive(&mut sys, &pids);
 
     // Send cancellation signal
     let _ = cancel_tx.send("Adversarial cancellation midway through auto-rig".to_string());
@@ -443,6 +425,9 @@ time.sleep(30.0)
         "Cancelled task must return EXIT_CODE_CANCELLED (130)"
     );
     assert!(!result.is_success());
+
+    // Both the fake Blender process and its grandchild must be dead
+    assert_all_dead_async(&pids, Duration::from_secs(4)).await;
 }
 
 // ============================================================================
@@ -451,12 +436,15 @@ time.sleep(30.0)
 
 #[tokio::test]
 async fn test_graceful_fallback_when_blender_path_is_invalid_or_missing() {
-    // Set BLENDER_PATH to non-existent executable
-    let _env = ScopedEnvVar::set(
-        "BLENDER_PATH",
-        r"C:\nonexistent_blender_dir\blender_invalid_404.exe",
-    )
-    .await;
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let missing_blender = temp_dir.path().join("blender_invalid_404.exe");
+
+    // Set BLENDER_PATH to non-existent executable; resolver must return None even if host has Blender
+    let _env = ScopedEnvVar::set("BLENDER_PATH", &missing_blender).await;
+    assert!(
+        blender_provider::resolve_blender_binary().is_none(),
+        "Explicit invalid BLENDER_PATH must not fall through to a host Blender installation"
+    );
 
     let input_mesh = generate_test_glb_mesh();
     let spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped")
@@ -512,29 +500,7 @@ fn create_crashing_fake_blender(
     );
     std::fs::write(&logic_path, script).expect("write logic");
 
-    let py_exe = if let Ok(custom) = std::env::var("OXIDESWARM_PYTHON") {
-        std::path::PathBuf::from(custom)
-    } else {
-        #[cfg(windows)]
-        {
-            let output = std::process::Command::new("where.exe")
-                .arg("python.exe")
-                .output()
-                .ok();
-            output
-                .and_then(|out| {
-                    let text = String::from_utf8_lossy(&out.stdout);
-                    text.lines()
-                        .next()
-                        .map(|line| std::path::PathBuf::from(line.trim()))
-                })
-                .unwrap_or_else(|| std::path::PathBuf::from("python"))
-        }
-        #[cfg(not(windows))]
-        {
-            std::path::PathBuf::from("python3")
-        }
-    };
+    let py_exe = get_python_exe();
 
     #[cfg(windows)]
     {
@@ -571,7 +537,7 @@ async fn test_graceful_fallback_when_blender_binary_crashes() {
     let fake_blender = create_crashing_fake_blender(temp_dir.path(), &marker_file, 1);
 
     // Point BLENDER_PATH to the crashing binary
-    let _env = ScopedEnvVar::set("BLENDER_PATH", fake_blender.to_str().unwrap()).await;
+    let _env = ScopedEnvVar::set("BLENDER_PATH", &fake_blender).await;
 
     let input_mesh = generate_test_glb_mesh();
     let spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped")
@@ -609,7 +575,7 @@ async fn test_graceful_fallback_via_task_runner_on_blender_failure() {
     let marker_file = temp_dir.path().join("failure_marker.txt");
     let fake_blender = create_crashing_fake_blender(temp_dir.path(), &marker_file, 42);
 
-    let _env = ScopedEnvVar::set("BLENDER_PATH", fake_blender.to_str().unwrap()).await;
+    let _env = ScopedEnvVar::set("BLENDER_PATH", &fake_blender).await;
 
     let input_mesh = generate_test_glb_mesh();
     let spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped")

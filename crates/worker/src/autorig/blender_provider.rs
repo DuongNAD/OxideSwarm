@@ -12,21 +12,27 @@ pub const EMBEDDED_BLENDER_RIG_SCRIPT: &str =
 
 /// Resolves the file path to host Blender executable.
 pub fn resolve_blender_binary() -> Option<PathBuf> {
-    // 1. Environment variables
+    // 1. Explicit environment variable override.
+    // If an override variable is set to a non-empty value, honour it exclusively
+    // rather than silently falling back to a host-wide Blender installation.
     for env_var in &[
         "RUSTY_GRID_BLENDER_PATH",
         "OXIDE_SWARM_BLENDER_PATH",
         "BLENDER_PATH",
     ] {
         if let Ok(env_path) = std::env::var(env_var) {
-            let p = PathBuf::from(env_path.trim());
-            if p.is_file() {
-                return Some(p);
+            let trimmed = env_path.trim();
+            if !trimmed.is_empty() {
+                let p = PathBuf::from(trimmed);
+                if p.is_file() {
+                    return Some(p);
+                }
+                return None;
             }
         }
     }
 
-    // 2. Standard Windows installation paths
+    // 2. Standard OS installation paths (matching rusty_grid_core::capabilities::detect_blender_installation)
     #[cfg(windows)]
     {
         let mut search_dirs = Vec::new();
@@ -35,6 +41,13 @@ pub fn resolve_blender_binary() -> Option<PathBuf> {
         }
         if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
             search_dirs.push(PathBuf::from(pf86).join("Blender Foundation"));
+        }
+        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+            search_dirs.push(
+                PathBuf::from(local_appdata)
+                    .join("Programs")
+                    .join("Blender Foundation"),
+            );
         }
         search_dirs.push(PathBuf::from(r"C:\Program Files\Blender Foundation"));
 
@@ -52,7 +65,7 @@ pub fn resolve_blender_binary() -> Option<PathBuf> {
                                     .starts_with("Blender")
                         })
                         .collect();
-                    version_dirs.sort_by(|a, b| b.cmp(a)); // Descending version order (prefer 4.5 over older)
+                    version_dirs.sort_by(|a, b| b.cmp(a)); // Descending version order (prefer newer)
                     for dir in version_dirs {
                         let exe = dir.join("blender.exe");
                         if exe.is_file() {
@@ -60,6 +73,39 @@ pub fn resolve_blender_binary() -> Option<PathBuf> {
                         }
                     }
                 }
+            }
+        }
+
+        let steam_blender =
+            PathBuf::from(r"C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe");
+        if steam_blender.is_file() {
+            return Some(steam_blender);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        for app_path in &[
+            "/Applications/Blender.app/Contents/MacOS/Blender",
+            "/Applications/Blender/Blender.app/Contents/MacOS/Blender",
+        ] {
+            let p = PathBuf::from(app_path);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        for linux_path in &[
+            "/usr/bin/blender",
+            "/usr/local/bin/blender",
+            "/snap/bin/blender",
+        ] {
+            let p = PathBuf::from(linux_path);
+            if p.is_file() {
+                return Some(p);
             }
         }
     }
