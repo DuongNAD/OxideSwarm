@@ -41,13 +41,13 @@ Fixes `oxideswarm mapreduce` (`MR-1`) so that local file paths passed to `--mapp
 ### 2. `--map-cmd` and `--reduce-cmd` (`crates/cli/src/cli_app.rs`)
 
 - Adds `--map-cmd <CMD>` (mutually exclusive with `--mapper`) and `--reduce-cmd <CMD>` (mutually exclusive with `--reducer`) to `MapReduceArgs`.
-- `split_command_line` splits the command string into `(program, args)` honouring single and double quotes. Outside single quotes, a backslash `\` acts as an escape only before `"`, `'`, `\`, or (when unquoted) whitespace; ordinary Windows path backslashes (e.g. `C:\Tools\mapper.exe --flag`) and UNC path prefixes (`\\<server>\<share>...` at the start of an unquoted token, at the start of a double-quoted token `"\\srv\my share\m.exe"`, or after `=` in `--in=\\srv\share\x`) are preserved literally, while explicit four-backslash escapes (`\\\\srv\\share\\m.exe`) and non-UNC backslash escapes (`tr -d \\r` -> `\r`) keep their standard escape meaning.
+- `split_command_line` splits the command string into `(program, args)` honouring single and double quotes. Outside single quotes, a backslash `\` acts as an escape before `"`, `'`, `\`, or (when unquoted) whitespace, so `\\` always produces a single backslash `\` while ordinary single Windows path backslashes (e.g. `C:\Tools\mapper.exe --flag`) are preserved literally. A UNC path (`\\<server>\<share>...`) therefore requires single quotes or doubled backslashes (`'\\srv\share\m.exe'` or `\\\\srv\\share\\m.exe`).
 
 ### 3. Finite Floating-Point Support in Built-in Reducers (`crates/master/src/mapreduce.rs`)
 
 - `reduce_builtin` for `"sum"`, `"max"`, and `"min"` accepts integer (`i64`), finite floating-point (`f64`), and numeric string values (`s.parse::<i64>()` / `s.parse::<f64>()` with `f.is_finite()`).
-- In `"sum"`, integer addition uses `i64::checked_add` and promotes to `f64` on overflow rather than saturating at `i64::MAX`, and finite `f64` sums that overflow `f64` (`1e308 + 1e308`) saturate to `f64::MAX` / `f64::MIN` so keys with usable values are always reported as finite JSON numbers.
-- Non-finite floating-point inputs (`inf`, `-inf`, `NaN`, `1e999`) and non-numeric strings (`abc`) are ignored so `serde_json::json!` never serializes a `null` output for a completed key. When every value of a key is skipped (so the key has no usable finite numeric value), `reduce_builtin` returns `Ok(None)`, logs a warning, and omits the key from `MapReduceResult::output` rather than reporting `0`, `i64::MIN`, `i64::MAX`, or `null`.
+- In `"sum"`, integer values accumulate in `i128` (so intermediate overflows such as `i64::MAX + 1 - 1` still yield the exact `i64` result independently of input order) and fall back to `f64` only when the final sum does not fit in `i64`. If a floating-point sum overflows `f64` (`±inf`, e.g. `1e308 + 1e308`), `reduce_builtin` returns `Err` and the job reports the key as failed (naming the key) rather than clamping to `±f64::MAX`.
+- Non-finite floating-point inputs (`inf`, `-inf`, `NaN`, `1e999`) and non-numeric strings (`abc`) are ignored so `serde_json::json!` never serializes a `null` output for a completed key. When every value of a key is skipped (so the key has no usable finite numeric value), `reduce_builtin` returns `Ok(None)` and `MapReduceEngine::execute` logs one warning naming the job ID and key, omitting the key from `MapReduceResult::output` rather than reporting `0`, `i64::MIN`, `i64::MAX`, or `null`.
 
 ### 4. Missing-`sh` Diagnostic and Worker Placement (`crates/master/src/mapreduce.rs`)
 
@@ -72,16 +72,17 @@ Fixes `oxideswarm mapreduce` (`MR-1`) so that local file paths passed to `--mapp
   - `test_cli_mapreduce_ships_local_mapper_and_reducer_scripts` (local `./local.sh` and `./sum.sh` shipped from a separate client directory; planted `word_count` and `sum` in cwd ignored by default flags; oversized `> 64 KiB` script rejected with size error)
   - `test_cli_mapreduce_map_cmd_and_reduce_cmd_and_float_max_min` (`--map-cmd`, `--reduce-cmd`, float and string-float `max`/`min`, `inf`/`NaN` skipped without `null`, Windows backslash path preserved in `--map-cmd`)
   - `test_mapreduce_missing_sh_returns_clear_error` (missing-`sh` hint on `Builtin` map and `ShellScript` reduce; no hint on `Command` map or `E2BIG` spawn failure)
-- `cargo test -p rusty_grid_master --lib mapreduce::tests::test_builtin_reducer_omits_keys_whose_values_are_all_skipped` (omits all-skipped keys, preserves keys with `0`, promotes `i64` sum overflow via `checked_add` to `f64`, and saturates finite `f64` sum overflow to `f64::MAX` / `f64::MIN`)
-- `cargo test -p rusty_grid_cli --lib cli_app::tests::test_read_mapreduce_script_names_map_cmd_and_reduce_cmd_flags_and_split_unc_paths` (`--map-cmd` / `--reduce-cmd` named in script size errors; unquoted, double-quoted, and `--in=\\...` UNC paths preserved alongside `\\\\` and `\\r` escapes)
+- `cargo test -p rusty_grid_master --lib mapreduce::tests::test_builtin_reducer_omits_keys_whose_values_are_all_skipped` (omits all-skipped keys, preserves keys with `0`, accumulates `i64` sums in `i128` before falling back to `f64`, and fails keys whose `f64` sum overflows)
+- `cargo test -p rusty_grid_master --lib mapreduce::tests::test_mapreduce_f64_sum_overflow_fails_job_naming_key` (reports `Failed` naming the overflowing key on `1e308 + 1e308 - 1e308`)
+- `cargo test -p rusty_grid_cli --lib cli_app::tests::test_read_mapreduce_script_names_map_cmd_and_reduce_cmd_flags_and_split_unc_paths` (`--map-cmd` / `--reduce-cmd` named in script size errors; standard `\\` escaping everywhere outside single quotes, and UNC paths preserved with single quotes or doubled backslashes)
 - `cargo test -p rusty_grid_cli --test cli_dashboard_policy_e2e` (`test_mapreduce_exits_non_zero_when_the_job_fails`)
 
 ## Work items
 
 - `MR-1`: Ship local mapper and reducer scripts from `oxideswarm mapreduce`, add `--map-cmd` and `--reduce-cmd`, support float `max`/`min`, and surface missing-`sh` diagnostics.
-- `BUG-13`: Leave keys whose values are all skipped out of `MapReduceResult::output` for built-in `sum`/`max`/`min`, name `--map-cmd` and `--reduce-cmd` in script size errors, and preserve leading UNC `\\` in unquoted `--map-cmd` / `--reduce-cmd` tokens.
+- `BUG-13`: Leave keys whose values are all skipped out of `MapReduceResult::output` for built-in `sum`/`max`/`min`, name `--map-cmd` and `--reduce-cmd` in script size errors, and document single-quoted or doubled-backslash UNC paths in `--map-cmd` / `--reduce-cmd`.
 
 ## Status log
 
 - 2026-11-02: Implemented `MR-1` in `crates/cli/src/cli_app.rs` and `crates/master/src/mapreduce.rs`; addressed review findings `F33-1` through `F33-8` and renumbered design record to `0016`.
-- 2026-11-04: Implemented `BUG-13` follow-ups (`N33-1`..`N33-4`): omit keys with no usable finite numeric values from built-in `sum`/`max`/`min` outputs, pass `--map-cmd` / `--reduce-cmd` into `read_mapreduce_script`, and preserve leading UNC `\\` in `split_command_line`.
+- 2026-11-04: Implemented `BUG-13` follow-ups (`N33-1`..`N33-4`): omit keys with no usable finite numeric values from built-in `sum`/`max`/`min` outputs, accumulate integer sums in `i128` and fail keys whose `f64` sum overflows, pass `--map-cmd` / `--reduce-cmd` into `read_mapreduce_script`, and document single-quoted / doubled-backslash UNC paths for `--map-cmd` / `--reduce-cmd`.

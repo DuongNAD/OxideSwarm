@@ -468,7 +468,7 @@ async fn test_cli_mapreduce_map_cmd_and_reduce_cmd_and_float_max_min() {
         "expected unquoted Windows path backslashes to be preserved, got: {win_stderr}"
     );
 
-    // 5. N33-2: Verify unquoted Windows UNC path `\\srv\share\m.exe` preserves its leading double backslash.
+    // 5. N33-2: Verify single-quoted Windows UNC path `'\\srv\share\m.exe'` preserves its leading double backslash.
     let c_path = client_path.clone();
     let m_arg = master_addr.clone();
     let unc_out = tokio::task::spawn_blocking(move || {
@@ -480,7 +480,7 @@ async fn test_cli_mapreduce_map_cmd_and_reduce_cmd_and_float_max_min() {
                 "--input",
                 "floats.txt",
                 "--map-cmd",
-                r"\\srv\share\m.exe --flag",
+                r"'\\srv\share\m.exe' --flag",
                 "--chunks",
                 "1",
             ])
@@ -493,7 +493,7 @@ async fn test_cli_mapreduce_map_cmd_and_reduce_cmd_and_float_max_min() {
     let unc_stderr = String::from_utf8_lossy(&unc_out.stderr);
     assert!(
         unc_stderr.contains(r"\\srv\share\m.exe"),
-        "expected unquoted UNC path leading double backslash to be preserved, got: {unc_stderr}"
+        "expected single-quoted UNC path leading double backslash to be preserved, got: {unc_stderr}"
     );
 
     let _ = shutdown_tx.send(true);
