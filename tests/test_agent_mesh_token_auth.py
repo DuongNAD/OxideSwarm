@@ -65,6 +65,7 @@ def _drain_stream(stream):
 
 def start_hub(token=TOKEN):
     """Starts the Rust hub on an ephemeral loopback port; returns (process, ws_url, http_base)."""
+    import queue
     import threading
 
     env = {k: v for k, v in os.environ.items() if k != "OXIDE_MESH_TOKEN"}
@@ -75,17 +76,39 @@ def start_hub(token=TOKEN):
         text=True,
         env=env,
     )
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        line = proc.stdout.readline()
-        if not line:
+    line_queue: queue.Queue = queue.Queue()
+
+    def _reader():
+        try:
+            for line in proc.stdout:
+                line_queue.put(line)
+                if "running at " in line:
+                    break
+            for _ in proc.stdout:
+                pass
+        except Exception:
+            pass
+        finally:
+            line_queue.put(None)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    deadline = time.time() + 15.0
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        try:
+            line = line_queue.get(timeout=remaining)
+        except queue.Empty:
+            break
+        if line is None:
             break
         if "running at " in line:
             ws_url = line.split("running at ", 1)[1].strip()
             http_base = "http://" + ws_url.split("://", 1)[1].rsplit("/ws", 1)[0]
-            threading.Thread(target=_drain_stream, args=(proc.stdout,), daemon=True).start()
             return proc, ws_url, http_base
     proc.kill()
+    proc.wait(timeout=3)
     raise RuntimeError("hub did not report its address")
 
 
