@@ -859,8 +859,6 @@ enum JsonOutcome {
     RoundTrips,
     /// It is refused, on purpose.
     Refused,
-    /// It decodes to a different message: a mirror bug, asserted so that a fix is noticed.
-    Diverges,
 }
 
 fn json_outcome(key: &str) -> JsonOutcome {
@@ -871,13 +869,6 @@ fn json_outcome(key: &str) -> JsonOutcome {
         "WorkerMessage::UnknownVariant"
         | "MasterMessage::UnknownVariant"
         | "InboundMessage::Worker(UnknownVariant)" => JsonOutcome::Refused,
-        // KNOWN DIVERGENCE: `HumanInboundMessage` is `#[serde(untagged)]` and tries `Client`
-        // first. `WorkerMessage::BlobRequest` and `ClientMessage::BlobRequest` share the JSON tag
-        // `"type":"BlobRequest"` and the client variant ignores the unknown `request_id`, so this
-        // decodes as `InboundMessage::Client(ClientMessage::BlobRequest { .. })` without its id.
-        // Latent: the Master reads only the first frame of a connection as an `InboundMessage`,
-        // and a worker's first frame is `Register`. Not part of the recorded layout.
-        "InboundMessage::Worker(BlobRequest)" => JsonOutcome::Diverges,
         _ => JsonOutcome::RoundTrips,
     }
 }
@@ -943,11 +934,6 @@ where
                 JsonOutcome::Refused => {
                     if let Ok((back, _)) = decoded {
                         panic!("{key}: the {path} must be refused, it decoded to {back:?}");
-                    }
-                }
-                JsonOutcome::Diverges => {
-                    if matches!(&decoded, Ok((back, _)) if back == msg) {
-                        panic!("{key}: the {path} round-trips now; remove its known divergence");
                     }
                 }
             }

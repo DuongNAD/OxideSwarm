@@ -830,7 +830,7 @@ pub struct MapReduceArgs {
     #[arg(
         long,
         conflicts_with = "mapper",
-        help = "Command line to run as the mapper (receives chunk on stdin, writes key/value lines to stdout)"
+        help = "Command line to run as the mapper (receives chunk on stdin, writes key/value lines to stdout; quote UNC paths with single quotes or doubled backslashes, e.g. '\\\\srv\\share\\m.exe' or \\\\\\\\srv\\\\share\\\\m.exe)"
     )]
     pub map_cmd: Option<String>,
 
@@ -845,7 +845,7 @@ pub struct MapReduceArgs {
     #[arg(
         long,
         conflicts_with = "reducer",
-        help = "Command line to run as the reducer (receives grouped JSON on stdin, writes reduced value to stdout)"
+        help = "Command line to run as the reducer (receives grouped JSON on stdin, writes reduced value to stdout; quote UNC paths with single quotes or doubled backslashes, e.g. '\\\\srv\\share\\r.exe' or \\\\\\\\srv\\\\share\\\\r.exe)"
     )]
     pub reduce_cmd: Option<String>,
 
@@ -3381,12 +3381,6 @@ fn split_command_line(cmd: &str) -> Result<(String, Vec<String>), String> {
     while let Some(ch) = chars.next() {
         match ch {
             '\\' if !in_single => {
-                if !in_double && !token_started && chars.peek() == Some(&'\\') {
-                    chars.next();
-                    current.push_str(r"\\");
-                    token_started = true;
-                    continue;
-                }
                 let should_escape = if in_double {
                     matches!(chars.peek(), Some('"' | '\\'))
                 } else {
@@ -4449,10 +4443,33 @@ max_active_mb = 768
         );
         assert!(!reduce_err.contains("--reducer-cmd"), "{reduce_err}");
 
-        // Unquoted UNC paths keep their leading double backslash in both program and argument tokens.
+        // Outside single quotes, `\\` is always one backslash everywhere:
         let (prog, args) =
-            split_command_line(r"\\srv\share\m.exe \\srv\share\arg.txt --flag").unwrap();
-        assert_eq!(prog, r"\\srv\share\m.exe");
-        assert_eq!(args, vec![r"\\srv\share\arg.txt", "--flag"]);
+            split_command_line(r#"prog "\\r\\n" "\\d+\\.\\d+" --regexp=\\d+\\.\\d+"#).unwrap();
+        assert_eq!(prog, "prog");
+        assert_eq!(args, vec![r"\r\n", r"\d+\.\d+", r"--regexp=\d+\.\d+"]);
+
+        let (printf_prog, printf_args) = split_command_line(r#"printf "\\t%s\\n""#).unwrap();
+        assert_eq!(printf_prog, "printf");
+        assert_eq!(printf_args, vec![r"\t%s\n"]);
+
+        let (ps_prog, ps_args) = split_command_line(r"psexec \\host").unwrap();
+        assert_eq!(ps_prog, "psexec");
+        assert_eq!(ps_args, vec![r"\host"]);
+
+        let (sp_prog, sp_args) = split_command_line(r"prog \\ next\x").unwrap();
+        assert_eq!(sp_prog, "prog");
+        assert_eq!(sp_args, vec![r"\", r"next\x"]);
+
+        // UNC paths use single quotes or doubled backslashes (`'\\srv\share\m.exe'` or
+        // `\\\\srv\\share\\m.exe`):
+        let (unc_prog, unc_args) =
+            split_command_line(r"'\\srv\share\m.exe' '\\srv\share\arg.txt'").unwrap();
+        assert_eq!(unc_prog, r"\\srv\share\m.exe");
+        assert_eq!(unc_args, vec![r"\\srv\share\arg.txt"]);
+
+        let (esc_prog, esc_args) = split_command_line(r"\\\\srv\\share\\m.exe tr -d \\r").unwrap();
+        assert_eq!(esc_prog, r"\\srv\share\m.exe");
+        assert_eq!(esc_args, vec!["tr", "-d", r"\r"]);
     }
 }

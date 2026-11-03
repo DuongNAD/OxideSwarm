@@ -1,7 +1,7 @@
 # 0017: Honest 3D Procedural SDF Fallback, Neural Model Refusal, and Environment Isolation
 
 Status: Implemented
-Created: 2026-11-01    Updated: 2026-11-02
+Created: 2026-11-01    Updated: 2026-11-03
 
 ## Summary
 
@@ -59,9 +59,9 @@ Behaviour before this change:
 ### D3. Fast Pre-submission Validation for Image Inputs
 - In `crates/core/src/task.rs`:
   - `Generative3DSpec::new_image` defaults `engine_preference` to `Some("triposr".to_string())` (`crates/core/src/task.rs:852`).
-  - `TaskSpec::validate()` checks `engine` when `has_image` is true:
-    - For `"auto"` or `"procedural"`, returns `"Image input is only supported with neural 3D engines (e.g. triposr); auto and procedural engines do not accept images"`.
-    - For `"sdf"` or `"tier0_sdf"`, returns `"Tier 0 procedural SDF engine does not support image input (text prompt only)"`.
+  - `TaskSpec::validate()` parses the engine into `Engine3D` via `spec.try_engine()?` and matches on it when `has_image` is true:
+    - For `Engine3D::Auto` (`None`, `""`, `"auto"`), returns `"Image input is only supported with neural 3D engines (e.g. triposr); the auto engine does not accept images"`.
+    - For `Engine3D::Sdf` (`"sdf"`, `"tier0_sdf"`, `"tier0"`, `"tier-0"`, `"procedural"`, `"procedural_sdf"`), returns `"Tier 0 procedural SDF engine does not support image input (text prompt only)"`.
   - In `crates/cli/src/cli_app.rs`: `build_task_spec` invokes `spec.validate()?` before connecting to master.
 
 ### D4. Subprocess Diagnostic Stderr Extraction
@@ -98,9 +98,11 @@ Behaviour before this change:
   - `test_3d1_auto_engine_defaults_to_sdf_tier`: asserts `Procedural-SDF-PureRust`.
   - `test_3d1_auto_engine_never_invokes_python_runtime`: trap script verification.
   - `test_3d1_auto_engine_defaults_to_sdf_tier_even_with_custom_script`: env override verification.
-  - `test_3d1_sdf_tier_rejects_image_input_honestly`: asserts rejection on `auto`, `sdf`, `tier0_sdf`, `procedural`.
+  - `test_3d1_sdf_tier_rejects_image_input_honestly`: asserts rejection on `auto` and all `Engine3D::Sdf` aliases (`sdf`, `tier0_sdf`, `tier0`, `tier-0`, `procedural`, `procedural_sdf`).
   - `test_3d1_success_path_device_name_comes_from_engine`: verifies dynamic device label.
   - `test_3d1_resolve_python_preserves_venv_sys_prefix`: verifies `sys.prefix` consistency.
+- `crates/core/src/task.rs`:
+  - `test_validate_generative_3d_sdf_aliases_and_auto_reject_image`: verifies `TaskSpec::validate()` rejects image input on `Engine3D::Auto` and all `Engine3D::Sdf` aliases with their respective diagnostic errors.
 - `crates/cli/tests/test_cli_3d_submission.rs`:
   - `test_cli_3d_default_engine_with_image_fails_before_submit`: fast pre-submission failure.
 
@@ -119,3 +121,4 @@ Behaviour before this change:
 ## Status log
 
 - 2026-11-02: Design record 0017 drafted and implemented for PR #22 remediation.
+- 2026-11-03: Updated D3 to reflect `TaskSpec::validate()` matching on parsed `Engine3D` across all `Engine3D::Sdf` aliases (`sdf`, `tier0_sdf`, `tier0`, `tier-0`, `procedural`, `procedural_sdf`), aligned missing-Python assertion in `test_3d1_honest_sdf.rs`, and removed obsolete `auto` fallback half from `test_sec5_missing_output_file_fails_under_explicit_engine`.

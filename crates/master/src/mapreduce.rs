@@ -276,8 +276,28 @@ impl MapReduceEngine {
         match &spec.reducer {
             ReduceFunctionSpec::Builtin { operator } => {
                 for (key, values) in grouped {
-                    if let Some(reduced) = reduce_builtin(operator, &values)? {
-                        final_output.insert(key, reduced);
+                    match reduce_builtin(operator, &values) {
+                        Ok(Some(reduced)) => {
+                            final_output.insert(key, reduced);
+                        }
+                        Ok(None) => {
+                            warn!(
+                                job_id = %spec.job_id,
+                                key = %key,
+                                operator = %operator,
+                                skipped_values = values.len(),
+                                "Dropping MapReduce key with no usable finite numeric values"
+                            );
+                        }
+                        Err(e) => {
+                            return Ok(failed_result(
+                                &spec,
+                                start_time,
+                                (map_tasks_total, map_tasks_completed),
+                                (reduce_tasks_total, reduce_tasks_completed),
+                                format!("Reducer for key '{key}' failed: {e}"),
+                            ));
+                        }
                     }
                     reduce_tasks_completed += 1;
                 }
@@ -698,49 +718,80 @@ fn validate_builtin_reducer(operator: &str) -> GridResult<()> {
 /// Applies a built-in reducer to the values of one key.
 /// Returns `Ok(None)` when every value of the key is skipped (no usable finite numeric value
 /// for `"sum"`, `"max"`, or `"min"`), so the key is omitted from the output rather than
-/// reporting a bogus default (`0`, `i64::MIN`, `i64::MAX`, or `null`).
+/// reporting a bogus default (`0`, `i64::MIN`, `i64::MAX`, or `null`). Integer `"sum"`
+/// accumulates in `i128` and falls back to `f64` only when the final sum does not fit in
+/// `i64`; if an `f64` sum overflows to `±inf`, returns `Err` so the job fails the key with
+/// its name instead of reporting a clamped sentinel number.
 fn reduce_builtin(
     operator: &str,
     values: &[serde_json::Value],
 ) -> GridResult<Option<serde_json::Value>> {
     Ok(match operator {
         "sum" => {
-            let mut sum_f = 0.0;
-            let mut is_float = false;
-            let mut sum_i: i64 = 0;
+            let mut sum_i: i128 = 0;
+            let mut sum_f: f64 = 0.0;
+            let mut has_float = false;
+            let mut overflow_i128 = false;
             let mut has_usable = false;
             for val in values {
-                if let Some(n) = val.as_i64() {
-                    sum_i = sum_i.saturating_add(n);
-                    has_usable = true;
-                } else if let Some(f) = val.as_f64().filter(|f| f.is_finite()) {
-                    is_float = true;
-                    sum_f += f;
-                    has_usable = true;
-                } else if let Some(s) = val.as_str() {
-                    if let Ok(n) = s.parse::<i64>() {
-                        sum_i = sum_i.saturating_add(n);
-                        has_usable = true;
-                    } else if let Ok(f) = s.parse::<f64>() {
-                        if f.is_finite() {
-                            is_float = true;
-                            sum_f += f;
-                            has_usable = true;
+                let parsed_i = val
+                    .as_i64()
+                    .or_else(|| val.as_str().and_then(|s| s.parse::<i64>().ok()));
+                let parsed_f = if parsed_i.is_none() {
+                    val.as_f64()
+                        .or_else(|| val.as_str().and_then(|s| s.parse::<f64>().ok()))
+                        .filter(|f| f.is_finite())
+                } else {
+                    None
+                };
+                if let Some(n) = parsed_i {
+                    if !overflow_i128 {
+                        if let Some(next) = sum_i.checked_add(i128::from(n)) {
+                            sum_i = next;
+                        } else {
+                            overflow_i128 = true;
+                            sum_f += (sum_i as f64) + (n as f64);
+                            sum_i = 0;
+                            if !sum_f.is_finite() {
+                                return Err(GridError::Config(
+                                    "f64 sum overflowed to infinity".to_string(),
+                                ));
+                            }
+                        }
+                    } else {
+                        sum_f += n as f64;
+                        if !sum_f.is_finite() {
+                            return Err(GridError::Config(
+                                "f64 sum overflowed to infinity".to_string(),
+                            ));
                         }
                     }
+                    has_usable = true;
+                } else if let Some(f) = parsed_f {
+                    has_float = true;
+                    sum_f += f;
+                    if !sum_f.is_finite() {
+                        return Err(GridError::Config(
+                            "f64 sum overflowed to infinity".to_string(),
+                        ));
+                    }
+                    has_usable = true;
                 }
             }
             if !has_usable {
                 None
-            } else if is_float {
-                let total = sum_f + sum_i as f64;
-                if total.is_finite() {
-                    Some(serde_json::json!(total))
-                } else {
-                    None
+            } else if has_float || overflow_i128 {
+                let total = sum_f + (sum_i as f64);
+                if !total.is_finite() {
+                    return Err(GridError::Config(
+                        "f64 sum overflowed to infinity".to_string(),
+                    ));
                 }
+                Some(serde_json::json!(total))
+            } else if let Ok(exact_i64) = i64::try_from(sum_i) {
+                Some(serde_json::json!(exact_i64))
             } else {
-                Some(serde_json::json!(sum_i))
+                Some(serde_json::json!(sum_i as f64))
             }
         }
         "count" => Some(serde_json::json!(values.len())),
@@ -1882,6 +1933,130 @@ mod tests {
         assert_eq!(
             reduce_builtin("min", &with_zero).unwrap(),
             Some(serde_json::json!(0))
+        );
+
+        // Integer sum accumulates in `i128` so `i64::MAX + 1 - 1` and `1 - 1 + i64::MAX` both
+        // return the exact `i64::MAX`, falling back to `f64` only when the final sum does not fit in `i64`.
+        assert_eq!(
+            reduce_builtin(
+                "sum",
+                &[
+                    serde_json::json!(i64::MAX),
+                    serde_json::json!(1),
+                    serde_json::json!(-1)
+                ]
+            )
+            .unwrap(),
+            Some(serde_json::json!(i64::MAX))
+        );
+        assert_eq!(
+            reduce_builtin(
+                "sum",
+                &[
+                    serde_json::json!(1),
+                    serde_json::json!(-1),
+                    serde_json::json!(i64::MAX)
+                ]
+            )
+            .unwrap(),
+            Some(serde_json::json!(i64::MAX))
+        );
+
+        let int_overflow = vec![
+            serde_json::json!(i64::MAX),
+            serde_json::json!(i64::MAX.to_string()),
+        ];
+        let int_sum = reduce_builtin("sum", &int_overflow)
+            .unwrap()
+            .expect("overflowing i64 sum must be reported");
+        let int_sum_f = int_sum.as_f64().expect("promoted to f64");
+        assert!(
+            int_sum_f > (i64::MAX as f64) * 1.5,
+            "expected f64 sum > 1.5 * i64::MAX, got {int_sum_f}"
+        );
+        assert_eq!(
+            reduce_builtin("sum", &[serde_json::json!(0.5), serde_json::json!(10)]).unwrap(),
+            Some(serde_json::json!(10.5))
+        );
+        assert_eq!(
+            reduce_builtin("sum", &[serde_json::json!(10), serde_json::json!(0.5)]).unwrap(),
+            Some(serde_json::json!(10.5))
+        );
+
+        // Finite `f64` sums that overflow `f64` (including `1e308 + 1e308 - 1e308`) fail instead
+        // of clamping to `±f64::MAX` and returning a corrupted number.
+        let float_overflow = vec![serde_json::json!(1e308), serde_json::json!("1e308")];
+        assert!(
+            reduce_builtin("sum", &float_overflow).is_err(),
+            "f64 sum overflow must return Err"
+        );
+        let float_overflow_then_sub = vec![
+            serde_json::json!(1e308),
+            serde_json::json!(1e308),
+            serde_json::json!(-1e308),
+        ];
+        assert!(
+            reduce_builtin("sum", &float_overflow_then_sub).is_err(),
+            "1e308 + 1e308 - 1e308 must fail on f64 overflow rather than returning a clamped number"
+        );
+        let neg_float_overflow = vec![serde_json::json!(-1e308), serde_json::json!("-1e308")];
+        assert!(
+            reduce_builtin("sum", &neg_float_overflow).is_err(),
+            "negative f64 sum overflow must return Err"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mapreduce_f64_sum_overflow_fails_job_naming_key() {
+        let queue = TaskQueue::new();
+        let notify = Arc::new(Notify::new());
+        let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let engine = MapReduceEngine::new(queue.clone(), notify.clone(), waiters.clone());
+
+        let q_clone = queue.clone();
+        let w_clone = Arc::clone(&waiters);
+        let n_clone = Arc::clone(&notify);
+        tokio::spawn(async move {
+            n_clone.notified().await;
+            for t in q_clone.get_schedulable_tasks().await {
+                let task_id = t.id;
+                let _ = q_clone.mark_running(&task_id, Uuid::new_v4()).await;
+                let res = TaskResult::success(
+                    Uuid::new_v4(),
+                    task_id,
+                    "overflow_key\t1e308\noverflow_key\t1e308\noverflow_key\t-1e308\n".to_string(),
+                    5,
+                    false,
+                );
+                let _ = q_clone.record_result(res.clone()).await;
+                if let Some(senders) = w_clone.write().await.remove(&task_id) {
+                    for tx in senders {
+                        let _ = tx.send(res.clone());
+                    }
+                }
+            }
+        });
+
+        let spec = MapReduceJobSpec::new(
+            "test_f64_overflow",
+            vec!["input".into()],
+            MapFunctionSpec::Builtin {
+                operator: "identity".into(),
+            },
+            ReduceFunctionSpec::Builtin {
+                operator: "sum".into(),
+            },
+            1,
+            1,
+            30,
+        );
+        let res = engine.execute(spec).await.expect("execute returns result");
+        assert_eq!(res.status, "Failed", "job must fail on f64 sum overflow");
+        assert!(res.output.is_empty());
+        let err = res.error.expect("error message must be set");
+        assert!(
+            err.contains("overflow_key"),
+            "error must name the overflowing key, got: {err}"
         );
     }
 }

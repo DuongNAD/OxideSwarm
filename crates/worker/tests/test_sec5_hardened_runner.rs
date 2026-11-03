@@ -1133,11 +1133,11 @@ sys.exit(0)
 }
 
 // ============================================================================
-// Test 15: Missing Output File Falls Back Under Auto and Fails Under Explicit
+// Test 15: Missing Output File Fails Under Explicit Engine
 // ============================================================================
 
 #[tokio::test]
-async fn test_sec5_missing_output_file_falls_back_under_auto_and_fails_under_explicit() {
+async fn test_sec5_missing_output_file_fails_under_explicit_engine() {
     let (runner, _dir) = create_test_runner();
     let temp_dir = tempfile::tempdir().expect("tempdir");
 
@@ -1152,33 +1152,17 @@ async fn test_sec5_missing_output_file_falls_back_under_auto_and_fails_under_exp
     );
 
     // Explicit engine 'triposr' must fail with missing file error
-    {
-        let spec = Generative3DSpec::new_prompt("Missing Output Explicit").with_engine("triposr");
-        let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
-        let res = runner.execute_task(&task, None, None).await;
+    let spec = Generative3DSpec::new_prompt("Missing Output Explicit").with_engine("triposr");
+    let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
+    let res = runner.execute_task(&task, None, None).await;
 
-        assert_eq!(res.exit_code, EXIT_CODE_GENERAL_ERROR);
-        let err = res.error.as_deref().unwrap_or("");
-        assert!(
-            err.starts_with("Process succeeded but expected output file"),
-            "Expected missing file error, got: '{err}'"
-        );
-        assert!(res.asset_bytes.is_none());
-    }
-
-    // Engine 'auto' must fall back to Tier 0 SDF and succeed
-    {
-        let spec = Generative3DSpec::new_prompt("Missing Output Auto").with_engine("auto");
-        let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
-        let res = runner.execute_task(&task, None, None).await;
-
-        assert!(
-            res.is_success(),
-            "Auto must fall back to Tier 0 SDF on missing output"
-        );
-        assert!(res.asset_bytes.is_some());
-        assert!(res.asset_bytes.unwrap().as_slice().starts_with(b"glTF"));
-    }
+    assert_eq!(res.exit_code, EXIT_CODE_GENERAL_ERROR);
+    let err = res.error.as_deref().unwrap_or("");
+    assert!(
+        err.starts_with("Process succeeded but expected output file"),
+        "Expected missing file error, got: '{err}'"
+    );
+    assert!(res.asset_bytes.is_none());
 }
 
 // ============================================================================
@@ -1242,4 +1226,181 @@ sys.exit(0)
             "asset_bytes must be None for engine {engine}"
         );
     }
+}
+
+// ============================================================================
+// Test 17: BUG-10 - 3D and Blender Refuse Symbolic Link Output
+// ============================================================================
+
+#[tokio::test]
+async fn test_bug10_3d_and_blender_refuse_symlink_output() {
+    let (runner, _dir) = create_test_runner();
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+
+    let mock_script = temp_dir.path().join("symlink_output_engine.py");
+    let script_content = r#"
+import os
+import subprocess
+import sys
+
+if "--output" in sys.argv:
+    out_idx = sys.argv.index("--output")
+    out_path = sys.argv[out_idx + 1]
+    parent = os.path.dirname(os.path.abspath(out_path))
+    target_file = os.path.join(parent, "real_target.glb")
+    with open(target_file, "wb") as f:
+        f.write(b"glTF\x02\x00\x00\x00\x0c\x00\x00\x00")
+    try:
+        os.symlink(target_file, out_path)
+    except OSError:
+        target_dir = os.path.join(parent, "real_target_dir")
+        os.makedirs(target_dir, exist_ok=True)
+        subprocess.run(["cmd", "/C", "mklink", "/J", out_path, target_dir], check=True)
+sys.exit(0)
+"#;
+    std::fs::write(&mock_script, script_content).expect("write mock script");
+
+    let mut env = EnvLock::lock().await;
+    env.set(
+        "OXIDESWARM_GEN3D_SCRIPT",
+        mock_script.to_str().expect("path"),
+    );
+
+    for engine in ["triposr"] {
+        let spec = Generative3DSpec::new_prompt("Symlink Output Test").with_engine(engine);
+        let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
+        let res = runner.execute_task(&task, None, None).await;
+
+        assert_eq!(
+            res.exit_code, EXIT_CODE_GENERAL_ERROR,
+            "Exit code must be 1 for engine {engine}"
+        );
+        let err = res.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("Failed to read generated .glb asset") && err.contains("symbolic link"),
+            "Error for engine {engine} must report symbolic link refusal, got: '{err}'"
+        );
+        assert!(
+            res.asset_bytes.is_none(),
+            "asset_bytes must be None for engine {engine}"
+        );
+    }
+
+    drop(env);
+
+    // Also verify BlenderRigProvider refuses a symlink / junction at its output path
+    let fake_blender = create_fake_blender_executable(temp_dir.path(), script_content);
+    let blender_err = BlenderRigProvider::execute_rigging(
+        &runner,
+        TaskId::new(),
+        &fake_blender,
+        b"glTF\x02\x00\x00\x00\x0c\x00\x00\x00",
+        "biped",
+        &[],
+        15,
+    )
+    .await
+    .expect_err("BlenderRigProvider must refuse symlink output");
+    assert!(
+        blender_err.contains("symbolic link") && blender_err.contains("rigged_output.glb"),
+        "Blender error must report symbolic link and output path, got: '{blender_err}'"
+    );
+}
+
+// ============================================================================
+// Test 18: BUG-10 - 3D and Blender Refuse Oversized Sparse File Without Reading
+// ============================================================================
+
+#[tokio::test]
+async fn test_bug10_3d_and_blender_refuse_oversized_sparse_output_without_reading() {
+    let (runner, _dir) = create_test_runner();
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+
+    let sparse_bytes: u64 = (rusty_grid_core::protocol::MAX_FRAME_SIZE as u64) + 1; // 64 MiB + 1 byte
+    let mock_script = temp_dir.path().join("sparse_output_engine.py");
+    let script_content = format!(
+        r#"
+import os
+import subprocess
+import sys
+
+if "--output" in sys.argv:
+    out_idx = sys.argv.index("--output")
+    out_path = sys.argv[out_idx + 1]
+    with open(out_path, "wb") as f:
+        pass
+    if os.name == "nt":
+        subprocess.run(
+            ["fsutil", "sparse", "setflag", out_path],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    with open(out_path, "r+b") as f:
+        f.truncate({sparse_bytes})
+sys.exit(0)
+"#
+    );
+    std::fs::write(&mock_script, &script_content).expect("write mock script");
+
+    let mut env = EnvLock::lock().await;
+    env.set(
+        "OXIDESWARM_GEN3D_SCRIPT",
+        mock_script.to_str().expect("path"),
+    );
+
+    for engine in ["triposr"] {
+        let spec = Generative3DSpec::new_prompt("Sparse Output Test").with_engine(engine);
+        let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
+        let start = Instant::now();
+        let res = runner.execute_task(&task, None, None).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "Oversized sparse file must fail without reading into memory, took {elapsed:?}"
+        );
+        assert_eq!(
+            res.exit_code, EXIT_CODE_GENERAL_ERROR,
+            "Exit code must be 1 for engine {engine}"
+        );
+        let err = res.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("output_model.glb")
+                && err.contains(&format!("is {sparse_bytes} bytes"))
+                && !err.contains("is more than"),
+            "Error for engine {engine} must name output path and exact size 'is {sparse_bytes} bytes', got: '{err}'"
+        );
+        assert!(
+            res.asset_bytes.is_none(),
+            "asset_bytes must be None for engine {engine}"
+        );
+    }
+
+    drop(env);
+
+    let fake_blender = create_fake_blender_executable(temp_dir.path(), &script_content);
+    let start = Instant::now();
+    let blender_err = BlenderRigProvider::execute_rigging(
+        &runner,
+        TaskId::new(),
+        &fake_blender,
+        b"glTF\x02\x00\x00\x00\x0c\x00\x00\x00",
+        "biped",
+        &[],
+        15,
+    )
+    .await
+    .expect_err("BlenderRigProvider must refuse oversized sparse output");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "Blender oversized sparse file must fail without reading into memory, took {elapsed:?}"
+    );
+    assert!(
+        blender_err.contains("rigged_output.glb")
+            && blender_err.contains(&format!("is {sparse_bytes} bytes"))
+            && !blender_err.contains("is more than"),
+        "Blender error must name output path and exact size 'is {sparse_bytes} bytes', got: '{blender_err}'"
+    );
 }

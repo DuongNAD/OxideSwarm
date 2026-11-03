@@ -194,12 +194,10 @@ async fn test_sec6_environment_secret_stripping_cross_platform() {
     let hub_url = format!("ws://127.0.0.1:{}/ws", port);
 
     // Set sentinel secrets on this process
-    const SENTINELS: [(&str, &str); 5] = [
+    const SENTINELS: [(&str, &str); 3] = [
         ("OXIDESWARM_SECRET", "sentinel-cluster-secret-999"),
         ("OXIDESWARM_SECRET_FILE", "/sentinel/secret/file/888"),
         ("OXIDE_MESH_TOKEN", "sentinel-mesh-token-777"),
-        ("RUSTY_GRID_SECRET", "sentinel-grid-secret-666"),
-        ("RUSTY_GRID_SECRET_FILE", "/sentinel/grid-file/555"),
     ];
 
     for (name, val) in SENTINELS {
@@ -217,7 +215,7 @@ async fn test_sec6_environment_secret_stripping_cross_platform() {
     let script_path = std::env::current_dir().unwrap().join(&script_name);
     let script_content = r#"
 import os
-keys = ['OXIDESWARM_SECRET', 'OXIDESWARM_SECRET_FILE', 'OXIDE_MESH_TOKEN', 'RUSTY_GRID_SECRET', 'RUSTY_GRID_SECRET_FILE']
+keys = ['OXIDESWARM_SECRET', 'OXIDESWARM_SECRET_FILE', 'OXIDE_MESH_TOKEN']
 print(' '.join(k + '=' + os.environ.get(k, 'UNSET') for k in keys))
 "#;
     std::fs::write(&script_path, script_content).expect("Failed to write test script");
@@ -238,7 +236,7 @@ print(' '.join(k + '=' + os.environ.get(k, 'UNSET') for k in keys))
         {
             format!("python {}", script_name)
         } else {
-            "sh -c 'echo \"OXIDESWARM_SECRET=${OXIDESWARM_SECRET:-UNSET} OXIDESWARM_SECRET_FILE=${OXIDESWARM_SECRET_FILE:-UNSET} OXIDE_MESH_TOKEN=${OXIDE_MESH_TOKEN:-UNSET} RUSTY_GRID_SECRET=${RUSTY_GRID_SECRET:-UNSET} RUSTY_GRID_SECRET_FILE=${RUSTY_GRID_SECRET_FILE:-UNSET}\"'".to_string()
+            "sh -c 'echo \"OXIDESWARM_SECRET=${OXIDESWARM_SECRET:-UNSET} OXIDESWARM_SECRET_FILE=${OXIDESWARM_SECRET_FILE:-UNSET} OXIDE_MESH_TOKEN=${OXIDE_MESH_TOKEN:-UNSET}\"'".to_string()
         }
     };
 

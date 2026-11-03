@@ -8,16 +8,17 @@ Created: 2026-11-01    Updated: 2026-11-02
 Hardens the agent mesh command execution layer across Rust (`agent_mesh`) and Python (`scripts/agent_node.py`)
 runtimes (SEC-6). Restricts nodes to 5 advertised commands (`echo`, `ping`, `system_info`, `sha256_verify`,
 `shell_exec`), rejecting unadvertised commands with exit code 127. Adds `--no-shell` flag to suppress
-`shell_exec` advertising and execution. Strips 5 sensitive environment variables from child command
-inheritance, detaches stdin (`DEVNULL`), caps output streams at 1 MiB per stream with truncation markers,
-and exposes `--no-shell` across all platform launchers.
+`shell_exec` advertising and execution. Strips the 3 sensitive secret environment variables (`OXIDESWARM_SECRET`,
+`OXIDESWARM_SECRET_FILE`, `OXIDE_MESH_TOKEN`) from child command inheritance, detaches stdin (`DEVNULL`),
+caps output streams at 1 MiB per stream with truncation markers, and exposes `--no-shell` across all
+platform launchers.
 
 ## Context
 
 Prior to SEC-6, mesh nodes allowed arbitrary commands to be executed via raw binary names or shells
 without restriction (`crates/agent_mesh/src/executor.rs`, `scripts/agent_node.py`). Child processes
 inherited all environment variables from the parent node process (including `OXIDESWARM_SECRET`,
-`OXIDE_MESH_TOKEN`, and `RUSTY_GRID_SECRET`), inherited stdin (causing commands like `cat` to hang
+`OXIDESWARM_SECRET_FILE`, and `OXIDE_MESH_TOKEN`), inherited stdin (causing commands like `cat` to hang
 until timeout), and had unbounded stdout/stderr capture that could exceed WebSocket message limits
 (16 MiB). In addition, platform launcher scripts (`packaging/agent_mesh/*`) did not allow operators
 to configure `--no-shell`.
@@ -29,8 +30,8 @@ to configure `--no-shell`.
   and `status: "failed"`.
 - G2: Provide `--no-shell` mode: omits `shell_exec` from capability registration and refuses incoming
   `shell_exec` with `exit_code: 127` while keeping safe built-ins operational.
-- G3: Environment variable sanitization: strip 5 sensitive variables (`OXIDESWARM_SECRET`,
-  `OXIDESWARM_SECRET_FILE`, `OXIDE_MESH_TOKEN`, `RUSTY_GRID_SECRET`, `RUSTY_GRID_SECRET_FILE`) from
+- G3: Environment variable sanitization: strip the 3 sensitive secret variables (`OXIDESWARM_SECRET`,
+  `OXIDESWARM_SECRET_FILE`, `OXIDE_MESH_TOKEN`) from
   parent process inheritance before child execution, while preserving user-provided `env` overrides.
 - G4: Process I/O controls: detach stdin (`DEVNULL` / null) so interactive commands terminate immediately;
   cap stdout and stderr streams at 1 MiB (1,048,576 bytes) with an explicit truncation notice
@@ -66,8 +67,8 @@ When `--no-shell` is enabled:
 - Built-in safe commands (`echo`, `ping`, `system_info`, `sha256_verify`) remain fully functional.
 
 ### D3: Environment Sanitization
-Before spawning a subprocess, the node removes `SECRET_ENV_VARS`:
-`OXIDESWARM_SECRET`, `OXIDESWARM_SECRET_FILE`, `OXIDE_MESH_TOKEN`, `RUSTY_GRID_SECRET`, `RUSTY_GRID_SECRET_FILE`.
+Before spawning a subprocess, the node removes `SECRET_ENV_VARS` (re-exported from `rusty_grid_core::cluster_auth::SECRET_ENV_VARS` in `crates/agent_mesh/src/executor.rs`):
+`OXIDESWARM_SECRET`, `OXIDESWARM_SECRET_FILE`, `OXIDE_MESH_TOKEN`.
 User-provided environment variables passed in `args.env` are applied after sanitization, allowing callers
 to explicitly supply task-specific variables.
 
@@ -94,9 +95,11 @@ environment variable `OXIDE_MESH_NO_SHELL` (value `1`) or the CLI argument `--no
 `agent-mesh send` prints `Exit Code: 127` and exits process code 0 because message delivery succeeded.
 Process code non-zero is reserved for transport or delivery failure (`DeliveryNack`).
 
-### D9: Variable List Parity (F12)
-`RUSTY_GRID_SECRET` and `RUSTY_GRID_SECRET_FILE` are retained defensively to shield potential legacy
-grid variables. A shared test validates that Rust and Python lists remain identical.
+### D9: Variable List Parity (F12 & R25-1)
+`crates/agent_mesh/src/executor.rs` re-exports `pub use rusty_grid_core::cluster_auth::SECRET_ENV_VARS;`
+so the core, worker, and mesh crates share a single canonical 3-variable definition (`OXIDESWARM_SECRET`,
+`OXIDESWARM_SECRET_FILE`, `OXIDE_MESH_TOKEN`). A shared test validates that `scripts/agent_node.py`
+strips the identical set.
 
 ### D10: Parity Matrix for Non-Uniform Runtime Behaviors (F10)
 - `timeout_ms: null`: Both runtimes safely default to 15000 ms.
@@ -134,7 +137,7 @@ operators must activate `--no-shell`.
 |---|---|---|---|---|
 | SEC6-1 | Command restriction & 127 code | `executor.rs`, `agent_node.py` | Unadvertised commands return 127 | Implemented |
 | SEC6-2 | `--no-shell` flag & filter | `client.rs`, `main.rs`, `agent_node.py` | Capability filtered and execution refused | Implemented |
-| SEC6-3 | Env sanitization & 5 vars | `executor.rs`, `agent_node.py` | 5 vars absent from child env | Implemented |
+| SEC6-3 | Env sanitization & 3 secret vars | `executor.rs`, `agent_node.py` | 3 vars absent from child env | Implemented |
 | SEC6-4 | Output cap at 1 MiB | `executor.rs`, `agent_node.py` | Stream truncated with marker | Implemented |
 | SEC6-5 | Launcher `--no-shell` support | `packaging/agent_mesh/*` | All launchers accept flag / env var | Implemented |
 | SEC6-6 | CI integration | `.github/workflows/ci.yml`, `run_all_mesh_tests.py` | Tests run in CI | Implemented |
@@ -143,3 +146,4 @@ operators must activate `--no-shell`.
 
 - 2026-11-01: SEC-6 implementation landed in branch `win/sec-6-mesh-sandbox` (commit `a95e668`).
 - 2026-11-02: Review fixes applied: design record added, terminology clarified, launchers updated, CI enabled.
+- 2026-11-03: R25-1 follow-up: unified `SECRET_ENV_VARS` via `pub use rusty_grid_core::cluster_auth::SECRET_ENV_VARS` across Rust and Python (`OXIDESWARM_SECRET`, `OXIDESWARM_SECRET_FILE`, `OXIDE_MESH_TOKEN`) and covered native binary branch in launcher tests.

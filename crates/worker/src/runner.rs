@@ -2725,18 +2725,69 @@ pub(crate) fn append_note(bytes: Bytes, note: &str) -> Bytes {
 
 /// Reads an output file produced by a task process.
 ///
-/// Verifies that the target path exists and is a regular file before reading to prevent
-/// hanging on special non-regular files (such as FIFOs, character devices, or directories).
+/// Opens the path first without following symbolic links or blocking on FIFOs
+/// (`O_NOFOLLOW | O_NONBLOCK` on Unix; `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS`
+/// on Windows), inspects `file.metadata()` on the open handle to refuse symbolic links/reparse
+/// points, non-regular files (such as FIFOs, character devices, or directories), and files whose
+/// size exceeds `MAX_FRAME_SIZE` (64 MiB = 67,108,864 bytes) before reading, and bounds the read
+/// with `AsyncReadExt::take(MAX_FRAME_SIZE as u64 + 1)` so a file that grows past the limit while
+/// being read is also refused.
 ///
-/// Returns `Ok(Some(Vec<u8>))` if the file exists and is read successfully.
+/// Returns `Ok(Some(Vec<u8>))` if the regular file exists, is within the frame limit,
+/// and is read successfully.
 /// Returns `Ok(None)` only if the file was not found (`ErrorKind::NotFound`).
-/// Returns `Err(io::Error)` if reading failed for any other reason (e.g. not a regular file, permission denied).
+/// Returns `Err(io::Error)` if reading failed for any other reason (e.g. symbolic link,
+/// not a regular file, exceeds `MAX_FRAME_SIZE`, or permission denied).
 pub(crate) async fn read_output_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-    let meta = match tokio::fs::metadata(path).await {
-        Ok(meta) => meta,
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+    }
+
+    let file = match opts.open(path).await {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "output path is a symbolic link (symbolic links are prohibited for security isolation): {}",
+                    path.display()
+                ),
+            ));
+        }
         Err(e) => return Err(e),
     };
+
+    let meta = file.metadata().await?;
+
+    #[cfg(windows)]
+    let is_reparse = {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    };
+    #[cfg(not(windows))]
+    let is_reparse = false;
+
+    if meta.file_type().is_symlink() || is_reparse {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "output path is a symbolic link (symbolic links are prohibited for security isolation): {}",
+                path.display()
+            ),
+        ));
+    }
 
     if !meta.is_file() {
         return Err(std::io::Error::new(
@@ -2745,11 +2796,37 @@ pub(crate) async fn read_output_file(path: &Path) -> std::io::Result<Option<Vec<
         ));
     }
 
-    match tokio::fs::read(path).await {
-        Ok(data) => Ok(Some(data)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+    let max_bytes = rusty_grid_core::protocol::MAX_FRAME_SIZE as u64;
+    let size = meta.len();
+    if size > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "output file '{}' is {} bytes, exceeding frame limit of {} bytes (64 MiB)",
+                path.display(),
+                size,
+                max_bytes
+            ),
+        ));
     }
+
+    let mut data = Vec::with_capacity(size as usize);
+    use tokio::io::AsyncReadExt;
+    file.take(max_bytes + 1).read_to_end(&mut data).await?;
+
+    if (data.len() as u64) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "output file '{}' is more than {} bytes, exceeding frame limit of {} bytes (64 MiB)",
+                path.display(),
+                max_bytes,
+                max_bytes
+            ),
+        ));
+    }
+
+    Ok(Some(data))
 }
 
 #[cfg(test)]
@@ -3383,6 +3460,268 @@ mod outcome_tests {
         assert!(res.is_success(), "{res:?}");
         assert_eq!(res.stdout_str().trim(), "via-default-shell");
     }
+
+    #[tokio::test]
+    async fn test_read_output_file_regular_missing_and_directory() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("model.glb");
+        let non_existent = temp_dir.path().join("missing.glb");
+        let dir_path = temp_dir.path().join("subdir");
+        tokio::fs::create_dir(&dir_path).await.expect("create dir");
+
+        // Missing file -> Ok(None)
+        let res = read_output_file(&non_existent).await.expect("read missing");
+        assert!(res.is_none());
+
+        // Regular file -> Ok(Some(data))
+        tokio::fs::write(&file_path, b"glTF test content")
+            .await
+            .expect("write file");
+        let res = read_output_file(&file_path).await.expect("read file");
+        assert_eq!(res, Some(b"glTF test content".to_vec()));
+
+        // Directory -> Err
+        let err = read_output_file(&dir_path).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("output path is not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_output_file_fifo_returns_error_immediately() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let fifo_path = temp_dir.path().join("fifo_output.glb");
+        let c_path =
+            std::ffi::CString::new(fifo_path.to_str().expect("utf8 path")).expect("cstring");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed");
+
+        let start = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_output_file(&fifo_path),
+        )
+        .await
+        .expect("read_output_file must not hang on FIFO")
+        .expect_err("FIFO output must be refused");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "FIFO check took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("output path is not a regular file"),
+            "unexpected FIFO error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_output_file_refuses_symlink_and_oversized_or_sparse_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let target_file = temp_dir.path().join("target.glb");
+        tokio::fs::write(&target_file, b"SECRET_SYMLINK_TARGET_BYTES")
+            .await
+            .expect("write target file");
+
+        // 1. Symbolic link / junction must be refused via open-without-follow
+        let link_path = temp_dir.path().join("link_model.glb");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target_file, &link_path).expect("create unix symlink");
+        }
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_file(&target_file, &link_path).is_err() {
+                let target_dir = temp_dir.path().join("target_dir");
+                std::fs::create_dir(&target_dir).expect("create target_dir");
+                let status = std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(&link_path)
+                    .arg(&target_dir)
+                    .status()
+                    .expect("run mklink /J");
+                assert!(status.success(), "mklink /J must succeed");
+            }
+        }
+
+        let link_err = read_output_file(&link_path)
+            .await
+            .expect_err("symlink output must be refused");
+        assert_eq!(link_err.kind(), std::io::ErrorKind::InvalidData);
+        let link_msg = link_err.to_string();
+        assert!(
+            link_msg.contains("symbolic link")
+                && link_msg.contains(&link_path.display().to_string()),
+            "expected symlink error naming path '{}', got: '{link_msg}'",
+            link_path.display()
+        );
+
+        // 2. Concurrent swap between regular file and symlink must never read symlink target
+        let swap_path = temp_dir.path().join("swap_model.glb");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let swap_path_bg = swap_path.clone();
+        let target_bg = target_file.clone();
+        let temp_bg = temp_dir.path().to_path_buf();
+        let swapper = std::thread::spawn(move || {
+            let mut i = 0u64;
+            while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                let tmp_reg = temp_bg.join(format!("tmp_reg_{i}.glb"));
+                let _ = std::fs::write(&tmp_reg, b"REGULAR_GLTF_BYTES");
+                let _ = std::fs::rename(&tmp_reg, &swap_path_bg);
+                #[cfg(unix)]
+                {
+                    let tmp_lnk = temp_bg.join(format!("tmp_lnk_{i}.glb"));
+                    let _ = std::os::unix::fs::symlink(&target_bg, &tmp_lnk);
+                    let _ = std::fs::rename(&tmp_lnk, &swap_path_bg);
+                }
+                #[cfg(windows)]
+                {
+                    let _ = std::fs::remove_file(&swap_path_bg);
+                    let _ = std::os::windows::fs::symlink_file(&target_bg, &swap_path_bg);
+                }
+                i = i.wrapping_add(1);
+            }
+        });
+        for _ in 0..80 {
+            if let Ok(Some(bytes)) = read_output_file(&swap_path).await {
+                assert_ne!(
+                    bytes.as_slice(),
+                    b"SECRET_SYMLINK_TARGET_BYTES",
+                    "read_output_file must never follow a swapped symlink"
+                );
+                assert_eq!(bytes.as_slice(), b"REGULAR_GLTF_BYTES");
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = swapper.join();
+
+        // 3. File at smallest size above MAX_FRAME_SIZE (64 MiB + 1 byte) must be refused without reading
+        let max_bytes = rusty_grid_core::protocol::MAX_FRAME_SIZE as u64;
+        let oversized_path = temp_dir.path().join("oversized.glb");
+        let oversized_len = max_bytes + 1;
+        let lock_file = {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&oversized_path)
+                .expect("create oversized file");
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("fsutil")
+                    .args(["sparse", "setflag"])
+                    .arg(&oversized_path)
+                    .output();
+            }
+            f.set_len(oversized_len).expect("set_len oversized");
+            #[cfg(windows)]
+            {
+                // Hold a mandatory exclusive lock on Windows so any attempted read fails with OS error 33
+                f.lock().expect("lock oversized file");
+            }
+            f
+        };
+        let over_err = read_output_file(&oversized_path)
+            .await
+            .expect_err("file above MAX_FRAME_SIZE must be refused before reading");
+        drop(lock_file);
+        assert_eq!(over_err.kind(), std::io::ErrorKind::InvalidData);
+        let over_msg = over_err.to_string();
+        assert!(
+            over_msg.contains(&oversized_path.display().to_string())
+                && over_msg.contains(&format!("is {oversized_len} bytes"))
+                && !over_msg.contains("is more than"),
+            "expected pre-read error naming path '{}' and exact size 'is {oversized_len} bytes', got: '{over_msg}'",
+            oversized_path.display()
+        );
+
+        // 4. File that grows past MAX_FRAME_SIZE while being read is caught by the capped read ("is more than")
+        let growing_path = temp_dir.path().join("growing.glb");
+        {
+            let f = std::fs::File::create(&growing_path).expect("create growing file");
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("fsutil")
+                    .args(["sparse", "setflag"])
+                    .arg(&growing_path)
+                    .output();
+            }
+            f.set_len(max_bytes).expect("set_len max_bytes");
+        }
+        let mut observed_capped_err = false;
+        for delay_us in [
+            0u64, 50, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 40_000,
+        ] {
+            let writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&growing_path)
+                .expect("open growing file for write");
+            writer.set_len(max_bytes).expect("reset to max_bytes");
+
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_writer = Arc::clone(&stop);
+            let max_sparse_len = 16 * 1024 * 1024 * 1024u64;
+            let step_bytes = 128 * 1024 * 1024u64;
+            let handle = std::thread::spawn(move || {
+                if delay_us > 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(delay_us));
+                }
+                let mut target_len = max_bytes + step_bytes;
+                let _ = writer.set_len(target_len);
+                // Keep advancing the sparse EOF until `read_output_file` returns.
+                // With `.take(max_bytes + 1)`, the reader stops immediately at `max_bytes + 1`
+                // bytes; if `.take(max_bytes + 1)` is removed, `read_to_end` chases the
+                // growing sparse file past `max_bytes + 1` until the timeout below fires.
+                while !stop_writer.load(std::sync::atomic::Ordering::Relaxed)
+                    && target_len < max_sparse_len
+                {
+                    target_len = (target_len + step_bytes).min(max_sparse_len);
+                    let _ = writer.set_len(target_len);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+
+            let read_res = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                read_output_file(&growing_path),
+            )
+            .await;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = handle.join();
+
+            match read_res.expect(
+                "read_output_file timed out on a growing sparse file; read must be capped by .take(MAX_FRAME_SIZE + 1)",
+            ) {
+                Ok(Some(data)) => {
+                    assert!(
+                        (data.len() as u64) <= max_bytes,
+                        "read_output_file must never return more than MAX_FRAME_SIZE bytes (got {})",
+                        data.len()
+                    );
+                }
+                Ok(None) => panic!("growing file must exist"),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains(&format!("is more than {max_bytes} bytes")) {
+                        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+                        assert!(msg.contains(&growing_path.display().to_string()));
+                        observed_capped_err = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            observed_capped_err,
+            "capped read check ('is more than {max_bytes} bytes') must trigger when file grows during read"
+        );
+    }
 }
 
 /// Real process trees: every test here spawns grandchildren (`sh -c` with a background `sleep`)
@@ -3832,32 +4171,5 @@ mod process_tree_tests {
             "[unset][unset][given-on-purpose]",
             "{res:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn test_read_output_file_regular_missing_and_directory() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let file_path = temp_dir.path().join("model.glb");
-        let non_existent = temp_dir.path().join("missing.glb");
-        let dir_path = temp_dir.path().join("subdir");
-        tokio::fs::create_dir(&dir_path).await.expect("create dir");
-
-        // Missing file -> Ok(None)
-        let res = read_output_file(&non_existent).await.expect("read missing");
-        assert!(res.is_none());
-
-        // Regular file -> Ok(Some(data))
-        tokio::fs::write(&file_path, b"glTF test content")
-            .await
-            .expect("write file");
-        let res = read_output_file(&file_path).await.expect("read file");
-        assert_eq!(res, Some(b"glTF test content".to_vec()));
-
-        // Directory -> Err
-        let err = read_output_file(&dir_path).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(err
-            .to_string()
-            .contains("output path is not a regular file"));
     }
 }
