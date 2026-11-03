@@ -12,7 +12,7 @@ Distribute input files to worker execution sandboxes and collect output artifact
 - define `StagedFile` and `OutputArtifact` data models with SHA-256 content verification;
 - write staged files directly into each worker task sandbox (`nlink == 1`) so in-place edits by one task never affect subsequent tasks;
 - isolate sandboxes against directory traversal (`..`), leading slashes, Windows DOS device names, and symlink escapes;
-- account for file staging payloads within the master queue 256 MiB LRU retention budget.
+- account for file staging payloads within the master queue 256 MiB oldest-first retention budget.
 
 ## Context
 
@@ -131,7 +131,7 @@ To prevent directory traversal and host compromises, paths are validated by `val
 
 Implemented in `crates/core/src/protocol.rs` and `crates/core/src/task.rs`.
 
-### D6 Master queue memory accounting and LRU budget
+### D6 Master queue memory accounting and oldest-first retention budget
 
 The master queue tracks active and retained payload memory in `crates/master/src/queue.rs` (see also `docs/design/0008-oversized-task-results-and-active-queue-budget.md`):
 - Active (non-terminal) task memory defaults to 256 MiB (`DEFAULT_MAX_ACTIVE_BYTES`), configurable via `--max-active-mb`, `RUSTY_GRID_MAX_ACTIVE_MB`, or `max_active_mb` in `[master]`. Submissions and checkpoint increases that would exceed this cap are refused with `GridError::QueueByteLimitExceeded`.
@@ -155,7 +155,7 @@ The master queue tracks active and retained payload memory in `crates/master/src
 
 - **Unit:** path normalization, traversal rejection, DOS device name evasion, SHA-256 digest validation, and cache atomic placement (`crates/core`, `crates/worker`).
 - **Stress:** adversarial path traversal test suites, whitespace evasion generators, and combinatorial fuzzing (`tests/m5b_challenger_1_stress.rs`, `tests/m5b_challenger_2_stress.rs`).
-- **Integration:** end-to-end file staging, execution, output artifact collection, and LRU queue eviction over JSON and Bincode wire codecs (`tests/file_staging_e2e.rs`).
+- **Integration:** end-to-end file staging, execution, output artifact collection, and oldest-first queue eviction over JSON and Bincode wire codecs (`tests/file_staging_e2e.rs`).
 - **Gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 
 ## Work items
@@ -165,7 +165,7 @@ The master queue tracks active and retained payload memory in `crates/master/src
 | W1 | Staging data models and sanitization | `crates/core/src/task.rs` | `StagedFile`, `OutputArtifact`, and `validate_relative_sandbox_path` implemented | Implemented |
 | W2 | Worker sandbox staging | `crates/worker/src/sandbox.rs` | SHA-256 verification, independent per-sandbox placement (`nlink == 1`), and artifact collection | Implemented |
 | W3 | CLI staging options | `crates/cli/src/cli_app.rs` | `--file`, `--output`, `--output-dir` parsing and payload building | Implemented |
-| W4 | Master queue LRU budget | `crates/master/src/queue.rs` | 256 MiB retention budget and artifact eviction | Implemented |
+| W4 | Master queue retention budget | `crates/master/src/queue.rs` | 256 MiB oldest-first retention budget and artifact eviction | Implemented |
 | W5 | End-to-end integration tests | `tests/file_staging_e2e.rs` | Staging and artifact round-trip passes on JSON and Bincode | Implemented |
 | W6 | Adversarial path stress tests | `tests/m5b_challenger_1_stress.rs`, `tests/m5b_challenger_2_stress.rs` | Traversal fuzzing and DOS device evasion tests pass | Implemented |
 

@@ -489,6 +489,10 @@ pub struct DashboardTasks {
     pub failed: usize,
     #[serde(default)]
     pub cancelled: usize,
+    #[serde(default)]
+    pub active_bytes: usize,
+    #[serde(default)]
+    pub max_active_bytes: usize,
     /// The newest non-finished tasks, at most [`STATUS_ACTIVE_LIST_LIMIT`]. `state` is spelled
     /// like everywhere else in the API (`TaskState::as_str`, snake_case).
     #[serde(default)]
@@ -654,6 +658,8 @@ async fn api_status(
         completed: stats.completed,
         failed: stats.failed,
         cancelled: stats.cancelled,
+        active_bytes: stats.active_bytes,
+        max_active_bytes: stats.max_active_bytes,
         active_list,
         active_total: pending + running,
     };
@@ -836,7 +842,12 @@ async fn api_submit_task(
             format!("task queue is full ({capacity} active tasks)"),
         ),
         Err(e @ rusty_grid_core::GridError::QueueByteLimitExceeded { .. }) => {
-            json_error(StatusCode::SERVICE_UNAVAILABLE, e.to_string())
+            let status = if e.is_transient() {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::PAYLOAD_TOO_LARGE
+            };
+            json_error(status, e.to_string())
         }
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -2315,12 +2326,25 @@ mod tests {
             .await
             .unwrap();
         let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("task requires "), "unexpected body: {text}");
         assert!(text.contains("bytes in use"), "unexpected body: {text}");
         assert!(text.contains("limit 1500 bytes"), "unexpected body: {text}");
         assert!(text.contains("--max-active-mb"), "unexpected body: {text}");
         assert!(
             !text.contains("active tasks"),
             "byte limit must not report a task count: {text}"
+        );
+
+        let too_large = api_submit_task(
+            State(state),
+            Ok(Json(payload(&format!("echo {}", "x".repeat(2_000))))),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            too_large.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a task larger than max_active_bytes can never fit and must return 413"
         );
     }
 }

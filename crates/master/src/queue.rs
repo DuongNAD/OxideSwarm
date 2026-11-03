@@ -350,6 +350,12 @@ pub struct QueueStats {
     pub completed: usize,
     pub failed: usize,
     pub cancelled: usize,
+    /// Bytes currently charged for active (non-terminal) tasks in the queue.
+    #[serde(default)]
+    pub active_bytes: usize,
+    /// Configured active byte budget (`--max-active-mb`, default 256 MiB).
+    #[serde(default)]
+    pub max_active_bytes: usize,
 }
 
 impl QueueStats {
@@ -562,12 +568,13 @@ pub(crate) fn task_active_bytes(task: &Task) -> usize {
             program,
             args,
             env,
+            working_dir,
             stdin,
-            ..
         } => {
             program.len()
                 + args.iter().map(String::len).sum::<usize>()
                 + env.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+                + working_dir.as_ref().map_or(0, |p| p.as_os_str().len())
                 + stdin.as_ref().map_or(0, Vec::len)
         }
         TaskSpec::ShellScript {
@@ -583,7 +590,7 @@ pub(crate) fn task_active_bytes(task: &Task) -> usize {
             crate_name,
             source_files,
             compiler_flags,
-            ..
+            target_dir,
         } => {
             crate_name.len()
                 + source_files
@@ -591,6 +598,7 @@ pub(crate) fn task_active_bytes(task: &Task) -> usize {
                     .map(|(k, v)| k.len() + v.len())
                     .sum::<usize>()
                 + compiler_flags.iter().map(String::len).sum::<usize>()
+                + target_dir.as_ref().map_or(0, |p| p.as_os_str().len())
         }
         TaskSpec::GpuCompute {
             kernel_name,
@@ -608,6 +616,7 @@ pub(crate) fn task_active_bytes(task: &Task) -> usize {
             s.input_mesh.len()
                 + s.rig_preset.len()
                 + s.embed_animations.iter().map(String::len).sum::<usize>()
+                + s.preferred_provider.as_ref().map_or(0, String::len)
         }
     };
     let checkpoint = task
@@ -868,6 +877,115 @@ impl TaskQueue {
         self.submit_with_priority(task, 0).await
     }
 
+    /// Checks under the read lock whether a task of `task_bytes` bytes can currently fit in the
+    /// queue (both task-count `capacity` and `max_active_bytes`), without cloning `Task`.
+    pub(crate) async fn check_room(&self, task_bytes: usize) -> GridResult<()> {
+        let inner = self.inner.read().await;
+        if let Some(cap) = inner.capacity {
+            let active_count = inner
+                .tasks
+                .values()
+                .filter(|e| !e.state.is_terminal())
+                .count();
+            if active_count >= cap {
+                return Err(GridError::QueueFull { capacity: cap });
+            }
+        }
+        if inner.active_bytes.saturating_add(task_bytes) > inner.max_active_bytes {
+            return Err(GridError::QueueByteLimitExceeded {
+                task_bytes,
+                in_use_bytes: inner.active_bytes,
+                max_bytes: inner.max_active_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    /// Attempts to submit the task in `task_slot` with priority 0, taking ownership from
+    /// `task_slot` (`*task_slot = None`) only if the task is accepted into the queue.
+    ///
+    /// When the queue is full (`QueueFull` or `QueueByteLimitExceeded`), `task_slot` is left
+    /// untouched so the caller can retry after backoff without ever cloning the task payload.
+    pub(crate) async fn try_submit_slot(&self, task_slot: &mut Option<Task>) -> GridResult<TaskId> {
+        let task_ref = task_slot
+            .as_ref()
+            .ok_or_else(|| GridError::Config("task_slot is empty".into()))?;
+        task_ref.validate().map_err(GridError::Config)?;
+        let entry_bytes = task_active_bytes(task_ref);
+
+        self.check_room(entry_bytes).await?;
+
+        let mut inner = self.inner.write().await;
+
+        let task_ref = task_slot.as_ref().expect("task_slot checked above");
+        if let Some(existing) = inner.tasks.get(&task_ref.id) {
+            return Err(GridError::Config(format!(
+                "Task {} already exists (state {:?}); task ids must be unique, query its outcome instead of resubmitting",
+                task_ref.id, existing.state
+            )));
+        }
+
+        if let Some(cap) = inner.capacity {
+            let active_count = inner
+                .tasks
+                .values()
+                .filter(|e| !e.state.is_terminal())
+                .count();
+            if active_count >= cap {
+                return Err(GridError::QueueFull { capacity: cap });
+            }
+        }
+
+        if inner.active_bytes.saturating_add(entry_bytes) > inner.max_active_bytes {
+            return Err(GridError::QueueByteLimitExceeded {
+                task_bytes: entry_bytes,
+                in_use_bytes: inner.active_bytes,
+                max_bytes: inner.max_active_bytes,
+            });
+        }
+
+        let task = task_slot.take().expect("task_slot checked above");
+        let task_id = task.id;
+        let sequence = inner.next_sequence;
+        inner.next_sequence += 1;
+
+        let now_instant = Instant::now();
+        let now_epoch = Utc::now().timestamp() as u64;
+
+        let entry = TaskEntry {
+            task,
+            priority: 0,
+            sequence,
+            state: TaskState::Queued,
+            assigned_worker_id: None,
+            submitted_at_utc: now_epoch,
+            submitted_instant: now_instant,
+            scheduled_instant: None,
+            started_instant: None,
+            finished_instant: None,
+            retry_after_instant: None,
+            retry_count: 0,
+            failover_count: 0,
+            rejection_count: 0,
+            avoid_workers: Vec::new(),
+            assigned_session: None,
+            retry_history: Vec::new(),
+            result: None,
+            error_message: None,
+        };
+
+        inner.tasks.insert(task_id, entry);
+        inner.active_sizes.insert(task_id, entry_bytes);
+        inner.active_bytes = inner.active_bytes.saturating_add(entry_bytes);
+        inner.ready_queue.insert(QueueOrderKey {
+            priority_rev: Reverse(0),
+            sequence,
+            task_id,
+        });
+
+        Ok(task_id)
+    }
+
     /// Submits a task with explicit scheduling priority.
     ///
     /// Task ids are unique for as long as the queue retains the entry: resubmitting an id that is
@@ -928,6 +1046,7 @@ impl TaskQueue {
         let entry_bytes = retained_bytes(&entry);
         if inner.active_bytes.saturating_add(entry_bytes) > inner.max_active_bytes {
             return Err(GridError::QueueByteLimitExceeded {
+                task_bytes: entry_bytes,
                 in_use_bytes: inner.active_bytes,
                 max_bytes: inner.max_active_bytes,
             });
@@ -1415,8 +1534,11 @@ impl TaskQueue {
             return Ok(());
         }
 
-        if Self::checkpoint_exceeds_active_cap(entry, &checkpoint, active_bytes, max_active) {
+        if let Some(task_bytes) =
+            Self::checkpoint_exceeds_active_cap(entry, &checkpoint, active_bytes, max_active)
+        {
             return Err(GridError::QueueByteLimitExceeded {
+                task_bytes,
                 in_use_bytes: active_bytes,
                 max_bytes: max_active,
             });
@@ -1458,8 +1580,11 @@ impl TaskQueue {
             return Ok(false);
         }
 
-        if Self::checkpoint_exceeds_active_cap(entry, &checkpoint, active_bytes, max_active) {
+        if let Some(task_bytes) =
+            Self::checkpoint_exceeds_active_cap(entry, &checkpoint, active_bytes, max_active)
+        {
             return Err(GridError::QueueByteLimitExceeded {
+                task_bytes,
                 in_use_bytes: active_bytes,
                 max_bytes: max_active,
             });
@@ -1484,9 +1609,9 @@ impl TaskQueue {
         checkpoint: &CheckpointData,
         active_bytes: usize,
         max_active_bytes: usize,
-    ) -> bool {
+    ) -> Option<usize> {
         if !Self::is_newer_checkpoint(entry, checkpoint) {
-            return false;
+            return None;
         }
         let old_cp = entry
             .task
@@ -1494,8 +1619,17 @@ impl TaskQueue {
             .as_ref()
             .map_or(0, |c| c.delta_state.0.len());
         let new_cp = checkpoint.delta_state.0.len();
-        new_cp > old_cp
+        if new_cp > old_cp
             && active_bytes.saturating_sub(old_cp).saturating_add(new_cp) > max_active_bytes
+        {
+            Some(
+                retained_bytes(entry)
+                    .saturating_sub(old_cp)
+                    .saturating_add(new_cp),
+            )
+        } else {
+            None
+        }
     }
 
     fn apply_checkpoint(entry: &mut TaskEntry, checkpoint: CheckpointData) -> bool {
@@ -2089,6 +2223,8 @@ impl TaskQueue {
         let inner = self.inner.read().await;
         let mut stats = QueueStats {
             total: inner.tasks.len(),
+            active_bytes: inner.active_bytes,
+            max_active_bytes: inner.max_active_bytes,
             ..Default::default()
         };
 
@@ -3612,5 +3748,94 @@ mod tests {
                 "TaskState::as_str must be the serde spelling every endpoint uses"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_task_active_bytes_counts_working_dir_target_dir_and_preferred_provider() {
+        use rusty_grid_core::task::AutoRigSpec;
+
+        let base_cmd = Task::new(
+            TaskSpec::Command {
+                program: "echo".into(),
+                args: vec![],
+                env: Default::default(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 30),
+        );
+        let with_wdir = Task::new(
+            TaskSpec::Command {
+                program: "echo".into(),
+                args: vec![],
+                env: Default::default(),
+                working_dir: Some("/custom/working/directory/path".into()),
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 30),
+        );
+        assert_eq!(
+            task_active_bytes(&with_wdir) - task_active_bytes(&base_cmd),
+            "/custom/working/directory/path".len()
+        );
+
+        let base_compile = Task::new(
+            TaskSpec::RustCompilation {
+                crate_name: "proj".into(),
+                source_files: Default::default(),
+                compiler_flags: vec![],
+                target_dir: None,
+            },
+            TaskRequirements::generic(1, 30),
+        );
+        let with_tdir = Task::new(
+            TaskSpec::RustCompilation {
+                crate_name: "proj".into(),
+                source_files: Default::default(),
+                compiler_flags: vec![],
+                target_dir: Some("/tmp/custom-target-dir".into()),
+            },
+            TaskRequirements::generic(1, 30),
+        );
+        assert_eq!(
+            task_active_bytes(&with_tdir) - task_active_bytes(&base_compile),
+            "/tmp/custom-target-dir".len()
+        );
+
+        let base_rig = Task::new(
+            TaskSpec::AutoRig(AutoRigSpec {
+                input_mesh: "mesh.glb".into(),
+                rig_preset: "humanoid".into(),
+                embed_animations: vec![],
+                preferred_provider: None,
+            }),
+            TaskRequirements::generic(1, 30),
+        );
+        let with_prov = Task::new(
+            TaskSpec::AutoRig(AutoRigSpec {
+                input_mesh: "mesh.glb".into(),
+                rig_preset: "humanoid".into(),
+                embed_animations: vec![],
+                preferred_provider: Some("rig_net_provider".into()),
+            }),
+            TaskRequirements::generic(1, 30),
+        );
+        assert_eq!(
+            task_active_bytes(&with_prov) - task_active_bytes(&base_rig),
+            "rig_net_provider".len()
+        );
+
+        let queue = TaskQueue::with_retention_limits(
+            RetryPolicy::default(),
+            None,
+            DEFAULT_MAX_TERMINAL_TASKS,
+            DEFAULT_MAX_TERMINAL_BYTES,
+            2_000,
+        );
+        let expected_bytes = task_active_bytes(&with_wdir);
+        queue.submit(with_wdir).await.unwrap();
+        let stats = queue.stats().await;
+        assert_eq!(stats.active_bytes, expected_bytes);
+        assert_eq!(stats.max_active_bytes, 2_000);
     }
 }

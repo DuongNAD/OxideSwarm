@@ -2081,6 +2081,8 @@ pub enum ClientResponse {
         completed_tasks: usize,
         failed_tasks: usize,
         workers: Vec<WorkerCapabilities>,
+        active_bytes: usize,
+        max_active_bytes: usize,
     },
     WorkerList {
         workers: Vec<WorkerCapabilities>,
@@ -2129,6 +2131,10 @@ enum HumanClientResponse {
         completed_tasks: usize,
         failed_tasks: usize,
         workers: Vec<WorkerCapabilities>,
+        #[serde(default)]
+        active_bytes: usize,
+        #[serde(default)]
+        max_active_bytes: usize,
     },
     WorkerList {
         workers: Vec<WorkerCapabilities>,
@@ -2176,6 +2182,8 @@ enum BinaryClientResponse {
         completed_tasks: usize,
         failed_tasks: usize,
         workers: Vec<WorkerCapabilities>,
+        active_bytes: usize,
+        max_active_bytes: usize,
     },
     WorkerList {
         workers: Vec<WorkerCapabilities>,
@@ -2228,6 +2236,8 @@ impl From<ClientResponse> for HumanClientResponse {
                 completed_tasks,
                 failed_tasks,
                 workers,
+                active_bytes,
+                max_active_bytes,
             } => HumanClientResponse::ClusterStatus {
                 total_tasks,
                 pending_tasks,
@@ -2235,6 +2245,8 @@ impl From<ClientResponse> for HumanClientResponse {
                 completed_tasks,
                 failed_tasks,
                 workers,
+                active_bytes,
+                max_active_bytes,
             },
             ClientResponse::WorkerList { workers } => HumanClientResponse::WorkerList { workers },
             ClientResponse::MapReduceSubmitted { job_id } => {
@@ -2281,6 +2293,8 @@ impl From<HumanClientResponse> for ClientResponse {
                 completed_tasks,
                 failed_tasks,
                 workers,
+                active_bytes,
+                max_active_bytes,
             } => ClientResponse::ClusterStatus {
                 total_tasks,
                 pending_tasks,
@@ -2288,6 +2302,8 @@ impl From<HumanClientResponse> for ClientResponse {
                 completed_tasks,
                 failed_tasks,
                 workers,
+                active_bytes,
+                max_active_bytes,
             },
             HumanClientResponse::WorkerList { workers } => ClientResponse::WorkerList { workers },
             HumanClientResponse::MapReduceSubmitted { job_id } => {
@@ -2334,6 +2350,8 @@ impl From<ClientResponse> for BinaryClientResponse {
                 completed_tasks,
                 failed_tasks,
                 workers,
+                active_bytes,
+                max_active_bytes,
             } => BinaryClientResponse::ClusterStatus {
                 total_tasks,
                 pending_tasks,
@@ -2341,6 +2359,8 @@ impl From<ClientResponse> for BinaryClientResponse {
                 completed_tasks,
                 failed_tasks,
                 workers,
+                active_bytes,
+                max_active_bytes,
             },
             ClientResponse::WorkerList { workers } => BinaryClientResponse::WorkerList { workers },
             ClientResponse::MapReduceSubmitted { job_id } => {
@@ -2387,6 +2407,8 @@ impl From<BinaryClientResponse> for ClientResponse {
                 completed_tasks,
                 failed_tasks,
                 workers,
+                active_bytes,
+                max_active_bytes,
             } => ClientResponse::ClusterStatus {
                 total_tasks,
                 pending_tasks,
@@ -2394,6 +2416,8 @@ impl From<BinaryClientResponse> for ClientResponse {
                 completed_tasks,
                 failed_tasks,
                 workers,
+                active_bytes,
+                max_active_bytes,
             },
             BinaryClientResponse::WorkerList { workers } => ClientResponse::WorkerList { workers },
             BinaryClientResponse::MapReduceSubmitted { job_id } => {
@@ -4388,6 +4412,82 @@ mod tests {
                 assert_eq!(raw_bytes, b"future-master-payload");
             }
             other => panic!("expected MasterMessage::UnknownVariant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cluster_status_trailing_budget_fields_decode_into_legacy_bincode_client() {
+        // F36-1: `active_bytes` and `max_active_bytes` must sit after `workers` in
+        // `BinaryClientResponse::ClusterStatus` so a legacy bincode client (whose
+        // `ClusterStatus` ends at `workers`) decodes the prefix cleanly and ignores
+        // the trailing 16 bytes even when tasks are queued (`active_bytes > 0`).
+        #[derive(Deserialize, Debug)]
+        #[allow(dead_code)]
+        enum LegacyBinaryClientResponse {
+            TaskSubmitted {
+                task_id: TaskId,
+            },
+            TaskCompleted {
+                task_id: TaskId,
+                result: TaskResult,
+            },
+            TaskStatusInfo {
+                task_id: TaskId,
+                status: TaskStatus,
+                state_name: String,
+                assigned_worker: Option<Uuid>,
+                error: Option<String>,
+            },
+            TaskCancelled {
+                task_id: TaskId,
+                success: bool,
+            },
+            ClusterStatus {
+                total_tasks: usize,
+                pending_tasks: usize,
+                running_tasks: usize,
+                completed_tasks: usize,
+                failed_tasks: usize,
+                workers: Vec<WorkerCapabilities>,
+            },
+        }
+
+        let worker_cap = WorkerCapabilities::new("w1", 8, 16_384, false, false, None);
+        let msg = ClientResponse::ClusterStatus {
+            total_tasks: 3,
+            pending_tasks: 2,
+            running_tasks: 1,
+            completed_tasks: 0,
+            failed_tasks: 0,
+            workers: vec![worker_cap],
+            active_bytes: 601_029,
+            max_active_bytes: 1_048_576,
+        };
+        let encoded = serialize_message(&msg, WireCodec::Bincode).unwrap();
+        assert_eq!(encoded[0], WIRE_FORMAT_BINCODE);
+
+        // Decode with the legacy bincode schema (which uses `bincode::deserialize_from` on a slice
+        // reader, just like `deserialize_message` in `protocol.rs`).
+        let mut cursor = std::io::Cursor::new(&encoded[1..]);
+        let legacy: LegacyBinaryClientResponse = bincode::deserialize_from(&mut cursor).unwrap();
+        match legacy {
+            LegacyBinaryClientResponse::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+            } => {
+                assert_eq!(total_tasks, 3);
+                assert_eq!(pending_tasks, 2);
+                assert_eq!(running_tasks, 1);
+                assert_eq!(completed_tasks, 0);
+                assert_eq!(failed_tasks, 0);
+                assert_eq!(workers.len(), 1);
+                assert_eq!(workers[0].name, "w1");
+            }
+            other => panic!("expected LegacyBinaryClientResponse::ClusterStatus, got {other:?}"),
         }
     }
 }
