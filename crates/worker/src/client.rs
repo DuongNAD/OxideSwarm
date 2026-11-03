@@ -998,11 +998,17 @@ impl Drop for Session {
 }
 
 /// What the worker advertises in `WorkerCapabilities::tags`: its system tags (`os:`, `arch:`, see
-/// `rusty_grid_core::placement`), then the configured user tags that are not among them.
-fn advertised_tags(user_tags: &[String]) -> Vec<String> {
+/// `rusty_grid_core::placement`), its effective task concurrency (`slots:<n>`), then the
+/// configured user tags that are not among them.
+fn advertised_tags(user_tags: &[String], slots: usize) -> Vec<String> {
     let mut tags = rusty_grid_core::placement::system_tags();
+    tags.push(format!(
+        "{}{}",
+        rusty_grid_core::placement::SLOTS_TAG_PREFIX,
+        slots.max(1)
+    ));
     for tag in user_tags {
-        if !tags.contains(tag) {
+        if !tags.contains(tag) && !tag.starts_with(rusty_grid_core::placement::SLOTS_TAG_PREFIX) {
             tags.push(tag.clone());
         }
     }
@@ -1035,8 +1041,20 @@ impl WorkerClient {
             cuda: config.cuda,
             no_cuda: config.no_cuda,
         };
-        let mut capabilities = WorkerCapabilities::detect_with_overrides(overrides)
-            .with_tags(advertised_tags(&config.tags));
+        let mut capabilities = WorkerCapabilities::detect_with_overrides(overrides);
+        let concurrency_permits = config
+            .max_concurrency
+            .unwrap_or_else(|| {
+                // Cores the owner named (`--cores`) are capacity they chose to offer; only the
+                // detected count gets the headroom.
+                if config.cores.is_some() {
+                    capabilities.cpu_cores
+                } else {
+                    default_max_concurrency(capabilities.cpu_cores)
+                }
+            })
+            .max(1);
+        capabilities = capabilities.with_tags(advertised_tags(&config.tags, concurrency_permits));
         // A real GPU is advertised only if this binary can compute on one (see `gpu`).
         let gpu_request = GpuRequest {
             no_gpu: config.no_gpu,
@@ -1093,18 +1111,6 @@ impl WorkerClient {
         }
         let runner = Arc::new(TaskRunner::new(worker_id, capabilities.clone(), runner_cfg));
         let active_task_table = Arc::new(RwLock::new(HashMap::new()));
-        let concurrency_permits = config
-            .max_concurrency
-            .unwrap_or_else(|| {
-                // Cores the owner named (`--cores`) are capacity they chose to offer; only the
-                // detected count gets the headroom.
-                if config.cores.is_some() {
-                    capabilities.cpu_cores
-                } else {
-                    default_max_concurrency(capabilities.cpu_cores)
-                }
-            })
-            .max(1);
         let concurrency_semaphore = Arc::new(Semaphore::new(concurrency_permits));
 
         let initial_beacon = if !config.master_addr.is_empty()
@@ -3702,6 +3708,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_cancel_task_stops_task_waiting_for_a_permit_and_reports_130() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = test_client(dir.path(), 1);
+        let (tx, mut rx) = mpsc::channel(32);
+
+        let running = Task::new(
+            rusty_grid_core::task::TaskSpec::command("sleep", vec!["0.5".into()]),
+            TaskRequirements::generic(1, 60),
+        );
+        let queued = Task::new(
+            rusty_grid_core::task::TaskSpec::command("sleep", vec!["30".into()]),
+            TaskRequirements::generic(1, 60),
+        );
+        let running_id = running.id;
+        let queued_id = queued.id;
+
+        client.handle_assign_task(running, tx.clone()).await;
+        wait_running(&mut rx, running_id).await;
+
+        // Assign second task while the single permit is held by `running`.
+        client.handle_assign_task(queued, tx.clone()).await;
+        assert_eq!(client.active_task_table().read().await.len(), 2);
+
+        // Cancel the permit-waiting task via `handle_cancel_task`.
+        client
+            .handle_cancel_task(queued_id, Some("cancelled while waiting for permit".into()))
+            .await;
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("cancelled permit-waiting task must report promptly")
+            .expect("channel open");
+        match msg {
+            WorkerMessage::TaskResult {
+                task_id,
+                exit_code,
+                error,
+                ..
+            } => {
+                assert_eq!(task_id, queued_id);
+                assert_eq!(exit_code, EXIT_CODE_CANCELLED);
+                assert!(
+                    error.as_deref().unwrap_or("").contains("Cancelled"),
+                    "expected Cancelled error message, got: {error:?}"
+                );
+            }
+            other => panic!("expected TaskResult for cancelled queued task, got {other:?}"),
+        }
+
+        // Wait for `running` to complete naturally, then verify permit is released and a third task runs.
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(WorkerMessage::TaskResult {
+                    task_id, exit_code, ..
+                })) if task_id == running_id => {
+                    assert_eq!(exit_code, 0);
+                    break;
+                }
+                Ok(Some(_)) => {}
+                other => panic!("running task did not finish: {other:?}"),
+            }
+        }
+
+        let follow_up = Task::new(
+            rusty_grid_core::task::TaskSpec::command("echo", vec!["permit_ok".into()]),
+            TaskRequirements::generic(1, 30),
+        );
+        let follow_id = follow_up.id;
+        client.handle_assign_task(follow_up, tx).await;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(WorkerMessage::TaskResult {
+                    task_id,
+                    exit_code,
+                    stdout,
+                    ..
+                })) if task_id == follow_id => {
+                    assert_eq!(exit_code, 0);
+                    assert!(String::from_utf8_lossy(&stdout.0).contains("permit_ok"));
+                    break;
+                }
+                Ok(Some(_)) => {}
+                other => panic!("follow_up task did not finish: {other:?}"),
+            }
+        }
+        assert_eq!(client.concurrency_semaphore().available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn test_a_leftover_sandbox_directory_does_not_fail_the_assignment() {
         let dir = tempfile::tempdir().unwrap();
         let client = test_client(dir.path(), 2);
@@ -4726,9 +4821,11 @@ mod tests {
     fn test_worker_advertises_system_tags_then_user_tags() {
         let client = WorkerClient::new(
             WorkerConfig::new("127.0.0.1:9")
+                .with_max_concurrency(3)
                 .with_tags(vec![
                     "laptop".into(),
                     format!("os:{}", std::env::consts::OS),
+                    "slots:99".into(),
                 ])
                 .with_redirection_portal(false),
         );
@@ -4737,9 +4834,10 @@ mod tests {
             vec![
                 format!("os:{}", std::env::consts::OS),
                 format!("arch:{}", std::env::consts::ARCH),
+                "slots:3".to_string(),
                 "laptop".to_string(),
             ],
-            "system tags first, a user tag equal to one of them is not repeated"
+            "system tags and slots:<n> first, a user tag equal to one of them or starting with slots: is not repeated"
         );
     }
 
