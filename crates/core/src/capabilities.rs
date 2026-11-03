@@ -798,11 +798,9 @@ fn detect_system_ram_mb() -> u64 {
     // 3. macOS / Darwin sysctl hw.memsize inspection
     #[cfg(unix)]
     {
-        if let Ok(output) = std::process::Command::new("sysctl")
-            .arg("-n")
-            .arg("hw.memsize")
-            .output()
-        {
+        let mut cmd = std::process::Command::new("sysctl");
+        cmd.arg("-n").arg("hw.memsize");
+        if let Some(output) = run_host_probe(&mut cmd, "sysctl hw.memsize") {
             if output.status.success() {
                 if let Ok(s) = std::str::from_utf8(&output.stdout) {
                     if let Ok(bytes) = s.trim().parse::<u64>() {
@@ -825,11 +823,9 @@ fn detect_system_ram_mb() -> u64 {
 fn detect_physical_gpu() -> (bool, bool, Option<String>) {
     if std::env::var("RUSTY_GRID_ENABLE_PHYSICAL_GPU").as_deref() == Ok("1") {
         // Optional probe for nvidia-smi
-        if let Ok(output) = std::process::Command::new("nvidia-smi")
-            .arg("--query-gpu=name")
-            .arg("--format=csv,noheader")
-            .output()
-        {
+        let mut cmd = std::process::Command::new("nvidia-smi");
+        cmd.arg("--query-gpu=name").arg("--format=csv,noheader");
+        if let Some(output) = run_host_probe(&mut cmd, "nvidia-smi --query-gpu=name") {
             if output.status.success() {
                 if let Ok(s) = std::str::from_utf8(&output.stdout) {
                     let name = s.trim();
@@ -907,11 +903,9 @@ fn detect_battery() -> (Option<u8>, Option<bool>) {
     // 2. macOS pmset fallback
     #[cfg(target_os = "macos")]
     {
-        if let Ok(output) = std::process::Command::new("pmset")
-            .arg("-g")
-            .arg("batt")
-            .output()
-        {
+        let mut cmd = std::process::Command::new("pmset");
+        cmd.arg("-g").arg("batt");
+        if let Some(output) = run_host_probe(&mut cmd, "pmset -g batt") {
             let text = String::from_utf8_lossy(&output.stdout);
             let (pct, charging) = parse_pmset_batt(&text);
             if pct.is_some() {
@@ -922,10 +916,9 @@ fn detect_battery() -> (Option<u8>, Option<bool>) {
 
     // 3. Android dumpsys battery fallback
     if is_android_env() {
-        if let Ok(output) = std::process::Command::new("/system/bin/dumpsys")
-            .arg("battery")
-            .output()
-        {
+        let mut cmd = std::process::Command::new("/system/bin/dumpsys");
+        cmd.arg("battery");
+        if let Some(output) = run_host_probe(&mut cmd, "/system/bin/dumpsys battery") {
             let text = String::from_utf8_lossy(&output.stdout);
             let mut level: Option<u8> = None;
             let mut is_charging: Option<bool> = None;
@@ -1094,10 +1087,9 @@ fn parse_pmset_batt(text: &str) -> (Option<u8>, Option<bool>) {
 fn detect_thermal_throttling() -> bool {
     // 1. Android dumpsys thermalservice check
     if is_android_env() {
-        if let Ok(output) = std::process::Command::new("/system/bin/dumpsys")
-            .arg("thermalservice")
-            .output()
-        {
+        let mut cmd = std::process::Command::new("/system/bin/dumpsys");
+        cmd.arg("thermalservice");
+        if let Some(output) = run_host_probe(&mut cmd, "/system/bin/dumpsys thermalservice") {
             let text = String::from_utf8_lossy(&output.stdout);
             for line in text.lines() {
                 let trimmed = line.trim();
@@ -1163,7 +1155,9 @@ fn cooling_device_indicates_throttling(kind: &str, cur_state: u32) -> bool {
 fn detect_soc_model(is_android: bool) -> String {
     if is_android {
         for prop in &["ro.soc.model", "ro.board.platform", "ro.product.board"] {
-            if let Ok(output) = std::process::Command::new("getprop").arg(prop).output() {
+            let mut cmd = std::process::Command::new("getprop");
+            cmd.arg(prop);
+            if let Some(output) = run_host_probe(&mut cmd, &format!("getprop {prop}")) {
                 let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !val.is_empty() {
                     return val;
@@ -1185,11 +1179,9 @@ fn detect_soc_model(is_android: bool) -> String {
     }
     #[cfg(target_os = "macos")]
     {
-        if let Ok(output) = std::process::Command::new("sysctl")
-            .arg("-n")
-            .arg("machdep.cpu.brand_string")
-            .output()
-        {
+        let mut cmd = std::process::Command::new("sysctl");
+        cmd.arg("-n").arg("machdep.cpu.brand_string");
+        if let Some(output) = run_host_probe(&mut cmd, "sysctl machdep.cpu.brand_string") {
             let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !val.is_empty() {
                 return val;
@@ -1201,24 +1193,25 @@ fn detect_soc_model(is_android: bool) -> String {
 
 fn detect_os_version(is_android: bool) -> String {
     if is_android {
-        let release = std::process::Command::new("getprop")
-            .arg("ro.build.version.release")
-            .output()
+        let mut rel_cmd = std::process::Command::new("getprop");
+        rel_cmd.arg("ro.build.version.release");
+        let release = run_host_probe(&mut rel_cmd, "getprop ro.build.version.release")
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|_| "Unknown".into());
-        let sdk = std::process::Command::new("getprop")
-            .arg("ro.build.version.sdk")
-            .output()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Unknown".into());
+        let mut sdk_cmd = std::process::Command::new("getprop");
+        sdk_cmd.arg("ro.build.version.sdk");
+        let sdk = run_host_probe(&mut sdk_cmd, "getprop ro.build.version.sdk")
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|_| "Unknown".into());
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Unknown".into());
         return format!("Android {} (API {})", release, sdk);
     }
     #[cfg(target_os = "macos")]
     {
-        if let Ok(output) = std::process::Command::new("sw_vers")
-            .arg("-productVersion")
-            .output()
-        {
+        let mut cmd = std::process::Command::new("sw_vers");
+        cmd.arg("-productVersion");
+        if let Some(output) = run_host_probe(&mut cmd, "sw_vers -productVersion") {
             let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !val.is_empty() {
                 return format!("macOS {}", val);
@@ -1228,16 +1221,178 @@ fn detect_os_version(is_android: bool) -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
+/// Maximum wall-clock time a single host capability probe subprocess (`blender --version`,
+/// `pmset`, `sysctl`, `sw_vers`, `nvidia-smi`, `nvcc`, `dumpsys`, `getprop`) may take before it is
+/// killed and treated as unavailable.
+pub const HOST_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[derive(Debug)]
+enum ProbeExecOutcome {
+    Output(std::process::Output),
+    TimedOut,
+    SpawnFailed,
+}
+
+fn kill_probe_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        if pid > 0 {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &format!("-{pid}")])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Runs `cmd` with stdin/stderr closed and stdout captured, killing the process (and its Unix
+/// process group) if it does not exit within `timeout`.
+fn run_command_bounded(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> ProbeExecOutcome {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let mut child = {
+        let mut attempt = 0;
+        loop {
+            match cmd.spawn() {
+                Ok(c) => break c,
+                // On Unix, executing a freshly written script while another thread forks can yield
+                // ETXTBSY (26); retry briefly.
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 5 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => return ProbeExecOutcome::SpawnFailed,
+            }
+        }
+    };
+
+    let stdout_handle = child.stdout.take().map(|out| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = out.take(64 * 1024).read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut poll_interval = std::time::Duration::from_millis(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = stdout_handle
+                    .and_then(|h| h.join().ok())
+                    .unwrap_or_default();
+                return ProbeExecOutcome::Output(std::process::Output {
+                    status,
+                    stdout,
+                    stderr: Vec::new(),
+                });
+            }
+            Ok(None) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    kill_probe_child(&mut child);
+                    return ProbeExecOutcome::TimedOut;
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                std::thread::sleep(poll_interval.min(remaining));
+                poll_interval = (poll_interval * 2).min(std::time::Duration::from_millis(25));
+            }
+            Err(_) => {
+                kill_probe_child(&mut child);
+                return ProbeExecOutcome::SpawnFailed;
+            }
+        }
+    }
+}
+
+fn run_host_probe(cmd: &mut std::process::Command, label: &str) -> Option<std::process::Output> {
+    match run_command_bounded(cmd, HOST_PROBE_TIMEOUT) {
+        ProbeExecOutcome::Output(output) => Some(output),
+        ProbeExecOutcome::TimedOut => {
+            tracing::warn!(
+                probe = %label,
+                timeout_secs = HOST_PROBE_TIMEOUT.as_secs_f32(),
+                "Host capability probe timed out; ignoring probe result"
+            );
+            None
+        }
+        ProbeExecOutcome::SpawnFailed => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlenderProbeResult {
+    Version(String),
+    SucceededWithoutVersion,
+    Failed,
+    TimedOut,
+}
+
+fn probe_blender_with_timeout<P: AsRef<std::ffi::OsStr>>(
+    program: P,
+    timeout: std::time::Duration,
+) -> BlenderProbeResult {
+    let program_ref = program.as_ref();
+    let mut cmd = crate::cluster_auth::probe_command(program_ref);
+    cmd.arg("--version");
+    match run_command_bounded(&mut cmd, timeout) {
+        ProbeExecOutcome::Output(output) => {
+            if output.status.success() {
+                if let Ok(text) = std::str::from_utf8(&output.stdout) {
+                    if let Some(first_line) = text.lines().next() {
+                        let trimmed = first_line.trim();
+                        if trimmed.starts_with("Blender") {
+                            return BlenderProbeResult::Version(trimmed.to_string());
+                        }
+                    }
+                }
+                BlenderProbeResult::SucceededWithoutVersion
+            } else {
+                BlenderProbeResult::Failed
+            }
+        }
+        ProbeExecOutcome::TimedOut => {
+            tracing::warn!(
+                path = %program_ref.to_string_lossy(),
+                timeout_secs = timeout.as_secs_f32(),
+                "Blender version probe timed out; treating Blender as unavailable"
+            );
+            BlenderProbeResult::TimedOut
+        }
+        ProbeExecOutcome::SpawnFailed => BlenderProbeResult::Failed,
+    }
+}
+
 /// Discovers Blender executable and queries its version.
 pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
     // 1. Check explicit path
     if let Some(path_str) = explicit_path {
         let p = std::path::Path::new(path_str);
         if p.is_file() {
-            if let Some(ver) = query_blender_version(p) {
-                return (true, Some(ver));
-            }
-            return (true, Some("Blender (Custom Path)".to_string()));
+            return match probe_blender_with_timeout(p, HOST_PROBE_TIMEOUT) {
+                BlenderProbeResult::Version(ver) => (true, Some(ver)),
+                BlenderProbeResult::TimedOut => (false, None),
+                BlenderProbeResult::SucceededWithoutVersion | BlenderProbeResult::Failed => {
+                    (true, Some("Blender (Custom Path)".to_string()))
+                }
+            };
         }
     }
 
@@ -1250,10 +1405,13 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
         if let Ok(env_path) = std::env::var(env_var) {
             let p = std::path::Path::new(env_path.trim());
             if p.is_file() {
-                if let Some(ver) = query_blender_version(p) {
-                    return (true, Some(ver));
-                }
-                return (true, Some("Blender (Env Path)".to_string()));
+                return match probe_blender_with_timeout(p, HOST_PROBE_TIMEOUT) {
+                    BlenderProbeResult::Version(ver) => (true, Some(ver)),
+                    BlenderProbeResult::TimedOut => (false, None),
+                    BlenderProbeResult::SucceededWithoutVersion | BlenderProbeResult::Failed => {
+                        (true, Some("Blender (Env Path)".to_string()))
+                    }
+                };
             }
         }
     }
@@ -1294,11 +1452,17 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
                     for dir in version_dirs {
                         let candidate = dir.join("blender.exe");
                         if candidate.is_file() {
-                            if let Some(ver) = query_blender_version(&candidate) {
-                                return (true, Some(ver));
-                            }
-                            let dir_name = dir.file_name().map(|n| n.to_string_lossy().to_string());
-                            return (true, dir_name);
+                            return match probe_blender_with_timeout(&candidate, HOST_PROBE_TIMEOUT)
+                            {
+                                BlenderProbeResult::Version(ver) => (true, Some(ver)),
+                                BlenderProbeResult::TimedOut => (false, None),
+                                BlenderProbeResult::SucceededWithoutVersion
+                                | BlenderProbeResult::Failed => {
+                                    let dir_name =
+                                        dir.file_name().map(|n| n.to_string_lossy().to_string());
+                                    (true, dir_name)
+                                }
+                            };
                         }
                     }
                 }
@@ -1310,10 +1474,13 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
             r"C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe",
         );
         if steam_blender.is_file() {
-            if let Some(ver) = query_blender_version(&steam_blender) {
-                return (true, Some(ver));
-            }
-            return (true, Some("Blender (Steam)".to_string()));
+            return match probe_blender_with_timeout(&steam_blender, HOST_PROBE_TIMEOUT) {
+                BlenderProbeResult::Version(ver) => (true, Some(ver)),
+                BlenderProbeResult::TimedOut => (false, None),
+                BlenderProbeResult::SucceededWithoutVersion | BlenderProbeResult::Failed => {
+                    (true, Some("Blender (Steam)".to_string()))
+                }
+            };
         }
     }
 
@@ -1325,10 +1492,13 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
         ] {
             let p = std::path::Path::new(app_path);
             if p.is_file() {
-                if let Some(ver) = query_blender_version(p) {
-                    return (true, Some(ver));
-                }
-                return (true, Some("Blender".to_string()));
+                return match probe_blender_with_timeout(p, HOST_PROBE_TIMEOUT) {
+                    BlenderProbeResult::Version(ver) => (true, Some(ver)),
+                    BlenderProbeResult::TimedOut => (false, None),
+                    BlenderProbeResult::SucceededWithoutVersion | BlenderProbeResult::Failed => {
+                        (true, Some("Blender".to_string()))
+                    }
+                };
             }
         }
     }
@@ -1342,10 +1512,13 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
         ] {
             let p = std::path::Path::new(linux_path);
             if p.is_file() {
-                if let Some(ver) = query_blender_version(p) {
-                    return (true, Some(ver));
-                }
-                return (true, Some("Blender".to_string()));
+                return match probe_blender_with_timeout(p, HOST_PROBE_TIMEOUT) {
+                    BlenderProbeResult::Version(ver) => (true, Some(ver)),
+                    BlenderProbeResult::TimedOut => (false, None),
+                    BlenderProbeResult::SucceededWithoutVersion | BlenderProbeResult::Failed => {
+                        (true, Some("Blender".to_string()))
+                    }
+                };
             }
         }
     }
@@ -1356,38 +1529,20 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
 
 /// Probes a Blender executable candidate by running `<program> --version` with secrets stripped.
 pub fn probe_blender_binary<P: AsRef<std::ffi::OsStr>>(program: P) -> (bool, Option<String>) {
-    if let Ok(output) = crate::cluster_auth::probe_command(program)
-        .arg("--version")
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(text) = std::str::from_utf8(&output.stdout) {
-                if let Some(first_line) = text.lines().next() {
-                    let trimmed = first_line.trim();
-                    if trimmed.starts_with("Blender") {
-                        return (true, Some(trimmed.to_string()));
-                    }
-                }
-            }
-            return (true, Some("Blender".to_string()));
-        }
+    match probe_blender_with_timeout(program, HOST_PROBE_TIMEOUT) {
+        BlenderProbeResult::Version(ver) => (true, Some(ver)),
+        BlenderProbeResult::SucceededWithoutVersion => (true, Some("Blender".to_string())),
+        BlenderProbeResult::Failed | BlenderProbeResult::TimedOut => (false, None),
     }
-    (false, None)
 }
 
 pub fn query_blender_version<P: AsRef<std::ffi::OsStr>>(program: P) -> Option<String> {
-    let output = crate::cluster_auth::probe_command(program)
-        .arg("--version")
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let text = std::str::from_utf8(&output.stdout).ok()?;
-        let first_line = text.lines().next()?.trim();
-        if first_line.starts_with("Blender") {
-            return Some(first_line.to_string());
-        }
+    match probe_blender_with_timeout(program, HOST_PROBE_TIMEOUT) {
+        BlenderProbeResult::Version(ver) => Some(ver),
+        BlenderProbeResult::SucceededWithoutVersion
+        | BlenderProbeResult::Failed
+        | BlenderProbeResult::TimedOut => None,
     }
-    None
 }
 
 fn probe_blender_version_from_path(path: Option<&str>) -> Option<String> {
@@ -1398,11 +1553,10 @@ fn probe_blender_version_from_path(path: Option<&str>) -> Option<String> {
 /// Inspects host GPU dedicated VRAM in Megabytes.
 pub fn detect_gpu_vram_mb() -> Option<u64> {
     // 1. Probe nvidia-smi
-    if let Ok(output) = std::process::Command::new("nvidia-smi")
-        .arg("--query-gpu=memory.total")
-        .arg("--format=csv,noheader,nounits")
-        .output()
-    {
+    let mut cmd = std::process::Command::new("nvidia-smi");
+    cmd.arg("--query-gpu=memory.total")
+        .arg("--format=csv,noheader,nounits");
+    if let Some(output) = run_host_probe(&mut cmd, "nvidia-smi --query-gpu=memory.total") {
         if output.status.success() {
             if let Ok(text) = std::str::from_utf8(&output.stdout) {
                 for line in text.lines() {
@@ -1452,7 +1606,9 @@ pub fn detect_cuda_support(has_gpu: bool) -> bool {
     }
 
     // 2. Probe nvcc compiler on PATH
-    if let Ok(output) = std::process::Command::new("nvcc").arg("--version").output() {
+    let mut nvcc_cmd = std::process::Command::new("nvcc");
+    nvcc_cmd.arg("--version");
+    if let Some(output) = run_host_probe(&mut nvcc_cmd, "nvcc --version") {
         if output.status.success() {
             return true;
         }
@@ -1482,7 +1638,8 @@ pub fn detect_cuda_support(has_gpu: bool) -> bool {
 
     // 4. If has_gpu is true and nvidia-smi ran successfully, NVIDIA driver provides CUDA runtime
     if has_gpu {
-        if let Ok(output) = std::process::Command::new("nvidia-smi").output() {
+        let mut smi_cmd = std::process::Command::new("nvidia-smi");
+        if let Some(output) = run_host_probe(&mut smi_cmd, "nvidia-smi") {
             if output.status.success() {
                 return true;
             }
@@ -1497,8 +1654,13 @@ mod tests {
     use super::*;
     use crate::task::TaskRequirements;
 
+    static BLENDER_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_capabilities_detect_default() {
+        let _guard = BLENDER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let caps = WorkerCapabilities::detect(None, None, false);
         assert!(!caps.name.is_empty(), "Worker name should not be empty");
         assert!(caps.cpu_cores >= 1, "CPU cores must be >= 1");
@@ -1573,6 +1735,9 @@ mod tests {
 
     #[test]
     fn test_capabilities_detect_cores_override() {
+        let _guard = BLENDER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let caps = WorkerCapabilities::detect(Some("worker-test".into()), Some(16), false);
         assert_eq!(caps.name, "worker-test");
         assert_eq!(caps.cpu_cores, 16);
@@ -1580,6 +1745,9 @@ mod tests {
 
     #[test]
     fn test_capabilities_detect_simulate_gpu() {
+        let _guard = BLENDER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let caps = WorkerCapabilities::detect(Some("gpu-worker".into()), Some(4), true);
         assert_eq!(caps.name, "gpu-worker");
         assert!(caps.has_gpu);
@@ -1590,6 +1758,9 @@ mod tests {
 
     #[test]
     fn test_capabilities_hardware_overrides() {
+        let _guard = BLENDER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let overrides = HardwareOverrides {
             name: Some("custom-node".into()),
             cores: Some(32),
@@ -1999,6 +2170,9 @@ mod tests {
 
     #[test]
     fn test_detect_blender_non_panicking() {
+        let _guard = BLENDER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (has_blender, ver) = detect_blender(None);
         if has_blender {
             assert!(ver.is_some());
@@ -2290,5 +2464,123 @@ Now drawing from 'AC Power'
         // Desktop with Mains online but no battery returns (None, None)
         let desktop = write_sysfs(None, "", Some("1"));
         assert_eq!(parse_sysfs_power_supply(desktop.path()), (None, None));
+    }
+
+    fn write_test_script(
+        dir: &std::path::Path,
+        name: &str,
+        unix_body: &str,
+        win_body: &str,
+    ) -> std::path::PathBuf {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = win_body;
+            let path = dir.join(format!("{name}.sh"));
+            std::fs::write(&path, format!("#!/bin/sh\n{unix_body}\n")).expect("write script");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod script");
+            path
+        }
+        #[cfg(windows)]
+        {
+            let _ = unix_body;
+            let path = dir.join(format!("{name}.cmd"));
+            std::fs::write(&path, format!("@echo off\r\n{win_body}\r\n")).expect("write script");
+            path
+        }
+    }
+
+    #[test]
+    fn test_probe_blender_with_timeout_handles_version_non_version_failure_and_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let ok_ver = write_test_script(
+            dir.path(),
+            "blender_ok",
+            "echo 'Blender 4.5.4 LTS'",
+            "echo Blender 4.5.4 LTS",
+        );
+        assert_eq!(
+            probe_blender_with_timeout(&ok_ver, std::time::Duration::from_secs(2)),
+            BlenderProbeResult::Version("Blender 4.5.4 LTS".to_string())
+        );
+
+        let no_ver = write_test_script(
+            dir.path(),
+            "blender_custom",
+            "echo 'custom stub'",
+            "echo custom stub",
+        );
+        assert_eq!(
+            probe_blender_with_timeout(&no_ver, std::time::Duration::from_secs(2)),
+            BlenderProbeResult::SucceededWithoutVersion
+        );
+
+        let fail = write_test_script(dir.path(), "blender_fail", "exit 1", "exit /b 1");
+        assert_eq!(
+            probe_blender_with_timeout(&fail, std::time::Duration::from_secs(2)),
+            BlenderProbeResult::Failed
+        );
+
+        let hung = write_test_script(
+            dir.path(),
+            "blender_hung",
+            "sleep 60",
+            "ping -n 60 127.0.0.1 >NUL",
+        );
+        let start = std::time::Instant::now();
+        assert_eq!(
+            probe_blender_with_timeout(&hung, std::time::Duration::from_millis(200)),
+            BlenderProbeResult::TimedOut
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "timed-out probe took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_hung_blender_probe_via_env_times_out_and_reports_no_blender() {
+        let _guard = BLENDER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hung = write_test_script(
+            dir.path(),
+            "hung_blender_env",
+            "sleep 60",
+            "ping -n 60 127.0.0.1 >NUL",
+        );
+
+        let prev = std::env::var_os("RUSTY_GRID_BLENDER_PATH");
+        std::env::set_var("RUSTY_GRID_BLENDER_PATH", &hung);
+
+        let start = std::time::Instant::now();
+        let caps = WorkerCapabilities::detect_with_overrides(HardwareOverrides::default());
+        let elapsed = start.elapsed();
+
+        match prev {
+            Some(v) => std::env::set_var("RUSTY_GRID_BLENDER_PATH", v),
+            None => std::env::remove_var("RUSTY_GRID_BLENDER_PATH"),
+        }
+
+        assert!(
+            !caps.has_blender,
+            "a hung RUSTY_GRID_BLENDER_PATH probe must report has_blender = false"
+        );
+        assert!(
+            caps.blender_version.is_none(),
+            "a hung RUSTY_GRID_BLENDER_PATH probe must report blender_version = None, got {:?}",
+            caps.blender_version
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_secs(2)
+                && elapsed < HOST_PROBE_TIMEOUT + std::time::Duration::from_secs(5),
+            "expected probe to time out around {:?}, took {:?}",
+            HOST_PROBE_TIMEOUT,
+            elapsed
+        );
     }
 }

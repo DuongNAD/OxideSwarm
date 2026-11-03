@@ -5212,4 +5212,43 @@ mod tests {
         assert!(matches!(n, Ok(0) | Err(_)));
         let _ = shutdown.send(true);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_worker_client_with_hung_blender_path_reports_no_blender_within_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("oxideswarm_worker_hung_blender_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("blender");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&script).unwrap();
+            file.write_all(b"#!/bin/sh\nsleep 60\n").unwrap();
+            file.sync_all().unwrap();
+        }
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let started = std::time::Instant::now();
+        let client = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_name("hung-blender-worker")
+                .with_cores(2)
+                .with_no_gpu(true)
+                .with_no_cuda(true)
+                .with_blender_path(script.to_string_lossy().to_string()),
+        );
+        let elapsed = started.elapsed();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(!client.capabilities().has_blender);
+        assert!(client.capabilities().blender_version.is_none());
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "WorkerClient::new took too long ({elapsed:?}) when blender_path hung"
+        );
+    }
 }
