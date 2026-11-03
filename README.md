@@ -311,7 +311,7 @@ or `~/.oxideswarm/cluster.secret`.
 ./target/release/oxideswarm status --master 127.0.0.1:8088 --json
 ./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --mapper word_count --reducer sum
 ./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --mapper ./map.sh --reducer ./reduce.sh
-./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --map-cmd "python3 map.py" --reduce-cmd "python3 reduce.py"
+./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --map-cmd "python3 /tmp/map.py" --reduce-cmd "python3 /tmp/reduce.py"
 
 # Model Context Protocol (MCP) stdio server for AI coding assistants
 ./target/release/oxideswarm mcp --master 127.0.0.1:8088
