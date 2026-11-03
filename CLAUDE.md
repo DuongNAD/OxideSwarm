@@ -43,7 +43,8 @@ cargo mode <test|dev|doc|research> [action]       # alias in .cargo/config.toml 
 ./test_integration.sh                              # E2E: 1 master + 3 workers (one simulated GPU), loopback, private HOME, ephemeral ports
 ./run_chaos_test.sh                                # starts its own cluster, SIGKILLs a worker that holds running tasks, asserts re-execution (fails otherwise)
 ./run_cluster_benchmark.sh                         # two-node benchmark: two local workers (default) or a phone via --adb-id
-python tests/run_all_mesh_tests.py                 # Agent Mesh protocol suites against a PYTHON reference hub (not the Rust hub); tests/test_challenger_*.py individually
+python tests/run_mesh_simulation_tests.py          # Agent Mesh protocol suites against a PYTHON reference hub (not the Rust hub)
+cargo build -p agent_mesh && python tests/test_agent_mesh_rust_hub_cross_interop.py # Agent Mesh Python client suites against the compiled RUST hub binary
 python3 tests/test_launcher_scripts.py             # launcher/installer scripts vs fake binaries in a private HOME (stdlib only; OX_SCRIPT_ROOT=<old checkout> for a mutation check)
 python3 scripts/agent_bridge.py diagnose           # cross-machine coding-agent diagnostics, git/secret-hash parity & mailbox over Google Drive (OxideSwarm_Agent_Hub)
 python3 tests/test_agent_bridge.py                 # agent_bridge.py message trigger against a temporary hub (stdlib only; also in CI on all three systems)

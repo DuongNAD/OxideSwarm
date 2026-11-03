@@ -274,22 +274,23 @@ The Agent Mesh hub in this guide uses its own JSON envelopes and is unaffected.
 ## 4. Testing & Verification
 
 ### 4.1 Protocol Simulation (Python reference hub, NOT the Rust hub)
-`tests/run_all_mesh_tests.py` runs the mesh protocol against a **Python re-implementation of the hub**
+`tests/run_mesh_simulation_tests.py` runs the mesh protocol against a **Python re-implementation of the hub**
 (`OxideRelayHub` inside `tests/test_agent_mesh_simulation.py`) with simulated nodes. It documents and checks the
 protocol; it never starts the Rust `agent-mesh` binary, so a pass says nothing about the Rust hub.
 ```bash
 python3 -c "import websockets; print('Websockets OK')"
-python3 tests/run_all_mesh_tests.py
+python3 tests/run_mesh_simulation_tests.py
 ```
-It executes an automated 8-phase scenario:
-1. Starts the Python reference hub on loopback.
-2. Starts 3 simulated nodes (`node-win-1`, `node-mac-2`, `node-android-3`).
-3. Queries node catalog.
-4. Routes targeted command from Node 1 to Node 3.
-5. Asserts Node 2 isolation (execution count strictly 0).
-6. Executes real OS subprocess command on Node 3.
-7. Transmits 64 KB forward and 64 KB reverse payload with bit-for-bit SHA-256 validation.
-8. Sends a 50-packet burst in each direction and counts losses.
+It executes 4 suites against the Python reference hub:
+1. **Suite 1 (`test_agent_mesh_simulation.py`) — 3-node mesh simulation & targeted command routing**:
+   - Starts the Python reference hub on loopback and connects 3 simulated nodes (`node-win-1`, `node-mac-2`, `node-android-3`).
+   - Queries the node catalog, routes a targeted command from Node 1 to Node 3, asserts Node 2 isolation (0 executions), and checks `DeliveryNack` on nonexistent targets.
+2. **Suite 2 (`test_agent_mesh_data_loss.py`) — Bidirectional zero-data-loss & burst verification**:
+   - Transmits 64 KB forward/reverse payloads and 0-byte / 128 KB boundaries with SHA-256 verification, and runs a 100-packet bidirectional burst.
+3. **Suite 3 (`test_sec6_mesh_sandbox.py`) — SEC-6 command hardening & process controls**:
+   - Verifies command allowlist (`127` for unadvertised commands), `--no-shell` capability filtering and execution refusal, secret env var stripping (`OXIDESWARM_SECRET`, `OXIDESWARM_SECRET_FILE`, `OXIDE_MESH_TOKEN`), `cwd` and explicit `env`, 1 MiB output capping, non-zero exit code + `stderr` propagation, timeout partial output retention, and subprocess tree termination.
+4. **Suite 4 (`test_challenger_m4_python_tampering.py`) — Python SHA-256 asset tamper detection & burst routing**:
+   - Verifies single-bit-flip SHA-256 tamper rejection in `OxideAgentNode.extract_and_verify_asset`, nested output directory creation, and 10-client concurrent correlation routing.
 
 ### 4.2 Tests against the Rust hub
 ```bash

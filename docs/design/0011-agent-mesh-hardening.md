@@ -140,7 +140,7 @@ operators must activate `--no-shell`.
 | SEC6-3 | Env sanitization & 3 secret vars | `executor.rs`, `agent_node.py` | 3 vars absent from child env | Implemented |
 | SEC6-4 | Output cap at 1 MiB | `executor.rs`, `agent_node.py` | Stream truncated with marker | Implemented |
 | SEC6-5 | Launcher `--no-shell` support | `packaging/agent_mesh/*` | All launchers accept flag / env var | Implemented |
-| SEC6-6 | CI integration | `.github/workflows/ci.yml`, `run_all_mesh_tests.py` | Tests run in CI | Implemented |
+| SEC6-6 | CI integration | `.github/workflows/ci.yml`, `run_mesh_simulation_tests.py` | Tests run in CI | Implemented |
 
 ## Status log
 

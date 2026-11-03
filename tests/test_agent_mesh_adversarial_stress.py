@@ -38,8 +38,9 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def find_binary() -> str:
+    target_dir = os.environ.get("CARGO_TARGET_DIR") or os.path.join(PROJECT_ROOT, "target")
     for name in ("agent-mesh.exe", "agent-mesh"):
-        p = os.path.join(PROJECT_ROOT, "target", "debug", name)
+        p = os.path.join(target_dir, "debug", name)
         if os.path.exists(p):
             return p
     raise FileNotFoundError("agent-mesh binary not found; build target/debug first")
@@ -426,7 +427,7 @@ async def test_unattached_hub_stress():
         stop_hub(proc)
 
 
-async def main():
+async def run_adversarial_stress_tests() -> bool:
     logger.info("Beginning Adversarial Stress Test Suite for Milestone 2...")
     t0 = time.time()
     await test_attached_hub_stress()
@@ -435,6 +436,11 @@ async def main():
     logger.info("==================================================================")
     logger.info(" ALL ADVERSARIAL STRESS SUITES PASSED SUCCESSFULLY (%.2fs)       ", elapsed)
     logger.info("==================================================================")
+    return True
+
+
+async def main():
+    await run_adversarial_stress_tests()
 
 
 if __name__ == "__main__":

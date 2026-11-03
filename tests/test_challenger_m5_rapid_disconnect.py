@@ -16,9 +16,11 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import random
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import uuid
@@ -35,25 +37,58 @@ logger = logging.getLogger("RapidDisconnect")
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-async def run_rapid_disconnect_stress():
-    bin_name = "agent-mesh.exe" if sys.platform == "win32" else "agent-mesh"
-    bin_path = os.path.join(PROJECT_ROOT, "target", "debug", bin_name)
-    if not os.path.exists(bin_path):
-        raise FileNotFoundError(f"agent-mesh binary not found at {bin_path}")
+def _find_binary() -> str:
+    target_dir = os.environ.get("CARGO_TARGET_DIR") or os.path.join(PROJECT_ROOT, "target")
+    for name in ("agent-mesh.exe", "agent-mesh"):
+        p = os.path.join(target_dir, "debug", name)
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError("agent-mesh binary not found; build target/debug first")
 
-    port = 24250
-    hub_ws_url = f"ws://127.0.0.1:{port}/ws"
-    hub_health_url = f"http://127.0.0.1:{port}/api/health"
-    hub_nodes_url = f"http://127.0.0.1:{port}/api/nodes"
 
-    logger.info(f"Launching Rust Hub binary on port {port}...")
+def _wait_for_hub_url(proc: subprocess.Popen, timeout_s: float = 15.0) -> str:
+    url_queue: queue.Queue = queue.Queue()
+
+    def _reader():
+        try:
+            for line in proc.stdout:
+                if "running at " in line:
+                    url_queue.put(line.split("running at ", 1)[1].strip())
+                    break
+            for _ in proc.stdout:
+                pass
+        except Exception:
+            pass
+        finally:
+            url_queue.put(None)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    try:
+        hub_url = url_queue.get(timeout=timeout_s)
+    except queue.Empty as exc:
+        raise TimeoutError(f"Rust Hub failed to report its bound address within {timeout_s}s") from exc
+    if not hub_url:
+        raise RuntimeError("Rust Hub exited before reporting its bound address")
+    return hub_url
+
+
+async def run_rapid_disconnect_stress() -> bool:
+    bin_path = _find_binary()
+    logger.info("Launching Rust Hub binary on an ephemeral port...")
     proc = subprocess.Popen(
-        [bin_path, "hub", "--listen", f"127.0.0.1:{port}"],
-        stdout=subprocess.DEVNULL,
+        [bin_path, "hub", "--listen", "127.0.0.1:0"],
+        stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
+        text=True,
     )
 
     try:
+        hub_ws_url = _wait_for_hub_url(proc, timeout_s=15.0)
+
+        http_base = "http://" + hub_ws_url.split("://", 1)[1].rsplit("/ws", 1)[0]
+        hub_health_url = f"{http_base}/api/health"
+        hub_nodes_url = f"{http_base}/api/nodes"
+
         # Await health
         online = False
         for _ in range(30):
@@ -104,7 +139,7 @@ async def run_rapid_disconnect_stress():
                     # Abrupt violent exit (close socket with error code or immediately exit context)
                     if random.random() < 0.5:
                         await ws.close(code=1006)  # Abnormal closure simulation
-            except Exception as e:
+            except Exception:
                 # Connection / socket dropped as intended
                 pass
 
@@ -129,6 +164,7 @@ async def run_rapid_disconnect_stress():
             assert len(active_nodes) == 0, f"Expected 0 active nodes after all closed, got {len(active_nodes)}"
 
         logger.info("✓ Rust Hub survived all 25 concurrent turbulent client drops with 0 crashes and clean session cleanup")
+        return True
 
     finally:
         proc.terminate()
