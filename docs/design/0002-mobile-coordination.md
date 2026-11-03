@@ -78,7 +78,7 @@ The master calculates the dead peer window dynamically from the worker's reporte
 
 $$W_{\text{dead}} = \max(2\text{ s}, 4 \times \tau_{\text{worker}})$$
 
-Implemented in `crates/core/src/capabilities.rs` (`calculate_keepalive_interval`, `MobileLiveStatus::recommended_keepalive_interval`) and `crates/master/src/registry.rs`.
+Implemented in `crates/core/src/capabilities.rs` (`MobileLiveStatus::recommended_keepalive_interval`) and `crates/master/src/registry.rs`.
 
 ### D3 Strict five-rule mobile master refusal matrix
 
@@ -128,7 +128,7 @@ $$\text{HMAC-SHA256}(\text{cluster\_secret}, \text{"oxs1-master-lease"} \paralle
 
 When an elected worker claims coordinator role, it transmits `WorkerMessage::ClaimMasterRole { ticket }`. Nodes verify the HMAC signature and epoch before accepting the new coordinator.
 
-Types and verification helpers live in `crates/core/src/arbitrage.rs` (`MasterLeaseTicket`) and `crates/master/src/server.rs`; automatic failover and coordinator handover remain **Design only** (no node sends `ClaimMasterRole` in production, and role switching is performed manually via `switch_role.sh` / `windows/switch_role.cmd`).
+Types and verification helpers live in `crates/core/src/arbitrage.rs` (`MasterLeaseTicket`), `ROLE_ARBITRAGE` is advertised in `crates/core/src/protocol.rs:81`, and three live handlers in `crates/master/src/server.rs` (`:3123`, `:3463`, `:4080`) check a claim against a hardcoded incumbent (`3500` at `:3134`), take `AcceptedAndStepDown` without a secret (`:3147-3151`), answer `RoleHandoverAck { accepted: true, task_queue_snapshot }` (`:3168`), and keep serving; however, no production code constructs `ClaimMasterRole` and automatic coordinator failover/election remains **Design only** (role switching is performed manually via `switch_role.sh` / `windows/switch_role.cmd`).
 
 ### D6 Pre-sleep fast task evacuation hook
 
@@ -166,7 +166,7 @@ Implemented in `crates/worker/src/client.rs` (`evacuate_before_sleep`) and `crat
 | W1 | Arbitrage and refusal module | `crates/core/src/arbitrage.rs` | Refusal matrix, $S_{\text{auth}}$ calculation, and lease ticket types implemented with unit tests | Implemented |
 | W2 | Scheduler multi-tier throttling | `crates/master/src/scheduler.rs` | Concurrency scaled by $C_{\text{eff}} = \min(C_{\text{bat}}, C_{\text{therm}})$ in matchmaking | Implemented |
 | W3 | Adaptive keepalive controller | `crates/core/src/capabilities.rs`, `crates/master/src/registry.rs` | 10s / 25s / 60s intervals and dynamic $W_{\text{dead}}$ calculation | Partial |
-| W4 | Master lease claim handling | `crates/master/src/server.rs` | `ClaimMasterRole` verification and coordinator state transition | Design only |
+| W4 | Master lease claim handling | `crates/master/src/server.rs` | `ROLE_ARBITRAGE` advertised (`protocol.rs:81`); three live handlers (`server.rs:3123`, `:3463`, `:4080`) check a claim against a hardcoded incumbent (`3500` at `:3134`), take `AcceptedAndStepDown` without a secret (`:3147-3151`), answer `RoleHandoverAck { accepted: true, task_queue_snapshot }` (`:3168`), and keep serving; nothing constructs `ClaimMasterRole` | Partial |
 | W5 | Pre-sleep fast evacuation | `crates/worker/src/client.rs`, `crates/master/src/server.rs` | Disconnecting drain frame returned and tasks requeued in $< 50\text{ ms}$ | Implemented |
 | W6 | Stress test suites | `tests/mobile_coordination_test.rs`, `tests/m5a_challenger_1_stress.rs`, `tests/m5a_challenger_2_stress.rs` | All stress tests pass with 0 failures | Implemented |
 

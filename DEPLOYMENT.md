@@ -253,7 +253,7 @@ This app runs the **compute-grid worker** (not the agent-mesh node) in-process v
 - It needs `liboxideworker.so`, built first with `packaging/android/build_android_jni.sh --release`; without it the app has no worker. See [packaging/android/README.md](packaging/android/README.md).
 - It uses an Android Foreground Service with an ongoing notification and holds `PARTIAL_WAKE_LOCK` / `WIFI_MODE_FULL_LOW_LATENCY`.
 - Built-in tasks run inside the app process and are not exposed to the Android 12+ **Phantom Process Killer (PPK)**; command, shell and compile tasks spawn child processes, and those can be killed by it.
-- Supports cluster secret authentication via native JNI configuration (`nativeSetClusterSecret`).
+- Supports cluster secret authentication via native JNI configuration (`nativeSetClusterSecret`; note: the Gradle APK project in `packaging/android/app/` does not compile yet, see `AND-1` in [docs/BACKLOG.md](docs/BACKLOG.md)).
 
 ### 3.5 Upgrading a running grid (master and workers)
 All nodes in a cluster (`master`, `worker`, and CLI commands) must run one build: `Task`, `TaskResult`, and message
