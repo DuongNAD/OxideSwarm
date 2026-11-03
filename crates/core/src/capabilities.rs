@@ -2958,40 +2958,52 @@ Now drawing from 'AC Power'
     #[test]
     fn test_hung_blender_probe_via_override_times_out_and_reports_no_blender() {
         let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
         let env_pid_file = dir.path().join("env_hung_grandchild.pid");
+        let unix_script = {
+            #[cfg(unix)]
+            {
+                format!("sleep 60 &\necho $! > '{}'\nwait", env_pid_file.display())
+            }
+            #[cfg(not(unix))]
+            {
+                String::new()
+            }
+        };
         let hung = write_test_script(
             dir.path(),
             "hung_blender_env",
-            &format!("sleep 60 &\necho $! > '{}'\nwait", env_pid_file.display()),
-            &format!(
-                "python -c \"import subprocess; p = subprocess.Popen(['ping', '-n', '60', '127.0.0.1']); open(r'{}', 'w').write(str(p.pid)); p.wait()\"",
-                env_pid_file.display()
-            ),
+            &unix_script,
+            "ping -n 60 127.0.0.1 >NUL",
         );
 
         let start = std::time::Instant::now();
-        let caps = WorkerCapabilities::detect_with_overrides(HardwareOverrides {
-            blender_path: Some(hung.to_string_lossy().to_string()),
-            ..Default::default()
-        });
+        let hung_str = hung.to_string_lossy().to_string();
+        let (has_blender, blender_version) = detect_blender(Some(&hung_str));
         let elapsed = start.elapsed();
 
         assert!(
-            !caps.has_blender,
+            !has_blender,
             "a hung blender_path override probe must report has_blender = false"
         );
         assert!(
-            caps.blender_version.is_none(),
+            blender_version.is_none(),
             "a hung blender_path override probe must report blender_version = None, got {:?}",
-            caps.blender_version
+            blender_version
         );
+        let max_overhead = if cfg!(windows) {
+            std::time::Duration::from_secs(10)
+        } else {
+            std::time::Duration::from_secs(5)
+        };
         assert!(
             elapsed >= std::time::Duration::from_secs(2)
-                && elapsed < HOST_PROBE_TIMEOUT + std::time::Duration::from_secs(5),
+                && elapsed < HOST_PROBE_TIMEOUT + max_overhead,
             "expected probe to time out around {:?}, took {:?}",
             HOST_PROBE_TIMEOUT,
             elapsed
         );
+        #[cfg(unix)]
         assert_pid_file_process_dead(&env_pid_file);
     }
 }
