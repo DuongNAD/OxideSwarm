@@ -171,6 +171,44 @@ async fn test_cli_cancel_stops_running_sleep_task() {
         "must not print nil worker UUID: {res_stdout}"
     );
 
+    // F30-a: Submit a task that stays Queued (`--require-tag absent`), cancel it while queued
+    // (so `result.worker_id` is `Uuid::nil()`), and assert `result` prints no `Worker:` line.
+    let queued_sub = cli_cmd(home)
+        .args([
+            "submit",
+            "--master",
+            &master_addr,
+            "--require-tag",
+            "absent",
+            "--json",
+            "--",
+            "echo",
+            "never-runs",
+        ])
+        .output()
+        .expect("spawn queued submit");
+    assert!(queued_sub.status.success());
+    let queued_sub_json: serde_json::Value =
+        serde_json::from_slice(&queued_sub.stdout).expect("parse queued_sub json");
+    let queued_id = queued_sub_json["task_id"].as_str().expect("queued_id");
+
+    let queued_cancel = cli_cmd(home)
+        .args(["cancel", queued_id, "--master", &master_addr])
+        .output()
+        .expect("cancel queued task");
+    assert!(queued_cancel.status.success());
+
+    let queued_res = cli_cmd(home)
+        .args(["result", queued_id, "--master", &master_addr])
+        .output()
+        .expect("result of queued-cancelled task");
+    assert!(!queued_res.status.success());
+    let queued_res_stdout = String::from_utf8_lossy(&queued_res.stdout);
+    assert!(
+        !queued_res_stdout.contains("Worker:"),
+        "result of a task cancelled while queued (nil worker_id) must print no Worker: line, got: {queued_res_stdout}"
+    );
+
     let _ = shutdown_tx.send(true);
     worker_handle.abort();
     let _ = master.shutdown();
@@ -542,6 +580,83 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
         bad_inline_json.get("artifact_save_error").is_some(),
         "expected artifact_save_error in json: {bad_inline_json}"
     );
+
+    // 6. F30-b: Verify that `submit --wait` also exits non-zero (`ExitCode::FAILURE`) and
+    // reports `artifact_save_error` when saving an inline `OutputArtifact` fails (e.g. when
+    // `--output-dir` is a regular file).
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock master for submit artifact_save_error");
+    let mock_addr = mock_listener.local_addr().expect("mock_addr").to_string();
+    let mock_handle = tokio::spawn(async move {
+        if let Ok((stream, _)) = mock_listener.accept().await {
+            let mut tx = rusty_grid_core::protocol::MessageTransport::new(stream);
+            while let Ok(Some(msg)) = tx
+                .recv_msg::<rusty_grid_core::protocol::ClientMessage>()
+                .await
+            {
+                match msg {
+                    rusty_grid_core::protocol::ClientMessage::SubmitTask { task, .. } => {
+                        let mut res = rusty_grid_core::TaskResult::success(
+                            uuid::Uuid::new_v4(),
+                            task.id,
+                            "ok",
+                            5,
+                            false,
+                        );
+                        res.artifacts
+                            .push(rusty_grid_core::task::OutputArtifact::new(
+                                "rep.txt",
+                                b"INLINE_DATA".to_vec(),
+                            ));
+                        let _ = tx
+                            .send_msg(&rusty_grid_core::protocol::ClientResponse::TaskCompleted {
+                                task_id: task.id,
+                                result: res,
+                            })
+                            .await;
+                    }
+                    rusty_grid_core::protocol::ClientMessage::ListWorkers => {
+                        let _ = tx
+                            .send_msg(&rusty_grid_core::protocol::ClientResponse::WorkerList {
+                                workers: Vec::new(),
+                            })
+                            .await;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    });
+
+    let bad_submit_inline = cli_cmd(home)
+        .args([
+            "submit",
+            "--master",
+            &mock_addr,
+            "--wait",
+            "--output",
+            "rep.txt",
+            "--output-dir",
+            not_a_dir.to_str().unwrap(),
+            "--json",
+            "--",
+            "echo",
+            "inline-fail",
+        ])
+        .output()
+        .expect("spawn submit with regular file as --output-dir for inline artifact");
+    assert!(
+        !bad_submit_inline.status.success(),
+        "submit must exit non-zero when saving inline OutputArtifact fails"
+    );
+    let bad_submit_inline_json: serde_json::Value =
+        serde_json::from_slice(&bad_submit_inline.stdout).expect("parse bad_submit_inline json");
+    assert!(
+        bad_submit_inline_json.get("artifact_save_error").is_some(),
+        "expected artifact_save_error in submit json: {bad_submit_inline_json}"
+    );
+    mock_handle.abort();
 
     let _ = shutdown_tx.send(true);
     worker_handle.abort();
