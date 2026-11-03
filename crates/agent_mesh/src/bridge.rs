@@ -590,7 +590,7 @@ impl AgentGridBridge {
                     correlation_id,
                     command,
                     1,
-                    "Invalid 3D generation specification: 'engine' must be a string",
+                    "Invalid 3D generation specification: 'engine_preference' must be a string",
                 );
             }
         }
@@ -1206,8 +1206,8 @@ mod tests {
                 assert_eq!(status, "failed");
                 assert_ne!(exit_code, 0);
                 assert!(
-                    stderr.contains("'engine' must be a string"),
-                    "Expected non-string engine error, got: {stderr}"
+                    stderr.contains("'engine_preference' must be a string"),
+                    "Expected non-string engine_preference error, got: {stderr}"
                 );
             }
             other => panic!("expected CommandResponse, got {other:?}"),
