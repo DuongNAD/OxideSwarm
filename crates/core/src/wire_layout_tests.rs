@@ -8,16 +8,21 @@
 //! * that each instance comes back unchanged from both codecs and from the raw JSON read path, so
 //!   a field that one mirror or one `From` impl drops or mangles fails here (the values are
 //!   non-default because the JSON mirrors fill a missing field from `#[serde(default)]`), and
-//! * that the bincode encoding of each instance is the one recorded in
+//! * that the bincode encoding of each instance of the four message enums is the one recorded in
 //!   [`WIRE_LAYOUT_FILE`]. Bincode is positional: a field inserted before existing ones, a moved
 //!   variant or a changed field type makes an older peer misread the frame, and it changes the
-//!   recorded bytes.
+//!   recorded bytes. `InboundMessage` is only round-tripped: no peer sends the wrapped form.
 //!
 //! A new variant does not compile until it has an arm in the exhaustive `match` of its enum's
 //! instance list, and each list is checked against the variants its `Binary*` mirror declares, so
-//! a variant cannot be left without a canonical instance either.
+//! a variant cannot be left without a canonical instance either. Every `TaskSpec` variant must
+//! travel in one of the messages as well.
+//!
+//! Non-default values never trip a `skip_serializing_if` predicate, so this module cannot see one
+//! on a bincode type; `skip_serializing_if_is_kept_off_bincode_types` in `lib.rs` scans every
+//! `crates/core/src/*.rs` for that, so no sparse twins of these instances are needed.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{Debug, Display, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -44,19 +49,24 @@ use crate::task::{
 const WIRE_LAYOUT_FILE: &str = "tests/data/wire_layout.txt";
 /// Set to `1` to rewrite [`WIRE_LAYOUT_FILE`] from the current encodings instead of comparing.
 const UPDATE_ENV: &str = "UPDATE_WIRE_LAYOUT";
-const REGENERATE: &str = "UPDATE_WIRE_LAYOUT=1 cargo test -p rusty_grid_core --lib wire_layout";
+/// The command that rewrites [`WIRE_LAYOUT_FILE`], for a POSIX shell and for PowerShell.
+const REGENERATE: &str =
+    "    UPDATE_WIRE_LAYOUT=1 cargo test -p rusty_grid_core --lib wire_layout\n    \
+     $env:UPDATE_WIRE_LAYOUT=1; cargo test -p rusty_grid_core --lib wire_layout   (PowerShell)";
 
 const HEADER: &str = "\
 # Bincode wire layout of the protocol messages (crates/core/src/protocol.rs): one canonical
-# instance per variant, built in crates/core/src/wire_layout_tests.rs, as `<Enum>::<Variant> <hex>`
-# (the frame payload after the 0x02 format byte), sorted by name. A changed line is a wire format
-# change: read the test's failure message, then regenerate with
+# instance per variant of WorkerMessage, MasterMessage, ClientMessage and ClientResponse, built in
+# crates/core/src/wire_layout_tests.rs, as `<Enum>::<Variant> <hex>` (the frame payload after the
+# 0x02 format byte), sorted by name. Read the test's failure message, then regenerate with
 #   UPDATE_WIRE_LAYOUT=1 cargo test -p rusty_grid_core --lib wire_layout
+#   $env:UPDATE_WIRE_LAYOUT=1; cargo test -p rusty_grid_core --lib wire_layout   (PowerShell)
 ";
 
 // ---------------------------------------------------------------------------------------------
-// Fixed values. Fields of the same type get different values, so a mirror that swaps two of them
-// changes the bytes even where the round trip swaps them back.
+// Fixed values. Within a message, fields of the same type (nested ones included) hold different
+// values, so a mirror or `From` impl that reads one in place of another fails the round trip or
+// changes the recorded bytes. A bool has two values only: see `worker_capabilities`.
 // ---------------------------------------------------------------------------------------------
 
 /// 2026-01-01T00:00:00Z in seconds since the Unix epoch.
@@ -97,13 +107,23 @@ fn features() -> ProtocolCapabilities {
     ProtocolCapabilities::MOBILE_TELEMETRY | ProtocolCapabilities::BLOB_TRANSFER
 }
 
-fn worker_capabilities(name: &str) -> WorkerCapabilities {
+/// Capabilities `n` (0, 1 or 2). The mirrors carry its four bools side by side and a bool has two
+/// values only, so the three instances take turns: each bool is `true` in one of them (a field a
+/// mirror drops falls back to `false`), and every pair of bools differs in one of them.
+fn worker_capabilities(n: usize) -> WorkerCapabilities {
+    // [has_gpu, is_simulated_gpu, has_blender, has_cuda]
+    const BOOLS: [[bool; 4]; 3] = [
+        [true, true, true, true],
+        [true, true, false, false],
+        [true, false, true, false],
+    ];
+    let [has_gpu, is_simulated_gpu, has_blender, has_cuda] = BOOLS[n];
     WorkerCapabilities {
-        name: name.into(),
+        name: format!("wire-worker-{n}"),
         cpu_cores: 12,
         ram_mb: 32_768,
-        has_gpu: true,
-        is_simulated_gpu: true,
+        has_gpu,
+        is_simulated_gpu,
         gpu_device_name: Some("Adreno 740".into()),
         tags: vec!["zone:lab".into(), "fast-disk".into()],
         mobile: Some(MobileCapabilities {
@@ -113,25 +133,25 @@ fn worker_capabilities(name: &str) -> WorkerCapabilities {
             is_charging: Some(true),
             thermal_throttled: true,
         }),
-        has_blender: true,
+        has_blender,
         blender_version: Some("Blender 4.5.4 LTS".into()),
         vram_mb: Some(8_192),
-        has_cuda: true,
+        has_cuda,
     }
 }
 
-/// Built literally: `CheckpointData::new` reads the clock.
-fn checkpoint() -> CheckpointData {
+/// Checkpoint `n`, built literally: `CheckpointData::new` reads the clock.
+fn checkpoint(n: u8) -> CheckpointData {
     CheckpointData {
-        sequence: 7,
+        sequence: 100 + u64::from(n),
         // Not UTF-8, so JSON carries it as an array rather than a string.
-        delta_state: Bytes::from_static(b"\x00\x01delta\xff"),
-        timestamp: EPOCH_SECS + 30,
+        delta_state: Bytes::from(vec![0x00, b'd', n, 0xff]),
+        timestamp: EPOCH_SECS + 1_000 + u64::from(n),
     }
 }
 
-/// A task with every field set, `n` giving it its own id. Built literally: `Task::new` draws a
-/// random id and reads the clock.
+/// A task with every field set, `n` giving it its own id and checkpoint. Built literally:
+/// `Task::new` draws a random id and reads the clock.
 fn task(n: u8, spec: TaskSpec) -> Task {
     Task {
         id: TaskId(fixed_uuid(0x10 + n)),
@@ -139,13 +159,15 @@ fn task(n: u8, spec: TaskSpec) -> Task {
         requirements: TaskRequirements {
             cpu_cores: 3,
             ram_mb: 2_048,
-            gpu_required: true,
+            // Not `true`: `ClientMessage::SubmitTask` carries one of these tasks next to its
+            // `wait: true`, and `TaskRequirements` has no mirror that could drop the field.
+            gpu_required: false,
             timeout_secs: 90,
             max_retries: Some(4),
         },
         created_at_utc: EPOCH_SECS,
         tags: vec!["require:os=linux".into(), "batch-7".into()],
-        latest_checkpoint: Some(checkpoint()),
+        latest_checkpoint: Some(checkpoint(n)),
         staged_files: vec![StagedFile {
             path: "data/input.csv".into(),
             size: 8,
@@ -220,14 +242,16 @@ fn gpu_spec() -> TaskSpec {
     }
 }
 
-fn builtin_spec() -> TaskSpec {
+/// Two bools side by side, like [`worker_capabilities`]: the instances `(true, true)` and
+/// `(false, true)` set each of them and tell them apart.
+fn builtin_spec(should_fail: bool, require_gpu: bool) -> TaskSpec {
     TaskSpec::BuiltinTest {
         // The JSON defaults are "hash_compute" and 100_000.
         test_name: "sleep_spin".into(),
         iterations: 1_234,
         duration_ms: 50,
-        should_fail: true,
-        require_gpu: true,
+        should_fail,
+        require_gpu,
     }
 }
 
@@ -252,10 +276,11 @@ fn auto_rig_spec() -> TaskSpec {
     })
 }
 
+/// Its `task_id` is not [`task_id`]: `ClientResponse::TaskCompleted` carries both.
 fn task_result() -> TaskResult {
     TaskResult {
         worker_id: worker_id(),
-        task_id: task_id(),
+        task_id: TaskId(fixed_uuid(0x06)),
         exit_code: -3,
         stdout: Bytes::from_static(b"compiled 3 crates\n"),
         stderr: Bytes::from_static(b"warning: \xff unused\n"),
@@ -335,7 +360,7 @@ fn worker_messages() -> Vec<(&'static str, WorkerMessage)> {
             "Register",
             WorkerMessage::Register {
                 worker_id: worker_id(),
-                capabilities: worker_capabilities("wire-worker-a"),
+                capabilities: worker_capabilities(0),
                 protocol_version: PROTOCOL_VERSION,
                 features: features(),
             },
@@ -359,23 +384,8 @@ fn worker_messages() -> Vec<(&'static str, WorkerMessage)> {
                 status: TaskStatus::Running,
             },
         ),
-        (
-            "TaskResult",
-            WorkerMessage::TaskResult {
-                worker_id: worker_id(),
-                task_id: task_id(),
-                exit_code: -3,
-                stdout: Bytes::from_static(b"compiled 3 crates\n"),
-                stderr: Bytes::from_static(b"warning: \xff unused\n"),
-                execution_time_ms: 1_250,
-                is_gpu_executed: true,
-                device_name: Some("Adreno 740".into()),
-                error: Some("exit status -3".into()),
-                asset_bytes: Some(Bytes::from_static(b"glb\x00asset")),
-                artifacts: task_result().artifacts,
-                outputs: task_result().outputs,
-            },
-        ),
+        // Through `From<TaskResult>`, which is how the worker sends its results.
+        ("TaskResult", WorkerMessage::from(task_result())),
         (
             "Checkpoint",
             WorkerMessage::Checkpoint {
@@ -473,7 +483,8 @@ fn master_messages() -> Vec<(&'static str, MasterMessage)> {
             "AssignTaskWithCheckpoint",
             MasterMessage::AssignTaskWithCheckpoint {
                 task: task(2, shell_spec()),
-                latest_checkpoint: Some(checkpoint()),
+                // Not the task's own `checkpoint(2)`, so neither can stand in for the other.
+                latest_checkpoint: Some(checkpoint(0x20)),
             },
         ),
         (
@@ -497,11 +508,12 @@ fn master_messages() -> Vec<(&'static str, MasterMessage)> {
                 reason: Some("lease 41 accepted".into()),
                 task_queue_snapshot: vec![
                     task(3, gpu_spec()),
-                    task(4, builtin_spec()),
+                    task(4, builtin_spec(true, true)),
                     task(5, generative_spec()),
                     task(6, auto_rig_spec()),
+                    task(8, builtin_spec(false, true)),
                 ],
-                connected_workers: vec![worker_capabilities("wire-worker-b")],
+                connected_workers: vec![worker_capabilities(1)],
             },
         ),
         (
@@ -631,7 +643,7 @@ fn client_responses() -> Vec<(&'static str, ClientResponse)> {
                 running_tasks: 2,
                 completed_tasks: 5,
                 failed_tasks: 1,
-                workers: vec![worker_capabilities("wire-worker-a")],
+                workers: vec![worker_capabilities(2)],
                 active_bytes: 601_029,
                 max_active_bytes: 268_435_456,
             },
@@ -639,10 +651,7 @@ fn client_responses() -> Vec<(&'static str, ClientResponse)> {
         (
             "WorkerList",
             ClientResponse::WorkerList {
-                workers: vec![
-                    worker_capabilities("wire-worker-a"),
-                    worker_capabilities("wire-worker-b"),
-                ],
+                workers: vec![worker_capabilities(1), worker_capabilities(2)],
             },
         ),
         (
@@ -805,12 +814,46 @@ impl<'de> serde::Deserializer<'de> for &mut VariantNameProbe {
     }
 }
 
+/// Every `Task` the canonical messages carry.
+fn canonical_tasks() -> Vec<Task> {
+    let mut tasks = Vec::new();
+    for (_, msg) in master_messages() {
+        match msg {
+            MasterMessage::AssignTask { task }
+            | MasterMessage::AssignTaskWithCheckpoint { task, .. } => tasks.push(task),
+            MasterMessage::RoleHandoverAck {
+                task_queue_snapshot,
+                ..
+            } => tasks.extend(task_queue_snapshot),
+            _ => {}
+        }
+    }
+    for (_, msg) in client_messages() {
+        if let ClientMessage::SubmitTask { task, .. } = msg {
+            tasks.push(task);
+        }
+    }
+    tasks
+}
+
+/// The variant name of `spec`. No `_` arm: a new `TaskSpec` variant does not compile here.
+fn task_spec_variant(spec: &TaskSpec) -> &'static str {
+    match spec {
+        TaskSpec::Command { .. } => "Command",
+        TaskSpec::ShellScript { .. } => "ShellScript",
+        TaskSpec::RustCompilation { .. } => "RustCompilation",
+        TaskSpec::GpuCompute { .. } => "GpuCompute",
+        TaskSpec::BuiltinTest { .. } => "BuiltinTest",
+        TaskSpec::Generative3D(_) => "Generative3D",
+        TaskSpec::AutoRig(_) => "AutoRig",
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Round trips.
 // ---------------------------------------------------------------------------------------------
 
 /// What the JSON read paths do with an instance, keyed `<Enum>::<label>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JsonOutcome {
     /// It decodes back to the same message.
     RoundTrips,
@@ -921,7 +964,7 @@ fn wire_layout_path() -> PathBuf {
 }
 
 /// `<Enum>::<Variant>` -> hex of the bincode encoding (the frame after its 0x02 format byte) of
-/// every canonical instance.
+/// every canonical instance of the four message enums.
 fn current_wire_layout() -> BTreeMap<String, String> {
     fn record<M: Serialize>(
         layout: &mut BTreeMap<String, String>,
@@ -930,10 +973,6 @@ fn current_wire_layout() -> BTreeMap<String, String> {
     ) {
         for (variant, msg) in instances {
             let key = format!("{enum_name}::{variant}");
-            // An instance with a known divergence is not recorded: its bytes are not a reference.
-            if json_outcome(&key) == JsonOutcome::Diverges {
-                continue;
-            }
             let hex = to_hex(&bincode_frame(&key, &msg)[1..]);
             assert!(layout.insert(key, hex).is_none(), "duplicate {variant}");
         }
@@ -943,7 +982,6 @@ fn current_wire_layout() -> BTreeMap<String, String> {
     record(&mut layout, "MasterMessage", master_messages());
     record(&mut layout, "ClientMessage", client_messages());
     record(&mut layout, "ClientResponse", client_responses());
-    record(&mut layout, "InboundMessage", inbound_messages());
     layout
 }
 
@@ -981,7 +1019,7 @@ fn parse_wire_layout(text: &str) -> BTreeMap<String, String> {
             assert!(
                 previous < key,
                 "{WIRE_LAYOUT_FILE}:{line_no}: `{key}` is out of order or listed twice; \
-                 regenerate the file with\n    {REGENERATE}"
+                 regenerate the file with\n{REGENERATE}"
             );
         }
         previous = Some(key);
@@ -1056,6 +1094,23 @@ fn every_variant_has_one_canonical_instance() {
     inbound_messages();
 }
 
+/// The `TaskSpec` mirrors only travel inside a `Task`, so a new `TaskSpec` variant needs a task in
+/// one of the canonical messages.
+#[test]
+fn every_task_spec_variant_travels_in_a_canonical_message() {
+    let carried: BTreeSet<&str> = canonical_tasks()
+        .iter()
+        .map(|task| task_spec_variant(&task.spec))
+        .collect();
+    let declared: BTreeSet<&str> = binary_variant_names::<TaskSpec>().into_iter().collect();
+    assert_eq!(
+        carried, declared,
+        "the TaskSpec variants the canonical messages carry (left) must be all that the binary \
+         mirror declares (right): give a task in master_messages() or client_messages() each \
+         missing spec"
+    );
+}
+
 #[test]
 fn canonical_instances_round_trip_through_both_codecs() {
     assert_round_trips("WorkerMessage", &worker_messages());
@@ -1127,18 +1182,22 @@ fn bincode_encoding_matches_the_recorded_wire_layout() {
 
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
-            "cannot read {}: {e}\nGenerate it with\n    {REGENERATE}",
+            "cannot read {}: {e}\nGenerate it with\n{REGENERATE}",
             path.display()
         )
     });
     let differences = layout_differences(&parse_wire_layout(&text), &current);
     assert!(
         differences.is_empty(),
-        "The bincode encoding of {} message variant(s) differs from {WIRE_LAYOUT_FILE}:\n\n    \
-         {}\n\nThis is a wire format change. Bincode is positional, so new fields go after the \
-         existing ones, and peers built before the change must still decode every frame (see \
-         \"Wire protocol\" in CLAUDE.md). Record the change in a design record \
-         (docs/design/NNNN-<slug>.md), then regenerate the file with\n    {REGENERATE}\n",
+        "The bincode encoding of {} canonical message(s) differs from {WIRE_LAYOUT_FILE}:\n\n    \
+         {}\n\nIf a message type changed (a field or variant added, removed, moved or retyped, in \
+         the message or in a type it carries), this is a wire format change: bincode is \
+         positional, so new fields go after the existing ones, and peers built before the change \
+         must still decode every frame (see \"Wire protocol\" in CLAUDE.md). Record it in a design \
+         record (docs/design/NNNN-<slug>.md). If only a canonical value in \
+         crates/core/src/wire_layout_tests.rs changed, no design record is needed.\n\nThen \
+         regenerate the file with\n{REGENERATE}\n(PowerShell keeps the variable for the session: \
+         `Remove-Item Env:{UPDATE_ENV}` afterwards.)\n",
         differences.len(),
         differences.join("\n    ")
     );
