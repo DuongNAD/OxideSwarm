@@ -11,7 +11,6 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,53 +27,11 @@ use rusty_grid_worker::{
     EXIT_CODE_TIMEOUT,
 };
 
-static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+mod common;
 
-/// Guard to safely set and restore multiple environment variables in async tests without self-deadlock.
-struct EnvLock {
-    _guard: tokio::sync::MutexGuard<'static, ()>,
-    vars: Vec<(&'static str, Option<String>)>,
-}
-
-impl EnvLock {
-    pub async fn lock() -> Self {
-        let guard = ENV_MUTEX.lock().await;
-        Self {
-            _guard: guard,
-            vars: Vec::new(),
-        }
-    }
-
-    pub fn set(&mut self, key: &'static str, val: &str) {
-        let original_val = std::env::var(key).ok();
-        std::env::set_var(key, val);
-        self.vars.push((key, original_val));
-    }
-}
-
-impl Drop for EnvLock {
-    fn drop(&mut self) {
-        for (key, original_val) in self.vars.iter().rev() {
-            if let Some(ref orig) = original_val {
-                std::env::set_var(key, orig);
-            } else {
-                std::env::remove_var(key);
-            }
-        }
-    }
-}
-
-/// Resolves python executable for tests.
-#[allow(dead_code)]
-fn get_python_exe() -> PathBuf {
-    if let Ok(custom) = std::env::var("OXIDESWARM_PYTHON") {
-        let p = PathBuf::from(custom);
-        if p.is_file() {
-            return p;
-        }
-    }
-    PathBuf::from("python")
-}
+use common::{
+    assert_all_dead_async, create_fake_blender_executable, get_python_exe, poll_pids_async, EnvLock,
+};
 
 /// Creates a standard test TaskRunner.
 fn create_test_runner() -> (TaskRunner, TempDir) {
@@ -85,105 +42,6 @@ fn create_test_runner() -> (TaskRunner, TempDir) {
     caps.has_cuda = false;
     let runner = TaskRunner::new(uuid::Uuid::new_v4(), caps, runner_config);
     (runner, temp_dir)
-}
-
-/// Polls `pids_file` until `expected_count` distinct PIDs have been recorded.
-async fn poll_pids_async(pids_file: &Path, expected_count: usize, timeout: Duration) -> Vec<u32> {
-    let start = Instant::now();
-    let mut pids = Vec::new();
-    while start.elapsed() < timeout {
-        if let Ok(content) = tokio::fs::read_to_string(pids_file).await {
-            pids.clear();
-            for line in content.lines() {
-                if let Some(pid_str) = line.strip_prefix("PID:") {
-                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                        if !pids.contains(&pid) {
-                            pids.push(pid);
-                        }
-                    }
-                }
-            }
-            if pids.len() >= expected_count {
-                return pids;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    pids
-}
-
-/// Asserts that all given PIDs are absent from the OS process table within timeout.
-async fn assert_all_dead_async(pids: &[u32], timeout: Duration) {
-    let mut sys = sysinfo::System::new();
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        sys.refresh_processes();
-        let any_alive = pids
-            .iter()
-            .any(|&pid| sys.process(sysinfo::Pid::from(pid as usize)).is_some());
-        if !any_alive {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    sys.refresh_processes();
-    let survivors: Vec<u32> = pids
-        .iter()
-        .copied()
-        .filter(|&pid| sys.process(sysinfo::Pid::from(pid as usize)).is_some())
-        .collect();
-
-    // Clean up survivors before panic
-    for &pid in &survivors {
-        if let Some(p) = sys.process(sysinfo::Pid::from(pid as usize)) {
-            let _ = p.kill();
-        }
-    }
-
-    assert!(
-        survivors.is_empty(),
-        "Orphaned descendant processes survived termination: {:?}",
-        survivors
-    );
-}
-
-/// Creates a portable fake Blender runner script that executes a Python logic file.
-fn create_fake_blender_executable(dir: &Path, python_logic: &str) -> PathBuf {
-    let logic_path = dir.join("fake_blender_logic.py");
-    let mut f = File::create(&logic_path).expect("Failed to create logic file");
-    f.write_all(python_logic.as_bytes())
-        .expect("Failed to write logic file");
-    drop(f);
-
-    #[cfg(windows)]
-    {
-        let cmd_path = dir.join("fake_blender.cmd");
-        let content = format!(
-            "@echo off\r\n\"{}\" \"{}\" %*\r\n",
-            get_python_exe().display(),
-            logic_path.display()
-        );
-        let mut f = File::create(&cmd_path).expect("Failed to create .cmd file");
-        f.write_all(content.as_bytes())
-            .expect("Failed to write .cmd file");
-        cmd_path
-    }
-
-    #[cfg(not(windows))]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let sh_path = dir.join("fake_blender.sh");
-        let content = format!(
-            "#!/bin/sh\nexec python3 \"{}\" \"$@\"\n",
-            logic_path.display()
-        );
-        let mut f = File::create(&sh_path).expect("Failed to create .sh file");
-        f.write_all(content.as_bytes())
-            .expect("Failed to write .sh file");
-        let _ = std::fs::set_permissions(&sh_path, std::fs::Permissions::from_mode(0o755));
-        sh_path
-    }
 }
 
 // ============================================================================
@@ -875,27 +733,7 @@ sys.exit(0)
     let script_py = temp_dir.path().join("probe_mock.py");
     std::fs::write(&script_py, &probe_logic).expect("write mock script");
 
-    let real_py = if let Ok(custom) = std::env::var("OXIDESWARM_PYTHON") {
-        PathBuf::from(custom)
-    } else {
-        #[cfg(windows)]
-        {
-            let output = std::process::Command::new("where.exe")
-                .arg("python.exe")
-                .output()
-                .ok();
-            output
-                .and_then(|out| {
-                    let text = String::from_utf8_lossy(&out.stdout);
-                    text.lines().next().map(|line| PathBuf::from(line.trim()))
-                })
-                .unwrap_or_else(|| PathBuf::from("python"))
-        }
-        #[cfg(not(windows))]
-        {
-            PathBuf::from("python3")
-        }
-    };
+    let real_py = get_python_exe();
 
     #[cfg(windows)]
     let (fake_blender, fake_python) = {

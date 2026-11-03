@@ -1836,6 +1836,58 @@ impl TaskQueue {
         })
     }
 
+    /// Fails a task terminally when its assignment message exceeds `MAX_FRAME_SIZE`
+    /// (`ProtocolError::FrameTooLarge`). Never retries, even when `retry_on_execution_failure` is
+    /// enabled, because the assignment itself cannot fit a protocol frame.
+    pub async fn fail_unsendable_assignment(
+        &self,
+        worker_id: Uuid,
+        session_id: Option<u64>,
+        result: TaskResult,
+    ) -> GridResult<ResultDisposition> {
+        let task_id = result.task_id;
+        let mut inner = self.inner.write().await;
+
+        let (state, owner) = {
+            let entry = inner
+                .tasks
+                .get(&task_id)
+                .ok_or(GridError::TaskNotFound(task_id.0))?;
+            (entry.state, owned_by(entry, &worker_id, session_id))
+        };
+
+        if !owner {
+            return Ok(ResultDisposition::Stale);
+        }
+
+        if let Some(tasks) = inner.worker_assignments.get_mut(&worker_id) {
+            tasks.remove(&task_id);
+        }
+
+        if state.is_terminal() {
+            return Ok(ResultDisposition::Late);
+        }
+
+        let entry = inner
+            .tasks
+            .get_mut(&task_id)
+            .ok_or(GridError::TaskNotFound(task_id.0))?;
+        if !entry.state.can_transition_to(TaskState::Failed) {
+            return Err(GridError::InvalidTaskState {
+                task_id: task_id.0,
+                current: format!("{:?}", entry.state),
+                attempted: "Failed".into(),
+            });
+        }
+        entry.state = TaskState::Failed;
+        entry.finished_instant = Some(Instant::now());
+        entry.error_message = result.error.clone();
+        entry.result = Some(result);
+
+        inner.track_terminal_task(task_id);
+        Ok(ResultDisposition::Terminal)
+    }
+
     // --- Worker Disconnect & Failover ---
 
     /// Reaps all tasks assigned to a disconnected or timed-out worker, whatever session they were
