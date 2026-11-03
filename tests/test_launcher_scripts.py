@@ -161,9 +161,9 @@ class ShellLauncherTests(unittest.TestCase):
         env.update(extra)
         return env
 
-    def copy_script(self, relative):
+    def copy_script(self, relative, dst_name=None):
         src = os.path.join(ROOT, relative)
-        dst = os.path.join(self.repo, os.path.basename(relative))
+        dst = os.path.join(self.repo, dst_name or os.path.basename(relative))
         shutil.copy(src, dst)
         os.chmod(dst, 0o755)
         return dst
@@ -421,7 +421,10 @@ class ShellLauncherTests(unittest.TestCase):
         test_path = self.repo + os.pathsep + os.environ.get("PATH", "")
 
         # 1. Test Ubuntu launcher with OXIDE_MESH_NO_SHELL=1
-        ub_script = self.copy_script("packaging/agent_mesh/ubuntu/run_agent_node.sh")
+        ub_script = self.copy_script(
+            "packaging/agent_mesh/ubuntu/run_agent_node.sh",
+            "run_agent_node_ubuntu.sh",
+        )
         self.run_script(
             ["bash", ub_script, "ws://127.0.0.1:8088/ws", "node-ub"],
             OXIDE_MESH_NO_SHELL="1",
@@ -431,7 +434,10 @@ class ShellLauncherTests(unittest.TestCase):
         self.assertTrue(any("node-ub" in l and "--no-shell" in l for l in lines), f"Ubuntu launcher did not pass --no-shell: {lines}")
 
         # 2. Test macOS launcher with --no-shell CLI argument
-        mac_script = self.copy_script("packaging/agent_mesh/macos/run_agent_node.sh")
+        mac_script = self.copy_script(
+            "packaging/agent_mesh/macos/run_agent_node.sh",
+            "run_agent_node_macos.sh",
+        )
         self.run_script(
             ["bash", mac_script, "ws://127.0.0.1:8088/ws", "node-mac", "--no-shell"],
             PATH=test_path,
