@@ -5,7 +5,7 @@ Created: 2026-11-04    Updated: 2026-11-04
 
 ## Summary
 
-Bound every host capability probe subprocess spawned during `WorkerCapabilities::detect` / `WorkerCapabilities::detect_with_overrides` (`blender --version`, `sysctl`, `nvidia-smi`, `pmset`, `dumpsys`, `getprop`, `sw_vers`, and `nvcc`) to `HOST_PROBE_TIMEOUT` (`3 s`), kill the probe's process group (Unix `libc::killpg`) or process tree (Windows `taskkill /F /T`), reap timed-out children on a detached thread so uninterruptible kernel sleeps never block start-up, and treat a timed-out Blender probe as "no Blender" (`has_blender = false, blender_version = None`) with a warning that names the binary path.
+Bound every host capability probe subprocess spawned during `WorkerCapabilities::detect` / `WorkerCapabilities::detect_with_overrides` (`blender --version`, `sysctl`, `nvidia-smi`, `pmset`, `dumpsys`, `getprop`, `sw_vers`, and `nvcc`) to `HOST_PROBE_TIMEOUT` (`3 s`), kill the probe's process group (Unix `libc::killpg` with `libc::SIGKILL`) or Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) on both child exit and timeout, reap timed-out children on a detached thread so uninterruptible kernel sleeps never block start-up, and treat a timed-out Blender probe as "no Blender" (`has_blender = false, blender_version = None`) with a warning that names the binary path.
 
 ## Context
 
@@ -33,11 +33,11 @@ Bound every host capability probe subprocess spawned during `WorkerCapabilities:
 ### D1 Bounded probe runner (`run_command_bounded`)
 
 `run_command_bounded(cmd, timeout)` runs `cmd` with `Stdio::null()` stdin/stderr and piped stdout:
-1. On Unix, `cmd.process_group(0)` places the probe in its own process group whose PGID equals the child PID.
-2. A reader thread streams chunks into a shared `Arc<Mutex<Vec<u8>>>` (capped at `64 KiB`) as they arrive from the child's stdout pipe and signals a `std::sync::mpsc::sync_channel(1)` when EOF (or the `64 KiB` cap) is reached.
+1. On Unix, `cmd.process_group(0)` places the probe in its own process group whose PGID equals the child PID. On Windows, `cmd.creation_flags(WINDOWS_CREATE_SUSPENDED)` spawns the child suspended so `attach_suspended_process_to_kill_on_close_job` (shared between `rusty_grid_core::capabilities` and `rusty_grid_worker::process_tree`) can create an anonymous Win32 Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, call `AssignProcessToJobObject` before any child instruction runs, and resume the child via `NtResumeProcess`.
+2. A reader thread reads up to `64 KiB` from the child's stdout pipe (`out.take(64 * 1024).read_to_end(&mut buf)`) and sends the collected bytes over a `std::sync::mpsc::sync_channel(1)` when EOF (or the `64 KiB` cap) is reached.
 3. The caller polls `child.try_wait()` with exponential backoff (`5 ms` up to `25 ms`) until `deadline = Instant::now() + timeout`:
-   - **When the direct child exits (`Ok(Some(status))`):** on Unix, `kill_probe_group(pid)` (`killpg(pgid, SIGKILL)`) is called immediately so any background grandchild spawned in the probe's process group (e.g. a wrapper script that ran `sleep 8 &` before exiting) is killed and closes its inherited stdout descriptor. The caller then waits up to `50 ms` (bounded by `deadline`) on the EOF notification channel; if a grandchild outside the Unix process group (`setsid`) or a background child of `cmd.exe` on Windows keeps the pipe open after the direct child has already exited, the caller takes the bytes already accumulated in `Arc<Mutex<Vec<u8>>>` and returns `ProbeExecOutcome::Output` rather than turning a completed probe into a timeout.
-   - **When `deadline` expires (`now >= deadline`):** `reap_probe_child_detached(child)` kills the process group (`killpg` on Unix) and direct child (`child.kill()`), and spawns a detached thread (running `taskkill /F /T /PID <pid>` before `child.kill()` on Windows while the parent `cmd.exe` PID is still in the process table, followed by `child.wait()`). Reaping on a detached thread guarantees that a process wedged in uninterruptible kernel sleep (`nvidia-smi` on a hung GPU driver) never blocks worker start-up past `HOST_PROBE_TIMEOUT`.
+   - **When the direct child exits (`Ok(Some(status))`):** on Unix, `kill_probe_group(pid)` (`libc::killpg(pgid, libc::SIGKILL)`) is called immediately; on Windows, `job_guard.terminate_and_close()` (`TerminateJobObject` + `CloseHandle`) terminates the `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job Object immediately. Any background grandchild spawned in the probe's process group or Job Object (even if the direct `cmd.exe` or shell wrapper has already exited) is terminated and closes its inherited stdout descriptor. The caller then waits on `rx.recv_timeout(remaining)` for the remaining probe budget; if a grandchild that escaped the Unix process group via `setsid` still holds the pipe open past `deadline`, `rx.recv_timeout(remaining)` times out and `run_command_bounded` returns `ProbeExecOutcome::TimedOut`.
+   - **When `deadline` expires (`now >= deadline`):** `job_guard.terminate_and_close()` terminates and closes the Windows Job Object, and `reap_probe_child_detached(child)` kills the Unix process group (`libc::killpg(pgid, libc::SIGKILL)`) and direct child (`child.kill()`), then spawns a detached thread calling `child.wait()`. Reaping on a detached thread guarantees that a process wedged in uninterruptible kernel sleep (`nvidia-smi` on a hung GPU driver) never blocks worker start-up past `HOST_PROBE_TIMEOUT`.
 
 ### D2 Blender and host probe semantics (`probe_blender_with_timeout`, `run_host_probe`)
 
@@ -53,12 +53,12 @@ Bound every host capability probe subprocess spawned during `WorkerCapabilities:
 ## Security
 
 - Preserves [design 0009](0009-blender-and-3d-process-supervision.md) **G3**: `probe_blender_with_timeout` uses `crate::cluster_auth::probe_command` so cluster secret environment variables (`OXIDESWARM_SECRET`, `OXIDESWARM_SECRET_FILE`, `OXIDE_MESH_TOKEN`) are stripped from `blender --version` probes.
-- Using `libc::killpg` directly on Unix avoids invoking an external `kill` binary from `PATH`.
+- Using `libc::killpg` directly on Unix and Win32 Job Objects (`CreateJobObjectW` / `SetInformationJobObject` / `AssignProcessToJobObject` / `TerminateJobObject`) on Windows avoids invoking external `kill` or `taskkill` binaries from `PATH` and eliminates the race where a root `cmd.exe` exits before `taskkill /T` can walk its child list.
 
 ## Test plan
 
-- `capabilities::tests::test_probe_blender_with_timeout_handles_version_non_version_failure_and_timeout` in `crates/core/src/capabilities.rs` (covering normal version output, non-version output, non-zero exit, wrapper script leaving a background grandchild holding stdout, detached-session grandchild holding stdout, and hung script timeout + grandchild termination via PID file).
-- `capabilities::tests::test_hung_blender_probe_via_env_times_out_and_reports_no_blender` in `crates/core/src/capabilities.rs` (verifying `RUSTY_GRID_BLENDER_PATH` pointing to a 60s sleep script returns within `HOST_PROBE_TIMEOUT` with `has_blender == false`, `blender_version == None`, and no surviving grandchild).
+- `capabilities::tests::test_probe_blender_with_timeout_handles_version_non_version_failure_and_timeout` in `crates/core/src/capabilities.rs` (covering normal version output, non-version output, non-zero exit, wrapper script leaving a background grandchild holding stdout, detached-session `setsid` grandchild holding stdout past the deadline, and hung script timeout + grandchild termination via PID file on both Unix and Windows).
+- `capabilities::tests::test_hung_blender_probe_via_env_times_out_and_reports_no_blender` in `crates/core/src/capabilities.rs` (verifying `RUSTY_GRID_BLENDER_PATH` pointing to a 60s sleep script returns within `HOST_PROBE_TIMEOUT` with `has_blender == false`, `blender_version == None`, and no surviving grandchild on both Unix and Windows).
 - `client::tests::test_worker_client_with_hung_blender_path_reports_no_blender_within_timeout` in `crates/worker/src/client.rs`.
 
 ## Work items
@@ -67,4 +67,4 @@ Bound every host capability probe subprocess spawned during `WorkerCapabilities:
 
 ## Status log
 
-- 2026-11-04: Implemented `HOST_PROBE_TIMEOUT` (`3 s`), `run_command_bounded`, `probe_blender_with_timeout`, and `run_host_probe` in `crates/core/src/capabilities.rs`; bounded stdout reader join with `recv_timeout(remaining)`, killed process group via `libc::killpg` (Unix) / `taskkill /F /T` (Windows) on both child exit and timeout, reaped timed-out probes on a detached thread, and verified grandchild cleanup in unit tests.
+- 2026-11-04: Implemented `HOST_PROBE_TIMEOUT` (`3 s`), `run_command_bounded`, `probe_blender_with_timeout`, and `run_host_probe` in `crates/core/src/capabilities.rs`; shared Windows Job Object helper (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) between `rusty_grid_core::capabilities` and `rusty_grid_worker::process_tree`; bounded stdout reader join with `rx.recv_timeout(remaining)`, killed process group via `libc::killpg(pgid, libc::SIGKILL)` (Unix) or Job Object termination (Windows) on both child exit and timeout, reaped timed-out probes on a detached thread, and verified grandchild cleanup in unit tests.

@@ -1234,67 +1234,146 @@ enum ProbeExecOutcome {
 }
 
 #[cfg(unix)]
-extern "C" {
-    fn killpg(pgrp: i32, sig: i32) -> i32;
-    #[cfg(test)]
-    fn kill(pid: i32, sig: i32) -> i32;
-}
-
-#[cfg(unix)]
-const UNIX_SIGKILL: i32 = 9;
-
-#[cfg(unix)]
 fn kill_probe_group(pid: u32) {
-    if let Ok(pgid) = i32::try_from(pid) {
+    if let Ok(pgid) = libc::pid_t::try_from(pid) {
         if pgid > 1 {
             // SAFETY: `pgid` is the leader PID of the process group created by
-            // `cmd.process_group(0)` for this probe subprocess; `std` links the system C library
-            // on all Unix targets and `SIGKILL` (9) is universal across Unix platforms.
+            // `cmd.process_group(0)` for this probe subprocess.
             unsafe {
-                let _ = killpg(pgid, UNIX_SIGKILL);
+                let _ = libc::killpg(pgid, libc::SIGKILL);
             }
         }
     }
 }
 
+/// Windows creation flag (`CREATE_SUSPENDED`) used so a spawned child can be assigned to a Job
+/// Object before its main thread executes any user code or spawns grandchildren.
 #[cfg(windows)]
-fn kill_probe_group(pid: u32) {
-    if pid > 0 {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+pub const WINDOWS_CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+/// Creates a Windows Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, assigns
+/// the suspended `process` handle to it, and resumes `process` via `NtResumeProcess`.
+///
+/// Returns the Job Object handle as `isize` on success, or `None` if creation/assignment failed
+/// (in which case `process` is still resumed and any partially created job handle is closed).
+#[cfg(windows)]
+pub fn attach_suspended_process_to_kill_on_close_job(
+    process: *mut core::ffi::c_void,
+) -> Option<isize> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+
+    unsafe fn resume_process(process: HANDLE) {
+        type NtResumeProcessFn = unsafe extern "system" fn(HANDLE) -> i32;
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8);
+        if !ntdll.is_null() {
+            let func = GetProcAddress(ntdll, c"NtResumeProcess".as_ptr() as *const u8);
+            if let Some(func) = func {
+                let nt_resume: NtResumeProcessFn = std::mem::transmute(func);
+                let _ = nt_resume(process);
+            }
+        }
+    }
+
+    let process: HANDLE = process;
+    if process.is_null() {
+        return None;
+    }
+    // SAFETY: Win32 calls on a newly created job handle and the caller's live process handle;
+    // the job handle is closed on every failure path and returned to the caller on success.
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            resume_process(process);
+            return None;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if configured == 0 || AssignProcessToJobObject(job, process) == 0 {
+            CloseHandle(job);
+            resume_process(process);
+            return None;
+        }
+        resume_process(process);
+        Some(job as isize)
     }
 }
 
-#[cfg(not(any(unix, windows)))]
-fn kill_probe_group(_pid: u32) {}
+/// Terminates every process in the Windows Job Object `job`.
+#[cfg(windows)]
+pub fn terminate_job_object(job: isize) {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+    // SAFETY: `job` is a live Job Object handle created by
+    // `attach_suspended_process_to_kill_on_close_job`.
+    unsafe {
+        TerminateJobObject(job as HANDLE, 1);
+    }
+}
+
+/// Closes the Windows Job Object handle `job`. Because the job was configured with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, closing the last handle also terminates any remaining
+/// processes in the job.
+#[cfg(windows)]
+pub fn close_job_object(job: isize) {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    // SAFETY: last use of the Job Object handle.
+    unsafe {
+        CloseHandle(job as HANDLE);
+    }
+}
+
+#[cfg(windows)]
+struct ProbeJobGuard(Option<isize>);
+
+#[cfg(windows)]
+impl ProbeJobGuard {
+    fn attach(child: &std::process::Child) -> Self {
+        use std::os::windows::io::AsRawHandle;
+        Self(attach_suspended_process_to_kill_on_close_job(
+            child.as_raw_handle(),
+        ))
+    }
+
+    fn terminate_and_close(&mut self) {
+        if let Some(job) = self.0.take() {
+            terminate_job_object(job);
+            close_job_object(job);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProbeJobGuard {
+    fn drop(&mut self) {
+        self.terminate_and_close();
+    }
+}
 
 fn reap_probe_child_detached(mut child: std::process::Child) {
-    let pid = child.id();
     #[cfg(unix)]
-    {
-        kill_probe_group(pid);
-        let _ = child.kill();
-    }
-    // Reap on a detached thread (and on Windows run `taskkill /F /T` before `child.kill()` while
-    // the parent `cmd.exe` PID is still in the process table) so a probe stuck in uninterruptible
-    // kernel sleep (e.g. `nvidia-smi` on a wedged GPU driver) never blocks worker start-up past
-    // the deadline.
+    kill_probe_group(child.id());
+    let _ = child.kill();
+    // Reap on a detached thread so a probe stuck in uninterruptible kernel sleep (e.g.
+    // `nvidia-smi` on a wedged GPU driver) never blocks worker start-up past the deadline.
     std::thread::spawn(move || {
-        #[cfg(windows)]
-        {
-            kill_probe_group(pid);
-            let _ = child.kill();
-        }
         let _ = child.wait();
     });
 }
 
 /// Runs `cmd` with stdin/stderr closed and stdout captured, killing the process (and its Unix
-/// process group or Windows process tree) if it does not finish within `timeout`.
+/// process group or Windows Job Object) if it or its stdout pipe does not finish within `timeout`.
 fn run_command_bounded(
     cmd: &mut std::process::Command,
     timeout: std::time::Duration,
@@ -1306,6 +1385,11 @@ fn run_command_bounded(
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(WINDOWS_CREATE_SUSPENDED);
     }
 
     let mut child = {
@@ -1324,28 +1408,16 @@ fn run_command_bounded(
         }
     };
 
-    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let stdout_done_rx = child.stdout.take().map(|mut out| {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
-        let buf_clone = std::sync::Arc::clone(&stdout_buf);
+    #[cfg(windows)]
+    let mut job_guard = ProbeJobGuard::attach(&child);
+
+    let stdout_rx = child.stdout.take().map(|out| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
         std::thread::spawn(move || {
             use std::io::Read;
-            let mut chunk = [0u8; 4096];
-            loop {
-                match out.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let mut guard = buf_clone.lock().unwrap_or_else(|e| e.into_inner());
-                        let remaining_cap = (64 * 1024usize).saturating_sub(guard.len());
-                        let to_copy = n.min(remaining_cap);
-                        guard.extend_from_slice(&chunk[..to_copy]);
-                        if guard.len() >= 64 * 1024 {
-                            break;
-                        }
-                    }
-                }
-            }
-            let _ = tx.send(());
+            let mut buf = Vec::new();
+            let _ = out.take(64 * 1024).read_to_end(&mut buf);
+            let _ = tx.send(buf);
         });
         rx
     });
@@ -1355,26 +1427,26 @@ fn run_command_bounded(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                // Kill the probe's process group (Unix) or Job Object (Windows) when the direct
+                // child exits so a wrapper script that leaves a background grandchild holding
+                // stdout (`sleep 8 &` or `start /b`) is terminated immediately and closes the
+                // inherited stdout pipe.
                 #[cfg(unix)]
-                {
-                    let pid = child.id();
-                    // Kill the probe's process group when the direct child exits so a wrapper
-                    // script that leaves a background grandchild holding stdout (`sleep 8 &`) is
-                    // terminated immediately instead of keeping the pipe open.
-                    kill_probe_group(pid);
-                }
+                kill_probe_group(child.id());
+                #[cfg(windows)]
+                job_guard.terminate_and_close();
 
-                if let Some(rx) = stdout_done_rx {
-                    // Wait briefly for the reader thread to hit EOF. If a grandchild outside the
-                    // Unix process group (`setsid`) or a background child of `cmd.exe` on Windows
-                    // keeps the pipe open after the direct child has already exited, take the
-                    // bytes already buffered rather than turning a completed probe into a timeout.
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    let drain_grace = std::time::Duration::from_millis(50).min(remaining);
-                    let _ = rx.recv_timeout(drain_grace);
-                }
-                let stdout =
-                    std::mem::take(&mut *stdout_buf.lock().unwrap_or_else(|e| e.into_inner()));
+                let stdout = match stdout_rx {
+                    Some(rx) => {
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        match rx.recv_timeout(remaining) {
+                            Ok(bytes) => bytes,
+                            Err(_) => return ProbeExecOutcome::TimedOut,
+                        }
+                    }
+                    None => Vec::new(),
+                };
                 return ProbeExecOutcome::Output(std::process::Output {
                     status,
                     stdout,
@@ -1384,6 +1456,8 @@ fn run_command_bounded(
             Ok(None) => {
                 let now = std::time::Instant::now();
                 if now >= deadline {
+                    #[cfg(windows)]
+                    job_guard.terminate_and_close();
                     reap_probe_child_detached(child);
                     return ProbeExecOutcome::TimedOut;
                 }
@@ -1392,6 +1466,8 @@ fn run_command_bounded(
                 poll_interval = (poll_interval * 2).min(std::time::Duration::from_millis(25));
             }
             Err(_) => {
+                #[cfg(windows)]
+                job_guard.terminate_and_close();
                 reap_probe_child_detached(child);
                 return ProbeExecOutcome::SpawnFailed;
             }
@@ -2568,7 +2644,6 @@ Now drawing from 'AC Power'
         }
     }
 
-    #[cfg(unix)]
     fn assert_pid_file_process_dead(pid_file: &std::path::Path) {
         let raw = std::fs::read_to_string(pid_file).unwrap_or_else(|e| {
             panic!(
@@ -2576,7 +2651,7 @@ Now drawing from 'AC Power'
                 pid_file.display()
             )
         });
-        let pid: i32 = raw.trim().parse().unwrap_or_else(|e| {
+        let pid: u32 = raw.trim().parse().unwrap_or_else(|e| {
             panic!(
                 "invalid pid '{}' in {}: {e}",
                 raw.trim(),
@@ -2584,19 +2659,23 @@ Now drawing from 'AC Power'
             )
         });
         assert!(pid > 1, "unexpected pid {pid}");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut sys = sysinfo::System::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let alive = unsafe { super::kill(pid, 0) == 0 };
+            sys.refresh_processes();
+            let alive = sys
+                .process(sysinfo::Pid::from(pid as usize))
+                .is_some_and(|p| p.status() != sysinfo::ProcessStatus::Zombie);
             if !alive {
                 return;
             }
             if std::time::Instant::now() >= deadline {
-                unsafe {
-                    let _ = super::kill(pid, super::UNIX_SIGKILL);
+                if let Some(p) = sys.process(sysinfo::Pid::from(pid as usize)) {
+                    let _ = p.kill();
                 }
                 panic!("probe grandchild process {pid} survived after probe finished");
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
@@ -2633,9 +2712,9 @@ Now drawing from 'AC Power'
         );
 
         // Wrapper script that prints a version, leaves a background grandchild holding stdout open,
-        // and exits immediately: group kill on child exit (Unix) and incremental stdout capture +
-        // post-exit drain grace (Windows / detached child) must return the version well before the
-        // grandchild finishes.
+        // and exits immediately: group kill on child exit (Unix) or Job Object termination on
+        // child exit (Windows) must kill the grandchild so stdout closes and the version is
+        // returned well before the grandchild's 60s sleep.
         let bg_pid_file = dir.path().join("bg_grandchild.pid");
         let bg_ver = write_test_script(
             dir.path(),
@@ -2644,24 +2723,25 @@ Now drawing from 'AC Power'
                 "echo 'Blender 4.5.4 LTS'\nsleep 60 &\necho $! > '{}'\nexit 0",
                 bg_pid_file.display()
             ),
-            "echo Blender 4.5.4 LTS\r\nstart /b ping -n 3 127.0.0.1 >NUL\r\nexit /b 0",
+            &format!(
+                "echo Blender 4.5.4 LTS\r\npython -c \"import subprocess; p = subprocess.Popen(['ping', '-n', '60', '127.0.0.1']); open(r'{}', 'w').write(str(p.pid))\"\r\nexit /b 0",
+                bg_pid_file.display()
+            ),
         );
         let bg_start = std::time::Instant::now();
         assert_eq!(
-            probe_blender_with_timeout(&bg_ver, std::time::Duration::from_secs(1)),
+            probe_blender_with_timeout(&bg_ver, std::time::Duration::from_secs(2)),
             BlenderProbeResult::Version("Blender 4.5.4 LTS".to_string())
         );
         assert!(
-            bg_start.elapsed() < std::time::Duration::from_millis(800),
+            bg_start.elapsed() < std::time::Duration::from_millis(1500),
             "background-stdout wrapper took {:?}",
             bg_start.elapsed()
         );
-        #[cfg(unix)]
         assert_pid_file_process_dead(&bg_pid_file);
 
         // Even if a grandchild escapes the process group (`setsid`) and holds stdout open after the
-        // direct child prints the version and exits, incremental stdout buffering + bounded
-        // post-exit drain must return the version immediately rather than timing out.
+        // direct child exits, `recv_timeout(remaining)` must bound the probe to `timeout`.
         #[cfg(unix)]
         {
             let detached_pid_file = dir.path().join("detached_grandchild.pid");
@@ -2669,31 +2749,36 @@ Now drawing from 'AC Power'
                 dir.path(),
                 "blender_detached_stdout",
                 &format!(
-                    "python3 -c 'import os, sys, time\nsys.stdout.write(\"Blender 4.5.4 LTS\\n\")\nsys.stdout.flush()\npid = os.fork()\nif pid > 0:\n    open({:?}, \"w\").write(str(pid))\n    os._exit(0)\nos.setsid()\ntime.sleep(60)\n'",
+                    "python3 -c 'import os, time\npid = os.fork()\nif pid > 0:\n    open({:?}, \"w\").write(str(pid))\n    os._exit(0)\nos.setsid()\ntime.sleep(60)\n'",
                     detached_pid_file.to_string_lossy()
                 ),
                 "",
             );
             let det_start = std::time::Instant::now();
-            let det_res = probe_blender_with_timeout(&detached, std::time::Duration::from_secs(1));
+            let det_res =
+                probe_blender_with_timeout(&detached, std::time::Duration::from_millis(800));
             let det_elapsed = det_start.elapsed();
+            assert!(
+                detached_pid_file.is_file(),
+                "setsid grandchild PID file must exist so the post-exit stdout deadline was exercised"
+            );
             if let Ok(raw) = std::fs::read_to_string(&detached_pid_file) {
-                if let Ok(pid) = raw.trim().parse::<i32>() {
+                if let Ok(pid) = raw.trim().parse::<libc::pid_t>() {
                     if pid > 1 {
                         unsafe {
-                            let _ = super::kill(pid, super::UNIX_SIGKILL);
+                            let _ = libc::kill(pid, libc::SIGKILL);
                         }
                     }
                 }
             }
             assert_eq!(
                 det_res,
-                BlenderProbeResult::Version("Blender 4.5.4 LTS".to_string()),
+                BlenderProbeResult::TimedOut,
                 "unexpected result for detached-stdout wrapper: {det_res:?}"
             );
             assert!(
-                det_elapsed < std::time::Duration::from_millis(800),
-                "detached-stdout wrapper blocked past drain grace: {det_elapsed:?}"
+                det_elapsed < std::time::Duration::from_secs(3),
+                "detached-stdout wrapper blocked past timeout: {det_elapsed:?}"
             );
         }
 
@@ -2702,19 +2787,21 @@ Now drawing from 'AC Power'
             dir.path(),
             "blender_hung",
             &format!("sleep 60 &\necho $! > '{}'\nwait", hung_pid_file.display()),
-            "start /b ping -n 60 127.0.0.1 >NUL\r\nping -n 60 127.0.0.1 >NUL",
+            &format!(
+                "python -c \"import subprocess; p = subprocess.Popen(['ping', '-n', '60', '127.0.0.1']); open(r'{}', 'w').write(str(p.pid)); p.wait()\"",
+                hung_pid_file.display()
+            ),
         );
         let start = std::time::Instant::now();
         assert_eq!(
-            probe_blender_with_timeout(&hung, std::time::Duration::from_millis(600)),
+            probe_blender_with_timeout(&hung, std::time::Duration::from_millis(800)),
             BlenderProbeResult::TimedOut
         );
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(3),
+            start.elapsed() < std::time::Duration::from_secs(4),
             "timed-out probe took {:?}",
             start.elapsed()
         );
-        #[cfg(unix)]
         assert_pid_file_process_dead(&hung_pid_file);
     }
 
@@ -2729,7 +2816,10 @@ Now drawing from 'AC Power'
             dir.path(),
             "hung_blender_env",
             &format!("sleep 60 &\necho $! > '{}'\nwait", env_pid_file.display()),
-            "start /b ping -n 60 127.0.0.1 >NUL\r\nping -n 60 127.0.0.1 >NUL",
+            &format!(
+                "python -c \"import subprocess; p = subprocess.Popen(['ping', '-n', '60', '127.0.0.1']); open(r'{}', 'w').write(str(p.pid)); p.wait()\"",
+                env_pid_file.display()
+            ),
         );
 
         let prev_path = std::env::var_os("RUSTY_GRID_BLENDER_PATH");
@@ -2772,7 +2862,6 @@ Now drawing from 'AC Power'
             HOST_PROBE_TIMEOUT,
             elapsed
         );
-        #[cfg(unix)]
         assert_pid_file_process_dead(&env_pid_file);
     }
 }

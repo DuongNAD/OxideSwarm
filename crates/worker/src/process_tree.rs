@@ -139,8 +139,8 @@ pub(crate) fn configure_command(cmd: &mut tokio::process::Command, priority: Pro
 
     #[cfg(windows)]
     {
-        const CREATE_SUSPENDED: u32 = 0x0000_0004;
-        let flag = priority.windows_class_flag() | CREATE_SUSPENDED;
+        let flag =
+            priority.windows_class_flag() | rusty_grid_core::capabilities::WINDOWS_CREATE_SUSPENDED;
         cmd.creation_flags(flag);
     }
 
@@ -188,57 +188,17 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    use tokio::process::Child;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    use rusty_grid_core::capabilities::{
+        attach_suspended_process_to_kill_on_close_job, close_job_object, terminate_job_object,
     };
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    use tokio::process::Child;
 
     /// A Job Object handle, as an integer so it can sit in a `static`.
     pub(super) type RawId = isize;
 
-    unsafe fn resume_process(process: HANDLE) {
-        type NtResumeProcessFn = unsafe extern "system" fn(HANDLE) -> i32;
-        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8);
-        if !ntdll.is_null() {
-            let func = GetProcAddress(ntdll, c"NtResumeProcess".as_ptr() as *const u8);
-            if let Some(func) = func {
-                let nt_resume: NtResumeProcessFn = std::mem::transmute(func);
-                let _ = nt_resume(process);
-            }
-        }
-    }
-
     pub(super) fn attach(child: &Child) -> Option<RawId> {
-        let process: HANDLE = child.raw_handle()?;
-        // SAFETY: plain Win32 calls on a handle created here and on the live process handle that
-        // `child` owns; the job handle is closed on every failure path and otherwise owned by the
-        // `ProcessTree` that stores the returned id.
-        unsafe {
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job.is_null() {
-                resume_process(process);
-                return None;
-            }
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let configured = SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *const core::ffi::c_void,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            );
-            if configured == 0 || AssignProcessToJobObject(job, process) == 0 {
-                CloseHandle(job);
-                resume_process(process);
-                return None;
-            }
-            resume_process(process);
-            Some(job as RawId)
-        }
+        let process = child.raw_handle()?;
+        attach_suspended_process_to_kill_on_close_job(process)
     }
 
     /// Windows has no polite group signal; the caller goes straight to `kill`.
@@ -247,17 +207,11 @@ mod imp {
     }
 
     pub(super) fn kill(id: RawId) {
-        // SAFETY: `id` is a job handle that has not been released (see `ProcessTree::drop`).
-        unsafe {
-            TerminateJobObject(id as HANDLE, 1);
-        }
+        terminate_job_object(id);
     }
 
     pub(super) fn release(id: RawId) {
-        // SAFETY: the last use of the handle; `kill_all` cannot race it (both hold `LIVE`).
-        unsafe {
-            CloseHandle(id as HANDLE);
-        }
+        close_job_object(id);
     }
 }
 
