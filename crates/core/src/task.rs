@@ -1624,31 +1624,28 @@ impl TaskSpec {
                 if spec.quality.trim().is_empty() {
                     return Err("Generative3D quality cannot be empty".to_string());
                 }
-                if let Some(ref raw_engine) = spec.engine_preference {
-                    let engine = raw_engine.parse::<Engine3D>()?;
-                    if engine == Engine3D::Trellis {
-                        return Err(
-                            "Trellis 3D neural engine is not supported; use sdf or triposr"
-                                .to_string(),
-                        );
+                let engine = spec.try_engine()?;
+                if engine == Engine3D::Trellis {
+                    return Err(
+                        "Trellis 3D neural engine is not supported; use sdf or triposr".to_string(),
+                    );
+                }
+                if has_image {
+                    match engine {
+                        Engine3D::Auto => {
+                            return Err(
+                                "Image input is only supported with neural 3D engines (e.g. triposr); auto and procedural engines do not accept images"
+                                    .to_string(),
+                            );
+                        }
+                        Engine3D::Sdf => {
+                            return Err(
+                                "Tier 0 procedural SDF engine does not support image input (text prompt only)"
+                                    .to_string(),
+                            );
+                        }
+                        Engine3D::TripoSr | Engine3D::Trellis => {}
                     }
-                }
-                let engine = spec
-                    .engine_preference
-                    .as_deref()
-                    .unwrap_or("auto")
-                    .to_lowercase();
-                if (engine == "auto" || engine == "procedural") && has_image {
-                    return Err(
-                        "Image input is only supported with neural 3D engines (e.g. triposr); auto and procedural engines do not accept images"
-                            .to_string(),
-                    );
-                }
-                if (engine == "sdf" || engine == "tier0_sdf") && has_image {
-                    return Err(
-                        "Tier 0 procedural SDF engine does not support image input (text prompt only)"
-                            .to_string(),
-                    );
                 }
             }
             TaskSpec::AutoRig(spec) => {
@@ -3274,5 +3271,40 @@ mod tests {
         let deser_bin: Task =
             bincode::deserialize(&bin).expect("bincode deserialize Task with Generative3D");
         assert_eq!(task, deser_bin);
+    }
+
+    #[test]
+    fn test_validate_generative_3d_sdf_aliases_and_auto_reject_image() {
+        for alias in [
+            "sdf",
+            "tier0_sdf",
+            "tier0",
+            "tier-0",
+            "procedural",
+            "procedural_sdf",
+        ] {
+            let mut spec = Generative3DSpec::new_prompt("statue").with_engine(alias);
+            spec.image_data = Some(Bytes::from_static(b"png_bytes"));
+            let err = TaskSpec::Generative3D(spec)
+                .validate()
+                .expect_err(&format!("SDF alias '{alias}' must reject image input"));
+            assert_eq!(
+                err, "Tier 0 procedural SDF engine does not support image input (text prompt only)",
+                "Unexpected error for SDF alias '{alias}'"
+            );
+        }
+
+        for auto_pref in [None, Some(""), Some("auto")] {
+            let mut spec = Generative3DSpec::new_prompt("statue");
+            spec.engine_preference = auto_pref.map(str::to_string);
+            spec.image_data = Some(Bytes::from_static(b"png_bytes"));
+            let err = TaskSpec::Generative3D(spec)
+                .validate()
+                .expect_err("Auto engine must reject image input");
+            assert_eq!(
+                err,
+                "Image input is only supported with neural 3D engines (e.g. triposr); auto and procedural engines do not accept images"
+            );
+        }
     }
 }

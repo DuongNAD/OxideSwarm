@@ -98,8 +98,12 @@ async fn test_3d1_triposr_without_model_fails_honestly() {
         );
     } else {
         assert!(
-            err_str.contains("Missing Python") || err_str.contains("Local Python 3D engine"),
-            "Failure must name missing runtime; got error: {err_str}"
+            stderr_str.contains("TripoSR model not available: missing Python"),
+            "Failure must explicitly name missing runtime 'TripoSR model not available: missing Python'; got stderr: {stderr_str}"
+        );
+        assert!(
+            err_str.contains("TripoSR model not available: missing Python"),
+            "Failure must name missing runtime 'TripoSR model not available: missing Python'; got error: {err_str}"
         );
     }
 
@@ -284,17 +288,20 @@ async fn test_3d1_sdf_tier_rejects_image_input_honestly() {
         "Image input is only supported with neural 3D engines (e.g. triposr); auto and procedural engines do not accept images"
     );
 
-    // Also test with "procedural" engine name
-    let mut proc_spec = Generative3DSpec::new_prompt("stylized creature").with_engine("procedural");
-    proc_spec.image_data = Some(Bytes::from_static(b"fake_image_data_bytes"));
-    let proc_task_spec = TaskSpec::Generative3D(proc_spec);
-    let val_err_proc = proc_task_spec
-        .validate()
-        .expect_err("TaskSpec::validate must reject image on procedural");
-    assert_eq!(
-        val_err_proc,
-        "Image input is only supported with neural 3D engines (e.g. triposr); auto and procedural engines do not accept images"
-    );
+    // Also test all remaining Engine3D::Sdf aliases ("procedural", "tier0", "tier-0", "procedural_sdf")
+    for alias in ["procedural", "tier0", "tier-0", "procedural_sdf"] {
+        let mut alias_spec = Generative3DSpec::new_prompt("stylized creature").with_engine(alias);
+        alias_spec.image_data = Some(Bytes::from_static(b"fake_image_data_bytes"));
+        let alias_task_spec = TaskSpec::Generative3D(alias_spec);
+        let val_err_alias = alias_task_spec
+            .validate()
+            .expect_err("TaskSpec::validate must reject image on SDF alias");
+        assert_eq!(
+            val_err_alias,
+            "Tier 0 procedural SDF engine does not support image input (text prompt only)",
+            "SDF alias '{alias}' must return SDF image rejection error"
+        );
+    }
 
     // Also test with default engine (None)
     let mut default_spec = Generative3DSpec::new_prompt("stylized creature");

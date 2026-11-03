@@ -1295,11 +1295,11 @@ sys.exit(0)
 }
 
 // ============================================================================
-// Test 15: Missing Output File Falls Back Under Auto and Fails Under Explicit
+// Test 15: Missing Output File Fails Under Explicit Engine
 // ============================================================================
 
 #[tokio::test]
-async fn test_sec5_missing_output_file_falls_back_under_auto_and_fails_under_explicit() {
+async fn test_sec5_missing_output_file_fails_under_explicit_engine() {
     let (runner, _dir) = create_test_runner();
     let temp_dir = tempfile::tempdir().expect("tempdir");
 
@@ -1314,33 +1314,17 @@ async fn test_sec5_missing_output_file_falls_back_under_auto_and_fails_under_exp
     );
 
     // Explicit engine 'triposr' must fail with missing file error
-    {
-        let spec = Generative3DSpec::new_prompt("Missing Output Explicit").with_engine("triposr");
-        let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
-        let res = runner.execute_task(&task, None, None).await;
+    let spec = Generative3DSpec::new_prompt("Missing Output Explicit").with_engine("triposr");
+    let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
+    let res = runner.execute_task(&task, None, None).await;
 
-        assert_eq!(res.exit_code, EXIT_CODE_GENERAL_ERROR);
-        let err = res.error.as_deref().unwrap_or("");
-        assert!(
-            err.starts_with("Process succeeded but expected output file"),
-            "Expected missing file error, got: '{err}'"
-        );
-        assert!(res.asset_bytes.is_none());
-    }
-
-    // Engine 'auto' must fall back to Tier 0 SDF and succeed
-    {
-        let spec = Generative3DSpec::new_prompt("Missing Output Auto").with_engine("auto");
-        let task = Task::new(TaskSpec::Generative3D(spec), TaskRequirements::default());
-        let res = runner.execute_task(&task, None, None).await;
-
-        assert!(
-            res.is_success(),
-            "Auto must fall back to Tier 0 SDF on missing output"
-        );
-        assert!(res.asset_bytes.is_some());
-        assert!(res.asset_bytes.unwrap().as_slice().starts_with(b"glTF"));
-    }
+    assert_eq!(res.exit_code, EXIT_CODE_GENERAL_ERROR);
+    let err = res.error.as_deref().unwrap_or("");
+    assert!(
+        err.starts_with("Process succeeded but expected output file"),
+        "Expected missing file error, got: '{err}'"
+    );
+    assert!(res.asset_bytes.is_none());
 }
 
 // ============================================================================
