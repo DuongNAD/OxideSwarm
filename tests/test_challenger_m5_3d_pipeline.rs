@@ -215,8 +215,13 @@ struct ChallengerWorker {
 
 impl ChallengerCluster {
     pub async fn spawn(num_workers: usize, max_retries: u32) -> Self {
+        // A lost worker is charged to `max_failovers`, not to `max_retries`
+        // (`RetryPolicy::failover_budget`), so both get the same limit: a task here is re-run at
+        // most `max_retries` times after losing its worker.
         let master = MasterServer::spawn(
-            ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(max_retries),
+            ServerConfig::new("127.0.0.1:0".parse().unwrap())
+                .with_max_retries(max_retries)
+                .with_max_failovers(max_retries),
         )
         .await
         .expect("MasterServer::spawn failed");
@@ -493,52 +498,13 @@ async fn test_challenger_cascading_worker_crashes_exhaust_retries() {
     );
     let task_id = cluster.master.submit_task(task).await.expect("submit task");
 
-    // Iteration 1: initial run (retry_count == 0) -> crash assigned worker
-    for _ in 0..100 {
-        if let Ok(info) = cluster.master.get_task_info(task_id).await {
-            if info.state == TaskState::Running && info.retry_count == 0 {
-                if let Some(wid) = info.assigned_worker_id {
-                    if let Some(idx) = cluster.workers.iter().position(|w| w.worker_id == wid) {
-                        let w = cluster.workers.remove(idx);
-                        w.handle.abort();
-                        break;
-                    }
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    // Iteration 2: retry 1 (retry_count == 1) -> crash assigned worker
-    for _ in 0..100 {
-        if let Ok(info) = cluster.master.get_task_info(task_id).await {
-            if info.state == TaskState::Running && info.retry_count == 1 {
-                if let Some(wid) = info.assigned_worker_id {
-                    if let Some(idx) = cluster.workers.iter().position(|w| w.worker_id == wid) {
-                        let w = cluster.workers.remove(idx);
-                        w.handle.abort();
-                        break;
-                    }
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(30)).await;
-    }
-
-    // Iteration 3: retry 2 (retry_count == 2) -> crash assigned worker (retries should now be exhausted)
-    for _ in 0..100 {
-        if let Ok(info) = cluster.master.get_task_info(task_id).await {
-            if info.state == TaskState::Running && info.retry_count == 2 {
-                if let Some(wid) = info.assigned_worker_id {
-                    if let Some(idx) = cluster.workers.iter().position(|w| w.worker_id == wid) {
-                        let w = cluster.workers.remove(idx);
-                        w.handle.abort();
-                        break;
-                    }
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(30)).await;
+    // Crash the worker of the first run (retry_count == 0) and of both re-runs. The third crash
+    // exhausts the budget of two re-runs.
+    for attempt in 0..=2u32 {
+        assert!(
+            crash_worker_running(&mut cluster, task_id, attempt).await,
+            "run {attempt} never started on a worker that could be crashed"
+        );
     }
 
     // Await terminal state
@@ -559,15 +525,37 @@ async fn test_challenger_cascading_worker_crashes_exhaust_retries() {
 
     let final_info = cluster.master.get_task_info(task_id).await.unwrap();
     assert_eq!(final_info.state, TaskState::Failed);
+    let error = final_info.error_message.unwrap_or_default();
     assert!(
-        final_info
-            .error_message
-            .unwrap()
-            .contains("maximum retry limit"),
-        "Error message must specify max retry limit"
+        error.contains("maximum retry limit (2) reached"),
+        "Error message must name the limit of two re-runs: {error}"
     );
 
     cluster.shutdown().await;
+}
+
+/// Waits until `task_id` runs with `retry_count == attempt`, then aborts the worker that runs it.
+/// Returns whether a worker was crashed.
+async fn crash_worker_running(
+    cluster: &mut ChallengerCluster,
+    task_id: rusty_grid_core::task::TaskId,
+    attempt: u32,
+) -> bool {
+    for _ in 0..150 {
+        if let Ok(info) = cluster.master.get_task_info(task_id).await {
+            if info.state == TaskState::Running && info.retry_count == attempt {
+                if let Some(wid) = info.assigned_worker_id {
+                    if let Some(idx) = cluster.workers.iter().position(|w| w.worker_id == wid) {
+                        let w = cluster.workers.remove(idx);
+                        w.handle.abort();
+                        return true;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    false
 }
 
 // =========================================================================
