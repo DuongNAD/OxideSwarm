@@ -1346,12 +1346,77 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                             "Task {task_id} was submitted ({e}); query its outcome with task_result or status"
                         ),
                     ),
-                    Ok(ClientResponse::Error { message }) if message.contains("not found") => (
-                        "NotSubmitted".to_string(),
-                        "not_submitted".to_string(),
-                        true,
-                        format!("Task {task_id} was not submitted ({e}): {message}"),
-                    ),
+                    Ok(ClientResponse::Error { message }) if message.contains("not found") => {
+                        // A frame written before a receive timeout may still be in flight or may
+                        // have been lost when the pooled connection closed. Resend the same
+                        // `SubmitTask` (with the same `task_id`) once on a fresh connection: the
+                        // Master deduplicates by `task_id`, so treating `already exists` as
+                        // submitted guarantees at most one task is queued.
+                        match state
+                            .request_with_timeout(&msg, DEFAULT_MASTER_RPC_TIMEOUT)
+                            .await
+                        {
+                            Ok(ClientResponse::TaskSubmitted { task_id }) => {
+                                if ctx.is_cancelled() {
+                                    ctx.aborted_by_cancel = true;
+                                    let _ = state
+                                        .request_with_timeout(
+                                            &ClientMessage::CancelTask { task_id },
+                                            Duration::from_millis(500),
+                                        )
+                                        .await;
+                                    return ToolCallResult::error(format!(
+                                        "Task {task_id} cancelled by client"
+                                    ));
+                                }
+                                ctx.send_progress(1, Some(1), format!("Task {task_id} submitted"));
+                                let mut body = json!({
+                                    "task_id": task_id.to_string(),
+                                    "status": "submitted",
+                                });
+                                if let Some(w) = warning {
+                                    body["warning"] = Value::String(w);
+                                }
+                                return ToolCallResult::ok_json(&body);
+                            }
+                            Ok(ClientResponse::Error { ref message })
+                                if message.contains("already exists") =>
+                            {
+                                if ctx.is_cancelled() {
+                                    ctx.aborted_by_cancel = true;
+                                    let _ = state
+                                        .request_with_timeout(
+                                            &ClientMessage::CancelTask { task_id },
+                                            Duration::from_millis(500),
+                                        )
+                                        .await;
+                                    return ToolCallResult::error(format!(
+                                        "Task {task_id} cancelled by client"
+                                    ));
+                                }
+                                ctx.send_progress(1, Some(1), format!("Task {task_id} submitted"));
+                                let mut body = json!({
+                                    "task_id": task_id.to_string(),
+                                    "status": "submitted",
+                                });
+                                if let Some(w) = warning {
+                                    body["warning"] = Value::String(w);
+                                }
+                                return ToolCallResult::ok_json(&body);
+                            }
+                            Ok(ClientResponse::Error { message }) => {
+                                return ToolCallResult::error(message);
+                            }
+                            _ => (
+                                "Unknown".to_string(),
+                                "unknown".to_string(),
+                                false,
+                                format!(
+                                    "Task {task_id} may have been submitted ({e}); query its outcome with task_result or status"
+                                ),
+                            ),
+                        }
+                    }
                     _ => (
                         "Unknown".to_string(),
                         "unknown".to_string(),
@@ -1403,10 +1468,26 @@ async fn tool_cancel(state: &McpState, args: &Value) -> ToolCallResult {
     let task_id = TaskId(task_uuid);
 
     match state.request(&ClientMessage::CancelTask { task_id }).await {
-        Ok(ClientResponse::TaskCancelled { task_id, success }) => ToolCallResult::ok_json(&json!({
-            "task_id": task_id.to_string(),
-            "cancelled": success,
-        })),
+        Ok(ClientResponse::TaskCancelled { task_id, success }) => {
+            let mut cancelled = success;
+            if !cancelled {
+                if let Ok(ClientResponse::TaskStatusInfo { status, .. }) = state
+                    .request_with_timeout(
+                        &ClientMessage::GetTaskStatus { task_id },
+                        Duration::from_millis(500),
+                    )
+                    .await
+                {
+                    if matches!(status, rusty_grid_core::TaskStatus::Cancelled) {
+                        cancelled = true;
+                    }
+                }
+            }
+            ToolCallResult::ok_json(&json!({
+                "task_id": task_id.to_string(),
+                "cancelled": cancelled,
+            }))
+        }
         Ok(ClientResponse::Error { message }) => ToolCallResult::error(message),
         Ok(other) => ToolCallResult::error(format!("Unexpected Master response: {other:?}")),
         Err(e) => ToolCallResult::error(e),

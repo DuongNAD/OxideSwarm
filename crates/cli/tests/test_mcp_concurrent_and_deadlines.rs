@@ -1604,12 +1604,16 @@ async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_z
     let proxy_addr = proxy_listener.local_addr().expect("proxy_addr").to_string();
     let eof_submits = Arc::new(AtomicUsize::new(0));
     let corrupt_submits = Arc::new(AtomicUsize::new(0));
+    let f3_submits = Arc::new(AtomicUsize::new(0));
+    let status_stalls = Arc::new(AtomicUsize::new(0));
     let stall_next_status = Arc::new(AtomicBool::new(false));
     let cancelled_tid: Arc<tokio::sync::Mutex<Option<TaskId>>> =
         Arc::new(tokio::sync::Mutex::new(None));
 
     let eof_submits_srv = Arc::clone(&eof_submits);
     let corrupt_submits_srv = Arc::clone(&corrupt_submits);
+    let f3_submits_srv = Arc::clone(&f3_submits);
+    let status_stalls_srv = Arc::clone(&status_stalls);
     let stall_status_srv = Arc::clone(&stall_next_status);
     let cancelled_tid_srv = Arc::clone(&cancelled_tid);
     let master_addr_srv = master_addr.clone();
@@ -1618,6 +1622,8 @@ async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_z
         while let Ok((client_stream, _)) = proxy_listener.accept().await {
             let eof_s = Arc::clone(&eof_submits_srv);
             let corrupt_s = Arc::clone(&corrupt_submits_srv);
+            let f3_s = Arc::clone(&f3_submits_srv);
+            let st_stalls = Arc::clone(&status_stalls_srv);
             let stall_st = Arc::clone(&stall_status_srv);
             let cancel_tid = Arc::clone(&cancelled_tid_srv);
             let upstream_addr = master_addr_srv.clone();
@@ -1629,13 +1635,22 @@ async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_z
                 let mut client_tx = MessageTransport::new(client_stream);
                 let mut upstream_tx = MessageTransport::new(upstream_stream);
                 while let Ok(Some(msg)) = client_tx.recv_msg::<ClientMessage>().await {
-                    if matches!(msg, ClientMessage::ClusterStatus)
-                        && stall_st.swap(false, Ordering::SeqCst)
+                    if matches!(
+                        msg,
+                        ClientMessage::ListWorkers | ClientMessage::ClusterStatus
+                    ) && stall_st.swap(false, Ordering::SeqCst)
                     {
-                        // F2: Stall pooled connection past the 2s idle timeout so `status`
-                        // must recover on a fresh connection.
+                        // F2: Stall pooled connection past the 2s idle timeout on the
+                        // `ListWorkers` frame that `status` sends so `status` must recover
+                        // on a fresh connection.
+                        st_stalls.fetch_add(1, Ordering::SeqCst);
                         tokio::time::sleep(Duration::from_millis(2400)).await;
                         break;
+                    }
+                    if matches!(msg, ClientMessage::GetTaskResult { .. }) {
+                        // Add a few ms of proxy latency on `GetTaskResult` so `timeout_secs: 0`
+                        // deterministically exceeds Tokio's 1ms timer tick if the wait loop runs.
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                     if let ClientMessage::SubmitTask { ref task, .. } = msg {
                         let tag = match &task.spec {
@@ -1664,9 +1679,14 @@ async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_z
                                 let _ = raw.flush().await;
                                 break;
                             }
-                            "f3-drop" => {
-                                // Close pooled client connection WITHOUT forwarding SubmitTask so
-                                // the Master answers `Task ... not found` on GetTaskStatus.
+                            "f3-drop" if f3_s.fetch_add(1, Ordering::SeqCst) == 0 => {
+                                // Hold the first SubmitTask for 1.5s while wait_secs is 1s so
+                                // `GetTaskStatus` at 1.0s answers `not found`, triggering a
+                                // same-task_id resend on a fresh connection before this delayed
+                                // frame reaches the Master at 1.5s.
+                                tokio::time::sleep(Duration::from_millis(1500)).await;
+                                let _ = upstream_tx.send_msg(&msg).await;
+                                let _ = upstream_tx.recv_msg::<ClientResponse>().await;
                                 break;
                             }
                             "f4-cancel" => {
@@ -1837,9 +1857,17 @@ async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_z
     )
     .expect("status json");
     assert_eq!(st_body["cluster_status"], "ok");
+    assert_eq!(
+        status_stalls.load(Ordering::SeqCst),
+        1,
+        "status must have hit the pooled ListWorkers stall before recovering"
+    );
 
-    // 4. F3: When `GetTaskStatus` answers `Task ... not found` because the submit never reached
-    // the Master, `submit` must return `isError: true` and `state: "not_submitted"`.
+    // 4. F3: When the first `SubmitTask` is held for 1.5s while `wait_secs: 1`, `GetTaskStatus`
+    // at 1.0s answers `Task ... not found`. `submit` must resend the same `SubmitTask` (with the
+    // same `task_id`) once on a fresh connection, return a non-error response naming `task_id`,
+    // and leave exactly one task for that `task_id` on the Master even after the delayed first
+    // frame arrives at 1.5s.
     mcp.send(&json!({
         "jsonrpc": "2.0",
         "id": 5,
@@ -1851,15 +1879,16 @@ async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_z
                 "command": "echo",
                 "args": ["f3-drop"],
                 "require_tags": ["absent"],
-                "wait": false
+                "wait": false,
+                "wait_secs": 1
             }
         }
     }));
     let drop_resp = mcp.recv_timeout(Duration::from_secs(5));
     assert_eq!(drop_resp["id"], 5);
     assert_eq!(
-        drop_resp["result"]["isError"], true,
-        "unsubmitted task must return isError: true: {drop_resp}"
+        drop_resp["result"]["isError"], false,
+        "SubmitTask that gets not-found on GetTaskStatus must be resent with the same task_id and succeed: {drop_resp}"
     );
     let drop_body: Value = serde_json::from_str(
         drop_resp["result"]["content"][0]["text"]
@@ -1867,8 +1896,25 @@ async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_z
             .expect("drop text"),
     )
     .expect("drop json");
-    assert_eq!(drop_body["state"], "not_submitted");
-    assert_eq!(drop_body["status"], "NotSubmitted");
+    assert_eq!(drop_body["status"], "submitted");
+    let f3_tid =
+        Uuid::parse_str(drop_body["task_id"].as_str().expect("f3 task_id")).expect("valid uuid");
+    // Wait past the 1.5s proxy hold so the delayed first frame also reaches the Master.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        f3_submits.load(Ordering::SeqCst),
+        2,
+        "expected initial SubmitTask + 1 same-task_id resend after not-found"
+    );
+    assert!(
+        master.queue().get_task(&TaskId(f3_tid)).await.is_some(),
+        "Master must hold the task from f3-drop"
+    );
+    assert_eq!(
+        master.queue().list_tasks().await.len(),
+        3,
+        "Master must hold exactly one task each from f1-eof, f1-corrupt, and f3-drop"
+    );
 
     // 5. F4: Cancel check in the post-write failure branch of `tool_submit`.
     mcp.send(&json!({
