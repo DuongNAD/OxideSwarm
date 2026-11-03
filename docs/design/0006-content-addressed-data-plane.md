@@ -146,7 +146,9 @@ Behaviour before this change (design record 0003, inline staging):
   pattern without wildcards that matched nothing in a run that succeeded, fails the task with a
   message that names the cause. Collected files move into the cache.
 - The worker asks the Master which output blobs it lacks, uploads those, and only then sends the
-  result. A failed upload fails the task.
+  result. A failed upload fails the task. A cancellation that arrives after the process exits
+  (while draining pipes, collecting outputs, or uploading missing output blobs) interrupts the
+  upload, clears the task's output references, and sends one `130` (`Cancelled`) result.
 - `RustCompilation` adds the pattern `<out dir>/*`, so `target/lib<crate>.rlib` (or the binary) is
   returned. With a Master that has no store these implicit outputs are dropped with a note in
   stderr; outputs the task asked for fail it.
@@ -232,3 +234,7 @@ Behaviour before this change (design record 0003, inline staging):
 - 2026-11-04: BUG-14 follow-up on `mac/bug-14-worker-json-blob-request`: order `Worker` before
   `Client` in `HumanInboundMessage` so JSON-encoded `WorkerMessage::BlobRequest` round-trips
   through `InboundMessage` without losing `request_id` (design record 0018).
+- 2026-11-04: BUG-7 follow-up on `mac/bug-7-cancel-during-output-upload`: keep the task's
+  cancellation receiver alive through post-exit output collection and output blob upload, so a
+  cancellation arriving after the process exits interrupts `upload_task_outputs` and reports a
+  single `130` (`Cancelled`) result instead of aborting the task task without a result.

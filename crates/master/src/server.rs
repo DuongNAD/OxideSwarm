@@ -2074,6 +2074,132 @@ async fn apply_task_result(
     scheduler_notify.notify_one();
 }
 
+/// Fails only the task when an outbound `MasterMessage::AssignTask` or
+/// `AssignTaskWithCheckpoint` exceeds `MAX_FRAME_SIZE`, keeping the worker session alive so
+/// unrelated tasks on the worker can continue.
+#[allow(clippy::too_many_arguments)]
+async fn handle_oversized_master_message(
+    msg: MasterMessage,
+    size: usize,
+    max: usize,
+    registry: &WorkerRegistry,
+    queue: &TaskQueue,
+    scheduler_notify: &tokio::sync::Notify,
+    waiters: &WaiterMap,
+    worker_id: Uuid,
+    session_id: u64,
+    blob_store: Option<&Arc<BlobStore>>,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<&DashboardTx>,
+) {
+    let task_id = match msg {
+        MasterMessage::AssignTask { task }
+        | MasterMessage::AssignTaskWithCheckpoint { task, .. } => task.id,
+        other => {
+            warn!(
+                worker_id = %worker_id,
+                session_id = session_id,
+                variant = %other.variant_name(),
+                size = size,
+                max = max,
+                "Outbound master message exceeds frame limit; dropping frame without closing session"
+            );
+            return;
+        }
+    };
+
+    let reason = format!(
+        "Task assignment frame ({size} bytes) exceeds maximum protocol frame limit ({max} bytes)"
+    );
+    warn!(
+        worker_id = %worker_id,
+        session_id = session_id,
+        task_id = %task_id,
+        size = size,
+        max = max,
+        "Refusing oversized task assignment without terminating worker session"
+    );
+    let result = TaskResult::failure(
+        worker_id,
+        task_id,
+        1,
+        rusty_grid_core::task::Bytes::new(),
+        format!("[rusty_grid: {reason}]\n").into_bytes(),
+        0,
+        Some(reason),
+    );
+
+    let disposition = match queue
+        .fail_unsendable_assignment(worker_id, Some(session_id), result.clone())
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(task_id = %task_id, error = %e, "Failed to record oversized assignment failure");
+            return;
+        }
+    };
+
+    if disposition == ResultDisposition::Stale {
+        return;
+    }
+
+    #[cfg(feature = "dashboard")]
+    if let Some(b_tx) = broadcast_tx {
+        if let Some(info) = queue.get_task(&task_id).await {
+            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                info,
+            ));
+        }
+        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+            queue.stats().await,
+        ));
+    }
+
+    let _ = registry.decrement_active_tasks(&worker_id).await;
+
+    if disposition == ResultDisposition::Terminal {
+        if let Some(store) = blob_store {
+            store.unpin_task(&task_id).await;
+        }
+        let mut lock = waiters.write().await;
+        if let Some(senders) = lock.remove(&task_id) {
+            for tx in senders {
+                let _ = tx.send(result.clone());
+            }
+        }
+    }
+
+    scheduler_notify.notify_one();
+}
+
+/// Sends `resp` to a client, converting `ProtocolError::FrameTooLarge` into a
+/// `ClientResponse::Error` frame instead of dropping the connection with no explanation.
+async fn send_client_response<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    transport: &mut MessageTransport<S>,
+    resp: &ClientResponse,
+) -> Result<(), rusty_grid_core::protocol::ProtocolError> {
+    match transport.send_msg(resp).await {
+        Ok(()) => Ok(()),
+        Err(rusty_grid_core::protocol::ProtocolError::FrameTooLarge { size, max }) => {
+            let message = match resp {
+                ClientResponse::TaskCompleted { task_id, .. } => format!(
+                    "Task {task_id} result frame ({size} bytes) exceeds maximum protocol frame limit ({max} bytes); write large outputs to files and retrieve them with `--output`"
+                ),
+                _ => format!(
+                    "Master response frame ({size} bytes) exceeds maximum protocol frame limit ({max} bytes)"
+                ),
+            };
+            warn!(
+                size = size,
+                max = max,
+                "Client response exceeds frame limit; returning ClientResponse::Error"
+            );
+            transport.send_msg(&ClientResponse::Error { message }).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Handles incoming `WorkerMessage::TaskProgress` messages.
 pub async fn handle_task_progress(
     queue: &TaskQueue,
@@ -2648,8 +2774,7 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 if !known {
                     if let Err(message) = admit_blob_task(blob_store.as_ref(), &task).await {
                         warn!(task_id = %task_id, error = %message, "SubmitTask rejected");
-                        transport
-                            .send_msg(&ClientResponse::Error { message })
+                        send_client_response(&mut transport, &ClientResponse::Error { message })
                             .await?;
                         continue;
                     }
@@ -2676,7 +2801,7 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     let resp = ClientResponse::Error {
                         message: e.to_string(),
                     };
-                    transport.send_msg(&resp).await?;
+                    send_client_response(&mut transport, &resp).await?;
                     continue;
                 }
                 scheduler_notify.notify_one();
@@ -2697,23 +2822,23 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     match rx.await {
                         Ok(result) => {
                             let resp = ClientResponse::TaskCompleted { task_id, result };
-                            transport.send_msg(&resp).await?;
+                            send_client_response(&mut transport, &resp).await?;
                         }
                         Err(_) => {
                             let resp = ClientResponse::Error {
                                 message: "Task completion channel closed unexpectedly".into(),
                             };
-                            transport.send_msg(&resp).await?;
+                            send_client_response(&mut transport, &resp).await?;
                         }
                     }
                 } else {
                     let resp = ClientResponse::TaskSubmitted { task_id };
-                    transport.send_msg(&resp).await?;
+                    send_client_response(&mut transport, &resp).await?;
                 }
             }
             ClientMessage::GetTaskStatus { task_id } => {
                 let resp = task_status_response(&queue, task_id).await;
-                transport.send_msg(&resp).await?;
+                send_client_response(&mut transport, &resp).await?;
             }
             ClientMessage::CancelTask { task_id } => {
                 // Cancels in the queue, tells the executing worker to stop and wakes `wait`ers.
@@ -2749,7 +2874,7 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     }
                 }
                 let resp = ClientResponse::TaskCancelled { task_id, success };
-                transport.send_msg(&resp).await?;
+                send_client_response(&mut transport, &resp).await?;
             }
             ClientMessage::ClusterStatus => {
                 let workers_info = registry.list_all_workers().await;
@@ -2776,7 +2901,7 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     max_active_bytes: stats.max_active_bytes,
                     workers,
                 };
-                transport.send_msg(&resp).await?;
+                send_client_response(&mut transport, &resp).await?;
             }
             ClientMessage::ListWorkers => {
                 let workers_info = registry.list_all_workers().await;
@@ -2792,7 +2917,7 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     );
                 }
                 let resp = ClientResponse::WorkerList { workers };
-                transport.send_msg(&resp).await?;
+                send_client_response(&mut transport, &resp).await?;
             }
             ClientMessage::SubmitMapReduce { job } => {
                 let job_id = job.job_id;
@@ -2819,13 +2944,13 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 match outcome {
                     Some(Ok(result)) => {
                         let resp = ClientResponse::MapReduceCompleted { result };
-                        transport.send_msg(&resp).await?;
+                        send_client_response(&mut transport, &resp).await?;
                     }
                     Some(Err(e)) => {
                         let resp = ClientResponse::Error {
                             message: e.to_string(),
                         };
-                        transport.send_msg(&resp).await?;
+                        send_client_response(&mut transport, &resp).await?;
                     }
                     None => break,
                 }
@@ -2842,7 +2967,7 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     }
                     _ => task_status_response(&queue, task_id).await,
                 };
-                transport.send_msg(&resp).await?;
+                send_client_response(&mut transport, &resp).await?;
             }
             ClientMessage::BlobRequest { request } => {
                 let reply = match (&blob_store, &uploads) {
@@ -2851,9 +2976,7 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                         message: NO_BLOB_STORE.to_string(),
                     },
                 };
-                transport
-                    .send_msg(&ClientResponse::BlobReply { reply })
-                    .await?;
+                send_client_response(&mut transport, &ClientResponse::BlobReply { reply }).await?;
             }
         }
     }
@@ -3324,11 +3447,38 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (mut writer, mut reader) = transport.split();
 
     // 6. Spawn outbound message writer task
+    let writer_registry = registry.clone();
+    let writer_queue = queue.clone();
+    let writer_sched_notify = Arc::clone(&scheduler_notify);
+    let writer_waiters = Arc::clone(&waiters);
+    let writer_blob_store = blob_store.clone();
+    #[cfg(feature = "dashboard")]
+    let writer_broadcast_tx = broadcast_tx.clone();
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = outbound_rx.recv().await {
-            if let Err(e) = writer.send_msg(&msg).await {
-                debug!(error = %e, "Outbound message write failed; terminating writer task");
-                break;
+            match writer.send_msg(&msg).await {
+                Ok(()) => {}
+                Err(rusty_grid_core::protocol::ProtocolError::FrameTooLarge { size, max }) => {
+                    handle_oversized_master_message(
+                        msg,
+                        size,
+                        max,
+                        &writer_registry,
+                        &writer_queue,
+                        &writer_sched_notify,
+                        &writer_waiters,
+                        worker_id,
+                        session_id,
+                        writer_blob_store.as_ref(),
+                        #[cfg(feature = "dashboard")]
+                        writer_broadcast_tx.as_ref(),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    debug!(error = %e, "Outbound message write failed; terminating writer task");
+                    break;
+                }
             }
         }
     });
@@ -3950,18 +4100,58 @@ async fn handle_multiplexed_connection<
 
     let ctrl_writer_task = tokio::spawn(async move {
         while let Some(msg) = ctrl_out_rx.recv().await {
-            if let Err(e) = ctrl_writer.send_msg(&msg).await {
-                debug!(error = %e, "Control writer send error; terminating");
-                break;
+            match ctrl_writer.send_msg(&msg).await {
+                Ok(()) => {}
+                Err(rusty_grid_core::protocol::ProtocolError::FrameTooLarge { size, max }) => {
+                    warn!(
+                        worker_id = %worker_id,
+                        session_id = session_id,
+                        variant = %msg.variant_name(),
+                        size = size,
+                        max = max,
+                        "Control frame exceeds frame limit; dropping frame without closing session"
+                    );
+                }
+                Err(e) => {
+                    debug!(error = %e, "Control writer send error; terminating");
+                    break;
+                }
             }
         }
     });
 
+    let data_registry = registry.clone();
+    let data_queue = queue.clone();
+    let data_sched_notify = Arc::clone(&scheduler_notify);
+    let data_waiters = Arc::clone(&waiters);
+    let data_blob_store = blob_store.clone();
+    #[cfg(feature = "dashboard")]
+    let data_broadcast_tx = broadcast_tx.clone();
     let data_writer_task = tokio::spawn(async move {
         while let Some(msg) = data_out_rx.recv().await {
-            if let Err(e) = data_writer.send_msg(&msg).await {
-                debug!(error = %e, "Data writer send error; terminating");
-                break;
+            match data_writer.send_msg(&msg).await {
+                Ok(()) => {}
+                Err(rusty_grid_core::protocol::ProtocolError::FrameTooLarge { size, max }) => {
+                    handle_oversized_master_message(
+                        msg,
+                        size,
+                        max,
+                        &data_registry,
+                        &data_queue,
+                        &data_sched_notify,
+                        &data_waiters,
+                        worker_id,
+                        session_id,
+                        data_blob_store.as_ref(),
+                        #[cfg(feature = "dashboard")]
+                        data_broadcast_tx.as_ref(),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    debug!(error = %e, "Data writer send error; terminating");
+                    break;
+                }
             }
         }
     });
@@ -5366,5 +5556,394 @@ mod tests {
             "client disconnect must cancel running/queued partitions and queue no waiting ones, got {final_stats:?}"
         );
         let _ = master.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_oversized_master_frames_fail_only_the_task_and_return_client_error() {
+        use rusty_grid_core::protocol::{
+            serialize_message, ProtocolCapabilities, WireCodec, MAX_FRAME_SIZE,
+            PROTOCOL_VERSION_CURRENT,
+        };
+        use rusty_grid_core::task::{Bytes, TaskRequirements, TaskSpec};
+        use std::collections::HashMap;
+
+        let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
+            .await
+            .unwrap();
+        let addr = master.server_addr();
+
+        // Register a mock worker with 1 CPU slot so a second task can only be dispatched if
+        // `handle_oversized_master_message` releases the worker slot (`decrement_active_tasks`).
+        let worker_stream = TcpStream::connect(addr).await.unwrap();
+        let mut worker = MessageTransport::new(worker_stream);
+        let worker_id = Uuid::new_v4();
+        worker
+            .send_msg(&WorkerMessage::Register {
+                worker_id,
+                capabilities: WorkerCapabilities {
+                    name: "bug11-worker".into(),
+                    cpu_cores: 1,
+                    ram_mb: 8192,
+                    has_gpu: false,
+                    is_simulated_gpu: false,
+                    gpu_device_name: None,
+                    tags: vec![],
+                    mobile: None,
+                    has_blender: false,
+                    blender_version: None,
+                    vram_mb: None,
+                    has_cuda: false,
+                },
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        match worker.recv_msg::<MasterMessage>().await.unwrap() {
+            Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+            other => panic!("expected RegisterAck, got {other:?}"),
+        }
+
+        // 1. Submit an oversized task (> 64 MiB stdin) with a registered waiter and a normal
+        //    sibling task on a 1-core worker.
+        //    The oversized assignment must wake its waiter with the frame-limit failure, release
+        //    the worker's single slot without killing the worker session, and allow the sibling
+        //    task to be dispatched and finish.
+        let oversized_task = Task::new(
+            TaskSpec::Command {
+                program: "cat".into(),
+                args: vec![],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: Some(vec![b'x'; MAX_FRAME_SIZE + 1024]),
+            },
+            TaskRequirements::generic(1, 64),
+        );
+        let oversized_id = oversized_task.id;
+        let (oversized_waiter_tx, oversized_waiter_rx) = tokio::sync::oneshot::channel();
+        master
+            .waiters
+            .write()
+            .await
+            .entry(oversized_id)
+            .or_default()
+            .push(oversized_waiter_tx);
+        master.submit_task(oversized_task).await.unwrap();
+
+        // The registered waiter must wake with the failure result, and the worker's registry slot
+        // must be released (`active_tasks == 0` and status not `Busy`).
+        let oversized_res = tokio::time::timeout(Duration::from_secs(2), oversized_waiter_rx)
+            .await
+            .expect("oversized task waiter must be woken when assignment fails")
+            .expect("oversized task waiter channel must receive TaskResult");
+        assert!(!oversized_res.is_success());
+        let err_msg = oversized_res.error.unwrap_or_default();
+        assert!(
+            err_msg.contains("frame") && err_msg.contains(&MAX_FRAME_SIZE.to_string()),
+            "oversized task failure reason must mention the frame limit, got: {err_msg}"
+        );
+        assert_eq!(
+            master.get_task_info(oversized_id).await.unwrap().state,
+            crate::queue::TaskState::Failed
+        );
+        let worker_after_fail = master.registry.get_worker(worker_id).await.unwrap();
+        assert_eq!(
+            worker_after_fail.active_tasks, 0,
+            "worker registry active_tasks must return to 0 after unsendable assignment"
+        );
+        assert_ne!(
+            worker_after_fail.status,
+            crate::registry::WorkerStatus::Busy,
+            "worker registry status must not stay Busy after unsendable assignment"
+        );
+
+        let sibling_task = Task::new(
+            TaskSpec::command("echo", vec!["sibling".into()]),
+            TaskRequirements::generic(1, 64),
+        );
+        let sibling_id = sibling_task.id;
+        master.submit_task(sibling_task).await.unwrap();
+
+        // The 1-slot worker session must still be alive, have its slot released, and receive the
+        // sibling task assignment.
+        let assigned =
+            tokio::time::timeout(Duration::from_secs(2), worker.recv_msg::<MasterMessage>())
+                .await
+                .expect("worker session must receive sibling AssignTask without timing out")
+                .expect("worker transport must not error")
+                .expect("worker transport must not be closed");
+        match assigned {
+            MasterMessage::AssignTask { task } => assert_eq!(task.id, sibling_id),
+            other => panic!("expected sibling AssignTask, got {other:?}"),
+        }
+
+        // Complete the sibling task with a result whose WorkerMessage::TaskResult frame fits
+        // MAX_FRAME_SIZE (by 8 bytes), so its ClientResponse::TaskCompleted frame (which carries
+        // an extra 24 bytes in bincode) exceeds MAX_FRAME_SIZE by 16 bytes.
+        let mut probe_msg = WorkerMessage::TaskResult {
+            worker_id,
+            task_id: sibling_id,
+            exit_code: 0,
+            stdout: Bytes::new(),
+            stderr: Bytes::new(),
+            execution_time_ms: 1,
+            is_gpu_executed: false,
+            device_name: None,
+            error: None,
+            asset_bytes: None,
+            artifacts: vec![],
+            outputs: vec![],
+        };
+        let empty_size = serialize_message(&probe_msg, WireCodec::Bincode)
+            .unwrap()
+            .len();
+        let stdout_len = MAX_FRAME_SIZE - empty_size - 8;
+        if let WorkerMessage::TaskResult { ref mut stdout, .. } = probe_msg {
+            *stdout = Bytes::from(vec![b'a'; stdout_len]);
+        }
+        let worker_frame_len = serialize_message(&probe_msg, WireCodec::Bincode)
+            .unwrap()
+            .len();
+        assert!(
+            worker_frame_len <= MAX_FRAME_SIZE,
+            "worker frame must fit MAX_FRAME_SIZE: {worker_frame_len}"
+        );
+
+        worker.send_msg(&probe_msg).await.unwrap();
+
+        // Wait for sibling task to complete on the master.
+        for _ in 0..80 {
+            if let Ok(info) = master.get_task_info(sibling_id).await {
+                if info.state == crate::queue::TaskState::Completed {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            master.get_task_info(sibling_id).await.unwrap().state,
+            crate::queue::TaskState::Completed
+        );
+
+        // 2. A client requesting the sibling task result (whose ClientResponse::TaskCompleted
+        //    exceeds MAX_FRAME_SIZE) must receive ClientResponse::Error instead of EOF.
+        let client_stream = TcpStream::connect(addr).await.unwrap();
+        let mut client = MessageTransport::new(client_stream);
+        client
+            .send_msg(&ClientMessage::GetTaskResult {
+                task_id: sibling_id,
+            })
+            .await
+            .unwrap();
+        match client.recv_msg::<ClientResponse>().await.unwrap() {
+            Some(ClientResponse::Error { message }) => {
+                assert!(
+                    message.contains(&sibling_id.to_string())
+                        && message.contains("frame")
+                        && message.contains(&MAX_FRAME_SIZE.to_string())
+                        && message.contains("--output"),
+                    "expected frame limit error message naming task and --output, got: {message}"
+                );
+            }
+            other => {
+                panic!("expected ClientResponse::Error for oversized client reply, got {other:?}")
+            }
+        }
+
+        // 3. A task with a 33 MiB checkpoint dispatched via AssignTaskWithCheckpoint carries the
+        //    checkpoint once (`latest_checkpoint: Some(...)`, `task.latest_checkpoint: None`), so
+        //    it fits inside the 64 MiB frame limit instead of doubling to 66 MiB.
+        let mut cp_task = Task::new(
+            TaskSpec::command("echo", vec!["cp".into()]),
+            TaskRequirements::generic(1, 64),
+        );
+        cp_task.latest_checkpoint = Some(rusty_grid_core::task::CheckpointData::new(
+            1,
+            vec![b'c'; 33 * 1024 * 1024],
+        ));
+        let cp_task_id = cp_task.id;
+        master.submit_task(cp_task).await.unwrap();
+
+        let cp_assigned =
+            tokio::time::timeout(Duration::from_secs(2), worker.recv_msg::<MasterMessage>())
+                .await
+                .expect("worker must receive 33 MiB AssignTaskWithCheckpoint")
+                .expect("worker transport must not error")
+                .expect("worker transport must not be closed");
+        match cp_assigned {
+            MasterMessage::AssignTaskWithCheckpoint {
+                task,
+                latest_checkpoint,
+            } => {
+                assert_eq!(task.id, cp_task_id);
+                assert!(
+                    task.latest_checkpoint.is_none(),
+                    "checkpoint must not be duplicated in task.latest_checkpoint"
+                );
+                assert_eq!(
+                    latest_checkpoint.as_ref().map(|c| c.delta_state.len()),
+                    Some(33 * 1024 * 1024)
+                );
+            }
+            other => panic!("expected AssignTaskWithCheckpoint, got {other:?}"),
+        }
+
+        let _ = master.shutdown();
+
+        // 4. Verify the multiplexed (QUIC 2-lane) data-writer path (`handle_multiplexed_connection`)
+        //    also fails only the oversized task, releases the worker slot, wakes its waiter, and
+        //    keeps the data lane open for the next assignment.
+        let mux_registry = WorkerRegistry::new();
+        let mux_queue = TaskQueue::new();
+        let mux_notify = Arc::new(tokio::sync::Notify::new());
+        let mux_waiters: WaiterMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (c_master, c_worker) = tokio::io::duplex(64 * 1024);
+        let (d_master, d_worker) = tokio::io::duplex(64 * 1024);
+
+        let mux_reg_clone = mux_registry.clone();
+        let mux_queue_clone = mux_queue.clone();
+        let mux_notify_clone = Arc::clone(&mux_notify);
+        let mux_waiters_clone = Arc::clone(&mux_waiters);
+        let mux_conn = tokio::spawn(async move {
+            let _ = handle_multiplexed_connection(
+                c_master,
+                d_master,
+                "127.0.0.1:50000".parse().unwrap(),
+                mux_reg_clone,
+                mux_queue_clone,
+                mux_notify_clone,
+                mux_waiters_clone,
+                10,
+                Duration::from_secs(5),
+                stop_rx,
+                None,
+                WireCodec::Bincode,
+                None,
+                None,
+                None,
+                #[cfg(feature = "dashboard")]
+                None,
+                #[cfg(feature = "p2p")]
+                None,
+                #[cfg(feature = "p2p")]
+                None,
+            )
+            .await;
+        });
+
+        let mut mux_ctrl = MessageTransport::new(c_worker);
+        let mut mux_data = MessageTransport::new(d_worker);
+        let mux_worker_id = Uuid::new_v4();
+        mux_ctrl
+            .send_msg(&WorkerMessage::Register {
+                worker_id: mux_worker_id,
+                capabilities: WorkerCapabilities {
+                    name: "bug11-mux-worker".into(),
+                    cpu_cores: 1,
+                    ram_mb: 8192,
+                    has_gpu: false,
+                    is_simulated_gpu: false,
+                    gpu_device_name: None,
+                    tags: vec![],
+                    mobile: None,
+                    has_blender: false,
+                    blender_version: None,
+                    vram_mb: None,
+                    has_cuda: false,
+                },
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        match mux_ctrl.recv_msg::<MasterMessage>().await.unwrap() {
+            Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+            other => panic!("expected mux RegisterAck, got {other:?}"),
+        }
+
+        let mux_oversized = Task::new(
+            TaskSpec::Command {
+                program: "cat".into(),
+                args: vec![],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: Some(vec![b'y'; MAX_FRAME_SIZE + 1024]),
+            },
+            TaskRequirements::generic(1, 64),
+        );
+        let mux_oversized_id = mux_oversized.id;
+        let (mux_waiter_tx, mux_waiter_rx) = tokio::sync::oneshot::channel();
+        mux_waiters
+            .write()
+            .await
+            .entry(mux_oversized_id)
+            .or_default()
+            .push(mux_waiter_tx);
+        mux_queue.submit(mux_oversized).await.unwrap();
+
+        let mux_scheduler = crate::scheduler::WorkloadScheduler::new(
+            crate::scheduler::SchedulerConfig::default(),
+            mux_registry.clone(),
+            mux_queue.clone(),
+            Arc::clone(&mux_notify),
+        );
+        assert_eq!(
+            mux_scheduler
+                .schedule_batch(10)
+                .await
+                .unwrap()
+                .assignments
+                .len(),
+            1
+        );
+
+        let mux_res = tokio::time::timeout(Duration::from_secs(2), mux_waiter_rx)
+            .await
+            .expect("mux waiter must be woken when data-lane assignment fails")
+            .expect("mux waiter must receive TaskResult");
+        assert!(!mux_res.is_success());
+        let mux_worker_after_fail = mux_registry.get_worker(mux_worker_id).await.unwrap();
+        assert_eq!(
+            mux_worker_after_fail.active_tasks, 0,
+            "mux worker registry active_tasks must return to 0 after unsendable assignment"
+        );
+        assert_ne!(
+            mux_worker_after_fail.status,
+            crate::registry::WorkerStatus::Busy,
+            "mux worker registry status must not stay Busy after unsendable assignment"
+        );
+
+        // Because the 1-slot mux worker's slot was released, a second task can now be scheduled
+        // and arrives on `mux_data`.
+        let mux_sibling = Task::new(
+            TaskSpec::command("echo", vec!["mux-ok".into()]),
+            TaskRequirements::generic(1, 64),
+        );
+        let mux_sibling_id = mux_sibling.id;
+        mux_queue.submit(mux_sibling).await.unwrap();
+        assert_eq!(
+            mux_scheduler
+                .schedule_batch(10)
+                .await
+                .unwrap()
+                .assignments
+                .len(),
+            1
+        );
+
+        let mux_assigned =
+            tokio::time::timeout(Duration::from_secs(2), mux_data.recv_msg::<MasterMessage>())
+                .await
+                .expect("mux data lane must receive sibling AssignTask")
+                .expect("mux data lane must not error")
+                .expect("mux data lane must stay open");
+        match mux_assigned {
+            MasterMessage::AssignTask { task } => assert_eq!(task.id, mux_sibling_id),
+            other => panic!("expected mux sibling AssignTask, got {other:?}"),
+        }
+
+        let _ = stop_tx.send(true);
+        mux_conn.abort();
     }
 }

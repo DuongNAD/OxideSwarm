@@ -1130,14 +1130,14 @@ impl WorkloadScheduler {
 
         // Step 5: Dispatch AssignTask frames to workers
         for assignment in &report.assignments {
-            let task = &assignment.task;
-            let msg = if task.latest_checkpoint.is_some() {
+            let mut task = assignment.task.clone();
+            let msg = if let Some(latest_checkpoint) = task.latest_checkpoint.take() {
                 MasterMessage::AssignTaskWithCheckpoint {
-                    task: task.clone(),
-                    latest_checkpoint: task.latest_checkpoint.clone(),
+                    task,
+                    latest_checkpoint: Some(latest_checkpoint),
                 }
             } else {
-                MasterMessage::AssignTask { task: task.clone() }
+                MasterMessage::AssignTask { task }
             };
             self.dispatch(assignment, msg).await;
         }

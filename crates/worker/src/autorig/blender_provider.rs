@@ -11,75 +11,17 @@ pub const EMBEDDED_BLENDER_RIG_SCRIPT: &str =
     include_str!("../../../../engines/autorig/blender_rig.py");
 
 /// Resolves the file path to host Blender executable.
-pub fn resolve_blender_binary() -> Option<PathBuf> {
-    // 1. Environment variables
-    for env_var in &[
-        "RUSTY_GRID_BLENDER_PATH",
-        "OXIDE_SWARM_BLENDER_PATH",
-        "BLENDER_PATH",
-    ] {
-        if let Ok(env_path) = std::env::var(env_var) {
-            let p = PathBuf::from(env_path.trim());
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-
-    // 2. Standard Windows installation paths
-    #[cfg(windows)]
-    {
-        let mut search_dirs = Vec::new();
-        if let Ok(pf) = std::env::var("ProgramFiles") {
-            search_dirs.push(PathBuf::from(pf).join("Blender Foundation"));
-        }
-        if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
-            search_dirs.push(PathBuf::from(pf86).join("Blender Foundation"));
-        }
-        search_dirs.push(PathBuf::from(r"C:\Program Files\Blender Foundation"));
-
-        for base_dir in search_dirs {
-            if base_dir.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(&base_dir) {
-                    let mut version_dirs: Vec<PathBuf> = entries
-                        .flatten()
-                        .map(|e| e.path())
-                        .filter(|p| {
-                            p.is_dir()
-                                && p.file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .starts_with("Blender")
-                        })
-                        .collect();
-                    version_dirs.sort_by(|a, b| b.cmp(a)); // Descending version order (prefer 4.5 over older)
-                    for dir in version_dirs {
-                        let exe = dir.join("blender.exe");
-                        if exe.is_file() {
-                            return Some(exe);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Fallback check for "blender" on PATH
-    if probe_blender("blender") {
-        return Some(PathBuf::from("blender"));
-    }
-
-    None
+///
+/// Delegates to [`rusty_grid_core::capabilities::resolve_blender_binary`] so capability
+/// detection (`detect_blender`) and task execution share one resolution rule and search path list.
+pub fn resolve_blender_binary(explicit_path: Option<&str>) -> Option<PathBuf> {
+    rusty_grid_core::capabilities::resolve_blender_binary(explicit_path)
 }
 
 /// Probes whether a Blender executable candidate is runnable by invoking `<program> --version`
 /// with sensitive environment variables stripped.
 pub fn probe_blender<P: AsRef<std::ffi::OsStr>>(program: P) -> bool {
-    rusty_grid_core::cluster_auth::probe_command(program)
-        .arg("--version")
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+    rusty_grid_core::capabilities::probe_blender_binary(program).0
 }
 
 /// Resolves the path to `engines/autorig/blender_rig.py`.
