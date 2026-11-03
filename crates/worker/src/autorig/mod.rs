@@ -122,7 +122,9 @@ pub async fn auto_rig_mesh_async(
         .to_lowercase();
 
     if pref == "blender" {
-        if let Some(blender_bin) = blender_provider::resolve_blender_binary() {
+        if let Some(blender_bin) =
+            blender_provider::resolve_blender_binary(runner.config().blender_path.as_deref())
+        {
             info!(bin = ?blender_bin, "Attempting Blender headless auto-rigging provider");
             match BlenderRigProvider::execute_rigging(
                 runner,
