@@ -36,7 +36,7 @@ use rusty_grid_core::task::TaskRequirements;
 use rusty_grid_master::reaper::{spawn_reaper, ReaperConfig};
 use rusty_grid_master::registry::{WorkerRegistry, WorkerStatus};
 use rusty_grid_master::server::{MasterServer, ServerConfig};
-use rusty_grid_worker::client::WorkerClient;
+use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 
 /// Polls `condition` every `step` until true or `timeout` elapses.
 async fn poll_until<F, Fut>(timeout: Duration, step: Duration, mut condition: F) -> bool
@@ -503,7 +503,7 @@ async fn test_port_file_atomic_overwrite_of_stale_content() {
 // Challenge 3: Capability Queries Under High Concurrency Stress
 // =========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_capability_queries_under_connect_disconnect_stress() {
     let (master_shutdown_tx, master_shutdown_rx) = watch::channel(false);
     let registry = WorkerRegistry::new();
@@ -530,12 +530,18 @@ async fn test_capability_queries_under_connect_disconnect_stress() {
 
         let handle = tokio::spawn(async move {
             while is_running.load(Ordering::Relaxed) {
-                let mut client = WorkerClient::from_options(
-                    m_addr.clone(),
-                    Some(worker_name.clone()),
-                    Some(4),
-                    is_gpu,
-                );
+                // `WorkerClient::new` probes the host synchronously (child processes such as
+                // `pmset` and `sw_vers`), so build it off the runtime threads the queries run on.
+                // Blender detection would launch Blender itself on every reconnect: turn it off.
+                let config = WorkerConfig::new(m_addr.clone())
+                    .with_name(worker_name.clone())
+                    .with_cores(4)
+                    .with_simulate_gpu(is_gpu)
+                    .with_no_blender(true)
+                    .with_redirection_portal(false);
+                let mut client = tokio::task::spawn_blocking(move || WorkerClient::new(config))
+                    .await
+                    .expect("building a churn worker must not panic");
 
                 // Run client for short burst
                 tokio::select! {
@@ -678,7 +684,12 @@ async fn test_capability_queries_under_connect_disconnect_stress() {
         let _ = tx.send(true);
     }
 
-    let _ = tokio::join!(q1_handle, q2_handle, q3_handle, q4_handle);
+    // A broken invariant panics its query task: that must fail the test, not just stop the loop.
+    let (r1, r2, r3, r4) = tokio::join!(q1_handle, q2_handle, q3_handle, q4_handle);
+    r1.expect("list_gpu_workers query task failed");
+    r2.expect("list_non_gpu_workers query task failed");
+    r3.expect("list_active_workers / counts query task failed");
+    r4.expect("find_eligible_workers query task failed");
     for h in worker_handles {
         let _ = h.await;
     }
@@ -697,6 +708,14 @@ async fn test_capability_queries_under_connect_disconnect_stress() {
         q_gpu > 50 && q_cpu > 50 && q_act > 50 && q_fil > 50,
         "Continuous query progress must be sustained under churn (observed GPU={}, NonGPU={}, Active={}, Eligible={})",
         q_gpu, q_cpu, q_act, q_fil
+    );
+
+    // Every churn connection registers a fresh worker id, and the registry keeps disconnected
+    // entries for an hour, so the total shows that the queries really ran against churn.
+    let (registered, _, _) = registry.counts().await;
+    assert!(
+        registered >= 16,
+        "The churn workers must reconnect during the run (observed {registered} registrations from 8 workers)"
     );
 
     let _ = master_shutdown_tx.send(true);
