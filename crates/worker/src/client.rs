@@ -3440,20 +3440,18 @@ mod tests {
     async fn test_worker_redirection_portal() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let test_port = 18080;
-        let master_target = "192.168.1.123:8088".to_string();
+        // Hold port 18080 (if not already held by another process) so the test proves it never
+        // depends on a fixed port being free.
+        let _occupied_18080 = tokio::net::TcpListener::bind("127.0.0.1:18080").await.ok();
 
-        tokio::spawn(async move {
-            spawn_worker_redirection_portal(test_port, master_target, shutdown_rx).await;
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (addr, shutdown_tx) = portal_fixture(
+            PortalTarget::from("192.168.1.123:8088"),
+            PORTAL_MAX_CONNECTIONS,
+        )
+        .await;
 
         // 1. Test browser navigation / redirect
-        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", test_port))
-            .await
-            .unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .await
@@ -3465,9 +3463,7 @@ mod tests {
         assert!(resp.contains("Location: http://192.168.1.123:8080"));
 
         // 2. Test /api/status probe
-        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", test_port))
-            .await
-            .unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(b"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .await
