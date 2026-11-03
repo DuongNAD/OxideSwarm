@@ -234,12 +234,41 @@ task_state() {  # task id -> "state worker"
     json_get "$out" "d.get('state', 'Unknown') + ' ' + str(d.get('assigned_worker') or '-')"
 }
 
-# Wait until the victim provably holds running tasks.
+# Wait until the victim provably holds running tasks, and right before `kill -KILL`, remove from
+# `VICTIM_TASKS` every task that already has a `done:` line or that the master already shows as
+# `Completed`.
 VICTIM_TASKS=()
 for _ in $(seq 1 100); do
-    VICTIM_TASKS=()
+    CANDIDATE_TASKS=()
     for i in $(seq 1 "$TASKS_COUNT"); do
-        if [[ -f "${MARKERS}/task_${i}.log" ]] && grep -q "^start:${SB_VICTIM}" "${MARKERS}/task_${i}.log"; then
+        if [[ -f "${MARKERS}/task_${i}.log" ]] \
+            && grep -q "^start:${SB_VICTIM}" "${MARKERS}/task_${i}.log" \
+            && ! grep -q "^done:" "${MARKERS}/task_${i}.log"; then
+            CANDIDATE_TASKS+=("$i")
+        fi
+    done
+    if [[ ${#CANDIDATE_TASKS[@]} -eq 0 ]]; then
+        sleep 0.1
+        continue
+    fi
+
+    STILL_RUNNING_VICTIM_TASKS=()
+    for i in "${CANDIDATE_TASKS[@]}"; do
+        if grep -q "^done:" "${MARKERS}/task_${i}.log"; then
+            continue
+        fi
+        read -r VSTATE _ <<< "$(task_state "${TASK_IDS[$((i - 1))]}")"
+        if [[ "$VSTATE" == "Completed" ]]; then
+            continue
+        fi
+        if ! grep -q "^done:" "${MARKERS}/task_${i}.log"; then
+            STILL_RUNNING_VICTIM_TASKS+=("$i")
+        fi
+    done
+
+    VICTIM_TASKS=()
+    for i in "${STILL_RUNNING_VICTIM_TASKS[@]}"; do
+        if ! grep -q "^done:" "${MARKERS}/task_${i}.log"; then
             VICTIM_TASKS+=("$i")
         fi
     done
