@@ -216,8 +216,8 @@ struct ChallengerWorker {
 impl ChallengerCluster {
     pub async fn spawn(num_workers: usize, max_retries: u32) -> Self {
         // A lost worker is charged to `max_failovers`, not to `max_retries`
-        // (`RetryPolicy::failover_budget`), so both get the same limit: `max_retries` is the number
-        // of re-runs a task gets here, whatever ended the previous run.
+        // (`RetryPolicy::failover_budget`), so both get the same limit: a task here is re-run at
+        // most `max_retries` times after losing its worker.
         let master = MasterServer::spawn(
             ServerConfig::new("127.0.0.1:0".parse().unwrap())
                 .with_max_retries(max_retries)

@@ -631,14 +631,13 @@ async fn test_capability_queries_under_connect_disconnect_stress() {
                     w
                 );
             }
-            let (_total, active_cnt, gpu_cnt) = reg3.counts().await;
+            // A reconnect registers a fresh id while the old one stays Connected until the master
+            // handles its EOF, so the active count can briefly exceed the 8 churn workers. What one
+            // `counts()` call must keep is its own consistency.
+            let (total, active_cnt, gpu_cnt) = reg3.counts().await;
             assert!(
-                active_cnt <= 8,
-                "active count ({active_cnt}) exceeds max workers"
-            );
-            assert!(
-                gpu_cnt <= 4,
-                "gpu count ({gpu_cnt}) exceeds max GPU workers"
+                gpu_cnt <= active_cnt && active_cnt <= total,
+                "counts() is inconsistent: total {total}, active {active_cnt}, gpu {gpu_cnt}"
             );
             count3.fetch_add(1, Ordering::Relaxed);
             tokio::task::yield_now().await;
@@ -710,8 +709,8 @@ async fn test_capability_queries_under_connect_disconnect_stress() {
         q_gpu, q_cpu, q_act, q_fil
     );
 
-    // Every churn connection registers a fresh worker id, and the registry keeps disconnected
-    // entries for an hour, so the total shows that the queries really ran against churn.
+    // Every churn connection registers a fresh worker id, and this test starts no reaper, so
+    // disconnected entries stay: the total shows that the queries really ran against churn.
     let (registered, _, _) = registry.counts().await;
     assert!(
         registered >= 16,
