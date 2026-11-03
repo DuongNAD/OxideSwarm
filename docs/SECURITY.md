@@ -88,7 +88,7 @@ implemented.
 ### Agent Mesh Security Boundaries and Limitations
 
 - **No OS Sandboxing**: Agent mesh nodes run commands with the privileges of the node's OS user. Commands have access to the local filesystem and network.
-- **Environment Sanitization vs File Access**: Child processes do not inherit 5 sensitive variables (`OXIDESWARM_SECRET`, `OXIDESWARM_SECRET_FILE`, `OXIDE_MESH_TOKEN`, `RUSTY_GRID_SECRET`, `RUSTY_GRID_SECRET_FILE`). However, environment stripping only blocks inheritance from the parent process; a command run via `shell_exec` can still read `~/.oxideswarm/cluster.secret` or inspect `/proc`. Only `--no-shell` closes the arbitrary command execution path.
+- **Environment Sanitization vs File Access**: Child processes do not inherit the 3 cluster and mesh secret variables (`OXIDESWARM_SECRET`, `OXIDESWARM_SECRET_FILE`, `OXIDE_MESH_TOKEN`). However, environment stripping only blocks inheritance from the parent process; a command run via `shell_exec` can still read `~/.oxideswarm/cluster.secret` or inspect `/proc`. Only `--no-shell` closes the arbitrary command execution path.
 - **Embedded Master Integration (`--grid-master`)**: Starting a hub with `--grid-master` enables `grid_submit` task dispatching. The `--no-shell` flag on a mesh node does not disable grid compute/shell tasks dispatched to grid workers.
 
 The agent-mesh hub and the grid master both default to port 8088. Run them on the same machine only with

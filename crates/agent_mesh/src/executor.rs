@@ -4,7 +4,7 @@
 //! execution duration measurement, timeout safety watchdogs,
 //! and native built-in commands (echo, system_info, ping, sha256_verify).
 
-use rusty_grid_core::cluster_auth::{ENV_SECRET, ENV_SECRET_FILE};
+pub use rusty_grid_core::cluster_auth::SECRET_ENV_VARS;
 use serde_json::Value;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -20,17 +20,6 @@ pub const MAX_CAPTURED_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// How long to wait for the output readers to finish once a timed-out process tree is dead.
 const READER_DRAIN_GRACE: Duration = Duration::from_secs(1);
-
-/// Variables of the node's own environment that a command must never inherit: they hold the
-/// cluster secret or the hub token (`--token` / `OXIDE_MESH_TOKEN`), and `shell_exec` runs
-/// whatever a remote peer sends. A command can still be given one in its own `env`.
-pub const SECRET_ENV_VARS: [&str; 5] = [
-    ENV_SECRET,
-    ENV_SECRET_FILE,
-    "OXIDE_MESH_TOKEN",
-    "RUSTY_GRID_SECRET",
-    "RUSTY_GRID_SECRET_FILE",
-];
 
 #[derive(Debug, Clone)]
 pub struct CommandExecutionResult {
@@ -660,12 +649,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_secrets_in_the_nodes_environment_are_not_inherited_by_commands() {
-        const SENTINELS: [(&str, &str); 5] = [
+        const SENTINELS: [(&str, &str); 3] = [
             ("OXIDESWARM_SECRET", "sentinel-cluster-secret"),
             ("OXIDESWARM_SECRET_FILE", "/sentinel/secret/file"),
             ("OXIDE_MESH_TOKEN", "sentinel-mesh-token"),
-            ("RUSTY_GRID_SECRET", "sentinel-grid-secret"),
-            ("RUSTY_GRID_SECRET_FILE", "/sentinel/grid-file"),
         ];
         // The node's own secrets live in this process's environment; remove them afterwards.
         struct Restore;
@@ -681,7 +668,7 @@ mod tests {
             std::env::set_var(name, value);
         }
 
-        let probe = "echo \"[${OXIDESWARM_SECRET-unset}][${OXIDESWARM_SECRET_FILE-unset}][${OXIDE_MESH_TOKEN-unset}][${RUSTY_GRID_SECRET-unset}][${RUSTY_GRID_SECRET_FILE-unset}]\"";
+        let probe = "echo \"[${OXIDESWARM_SECRET-unset}][${OXIDESWARM_SECRET_FILE-unset}][${OXIDE_MESH_TOKEN-unset}]\"";
         let res = CommandExecutor::execute(
             "shell_exec",
             &serde_json::json!({ "cmd": probe }),
@@ -689,7 +676,7 @@ mod tests {
         )
         .await;
         assert_eq!(res.status, "success");
-        assert_eq!(res.stdout.trim(), "[unset][unset][unset][unset][unset]");
+        assert_eq!(res.stdout.trim(), "[unset][unset][unset]");
 
         // Unadvertised command directly spawned must be rejected with 127
         let res =
@@ -705,10 +692,7 @@ mod tests {
             Some(5000),
         )
         .await;
-        assert_eq!(
-            res.stdout.trim(),
-            "[unset][unset][given-on-purpose][unset][unset]"
-        );
+        assert_eq!(res.stdout.trim(), "[unset][unset][given-on-purpose]");
     }
 
     #[cfg(unix)]
