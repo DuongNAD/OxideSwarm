@@ -1275,21 +1275,26 @@ fn kill_probe_group(_pid: u32) {}
 fn reap_probe_child_detached(mut child: std::process::Child) {
     let pid = child.id();
     #[cfg(unix)]
-    kill_probe_group(pid);
-    let _ = child.kill();
-    // Reap on a detached thread (and run `taskkill /F /T` there on Windows) so a probe stuck in
-    // uninterruptible kernel sleep (e.g. `nvidia-smi` on a wedged GPU driver) never blocks worker
-    // start-up past the deadline.
+    {
+        kill_probe_group(pid);
+        let _ = child.kill();
+    }
+    // Reap on a detached thread (and on Windows run `taskkill /F /T` before `child.kill()` while
+    // the parent `cmd.exe` PID is still in the process table) so a probe stuck in uninterruptible
+    // kernel sleep (e.g. `nvidia-smi` on a wedged GPU driver) never blocks worker start-up past
+    // the deadline.
     std::thread::spawn(move || {
         #[cfg(windows)]
-        kill_probe_group(pid);
+        {
+            kill_probe_group(pid);
+            let _ = child.kill();
+        }
         let _ = child.wait();
     });
 }
 
 /// Runs `cmd` with stdin/stderr closed and stdout captured, killing the process (and its Unix
-/// process group or Windows process tree) if it or its stdout pipe does not finish within
-/// `timeout`.
+/// process group or Windows process tree) if it does not finish within `timeout`.
 fn run_command_bounded(
     cmd: &mut std::process::Command,
     timeout: std::time::Duration,
@@ -1319,13 +1324,28 @@ fn run_command_bounded(
         }
     };
 
-    let stdout_rx = child.stdout.take().map(|out| {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stdout_done_rx = child.stdout.take().map(|mut out| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let buf_clone = std::sync::Arc::clone(&stdout_buf);
         std::thread::spawn(move || {
             use std::io::Read;
-            let mut buf = Vec::new();
-            let _ = out.take(64 * 1024).read_to_end(&mut buf);
-            let _ = tx.send(buf);
+            let mut chunk = [0u8; 4096];
+            loop {
+                match out.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut guard = buf_clone.lock().unwrap_or_else(|e| e.into_inner());
+                        let remaining_cap = (64 * 1024usize).saturating_sub(guard.len());
+                        let to_copy = n.min(remaining_cap);
+                        guard.extend_from_slice(&chunk[..to_copy]);
+                        if guard.len() >= 64 * 1024 {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(());
         });
         rx
     });
@@ -1335,45 +1355,26 @@ fn run_command_bounded(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let pid = child.id();
-                // Kill the probe's process group when the direct child exits so a wrapper script
-                // that leaves a background grandchild holding stdout (`sleep 8 &`) is terminated
-                // immediately instead of keeping the pipe open.
                 #[cfg(unix)]
-                kill_probe_group(pid);
+                {
+                    let pid = child.id();
+                    // Kill the probe's process group when the direct child exits so a wrapper
+                    // script that leaves a background grandchild holding stdout (`sleep 8 &`) is
+                    // terminated immediately instead of keeping the pipe open.
+                    kill_probe_group(pid);
+                }
 
-                let stdout = match stdout_rx {
-                    Some(rx) => {
-                        #[cfg(windows)]
-                        let rx = match rx.recv_timeout(std::time::Duration::from_millis(25)) {
-                            Ok(bytes) => {
-                                return ProbeExecOutcome::Output(std::process::Output {
-                                    status,
-                                    stdout: bytes,
-                                    stderr: Vec::new(),
-                                });
-                            }
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                return ProbeExecOutcome::Output(std::process::Output {
-                                    status,
-                                    stdout: Vec::new(),
-                                    stderr: Vec::new(),
-                                });
-                            }
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                kill_probe_group(pid);
-                                rx
-                            }
-                        };
-                        let remaining =
-                            deadline.saturating_duration_since(std::time::Instant::now());
-                        match rx.recv_timeout(remaining) {
-                            Ok(bytes) => bytes,
-                            Err(_) => return ProbeExecOutcome::TimedOut,
-                        }
-                    }
-                    None => Vec::new(),
-                };
+                if let Some(rx) = stdout_done_rx {
+                    // Wait briefly for the reader thread to hit EOF. If a grandchild outside the
+                    // Unix process group (`setsid`) or a background child of `cmd.exe` on Windows
+                    // keeps the pipe open after the direct child has already exited, take the
+                    // bytes already buffered rather than turning a completed probe into a timeout.
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let drain_grace = std::time::Duration::from_millis(50).min(remaining);
+                    let _ = rx.recv_timeout(drain_grace);
+                }
+                let stdout =
+                    std::mem::take(&mut *stdout_buf.lock().unwrap_or_else(|e| e.into_inner()));
                 return ProbeExecOutcome::Output(std::process::Output {
                     status,
                     stdout,
@@ -2632,8 +2633,9 @@ Now drawing from 'AC Power'
         );
 
         // Wrapper script that prints a version, leaves a background grandchild holding stdout open,
-        // and exits immediately: group kill on child exit must terminate the grandchild and return
-        // well before the grandchild's 60s sleep.
+        // and exits immediately: group kill on child exit (Unix) and incremental stdout capture +
+        // post-exit drain grace (Windows / detached child) must return the version well before the
+        // grandchild finishes.
         let bg_pid_file = dir.path().join("bg_grandchild.pid");
         let bg_ver = write_test_script(
             dir.path(),
@@ -2642,7 +2644,7 @@ Now drawing from 'AC Power'
                 "echo 'Blender 4.5.4 LTS'\nsleep 60 &\necho $! > '{}'\nexit 0",
                 bg_pid_file.display()
             ),
-            "echo Blender 4.5.4 LTS\r\nstart /b ping -n 60 127.0.0.1 >NUL\r\nexit /b 0",
+            "echo Blender 4.5.4 LTS\r\nstart /b ping -n 3 127.0.0.1 >NUL\r\nexit /b 0",
         );
         let bg_start = std::time::Instant::now();
         assert_eq!(
@@ -2658,7 +2660,8 @@ Now drawing from 'AC Power'
         assert_pid_file_process_dead(&bg_pid_file);
 
         // Even if a grandchild escapes the process group (`setsid`) and holds stdout open after the
-        // direct child exits, `recv_timeout(remaining)` must bound the probe to `timeout`.
+        // direct child prints the version and exits, incremental stdout buffering + bounded
+        // post-exit drain must return the version immediately rather than timing out.
         #[cfg(unix)]
         {
             let detached_pid_file = dir.path().join("detached_grandchild.pid");
@@ -2666,14 +2669,13 @@ Now drawing from 'AC Power'
                 dir.path(),
                 "blender_detached_stdout",
                 &format!(
-                    "python3 -c 'import os, sys, time\npid = os.fork()\nif pid > 0:\n    open({:?}, \"w\").write(str(pid))\n    os._exit(0)\nos.setsid()\ntime.sleep(60)\n'",
+                    "python3 -c 'import os, sys, time\nsys.stdout.write(\"Blender 4.5.4 LTS\\n\")\nsys.stdout.flush()\npid = os.fork()\nif pid > 0:\n    open({:?}, \"w\").write(str(pid))\n    os._exit(0)\nos.setsid()\ntime.sleep(60)\n'",
                     detached_pid_file.to_string_lossy()
                 ),
                 "",
             );
             let det_start = std::time::Instant::now();
-            let det_res =
-                probe_blender_with_timeout(&detached, std::time::Duration::from_millis(300));
+            let det_res = probe_blender_with_timeout(&detached, std::time::Duration::from_secs(1));
             let det_elapsed = det_start.elapsed();
             if let Ok(raw) = std::fs::read_to_string(&detached_pid_file) {
                 if let Ok(pid) = raw.trim().parse::<i32>() {
@@ -2684,16 +2686,14 @@ Now drawing from 'AC Power'
                     }
                 }
             }
-            assert!(
-                matches!(
-                    det_res,
-                    BlenderProbeResult::TimedOut | BlenderProbeResult::SucceededWithoutVersion
-                ),
+            assert_eq!(
+                det_res,
+                BlenderProbeResult::Version("Blender 4.5.4 LTS".to_string()),
                 "unexpected result for detached-stdout wrapper: {det_res:?}"
             );
             assert!(
-                det_elapsed < std::time::Duration::from_secs(2),
-                "detached-stdout wrapper blocked past timeout: {det_elapsed:?}"
+                det_elapsed < std::time::Duration::from_millis(800),
+                "detached-stdout wrapper blocked past drain grace: {det_elapsed:?}"
             );
         }
 
