@@ -1,7 +1,7 @@
 # 0006: Content-addressed task inputs and output files
 
 Status: Implemented
-Created: 2026-10-26    Updated: 2026-10-26
+Created: 2026-10-26    Updated: 2026-11-04
 
 ## Summary
 
@@ -75,7 +75,7 @@ Behaviour before this change (design record 0003, inline staging):
 | Message | Direction | Notes |
 |---|---|---|
 | `ClientMessage::BlobRequest { request }` / `ClientResponse::BlobReply { reply }` | client ↔ Master | Answered in order on one connection. Appended last to both enums. |
-| `WorkerMessage::BlobRequest { request_id, request }` / `MasterMessage::BlobReply { request_id, reply }` | worker ↔ Master | Appended after `UnknownVariant`, so existing variant indices do not move. A worker sends them only to a Master that announced `master_features::BLOBS`. |
+| `WorkerMessage::BlobRequest { request_id, request }` / `MasterMessage::BlobReply { request_id, reply }` | worker ↔ Master | Appended after `UnknownVariant`, so existing variant indices do not move. A worker sends them only to a Master that announced `master_features::BLOBS`. `HumanInboundMessage` tries `Worker(WorkerMessage)` before `Client(ClientMessage)` so JSON `BlobRequest` frames with a required `request_id` route to `InboundMessage::Worker` and frames without `request_id` route to `InboundMessage::Client` (design record 0018). |
 
 | Request | Reply |
 |---|---|
@@ -229,3 +229,6 @@ Behaviour before this change (design record 0003, inline staging):
   store/cache locks, clean up cancelled `.part` fetches and aborted in-flight uploads, fail output
   walks on selected invalid/non-UTF-8 paths or read errors, and print failure status/error details
   and task output on CLI download failures.
+- 2026-11-04: BUG-14 follow-up on `mac/bug-14-worker-json-blob-request`: order `Worker` before
+  `Client` in `HumanInboundMessage` so JSON-encoded `WorkerMessage::BlobRequest` round-trips
+  through `InboundMessage` without losing `request_id` (design record 0018).
