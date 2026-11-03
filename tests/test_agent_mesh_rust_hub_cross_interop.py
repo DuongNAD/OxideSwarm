@@ -1,27 +1,37 @@
 #!/usr/bin/env python3
 """
-OxideSwarm Cross-Platform Coding Agent Mesh - Rust Hub & Python Node Cross-Interop Test
+OxideSwarm Cross-Platform Coding Agent Mesh - Rust Hub & Python Node Cross-Interop Runner
 File: tests/test_agent_mesh_rust_hub_cross_interop.py
 
-Author: Challenger 1 (teamwork_preview_challenger)
-
-Tests the actual compiled Rust binary (`agent-mesh` Hub) with Python agent nodes:
-1. Spawns Rust Hub subprocess (`target/debug/agent-mesh.exe hub --listen 127.0.0.1:23890`).
-2. Verifies REST status & nodes endpoints.
-3. Connects 3 Python agent nodes (Win, Mac, Android).
-4. Routes command Node 1 -> Node 3 and asserts response.
-5. Verifies strict Node 2 isolation (Node 2 receives 0 commands).
-6. Verifies DeliveryNack for nonexistent target.
-7. Performs 50-packet bidirectional data burst.
+Tests the compiled Rust binary (`agent-mesh` Hub) with Python agent nodes across 5 suites:
+1. Suite 1 (Cross-Interop):
+   - Spawns Rust Hub subprocess (`agent-mesh hub --listen 127.0.0.1:0`).
+   - Verifies REST status & nodes endpoints.
+   - Connects 3 Python agent nodes (Win, Mac, Android).
+   - Routes command Node 1 -> Node 3 and asserts response.
+   - Verifies strict Node 2 isolation (Node 2 receives 0 commands).
+   - Verifies DeliveryNack for nonexistent target.
+   - Performs 50-packet bidirectional data burst.
+2. Suite 2 (`test_agent_mesh_token_auth.py`):
+   - Token authentication, duplicate node ID rejection, forged `from` NACK, foreign Origin 403,
+     and `--token` / `OXIDE_MESH_TOKEN` CLI flags.
+3. Suite 3 (`test_agent_mesh_adversarial_stress.py`):
+   - High-concurrency stress against Rust Hub with and without `--grid-master`.
+4. Suite 4 (`test_challenger_m5_rapid_disconnect.py`):
+   - 25 concurrent Python clients rapidly connecting, sending commands, and abruptly dropping sockets.
+5. Suite 5 (`test_challenger_m5_ecosystem_stress.py`):
+   - `scripts/agent_node.py` CLI one-shot flags against unattached Rust Hub, intermediate
+     `DeliveryAck("target_forwarded")` handling, timeout cleanup, socket drop, and corrupt JSON.
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -38,7 +48,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("CrossInterop")
 
-# Import SimulatedAgentNode
+# Ensure tests and root directory are in sys.path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 for p in [current_dir, parent_dir]:
@@ -46,6 +56,45 @@ for p in [current_dir, parent_dir]:
         sys.path.insert(0, p)
 
 from test_agent_mesh_simulation import SimulatedAgentNode
+from test_agent_mesh_token_auth import run_token_auth_tests
+from test_agent_mesh_adversarial_stress import run_adversarial_stress_tests
+from test_challenger_m5_rapid_disconnect import run_rapid_disconnect_stress
+from test_challenger_m5_ecosystem_stress import run_m5_ecosystem_stress_tests
+
+
+def _find_binary() -> str:
+    target_dir = os.environ.get("CARGO_TARGET_DIR") or os.path.join(parent_dir, "target")
+    for name in ("agent-mesh.exe", "agent-mesh"):
+        bin_path = os.path.join(target_dir, "debug", name)
+        if os.path.exists(bin_path):
+            return bin_path
+    raise FileNotFoundError(f"agent-mesh binary not found in {target_dir}/debug")
+
+
+def _wait_for_hub_url(proc: subprocess.Popen, timeout_s: float = 15.0) -> str:
+    url_queue: queue.Queue = queue.Queue()
+
+    def _reader():
+        try:
+            for line in proc.stdout:
+                if "running at " in line:
+                    url_queue.put(line.split("running at ", 1)[1].strip())
+                    break
+            for _ in proc.stdout:
+                pass
+        except Exception:
+            pass
+        finally:
+            url_queue.put(None)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    try:
+        hub_url = url_queue.get(timeout=timeout_s)
+    except queue.Empty as exc:
+        raise TimeoutError(f"Rust Hub failed to report its bound address within {timeout_s}s") from exc
+    if not hub_url:
+        raise RuntimeError("Rust Hub exited before reporting its bound address")
+    return hub_url
 
 
 async def run_cross_interop_tests():
@@ -53,26 +102,20 @@ async def run_cross_interop_tests():
     logger.info("  STARTING RUST HUB + PYTHON AGENT CROSS-INTEROP ADVERSARIAL TEST ")
     logger.info("==================================================================")
 
-    # Find agent-mesh binary
-    bin_path = os.path.join(parent_dir, "target", "debug", "agent-mesh.exe")
-    if not os.path.exists(bin_path):
-        bin_path = os.path.join(parent_dir, "target", "debug", "agent-mesh")
-    if not os.path.exists(bin_path):
-        raise FileNotFoundError(f"agent-mesh binary not found at {bin_path}")
+    bin_path = _find_binary()
 
-    # Use a high port for testing
-    test_port = 23890
-    hub_ws_url = f"ws://127.0.0.1:{test_port}/ws"
-    hub_http_url = f"http://127.0.0.1:{test_port}"
-
-    logger.info(f"Launching Rust Hub binary on port {test_port}...")
+    logger.info("Launching Rust Hub binary on an ephemeral port...")
     proc = subprocess.Popen(
-        [bin_path, "hub", "--listen", f"127.0.0.1:{test_port}"],
+        [bin_path, "hub", "--listen", "127.0.0.1:0"],
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
     )
 
     try:
+        hub_ws_url = _wait_for_hub_url(proc, timeout_s=15.0)
+        hub_http_url = "http://" + hub_ws_url.split("://", 1)[1].rsplit("/ws", 1)[0]
+
         # Wait for hub to become healthy
         online = False
         for _ in range(30):
@@ -173,9 +216,26 @@ async def run_cross_interop_tests():
             proc.kill()
 
 
+async def run_all_rust_hub_python_suites() -> bool:
+    suites = [
+        ("run_cross_interop_tests", run_cross_interop_tests),
+        ("run_token_auth_tests", run_token_auth_tests),
+        ("run_adversarial_stress_tests", run_adversarial_stress_tests),
+        ("run_rapid_disconnect_stress", run_rapid_disconnect_stress),
+        ("run_m5_ecosystem_stress_tests", run_m5_ecosystem_stress_tests),
+    ]
+    for name, suite in suites:
+        if not await suite():
+            raise RuntimeError(f"Suite {name} returned False")
+    logger.info("==================================================================")
+    logger.info("  ALL 5 RUST HUB + PYTHON AGENT INTEROP SUITES PASSED (100%)      ")
+    logger.info("==================================================================")
+    return True
+
+
 def main():
     try:
-        success = asyncio.run(run_cross_interop_tests())
+        success = asyncio.run(run_all_rust_hub_python_suites())
         sys.exit(0 if success else 1)
     except Exception as e:
         logger.error(f"Cross-interop test failed: {e}", exc_info=True)

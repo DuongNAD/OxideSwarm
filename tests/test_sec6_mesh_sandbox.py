@@ -24,6 +24,7 @@ Verifies:
 import asyncio
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -52,6 +53,42 @@ class RobustCallerNode(OxideAgentNode):
         if msg_type == "DeliveryAck" and msg.get("status") == "target_forwarded":
             return
         await super()._dispatch_incoming(msg)
+
+
+def _is_pid_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        res = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return f'"{pid}"' in res.stdout
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    stat_path = f"/proc/{pid}/stat"
+    if os.path.exists(stat_path):
+        try:
+            with open(stat_path, "r", encoding="utf-8") as f:
+                if ") Z " in f.read():
+                    return False
+        except OSError:
+            return False
+    else:
+        res = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        state = res.stdout.strip()
+        if not state or state.startswith("Z"):
+            return False
+    return True
 
 
 async def run_sec6_tests():
@@ -211,6 +248,25 @@ async def run_sec6_tests():
         logger.info(f"✓ Test 6 PASSED: Output capped at {len(out_bytes)} bytes with truncation notice!")
 
         # ----------------------------------------------------------------------
+        # Test 6b: Non-Zero Exit Code & Stderr Propagation
+        # ----------------------------------------------------------------------
+        logger.info("[Test 6b] Testing non-zero exit code 42 and stderr propagation...")
+        nz_probe = (
+            f'"{sys.executable}" -c '
+            "\"import sys; sys.stderr.write('ERR_NONZERO_42_STDERR\\n'); sys.stderr.flush(); sys.exit(42)\""
+        )
+        resp_nz = await caller.send_command(
+            "worker-node",
+            "shell_exec",
+            {"cmd": nz_probe},
+            timeout=10.0,
+        )
+        assert resp_nz.get("status") == "failed", f"Expected failed status for exit 42, got {resp_nz}"
+        assert resp_nz.get("exit_code") == 42, f"Expected exit_code 42, got {resp_nz.get('exit_code')}"
+        assert "ERR_NONZERO_42_STDERR" in resp_nz.get("stderr", ""), f"Missing stderr in {resp_nz}"
+        logger.info("✓ Test 6b PASSED: Non-zero exit code 42 and stderr propagated intact!")
+
+        # ----------------------------------------------------------------------
         # Test 7: Timeout Watchdog & Partial Output Retention (Kills Mutant P11)
         # ----------------------------------------------------------------------
         logger.info("[Test 7] Testing timeout path and partial output retention (Mutant P11)...")
@@ -274,25 +330,21 @@ async def run_sec6_tests():
         )
         assert resp_tree.get("status") == "timeout", f"Expected timeout, got {resp_tree}"
         await asyncio.sleep(0.5)
-        if os.path.exists(pid_file):
-            try:
-                with open(pid_file, "r") as f:
-                    pids_str = f.read().strip()
-                if pids_str:
-                    leader_pid, child_pid = [int(p) for p in pids_str.split(",")]
+        try:
+            assert os.path.exists(pid_file), "Parent process did not write pid_file before timeout"
+            with open(pid_file, "r", encoding="utf-8") as f:
+                pids_str = f.read().strip()
+            assert pids_str, "pid_file was empty"
+            leader_pid, child_pid = [int(p) for p in pids_str.split(",")]
+            assert not _is_pid_alive(leader_pid), f"Leader PID {leader_pid} survived timeout (Mutant P10)!"
+            assert not _is_pid_alive(child_pid), f"Detached setsid child PID {child_pid} survived timeout (F7)!"
+        finally:
+            for f_path in (pid_file, child_py, parent_py):
+                if os.path.exists(f_path):
                     try:
-                        import psutil
-                        assert not psutil.pid_exists(leader_pid) or psutil.Process(leader_pid).status() == psutil.STATUS_ZOMBIE, f"Leader PID {leader_pid} survived timeout (Mutant P10)!"
-                        assert not psutil.pid_exists(child_pid) or psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE, f"Detached setsid child PID {child_pid} survived timeout (F7)!"
-                    except ImportError:
+                        os.remove(f_path)
+                    except Exception:
                         pass
-            finally:
-                for f_path in (pid_file, child_py, parent_py):
-                    if os.path.exists(f_path):
-                        try:
-                            os.remove(f_path)
-                        except Exception:
-                            pass
         logger.info("✓ Test 8 PASSED: Subprocess tree and setsid child terminated (P10 killed)!")
 
         # ----------------------------------------------------------------------

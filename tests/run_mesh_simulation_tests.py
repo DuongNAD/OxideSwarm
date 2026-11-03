@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-OxideSwarm Cross-Platform Coding Agent Mesh - Master Test Runner
-File: tests/run_all_mesh_tests.py
+OxideSwarm Cross-Platform Coding Agent Mesh - Python Reference-Hub Simulation Runner
+File: tests/run_mesh_simulation_tests.py
 
-Authoritative Verification Runner for Acceptance Criteria (ORIGINAL_REQUEST.md ## 2026-09-23T09:50:43Z):
+Simulation Runner for the Python Agent Node & In-Process Reference Hub (`OxideRelayHub`):
+NOTE: This runner tests the Python protocol simulation and `scripts/agent_node.py` against
+in-process Python mock/reference hubs. It does NOT start the compiled Rust `agent-mesh` hub
+binary (for Rust hub interop tests, run `python tests/test_agent_mesh_rust_hub_cross_interop.py`).
+
 1. Runs Suite 1: 3-Node Mesh Simulation & Targeted Command Routing (test_agent_mesh_simulation.py)
-   - In-process ephemeral OxideRelay Hub
+   - In-process ephemeral Python OxideRelayHub
    - 3 Heterogeneous nodes: Node 1 (Windows), Node 2 (macOS), Node 3 (Android)
    - Active Directory Catalog registration verification
    - Node 1 -> Node 3 targeted command routing & stdout/stderr/duration response
@@ -17,6 +21,12 @@ Authoritative Verification Runner for Acceptance Criteria (ORIGINAL_REQUEST.md #
    - Boundary tests: 0-byte and 128 KB binary transfers
    - Concurrent burst stress test (50 forward + 50 reverse = 100 packets) verifying 0.00% data loss
    - Intermediary node isolation under high packet load
+3. Runs Suite 3: SEC-6 Command Hardening & Process Controls (test_sec6_mesh_sandbox.py)
+   - Unadvertised command rejection (exit code 127), `--no-shell` enforcement, secret env scrubbing,
+     1 MiB output truncation, and timeout process-tree termination
+4. Runs Suite 4: Python SHA-256 Asset Tamper Detection & Burst Routing (test_challenger_m4_python_tampering.py)
+   - Single-bit-flip SHA-256 tamper rejection in `OxideAgentNode.extract_and_verify_asset`
+   - Deeply nested output directory creation and 10-client concurrent correlation routing
 """
 
 import asyncio
@@ -35,18 +45,19 @@ try:
     from test_agent_mesh_simulation import run_simulation_tests
     from test_agent_mesh_data_loss import run_data_loss_tests
     from test_sec6_mesh_sandbox import run_sec6_tests
+    from test_challenger_m4_python_tampering import run_python_tampering_tests
 except ImportError:
     from tests.test_agent_mesh_simulation import run_simulation_tests
     from tests.test_agent_mesh_data_loss import run_data_loss_tests
     from tests.test_sec6_mesh_sandbox import run_sec6_tests
+    from tests.test_challenger_m4_python_tampering import run_python_tampering_tests
 
 
 def print_banner():
     banner = """
 ================================================================================
-          OXIDESWARM AGENT MESH - COMPREHENSIVE ACCEPTANCE TEST SUITE           
-                  Cross-Platform Coding Agent Communication PoC                 
-               Governing Mandate: ORIGINAL_REQUEST.md (2026-09-23)              
+       OXIDESWARM AGENT MESH - PYTHON REFERENCE-HUB SIMULATION TEST SUITE       
+       Protocol Simulation & Python Client Verification (No Rust Binary)        
 ================================================================================
 """
     print(banner)
@@ -105,13 +116,30 @@ async def main_async():
     suite3_duration = time.time() - suite3_start
     results.append(("Suite 3: SEC-6 Command Hardening & Process Controls", suite3_passed, suite3_duration))
 
+    # Small pause between suites
+    await asyncio.sleep(0.2)
+
+    # --------------------------------------------------------------------------
+    # Suite 4: Python SHA-256 Tamper Detection & Burst Routing
+    # --------------------------------------------------------------------------
+    print("\n>>> Executing Suite 4: Python SHA-256 Tamper Detection & Burst Routing")
+    suite4_start = time.time()
+    suite4_passed = False
+    try:
+        suite4_passed = await run_python_tampering_tests()
+    except Exception as e:
+        print(f"[FAILED] Suite 4 raised exception: {e}")
+        suite4_passed = False
+    suite4_duration = time.time() - suite4_start
+    results.append(("Suite 4: Python SHA-256 Tampering & Burst Routing", suite4_passed, suite4_duration))
+
     total_duration = time.time() - overall_start
 
     # --------------------------------------------------------------------------
     # Summary Report
     # --------------------------------------------------------------------------
     print("\n" + "=" * 80)
-    print("                      ACCEPTANCE TEST EXECUTION SUMMARY                         ")
+    print("                    SIMULATION TEST EXECUTION SUMMARY                           ")
     print("=" * 80)
     print(f"{'Test Suite Name':<52} | {'Duration':<10} | {'Result':<10}")
     print("-" * 80)
@@ -125,7 +153,7 @@ async def main_async():
 
     print("-" * 80)
     print(f"Total Execution Time: {total_duration:.3f} seconds")
-    print(f"Final Verification Verdict: {'ALL SUITES PASSED (100%)' if all_passed else 'SOME SUITES FAILED'}")
+    print(f"Final Simulation Verdict: {'ALL SUITES PASSED (100%)' if all_passed else 'SOME SUITES FAILED'}")
     print("=" * 80 + "\n")
 
     return 0 if all_passed else 1

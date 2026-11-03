@@ -4,7 +4,7 @@
 //! 1. Single and multi-file staging into worker sandbox.
 //! 2. Path traversal rejection (.., absolute paths, Windows drive/device prefixes).
 //! 3. Windows DOS device names rejection (CON, PRN, AUX, NUL, COM1..9, LPT1..9).
-//! 4. Content-hash deduplication cache at <sandbox_base>/cache/objects/<sha256>.
+//! 4. Independent per-sandbox staged file placement (in-place mutations do not affect subsequent tasks).
 //! 5. Output artifact harvesting, size caps (10 MiB single, 32 MiB aggregate), and SHA-256 verification.
 //! 6. Symlink escape defense (refusing to exfiltrate symlinks pointing outside sandbox).
 //! 7. Wire codec roundtrips across JSON (0x01) and Bincode (0x02).
@@ -160,11 +160,11 @@ async fn test_multi_file_staging_nested_directories() {
 }
 
 // ============================================================================
-// 2. Worker Content-Hash Cache & Deduplication Tests
+// 2. Independent Per-Sandbox Staged File Isolation Tests
 // ============================================================================
 
 #[tokio::test]
-async fn test_worker_content_hash_cache_deduplication() {
+async fn test_staged_file_in_place_mutation_does_not_corrupt_subsequent_tasks() {
     let (runner, tmp) = make_test_runner();
 
     let payload = b"original\n".to_vec();

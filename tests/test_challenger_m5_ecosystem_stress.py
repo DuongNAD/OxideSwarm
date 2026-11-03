@@ -21,8 +21,10 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import uuid
@@ -44,29 +46,62 @@ if SCRIPTS_DIR not in sys.path:
 from agent_node import OxideAgentNode
 
 
+def _find_binary() -> str:
+    target_dir = os.environ.get("CARGO_TARGET_DIR") or os.path.join(PROJECT_ROOT, "target")
+    for name in ("agent-mesh.exe", "agent-mesh"):
+        p = os.path.join(target_dir, "debug", name)
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError("agent-mesh binary not found; build target/debug first")
+
+
+def _wait_for_hub_url(proc: subprocess.Popen, timeout_s: float = 15.0) -> str:
+    url_queue: queue.Queue = queue.Queue()
+
+    def _reader():
+        try:
+            for line in proc.stdout:
+                if "running at " in line:
+                    url_queue.put(line.split("running at ", 1)[1].strip())
+                    break
+            for _ in proc.stdout:
+                pass
+        except Exception:
+            pass
+        finally:
+            url_queue.put(None)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    try:
+        hub_url = url_queue.get(timeout=timeout_s)
+    except queue.Empty as exc:
+        raise TimeoutError(f"Rust Hub failed to report its bound address within {timeout_s}s") from exc
+    if not hub_url:
+        raise RuntimeError("Rust Hub exited before reporting its bound address")
+    return hub_url
+
+
 # =========================================================================
 # TEST 1: Python CLI One-Shot Execution Against Unattached Rust Hub
 # =========================================================================
 async def test_unattached_hub_rejections():
     logger.info("=== Running Test 1: Python CLI Against Unattached Rust Hub ===")
-    
-    bin_name = "agent-mesh.exe" if sys.platform == "win32" else "agent-mesh"
-    bin_path = os.path.join(PROJECT_ROOT, "target", "debug", bin_name)
-    if not os.path.exists(bin_path):
-        raise FileNotFoundError(f"agent-mesh binary not found at {bin_path}")
 
-    port = 24199
-    hub_url = f"ws://127.0.0.1:{port}/ws"
-    health_url = f"http://127.0.0.1:{port}/api/health"
+    bin_path = _find_binary()
 
-    logger.info(f"Starting unattached Rust Hub on port {port}...")
+    logger.info("Starting unattached Rust Hub on an ephemeral port...")
     proc = subprocess.Popen(
-        [bin_path, "hub", "--listen", f"127.0.0.1:{port}"],
+        [bin_path, "hub", "--listen", "127.0.0.1:0"],
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
     )
 
     try:
+        hub_url = _wait_for_hub_url(proc, timeout_s=15.0)
+        http_base = "http://" + hub_url.split("://", 1)[1].rsplit("/ws", 1)[0]
+        health_url = f"{http_base}/api/health"
+
         # Wait for hub to be ready
         ready = False
         for _ in range(30):
@@ -188,7 +223,6 @@ async def test_unattached_hub_rejections():
 async def test_intermediate_ack_handling():
     logger.info("=== Running Test 2: Intermediate target_forwarded ACK Non-Preemption ===")
 
-    server_port = 24201
     received_requests = []
 
     async def mock_hub_handler(ws):
@@ -249,7 +283,8 @@ async def test_intermediate_ack_handling():
         }
         await ws.send(json.dumps(final_resp))
 
-    server = await websockets.serve(mock_hub_handler, "127.0.0.1", server_port)
+    server = await websockets.serve(mock_hub_handler, "127.0.0.1", 0)
+    server_port = server.sockets[0].getsockname()[1]
 
     node = OxideAgentNode(
         hub_url=f"ws://127.0.0.1:{server_port}/ws",
@@ -283,8 +318,6 @@ async def test_intermediate_ack_handling():
 async def test_command_timeout_and_leak_prevention():
     logger.info("=== Running Test 3: Command Timeout & Leak Prevention ===")
 
-    server_port = 24202
-
     async def mock_hub_blackhole(ws):
         reg_raw = await ws.recv()
         reg = json.loads(reg_raw)
@@ -302,11 +335,12 @@ async def test_command_timeout_and_leak_prevention():
                 }
             )
         )
-        # Black hole: receive command, never reply
+        # Black hole: receive command, never reply until client disconnects
         _ = await ws.recv()
-        await asyncio.sleep(10.0)
+        await ws.wait_closed()
 
-    server = await websockets.serve(mock_hub_blackhole, "127.0.0.1", server_port)
+    server = await websockets.serve(mock_hub_blackhole, "127.0.0.1", 0)
+    server_port = server.sockets[0].getsockname()[1]
 
     node = OxideAgentNode(
         hub_url=f"ws://127.0.0.1:{server_port}/ws",
@@ -340,8 +374,6 @@ async def test_command_timeout_and_leak_prevention():
 async def test_abrupt_socket_disconnection():
     logger.info("=== Running Test 4: Abrupt Socket Disconnect Mid-Command ===")
 
-    server_port = 24203
-
     async def mock_hub_disconnect(ws):
         reg_raw = await ws.recv()
         reg = json.loads(reg_raw)
@@ -363,7 +395,8 @@ async def test_abrupt_socket_disconnection():
         # Abrupt close mid-execution!
         await ws.close(code=1001, reason="Simulated abrupt hub shutdown")
 
-    server = await websockets.serve(mock_hub_disconnect, "127.0.0.1", server_port)
+    server = await websockets.serve(mock_hub_disconnect, "127.0.0.1", 0)
+    server_port = server.sockets[0].getsockname()[1]
 
     node = OxideAgentNode(
         hub_url=f"ws://127.0.0.1:{server_port}/ws",
@@ -375,10 +408,13 @@ async def test_abrupt_socket_disconnection():
 
     try:
         # Node sends command; connection will be dropped mid-flight
+        caught = None
         try:
             await node.submit_grid_compute("matrix_multiply", matrix_dim=64, timeout_s=2.0)
-        except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError) as e:
+        except (websockets.exceptions.ConnectionClosed, ConnectionError) as e:
+            caught = e
             logger.info(f"✓ Caught expected exception on socket drop: {type(e).__name__}")
+        assert caught is not None, "Expected ConnectionClosed or ConnectionError on socket drop"
 
         # The listen task should exit cleanly on connection close without unhandled panic
         await asyncio.sleep(0.2)
@@ -397,8 +433,6 @@ async def test_abrupt_socket_disconnection():
 # =========================================================================
 async def test_corrupt_message_resilience():
     logger.info("=== Running Test 5: Corrupt & Chaotic Message Injection ===")
-
-    server_port = 24204
 
     async def mock_hub_chaos(ws):
         reg_raw = await ws.recv()
@@ -422,7 +456,7 @@ async def test_corrupt_message_resilience():
         await ws.send("NON_JSON_CORRUPT_STRING")
         await ws.send(json.dumps({"unknown_field": 123}))
         await ws.send(json.dumps({"type": "UnknownType", "id": "123"}))
-        await ws.send(json.dumps({"type": "CommandRequest"})) # missing fields
+        await ws.send(json.dumps({"type": "CommandRequest"}))  # missing fields
 
         # Followed by a valid heartbeat / ping
         await asyncio.sleep(0.2)
@@ -437,9 +471,10 @@ async def test_corrupt_message_resilience():
                 }
             )
         )
-        await asyncio.sleep(5.0)
+        await ws.wait_closed()
 
-    server = await websockets.serve(mock_hub_chaos, "127.0.0.1", server_port)
+    server = await websockets.serve(mock_hub_chaos, "127.0.0.1", 0)
+    server_port = server.sockets[0].getsockname()[1]
 
     node = OxideAgentNode(
         hub_url=f"ws://127.0.0.1:{server_port}/ws",
@@ -461,7 +496,7 @@ async def test_corrupt_message_resilience():
         await server.wait_closed()
 
 
-async def main():
+async def run_m5_ecosystem_stress_tests() -> bool:
     logger.info("==================================================================")
     logger.info("  STARTING M5 ECOSYSTEM CONVERGENCE ADVERSARIAL CHALLENGER SUITE  ")
     logger.info("==================================================================")
@@ -475,6 +510,11 @@ async def main():
     logger.info("==================================================================")
     logger.info("  ALL M5 ADVERSARIAL CHALLENGE SUITES PASSED EMPIRICALLY (100%)   ")
     logger.info("==================================================================")
+    return True
+
+
+async def main():
+    await run_m5_ecosystem_stress_tests()
 
 
 if __name__ == "__main__":

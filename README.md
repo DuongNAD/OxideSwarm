@@ -599,8 +599,8 @@ cargo test -p agent_mesh
 python3 tests/test_agent_mesh_token_auth.py
 python3 tests/test_agent_mesh_rust_hub_cross_interop.py
 
-# Protocol simulation against a PYTHON reference hub (tests/run_all_mesh_tests.py does NOT start the Rust hub)
-python3 tests/run_all_mesh_tests.py
+# Protocol simulation against a PYTHON reference hub (tests/run_mesh_simulation_tests.py does NOT start the Rust hub)
+python3 tests/run_mesh_simulation_tests.py
 
 # Launcher / installer scripts (switch_role.sh, connect_remote.sh, Termux supervisor, macOS installer dry-run,
 # line endings, no hard-coded owner values): runs them against fake binaries in a private HOME; no build needed

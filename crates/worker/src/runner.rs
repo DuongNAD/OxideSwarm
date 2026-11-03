@@ -1384,8 +1384,7 @@ impl TaskRunner {
         if task.staged_files.is_empty() {
             return Ok(());
         }
-        let cache_base = self.config.sandbox_config.base_dir.join("cache");
-        sandbox.stage_files(&task.staged_files, &cache_base).await
+        sandbox.stage_files(&task.staged_files).await
     }
 
     /// Places the task's blob inputs (`Task::inputs`) into the sandbox from the blob cache. The

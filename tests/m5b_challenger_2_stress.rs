@@ -1,8 +1,8 @@
 //! Adversarial Stress Test Suite for Milestone M5B (Challenger 2).
 //!
 //! Stress-tests:
-//! 1. Worker content-hash deduplication, cache object directory layout, hardlinks, and distinct content isolation.
-//! 2. Concurrent cache staging under race conditions.
+//! 1. Independent per-sandbox staged file placement (`nlink == 1`) and distinct content isolation.
+//! 2. Concurrent multi-sandbox file staging under race conditions.
 //! 3. Symlink escape defense, canonicalization checks, and path traversal rejection in `harvest_output_artifacts`.
 //! 4. Multi-codec wire serialization across JSON (0x01), Bincode (0x02), and AEAD (0x04) with tamper detection.
 //! 5. Master Queue LRU retention accounting for staged files, expected outputs, and artifacts, enforcing budget eviction.
@@ -49,15 +49,13 @@ fn make_test_runner() -> (TaskRunner, tempfile::TempDir) {
 }
 
 // ============================================================================
-// 1. Cache Deduplication, Hardlink Acceleration & Content Isolation
+// 1. Independent Per-Sandbox Staged File Placement & Content Isolation
 // ============================================================================
 
 #[tokio::test]
-async fn test_cache_deduplication_and_hardlink_acceleration() {
-    let temp_dir = tempfile::tempdir().expect("create temp dir for cache test");
+async fn test_independent_sandbox_staging_and_content_isolation() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir for staging test");
     let base_dir = temp_dir.path();
-    let cache_dir = base_dir.join("cache");
-    let objects_dir = cache_dir.join("objects");
 
     let sb_cfg = SandboxConfig::new(base_dir);
 
@@ -72,13 +70,13 @@ async fn test_cache_deduplication_and_hardlink_acceleration() {
         false,
     );
 
-    // --- Task 1: First staging creates cache object ---
+    // --- Task 1: First staging writes independent sandbox file ---
     let task_id_1 = TaskId::new();
     let sandbox_1 = Sandbox::create(&sb_cfg, task_id_1)
         .await
         .expect("create sandbox 1");
     sandbox_1
-        .stage_files(std::slice::from_ref(&staged_a), &cache_dir)
+        .stage_files(std::slice::from_ref(&staged_a))
         .await
         .expect("stage files task 1");
 
@@ -95,7 +93,7 @@ async fn test_cache_deduplication_and_hardlink_acceleration() {
         .await
         .expect("create sandbox 2");
     sandbox_2
-        .stage_files(std::slice::from_ref(&staged_a), &cache_dir)
+        .stage_files(std::slice::from_ref(&staged_a))
         .await
         .expect("stage files task 2");
 
@@ -116,7 +114,7 @@ async fn test_cache_deduplication_and_hardlink_acceleration() {
         assert_eq!(std::fs::metadata(&staged_file_2).unwrap().nlink(), 1);
     }
     assert!(
-        !objects_dir.exists(),
+        !base_dir.join("cache").join("objects").exists(),
         "Inline stage_files must not create shared cache/objects"
     );
 
@@ -140,7 +138,7 @@ async fn test_cache_deduplication_and_hardlink_acceleration() {
         .await
         .expect("create sandbox 3");
     sandbox_3
-        .stage_files(&[staged_b], &cache_dir)
+        .stage_files(&[staged_b])
         .await
         .expect("stage files task 3");
 
@@ -150,10 +148,9 @@ async fn test_cache_deduplication_and_hardlink_acceleration() {
 }
 
 #[tokio::test]
-async fn test_concurrent_cache_staging_race_conditions() {
-    let temp_dir = tempfile::tempdir().expect("create temp dir for concurrent cache");
+async fn test_concurrent_sandbox_staging_isolation() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir for concurrent staging");
     let base_dir = Arc::new(temp_dir.path().to_path_buf());
-    let cache_dir = base_dir.join("cache");
 
     let content = b"CONCURRENT_CONTENT_SHARED_ACROSS_WORKERS_1234567890";
     let staged = StagedFile::new("shared.dat", Bytes::copy_from_slice(content), false);
@@ -162,7 +159,6 @@ async fn test_concurrent_cache_staging_race_conditions() {
     let mut handles = Vec::new();
     for i in 0..10 {
         let base = Arc::clone(&base_dir);
-        let c_dir = cache_dir.clone();
         let file = staged.clone();
         let handle = tokio::spawn(async move {
             let sb_cfg = SandboxConfig::new(&*base);
@@ -170,10 +166,7 @@ async fn test_concurrent_cache_staging_race_conditions() {
             let sandbox = Sandbox::create(&sb_cfg, task_id)
                 .await
                 .expect("create sandbox");
-            sandbox
-                .stage_files(&[file], &c_dir)
-                .await
-                .expect("stage file");
+            sandbox.stage_files(&[file]).await.expect("stage file");
 
             let target = sandbox.path().join("shared.dat");
             let read_back = tokio::fs::read(&target).await.expect("read back file");
@@ -193,7 +186,7 @@ async fn test_concurrent_cache_staging_race_conditions() {
         assert!(i < 10);
     }
 
-    assert!(!cache_dir.join("objects").exists());
+    assert!(!base_dir.join("cache").join("objects").exists());
 }
 
 // ============================================================================

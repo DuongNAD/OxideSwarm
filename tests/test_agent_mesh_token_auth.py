@@ -47,15 +47,26 @@ TOKEN = "py-mesh-token-0123456789abcdef"
 
 
 def find_binary() -> str:
+    target_dir = os.environ.get("CARGO_TARGET_DIR") or os.path.join(PROJECT_ROOT, "target")
     for name in ("agent-mesh", "agent-mesh.exe"):
-        path = os.path.join(PROJECT_ROOT, "target", "debug", name)
+        path = os.path.join(target_dir, "debug", name)
         if os.path.exists(path):
             return path
     raise FileNotFoundError("agent-mesh binary not found; run `cargo build -p agent_mesh` first")
 
 
+def _drain_stream(stream):
+    try:
+        for _ in stream:
+            pass
+    except Exception:
+        pass
+
+
 def start_hub(token=TOKEN):
     """Starts the Rust hub on an ephemeral loopback port; returns (process, ws_url, http_base)."""
+    import threading
+
     env = {k: v for k, v in os.environ.items() if k != "OXIDE_MESH_TOKEN"}
     proc = subprocess.Popen(
         [find_binary(), "hub", "--listen", "127.0.0.1:0", "--token", token],
@@ -72,6 +83,7 @@ def start_hub(token=TOKEN):
         if "running at " in line:
             ws_url = line.split("running at ", 1)[1].strip()
             http_base = "http://" + ws_url.split("://", 1)[1].rsplit("/ws", 1)[0]
+            threading.Thread(target=_drain_stream, args=(proc.stdout,), daemon=True).start()
             return proc, ws_url, http_base
     proc.kill()
     raise RuntimeError("hub did not report its address")
@@ -217,7 +229,7 @@ def test_cli_token_flag_and_environment(url):
     print("PASS --token and OXIDE_MESH_TOKEN are honoured by agent_node.py")
 
 
-async def main():
+async def run_token_auth_tests() -> bool:
     proc, url, http = start_hub()
     try:
         await test_missing_and_wrong_token_are_rejected(url, http)
@@ -227,12 +239,17 @@ async def main():
         await test_rest_needs_token(http)
         await asyncio.get_running_loop().run_in_executor(None, test_cli_token_flag_and_environment, url)
         print("ALL TOKEN AUTH TESTS PASSED")
+        return True
     finally:
         proc.terminate()
         try:
             proc.wait(timeout=3.0)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+async def main():
+    await run_token_auth_tests()
 
 
 if __name__ == "__main__":

@@ -79,7 +79,7 @@ Results on an Apple Silicon Mac with Rust 1.96.0, at `3a1c120`, with a temporary
 | `./test_integration.sh` | Pass |
 | `./run_chaos_test.sh` | Pass |
 | `python3 tests/test_launcher_scripts.py` | Pass |
-| `python3 tests/run_all_mesh_tests.py` | Pass, but it tests a Python reference hub only |
+| `python3 tests/run_mesh_simulation_tests.py` | Pass, but it tests a Python reference hub only |
 | `cargo test --workspace --no-fail-fast` | 1392 passed, 19 failed in 9 test targets |
 | The same, with a dummy `cluster.secret` in `HOME` | Six more tests fail (TEST-4) |
 
