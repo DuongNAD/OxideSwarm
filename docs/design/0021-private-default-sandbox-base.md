@@ -98,7 +98,7 @@ and `ensure_private_root_blocking` serves callers without a runtime, such as the
     have waited for a slot in between.
   - `Sandbox::create` runs it before it creates the task sandbox.
 
-  A refused task fails with `BaseDirUnsafe` and runs nowhere. Each check costs two `mkdir` and two
+  A refused task fails with `BaseDirUnsafe` and runs nowhere. Each check costs two `mkdir` and three
   `stat` calls.
 
 The check applies only while the base lies inside the private root. Code that sets
@@ -171,9 +171,14 @@ Unit tests in `crates/worker/src/sandbox.rs`, all Unix-only except the first and
 - `client::tests::test_assign_refuses_a_task_before_touching_a_replaced_sandbox_root`: a task whose
   private root was replaced by a link is refused with `BaseDirUnsafe`. A leftover sandbox of that
   task behind the link is not reclaimed.
+- `tests::test_bridge_check_creates_the_default_private_root_with_mode_700` in
+  `crates/android_bridge/src/lib.rs`: the bridge's fallback creates the root with mode 700, and the
+  worker accepts it. This test catches a missing call only under a umask that leaves group or other
+  bits, such as the usual 022.
 
-Each refusal and each call of the check is covered by a mutation: disabling it fails at least one of
-these tests.
+Disabling any refusal fails at least one of these tests. Disabling any call of the check fails one too,
+with one exception: the second check in `handle_assign_task`'s task, before the input fetch, has no
+test. A test for it would have to replace the root while the task waits for a slot.
 
 ## Work items
 

@@ -239,6 +239,13 @@ impl SandboxConfig {
         }
     }
 
+    /// The default configuration as if `TMPDIR` named `temp_dir`: base
+    /// `<temp_dir>/rusty_grid-<euid>/sandboxes` on Unix, with its private root (design 0021). For
+    /// callers and tests that choose the temp dir themselves.
+    pub fn default_under(temp_dir: impl Into<PathBuf>) -> Self {
+        Self::from_env(|_| None, temp_dir.into())
+    }
+
     /// The default configuration for an environment lookup and a platform temp dir (see
     /// [`resolve_default_base_dir`]); parameters so tests need not touch the process environment.
     pub(crate) fn from_env(env: impl Fn(&str) -> Option<String>, platform_temp: PathBuf) -> Self {
@@ -584,7 +591,7 @@ fn root_refusal(meta: &std::fs::Metadata, euid: u32) -> Option<String> {
     let mode = meta.permissions().mode() & 0o7777;
     if mode & 0o077 != 0 {
         return Some(format!(
-            "its mode is {mode:o}, so other users can enter it (it must be 700)"
+            "its mode is {mode:o}: other users can enter it (it must be 700)"
         ));
     }
     None

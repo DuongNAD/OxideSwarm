@@ -963,6 +963,30 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
 mod tests {
     use super::*;
 
+    /// Design 0021: when the app names no sandbox directory, the bridge's check creates the
+    /// default private root with mode 700 itself, so the worker's own check accepts it. Without
+    /// `ensure_private_root_blocking`, `create_dir_all` would leave the umask mode (755 under the
+    /// usual 022) and the worker would refuse the root for good.
+    #[cfg(unix)]
+    #[test]
+    fn test_bridge_check_creates_the_default_private_root_with_mode_700() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxConfig::default_under(temp.path());
+        check_sandbox_usable(&sandbox).expect("the bridge check passes");
+        let root = sandbox.base_dir.parent().unwrap();
+        let mode = std::fs::symlink_metadata(root)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o700, "root {} has mode {mode:o}", root.display());
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(sandbox.ensure_usable())
+            .expect("the worker's own check accepts what the bridge created");
+    }
+
     static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn reset_test_state() {
