@@ -225,6 +225,10 @@ impl SandboxConfig {
     /// and writes (then removes) a probe file in it. Call it when the worker starts, so a base
     /// directory the process may not write to (on Android the default `/data/local/tmp` is closed
     /// to apps) is one clear error instead of a failure of every process task.
+    ///
+    /// Also removes legacy `<base_dir>/cache/objects` and `<base_dir>/cache/tmp` directories left
+    /// behind by older worker builds, logging a warning if removal fails and leaving
+    /// `<base_dir>/cache/blobs` untouched.
     pub async fn ensure_usable(&self) -> Result<(), SandboxError> {
         let unusable = |source: std::io::Error| SandboxError::BaseDirUnusable {
             path: self.base_dir.clone(),
@@ -240,7 +244,46 @@ impl SandboxConfig {
         ));
         tokio::fs::write(&probe, b"probe").await.map_err(unusable)?;
         let _ = tokio::fs::remove_file(&probe).await;
+        self.remove_legacy_staging_cache().await;
         Ok(())
+    }
+
+    /// Removes legacy `<base_dir>/cache/objects` and `<base_dir>/cache/tmp` directories left
+    /// behind by older worker builds. Logs a warning on failure and leaves `cache/blobs` alone.
+    pub async fn remove_legacy_staging_cache(&self) {
+        let cache_dir = self.base_dir.join("cache");
+        for name in ["objects", "tmp"] {
+            let path = cache_dir.join(name);
+            match tokio::fs::symlink_metadata(&path).await {
+                Ok(meta) => {
+                    let res = if meta.is_dir() {
+                        tokio::fs::remove_dir_all(&path).await
+                    } else {
+                        tokio::fs::remove_file(&path).await
+                    };
+                    if let Err(e) = res {
+                        warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "Failed to remove legacy staging cache directory"
+                        );
+                    } else {
+                        debug!(
+                            path = %path.display(),
+                            "Removed legacy staging cache directory"
+                        );
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to inspect legacy staging cache directory"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -415,11 +458,7 @@ impl Sandbox {
     ///
     /// Each sandbox receives its own independent file (`nlink == 1`) written from `staged.data`
     /// so in-place edits or permission changes by a task never affect subsequent tasks.
-    pub async fn stage_files(
-        &self,
-        staged_files: &[StagedFile],
-        _cache_base_dir: &Path,
-    ) -> Result<(), SandboxError> {
+    pub async fn stage_files(&self, staged_files: &[StagedFile]) -> Result<(), SandboxError> {
         let mut total_bytes: u64 = 0;
         for staged in staged_files {
             if staged.size > MAX_STAGED_FILE_BYTES as u64 {
@@ -765,12 +804,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ensure_usable_removes_legacy_cache_dirs_and_leaves_cache_blobs_alone() {
+        let root = std::env::temp_dir().join(format!("test_sb_legacy_cache_{}", TaskId::new()));
+        let cache_dir = root.join("cache");
+        let objects_dir = cache_dir.join("objects");
+        let tmp_dir = cache_dir.join("tmp");
+        let blobs_dir = cache_dir.join("blobs").join("ab");
+
+        std::fs::create_dir_all(&objects_dir).unwrap();
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+
+        std::fs::write(objects_dir.join("deadbeef"), b"old_object").unwrap();
+        std::fs::write(tmp_dir.join("partial.tmp"), b"old_tmp").unwrap();
+        let blob_file = blobs_dir.join("cd1234");
+        std::fs::write(&blob_file, b"keep_blob").unwrap();
+
+        let config = SandboxConfig::new(&root);
+        config
+            .ensure_usable()
+            .await
+            .expect("ensure_usable succeeds and cleans legacy cache dirs");
+
+        assert!(
+            !objects_dir.exists(),
+            "cache/objects must be removed at worker start"
+        );
+        assert!(
+            !tmp_dir.exists(),
+            "cache/tmp must be removed at worker start"
+        );
+        assert!(
+            blob_file.is_file(),
+            "cache/blobs must be left untouched at worker start"
+        );
+        assert_eq!(std::fs::read(&blob_file).unwrap(), b"keep_blob");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn test_staged_file_in_place_mutation_does_not_corrupt_subsequent_tasks() {
         use rusty_grid_core::task::Bytes;
         use tokio::io::AsyncWriteExt;
 
         let temp_dir = std::env::temp_dir().join(format!("test_sb_bug1_{}", TaskId::new()));
-        let cache_dir = temp_dir.join("cache");
         let config = SandboxConfig::new(&temp_dir);
 
         let original = b"original\n";
@@ -778,7 +856,7 @@ mod tests {
 
         // Task 1 stages and reads the file
         let mut sb1 = Sandbox::create(&config, TaskId::new()).await.unwrap();
-        sb1.stage_files(std::slice::from_ref(&staged), &cache_dir)
+        sb1.stage_files(std::slice::from_ref(&staged))
             .await
             .unwrap();
         let file1 = sb1.path().join("input.txt");
@@ -791,7 +869,7 @@ mod tests {
 
         // Task 2 stages the same file and appends in place
         let mut sb2 = Sandbox::create(&config, TaskId::new()).await.unwrap();
-        sb2.stage_files(std::slice::from_ref(&staged), &cache_dir)
+        sb2.stage_files(std::slice::from_ref(&staged))
             .await
             .unwrap();
         let file2 = sb2.path().join("input.txt");
@@ -815,7 +893,7 @@ mod tests {
 
         // Task 3 stages the same file and must still read the original bytes with nlink == 1
         let mut sb3 = Sandbox::create(&config, TaskId::new()).await.unwrap();
-        sb3.stage_files(std::slice::from_ref(&staged), &cache_dir)
+        sb3.stage_files(std::slice::from_ref(&staged))
             .await
             .unwrap();
         let file3 = sb3.path().join("input.txt");
@@ -825,10 +903,6 @@ mod tests {
             use std::os::unix::fs::MetadataExt;
             assert_eq!(std::fs::metadata(&file3).unwrap().nlink(), 1);
         }
-        assert!(
-            !cache_dir.join("objects").exists(),
-            "inline stage_files must not populate cache/objects"
-        );
 
         sb1.destroy().await.unwrap();
         sb2.destroy().await.unwrap();
