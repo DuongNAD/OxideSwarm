@@ -602,7 +602,7 @@ pub(crate) fn task_active_bytes(task: &Task) -> usize {
             s.prompt.as_ref().map_or(0, String::len)
                 + s.image_data.as_ref().map_or(0, |b| b.len())
                 + s.quality.len()
-                + s.engine_preference.as_ref().map_or(0, String::len)
+                + s.engine_preference.as_ref().map_or(0, |e| e.as_str().len())
         }
         TaskSpec::AutoRig(s) => {
             s.input_mesh.len()

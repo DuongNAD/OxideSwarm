@@ -92,6 +92,7 @@ Documentation index and writing standard: [docs/README.md](docs/README.md). A ma
 | **19. Mobile coordination & battery governance** | Multi-tier throttling $C_{\text{eff}} = \min(C_{\text{bat}}, C_{\text{therm}})$, RRC adaptive keepalive (10s/25s/60s), 5-rule refusal matrix, authenticated candidate score election $S_{\text{auth}}$, cryptographic lease tickets, and pre-sleep evacuation. Design: [docs/design/0002-mobile-coordination.md](docs/design/0002-mobile-coordination.md). | Implemented + tests |
 | **20. Task input and output files** | `submit --input LOCAL[:SANDBOX]` sends files and whole directories, `--output PATTERN` (`*`, `?`, `**`) brings files back into `--output-dir`. Files move as BLAKE3-named blobs through a bounded store on the master (`~/.oxideswarm/blobs`, `master --blob-dir` / `--blob-store-mb`) in 4 MiB chunks: a client uploads only the blobs the master lacks, a worker fetches only the blobs its cache lacks (`worker --blob-cache-mb`), so an unchanged file is not sent twice. Outputs are capped per task (`worker --output-limit-mb`); `RustCompilation` returns the library or binary it built. Design: [docs/design/0006-content-addressed-data-plane.md](docs/design/0006-content-addressed-data-plane.md). The older inline staging (at most 32 MiB, used by the MCP server) is [design 0003](docs/design/0003-distributed-file-staging.md). Task output validation and mandatory harvesting failure semantics are documented in [docs/design/0013-task-output-validation-and-harvesting.md](docs/design/0013-task-output-validation-and-harvesting.md). | Implemented + tests |
 | **21. Model Context Protocol (MCP) server** | Standard JSON-RPC 2.0 stdio MCP server (`oxideswarm mcp`) exposing 5 core cluster tools (`oxideswarm_status`, `oxideswarm_workers`, `oxideswarm_submit`, `oxideswarm_task_status`, `oxideswarm_cancel`) to LLM coding agents with strict stdout hygiene. Design: [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md). | Implemented + tests |
+| **22. 3D generative engine names & CPU fallback** | 3D generation tasks (`submit --prompt <PROMPT>`) default to CPU-capable procedural SDF generation and succeed on CPU-only worker nodes without requiring a GPU or `--gpu`. The `--engine` flag strictly enforces supported engines (`sdf`, `triposr`, `auto`), refusing unknown engine names with an informative error rather than silently falling back to `auto`. Design: [docs/design/0015-engine-names-and-cpu-fallback.md](docs/design/0015-engine-names-and-cpu-fallback.md). | Implemented + tests |
 
 ---
 
@@ -109,6 +110,7 @@ Documentation index and writing standard: [docs/README.md](docs/README.md). A ma
 | **8** | Mid-task checkpointing | Done | See feature 14. |
 | **9** | OS child process containment | Hardened | Spawned task child processes are atomically bound to OS-level containment handles: Windows Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` with `CREATE_SUSPENDED`) and Linux `PR_SET_PDEATHSIG(SIGKILL)` guarantee child tree cleanup on worker termination. |
 | **10** | Protocol version & capability negotiation | Completed | Formal `PROTOCOL_VERSION` and `ProtocolCapabilities` handshake exchange prevents frame drops and enables graceful capability mismatch handling across master, worker, and CLI. |
+| **11** | 3D generative engine names and CPU fallback | Completed | Default 3D generation executes on CPU worker nodes via procedural SDF without GPU hardware. Strict validation refuses unknown engine names across CLI, core builder, Agent Mesh bridge, and wire codecs (JSON and bincode). Documented in [docs/design/0015-engine-names-and-cpu-fallback.md](docs/design/0015-engine-names-and-cpu-fallback.md). |
 
 ---
 
@@ -299,6 +301,10 @@ or `~/.oxideswarm/cluster.secret`.
 
 # GPU task of a chosen size (default 64; up to 8192 on a real GPU, 2048 on the simulated one)
 ./target/release/oxideswarm submit --type gpu --matrix-dim 2048 --wait
+
+# 3D mesh generation: default runs on CPU via procedural SDF and writes a glTF 2.0 binary asset
+./target/release/oxideswarm submit --prompt "a solid cube" -o cube.glb --wait
+./target/release/oxideswarm submit --prompt "robot" --engine sdf -o robot.glb --wait
 
 # Inspect the grid
 ./target/release/oxideswarm workers --master 127.0.0.1:8088
