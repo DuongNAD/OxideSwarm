@@ -274,12 +274,12 @@ The Agent Mesh hub in this guide uses its own JSON envelopes and is unaffected.
 ## 4. Testing & Verification
 
 ### 4.1 Protocol Simulation (Python reference hub, NOT the Rust hub)
-`tests/run_all_mesh_tests.py` runs the mesh protocol against a **Python re-implementation of the hub**
+`tests/run_mesh_simulation_tests.py` runs the mesh protocol against a **Python re-implementation of the hub**
 (`OxideRelayHub` inside `tests/test_agent_mesh_simulation.py`) with simulated nodes. It documents and checks the
 protocol; it never starts the Rust `agent-mesh` binary, so a pass says nothing about the Rust hub.
 ```bash
 python3 -c "import websockets; print('Websockets OK')"
-python3 tests/run_all_mesh_tests.py
+python3 tests/run_mesh_simulation_tests.py
 ```
 It executes an automated 8-phase scenario:
 1. Starts the Python reference hub on loopback.

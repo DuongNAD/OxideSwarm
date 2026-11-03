@@ -111,7 +111,7 @@ jobs:
       - run: pip install websockets
       - run: python tests/test_agent_bridge.py
       - name: run agent mesh test suite
-        run: python tests/run_all_mesh_tests.py
+        run: python tests/run_mesh_simulation_tests.py
 
   audit:
     name: cargo audit

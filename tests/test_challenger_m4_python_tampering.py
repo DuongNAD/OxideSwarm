@@ -368,13 +368,18 @@ async def test_high_concurrency_burst():
         await hub.stop()
 
 
-def main():
+async def run_python_tampering_tests() -> bool:
     test_sha256_single_bit_flip_tampering()
     test_deeply_nested_output_path()
-    asyncio.run(test_high_concurrency_burst())
+    await test_high_concurrency_burst()
     logger.info("==================================================================")
     logger.info("  ALL PYTHON ADVERSARIAL CHALLENGER TESTS PASSED (100% SUCCESS)  ")
     logger.info("==================================================================")
+    return True
+
+
+def main():
+    asyncio.run(run_python_tampering_tests())
 
 
 if __name__ == "__main__":
