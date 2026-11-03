@@ -1533,38 +1533,64 @@ fn probe_blender_with_timeout<P: AsRef<std::ffi::OsStr>>(
     }
 }
 
-/// Discovers Blender executable and queries its version.
-pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
-    // 1. Check explicit path
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlenderResolution {
+    /// An explicit argument or environment variable override was set to a non-empty path that
+    /// does not point to an existing regular file. Do not fall through to host installations.
+    InvalidOverride,
+    /// Found a concrete Blender executable file on disk, along with its fallback version label.
+    File {
+        path: std::path::PathBuf,
+        fallback_label: String,
+    },
+    /// No override was set and no standard OS installation path matched; try `blender` on `PATH`.
+    NotFoundInStandardPaths,
+}
+
+fn resolve_blender_candidate(explicit_path: Option<&str>) -> BlenderResolution {
+    resolve_blender_candidate_with_env(explicit_path, |key| std::env::var(key).ok())
+}
+
+fn resolve_blender_candidate_with_env<F>(
+    explicit_path: Option<&str>,
+    env_lookup: F,
+) -> BlenderResolution
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // 1. Check explicit path override. If non-empty and missing, do not fall through.
     if let Some(path_str) = explicit_path {
-        let p = std::path::Path::new(path_str);
-        if p.is_file() {
-            return match probe_blender_with_timeout(p, HOST_PROBE_TIMEOUT) {
-                BlenderProbeResult::Version(ver) => (true, Some(ver)),
-                BlenderProbeResult::TimedOut => (false, None),
-                BlenderProbeResult::SucceededWithoutVersion | BlenderProbeResult::Failed => {
-                    (true, Some("Blender (Custom Path)".to_string()))
-                }
-            };
+        let trimmed = path_str.trim();
+        if !trimmed.is_empty() {
+            let p = std::path::PathBuf::from(trimmed);
+            if p.is_file() {
+                return BlenderResolution::File {
+                    path: p,
+                    fallback_label: "Blender (Custom Path)".to_string(),
+                };
+            }
+            return BlenderResolution::InvalidOverride;
         }
     }
 
-    // 2. Check environment variables
+    // 2. Check environment variable overrides in precedence order.
+    // The first non-empty variable is authoritative; if it points at no file, do not fall through.
     for env_var in &[
         "RUSTY_GRID_BLENDER_PATH",
         "OXIDE_SWARM_BLENDER_PATH",
         "BLENDER_PATH",
     ] {
-        if let Ok(env_path) = std::env::var(env_var) {
-            let p = std::path::Path::new(env_path.trim());
-            if p.is_file() {
-                return match probe_blender_with_timeout(p, HOST_PROBE_TIMEOUT) {
-                    BlenderProbeResult::Version(ver) => (true, Some(ver)),
-                    BlenderProbeResult::TimedOut => (false, None),
-                    BlenderProbeResult::SucceededWithoutVersion | BlenderProbeResult::Failed => {
-                        (true, Some("Blender (Env Path)".to_string()))
-                    }
-                };
+        if let Some(env_path) = env_lookup(env_var) {
+            let trimmed = env_path.trim();
+            if !trimmed.is_empty() {
+                let p = std::path::PathBuf::from(trimmed);
+                if p.is_file() {
+                    return BlenderResolution::File {
+                        path: p,
+                        fallback_label: "Blender (Env Path)".to_string(),
+                    };
+                }
+                return BlenderResolution::InvalidOverride;
             }
         }
     }
@@ -1596,7 +1622,13 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
                     let mut version_dirs: Vec<std::path::PathBuf> = entries
                         .flatten()
                         .map(|e| e.path())
-                        .filter(|p| p.is_dir())
+                        .filter(|p| {
+                            p.is_dir()
+                                && p.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .starts_with("Blender")
+                        })
                         .collect();
 
                     // Sort descending so newer versions (e.g. 4.5) precede older versions (e.g. 4.2)
@@ -1605,16 +1637,13 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
                     for dir in version_dirs {
                         let candidate = dir.join("blender.exe");
                         if candidate.is_file() {
-                            return match probe_blender_with_timeout(&candidate, HOST_PROBE_TIMEOUT)
-                            {
-                                BlenderProbeResult::Version(ver) => (true, Some(ver)),
-                                BlenderProbeResult::TimedOut => (false, None),
-                                BlenderProbeResult::SucceededWithoutVersion
-                                | BlenderProbeResult::Failed => {
-                                    let dir_name =
-                                        dir.file_name().map(|n| n.to_string_lossy().to_string());
-                                    (true, dir_name)
-                                }
+                            let dir_name = dir
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "Blender".to_string());
+                            return BlenderResolution::File {
+                                path: candidate,
+                                fallback_label: dir_name,
                             };
                         }
                     }
@@ -1627,12 +1656,9 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
             r"C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe",
         );
         if steam_blender.is_file() {
-            return match probe_blender_with_timeout(&steam_blender, HOST_PROBE_TIMEOUT) {
-                BlenderProbeResult::Version(ver) => (true, Some(ver)),
-                BlenderProbeResult::TimedOut => (false, None),
-                BlenderProbeResult::SucceededWithoutVersion | BlenderProbeResult::Failed => {
-                    (true, Some("Blender (Steam)".to_string()))
-                }
+            return BlenderResolution::File {
+                path: steam_blender,
+                fallback_label: "Blender (Steam)".to_string(),
             };
         }
     }
@@ -1643,14 +1669,11 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
             "/Applications/Blender.app/Contents/MacOS/Blender",
             "/Applications/Blender/Blender.app/Contents/MacOS/Blender",
         ] {
-            let p = std::path::Path::new(app_path);
+            let p = std::path::PathBuf::from(app_path);
             if p.is_file() {
-                return match probe_blender_with_timeout(p, HOST_PROBE_TIMEOUT) {
-                    BlenderProbeResult::Version(ver) => (true, Some(ver)),
-                    BlenderProbeResult::TimedOut => (false, None),
-                    BlenderProbeResult::SucceededWithoutVersion | BlenderProbeResult::Failed => {
-                        (true, Some("Blender".to_string()))
-                    }
+                return BlenderResolution::File {
+                    path: p,
+                    fallback_label: "Blender".to_string(),
                 };
             }
         }
@@ -1663,21 +1686,55 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
             "/usr/local/bin/blender",
             "/snap/bin/blender",
         ] {
-            let p = std::path::Path::new(linux_path);
+            let p = std::path::PathBuf::from(linux_path);
             if p.is_file() {
-                return match probe_blender_with_timeout(p, HOST_PROBE_TIMEOUT) {
-                    BlenderProbeResult::Version(ver) => (true, Some(ver)),
-                    BlenderProbeResult::TimedOut => (false, None),
-                    BlenderProbeResult::SucceededWithoutVersion | BlenderProbeResult::Failed => {
-                        (true, Some("Blender".to_string()))
-                    }
+                return BlenderResolution::File {
+                    path: p,
+                    fallback_label: "Blender".to_string(),
                 };
             }
         }
     }
 
-    // 4. PATH lookup fallback (e.g. `blender --version`)
-    probe_blender_binary("blender")
+    BlenderResolution::NotFoundInStandardPaths
+}
+
+/// Resolves the file path to the host Blender executable using the shared resolution order:
+/// explicit path override -> environment variable overrides (`RUSTY_GRID_BLENDER_PATH`,
+/// `OXIDE_SWARM_BLENDER_PATH`, `BLENDER_PATH`) -> OS standard installation paths -> `PATH`.
+///
+/// If a non-empty explicit path or environment variable override is set but does not point to an
+/// existing regular file, returns `None` rather than falling through to host installations.
+pub fn resolve_blender_binary(explicit_path: Option<&str>) -> Option<std::path::PathBuf> {
+    match resolve_blender_candidate(explicit_path) {
+        BlenderResolution::InvalidOverride => None,
+        BlenderResolution::File { path, .. } => Some(path),
+        BlenderResolution::NotFoundInStandardPaths => {
+            if probe_blender_binary("blender").0 {
+                Some(std::path::PathBuf::from("blender"))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Discovers Blender executable and queries its version.
+pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
+    match resolve_blender_candidate(explicit_path) {
+        BlenderResolution::InvalidOverride => (false, None),
+        BlenderResolution::File {
+            path,
+            fallback_label,
+        } => match probe_blender_with_timeout(&path, HOST_PROBE_TIMEOUT) {
+            BlenderProbeResult::Version(ver) => (true, Some(ver)),
+            BlenderProbeResult::TimedOut => (false, None),
+            BlenderProbeResult::SucceededWithoutVersion | BlenderProbeResult::Failed => {
+                (true, Some(fallback_label))
+            }
+        },
+        BlenderResolution::NotFoundInStandardPaths => probe_blender_binary("blender"),
+    }
 }
 
 /// Probes a Blender executable candidate by running `<program> --version` with secrets stripped.
@@ -1807,13 +1864,8 @@ mod tests {
     use super::*;
     use crate::task::TaskRequirements;
 
-    static BLENDER_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn test_capabilities_detect_default() {
-        let _guard = BLENDER_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let caps = WorkerCapabilities::detect(None, None, false);
         assert!(!caps.name.is_empty(), "Worker name should not be empty");
         assert!(caps.cpu_cores >= 1, "CPU cores must be >= 1");
@@ -1888,9 +1940,6 @@ mod tests {
 
     #[test]
     fn test_capabilities_detect_cores_override() {
-        let _guard = BLENDER_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let caps = WorkerCapabilities::detect(Some("worker-test".into()), Some(16), false);
         assert_eq!(caps.name, "worker-test");
         assert_eq!(caps.cpu_cores, 16);
@@ -1898,9 +1947,6 @@ mod tests {
 
     #[test]
     fn test_capabilities_detect_simulate_gpu() {
-        let _guard = BLENDER_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let caps = WorkerCapabilities::detect(Some("gpu-worker".into()), Some(4), true);
         assert_eq!(caps.name, "gpu-worker");
         assert!(caps.has_gpu);
@@ -1911,9 +1957,6 @@ mod tests {
 
     #[test]
     fn test_capabilities_hardware_overrides() {
-        let _guard = BLENDER_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let overrides = HardwareOverrides {
             name: Some("custom-node".into()),
             cores: Some(32),
@@ -2323,13 +2366,90 @@ mod tests {
 
     #[test]
     fn test_detect_blender_non_panicking() {
-        let _guard = BLENDER_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let (has_blender, ver) = detect_blender(None);
         if has_blender {
             assert!(ver.is_some());
         }
+    }
+
+    #[test]
+    fn test_stale_blender_override_returns_none_and_false_without_fallthrough() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("stale_missing_blender_404.exe");
+        let missing_str = missing.to_string_lossy().to_string();
+        let existing_file = dir.path().join("fake_blender_file.exe");
+        std::fs::write(&existing_file, b"not-a-real-blender").expect("write fake file");
+        let existing_str = existing_file.to_string_lossy().to_string();
+
+        // 1. Stale explicit_path returns None / (false, None) without falling through to host or env.
+        assert_eq!(resolve_blender_binary(Some(&missing_str)), None);
+        assert_eq!(detect_blender(Some(&missing_str)), (false, None));
+        let stale_caps = WorkerCapabilities::detect_with_overrides(HardwareOverrides {
+            blender_path: Some(missing_str.clone()),
+            ..Default::default()
+        });
+        assert!(!stale_caps.has_blender);
+        assert!(stale_caps.blender_version.is_none());
+
+        // 2. Valid explicit_path resolves on both sides.
+        assert_eq!(
+            resolve_blender_binary(Some(&existing_str)),
+            Some(existing_file.clone()),
+            "valid explicit_path must resolve to the file"
+        );
+        let (has_valid, ver_valid) = detect_blender(Some(&existing_str));
+        assert!(
+            has_valid,
+            "valid explicit_path file must report has_blender"
+        );
+        assert!(ver_valid.is_some());
+        let valid_caps = WorkerCapabilities::detect_with_overrides(HardwareOverrides {
+            blender_path: Some(existing_str.clone()),
+            ..Default::default()
+        });
+        assert!(valid_caps.has_blender);
+        assert!(valid_caps.blender_version.is_some());
+
+        // 3. Stale explicit_path does not fall through even when BLENDER_PATH points to an existing file.
+        let res_stale_explicit = resolve_blender_candidate_with_env(Some(&missing_str), |k| {
+            (k == "BLENDER_PATH").then(|| existing_str.clone())
+        });
+        assert!(matches!(
+            res_stale_explicit,
+            BlenderResolution::InvalidOverride
+        ));
+
+        // 4. Stale env override in any of the three variables returns InvalidOverride without falling through.
+        for &var in &[
+            "RUSTY_GRID_BLENDER_PATH",
+            "OXIDE_SWARM_BLENDER_PATH",
+            "BLENDER_PATH",
+        ] {
+            let res = resolve_blender_candidate_with_env(None, |k| {
+                (k == var).then(|| missing_str.clone())
+            });
+            assert!(
+                matches!(res, BlenderResolution::InvalidOverride),
+                "stale {var} must not fall through"
+            );
+
+            let res_valid = resolve_blender_candidate_with_env(None, |k| {
+                (k == var).then(|| existing_str.clone())
+            });
+            assert!(
+                matches!(res_valid, BlenderResolution::File { ref path, .. } if path == &existing_file),
+                "valid {var} must resolve to the file"
+            );
+        }
+
+        // 5. Higher-precedence stale override (RUSTY_GRID_BLENDER_PATH) does not fall through to
+        //    lower-precedence valid override (BLENDER_PATH).
+        let res_prec = resolve_blender_candidate_with_env(None, |k| match k {
+            "RUSTY_GRID_BLENDER_PATH" => Some(missing_str.clone()),
+            "BLENDER_PATH" => Some(existing_str.clone()),
+            _ => None,
+        });
+        assert!(matches!(res_prec, BlenderResolution::InvalidOverride));
     }
 
     #[test]
@@ -2836,10 +2956,7 @@ Now drawing from 'AC Power'
     }
 
     #[test]
-    fn test_hung_blender_probe_via_env_times_out_and_reports_no_blender() {
-        let _guard = BLENDER_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    fn test_hung_blender_probe_via_override_times_out_and_reports_no_blender() {
         let dir = tempfile::tempdir().expect("tempdir");
         let env_pid_file = dir.path().join("env_hung_grandchild.pid");
         let hung = write_test_script(
@@ -2852,37 +2969,20 @@ Now drawing from 'AC Power'
             ),
         );
 
-        let prev_path = std::env::var_os("RUSTY_GRID_BLENDER_PATH");
-        let prev_no_blender = std::env::var_os("RUSTY_GRID_NO_BLENDER");
-        let prev_ox_no_blender = std::env::var_os("OXIDE_SWARM_NO_BLENDER");
-        std::env::set_var("RUSTY_GRID_BLENDER_PATH", &hung);
-        std::env::remove_var("RUSTY_GRID_NO_BLENDER");
-        std::env::remove_var("OXIDE_SWARM_NO_BLENDER");
-
         let start = std::time::Instant::now();
-        let caps = WorkerCapabilities::detect_with_overrides(HardwareOverrides::default());
+        let caps = WorkerCapabilities::detect_with_overrides(HardwareOverrides {
+            blender_path: Some(hung.to_string_lossy().to_string()),
+            ..Default::default()
+        });
         let elapsed = start.elapsed();
-
-        match prev_path {
-            Some(v) => std::env::set_var("RUSTY_GRID_BLENDER_PATH", v),
-            None => std::env::remove_var("RUSTY_GRID_BLENDER_PATH"),
-        }
-        match prev_no_blender {
-            Some(v) => std::env::set_var("RUSTY_GRID_NO_BLENDER", v),
-            None => std::env::remove_var("RUSTY_GRID_NO_BLENDER"),
-        }
-        match prev_ox_no_blender {
-            Some(v) => std::env::set_var("OXIDE_SWARM_NO_BLENDER", v),
-            None => std::env::remove_var("OXIDE_SWARM_NO_BLENDER"),
-        }
 
         assert!(
             !caps.has_blender,
-            "a hung RUSTY_GRID_BLENDER_PATH probe must report has_blender = false"
+            "a hung blender_path override probe must report has_blender = false"
         );
         assert!(
             caps.blender_version.is_none(),
-            "a hung RUSTY_GRID_BLENDER_PATH probe must report blender_version = None, got {:?}",
+            "a hung blender_path override probe must report blender_version = None, got {:?}",
             caps.blender_version
         );
         assert!(

@@ -8,7 +8,7 @@ The Windows launcher suite enables high-performance computing machines (such as 
 
 ## 1. Capabilities and Architecture
 
-- **Minimal Overhead & Zero External Runtimes**: Built entirely in Rust. Does not require Python, Node.js, Java, or Electron runtimes. An idle worker consumes approximately 7–15 MB of working set RAM and virtually 0% CPU. Run `status_worker.cmd` to inspect the exact real-time RAM usage of the active process.
+- **Minimal Overhead & Zero External Runtimes**: Built entirely in Rust. Does not require Python, Node.js, Java, or Electron runtimes. Run `status_worker.cmd` to inspect the real-time working-set RAM usage of the active worker process.
 - **Silent Background Execution**: Runs completely headless without intrusive console windows popping up or remaining open on your desktop (leveraging `WScript.Shell.Run` and PowerShell hidden window execution).
 - **Automatic Reconnection & Resilience**: Workers continuously attempt reconnection using exponential backoff if the Master is temporarily restarted, unreachable, or undergoing maintenance.
 - **Hardware GPU Acceleration (`gpu-wgpu`)**: The worker automatically detects local graphics hardware if the executable was compiled with the `gpu-wgpu` feature (`cargo build --release --bin oxideswarm --features gpu-wgpu` or `build_windows_worker.sh --gpu`). The `GPU:` entry in `worker.log` indicates whether hardware acceleration is active. If built without `gpu-wgpu`, no GPU is advertised to the cluster (CPU is never misrepresented as a GPU). Pass `--no-gpu` if you wish to reserve the local graphics card exclusively for desktop or gaming tasks.

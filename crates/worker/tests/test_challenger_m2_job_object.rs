@@ -13,7 +13,6 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,16 +24,9 @@ use rusty_grid_core::task::{Generative3DSpec, Task, TaskRequirements, TaskSpec};
 use rusty_grid_worker::sandbox::SandboxConfig;
 use rusty_grid_worker::{RunnerConfig, TaskRunner, EXIT_CODE_CANCELLED, EXIT_CODE_TIMEOUT};
 
-/// Resolves python executable for tests.
-fn get_python_exe() -> PathBuf {
-    if let Ok(custom) = std::env::var("OXIDESWARM_PYTHON") {
-        let p = PathBuf::from(custom);
-        if p.is_file() {
-            return p;
-        }
-    }
-    PathBuf::from("python")
-}
+mod common;
+
+use common::{assert_all_alive, assert_all_dead_async, poll_pids_async, ScopedEnvVar};
 
 /// Creates a standard test TaskRunner.
 fn create_test_runner() -> (TaskRunner, TempDir) {
@@ -47,163 +39,15 @@ fn create_test_runner() -> (TaskRunner, TempDir) {
     (runner, temp_dir)
 }
 
-/// Polls `pids_file` until `expected_count` distinct PIDs have been recorded.
-#[cfg(windows)]
-fn poll_pids(pids_file: &Path, expected_count: usize, timeout: Duration) -> Vec<u32> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if let Ok(content) = std::fs::read_to_string(pids_file) {
-            let mut pids = Vec::new();
-            for line in content.lines() {
-                if let Some(pid_str) = line.strip_prefix("PID:") {
-                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                        if !pids.contains(&pid) {
-                            pids.push(pid);
-                        }
-                    }
-                }
-            }
-            if pids.len() >= expected_count {
-                return pids;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let current_content = std::fs::read_to_string(pids_file).unwrap_or_default();
-    panic!("Timed out waiting for {expected_count} PIDs. Current content:\n{current_content}");
-}
-
-/// Verifies that all given PIDs are actively running in the OS process table.
-fn assert_all_alive(sys: &mut sysinfo::System, pids: &[u32]) {
-    sys.refresh_processes();
-    for &pid in pids {
-        assert!(
-            sys.process(sysinfo::Pid::from(pid as usize)).is_some(),
-            "Expected PID {pid} to be alive, but it was not found in system process table"
-        );
-    }
-}
-
-/// Polls until all given PIDs are absent from the OS process table.
-#[cfg(windows)]
-fn assert_all_dead(sys: &mut sysinfo::System, pids: &[u32], timeout: Duration) {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        sys.refresh_processes();
-        let any_alive = pids
-            .iter()
-            .any(|&pid| sys.process(sysinfo::Pid::from(pid as usize)).is_some());
-        if !any_alive {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    sys.refresh_processes();
-    let survivors: Vec<u32> = pids
-        .iter()
-        .copied()
-        .filter(|&pid| sys.process(sysinfo::Pid::from(pid as usize)).is_some())
-        .collect();
-
-    // Clean up any remaining processes before panicking
-    for &pid in &survivors {
-        if let Some(p) = sys.process(sysinfo::Pid::from(pid as usize)) {
-            let _ = p.kill();
-        }
-    }
-
-    panic!(
-        "CRITICAL BUG: Orphaned / zombie processes survived termination! Survivors: {:?}",
-        survivors
-    );
-}
-
-static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-struct ScopedEnvVar {
-    _guard: tokio::sync::MutexGuard<'static, ()>,
-    key: &'static str,
-}
-
-impl ScopedEnvVar {
-    pub async fn set(key: &'static str, val: &Path) -> Self {
-        let guard = ENV_LOCK.lock().await;
-        std::env::set_var(key, val);
-        Self { _guard: guard, key }
-    }
-}
-
-impl Drop for ScopedEnvVar {
-    fn drop(&mut self) {
-        std::env::remove_var(self.key);
-    }
-}
-
-async fn poll_pids_async(pids_file: &Path, expected_count: usize, timeout: Duration) -> Vec<u32> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if let Ok(content) = tokio::fs::read_to_string(pids_file).await {
-            let mut pids = Vec::new();
-            for line in content.lines() {
-                if let Some(pid_str) = line.strip_prefix("PID:") {
-                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                        if !pids.contains(&pid) {
-                            pids.push(pid);
-                        }
-                    }
-                }
-            }
-            if pids.len() >= expected_count {
-                return pids;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let current_content = tokio::fs::read_to_string(pids_file)
-        .await
-        .unwrap_or_default();
-    panic!("Timed out waiting for {expected_count} PIDs. Current content:\n{current_content}");
-}
-
-async fn assert_all_dead_async(sys: &mut sysinfo::System, pids: &[u32], timeout: Duration) {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        sys.refresh_processes();
-        let any_alive = pids
-            .iter()
-            .any(|&pid| sys.process(sysinfo::Pid::from(pid as usize)).is_some());
-        if !any_alive {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    sys.refresh_processes();
-    let survivors: Vec<u32> = pids
-        .iter()
-        .copied()
-        .filter(|&pid| sys.process(sysinfo::Pid::from(pid as usize)).is_some())
-        .collect();
-
-    for &pid in &survivors {
-        if let Some(p) = sys.process(sysinfo::Pid::from(pid as usize)) {
-            let _ = p.kill();
-        }
-    }
-
-    panic!(
-        "CRITICAL BUG: Orphaned / zombie processes survived termination! Survivors: {:?}",
-        survivors
-    );
-}
-
 // ============================================================================
-// Challenge 3: Worker Process Abrupt Crash / Exit Simulation
+// Challenge 3: Worker Process Abrupt Crash / Exit Simulation (Windows Job Object)
 // ============================================================================
 
+#[cfg(windows)]
 #[test]
 fn test_adversarial_worker_abrupt_crash_kernel_reaps_descendants() {
+    use common::{assert_all_dead, get_python_exe, poll_pids};
+
     let temp_dir = tempfile::tempdir().expect("Failed to create tempdir");
     let pids_file = temp_dir.path().join("pids_crash.txt");
 
@@ -308,22 +152,19 @@ else:
         .arg(&crash_worker_script)
         .status()
         .expect("Failed to execute crash worker");
-    let _ = status;
 
-    #[cfg(windows)]
-    {
-        // Worker must have exited with code 42
-        assert_eq!(status.code(), Some(42));
+    // Worker must have exited with code 42
+    assert_eq!(status.code(), Some(42));
 
-        let pids = poll_pids(&pids_file, 1, Duration::from_secs(5));
-        let child_pid = pids[0];
+    let pids = poll_pids(&pids_file, 1, Duration::from_secs(5));
+    assert_eq!(pids.len(), 1);
+    let child_pid = pids[0];
 
-        let mut sys = sysinfo::System::new();
-        // The Windows NT kernel must have auto-reaped the child process because
-        // the owning worker crashed and closed its handles!
-        assert_all_dead(&mut sys, &[child_pid], Duration::from_secs(4));
-        println!("Confirmed Windows kernel reaped child PID {child_pid} after worker crash!");
-    }
+    let mut sys = sysinfo::System::new();
+    // The Windows NT kernel must have auto-reaped the child process because
+    // the owning worker crashed and closed its handles!
+    assert_all_dead(&mut sys, &[child_pid], Duration::from_secs(4));
+    println!("Confirmed Windows kernel reaped child PID {child_pid} after worker crash!");
 }
 
 // ============================================================================
@@ -411,7 +252,7 @@ time.sleep(30.0)
     assert!(!result.is_success());
 
     // Both the 3D script and the grandchild must be completely dead
-    assert_all_dead_async(&mut sys, &pids, Duration::from_secs(4)).await;
+    assert_all_dead_async(&pids, Duration::from_secs(4)).await;
     println!("Verified complete tree cleanup on TaskRunner Generative3D cancellation!");
 }
 
@@ -482,8 +323,8 @@ time.sleep(30.0)
 
     // Check PIDs were spawned and are now completely dead
     let pids = poll_pids_async(&pids_file, 2, Duration::from_secs(20)).await;
-    let mut sys = sysinfo::System::new();
-    assert_all_dead_async(&mut sys, &pids, Duration::from_secs(4)).await;
+    assert_eq!(pids.len(), 2);
+    assert_all_dead_async(&pids, Duration::from_secs(4)).await;
     println!("Verified complete tree cleanup on TaskRunner Generative3D watchdog timeout!");
 }
 
@@ -549,6 +390,7 @@ time.sleep(30.0)
 
     // Wait until both processes are running
     let pids = poll_pids_async(&pids_file, 2, Duration::from_secs(20)).await;
+    assert_eq!(pids.len(), 2);
     let mut sys = sysinfo::System::new();
     assert_all_alive(&mut sys, &pids);
 
@@ -557,6 +399,6 @@ time.sleep(30.0)
     let _ = task_handle.await;
 
     // RAII ProcessTree drop in the unwound async stack must trigger kernel auto-reap
-    assert_all_dead_async(&mut sys, &pids, Duration::from_secs(4)).await;
+    assert_all_dead_async(&pids, Duration::from_secs(4)).await;
     println!("Verified complete tree cleanup on TaskRunner future abort/drop!");
 }

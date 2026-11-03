@@ -94,12 +94,14 @@ fn test_marching_cubes_watertightness_and_speed() {
         elapsed
     );
 
-    // Latency budget check (< 50ms target)
-    assert!(
-        elapsed < Duration::from_millis(50),
-        "Marching Cubes took too long: {:?}",
-        elapsed
-    );
+    // Latency budget check (< 50ms target in release builds)
+    if !cfg!(debug_assertions) {
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "Marching Cubes took too long: {:?}",
+            elapsed
+        );
+    }
 
     assert!(mesh.vertex_count() > 100);
     assert!(mesh.triangle_count() > 200);
@@ -272,11 +274,8 @@ fn test_glb_container_compliance() {
     assert_eq!(bin_len % 4, 0, "BIN chunk length must be 4-byte aligned");
     assert_eq!(12 + 8 + json_len + 8 + bin_len, glb.len());
 
-    let out_path =
-        std::path::PathBuf::from(r"E:\teamwork_projects\OxideSwarm\target\tier0_test.glb");
-    if let Some(parent) = out_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    let temp_dir = tempfile::tempdir().expect("Failed to create tempdir");
+    let out_path = temp_dir.path().join("tier0_test.glb");
     std::fs::write(&out_path, &glb).expect("Failed to write tier0_test.glb");
 }
 
