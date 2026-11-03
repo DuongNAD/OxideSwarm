@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+rust-version.workspace = true
 description = "Cross-Platform Coding Agent Communication Framework PoC"
 
 [[bin]]
