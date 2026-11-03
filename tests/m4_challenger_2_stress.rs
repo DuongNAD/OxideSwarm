@@ -83,9 +83,14 @@ fn spawn_test_worker(
         .with_name(name)
         .with_cores(cores)
         .with_simulate_gpu(simulate_gpu)
+        .with_mobile_telemetry(rusty_grid_worker::MobileTelemetryHandle::new(None))
         .with_sandbox_base_dir(temp_dir.path());
 
     let mut worker = WorkerClient::new(cfg);
+    // Clear any host laptop battery/mobile snapshot so concurrency limits in these tests depend
+    // on `cores`, `core_concurrency_multiplier`, and `slots:<n>`, not on whether the test host
+    // has a battery.
+    worker.mobile_telemetry().set(None);
     let worker_id = worker.worker_id();
     let (tx, rx) = watch::channel(false);
 
@@ -649,6 +654,11 @@ async fn test_adversarial_cancel_worker_queued_concurrency_throttle() {
     )
     .await;
     assert!(registered, "Single core worker must register");
+    let registered_workers = master.list_workers().await.expect("list_workers");
+    assert!(
+        registered_workers[0].capabilities.mobile.is_none(),
+        "Test worker must register without mobile/battery capabilities so core_concurrency_multiplier: 2.0 gives max_slots = 2"
+    );
 
     // Task A occupies the single permit for 1.2s
     let task_a = Task::new(

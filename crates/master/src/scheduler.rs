@@ -2450,6 +2450,37 @@ mod tests {
         let report =
             WorkloadScheduler::matchmake(&config, &[cmd_task("c")], std::slice::from_ref(&solo));
         assert_eq!(report.assignments.len(), 1);
+
+        // N34-2: When an 8-core GPU worker is capped by `slots:3` (`max_slots = 8`, `max_tasks = 3`),
+        // Stage 6 reserves one of the 3 task permits (`max_tasks`) even though 5 core slots remain free.
+        let mut gpu_8c_slots3 = make_worker("gpu-8c-slots3", 8, 32768, true, true);
+        gpu_8c_slots3.capabilities.tags.push("slots:3".into());
+        let mut batch = vec![gpu_task()];
+        batch.extend((0..4).map(|i| cmd_task(&format!("slots3-c-{i}"))));
+        let report =
+            WorkloadScheduler::matchmake(&config, &batch, std::slice::from_ref(&gpu_8c_slots3));
+        assert_eq!(
+            report.assignments.len(),
+            2,
+            "8-core GPU worker with slots:3 must run 1 GPU + 1 CPU task and keep 1 of its 3 task permits reserved"
+        );
+
+        // N34-2: Conversely, an 8-core GPU worker capped by `slots:1` (`max_slots = 8`, `max_tasks = 1`)
+        // clamps `reserve` to `max_tasks - 1 = 0`, so it is not starved of CPU work while GPU work waits.
+        let mut gpu_8c_slots1 = make_worker("gpu-8c-slots1", 8, 32768, true, true);
+        gpu_8c_slots1.capabilities.tags.push("slots:1".into());
+        let pinned_gpu = gpu_task().with_tags(vec![format!("require:worker={}", solo.worker_id)]);
+        let report = WorkloadScheduler::matchmake(
+            &config,
+            &[pinned_gpu, cmd_task("for-slots1")],
+            &[solo, gpu_8c_slots1.clone()],
+        );
+        let counts = placements_per_worker(&report);
+        assert_eq!(
+            counts.get(&gpu_8c_slots1.worker_id).copied(),
+            Some(1),
+            "8-core GPU worker with slots:1 must not be starved of CPU work by gpu_reserved_slots"
+        );
     }
 
     #[tokio::test]
