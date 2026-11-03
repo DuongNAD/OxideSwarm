@@ -1264,3 +1264,5 @@ Add one dated line per finished item, newest last.
 - 2026-11-01: `agent_bridge.py watch` gained once-only delivery and a Claude Code wake (design 0007),
   which also fixed the `--auto-pull` part of BRIDGE-1. This needs no backlog item of its own.
 - 2026-11-01: INT-5 completed; implemented F1 to F6 on `int-4-content-addressed-data-plane` (Windows clippy, symlinked output parent rejection, output blob pin retention on Master, immediate output file pinning in worker cache, bounded in-flight blob requests per session, and protocol version 2 enforcement).
+- 2026-11-04: SEC-8 completed; the Unix default sandbox base is `<temp>/rusty_grid-<euid>/sandboxes`, and the
+  worker refuses a `rusty_grid-<euid>` another local user could change (design 0021).

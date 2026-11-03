@@ -138,9 +138,10 @@ pub fn set_cluster_secret_impl(secret_text: &str) -> bool {
     true
 }
 
-/// Same check as the worker's own start-up check (`SandboxConfig::ensure_usable`), without a
+/// The write check of the worker's own start-up check (`SandboxConfig::ensure_usable`), without a
 /// runtime: `start_worker_impl` has to answer the app synchronously, and may itself be called
-/// from inside one.
+/// from inside one. The private-root check of the Unix default base (design 0021) runs later, in
+/// the worker's own check; the app names its cache directory, which is used as given.
 fn check_sandbox_usable(base_dir: &Path) -> Result<(), SandboxError> {
     let unusable = |source: std::io::Error| SandboxError::BaseDirUnusable {
         path: base_dir.to_path_buf(),
