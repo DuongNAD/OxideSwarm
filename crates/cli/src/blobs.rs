@@ -352,7 +352,7 @@ pub async fn upload_inputs<C: BlobChannel>(
 
 /// Creates the directories of `rel` below `root`, refusing to go through a symbolic link or a
 /// file, and returns the path the file goes to.
-fn prepare_destination(root: &Path, rel: &str) -> Result<PathBuf, String> {
+pub(crate) fn prepare_destination(root: &Path, rel: &str) -> Result<PathBuf, String> {
     validate_blob_path(rel).map_err(|e| format!("output '{rel}': {e}"))?;
     #[cfg(windows)]
     rusty_grid_core::task::validate_relative_sandbox_path(rel)
@@ -389,11 +389,19 @@ fn prepare_destination(root: &Path, rel: &str) -> Result<PathBuf, String> {
         }
     }
     let target = dir.join(parts[parts.len() - 1]);
-    if std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir()) {
-        return Err(format!(
-            "output '{rel}': '{}' is a directory",
-            target.display()
-        ));
+    if let Ok(meta) = std::fs::symlink_metadata(&target) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "output '{rel}': '{}' is a symbolic link; refusing to write through it",
+                target.display()
+            ));
+        }
+        if meta.is_dir() {
+            return Err(format!(
+                "output '{rel}': '{}' is a directory",
+                target.display()
+            ));
+        }
     }
     Ok(target)
 }

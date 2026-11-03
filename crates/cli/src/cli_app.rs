@@ -136,6 +136,12 @@ pub enum Commands {
     /// Query cluster status or task execution state
     Status(StatusArgs),
 
+    /// Cancel a queued or running task by ID
+    Cancel(CancelArgs),
+
+    /// Fetch the result and outputs of a task by ID
+    Result(ResultArgs),
+
     /// List active worker nodes in the grid
     Workers(WorkersArgs),
 
@@ -738,6 +744,56 @@ pub struct StatusArgs {
 }
 
 #[derive(Parser, Debug, Clone)]
+pub struct CancelArgs {
+    #[arg(value_name = "ID", help = "Task UUID to cancel")]
+    pub task_id: Uuid,
+
+    #[arg(
+        long,
+        help = "Address of the Master's grid port (default 127.0.0.1:8088); a bare host gets :8088; 'auto' discovers it on the LAN"
+    )]
+    pub master: Option<String>,
+
+    #[arg(long, help = "Format output as JSON")]
+    pub json: bool,
+
+    #[arg(long, help = INSECURE_PEER_HELP)]
+    pub insecure: bool,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct ResultArgs {
+    #[arg(value_name = "ID", help = "Task UUID whose result to fetch")]
+    pub task_id: Uuid,
+
+    #[arg(
+        long,
+        help = "Address of the Master's grid port (default 127.0.0.1:8088); a bare host gets :8088; 'auto' discovers it on the LAN"
+    )]
+    pub master: Option<String>,
+
+    #[arg(
+        short,
+        long,
+        help = "Wait (poll) until the task reaches a terminal state"
+    )]
+    pub wait: bool,
+
+    #[arg(long, help = "Format output as JSON")]
+    pub json: bool,
+
+    #[arg(
+        long = "output-dir",
+        value_name = "DIR",
+        help = "Local directory the output files are written to, at their sandbox paths (default: current directory)"
+    )]
+    pub output_dir: Option<PathBuf>,
+
+    #[arg(long, help = INSECURE_PEER_HELP)]
+    pub insecure: bool,
+}
+
+#[derive(Parser, Debug, Clone)]
 pub struct WorkersArgs {
     #[arg(
         long,
@@ -906,6 +962,8 @@ pub async fn run_cli() -> ExitCode {
         Commands::Worker(args) => run_worker(args, config_file, secret_opts).await,
         Commands::Submit(args) => run_submit_with_secret(args, config_file, secret_opts).await,
         Commands::Status(args) => run_status(args, config_file, secret_opts).await,
+        Commands::Cancel(args) => run_cancel(args, config_file, secret_opts).await,
+        Commands::Result(args) => run_result(args, config_file, secret_opts).await,
         Commands::Workers(args) => run_workers(args, config_file, secret_opts).await,
         Commands::Mapreduce(args) => run_mapreduce(args, config_file, secret_opts).await,
         Commands::Doctor(args) => run_doctor_command(args, config_file, secret_opts).await,
@@ -2556,11 +2614,12 @@ async fn run_submit_with_secret(
                     }
                 }
             };
+            let mut artifact_save_error: Option<String> = None;
             let saved_artifacts = if !result.artifacts.is_empty() {
                 match crate::connect::save_output_artifacts(&result.artifacts, output_dir) {
                     Ok(saved) => Some(saved),
                     Err(e) => {
-                        eprintln!("Failed to save output artifacts: {e}");
+                        artifact_save_error = Some(e);
                         None
                     }
                 }
@@ -2576,6 +2635,9 @@ async fn run_submit_with_secret(
                         let saved_strs: Vec<String> =
                             saved.iter().map(|p| p.display().to_string()).collect();
                         obj.insert("saved_artifacts".to_string(), serde_json::json!(saved_strs));
+                    }
+                    if let Some(ref err) = artifact_save_error {
+                        obj.insert("artifact_save_error".to_string(), serde_json::json!(err));
                     }
                     if let Some(ref saved) = saved_outputs {
                         let saved_strs: Vec<String> =
@@ -2640,6 +2702,10 @@ async fn run_submit_with_secret(
                 if let Some(ref error) = result.error {
                     eprintln!("Error: {error}");
                 }
+            }
+            if let Some(err) = artifact_save_error {
+                eprintln!("Failed to save output artifacts: {err}");
+                return ExitCode::FAILURE;
             }
             if download_failed {
                 ExitCode::FAILURE
@@ -2897,6 +2963,343 @@ async fn run_status(
             other => {
                 eprintln!("Unexpected response: {other:?}");
                 ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+pub async fn run_cancel(
+    args: CancelArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
+    let status_cfg = config_file.as_ref().and_then(|c| c.status.clone());
+    let master_addr = resolve_string(
+        args.master,
+        &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
+        status_cfg.as_ref().and_then(|s| s.master.clone()),
+        DEFAULT_MASTER_ADDR,
+    );
+    let secret = match client_secret(
+        &secret_opts,
+        config_file.as_ref(),
+        SecretSection::Status,
+        &master_addr,
+        peer_insecure(args.insecure, status_cfg.as_ref().and_then(|s| s.insecure)),
+    ) {
+        Ok(secret) => secret,
+        Err(code) => return code,
+    };
+
+    let mut transport = match connect_master(&master_addr, secret.as_ref()).await {
+        Ok(t) => t,
+        Err(e) => {
+            return report_master_failure(
+                &master_addr,
+                secret.is_some(),
+                "Failed to connect to Master",
+                &e,
+            )
+        }
+    };
+    let had_secret = secret.is_some();
+    let task_id = TaskId(args.task_id);
+    let msg = ClientMessage::CancelTask { task_id };
+    let response = match exchange(
+        &mut transport,
+        &master_addr,
+        had_secret,
+        &msg,
+        "Failed to cancel task",
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(code) => return code,
+    };
+
+    match response {
+        ClientResponse::TaskCancelled { task_id, success } => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "task_id": task_id.to_string(),
+                        "cancelled": success,
+                    })
+                );
+            } else if success {
+                println!("Task {task_id} cancelled.");
+            } else {
+                eprintln!("Task {task_id} could not be cancelled (not found or already finished).");
+            }
+            if success {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        ClientResponse::Error { message } => {
+            if args.json {
+                println!("{}", serde_json::json!({ "error": message }));
+            } else {
+                eprintln!("Error: {message}");
+            }
+            ExitCode::FAILURE
+        }
+        other => {
+            eprintln!("Unexpected response: {other:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+pub async fn run_result(
+    args: ResultArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
+    let status_cfg = config_file.as_ref().and_then(|c| c.status.clone());
+    let master_addr = resolve_string(
+        args.master,
+        &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
+        status_cfg.as_ref().and_then(|s| s.master.clone()),
+        DEFAULT_MASTER_ADDR,
+    );
+    let secret = match client_secret(
+        &secret_opts,
+        config_file.as_ref(),
+        SecretSection::Status,
+        &master_addr,
+        peer_insecure(args.insecure, status_cfg.as_ref().and_then(|s| s.insecure)),
+    ) {
+        Ok(secret) => secret,
+        Err(code) => return code,
+    };
+
+    let mut transport = match connect_master(&master_addr, secret.as_ref()).await {
+        Ok(t) => t,
+        Err(e) => {
+            return report_master_failure(
+                &master_addr,
+                secret.is_some(),
+                "Failed to connect to Master",
+                &e,
+            )
+        }
+    };
+    let had_secret = secret.is_some();
+    let task_id = TaskId(args.task_id);
+    let msg = ClientMessage::GetTaskResult { task_id };
+
+    loop {
+        let response = match exchange(
+            &mut transport,
+            &master_addr,
+            had_secret,
+            &msg,
+            "Failed to fetch task result",
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(code) => return code,
+        };
+
+        match response {
+            ClientResponse::TaskCompleted { task_id, result } => {
+                let output_dir = args.output_dir.as_deref().unwrap_or(Path::new("."));
+                let mut output_download_error: Option<String> = None;
+                let saved_outputs = if result.outputs.is_empty() {
+                    None
+                } else {
+                    let downloaded =
+                        match crate::blobs::BlobConnection::connect(&master_addr, secret.as_ref())
+                            .await
+                        {
+                            Ok(connection) => {
+                                crate::blobs::download_outputs(
+                                    &connection,
+                                    &result.outputs,
+                                    output_dir,
+                                )
+                                .await
+                            }
+                            Err(e) => Err(e.to_string()),
+                        };
+                    match downloaded {
+                        Ok(saved) => Some(saved),
+                        Err(e) => {
+                            output_download_error = Some(e);
+                            None
+                        }
+                    }
+                };
+                let mut artifact_save_error: Option<String> = None;
+                let saved_artifacts = if !result.artifacts.is_empty() {
+                    match crate::connect::save_output_artifacts(&result.artifacts, output_dir) {
+                        Ok(saved) => Some(saved),
+                        Err(e) => {
+                            artifact_save_error = Some(e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                if args.json {
+                    let mut value = serde_json::to_value(&result).unwrap_or_default();
+                    if let Some(obj) = value.as_object_mut() {
+                        if let Some(ref saved) = saved_artifacts {
+                            let saved_strs: Vec<String> =
+                                saved.iter().map(|p| p.display().to_string()).collect();
+                            obj.insert(
+                                "saved_artifacts".to_string(),
+                                serde_json::json!(saved_strs),
+                            );
+                        }
+                        if let Some(ref err) = artifact_save_error {
+                            obj.insert("artifact_save_error".to_string(), serde_json::json!(err));
+                        }
+                        if let Some(ref saved) = saved_outputs {
+                            let saved_strs: Vec<String> =
+                                saved.iter().map(|p| p.display().to_string()).collect();
+                            obj.insert("saved_outputs".to_string(), serde_json::json!(saved_strs));
+                        }
+                        if let Some(ref err) = output_download_error {
+                            obj.insert("output_download_error".to_string(), serde_json::json!(err));
+                        }
+                    }
+                    println!("{}", serde_json::to_string_pretty(&value).unwrap());
+                } else {
+                    if result.is_success() {
+                        println!("Task {task_id} completed successfully.");
+                    } else if result.exit_code == 130 {
+                        println!("Task {task_id} was cancelled.");
+                    } else {
+                        println!("Task {task_id} failed.");
+                    }
+                    if !result.worker_id.is_nil() {
+                        println!("Worker: {}", result.worker_id);
+                    }
+                    println!("Exit Code: {}", result.exit_code);
+                    println!("Execution Time: {}ms", result.execution_time_ms);
+                    if let Some(ref saved) = saved_artifacts {
+                        println!(
+                            "Artifacts ({} saved to {}):",
+                            saved.len(),
+                            output_dir.display()
+                        );
+                        for (artifact, path) in result.artifacts.iter().zip(saved.iter()) {
+                            println!(
+                                "  - {} ({} bytes, sha256: {}) -> {}",
+                                artifact.path,
+                                artifact.size,
+                                artifact.sha256_hex(),
+                                path.display()
+                            );
+                        }
+                    }
+                    if let Some(ref saved) = saved_outputs {
+                        println!(
+                            "Output files ({} saved to {}):",
+                            saved.len(),
+                            output_dir.display()
+                        );
+                        for (output, path) in result.outputs.iter().zip(saved.iter()) {
+                            println!(
+                                "  - {} ({} bytes, blake3: {}) -> {}",
+                                output.path,
+                                output.size,
+                                output.id.short(),
+                                path.display()
+                            );
+                        }
+                    }
+                    if !result.stdout.is_empty() {
+                        println!("Stdout:\n{}", result.stdout_str().trim());
+                    }
+                    if !result.stderr.is_empty() {
+                        eprintln!("Stderr:\n{}", result.stderr_str().trim());
+                    }
+                    if let Some(ref err) = result.error {
+                        eprintln!("Error: {err}");
+                    }
+                }
+                if let Some(err) = output_download_error {
+                    eprintln!("Downloading the output files failed: {err}");
+                    return ExitCode::FAILURE;
+                }
+                if let Some(err) = artifact_save_error {
+                    eprintln!("Failed to save output artifacts: {err}");
+                    return ExitCode::FAILURE;
+                }
+                return if result.is_success() {
+                    ExitCode::SUCCESS
+                } else {
+                    let code = result.exit_code.clamp(1, 255) as u8;
+                    ExitCode::from(if code == 3 { 1 } else { code })
+                };
+            }
+            ClientResponse::TaskStatusInfo {
+                task_id,
+                status,
+                state_name,
+                assigned_worker,
+                error,
+            } => {
+                let is_terminal = matches!(
+                    status,
+                    rusty_grid_core::TaskStatus::Completed
+                        | rusty_grid_core::TaskStatus::Failed
+                        | rusty_grid_core::TaskStatus::Cancelled
+                );
+                if args.wait && !is_terminal {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "task_id": task_id.to_string(),
+                            "status": format!("{:?}", status),
+                            "state": state_name,
+                            "assigned_worker": assigned_worker,
+                            "error": error,
+                        })
+                    );
+                } else {
+                    println!("Task ID:        {task_id}");
+                    println!("Status:         {:?}", status);
+                    println!("State:          {state_name}");
+                    if let Some(w) = assigned_worker {
+                        println!("Worker:         {w}");
+                    }
+                    if let Some(err) = error {
+                        eprintln!("Error:          {err}");
+                    }
+                }
+                return if status == rusty_grid_core::TaskStatus::Completed {
+                    ExitCode::SUCCESS
+                } else if !is_terminal {
+                    ExitCode::from(3)
+                } else {
+                    ExitCode::FAILURE
+                };
+            }
+            ClientResponse::Error { message } => {
+                if args.json {
+                    println!("{}", serde_json::json!({ "error": message }));
+                } else {
+                    eprintln!("Error: {message}");
+                }
+                return ExitCode::FAILURE;
+            }
+            other => {
+                eprintln!("Unexpected response: {other:?}");
+                return ExitCode::FAILURE;
             }
         }
     }
@@ -3313,6 +3716,29 @@ mod tests {
         let (program, args) = command_of(build_task_spec(&submit_args(&[])));
         assert_eq!(program, "echo");
         assert_eq!(args, ["Hello from RustyGrid"]);
+    }
+
+    #[test]
+    fn test_cancel_and_result_cli_flags_parse() {
+        let id = Uuid::new_v4();
+        let id_str = id.to_string();
+        match parse(&["cancel", &id_str, "--json", "--master", "127.0.0.1:8088"]).command {
+            Commands::Cancel(c) => {
+                assert_eq!(c.task_id, id);
+                assert!(c.json);
+                assert_eq!(c.master.as_deref(), Some("127.0.0.1:8088"));
+            }
+            other => panic!("expected Cancel, got {other:?}"),
+        }
+        match parse(&["result", &id_str, "--wait", "--json", "--output-dir", "out"]).command {
+            Commands::Result(r) => {
+                assert_eq!(r.task_id, id);
+                assert!(r.wait);
+                assert!(r.json);
+                assert_eq!(r.output_dir.as_deref(), Some(Path::new("out")));
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
     }
 
     #[test]

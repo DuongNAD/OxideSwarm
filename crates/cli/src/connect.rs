@@ -381,6 +381,14 @@ pub fn save_output_artifacts(
     artifacts: &[OutputArtifact],
     output_dir: &Path,
 ) -> Result<Vec<PathBuf>, String> {
+    if let Ok(meta) = std::fs::metadata(output_dir) {
+        if !meta.is_dir() {
+            return Err(format!(
+                "Failed to create output directory {}: exists and is not a directory",
+                output_dir.display()
+            ));
+        }
+    }
     std::fs::create_dir_all(output_dir).map_err(|e| {
         format!(
             "Failed to create output directory {}: {e}",
@@ -388,21 +396,12 @@ pub fn save_output_artifacts(
         )
     })?;
 
-    let canonical_dest = output_dir
-        .canonicalize()
-        .map_err(|e| format!("Failed to canonicalize output directory: {e}"))?;
-
     let mut written_paths = Vec::with_capacity(artifacts.len());
 
     for artifact in artifacts {
         let clean_rel = validate_relative_sandbox_path(&artifact.path)
             .map_err(|e| format!("Invalid artifact path '{}': {e}", artifact.path))?;
-        let target_path = output_dir.join(&clean_rel);
-
-        if let Some(parent) = target_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
-        }
+        let target_path = crate::blobs::prepare_destination(output_dir, &clean_rel)?;
 
         if !artifact.verify_checksum() {
             return Err(format!(
@@ -411,17 +410,24 @@ pub fn save_output_artifacts(
             ));
         }
 
-        std::fs::write(&target_path, artifact.data.as_bytes())
-            .map_err(|e| format!("Failed to write artifact {}: {e}", target_path.display()))?;
-
-        if let Ok(canon_target) = target_path.canonicalize() {
-            if !canon_target.starts_with(&canonical_dest) {
-                let _ = std::fs::remove_file(&target_path);
-                return Err(format!(
-                    "Security violation: artifact path '{}' escaped output directory",
-                    artifact.path
-                ));
-            }
+        let name = target_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("artifact");
+        let tmp = target_path.with_file_name(format!(".{name}.{}.part", uuid::Uuid::new_v4()));
+        if let Err(e) = std::fs::write(&tmp, artifact.data.as_bytes()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "Failed to write artifact {}: {e}",
+                target_path.display()
+            ));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &target_path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "Failed to finalize artifact {}: {e}",
+                target_path.display()
+            ));
         }
 
         written_paths.push(target_path);
