@@ -1,7 +1,7 @@
 # 0015: 3D Engine Name Validation, Strict Fallback Removal, and Default CPU Execution
 
 Status: Implemented
-Created: 2026-11-01    Updated: 2026-11-01
+Created: 2026-11-01    Updated: 2026-11-03
 
 ## Summary
 
@@ -43,7 +43,7 @@ Behaviour before this change:
 
 ### D1. CPU-Capable Default 3D Execution Semantics
 In `crates/core/src/task.rs` and `crates/cli/src/cli_app.rs`:
-- `Generative3DSpec::default()` selects `Engine3D::Auto`, which maps to CPU procedural SDF generation.
+- `Generative3DSpec::new_prompt` initializes `engine_preference: None`, which `Engine3D::default()` and `Generative3DSpec::try_engine()` resolve to `Engine3D::Auto` (mapping to CPU procedural SDF generation). `Generative3DSpec::new_image` sets `engine_preference: Some("triposr".to_string())`, so an image task requests TripoSR unless the caller explicitly chooses another engine.
 - `requires_gpu()` returns `false` for `Engine3D::Auto`, `Engine3D::Sdf`, `Engine3D::TripoSr` (CPU mode supported), and `Engine3D::Trellis` (so tasks are not stalled in queue on CPU clusters).
 - In `crates/cli/src/cli_app.rs`, `requirements.gpu_required` is `false` unless explicitly requested via `--gpu` or `--type gpu`.
 - Default 3D tasks are immediately matched and executed by standard CPU workers, producing a valid glTF 2.0 binary asset.
@@ -51,7 +51,7 @@ In `crates/core/src/task.rs` and `crates/cli/src/cli_app.rs`:
 ### D2. Strict Engine Name Validation and Fallback Elimination
 - Remove `impl From<&str> for Engine3D` that defaulted unmatched strings to `Auto`.
 - Implement `std::str::FromStr` and `TryFrom<&str>` for `Engine3D`:
-  - Supported parsable strings: `"auto"`, `"sdf"`, `"triposr"`, and `"trellis"` (case-insensitive ASCII).
+  - Supported parsable strings (case-insensitive ASCII): `"auto"` (and `""`), `"sdf"` (with aliases `"tier0_sdf"`, `"tier0"`, `"tier-0"`, `"procedural"`, `"procedural_sdf"`), `"triposr"` (with aliases `"tripo_sr"`, `"triposr-cuda"`, `"triposr-cpu"`, `"tripo"`), and `"trellis"`.
   - Unknown strings (e.g. `"rodin"`): return `Err("unknown 3D engine '{name}'; valid engines are: auto, sdf, triposr")`.
 - Store `engine_preference: Option<String>` in `Generative3DSpec`, preserving raw input string so validation fails with explicit error.
 - Enforce in `TaskSpec::validate()`: unknown engine names fail with unknown engine error, and `"trellis"` fails with `"Trellis 3D neural engine is not supported; use sdf or triposr"`.
@@ -117,3 +117,4 @@ In `crates/core/src/task.rs` and `crates/cli/src/cli_app.rs`:
 ## Status log
 
 - 2026-11-01: Design record 0015 drafted and implemented for PR 21 remediation.
+- 2026-11-03: Updated D1 constructor names (`new_prompt` / `new_image`) and D2 alias list (`tier0_sdf`, `tier0`, `tier-0`, `procedural`, `procedural_sdf`, `tripo_sr`, `triposr-cuda`, `triposr-cpu`, `tripo`) per PR 21 review follow-up (L21-3).
