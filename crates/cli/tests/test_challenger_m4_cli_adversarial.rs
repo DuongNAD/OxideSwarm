@@ -18,9 +18,11 @@
 //! 3. Output path boundary conditions:
 //!    - Deeply nested non-existent directory tree (auto-creation validation)
 
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::process::Command;
 use tokio::sync::watch;
 
 use rusty_grid_cli::cli_app::{run_submit, validate_glb_header, SubmitArgs};
@@ -494,11 +496,35 @@ async fn test_cli_malicious_image_and_prompt_inputs() {
 // 3. Output Path Boundary Conditions: Deeply Nested Directory Creation
 // =========================================================================
 
-#[tokio::test]
+const BIN: &str = env!("CARGO_BIN_EXE_rusty-grid");
+
+fn cli_command(home: &Path) -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("OXIDESWARM_HOME", home.join(".oxideswarm"))
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_SECRET")
+        .env_remove("RUSTY_GRID_CONFIG")
+        .env_remove("RUSTY_GRID_MASTER")
+        .env_remove("RUSTY_GRID_MASTER_ADDR")
+        .env_remove("RUSTY_GRID_INSECURE")
+        .env_remove("RUSTY_GRID_WORKER_NAME")
+        .env_remove("RUSTY_GRID_NAME")
+        .env_remove("RUSTY_GRID_WORKER_ID_FILE")
+        .env("RUSTY_GRID_DISABLE_DISCOVERY", "1")
+        .env("RUSTY_GRID_DISABLE_WEB_UI", "1")
+        .env("NO_COLOR", "1")
+        .current_dir(home);
+    cmd
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_cli_deeply_nested_output_directory_creation() {
-    let temp_dir = TempDir::new().unwrap();
+    let temp_home = TempDir::new().expect("create test temp dir");
     // Deeply nested non-existent directory path
-    let deeply_nested_out = temp_dir
+    let deeply_nested_out = temp_home
         .path()
         .join("level1")
         .join("level2")
@@ -534,38 +560,32 @@ async fn test_cli_deeply_nested_output_directory_creation() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // 3. Submit 3D task with deeply nested output path
-    let args = SubmitArgs {
-        master: Some(master_addr.to_string()),
-        task_type: "3d".to_string(),
-        command: None,
-        cores: 1,
-        ram_mb: 0,
-        gpu: false,
-        timeout_secs: 30,
-        max_retries: None,
-        wait: true,
-        json: true,
-        prompt: Some("an obsidian monolith".to_string()),
-        image: None,
-        quality: Some("fast".to_string()),
-        engine: Some("sdf".to_string()),
-        export_texture: true,
-        no_export_texture: false,
-        input_mesh: None,
-        rig_preset: None,
-        embed_animations: Vec::new(),
-        preferred_provider: None,
-        output: Some(deeply_nested_out.clone()),
-        args: Vec::new(),
-        ..Default::default()
-    };
+    // 3. Submit 3D task with deeply nested output path via spawned CLI binary
+    let output = cli_command(temp_home.path())
+        .arg("submit")
+        .arg("--master")
+        .arg(master_addr.to_string())
+        .arg("--type")
+        .arg("3d")
+        .arg("--prompt")
+        .arg("an obsidian monolith")
+        .arg("--quality")
+        .arg("fast")
+        .arg("--engine")
+        .arg("sdf")
+        .arg("--export-texture")
+        .arg("--wait")
+        .arg("--json")
+        .arg("-o")
+        .arg(&deeply_nested_out)
+        .output()
+        .await
+        .expect("spawn submit command");
 
-    let exit_code = run_submit(args, None).await;
-    assert_eq!(
-        exit_code,
-        ExitCode::SUCCESS,
-        "Task submission and export must succeed"
+    assert!(
+        output.status.success(),
+        "Task submission and export must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 
     // 4. Verify deeply nested parent dirs were created and file exists

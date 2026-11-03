@@ -18,12 +18,21 @@ fn cli(home: &Path) -> Command {
     let mut cmd = Command::new(BIN);
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
-        .env_remove("OXIDESWARM_HOME")
+        .env("OXIDESWARM_HOME", home.join(".oxideswarm"))
         .env_remove("OXIDESWARM_SECRET")
         .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_SECRET")
         .env_remove("RUSTY_GRID_CONFIG")
         .env_remove("RUSTY_GRID_MASTER")
         .env_remove("RUSTY_GRID_MASTER_ADDR")
+        .env_remove("RUSTY_GRID_INSECURE")
+        .env_remove("RUSTY_GRID_WORKER_NAME")
+        .env_remove("RUSTY_GRID_NAME")
+        .env_remove("RUSTY_GRID_WORKER_ID_FILE")
+        .env("RUSTY_GRID_DISABLE_DISCOVERY", "1")
+        .env("RUSTY_GRID_DISABLE_WEB_UI", "1")
+        .env("NO_COLOR", "1")
+        .current_dir(home)
         .stdin(Stdio::null());
     cmd
 }

@@ -19,9 +19,10 @@
 )]
 
 use std::net::SocketAddr;
-use std::process::ExitCode;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::process::Command;
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -33,7 +34,7 @@ use agent_mesh::client::AgentMeshClient;
 use agent_mesh::hub::AgentMeshHub;
 use agent_mesh::protocol::{compute_sha256, verify_sha256, AgentMeshEnvelope};
 
-use rusty_grid_cli::cli_app::{run_submit, validate_glb_header, SubmitArgs};
+use rusty_grid_cli::cli_app::validate_glb_header;
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::WorkerMessage;
 use rusty_grid_core::task::{AutoRigSpec, Generative3DSpec, Task, TaskRequirements, TaskSpec};
@@ -1299,10 +1300,34 @@ async fn test_e2e_agent_mesh_bridge_3d_and_autorig() {
     cluster.shutdown().await;
 }
 
+const BIN: &str = env!("CARGO_BIN_EXE_rusty-grid");
+
+fn cli_command(home: &Path) -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("OXIDESWARM_HOME", home.join(".oxideswarm"))
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_SECRET")
+        .env_remove("RUSTY_GRID_CONFIG")
+        .env_remove("RUSTY_GRID_MASTER")
+        .env_remove("RUSTY_GRID_MASTER_ADDR")
+        .env_remove("RUSTY_GRID_INSECURE")
+        .env_remove("RUSTY_GRID_WORKER_NAME")
+        .env_remove("RUSTY_GRID_NAME")
+        .env_remove("RUSTY_GRID_WORKER_ID_FILE")
+        .env("RUSTY_GRID_DISABLE_DISCOVERY", "1")
+        .env("RUSTY_GRID_DISABLE_WEB_UI", "1")
+        .env("NO_COLOR", "1")
+        .current_dir(home);
+    cmd
+}
+
 /// 4. `test_e2e_cli_submit_3d_and_disk_export`:
-/// Exercises run_submit with --prompt, --quality fast, --engine sdf, --wait, --output <temp_dir>/output.glb,
-/// verifies file written to disk, validate_glb_header pass, and full glTF validation pass.
-#[tokio::test]
+///    Exercises CLI submit with --prompt, --quality fast, --engine sdf, --wait, --output <temp_dir>/output.glb,
+///    verifies file written to disk, validate_glb_header pass, and full glTF validation pass.
+#[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_cli_submit_3d_and_disk_export() {
     let cluster = PipelineCluster::spawn(1).await;
     let temp_dir = TempDir::new().expect("tempdir");
@@ -1311,34 +1336,32 @@ async fn test_e2e_cli_submit_3d_and_disk_export() {
     let out_rigged_path = temp_dir.path().join("cli_exported_rigged.glb");
 
     // 1. Submit 3D generation via CLI
-    let args_3d = SubmitArgs {
-        master: Some(cluster.master_addr.to_string()),
-        task_type: "3d".to_string(),
-        command: None,
-        cores: 1,
-        ram_mb: 0,
-        gpu: false,
-        timeout_secs: 30,
-        max_retries: None,
-        wait: true,
-        json: true,
-        prompt: Some("humanoid automaton".to_string()),
-        image: None,
-        quality: Some("fast".to_string()),
-        engine: Some("sdf".to_string()),
-        export_texture: true,
-        no_export_texture: false,
-        input_mesh: None,
-        rig_preset: None,
-        embed_animations: Vec::new(),
-        preferred_provider: None,
-        output: Some(out_mesh_path.clone()),
-        args: Vec::new(),
-        ..Default::default()
-    };
+    let output_3d = cli_command(temp_dir.path())
+        .arg("submit")
+        .arg("--master")
+        .arg(cluster.master_addr.to_string())
+        .arg("--type")
+        .arg("3d")
+        .arg("--prompt")
+        .arg("humanoid automaton")
+        .arg("--quality")
+        .arg("fast")
+        .arg("--engine")
+        .arg("sdf")
+        .arg("--export-texture")
+        .arg("--wait")
+        .arg("--json")
+        .arg("-o")
+        .arg(&out_mesh_path)
+        .output()
+        .await
+        .expect("spawn 3d submit command");
 
-    let exit_code = run_submit(args_3d, None).await;
-    assert_eq!(exit_code, ExitCode::SUCCESS);
+    assert!(
+        output_3d.status.success(),
+        "3D submit failed: {}",
+        String::from_utf8_lossy(&output_3d.stderr)
+    );
     assert!(
         out_mesh_path.is_file(),
         "Mesh output file must exist on disk"
@@ -1350,49 +1373,43 @@ async fn test_e2e_cli_submit_3d_and_disk_export() {
     validate_unrigged_mesh(&mesh_data).expect("full glTF 2.0 unrigged mesh validation failed");
 
     // 2. Submit AutoRig via CLI chaining the mesh file from disk
-    let args_rig = SubmitArgs {
-        master: Some(cluster.master_addr.to_string()),
-        task_type: "autorig".to_string(),
-        command: None,
-        cores: 1,
-        ram_mb: 0,
-        gpu: false,
-        timeout_secs: 30,
-        max_retries: None,
-        wait: true,
-        json: true,
-        prompt: None,
-        image: None,
-        quality: None,
-        engine: None,
-        export_texture: false,
-        no_export_texture: false,
-        input_mesh: Some(out_mesh_path),
-        rig_preset: Some("biped".to_string()),
-        embed_animations: vec![
-            "idle".to_string(),
-            "walk".to_string(),
-            "turnaround".to_string(),
-        ],
-        preferred_provider: Some("builtin".to_string()),
-        output: Some(out_rigged_path.clone()),
-        args: Vec::new(),
-        ..Default::default()
-    };
+    let output_rig = cli_command(temp_dir.path())
+        .arg("submit")
+        .arg("--master")
+        .arg(cluster.master_addr.to_string())
+        .arg("--type")
+        .arg("autorig")
+        .arg("--input-mesh")
+        .arg(&out_mesh_path)
+        .arg("--rig-preset")
+        .arg("biped")
+        .arg("--embed-animations")
+        .arg("idle,walk,turnaround")
+        .arg("--preferred-provider")
+        .arg("builtin")
+        .arg("--wait")
+        .arg("--json")
+        .arg("-o")
+        .arg(&out_rigged_path)
+        .output()
+        .await
+        .expect("spawn autorig submit command");
 
-    let exit_code_rig = run_submit(args_rig, None).await;
-    assert_eq!(exit_code_rig, ExitCode::SUCCESS);
+    assert!(
+        output_rig.status.success(),
+        "AutoRig submit failed: {}",
+        String::from_utf8_lossy(&output_rig.stderr)
+    );
     assert!(
         out_rigged_path.is_file(),
-        "Rigged output file must exist on disk"
+        "Rigged mesh output file must exist on disk"
     );
 
     let rigged_data = std::fs::read(&out_rigged_path).expect("read exported rigged mesh");
     assert!(rigged_data.len() > 1000);
     assert!(validate_glb_header(&rigged_data).is_ok());
-
     let summary = validate_complete_rigged_glb(&rigged_data, &["idle", "walk", "turnaround"])
-        .expect("full glTF 2.0 rigged mesh validation failed");
+        .expect("rigged glb validation failed");
     assert_eq!(summary.skin.joint_count, 15);
     assert_eq!(
         summary.animations.clip_names,
@@ -1505,7 +1522,7 @@ async fn test_e2e_checkpoint_monotonic_progress() {
 
 /// 6. `test_boundary_and_corrupted_mesh_rejection`:
 /// Corrupted input bytes properly rejected with error, no panics.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_boundary_and_corrupted_mesh_rejection() {
     let runner = make_test_runner(false);
 
@@ -1579,33 +1596,23 @@ async fn test_boundary_and_corrupted_mesh_rejection() {
     let empty_file = temp_dir.path().join("zero.glb");
     std::fs::write(&empty_file, b"").unwrap();
 
-    let args_mesh = SubmitArgs {
-        master: Some("127.0.0.1:8080".to_string()),
-        task_type: "autorig".to_string(),
-        command: None,
-        cores: 1,
-        ram_mb: 0,
-        gpu: false,
-        timeout_secs: 30,
-        max_retries: None,
-        wait: true,
-        json: false,
-        prompt: None,
-        image: None,
-        quality: None,
-        engine: None,
-        export_texture: false,
-        no_export_texture: false,
-        input_mesh: Some(empty_file),
-        rig_preset: None,
-        embed_animations: Vec::new(),
-        preferred_provider: None,
-        output: None,
-        args: Vec::new(),
-        ..Default::default()
-    };
-    let exit_code = run_submit(args_mesh, None).await;
-    assert_eq!(exit_code, ExitCode::FAILURE);
+    let output = cli_command(temp_dir.path())
+        .arg("submit")
+        .arg("--master")
+        .arg("127.0.0.1:8080")
+        .arg("--type")
+        .arg("autorig")
+        .arg("--input-mesh")
+        .arg(&empty_file)
+        .arg("--wait")
+        .output()
+        .await
+        .expect("spawn autorig submit command");
+
+    assert!(
+        !output.status.success(),
+        "zero-byte file submission must fail"
+    );
 }
 
 /// 7. `test_adversarial_single_bit_tamper_detection`:
