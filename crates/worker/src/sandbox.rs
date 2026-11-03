@@ -241,7 +241,7 @@ impl SandboxConfig {
 
     /// The default configuration for an environment lookup and a platform temp dir (see
     /// [`resolve_default_base_dir`]); parameters so tests need not touch the process environment.
-    fn from_env(env: impl Fn(&str) -> Option<String>, platform_temp: PathBuf) -> Self {
+    pub(crate) fn from_env(env: impl Fn(&str) -> Option<String>, platform_temp: PathBuf) -> Self {
         let (base_dir, private_root) = default_base(env, platform_temp);
         Self {
             base_dir,
@@ -287,13 +287,38 @@ impl SandboxConfig {
         Ok(())
     }
 
-    /// Creates and checks the private root (see `ensure_private_dir`) while `base_dir` lies
-    /// inside it. Does nothing for a directory the operator named.
-    async fn ensure_private_root(&self) -> Result<(), SandboxError> {
-        match &self.private_root {
-            Some(root) if self.base_dir.starts_with(root) => ensure_private_dir(root).await,
-            _ => Ok(()),
+    /// Creates and checks the private root of the default base (see `ensure_private_dir`) while
+    /// `base_dir` lies inside it, and does nothing for a directory the operator named. Call it
+    /// before anything touches the base: `WorkerClient` does when a task is assigned and again
+    /// before it fetches the task's input files, and `Sandbox::create` does too (design 0021).
+    pub async fn ensure_private_root(&self) -> Result<(), SandboxError> {
+        let Some(root) = self.checked_private_root().map(Path::to_path_buf) else {
+            return Ok(());
+        };
+        let path = root.clone();
+        tokio::task::spawn_blocking(move || ensure_private_dir(&root))
+            .await
+            .unwrap_or_else(|e| {
+                Err(SandboxError::BaseDirUnusable {
+                    path,
+                    source: std::io::Error::other(e.to_string()),
+                })
+            })
+    }
+
+    /// `ensure_private_root` without a runtime, for a caller that must answer synchronously (the
+    /// Android bridge's start check).
+    pub fn ensure_private_root_blocking(&self) -> Result<(), SandboxError> {
+        match self.checked_private_root() {
+            Some(root) => ensure_private_dir(root),
+            None => Ok(()),
         }
+    }
+
+    fn checked_private_root(&self) -> Option<&Path> {
+        self.private_root
+            .as_deref()
+            .filter(|root| self.base_dir.starts_with(root))
     }
 
     /// Removes legacy `<base_dir>/cache/objects` and `<base_dir>/cache/tmp` directories left
@@ -444,12 +469,16 @@ pub enum SandboxError {
     },
 
     #[error(
-        "The sandbox base directory '{}' is not safe to use: {reason}. Another local user could \
-         swap task files there. Remove it (this may need its owner or root), or point the worker \
-         at a private directory with --sandbox-base-dir or RUSTY_GRID_SANDBOX_BASE_DIR",
+        "Task sandboxes cannot use '{}' safely: {reason}, so another local user could swap task \
+         files there. {remedy}, or point the worker at a private directory with \
+         --sandbox-base-dir or RUSTY_GRID_SANDBOX_BASE_DIR",
         path.display()
     )]
-    BaseDirUnsafe { path: PathBuf, reason: String },
+    BaseDirUnsafe {
+        path: PathBuf,
+        reason: String,
+        remedy: String,
+    },
 }
 
 /// Effective user id of the worker process.
@@ -464,34 +493,42 @@ fn current_euid() -> u32 {
 /// (design 0021): see `parent_refusal` and `root_refusal`. The mode of an existing `root` is never
 /// changed, because another user may already have put links into one that was open. Does nothing
 /// on systems without Unix modes.
-async fn ensure_private_dir(root: &Path) -> Result<(), SandboxError> {
+fn ensure_private_dir(root: &Path) -> Result<(), SandboxError> {
     #[cfg(unix)]
     {
+        use std::os::unix::fs::DirBuilderExt;
+
         let unusable = |source: std::io::Error| SandboxError::BaseDirUnusable {
             path: root.to_path_buf(),
             source,
         };
-        let refuse = |reason: String| SandboxError::BaseDirUnsafe {
-            path: root.to_path_buf(),
-            reason,
-        };
         let euid = current_euid();
 
         if let Some(parent) = root.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(unusable)?;
-            let meta = tokio::fs::metadata(parent).await.map_err(unusable)?;
-            if let Some(reason) = parent_refusal(parent, &meta, euid) {
-                return Err(refuse(reason));
+            std::fs::create_dir_all(parent).map_err(unusable)?;
+            let meta = std::fs::metadata(parent).map_err(unusable)?;
+            if let Some(reason) = parent_refusal(&meta, euid) {
+                return Err(SandboxError::BaseDirUnsafe {
+                    path: parent.to_path_buf(),
+                    reason,
+                    remedy: "Set TMPDIR to a directory only this user can write, or add the \
+                             sticky bit to this one"
+                        .to_string(),
+                });
             }
         }
-        match tokio::fs::DirBuilder::new().mode(0o700).create(root).await {
+        match std::fs::DirBuilder::new().mode(0o700).create(root) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(unusable(e)),
         }
-        let meta = tokio::fs::symlink_metadata(root).await.map_err(unusable)?;
+        let meta = std::fs::symlink_metadata(root).map_err(unusable)?;
         match root_refusal(&meta, euid) {
-            Some(reason) => Err(refuse(reason)),
+            Some(reason) => Err(SandboxError::BaseDirUnsafe {
+                path: root.to_path_buf(),
+                reason,
+                remedy: "Remove it (this may need its owner or root)".to_string(),
+            }),
             None => Ok(()),
         }
     }
@@ -502,25 +539,25 @@ async fn ensure_private_dir(root: &Path) -> Result<(), SandboxError> {
     }
 }
 
-/// Why the directory above the private root (the temp dir, `meta` following links) is unsafe for
-/// the user `euid`: it belongs to a user other than root or `euid`, or group or others may write it
-/// without the sticky bit. Either way another user could rename the root away and put their own in
-/// its place.
+/// Why the temp dir that holds the private root (`meta` following links) is unsafe for the user
+/// `euid`: it belongs to a user other than root or `euid`, or group or others may write it without
+/// the sticky bit. Either way another user could rename the root away and put their own in its
+/// place.
 #[cfg(unix)]
-fn parent_refusal(parent: &Path, meta: &std::fs::Metadata, euid: u32) -> Option<String> {
+fn parent_refusal(meta: &std::fs::Metadata, euid: u32) -> Option<String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     if meta.uid() != 0 && meta.uid() != euid {
         return Some(format!(
-            "the directory above it, '{}', belongs to user {}",
-            parent.display(),
+            "it holds the private sandbox root but belongs to user {}",
             meta.uid()
         ));
     }
     let mode = meta.permissions().mode();
     if mode & 0o022 != 0 && mode & 0o1000 == 0 {
         return Some(format!(
-            "the directory above it, '{}', is writable by other users and has no sticky bit",
-            parent.display()
+            "it holds the private sandbox root, but its mode is {:o}: writable by other users, \
+             without the sticky bit",
+            mode & 0o7777
         ));
     }
     None
@@ -1047,17 +1084,19 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn assert_unsafe(err: SandboxError, root: &Path, reason_part: &str) {
+    fn assert_unsafe(err: SandboxError, dir: &Path, reason_part: &str) {
         let text = err.to_string();
         assert!(
-            matches!(&err, SandboxError::BaseDirUnsafe { path, reason }
-                if path == root && reason.contains(reason_part)),
+            matches!(&err, SandboxError::BaseDirUnsafe { path, reason, .. }
+                if path == dir && reason.contains(reason_part)),
             "expected BaseDirUnsafe for {} containing {reason_part:?}, got {err:?}",
-            root.display()
+            dir.display()
         );
         assert!(
-            text.contains("--sandbox-base-dir") && text.contains("RUSTY_GRID_SANDBOX_BASE_DIR"),
-            "the message must say how to fix it: {text}"
+            text.contains(&dir.display().to_string())
+                && text.contains("--sandbox-base-dir")
+                && text.contains("RUSTY_GRID_SANDBOX_BASE_DIR"),
+            "the message must name the directory and say how to fix it: {text}"
         );
     }
 
@@ -1147,14 +1186,19 @@ mod tests {
         );
 
         let temp_meta = std::fs::metadata(&temp).unwrap();
-        assert_eq!(parent_refusal(&temp, &temp_meta, euid), None);
-        let reason = parent_refusal(&temp, &temp_meta, other)
-            .expect("a temp dir of another user is refused");
-        assert!(reason.contains("the directory above it"), "{reason}");
+        assert_eq!(parent_refusal(&temp_meta, euid), None);
+        // Run as root, the temp dir belongs to root, which every user may rely on.
+        if euid != 0 {
+            let reason =
+                parent_refusal(&temp_meta, other).expect("a temp dir of another user is refused");
+            assert!(
+                reason.contains(&format!("belongs to user {euid}")),
+                "{reason}"
+            );
+        }
         // A temp dir that belongs to root, such as /tmp, is fine for every user.
-        let slash = Path::new("/");
-        let slash_meta = std::fs::metadata(slash).unwrap();
-        assert_eq!(parent_refusal(slash, &slash_meta, other), None);
+        let slash_meta = std::fs::metadata("/").unwrap();
+        assert_eq!(parent_refusal(&slash_meta, other), None);
 
         let _ = std::fs::remove_dir_all(&temp);
     }
@@ -1165,13 +1209,16 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (temp, root, config) = default_config_in_fresh_temp();
 
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let err = config
-            .ensure_usable()
-            .await
-            .expect_err("others could rename the root away");
-        assert_unsafe(err, &root, "no sticky bit");
-        assert!(!root.exists(), "nothing may be created there");
+        // Writable by others, or by the group only: both could rename the root away.
+        for mode in [0o777, 0o770] {
+            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = config
+                .ensure_usable()
+                .await
+                .expect_err("others could rename the root away");
+            assert_unsafe(err, &temp, &format!("mode is {mode:o}"));
+            assert!(!root.exists(), "nothing may be created there");
+        }
 
         // The sticky bit keeps others from renaming entries they do not own, as in /tmp.
         std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o1777)).unwrap();

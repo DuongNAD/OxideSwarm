@@ -418,7 +418,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_REQUIRE_GPU` | Worker | In tests, asserts that failure to initialize physical GPU is fatal |
 | `RUSTY_GRID_MAX_CONCURRENCY` | Worker | Maximum simultaneous concurrent tasks executed |
 | `RUSTY_GRID_MAX_CONCURRENT_TASKS` | Worker | Secondary alias for maximum concurrent tasks |
-| `RUSTY_GRID_SANDBOX_BASE_DIR` | Worker | Base filesystem directory for task execution sandboxes, used as given (`--sandbox-base-dir` outranks it). Without either, the worker uses `<TMPDIR or temp dir>/rusty_grid-<uid>/sandboxes` on Unix, private to its user ([design 0021](docs/design/0021-private-default-sandbox-base.md)), and `%TEMP%\rusty_grid\sandboxes` on Windows |
+| `RUSTY_GRID_SANDBOX_BASE_DIR` | Worker | Base filesystem directory for task execution sandboxes, used as given (`--sandbox-base-dir` outranks it). Without either, the worker uses `<TMPDIR or temp dir>/rusty_grid-<euid>/sandboxes` on Unix, private to its user ([design 0021](docs/design/0021-private-default-sandbox-base.md)), and `%TEMP%\rusty_grid\sandboxes` on Windows |
 | `RUSTY_GRID_TASK_PRIORITY` | Worker | Process scheduling priority: `normal`, `below-normal`, or `idle` |
 | `RUSTY_GRID_KEEP_SANDBOXES` | Worker | Retains task working directories upon completion |
 | `RUSTY_GRID_BLOB_CACHE_MB` | Worker | Megabytes of task input and output files cached in `<sandbox base>/cache/blobs` (`--blob-cache-mb`; default 2048) |

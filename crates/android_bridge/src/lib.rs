@@ -8,7 +8,7 @@
 //! Running in-process produces 0 child processes for the worker loop itself, ensuring immunity
 //! against the Android 12+ Phantom Process Killer (PPK) and W^X execution restrictions.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -138,11 +138,13 @@ pub fn set_cluster_secret_impl(secret_text: &str) -> bool {
     true
 }
 
-/// The write check of the worker's own start-up check (`SandboxConfig::ensure_usable`), without a
+/// Same check as the worker's own start-up check (`SandboxConfig::ensure_usable`), without a
 /// runtime: `start_worker_impl` has to answer the app synchronously, and may itself be called
-/// from inside one. The private-root check of the Unix default base (design 0021) runs later, in
-/// the worker's own check; the app names its cache directory, which is used as given.
-fn check_sandbox_usable(base_dir: &Path) -> Result<(), SandboxError> {
+/// from inside one. For the default base it first creates the private root with mode 700
+/// (design 0021); the app's cache directory is used as given.
+fn check_sandbox_usable(sandbox: &SandboxConfig) -> Result<(), SandboxError> {
+    sandbox.ensure_private_root_blocking()?;
+    let base_dir = &sandbox.base_dir;
     let unusable = |source: std::io::Error| SandboxError::BaseDirUnusable {
         path: base_dir.to_path_buf(),
         source,
@@ -205,11 +207,11 @@ pub fn start_worker_impl(
     // The worker refuses to run without a writable sandbox directory (every process task would
     // fail otherwise); say so here, where the app can show it, instead of from a thread that
     // exits unnoticed.
-    let sandbox_base = config
-        .sandbox_base_dir
-        .clone()
-        .unwrap_or_else(|| SandboxConfig::default().base_dir);
-    if let Err(e) = check_sandbox_usable(&sandbox_base) {
+    let sandbox = match config.sandbox_base_dir.clone() {
+        Some(dir) => SandboxConfig::new(dir),
+        None => SandboxConfig::default(),
+    };
+    if let Err(e) = check_sandbox_usable(&sandbox) {
         error!(error = %e, "Android worker cannot start: task sandboxes cannot be created");
         *state.status.lock().unwrap() = format!("ERROR: {e}");
         return false;
