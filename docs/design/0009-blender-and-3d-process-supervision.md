@@ -11,8 +11,8 @@ SDF per Design 0017) and Blender mesh auto-rigging run as external subprocesses.
 these workloads relied on ad-hoc runner logic and an isolated Win32 `JobObject` wrapper, bypassing
 the worker's unified task supervision. This design unifies 3D and Blender execution under
 `TaskRunner::execute_process_supervised`, standardizes process tree supervision across Windows and
-Unix, parses progress markers post-exit, and strictly sanitizes cluster secrets from child process
-environments.
+Unix, unifies Blender binary resolution across capability discovery and task execution, parses
+progress markers post-exit, and strictly sanitizes cluster secrets from child process environments.
 
 ## Context
 
@@ -93,6 +93,37 @@ unchanged. Tasks receive standard environment variables:
 - `RUSTY_GRID_WORKER_ID`: Matching worker node UUID.
 - `RUSTY_GRID_SANDBOX_DIR`: Absolute path to task workspace.
 
+### D4: Unified Blender binary resolution and search paths
+
+Both capability discovery (`rusty_grid_core::capabilities::detect_blender`) and task execution
+(`rusty_grid_worker::autorig::blender_provider::resolve_blender_binary`) delegate to a single resolver
+in `rusty_grid_core::capabilities::resolve_blender_binary`:
+
+1. **Explicit path argument** (`explicit_path`, when non-empty): if the path is an existing regular
+   file (`is_file()`), it is selected; if it does not point to an existing file, resolution returns
+   `None` / `(false, None)` immediately without falling through to environment variables or standard
+   host paths.
+2. **Environment variable override** (`RUSTY_GRID_BLENDER_PATH`, `OXIDE_SWARM_BLENDER_PATH`,
+   `BLENDER_PATH`, evaluated in that order): the first non-empty variable is authoritative. If it
+   points to an existing regular file, it is selected; if it points to a missing or non-file path
+   (stale override), resolution returns `None` / `(false, None)` immediately without falling through
+   to standard host installation paths or `PATH`.
+3. **Platform standard installation paths**:
+   - **Windows**: `Blender*` version subdirectories (sorted descending by directory name so newer
+     versions precede older ones) under `%ProgramFiles%\Blender Foundation`,
+     `%ProgramFiles(x86)%\Blender Foundation`, `%LOCALAPPDATA%\Programs\Blender Foundation`, and
+     `C:\Program Files\Blender Foundation` (`blender.exe`), followed by
+     `C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe`.
+   - **macOS**: `/Applications/Blender.app/Contents/MacOS/Blender` and
+     `/Applications/Blender/Blender.app/Contents/MacOS/Blender`.
+   - **Linux**: `/usr/bin/blender`, `/usr/local/bin/blender`, and `/snap/bin/blender`.
+4. **System `PATH` fallback**: probes `blender --version` via `probe_blender_binary("blender")`
+   (using `probe_command` with cluster secrets stripped).
+
+In host-bound Blender integration tests (`crates/worker/tests/common/mod.rs`), `blender_binary_or_skip`
+skips the test when `resolve_blender_binary()` returns `None`, unless `RUSTY_GRID_REQUIRE_BLENDER` is
+set to `1` or `true` (case-insensitive), in which case a missing Blender panics and fails the test.
+
 ## Known limits
 
 - **Wire frame limit on output assets**: `read_output_file` opens the output path first with
@@ -133,6 +164,8 @@ a task process can still read the worker account's secret file on disk, as docum
 
 ## Test plan
 
+- `crates/core/src/capabilities.rs` (`mod tests`): Unit tests for `resolve_blender_binary` and `detect_blender`:
+  - `test_stale_blender_override_returns_none_and_false_without_fallthrough`: verifies that a stale/non-existent `explicit_path` or environment override (`RUSTY_GRID_BLENDER_PATH`, `OXIDE_SWARM_BLENDER_PATH`, `BLENDER_PATH`) returns `None` from `resolve_blender_binary` and `(false, None)` from `detect_blender` without falling through to lower-precedence overrides or standard host installation paths.
 - `crates/worker/src/runner.rs` (`mod outcome_tests`): Unit tests for `read_output_file`:
   - `test_read_output_file_regular_missing_and_directory`: missing path returns `Ok(None)`, regular file returns `Ok(Some(bytes))`, directory returns `Err(InvalidData)`.
   - `test_read_output_file_fifo_returns_error_immediately` (Unix): FIFO at output path returns `Err(InvalidData)` immediately via `O_NONBLOCK` without hanging.
@@ -146,7 +179,9 @@ a task process can still read the worker account's secret file on disk, as docum
   under cancellation, watchdog timeout, and future drop via `TaskRunner` and `ProcessTree`, plus an
   OS-level abrupt process termination crash test via Python.
 - `crates/worker/tests/test_challenger_m3_blender_job_object.rs`: Validates host Blender headless
-  execution, process tree termination on cancellation, and graceful fallback to pure-Rust auto-rigging
+  execution (gated by `blender_binary_or_skip` and `RUSTY_GRID_REQUIRE_BLENDER`), process tree
+  termination on cancellation, stale-override rejection across both `blender_provider::resolve_blender_binary`
+  and `rusty_grid_core::capabilities::detect_blender`, and graceful fallback to pure-Rust auto-rigging
   when Blender is missing or exits abnormally.
 - `crates/worker/tests/test_gen3d_adversarial_stress.rs`: Tests generative 3D SDF preset resolution,
   latency benchmarks, manifoldness, binary glTF conformance, PNG encoding, and Blender headless
@@ -161,6 +196,7 @@ a task process can still read the worker account's secret file on disk, as docum
 | W3 | Output file reading helper | `runner.rs` | `read_output_file` refuses symlinks, non-regular files, and files above `MAX_FRAME_SIZE` | Implemented |
 | W4 | Clean up dead code & update headers | `runner.rs`, `*_job_object.rs` | `terminate_process_tree` removed; headers updated | Implemented |
 | W5 | Test suite verification | `test_sec5_*.rs`, `test_challenger_*.rs` | All suites pass on Windows; CI runs `test_sec5_hardened_runner` on Linux and macOS | Implemented |
+| W6 | Unified Blender resolver & host test gating | `capabilities.rs`, `blender_provider.rs`, `common/mod.rs`, `README.md` | Runner and capability probe share `resolve_blender_binary`; `RUSTY_GRID_REQUIRE_BLENDER` documented | Implemented |
 
 ## Status log
 
@@ -169,4 +205,4 @@ a task process can still read the worker account's secret file on disk, as docum
 - 2026-11-01: Updated design record for round 3 review: corrected default output buffer limit, metadata regular file check, task env stripping vs probe_command distinction, CI scope, and W2 file list.
 - 2026-11-03: Guarded `read_output_file` by opening with `O_NOFOLLOW | O_NONBLOCK` (Unix) and `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS` (Windows) before inspecting `file.metadata()`, refusing symbolic links/reparse points, non-regular files, and files exceeding `MAX_FRAME_SIZE` (`67,108,864` bytes) before reading, and capping reads with `take(MAX_FRAME_SIZE as u64 + 1)` (BUG-10).
 - 2026-11-03: Corrected `runner.rs` line references (`:2100`/`:2152` and `:2364`), `AEAD_RECORD_OVERHEAD` (`25` bytes), JSON byte-array serialization description, and `mod outcome_tests` module name.
-
+- 2026-11-03: Unified Blender binary resolution (`resolve_blender_binary`) across `rusty_grid_core::capabilities` and `rusty_grid_worker::autorig::blender_provider`, including Windows/macOS/Linux/Steam search paths, strict non-fallthrough on stale overrides, and `RUSTY_GRID_REQUIRE_BLENDER` test gating (TEST-1).

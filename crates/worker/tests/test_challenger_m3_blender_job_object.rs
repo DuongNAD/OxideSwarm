@@ -439,11 +439,22 @@ async fn test_graceful_fallback_when_blender_path_is_invalid_or_missing() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let missing_blender = temp_dir.path().join("blender_invalid_404.exe");
 
-    // Set BLENDER_PATH to non-existent executable; resolver must return None even if host has Blender
+    // Set BLENDER_PATH to non-existent executable; both the worker resolver and core capability
+    // detection must return None / (false, None) even if the host has Blender installed.
     let _env = ScopedEnvVar::set("BLENDER_PATH", &missing_blender).await;
     assert!(
         blender_provider::resolve_blender_binary().is_none(),
-        "Explicit invalid BLENDER_PATH must not fall through to a host Blender installation"
+        "Explicit invalid BLENDER_PATH must not fall through to a host Blender installation in runner"
+    );
+    assert_eq!(
+        rusty_grid_core::capabilities::resolve_blender_binary(None),
+        None,
+        "Explicit invalid BLENDER_PATH must not fall through in core resolve_blender_binary"
+    );
+    assert_eq!(
+        rusty_grid_core::capabilities::detect_blender(None),
+        (false, None),
+        "Explicit invalid BLENDER_PATH must not fall through in core detect_blender"
     );
 
     let input_mesh = generate_test_glb_mesh();

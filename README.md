@@ -416,6 +416,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_GPU_NAME` | Worker | Custom advertised GPU model string |
 | `RUSTY_GRID_ENABLE_PHYSICAL_GPU` | Worker | Force-enables hardware wgpu engine initialization without `--gpu` |
 | `RUSTY_GRID_REQUIRE_GPU` | Worker | In tests, asserts that failure to initialize physical GPU is fatal |
+| `RUSTY_GRID_REQUIRE_BLENDER` | Worker | In tests, asserts that a missing host Blender binary is fatal instead of skipping (`1` or `true`) |
 | `RUSTY_GRID_MAX_CONCURRENCY` | Worker | Maximum simultaneous concurrent tasks executed |
 | `RUSTY_GRID_MAX_CONCURRENT_TASKS` | Worker | Secondary alias for maximum concurrent tasks |
 | `RUSTY_GRID_SANDBOX_BASE_DIR` | Worker | Base filesystem directory for task execution sandboxes |

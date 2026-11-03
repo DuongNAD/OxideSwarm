@@ -1228,32 +1228,54 @@ fn detect_os_version(is_android: bool) -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// Discovers Blender executable and queries its version.
-pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
-    // 1. Check explicit path
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlenderResolution {
+    /// An explicit argument or environment variable override was set to a non-empty path that
+    /// does not point to an existing regular file. Do not fall through to host installations.
+    InvalidOverride,
+    /// Found a concrete Blender executable file on disk, along with its fallback version label.
+    File {
+        path: std::path::PathBuf,
+        fallback_label: String,
+    },
+    /// No override was set and no standard OS installation path matched; try `blender` on `PATH`.
+    NotFoundInStandardPaths,
+}
+
+fn resolve_blender_candidate(explicit_path: Option<&str>) -> BlenderResolution {
+    // 1. Check explicit path override. If non-empty and missing, do not fall through.
     if let Some(path_str) = explicit_path {
-        let p = std::path::Path::new(path_str);
-        if p.is_file() {
-            if let Some(ver) = query_blender_version(p) {
-                return (true, Some(ver));
+        let trimmed = path_str.trim();
+        if !trimmed.is_empty() {
+            let p = std::path::PathBuf::from(trimmed);
+            if p.is_file() {
+                return BlenderResolution::File {
+                    path: p,
+                    fallback_label: "Blender (Custom Path)".to_string(),
+                };
             }
-            return (true, Some("Blender (Custom Path)".to_string()));
+            return BlenderResolution::InvalidOverride;
         }
     }
 
-    // 2. Check environment variables
+    // 2. Check environment variable overrides in precedence order.
+    // The first non-empty variable is authoritative; if it points at no file, do not fall through.
     for env_var in &[
         "RUSTY_GRID_BLENDER_PATH",
         "OXIDE_SWARM_BLENDER_PATH",
         "BLENDER_PATH",
     ] {
         if let Ok(env_path) = std::env::var(env_var) {
-            let p = std::path::Path::new(env_path.trim());
-            if p.is_file() {
-                if let Some(ver) = query_blender_version(p) {
-                    return (true, Some(ver));
+            let trimmed = env_path.trim();
+            if !trimmed.is_empty() {
+                let p = std::path::PathBuf::from(trimmed);
+                if p.is_file() {
+                    return BlenderResolution::File {
+                        path: p,
+                        fallback_label: "Blender (Env Path)".to_string(),
+                    };
                 }
-                return (true, Some("Blender (Env Path)".to_string()));
+                return BlenderResolution::InvalidOverride;
             }
         }
     }
@@ -1285,7 +1307,13 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
                     let mut version_dirs: Vec<std::path::PathBuf> = entries
                         .flatten()
                         .map(|e| e.path())
-                        .filter(|p| p.is_dir())
+                        .filter(|p| {
+                            p.is_dir()
+                                && p.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .starts_with("Blender")
+                        })
                         .collect();
 
                     // Sort descending so newer versions (e.g. 4.5) precede older versions (e.g. 4.2)
@@ -1294,11 +1322,14 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
                     for dir in version_dirs {
                         let candidate = dir.join("blender.exe");
                         if candidate.is_file() {
-                            if let Some(ver) = query_blender_version(&candidate) {
-                                return (true, Some(ver));
-                            }
-                            let dir_name = dir.file_name().map(|n| n.to_string_lossy().to_string());
-                            return (true, dir_name);
+                            let dir_name = dir
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "Blender".to_string());
+                            return BlenderResolution::File {
+                                path: candidate,
+                                fallback_label: dir_name,
+                            };
                         }
                     }
                 }
@@ -1310,10 +1341,10 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
             r"C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe",
         );
         if steam_blender.is_file() {
-            if let Some(ver) = query_blender_version(&steam_blender) {
-                return (true, Some(ver));
-            }
-            return (true, Some("Blender (Steam)".to_string()));
+            return BlenderResolution::File {
+                path: steam_blender,
+                fallback_label: "Blender (Steam)".to_string(),
+            };
         }
     }
 
@@ -1323,12 +1354,12 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
             "/Applications/Blender.app/Contents/MacOS/Blender",
             "/Applications/Blender/Blender.app/Contents/MacOS/Blender",
         ] {
-            let p = std::path::Path::new(app_path);
+            let p = std::path::PathBuf::from(app_path);
             if p.is_file() {
-                if let Some(ver) = query_blender_version(p) {
-                    return (true, Some(ver));
-                }
-                return (true, Some("Blender".to_string()));
+                return BlenderResolution::File {
+                    path: p,
+                    fallback_label: "Blender".to_string(),
+                };
             }
         }
     }
@@ -1340,18 +1371,55 @@ pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
             "/usr/local/bin/blender",
             "/snap/bin/blender",
         ] {
-            let p = std::path::Path::new(linux_path);
+            let p = std::path::PathBuf::from(linux_path);
             if p.is_file() {
-                if let Some(ver) = query_blender_version(p) {
-                    return (true, Some(ver));
-                }
-                return (true, Some("Blender".to_string()));
+                return BlenderResolution::File {
+                    path: p,
+                    fallback_label: "Blender".to_string(),
+                };
             }
         }
     }
 
-    // 4. PATH lookup fallback (e.g. `blender --version`)
-    probe_blender_binary("blender")
+    BlenderResolution::NotFoundInStandardPaths
+}
+
+/// Resolves the file path to the host Blender executable using the shared resolution order:
+/// explicit path override -> environment variable overrides (`RUSTY_GRID_BLENDER_PATH`,
+/// `OXIDE_SWARM_BLENDER_PATH`, `BLENDER_PATH`) -> OS standard installation paths -> `PATH`.
+///
+/// If a non-empty explicit path or environment variable override is set but does not point to an
+/// existing regular file, returns `None` rather than falling through to host installations.
+pub fn resolve_blender_binary(explicit_path: Option<&str>) -> Option<std::path::PathBuf> {
+    match resolve_blender_candidate(explicit_path) {
+        BlenderResolution::InvalidOverride => None,
+        BlenderResolution::File { path, .. } => Some(path),
+        BlenderResolution::NotFoundInStandardPaths => {
+            if probe_blender_binary("blender").0 {
+                Some(std::path::PathBuf::from("blender"))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Discovers Blender executable and queries its version.
+pub fn detect_blender(explicit_path: Option<&str>) -> (bool, Option<String>) {
+    match resolve_blender_candidate(explicit_path) {
+        BlenderResolution::InvalidOverride => (false, None),
+        BlenderResolution::File {
+            path,
+            fallback_label,
+        } => {
+            if let Some(ver) = query_blender_version(&path) {
+                (true, Some(ver))
+            } else {
+                (true, Some(fallback_label))
+            }
+        }
+        BlenderResolution::NotFoundInStandardPaths => probe_blender_binary("blender"),
+    }
 }
 
 /// Probes a Blender executable candidate by running `<program> --version` with secrets stripped.
@@ -1497,8 +1565,13 @@ mod tests {
     use super::*;
     use crate::task::TaskRequirements;
 
+    static BLENDER_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_capabilities_detect_default() {
+        let _guard = BLENDER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let caps = WorkerCapabilities::detect(None, None, false);
         assert!(!caps.name.is_empty(), "Worker name should not be empty");
         assert!(caps.cpu_cores >= 1, "CPU cores must be >= 1");
@@ -1573,6 +1646,9 @@ mod tests {
 
     #[test]
     fn test_capabilities_detect_cores_override() {
+        let _guard = BLENDER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let caps = WorkerCapabilities::detect(Some("worker-test".into()), Some(16), false);
         assert_eq!(caps.name, "worker-test");
         assert_eq!(caps.cpu_cores, 16);
@@ -1580,6 +1656,9 @@ mod tests {
 
     #[test]
     fn test_capabilities_detect_simulate_gpu() {
+        let _guard = BLENDER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let caps = WorkerCapabilities::detect(Some("gpu-worker".into()), Some(4), true);
         assert_eq!(caps.name, "gpu-worker");
         assert!(caps.has_gpu);
@@ -1590,6 +1669,9 @@ mod tests {
 
     #[test]
     fn test_capabilities_hardware_overrides() {
+        let _guard = BLENDER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let overrides = HardwareOverrides {
             name: Some("custom-node".into()),
             cores: Some(32),
@@ -1999,9 +2081,89 @@ mod tests {
 
     #[test]
     fn test_detect_blender_non_panicking() {
+        let _guard = BLENDER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (has_blender, ver) = detect_blender(None);
         if has_blender {
             assert!(ver.is_some());
+        }
+    }
+
+    #[test]
+    fn test_stale_blender_override_returns_none_and_false_without_fallthrough() {
+        let _guard = BLENDER_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("stale_missing_blender_404.exe");
+        let missing_str = missing.to_string_lossy().to_string();
+        let existing_file = dir.path().join("fake_blender_file.exe");
+        std::fs::write(&existing_file, b"not-a-real-blender").expect("write fake file");
+
+        let env_vars = [
+            "RUSTY_GRID_BLENDER_PATH",
+            "OXIDE_SWARM_BLENDER_PATH",
+            "BLENDER_PATH",
+        ];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            env_vars.iter().map(|&k| (k, std::env::var_os(k))).collect();
+
+        for (k, _) in &saved {
+            std::env::remove_var(k);
+        }
+
+        // 1. Stale explicit_path does not fall through even when BLENDER_PATH points to an existing file.
+        std::env::set_var("BLENDER_PATH", &existing_file);
+        assert_eq!(resolve_blender_binary(Some(&missing_str)), None);
+        assert_eq!(detect_blender(Some(&missing_str)), (false, None));
+
+        // 2. Valid env override resolves on both sides.
+        assert_eq!(
+            resolve_blender_binary(None),
+            Some(existing_file.clone()),
+            "valid BLENDER_PATH must resolve to the file"
+        );
+        let (has_valid, ver_valid) = detect_blender(None);
+        assert!(has_valid, "valid BLENDER_PATH file must report has_blender");
+        assert!(ver_valid.is_some());
+
+        // 3. Stale env override in any of the three variables returns None and (false, None)
+        //    without falling through to lower-precedence variables or host installations.
+        for &var in &env_vars {
+            for (k, _) in &saved {
+                std::env::remove_var(k);
+            }
+            std::env::set_var(var, &missing_str);
+            assert_eq!(
+                resolve_blender_binary(None),
+                None,
+                "stale {var} must not fall through in resolve_blender_binary"
+            );
+            assert_eq!(
+                detect_blender(None),
+                (false, None),
+                "stale {var} must not fall through in detect_blender"
+            );
+            let caps = WorkerCapabilities::detect_with_overrides(HardwareOverrides::default());
+            assert!(
+                !caps.has_blender && caps.blender_version.is_none(),
+                "WorkerCapabilities::detect_with_overrides must report no Blender on stale {var}"
+            );
+        }
+
+        // 4. Higher-precedence stale override (RUSTY_GRID_BLENDER_PATH) does not fall through to
+        //    lower-precedence valid override (BLENDER_PATH).
+        std::env::set_var("RUSTY_GRID_BLENDER_PATH", &missing_str);
+        std::env::set_var("BLENDER_PATH", &existing_file);
+        assert_eq!(resolve_blender_binary(None), None);
+        assert_eq!(detect_blender(None), (false, None));
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
         }
     }
 
