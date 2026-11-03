@@ -253,7 +253,7 @@ for _ in $(seq 1 100); do
     fi
 
     STILL_RUNNING_VICTIM_TASKS=()
-    for i in "${CANDIDATE_TASKS[@]}"; do
+    for i in "${CANDIDATE_TASKS[@]+"${CANDIDATE_TASKS[@]}"}"; do
         if grep -q "^done:" "${MARKERS}/task_${i}.log"; then
             continue
         fi
@@ -265,9 +265,15 @@ for _ in $(seq 1 100); do
             STILL_RUNNING_VICTIM_TASKS+=("$i")
         fi
     done
+    if [[ ${#STILL_RUNNING_VICTIM_TASKS[@]} -eq 0 ]]; then
+        sleep 0.1
+        continue
+    fi
 
+    # Re-check `done:` across all surviving candidates in a tight local loop (without CLI calls)
+    # to narrow the window after the `task_state` RPCs and immediately before `kill -KILL`.
     VICTIM_TASKS=()
-    for i in "${STILL_RUNNING_VICTIM_TASKS[@]}"; do
+    for i in "${STILL_RUNNING_VICTIM_TASKS[@]+"${STILL_RUNNING_VICTIM_TASKS[@]}"}"; do
         if ! grep -q "^done:" "${MARKERS}/task_${i}.log"; then
             VICTIM_TASKS+=("$i")
         fi
