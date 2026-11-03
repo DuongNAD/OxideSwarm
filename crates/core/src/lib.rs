@@ -14,6 +14,9 @@ pub mod protocol;
 pub mod task;
 pub mod transport;
 
+#[cfg(test)]
+mod wire_layout_tests;
+
 pub use arbitrage::{
     calculate_authority_score, check_mobile_master_eligibility, evaluate_master_claim,
     evaluate_mobile_master_refusal, evaluate_mobile_master_refusal_matrix, resolve_election_tie,
