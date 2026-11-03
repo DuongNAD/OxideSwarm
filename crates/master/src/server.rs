@@ -2186,7 +2186,7 @@ async fn send_client_response<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     "Task {task_id} result frame ({size} bytes) exceeds maximum protocol frame limit ({max} bytes); write large outputs to files and retrieve them with `--output`"
                 ),
                 _ => format!(
-                    "Master response frame ({size} bytes) exceeds maximum protocol frame limit ({max} bytes); write large outputs to files and retrieve them with `--output`"
+                    "Master response frame ({size} bytes) exceeds maximum protocol frame limit ({max} bytes)"
                 ),
             };
             warn!(
@@ -5630,14 +5630,8 @@ mod tests {
             .push(oversized_waiter_tx);
         master.submit_task(oversized_task).await.unwrap();
 
-        let sibling_task = Task::new(
-            TaskSpec::command("echo", vec!["sibling".into()]),
-            TaskRequirements::generic(1, 64),
-        );
-        let sibling_id = sibling_task.id;
-        master.submit_task(sibling_task).await.unwrap();
-
-        // The registered waiter must wake with the failure result.
+        // The registered waiter must wake with the failure result, and the worker's registry slot
+        // must be released (`active_tasks == 0` and status not `Busy`).
         let oversized_res = tokio::time::timeout(Duration::from_secs(2), oversized_waiter_rx)
             .await
             .expect("oversized task waiter must be woken when assignment fails")
@@ -5652,6 +5646,23 @@ mod tests {
             master.get_task_info(oversized_id).await.unwrap().state,
             crate::queue::TaskState::Failed
         );
+        let worker_after_fail = master.registry.get_worker(worker_id).await.unwrap();
+        assert_eq!(
+            worker_after_fail.active_tasks, 0,
+            "worker registry active_tasks must return to 0 after unsendable assignment"
+        );
+        assert_ne!(
+            worker_after_fail.status,
+            crate::registry::WorkerStatus::Busy,
+            "worker registry status must not stay Busy after unsendable assignment"
+        );
+
+        let sibling_task = Task::new(
+            TaskSpec::command("echo", vec!["sibling".into()]),
+            TaskRequirements::generic(1, 64),
+        );
+        let sibling_id = sibling_task.id;
+        master.submit_task(sibling_task).await.unwrap();
 
         // The 1-slot worker session must still be alive, have its slot released, and receive the
         // sibling task assignment.
@@ -5892,6 +5903,16 @@ mod tests {
             .expect("mux waiter must be woken when data-lane assignment fails")
             .expect("mux waiter must receive TaskResult");
         assert!(!mux_res.is_success());
+        let mux_worker_after_fail = mux_registry.get_worker(mux_worker_id).await.unwrap();
+        assert_eq!(
+            mux_worker_after_fail.active_tasks, 0,
+            "mux worker registry active_tasks must return to 0 after unsendable assignment"
+        );
+        assert_ne!(
+            mux_worker_after_fail.status,
+            crate::registry::WorkerStatus::Busy,
+            "mux worker registry status must not stay Busy after unsendable assignment"
+        );
 
         // Because the 1-slot mux worker's slot was released, a second task can now be scheduled
         // and arrives on `mux_data`.
