@@ -5243,6 +5243,9 @@ max_active_mb = 768
         );
 
         let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("OXIDESWARM_HOME", dir.path());
+        std::env::remove_var("OXIDESWARM_SECRET");
+        std::env::remove_var("OXIDESWARM_SECRET_FILE");
         let cfg_path = dir.path().join("rusty-grid.toml");
         std::fs::write(
             &cfg_path,
@@ -5251,19 +5254,102 @@ max_active_mb = 768
         .unwrap();
         let loaded = crate::config::load_config_file(Some(&cfg_path)).unwrap();
         assert!(
-            loaded.and_then(|c| c.worker).is_some(),
-            "config file with unknown no_battery keys must still load without enabling no_battery"
-        );
-        assert!(
-            !resolve_no_battery(),
-            "a config file must never be able to disable battery protection"
+            loaded.as_ref().and_then(|c| c.worker.as_ref()).is_some(),
+            "config file with unknown no_battery keys must still load"
         );
 
-        std::env::set_var("RUSTY_GRID_NO_BATTERY", "1");
-        assert!(
-            resolve_no_battery(),
-            "RUSTY_GRID_NO_BATTERY=1 must disable host battery probing in the CLI layer"
-        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rusty_grid_core::capabilities::with_test_battery_probe((Some(10), Some(false)), || {
+            rt.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let master_addr = listener.local_addr().unwrap().to_string();
+
+                let accept_register = || async {
+                    let (stream, _) =
+                        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                            .await
+                            .expect("run_worker must connect to local listener")
+                            .unwrap();
+                    let mut transport = MessageTransport::new(stream);
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        transport.recv_msg::<rusty_grid_core::protocol::WorkerMessage>(),
+                    )
+                    .await
+                    .expect("run_worker must send Register")
+                    .unwrap()
+                    {
+                        Some(rusty_grid_core::protocol::WorkerMessage::Register {
+                            capabilities,
+                            ..
+                        }) => capabilities,
+                        other => panic!("expected WorkerMessage::Register, got {other:?}"),
+                    }
+                };
+
+                let make_worker_args = |sandbox_sub: &str| {
+                    let sb = dir.path().join(sandbox_sub);
+                    let cli = Cli::try_parse_from([
+                        "oxideswarm",
+                        "worker",
+                        "--master",
+                        &master_addr,
+                        "--no-gpu",
+                        "--no-cuda",
+                        "--no-blender",
+                        "--no-portal",
+                        "--sandbox-base-dir",
+                        sb.to_str().unwrap(),
+                    ])
+                    .unwrap();
+                    let Commands::Worker(w_args) = cli.command else {
+                        panic!("expected Worker");
+                    };
+                    w_args
+                };
+
+                let secret_opts = SecretOpts {
+                    value: None,
+                    file: None,
+                };
+
+                // 1. With `no_battery = true` in `rusty-grid.toml` (and alias env vars set), `run_worker`
+                //    must still probe the 10% simulated battery and advertise `battery_pct == Some(10)`.
+                let w_task1 = tokio::spawn(run_worker(
+                    make_worker_args("sb1"),
+                    loaded.clone(),
+                    secret_opts.clone(),
+                ));
+                let caps_from_cfg = accept_register().await;
+                w_task1.abort();
+                assert_eq!(
+                    caps_from_cfg.mobile.as_ref().and_then(|m| m.battery_pct),
+                    Some(10),
+                    "no_battery = true in rusty-grid.toml must not disable battery probing in run_worker"
+                );
+
+                // 2. With `RUSTY_GRID_NO_BATTERY=1` in the environment, `run_worker` disables battery probing.
+                std::env::set_var("RUSTY_GRID_NO_BATTERY", "1");
+                assert!(
+                    resolve_no_battery(),
+                    "RUSTY_GRID_NO_BATTERY=1 must disable host battery probing in the CLI layer"
+                );
+                let w_task2 = tokio::spawn(run_worker(
+                    make_worker_args("sb2"),
+                    loaded,
+                    secret_opts,
+                ));
+                let caps_from_env = accept_register().await;
+                w_task2.abort();
+                assert!(
+                    caps_from_env.mobile.is_none(),
+                    "RUSTY_GRID_NO_BATTERY=1 must suppress host battery probing in run_worker"
+                );
+            });
+        });
 
         std::env::remove_var("RUSTY_GRID_NO_BATTERY");
         std::env::remove_var("OXIDE_SWARM_NO_BATTERY");

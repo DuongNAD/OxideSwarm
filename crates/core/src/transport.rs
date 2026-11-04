@@ -310,10 +310,10 @@ mod tests {
     #[cfg(feature = "p2p")]
     #[test]
     fn test_ticket_serialization_roundtrip() {
-        use iroh::endpoint::presets::N0;
+        use iroh::endpoint::presets::Minimal;
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let endpoint = iroh::Endpoint::builder(N0)
+            let endpoint = iroh::Endpoint::builder(Minimal)
                 .alpns(vec![GRID_ALPN.to_vec()])
                 .bind()
                 .await

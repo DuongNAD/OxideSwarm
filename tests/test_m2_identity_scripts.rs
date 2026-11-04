@@ -49,6 +49,7 @@ async fn test_0_config_master_secret_key_persistence() {
             // Run 1: 0-config P2P (no p2p_key_file specified)
             let config1 = ServerConfig::new(master_bind)
                 .with_p2p(true)
+                .with_p2p_minimal_preset(true)
                 .with_p2p_ticket_file(&ticket_file1);
 
             let master1 = MasterServer::spawn(config1).await.expect("spawn master 1");
@@ -77,6 +78,7 @@ async fn test_0_config_master_secret_key_persistence() {
             let ticket_file2 = mock_home.join("master2.ticket");
             let config2 = ServerConfig::new(master_bind)
                 .with_p2p(true)
+                .with_p2p_minimal_preset(true)
                 .with_p2p_ticket_file(&ticket_file2);
 
             let master2 = MasterServer::spawn(config2).await.expect("spawn master 2");
@@ -158,8 +160,16 @@ async fn test_worker_auto_reconnect_under_3_seconds() {
     let ticket_file = temp_dir.path().join("fast_reconnect_master.ticket");
 
     let master_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    // Reserve a loopback UDP port so that with `presets::Minimal` (offline, no DERP relay),
+    // Master Run 1 and Master Run 2 share the same direct P2P address as well as the same NodeId.
+    let udp_probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP probe");
+    let p2p_bind = udp_probe.local_addr().expect("local UDP addr");
+    drop(udp_probe);
+
     let config1 = ServerConfig::new(master_bind)
         .with_p2p(true)
+        .with_p2p_minimal_preset(true)
+        .with_p2p_bind_addr(p2p_bind)
         .with_p2p_key_file(&key_file)
         .with_p2p_ticket_file(&ticket_file);
 
@@ -177,6 +187,7 @@ async fn test_worker_auto_reconnect_under_3_seconds() {
         .with_cores(2)
         .with_sandbox_base_dir(&worker_sandbox)
         .with_p2p_ticket(&ticket1)
+        .with_p2p_minimal_preset(true)
         .with_connect_timeout(Duration::from_millis(1200));
 
     let mut worker = WorkerClient::new(worker_config);
@@ -214,7 +225,7 @@ async fn test_worker_auto_reconnect_under_3_seconds() {
         "Worker must register with Master 1 initially"
     );
 
-    // 3. Stop Master 1 and wait for its P2P endpoint to close
+    // 3. Stop Master 1 and wait for its P2P endpoint to close and release the UDP socket
     let ep1 = master1
         .p2p_endpoint()
         .cloned()
@@ -228,10 +239,21 @@ async fn test_worker_auto_reconnect_under_3_seconds() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    drop(ep1);
+    drop(master1);
+    while std::net::UdpSocket::bind(p2p_bind).is_err() {
+        assert!(
+            tokio::time::Instant::now() < close_deadline,
+            "master1 UDP socket must be released after shutdown"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
-    // 4. Start Master Run 2 with same persistent key
+    // 4. Start Master Run 2 with same persistent key and loopback P2P UDP address
     let config2 = ServerConfig::new(master_bind)
         .with_p2p(true)
+        .with_p2p_minimal_preset(true)
+        .with_p2p_bind_addr(p2p_bind)
         .with_p2p_key_file(&key_file)
         .with_p2p_ticket_file(&ticket_file);
 

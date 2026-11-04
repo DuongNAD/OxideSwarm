@@ -65,7 +65,11 @@ directly inside `crates/core/src/capabilities.rs`, turned battery protection off
    host battery poller.
 
 `crates/core/src/capabilities.rs` does not read `RUSTY_GRID_NO_BATTERY` or any other battery
-environment variable directly.
+environment variable directly. For unit tests that need to simulate a discharging battery on any
+host (including headless CI runners without a physical battery), `crates/core/src/capabilities.rs`
+exposes a thread-local test hook `#[doc(hidden)] pub fn with_test_battery_probe` that overrides the
+reading returned by `detect_battery` for the duration of a closure and restores the previous
+thread-local state on drop.
 
 ### D2: Single CLI environment variable (`RUSTY_GRID_NO_BATTERY`) and start-up warning
 
@@ -108,12 +112,16 @@ warning makes the override visible in operator logs.
   (`crates/worker/src/client.rs`) uses `with_test_battery_probe((Some(10), Some(false)), ...)`
   so that on any host (including headless CI without a battery), `WorkerConfig::new` and
   `WorkerClient::from_options` observe the 10 % critical battery while `with_no_battery(true)` and
-  `WorkerClient::for_testing` suppress it.
+  `WorkerClient::for_testing` suppress it, and captures `tracing` events via
+  `tracing::subscriber::with_default` to verify that `WorkerClient::new` emits the `no_battery=true`
+  warning only when `no_battery` is `true`.
 - Unit test
   `cli_app::tests::test_resolve_no_battery_only_accepts_rusty_grid_no_battery_env_and_not_config_or_aliases`
-  (`crates/cli/src/cli_app.rs`) verifies that `OXIDE_SWARM_NO_BATTERY`,
-  `RUSTY_GRID_DISABLE_BATTERY`, and `no_battery = true` in `rusty-grid.toml` do not enable
-  `resolve_no_battery()`, and that `RUSTY_GRID_NO_BATTERY=1` does.
+  (`crates/cli/src/cli_app.rs`) verifies that `OXIDE_SWARM_NO_BATTERY` and
+  `RUSTY_GRID_DISABLE_BATTERY` do not enable `resolve_no_battery()`, that running `run_worker` with
+  `no_battery = true` in `rusty-grid.toml` under `with_test_battery_probe((Some(10), Some(false)), ...)`
+  still registers with `battery_pct == Some(10)`, and that `RUSTY_GRID_NO_BATTERY=1` suppresses
+  host battery probing in `run_worker`.
 - End-to-end test `test_sigterm_stops_the_worker_gracefully_and_takes_its_task_trees_with_it`
   (`tests/cli_worker_signals_e2e.rs`) asserts that a worker spawned with
   `RUSTY_GRID_NO_BATTERY=1` prints the start-up warning to its log.

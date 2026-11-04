@@ -94,6 +94,14 @@ receive `cancel_tx.send(true)` and have up to `500 ms` to send `CancelTask` befo
   P2P accept loop (or if `*p2p_shutdown.borrow_and_update()` is already true when the loop starts),
   the loop calls `endpoint.close().await` before breaking so `MasterServer::shutdown()` closes the
   `iroh::Endpoint`.
+- For offline and loopback P2P tests (`TEST-16`), `ServerConfig::with_p2p_minimal_preset(true)`
+  (`crates/master/src/server.rs`), `WorkerConfig::with_p2p_minimal_preset(true)`
+  (`crates/worker/src/client.rs`), and the `RUSTY_GRID_P2P_MINIMAL=1` environment variable build
+  `iroh::Endpoint` with `iroh::endpoint::presets::Minimal` (no n0 DERP relay connection or pkarr/DNS
+  address lookup) and skip the `5 s` `endpoint.online()` relay wait, while production defaults remain
+  `presets::N0` (`false`). `ServerConfig::with_p2p_bind_addr(SocketAddr)` allows restart tests
+  (`tests/test_m2_identity_scripts.rs`) to re-bind the same loopback UDP address across a master
+  restart without needing a public DERP relay.
 
 ## Compatibility
 
@@ -136,7 +144,9 @@ receive `cancel_tx.send(true)` and have up to `500 ms` to send `CancelTask` befo
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
 | TEST-15 | Stabilize MCP pipelined cancel, EOF grace, and P2P master restart tests | `crates/cli/src/mcp.rs`, `crates/master/src/server.rs`, `crates/cli/tests/test_mcp_concurrent_and_deadlines.rs`, `tests/test_p2p_wan_fallback.rs`, `tests/test_m2_identity_scripts.rs`, `crates/core/tests/m1_challenger_1_3d_serialization.rs` | All TEST-15 targets pass repeatedly under load and required mutations fail tests | Implemented |
+| TEST-16 | Keep workspace P2P tests off the external network (`presets::Minimal`) and mark live DERP relay tests `#[ignore]` | `crates/master/src/server.rs`, `crates/worker/src/client.rs`, `crates/core/src/transport.rs`, `crates/core/tests/quic_latency_bench.rs`, `tests/cluster_auth_e2e.rs`, `tests/m2_challenger_1_stress.rs`, `tests/m2_challenger_2_stress.rs`, `tests/m4_challenger_1_state_isolation.rs`, `tests/master_failover_cancel_liveness.rs`, `tests/master_quic_limits.rs`, `tests/test_m2_identity_scripts.rs`, `tests/test_m4_dashboard_telemetry.rs`, `tests/test_p2p_wan_fallback.rs`, `tests/worker_cluster_auth.rs`, `tests/worker_connection_lifecycle.rs`, `tests/zero_copy_quic_test.rs`, `crates/cli/tests/test_p2p_key_persistence.rs`, `crates/android_bridge/tests/adversarial_challenge_tests.rs` | Workspace P2P tests pass with non-loopback outbound network denied (`sandbox-exec`), and the 3 live DERP relay tests in `tests/test_p2p_wan_fallback.rs` are marked `#[ignore]` | Implemented |
 
 ## Status log
 
 - 2026-11-04: Implemented and verified against review feedback on pull request 83.
+- 2026-11-04: Added `with_p2p_minimal_preset(true)`, `with_p2p_bind_addr`, and `RUSTY_GRID_P2P_MINIMAL=1` (`TEST-16`) so workspace P2P tests run offline with `iroh::endpoint::presets::Minimal`.

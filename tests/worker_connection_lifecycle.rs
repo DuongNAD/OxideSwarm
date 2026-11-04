@@ -961,7 +961,7 @@ async fn test_a_restarted_worker_keeps_its_identity_at_the_master() {
 async fn test_a_stale_p2p_ticket_falls_back_to_the_tcp_address() {
     // A syntactically valid ticket for a node that no longer exists (the master "restarted with a
     // new identity"): bind a throwaway endpoint, take its address, and close it again.
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
         .alpns(vec![rusty_grid_core::transport::GRID_ALPN.to_vec()])
         .bind()
         .await
@@ -972,6 +972,7 @@ async fn test_a_stale_p2p_ticket_falls_back_to_the_tcp_address() {
     let master = ScriptedMaster::start().await;
     let worker = start_worker(master.addr, |c| {
         c.with_p2p_ticket(stale_ticket)
+            .with_p2p_minimal_preset(true)
             .with_connect_timeout(Duration::from_secs(2))
     });
 

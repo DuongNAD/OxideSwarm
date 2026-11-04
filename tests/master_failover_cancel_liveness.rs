@@ -1317,6 +1317,7 @@ mod quic {
     ) -> (MasterHandle, iroh::EndpointAddr, iroh::Endpoint) {
         let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
             .with_p2p(true)
+            .with_p2p_minimal_preset(true)
             .with_ephemeral_key(true);
         let master = MasterServer::spawn_with_config(config, SchedulerConfig::default(), reaper)
             .await
@@ -1324,7 +1325,7 @@ mod quic {
         let ticket = master.p2p_ticket().expect("p2p ticket").to_string();
         let mut master_addr = parse_p2p_ticket(&ticket).expect("parse ticket");
         master_addr.addrs.retain(|a| !a.is_relay());
-        let client = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
             .relay_mode(iroh::endpoint::RelayMode::Disabled)
             .alpns(vec![GRID_ALPN.to_vec()])
             .bind()

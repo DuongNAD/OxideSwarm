@@ -855,6 +855,7 @@ std::thread_local! {
 /// Overrides the host battery reading returned by `detect_battery` on the current thread for the
 /// duration of `f`. Used by unit tests to simulate a discharging battery on any host (such as a
 /// headless CI runner without a battery).
+#[doc(hidden)]
 pub fn with_test_battery_probe<R>(reading: (Option<u8>, Option<bool>), f: impl FnOnce() -> R) -> R {
     struct Reset(Option<(Option<u8>, Option<bool>)>);
     impl Drop for Reset {
