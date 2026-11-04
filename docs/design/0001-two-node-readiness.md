@@ -61,9 +61,10 @@ which calls `Task::validate`. Validation added there covers all paths.
 - In `ListWorkers` and `ClusterStatus` answers the master adds `link:<path>` (as before),
   `id:<worker uuid>` and `state:<connected|busy|disconnected>`. Clients receive only
   `WorkerCapabilities`, so the `id:` tag is how they learn the id a `worker` constraint can name.
-- A user tag is 1 to 64 bytes with no whitespace, `=` or `,`. The prefixes `os:`, `arch:`, `link:`,
-  `id:` and `state:` are reserved; a worker given such a tag refuses to start with a configuration
-  error (`WorkerClient::run`, and the CLI before that).
+- A user tag is 1 to 64 bytes with no whitespace, `=` or `,`. The prefixes `os:`, `arch:`, `slots:`,
+  `link:`, `id:` and `state:` (`RESERVED_TAG_PREFIXES` in `crates/core/src/placement.rs`) are
+  reserved; a worker given such a tag refuses to start with a configuration error
+  (`WorkerClient::run`, and the CLI before that).
 
 ### D2 Placement constraints
 
@@ -174,7 +175,8 @@ the network. Default behaviour is unchanged.
   (`DEFAULT_MAX_OUTPUT_BYTES`, 10 MiB).
 - The worker still removes its own `OXIDESWARM_SECRET`, `OXIDESWARM_SECRET_FILE` and
   `OXIDE_MESH_TOKEN` before it applies the task's environment (`SECRET_ENV_VARS` in
-  `crates/worker/src/runner.rs`); `--env` values are passed as given.
+  `crates/core/src/cluster_auth.rs`, applied in `crates/worker/src/runner.rs`); `--env` values are
+  passed as given.
 
 ## Test plan
 

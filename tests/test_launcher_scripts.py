@@ -598,6 +598,14 @@ class StaticRepositoryChecks(unittest.TestCase):
             self.assertIn("--no-shell", text, f"{path} must support --no-shell")
 
     def test_gitignore_covers_test_reports_and_jnilibs_so_files(self):
+        probe = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if probe.returncode != 0:
+            self.skipTest("git check-ignore requires a git checkout")
         for rel in (
             "test_reports/chaos_test_report.md",
             "packaging/android/app/app/src/main/jniLibs/arm64-v8a/liboxideworker.so",

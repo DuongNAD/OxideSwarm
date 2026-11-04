@@ -272,8 +272,8 @@ case "${MODE}" in
         exit 0
         ;;
     *)
-        echo -e "${CLR_RED}Lỗi: Chế độ không hợp lệ '${MODE}'.${CLR_RESET}"
-        echo -e "Các chế độ hỗ trợ: ${CLR_BOLD}test, dev, doc, research${CLR_RESET} (hoặc chạy không tham số để mở Menu)."
+        echo -e "${CLR_RED}Error: Invalid workflow mode '${MODE}'.${CLR_RESET}"
+        echo -e "Supported modes: ${CLR_BOLD}test, dev, doc, research${CLR_RESET} (or run without arguments to open the interactive menu)."
         exit 1
         ;;
 esac

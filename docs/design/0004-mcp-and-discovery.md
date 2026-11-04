@@ -1,7 +1,7 @@
 # 0004: Model Context Protocol server and subnet-isolated discovery fallback
 
-Status: Implemented
-Created: 2026-10-23    Updated: 2026-11-01
+Status: Partial
+Created: 2026-10-23    Updated: 2026-11-04
 
 ## Summary
 
@@ -68,7 +68,7 @@ Implemented in `crates/cli/src/mcp.rs` and `crates/cli/src/config.rs`.
 |---|---|---|
 | `status` | `task_id` (optional string), `workers` (optional bool) | Returns overall cluster status, active task counts, and worker counts, or execution state of a specific task. |
 | `workers` | `connected_only`, `os`, `arch`, `gpu_only` | Lists registered compute workers, hardware capabilities, and tags matching the given filters. |
-| `submit` | `type`, `command`, `args`, `script`, `interpreter`, `stdin`, `env`, `os`, `arch`, `worker`, `require_tags`, `gpu`, `matrix_dim`, `files`, `outputs`, `wait`, `timeout_secs`, `wait_secs`, `max_retries` | Submits a computation task to the grid with optional file staging, placement constraints, and client wait deadline (`wait_secs`). |
+| `submit` | `type`, `command`, `args`, `script`, `interpreter`, `stdin`, `env`, `os`, `arch`, `worker`, `require_tags`, `cores`, `ram_mb`, `gpu`, `matrix_dim`, `work_group_size`, `files`, `outputs`, `wait`, `timeout_secs`, `wait_secs`, `max_retries` | Submits a computation task to the grid with optional file staging, placement constraints, and client wait deadline (`wait_secs`). Note: when `type` is `"command"` (or omitted), `script` and `interpreter` are ignored and an omitted `command` defaults to `echo "Hello from OxideSwarm MCP"` (`MCP-3`). |
 | `task_result` | `task_id`, `wait`, `timeout_secs`, `wait_secs` | Retrieves execution outcome, exit code, stdout, stderr, execution duration, and output artifacts. |
 | `cancel` | `task_id` | Cancels a queued or running task on the master by UUID. |
 | `doctor` | `expect_workers`, `timeout_secs`, `gpu_dim`, `spread_tasks`, `skip_gpu`, `skip_spread` | Runs cluster diagnostic checks C1–C6 and returns complete health check results. |
@@ -120,7 +120,7 @@ When master and workers reside on different subnets with no shared broadcast dom
    ```http
    GET /api/rendezvous/master HTTP/1.1
    ```
-   The returned `RendezvousLease` is verified against the local `cluster.secret`.
+   The returned `RendezvousLease` is verified against the local `cluster.secret`. Anonymous (unauthenticated) reads of `GET /api/rendezvous/master` drop `p2p_ticket` (`None`), whereas requests presenting a valid `observer` (or higher) dashboard token receive the full lease (`crates/master/src/web_ui.rs`: `api_rendezvous_master`).
 
 Implemented in `crates/core/src/discovery.rs` and `crates/master/src/server.rs`.
 
@@ -146,7 +146,7 @@ Implemented in `crates/core/src/discovery.rs` and `crates/master/src/server.rs`.
 ## Test plan
 
 - **Unit:** JSON-RPC parsing, tool schema validation, rendezvous lease HMAC signing/verification, and URL parsing (`crates/core`, `crates/cli`).
-- **Integration:** MCP server stdio lifecycle, tool execution (`status`, `workers`, `submit`, `task_result`, `doctor`), and stdout hygiene verification asserting zero non-JSON frames on stdout (`tests/mcp_server_e2e.rs`).
+- **Integration:** MCP server stdio lifecycle, tool execution (`status`, `workers`, `submit`, `task_result`, `cancel`, `doctor`), and stdout hygiene verification asserting zero non-JSON frames on stdout (`tests/mcp_server_e2e.rs`).
 - **Integration:** HTTP discovery probe verification, nonce replay rejection, rendezvous registration and lookup, and tiered discovery fallback (`tests/discovery_fallback_e2e.rs`).
 - **Gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 
@@ -154,7 +154,7 @@ Implemented in `crates/core/src/discovery.rs` and `crates/master/src/server.rs`.
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| W1 | MCP stdio protocol engine | `crates/cli/src/mcp.rs` | JSON-RPC 2.0 lifecycle and 5 tools implemented | Implemented |
+| W1 | MCP stdio protocol engine | `crates/cli/src/mcp.rs` | JSON-RPC 2.0 lifecycle and 6 tools implemented (`MCP-2` output truncation/blob staging and `MCP-3` strict argument validation still open) | Partial |
 | W2 | CLI MCP subcommand and stdout hygiene | `crates/cli/src/cli_app.rs` | `oxideswarm mcp` command added, tracing routed to `stderr` | Implemented |
 | W3 | Authenticated HTTP discovery probe | `crates/core/src/discovery.rs`, `crates/master/src/web_ui.rs` | `/api/discovery/probe` handler and client probe with nonce HMAC | Implemented |
 | W4 | Rendezvous registry service | `crates/core/src/discovery.rs`, `crates/master/src/web_ui.rs`, `crates/master/src/server.rs` | Signed lease registration and lookup with sanitised address | Implemented |
@@ -167,3 +167,4 @@ Implemented in `crates/core/src/discovery.rs` and `crates/master/src/server.rs`.
 - 2026-10-23: Implemented W1–W6 on branch `feat/m5c-mcp-and-discovery`.
 - 2026-10-23: Verified via `cargo test -p rusty_grid_cli --test mcp_server_e2e` and `discovery_fallback_e2e` (5 passing tests). Status marked Implemented.
 - 2026-11-01: Removed the unauthenticated `--sse` HTTP surface (`SEC-1`) and enforced startup secret validation via `client_secret` using `[status]` for `master`, `secret`, and `insecure` while skipping working-directory config files (`SEC-2`).
+- 2026-11-04: Documented all `submit` schema arguments (`cores`, `ram_mb`, `work_group_size`) and current command fallback behaviour in D2, noted that anonymous reads of `GET /api/rendezvous/master` drop `p2p_ticket` in D5, and set status to `Partial` while `MCP-2` and `MCP-3` remain open (`DOC-3`).
