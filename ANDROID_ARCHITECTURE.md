@@ -757,8 +757,8 @@ To prevent split-brain clusters without requiring heavyweight consensus protocol
    }
    ```
 2. **Heartbeat Lease Renewal**: The Master renews its lease every 10 seconds.
-3. **Graceful Handover to Superior Node**:
-   When a desktop workstation ($S_{auth} = 9,500$) boots up and joins a cluster temporarily led by an Android smartphone ($S_{auth} = 3,800$), the desktop sends a `ClaimMasterRole` message presenting its superior score. The mobile Master flushes its pending task queue to the desktop, relinquishes leadership, and transitions to a worker node within $500\text{ms}$.
+3. **Graceful Handover to Superior Node** *(Coordinator role on Android removed by decision D2 / `SEC-3`: the Android app is a worker only and never runs an embedded Master)*:
+   In the original specification, when a desktop workstation ($S_{auth} = 9,500$) booted up and joined a cluster temporarily led by an Android smartphone ($S_{auth} = 3,800$), the desktop would send a `ClaimMasterRole` message presenting its superior score so the mobile node could flush its pending task queue and transition to a worker node within $500\text{ms}$. Under decision D2 (`SEC-3`), Android nodes never assume the coordinator role.
 
 ---
 

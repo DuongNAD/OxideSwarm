@@ -124,8 +124,9 @@ Extra tokens with a narrower scope can be registered when starting the master:
 Public routes on the dashboard listener (`8080/tcp`) that do not require a dashboard token:
 
 * `GET /`: serves the static SPA shell HTML (contains no cluster state).
-* `GET /api/discovery/probe`: HTTP discovery fallback returning a `MasterBeacon` (cluster address, web UI URL,
-  hostname, worker count; signed with the cluster secret when a secret and `nonce` query parameter are present).
+* `GET /api/discovery/probe?nonce=<32-hex-chars>`: HTTP discovery fallback returning a `MasterBeacon` (cluster
+  address, web UI URL, hostname, worker count). Requires a 16-byte (32-hex-character) `nonce` query parameter;
+  the answer is signed with the cluster secret when the master has a secret.
 * `GET /api/rendezvous/master`: returns the active `RendezvousLease` (cluster address, web UI URL, hostname,
   worker count, TTL, and HMAC signature). Unauthenticated reads redact `p2p_ticket` (`None`); callers presenting
   a valid `observer` (or higher) token receive the full lease.
