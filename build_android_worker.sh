@@ -208,7 +208,7 @@ if [[ -f "$OUTPUT_BIN" ]]; then
     echo "  3. Push the master's cluster secret (copied from ~/.oxideswarm/cluster.secret on the master):"
     echo "     adb push cluster.secret /data/local/tmp/cluster.secret && adb shell chmod 600 /data/local/tmp/cluster.secret"
     echo "  4. Run worker against the master's CLUSTER port 8088 (never the dashboard port 8080):"
-    echo "     adb shell /data/local/tmp/rusty-grid worker --master <MASTER_IP>:8088 --secret-file /data/local/tmp/cluster.secret"
+    echo "     adb shell /data/local/tmp/rusty-grid worker --master <MASTER_IP>:8088 --secret-file /data/local/tmp/cluster.secret --sandbox-base-dir /data/local/tmp/rusty_grid/sandboxes"
     echo "=================================================================="
 else
     log_err "Expected output binary not found at ${OUTPUT_BIN}"
