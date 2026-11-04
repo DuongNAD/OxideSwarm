@@ -4472,4 +4472,47 @@ max_active_mb = 768
         assert_eq!(esc_prog, r"\\srv\share\m.exe");
         assert_eq!(esc_args, vec!["tr", "-d", r"\r"]);
     }
+
+    #[test]
+    fn test_every_cli_long_flag_is_documented_in_readme() {
+        use clap::CommandFactory;
+
+        fn collect_long_flags(cmd: &clap::Command, path: &str, out: &mut Vec<(String, String)>) {
+            for arg in cmd.get_arguments() {
+                if let Some(long) = arg.get_long() {
+                    out.push((path.to_string(), format!("--{long}")));
+                }
+                if let Some(aliases) = arg.get_all_aliases() {
+                    for alias in aliases {
+                        out.push((path.to_string(), format!("--{alias}")));
+                    }
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                if sub.get_name() == "help" {
+                    continue;
+                }
+                let sub_path = format!("{path} {}", sub.get_name());
+                collect_long_flags(sub, &sub_path, out);
+            }
+        }
+
+        let readme = include_str!("../../../README.md");
+        let cmd = Cli::command();
+        let mut flags = Vec::new();
+        collect_long_flags(&cmd, "oxideswarm", &mut flags);
+        assert!(!flags.is_empty(), "Cli::command() must expose long flags");
+
+        let missing: Vec<String> = flags
+            .into_iter()
+            .filter(|(_, flag)| !readme.contains(flag.as_str()))
+            .map(|(sub, flag)| format!("{sub}: {flag}"))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "Every CLI long flag and alias in Cli::command() must be documented in README.md; missing:\n{}",
+            missing.join("\n")
+        );
+    }
 }

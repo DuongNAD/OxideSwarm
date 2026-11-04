@@ -29,13 +29,13 @@ echo ===========================================================================
 echo  Host          : %COMPUTERNAME%
 echo ==============================================================================
 echo.
-echo  [1] Chuyen may nay thanh MASTER (Dieu phoi cum; dashboard chi tren may nay)
-echo  [2] Chuyen may nay thanh WORKER (May tram tinh toan phu tro)
-echo  [3] Kiem tra trang thai chi tiet va Log
-echo  [4] Tat cac tien trinh do script nay chay (Stop)
-echo  [5] Thoat
+echo  [1] Promote this machine to MASTER (Cluster coordinator; loopback dashboard by default)
+echo  [2] Switch this machine to WORKER (Compute worker node)
+echo  [3] Show current node status and logs
+echo  [4] Stop processes started by this launcher
+echo  [5] Exit
 echo.
-set /p "CHOICE=Nhap lua chon [1-5]: "
+set /p "CHOICE=Select option [1-5]: "
 
 if "%CHOICE%"=="1" goto menu_master
 if "%CHOICE%"=="2" goto menu_worker
@@ -47,16 +47,16 @@ goto show_menu
 :menu_master
 set "MASTER_FLAGS="
 set "ANS="
-set /p "ANS=Mo dashboard cho dien thoai/LAN (--lan-dashboard)? [y/N]: "
+set /p "ANS=Expose dashboard on LAN (--lan-dashboard)? [y/N]: "
 if /i "%ANS%"=="y" set "MASTER_FLAGS=%MASTER_FLAGS% --lan-dashboard"
 set "ANS="
-set /p "ANS=Bat P2P cho may o mang khac (--p2p)? [y/N]: "
+set /p "ANS=Enable P2P for remote networks (--p2p)? [y/N]: "
 if /i "%ANS%"=="y" set "MASTER_FLAGS=%MASTER_FLAGS% --p2p"
 goto do_master
 
 :menu_worker
 set "CUSTOM_MASTER="
-set /p "CUSTOM_MASTER=Nhap dia chi Master dang IP:8088 [Enter de tu dong quet 'auto']: "
+set /p "CUSTOM_MASTER=Enter Master address IP:8088 [Press Enter for 'auto' discovery]: "
 if not defined CUSTOM_MASTER set "CUSTOM_MASTER=auto"
 goto do_worker
 
@@ -95,14 +95,14 @@ rem  Role: MASTER
 rem ------------------------------------------------------------------------------
 :do_master
 echo.
-echo [INFO] Dang chuyen doi sang vai tro MASTER...
+echo [INFO] Switching node role to MASTER...
 call "%SCRIPT_DIR%start_master.cmd"%MASTER_FLAGS%
 if errorlevel 1 goto failed
 echo.
-echo   * KET NOI CAC MAY KHAC (cung LAN) sau khi da chep cluster.secret sang may do:
-echo       Windows : switch_role.cmd worker IP-MAY-NAY:8088
-echo       Mac/Linux: ./switch_role.sh worker IP-MAY-NAY:8088
-echo   * May o mang khac: chay lai voi --p2p va dung ticket cung connect_remote.
+echo   * CONNECT FROM OTHER LAN MACHINES (after copying cluster.secret):
+echo       Windows : switch_role.cmd worker THIS-PC-IP:8088
+echo       Mac/Linux: ./switch_role.sh worker THIS-PC-IP:8088
+echo   * Remote networks: re-run with --p2p and use the ticket with connect_remote.
 if "%TARGET_ARG%"=="" pause
 exit /b 0
 
@@ -111,7 +111,7 @@ rem  Role: WORKER
 rem ------------------------------------------------------------------------------
 :do_worker
 echo.
-echo [INFO] Dang chuyen doi sang vai tro WORKER...
+echo [INFO] Switching node role to WORKER...
 call "%SCRIPT_DIR%start_worker.cmd" "%CUSTOM_MASTER%"%WORKER_REST%
 if errorlevel 1 goto failed
 if "%TARGET_ARG%"=="" pause
@@ -125,13 +125,13 @@ call "%SCRIPT_DIR%status_worker.cmd"
 exit /b 0
 
 :do_stop
-echo [INFO] Dang tat cac tien trinh OxideSwarm do script nay chay...
+echo [INFO] Stopping OxideSwarm processes started by this launcher...
 call "%SCRIPT_DIR%stop_worker.cmd" all
 if "%TARGET_ARG%"=="" pause
 exit /b 0
 
 :failed
 echo.
-echo [ERROR] Khong khoi dong duoc. Xem log trong %USERPROFILE%\.oxideswarm\run
+echo [ERROR] Failed to start. Check logs in %USERPROFILE%\.oxideswarm\run
 if "%TARGET_ARG%"=="" pause
 exit /b 1
