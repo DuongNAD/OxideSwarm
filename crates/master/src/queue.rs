@@ -1849,6 +1849,43 @@ impl TaskQueue {
         Ok(ResultDisposition::Terminal)
     }
 
+    /// Fails a queued task terminally when no registered worker in the cluster can satisfy its
+    /// capabilities or placement constraints (`SchedulerConfig::fail_unfulfillable_tasks`), or
+    /// when its placement constraints are syntactically invalid.
+    ///
+    /// Returns `Some(TaskResult)` when the task transitioned from `Queued` to `Failed`, or `None`
+    /// if the task was already scheduled, cancelled, or finished in the meantime.
+    pub async fn fail_unfulfillable_task(
+        &self,
+        task_id: &TaskId,
+        reason: String,
+    ) -> Option<TaskResult> {
+        let mut inner = self.inner.write().await;
+        let (priority, sequence) = {
+            let entry = inner.tasks.get(task_id)?;
+            if entry.state != TaskState::Queued {
+                return None;
+            }
+            (entry.priority, entry.sequence)
+        };
+
+        inner.ready_queue.remove(&QueueOrderKey {
+            priority_rev: Reverse(priority),
+            sequence,
+            task_id: *task_id,
+        });
+
+        let result = TaskResult::failure(Uuid::nil(), *task_id, 1, "", "", 0, Some(reason.clone()));
+
+        if let Some(entry) = inner.tasks.get_mut(task_id) {
+            entry.state = TaskState::Failed;
+            entry.error_message = Some(reason);
+            entry.result = Some(result.clone());
+        }
+        inner.track_terminal_task(*task_id);
+        Some(result)
+    }
+
     // --- Worker Disconnect & Failover ---
 
     /// Reaps all tasks assigned to a disconnected or timed-out worker, whatever session they were

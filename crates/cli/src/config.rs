@@ -48,6 +48,7 @@ pub struct MasterFileConfig {
     pub scheduler_policy: Option<String>,
     pub max_host_cpu_pct: Option<f32>,
     pub preserve_gpu: Option<bool>,
+    pub fail_unfulfillable_tasks: Option<bool>,
     pub p2p: Option<bool>,
     pub p2p_ticket_file: Option<String>,
     pub p2p_key_file: Option<String>,
@@ -561,6 +562,7 @@ gpu_name = "Mock RTX"
   "master": {
     "listen": "0.0.0.0:8888",
     "preserve_gpu": false,
+    "fail_unfulfillable_tasks": true,
     "dashboard_port": 8080,
     "dashboard_port_file": "dashboard.port"
   }
@@ -569,6 +571,14 @@ gpu_name = "Mock RTX"
         assert_eq!(
             parsed_json.master.as_ref().unwrap().preserve_gpu,
             Some(false)
+        );
+        assert_eq!(
+            parsed_json
+                .master
+                .as_ref()
+                .unwrap()
+                .fail_unfulfillable_tasks,
+            Some(true)
         );
         assert_eq!(
             parsed_json.master.as_ref().unwrap().dashboard_port,
