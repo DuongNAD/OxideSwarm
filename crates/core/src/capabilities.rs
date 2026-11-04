@@ -883,6 +883,18 @@ pub fn with_test_battery_probe<R>(reading: (Option<u8>, Option<bool>), f: impl F
 
 /// Auto-detects mobile hardware attributes and real-time battery/thermal status.
 /// Returns `None` on standard desktop/server environments without battery unless on Android.
+///
+/// Platform sensing coverage:
+/// - **Android:** reads `/sys/class/power_supply` (with `/system/bin/dumpsys battery` fallback) and
+///   `/system/bin/dumpsys thermalservice` / `/sys/class/thermal`; at runtime the Android app pushes
+///   full [`MobileLiveStatus`] readings (including `battery_temperature`, `network_type`,
+///   `battery_tier`, and `thermal_tier`) via `OxideWorkerBridge.nativeUpdateMobileTelemetry`.
+/// - **Linux:** reads `/sys/class/power_supply` (`BAT0`/`BAT1`/`battery`) and `/sys/class/thermal`.
+/// - **macOS:** reads battery percentage and power source via `pmset -g batt`; does not probe
+///   battery/die temperature (`thermal_throttled` is `false`, `battery_temperature` is `None`).
+/// - **Windows:** does not probe host battery or thermal sensors (`detect_battery` returns
+///   `(None, None)` and `detect_thermal_throttling` returns `false`), so this function returns
+///   `None` unless `TEST_BATTERY_PROBE` is set in tests.
 pub fn detect_mobile_capabilities() -> Option<MobileCapabilities> {
     let is_android = is_android_env();
     let (battery_pct, is_charging) = detect_battery();
@@ -905,7 +917,9 @@ pub fn detect_mobile_capabilities() -> Option<MobileCapabilities> {
 
 /// Re-reads only the battery and thermal state (no SoC / OS probing), cheap enough to run every
 /// few seconds. Returns `None` on a machine without a readable battery that is not Android, i.e.
-/// exactly when [`detect_mobile_capabilities`] would. Blocking (sysfs reads, `pmset`/`dumpsys`
+/// exactly when [`detect_mobile_capabilities`] would (including on Windows when no test probe is
+/// active). On macOS, `pmset -g batt` supplies `battery_pct` and `is_charging` while
+/// `battery_temperature` and `network_type` remain `None`. Blocking (sysfs reads, `pmset`/`dumpsys`
 /// child processes): call it from `spawn_blocking`.
 pub fn detect_live_mobile_status() -> Option<MobileLiveStatus> {
     let (battery_pct, is_charging) = detect_battery();
@@ -932,6 +946,9 @@ fn is_android_env() -> bool {
         || std::path::Path::new("/system/bin/getprop").exists()
 }
 
+/// Probes battery charge percentage and charging state on Linux/Android (`/sys/class/power_supply`
+/// and `/system/bin/dumpsys battery`) and macOS (`pmset -g batt`). Windows has no host battery
+/// probe and returns `(None, None)`.
 fn detect_battery() -> (Option<u8>, Option<bool>) {
     if let Some(reading) = TEST_BATTERY_PROBE.with(|c| c.get()) {
         return reading;
@@ -1127,6 +1144,9 @@ fn parse_pmset_batt(text: &str) -> (Option<u8>, Option<bool>) {
     }
 }
 
+/// Probes OS/sysfs thermal throttling state on Android (`/system/bin/dumpsys thermalservice`) and
+/// Linux (`/sys/class/thermal`). macOS and Windows do not expose `/sys/class/thermal` and return
+/// `false`.
 fn detect_thermal_throttling() -> bool {
     // 1. Android dumpsys thermalservice check
     if is_android_env() {

@@ -143,6 +143,7 @@ fn make_test_worker_entry(
         excluded_until: None,
         heartbeat_interval: tau,
         features: Default::default(),
+        mobile_status: None,
     }
 }
 

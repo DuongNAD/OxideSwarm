@@ -461,6 +461,7 @@ async fn test_adaptive_rrc_keepalive_controller_and_dynamic_master_timeout() {
         excluded_until: None,
         heartbeat_interval: Some(Duration::from_secs(25)), // 4 * 25s = 100s window
         features: Default::default(),
+        mobile_status: None,
     };
 
     // Test silence predicate at various simulated durations
