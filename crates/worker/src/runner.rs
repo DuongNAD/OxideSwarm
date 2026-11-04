@@ -245,13 +245,16 @@ fn augment_windows_path(existing_path: &str) -> String {
 }
 
 #[cfg(windows)]
+const WINDOWS_EXEC_EXTS: &[&str] = &[".com", ".exe", ".bat", ".cmd"];
+
+#[cfg(windows)]
 fn has_windows_exec_ext(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| {
             matches!(
                 ext.to_ascii_lowercase().as_str(),
-                "exe" | "com" | "cmd" | "bat"
+                "com" | "exe" | "bat" | "cmd"
             )
         })
         .unwrap_or(false)
@@ -259,17 +262,31 @@ fn has_windows_exec_ext(path: &Path) -> bool {
 
 #[cfg(windows)]
 fn is_valid_windows_executable(path: &Path) -> bool {
-    if !path.is_file() || !has_windows_exec_ext(path) {
+    if !path.is_file() {
+        return false;
+    }
+    if !has_windows_exec_ext(path) {
+        debug!(
+            path = %path.display(),
+            "Skipping Windows executable candidate without .com/.exe/.bat/.cmd extension"
+        );
         return false;
     }
     match path.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) if matches!(ext.to_ascii_lowercase().as_str(), "exe" | "com") => {
+        Some(ext) if matches!(ext.to_ascii_lowercase().as_str(), "com" | "exe") => {
             use std::io::Read;
             let mut magic = [0u8; 2];
-            std::fs::File::open(path)
+            let valid_mz = std::fs::File::open(path)
                 .and_then(|mut f| f.read_exact(&mut magic))
                 .map(|()| &magic == b"MZ")
-                .unwrap_or(false)
+                .unwrap_or(false);
+            if !valid_mz {
+                debug!(
+                    path = %path.display(),
+                    "Skipping Windows PE candidate without valid MZ header"
+                );
+            }
+            valid_mz
         }
         _ => true,
     }
@@ -277,13 +294,11 @@ fn is_valid_windows_executable(path: &Path) -> bool {
 
 #[cfg(windows)]
 fn probe_candidate_in_dir(dir: &Path, bare_name: &str) -> Option<String> {
-    if has_windows_exec_ext(Path::new(bare_name)) {
-        let candidate = dir.join(bare_name);
-        if is_valid_windows_executable(&candidate) {
-            return Some(candidate.to_string_lossy().to_string());
-        }
+    let candidate = dir.join(bare_name);
+    if is_valid_windows_executable(&candidate) {
+        return Some(candidate.to_string_lossy().to_string());
     }
-    for ext in &[".exe", ".com", ".cmd", ".bat"] {
+    for ext in WINDOWS_EXEC_EXTS {
         let candidate_ext = dir.join(format!("{bare_name}{ext}"));
         if is_valid_windows_executable(&candidate_ext) {
             return Some(candidate_ext.to_string_lossy().to_string());
@@ -300,37 +315,29 @@ fn resolve_windows_executable(program: &str, effective_path: &str) -> String {
         if is_valid_windows_executable(p) {
             return program.to_string();
         }
-        for ext in &[".exe", ".com", ".cmd", ".bat"] {
+        for ext in WINDOWS_EXEC_EXTS {
             let with_ext = format!("{program}{ext}");
             if is_valid_windows_executable(Path::new(&with_ext)) {
                 return with_ext;
             }
         }
+        return program.to_string();
     }
 
     let bare_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(program);
 
-    for dir in std::env::split_paths(effective_path) {
-        if let Some(found) = probe_candidate_in_dir(&dir, bare_name) {
-            return found;
-        }
-    }
-
+    // Fast path: check Git for Windows usr/bin first so bare Unix tool names
+    // (find, sort, timeout, tar, ssh, sh) resolve consistently with macOS/Linux
+    // workers even when Git's directories sit after System32 in PATH.
     for base in &[r"C:\Program Files\Git\usr\bin", r"C:\Program Files\Git\bin"] {
         if let Some(found) = probe_candidate_in_dir(Path::new(base), bare_name) {
             return found;
         }
     }
 
-    if !has_path_sep {
-        if is_valid_windows_executable(p) {
-            return program.to_string();
-        }
-        for ext in &[".exe", ".com", ".cmd", ".bat"] {
-            let with_ext = format!("{program}{ext}");
-            if is_valid_windows_executable(Path::new(&with_ext)) {
-                return with_ext;
-            }
+    for dir in std::env::split_paths(effective_path) {
+        if let Some(found) = probe_candidate_in_dir(&dir, bare_name) {
+            return found;
         }
     }
 
@@ -2607,9 +2614,13 @@ impl TaskRunner {
                     task_id,
                     EXIT_CODE_GENERAL_ERROR,
                     "",
-                    format!("Failed to spawn process '{program}': {e}"),
+                    format!(
+                        "Failed to spawn process '{program}' (resolved: '{resolved_program}'): {e}"
+                    ),
                     start_time.elapsed().as_millis() as u64,
-                    Some(format!("Process spawn error: {e}")),
+                    Some(format!(
+                        "Process spawn error for '{program}' (resolved: '{resolved_program}'): {e}"
+                    )),
                 );
             }
         };
@@ -3832,6 +3843,81 @@ mod outcome_tests {
             "cmd must spawn cleanly even when an extensionless 'cmd' precedes System32 on PATH: {res:?}"
         );
         assert_eq!(res.stdout_str().trim(), "win32-spawn-ok");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_resolve_windows_executable_explicit_path_and_pathext_order() {
+        let fake_dir = tempfile::tempdir().unwrap();
+        let sandbox_dir = tempfile::tempdir().unwrap();
+
+        // 1. An explicit path (with path separator) that fails validation must return the
+        //    given path unchanged instead of falling through to PATH for its base name.
+        let bad_explicit_cmd = fake_dir.path().join("cmd");
+        std::fs::write(&bad_explicit_cmd, b"#!/bin/sh\necho not-win32\n").unwrap();
+        let bad_explicit_str = bad_explicit_cmd.to_string_lossy().to_string();
+        let sys_path = std::env::var("PATH").unwrap_or_default();
+
+        assert_eq!(
+            resolve_windows_executable(&bad_explicit_str, &sys_path),
+            bad_explicit_str,
+            "explicit path that fails validation must not fall through to System32\\cmd.exe on PATH"
+        );
+
+        // 2. When spawning that invalid explicit path fails, both stderr and result.error
+        //    must name the resolved path so logs show which file was selected.
+        let runner = runner_in(sandbox_dir.path());
+        let task = Task::new(
+            TaskSpec::Command {
+                program: bad_explicit_str.clone(),
+                args: vec![],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 10),
+        );
+        let res = runner.execute_task(&task, None, None).await;
+        assert!(
+            !res.is_success(),
+            "invalid explicit path must fail to spawn"
+        );
+        assert!(
+            res.stderr_str().contains(&bad_explicit_str),
+            "stderr must include resolved path '{bad_explicit_str}', got: {}",
+            res.stderr_str()
+        );
+        let err_msg = res.error.as_deref().unwrap_or_default();
+        assert!(
+            err_msg.contains(&bad_explicit_str),
+            "result.error must include resolved path '{bad_explicit_str}', got: {err_msg}"
+        );
+
+        // 3. PATHEXT order: .com (with MZ) before .exe (with MZ) before .bat before .cmd.
+        std::fs::write(fake_dir.path().join("prio.com"), b"MZfake-com").unwrap();
+        std::fs::write(fake_dir.path().join("prio.exe"), b"MZfake-exe").unwrap();
+        std::fs::write(fake_dir.path().join("prio.bat"), b"@echo bat\r\n").unwrap();
+        std::fs::write(fake_dir.path().join("prio.cmd"), b"@echo cmd\r\n").unwrap();
+        let only_fake_path = fake_dir.path().to_string_lossy().to_string();
+        assert_eq!(
+            Path::new(&resolve_windows_executable("prio", &only_fake_path)),
+            fake_dir.path().join("prio.com")
+        );
+        std::fs::remove_file(fake_dir.path().join("prio.com")).unwrap();
+        assert_eq!(
+            Path::new(&resolve_windows_executable("prio", &only_fake_path)),
+            fake_dir.path().join("prio.exe")
+        );
+        std::fs::remove_file(fake_dir.path().join("prio.exe")).unwrap();
+        assert_eq!(
+            Path::new(&resolve_windows_executable("prio", &only_fake_path)),
+            fake_dir.path().join("prio.bat")
+        );
+        std::fs::remove_file(fake_dir.path().join("prio.bat")).unwrap();
+        assert_eq!(
+            Path::new(&resolve_windows_executable("prio", &only_fake_path)),
+            fake_dir.path().join("prio.cmd")
+        );
     }
 }
 
