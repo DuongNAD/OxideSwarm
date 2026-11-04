@@ -86,7 +86,7 @@ async fn test_challenge_concurrent_worker_burst_20_nodes() {
         worker_shutdown_txs.push(shutdown_tx);
 
         let mut client =
-            WorkerClient::from_options(master_addr.clone(), Some(name), Some(cores), is_gpu);
+            WorkerClient::for_testing(master_addr.clone(), Some(name), Some(cores), is_gpu);
         let wid = client.worker_id();
         expected_uuids.push((wid, is_gpu));
 

@@ -185,6 +185,13 @@ fn test_sigterm_stops_the_worker_gracefully_and_takes_its_task_trees_with_it() {
     let master = start_master(home.path());
     let mut worker = start_worker(home.path(), &master.addr, "sigterm-worker", &[]);
     wait_for_worker(home.path(), &master, &worker);
+    assert!(
+        worker.log().contains(
+            "Warning: host battery and thermal protection is disabled (RUSTY_GRID_NO_BATTERY)"
+        ),
+        "worker started with RUSTY_GRID_NO_BATTERY=1 must log a startup warning:\n{}",
+        worker.log()
+    );
 
     // A task with a background child and a nested shell with a grandchild, running for minutes.
     let child_file = home.path().join("child.pid");

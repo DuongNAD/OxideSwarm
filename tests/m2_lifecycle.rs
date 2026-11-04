@@ -58,19 +58,19 @@ async fn test_m2_three_workers_registration_and_gpu_capabilities() {
     let (w2_shutdown_tx, w2_shutdown_rx) = watch::channel(false);
     let (w3_shutdown_tx, w3_shutdown_rx) = watch::channel(false);
 
-    let mut w1 = WorkerClient::from_options(
+    let mut w1 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("worker-cpu-1".into()),
         Some(2),
         false,
     );
-    let mut w2 = WorkerClient::from_options(
+    let mut w2 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("worker-cpu-2".into()),
         Some(4),
         false,
     );
-    let mut w3 = WorkerClient::from_options(
+    let mut w3 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("worker-gpu-3".into()),
         Some(8),
@@ -229,7 +229,7 @@ async fn test_m2_graceful_disconnect_via_disconnecting_message() {
 
     let (w_shutdown_tx, w_shutdown_rx) = watch::channel(false);
     let mut w =
-        WorkerClient::from_options(master_addr, Some("worker-graceful".into()), Some(2), false);
+        WorkerClient::for_testing(master_addr, Some("worker-graceful".into()), Some(2), false);
     let w_id = w.worker_id();
 
     let worker_handle = tokio::spawn(async move { w.run(w_shutdown_rx).await });
@@ -395,7 +395,7 @@ async fn test_m2_worker_reconnection_preserves_uuid() {
 
     let (w_shutdown_tx, w_shutdown_rx) = watch::channel(false);
     let mut worker =
-        WorkerClient::from_options(master_addr, Some("worker-reconnect".into()), Some(4), false);
+        WorkerClient::for_testing(master_addr, Some("worker-reconnect".into()), Some(4), false);
     // Configure fast backoff for quick test
     worker.set_backoff_config(BackoffConfig {
         initial: Duration::from_millis(30),

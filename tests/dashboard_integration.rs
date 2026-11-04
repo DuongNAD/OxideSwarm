@@ -114,7 +114,7 @@ async fn test_dashboard_http_rest_endpoints() {
 
     // 5. Connect a worker and verify GET /api/workers updates
     let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
-    let mut worker = WorkerClient::from_options(
+    let mut worker = WorkerClient::for_testing(
         master.server_addr().to_string(),
         Some("dash-test-worker".into()),
         Some(4),

@@ -303,11 +303,11 @@ pub struct WorkerConfig {
     pub blender_version: Option<String>,
     /// Optional explicit GPU VRAM in MB override (CLI `--vram-mb`).
     pub vram_mb: Option<u64>,
-    ///Explicit CUDA availability override (CLI `--cuda`).
+    /// Explicit CUDA availability override (CLI `--cuda`).
     pub cuda: Option<bool>,
     /// Explicitly disable CUDA capability (CLI `--no-cuda`).
     pub no_cuda: bool,
-    /// Explicitly disable host battery and mobile capability probing (CLI `--no-battery` / env `RUSTY_GRID_NO_BATTERY`).
+    /// Explicitly disable host battery and mobile capability probing (`RUSTY_GRID_NO_BATTERY`).
     pub no_battery: bool,
 }
 
@@ -1143,6 +1143,13 @@ impl WorkerClient {
         };
         let master_beacon = Arc::new(RwLock::new(initial_beacon));
 
+        if config.no_battery {
+            warn!(
+                worker_id = %worker_id,
+                "Host battery and thermal protection is disabled (no_battery=true); this worker will accept tasks regardless of battery level or thermal state"
+            );
+        }
+
         info!(
             worker_id = %worker_id,
             name = %capabilities.name,
@@ -1222,6 +1229,26 @@ impl WorkerClient {
 
     /// Convenience constructor initializing WorkerClient directly with common CLI options.
     pub fn from_options(
+        master_addr: impl Into<String>,
+        name: Option<String>,
+        cores: Option<usize>,
+        simulate_gpu: bool,
+    ) -> Self {
+        let mut config = WorkerConfig::new(master_addr);
+        config.enable_redirection_portal = false;
+        if let Some(n) = name {
+            config = config.with_name(n);
+        }
+        if let Some(c) = cores {
+            config = config.with_cores(c);
+        }
+        config = config.with_simulate_gpu(simulate_gpu);
+        Self::new(config)
+    }
+
+    /// Test-only constructor initializing `WorkerClient` with host battery probing and the
+    /// redirection portal disabled so tests do not depend on the test runner's battery state.
+    pub fn for_testing(
         master_addr: impl Into<String>,
         name: Option<String>,
         cores: Option<usize>,
@@ -1365,7 +1392,6 @@ impl WorkerClient {
         // one fed by a platform app is updated by that app instead.
         let _mobile_poller = (!self.mobile_fed_externally
             && !self.config.no_battery
-            && !rusty_grid_core::capabilities::env_no_battery()
             && self.mobile.snapshot().is_some())
         .then(|| {
             AbortOnDrop(spawn_mobile_poller(
@@ -3260,19 +3286,59 @@ mod tests {
 
     #[test]
     fn test_worker_config_no_battery_disables_host_battery_probe() {
-        let default_cfg = WorkerConfig::new("127.0.0.1:9999");
-        assert!(!default_cfg.no_battery);
-        let no_bat_cfg = WorkerConfig::new("127.0.0.1:9999").with_no_battery(true);
-        assert!(no_bat_cfg.no_battery);
-        let client = WorkerClient::new(no_bat_cfg);
-        assert!(
-            client.capabilities().mobile.is_none(),
-            "with_no_battery(true) must suppress host battery detection"
-        );
-        assert!(
-            client.mobile_telemetry().snapshot().is_none(),
-            "with_no_battery(true) must leave mobile telemetry handle empty unless fed externally"
-        );
+        rusty_grid_core::capabilities::with_test_battery_probe((Some(10), Some(false)), || {
+            let default_cfg = WorkerConfig::new("127.0.0.1:9999");
+            assert!(!default_cfg.no_battery);
+            let default_client = WorkerClient::new(default_cfg);
+            assert_eq!(
+                default_client
+                    .capabilities()
+                    .mobile
+                    .as_ref()
+                    .and_then(|m| m.battery_pct),
+                Some(10),
+                "without with_no_battery(true), WorkerClient::new must observe the 10 % battery probe"
+            );
+            assert_eq!(
+                default_client
+                    .mobile_telemetry()
+                    .snapshot()
+                    .and_then(|s| s.battery_pct),
+                Some(10),
+                "without with_no_battery(true), a 10 % discharging battery probe must populate mobile_telemetry()"
+            );
+
+            let from_opts_client =
+                WorkerClient::from_options("127.0.0.1:9999", Some("opts".into()), Some(2), false);
+            assert_eq!(
+                from_opts_client
+                    .capabilities()
+                    .mobile
+                    .as_ref()
+                    .and_then(|m| m.battery_pct),
+                Some(10),
+                "WorkerClient::from_options must keep host battery protection enabled"
+            );
+
+            let no_bat_cfg = WorkerConfig::new("127.0.0.1:9999").with_no_battery(true);
+            assert!(no_bat_cfg.no_battery);
+            let client = WorkerClient::new(no_bat_cfg);
+            assert!(
+                client.capabilities().mobile.is_none(),
+                "with_no_battery(true) must suppress host battery detection even when the battery probe reports 10 %"
+            );
+            assert!(
+                client.mobile_telemetry().snapshot().is_none(),
+                "with_no_battery(true) must leave mobile telemetry handle empty unless fed externally"
+            );
+
+            let testing_client =
+                WorkerClient::for_testing("127.0.0.1:9999", Some("test".into()), Some(2), false);
+            assert!(
+                testing_client.capabilities().mobile.is_none(),
+                "WorkerClient::for_testing must suppress host battery detection"
+            );
+        });
     }
 
     /// Design 0021: a task is refused before anything touches the sandbox base when its private

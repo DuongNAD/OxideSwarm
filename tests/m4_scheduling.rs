@@ -67,7 +67,7 @@ impl TestCluster {
         let (w3_tx, w3_rx) = watch::channel(false);
 
         // Worker 1: 2 CPU cores, CPU-only
-        let mut w1 = WorkerClient::from_options(
+        let mut w1 = WorkerClient::for_testing(
             master_addr.clone(),
             Some("worker-cpu-1".into()),
             Some(2),
@@ -76,7 +76,7 @@ impl TestCluster {
         let w1_id = w1.worker_id();
 
         // Worker 2: 4 CPU cores, CPU-only
-        let mut w2 = WorkerClient::from_options(
+        let mut w2 = WorkerClient::for_testing(
             master_addr.clone(),
             Some("worker-cpu-2".into()),
             Some(4),
@@ -85,7 +85,7 @@ impl TestCluster {
         let w2_id = w2.worker_id();
 
         // Worker 3: 8 CPU cores, Simulated GPU enabled
-        let mut w3 = WorkerClient::from_options(
+        let mut w3 = WorkerClient::for_testing(
             master_addr.clone(),
             Some("worker-gpu-3".into()),
             Some(8),
@@ -292,7 +292,7 @@ async fn test_m4_strict_gpu_task_routing_isolation() {
 
     // Reconnect a new simulated GPU worker
     let (w3b_tx, w3b_rx) = watch::channel(false);
-    let mut w3b = WorkerClient::from_options(
+    let mut w3b = WorkerClient::for_testing(
         cluster.master_addr.clone(),
         Some("worker-gpu-3b".into()),
         Some(8),
