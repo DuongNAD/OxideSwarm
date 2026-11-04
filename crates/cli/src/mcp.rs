@@ -50,8 +50,7 @@ use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
 
 use crate::config::ConfigFile;
 use crate::connect::{
-    connect_master, normalize_master_addr, prepare_staged_files, validate_output_paths,
-    DEFAULT_MASTER_ADDR,
+    connect_master, normalize_master_addr, save_output_artifacts, DEFAULT_MASTER_ADDR,
 };
 use crate::doctor::{run_doctor, DoctorOptions};
 use crate::secret_cmd::SecretOpts;
@@ -62,6 +61,8 @@ pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 pub const MCP_SERVER_NAME: &str = "oxideswarm";
 /// Server software version.
 pub const MCP_SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Default inline output capture budget (16 KiB per stream, head + tail) returned to LLM callers.
+pub const DEFAULT_MCP_MAX_OUTPUT_BYTES: usize = 16_384;
 
 /// CLI arguments for the `oxideswarm mcp` command.
 #[derive(Parser, Debug, Clone)]
@@ -552,12 +553,20 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                     "files": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Local files to stage into sandbox: 'LOCAL_PATH' or 'LOCAL_PATH:SANDBOX_PATH'"
+                        "description": "Local files or directories inside the working directory to stage into the sandbox via content-addressed blobs: 'LOCAL_PATH' or 'LOCAL_PATH:SANDBOX_PATH' (symbolic links and paths outside the working directory are refused)"
                     },
                     "outputs": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Declared output artifact paths to retrieve upon completion"
+                        "description": "Declared output file paths or glob patterns to retrieve upon completion"
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Local directory inside the working directory to download declared output files into when wait is true (symbolic links and paths outside the working directory are refused)"
+                    },
+                    "max_output_bytes": {
+                        "type": "integer",
+                        "description": "Maximum escaped bytes of stdout and stderr combined to return inline (head + tail, default: 16384)"
                     }
                 }
             }),
@@ -583,6 +592,14 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                     "wait_secs": {
                         "type": "integer",
                         "description": "Alias for timeout_secs: client wait deadline in seconds when waiting"
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Local directory inside the working directory to download task output files into (symbolic links and paths outside the working directory are refused)"
+                    },
+                    "max_output_bytes": {
+                        "type": "integer",
+                        "description": "Maximum escaped bytes of stdout and stderr combined to return inline (head + tail, default: 16384)"
                     }
                 },
                 "required": ["task_id"]
@@ -885,6 +902,541 @@ async fn tool_workers(state: &McpState, args: &Value) -> ToolCallResult {
 }
 
 // ----------------------------------------------------------------------------
+// MCP File Input Validation & Safe LLM Output Formatting
+// ----------------------------------------------------------------------------
+
+fn reject_symlinks_in_dir_tree(root: &std::path::Path) -> Result<(), String> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| format!("cannot read directory '{}': {e}", dir.display()))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| format!("cannot read directory '{}': {e}", dir.display()))?;
+            let path = entry.path();
+            let ft = entry
+                .file_type()
+                .map_err(|e| format!("cannot inspect '{}': {e}", path.display()))?;
+            if ft.is_symlink() {
+                return Err(format!(
+                    "'{}' is a symbolic link; symbolic links are refused in MCP submit files",
+                    path.display()
+                ));
+            }
+            if ft.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rel_path_within_cwd(
+    cwd: &std::path::Path,
+    canon_cwd: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if !path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    if let Ok(rel) = path
+        .strip_prefix(cwd)
+        .or_else(|_| path.strip_prefix(canon_cwd))
+    {
+        return Some(rel.to_path_buf());
+    }
+    let ancestors: Vec<&std::path::Path> = path.ancestors().collect();
+    for anc in ancestors.into_iter().rev() {
+        if let Ok(canon_anc) = std::fs::canonicalize(anc) {
+            if canon_anc == *canon_cwd {
+                return path
+                    .strip_prefix(anc)
+                    .ok()
+                    .map(std::path::Path::to_path_buf);
+            }
+        }
+    }
+    None
+}
+
+/// Validates that every `LOCAL[:SANDBOX]` spec in `specs` stays inside `cwd` and neither is nor
+/// traverses a symbolic link, then hashes the inputs via [`crate::blobs::scan_input_paths`].
+pub fn scan_mcp_inputs_in_dir(
+    cwd: &std::path::Path,
+    specs: &[String],
+) -> Result<crate::blobs::PreparedInputs, String> {
+    use std::path::Component;
+
+    let canon_cwd = std::fs::canonicalize(cwd)
+        .map_err(|e| format!("cannot resolve working directory '{}': {e}", cwd.display()))?;
+
+    let mut checked_specs = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let (local, dest) = crate::blobs::parse_input_spec(spec)?;
+        if local.as_os_str().is_empty() {
+            return Err("input path cannot be empty".to_string());
+        }
+        if local
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
+            return Err(format!(
+                "path '{}' must not contain '..' or leave the working directory",
+                local.display()
+            ));
+        }
+
+        let rel_path = rel_path_within_cwd(cwd, &canon_cwd, &local).ok_or_else(|| {
+            format!(
+                "path '{}' is outside the working directory '{}'",
+                local.display(),
+                cwd.display()
+            )
+        })?;
+
+        let mut cur = cwd.to_path_buf();
+        let mut saw_normal = false;
+        for comp in rel_path.components() {
+            match comp {
+                Component::CurDir => {}
+                Component::Normal(part) => {
+                    saw_normal = true;
+                    cur.push(part);
+                    let meta = std::fs::symlink_metadata(&cur)
+                        .map_err(|e| format!("'{}': {e}", local.display()))?;
+                    if meta.file_type().is_symlink() {
+                        return Err(format!(
+                            "'{}' is or traverses a symbolic link ('{}'), which is refused in MCP submit files",
+                            local.display(),
+                            cur.display()
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "path '{}' is not a relative path inside the working directory",
+                        local.display()
+                    ));
+                }
+            }
+        }
+
+        let target_meta =
+            std::fs::symlink_metadata(&cur).map_err(|e| format!("'{}': {e}", local.display()))?;
+        if target_meta.file_type().is_symlink() {
+            return Err(format!(
+                "'{}' is a symbolic link, which is refused in MCP submit files",
+                local.display()
+            ));
+        }
+        let canon_target =
+            std::fs::canonicalize(&cur).map_err(|e| format!("'{}': {e}", local.display()))?;
+        if !canon_target.starts_with(&canon_cwd) {
+            return Err(format!(
+                "path '{}' resolves outside the working directory '{}'",
+                local.display(),
+                cwd.display()
+            ));
+        }
+        if target_meta.is_dir() {
+            reject_symlinks_in_dir_tree(&cur)?;
+        }
+
+        let effective_dest = match dest {
+            Some(d) => Some(d),
+            None if saw_normal => Some(rel_path.to_string_lossy().replace('\\', "/")),
+            None => Some(rusty_grid_core::blob::SANDBOX_ROOT.to_string()),
+        };
+        checked_specs.push((cur, effective_dest));
+    }
+
+    crate::blobs::scan_input_paths_with_limits(&checked_specs, crate::blobs::InputLimits::default())
+}
+
+/// Validates that `raw` stays inside `cwd`, contains no `..`, and neither is nor traverses a
+/// symbolic link, creating missing directory components one by one and returning the checked
+/// directory path.
+pub fn prepare_mcp_output_dir_in_dir(
+    cwd: &std::path::Path,
+    raw: &str,
+) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("output_dir cannot be empty".to_string());
+    }
+    let out_path = std::path::Path::new(trimmed);
+    if out_path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(format!(
+            "output_dir '{}' must not contain '..' or leave the working directory",
+            out_path.display()
+        ));
+    }
+
+    let canon_cwd = std::fs::canonicalize(cwd)
+        .map_err(|e| format!("cannot resolve working directory '{}': {e}", cwd.display()))?;
+
+    let rel_path = rel_path_within_cwd(cwd, &canon_cwd, out_path).ok_or_else(|| {
+        format!(
+            "output_dir '{}' is outside the working directory '{}'",
+            out_path.display(),
+            cwd.display()
+        )
+    })?;
+
+    let mut cur = cwd.to_path_buf();
+    for comp in rel_path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(part) => {
+                cur.push(part);
+                match std::fs::symlink_metadata(&cur) {
+                    Ok(meta) => {
+                        if meta.file_type().is_symlink() {
+                            return Err(format!(
+                                "output_dir '{}' is or traverses a symbolic link ('{}'), which is refused in MCP output_dir",
+                                out_path.display(),
+                                cur.display()
+                            ));
+                        }
+                        if !meta.is_dir() {
+                            return Err(format!(
+                                "output_dir '{}': '{}' exists and is not a directory",
+                                out_path.display(),
+                                cur.display()
+                            ));
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&cur).map_err(|e| {
+                            format!(
+                                "output_dir '{}': cannot create directory '{}': {e}",
+                                out_path.display(),
+                                cur.display()
+                            )
+                        })?;
+                        let meta = std::fs::symlink_metadata(&cur)
+                            .map_err(|e| format!("output_dir '{}': {e}", out_path.display()))?;
+                        if meta.file_type().is_symlink() || !meta.is_dir() {
+                            return Err(format!(
+                                "output_dir '{}': '{}' is not a regular directory",
+                                out_path.display(),
+                                cur.display()
+                            ));
+                        }
+                    }
+                    Err(e) => return Err(format!("output_dir '{}': {e}", out_path.display())),
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "output_dir '{}' is not a relative path inside the working directory",
+                    out_path.display()
+                ));
+            }
+        }
+    }
+
+    let target_meta =
+        std::fs::symlink_metadata(&cur).map_err(|e| format!("output_dir '{}': {e}", raw))?;
+    if target_meta.file_type().is_symlink() {
+        return Err(format!(
+            "output_dir '{}' is a symbolic link, which is refused in MCP output_dir",
+            out_path.display()
+        ));
+    }
+    if !target_meta.is_dir() {
+        return Err(format!(
+            "output_dir '{}': '{}' is not a directory",
+            out_path.display(),
+            cur.display()
+        ));
+    }
+    let canon_target =
+        std::fs::canonicalize(&cur).map_err(|e| format!("output_dir '{}': {e}", raw))?;
+    if !canon_target.starts_with(&canon_cwd) {
+        return Err(format!(
+            "output_dir '{}' resolves outside the working directory '{}'",
+            out_path.display(),
+            cwd.display()
+        ));
+    }
+
+    Ok(cur)
+}
+
+const WORKER_TRUNCATION_NOTICE: &[u8] =
+    b"\n[rusty_grid: output truncated after exceeding size limit]\n";
+
+/// True when `bytes` was cut short by the worker's stream capture limit (`StreamCapture` inserts
+/// [`WORKER_TRUNCATION_NOTICE`] at the exact midpoint between `head` and `tail` for any configured
+/// worker cap). Short output that merely prints the marker text does not have matching non-empty
+/// `head` and `tail` halves around the notice and therefore does not match.
+pub fn stream_was_worker_truncated(bytes: &[u8]) -> bool {
+    let notice_len = WORKER_TRUNCATION_NOTICE.len();
+    if bytes.len() <= notice_len {
+        return false;
+    }
+    let head_cap = (bytes.len() - notice_len) / 2;
+    head_cap > 0
+        && bytes
+            .get(head_cap..head_cap + notice_len)
+            .is_some_and(|s| s == WORKER_TRUNCATION_NOTICE)
+}
+
+/// Number of bytes `ch` occupies in the outer JSON-RPC response line after `ToolCallResult::ok_json`
+/// encodes the tool body and `JsonRpcResponse` encodes that JSON string a second time.
+fn escaped_char_bytes(ch: char) -> usize {
+    match ch {
+        '"' | '\\' => 4,
+        '\n' | '\r' | '\t' | '\x08' | '\x0c' => 3,
+        c if (c as u32) < 0x20 => 7,
+        c => c.len_utf8(),
+    }
+}
+
+fn escaped_str_bytes(s: &str) -> usize {
+    s.chars().map(escaped_char_bytes).sum()
+}
+
+fn take_head_escaped(s: &str, max_escaped: usize) -> (&str, usize) {
+    let mut used = 0usize;
+    let mut end_byte = 0usize;
+    for (idx, ch) in s.char_indices() {
+        let cost = escaped_char_bytes(ch);
+        if used + cost > max_escaped {
+            break;
+        }
+        used += cost;
+        end_byte = idx + ch.len_utf8();
+    }
+    (&s[..end_byte], end_byte)
+}
+
+fn take_tail_escaped(s: &str, max_escaped: usize) -> (&str, usize) {
+    let mut used = 0usize;
+    let mut start_byte = s.len();
+    for (idx, ch) in s.char_indices().rev() {
+        let cost = escaped_char_bytes(ch);
+        if used + cost > max_escaped {
+            break;
+        }
+        used += cost;
+        start_byte = idx;
+    }
+    (&s[start_byte..], s.len() - start_byte)
+}
+
+fn split_stream_budgets(
+    stdout_need: usize,
+    stderr_need: usize,
+    max_output_bytes: usize,
+) -> (usize, usize) {
+    if stdout_need.saturating_add(stderr_need) <= max_output_bytes {
+        return (stdout_need, stderr_need);
+    }
+    let half = max_output_bytes / 2;
+    let other_half = max_output_bytes - half;
+    if stdout_need <= half {
+        (stdout_need, max_output_bytes - stdout_need)
+    } else if stderr_need <= other_half {
+        (max_output_bytes - stderr_need, stderr_need)
+    } else {
+        (half, other_half)
+    }
+}
+
+/// Formats a raw output stream (`stdout` or `stderr`) for an LLM tool reply, decoding first via
+/// `String::from_utf8_lossy`, cutting at `char` boundaries within `max_output_bytes` escaped
+/// bytes, and reporting `(formatted_text, was_truncated_by_mcp, captured_bytes)`.
+pub fn truncate_stream_for_llm(bytes: &[u8], max_output_bytes: usize) -> (String, bool, usize) {
+    let captured_bytes = bytes.len();
+    let decoded = String::from_utf8_lossy(bytes);
+    let total_escaped = escaped_str_bytes(&decoded);
+
+    if total_escaped <= max_output_bytes {
+        return (decoded.into_owned(), false, captured_bytes);
+    }
+
+    if max_output_bytes == 0 {
+        return (String::new(), true, captured_bytes);
+    }
+
+    let worst_notice = format!("\n...[truncated {captured_bytes} bytes]...\n");
+    let worst_notice_escaped = escaped_str_bytes(&worst_notice);
+    if max_output_bytes <= worst_notice_escaped + 2 {
+        let head_budget = max_output_bytes / 2;
+        let tail_budget = max_output_bytes - head_budget;
+        let (head, _) = take_head_escaped(&decoded, head_budget);
+        let (tail, _) = take_tail_escaped(&decoded, tail_budget);
+        return (format!("{head}{tail}"), true, captured_bytes);
+    }
+
+    let content_budget = max_output_bytes - worst_notice_escaped;
+    let head_budget = content_budget / 2;
+    let tail_budget = content_budget - head_budget;
+    let (head, head_utf8) = take_head_escaped(&decoded, head_budget);
+    let (tail, tail_utf8) = take_tail_escaped(&decoded, tail_budget);
+    let kept_bytes = head_utf8.saturating_add(tail_utf8).min(captured_bytes);
+    let omitted = captured_bytes.saturating_sub(kept_bytes).max(1);
+    let notice = format!("\n...[truncated {omitted} bytes]...\n");
+    (format!("{head}{notice}{tail}"), true, captured_bytes)
+}
+
+async fn format_completed_task_result(
+    state: &McpState,
+    result: &rusty_grid_core::task::TaskResult,
+    args: &Value,
+    warning: Option<String>,
+) -> ToolCallResult {
+    let output_dir_opt = args.get("output_dir").and_then(Value::as_str);
+    let max_output_bytes = args
+        .get("max_output_bytes")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_MCP_MAX_OUTPUT_BYTES);
+
+    let mut saved_outputs: Option<Vec<std::path::PathBuf>> = None;
+    let mut saved_artifacts: Option<Vec<std::path::PathBuf>> = None;
+
+    if let Some(out_dir_str) = output_dir_opt {
+        let cwd = match std::env::current_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                return ToolCallResult::error(format!(
+                    "Output directory error: cannot determine working directory: {e}"
+                ))
+            }
+        };
+        let out_dir = match prepare_mcp_output_dir_in_dir(&cwd, out_dir_str) {
+            Ok(dir) => dir,
+            Err(e) => return ToolCallResult::error(format!("Output directory error: {e}")),
+        };
+        if !result.outputs.is_empty() {
+            let target_addr = match state.resolve_target_addr().await {
+                Ok(addr) => addr,
+                Err(e) => return ToolCallResult::error(e),
+            };
+            let conn =
+                match crate::blobs::BlobConnection::connect(&target_addr, state.secret.as_ref())
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return ToolCallResult::error(format!(
+                            "Failed to connect to Master for output download: {e}"
+                        ))
+                    }
+                };
+            match crate::blobs::download_outputs(&conn, &result.outputs, &out_dir).await {
+                Ok(paths) => saved_outputs = Some(paths),
+                Err(e) => {
+                    return ToolCallResult::error(format!(
+                        "Failed to download output files to '{}': {e}",
+                        out_dir.display()
+                    ))
+                }
+            }
+        }
+        if !result.artifacts.is_empty() {
+            match save_output_artifacts(&result.artifacts, &out_dir) {
+                Ok(paths) => saved_artifacts = Some(paths),
+                Err(e) => {
+                    return ToolCallResult::error(format!(
+                        "Failed to save output artifacts to '{}': {e}",
+                        out_dir.display()
+                    ))
+                }
+            }
+        }
+    }
+
+    let mut out_artifacts: Vec<Value> = Vec::new();
+    for (idx, output) in result.outputs.iter().enumerate() {
+        let mut entry = json!({
+            "path": output.path,
+            "size_bytes": output.size,
+            "blob_id": output.id.to_hex(),
+            "checksum_blake3": output.id.to_hex(),
+            "executable": output.executable,
+        });
+        if let Some(ref paths) = saved_outputs {
+            if let Some(saved_path) = paths.get(idx) {
+                entry["saved_path"] = Value::String(saved_path.display().to_string());
+            }
+        }
+        out_artifacts.push(entry);
+    }
+    for (idx, artifact) in result.artifacts.iter().enumerate() {
+        let mut entry = json!({
+            "path": artifact.path,
+            "size_bytes": artifact.size,
+            "checksum_sha256": artifact.sha256_hex(),
+        });
+        if let Some(ref paths) = saved_artifacts {
+            if let Some(saved_path) = paths.get(idx) {
+                entry["saved_path"] = Value::String(saved_path.display().to_string());
+            }
+        }
+        out_artifacts.push(entry);
+    }
+
+    let stdout_raw = result.stdout.as_bytes();
+    let stderr_raw = result.stderr.as_bytes();
+    let stdout_worker_truncated = stream_was_worker_truncated(stdout_raw);
+    let stderr_worker_truncated = stream_was_worker_truncated(stderr_raw);
+    let worker_truncated = stdout_worker_truncated || stderr_worker_truncated;
+
+    let stdout_need = escaped_str_bytes(&String::from_utf8_lossy(stdout_raw));
+    let stderr_need = escaped_str_bytes(&String::from_utf8_lossy(stderr_raw));
+    let (stdout_budget, stderr_budget) =
+        split_stream_budgets(stdout_need, stderr_need, max_output_bytes);
+
+    let (stdout_str, stdout_mcp_truncated, stdout_captured_bytes) =
+        truncate_stream_for_llm(stdout_raw, stdout_budget);
+    let (stderr_str, stderr_mcp_truncated, stderr_captured_bytes) =
+        truncate_stream_for_llm(stderr_raw, stderr_budget);
+    let stdout_truncated = stdout_mcp_truncated || stdout_worker_truncated;
+    let stderr_truncated = stderr_mcp_truncated || stderr_worker_truncated;
+    let truncated = stdout_truncated || stderr_truncated;
+    let captured_bytes = stdout_captured_bytes + stderr_captured_bytes;
+
+    let status_str = if result.is_success() {
+        "completed"
+    } else {
+        "failed"
+    };
+
+    let mut body = json!({
+        "task_id": result.task_id.to_string(),
+        "status": status_str,
+        "exit_code": result.exit_code,
+        "stdout": stdout_str,
+        "stderr": stderr_str,
+        "truncated": truncated,
+        "worker_truncated": worker_truncated,
+        "captured_bytes": captured_bytes,
+        "stdout_truncated": stdout_truncated,
+        "stdout_worker_truncated": stdout_worker_truncated,
+        "stdout_captured_bytes": stdout_captured_bytes,
+        "stderr_truncated": stderr_truncated,
+        "stderr_worker_truncated": stderr_worker_truncated,
+        "stderr_captured_bytes": stderr_captured_bytes,
+        "duration_ms": result.execution_time_ms,
+        "error": result.error,
+        "artifacts": out_artifacts,
+    });
+    if let Some(w) = warning {
+        body["warning"] = Value::String(w);
+    }
+    ToolCallResult::ok_json(&body)
+}
+
+// ----------------------------------------------------------------------------
 // Tool: submit
 // ----------------------------------------------------------------------------
 
@@ -1064,8 +1616,23 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         Err(e) => return ToolCallResult::error(format!("Invalid placement constraints: {e}")),
     };
 
-    // Staged files
-    let mut staged_files = Vec::new();
+    // Validate output_dir upfront if provided
+    if let Some(out_dir_str) = args.get("output_dir").and_then(Value::as_str) {
+        let cwd = match std::env::current_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                return ToolCallResult::error(format!(
+                    "Output directory error: cannot determine working directory: {e}"
+                ))
+            }
+        };
+        if let Err(e) = prepare_mcp_output_dir_in_dir(&cwd, out_dir_str) {
+            return ToolCallResult::error(format!("Output directory error: {e}"));
+        }
+    }
+
+    // Staged files (content-addressed blobs, restricted to non-symlink paths inside the working directory)
+    let mut prepared_inputs = crate::blobs::PreparedInputs::default();
     if let Some(files_arr) = args.get("files").and_then(Value::as_array) {
         let string_paths: Vec<String> = files_arr
             .iter()
@@ -1073,15 +1640,28 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
             .map(str::to_string)
             .collect();
         if !string_paths.is_empty() {
-            match prepare_staged_files(&string_paths) {
-                Ok(files) => staged_files = files,
+            let cwd = match std::env::current_dir() {
+                Ok(dir) => dir,
+                Err(e) => {
+                    return ToolCallResult::error(format!(
+                        "Staged files error: cannot determine working directory: {e}"
+                    ))
+                }
+            };
+            let scan_res =
+                tokio::task::spawn_blocking(move || scan_mcp_inputs_in_dir(&cwd, &string_paths))
+                    .await
+                    .map_err(|e| format!("input scan task failed: {e}"))
+                    .and_then(|r| r);
+            match scan_res {
+                Ok(inputs) => prepared_inputs = inputs,
                 Err(e) => return ToolCallResult::error(format!("Staged files error: {e}")),
             }
         }
     }
 
-    // Expected outputs
-    let mut expected_outputs = Vec::new();
+    // Expected outputs (blob output globs)
+    let mut output_globs = Vec::new();
     if let Some(outputs_arr) = args.get("outputs").and_then(Value::as_array) {
         let string_outputs: Vec<String> = outputs_arr
             .iter()
@@ -1089,19 +1669,19 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
             .map(str::to_string)
             .collect();
         if !string_outputs.is_empty() {
-            match validate_output_paths(&string_outputs) {
-                Ok(outs) => expected_outputs = outs,
-                Err(e) => return ToolCallResult::error(format!("Expected outputs error: {e}")),
+            if let Err(e) = rusty_grid_core::blob::validate_output_patterns(&string_outputs) {
+                return ToolCallResult::error(format!("Expected outputs error: {e}"));
             }
+            output_globs = string_outputs;
         }
     }
 
     let mut task = Task::new(spec, requirements.clone()).with_placement(&placement);
-    if !staged_files.is_empty() {
-        task = task.with_staged_files(staged_files);
+    if !prepared_inputs.inputs.is_empty() {
+        task = task.with_inputs(prepared_inputs.inputs.clone());
     }
-    if !expected_outputs.is_empty() {
-        task = task.with_expected_outputs(expected_outputs);
+    if !output_globs.is_empty() {
+        task = task.with_output_globs(output_globs);
     }
     let task_id = task.id;
     *ctx.submitted_task_id.lock().await = Some(task_id);
@@ -1111,13 +1691,30 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
         return ToolCallResult::error(format!("Task {task_id} cancelled by client"));
     }
 
-    if let Err(e) = state.resolve_target_addr().await {
-        return ToolCallResult::error(e);
-    }
+    let target_addr = match state.resolve_target_addr().await {
+        Ok(addr) => addr,
+        Err(e) => return ToolCallResult::error(e),
+    };
 
     if ctx.is_cancelled() {
         ctx.aborted_by_cancel = true;
         return ToolCallResult::error(format!("Task {task_id} cancelled by client"));
+    }
+
+    if !prepared_inputs.inputs.is_empty() {
+        let conn = match crate::blobs::BlobConnection::connect(&target_addr, state.secret.as_ref())
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return ToolCallResult::error(format!(
+                    "Failed to connect to Master for input blob upload: {e}"
+                ))
+            }
+        };
+        if let Err(e) = crate::blobs::upload_inputs(&conn, &prepared_inputs).await {
+            return ToolCallResult::error(format!("Failed to upload input files: {e}"));
+        }
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs);
@@ -1223,39 +1820,7 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                     Some(step + 1),
                     format!("Task {task_id} completed"),
                 );
-                let out_artifacts: Vec<Value> = result
-                    .artifacts
-                    .iter()
-                    .map(|a| {
-                        json!({
-                            "path": a.path,
-                            "size_bytes": a.size,
-                            "checksum_sha256": a.sha256_hex(),
-                            "data_preview": a.content().to_string_lossy(),
-                        })
-                    })
-                    .collect();
-
-                let status_str = if result.is_success() {
-                    "completed"
-                } else {
-                    "failed"
-                };
-
-                let mut body = json!({
-                    "task_id": result.task_id.to_string(),
-                    "status": status_str,
-                    "exit_code": result.exit_code,
-                    "stdout": result.stdout_str(),
-                    "stderr": result.stderr_str(),
-                    "duration_ms": result.execution_time_ms,
-                    "error": result.error,
-                    "artifacts": out_artifacts,
-                });
-                if let Some(w) = warning {
-                    body["warning"] = Value::String(w);
-                }
-                ToolCallResult::ok_json(&body)
+                format_completed_task_result(state, &result, args, warning).await
             }
             Some(Ok(Some(ClientResponse::Error { message }))) => ToolCallResult::error(message),
             Some(Ok(Some(other))) => {
@@ -1536,6 +2101,20 @@ async fn tool_task_result(
     };
     let task_id = TaskId(task_uuid);
 
+    if let Some(out_dir_str) = args.get("output_dir").and_then(Value::as_str) {
+        let cwd = match std::env::current_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                return ToolCallResult::error(format!(
+                    "Output directory error: cannot determine working directory: {e}"
+                ))
+            }
+        };
+        if let Err(e) = prepare_mcp_output_dir_in_dir(&cwd, out_dir_str) {
+            return ToolCallResult::error(format!("Output directory error: {e}"));
+        }
+    }
+
     let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(false);
     let timeout_secs = args
         .get("wait_secs")
@@ -1628,34 +2207,7 @@ async fn tool_task_result(
                         Some(step + 1),
                         format!("Task {task_id} completed"),
                     );
-                    let out_artifacts: Vec<Value> = result
-                        .artifacts
-                        .iter()
-                        .map(|a| {
-                            json!({
-                                "path": a.path,
-                                "size_bytes": a.size,
-                                "checksum_sha256": a.sha256_hex(),
-                            })
-                        })
-                        .collect();
-
-                    let status_str = if result.is_success() {
-                        "completed"
-                    } else {
-                        "failed"
-                    };
-
-                    return ToolCallResult::ok_json(&json!({
-                        "task_id": result.task_id.to_string(),
-                        "status": status_str,
-                        "exit_code": result.exit_code,
-                        "stdout": result.stdout_str(),
-                        "stderr": result.stderr_str(),
-                        "duration_ms": result.execution_time_ms,
-                        "error": result.error,
-                        "artifacts": out_artifacts,
-                    }));
+                    return format_completed_task_result(state, &result, args, None).await;
                 }
                 Ok(Some(ClientResponse::TaskStatusInfo {
                     task_id: tid,
@@ -1720,34 +2272,7 @@ async fn tool_task_result(
             .await
         {
             Ok(ClientResponse::TaskCompleted { result, .. }) => {
-                let out_artifacts: Vec<Value> = result
-                    .artifacts
-                    .iter()
-                    .map(|a| {
-                        json!({
-                            "path": a.path,
-                            "size_bytes": a.size,
-                            "checksum_sha256": a.sha256_hex(),
-                        })
-                    })
-                    .collect();
-
-                let status_str = if result.is_success() {
-                    "completed"
-                } else {
-                    "failed"
-                };
-
-                ToolCallResult::ok_json(&json!({
-                    "task_id": result.task_id.to_string(),
-                    "status": status_str,
-                    "exit_code": result.exit_code,
-                    "stdout": result.stdout_str(),
-                    "stderr": result.stderr_str(),
-                    "duration_ms": result.execution_time_ms,
-                    "error": result.error,
-                    "artifacts": out_artifacts,
-                }))
+                format_completed_task_result(state, &result, args, None).await
             }
             Ok(ClientResponse::TaskStatusInfo {
                 task_id,
@@ -2170,5 +2695,279 @@ mod tests {
             .expect("valid mcp args should parse");
         assert_eq!(ok.master.as_deref(), Some("127.0.0.1:8088"));
         assert!(!ok.insecure);
+    }
+
+    #[test]
+    fn test_scan_mcp_inputs_refuses_outside_cwd_and_symlinks() {
+        let outer = tempfile::tempdir().unwrap();
+        let cwd = outer.path().join("workspace");
+        std::fs::create_dir_all(cwd.join("sub")).unwrap();
+        std::fs::write(cwd.join("sub/inside.txt"), b"hello-inside").unwrap();
+        let secret_outside = outer.path().join("outside_secret.txt");
+        std::fs::write(&secret_outside, b"do-not-exfiltrate").unwrap();
+
+        // 1. Valid relative file inside cwd succeeds and preserves relative destination.
+        let ok = scan_mcp_inputs_in_dir(&cwd, &["sub/inside.txt".to_string()])
+            .expect("relative file inside cwd must succeed");
+        assert_eq!(ok.inputs.len(), 1);
+        assert_eq!(ok.inputs[0].path, "sub/inside.txt");
+
+        // 2. Parent traversal (`..`) is refused.
+        let err_parent = scan_mcp_inputs_in_dir(&cwd, &["../outside_secret.txt".to_string()])
+            .err()
+            .expect("parent traversal must be refused");
+        assert!(err_parent.contains(".."), "{err_parent}");
+
+        // 3. Absolute path outside cwd is refused.
+        let err_abs = scan_mcp_inputs_in_dir(&cwd, &[secret_outside.to_string_lossy().to_string()])
+            .err()
+            .expect("absolute path outside cwd must be refused");
+        assert!(
+            err_abs.contains("outside the working directory"),
+            "{err_abs}"
+        );
+
+        // 4. Symbolic link (both direct file symlink and symlink inside a directory) is refused.
+        #[cfg(unix)]
+        {
+            let link_file = cwd.join("link_to_secret.txt");
+            std::os::unix::fs::symlink(&secret_outside, &link_file).unwrap();
+            let err_link = scan_mcp_inputs_in_dir(&cwd, &["link_to_secret.txt".to_string()])
+                .err()
+                .expect("symlink file must be refused");
+            assert!(err_link.contains("symbolic link"), "{err_link}");
+
+            let err_dir_with_link = scan_mcp_inputs_in_dir(&cwd, &[".".to_string()])
+                .err()
+                .expect("directory containing symlink must be refused");
+            assert!(
+                err_dir_with_link.contains("symbolic link"),
+                "{err_dir_with_link}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_truncate_stream_for_llm_keeps_head_and_tail_within_budget() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"START_BANNER\n");
+        raw.extend(std::iter::repeat_n(b'x', 20_000));
+        raw.extend_from_slice(b"\nFINAL_SUMMARY_MARKER\n");
+
+        let (formatted, truncated, captured_bytes) = truncate_stream_for_llm(&raw, 4096);
+        assert!(truncated);
+        assert_eq!(captured_bytes, raw.len());
+        assert!(
+            formatted.len() <= 4096,
+            "formatted output ({} bytes) must fit within max_output_bytes (4096)",
+            formatted.len()
+        );
+        assert!(formatted.starts_with("START_BANNER\n"));
+        assert!(formatted.ends_with("\nFINAL_SUMMARY_MARKER\n"));
+        assert!(formatted.contains("...[truncated "));
+    }
+
+    #[test]
+    fn test_scan_mcp_inputs_dot_maps_to_sandbox_root_and_handles_colon_cwd() {
+        let outer = tempfile::tempdir().unwrap();
+        let workspace = outer.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            b"[package]\nname = \"demo\"\n",
+        )
+        .unwrap();
+
+        let prepared = scan_mcp_inputs_in_dir(&workspace, &[".".to_string()])
+            .expect("staging '.' inside workspace must succeed");
+        assert_eq!(prepared.inputs.len(), 1);
+        assert_eq!(prepared.inputs[0].path, ".");
+
+        // On Unix, verify a working directory whose name contains ':' does not split at ':'
+        // and never stages a sibling directory.
+        #[cfg(unix)]
+        {
+            let sibling_proj = outer.path().join("proj");
+            std::fs::create_dir_all(&sibling_proj).unwrap();
+            let secret_hash = rusty_grid_core::blob::BlobId::of(b"sibling-secret-do-not-stage");
+            std::fs::write(
+                sibling_proj.join("secret.txt"),
+                b"sibling-secret-do-not-stage",
+            )
+            .unwrap();
+
+            let colon_cwd = outer.path().join("proj:v2");
+            std::fs::create_dir_all(&colon_cwd).unwrap();
+            let inside_hash = rusty_grid_core::blob::BlobId::of(b"only-inside-colon-cwd");
+            std::fs::write(colon_cwd.join("inside.txt"), b"only-inside-colon-cwd").unwrap();
+
+            let dot_in_colon = scan_mcp_inputs_in_dir(&colon_cwd, &[".".to_string()])
+                .expect("staging '.' in cwd with ':' must succeed");
+            assert_eq!(dot_in_colon.inputs.len(), 1);
+            assert_eq!(dot_in_colon.inputs[0].path, ".");
+            assert!(
+                dot_in_colon.has_blob(&inside_hash),
+                "expected inside.txt blob to be staged"
+            );
+            assert!(
+                !dot_in_colon.has_blob(&secret_hash),
+                "sibling /proj/secret.txt must never be staged"
+            );
+
+            let file_in_colon = scan_mcp_inputs_in_dir(&colon_cwd, &["inside.txt".to_string()])
+                .expect("staging relative file in cwd with ':' must succeed");
+            assert_eq!(file_in_colon.inputs.len(), 1);
+            assert_eq!(file_in_colon.inputs[0].path, "inside.txt");
+            assert_eq!(file_in_colon.inputs[0].blob_id(), inside_hash);
+        }
+    }
+
+    #[test]
+    fn test_prepare_mcp_output_dir_refuses_symlinks_parent_and_outside_cwd() {
+        let outer = tempfile::tempdir().unwrap();
+        let cwd = outer.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let outside_dir = outer.path().join("outside_dir");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+
+        // 1. Valid nested relative output_dir inside cwd is created one by one.
+        let ok = prepare_mcp_output_dir_in_dir(&cwd, "nested/outputs")
+            .expect("valid relative output_dir inside cwd must succeed");
+        assert_eq!(ok, cwd.join("nested/outputs"));
+        assert!(ok.is_dir());
+
+        // 2. Parent traversal (`..`) is refused.
+        let err_parent = prepare_mcp_output_dir_in_dir(&cwd, "../outside_dir")
+            .expect_err("output_dir with '..' must be refused");
+        assert!(err_parent.contains(".."), "{err_parent}");
+
+        // 3. Absolute path outside cwd is refused.
+        let err_abs = prepare_mcp_output_dir_in_dir(&cwd, &outside_dir.to_string_lossy())
+            .expect_err("absolute output_dir outside cwd must be refused");
+        assert!(
+            err_abs.contains("outside the working directory"),
+            "{err_abs}"
+        );
+
+        // 4. Symbolic link as output_dir or intermediate component is refused.
+        #[cfg(unix)]
+        {
+            let link_out = cwd.join("out_link");
+            std::os::unix::fs::symlink(&outside_dir, &link_out).unwrap();
+            let err_link = prepare_mcp_output_dir_in_dir(&cwd, "out_link")
+                .expect_err("symlink output_dir must be refused");
+            assert!(err_link.contains("symbolic link"), "{err_link}");
+
+            let err_trav = prepare_mcp_output_dir_in_dir(&cwd, "out_link/sub")
+                .expect_err("output_dir traversing a symlink must be refused");
+            assert!(err_trav.contains("symbolic link"), "{err_trav}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_max_output_bytes_bounds_jsonrpc_reply_for_0xff_0x01_and_escaped_chars() {
+        use rusty_grid_core::task::{TaskId, TaskResult};
+
+        let state = McpState::new("127.0.0.1:8088".to_string(), None);
+        let args = json!({ "max_output_bytes": 4096 });
+        let base = TaskResult::success(Uuid::new_v4(), TaskId::new(), "", 10, false);
+
+        // Case 1: 20 KB of 0xFF on stdout.
+        let res_ff = TaskResult {
+            stdout: vec![0xFFu8; 20_000].into(),
+            ..base.clone()
+        };
+        let call_ff = format_completed_task_result(&state, &res_ff, &args, None).await;
+        let rpc_ff = serde_json::to_string(&JsonRpcResponse::success(
+            Some(json!(1)),
+            serde_json::to_value(&call_ff).unwrap(),
+        ))
+        .unwrap();
+        assert!(
+            rpc_ff.len() < 8 * 1024,
+            "20 KB of 0xFF at max_output_bytes=4096 must give a JSON-RPC reply < 8 KiB, got {} bytes",
+            rpc_ff.len()
+        );
+        let body_ff: Value = serde_json::from_str(match &call_ff.content[0] {
+            ToolContent::Text { text } => text,
+        })
+        .unwrap();
+        assert!(body_ff["stdout"].as_str().unwrap().len() <= 4096);
+        assert_eq!(body_ff["captured_bytes"], 20_000);
+        assert_eq!(body_ff["truncated"], true);
+        assert_eq!(body_ff["worker_truncated"], false);
+
+        // Case 2: 20 KB of 0x01 on BOTH stdout and stderr.
+        let res_ctrl = TaskResult {
+            stdout: vec![0x01u8; 20_000].into(),
+            stderr: vec![0x01u8; 20_000].into(),
+            ..base.clone()
+        };
+        let call_ctrl = format_completed_task_result(&state, &res_ctrl, &args, None).await;
+        let rpc_ctrl = serde_json::to_string(&JsonRpcResponse::success(
+            Some(json!(2)),
+            serde_json::to_value(&call_ctrl).unwrap(),
+        ))
+        .unwrap();
+        assert!(
+            rpc_ctrl.len() < 8 * 1024,
+            "0x01 on both streams at max_output_bytes=4096 must give a JSON-RPC reply < 8 KiB, got {} bytes",
+            rpc_ctrl.len()
+        );
+
+        // Case 3: Quotes, backslashes, and newlines on BOTH stdout and stderr.
+        let pat: Vec<u8> = b"\"\\\n".iter().copied().cycle().take(20_000).collect();
+        let res_esc = TaskResult {
+            stdout: pat.clone().into(),
+            stderr: pat.into(),
+            ..base.clone()
+        };
+        let call_esc = format_completed_task_result(&state, &res_esc, &args, None).await;
+        let rpc_esc = serde_json::to_string(&JsonRpcResponse::success(
+            Some(json!(3)),
+            serde_json::to_value(&call_esc).unwrap(),
+        ))
+        .unwrap();
+        assert!(
+            rpc_esc.len() < 8 * 1024,
+            "quotes, backslashes and newlines on both streams at max_output_bytes=4096 must give a JSON-RPC reply < 8 KiB, got {} bytes",
+            rpc_esc.len()
+        );
+
+        // Case 4: Output that merely prints the worker marker text is neither `truncated` nor `worker_truncated`.
+        let marker_echo = b"echo [rusty_grid: output truncated after exceeding size limit]\n";
+        let res_marker = TaskResult {
+            stdout: marker_echo.to_vec().into(),
+            ..base.clone()
+        };
+        let call_marker = format_completed_task_result(&state, &res_marker, &args, None).await;
+        let body_marker: Value = serde_json::from_str(match &call_marker.content[0] {
+            ToolContent::Text { text } => text,
+        })
+        .unwrap();
+        assert_eq!(body_marker["truncated"], false);
+        assert_eq!(body_marker["worker_truncated"], false);
+        assert_eq!(body_marker["stdout_truncated"], false);
+        assert_eq!(body_marker["stdout_worker_truncated"], false);
+        assert_eq!(body_marker["captured_bytes"], marker_echo.len());
+
+        // Case 5: Worker configured with a smaller custom stream cap (e.g. 128 bytes: 64B head + notice + 64B tail)
+        // still reports `worker_truncated: true` and `truncated: true`.
+        let mut custom_cap_out = vec![b'H'; 64];
+        custom_cap_out.extend_from_slice(WORKER_TRUNCATION_NOTICE);
+        custom_cap_out.extend_from_slice(&[b'T'; 64]);
+        let res_custom_cap = TaskResult {
+            stdout: custom_cap_out.into(),
+            ..base
+        };
+        let call_custom_cap =
+            format_completed_task_result(&state, &res_custom_cap, &args, None).await;
+        let body_custom_cap: Value = serde_json::from_str(match &call_custom_cap.content[0] {
+            ToolContent::Text { text } => text,
+        })
+        .unwrap();
+        assert_eq!(body_custom_cap["worker_truncated"], true);
+        assert_eq!(body_custom_cap["stdout_worker_truncated"], true);
+        assert_eq!(body_custom_cap["truncated"], true);
     }
 }
