@@ -52,7 +52,7 @@ MasterMessage::RoleHandoverAck {
 All four `WorkerMessage::ClaimMasterRole` match arms in `crates/master/src/server.rs` call `reject_master_role_claim`:
 1. `handle_connection` handshake arm: sends the refusal `RoleHandoverAck` and returns `Ok(())` without registering a worker.
 2. `handle_connection` active-session arm: sends the refusal `RoleHandoverAck` on `outbound_tx` and keeps the registered worker session alive (`WorkerStatus::Connected`).
-3. `handle_multiplexed_connection` handshake arm: sends the refusal `RoleHandoverAck` on `ctrl_transport` and returns `Ok(())` without registering a worker.
+3. `handle_multiplexed_connection` handshake arm: sends the refusal `RoleHandoverAck` on `ctrl_transport` via `send_refusal_and_drain` (which finishes the control send stream via `AsyncWriteExt::shutdown` and waits up to `1 s` for the peer to reach EOF or close the QUIC connection before dropping `p2p_conn`, shared with the three `RegisterAck { accepted: false, .. }` handshake refusal arms so iroh does not abort the connection with `ApplicationClosed(0)` before the refusal frame is delivered) and returns `Ok(())` without registering a worker.
 4. `handle_multiplexed_connection` active-session control arm: sends the refusal `RoleHandoverAck` on `ctrl_sender` and keeps the multiplexed worker session alive (`WorkerStatus::Connected`), while the data stream catch-all arm in `handle_multiplexed_connection` logs and ignores unexpected control frames on the data lane.
 
 ### D2 Stop advertising `ROLE_ARBITRAGE` in `ProtocolCapabilities::all_supported()`
@@ -76,6 +76,7 @@ All four `WorkerMessage::ClaimMasterRole` match arms in `crates/master/src/serve
   1. TCP handshake `ClaimMasterRole` before and after queuing a task is refused with an empty `task_queue_snapshot`, returns `Ok(())`, and leaves `WorkerRegistry` empty;
   2. multiplexed P2P handshake `ClaimMasterRole` as the first control message after queuing a task is refused with an empty `task_queue_snapshot`, returns `Ok(())`, and leaves `WorkerRegistry` empty;
   3. active TCP and active multiplexed worker sessions refuse `ClaimMasterRole` with an empty `task_queue_snapshot`, keep the worker `Connected` in `WorkerRegistry`, and complete a subsequent `Heartbeat` / `HeartbeatAck` round-trip.
+- **Unit (`crates/master/src/server.rs`):** `test_p2p_handshake_refusals_delivered_over_real_iroh` verifies over real loopback `iroh` endpoints (with relays disabled, both with `cluster_secret = None` and `cluster_secret = Some`) that `RoleHandoverAck { accepted: false, .. }` and `RegisterAck { accepted: false, .. }` refusals on the multiplexed handshake path are reliably delivered before the QUIC connection closes (`BUG-17`).
 - **Integration (`crates/android_bridge`):** `mobile_coordination_test`, `m5a_challenger_1_stress`, and `m5a_challenger_2_stress`.
 - **Gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test -p rusty_grid_core --lib`, `cargo test -p rusty_grid_master --lib`.
 

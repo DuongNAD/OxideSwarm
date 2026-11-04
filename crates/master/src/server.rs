@@ -3163,6 +3163,44 @@ fn reject_master_role_claim(
     }
 }
 
+/// Sends a handshake refusal message (`RegisterAck { accepted: false, .. }` or
+/// `RoleHandoverAck { accepted: false, .. }`), finishes the control send stream, and waits a
+/// bounded time (`1 s`) for the peer to read it or close before dropping the QUIC connection
+/// handle (`BUG-17`).
+async fn send_refusal_and_drain<T: AsyncRead + AsyncWrite + Unpin>(
+    transport: &mut MessageTransport<T>,
+    msg: &MasterMessage,
+    #[cfg(feature = "p2p")] p2p_conn: Option<&iroh::endpoint::Connection>,
+) {
+    let _ = transport.send_msg(msg).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::io::AsyncWriteExt::shutdown(transport.get_mut()),
+    )
+    .await;
+    let mut drain_buf = [0u8; 64];
+    let peer_eof = async {
+        loop {
+            match tokio::io::AsyncReadExt::read(transport.get_mut(), &mut drain_buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    };
+    #[cfg(feature = "p2p")]
+    if let Some(conn) = p2p_conn {
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                _ = peer_eof => {}
+                _ = conn.closed() => {}
+            }
+        })
+        .await;
+        return;
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(1), peer_eof).await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
@@ -3737,7 +3775,13 @@ async fn handle_multiplexed_connection<
                         "Incompatible protocol version {protocol_version} (minimum required: {PROTOCOL_VERSION_MIN_COMPATIBLE})"
                     )),
                 };
-                let _ = ctrl_transport.send_msg(&reject_ack).await;
+                send_refusal_and_drain(
+                    &mut ctrl_transport,
+                    &reject_ack,
+                    #[cfg(feature = "p2p")]
+                    p2p_conn.as_ref(),
+                )
+                .await;
                 return Err(GridError::RegistrationRejected(format!(
                     "Incompatible protocol version {protocol_version}"
                 )));
@@ -3751,7 +3795,13 @@ async fn handle_multiplexed_connection<
                     features: ProtocolCapabilities::empty(),
                     message: Some("Invalid capability: cpu_cores must be > 0".into()),
                 };
-                let _ = ctrl_transport.send_msg(&reject_ack).await;
+                send_refusal_and_drain(
+                    &mut ctrl_transport,
+                    &reject_ack,
+                    #[cfg(feature = "p2p")]
+                    p2p_conn.as_ref(),
+                )
+                .await;
                 return Err(GridError::RegistrationRejected(
                     "cpu_cores must be > 0".into(),
                 ));
@@ -3760,7 +3810,13 @@ async fn handle_multiplexed_connection<
         }
         WorkerMessage::ClaimMasterRole { ticket } => {
             let ack = reject_master_role_claim(&ticket);
-            let _ = ctrl_transport.send_msg(&ack).await;
+            send_refusal_and_drain(
+                &mut ctrl_transport,
+                &ack,
+                #[cfg(feature = "p2p")]
+                p2p_conn.as_ref(),
+            )
+            .await;
             return Ok(());
         }
         other => {
@@ -3775,7 +3831,13 @@ async fn handle_multiplexed_connection<
                     other.variant_name()
                 )),
             };
-            let _ = ctrl_transport.send_msg(&reject_ack).await;
+            send_refusal_and_drain(
+                &mut ctrl_transport,
+                &reject_ack,
+                #[cfg(feature = "p2p")]
+                p2p_conn.as_ref(),
+            )
+            .await;
             return Err(GridError::HandshakeFailed(format!(
                 "Expected Register message, received {}",
                 other.variant_name()
@@ -5938,6 +6000,7 @@ mod tests {
                         "post-queue mux handshake ClaimMasterRole must receive RoleHandoverAck",
                     );
                 assert_refused_ack(ack, "post-queue multiplexed handshake");
+                drop(ctrl_transport);
                 mux_hs_task.await.unwrap().unwrap();
                 assert!(
                     registry.list_workers().await.is_empty(),
@@ -6191,5 +6254,265 @@ mod tests {
         }
 
         server_task.abort();
+    }
+
+    #[cfg(feature = "p2p")]
+    #[tokio::test]
+    async fn test_p2p_handshake_refusals_delivered_over_real_iroh() {
+        use iroh::endpoint::presets::N0;
+        use iroh::endpoint::RelayMode;
+        use rusty_grid_core::arbitrage::{MasterLeaseTicket, LEASE_VALIDITY_DURATION_MS};
+        use rusty_grid_core::cluster_auth::{client_handshake, ClusterSecret};
+        use rusty_grid_core::protocol::EndpointRole;
+        use rusty_grid_core::transport::{BiStream, GRID_ALPN, STREAM_CONTROL, STREAM_DATA};
+
+        let test_secret = ClusterSecret::generate().unwrap();
+        let signing_secret = test_secret.clone();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let claim_ticket = MasterLeaseTicket::issue(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            10,
+            9500,
+            now_ms,
+            Duration::from_millis(LEASE_VALIDITY_DURATION_MS),
+            &signing_secret,
+        );
+
+        for secret in [None, Some(test_secret)] {
+            let mut cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
+            cfg.cluster_secret = secret.clone();
+            let mut server = MasterServer::bind(cfg, WorkerRegistry::new())
+                .await
+                .unwrap();
+            let master_ep = iroh::Endpoint::builder(N0)
+                .relay_mode(RelayMode::Disabled)
+                .alpns(vec![GRID_ALPN.to_vec()])
+                .bind()
+                .await
+                .unwrap();
+            let master_addr = master_ep.addr();
+            server.p2p_endpoint = Some(master_ep.clone());
+
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            let server_task = tokio::spawn(server.run(stop_rx));
+
+            let client_ep = iroh::Endpoint::builder(N0)
+                .relay_mode(RelayMode::Disabled)
+                .alpns(vec![GRID_ALPN.to_vec()])
+                .bind()
+                .await
+                .unwrap();
+
+            let open_ctrl = || async {
+                let conn = client_ep
+                    .connect(master_addr.clone(), GRID_ALPN)
+                    .await
+                    .expect("connect to master over loopback iroh");
+                let (mut ctrl_send, ctrl_recv) = conn.open_bi().await.expect("open ctrl bi");
+                ctrl_send.write_all(&[STREAM_CONTROL]).await.unwrap();
+                let (mut data_send, data_recv) = conn.open_bi().await.expect("open data bi");
+                data_send.write_all(&[STREAM_DATA]).await.unwrap();
+                let mut transport =
+                    MessageTransport::new(GridStream::P2p(BiStream::new(ctrl_recv, ctrl_send)));
+                if let Some(ref sec) = secret {
+                    let key = client_handshake(&mut transport, sec)
+                        .await
+                        .expect("client handshake over iroh");
+                    transport.enable_encryption(&key, EndpointRole::Client);
+                }
+                (transport, (conn, data_send, data_recv))
+            };
+
+            for iter in 0..8 {
+                // 1. ClaimMasterRole refusal on the P2P handshake path.
+                let (mut ctrl, _keep) = open_ctrl().await;
+                ctrl.send_msg(&WorkerMessage::ClaimMasterRole {
+                    ticket: claim_ticket.clone(),
+                })
+                .await
+                .unwrap();
+                let claim_reply = ctrl
+                    .recv_msg::<MasterMessage>()
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "iter {iter} (secret={}): ClaimMasterRole refusal read failed: {e}",
+                            secret.is_some()
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "iter {iter} (secret={}): ClaimMasterRole refusal stream closed before frame arrived",
+                            secret.is_some()
+                        )
+                    });
+                match claim_reply {
+                    MasterMessage::RoleHandoverAck {
+                        accepted: false,
+                        ref reason,
+                        ref task_queue_snapshot,
+                        ref connected_workers,
+                    } => {
+                        assert!(reason.is_some());
+                        assert!(task_queue_snapshot.is_empty());
+                        assert!(connected_workers.is_empty());
+                    }
+                    other => panic!("expected refused RoleHandoverAck, got {other:?}"),
+                }
+
+                // 2. RegisterAck { accepted: false } refusal (cpu_cores == 0) on the P2P handshake path.
+                let (mut ctrl_reg, _keep_reg) = open_ctrl().await;
+                ctrl_reg
+                    .send_msg(&WorkerMessage::Register {
+                        worker_id: Uuid::new_v4(),
+                        capabilities: WorkerCapabilities::new(
+                            "zero-core-worker",
+                            0,
+                            2048,
+                            false,
+                            false,
+                            None,
+                        ),
+                        protocol_version: PROTOCOL_VERSION_CURRENT,
+                        features: ProtocolCapabilities::all_supported(),
+                    })
+                    .await
+                    .unwrap();
+                let reg_reply = ctrl_reg
+                    .recv_msg::<MasterMessage>()
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "iter {iter} (secret={}): RegisterAck (cpu_cores=0) refusal read failed: {e}",
+                            secret.is_some()
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "iter {iter} (secret={}): RegisterAck (cpu_cores=0) refusal stream closed before frame arrived",
+                            secret.is_some()
+                        )
+                    });
+                match reg_reply {
+                    MasterMessage::RegisterAck {
+                        accepted: false,
+                        ref message,
+                        ..
+                    } => {
+                        assert!(
+                            message
+                                .as_deref()
+                                .unwrap_or_default()
+                                .contains("cpu_cores must be > 0"),
+                            "unexpected refusal message: {message:?}"
+                        );
+                    }
+                    other => panic!("expected refused RegisterAck, got {other:?}"),
+                }
+
+                // 3. RegisterAck { accepted: false } refusal (incompatible protocol_version) on P2P handshake path.
+                let (mut ctrl_ver, _keep_ver) = open_ctrl().await;
+                ctrl_ver
+                    .send_msg(&WorkerMessage::Register {
+                        worker_id: Uuid::new_v4(),
+                        capabilities: WorkerCapabilities::new(
+                            "old-proto-worker",
+                            4,
+                            2048,
+                            false,
+                            false,
+                            None,
+                        ),
+                        protocol_version: 0,
+                        features: ProtocolCapabilities::all_supported(),
+                    })
+                    .await
+                    .unwrap();
+                let ver_reply = ctrl_ver
+                    .recv_msg::<MasterMessage>()
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "iter {iter} (secret={}): RegisterAck (protocol_version=0) refusal read failed: {e}",
+                            secret.is_some()
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "iter {iter} (secret={}): RegisterAck (protocol_version=0) refusal stream closed before frame arrived",
+                            secret.is_some()
+                        )
+                    });
+                match ver_reply {
+                    MasterMessage::RegisterAck {
+                        accepted: false,
+                        ref message,
+                        ..
+                    } => {
+                        assert!(
+                            message
+                                .as_deref()
+                                .unwrap_or_default()
+                                .contains("Incompatible protocol version"),
+                            "unexpected refusal message: {message:?}"
+                        );
+                    }
+                    other => panic!("expected refused RegisterAck, got {other:?}"),
+                }
+
+                // 4. RegisterAck { accepted: false } refusal (unexpected first WorkerMessage) on P2P handshake path.
+                let (mut ctrl_other, _keep_other) = open_ctrl().await;
+                ctrl_other
+                    .send_msg(&WorkerMessage::Heartbeat {
+                        worker_id: Uuid::new_v4(),
+                        timestamp: 1,
+                        active_tasks: 0,
+                        cpu_usage_pct: 0.0,
+                        ram_available_mb: 1024,
+                    })
+                    .await
+                    .unwrap();
+                let other_reply = ctrl_other
+                    .recv_msg::<MasterMessage>()
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "iter {iter} (secret={}): RegisterAck (unexpected Heartbeat) refusal read failed: {e}",
+                            secret.is_some()
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "iter {iter} (secret={}): RegisterAck (unexpected Heartbeat) refusal stream closed before frame arrived",
+                            secret.is_some()
+                        )
+                    });
+                match other_reply {
+                    MasterMessage::RegisterAck {
+                        accepted: false,
+                        ref message,
+                        ..
+                    } => {
+                        assert!(
+                            message
+                                .as_deref()
+                                .unwrap_or_default()
+                                .contains("Expected Register message, received Heartbeat"),
+                            "unexpected refusal message: {message:?}"
+                        );
+                    }
+                    other => panic!("expected refused RegisterAck, got {other:?}"),
+                }
+            }
+
+            let _ = stop_tx.send(true);
+            client_ep.close().await;
+            master_ep.close().await;
+            let _ = server_task.await;
+        }
     }
 }
