@@ -26,14 +26,13 @@ scripts/sync_network/
 ├── sync_network.sh      # macOS / Linux launcher
 ├── sync_network.cmd     # Windows launcher (py / python auto-detection)
 ├── protocol_v1.json     # design sketch of a larger mailbox (nodes/, verifications/, state machine); only part of it is implemented
-├── ping_success.txt     # HISTORICAL sample output (2026-09-23, the author's machines)
 └── README.md
 ```
 
 Files the script writes into the shared folder:
 - `claim_<platform>.json`, `<platform>_ip.txt`: the role claim and the LAN IP.
 - `server_ready.txt`: written by the SERVER; honoured for 180 s.
-- `ping_success.txt`: written by the CLIENT after a successful ping.
+- `ping_success.txt`: written by the CLIENT at run time after a successful ping (not committed).
 - `<platform>_error_log.txt`: connection errors with a remediation hint.
 
 ## Usage
