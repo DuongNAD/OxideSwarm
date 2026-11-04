@@ -3568,7 +3568,7 @@ mod tests {
         let _occupied_18080 = tokio::net::TcpListener::bind("127.0.0.1:18080").await.ok();
 
         let (addr, shutdown_tx) = portal_fixture(
-            PortalTarget::from("192.168.1.123:8088"),
+            PortalTarget::from("192.0.2.20:8088"),
             PORTAL_MAX_CONNECTIONS,
         )
         .await;
@@ -3583,7 +3583,7 @@ mod tests {
         let n = stream.read(&mut buf).await.unwrap();
         let resp = String::from_utf8_lossy(&buf[..n]);
         assert!(resp.contains("307 Temporary Redirect"));
-        assert!(resp.contains("Location: http://192.168.1.123:8080"));
+        assert!(resp.contains("Location: http://192.0.2.20:8080"));
 
         // 2. Test /api/status probe
         let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -3596,7 +3596,7 @@ mod tests {
         let resp = String::from_utf8_lossy(&buf[..n]);
         assert!(resp.contains("200 OK"));
         assert!(resp.contains("\"role\":\"WORKER_PORTAL\""));
-        assert!(resp.contains("http://192.168.1.123:8080"));
+        assert!(resp.contains("http://192.0.2.20:8080"));
 
         let _ = shutdown_tx.send(true);
     }

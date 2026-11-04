@@ -77,9 +77,9 @@ pub struct MasterBeacon {
     pub service: String,
     /// Protocol version
     pub version: u32,
-    /// Cluster TCP coordinator address, e.g. "192.168.1.144:8088"
+    /// Cluster TCP coordinator address, e.g. "192.0.2.10:8088"
     pub cluster_addr: String,
-    /// Web UI Dashboard HTTP URL, e.g. "http://192.168.1.144:8080"
+    /// Web UI Dashboard HTTP URL, e.g. "http://192.0.2.10:8080"
     pub web_ui_url: String,
     /// Hostname of the Master node
     pub hostname: String,
@@ -1096,8 +1096,8 @@ mod tests {
     #[test]
     fn test_beacon_serialization_roundtrip() {
         let beacon = MasterBeacon::new(
-            "192.168.1.144:8088",
-            "http://192.168.1.144:8080",
+            "192.0.2.10:8088",
+            "http://192.0.2.10:8080",
             "MacBook-Pro",
             2,
         );
@@ -1105,8 +1105,8 @@ mod tests {
         let parsed = MasterBeacon::from_bytes(&bytes).expect("Deserialization must succeed");
 
         assert_eq!(parsed.service, DISCOVERY_SERVICE_NAME);
-        assert_eq!(parsed.cluster_addr, "192.168.1.144:8088");
-        assert_eq!(parsed.web_ui_url, "http://192.168.1.144:8080");
+        assert_eq!(parsed.cluster_addr, "192.0.2.10:8088");
+        assert_eq!(parsed.web_ui_url, "http://192.0.2.10:8080");
         assert_eq!(parsed.hostname, "MacBook-Pro");
         assert_eq!(parsed.worker_count, 2);
     }
@@ -1348,7 +1348,7 @@ mod tests {
         assert_eq!(b.cluster_addr, "192.168.1.50:8088");
 
         // Local master replying from loopback while advertising its LAN address.
-        let b = normalize_beacon_source(beacon_advertising("192.168.1.144:8088"), lan("127.0.0.1"))
+        let b = normalize_beacon_source(beacon_advertising("192.0.2.10:8088"), lan("127.0.0.1"))
             .unwrap();
         assert_eq!(b.cluster_addr, "127.0.0.1:8088");
     }
@@ -1480,7 +1480,7 @@ mod tests {
             );
         }
         // A local (loopback) sender may advertise loopback, or its LAN address: kept as signed.
-        for ok in ["127.0.0.1:8088", "localhost:8088", "192.168.1.144:8088"] {
+        for ok in ["127.0.0.1:8088", "localhost:8088", "192.0.2.10:8088"] {
             let b = accept_verified_beacon(beacon_advertising(ok), lan("127.0.0.1")).unwrap();
             assert_eq!(b.cluster_addr, ok);
         }
@@ -1687,14 +1687,19 @@ mod tests {
         // HTTP candidate is the local machine.
         let source = include_str!("discovery.rs");
         let code = source.split("#[cfg(test)]").next().unwrap();
-        for ip in ["192.168.1.144", "192.168.1.123"] {
-            // The module docs mention example beacons; only executable code matters.
-            let in_code = code
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .any(|l| l.contains(ip));
-            assert!(!in_code, "{ip} must not appear in discovery code");
-        }
+        // The module docs mention example beacons; only executable code matters.
+        let in_code = code
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(|l| {
+                l.contains("192.168.1.")
+                    && !l.contains("192.168.1.1:80")
+                    && !l.contains("192.168.1.254:80")
+            });
+        assert!(
+            !in_code,
+            "site-specific 192.168.1.x address must not appear in discovery code"
+        );
         assert_eq!(
             parse_candidate_hosts("10.0.0.5, nas.local  [::1] bad!host,;evil 10.0.0.6"),
             vec!["10.0.0.5", "nas.local", "10.0.0.6"]
