@@ -217,10 +217,8 @@ def find_repo_dir(explicit_repo=None):
         return os.path.abspath(cwd)
     home = os.path.expanduser("~")
     candidates = [
-        os.path.join(home, "Documents", "antigravity", "magical-mendel"),
         os.path.join(home, "Documents", "OxideSwarm"),
         os.path.join(home, "OxideSwarm"),
-        "E:\\teamwork_projects\\OxideSwarm",
         "C:\\OxideSwarm",
         os.path.join(home, "source", "repos", "OxideSwarm"),
     ]
