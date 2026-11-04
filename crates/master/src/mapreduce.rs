@@ -25,17 +25,30 @@ use crate::server::{prune_closed_waiters, WaiterMap};
 /// Default number of a job's tasks in flight at once (see [`MapReduceEngine::with_parallelism`]).
 pub const DEFAULT_MAPREDUCE_PARALLELISM: usize = 256;
 
-/// The line a worker appends to a captured stream it had to cut short (`read_bounded_stream` in
-/// `rusty_grid_worker`). The task still exits 0, so this marker is the only sign of the loss.
+/// The line a worker inserts between the preserved head and tail of a captured stream it had to
+/// cut short (`read_bounded_stream` in `rusty_grid_worker`). The task still exits 0, so this
+/// marker is the only sign of the loss.
 pub const OUTPUT_TRUNCATED_MARKER: &str =
     "[rusty_grid: output truncated after exceeding size limit]";
 
 /// True if `result.stdout` was cut short by the worker's capture limit.
 pub fn stdout_was_truncated(result: &TaskResult) -> bool {
     let out = &result.stdout.0;
-    let tail = &out[out.len().saturating_sub(OUTPUT_TRUNCATED_MARKER.len() + 8)..];
-    tail.windows(OUTPUT_TRUNCATED_MARKER.len())
-        .any(|w| w == OUTPUT_TRUNCATED_MARKER.as_bytes())
+    let marker = OUTPUT_TRUNCATED_MARKER.as_bytes();
+    let tail = &out[out.len().saturating_sub(marker.len() + 8)..];
+    if tail.windows(marker.len()).any(|w| w == marker) {
+        return true;
+    }
+    let notice_len = marker.len() + 2; // leading and trailing '\n'
+    if out.len() >= notice_len {
+        let head_cap = (out.len() - notice_len) / 2;
+        if out.get(head_cap..head_cap + notice_len).is_some_and(|s| {
+            s[0] == b'\n' && &s[1..1 + marker.len()] == marker && s[1 + marker.len()] == b'\n'
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Shared "last sign of life" clock of one job, so a task's wait only times out when the job as a
@@ -1266,9 +1279,6 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        let data = [b'x'; 100];
-        let (cut, truncated) = rt.block_on(rusty_grid_worker::read_bounded_stream(&data[..], 10));
-        assert!(truncated);
         let base = TaskResult::success(
             Uuid::new_v4(),
             rusty_grid_core::task::TaskId::new(),
@@ -1276,22 +1286,40 @@ mod tests {
             1,
             false,
         );
-        let result = TaskResult {
-            stdout: cut,
-            ..base.clone()
-        };
-        assert!(stdout_was_truncated(&result));
 
-        let (whole, truncated) =
-            rt.block_on(rusty_grid_worker::read_bounded_stream(&data[..], 1000));
-        assert!(!truncated);
-        let result = TaskResult {
-            stdout: whole,
-            ..base.clone()
-        };
-        assert!(!stdout_was_truncated(&result));
+        // Test both small caps and realistic caps >= 1 KiB (even and odd) where the marker is far
+        // from the end of `stdout` and only the midpoint check in `stdout_was_truncated` can find it.
+        for cap in [10usize, 1024, 1025, 4096, 4097, 16_384] {
+            let exact = vec![b'x'; cap];
+            let (whole, truncated) =
+                rt.block_on(rusty_grid_worker::read_bounded_stream(&exact[..], cap));
+            assert!(!truncated, "exact fit cap={cap} must not truncate");
+            let whole_res = TaskResult {
+                stdout: whole,
+                ..base.clone()
+            };
+            assert!(
+                !stdout_was_truncated(&whole_res),
+                "exact fit cap={cap} must not be flagged as truncated"
+            );
 
-        // The text appearing early in a large honest output is not a truncation.
+            for len in [cap + 1, cap * 3 + 17] {
+                let data: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
+                let (cut, truncated) =
+                    rt.block_on(rusty_grid_worker::read_bounded_stream(&data[..], cap));
+                assert!(truncated, "len={len} > cap={cap} must truncate");
+                let cut_res = TaskResult {
+                    stdout: cut,
+                    ..base.clone()
+                };
+                assert!(
+                    stdout_was_truncated(&cut_res),
+                    "stdout_was_truncated must detect worker midpoint marker at cap={cap}, len={len}"
+                );
+            }
+        }
+
+        // The text appearing early or off-midpoint in a large honest output is not a truncation.
         let mut honest = format!("{OUTPUT_TRUNCATED_MARKER}\n").into_bytes();
         honest.extend(vec![b'y'; 4096]);
         let result = TaskResult {

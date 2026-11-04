@@ -275,14 +275,20 @@ async fn test_read_bounded_stream_binary_overflow_and_drain() {
     assert!(truncated, "Stream should be flagged as truncated");
     // Max captured bytes + truncation message
     assert!(captured.len() >= max_capture);
+    let notice = b"\n[rusty_grid: output truncated after exceeding size limit]\n";
     assert!(
         captured
             .as_bytes()
-            .ends_with(b"[rusty_grid: output truncated after exceeding size limit]\n"),
-        "Must contain truncation footer"
+            .windows(notice.len())
+            .any(|w| w == notice),
+        "Must contain truncation notice between head and tail"
     );
-    // Verify initial data chunk was captured correctly
+    // Verify both head and tail chunks were captured correctly
     assert_eq!(&captured.as_bytes()[0..1024], &[0xEEu8; 1024]);
+    assert_eq!(
+        &captured.as_bytes()[captured.len() - 1024..],
+        &[0xEEu8; 1024]
+    );
 }
 
 // =========================================================================
