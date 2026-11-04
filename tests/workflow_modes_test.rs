@@ -1,11 +1,13 @@
 //! Integration tests for OxideSwarm Workflow Modes & Presets (`MODE-1`).
 
 use rusty_grid_cli::mode::{
-    execute_mode_action, export_specification, find_workspace_root, get_mode_descriptors,
-    probe_cluster_health_with_root, run_distributed_benchmark, run_hardware_profile,
+    execute_mode_action, export_specification, find_workspace_root, generate_research_report,
+    get_mode_descriptors, launch_local_dev_cluster_with_ports, probe_cluster_health_with_root,
+    probe_cluster_health_with_secret, run_distributed_benchmark, run_hardware_profile,
     run_micro_benchmarks, run_mode_cli, run_watch_check, verify_documentation, ModeCliArgs,
     WorkflowMode,
 };
+use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::protocol::MAX_FRAME_SIZE;
 use rusty_grid_master::auth::{AuthConfig, AuthScope};
 use rusty_grid_master::server::{MasterServer, ServerConfig};
@@ -171,6 +173,12 @@ fn test_research_mode_profile_and_bench() {
     assert!(bench.success);
     assert!(bench.metrics.contains_key("serde_ops_per_sec"));
     assert!(bench.metrics.contains_key("codec_ops_per_sec"));
+    assert_eq!(bench.metrics["codec_wire_discriminator"], 2);
+    assert!(bench.metrics["codec_frame_bytes"].as_u64().unwrap_or(0) > 16);
+    assert_eq!(
+        bench.metrics["codec_decoded_task_id"],
+        bench.metrics["expected_task_id"]
+    );
     assert!(bench.stdout.contains("Bincode Wire Codec Roundtrip"));
     let serde_ops = bench.metrics["serde_ops_per_sec"].as_u64().unwrap_or(0);
     assert!(
@@ -183,6 +191,22 @@ fn test_research_mode_profile_and_bench() {
         codec_ops > 100,
         "Codec ops/sec should be > 100, got: {}",
         codec_ops
+    );
+
+    let root = find_workspace_root();
+    let mode_cli_src = std::fs::read_to_string(root.join("crates/cli/src/mode_cli.rs"))
+        .expect("read crates/cli/src/mode_cli.rs");
+    let fn_start = mode_cli_src
+        .find("pub fn run_micro_benchmarks()")
+        .expect("find run_micro_benchmarks");
+    let fn_body = &mode_cli_src[fn_start..fn_start + 3500];
+    assert!(
+        fn_body.contains("serialize_message(") && fn_body.contains("deserialize_message("),
+        "run_micro_benchmarks must benchmark serialize_message + deserialize_message"
+    );
+    assert!(
+        !fn_body.contains("extend_from_slice"),
+        "run_micro_benchmarks must not use a fake Vec::extend_from_slice byte-copy loop"
     );
 }
 
@@ -200,6 +224,19 @@ fn test_research_mode_distributed_and_report() {
     assert!(dist_res.metrics.contains_key("latency_p99_us"));
     assert!(dist_res.metrics.contains_key("worker_allocations"));
 
+    let allocs = dist_res.metrics["worker_allocations"]
+        .as_object()
+        .expect("worker_allocations object");
+    for key in allocs.keys() {
+        assert!(
+            matches!(
+                key.as_str(),
+                "sim-cpu-node-a" | "sim-cpu-node-b" | "sim-gpu-node" | "sim-mobile-node"
+            ),
+            "unexpected synthetic worker profile name: {key}"
+        );
+    }
+
     let throughput = dist_res.metrics["throughput_tasks_per_sec"]
         .as_f64()
         .unwrap_or(0.0);
@@ -210,7 +247,7 @@ fn test_research_mode_distributed_and_report() {
     );
 
     // 2. Full research report aggregation
-    let report_res = rusty_grid_cli::mode::generate_research_report(&root);
+    let report_res = generate_research_report(&root);
     assert!(
         report_res.success,
         "Research report generation should succeed"
@@ -227,13 +264,14 @@ fn test_research_mode_distributed_and_report() {
     let report_json = std::fs::read_to_string(&report_path).expect("read research_report.json");
 
     for text in [&dist_res.stdout, &report_res.stdout, &report_json] {
+        let lower = text.to_ascii_lowercase();
         assert!(!text.contains("OPTIMAL"), "output must not print OPTIMAL");
         assert!(
-            !text.contains("RTX 4090"),
-            "output must not print invented RTX 4090 hardware"
+            !lower.contains("rtx") && !lower.contains("4090") && !lower.contains("worker-gpu"),
+            "output must not print invented RTX / worker-gpu-rtx4090 hardware or node names"
         );
         assert!(
-            !text.contains("Snapdragon"),
+            !lower.contains("snapdragon"),
             "output must not print invented Snapdragon hardware"
         );
         assert!(
@@ -243,6 +281,16 @@ fn test_research_mode_distributed_and_report() {
             "output must not print invented node names"
         );
     }
+
+    // 3. Research report must fail when target directory cannot be created (e.g. target is a file)
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("target"), b"not a directory").expect("write target file");
+    let bad_report = generate_research_report(temp.path());
+    assert!(
+        !bad_report.success,
+        "generate_research_report must fail when target is a regular file"
+    );
+    assert_eq!(bad_report.exit_code, Some(1));
 }
 
 #[test]
@@ -330,7 +378,7 @@ async fn test_dev_status_against_protected_master_exits_nonzero() {
     .expect("write .dev_cluster.json");
 
     // 1. Direct engine probe against protected master returns failure with HTTP 401
-    let probe_res = probe_cluster_health_with_root(dash_port, temp.path());
+    let probe_res = probe_cluster_health_with_root(Some(dash_port), temp.path());
     assert!(
         !probe_res.success,
         "dev status against protected master (401) must fail"
@@ -371,6 +419,175 @@ async fn test_dev_status_against_protected_master_exits_nonzero() {
     );
 
     let _ = master.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dev_status_closed_port_fails_while_another_master_is_up() {
+    let auth_config = AuthConfig {
+        enabled: true,
+        dev_mode: true,
+        loopback_bypass: true,
+        tokens: Default::default(),
+        allowed_origins: Vec::new(),
+    };
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_dashboard_port(0)
+        .with_auth_config(auth_config);
+    let master = MasterServer::spawn(config).await.expect("start dev master");
+    let dash_port = master.dashboard_addr().expect("dashboard addr").port();
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        temp.path().join(".dev_cluster.json"),
+        serde_json::json!({ "web_ui_port": dash_port }).to_string(),
+    )
+    .expect("write .dev_cluster.json");
+
+    // Without explicit --port, fallback to .dev_cluster.json succeeds against dash_port
+    let default_res = probe_cluster_health_with_root(None, temp.path());
+    assert!(
+        default_res.success,
+        "probe without explicit port should succeed via .dev_cluster.json: {}",
+        default_res.stderr
+    );
+    assert_eq!(
+        default_res.metrics["endpoint"],
+        format!("http://127.0.0.1:{dash_port}/api/status")
+    );
+
+    // Pick a closed port
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        listener.local_addr().expect("local_addr").port()
+    };
+
+    // With explicit --port <closed_port>, must probe ONLY closed_port and fail (no fallback to .dev_cluster.json)
+    let explicit_res = probe_cluster_health_with_root(Some(closed_port), temp.path());
+    assert!(
+        !explicit_res.success,
+        "explicit --port on closed port must fail even when another master is listed in .dev_cluster.json"
+    );
+    assert_eq!(explicit_res.exit_code, Some(1));
+
+    let exit_code = run_mode_cli(ModeCliArgs {
+        mode: Some("dev".to_string()),
+        action: Some("status".to_string()),
+        action_opt: None,
+        iterations: 1,
+        port: Some(closed_port),
+        json: true,
+        interactive: false,
+    })
+    .await;
+    assert_ne!(
+        exit_code, 0,
+        "run_mode_cli with closed --port must return non-zero while another master is up"
+    );
+
+    let ox_mode_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_ox-mode"));
+    let out = std::process::Command::new(&ox_mode_bin)
+        .current_dir(temp.path())
+        .args([
+            "dev",
+            "status",
+            "--port",
+            &closed_port.to_string(),
+            "--json",
+        ])
+        .output()
+        .expect("spawn ox-mode dev status --port closed");
+    assert!(
+        !out.status.success(),
+        "ox-mode dev status --port <closed> must exit non-zero while another master is up"
+    );
+
+    let _ = master.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dev_status_succeeds_against_cluster_with_secret() {
+    let secret = ClusterSecret::generate().expect("generate secret");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let secret_path = temp.path().join("cluster.secret");
+    secret
+        .save_file(&secret_path, true)
+        .expect("save secret file");
+
+    let auth_config = AuthConfig {
+        enabled: true,
+        dev_mode: false,
+        loopback_bypass: false,
+        tokens: Default::default(),
+        allowed_origins: Vec::new(),
+    };
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_dashboard_port(0)
+        .with_cluster_secret(secret.clone())
+        .with_auth_config(auth_config);
+    let master = MasterServer::spawn(config)
+        .await
+        .expect("start secret-protected master");
+    let dash_port = master.dashboard_addr().expect("dashboard addr").port();
+
+    // 1. Without secret, status fails with HTTP 401
+    let no_secret_res = probe_cluster_health_with_secret(Some(dash_port), temp.path(), None);
+    assert!(
+        !no_secret_res.success,
+        "probe without secret against secret-protected master must fail"
+    );
+    assert_eq!(no_secret_res.metrics["http_status"], 401);
+
+    // 2. With cluster secret, status derives dashboard_admin_token(&secret) and succeeds (200 OK)
+    let with_secret_res =
+        probe_cluster_health_with_secret(Some(dash_port), temp.path(), Some(&secret));
+    assert!(
+        with_secret_res.success,
+        "probe with cluster secret must succeed against secret-protected master: {}",
+        with_secret_res.stderr
+    );
+    assert_eq!(with_secret_res.metrics["http_status"], 200);
+
+    // 3. Binary invocation with OXIDESWARM_SECRET_FILE succeeds and exits 0
+    let ox_mode_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_ox-mode"));
+    let out = std::process::Command::new(&ox_mode_bin)
+        .env("OXIDESWARM_SECRET_FILE", &secret_path)
+        .args(["dev", "status", "--port", &dash_port.to_string(), "--json"])
+        .output()
+        .expect("spawn ox-mode dev status with secret");
+    assert!(
+        out.status.success(),
+        "ox-mode dev status with OXIDESWARM_SECRET_FILE must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("parse ox-mode status json");
+    assert_eq!(json["success"], true);
+
+    let _ = master.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dev_cluster_fails_when_port_is_held() {
+    let held_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind held tcp port for master");
+    let held_port = held_listener.local_addr().expect("local_addr").port();
+    let free_web_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral web port");
+        l.local_addr().expect("local_addr").port()
+    };
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let res = launch_local_dev_cluster_with_ports(temp.path(), held_port, free_web_port).await;
+    assert!(
+        !res.success,
+        "launch_local_dev_cluster_with_ports must fail when the master TCP port is already held"
+    );
+    assert_eq!(res.exit_code, Some(1));
+    assert!(
+        !temp.path().join(".dev_cluster.json").exists(),
+        "failed dev cluster launch must clean up .dev_cluster.json"
+    );
+    drop(held_listener);
 }
 
 #[test]

@@ -33,6 +33,8 @@ uuid = { workspace = true, features = ["v4", "serde"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 toml = { workspace = true }
+chrono = { workspace = true }
+sysinfo = { workspace = true }
 
 [features]
 # Workers of this binary can compute on the GPU (Metal, Vulkan, DirectX 12) and advertise it:

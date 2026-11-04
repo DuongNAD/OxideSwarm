@@ -8,12 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use clap::Parser;
-use rusty_grid_core::mode::chrono::Utc;
-use rusty_grid_core::mode::sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 use serde::{Deserialize, Serialize};
+use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 
 use rusty_grid_core::capabilities::{MobileCapabilities, WorkerCapabilities};
+use rusty_grid_core::cluster_auth::ClusterSecret;
 pub use rusty_grid_core::mode::{
     find_workspace_root, get_mode_descriptors, ModeActionDescriptor, ModeDescriptor,
     ModeExecutionResult, WorkflowMode,
@@ -23,6 +24,9 @@ use rusty_grid_core::protocol::{
     MAX_FRAME_SIZE, PROTOCOL_VERSION_CURRENT, PROTOCOL_VERSION_MIN_COMPATIBLE,
 };
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
+
+use crate::config::{load_config_file, SecretSection};
+use crate::secret_cmd::SecretOpts;
 
 // ANSI terminal colors for CLI output
 const CLR_RESET: &str = "\x1b[0m";
@@ -74,6 +78,24 @@ pub struct ModeCliArgs {
 // 1. TESTING & QUALITY ASSURANCE ENGINE
 // ==============================================================================
 
+/// Sums `passed;` and `failed;` counts across every `test result:` summary line in `cargo test` output.
+pub fn parse_cargo_test_counts(stdout: &str) -> (usize, usize) {
+    let mut passed_tests = 0;
+    let mut failed_tests = 0;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("test result:") {
+            if let Some(passed) = extract_count(trimmed, "passed;") {
+                passed_tests += passed;
+            }
+            if let Some(failed) = extract_count(trimmed, "failed;") {
+                failed_tests += failed;
+            }
+        }
+    }
+    (passed_tests, failed_tests)
+}
+
 /// Runs quick workspace unit tests (`cargo test --workspace --lib`).
 pub fn run_quick_tests(workspace_root: &Path) -> ModeExecutionResult {
     let start = Instant::now();
@@ -93,17 +115,7 @@ pub fn run_quick_tests(workspace_root: &Path) -> ModeExecutionResult {
             res.stdout = String::from_utf8_lossy(&output.stdout).to_string();
             res.stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-            let mut passed_tests = 0;
-            let mut failed_tests = 0;
-            for line in res.stdout.lines() {
-                if line.contains("test result: ok.") {
-                    if let Some(passed) = extract_count(line, "passed;") {
-                        passed_tests += passed;
-                    }
-                } else if line.contains("FAILED") {
-                    failed_tests += 1;
-                }
-            }
+            let (passed_tests, failed_tests) = parse_cargo_test_counts(&res.stdout);
             res = res.with_metric("passed_tests", passed_tests);
             res = res.with_metric("failed_tests", failed_tests);
         }
@@ -144,10 +156,47 @@ pub fn run_full_tests(workspace_root: &Path) -> ModeExecutionResult {
     res
 }
 
+/// Combines `cargo clippy` and `cargo fmt --check` outcomes into a `ModeExecutionResult`.
+/// Both checks must succeed for `res.success` to be `true`.
+pub fn evaluate_lint_outcomes(
+    clippy_ok: bool,
+    clippy_stdout: &str,
+    clippy_stderr: &str,
+    fmt_ok: bool,
+    fmt_stdout: &str,
+    fmt_stderr: &str,
+    duration_ms: u64,
+) -> ModeExecutionResult {
+    let mut res = ModeExecutionResult::new(WorkflowMode::Test, "lint");
+    res.duration_ms = duration_ms;
+    res.success = clippy_ok && fmt_ok;
+    res.exit_code = Some(if res.success { 0 } else { 1 });
+
+    let mut combined_stdout = String::new();
+    let mut combined_stderr = String::new();
+
+    combined_stdout.push_str("=== 1. Cargo Clippy Lints ===\n");
+    combined_stdout.push_str(clippy_stdout);
+    combined_stderr.push_str(clippy_stderr);
+
+    combined_stdout.push_str("\n=== 2. Rustfmt Code Style ===\n");
+    if fmt_ok {
+        combined_stdout.push_str("All source files conform to standard Rust formatting.\n");
+    } else {
+        combined_stderr.push_str(fmt_stderr);
+        combined_stderr.push_str(fmt_stdout);
+    }
+
+    res.stdout = combined_stdout;
+    res.stderr = combined_stderr;
+    res = res.with_metric("clippy_passed", clippy_ok);
+    res = res.with_metric("fmt_passed", fmt_ok);
+    res
+}
+
 /// Runs clippy lint checks and rustfmt verification.
 pub fn run_lints(workspace_root: &Path) -> ModeExecutionResult {
     let start = Instant::now();
-    let mut res = ModeExecutionResult::new(WorkflowMode::Test, "lint");
 
     let clippy_out = Command::new("cargo")
         .args([
@@ -166,48 +215,51 @@ pub fn run_lints(workspace_root: &Path) -> ModeExecutionResult {
         .current_dir(workspace_root)
         .output();
 
-    res.duration_ms = start.elapsed().as_millis() as u64;
+    let duration_ms = start.elapsed().as_millis() as u64;
 
-    let clippy_ok = clippy_out
-        .as_ref()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let fmt_ok = fmt_out
-        .as_ref()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let (clippy_ok, clippy_stdout, clippy_stderr) = match clippy_out {
+        Ok(o) => (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        ),
+        Err(e) => (
+            false,
+            String::new(),
+            format!("Failed to spawn clippy: {e}\n"),
+        ),
+    };
 
-    res.success = clippy_ok && fmt_ok;
-    res.exit_code = Some(if res.success { 0 } else { 1 });
+    let (fmt_ok, fmt_stdout, fmt_stderr) = match fmt_out {
+        Ok(o) => (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        ),
+        Err(e) => (
+            false,
+            String::new(),
+            format!("Failed to spawn rustfmt: {e}\n"),
+        ),
+    };
 
-    let mut combined_stdout = String::new();
-    let mut combined_stderr = String::new();
-
-    combined_stdout.push_str("=== 1. Cargo Clippy Lints ===\n");
-    if let Ok(o) = clippy_out {
-        combined_stdout.push_str(&String::from_utf8_lossy(&o.stdout));
-        combined_stderr.push_str(&String::from_utf8_lossy(&o.stderr));
-    }
-    combined_stdout.push_str("\n=== 2. Rustfmt Code Style ===\n");
-    if let Ok(o) = fmt_out {
-        if o.status.success() {
-            combined_stdout.push_str("All source files conform to standard Rust formatting.\n");
-        } else {
-            combined_stderr.push_str(&String::from_utf8_lossy(&o.stderr));
-            combined_stderr.push_str(&String::from_utf8_lossy(&o.stdout));
-        }
-    }
-
-    res.stdout = combined_stdout;
-    res.stderr = combined_stderr;
-    res = res.with_metric("clippy_passed", clippy_ok);
-    res = res.with_metric("fmt_passed", fmt_ok);
-
-    res
+    evaluate_lint_outcomes(
+        clippy_ok,
+        &clippy_stdout,
+        &clippy_stderr,
+        fmt_ok,
+        &fmt_stdout,
+        &fmt_stderr,
+        duration_ms,
+    )
 }
 
-/// Runs test iterations to detect flaky non-deterministic tests.
-pub fn run_flaky_detection(workspace_root: &Path, iterations: usize) -> ModeExecutionResult {
+/// Evaluates flaky test detection iterations using the supplied per-iteration runner `(iteration_1_based) -> (passed, elapsed_ms)`.
+/// Every iteration must pass (`pass_count == iters`) for `res.success` to be `true`.
+pub fn run_flaky_detection_with<F>(iterations: usize, mut run_one: F) -> ModeExecutionResult
+where
+    F: FnMut(usize) -> (bool, u64),
+{
     let start = Instant::now();
     let mut res = ModeExecutionResult::new(WorkflowMode::Test, "flaky");
     let iters = if iterations == 0 { 5 } else { iterations };
@@ -217,20 +269,11 @@ pub fn run_flaky_detection(workspace_root: &Path, iterations: usize) -> ModeExec
     let mut total_duration_ms = 0u64;
 
     for i in 1..=iters {
-        let iter_start = Instant::now();
-        let cmd = Command::new("cargo")
-            .args(["test", "--workspace", "--lib", "--quiet"])
-            .current_dir(workspace_root)
-            .output();
-
-        let elapsed = iter_start.elapsed().as_millis() as u64;
+        let (ok, elapsed) = run_one(i);
         total_duration_ms += elapsed;
-
-        let ok = cmd.as_ref().map(|o| o.status.success()).unwrap_or(false);
         if ok {
             pass_count += 1;
         }
-
         iteration_results.push(serde_json::json!({
             "iteration": i,
             "success": ok,
@@ -270,6 +313,20 @@ pub fn run_flaky_detection(workspace_root: &Path, iterations: usize) -> ModeExec
     res = res.with_metric("runs", iteration_results);
 
     res
+}
+
+/// Runs test iterations to detect flaky non-deterministic tests.
+pub fn run_flaky_detection(workspace_root: &Path, iterations: usize) -> ModeExecutionResult {
+    run_flaky_detection_with(iterations, |_i| {
+        let iter_start = Instant::now();
+        let cmd = Command::new("cargo")
+            .args(["test", "--workspace", "--lib", "--quiet"])
+            .current_dir(workspace_root)
+            .output();
+        let elapsed = iter_start.elapsed().as_millis() as u64;
+        let ok = cmd.as_ref().map(|o| o.status.success()).unwrap_or(false);
+        (ok, elapsed)
+    })
 }
 
 // ==============================================================================
@@ -380,17 +437,40 @@ fn count_rust_files(dir: &Path, file_count: &mut usize, line_count: &mut usize) 
     }
 }
 
-/// Performs a synchronous HTTP/1.1 GET against `127.0.0.1:<port>/api/status`,
-/// returning `(http_status_code, response_body)`.
-fn http_get_local_status(port: u16) -> Result<(u16, String), String> {
+/// Resolves the cluster secret from the standard CLI/env/config/default-file hierarchy
+/// and derives the dashboard Admin Bearer token when a secret is present.
+fn resolve_dashboard_bearer_token() -> Option<String> {
+    let config = load_config_file(None).ok().flatten();
+    let opts = SecretOpts::default();
+    for section in [
+        SecretSection::Status,
+        SecretSection::Master,
+        SecretSection::Submit,
+        SecretSection::Worker,
+    ] {
+        if let Ok(Some(secret)) = opts.resolve(config.as_ref(), section) {
+            return Some(rusty_grid_master::dashboard_admin_token(&secret));
+        }
+    }
+    None
+}
+
+fn http_get_local_status_once(
+    port: u16,
+    bearer_token: Option<&str>,
+) -> Result<(u16, String), String> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(750))
         .map_err(|e| format!("connect 127.0.0.1:{port}: {e}"))?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
 
+    let auth_header = match bearer_token {
+        Some(token) if !token.is_empty() => format!("Authorization: Bearer {token}\r\n"),
+        _ => String::new(),
+    };
     let req = format!(
-        "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+        "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\n{auth_header}Connection: close\r\n\r\n"
     );
     stream
         .write_all(req.as_bytes())
@@ -416,55 +496,84 @@ fn http_get_local_status(port: u16) -> Result<(u16, String), String> {
     Ok((status_code, body.to_string()))
 }
 
-/// Probes the health and status of a running local master node across candidate ports.
-pub fn probe_cluster_health(port: u16) -> ModeExecutionResult {
+/// Performs a synchronous HTTP/1.1 GET against `127.0.0.1:<port>/api/status`,
+/// returning `(http_status_code, response_body)`.
+fn http_get_local_status(port: u16, bearer_token: Option<&str>) -> Result<(u16, String), String> {
+    let (status_code, body) = http_get_local_status_once(port, bearer_token)?;
+    if status_code == 401 && bearer_token.is_some() {
+        if let Ok((retry_code, retry_body)) = http_get_local_status_once(port, None) {
+            if (200..300).contains(&retry_code) {
+                return Ok((retry_code, retry_body));
+            }
+        }
+    }
+    Ok((status_code, body))
+}
+
+/// Probes the health and status of a running local master node.
+/// When `port` is `Some(p)`, probes only `p`; when `None`, checks `.dev_cluster.json` then HTTP ports `8080` and `3000`.
+pub fn probe_cluster_health(port: Option<u16>) -> ModeExecutionResult {
     probe_cluster_health_with_root(port, &find_workspace_root())
 }
 
 /// Probes the health and status of a running local master node with a specific workspace root.
-pub fn probe_cluster_health_with_root(port: u16, workspace_root: &Path) -> ModeExecutionResult {
+pub fn probe_cluster_health_with_root(
+    port: Option<u16>,
+    workspace_root: &Path,
+) -> ModeExecutionResult {
+    let bearer_token = resolve_dashboard_bearer_token();
+    probe_cluster_health_with_bearer(port, workspace_root, bearer_token.as_deref())
+}
+
+/// Probes the health and status of a running local master node using an explicit `ClusterSecret` (if any).
+pub fn probe_cluster_health_with_secret(
+    port: Option<u16>,
+    workspace_root: &Path,
+    secret: Option<&ClusterSecret>,
+) -> ModeExecutionResult {
+    let bearer_token = secret.map(rusty_grid_master::dashboard_admin_token);
+    probe_cluster_health_with_bearer(port, workspace_root, bearer_token.as_deref())
+}
+
+fn probe_cluster_health_with_bearer(
+    port: Option<u16>,
+    workspace_root: &Path,
+    bearer_token: Option<&str>,
+) -> ModeExecutionResult {
     let start = Instant::now();
     let mut res = ModeExecutionResult::new(WorkflowMode::Dev, "status");
 
     let mut candidate_ports = Vec::new();
-    let explicit_nondefault_port = port != 8080;
-    if explicit_nondefault_port {
-        candidate_ports.push(port);
-    }
-
-    let cluster_file = workspace_root.join(".dev_cluster.json");
-    let mut configured_port = if explicit_nondefault_port {
-        Some(port)
+    let configured_port = if let Some(explicit_port) = port {
+        // Explicit `--port` / `RUSTY_GRID_DASHBOARD_PORT`: probe only the given port.
+        candidate_ports.push(explicit_port);
+        Some(explicit_port)
     } else {
-        None
-    };
-    if let Ok(content) = fs::read_to_string(&cluster_file) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(p) = v.get("web_ui_port").and_then(|p| p.as_u64()) {
-                let p_u16 = p as u16;
-                if configured_port.is_none() {
-                    configured_port = Some(p_u16);
-                }
-                if !candidate_ports.contains(&p_u16) {
+        let mut from_cluster_file = None;
+        let cluster_file = workspace_root.join(".dev_cluster.json");
+        if let Ok(content) = fs::read_to_string(&cluster_file) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(p) = v.get("web_ui_port").and_then(|p| p.as_u64()) {
+                    let p_u16 = p as u16;
+                    from_cluster_file = Some(p_u16);
                     candidate_ports.push(p_u16);
                 }
             }
         }
-    }
-    if !candidate_ports.contains(&port) {
-        candidate_ports.push(port);
-    }
-    for fallback in [8088, 8080, 3000] {
-        if !candidate_ports.contains(&fallback) {
-            candidate_ports.push(fallback);
+        // Only HTTP dashboard ports (8088 is the default cluster TCP port, not HTTP).
+        for fallback in [8080u16, 3000u16] {
+            if !candidate_ports.contains(&fallback) {
+                candidate_ports.push(fallback);
+            }
         }
-    }
+        from_cluster_file
+    };
 
     let mut http_error_seen: Option<(String, u16, String)> = None;
 
     for &p in &candidate_ports {
         let url = format!("http://127.0.0.1:{}/api/status", p);
-        match http_get_local_status(p) {
+        match http_get_local_status(p, bearer_token) {
             Ok((status_code, body)) if (200..300).contains(&status_code) => {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
                     let has_workers_array =
@@ -533,6 +642,26 @@ pub fn probe_cluster_health_with_root(port: u16, workspace_root: &Path) -> ModeE
 // 3. DOCUMENTATION & SPECIFICATION ENGINE
 // ==============================================================================
 
+/// Verifies that the generated rustdoc HTML index exists on disk before reporting `doc build` success.
+pub fn finalize_doc_build_output(workspace_root: &Path, res: &mut ModeExecutionResult) {
+    if res.success {
+        let doc_index = workspace_root.join("target/doc/rusty_grid_core/index.html");
+        if doc_index.is_file() {
+            res.stdout.push_str(&format!(
+                "\nDocumentation built successfully!\nHTML Index: {}\n",
+                doc_index.display()
+            ));
+        } else {
+            res.success = false;
+            res.exit_code = Some(1);
+            res.stderr = format!(
+                "cargo doc exited 0, but expected HTML index does not exist: {}",
+                doc_index.display()
+            );
+        }
+    }
+}
+
 /// Builds rustdoc for all workspace crates.
 pub fn run_doc_build(workspace_root: &Path) -> ModeExecutionResult {
     let start = Instant::now();
@@ -551,13 +680,7 @@ pub fn run_doc_build(workspace_root: &Path) -> ModeExecutionResult {
             res.success = output.status.success();
             res.stdout = String::from_utf8_lossy(&output.stdout).to_string();
             res.stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            if res.success {
-                let doc_index = workspace_root.join("target/doc/rusty_grid_core/index.html");
-                res.stdout.push_str(&format!(
-                    "\nDocumentation built successfully!\nHTML Index: {}\n",
-                    doc_index.display()
-                ));
-            }
+            finalize_doc_build_output(workspace_root, &mut res);
         }
         Err(e) => {
             res.success = false;
@@ -1024,15 +1147,28 @@ pub fn run_micro_benchmarks() -> ModeExecutionResult {
 
     // Benchmark 2: Real Bincode wire-protocol serialize_message + deserialize_message roundtrip
     let codec_iters = 10_000usize;
+    let expected_task_id = dummy_task.id.to_string();
     let wire_msg = MasterMessage::AssignTask { task: dummy_task };
     let t2_start = Instant::now();
     let mut wire_bytes_total = 0usize;
-    for _ in 0..codec_iters {
+    let mut codec_frame_bytes = 0usize;
+    let mut codec_wire_discriminator = 0u8;
+    let mut codec_decoded_task_id = String::new();
+    for i in 0..codec_iters {
         let encoded =
             serialize_message(&wire_msg, WireCodec::Bincode).expect("Bincode wire serialize");
         wire_bytes_total += encoded.len();
-        let (_decoded, _codec): (MasterMessage, WireCodec) =
+        let (decoded, codec): (MasterMessage, WireCodec) =
             deserialize_message(&encoded).expect("Bincode wire deserialize");
+        if i == 0 {
+            codec_frame_bytes = encoded.len();
+            codec_wire_discriminator = encoded.first().copied().unwrap_or(0);
+            if codec == WireCodec::Bincode {
+                if let MasterMessage::AssignTask { task } = decoded {
+                    codec_decoded_task_id = task.id.to_string();
+                }
+            }
+        }
     }
     let t2_dur = t2_start.elapsed();
     let t2_secs = t2_dur.as_secs_f64().max(1e-9);
@@ -1040,8 +1176,10 @@ pub fn run_micro_benchmarks() -> ModeExecutionResult {
     let codec_mb_per_sec = (wire_bytes_total as f64 / (1024.0 * 1024.0)) / t2_secs;
 
     res.duration_ms = start.elapsed().as_millis() as u64;
-    res.success = true;
-    res.exit_code = Some(0);
+    res.success = codec_frame_bytes > 5
+        && codec_wire_discriminator == 0x02
+        && codec_decoded_task_id == expected_task_id;
+    res.exit_code = Some(if res.success { 0 } else { 1 });
 
     let stdout = format!(
         "=== OxideSwarm Micro-Benchmarks ===\n1. Task JSON Serde Roundtrip: {} tasks in {:.3}s -> {} ops/sec ({:.2} MB/s)\n2. Bincode Wire Codec Roundtrip (MasterMessage::AssignTask): {} iterations in {:.3}s -> {} ops/sec ({:.2} MB/s)\nTotal Duration: {} ms\n",
@@ -1062,6 +1200,10 @@ pub fn run_micro_benchmarks() -> ModeExecutionResult {
     res = res.with_metric("serde_mb_per_sec", serde_mb_per_sec);
     res = res.with_metric("codec_ops_per_sec", codec_ops_per_sec);
     res = res.with_metric("codec_mb_per_sec", codec_mb_per_sec);
+    res = res.with_metric("codec_frame_bytes", codec_frame_bytes);
+    res = res.with_metric("codec_wire_discriminator", codec_wire_discriminator);
+    res = res.with_metric("codec_decoded_task_id", codec_decoded_task_id);
+    res = res.with_metric("expected_task_id", expected_task_id);
 
     res
 }
@@ -1279,11 +1421,21 @@ pub fn generate_research_report(workspace_root: &Path) -> ModeExecutionResult {
     });
 
     let report_file = workspace_root.join("target/research_report.json");
-    if let Some(parent) = report_file.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(json_str) = serde_json::to_string_pretty(&report_data) {
-        let _ = fs::write(&report_file, json_str);
+    let write_res =
+        fs::create_dir_all(report_file.parent().unwrap_or(workspace_root)).and_then(|_| {
+            let json_str = serde_json::to_string_pretty(&report_data)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            fs::write(&report_file, json_str)
+        });
+    if let Err(e) = write_res {
+        res.success = false;
+        res.exit_code = Some(1);
+        res.stderr = format!(
+            "Failed to write research report to {}: {}",
+            report_file.display(),
+            e
+        );
+        return res;
     }
 
     let stdout = format!(
@@ -1333,7 +1485,7 @@ pub fn execute_mode_action(
         (WorkflowMode::Dev, "watch") | (WorkflowMode::Dev, "reload") => {
             run_watch_check(workspace_root)
         }
-        (WorkflowMode::Dev, "status") => probe_cluster_health_with_root(8080, workspace_root),
+        (WorkflowMode::Dev, "status") => probe_cluster_health_with_root(None, workspace_root),
         (WorkflowMode::Dev, "cluster") => {
             let mut res = ModeExecutionResult::new(WorkflowMode::Dev, "cluster");
             res.success = false;
@@ -1422,7 +1574,7 @@ pub async fn run_mode_cli(args: ModeCliArgs) -> i32 {
 
     let result =
         if parsed_mode == WorkflowMode::Dev && action_str.trim().eq_ignore_ascii_case("status") {
-            probe_cluster_health_with_root(args.port.unwrap_or(8080), &workspace_root)
+            probe_cluster_health_with_root(args.port, &workspace_root)
         } else {
             execute_single_action(parsed_mode, &action_str, args.iterations, &workspace_root).await
         };
@@ -1470,8 +1622,19 @@ pub async fn execute_single_action(
     execute_mode_action(mode, &action_clean, workspace_root)
 }
 
-/// Spawns local dev cluster: 1 Master with Web UI + 2 Workers in background with PID tracking.
+/// Spawns local dev cluster: 1 Master with Web UI + 2 Workers in background with PID tracking,
+/// verifying that all children stay alive and both workers appear in `/api/status`.
 pub async fn launch_local_dev_cluster(workspace_root: &Path) -> ModeExecutionResult {
+    launch_local_dev_cluster_with_ports(workspace_root, 9090, 8080).await
+}
+
+/// Spawns local dev cluster on the specified `master_tcp_port` and `web_ui_port`,
+/// calling `try_wait()` on each child and polling `/api/status` until both workers register.
+pub async fn launch_local_dev_cluster_with_ports(
+    workspace_root: &Path,
+    master_tcp_port: u16,
+    web_ui_port: u16,
+) -> ModeExecutionResult {
     let mut res = ModeExecutionResult::new(WorkflowMode::Dev, "cluster");
     let start = Instant::now();
 
@@ -1486,36 +1649,44 @@ pub async fn launch_local_dev_cluster(workspace_root: &Path) -> ModeExecutionRes
     } else {
         "target/debug/rusty-grid"
     };
-    let target_bin = workspace_root.join(bin_rel);
+    let mut target_bin = workspace_root.join(bin_rel);
     if !target_bin.exists() {
-        match Command::new("cargo")
-            .args(["build", "--bin", "rusty-grid"])
-            .current_dir(workspace_root)
-            .output()
-        {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => {
-                res.success = false;
-                res.exit_code = out.status.code().or(Some(1));
-                res.stderr = format!(
-                    "Failed to build rusty-grid binary: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-                return res;
-            }
-            Err(e) => {
-                res.success = false;
-                res.exit_code = Some(1);
-                res.stderr = format!("Failed to build rusty-grid binary: {}", e);
-                return res;
+        let fallback_root = find_workspace_root();
+        let fallback_bin = fallback_root.join(bin_rel);
+        if fallback_bin.exists() {
+            target_bin = fallback_bin;
+        } else {
+            match Command::new("cargo")
+                .args(["build", "--bin", "rusty-grid"])
+                .current_dir(&fallback_root)
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    if fallback_bin.exists() {
+                        target_bin = fallback_bin;
+                    }
+                }
+                Ok(out) => {
+                    res.success = false;
+                    res.exit_code = out.status.code().or(Some(1));
+                    res.stderr = format!(
+                        "Failed to build rusty-grid binary: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                    return res;
+                }
+                Err(e) => {
+                    res.success = false;
+                    res.exit_code = Some(1);
+                    res.stderr = format!("Failed to build rusty-grid binary: {}", e);
+                    return res;
+                }
             }
         }
     }
 
-    let master_tcp_port = 9090u16;
-    let web_ui_port = 8088u16;
-
     let mut spawned_pids = Vec::new();
+    let mut raw_pids = Vec::new();
 
     let master_res = Command::new(&target_bin)
         .args([
@@ -1530,11 +1701,12 @@ pub async fn launch_local_dev_cluster(workspace_root: &Path) -> ModeExecutionRes
         .stderr(Stdio::null())
         .spawn();
 
-    let master_pid = match master_res {
+    let mut master_child = match master_res {
         Ok(child) => {
             let pid = child.id();
             spawned_pids.push(format!("master:{}", pid));
-            pid
+            raw_pids.push(pid);
+            child
         }
         Err(e) => {
             res.success = false;
@@ -1543,8 +1715,21 @@ pub async fn launch_local_dev_cluster(workspace_root: &Path) -> ModeExecutionRes
             return res;
         }
     };
+    let master_pid = master_child.id();
 
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    if let Ok(Some(status)) = master_child.try_wait() {
+        for pid in &raw_pids {
+            let _ = terminate_process(*pid);
+        }
+        res.duration_ms = start.elapsed().as_millis() as u64;
+        res.success = false;
+        res.exit_code = Some(1);
+        res.stderr = format!(
+            "Master process exited immediately with {status} (port 127.0.0.1:{master_tcp_port} or 127.0.0.1:{web_ui_port} may already be in use)"
+        );
+        return res;
+    }
 
     let w1_res = Command::new(&target_bin)
         .args([
@@ -1563,9 +1748,24 @@ pub async fn launch_local_dev_cluster(workspace_root: &Path) -> ModeExecutionRes
         .stderr(Stdio::null())
         .spawn();
 
-    if let Ok(child) = w1_res {
-        spawned_pids.push(format!("worker_cpu:{}", child.id()));
-    }
+    let mut w1_child = match w1_res {
+        Ok(child) => {
+            let pid = child.id();
+            spawned_pids.push(format!("worker_cpu:{}", pid));
+            raw_pids.push(pid);
+            child
+        }
+        Err(e) => {
+            for pid in &raw_pids {
+                let _ = terminate_process(*pid);
+            }
+            res.duration_ms = start.elapsed().as_millis() as u64;
+            res.success = false;
+            res.exit_code = Some(1);
+            res.stderr = format!("Failed to spawn worker dev-worker-cpu-1: {}", e);
+            return res;
+        }
+    };
 
     let w2_res = Command::new(&target_bin)
         .args([
@@ -1585,11 +1785,110 @@ pub async fn launch_local_dev_cluster(workspace_root: &Path) -> ModeExecutionRes
         .stderr(Stdio::null())
         .spawn();
 
-    if let Ok(child) = w2_res {
-        spawned_pids.push(format!("worker_gpu:{}", child.id()));
+    let mut w2_child = match w2_res {
+        Ok(child) => {
+            let pid = child.id();
+            spawned_pids.push(format!("worker_gpu:{}", pid));
+            raw_pids.push(pid);
+            child
+        }
+        Err(e) => {
+            for pid in &raw_pids {
+                let _ = terminate_process(*pid);
+            }
+            res.duration_ms = start.elapsed().as_millis() as u64;
+            res.success = false;
+            res.exit_code = Some(1);
+            res.stderr = format!("Failed to spawn worker dev-worker-sim-gpu-2: {}", e);
+            return res;
+        }
+    };
+
+    let bearer_token = resolve_dashboard_bearer_token();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut cluster_ready = false;
+    let mut failure_reason = format!(
+        "Timed out waiting for master on http://127.0.0.1:{web_ui_port}/api/status and both workers to register on 127.0.0.1:{master_tcp_port}"
+    );
+
+    while Instant::now() < deadline {
+        for (label, child) in [
+            ("Master", &mut master_child),
+            ("Worker dev-worker-cpu-1", &mut w1_child),
+            ("Worker dev-worker-sim-gpu-2", &mut w2_child),
+        ] {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    failure_reason = format!("{label} exited prematurely with {status}");
+                    for pid in &raw_pids {
+                        let _ = terminate_process(*pid);
+                    }
+                    res.duration_ms = start.elapsed().as_millis() as u64;
+                    res.success = false;
+                    res.exit_code = Some(1);
+                    res.stderr = failure_reason;
+                    return res;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    failure_reason = format!("Failed to check status of {label}: {e}");
+                    for pid in &raw_pids {
+                        let _ = terminate_process(*pid);
+                    }
+                    res.duration_ms = start.elapsed().as_millis() as u64;
+                    res.success = false;
+                    res.exit_code = Some(1);
+                    res.stderr = failure_reason;
+                    return res;
+                }
+            }
+        }
+
+        if let Ok((status_code, body)) = http_get_local_status(web_ui_port, bearer_token.as_deref())
+        {
+            if (200..300).contains(&status_code) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if let Some(workers) = json.get("workers").and_then(|w| w.as_array()) {
+                        let has_w1 = workers.iter().any(|w| {
+                            w.get("name").and_then(|n| n.as_str()) == Some("dev-worker-cpu-1")
+                        });
+                        let has_w2 = workers.iter().any(|w| {
+                            w.get("name").and_then(|n| n.as_str()) == Some("dev-worker-sim-gpu-2")
+                        });
+                        if has_w1 && has_w2 {
+                            cluster_ready = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let _ = fs::write(&pid_file, spawned_pids.join("\n"));
+    if !cluster_ready {
+        for pid in &raw_pids {
+            let _ = terminate_process(*pid);
+        }
+        res.duration_ms = start.elapsed().as_millis() as u64;
+        res.success = false;
+        res.exit_code = Some(1);
+        res.stderr = failure_reason;
+        return res;
+    }
+
+    if let Err(e) = fs::write(&pid_file, spawned_pids.join("\n")) {
+        for pid in &raw_pids {
+            let _ = terminate_process(*pid);
+        }
+        res.duration_ms = start.elapsed().as_millis() as u64;
+        res.success = false;
+        res.exit_code = Some(1);
+        res.stderr = format!("Failed to write {}: {}", pid_file.display(), e);
+        return res;
+    }
+
     let cluster_json = serde_json::json!({
         "master_pid": master_pid,
         "master_tcp": format!("127.0.0.1:{}", master_tcp_port),
@@ -1597,8 +1896,19 @@ pub async fn launch_local_dev_cluster(workspace_root: &Path) -> ModeExecutionRes
         "web_ui_url": format!("http://127.0.0.1:{}", web_ui_port),
         "pids": spawned_pids,
     });
-    if let Ok(json_str) = serde_json::to_string_pretty(&cluster_json) {
-        let _ = fs::write(&json_file, json_str);
+    if let Err(e) = serde_json::to_string_pretty(&cluster_json)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        .and_then(|s| fs::write(&json_file, s))
+    {
+        for pid in &raw_pids {
+            let _ = terminate_process(*pid);
+        }
+        let _ = fs::remove_file(&pid_file);
+        res.duration_ms = start.elapsed().as_millis() as u64;
+        res.success = false;
+        res.exit_code = Some(1);
+        res.stderr = format!("Failed to write {}: {}", json_file.display(), e);
+        return res;
     }
 
     res.duration_ms = start.elapsed().as_millis() as u64;
@@ -2124,6 +2434,30 @@ mod tests {
         assert!(bench.success);
         assert!(bench.metrics.contains_key("serde_ops_per_sec"));
         assert!(bench.metrics.contains_key("codec_ops_per_sec"));
+        assert_eq!(
+            bench.metrics.get("codec_wire_discriminator"),
+            Some(&serde_json::json!(0x02))
+        );
+        let decoded_id = bench
+            .metrics
+            .get("codec_decoded_task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let expected_id = bench
+            .metrics
+            .get("expected_task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("mismatch");
+        assert!(!decoded_id.is_empty());
+        assert_eq!(decoded_id, expected_id);
+        assert!(
+            bench
+                .metrics
+                .get("codec_frame_bytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                > 20
+        );
         assert!(bench.stdout.contains("Bincode Wire Codec Roundtrip"));
     }
 
@@ -2136,8 +2470,123 @@ mod tests {
             dist.metrics.get("simulation_only"),
             Some(&serde_json::json!(true))
         );
-        assert!(!dist.stdout.contains("OPTIMAL"));
-        assert!(!dist.stdout.contains("RTX 4090"));
-        assert!(!dist.stdout.contains("Snapdragon"));
+        let lower = dist.stdout.to_lowercase();
+        assert!(!lower.contains("optimal"));
+        assert!(!lower.contains("rtx 4090"));
+        assert!(!lower.contains("rtx4090"));
+        assert!(!lower.contains("worker-gpu-rtx4090"));
+        assert!(!lower.contains("snapdragon"));
+
+        let allocs = dist
+            .metrics
+            .get("worker_allocations")
+            .and_then(|v| v.as_object())
+            .expect("worker_allocations object");
+        let allowed = [
+            "sim-cpu-node-a",
+            "sim-cpu-node-b",
+            "sim-gpu-node",
+            "sim-mobile-node",
+        ];
+        for key in allocs.keys() {
+            assert!(
+                allowed.contains(&key.as_str()),
+                "unexpected synthetic worker name '{key}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_cargo_test_counts_two_passed_one_failed() {
+        let fixture = "\
+running 3 tests
+test tests::test_alpha ... ok
+test tests::test_beta ... ok
+test tests::test_gamma ... FAILED
+
+failures:
+
+---- tests::test_gamma stdout ----
+thread 'tests::test_gamma' panicked at 'assertion failed'
+
+failures:
+    tests::test_gamma
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+";
+        let (passed, failed) = parse_cargo_test_counts(fixture);
+        assert_eq!(passed, 2);
+        assert_eq!(failed, 1);
+
+        let multi_crate_fixture = format!(
+            "running 5 tests\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n{fixture}"
+        );
+        assert_eq!(parse_cargo_test_counts(&multi_crate_fixture), (7, 1));
+    }
+
+    #[test]
+    fn test_lint_and_flaky_fail_when_only_part_passes() {
+        let clippy_only = evaluate_lint_outcomes(true, "ok", "", false, "Needs formatting", "", 12);
+        assert!(
+            !clippy_only.success,
+            "lint must fail when fmt fails even if clippy passed"
+        );
+        assert_eq!(clippy_only.exit_code, Some(1));
+
+        let fmt_only = evaluate_lint_outcomes(false, "", "clippy warning", true, "", "", 12);
+        assert!(
+            !fmt_only.success,
+            "lint must fail when clippy fails even if fmt passed"
+        );
+        assert_eq!(fmt_only.exit_code, Some(1));
+
+        let both_ok = evaluate_lint_outcomes(true, "", "", true, "", "", 12);
+        assert!(both_ok.success);
+        assert_eq!(both_ok.exit_code, Some(0));
+
+        let partial_flaky = run_flaky_detection_with(5, |iter| (iter != 3, 5));
+        assert!(
+            !partial_flaky.success,
+            "flaky detection must fail when only 4 of 5 iterations pass"
+        );
+        assert_eq!(partial_flaky.exit_code, Some(1));
+        assert_eq!(
+            partial_flaky.metrics.get("passed"),
+            Some(&serde_json::json!(4))
+        );
+
+        let all_flaky_pass = run_flaky_detection_with(5, |_| (true, 5));
+        assert!(all_flaky_pass.success);
+        assert_eq!(all_flaky_pass.exit_code, Some(0));
+    }
+
+    #[test]
+    fn test_research_report_and_doc_build_fail_on_missing_or_unwritable_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("target"), b"not a directory").expect("write target file");
+
+        let report_res = generate_research_report(temp.path());
+        assert!(
+            !report_res.success,
+            "generate_research_report must fail when target is a regular file"
+        );
+        assert_eq!(report_res.exit_code, Some(1));
+        assert!(
+            !report_res.stdout.contains("Saved Path:"),
+            "failed report must not claim Saved Path"
+        );
+        assert!(report_res
+            .stderr
+            .contains("Failed to write research report"));
+
+        let mut doc_res = ModeExecutionResult::new(WorkflowMode::Doc, "build");
+        doc_res.success = true;
+        doc_res.exit_code = Some(0);
+        finalize_doc_build_output(temp.path(), &mut doc_res);
+        assert!(
+            !doc_res.success,
+            "finalize_doc_build_output must fail when index.html was not produced"
+        );
+        assert_eq!(doc_res.exit_code, Some(1));
     }
 }

@@ -8,10 +8,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-pub use chrono;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-pub use sysinfo;
 
 /// Supported top-level workflow modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -181,7 +179,7 @@ pub fn get_mode_descriptors() -> Vec<ModeDescriptor> {
                         id: "lint".to_string(),
                         name: "Lints & Format Check".to_string(),
                         description: "Run clippy and rustfmt checks across workspace".to_string(),
-                    dangerous: false,
+                        dangerous: false,
                     },
                     ModeActionDescriptor {
                         id: "flaky".to_string(),
@@ -211,13 +209,15 @@ pub fn get_mode_descriptors() -> Vec<ModeDescriptor> {
                     ModeActionDescriptor {
                         id: "watch".to_string(),
                         name: "Live Reload (Watch)".to_string(),
-                        description: "Monitor workspace source files and re-check on changes".to_string(),
+                        description: "Monitor workspace source files and re-check on changes"
+                            .to_string(),
                         dangerous: false,
                     },
                     ModeActionDescriptor {
                         id: "cluster".to_string(),
                         name: "Launch Dev Cluster (CLI only)".to_string(),
-                        description: "Launch background Master and local Workers from ox-mode CLI".to_string(),
+                        description: "Launch background Master and local Workers from ox-mode CLI"
+                            .to_string(),
                         dangerous: false,
                     },
                     ModeActionDescriptor {
@@ -229,7 +229,8 @@ pub fn get_mode_descriptors() -> Vec<ModeDescriptor> {
                     ModeActionDescriptor {
                         id: "stop".to_string(),
                         name: "Stop Dev Cluster (CLI only)".to_string(),
-                        description: "Terminate background dev cluster processes from ox-mode CLI".to_string(),
+                        description: "Terminate background dev cluster processes from ox-mode CLI"
+                            .to_string(),
                         dangerous: true,
                     },
                 ],
@@ -242,19 +243,25 @@ pub fn get_mode_descriptors() -> Vec<ModeDescriptor> {
                     ModeActionDescriptor {
                         id: "build".to_string(),
                         name: "Build Rustdoc".to_string(),
-                        description: "Compile rustdoc documentation for workspace crates".to_string(),
+                        description: "Compile rustdoc documentation for workspace crates"
+                            .to_string(),
                         dangerous: false,
                     },
                     ModeActionDescriptor {
                         id: "verify".to_string(),
                         name: "Verify Specs & Docs".to_string(),
-                        description: "Inspect markdown files for headings, balanced code fences, and relative links".to_string(),
+                        description: concat!(
+                            "Inspect markdown files for headings, ",
+                            "balanced code fences, and relative links"
+                        )
+                        .to_string(),
                         dangerous: false,
                     },
                     ModeActionDescriptor {
                         id: "export".to_string(),
                         name: "Export Workspace Spec Summary".to_string(),
-                        description: "Generate workspace crate and wire-protocol constants summary".to_string(),
+                        description: "Generate workspace crate and wire-protocol constants summary"
+                            .to_string(),
                         dangerous: false,
                     },
                 ],
@@ -273,19 +280,29 @@ pub fn get_mode_descriptors() -> Vec<ModeDescriptor> {
                     ModeActionDescriptor {
                         id: "bench".to_string(),
                         name: "Micro-Benchmarks".to_string(),
-                        description: "Measure Task JSON serde and Bincode wire-codec roundtrips in ops/sec".to_string(),
+                        description:
+                            "Measure Task JSON serde and Bincode wire-codec roundtrips in ops/sec"
+                                .to_string(),
                         dangerous: false,
                     },
                     ModeActionDescriptor {
                         id: "distributed".to_string(),
                         name: "Synthetic Scheduling Simulation".to_string(),
-                        description: "Run in-memory synthetic task-scheduling simulation (not a live cluster)".to_string(),
+                        description: concat!(
+                            "Run in-memory synthetic task-scheduling simulation ",
+                            "(not a live cluster)"
+                        )
+                        .to_string(),
                         dangerous: false,
                     },
                     ModeActionDescriptor {
                         id: "report".to_string(),
                         name: "Research Report".to_string(),
-                        description: "Compile host profile, micro-benchmarks, and synthetic simulation into JSON".to_string(),
+                        description: concat!(
+                            "Compile host profile, micro-benchmarks, ",
+                            "and synthetic simulation into JSON"
+                        )
+                        .to_string(),
                         dangerous: false,
                     },
                 ],
@@ -316,7 +333,11 @@ pub fn dispatch_mode_action(
         let mut res = ModeExecutionResult::new(mode, action);
         res.success = false;
         res.exit_code = Some(1);
-        res.stderr = "Workflow mode runner is not registered in this process; run via `ox-mode` or `oxideswarm`.".to_string();
+        res.stderr = concat!(
+            "Workflow mode runner is not registered in this process; ",
+            "run via `ox-mode` or `oxideswarm`."
+        )
+        .to_string();
         res
     }
 }
@@ -389,5 +410,16 @@ mod tests {
         for d in descriptors {
             assert!(!d.actions.is_empty(), "Mode {} should have actions", d.id);
         }
+    }
+
+    #[test]
+    fn test_dispatch_mode_action_without_hook_fails() {
+        let res = dispatch_mode_action(WorkflowMode::Research, "profile", Path::new("."));
+        assert!(
+            !res.success,
+            "dispatch_mode_action without a registered hook must fail"
+        );
+        assert_eq!(res.exit_code, Some(1));
+        assert!(res.stderr.contains("not registered"));
     }
 }

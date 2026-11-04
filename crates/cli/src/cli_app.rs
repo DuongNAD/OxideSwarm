@@ -914,8 +914,10 @@ pub struct DoctorArgs {
 }
 
 pub async fn run_cli() -> ExitCode {
-    let cli = Cli::parse();
+    run_cli_with(Cli::parse()).await
+}
 
+pub async fn run_cli_with(cli: Cli) -> ExitCode {
     // Initialize tracing subscriber if not already set
     let log_level = if cli.verbose {
         "debug"
@@ -5209,6 +5211,30 @@ max_active_mb = 768
             captured_timeouts,
             vec![42, 15, 42, 15],
             "[submit].timeout_secs must set 42 for both submit and mapreduce when --timeout-secs is omitted and yield to 15 when --timeout-secs 15 is passed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_cli_registers_mode_runner_hook() {
+        let cli = Cli::try_parse_from([
+            "oxideswarm",
+            "--secret",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+            "secret",
+            "show",
+        ])
+        .unwrap();
+        let code = run_cli_with(cli).await;
+        assert_eq!(code, ExitCode::SUCCESS);
+        let res = rusty_grid_core::mode::dispatch_mode_action(
+            rusty_grid_core::mode::WorkflowMode::Research,
+            "profile",
+            std::path::Path::new("."),
+        );
+        assert!(
+            res.success,
+            "run_cli must register the mode runner hook before dispatching subcommands: {}",
+            res.stderr
         );
     }
 }
