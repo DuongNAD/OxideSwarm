@@ -5,13 +5,13 @@ Zero third-party dependencies (Python 3.7+ standard library only).
 Works identically on macOS (agent-mac), Windows (agent-win), and Linux over a shared cloud folder (Google Drive).
 
 Commands:
-  python3 scripts/agent_bridge.py heartbeat [--repo /path/to/OxideSwarm] [--hub-dir /path/to/OxideSwarm_Agent_Hub]
-  python3 scripts/agent_bridge.py diagnose  [--repo /path/to/OxideSwarm] [--hub-dir /path/to/OxideSwarm_Agent_Hub]
-  python3 scripts/agent_bridge.py inbox     [--ack <FILENAME_OR_ALL>]    [--hub-dir /path/to/OxideSwarm_Agent_Hub]
-  python3 scripts/agent_bridge.py send      --title "..." --body "..." [--priority normal|high|critical]
-  python3 scripts/agent_bridge.py incident  --id INC-001 --title "..." --symptom "..." --root-cause "..." [--fix "..."] [--status OPEN|FIXED|VERIFIED|CLOSED]
-  python3 scripts/agent_bridge.py peek      (one line about unread messages, for hooks)
-  python3 scripts/agent_bridge.py watch     [--once-on-message] [--notify] [--on-event "<COMMAND>"] [--consumer NAME] [--hook]
+  python3 scripts/agent_bridge.py heartbeat [--agent-id ID] [--repo /path/to/OxideSwarm] [--hub-dir /path/to/OxideSwarm_Agent_Hub]
+  python3 scripts/agent_bridge.py diagnose  [--agent-id ID] [--peer-id ID] [--repo /path/to/OxideSwarm] [--hub-dir /path/to/OxideSwarm_Agent_Hub]
+  python3 scripts/agent_bridge.py inbox     [--agent-id ID] [--ack <FILENAME_OR_ALL>] [--hub-dir /path/to/OxideSwarm_Agent_Hub]
+  python3 scripts/agent_bridge.py send      [--agent-id ID] [--peer-id ID] --title "..." --body "..." [--priority normal|high|critical]
+  python3 scripts/agent_bridge.py incident  [--agent-id ID] --id INC-001 --title "..." --symptom "..." --root-cause "..." [--fix "..."] [--status OPEN|FIXED|VERIFIED|CLOSED]
+  python3 scripts/agent_bridge.py peek      [--agent-id ID] (one line about unread messages, for hooks)
+  python3 scripts/agent_bridge.py watch     [--agent-id ID] [--once-on-message] [--notify] [--on-event "<COMMAND>"] [--consumer NAME] [--hook]
 """
 
 import argparse
@@ -149,15 +149,79 @@ def find_hub_dir(cli_dir=None):
     return target
 
 
+def normalize_agent_short(raw_id):
+    """Normalizes `--agent-id` (e.g. `agent-mac-2` or `mac-2`) to a safe short identifier (`mac-2`)."""
+    if not raw_id:
+        return None
+    s = raw_id.strip()
+    if s.startswith("agent-") and len(s) > len("agent-"):
+        s = s[len("agent-") :]
+    s = re.sub(r"[^A-Za-z0-9._-]", "_", s).strip("._-")
+    return s or None
+
+
+def resolve_self_short(args=None):
+    if args is not None:
+        raw = getattr(args, "sub_agent_id", None) or getattr(args, "agent_id", None)
+        norm = normalize_agent_short(raw)
+        if norm:
+            return norm
+    return SELF_SHORT
+
+
+def resolve_repo_arg(args=None):
+    if args is not None:
+        return getattr(args, "sub_repo", None) or getattr(args, "repo", None)
+    return None
+
+
+def resolve_peer_short(hub_dir, self_short=None, args=None):
+    self_short = self_short or SELF_SHORT
+    if args is not None:
+        raw_peer = getattr(args, "sub_peer_id", None) or getattr(args, "peer_id", None)
+        norm_peer = normalize_agent_short(raw_peer)
+        if norm_peer:
+            return norm_peer
+
+    nodes_dir = os.path.join(hub_dir, "nodes") if hub_dir else None
+    if nodes_dir and os.path.isdir(nodes_dir):
+        default_peer = PEER_SHORT if PEER_SHORT != self_short else None
+        if default_peer and os.path.exists(os.path.join(nodes_dir, f"{default_peer}_state.json")):
+            return default_peer
+        candidates = []
+        try:
+            for entry in sorted(os.listdir(nodes_dir)):
+                if not entry.endswith("_state.json"):
+                    continue
+                short = entry[: -len("_state.json")]
+                if short and short != self_short:
+                    path = os.path.join(nodes_dir, entry)
+                    try:
+                        mtime = os.path.getmtime(path)
+                    except OSError:
+                        mtime = 0.0
+                    candidates.append((mtime, short))
+        except OSError:
+            pass
+        if candidates:
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            return candidates[-1][1]
+
+    if self_short != SELF_SHORT:
+        return SELF_SHORT
+    return PEER_SHORT
+
+
 def utc_now_iso():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def atomic_write(filepath, content):
+def atomic_write(filepath, content, agent_short=None):
     parent = os.path.dirname(filepath)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    tmp_path = f"{filepath}.{SELF_SHORT}.{os.getpid()}.{int(time.time() * 1000)}.tmp"
+    tag = agent_short or SELF_SHORT
+    tmp_path = f"{filepath}.{tag}.{os.getpid()}.{int(time.time() * 1000)}.tmp"
     with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(content)
         f.flush()
@@ -178,7 +242,7 @@ def safe_read_json(filepath):
 
 
 def get_lan_ip():
-    for target in [("8.8.8.8", 80), ("192.168.1.1", 80), ("1.1.1.1", 80)]:
+    for target in [("192.0.2.1", 80), ("8.8.8.8", 80), ("1.1.1.1", 80)]:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(0.5)
@@ -207,26 +271,17 @@ def check_tcp_port(host, port, timeout=1.0):
 
 
 def find_repo_dir(explicit_repo=None):
-    if explicit_repo and os.path.exists(os.path.join(explicit_repo, "Cargo.toml")):
-        return os.path.abspath(explicit_repo)
+    if explicit_repo:
+        if os.path.exists(os.path.join(explicit_repo, "Cargo.toml")) or os.path.exists(
+            os.path.join(explicit_repo, ".git")
+        ):
+            return os.path.abspath(explicit_repo)
     script_parent = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     if os.path.exists(os.path.join(script_parent, "Cargo.toml")):
         return script_parent
     cwd = os.getcwd()
     if os.path.exists(os.path.join(cwd, "Cargo.toml")):
         return os.path.abspath(cwd)
-    home = os.path.expanduser("~")
-    candidates = [
-        os.path.join(home, "Documents", "antigravity", "magical-mendel"),
-        os.path.join(home, "Documents", "OxideSwarm"),
-        os.path.join(home, "OxideSwarm"),
-        "E:\\teamwork_projects\\OxideSwarm",
-        "C:\\OxideSwarm",
-        os.path.join(home, "source", "repos", "OxideSwarm"),
-    ]
-    for c in candidates:
-        if os.path.exists(os.path.join(c, "Cargo.toml")):
-            return os.path.abspath(c)
     return None
 
 
@@ -245,10 +300,14 @@ def git_output(repo_dir, *args):
 def get_git_info(repo_dir):
     if not repo_dir:
         return {"found": False}
+    if os.path.isdir(repo_dir) and not os.path.exists(os.path.join(repo_dir, ".git")):
+        return {"found": False, "error": "no .git checkout"}
     try:
         head = git_output(repo_dir, "rev-parse", "--short=12", "HEAD")
         branch = git_output(repo_dir, "rev-parse", "--abbrev-ref", "HEAD")
         status_out = git_output(repo_dir, "status", "--porcelain")
+        if not head or not branch:
+            return {"found": False}
         dirty_files = [line.strip() for line in status_out.splitlines() if line.strip()]
         return {
             "found": True,
@@ -311,11 +370,12 @@ def get_binaries_info(repo_dir):
     return bins
 
 
-def collect_state(repo_dir=None):
+def collect_state(repo_dir=None, agent_short=None):
+    self_short = agent_short or SELF_SHORT
     repo = find_repo_dir(repo_dir)
     lan_ip = get_lan_ip()
     return {
-        "agent_id": f"agent-{SELF_SHORT}",
+        "agent_id": f"agent-{self_short}",
         "hostname": socket.gethostname(),
         "platform": SELF_OS,
         "arch": platform.machine(),
@@ -331,31 +391,52 @@ def collect_state(repo_dir=None):
     }
 
 
+def peer_state_age_seconds(peer_state):
+    """Returns the age in seconds of `peer_state['updated_at_utc']`, or None when missing/invalid."""
+    if not isinstance(peer_state, dict):
+        return None
+    raw = peer_state.get("updated_at_utc")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        seen = datetime.datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    return (now - seen).total_seconds()
+
+
 def cmd_heartbeat(args):
     hub_dir = find_hub_dir(args.hub_dir)
-    state = collect_state(args.repo)
-    out_path = os.path.join(hub_dir, "nodes", f"{SELF_SHORT}_state.json")
-    atomic_write(out_path, json.dumps(state, indent=2, ensure_ascii=False) + "\n")
+    self_short = resolve_self_short(args)
+    state = collect_state(resolve_repo_arg(args), self_short)
+    out_path = os.path.join(hub_dir, "nodes", f"{self_short}_state.json")
+    atomic_write(out_path, json.dumps(state, indent=2, ensure_ascii=False) + "\n", self_short)
     print(f"[OK] Heartbeat written to {out_path}")
     print(json.dumps(state, indent=2, ensure_ascii=False))
+    return 0
 
 
 def cmd_diagnose(args):
     hub_dir = find_hub_dir(args.hub_dir)
-    my_state = collect_state(args.repo)
-    my_path = os.path.join(hub_dir, "nodes", f"{SELF_SHORT}_state.json")
-    atomic_write(my_path, json.dumps(my_state, indent=2, ensure_ascii=False) + "\n")
+    self_short = resolve_self_short(args)
+    my_state = collect_state(resolve_repo_arg(args), self_short)
+    my_path = os.path.join(hub_dir, "nodes", f"{self_short}_state.json")
+    atomic_write(my_path, json.dumps(my_state, indent=2, ensure_ascii=False) + "\n", self_short)
 
-    peer_path = os.path.join(hub_dir, "nodes", f"{PEER_SHORT}_state.json")
+    peer_short = resolve_peer_short(hub_dir, self_short, args)
+    peer_path = os.path.join(hub_dir, "nodes", f"{peer_short}_state.json")
     peer_state = safe_read_json(peer_path)
 
     print("=" * 78)
-    print(f"  OxideSwarm Multi-Agent Diagnostic Report (Self: agent-{SELF_SHORT}, Peer: agent-{PEER_SHORT})")
+    print(f"  OxideSwarm Multi-Agent Diagnostic Report (Self: agent-{self_short}, Peer: agent-{peer_short})")
     print(f"  Hub Directory : {hub_dir}")
     print("=" * 78)
 
     issues = []
     recommendations = []
+    peer_unknown = False
+    git_unknown = False
 
     sec = my_state.get("security_and_config", {})
     if sec.get("stale_p2p_ticket_in_config"):
@@ -370,19 +451,59 @@ def cmd_diagnose(args):
         issues.append("[LOCAL WARN] ~/.oxideswarm/cluster.secret does not exist yet on this machine.")
         recommendations.append("Start Master (`./switch_role.sh master`) or copy cluster.secret from the Master machine.")
 
+    my_git = my_state.get("git", {})
+    local_git_ok = bool(my_git.get("found") and my_git.get("git_head") and my_git.get("git_branch"))
+    if not local_git_ok:
+        git_unknown = True
+        print("  - Git Commit    : UNKNOWN (no git checkout)")
+        issues.append(
+            f"[GIT UNKNOWN] Local git commit or branch could not be read on agent-{self_short} (no git checkout)."
+        )
+        recommendations.append("Run `diagnose` from a git checkout or pass `--repo <PATH>` pointing to one.")
+
     if not peer_state:
-        print(f"  - Peer State ({PEER_SHORT}_state.json): NOT FOUND YET")
-        print(f"    -> Waiting for `agent-{PEER_SHORT}` to run: python scripts/agent_bridge.py heartbeat")
+        peer_unknown = True
+        print(f"  - Peer State ({peer_short}_state.json): UNKNOWN (NOT FOUND YET)")
+        print(f"    -> Waiting for `agent-{peer_short}` to run: {PYTHON_CMD} scripts/agent_bridge.py heartbeat")
+        issues.append(f"[PEER UNKNOWN] Peer state ({peer_short}_state.json) was not found.")
+        recommendations.append(f"Run `{PYTHON_CMD} scripts/agent_bridge.py heartbeat` on `agent-{peer_short}`.")
     else:
         print(f"  - Peer Hostname : {peer_state.get('hostname')} ({peer_state.get('platform')}/{peer_state.get('arch')})")
         print(f"  - Peer LAN IP   : {peer_state.get('lan_ip')} (Updated: {peer_state.get('updated_at_utc')})")
 
-        my_git = my_state.get("git", {})
+        age_secs = peer_state_age_seconds(peer_state)
+        if age_secs is None:
+            peer_unknown = True
+            print(f"  - Peer State    : UNKNOWN (invalid or missing updated_at_utc in {peer_short}_state.json)")
+            issues.append(
+                f"[PEER UNKNOWN] Peer state ({peer_short}_state.json) has a missing or invalid `updated_at_utc` timestamp."
+            )
+            recommendations.append(f"Re-run `{PYTHON_CMD} scripts/agent_bridge.py heartbeat` on `agent-{peer_short}`.")
+        elif age_secs >= PEER_STALE_MINUTES * 60 or age_secs < -60:
+            peer_unknown = True
+            minutes = int(age_secs // 60)
+            print(f"  - Peer State    : UNKNOWN (stale: {minutes} min old, limit {PEER_STALE_MINUTES} min)")
+            issues.append(
+                f"[PEER STALE] agent-{peer_short} state is stale ({minutes} min old; limit is {PEER_STALE_MINUTES} min)."
+            )
+            recommendations.append(
+                f"Run `{PYTHON_CMD} scripts/agent_bridge.py heartbeat` on `agent-{peer_short}` or restart its watcher."
+            )
+
         peer_git = peer_state.get("git", {})
-        if my_git.get("found") and peer_git.get("found"):
-            if my_git.get("git_head") != peer_git.get("git_head"):
+        if local_git_ok:
+            if not peer_git.get("found") or not peer_git.get("git_head"):
+                git_unknown = True
+                print(f"  - Git Commit    : UNKNOWN (no git checkout on agent-{peer_short})")
                 issues.append(
-                    f"[GIT DRIFT] Commit mismatch: agent-{SELF_SHORT}={my_git.get('git_head')} vs agent-{PEER_SHORT}={peer_git.get('git_head')}"
+                    f"[GIT UNKNOWN] Peer git commit could not be read from {peer_short}_state.json."
+                )
+                recommendations.append(
+                    f"Run `{PYTHON_CMD} scripts/agent_bridge.py heartbeat` from a git checkout on `agent-{peer_short}`."
+                )
+            elif my_git.get("git_head") != peer_git.get("git_head"):
+                issues.append(
+                    f"[GIT DRIFT] Commit mismatch: agent-{self_short}={my_git.get('git_head')} vs agent-{peer_short}={peer_git.get('git_head')}"
                 )
                 recommendations.append("Run `git pull` and rebuild binaries on the outdated node before testing.")
             else:
@@ -393,20 +514,27 @@ def cmd_diagnose(args):
         if my_fp and peer_fp:
             if my_fp != peer_fp:
                 issues.append(
-                    f"[AUTH MISMATCH] cluster.secret SHA-256 fingerprint differs! ({SELF_SHORT}={my_fp} vs {PEER_SHORT}={peer_fp})"
+                    f"[AUTH MISMATCH] cluster.secret SHA-256 fingerprint differs! ({self_short}={my_fp} vs {peer_short}={peer_fp})"
                 )
                 recommendations.append(
                     "Copy `~/.oxideswarm/cluster.secret` from the active Master to the Worker machine (never via Google Drive)."
                 )
             else:
                 print(f"  - Secret Hash   : MATCH (sha256[:12] = {my_fp})")
+        elif bool(my_fp) != bool(peer_fp):
+            issues.append(
+                f"[AUTH MISMATCH] cluster.secret missing on one node ({self_short}={my_fp or 'missing'} vs {peer_short}={peer_fp or 'missing'})."
+            )
+            recommendations.append(
+                "Copy `~/.oxideswarm/cluster.secret` from the active Master to the Worker machine (never via Google Drive)."
+            )
 
         peer_ip = peer_state.get("lan_ip")
         my_master_up = my_state.get("local_ports", {}).get("master_cluster_8088_listening")
         peer_master_up = peer_state.get("local_ports", {}).get("master_cluster_8088_listening")
         if my_master_up and peer_master_up:
             issues.append(
-                f"[SPLIT-BRAIN MASTER] Both agent-{SELF_SHORT} ({my_state.get('lan_ip')}:8088) and agent-{PEER_SHORT} ({peer_ip}:8088) are running a Master coordinator simultaneously."
+                f"[SPLIT-BRAIN MASTER] Both agent-{self_short} ({my_state.get('lan_ip')}:8088) and agent-{peer_short} ({peer_ip}:8088) are running a Master coordinator simultaneously."
             )
             recommendations.append(
                 f"Keep Master on one node and switch the other node to Worker (e.g. `windows\\switch_role.cmd worker {my_state.get('lan_ip')}:8088` or `./switch_role.sh worker {peer_ip}:8088`)."
@@ -417,15 +545,15 @@ def cmd_diagnose(args):
                 print(f"  - Peer Master   : REACHABLE at {peer_ip}:8088 (TCP OK)")
             else:
                 issues.append(
-                    f"[NETWORK BLOCKED] Peer Master is listening on {peer_ip}:8088, but TCP connection from {SELF_SHORT} failed."
+                    f"[NETWORK BLOCKED] Peer Master is listening on {peer_ip}:8088, but TCP connection from {self_short} failed."
                 )
                 recommendations.append(
                     f"Check Firewall on {peer_state.get('hostname')} (allow TCP 8088) or use `--p2p` mode."
                 )
 
-    inbox_dir = os.path.join(hub_dir, "mailbox", f"to_{SELF_SHORT}")
+    inbox_dir = os.path.join(hub_dir, "mailbox", f"to_{self_short}")
     inbox_files = sorted(glob.glob(os.path.join(inbox_dir, "*.md")))
-    print(f"  - Unread Inbox  : {len(inbox_files)} message(s) in mailbox/to_{SELF_SHORT}/")
+    print(f"  - Unread Inbox  : {len(inbox_files)} message(s) in mailbox/to_{self_short}/")
     for f in inbox_files:
         print(f"      * {os.path.basename(f)}")
 
@@ -433,44 +561,59 @@ def cmd_diagnose(args):
     print(f"  - Incident Logs : {len(inc_files)} file(s) in incidents/")
 
     print("-" * 78)
-    if not issues:
+    if not issues and not peer_unknown and not git_unknown:
         print("  STATUS: HEALTHY (No configuration, git drift, or auth conflicts detected)")
+        print("=" * 78)
+        return 0
+
+    if peer_unknown or git_unknown:
+        if peer_unknown and git_unknown:
+            print("  STATUS: UNKNOWN (Peer state and git checkout are missing or stale)")
+        elif git_unknown:
+            print("  STATUS: UNKNOWN (No git checkout)")
+        else:
+            print("  STATUS: UNKNOWN (Peer state is missing or stale)")
     else:
-        print("  DETECTED ISSUES:")
-        for idx, iss in enumerate(issues, 1):
-            print(f"    {idx}. {iss}")
-        print("\n  RECOMMENDED ACTIONS:")
-        for idx, rec in enumerate(recommendations, 1):
-            print(f"    {idx}. {rec}")
+        print(f"  STATUS: UNHEALTHY ({len(issues)} issue(s) detected)")
+    print("  DETECTED ISSUES:")
+    for idx, iss in enumerate(issues, 1):
+        print(f"    {idx}. {iss}")
+    print("\n  RECOMMENDED ACTIONS:")
+    for idx, rec in enumerate(recommendations, 1):
+        print(f"    {idx}. {rec}")
     print("=" * 78)
+    return 1
 
 
-def describe_peer_freshness(hub_dir):
+def describe_peer_freshness(hub_dir, peer_short=None):
     """Tells the sender whether the peer looks alive, because a watcher that is off delivers nothing."""
-    peer_state = safe_read_json(os.path.join(hub_dir, "nodes", f"{PEER_SHORT}_state.json")) or {}
+    peer_short = peer_short or PEER_SHORT
+    peer_state = safe_read_json(os.path.join(hub_dir, "nodes", f"{peer_short}_state.json")) or {}
     try:
         seen = datetime.datetime.strptime(peer_state.get("updated_at_utc", ""), "%Y-%m-%dT%H:%M:%SZ")
     except ValueError:
-        return f"[WARN] agent-{PEER_SHORT} has published no state yet. The message waits in its mailbox."
+        return f"[WARN] agent-{peer_short} has published no state yet. The message waits in its mailbox."
     age = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - seen
     minutes = int(age.total_seconds() // 60)
     if minutes >= PEER_STALE_MINUTES:
-        return f"[WARN] agent-{PEER_SHORT} was last seen {minutes} min ago. Its watcher may be off, so the message may wait."
-    return f"[INFO] agent-{PEER_SHORT} was last seen {minutes} min ago."
+        return f"[WARN] agent-{peer_short} was last seen {minutes} min ago. Its watcher may be off, so the message may wait."
+    return f"[INFO] agent-{peer_short} was last seen {minutes} min ago."
 
 
 def cmd_send(args):
     hub_dir = find_hub_dir(args.hub_dir)
+    self_short = resolve_self_short(args)
+    peer_short = resolve_peer_short(hub_dir, self_short, args)
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
     safe_slug = "".join(c if c.isalnum() else "_" for c in args.title.lower()).strip("_")[:40]
-    filename = f"MSG_{ts}_from_{SELF_SHORT}_{safe_slug}.md"
-    target_dir = os.path.join(hub_dir, "mailbox", f"to_{PEER_SHORT}")
+    filename = f"MSG_{ts}_from_{self_short}_{safe_slug}.md"
+    target_dir = os.path.join(hub_dir, "mailbox", f"to_{peer_short}")
     filepath = os.path.join(target_dir, filename)
 
     content = f"""# [{args.priority.upper()}] {args.title}
 
-- **From**: `agent-{SELF_SHORT}` (`{socket.gethostname()}`)
-- **To**: `agent-{PEER_SHORT}`
+- **From**: `agent-{self_short}` (`{socket.gethostname()}`)
+- **To**: `agent-{peer_short}`
 - **Timestamp (UTC)**: `{utc_now_iso()}`
 - **Priority**: `{args.priority}`
 
@@ -480,14 +623,15 @@ def cmd_send(args):
 
 {args.body}
 """
-    atomic_write(filepath, content)
-    print(f"[OK] Sent message to agent-{PEER_SHORT}: {filepath}")
-    print(describe_peer_freshness(hub_dir))
+    atomic_write(filepath, content, self_short)
+    print(f"[OK] Sent message to agent-{peer_short}: {filepath}")
+    print(describe_peer_freshness(hub_dir, peer_short))
 
 
 def cmd_inbox(args):
     hub_dir = find_hub_dir(args.hub_dir)
-    inbox_dir = os.path.join(hub_dir, "mailbox", f"to_{SELF_SHORT}")
+    self_short = resolve_self_short(args)
+    inbox_dir = os.path.join(hub_dir, "mailbox", f"to_{self_short}")
     archive_dir = os.path.join(hub_dir, "mailbox", "archive")
     os.makedirs(inbox_dir, exist_ok=True)
     os.makedirs(archive_dir, exist_ok=True)
@@ -506,7 +650,7 @@ def cmd_inbox(args):
 
     files = sorted(glob.glob(os.path.join(inbox_dir, "*.md")))
     if not files:
-        print(f"[INBOX] No unread messages in mailbox/to_{SELF_SHORT}/")
+        print(f"[INBOX] No unread messages in mailbox/to_{self_short}/")
         return
 
     for f in files:
@@ -520,6 +664,7 @@ def cmd_inbox(args):
 
 def cmd_incident(args):
     hub_dir = find_hub_dir(args.hub_dir)
+    self_short = resolve_self_short(args)
     inc_dir = os.path.join(hub_dir, "incidents")
     os.makedirs(inc_dir, exist_ok=True)
     safe_slug = "".join(c if c.isalnum() else "_" for c in args.title.lower()).strip("_")[:40]
@@ -528,7 +673,7 @@ def cmd_incident(args):
 
     content = f"""# [{args.status.upper()}] {args.id}: {args.title}
 
-- **Reported By**: `agent-{SELF_SHORT}` (`{socket.gethostname()}`)
+- **Reported By**: `agent-{self_short}` (`{socket.gethostname()}`)
 - **Updated At (UTC)**: `{utc_now_iso()}`
 - **Status**: `{args.status.upper()}`
 
@@ -546,7 +691,7 @@ def cmd_incident(args):
 ## 4. Cross-Platform Verification
 {args.verification or "Pending verification across macOS and Windows."}
 """
-    atomic_write(filepath, content)
+    atomic_write(filepath, content, self_short)
     print(f"[OK] Incident recorded: {filepath}")
 
 
@@ -667,13 +812,14 @@ def read_event_header(path):
     return title or os.path.basename(path), re.sub(r"\W", "", priority).lower(), sender.group(1) if sender else "?"
 
 
-def scan_events(hub_dir, consumer):
+def scan_events(hub_dir, consumer, self_short=None):
     """Lists the events `consumer` has not seen: messages for this machine and the peer's incidents.
 
     A seen event costs one stat call. Opening a file can make Google Drive download it, on every poll.
     """
+    self_short = self_short or SELF_SHORT
     events = []
-    inbox_dir = os.path.join(hub_dir, "mailbox", f"to_{SELF_SHORT}")
+    inbox_dir = os.path.join(hub_dir, "mailbox", f"to_{self_short}")
     for name in sorted(os.listdir(inbox_dir)):
         key = f"message:{name}"
         if not name.endswith(".md") or os.path.exists(claim_path(consumer, key)):
@@ -698,7 +844,7 @@ def scan_events(hub_dir, consumer):
             header = read_event_header(path)
         except FileNotFoundError:
             continue
-        if header and header[2] == SELF_SHORT:
+        if header and header[2] == self_short:
             claim_event(consumer, key)
         elif header:
             events.append(Event(key, "incident", name, path, *header))
@@ -745,6 +891,7 @@ def run_event_command(command, event):
 
 
 def deliver_event(event, args):
+    self_short = resolve_self_short(args)
     summary = f"New {event.kind} from agent-{event.sender}: {event.title}"
     if args.hook:
         # Stays short: the agent reads the body with `inbox`, as data, when it chooses to.
@@ -758,7 +905,7 @@ def deliver_event(event, args):
             print(f.read().strip())
     sys.stdout.flush()
     if args.notify:
-        desktop_notify(f"OxideSwarm agent-{SELF_SHORT}", summary)
+        desktop_notify(f"OxideSwarm agent-{self_short}", summary)
     if args.on_event:
         run_event_command(args.on_event, event)
 
@@ -778,7 +925,9 @@ def state_is_fresh_for_hook(path):
 
 def refresh_heartbeat(hub_dir, repo_dir, args, last_peer_head):
     """Publishes this node's state and reports a new peer commit. Returns the peer commit it saw."""
-    out_path = os.path.join(hub_dir, "nodes", f"{SELF_SHORT}_state.json")
+    self_short = resolve_self_short(args)
+    peer_short = resolve_peer_short(hub_dir, self_short, args)
+    out_path = os.path.join(hub_dir, "nodes", f"{self_short}_state.json")
     if args.hook:
         if state_is_fresh_for_hook(out_path):
             return last_peer_head
@@ -789,18 +938,18 @@ def refresh_heartbeat(hub_dir, repo_dir, args, last_peer_head):
             existing["updated_at_utc"] = utc_now_iso()
             state = existing
         else:
-            state = collect_state(repo_dir)
+            state = collect_state(repo_dir, self_short)
     else:
-        state = collect_state(repo_dir)
-    atomic_write(out_path, json.dumps(state, indent=2, ensure_ascii=False) + "\n")
+        state = collect_state(repo_dir, self_short)
+    atomic_write(out_path, json.dumps(state, indent=2, ensure_ascii=False) + "\n", self_short)
 
-    peer_state = safe_read_json(os.path.join(hub_dir, "nodes", f"{PEER_SHORT}_state.json"))
+    peer_state = safe_read_json(os.path.join(hub_dir, "nodes", f"{peer_short}_state.json"))
     peer_head = (peer_state or {}).get("git", {}).get("git_head")
     self_head = state.get("git", {}).get("git_head")
     if not peer_head or peer_head == last_peer_head:
         return last_peer_head
     if peer_head != self_head and not args.hook:
-        print(f"\n[WATCH: PEER GIT UPDATE] agent-{PEER_SHORT} is at {peer_head[:12]} (local: {str(self_head)[:12]})")
+        print(f"\n[WATCH: PEER GIT UPDATE] agent-{peer_short} is at {peer_head[:12]} (local: {str(self_head)[:12]})")
         if args.auto_pull and not state.get("git", {}).get("git_dirty"):
             try:
                 # Fast-forward only, on the branch checked out here: never rewrite local work.
@@ -823,12 +972,14 @@ def cmd_peek(args):
     hub_dir = discover_hub_dir(args.hub_dir)
     if hub_dir is None:
         return 0
+    self_short = resolve_self_short(args)
+    peer_short = resolve_peer_short(hub_dir, self_short, args)
     try:
-        names = [n for n in os.listdir(os.path.join(hub_dir, "mailbox", f"to_{SELF_SHORT}")) if n.endswith(".md")]
+        names = [n for n in os.listdir(os.path.join(hub_dir, "mailbox", f"to_{self_short}")) if n.endswith(".md")]
     except OSError:
         return 0
     if names:
-        print(f"[agent_bridge] {len(names)} unread message(s) from agent-{PEER_SHORT}.")
+        print(f"[agent_bridge] {len(names)} unread message(s) from agent-{peer_short}.")
         print(f"Read them with: {PYTHON_CMD} scripts/agent_bridge.py inbox")
         print(PEER_DATA_NOTE)
     return 0
@@ -840,28 +991,30 @@ def cmd_watch(args):
     hub_dir = discover_hub_dir(args.hub_dir) if args.hook else find_hub_dir(args.hub_dir)
     if hub_dir is None:
         return 0
-    lock = acquire_watch_lock(args.consumer, session_id or "default") if args.hook else None
+    self_short = resolve_self_short(args)
+    consumer = args.consumer if self_short == SELF_SHORT else f"{args.consumer}-{self_short}"
+    lock = acquire_watch_lock(consumer, session_id or "default") if args.hook else None
     if args.hook and lock is None:
         return 0
 
-    repo_dir = args.repo or os.getcwd()
+    repo_dir = resolve_repo_arg(args) or os.getcwd()
     once = args.once_on_message or args.hook
-    first_run = not os.path.isdir(claims_dir(args.consumer))
-    prune_bridge_state(args.consumer)
+    first_run = not os.path.isdir(claims_dir(consumer))
+    prune_bridge_state(consumer)
     try:
-        os.makedirs(os.path.join(hub_dir, "mailbox", f"to_{SELF_SHORT}"), exist_ok=True)
+        os.makedirs(os.path.join(hub_dir, "mailbox", f"to_{self_short}"), exist_ok=True)
         os.makedirs(os.path.join(hub_dir, "incidents"), exist_ok=True)
         # A first run starts from the incidents as they stand. Unread messages still count as new.
         if first_run:
-            for event in scan_events(hub_dir, args.consumer):
+            for event in scan_events(hub_dir, consumer, self_short):
                 if event.kind == "incident":
-                    claim_event(args.consumer, event.key)
+                    claim_event(consumer, event.key)
     except OSError as exc:
         print(f"[WATCH: HUB UNAVAILABLE] {exc}", file=sys.stderr)
 
     if not args.hook:
         print(
-            f"[WATCH] Monitoring {hub_dir} as agent-{SELF_SHORT} "
+            f"[WATCH] Monitoring {hub_dir} as agent-{self_short} "
             f"(interval={args.interval}s, heartbeat={args.heartbeat_every}s, consumer={args.consumer}, "
             f"once_on_message={args.once_on_message}, auto_pull={args.auto_pull})"
         )
@@ -879,8 +1032,8 @@ def cmd_watch(args):
             if time.time() >= next_heartbeat:
                 last_peer_head = refresh_heartbeat(hub_dir, repo_dir, args, last_peer_head)
                 next_heartbeat = time.time() + args.heartbeat_every
-            for event in scan_events(hub_dir, args.consumer):
-                if claim_event(args.consumer, event.key):
+            for event in scan_events(hub_dir, consumer, self_short):
+                if claim_event(consumer, event.key):
                     deliver_event(event, args)
                     delivered += 1
             if not hub_available:
@@ -903,30 +1056,62 @@ def cmd_watch(args):
         time.sleep(max(1, args.interval))
 
 
+def add_identity_args(subparser, include_peer=False):
+    subparser.add_argument(
+        "--agent-id",
+        dest="sub_agent_id",
+        default=None,
+        help="Agent identifier (e.g. mac-1 or agent-mac-1); defaults to platform id",
+    )
+    if include_peer:
+        subparser.add_argument(
+            "--peer-id",
+            dest="sub_peer_id",
+            default=None,
+            help="Peer agent identifier (e.g. win or mac-2); defaults to peer in nodes/",
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="OxideSwarm Multi-Agent Google Drive Bridge")
     parser.add_argument("--hub-dir", help="Explicit path to OxideSwarm_Agent_Hub", default=None)
+    parser.add_argument("--repo", help="Path to OxideSwarm repository", default=None)
+    parser.add_argument(
+        "--agent-id",
+        help="Agent identifier (e.g. mac-1 or agent-mac-1); defaults to platform id",
+        default=None,
+    )
+    parser.add_argument(
+        "--peer-id",
+        help="Peer agent identifier (e.g. win or mac-2); defaults to peer in nodes/",
+        default=None,
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_hb = sub.add_parser("heartbeat", help="Write current node state to nodes/<platform>_state.json")
-    p_hb.add_argument("--repo", help="Path to OxideSwarm repository", default=None)
+    p_hb = sub.add_parser("heartbeat", help="Write current node state to nodes/<agent-id>_state.json")
+    add_identity_args(p_hb)
+    p_hb.add_argument("--repo", dest="sub_repo", help="Path to OxideSwarm repository", default=None)
     p_hb.set_defaults(func=cmd_heartbeat)
 
-    p_diag = sub.add_parser("diagnose", help="Compare Mac & Windows states and detect root causes")
-    p_diag.add_argument("--repo", help="Path to OxideSwarm repository", default=None)
+    p_diag = sub.add_parser("diagnose", help="Compare self & peer states and detect root causes")
+    add_identity_args(p_diag, include_peer=True)
+    p_diag.add_argument("--repo", dest="sub_repo", help="Path to OxideSwarm repository", default=None)
     p_diag.set_defaults(func=cmd_diagnose)
 
     p_send = sub.add_parser("send", help="Send a message to the peer Coding Agent")
+    add_identity_args(p_send, include_peer=True)
     p_send.add_argument("--title", required=True, help="Message title")
     p_send.add_argument("--body", required=True, help="Message markdown body")
     p_send.add_argument("--priority", default="normal", choices=["normal", "high", "critical"])
     p_send.set_defaults(func=cmd_send)
 
     p_inbox = sub.add_parser("inbox", help="Read or archive messages in mailbox/to_<self>/")
+    add_identity_args(p_inbox)
     p_inbox.add_argument("--ack", help="Filename to archive, or 'all'", default=None)
     p_inbox.set_defaults(func=cmd_inbox)
 
     p_inc = sub.add_parser("incident", help="Create or update a root-cause incident report")
+    add_identity_args(p_inc)
     p_inc.add_argument("--id", required=True, help="Incident ID (e.g. INC-20261024-001)")
     p_inc.add_argument("--title", required=True, help="Short bug/optimization title")
     p_inc.add_argument("--symptom", required=True, help="Observed failure or bottleneck")
@@ -937,13 +1122,15 @@ def main():
     p_inc.set_defaults(func=cmd_incident)
 
     p_peek = sub.add_parser("peek", help="Print one line about unread messages; silent when there are none")
+    add_identity_args(p_peek, include_peer=True)
     p_peek.set_defaults(func=cmd_peek)
 
     p_watch = sub.add_parser(
         "watch",
         help="Wait for peer messages and incident updates, and deliver each one once per consumer",
     )
-    p_watch.add_argument("--repo", help="Path to OxideSwarm repository", default=None)
+    add_identity_args(p_watch, include_peer=True)
+    p_watch.add_argument("--repo", dest="sub_repo", help="Path to OxideSwarm repository", default=None)
     p_watch.add_argument("--interval", type=int, default=10, help="Polling interval in seconds (default: 10)")
     p_watch.add_argument(
         "--heartbeat-every",
