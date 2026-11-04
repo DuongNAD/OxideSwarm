@@ -181,16 +181,17 @@ pub fn open_regular_file_nofollow(
         // FILE_FLAG_OPEN_REPARSE_POINT = 0x0020_0000
         opts.custom_flags(0x0020_0000);
     }
-    let file = opts.open(path).map_err(|e| {
+    let file = match opts.open(path) {
+        Ok(file) => file,
         #[cfg(unix)]
-        if e.raw_os_error() == Some(libc::ELOOP) {
-            return std::io::Error::new(
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "symbolic links are not sent",
-            );
+            ));
         }
-        e
-    })?;
+        Err(e) => return Err(e),
+    };
     let meta = file.metadata()?;
     #[cfg(windows)]
     let is_reparse = {
@@ -217,8 +218,7 @@ pub fn open_regular_file_nofollow(
 
 /// Hashes the file at `path`: its blob id and its length.
 pub fn hash_file(path: &Path) -> std::io::Result<(BlobId, u64)> {
-    let (file, _) = open_regular_file_nofollow(path)?;
-    hash_reader(file)
+    hash_reader(std::fs::File::open(path)?)
 }
 
 /// Checks that `path` is a canonical relative blob path: `/`-separated segments that are not

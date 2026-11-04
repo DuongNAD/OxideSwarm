@@ -1050,7 +1050,7 @@ pub fn scan_mcp_inputs_in_dir(
         checked_specs.push((cur, effective_dest));
     }
 
-    crate::blobs::scan_input_paths(&checked_specs)
+    crate::blobs::scan_input_paths_with_limits(&checked_specs, crate::blobs::InputLimits::default())
 }
 
 /// Validates that `raw` stays inside `cwd`, contains no `..`, and neither is nor traverses a
@@ -1169,22 +1169,23 @@ pub fn prepare_mcp_output_dir_in_dir(
     Ok(cur)
 }
 
-const WORKER_MAX_OUTPUT_STREAM_BYTES: usize = 10 * 1024 * 1024;
 const WORKER_TRUNCATION_NOTICE: &[u8] =
     b"\n[rusty_grid: output truncated after exceeding size limit]\n";
 
-/// True when `bytes` was cut short by the worker's 10 MiB stream capture limit (`StreamCapture`
-/// inserts [`WORKER_TRUNCATION_NOTICE`] between the 5 MiB head and 5 MiB tail). Short output that
-/// merely prints the marker text does not match.
+/// True when `bytes` was cut short by the worker's stream capture limit (`StreamCapture` inserts
+/// [`WORKER_TRUNCATION_NOTICE`] at the exact midpoint between `head` and `tail` for any configured
+/// worker cap). Short output that merely prints the marker text does not have matching non-empty
+/// `head` and `tail` halves around the notice and therefore does not match.
 pub fn stream_was_worker_truncated(bytes: &[u8]) -> bool {
     let notice_len = WORKER_TRUNCATION_NOTICE.len();
-    if bytes.len() < WORKER_MAX_OUTPUT_STREAM_BYTES + notice_len {
+    if bytes.len() <= notice_len {
         return false;
     }
     let head_cap = (bytes.len() - notice_len) / 2;
-    bytes
-        .get(head_cap..head_cap + notice_len)
-        .is_some_and(|s| s == WORKER_TRUNCATION_NOTICE)
+    head_cap > 0
+        && bytes
+            .get(head_cap..head_cap + notice_len)
+            .is_some_and(|s| s == WORKER_TRUNCATION_NOTICE)
 }
 
 /// Number of bytes `ch` occupies in the outer JSON-RPC response line after `ToolCallResult::ok_json`
@@ -2937,7 +2938,7 @@ mod tests {
         let marker_echo = b"echo [rusty_grid: output truncated after exceeding size limit]\n";
         let res_marker = TaskResult {
             stdout: marker_echo.to_vec().into(),
-            ..base
+            ..base.clone()
         };
         let call_marker = format_completed_task_result(&state, &res_marker, &args, None).await;
         let body_marker: Value = serde_json::from_str(match &call_marker.content[0] {
@@ -2949,5 +2950,24 @@ mod tests {
         assert_eq!(body_marker["stdout_truncated"], false);
         assert_eq!(body_marker["stdout_worker_truncated"], false);
         assert_eq!(body_marker["captured_bytes"], marker_echo.len());
+
+        // Case 5: Worker configured with a smaller custom stream cap (e.g. 128 bytes: 64B head + notice + 64B tail)
+        // still reports `worker_truncated: true` and `truncated: true`.
+        let mut custom_cap_out = vec![b'H'; 64];
+        custom_cap_out.extend_from_slice(WORKER_TRUNCATION_NOTICE);
+        custom_cap_out.extend_from_slice(&[b'T'; 64]);
+        let res_custom_cap = TaskResult {
+            stdout: custom_cap_out.into(),
+            ..base
+        };
+        let call_custom_cap =
+            format_completed_task_result(&state, &res_custom_cap, &args, None).await;
+        let body_custom_cap: Value = serde_json::from_str(match &call_custom_cap.content[0] {
+            ToolContent::Text { text } => text,
+        })
+        .unwrap();
+        assert_eq!(body_custom_cap["worker_truncated"], true);
+        assert_eq!(body_custom_cap["stdout_worker_truncated"], true);
+        assert_eq!(body_custom_cap["truncated"], true);
     }
 }

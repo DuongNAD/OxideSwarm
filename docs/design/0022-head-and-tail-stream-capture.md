@@ -5,7 +5,7 @@ Created: 2026-11-04    Updated: 2026-11-04
 
 ## Summary
 
-Preserve both the startup header and the terminal summary when a task's `stdout` or `stderr` exceeds the worker capture limit (`MAX_OUTPUT_STREAM_BYTES = 10 MiB`):
+Preserve both the startup header and the terminal summary when a task's `stdout` or `stderr` exceeds the worker capture limit (`DEFAULT_MAX_OUTPUT_BYTES = 10 MiB`):
 
 - split `StreamCapture` in `crates/worker/src/runner.rs` into a fixed `head` (`max_bytes / 2`) and a rolling ring buffer `tail` (`max_bytes - max_bytes / 2`);
 - insert `\n[rusty_grid: output truncated after exceeding size limit]\n` between `head` and `tail` when the stream overflows `max_bytes`;
@@ -28,7 +28,7 @@ Behaviour before this change:
 
 ## Non-goals
 
-- Changing `TaskResult` wire layout or increasing `MAX_OUTPUT_STREAM_BYTES` beyond 10 MiB per stream.
+- Changing `TaskResult` wire layout or increasing `DEFAULT_MAX_OUTPUT_BYTES` beyond 10 MiB per stream.
 
 ## Design
 
@@ -53,11 +53,11 @@ In `crates/master/src/mapreduce.rs`, `stdout_was_truncated` checks:
 1. The legacy tail window (`out[out.len().saturating_sub(marker.len() + 8)..]`) so a newer master still recognizes truncation markers appended by older workers.
 2. The exact midpoint slice `out[head_cap..head_cap + notice_len]` where `notice_len = marker.len() + 2` and `head_cap = (out.len() - notice_len) / 2`, requiring `s[0] == b'\n'`, `&s[1..1 + marker.len()] == marker`, and `s[1 + marker.len()] == b'\n'`.
 
-In `crates/cli/src/mcp.rs`, `stream_was_worker_truncated` checks the same midpoint slice on streams of at least `WORKER_MAX_OUTPUT_STREAM_BYTES + WORKER_TRUNCATION_NOTICE.len()` bytes (`10,485,819` bytes), reporting `worker_truncated` (`stdout_worker_truncated`, `stderr_worker_truncated`) alongside `captured_bytes`.
+In `crates/cli/src/mcp.rs`, `stream_was_worker_truncated` checks the same midpoint slice (`head_cap = (bytes.len() - notice_len) / 2 > 0`) for any configured worker capture cap (`DEFAULT_MAX_OUTPUT_BYTES = 10 MiB` by default, or smaller caps configured through the library), reporting `worker_truncated` (`stdout_worker_truncated`, `stderr_worker_truncated`) alongside `captured_bytes`.
 
 ## Compatibility
 
-- **Wire format:** Unchanged. `TaskResult.stdout` and `TaskResult.stderr` remain `OutputStream` (`Bytes`) bounded by `10 MiB + 59 bytes`.
+- **Wire format:** Unchanged. `TaskResult.stdout` and `TaskResult.stderr` remain `task::Bytes` bounded by `DEFAULT_MAX_OUTPUT_BYTES + 59 bytes`.
 - **Rolling upgrade order (master first):** An older master only inspects the last `marker.len() + 8` bytes of `result.stdout` and would miss the midpoint marker produced by a new worker when a mapper writes more than 10 MiB. **Upgrade the master before upgrading workers**; a new master accepts both the legacy tail marker from older workers and the midpoint marker from new workers.
 
 ## Security
