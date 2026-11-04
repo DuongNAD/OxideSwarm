@@ -100,7 +100,7 @@ fn test_m4_cluster_status_dto_p2p_ticket() {
     let raw_with_ticket = r#"{
         "cluster_health": "Healthy",
         "master": {
-            "host": "192.168.1.144:8088",
+            "host": "192.0.2.10:8088",
             "role": "MASTER",
             "description": "Cluster Coordinator"
         },

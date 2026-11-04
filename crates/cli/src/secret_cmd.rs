@@ -947,8 +947,8 @@ mod tests {
     #[test]
     fn test_peer_policy_is_fail_closed_for_remote_auto_and_p2p_masters() {
         for (master, ticket) in [
-            ("192.168.1.144:8088", false),
-            ("192.168.1.144", false),
+            ("192.0.2.10:8088", false),
+            ("192.0.2.10", false),
             ("mac-studio.local:8088", false),
             ("auto", false),
             ("auto:8090", false),
