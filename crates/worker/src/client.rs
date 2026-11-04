@@ -1549,6 +1549,28 @@ impl WorkerClient {
         // delivery). Replacing the table entry would drop the old run's cancel handle and make it
         // look like a Master cancellation, so stop it explicitly first, silently.
         self.retire_previous_run(task_id).await;
+        // Nothing may touch the sandbox base (the reclaim below, the blob cache, the sandbox
+        // itself) while another local user could have replaced its private root (design 0021).
+        if let Err(e) = self
+            .runner
+            .config()
+            .sandbox_config
+            .ensure_private_root()
+            .await
+        {
+            warn!(task_id = %task_id, error = %e, "Refusing a task: the sandbox base is not safe");
+            let result = TaskResult::failure(
+                worker_id,
+                task_id,
+                EXIT_CODE_GENERAL_ERROR,
+                "",
+                e.to_string(),
+                0,
+                Some(format!("Sandbox base: {e}")),
+            );
+            let _ = outbound_tx.send(WorkerMessage::from(result)).await;
+            return;
+        }
         // A sandbox directory left behind by a killed worker process (or kept for debugging) would
         // make `Sandbox::create` fail with "already exists", and that failure is terminal.
         self.reclaim_stale_sandbox(task_id).await;
@@ -1626,6 +1648,13 @@ impl WorkerClient {
                 None
             } else {
                 let fetch = async {
+                    // Checked again: the task may have waited for a slot since it was assigned.
+                    runner
+                        .config()
+                        .sandbox_config
+                        .ensure_private_root()
+                        .await
+                        .map_err(|e| e.to_string())?;
                     let cache = runner.blob_cache()?;
                     fetch_task_inputs(&task, blob_client.as_deref(), &cache).await
                 };
@@ -3208,6 +3237,62 @@ mod tests {
         assert!(client.capabilities().can_execute_gpu());
         assert!(client.capabilities().is_simulated_gpu);
         assert_eq!(client.concurrency_semaphore().available_permits(), 8);
+    }
+
+    /// Design 0021: a task is refused before anything touches the sandbox base when its private
+    /// root was replaced (a link stands in for another user's directory), so the reclaim of a
+    /// leftover sandbox never runs behind the link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_assign_refuses_a_task_before_touching_a_replaced_sandbox_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp_str = temp.path().to_str().unwrap().to_string();
+        let sandbox_cfg = crate::sandbox::SandboxConfig::from_env(
+            |name| (name == "TMPDIR").then(|| temp_str.clone()),
+            PathBuf::from("/unused/platform/tmp"),
+        );
+        let root = sandbox_cfg.base_dir.parent().unwrap().to_path_buf();
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
+
+        let mut client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_cores(2));
+        client.sandbox_base_dir = sandbox_cfg.base_dir.clone();
+        client.runner = Arc::new(TaskRunner::new(
+            client.worker_id(),
+            client.capabilities().clone(),
+            crate::runner::RunnerConfig::new(sandbox_cfg),
+        ));
+
+        let task = Task::new(
+            rusty_grid_core::task::TaskSpec::command("echo", vec!["x".into()]),
+            TaskRequirements::generic(1, 10),
+        );
+        // A leftover sandbox of this task id, reached through the link.
+        let leftover = elsewhere.join("sandboxes").join(task.id.to_string());
+        std::fs::create_dir_all(&leftover).unwrap();
+        std::fs::write(leftover.join("keep"), b"x").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        client.handle_assign_task(task.clone(), tx).await;
+        match rx.recv().await.expect("a result for the refused task") {
+            WorkerMessage::TaskResult {
+                task_id,
+                exit_code,
+                error,
+                ..
+            } => {
+                assert_eq!(task_id, task.id);
+                assert_eq!(exit_code, EXIT_CODE_GENERAL_ERROR);
+                let error = error.unwrap_or_default();
+                assert!(error.contains("symbolic link"), "{error}");
+            }
+            other => panic!("expected the refusal as a TaskResult, got {other:?}"),
+        }
+        assert!(
+            leftover.join("keep").exists(),
+            "the reclaim must not run behind a replaced root"
+        );
     }
 
     #[tokio::test]
