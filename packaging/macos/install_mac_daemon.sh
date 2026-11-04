@@ -371,9 +371,17 @@ else
 fi
 
 # 6. Directory Structure and Permissions Setup
+SCRIPT_DIR_INSTALL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ENGINES_DIR="$(cd "${SCRIPT_DIR_INSTALL}/../.." 2>/dev/null && pwd)/engines"
 log_info "Configuring system directories..."
 if [[ "$DRY_RUN" == false ]]; then
     mkdir -p "${LOG_DIR}" "${WORK_DIR}" "${CONFIG_DIR}"
+    if [[ -d "${REPO_ENGINES_DIR}" ]]; then
+        mkdir -p "${WORK_DIR}/engines"
+        cp -R "${REPO_ENGINES_DIR}/." "${WORK_DIR}/engines/"
+        chown -R "${RUN_USER}:${RUN_GROUP}" "${WORK_DIR}/engines"
+        log_success "Deployed 3D engine scripts to ${WORK_DIR}/engines"
+    fi
     chown "${RUN_USER}:${RUN_GROUP}" "${LOG_DIR}" "${WORK_DIR}"
     chown root:wheel "${CONFIG_DIR}"
     chmod 755 "${LOG_DIR}" "${CONFIG_DIR}"
@@ -381,6 +389,9 @@ if [[ "$DRY_RUN" == false ]]; then
     log_success "Directories initialized (${LOG_DIR}, ${WORK_DIR} owned by ${RUN_USER}; ${CONFIG_DIR} root-owned)"
 else
     log_info "[DRY-RUN] Would create ${LOG_DIR} and ${WORK_DIR} (owner ${RUN_USER}) and ${CONFIG_DIR} (root:wheel)"
+    if [[ -d "${REPO_ENGINES_DIR}" ]]; then
+        log_info "[DRY-RUN] Would copy ${REPO_ENGINES_DIR} -> ${WORK_DIR}/engines (owner ${RUN_USER})"
+    fi
 fi
 
 # 7. Stop and Unload Existing Active Daemon (if registered)
@@ -513,6 +524,8 @@ $(echo -e "${PROG_ARGS_XML}")
         <string>${RUN_HOME}</string>
         <key>RUST_LOG</key>
         <string>info</string>
+        <key>OXIDESWARM_GEN3D_SCRIPT</key>
+        <string>${WORK_DIR}/engines/generative_3d/entrypoint.py</string>
     </dict>
 
     <!-- High Performance Grid Resource Limits -->

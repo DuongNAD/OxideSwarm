@@ -566,6 +566,9 @@ OxideSwarm/
 ├── windows/                       # Windows launchers (oxctl.ps1 engine + .cmd/.vbs wrappers)
 ├── assets/                        # Vector branding assets
 ├── benchmarks/interconnect/       # Interconnect comparison: static recorded data + a validator script
+├── engines/
+│   ├── generative_3d/             # Tier-1 3D generation Python entrypoint (`entrypoint.py`)
+│   └── autorig/                   # Headless Blender 4.5 LTS auto-rigging driver (`blender_rig.py`)
 ├── scripts/
 │   ├── sync_network/              # Shared-folder reachability probe (not part of the grid)
 │   ├── agent_node.py              # Lightweight Python agent node client
@@ -578,12 +581,21 @@ OxideSwarm/
 ├── crates/
 │   ├── core/                      # [Layer 1] Wire protocol, codec, cluster_auth (secret handshake), discovery, workflow modes
 │   ├── master/                    # [Layer 1] Scheduler, GPU routing, FSM, LRU bounding, Axum dashboard, RBAC auth
-│   ├── worker/                    # [Layer 1] Task runner, process-tree kill, CPU SIMD / wgpu compute, standby portal
+│   ├── worker/                    # [Layer 1] Task runner, process-tree kill, CPU SIMD / wgpu compute, gen3d, autorig, standby portal
 │   ├── cli/                       # [Layer 1] `oxideswarm` / `rusty-grid` / `ox-mode`; connect.rs (client plumbing), secret_cmd.rs
 │   ├── android_bridge/            # [Layer 2] JNI bridge (liboxideworker.so)
 │   └── agent_mesh/                # [Layer 3] Axum WebSocket relay hub & agent client
 └── tests/                         # Integration tests (registered per crate in Cargo.toml) and Python suites
 ```
+
+### Generative 3D & Auto-Rigging Subsystem (`crates/worker/src/gen3d`, `crates/worker/src/autorig`, `engines/`)
+
+The worker executes two 3D asset pipeline task types (architecture and limits in [docs/design/0023-generative-3d-and-autorig-subsystem.md](docs/design/0023-generative-3d-and-autorig-subsystem.md), [0015](docs/design/0015-engine-names-and-cpu-fallback.md), and [0017](docs/design/0017-honest-3d-sdf-fallback.md)):
+
+| Subsystem | Task Spec & CLI | Execution Tiers & Drivers | Current Limits (`docs/BACKLOG.md`) |
+| :--- | :--- | :--- | :--- |
+| **Generative 3D** (`crates/worker/src/gen3d`) | `TaskSpec::Generative3D(Generative3DSpec)` via `oxideswarm submit --type 3d --prompt <TEXT> [--quality fast\|standard\|high] [--engine auto\|sdf\|triposr] [-o <OUT.glb>]` | **Tier 0 (`sdf`, `auto`)**: in-process pure-Rust analytical SDF Marching Cubes (`32³`/`48³`/`64³`), manifold topology repair, conformal box UV unwrapping, barycentric PBR albedo PNG baking, and binary glTF 2.0 (`.glb`) export on CPU (`device_name = "Procedural-SDF-PureRust"`, no GPU required).<br>**Tier 1 (`triposr`)**: supervised Python subprocess running `engines/generative_3d/entrypoint.py` (located via `OXIDESWARM_GEN3D_SCRIPT` or relative to the worker working directory, using `OXIDESWARM_PYTHON` / `RUSTY_GRID_PYTHON` / `.venv`). | **Partial (`3D-2`, `3D-3`)**: Tier 0 maps prompt keywords (`robot`/`mech`/`droid`/`cyber`/`armor`, `chibi`/`cute`/`mascot`/`creature`/`stylized`, `orb`/`sphere`/`math`/`test`, else humanoid) to four fixed analytical SDF presets (`SdfPreset`) and rejects `--image` input (`3D-3`). No pretrained `TripoSR` checkpoint is bundled, so `--engine triposr` exits `1` with `"TripoSR model not available: local AI 3D model checkpoint is not installed"`; `--engine trellis` is refused upfront. |
+| **Auto-Rigging & Animation** (`crates/worker/src/autorig`) | `TaskSpec::AutoRig(AutoRigSpec)` via `oxideswarm submit --type autorig --input-mesh <MESH.glb\|.obj> [--rig-preset biped\|quadruped\|generic] [--embed-animations idle,walk,turnaround] [--preferred-provider builtin\|blender] [-o <OUT.glb>]` | **Built-in (`builtin`)**: in-process pure-Rust `.glb`/`.obj` loader, 3×3 PCA symmetry and 50-slab 15-landmark extraction, 15-joint topological DAG armature + $4	imes 4$ Inverse Bind Matrices, geodesic surface skinning with sagittal barrier and top-4 weight normalization, procedural TRS keyframe synthesis (`idle`, `walk`, `turnaround`), and rigged `.glb` export.<br>**Headless Blender (`blender`)**: supervised Blender subprocess (`--blender-path` / `RUSTY_GRID_BLENDER_PATH`) running `engines/autorig/blender_rig.py` (on-disk or embedded via `include_str!`), falling back to the built-in Rust engine if Blender is absent or fails. | **Partial (`3D-2`)**: When `--preferred-provider blender` falls back to the built-in Rust rigger because Blender is missing or exits non-zero, the warning is logged on the worker but `TaskResult` still reports `device_name = "OxideSwarm-AutoRig"` without flagging the fallback in task output (`3D-2`). |
 
 ---
 

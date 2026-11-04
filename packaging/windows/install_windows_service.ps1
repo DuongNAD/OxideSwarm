@@ -501,6 +501,16 @@ if (Test-Path $destWorkerBin) {
     }
 }
 
+# Deploy 3D subsystem driver scripts (engines/) into $InstallDir\engines so the service can locate them outside a repo checkout
+$sourceEnginesDir = Join-Path $PSScriptRoot "..\..\engines"
+$destEnginesDir   = Join-Path $InstallDir "engines"
+$gen3dScriptPath  = Join-Path $destEnginesDir "generative_3d\entrypoint.py"
+if (Test-Path $sourceEnginesDir) {
+    New-Item -ItemType Directory -Path $destEnginesDir -Force | Out-Null
+    Copy-Item -Path (Join-Path $sourceEnginesDir "*") -Destination $destEnginesDir -Recurse -Force
+    Write-Host "[OK] Deployed 3D engine scripts to: $destEnginesDir" -ForegroundColor Green
+}
+
 # ==============================================================================
 # 7. Generate Configuration File (rusty-grid.toml) and install the cluster secret
 # ==============================================================================
@@ -662,6 +672,7 @@ if ($ServiceMethod -eq "WinSW") {
     <keepFiles>5</keepFiles>
   </log>
   <env name="RUST_LOG" value="info" />
+  <env name="OXIDESWARM_GEN3D_SCRIPT" value="$gen3dScriptPath" />
 </service>
 "@
             [System.IO.File]::WriteAllText($serviceXmlPath, $xmlContent, (New-Object System.Text.UTF8Encoding($false)))
@@ -832,6 +843,7 @@ Write-Host "[OK] SCM Failure Recovery configured successfully." -ForegroundColor
 [Environment]::SetEnvironmentVariable("OXIDESWARM_BIN", $destWorkerBin, [EnvironmentVariableTarget]::Machine)
 [Environment]::SetEnvironmentVariable("OXIDESWARM_CONFIG", $ConfigPath, [EnvironmentVariableTarget]::Machine)
 [Environment]::SetEnvironmentVariable("OXIDESWARM_LOG_DIR", $LogDir, [EnvironmentVariableTarget]::Machine)
+[Environment]::SetEnvironmentVariable("OXIDESWARM_GEN3D_SCRIPT", $gen3dScriptPath, [EnvironmentVariableTarget]::Machine)
 # Older installers stored the ticket machine-wide, where it overrode every later configuration.
 [Environment]::SetEnvironmentVariable("OXIDESWARM_P2P_TICKET", $null, [EnvironmentVariableTarget]::Machine)
 Write-Host "[OK] Configured system environment variables for worker." -ForegroundColor Green
