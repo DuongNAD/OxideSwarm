@@ -194,5 +194,5 @@ in the process list.
 
 ## 9. Reporting a problem
 
-Open an issue without a working secret, token, ticket or address in it. If you accidentally published one,
-rotate it (section 5) before anything else.
+* **Security vulnerabilities (private route):** Do **not** open a public issue for a security vulnerability. Report it privately through **GitHub Private Vulnerability Reporting** ([`https://github.com/DuongNAD/OxideSwarm/security/advisories/new`](https://github.com/DuongNAD/OxideSwarm/security/advisories/new), under **Security -> Report a vulnerability** in the repository) so the issue can be fixed and disclosed responsibly.
+* **Non-security bugs:** Open a regular issue using the bug report template without any working secret, token, P2P ticket, or real host/LAN address in it. If you accidentally published a secret, token, or ticket, rotate it immediately (section 5) before anything else.
