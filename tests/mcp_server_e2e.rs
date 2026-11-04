@@ -985,10 +985,7 @@ async fn test_mcp_safe_llm_outputs_1mib_binary_and_20mib_stdout() {
     let _ = mcp.read_json_response();
 
     // 1. Stage `files: ["."]` and verify the task reads `Cargo.toml` at the sandbox root.
-    #[cfg(unix)]
     let root_script = "cat Cargo.toml";
-    #[cfg(windows)]
-    let root_script = "type Cargo.toml";
     mcp.send_line(
         &json!({
             "jsonrpc": "2.0",
@@ -1138,7 +1135,6 @@ async fn test_mcp_safe_llm_outputs_1mib_binary_and_20mib_stdout() {
 
     // 2. Submit a task that stages `seed.bin` and `chunk64k.txt` via blobs, writes a 1 MiB binary
     //    output `out.bin`, and writes 20 MiB of stdout ending in `FINAL_SUMMARY_MARKER_MCP2_OK`.
-    #[cfg(unix)]
     let script = "\
 cat seed.bin seed.bin seed.bin seed.bin > b256k.bin
 cat b256k.bin b256k.bin b256k.bin b256k.bin > out.bin
@@ -1148,20 +1144,6 @@ cat t256k.txt t256k.txt t256k.txt t256k.txt > t1m.txt
 cat t1m.txt t1m.txt t1m.txt t1m.txt t1m.txt > t5m.txt
 cat t5m.txt t5m.txt t5m.txt t5m.txt
 echo FINAL_SUMMARY_MARKER_MCP2_OK
-";
-    #[cfg(windows)]
-    let script = "\
-copy /b seed.bin+seed.bin+seed.bin+seed.bin b256k.bin >nul\r\n\
-copy /b b256k.bin+b256k.bin+b256k.bin+b256k.bin out.bin >nul\r\n\
-echo START_OF_20MIB_STDOUT\r\n\
-copy /b chunk64k.txt+chunk64k.txt+chunk64k.txt+chunk64k.txt t256k.txt >nul\r\n\
-copy /b t256k.txt+t256k.txt+t256k.txt+t256k.txt t1m.txt >nul\r\n\
-copy /b t1m.txt+t1m.txt+t1m.txt+t1m.txt+t1m.txt t5m.txt >nul\r\n\
-type t5m.txt\r\n\
-type t5m.txt\r\n\
-type t5m.txt\r\n\
-type t5m.txt\r\n\
-echo FINAL_SUMMARY_MARKER_MCP2_OK\r\n\
 ";
 
     mcp.send_line(
