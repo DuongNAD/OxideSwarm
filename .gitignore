@@ -63,6 +63,7 @@ local.properties
 captures/
 .externalNativeBuild/
 .cxx/
+**/jniLibs/**/*.so
 
 # --- IDEs & Code Editors ---
 # JetBrains / Android Studio
@@ -101,6 +102,8 @@ ENV/
 env/
 
 # --- Test Empirical Results & Dumps ---
+/test_reports/
+test_reports/
 tests/empirical_results.json
 tests/m7_challenger_2_results.json
 tests/*_results.json

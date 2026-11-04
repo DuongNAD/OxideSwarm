@@ -344,36 +344,69 @@ fn resolve_windows_executable(program: &str, effective_path: &str) -> String {
     program.to_string()
 }
 
-/// The notice appended to a capture that exceeded its size limit.
+/// The notice inserted between the preserved head and tail when a capture exceeds its size limit.
 const TRUNCATION_NOTICE: &[u8] = b"\n[rusty_grid: output truncated after exceeding size limit]\n";
 
 /// Bytes captured from one output stream so far. Shared with the reader so that what has been
 /// read is still there when the reader has to be abandoned (a timeout, or a background process
 /// that never closes the pipe).
+///
+/// Keeps the first `max_bytes / 2` bytes in `head` and a rolling ring buffer of the last
+/// `max_bytes - max_bytes / 2` bytes in `tail`, so both startup diagnostics and final test/build
+/// summaries are preserved when a stream overflows `max_bytes`.
 #[derive(Default)]
 struct StreamCapture {
-    data: BytesMut,
+    head: BytesMut,
+    tail: std::collections::VecDeque<u8>,
     truncated: bool,
 }
 
 impl StreamCapture {
     fn push(&mut self, chunk: &[u8], max_bytes: usize) {
-        if self.data.len() < max_bytes {
-            let to_copy = std::cmp::min(max_bytes - self.data.len(), chunk.len());
-            self.data.extend_from_slice(&chunk[..to_copy]);
-            if chunk.len() > to_copy {
+        if chunk.is_empty() {
+            return;
+        }
+        let head_cap = max_bytes / 2;
+        let tail_cap = max_bytes - head_cap;
+
+        let head_room = head_cap.saturating_sub(self.head.len());
+        let to_head = chunk.len().min(head_room);
+        if to_head > 0 {
+            self.head.extend_from_slice(&chunk[..to_head]);
+        }
+
+        let rest = &chunk[to_head..];
+        if rest.is_empty() {
+            return;
+        }
+        if tail_cap == 0 {
+            self.truncated = true;
+            return;
+        }
+        if rest.len() >= tail_cap {
+            if self.tail.len() + rest.len() > tail_cap {
                 self.truncated = true;
             }
+            self.tail.clear();
+            self.tail.extend(&rest[rest.len() - tail_cap..]);
         } else {
-            self.truncated = true;
+            let overflow = (self.tail.len() + rest.len()).saturating_sub(tail_cap);
+            if overflow > 0 {
+                self.truncated = true;
+                self.tail.drain(..overflow);
+            }
+            self.tail.extend(rest);
         }
     }
 
     fn finish(mut self) -> (Bytes, bool) {
         if self.truncated {
-            self.data.extend_from_slice(TRUNCATION_NOTICE);
+            self.head.extend_from_slice(TRUNCATION_NOTICE);
         }
-        (self.data.freeze().into(), self.truncated)
+        let (s1, s2) = self.tail.as_slices();
+        self.head.extend_from_slice(s1);
+        self.head.extend_from_slice(s2);
+        (self.head.freeze().into(), self.truncated)
     }
 }
 
@@ -4368,5 +4401,127 @@ mod process_tree_tests {
             "[unset][unset][given-on-purpose]",
             "{res:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_bounded_stream_keeps_head_and_tail_when_truncated() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"HEAD-0123456789");
+        input.extend(std::iter::repeat_n(b'M', 1024));
+        input.extend_from_slice(b"TAIL-9876543210");
+
+        let (captured, truncated) = read_bounded_stream(&input[..], 30).await;
+        assert!(truncated);
+        let text = String::from_utf8(captured.0.to_vec()).expect("utf8");
+        assert!(
+            text.starts_with("HEAD-0123456789"),
+            "expected head preserved, got {text:?}"
+        );
+        assert!(
+            text.ends_with("TAIL-9876543210"),
+            "expected tail preserved, got {text:?}"
+        );
+        assert!(
+            text.contains("[rusty_grid: output truncated after exceeding size limit]"),
+            "expected truncation notice in {text:?}"
+        );
+
+        // Exact fit does not mark truncated and preserves the full stream in order.
+        let exact = b"0123456789abcdef";
+        let (captured_exact, truncated_exact) = read_bounded_stream(&exact[..], exact.len()).await;
+        assert!(!truncated_exact);
+        assert_eq!(captured_exact.as_bytes(), exact);
+    }
+
+    #[tokio::test]
+    async fn test_read_bounded_stream_chunked_boundaries_exact_plus_one_and_many_wraps() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        struct ChunkedSlice<'a> {
+            data: &'a [u8],
+            pos: usize,
+            chunk_size: usize,
+        }
+
+        impl AsyncRead for ChunkedSlice<'_> {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.pos >= self.data.len() {
+                    return Poll::Ready(Ok(()));
+                }
+                let avail = self.data.len() - self.pos;
+                let n = avail.min(self.chunk_size).min(buf.remaining());
+                buf.put_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let max_len = 4096 * 4 + 37;
+        let master_input: Vec<u8> = (0..max_len).map(|i| ((i * 73 + 19) & 0xFF) as u8).collect();
+
+        for cap in [1usize, 2, 15, 16, 1024, 1025, 4096] {
+            let head_cap = cap / 2;
+            let tail_cap = cap - head_cap;
+            let lengths = [
+                cap.saturating_sub(1),
+                cap,
+                cap + 1,
+                head_cap + 1 + tail_cap,
+                cap * 4 + 37,
+            ];
+            for len in lengths {
+                let input = &master_input[..len];
+                for chunk_size in [1usize, 2, 7, 64, 511, 512, 513, 1024, 1025, 4096, 8192] {
+                    let reader = ChunkedSlice {
+                        data: input,
+                        pos: 0,
+                        chunk_size,
+                    };
+                    let (captured, truncated) = read_bounded_stream(reader, cap).await;
+                    let bytes = captured.as_bytes();
+                    if len <= cap {
+                        assert!(
+                            !truncated,
+                            "cap={cap} len={len} chunk_size={chunk_size}: must not truncate"
+                        );
+                        assert_eq!(
+                            bytes, input,
+                            "cap={cap} len={len} chunk_size={chunk_size}: exact bytes must match"
+                        );
+                    } else {
+                        assert!(
+                            truncated,
+                            "cap={cap} len={len} chunk_size={chunk_size}: must flag truncated"
+                        );
+                        assert_eq!(
+                            bytes.len(),
+                            cap + TRUNCATION_NOTICE.len(),
+                            "cap={cap} len={len} chunk_size={chunk_size}: truncated len mismatch"
+                        );
+                        assert_eq!(
+                            &bytes[..head_cap],
+                            &input[..head_cap],
+                            "cap={cap} len={len} chunk_size={chunk_size}: head mismatch"
+                        );
+                        assert_eq!(
+                            &bytes[head_cap..head_cap + TRUNCATION_NOTICE.len()],
+                            TRUNCATION_NOTICE,
+                            "cap={cap} len={len} chunk_size={chunk_size}: notice mismatch"
+                        );
+                        assert_eq!(
+                            &bytes[head_cap + TRUNCATION_NOTICE.len()..],
+                            &input[len - tail_cap..],
+                            "cap={cap} len={len} chunk_size={chunk_size}: tail mismatch"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
