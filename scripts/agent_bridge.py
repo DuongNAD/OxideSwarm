@@ -169,6 +169,12 @@ def resolve_self_short(args=None):
     return SELF_SHORT
 
 
+def resolve_repo_arg(args=None):
+    if args is not None:
+        return getattr(args, "sub_repo", None) or getattr(args, "repo", None)
+    return None
+
+
 def resolve_peer_short(hub_dir, self_short=None, args=None):
     self_short = self_short or SELF_SHORT
     if args is not None:
@@ -294,10 +300,14 @@ def git_output(repo_dir, *args):
 def get_git_info(repo_dir):
     if not repo_dir:
         return {"found": False}
+    if os.path.isdir(repo_dir) and not os.path.exists(os.path.join(repo_dir, ".git")):
+        return {"found": False, "error": "no .git checkout"}
     try:
         head = git_output(repo_dir, "rev-parse", "--short=12", "HEAD")
         branch = git_output(repo_dir, "rev-parse", "--abbrev-ref", "HEAD")
         status_out = git_output(repo_dir, "status", "--porcelain")
+        if not head or not branch:
+            return {"found": False}
         dirty_files = [line.strip() for line in status_out.splitlines() if line.strip()]
         return {
             "found": True,
@@ -399,7 +409,7 @@ def peer_state_age_seconds(peer_state):
 def cmd_heartbeat(args):
     hub_dir = find_hub_dir(args.hub_dir)
     self_short = resolve_self_short(args)
-    state = collect_state(args.repo, self_short)
+    state = collect_state(resolve_repo_arg(args), self_short)
     out_path = os.path.join(hub_dir, "nodes", f"{self_short}_state.json")
     atomic_write(out_path, json.dumps(state, indent=2, ensure_ascii=False) + "\n", self_short)
     print(f"[OK] Heartbeat written to {out_path}")
@@ -410,7 +420,7 @@ def cmd_heartbeat(args):
 def cmd_diagnose(args):
     hub_dir = find_hub_dir(args.hub_dir)
     self_short = resolve_self_short(args)
-    my_state = collect_state(args.repo, self_short)
+    my_state = collect_state(resolve_repo_arg(args), self_short)
     my_path = os.path.join(hub_dir, "nodes", f"{self_short}_state.json")
     atomic_write(my_path, json.dumps(my_state, indent=2, ensure_ascii=False) + "\n", self_short)
 
@@ -426,6 +436,7 @@ def cmd_diagnose(args):
     issues = []
     recommendations = []
     peer_unknown = False
+    git_unknown = False
 
     sec = my_state.get("security_and_config", {})
     if sec.get("stale_p2p_ticket_in_config"):
@@ -439,6 +450,16 @@ def cmd_diagnose(args):
     if not sec.get("secret_exists"):
         issues.append("[LOCAL WARN] ~/.oxideswarm/cluster.secret does not exist yet on this machine.")
         recommendations.append("Start Master (`./switch_role.sh master`) or copy cluster.secret from the Master machine.")
+
+    my_git = my_state.get("git", {})
+    local_git_ok = bool(my_git.get("found") and my_git.get("git_head") and my_git.get("git_branch"))
+    if not local_git_ok:
+        git_unknown = True
+        print("  - Git Commit    : UNKNOWN (no git checkout)")
+        issues.append(
+            f"[GIT UNKNOWN] Local git commit or branch could not be read on agent-{self_short} (no git checkout)."
+        )
+        recommendations.append("Run `diagnose` from a git checkout or pass `--repo <PATH>` pointing to one.")
 
     if not peer_state:
         peer_unknown = True
@@ -469,10 +490,18 @@ def cmd_diagnose(args):
                 f"Run `{PYTHON_CMD} scripts/agent_bridge.py heartbeat` on `agent-{peer_short}` or restart its watcher."
             )
 
-        my_git = my_state.get("git", {})
         peer_git = peer_state.get("git", {})
-        if my_git.get("found") and peer_git.get("found"):
-            if my_git.get("git_head") != peer_git.get("git_head"):
+        if local_git_ok:
+            if not peer_git.get("found") or not peer_git.get("git_head"):
+                git_unknown = True
+                print(f"  - Git Commit    : UNKNOWN (no git checkout on agent-{peer_short})")
+                issues.append(
+                    f"[GIT UNKNOWN] Peer git commit could not be read from {peer_short}_state.json."
+                )
+                recommendations.append(
+                    f"Run `{PYTHON_CMD} scripts/agent_bridge.py heartbeat` from a git checkout on `agent-{peer_short}`."
+                )
+            elif my_git.get("git_head") != peer_git.get("git_head"):
                 issues.append(
                     f"[GIT DRIFT] Commit mismatch: agent-{self_short}={my_git.get('git_head')} vs agent-{peer_short}={peer_git.get('git_head')}"
                 )
@@ -532,13 +561,18 @@ def cmd_diagnose(args):
     print(f"  - Incident Logs : {len(inc_files)} file(s) in incidents/")
 
     print("-" * 78)
-    if not issues and not peer_unknown:
+    if not issues and not peer_unknown and not git_unknown:
         print("  STATUS: HEALTHY (No configuration, git drift, or auth conflicts detected)")
         print("=" * 78)
         return 0
 
-    if peer_unknown:
-        print("  STATUS: UNKNOWN (Peer state is missing or stale)")
+    if peer_unknown or git_unknown:
+        if peer_unknown and git_unknown:
+            print("  STATUS: UNKNOWN (Peer state and git checkout are missing or stale)")
+        elif git_unknown:
+            print("  STATUS: UNKNOWN (No git checkout)")
+        else:
+            print("  STATUS: UNKNOWN (Peer state is missing or stale)")
     else:
         print(f"  STATUS: UNHEALTHY ({len(issues)} issue(s) detected)")
     print("  DETECTED ISSUES:")
@@ -963,7 +997,7 @@ def cmd_watch(args):
     if args.hook and lock is None:
         return 0
 
-    repo_dir = args.repo or os.getcwd()
+    repo_dir = resolve_repo_arg(args) or os.getcwd()
     once = args.once_on_message or args.hook
     first_run = not os.path.isdir(claims_dir(consumer))
     prune_bridge_state(consumer)
@@ -1041,6 +1075,7 @@ def add_identity_args(subparser, include_peer=False):
 def main():
     parser = argparse.ArgumentParser(description="OxideSwarm Multi-Agent Google Drive Bridge")
     parser.add_argument("--hub-dir", help="Explicit path to OxideSwarm_Agent_Hub", default=None)
+    parser.add_argument("--repo", help="Path to OxideSwarm repository", default=None)
     parser.add_argument(
         "--agent-id",
         help="Agent identifier (e.g. mac-1 or agent-mac-1); defaults to platform id",
@@ -1055,12 +1090,12 @@ def main():
 
     p_hb = sub.add_parser("heartbeat", help="Write current node state to nodes/<agent-id>_state.json")
     add_identity_args(p_hb)
-    p_hb.add_argument("--repo", help="Path to OxideSwarm repository", default=None)
+    p_hb.add_argument("--repo", dest="sub_repo", help="Path to OxideSwarm repository", default=None)
     p_hb.set_defaults(func=cmd_heartbeat)
 
     p_diag = sub.add_parser("diagnose", help="Compare self & peer states and detect root causes")
     add_identity_args(p_diag, include_peer=True)
-    p_diag.add_argument("--repo", help="Path to OxideSwarm repository", default=None)
+    p_diag.add_argument("--repo", dest="sub_repo", help="Path to OxideSwarm repository", default=None)
     p_diag.set_defaults(func=cmd_diagnose)
 
     p_send = sub.add_parser("send", help="Send a message to the peer Coding Agent")
@@ -1095,7 +1130,7 @@ def main():
         help="Wait for peer messages and incident updates, and deliver each one once per consumer",
     )
     add_identity_args(p_watch, include_peer=True)
-    p_watch.add_argument("--repo", help="Path to OxideSwarm repository", default=None)
+    p_watch.add_argument("--repo", dest="sub_repo", help="Path to OxideSwarm repository", default=None)
     p_watch.add_argument("--interval", type=int, default=10, help="Polling interval in seconds (default: 10)")
     p_watch.add_argument(
         "--heartbeat-every",

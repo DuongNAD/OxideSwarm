@@ -543,6 +543,34 @@ class Send(BridgeCase):
 
 
 class Diagnose(BridgeCase):
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(self.repo)
+        with open(os.path.join(self.repo, "Cargo.toml"), "w", encoding="utf-8") as f:
+            f.write("[workspace]\nmembers = []\n")
+        for cmd in (
+            ["git", "init", "-q"],
+            ["git", "config", "user.email", "test@oxideswarm.invalid"],
+            ["git", "config", "user.name", "OxideSwarm Test"],
+            ["git", "add", "Cargo.toml"],
+            ["git", "commit", "-q", "-m", "initial"],
+        ):
+            subprocess.run(
+                cmd,
+                cwd=self.repo,
+                env=self.env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+
+    def argv(self, *args, use_hub=True):
+        if "--repo" not in args:
+            args = ("--repo", self.repo, *args)
+        return super().argv(*args, use_hub=use_hub)
+
     def write_local_secret(self, secret_text="shared-cluster-secret-value"):
         ox_home = self.env["OXIDESWARM_HOME"]
         os.makedirs(ox_home, exist_ok=True)
@@ -640,6 +668,43 @@ class Diagnose(BridgeCase):
         output = res.stdout.decode("utf-8")
         self.assertEqual(res.returncode, 0, output)
         self.assertIn("STATUS: HEALTHY", output)
+
+    def test_diagnose_without_git_checkout_reports_unknown_and_exits_non_zero(self):
+        self.write_local_secret()
+        self.assertEqual(self.run_bridge("heartbeat").returncode, 0)
+        with open(os.path.join(self.nodes, f"{SELF}_state.json"), encoding="utf-8") as f:
+            self_state = json.load(f)
+        head = self_state["git"].get("git_head")
+        fp = self_state["security_and_config"].get("secret_sha256_12")
+        self.write_peer_node_state(age_minutes=0, git_head=head, secret_sha256_12=fp)
+
+        no_git_repo = os.path.join(self.tmp, "archive-export")
+        os.makedirs(no_git_repo)
+        with open(os.path.join(no_git_repo, "Cargo.toml"), "w", encoding="utf-8") as f:
+            f.write("[workspace]\nmembers = []\n")
+
+        res = self.run_bridge("--repo", no_git_repo, "diagnose")
+        output = res.stdout.decode("utf-8")
+        self.assertNotEqual(res.returncode, 0, output)
+        self.assertIn("UNKNOWN (no git checkout)", output)
+        self.assertIn("STATUS: UNKNOWN", output)
+        self.assertNotIn("STATUS: HEALTHY", output)
+
+        if not os.path.exists(os.path.join(ROOT, ".git")):
+            res_default = subprocess.run(
+                [sys.executable, SCRIPT, "--hub-dir", self.hub, "diagnose"],
+                cwd=self.tmp,
+                env=self.env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=WAIT,
+            )
+            out_default = res_default.stdout.decode("utf-8")
+            self.assertNotEqual(res_default.returncode, 0, out_default)
+            self.assertIn("UNKNOWN (no git checkout)", out_default)
+            self.assertIn("STATUS: UNKNOWN", out_default)
+            self.assertNotIn("STATUS: HEALTHY", out_default)
 
     def test_diagnose_exits_non_zero_on_git_drift_auth_mismatch_and_config_issues(self):
         self.write_local_secret()
