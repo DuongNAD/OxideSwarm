@@ -45,7 +45,7 @@ tempfile = "3"
 futures = { workspace = true }
 agent_mesh = { workspace = true }
 bytes = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 
 [[test]]
 name = "test_3d_autorig_pipeline"
