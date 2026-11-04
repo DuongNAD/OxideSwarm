@@ -131,6 +131,7 @@ async fn test_workers_over_quic_release_the_pre_auth_slot_once_registered() {
     for i in 0..3 {
         let sandbox = tempfile::tempdir().unwrap();
         let config = WorkerConfig::new("auto")
+            .with_no_battery(true)
             .with_name(format!("quic-worker-{i}"))
             .with_cores(1)
             .with_sandbox_base_dir(sandbox.path())

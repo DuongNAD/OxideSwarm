@@ -104,6 +104,7 @@ async fn test_worker_e2e_connection_via_auto_discovery() {
     // Configure worker with auto-discovery specifying port
     let temp_dir = tempfile::tempdir().expect("failed to create worker tempdir");
     let worker_config = WorkerConfig::new(format!("auto:{}", discovery_port))
+        .with_no_battery(true)
         .with_name("auto-discovery-worker-test")
         .with_cores(2)
         .with_sandbox_base_dir(temp_dir.path());
@@ -285,6 +286,7 @@ async fn test_worker_redirection_portal_with_auto_master() {
 
     let temp_dir = tempfile::tempdir().expect("worker tempdir");
     let worker_config = WorkerConfig::new(format!("auto:{}", discovery_port))
+        .with_no_battery(true)
         .with_name("portal-auto-worker-test")
         .with_cores(2)
         .with_sandbox_base_dir(temp_dir.path())

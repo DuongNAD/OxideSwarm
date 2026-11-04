@@ -45,6 +45,7 @@ async fn spawn_test_cluster() -> (
     let master_addr = master.server_addr().to_string();
 
     let worker_cfg = WorkerConfig::new(&master_addr)
+        .with_no_battery(true)
         .with_name("cli1-worker")
         .with_cores(4)
         .with_ram_mb(4096)

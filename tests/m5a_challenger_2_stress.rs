@@ -810,6 +810,7 @@ async fn test_pre_sleep_fast_evacuation_under_multi_task_load() {
 
     let w1_id = Uuid::new_v4();
     let config1 = WorkerConfig::new(&master_addr)
+        .with_no_battery(true)
         .with_name("mobile-evac-worker-1")
         .with_cores(4)
         .with_worker_id(w1_id)
@@ -818,6 +819,7 @@ async fn test_pre_sleep_fast_evacuation_under_multi_task_load() {
 
     let w2_id = Uuid::new_v4();
     let config2 = WorkerConfig::new(&master_addr)
+        .with_no_battery(true)
         .with_name("survivor-worker-2")
         .with_cores(4)
         .with_worker_id(w2_id)
@@ -826,6 +828,7 @@ async fn test_pre_sleep_fast_evacuation_under_multi_task_load() {
 
     let w3_id = Uuid::new_v4();
     let config3 = WorkerConfig::new(&master_addr)
+        .with_no_battery(true)
         .with_name("survivor-worker-3")
         .with_cores(4)
         .with_worker_id(w3_id)
@@ -1028,6 +1031,7 @@ async fn test_pre_sleep_fast_evacuation_under_multi_task_load() {
 
     // 9. Verify WorkerClient fast-path cancellation latency directly
     let test_worker_config = WorkerConfig::new(&master_addr)
+        .with_no_battery(true)
         .with_cores(2)
         .with_sandbox_base_dir(sandbox_path.join("fast_cancel"));
     let standalone_worker = WorkerClient::new(test_worker_config);

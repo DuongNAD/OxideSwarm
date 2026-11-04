@@ -66,6 +66,7 @@ fn spawn_test_worker(
 ) -> SpawnedWorker {
     let temp_dir = tempfile::tempdir().expect("failed to create worker tempdir");
     let cfg = WorkerConfig::new(master_addr)
+        .with_no_battery(true)
         .with_name(name)
         .with_cores(cores)
         .with_simulate_gpu(simulate_gpu)

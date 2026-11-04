@@ -51,6 +51,7 @@ impl Cluster {
     fn spawn_worker(&mut self, name: &str, tags: &[&str], simulate_gpu: bool) -> Uuid {
         let dir = tempfile::tempdir().expect("sandbox dir");
         let config = WorkerConfig::new(self.addr.clone())
+            .with_no_battery(true)
             .with_name(name)
             .with_cores(2)
             .with_ram_mb(2048)

@@ -1727,6 +1727,8 @@ async fn run_worker(
         false,
     );
 
+    let no_battery = resolve_no_battery();
+
     let max_concurrency = resolve_opt_usize(
         args.max_concurrency,
         &[
@@ -1838,6 +1840,9 @@ async fn run_worker(
     if no_cuda {
         config = config.with_no_cuda(true);
     }
+    if no_battery {
+        config = config.with_no_battery(true);
+    }
     if let Some(mc) = max_concurrency {
         config = config.with_max_concurrency(mc);
     }
@@ -1901,6 +1906,11 @@ async fn run_worker(
             NoticeLevel::Warn => eprintln!("Warning: {}", notice.message),
         }
     }
+    if no_battery {
+        eprintln!(
+            "Warning: host battery and thermal protection is disabled (RUSTY_GRID_NO_BATTERY); this worker will accept tasks regardless of battery level or thermal state"
+        );
+    }
     match peer_outcome {
         PeerSecretOutcome::Authenticated => println!("Cluster authentication: enabled"),
         PeerSecretOutcome::OpenLocalOnly => println!(
@@ -1931,6 +1941,12 @@ async fn run_worker(
             ExitCode::FAILURE
         }
     }
+}
+
+/// Reads `RUSTY_GRID_NO_BATTERY` from the process environment (and nowhere else: config files and
+/// legacy alias names cannot disable battery/thermal protection).
+pub(crate) fn resolve_no_battery() -> bool {
+    resolve_bool(None, &["RUSTY_GRID_NO_BATTERY"], None, false)
 }
 
 /// Resolves when the worker is asked to stop: Ctrl-C, and the signals a service manager, `kill`
@@ -5209,5 +5225,48 @@ max_active_mb = 768
             vec![42, 15, 42, 15],
             "[submit].timeout_secs must set 42 for both submit and mapreduce when --timeout-secs is omitted and yield to 15 when --timeout-secs 15 is passed"
         );
+    }
+
+    #[test]
+    fn test_resolve_no_battery_only_accepts_rusty_grid_no_battery_env_and_not_config_or_aliases() {
+        std::env::remove_var("RUSTY_GRID_NO_BATTERY");
+        std::env::remove_var("OXIDE_SWARM_NO_BATTERY");
+        std::env::remove_var("RUSTY_GRID_DISABLE_BATTERY");
+
+        assert!(!resolve_no_battery());
+
+        std::env::set_var("OXIDE_SWARM_NO_BATTERY", "yes");
+        std::env::set_var("RUSTY_GRID_DISABLE_BATTERY", "on");
+        assert!(
+            !resolve_no_battery(),
+            "undocumented alias env vars must not disable battery protection"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("rusty-grid.toml");
+        std::fs::write(
+            &cfg_path,
+            "[worker]\nno_battery = true\n[worker.hardware]\nno_battery = true\n",
+        )
+        .unwrap();
+        let loaded = crate::config::load_config_file(Some(&cfg_path)).unwrap();
+        assert!(
+            loaded.and_then(|c| c.worker).is_some(),
+            "config file with unknown no_battery keys must still load without enabling no_battery"
+        );
+        assert!(
+            !resolve_no_battery(),
+            "a config file must never be able to disable battery protection"
+        );
+
+        std::env::set_var("RUSTY_GRID_NO_BATTERY", "1");
+        assert!(
+            resolve_no_battery(),
+            "RUSTY_GRID_NO_BATTERY=1 must disable host battery probing in the CLI layer"
+        );
+
+        std::env::remove_var("RUSTY_GRID_NO_BATTERY");
+        std::env::remove_var("OXIDE_SWARM_NO_BATTERY");
+        std::env::remove_var("RUSTY_GRID_DISABLE_BATTERY");
     }
 }

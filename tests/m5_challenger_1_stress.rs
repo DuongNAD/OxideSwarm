@@ -545,7 +545,9 @@ fn test_adversarial_hardware_overrides_cores_zero_and_boundary() {
     assert_eq!(caps_1024.cpu_cores, 1024);
 
     // 3. Semaphore permits match the configured cores
-    let cfg = WorkerConfig::new("127.0.0.1:8080").with_cores(128);
+    let cfg = WorkerConfig::new("127.0.0.1:8080")
+        .with_no_battery(true)
+        .with_cores(128);
     let client = WorkerClient::new(cfg);
     assert_eq!(client.concurrency_semaphore().available_permits(), 128);
 }
@@ -675,6 +677,7 @@ fn test_adversarial_hardware_overrides_gpu_and_gpu_name_customization() {
 fn test_adversarial_worker_concurrency_semaphore_override() {
     // Setting max_concurrency: Some(2) on an 8-core worker must restrict permits to 2
     let cfg = WorkerConfig::new("127.0.0.1:8080")
+        .with_no_battery(true)
         .with_cores(8)
         .with_max_concurrency(2);
     let client = WorkerClient::new(cfg);
@@ -692,6 +695,7 @@ fn test_adversarial_worker_concurrency_semaphore_override() {
 
     // Setting max_concurrency: Some(0) must safely clamp to 1 permit to prevent deadlock
     let cfg_zero = WorkerConfig::new("127.0.0.1:8080")
+        .with_no_battery(true)
         .with_cores(8)
         .with_max_concurrency(0);
     let client_zero = WorkerClient::new(cfg_zero);
@@ -934,6 +938,7 @@ preserve_gpu = true
     let worker_cfg = loaded_worker_file.worker.unwrap();
 
     let worker_config = WorkerConfig::new(worker_cfg.master.unwrap())
+        .with_no_battery(true)
         .with_name(worker_cfg.name.unwrap())
         .with_cores(worker_cfg.cores.unwrap())
         .with_ram_mb(worker_cfg.ram_mb.unwrap())
