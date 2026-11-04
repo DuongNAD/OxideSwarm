@@ -77,6 +77,52 @@ fn wait_for_non_empty_file(path: &Path, timeout: Duration) -> Option<String> {
     None
 }
 
+fn run_with_timeout(mut cmd: Command, timeout: Duration) -> std::process::Output {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn rusty-grid");
+    let mut stdout_pipe = child.stdout.take().expect("take child stdout");
+    let mut stderr_pipe = child.stderr.take().expect("take child stderr");
+
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout_pipe, &mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stderr_pipe, &mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().expect("try_wait on rusty-grid child") {
+            Some(status) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break status;
+            }
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "rusty-grid child did not exit within {:?}; killed child",
+                    timeout
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(25)),
+        }
+    };
+
+    let stdout = stdout_reader.join().expect("join stdout reader");
+    let stderr = stderr_reader.join().expect("join stderr reader");
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
 fn ticket_endpoint_id(ticket_json: &str) -> String {
     let parsed: serde_json::Value =
         serde_json::from_str(ticket_json).expect("ticket must be valid JSON");
@@ -125,9 +171,8 @@ fn test_corrupt_p2p_key_file_exits_1_without_port_or_ticket_file() {
         .arg("--p2p-ticket-file")
         .arg(&ticket_file);
 
-        let output = cmd
-            .output()
-            .expect("run rusty-grid master with corrupt key");
+        let output = run_with_timeout(cmd, Duration::from_secs(10));
+
         assert_eq!(
             output.status.code(),
             Some(1),
@@ -293,7 +338,80 @@ fn test_key_file_cli_alias_and_env_and_config_precedence() {
         "--p2p-key-file must override RUSTY_GRID_P2P_KEY_FILE without creating the env key"
     );
 
-    // 4. TOML config `p2p_key_file` and CLI override over config
+    // 4. Precedence: `RUSTY_GRID_P2P_KEY_FILE` env var overrides TOML config `p2p_key_file`
+    let env_over_cfg_key = home.join("env_over_cfg_key.bin");
+    let cfg_lose_env_key = home.join("cfg_lose_env_key.bin");
+    let env_over_cfg_ticket = home.join("env_over_cfg.ticket");
+    let cfg_lose_env_toml = home.join("cfg_lose_env.toml");
+    fs::write(
+        &cfg_lose_env_toml,
+        format!(
+            "[master]\nlisten = \"127.0.0.1:0\"\np2p_ticket_file = \"{}\"\np2p_key_file = \"{}\"\n",
+            env_over_cfg_ticket.display().to_string().replace('\\', "/"),
+            cfg_lose_env_key.display().to_string().replace('\\', "/"),
+        ),
+    )
+    .expect("write cfg_lose_env.toml");
+    {
+        let mut cmd = cli(home);
+        cmd.env("RUSTY_GRID_P2P_KEY_FILE", &env_over_cfg_key)
+            .args(["master", "--web-ui-addr", "127.0.0.1:0", "--config"])
+            .arg(&cfg_lose_env_toml);
+
+        let mut master = RunningMaster::spawn(cmd);
+        let _ = wait_for_non_empty_file(&env_over_cfg_ticket, Duration::from_secs(10))
+            .expect("env-over-config master must publish ticket");
+        master.stop();
+    }
+    assert_eq!(
+        fs::metadata(&env_over_cfg_key)
+            .expect("env_over_cfg_key exists")
+            .len(),
+        32
+    );
+    assert!(
+        !cfg_lose_env_key.exists(),
+        "RUSTY_GRID_P2P_KEY_FILE must override config p2p_key_file without creating config key"
+    );
+
+    // 5. Precedence: `--p2p-key-file` CLI flag overrides TOML config `p2p_key_file`
+    let cli_over_cfg_key = home.join("cli_over_cfg_key.bin");
+    let cfg_lose_cli_key = home.join("cfg_lose_cli_key.bin");
+    let cli_over_cfg_ticket = home.join("cli_over_cfg.ticket");
+    let cfg_lose_cli_toml = home.join("cfg_lose_cli.toml");
+    fs::write(
+        &cfg_lose_cli_toml,
+        format!(
+            "[master]\nlisten = \"127.0.0.1:0\"\np2p_ticket_file = \"{}\"\np2p_key_file = \"{}\"\n",
+            cli_over_cfg_ticket.display().to_string().replace('\\', "/"),
+            cfg_lose_cli_key.display().to_string().replace('\\', "/"),
+        ),
+    )
+    .expect("write cfg_lose_cli.toml");
+    {
+        let mut cmd = cli(home);
+        cmd.args(["master", "--web-ui-addr", "127.0.0.1:0", "--p2p-key-file"])
+            .arg(&cli_over_cfg_key)
+            .arg("--config")
+            .arg(&cfg_lose_cli_toml);
+
+        let mut master = RunningMaster::spawn(cmd);
+        let _ = wait_for_non_empty_file(&cli_over_cfg_ticket, Duration::from_secs(10))
+            .expect("CLI-over-config master must publish ticket");
+        master.stop();
+    }
+    assert_eq!(
+        fs::metadata(&cli_over_cfg_key)
+            .expect("cli_over_cfg_key exists")
+            .len(),
+        32
+    );
+    assert!(
+        !cfg_lose_cli_key.exists(),
+        "--p2p-key-file must override config p2p_key_file without creating config key"
+    );
+
+    // 6. TOML config `p2p_key_file` when CLI flag and env var are absent
     let cfg_key = home.join("cfg_key.bin");
     let cfg_ticket = home.join("cfg.ticket");
     let config_toml = home.join("master.toml");
