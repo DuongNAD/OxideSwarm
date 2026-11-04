@@ -204,6 +204,7 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
     let (legit_shutdown_tx, legit_shutdown_rx) = watch::channel(false);
     let mut legit_client = WorkerClient::new(
         WorkerConfig::new(master_addr.to_string())
+            .with_no_battery(true)
             .with_name("legit-node")
             .with_cores(4)
             .with_no_blender(true)
@@ -395,6 +396,7 @@ async fn test_challenge_repeated_disconnect_reconnect_5_cycles() {
         let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
         // Force the same persistent UUID across every cycle
         let mut config = WorkerConfig::new(master_addr.clone())
+            .with_no_battery(true)
             .with_worker_id(fixed_worker_id)
             .with_name(format!("reconnect-node-cycle-{cycle}"))
             .with_cores(4);

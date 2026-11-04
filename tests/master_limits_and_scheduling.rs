@@ -36,6 +36,7 @@ impl Drop for TestWorker {
 fn spawn_worker(master: &MasterHandle, name: &str, cores: usize) -> TestWorker {
     let sandbox = tempfile::tempdir().expect("sandbox");
     let config = WorkerConfig::new(master.server_addr().to_string())
+        .with_no_battery(true)
         .with_name(name)
         .with_cores(cores)
         .with_sandbox_base_dir(sandbox.path());

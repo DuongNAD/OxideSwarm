@@ -461,11 +461,13 @@ async fn test_m4_worker_disconnect_during_execution_triggers_retry() {
     let dir_b = tempfile::tempdir().expect("tempdir");
 
     let cfg_a = WorkerConfig::new(master_addr.clone())
+        .with_no_battery(true)
         .with_name("worker-A")
         .with_cores(2)
         .with_sandbox_base_dir(dir_a.path())
         .with_redirection_portal(false);
     let cfg_b = WorkerConfig::new(master_addr.clone())
+        .with_no_battery(true)
         .with_name("worker-B")
         .with_cores(2)
         .with_sandbox_base_dir(dir_b.path())

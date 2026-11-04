@@ -72,6 +72,7 @@ impl TestCluster {
     fn spawn_worker(&mut self, name: &str, tags: &[&str], simulate_gpu: bool) {
         let sandbox_dir = tempfile::tempdir().expect("sandbox dir");
         let config = WorkerConfig::new(self.master_addr.clone())
+            .with_no_battery(true)
             .with_name(name)
             .with_cluster_secret(self.secret.clone())
             .with_cores(4)

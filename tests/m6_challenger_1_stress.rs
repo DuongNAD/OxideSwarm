@@ -101,6 +101,7 @@ impl ChallengerTestCluster {
     ) -> Uuid {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let cfg = WorkerConfig::new(self.master_addr.to_string())
+            .with_no_battery(true)
             .with_name(name)
             .with_cores(cores)
             .with_ram_mb(ram_mb)

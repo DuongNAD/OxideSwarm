@@ -815,6 +815,7 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
     let (_w2_shutdown_tx, w2_shutdown_rx) = watch::channel(false);
 
     let mut config1 = WorkerConfig::new(&master_addr)
+        .with_no_battery(true)
         .with_name("evac-worker-1")
         .with_cores(2)
         .with_sandbox_base_dir(sandbox_path.join("w1"));
@@ -823,6 +824,7 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
     let mut w1 = WorkerClient::new(config1);
 
     let mut config2 = WorkerConfig::new(&master_addr)
+        .with_no_battery(true)
         .with_name("evac-worker-2")
         .with_cores(2)
         .with_sandbox_base_dir(sandbox_path.join("w2"));

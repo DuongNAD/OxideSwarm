@@ -292,6 +292,7 @@ async fn test_timeout_watchdog_terminates_runaway() {
 async fn test_cancel_task_cancels_running_task() {
     let temp_dir = tempfile::tempdir().expect("temp dir for client");
     let config = WorkerConfig::new("127.0.0.1:9999")
+        .with_no_battery(true)
         .with_cores(4)
         .with_sandbox_base_dir(temp_dir.path());
     let client = WorkerClient::new(config);
@@ -351,6 +352,7 @@ async fn test_concurrency_semaphore_limits_active_tasks() {
     let temp_dir = tempfile::tempdir().expect("temp dir for concurrency client");
     let cores = 2;
     let config = WorkerConfig::new("127.0.0.1:9999")
+        .with_no_battery(true)
         .with_cores(cores)
         .with_sandbox_base_dir(temp_dir.path());
     let client = WorkerClient::new(config);

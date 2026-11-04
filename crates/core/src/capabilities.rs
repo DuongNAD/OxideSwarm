@@ -303,6 +303,8 @@ pub struct HardwareOverrides {
     pub vram_mb: Option<u64>,
     pub cuda: Option<bool>,
     pub no_cuda: bool,
+    /// Disables host battery and mobile capability probing (`pmset`, `/sys/class/power_supply`, `dumpsys`).
+    pub no_battery: bool,
 }
 
 /// Represents the hardware resources and computational capabilities of a Worker node.
@@ -672,7 +674,11 @@ impl WorkerCapabilities {
             false
         };
 
-        let mobile = detect_mobile_capabilities();
+        let mobile = if overrides.no_battery || env_no_battery() {
+            None
+        } else {
+            detect_mobile_capabilities()
+        };
 
         Self {
             name,
@@ -841,9 +847,20 @@ fn detect_physical_gpu() -> (bool, bool, Option<String>) {
     (false, false, None)
 }
 
+/// Returns `true` when `RUSTY_GRID_NO_BATTERY` or `OXIDE_SWARM_NO_BATTERY` is set to `"1"` or `"true"`.
+pub fn env_no_battery() -> bool {
+    std::env::var("RUSTY_GRID_NO_BATTERY")
+        .or_else(|_| std::env::var("OXIDE_SWARM_NO_BATTERY"))
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Auto-detects mobile hardware attributes and real-time battery/thermal status.
 /// Returns `None` on standard desktop/server environments without battery unless on Android.
 pub fn detect_mobile_capabilities() -> Option<MobileCapabilities> {
+    if env_no_battery() {
+        return None;
+    }
     let is_android = is_android_env();
     let (battery_pct, is_charging) = detect_battery();
     let thermal_throttled = detect_thermal_throttling();
@@ -868,6 +885,9 @@ pub fn detect_mobile_capabilities() -> Option<MobileCapabilities> {
 /// exactly when [`detect_mobile_capabilities`] would. Blocking (sysfs reads, `pmset`/`dumpsys`
 /// child processes): call it from `spawn_blocking`.
 pub fn detect_live_mobile_status() -> Option<MobileLiveStatus> {
+    if env_no_battery() {
+        return None;
+    }
     let (battery_pct, is_charging) = detect_battery();
     if !is_android_env() && battery_pct.is_none() {
         return None;
@@ -893,6 +913,9 @@ fn is_android_env() -> bool {
 }
 
 fn detect_battery() -> (Option<u8>, Option<bool>) {
+    if env_no_battery() {
+        return (None, None);
+    }
     // 1. Linux/Android sysfs: /sys/class/power_supply
     let (sysfs_pct, sysfs_charging) =
         parse_sysfs_power_supply(std::path::Path::new("/sys/class/power_supply"));

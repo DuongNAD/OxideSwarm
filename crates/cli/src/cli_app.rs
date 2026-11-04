@@ -1619,6 +1619,20 @@ async fn run_worker(
         false,
     );
 
+    let no_battery = resolve_bool(
+        None,
+        &[
+            "RUSTY_GRID_NO_BATTERY",
+            "OXIDE_SWARM_NO_BATTERY",
+            "RUSTY_GRID_DISABLE_BATTERY",
+        ],
+        worker_cfg
+            .as_ref()
+            .and_then(|w| w.no_battery)
+            .or_else(|| hw_cfg.as_ref().and_then(|h| h.no_battery)),
+        false,
+    );
+
     let max_concurrency = resolve_opt_usize(
         args.max_concurrency,
         &[
@@ -1729,6 +1743,9 @@ async fn run_worker(
     }
     if no_cuda {
         config = config.with_no_cuda(true);
+    }
+    if no_battery {
+        config = config.with_no_battery(true);
     }
     if let Some(mc) = max_concurrency {
         config = config.with_max_concurrency(mc);

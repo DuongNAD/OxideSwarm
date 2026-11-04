@@ -251,6 +251,7 @@ async fn test_strict_gpu_gating_unconditional_rejection() {
 async fn test_strict_gpu_gating_via_worker_client_assignment() {
     let temp_dir = tempfile::tempdir().expect("temp dir for client");
     let config = WorkerConfig::new("127.0.0.1:9999")
+        .with_no_battery(true)
         .with_cores(2)
         .with_simulate_gpu(false)
         .with_sandbox_base_dir(temp_dir.path());
@@ -372,6 +373,7 @@ async fn test_genuine_matrix_multiplication_oracle_dimensions() {
 async fn run_concurrency_flood_test(cores: usize, task_count: usize) {
     let temp_dir = tempfile::tempdir().expect("temp dir for concurrency client");
     let config = WorkerConfig::new("127.0.0.1:9999")
+        .with_no_battery(true)
         .with_cores(cores)
         .with_sandbox_base_dir(temp_dir.path());
     let client = WorkerClient::new(config);
@@ -500,6 +502,7 @@ async fn test_concurrency_throttle_mixed_adversarial_flood() {
     let total_tasks = 20;
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let config = WorkerConfig::new("127.0.0.1:9999")
+        .with_no_battery(true)
         .with_cores(cores)
         .with_sandbox_base_dir(temp_dir.path());
     let client = WorkerClient::new(config);
@@ -1348,6 +1351,7 @@ async fn test_high_concurrency_worker_client_run_stress_encrypted() {
     for i in 0..NUM_CLIENTS {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config = WorkerConfig::new(master_addr.to_string())
+            .with_no_battery(true)
             .with_name(format!("stress-worker-client-{}", i))
             .with_cores(1)
             .with_cluster_secret(cluster_secret.clone())

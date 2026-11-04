@@ -628,6 +628,7 @@ async fn test_timeout_watchdog_precision_and_os_reaping() {
 async fn test_cancellation_immediate_race() {
     let temp_dir = tempfile::tempdir().expect("temp dir for client");
     let config = WorkerConfig::new("127.0.0.1:9999")
+        .with_no_battery(true)
         .with_cores(4)
         .with_sandbox_base_dir(temp_dir.path());
     let client = WorkerClient::new(config);
@@ -703,6 +704,7 @@ async fn test_cancellation_immediate_race() {
 async fn test_cancellation_mid_flight_kills_and_reaps() {
     let temp_dir = tempfile::tempdir().expect("temp dir for client");
     let config = WorkerConfig::new("127.0.0.1:9999")
+        .with_no_battery(true)
         .with_cores(2)
         .with_sandbox_base_dir(temp_dir.path());
     let client = WorkerClient::new(config);
@@ -775,6 +777,7 @@ async fn test_cancellation_burst_storm_integrity() {
     let temp_dir = tempfile::tempdir().expect("temp dir for client");
     let cores = 4;
     let config = WorkerConfig::new("127.0.0.1:9999")
+        .with_no_battery(true)
         .with_cores(cores)
         .with_sandbox_base_dir(temp_dir.path());
     let client = Arc::new(WorkerClient::new(config));
@@ -862,6 +865,7 @@ async fn test_cancellation_of_queued_task_behind_saturated_worker() {
     let temp_dir = tempfile::tempdir().expect("temp dir for client");
     let cores = 1; // single core worker: max 1 active task
     let config = WorkerConfig::new("127.0.0.1:9999")
+        .with_no_battery(true)
         .with_cores(cores)
         .with_sandbox_base_dir(temp_dir.path());
     let client = Arc::new(WorkerClient::new(config));
@@ -1024,6 +1028,7 @@ async fn test_cancel_kills_three_level_tree() {
     let temp_dir = tempfile::tempdir().expect("temp dir for client");
     let client = WorkerClient::new(
         WorkerConfig::new("127.0.0.1:9999")
+            .with_no_battery(true)
             .with_cores(2)
             .with_sandbox_base_dir(temp_dir.path()),
     );
@@ -1093,6 +1098,7 @@ async fn test_worker_shutdown_kills_all_running_trees() {
     let temp_dir = tempfile::tempdir().expect("temp dir for client");
     let client = WorkerClient::new(
         WorkerConfig::new("127.0.0.1:9999")
+            .with_no_battery(true)
             .with_cores(4)
             .with_sandbox_base_dir(temp_dir.path()),
     );

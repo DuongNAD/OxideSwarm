@@ -169,6 +169,7 @@ async fn test_worker_auto_reconnect_under_3_seconds() {
     // 2. Start Worker with Ticket 1
     let worker_sandbox = temp_dir.path().join("worker_reconnect_sb");
     let worker_config = WorkerConfig::new("auto")
+        .with_no_battery(true)
         .with_name("fast-reconnect-worker")
         .with_cores(2)
         .with_sandbox_base_dir(&worker_sandbox)

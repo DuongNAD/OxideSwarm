@@ -167,7 +167,7 @@ async fn test_m2_heartbeat_updates() {
     let master_handle = tokio::spawn(async move { master.run(master_shutdown_rx).await });
 
     let (w_shutdown_tx, w_shutdown_rx) = watch::channel(false);
-    let mut config = WorkerConfig::new(master_addr);
+    let mut config = WorkerConfig::new(master_addr).with_no_battery(true);
     config.enable_redirection_portal = false;
     config.default_heartbeat_interval = Duration::from_millis(100);
     let mut worker = WorkerClient::new(config);
