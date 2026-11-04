@@ -154,6 +154,8 @@ merge.
 | TEST-7 | Run or delete the orphan Python tests | P2 | M | INT-4 | | Planned |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 | | Planned |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 | | Implemented |
+| DOC-1 | Correct false status claims | P1 | M | INT-4 | | Implemented |
+| DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 | | Planned |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 | | Planned |
 | DOC-4 | Complete the CLI and environment reference | P2 | M | INT-4 | | Planned |
 | DOC-5 | Document the 3D subsystem | P2 | S | 3D-1 | | Planned |
@@ -1265,3 +1267,4 @@ Add one dated line per finished item, newest last.
   which also fixed the `--auto-pull` part of BRIDGE-1. This needs no backlog item of its own.
 - 2026-11-01: INT-5 completed; implemented F1 to F6 on `int-4-content-addressed-data-plane` (Windows clippy, symlinked output parent rejection, output blob pin retention on Master, immediate output file pinning in worker cache, bounded in-flight blob requests per session, and protocol version 2 enforcement).
 - 2026-11-03: DOC-2 completed; removed unbacked throughput, scaling, and working-set RAM figures from `README.md` and `windows/README.md`.
+- 2026-11-04: DOC-1 completed; mapped all status cells in `README.md`, `PROJECT.md`, and `ANDROID_ARCHITECTURE.md` to the fixed vocabulary (`Implemented`, `Partial`, `Planned`, `Design only`), corrected false claims across `README.md`, `PROJECT.md`, `CLAUDE.md`, `DEPLOYMENT.md`, `ANDROID_ARCHITECTURE.md`, `docs/SECURITY.md`, `docs/design/0002-mobile-coordination.md`, and `packaging/android/README.md` (intentionally keeping MCP `cancel` in `README.md:94,116` because `mcp.rs:592` implements it, and keeping `--mapper` / `--reducer` script shipping in `README.md:78` because `cli_app.rs:822-828` implements it), added a dated per-platform verification table backed by recorded runs, and restored the `Exactly-once execution` (`Planned`) limitation row in `README.md`.
