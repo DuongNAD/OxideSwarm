@@ -155,13 +155,18 @@ async def run_rapid_disconnect_stress() -> bool:
             assert resp.status == 200, f"Expected 200 OK from health check, got {resp.status}"
             assert health_body.get("status") == "ok", f"Hub health abnormal: {health_body}"
 
-        # Check catalog cleanup
-        with urllib.request.urlopen(hub_nodes_url, timeout=2.0) as resp:
-            nodes_body = json.loads(resp.read().decode())
-            active_nodes = nodes_body if isinstance(nodes_body, list) else nodes_body.get("nodes", [])
-            logger.info(f"Post-test active registered nodes on Hub: {len(active_nodes)}")
-            # Dead sockets should have been culled or dropped from active sessions
-            assert len(active_nodes) == 0, f"Expected 0 active nodes after all closed, got {len(active_nodes)}"
+        # Check catalog cleanup (poll until all closed sockets have been culled)
+        active_nodes = []
+        cleanup_deadline = time.time() + 5.0
+        while time.time() < cleanup_deadline:
+            with urllib.request.urlopen(hub_nodes_url, timeout=2.0) as resp:
+                nodes_body = json.loads(resp.read().decode())
+                active_nodes = nodes_body if isinstance(nodes_body, list) else nodes_body.get("nodes", [])
+            if len(active_nodes) == 0:
+                break
+            await asyncio.sleep(0.05)
+        logger.info(f"Post-test active registered nodes on Hub: {len(active_nodes)}")
+        assert len(active_nodes) == 0, f"Expected 0 active nodes after all closed, got {len(active_nodes)}"
 
         logger.info("✓ Rust Hub survived all 25 concurrent turbulent client drops with 0 crashes and clean session cleanup")
         return True

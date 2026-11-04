@@ -56,6 +56,7 @@ def drain_stream(stream):
 
 def start_hub(args: list[str]):
     """Launches agent-mesh hub and parses ws_url, http_base, and master_addr."""
+    import queue
     import threading
 
     bin_path = find_binary()
@@ -71,11 +72,33 @@ def start_hub(args: list[str]):
     ws_url = None
     http_base = None
     master_addr = None
+    line_queue: queue.Queue = queue.Queue()
 
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        line = proc.stdout.readline()
-        if not line:
+    def _stdout_reader():
+        try:
+            for line in proc.stdout:
+                line_queue.put(line)
+                if "running at " in line:
+                    break
+            for _ in proc.stdout:
+                pass
+        except Exception:
+            pass
+        finally:
+            line_queue.put(None)
+
+    threading.Thread(target=_stdout_reader, daemon=True).start()
+
+    deadline = time.time() + 15.0
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        try:
+            line = line_queue.get(timeout=remaining)
+        except queue.Empty:
+            break
+        if line is None:
             break
         logger.debug("Hub stdout: %s", line.strip())
         if "Embedded Master Grid runtime active on" in line:
@@ -87,11 +110,10 @@ def start_hub(args: list[str]):
 
     if not ws_url:
         proc.kill()
-        stdout, stderr = proc.communicate(timeout=3)
-        raise RuntimeError(f"Hub failed to start. Stdout:\n{stdout}\nStderr:\n{stderr}")
+        _, stderr = proc.communicate(timeout=3)
+        raise RuntimeError(f"Hub failed to start.\nStderr:\n{stderr}")
 
-    # Continuously drain remaining stdout and stderr so pipe buffers never block on log flood
-    threading.Thread(target=drain_stream, args=(proc.stdout,), daemon=True).start()
+    # Continuously drain remaining stderr so pipe buffers never block on log flood
     threading.Thread(target=drain_stream, args=(proc.stderr,), daemon=True).start()
 
     logger.info("Hub online at %s (REST: %s, Master: %s)", ws_url, http_base, master_addr)

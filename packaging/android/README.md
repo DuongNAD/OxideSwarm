@@ -36,7 +36,7 @@ OxideSwarm offers two deployment paths:
 
 ## 2. Path A: Native Android Foreground Service App
 
-Located in `packaging/android/app/`, this is a production-grade, turnkey Android application written in Kotlin targeting modern Android (compileSdk 34, minSdk 24).
+Located in `packaging/android/app/`, this is a Kotlin Android application prototype targeting modern Android (`compileSdk 34`, `minSdk 24`). Note: the Gradle project currently does not compile out of the box (see `AND-1` in [../../docs/BACKLOG.md](../../docs/BACKLOG.md)); use the Termux Background Daemon (Path B below) for a working Android worker today.
 
 ### 2.1 Architectural Blueprint
 
