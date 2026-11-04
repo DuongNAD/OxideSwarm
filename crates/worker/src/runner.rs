@@ -3897,33 +3897,40 @@ mod outcome_tests {
             "explicit path that fails validation must not fall through to System32\\cmd.exe on PATH"
         );
 
-        // 2. When spawning that invalid explicit path fails, both stderr and result.error
-        //    must name the resolved path so logs show which file was selected.
+        // 2. When spawning a bare command whose resolved path differs from `program` fails
+        //    (e.g. a 2-byte 'MZ' stub that passes the 2-byte header check in fake_dir but is
+        //    not a complete PE image), both stderr and result.error must include the resolved
+        //    full path in fake_dir, not merely the bare program name 'brokenpe'.
+        let broken_pe = fake_dir.path().join("brokenpe.exe");
+        std::fs::write(&broken_pe, b"MZ").unwrap();
+        let broken_pe_str = broken_pe.to_string_lossy().to_string();
         let runner = runner_in(sandbox_dir.path());
+        let mut broken_env = HashMap::new();
+        broken_env.insert(
+            "PATH".to_string(),
+            fake_dir.path().to_string_lossy().to_string(),
+        );
         let task = Task::new(
             TaskSpec::Command {
-                program: bad_explicit_str.clone(),
+                program: "brokenpe".into(),
                 args: vec![],
-                env: HashMap::new(),
+                env: broken_env,
                 working_dir: None,
                 stdin: None,
             },
             TaskRequirements::generic(1, 10),
         );
         let res = runner.execute_task(&task, None, None).await;
+        assert!(!res.is_success(), "2-byte MZ stub must fail CreateProcessW");
         assert!(
-            !res.is_success(),
-            "invalid explicit path must fail to spawn"
-        );
-        assert!(
-            res.stderr_str().contains(&bad_explicit_str),
-            "stderr must include resolved path '{bad_explicit_str}', got: {}",
+            res.stderr_str().contains(&broken_pe_str),
+            "stderr must include resolved path '{broken_pe_str}' (distinct from program 'brokenpe'), got: {}",
             res.stderr_str()
         );
         let err_msg = res.error.as_deref().unwrap_or_default();
         assert!(
-            err_msg.contains(&bad_explicit_str),
-            "result.error must include resolved path '{bad_explicit_str}', got: {err_msg}"
+            err_msg.contains(&broken_pe_str),
+            "result.error must include resolved path '{broken_pe_str}' (distinct from program 'brokenpe'), got: {err_msg}"
         );
 
         // 3. PATHEXT order: .com (with MZ) before .exe (with MZ) before .bat before .cmd.

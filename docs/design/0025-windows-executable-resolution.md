@@ -5,7 +5,7 @@ Created: 2026-11-04    Updated: 2026-11-04
 
 ## Summary
 
-Validate Windows task executables in `resolve_windows_executable` (`crates/worker/src/runner.rs`) by requiring a Windows executable extension in `PATHEXT` order (`.com`, `.exe`, `.bat`, `.cmd`) and a 2-byte `MZ` header on `.com` and `.exe` files, keeping the Git-for-Windows-first search order for bare names, returning explicit paths unchanged when validation fails, and logging both skipped candidates (`debug!`) and the resolved path on `cmd.spawn()` failures.
+Validate Windows task executables in `resolve_windows_executable` (`crates/worker/src/runner.rs`) by requiring a Windows executable extension from the fixed list `[".com", ".exe", ".bat", ".cmd"]` (in `PATHEXT`'s default order) and a 2-byte `MZ` header on `.com` and `.exe` files, keeping the Git-for-Windows-first search order for bare names, returning explicit paths unchanged when validation fails, and logging both skipped candidates (`debug!`) and the resolved path on `cmd.spawn()` failures.
 
 ## Context
 
@@ -14,14 +14,14 @@ On Windows, `TaskRunner::execute_process_supervised` (`crates/worker/src/runner.
 | Area | Behaviour before this change | Code |
 |---|---|---|
 | Extensionless files in Git or `PATH` | `resolve_windows_executable` checked `for ext in &[".exe", ".cmd", ".bat", ""]` in `C:\Program Files\Git\usr\bin` and `C:\Program Files\Git\bin`, and `let candidate = dir.join(bare_name); if candidate.is_file()` in `effective_path`. Any extensionless file (`cmd`, `sh` wrapper, or data file) matching `bare_name` was selected and passed directly to `CreateProcessW`, failing with `os error 193` (`%1 is not a valid Win32 application`). | `crates/worker/src/runner.rs` |
-| 0-byte or non-PE `.exe` / `.com` stubs | `candidate.is_file()` accepted 0-byte app-execution-alias stubs and non-PE `.exe` files ahead of real system binaries on `PATH`, also failing `CreateProcessW` with `os error 193`. | `crates/worker/src/runner.rs` |
+| 0-byte or non-PE `.exe` / `.com` files | `candidate.is_file()` accepted 0-byte or non-PE `.exe` and `.com` files ahead of valid PE binaries on `PATH`, also failing `CreateProcessW` with `os error 193`. | `crates/worker/src/runner.rs` |
 | Silent refusal and opaque spawn errors | `cmd.spawn()` failure messages reported only the requested `'program'` name (`Failed to spawn process 'cmd': ...` and `Process spawn error: ...`), never the resolved path selected by `resolve_windows_executable`, and skipped candidates were not logged. | `crates/worker/src/runner.rs` |
 
-In Windows CI and full-suite runs, the `cmd /C` tests in `tests/blob_transfer_e2e.rs` (`test_input_directory_round_trip_and_second_submit_sends_nothing`, `test_output_patterns_never_follow_symlinked_parent_directories_or_steal_external_files`, `test_output_blobs_stay_pinned_for_delayed_client_download`, `test_output_blobs_can_be_evicted_after_output_pin_retention_expires`, `test_worker_pins_output_files_from_collection_through_upload`, and `cli::test_cli_submit_input_and_output_round_trip_with_dedup`) and `tests/cli_doctor_e2e.rs::test_doctor_passes_on_a_healthy_two_worker_cluster` (along with production `oxideswarm doctor` check C4 in `crates/cli/src/doctor.rs`) failed with `os error 193` when spawning `cmd /C ...`.
+In Windows CI runs (`workspace tests (windows-latest)`), 5 tests in `tests/blob_transfer_e2e.rs` (`test_input_directory_round_trip_and_second_submit_sends_nothing`, `test_output_patterns_never_follow_symlinked_parent_directories_or_steal_external_files`, `test_output_blobs_stay_pinned_for_delayed_client_download`, `test_output_blobs_can_be_evicted_after_output_pin_retention_expires`, and `cli::test_cli_submit_input_and_output_round_trip_with_dedup`) and `tests/cli_doctor_e2e.rs::test_doctor_passes_on_a_healthy_two_worker_cluster` (along with production `oxideswarm doctor` check C4 in `crates/cli/src/doctor.rs`) failed with `os error 193` when spawning `cmd /C ...`.
 
 ## Goals
 
-- **G1** Accept only files with a recognized Windows executable extension in standard `PATHEXT` order (`.com`, `.exe`, `.bat`, `.cmd`).
+- **G1** Accept only files with a recognized Windows executable extension from the fixed list `[".com", ".exe", ".bat", ".cmd"]` (in `PATHEXT`'s default order).
 - **G2** Verify that `.com` and `.exe` candidate files start with the 2-byte DOS/PE `MZ` signature (`[0x4D, 0x5A]`) before selecting them.
 - **G3** Preserve the search order for bare command names (`C:\Program Files\Git\usr\bin` and `C:\Program Files\Git\bin` first, then `effective_path`, then `std::process::Command` fallback) and never let an explicit path with a path separator fall through to a `PATH` lookup for its base name.
 - **G4** Emit a `tracing::debug!` event whenever an existing candidate file is skipped, and include `resolved_program` in both `stderr` and `result.error` when `cmd.spawn()` fails.
@@ -35,7 +35,7 @@ In Windows CI and full-suite runs, the `cmd /C` tests in `tests/blob_transfer_e2
 
 ### D1 Accepted extensions and `MZ` header check (`WINDOWS_EXEC_EXTS`, `is_valid_windows_executable`)
 
-1. `WINDOWS_EXEC_EXTS` is `[".com", ".exe", ".bat", ".cmd"]`, matching Windows `PATHEXT` precedence (`.COM;.EXE;.BAT;.CMD`).
+1. `WINDOWS_EXEC_EXTS` is the fixed list `[".com", ".exe", ".bat", ".cmd"]`, matching Windows `PATHEXT`'s default precedence (`.COM;.EXE;.BAT;.CMD`).
 2. `is_valid_windows_executable(path)` returns `false` immediately if `!path.is_file()`.
 3. If `path` exists as a file but its extension (case-insensitive ASCII) is not `com`, `exe`, `bat`, or `cmd`, `is_valid_windows_executable` logs `debug!(path = %path.display(), "Skipping Windows executable candidate without .com/.exe/.bat/.cmd extension")` and returns `false`.
 4. If the extension is `com` or `exe`, `is_valid_windows_executable` opens `path` and reads its first 2 bytes; if the read fails or the bytes are not `b"MZ"`, it logs `debug!(path = %path.display(), "Skipping Windows PE candidate without valid MZ header")` and returns `false`.
@@ -50,7 +50,7 @@ In Windows CI and full-suite runs, the `cmd /C` tests in `tests/blob_transfer_e2
 
 ### D3 Spawn failure diagnostics (`execute_process_supervised`)
 
-When `cmd.spawn()` returns `Err(e)` in `crates/worker/src/runner.rs`, `TaskResult::failure` records:
+When `cmd.spawn()` returns `Err(e)` in `crates/worker/src/runner.rs`, `TaskResult::failure` records on all platforms:
 - `stderr`: `Failed to spawn process '{program}' (resolved: '{resolved_program}'): {e}`
 - `error`: `Some(format!("Process spawn error for '{program}' (resolved: '{resolved_program}'): {e}"))`
 
@@ -58,8 +58,9 @@ Both strings preserve the `"Failed to spawn process '<program>'"` and `"Process 
 
 ## Compatibility
 
-- Wire protocol, CLI flags, and Unix worker behaviour are unchanged.
-- On Windows, tasks invoking bare commands (`cmd`, `powershell`, `sh`, `python`, `find`, `tar`) or explicit paths with or without an extension continue to work while skipping non-executable or corrupt stubs.
+- Wire protocol, CLI flags, and Unix command resolution are unchanged.
+- Spawn failure messages (`stderr` and `result.error` in `crates/worker/src/runner.rs`) now include `(resolved: '<resolved_program>')` on every platform; `crates/master/src/mapreduce.rs`'s substring checks (`"Failed to spawn process 'sh'"` and `"Process spawn error"`) still match the new text.
+- On Windows, tasks invoking bare commands (`cmd`, `powershell`, `sh`, `python`, `find`, `tar`) or explicit paths with or without an extension continue to work while skipping extensionless or non-`MZ` candidate files.
 
 ## Security
 
@@ -78,7 +79,7 @@ Both strings preserve the `"Failed to spawn process '<program>'"` and `"Process 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
 | W1 | Require `.com`/`.exe`/`.bat`/`.cmd` and `MZ` header in `resolve_windows_executable`, keep Git-first search order for bare names, and keep explicit paths from falling through to `PATH` | `crates/worker/src/runner.rs` | Unit tests and `blob_transfer_e2e` / `cli_doctor_e2e` pass on Windows | Implemented |
-| W2 | Log skipped candidates with `debug!` and include `resolved_program` in spawn failure messages | `crates/worker/src/runner.rs` | Spawn error unit test asserts `resolved_program` in `stderr` and `result.error` | Implemented |
+| W2 | Log skipped candidates with `debug!` and include `resolved_program` in spawn failure messages | `crates/worker/src/runner.rs` | Spawn error unit test asserts `resolved_program` in `stderr` and `result.error` when `program != resolved_program` | Implemented |
 | W3 | Add design record 0025 and update `README.md` and `CLAUDE.md` | `docs/design/0025-windows-executable-resolution.md`, `README.md`, `CLAUDE.md` | Hygiene checks pass | Implemented |
 
 ## Status log
