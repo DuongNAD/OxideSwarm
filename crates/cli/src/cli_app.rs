@@ -948,6 +948,7 @@ pub async fn run_cli() -> ExitCode {
     };
 
     let secret_opts = cli.secret_opts();
+    rusty_grid_core::mode::set_mode_runner_hook(crate::mode_cli::execute_mode_action);
     match cli.command {
         Commands::Master(args) => run_master(args, config_file, secret_opts).await,
         Commands::Worker(args) => run_worker(args, config_file, secret_opts).await,
