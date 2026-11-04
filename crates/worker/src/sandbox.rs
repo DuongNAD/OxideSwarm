@@ -170,41 +170,63 @@ pub struct SandboxConfig {
     pub base_dir: PathBuf,
     /// If true, sandbox directories are preserved after task completion for debugging.
     pub keep_sandboxes: bool,
+    /// The `<temp>/rusty_grid-<euid>` directory that holds the default base on Unix and must stay
+    /// private to this user (design 0021). `None` for a directory the operator named, which is
+    /// used as given. Checked only while `base_dir` lies inside it.
+    private_root: Option<PathBuf>,
 }
 
 /// Where task sandboxes go when nothing names a directory explicitly, in order of precedence:
 ///
 /// 1. `RUSTY_GRID_SANDBOX_BASE_DIR` (used as the base directory itself),
-/// 2. `<TMPDIR>/rusty_grid/sandboxes`,
-/// 3. `<platform temp dir>/rusty_grid/sandboxes`.
+/// 2. `<TMPDIR>/<root>/sandboxes`,
+/// 3. `<platform temp dir>/<root>/sandboxes`,
 ///
-/// An explicit directory (`SandboxConfig::new`, `WorkerConfig::with_sandbox_base_dir`, the
-/// `--sandbox-base-dir` flag) outranks all three. `env` looks a variable up and `platform_temp` is
-/// the platform's temp dir; both are parameters so the order can be tested without touching the
-/// process environment. Empty variables count as unset.
+/// where `<root>` is `rusty_grid-<euid>` on Unix (one per user, see design 0021) and `rusty_grid`
+/// on other systems. An explicit directory (`SandboxConfig::new`,
+/// `WorkerConfig::with_sandbox_base_dir`, the `--sandbox-base-dir` flag) outranks all three. `env`
+/// looks a variable up and `platform_temp` is the platform's temp dir; both are parameters so the
+/// order can be tested without touching the process environment. Empty variables count as unset.
 pub fn resolve_default_base_dir(
     env: impl Fn(&str) -> Option<String>,
     platform_temp: PathBuf,
 ) -> PathBuf {
+    default_base(env, platform_temp).0
+}
+
+/// Name of the directory inside the temp dir that holds the default base. On Unix it carries the
+/// effective user id, so the users of one host never share it.
+fn default_root_name() -> String {
+    #[cfg(unix)]
+    {
+        format!("rusty_grid-{}", current_euid())
+    }
+    #[cfg(not(unix))]
+    {
+        "rusty_grid".to_string()
+    }
+}
+
+/// [`resolve_default_base_dir`] plus the private root to check: `<temp>/rusty_grid-<euid>` on
+/// Unix, `None` on other systems and when `RUSTY_GRID_SANDBOX_BASE_DIR` names the base.
+fn default_base(
+    env: impl Fn(&str) -> Option<String>,
+    platform_temp: PathBuf,
+) -> (PathBuf, Option<PathBuf>) {
     let non_empty = |name: &str| env(name).filter(|v| !v.trim().is_empty());
     if let Some(dir) = non_empty(SANDBOX_BASE_DIR_ENV) {
-        return PathBuf::from(dir);
+        return (PathBuf::from(dir), None);
     }
     let temp = non_empty("TMPDIR")
         .map(PathBuf::from)
         .unwrap_or(platform_temp);
-    temp.join("rusty_grid").join("sandboxes")
+    let root = temp.join(default_root_name());
+    (root.join("sandboxes"), cfg!(unix).then_some(root))
 }
 
 impl Default for SandboxConfig {
     fn default() -> Self {
-        Self {
-            base_dir: resolve_default_base_dir(
-                |name| std::env::var(name).ok(),
-                std::env::temp_dir(),
-            ),
-            keep_sandboxes: false,
-        }
+        Self::from_env(|name| std::env::var(name).ok(), std::env::temp_dir())
     }
 }
 
@@ -213,6 +235,25 @@ impl SandboxConfig {
         Self {
             base_dir: base_dir.into(),
             keep_sandboxes: false,
+            private_root: None,
+        }
+    }
+
+    /// The default configuration as if `TMPDIR` named `temp_dir`: base
+    /// `<temp_dir>/rusty_grid-<euid>/sandboxes` on Unix, with its private root (design 0021). For
+    /// callers and tests that choose the temp dir themselves.
+    pub fn default_under(temp_dir: impl Into<PathBuf>) -> Self {
+        Self::from_env(|_| None, temp_dir.into())
+    }
+
+    /// The default configuration for an environment lookup and a platform temp dir (see
+    /// [`resolve_default_base_dir`]); parameters so tests need not touch the process environment.
+    pub(crate) fn from_env(env: impl Fn(&str) -> Option<String>, platform_temp: PathBuf) -> Self {
+        let (base_dir, private_root) = default_base(env, platform_temp);
+        Self {
+            base_dir,
+            keep_sandboxes: false,
+            private_root,
         }
     }
 
@@ -226,10 +267,15 @@ impl SandboxConfig {
     /// directory the process may not write to (on Android the default `/data/local/tmp` is closed
     /// to apps) is one clear error instead of a failure of every process task.
     ///
+    /// For the default base on Unix it first creates the private root (`<temp>/rusty_grid-<euid>`,
+    /// mode 700) and refuses one another local user could change (`SandboxError::BaseDirUnsafe`,
+    /// design 0021).
+    ///
     /// Also removes legacy `<base_dir>/cache/objects` and `<base_dir>/cache/tmp` directories left
     /// behind by older worker builds, logging a warning if removal fails and leaving
     /// `<base_dir>/cache/blobs` untouched.
     pub async fn ensure_usable(&self) -> Result<(), SandboxError> {
+        self.ensure_private_root().await?;
         let unusable = |source: std::io::Error| SandboxError::BaseDirUnusable {
             path: self.base_dir.clone(),
             source,
@@ -248,6 +294,40 @@ impl SandboxConfig {
         Ok(())
     }
 
+    /// Creates and checks the private root of the default base (see `ensure_private_dir`) while
+    /// `base_dir` lies inside it, and does nothing for a directory the operator named. Call it
+    /// before anything touches the base: `WorkerClient` does when a task is assigned and again
+    /// before it fetches the task's input files, and `Sandbox::create` does too (design 0021).
+    pub async fn ensure_private_root(&self) -> Result<(), SandboxError> {
+        let Some(root) = self.checked_private_root().map(Path::to_path_buf) else {
+            return Ok(());
+        };
+        let path = root.clone();
+        tokio::task::spawn_blocking(move || ensure_private_dir(&root))
+            .await
+            .unwrap_or_else(|e| {
+                Err(SandboxError::BaseDirUnusable {
+                    path,
+                    source: std::io::Error::other(e.to_string()),
+                })
+            })
+    }
+
+    /// `ensure_private_root` without a runtime, for a caller that must answer synchronously (the
+    /// Android bridge's start check).
+    pub fn ensure_private_root_blocking(&self) -> Result<(), SandboxError> {
+        match self.checked_private_root() {
+            Some(root) => ensure_private_dir(root),
+            None => Ok(()),
+        }
+    }
+
+    fn checked_private_root(&self) -> Option<&Path> {
+        self.private_root
+            .as_deref()
+            .filter(|root| self.base_dir.starts_with(root))
+    }
+
     /// Removes legacy `<base_dir>/cache/objects` and `<base_dir>/cache/tmp` directories left
     /// behind by older worker builds.
     ///
@@ -263,9 +343,7 @@ impl SandboxConfig {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                // SAFETY: `geteuid()` is thread-safe and has no preconditions.
-                let current_euid = unsafe { libc::geteuid() };
-                if meta.uid() != current_euid {
+                if meta.uid() != current_euid() {
                     return false;
                 }
             }
@@ -396,6 +474,127 @@ pub enum SandboxError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error(
+        "Task sandboxes cannot use '{}' safely: {reason}, so another local user could swap task \
+         files there. {remedy}, or point the worker at a private directory with \
+         --sandbox-base-dir or RUSTY_GRID_SANDBOX_BASE_DIR",
+        path.display()
+    )]
+    BaseDirUnsafe {
+        path: PathBuf,
+        reason: String,
+        remedy: String,
+    },
+}
+
+/// Effective user id of the worker process.
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    // SAFETY: `geteuid()` is thread-safe and has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+/// Creates `root` with mode 700 if it is missing and refuses it, as
+/// `SandboxError::BaseDirUnsafe`, when another local user could change what is inside it
+/// (design 0021): see `parent_refusal` and `root_refusal`. The mode of an existing `root` is never
+/// changed, because another user may already have put links into one that was open. Does nothing
+/// on systems without Unix modes.
+fn ensure_private_dir(root: &Path) -> Result<(), SandboxError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let unusable = |source: std::io::Error| SandboxError::BaseDirUnusable {
+            path: root.to_path_buf(),
+            source,
+        };
+        let euid = current_euid();
+
+        if let Some(parent) = root.parent() {
+            std::fs::create_dir_all(parent).map_err(unusable)?;
+            let meta = std::fs::metadata(parent).map_err(unusable)?;
+            if let Some(reason) = parent_refusal(&meta, euid) {
+                return Err(SandboxError::BaseDirUnsafe {
+                    path: parent.to_path_buf(),
+                    reason,
+                    remedy: "Set TMPDIR to a directory only this user can write, or add the \
+                             sticky bit to this one"
+                        .to_string(),
+                });
+            }
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(root) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(unusable(e)),
+        }
+        let meta = std::fs::symlink_metadata(root).map_err(unusable)?;
+        match root_refusal(&meta, euid) {
+            Some(reason) => Err(SandboxError::BaseDirUnsafe {
+                path: root.to_path_buf(),
+                reason,
+                remedy: "Remove it (this may need its owner or root)".to_string(),
+            }),
+            None => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        Ok(())
+    }
+}
+
+/// Why the temp dir that holds the private root (`meta` following links) is unsafe for the user
+/// `euid`: it belongs to a user other than root or `euid`, or group or others may write it without
+/// the sticky bit. Either way another user could rename the root away and put their own in its
+/// place.
+#[cfg(unix)]
+fn parent_refusal(meta: &std::fs::Metadata, euid: u32) -> Option<String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if meta.uid() != 0 && meta.uid() != euid {
+        return Some(format!(
+            "it holds the private sandbox root but belongs to user {}",
+            meta.uid()
+        ));
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Some(format!(
+            "it holds the private sandbox root, but its mode is {:o}: writable by other users, \
+             without the sticky bit",
+            mode & 0o7777
+        ));
+    }
+    None
+}
+
+/// Why the private root (`meta` from `symlink_metadata`) is unsafe for the user `euid`: it is a
+/// symbolic link, is not a directory, belongs to another user, or has a group or other permission
+/// bit.
+#[cfg(unix)]
+fn root_refusal(meta: &std::fs::Metadata, euid: u32) -> Option<String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if meta.file_type().is_symlink() {
+        return Some("it is a symbolic link".to_string());
+    }
+    if !meta.is_dir() {
+        return Some("it is not a directory".to_string());
+    }
+    if meta.uid() != euid {
+        return Some(format!(
+            "it belongs to user {}, not to user {euid} that runs this worker",
+            meta.uid()
+        ));
+    }
+    let mode = meta.permissions().mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        return Some(format!(
+            "its mode is {mode:o}: other users can enter it (it must be 700)"
+        ));
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -419,7 +618,12 @@ pub struct Sandbox {
 
 impl Sandbox {
     /// Creates and initializes a private directory `<base_dir>/<task_id>` with 0o700 permissions.
+    ///
+    /// For the default base on Unix the private root is checked again first, because a temp
+    /// cleaner may have removed it since start-up and another user may have created one
+    /// (design 0021).
     pub async fn create(config: &SandboxConfig, task_id: TaskId) -> Result<Self, SandboxError> {
+        config.ensure_private_root().await?;
         let path = config.base_dir.join(task_id.to_string());
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             return Err(SandboxError::AlreadyExists {
@@ -767,7 +971,17 @@ mod tests {
     #[test]
     fn test_default_base_dir_resolution_order() {
         let platform = PathBuf::from("/platform/tmp");
-        let nested = |root: &str| PathBuf::from(root).join("rusty_grid").join("sandboxes");
+        let nested = |root: &str| {
+            PathBuf::from(root)
+                .join(default_root_name())
+                .join("sandboxes")
+        };
+        #[cfg(unix)]
+        assert_eq!(
+            default_root_name(),
+            format!("rusty_grid-{}", current_euid()),
+            "one default root per user"
+        );
 
         // 3. nothing set: the platform temp dir
         assert_eq!(
@@ -848,6 +1062,259 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A default configuration whose temp dir is a fresh directory below the platform temp dir,
+    /// as `TMPDIR` would give it. Returns the temp dir, the private root and the configuration.
+    #[cfg(unix)]
+    fn default_config_in_fresh_temp() -> (PathBuf, PathBuf, SandboxConfig) {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = std::env::temp_dir().join(format!("test_sb_temp_{}", TaskId::new()));
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = SandboxConfig::from_env(
+            lookup(&[("TMPDIR", temp.to_str().unwrap())]),
+            PathBuf::from("/unused/platform/tmp"),
+        );
+        let root = temp.join(default_root_name());
+        (temp, root, config)
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn assert_unsafe(err: SandboxError, dir: &Path, reason_part: &str) {
+        let text = err.to_string();
+        assert!(
+            matches!(&err, SandboxError::BaseDirUnsafe { path, reason, .. }
+                if path == dir && reason.contains(reason_part)),
+            "expected BaseDirUnsafe for {} containing {reason_part:?}, got {err:?}",
+            dir.display()
+        );
+        assert!(
+            text.contains(&dir.display().to_string())
+                && text.contains("--sandbox-base-dir")
+                && text.contains("RUSTY_GRID_SANDBOX_BASE_DIR"),
+            "the message must name the directory and say how to fix it: {text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_default_base_is_created_private() {
+        let (temp, root, config) = default_config_in_fresh_temp();
+        assert_eq!(config.base_dir, root.join("sandboxes"));
+
+        config
+            .ensure_usable()
+            .await
+            .expect("a fresh private root is usable");
+        assert_eq!(
+            mode_of(&root),
+            0o700,
+            "the private root must be created 700"
+        );
+        assert!(config.base_dir.is_dir());
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_default_base_refuses_an_open_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, root, config) = default_config_in_fresh_temp();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = config.ensure_usable().await.expect_err("mode 755 is open");
+        assert_unsafe(err, &root, "mode is 755");
+        assert_eq!(mode_of(&root), 0o755, "the worker must not change the mode");
+        assert!(!config.base_dir.exists(), "nothing may be created inside");
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_default_base_refuses_a_symlinked_root() {
+        let (temp, root, config) = default_config_in_fresh_temp();
+        let elsewhere = temp.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
+
+        let err = config.ensure_usable().await.expect_err("a link is refused");
+        assert_unsafe(err, &root, "symbolic link");
+        assert_eq!(
+            std::fs::read_dir(&elsewhere).unwrap().count(),
+            0,
+            "nothing may be created behind the link"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_default_base_refuses_a_root_that_is_a_file() {
+        let (temp, root, config) = default_config_in_fresh_temp();
+        std::fs::write(&root, b"x").unwrap();
+
+        let err = config.ensure_usable().await.expect_err("a file is refused");
+        assert_unsafe(err, &root, "not a directory");
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_default_base_refuses_a_root_or_temp_dir_owned_by_another_user() {
+        let (temp, root, config) = default_config_in_fresh_temp();
+        config.ensure_usable().await.expect("usable");
+        // Both directories belong to the test's user. Checking them for any other user stands in
+        // for directories that another user created.
+        let euid = current_euid();
+        let other = euid.wrapping_add(1);
+
+        let root_meta = std::fs::symlink_metadata(&root).unwrap();
+        assert_eq!(root_refusal(&root_meta, euid), None);
+        let reason = root_refusal(&root_meta, other).expect("a root of another user is refused");
+        assert!(
+            reason.contains(&format!("belongs to user {euid}")),
+            "{reason}"
+        );
+
+        let temp_meta = std::fs::metadata(&temp).unwrap();
+        assert_eq!(parent_refusal(&temp_meta, euid), None);
+        // Run as root, the temp dir belongs to root, which every user may rely on.
+        if euid != 0 {
+            let reason =
+                parent_refusal(&temp_meta, other).expect("a temp dir of another user is refused");
+            assert!(
+                reason.contains(&format!("belongs to user {euid}")),
+                "{reason}"
+            );
+        }
+        // A temp dir that belongs to root, such as /tmp, is fine for every user.
+        let slash_meta = std::fs::metadata("/").unwrap();
+        assert_eq!(parent_refusal(&slash_meta, other), None);
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_default_base_refuses_an_open_temp_dir_without_sticky_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, root, config) = default_config_in_fresh_temp();
+
+        // Writable by others, or by the group only: both could rename the root away.
+        for mode in [0o777, 0o770] {
+            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = config
+                .ensure_usable()
+                .await
+                .expect_err("others could rename the root away");
+            assert_unsafe(err, &temp, &format!("mode is {mode:o}"));
+            assert!(!root.exists(), "nothing may be created there");
+        }
+
+        // The sticky bit keeps others from renaming entries they do not own, as in /tmp.
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        config
+            .ensure_usable()
+            .await
+            .expect("a sticky temp dir like /tmp is fine");
+        assert_eq!(mode_of(&root), 0o700);
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_sandbox_create_rechecks_the_private_root() {
+        let (temp, root, config) = default_config_in_fresh_temp();
+        config.ensure_usable().await.expect("usable at start-up");
+
+        // A temp cleaner removed the root after start-up: the next sandbox creates it again, private.
+        std::fs::remove_dir_all(&root).unwrap();
+        let mut sandbox = Sandbox::create(&config, TaskId::new())
+            .await
+            .expect("a removed root is created again");
+        assert_eq!(mode_of(&root), 0o700);
+        sandbox.destroy().await.unwrap();
+
+        // Another user put their own directory there (a link stands in for it): no sandbox.
+        std::fs::remove_dir_all(&root).unwrap();
+        let elsewhere = temp.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
+        let err = match Sandbox::create(&config, TaskId::new()).await {
+            Ok(_) => panic!("a sandbox must not be created behind a replaced root"),
+            Err(err) => err,
+        };
+        assert_unsafe(err, &root, "symbolic link");
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_explicit_base_dir_is_used_as_given() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("test_sb_explicit_{}", TaskId::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        // Named by the operator: no private-root check, as before design 0021.
+        let config = SandboxConfig::new(&dir);
+        config
+            .ensure_usable()
+            .await
+            .expect("an explicit directory is used as given");
+        let mut sandbox = Sandbox::create(&config, TaskId::new()).await.unwrap();
+        sandbox.destroy().await.unwrap();
+
+        // A default configuration whose base was replaced by another directory skips the check too.
+        let (temp, root, mut default_config) = default_config_in_fresh_temp();
+        default_config.base_dir = dir.clone();
+        default_config
+            .ensure_usable()
+            .await
+            .expect("the private root applies only while the base lies inside it");
+        assert!(
+            !root.exists(),
+            "the unused private root must not be created"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_base_from_the_variable_has_no_private_root() {
+        let config = SandboxConfig::from_env(
+            lookup(&[("TMPDIR", "/tmp/x"), (SANDBOX_BASE_DIR_ENV, "/big/disk/sb")]),
+            PathBuf::from("/platform/tmp"),
+        );
+        assert_eq!(config.base_dir, PathBuf::from("/big/disk/sb"));
+        assert_eq!(config.private_root, None);
+        assert_eq!(SandboxConfig::new("/srv/sb").private_root, None);
+        #[cfg(unix)]
+        assert_eq!(
+            SandboxConfig::from_env(lookup(&[("TMPDIR", "/tmp/x")]), PathBuf::from("/p"))
+                .private_root,
+            Some(PathBuf::from("/tmp/x").join(default_root_name()))
+        );
     }
 
     #[tokio::test]

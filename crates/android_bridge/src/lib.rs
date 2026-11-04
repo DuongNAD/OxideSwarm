@@ -8,7 +8,7 @@
 //! Running in-process produces 0 child processes for the worker loop itself, ensuring immunity
 //! against the Android 12+ Phantom Process Killer (PPK) and W^X execution restrictions.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -140,8 +140,11 @@ pub fn set_cluster_secret_impl(secret_text: &str) -> bool {
 
 /// Same check as the worker's own start-up check (`SandboxConfig::ensure_usable`), without a
 /// runtime: `start_worker_impl` has to answer the app synchronously, and may itself be called
-/// from inside one.
-fn check_sandbox_usable(base_dir: &Path) -> Result<(), SandboxError> {
+/// from inside one. For the default base it first creates the private root with mode 700
+/// (design 0021); the app's cache directory is used as given.
+fn check_sandbox_usable(sandbox: &SandboxConfig) -> Result<(), SandboxError> {
+    sandbox.ensure_private_root_blocking()?;
+    let base_dir = &sandbox.base_dir;
     let unusable = |source: std::io::Error| SandboxError::BaseDirUnusable {
         path: base_dir.to_path_buf(),
         source,
@@ -204,11 +207,11 @@ pub fn start_worker_impl(
     // The worker refuses to run without a writable sandbox directory (every process task would
     // fail otherwise); say so here, where the app can show it, instead of from a thread that
     // exits unnoticed.
-    let sandbox_base = config
-        .sandbox_base_dir
-        .clone()
-        .unwrap_or_else(|| SandboxConfig::default().base_dir);
-    if let Err(e) = check_sandbox_usable(&sandbox_base) {
+    let sandbox = match config.sandbox_base_dir.clone() {
+        Some(dir) => SandboxConfig::new(dir),
+        None => SandboxConfig::default(),
+    };
+    if let Err(e) = check_sandbox_usable(&sandbox) {
         error!(error = %e, "Android worker cannot start: task sandboxes cannot be created");
         *state.status.lock().unwrap() = format!("ERROR: {e}");
         return false;
@@ -959,6 +962,30 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Design 0021: when the app names no sandbox directory, the bridge's check creates the
+    /// default private root with mode 700 itself, so the worker's own check accepts it. Without
+    /// `ensure_private_root_blocking`, `create_dir_all` would leave the umask mode (755 under the
+    /// usual 022) and the worker would refuse the root for good.
+    #[cfg(unix)]
+    #[test]
+    fn test_bridge_check_creates_the_default_private_root_with_mode_700() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxConfig::default_under(temp.path());
+        check_sandbox_usable(&sandbox).expect("the bridge check passes");
+        let root = sandbox.base_dir.parent().unwrap();
+        let mode = std::fs::symlink_metadata(root)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o700, "root {} has mode {mode:o}", root.display());
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(sandbox.ensure_usable())
+            .expect("the worker's own check accepts what the bridge created");
+    }
 
     static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
