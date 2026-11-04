@@ -501,6 +501,16 @@ if (Test-Path $destWorkerBin) {
     }
 }
 
+# Deploy 3D subsystem driver scripts (engines/) into $InstallDir\engines so the service can locate them outside a repo checkout
+$sourceEnginesDir = Join-Path $PSScriptRoot "..\..\engines"
+$destEnginesDir   = Join-Path $InstallDir "engines"
+$gen3dScriptPath  = Join-Path $destEnginesDir "generative_3d\entrypoint.py"
+if (Test-Path $sourceEnginesDir) {
+    New-Item -ItemType Directory -Path $destEnginesDir -Force | Out-Null
+    Copy-Item -Path (Join-Path $sourceEnginesDir "*") -Destination $destEnginesDir -Recurse -Force
+    Write-Host "[OK] Deployed 3D engine scripts to: $destEnginesDir" -ForegroundColor Green
+}
+
 # ==============================================================================
 # 7. Generate Configuration File (rusty-grid.toml) and install the cluster secret
 # ==============================================================================
@@ -639,6 +649,7 @@ if ($ServiceMethod -eq "WinSW") {
             $xmlDoc.Save($serviceXmlPath)
         } else {
             # Generate XML directly
+            $gen3dEnvLine = if (Test-Path $gen3dScriptPath) { "`r`n  <env name=`"OXIDESWARM_GEN3D_SCRIPT`" value=`"$gen3dScriptPath`" />" } else { "" }
             $xmlContent = @"
 <service>
   <id>$ServiceName</id>
@@ -661,7 +672,7 @@ if ($ServiceMethod -eq "WinSW") {
     <sizeThreshold>10240</sizeThreshold>
     <keepFiles>5</keepFiles>
   </log>
-  <env name="RUST_LOG" value="info" />
+  <env name="RUST_LOG" value="info" />$gen3dEnvLine
 </service>
 "@
             [System.IO.File]::WriteAllText($serviceXmlPath, $xmlContent, (New-Object System.Text.UTF8Encoding($false)))
