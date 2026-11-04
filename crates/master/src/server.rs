@@ -3073,7 +3073,7 @@ where
         Ok(Err(ProtocolError::InvalidFormatTag(WIRE_FORMAT_AUTH))) if cluster_secret.is_none() => {
             warn!(remote = %peer, lane, "Peer attempted cluster authentication but this master has no cluster secret configured; rejecting");
             let _ = tokio::time::timeout(
-                Duration::from_secs(1),
+                REFUSAL_DRAIN_TIMEOUT,
                 send_reject(transport, REJECT_NO_SECRET),
             )
             .await;
@@ -3180,6 +3180,60 @@ fn reject_master_role_claim(
         task_queue_snapshot: Vec::new(),
         connected_workers: Vec::new(),
     }
+}
+
+/// Maximum time the master spends writing a handshake refusal, finishing the control send stream,
+/// and waiting for the peer to close the QUIC connection before dropping it (`BUG-17`).
+const REFUSAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+async fn finish_and_wait_for_peer_close<T: AsyncRead + AsyncWrite + Unpin>(
+    transport: &mut MessageTransport<T>,
+    #[cfg(feature = "p2p")] p2p_conn: Option<&iroh::endpoint::Connection>,
+) {
+    let _ = tokio::io::AsyncWriteExt::shutdown(transport.get_mut()).await;
+    #[cfg(feature = "p2p")]
+    if let Some(conn) = p2p_conn {
+        conn.closed().await;
+    }
+}
+
+/// Finishes the control send stream after an authentication `REJECT` frame has been written and
+/// waits up to [`REFUSAL_DRAIN_TIMEOUT`] for the peer to close the QUIC connection (`BUG-17`).
+async fn drain_refusal_stream<T: AsyncRead + AsyncWrite + Unpin>(
+    transport: &mut MessageTransport<T>,
+    #[cfg(feature = "p2p")] p2p_conn: Option<&iroh::endpoint::Connection>,
+) {
+    let _ = tokio::time::timeout(
+        REFUSAL_DRAIN_TIMEOUT,
+        finish_and_wait_for_peer_close(
+            transport,
+            #[cfg(feature = "p2p")]
+            p2p_conn,
+        ),
+    )
+    .await;
+}
+
+/// Sends a handshake refusal message (`RegisterAck { accepted: false, .. }` or
+/// `RoleHandoverAck { accepted: false, .. }`), finishes the control send stream, and waits up to
+/// [`REFUSAL_DRAIN_TIMEOUT`] (`1 s`) in total for the peer to close before dropping the QUIC
+/// connection handle (`BUG-17`).
+async fn send_refusal_and_drain<T: AsyncRead + AsyncWrite + Unpin>(
+    transport: &mut MessageTransport<T>,
+    msg: &MasterMessage,
+    #[cfg(feature = "p2p")] p2p_conn: Option<&iroh::endpoint::Connection>,
+) {
+    let _ = tokio::time::timeout(REFUSAL_DRAIN_TIMEOUT, async {
+        if transport.send_msg(msg).await.is_ok() {
+            finish_and_wait_for_peer_close(
+                transport,
+                #[cfg(feature = "p2p")]
+                p2p_conn,
+            )
+            .await;
+        }
+    })
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3714,15 +3768,29 @@ async fn handle_multiplexed_connection<
     let peer_label = remote_addr.to_string();
 
     // 1. Cluster authentication + handshake on the control stream (Slowloris defense)
-    let (first_msg, detected_codec) = authenticate_and_read_first_message(
+    let first_res = authenticate_and_read_first_message(
         &mut ctrl_transport,
         &peer_label,
         cluster_secret.as_ref(),
         handshake_timeout,
         "control stream",
     )
-    .await?;
+    .await;
     drop(handshake_permit);
+    let (first_msg, detected_codec) = match first_res {
+        Ok(pair) => pair,
+        Err(e) => {
+            if matches!(e, GridError::AuthFailed(_) | GridError::AuthRequired(_)) {
+                drain_refusal_stream(
+                    &mut ctrl_transport,
+                    #[cfg(feature = "p2p")]
+                    p2p_conn.as_ref(),
+                )
+                .await;
+            }
+            return Err(e);
+        }
+    };
 
     if wire_codec == WireCodec::Bincode {
         ctrl_transport.set_outbound_codec(detected_codec);
@@ -3757,7 +3825,13 @@ async fn handle_multiplexed_connection<
                         "Incompatible protocol version {protocol_version} (minimum required: {PROTOCOL_VERSION_MIN_COMPATIBLE})"
                     )),
                 };
-                let _ = ctrl_transport.send_msg(&reject_ack).await;
+                send_refusal_and_drain(
+                    &mut ctrl_transport,
+                    &reject_ack,
+                    #[cfg(feature = "p2p")]
+                    p2p_conn.as_ref(),
+                )
+                .await;
                 return Err(GridError::RegistrationRejected(format!(
                     "Incompatible protocol version {protocol_version}"
                 )));
@@ -3771,7 +3845,13 @@ async fn handle_multiplexed_connection<
                     features: ProtocolCapabilities::empty(),
                     message: Some("Invalid capability: cpu_cores must be > 0".into()),
                 };
-                let _ = ctrl_transport.send_msg(&reject_ack).await;
+                send_refusal_and_drain(
+                    &mut ctrl_transport,
+                    &reject_ack,
+                    #[cfg(feature = "p2p")]
+                    p2p_conn.as_ref(),
+                )
+                .await;
                 return Err(GridError::RegistrationRejected(
                     "cpu_cores must be > 0".into(),
                 ));
@@ -3780,7 +3860,13 @@ async fn handle_multiplexed_connection<
         }
         WorkerMessage::ClaimMasterRole { ticket } => {
             let ack = reject_master_role_claim(&ticket);
-            let _ = ctrl_transport.send_msg(&ack).await;
+            send_refusal_and_drain(
+                &mut ctrl_transport,
+                &ack,
+                #[cfg(feature = "p2p")]
+                p2p_conn.as_ref(),
+            )
+            .await;
             return Ok(());
         }
         other => {
@@ -3795,7 +3881,13 @@ async fn handle_multiplexed_connection<
                     other.variant_name()
                 )),
             };
-            let _ = ctrl_transport.send_msg(&reject_ack).await;
+            send_refusal_and_drain(
+                &mut ctrl_transport,
+                &reject_ack,
+                #[cfg(feature = "p2p")]
+                p2p_conn.as_ref(),
+            )
+            .await;
             return Err(GridError::HandshakeFailed(format!(
                 "Expected Register message, received {}",
                 other.variant_name()
@@ -5958,6 +6050,7 @@ mod tests {
                         "post-queue mux handshake ClaimMasterRole must receive RoleHandoverAck",
                     );
                 assert_refused_ack(ack, "post-queue multiplexed handshake");
+                drop(ctrl_transport);
                 mux_hs_task.await.unwrap().unwrap();
                 assert!(
                     registry.list_workers().await.is_empty(),
@@ -6375,5 +6468,531 @@ mod tests {
         );
         assert!(matches!(data_msg, MasterMessage::AssignTask { .. }));
         mux_task2.abort();
+    }
+
+    #[cfg(feature = "p2p")]
+    #[tokio::test]
+    async fn test_p2p_handshake_refusals_delivered_over_real_iroh() {
+        use iroh::endpoint::presets::Minimal;
+        use iroh::endpoint::{QuicTransportConfig, RelayMode, VarInt};
+        use rusty_grid_core::arbitrage::{MasterLeaseTicket, LEASE_VALIDITY_DURATION_MS};
+        use rusty_grid_core::cluster_auth::{
+            client_handshake, ClusterSecret, AUTH_VERSION, REJECT_NO_SECRET, WIRE_FORMAT_AUTH,
+        };
+        use rusty_grid_core::protocol::EndpointRole;
+        use rusty_grid_core::transport::{BiStream, GRID_ALPN, STREAM_CONTROL, STREAM_DATA};
+
+        let test_secret = ClusterSecret::generate().unwrap();
+        let signing_secret = test_secret.clone();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let claim_ticket = MasterLeaseTicket::issue(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            10,
+            9500,
+            now_ms,
+            Duration::from_millis(LEASE_VALIDITY_DURATION_MS),
+            &signing_secret,
+        );
+
+        for secret in [None, Some(test_secret.clone())] {
+            let mut cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
+            cfg.cluster_secret = secret.clone();
+            let mut server = MasterServer::bind(cfg, WorkerRegistry::new())
+                .await
+                .unwrap();
+            let master_ep = iroh::Endpoint::builder(Minimal)
+                .relay_mode(RelayMode::Disabled)
+                .alpns(vec![GRID_ALPN.to_vec()])
+                .bind()
+                .await
+                .unwrap();
+            let master_addr = master_ep.addr();
+            server.p2p_endpoint = Some(master_ep.clone());
+
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            let server_task = tokio::spawn(server.run(stop_rx));
+
+            let client_ep = iroh::Endpoint::builder(Minimal)
+                .relay_mode(RelayMode::Disabled)
+                .alpns(vec![GRID_ALPN.to_vec()])
+                .bind()
+                .await
+                .unwrap();
+
+            let open_raw_ctrl = || async {
+                let conn = client_ep
+                    .connect(master_addr.clone(), GRID_ALPN)
+                    .await
+                    .expect("connect to master over loopback iroh");
+                let (mut ctrl_send, ctrl_recv) = conn.open_bi().await.expect("open ctrl bi");
+                ctrl_send.write_all(&[STREAM_CONTROL]).await.unwrap();
+                let (mut data_send, data_recv) = conn.open_bi().await.expect("open data bi");
+                data_send.write_all(&[STREAM_DATA]).await.unwrap();
+                let transport =
+                    MessageTransport::new(GridStream::P2p(BiStream::new(ctrl_recv, ctrl_send)));
+                (transport, (conn, data_send, data_recv))
+            };
+
+            let open_ctrl = || async {
+                let (mut transport, keep) = open_raw_ctrl().await;
+                if let Some(ref sec) = secret {
+                    let key = client_handshake(&mut transport, sec)
+                        .await
+                        .expect("client handshake over iroh");
+                    transport.enable_encryption(&key, EndpointRole::Client);
+                }
+                (transport, keep)
+            };
+
+            for half_close in [false, true] {
+                for iter in 0..8 {
+                    // 1. ClaimMasterRole refusal on the P2P handshake path.
+                    let (mut ctrl, keep) = open_ctrl().await;
+                    ctrl.send_msg(&WorkerMessage::ClaimMasterRole {
+                        ticket: claim_ticket.clone(),
+                    })
+                    .await
+                    .unwrap();
+                    if half_close {
+                        tokio::io::AsyncWriteExt::shutdown(ctrl.get_mut())
+                            .await
+                            .unwrap();
+                    }
+                    let claim_reply = ctrl
+                        .recv_msg::<MasterMessage>()
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "iter {iter} (secret={}, half_close={half_close}): ClaimMasterRole refusal read failed: {e}",
+                                secret.is_some()
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "iter {iter} (secret={}, half_close={half_close}): ClaimMasterRole refusal stream closed before frame arrived",
+                                secret.is_some()
+                            )
+                        });
+                    match claim_reply {
+                        MasterMessage::RoleHandoverAck {
+                            accepted: false,
+                            ref reason,
+                            ref task_queue_snapshot,
+                            ref connected_workers,
+                        } => {
+                            assert!(reason.is_some());
+                            assert!(task_queue_snapshot.is_empty());
+                            assert!(connected_workers.is_empty());
+                        }
+                        other => panic!("expected refused RoleHandoverAck, got {other:?}"),
+                    }
+                    assert!(
+                        ctrl.recv_msg::<MasterMessage>().await.unwrap().is_none(),
+                        "master must finish the control send stream after ClaimMasterRole refusal"
+                    );
+                    keep.0.close(0u32.into(), b"done");
+
+                    // 2. RegisterAck { accepted: false } refusal (cpu_cores == 0) on the P2P handshake path.
+                    let (mut ctrl_reg, keep_reg) = open_ctrl().await;
+                    ctrl_reg
+                        .send_msg(&WorkerMessage::Register {
+                            worker_id: Uuid::new_v4(),
+                            capabilities: WorkerCapabilities::new(
+                                "zero-core-worker",
+                                0,
+                                2048,
+                                false,
+                                false,
+                                None,
+                            ),
+                            protocol_version: PROTOCOL_VERSION_CURRENT,
+                            features: ProtocolCapabilities::all_supported(),
+                        })
+                        .await
+                        .unwrap();
+                    if half_close {
+                        tokio::io::AsyncWriteExt::shutdown(ctrl_reg.get_mut())
+                            .await
+                            .unwrap();
+                    }
+                    let reg_reply = ctrl_reg
+                        .recv_msg::<MasterMessage>()
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "iter {iter} (secret={}, half_close={half_close}): RegisterAck (cpu_cores=0) refusal read failed: {e}",
+                                secret.is_some()
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "iter {iter} (secret={}, half_close={half_close}): RegisterAck (cpu_cores=0) refusal stream closed before frame arrived",
+                                secret.is_some()
+                            )
+                        });
+                    match reg_reply {
+                        MasterMessage::RegisterAck {
+                            accepted: false,
+                            ref message,
+                            ..
+                        } => {
+                            assert!(
+                                message
+                                    .as_deref()
+                                    .unwrap_or_default()
+                                    .contains("cpu_cores must be > 0"),
+                                "unexpected refusal message: {message:?}"
+                            );
+                        }
+                        other => panic!("expected refused RegisterAck, got {other:?}"),
+                    }
+                    assert!(
+                        ctrl_reg
+                            .recv_msg::<MasterMessage>()
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "master must finish the control send stream after cpu_cores=0 refusal"
+                    );
+                    keep_reg.0.close(0u32.into(), b"done");
+
+                    // 3. RegisterAck { accepted: false } refusal (incompatible protocol_version) on P2P handshake path.
+                    let (mut ctrl_ver, keep_ver) = open_ctrl().await;
+                    ctrl_ver
+                        .send_msg(&WorkerMessage::Register {
+                            worker_id: Uuid::new_v4(),
+                            capabilities: WorkerCapabilities::new(
+                                "old-proto-worker",
+                                4,
+                                2048,
+                                false,
+                                false,
+                                None,
+                            ),
+                            protocol_version: 0,
+                            features: ProtocolCapabilities::all_supported(),
+                        })
+                        .await
+                        .unwrap();
+                    if half_close {
+                        tokio::io::AsyncWriteExt::shutdown(ctrl_ver.get_mut())
+                            .await
+                            .unwrap();
+                    }
+                    let ver_reply = ctrl_ver
+                        .recv_msg::<MasterMessage>()
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "iter {iter} (secret={}, half_close={half_close}): RegisterAck (protocol_version=0) refusal read failed: {e}",
+                                secret.is_some()
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "iter {iter} (secret={}, half_close={half_close}): RegisterAck (protocol_version=0) refusal stream closed before frame arrived",
+                                secret.is_some()
+                            )
+                        });
+                    match ver_reply {
+                        MasterMessage::RegisterAck {
+                            accepted: false,
+                            ref message,
+                            ..
+                        } => {
+                            assert!(
+                                message
+                                    .as_deref()
+                                    .unwrap_or_default()
+                                    .contains("Incompatible protocol version"),
+                                "unexpected refusal message: {message:?}"
+                            );
+                        }
+                        other => panic!("expected refused RegisterAck, got {other:?}"),
+                    }
+                    assert!(
+                        ctrl_ver.recv_msg::<MasterMessage>().await.unwrap().is_none(),
+                        "master must finish the control send stream after protocol_version=0 refusal"
+                    );
+                    keep_ver.0.close(0u32.into(), b"done");
+
+                    // 4. RegisterAck { accepted: false } refusal (unexpected first WorkerMessage) on P2P handshake path.
+                    let (mut ctrl_other, keep_other) = open_ctrl().await;
+                    ctrl_other
+                        .send_msg(&WorkerMessage::Heartbeat {
+                            worker_id: Uuid::new_v4(),
+                            timestamp: 1,
+                            active_tasks: 0,
+                            cpu_usage_pct: 0.0,
+                            ram_available_mb: 1024,
+                        })
+                        .await
+                        .unwrap();
+                    if half_close {
+                        tokio::io::AsyncWriteExt::shutdown(ctrl_other.get_mut())
+                            .await
+                            .unwrap();
+                    }
+                    let other_reply = ctrl_other
+                        .recv_msg::<MasterMessage>()
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "iter {iter} (secret={}, half_close={half_close}): RegisterAck (unexpected Heartbeat) refusal read failed: {e}",
+                                secret.is_some()
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "iter {iter} (secret={}, half_close={half_close}): RegisterAck (unexpected Heartbeat) refusal stream closed before frame arrived",
+                                secret.is_some()
+                            )
+                        });
+                    match other_reply {
+                        MasterMessage::RegisterAck {
+                            accepted: false,
+                            ref message,
+                            ..
+                        } => {
+                            assert!(
+                                message
+                                    .as_deref()
+                                    .unwrap_or_default()
+                                    .contains("Expected Register message, received Heartbeat"),
+                                "unexpected refusal message: {message:?}"
+                            );
+                        }
+                        other => panic!("expected refused RegisterAck, got {other:?}"),
+                    }
+                    assert!(
+                        ctrl_other
+                            .recv_msg::<MasterMessage>()
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "master must finish the control send stream after unexpected Heartbeat refusal"
+                    );
+                    keep_other.0.close(0u32.into(), b"done");
+
+                    // 5. Cluster-auth refusal on the P2P handshake path (8 of 8 in both normal and half-close modes):
+                    //    - When `secret` is `None`: a client sending an auth HELLO receives `REJECT_NO_SECRET`.
+                    //    - When `secret` is `Some`: an unauthenticated client sending `Register` receives
+                    //      `REJECT_AUTH_REQUIRED` (`InvalidFormatTag(WIRE_FORMAT_AUTH)` -> `GridError::AuthRequired`).
+                    let (mut ctrl_auth, keep_auth) = open_raw_ctrl().await;
+                    if secret.is_none() {
+                        if !half_close {
+                            let err = client_handshake(&mut ctrl_auth, &test_secret)
+                                .await
+                                .expect_err("master without secret must reject client_handshake");
+                            match err {
+                                GridError::AuthFailed(ref msg)
+                                    if msg.contains("no cluster secret configured") => {}
+                                other => panic!(
+                                    "iter {iter} (half_close={half_close}): expected AuthFailed(no cluster secret configured), got {other:?}"
+                                ),
+                            }
+                        } else {
+                            let mut hello_frame =
+                                vec![0, 0, 0, 35, WIRE_FORMAT_AUTH, 0x01, AUTH_VERSION];
+                            hello_frame.extend_from_slice(&[7u8; 32]);
+                            tokio::io::AsyncWriteExt::write_all(ctrl_auth.get_mut(), &hello_frame)
+                                .await
+                                .unwrap();
+                            tokio::io::AsyncWriteExt::shutdown(ctrl_auth.get_mut())
+                                .await
+                                .unwrap();
+                            let reject_frame = ctrl_auth
+                                .recv_raw_frame_max(1024)
+                                .await
+                                .unwrap()
+                                .expect("REJECT_NO_SECRET frame must arrive after half-close");
+                            assert_eq!(reject_frame[0], WIRE_FORMAT_AUTH);
+                            assert_eq!(reject_frame[1], 0x05);
+                            assert_eq!(&reject_frame[2..], REJECT_NO_SECRET.as_bytes());
+                        }
+                        assert!(
+                            ctrl_auth.recv_raw_frame_max(1024).await.unwrap().is_none(),
+                            "master must finish the control send stream after REJECT_NO_SECRET"
+                        );
+                    } else {
+                        ctrl_auth
+                            .send_msg(&WorkerMessage::Register {
+                                worker_id: Uuid::new_v4(),
+                                capabilities: WorkerCapabilities::new(
+                                    "unauth-worker",
+                                    2,
+                                    2048,
+                                    false,
+                                    false,
+                                    None,
+                                ),
+                                protocol_version: PROTOCOL_VERSION_CURRENT,
+                                features: ProtocolCapabilities::all_supported(),
+                            })
+                            .await
+                            .unwrap();
+                        if half_close {
+                            tokio::io::AsyncWriteExt::shutdown(ctrl_auth.get_mut())
+                                .await
+                                .unwrap();
+                        }
+                        let err = ctrl_auth.recv_msg::<MasterMessage>().await.expect_err(
+                            "unauthenticated Register on secret master must be rejected",
+                        );
+                        assert!(
+                            matches!(err, ProtocolError::InvalidFormatTag(WIRE_FORMAT_AUTH)),
+                            "iter {iter} (half_close={half_close}): expected InvalidFormatTag(WIRE_FORMAT_AUTH), got {err:?}"
+                        );
+                        let grid_err: GridError = err.into();
+                        assert!(matches!(grid_err, GridError::AuthRequired(_)));
+                        assert!(
+                            ctrl_auth.recv_raw_frame_max(1024).await.unwrap().is_none(),
+                            "master must finish the control send stream after REJECT_AUTH_REQUIRED"
+                        );
+                    }
+                    keep_auth.0.close(0u32.into(), b"done");
+                }
+            }
+
+            // 6. Silent peer check: when a refused peer reads the refusal frame and stays silent
+            //    without closing `conn`, the master keeps `conn` open for `REFUSAL_DRAIN_TIMEOUT`
+            //    (`1 s`) and closes it between 0.9 s and 1.5 s.
+            {
+                let (mut ctrl_silent, keep_silent) = open_ctrl().await;
+                let started = tokio::time::Instant::now();
+                ctrl_silent
+                    .send_msg(&WorkerMessage::ClaimMasterRole {
+                        ticket: claim_ticket.clone(),
+                    })
+                    .await
+                    .unwrap();
+                let reply = ctrl_silent
+                    .recv_msg::<MasterMessage>()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    reply,
+                    MasterMessage::RoleHandoverAck {
+                        accepted: false,
+                        ..
+                    }
+                ));
+                keep_silent.0.closed().await;
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed >= Duration::from_millis(900) && elapsed <= Duration::from_millis(1500),
+                    "silent refused peer must be closed after ~1 s (0.9..=1.5 s), took {elapsed:?}"
+                );
+            }
+
+            let _ = stop_tx.send(true);
+            client_ep.close().await;
+            master_ep.close().await;
+            let _ = server_task.await;
+        }
+
+        // 7. Zero flow-control credit peer with `max_connections = 1`:
+        //    A peer whose QUIC stream receive window is 1 byte (smaller than the refusal frame)
+        //    causes `transport.send_msg` on the master to block on flow-control credit. The single
+        //    1 s timeout around `send_msg`, `shutdown`, and `conn.closed()` aborts the stalled
+        //    refusal within 1.5 s and frees the single connection slot.
+        {
+            let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_connections(1);
+            let mut server = MasterServer::bind(cfg, WorkerRegistry::new())
+                .await
+                .unwrap();
+            let master_ep = iroh::Endpoint::builder(Minimal)
+                .relay_mode(RelayMode::Disabled)
+                .alpns(vec![GRID_ALPN.to_vec()])
+                .bind()
+                .await
+                .unwrap();
+            let master_addr = master_ep.addr();
+            server.p2p_endpoint = Some(master_ep.clone());
+
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            let server_task = tokio::spawn(server.run(stop_rx));
+
+            let tiny_window_quic = QuicTransportConfig::builder()
+                .stream_receive_window(VarInt::from_u32(1))
+                .build();
+            let stalled_ep = iroh::Endpoint::builder(Minimal)
+                .relay_mode(RelayMode::Disabled)
+                .alpns(vec![GRID_ALPN.to_vec()])
+                .transport_config(tiny_window_quic)
+                .bind()
+                .await
+                .unwrap();
+
+            let stalled_conn = stalled_ep
+                .connect(master_addr.clone(), GRID_ALPN)
+                .await
+                .unwrap();
+            let (mut c_send, c_recv) = stalled_conn.open_bi().await.unwrap();
+            c_send.write_all(&[STREAM_CONTROL]).await.unwrap();
+            let (mut d_send, _d_recv) = stalled_conn.open_bi().await.unwrap();
+            d_send.write_all(&[STREAM_DATA]).await.unwrap();
+            let mut stalled_ctrl =
+                MessageTransport::new(GridStream::P2p(BiStream::new(c_recv, c_send)));
+            let started = tokio::time::Instant::now();
+            stalled_ctrl
+                .send_msg(&WorkerMessage::ClaimMasterRole {
+                    ticket: claim_ticket.clone(),
+                })
+                .await
+                .unwrap();
+            // Do not read from `stalled_ctrl`; its 1-byte stream receive window blocks `send_msg`.
+            stalled_conn.closed().await;
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed <= Duration::from_millis(1500),
+                "peer granting no flow-control credit must be closed within 1.5 s, took {elapsed:?}"
+            );
+
+            // Now `max_connections = 1` slot is free again: a normal peer must be admitted.
+            let normal_ep = iroh::Endpoint::builder(Minimal)
+                .relay_mode(RelayMode::Disabled)
+                .alpns(vec![GRID_ALPN.to_vec()])
+                .bind()
+                .await
+                .unwrap();
+            let normal_conn = normal_ep.connect(master_addr, GRID_ALPN).await.unwrap();
+            let (mut nc_send, nc_recv) = normal_conn.open_bi().await.unwrap();
+            nc_send.write_all(&[STREAM_CONTROL]).await.unwrap();
+            let (mut nd_send, _nd_recv) = normal_conn.open_bi().await.unwrap();
+            nd_send.write_all(&[STREAM_DATA]).await.unwrap();
+            let mut normal_ctrl =
+                MessageTransport::new(GridStream::P2p(BiStream::new(nc_recv, nc_send)));
+            normal_ctrl
+                .send_msg(&WorkerMessage::ClaimMasterRole {
+                    ticket: claim_ticket,
+                })
+                .await
+                .unwrap();
+            let reply = normal_ctrl
+                .recv_msg::<MasterMessage>()
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                reply,
+                MasterMessage::RoleHandoverAck {
+                    accepted: false,
+                    ..
+                }
+            ));
+            normal_conn.close(0u32.into(), b"done");
+
+            let _ = stop_tx.send(true);
+            stalled_ep.close().await;
+            normal_ep.close().await;
+            master_ep.close().await;
+            let _ = server_task.await;
+        }
     }
 }
