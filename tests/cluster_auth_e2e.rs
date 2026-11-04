@@ -690,10 +690,15 @@ mod quic {
         )
         .await
         {
-            Ok(Ok(Some(answer))) => {
-                panic!("unauthenticated QUIC Register was answered: {answer:?}")
+            Ok(Err(ProtocolError::InvalidFormatTag(WIRE_FORMAT_AUTH))) => {
+                let grid_err: GridError = ProtocolError::InvalidFormatTag(WIRE_FORMAT_AUTH).into();
+                assert!(matches!(grid_err, GridError::AuthRequired(_)));
             }
-            Ok(_) => {}
+            Ok(other) => {
+                panic!(
+                    "expected InvalidFormatTag(WIRE_FORMAT_AUTH) on unauthenticated QUIC Register, got: {other:?}"
+                )
+            }
             Err(_) => panic!("master left the unauthenticated QUIC stream hanging"),
         }
 
