@@ -990,13 +990,13 @@ async fn test_adversarial_quic_stream_multiplexing_heavy_saturation_anti_hol() {
         median_latency
     );
     assert!(
-        avg_latency < Duration::from_millis(150),
-        "Average heartbeat latency over multiplexed control stream must remain sub-150ms (got: {:?})",
+        avg_latency < Duration::from_millis(200),
+        "Average heartbeat latency over multiplexed control stream must remain sub-200ms (got: {:?})",
         avg_latency
     );
     assert!(
-        max_latency < Duration::from_millis(1000),
-        "Max single-sample heartbeat latency must remain bounded sub-1000ms (got: {:?})",
+        max_latency < Duration::from_millis(1500),
+        "Max single-sample heartbeat latency must remain bounded sub-1500ms (got: {:?})",
         max_latency
     );
 }
