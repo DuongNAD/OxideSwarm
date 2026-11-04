@@ -17,9 +17,9 @@ Behaviour before this change:
 
 | Area | Behaviour | Code |
 |---|---|---|
-| Open-cluster role claim (`cluster_secret.is_none()`) | When a master ran without a cluster secret (for example a local loopback master or `--insecure`), `handle_connection` and `handle_multiplexed_connection` checked only `ticket.authority_score >= ELECTION_THRESHOLD_SCORE` (`2500`) without verifying any cryptographic signature, answered `RoleHandoverAck { accepted: true, task_queue_snapshot, connected_workers }`, sent the entire queued task snapshot (`TaskSpec` command arguments, shell scripts, environment variables, and stdin bytes) and connected worker capabilities to any peer that could reach the grid port, and returned from the connection handler. | `crates/master/src/server.rs:3270-3304`, `:3637-3672`, `:4294-4328`, `:4423-4449` |
-| Authenticated role claim (`cluster_secret.is_some()`) | When a cluster secret was configured, the master synthesised an incumbent ticket with fixed score `3500` and accepted any validly signed `MasterLeaseTicket` with `authority_score > 3500`, returning the task queue snapshot and closing the worker session, even though no worker or CLI code ever constructed `WorkerMessage::ClaimMasterRole` or took over the master listener. | `crates/master/src/server.rs:3252-3304`, `:3619-3672`, `:4276-4328`, `:4405-4449` |
-| Capability bit | `ProtocolCapabilities::all_supported()` advertised `ROLE_ARBITRAGE` (`1 << 7`) during worker registration even though automatic coordinator election had no production caller. | `crates/core/src/protocol.rs:76-82` |
+| Open-cluster role claim (`cluster_secret.is_none()`) | When a master ran without a cluster secret (for example a local loopback master or `--insecure`), `handle_connection` and `handle_multiplexed_connection` checked only `ticket.authority_score >= ELECTION_THRESHOLD_SCORE` (`2500`) without verifying any cryptographic signature, answered `RoleHandoverAck { accepted: true, task_queue_snapshot, connected_workers }`, sent the entire queued task snapshot (`TaskSpec` command arguments, shell scripts, environment variables, and stdin bytes) and connected worker capabilities to any peer that could reach the grid port, and returned from the connection handler. | `handle_connection`, `handle_multiplexed_connection` (`crates/master/src/server.rs`) |
+| Authenticated role claim (`cluster_secret.is_some()`) | When a cluster secret was configured, the master synthesised an incumbent ticket with fixed score `3500` and accepted any validly signed `MasterLeaseTicket` with `authority_score > 3500`, returning the task queue snapshot and closing the worker session, even though no worker or CLI code ever constructed `WorkerMessage::ClaimMasterRole` or took over the master listener. | `handle_connection`, `handle_multiplexed_connection` (`crates/master/src/server.rs`) |
+| Capability bit | `ProtocolCapabilities::all_supported()` advertised `ROLE_ARBITRAGE` (`1 << 7`) during worker registration even though automatic coordinator election had no production caller. | `ProtocolCapabilities::all_supported` (`crates/core/src/protocol.rs`) |
 
 ## Goals
 
@@ -38,7 +38,7 @@ Behaviour before this change:
 
 Per owner decision D1 (`FEAT-6`), automatic master failover is not enabled; role switching between machines is performed explicitly by the operator via `switch_role.sh` and `windows/switch_role.cmd`.
 
-A single helper `reject_master_role_claim(ticket: &MasterLeaseTicket) -> MasterMessage` in `crates/master/src/server.rs` logs a warning with `claimed_master_id` and `claimed_score` and returns:
+A single helper `reject_master_role_claim(ticket: &MasterLeaseTicket) -> MasterMessage` in `crates/master/src/server.rs` logs a warning with `claimant_master_id` and `authority_score` and returns:
 
 ```rust
 MasterMessage::RoleHandoverAck {
@@ -50,24 +50,14 @@ MasterMessage::RoleHandoverAck {
 ```
 
 All four `WorkerMessage::ClaimMasterRole` match arms in `crates/master/src/server.rs` call `reject_master_role_claim`:
-1. `handle_connection` handshake arm (`crates/master/src/server.rs:3246-3250`): sends the refusal `RoleHandoverAck` and returns `Ok(())` without registering a worker.
-2. `handle_connection` active-session arm (`crates/master/src/server.rs:3542-3545`): sends the refusal `RoleHandoverAck` on `outbound_tx` and keeps the registered worker session alive (`WorkerStatus::Connected`).
-3. `handle_multiplexed_connection` handshake arm (`crates/master/src/server.rs:3748-3752`): sends the refusal `RoleHandoverAck` on `ctrl_transport` and returns `Ok(())` without registering a worker.
-4. `handle_multiplexed_connection` active-session control arm (`crates/master/src/server.rs:4183-4186`): sends the refusal `RoleHandoverAck` on `ctrl_sender` and keeps the multiplexed worker session alive (`WorkerStatus::Connected`), while the data stream arm (`:4223-4225`) logs and ignores unexpected `ClaimMasterRole` frames on the data lane.
+1. `handle_connection` handshake arm: sends the refusal `RoleHandoverAck` and returns `Ok(())` without registering a worker.
+2. `handle_connection` active-session arm: sends the refusal `RoleHandoverAck` on `outbound_tx` and keeps the registered worker session alive (`WorkerStatus::Connected`).
+3. `handle_multiplexed_connection` handshake arm: sends the refusal `RoleHandoverAck` on `ctrl_transport` and returns `Ok(())` without registering a worker.
+4. `handle_multiplexed_connection` active-session control arm: sends the refusal `RoleHandoverAck` on `ctrl_sender` and keeps the multiplexed worker session alive (`WorkerStatus::Connected`), while the data stream catch-all arm in `handle_multiplexed_connection` logs and ignores unexpected control frames on the data lane.
 
 ### D2 Stop advertising `ROLE_ARBITRAGE` in `ProtocolCapabilities::all_supported()`
 
-`ProtocolCapabilities::ROLE_ARBITRAGE` (`Self(1 << 7)`) remains defined in `crates/core/src/protocol.rs:66` so existing bitflag parsers and tests continue to compile, but `ProtocolCapabilities::all_supported()` (`crates/core/src/protocol.rs:76-81`) now includes only:
-- `HEARTBEAT_V2` (`1 << 0`)
-- `TASK_CANCELLATION` (`1 << 1`)
-- `BATCH_SCHEDULING` (`1 << 2`)
-- `GPU_COMPUTE` (`1 << 3`)
-- `CHECKPOINTING` (`1 << 4`)
-- `FILE_STAGING` (`1 << 5`)
-- `MOBILE_TELEMETRY` (`1 << 6`)
-- `BLOB_TRANSFER` (`1 << 8`)
-
-During registration, `worker_features & ProtocolCapabilities::all_supported()` masks out `ROLE_ARBITRAGE`.
+`ProtocolCapabilities::ROLE_ARBITRAGE` (`Self(1 << 7)`) remains defined in `crates/core/src/protocol.rs` so existing bitflag parsers and tests continue to compile, while `ProtocolCapabilities::all_supported()` (`crates/core/src/protocol.rs:73-84`) omits `ProtocolCapabilities::ROLE_ARBITRAGE`. During registration, `worker_features & ProtocolCapabilities::all_supported()` masks out `ROLE_ARBITRAGE`.
 
 ## Compatibility
 
@@ -81,7 +71,7 @@ During registration, `worker_features & ProtocolCapabilities::all_supported()` m
 
 ## Test plan
 
-- **Unit (`crates/core/src/protocol.rs`):** `test_protocol_capabilities_bitflags` verifies `!ProtocolCapabilities::all_supported().contains(ProtocolCapabilities::ROLE_ARBITRAGE)`.
+- **Unit (`crates/core/src/protocol.rs`):** `test_all_supported_does_not_advertise_role_arbitrage` verifies `!ProtocolCapabilities::all_supported().contains(ProtocolCapabilities::ROLE_ARBITRAGE)`.
 - **Unit (`crates/master/src/server.rs`):** `test_claim_master_role_is_refused_with_and_without_secret_and_sends_no_tasks` verifies, both with `cluster_secret = None` and `cluster_secret = Some`:
   1. TCP handshake `ClaimMasterRole` before and after queuing a task is refused with an empty `task_queue_snapshot`, returns `Ok(())`, and leaves `WorkerRegistry` empty;
   2. multiplexed P2P handshake `ClaimMasterRole` as the first control message after queuing a task is refused with an empty `task_queue_snapshot`, returns `Ok(())`, and leaves `WorkerRegistry` empty;
@@ -93,7 +83,7 @@ During registration, `worker_features & ProtocolCapabilities::all_supported()` m
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| W1 | Stop advertising `ROLE_ARBITRAGE` in `all_supported()` | `crates/core/src/protocol.rs`, `tests/mobile_coordination_test.rs` | `!ProtocolCapabilities::all_supported().contains(ProtocolCapabilities::ROLE_ARBITRAGE)` and all capability negotiation tests pass | Implemented |
+| W1 | Stop advertising `ROLE_ARBITRAGE` in `all_supported()` | `crates/core/src/protocol.rs` | `!ProtocolCapabilities::all_supported().contains(ProtocolCapabilities::ROLE_ARBITRAGE)` and all capability negotiation tests pass | Implemented |
 | W2 | Refuse every `ClaimMasterRole` across TCP and multiplexed handlers | `crates/master/src/server.rs` | All four `ClaimMasterRole` arms call `reject_master_role_claim`, return `accepted: false` with empty snapshots, and keep active sessions registered and responsive to heartbeats | Implemented |
 | W3 | Update design and architecture documentation | `docs/design/0002-mobile-coordination.md`, `docs/design/0026-refuse-claim-master-role.md`, `docs/README.md`, `README.md`, `PROJECT.md`, `ANDROID_ARCHITECTURE.md` | W4 of 0002 points to 0026 with status `Design only`, and reference docs match the code | Implemented |
 
