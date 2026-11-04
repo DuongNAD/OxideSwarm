@@ -198,7 +198,7 @@ merge.
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 | | Planned |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 | | Planned |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Planned |
-| REL-5 | Contributor and security files | P3 | S | REL-1 | | Planned |
+| REL-5 | Contributor and security files | P3 | S | REL-1 | | Implemented |
 
 ## Phase 0: integrate open work
 
@@ -1247,6 +1247,7 @@ Each item below needs a design record before code.
 
 ### REL-5: Contributor and security files
 
+- **Status:** Implemented (`win/rel-5-contributor-and-security-files`)
 - **Evidence:** Reproduced.
 - **Problem:** No `CONTRIBUTING`, `CHANGELOG`, issue template or dependabot configuration exists.
   `docs/SECURITY.md:172` offers only a public issue for security reports.
@@ -1270,3 +1271,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-04: DOC-1 completed; mapped all status cells in `README.md`, `PROJECT.md`, and `ANDROID_ARCHITECTURE.md` to the fixed vocabulary (`Implemented`, `Partial`, `Planned`, `Design only`), corrected false claims across `README.md`, `PROJECT.md`, `CLAUDE.md`, `DEPLOYMENT.md`, `ANDROID_ARCHITECTURE.md`, `docs/SECURITY.md`, `docs/design/0002-mobile-coordination.md`, and `packaging/android/README.md` (intentionally keeping MCP `cancel` in `README.md:94,116` because `mcp.rs:592` implements it, and keeping `--mapper` / `--reducer` script shipping in `README.md:78` because `cli_app.rs:822-828` implements it), added a dated per-platform verification table backed by recorded runs, and restored the `Exactly-once execution` (`Planned`) limitation row in `README.md`.
 - 2026-11-04: The Unix default sandbox base became `<temp>/rusty_grid-<euid>/sandboxes`. The worker now refuses
   a `rusty_grid-<euid>` that another local user could change (work item SEC-8 of design 0021).
+- 2026-11-04: REL-5 completed on branch `win/rel-5-contributor-and-security-files`; added `CONTRIBUTING.md`, `CHANGELOG.md`, `.github/ISSUE_TEMPLATE/bug_report.md`, `.github/ISSUE_TEMPLATE/feature_request.md`, `.github/ISSUE_TEMPLATE/config.yml`, and `.github/dependabot.yml`, and updated `docs/SECURITY.md` with the private GitHub Security Advisories vulnerability reporting route.

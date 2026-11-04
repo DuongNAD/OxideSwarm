@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (Private)
+    url: https://github.com/DuongNAD/OxideSwarm/security/advisories/new
+    about: Privately report a security vulnerability via GitHub Security Advisories (see docs/SECURITY.md).
