@@ -215,11 +215,11 @@ The OxideSwarm worker automatically detects and advertises mobile-specific hardw
 | :--- | :--- | :--- |
 | **Battery Percentage** | `/sys/class/power_supply/battery/capacity` | Current state of charge (0–100%) |
 | **Charging Status** | `/sys/class/power_supply/battery/status` | `Charging`, `Discharging`, `Full` |
-| **Thermal Throttling** | `/sys/class/thermal/thermal_zone*/temp` | `detect_thermal_throttled` flags kernel zone throttling at `> 75°C`, while `MobileLiveStatus` evaluates battery/skin thermal tiers at `37°C`, `40°C`, and `42°C` |
+| **Thermal Throttling** | `/sys/class/thermal/thermal_zone*/temp` | `detect_thermal_throttling` (`crates/core/src/capabilities.rs:1087`) flags kernel zone throttling at `temp >= 75_000` ($\ge 75^\circ\text{C}$), while `MobileLiveStatus` evaluates battery/skin thermal tiers at `37°C`, `40°C`, and `42°C` |
 | **Cooling State** | `/sys/class/thermal/cooling_device*/cur_state` | Hardware governor throttling level |
 | **SoC Model** | `getprop ro.soc.model` / `/proc/cpuinfo` | Identifies Qualcomm Snapdragon, MediaTek Dimensity, Google Tensor, etc. |
 
-The Master coordinator's scheduler and `MobileLiveStatus` (`crates/core/src/capabilities.rs`) evaluate multi-tier thermal and battery thresholds: thermal tiers scale concurrency at `> 37.0°C` (`Warm`, half concurrency), `> 40.0°C` (`Hot`, max 1 task, no GPU/compile), and `> 42.0°C` (`Critical`, 0 tasks), and discharging battery tiers scale concurrency at `< 50%` (`Low`, half concurrency, no GPU/compile), `< 30%` (`SubLow`, max 1 task, no GPU/compile), and `< 15%` (`Critical`, 0 tasks).
+On the phone, the JNI bridge computes multi-tier battery and thermal status locally (`MobileLiveStatus::compute_battery_tier` and `MobileLiveStatus::compute_thermal_tier` in `crates/android_bridge/src/lib.rs:412-413` and `crates/core/src/capabilities.rs`): thermal tiers scale concurrency at `> 37.0°C` (`Warm`, half concurrency), `> 40.0°C` (`Hot`, max 1 task, no GPU/compile or multi-core tasks), and `> 42.0°C` (`Critical`, 0 tasks), and discharging battery tiers scale concurrency at `< 50%` (`Low`, half concurrency, no GPU/compile), `< 30%` (`SubLow`, max 1 task, no GPU/compile or multi-core tasks), and `< 15%` (`Critical`, 0 tasks). Because `MobileCapabilities::live_status()` currently sets `battery_temperature` and `thermal_tier` to `None` and `WorkerRegistry::update_mobile_telemetry` (`crates/master/src/registry.rs:615`) uses `MobileCapabilities::with_live_status`, the Master scheduler currently sees all four battery tiers on Android workers (`effective_scheduler_battery_tier`) but only `ThermalTier::Normal` or `ThermalTier::Warm` (via `thermal_throttled`) until `MOB-2` lands.
 
 ---
 
