@@ -138,16 +138,20 @@ async def run_cross_interop_tests():
         await node1.connect(hub_ws_url)
         await node2.connect(hub_ws_url)
         await node3.connect(hub_ws_url)
-        await asyncio.sleep(0.15)
 
-        # Check /api/nodes on Rust Hub
-        with urllib.request.urlopen(f"{hub_http_url}/api/nodes", timeout=2.0) as resp:
-            catalog = json.loads(resp.read().decode("utf-8"))
-            active_ids = {n["node_id"] for n in catalog}
-            assert "cross-win-1" in active_ids
-            assert "cross-mac-2-isolated" in active_ids
-            assert "cross-android-3" in active_ids
-            logger.info(f"✓ Rust Hub active catalog contains all 3 Python nodes: {active_ids}")
+        # Wait until all 3 nodes appear in /api/nodes on the Rust Hub
+        expected_ids = {"cross-win-1", "cross-mac-2-isolated", "cross-android-3"}
+        active_ids: set[str] = set()
+        reg_deadline = time.time() + 5.0
+        while time.time() < reg_deadline:
+            with urllib.request.urlopen(f"{hub_http_url}/api/nodes", timeout=2.0) as resp:
+                catalog = json.loads(resp.read().decode("utf-8"))
+                active_ids = {n["node_id"] for n in catalog}
+            if expected_ids.issubset(active_ids):
+                break
+            await asyncio.sleep(0.02)
+        assert expected_ids.issubset(active_ids), f"expected {expected_ids} in catalog, got {active_ids}"
+        logger.info(f"✓ Rust Hub active catalog contains all 3 Python nodes: {active_ids}")
 
         # Targeted Command Dispatch: Node 1 -> Node 3
         logger.info("Dispatching command: Python Node 1 -> Rust Hub -> Python Node 3...")
@@ -191,7 +195,11 @@ async def run_cross_interop_tests():
             burst_tasks.append(node3.send_data_payload("cross-win-1", rev_data))
 
         await asyncio.gather(*burst_tasks)
-        await asyncio.sleep(0.3)
+        burst_deadline = time.time() + 5.0
+        while time.time() < burst_deadline:
+            if len(node3.received_data_payloads) == 25 and len(node1.received_data_payloads) == 25:
+                break
+            await asyncio.sleep(0.02)
 
         assert len(node3.received_data_payloads) == 25
         assert len(node1.received_data_payloads) == 25
