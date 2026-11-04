@@ -15,11 +15,11 @@ Thank you for contributing to OxideSwarm. Before making changes, read [`CLAUDE.m
    - `crates/master` (`rusty_grid_master`): task scheduler, worker registry, blob store, and Axum web dashboard (`8080/tcp`).
    - `crates/worker` (`rusty_grid_worker`): task runner, sandbox management, CPU/GPU compute, 3D (`gen3d`), and auto-rigging (`autorig`).
    - `crates/cli` (`rusty_grid_cli`): `oxideswarm` / `rusty-grid` / `ox-mode` binaries and MCP stdio server (`oxideswarm mcp`).
-   - `crates/android_bridge` (`oxideswarm_mobile_ffi`): Android JNI bridge.
+   - `crates/android_bridge` (`rusty_grid_android_bridge`, library `oxideworker`): Android JNI bridge.
    - `crates/agent_mesh` (`agent_mesh`): WebSocket relay hub and agent client.
 2. **Wire protocol compatibility (`CLAUDE.md`)**:
-   - Any new variant or field in `TaskSpec`, `WorkerMessage`, or `MasterMessage` must be added to the public enum, both bincode compatibility mirror enums in `crates/core/src/codec.rs`, and all four `From` implementations.
-   - Layout changes require bumping `PROTOCOL_VERSION_CURRENT` (and `PROTOCOL_VERSION_MIN_COMPATIBLE` when breaking) and updating the golden-bytes tests.
+   - Any new variant or field in `TaskSpec`, `WorkerMessage`, `MasterMessage`, `ClientMessage`, or `ClientResponse` must be added to the public enum, both compatibility mirror enums (`Human*` and `Binary*`) in `crates/core/src/protocol.rs`, and all four `From` implementations.
+   - When the wire layout changes, update the golden layout test (`crates/core/src/wire_layout_tests.rs` and `crates/core/tests/data/wire_layout.txt`); a breaking change needs a version bump (`PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE`).
 3. **Test isolation**:
    - Never read or write the real `~/.oxideswarm` (`%USERPROFILE%\.oxideswarm`) directory in tests. Always point child processes at a temporary directory via `Command::env("HOME", ...)` and `Command::env("USERPROFILE", ...)`.
 4. **Line endings (`.gitattributes`)**:
