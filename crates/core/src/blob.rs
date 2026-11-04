@@ -162,6 +162,60 @@ pub fn hash_reader<R: Read>(mut reader: R) -> std::io::Result<(BlobId, u64)> {
     Ok((hasher.finish(), len))
 }
 
+/// Opens `path` for reading without following a final symbolic link (`O_NOFOLLOW` on Unix,
+/// `FILE_FLAG_OPEN_REPARSE_POINT` on Windows) and inspects the open descriptor with `fstat`
+/// (`file.metadata()`), refusing anything that is not a regular file.
+pub fn open_regular_file_nofollow(
+    path: &Path,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT = 0x0020_0000
+        opts.custom_flags(0x0020_0000);
+    }
+    let file = match opts.open(path) {
+        Ok(file) => file,
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "symbolic links are not sent",
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    let meta = file.metadata()?;
+    #[cfg(windows)]
+    let is_reparse = {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    };
+    #[cfg(not(windows))]
+    let is_reparse = false;
+    if meta.file_type().is_symlink() || is_reparse {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "symbolic links are not sent",
+        ));
+    }
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok((file, meta))
+}
+
 /// Hashes the file at `path`: its blob id and its length.
 pub fn hash_file(path: &Path) -> std::io::Result<(BlobId, u64)> {
     hash_reader(std::fs::File::open(path)?)
