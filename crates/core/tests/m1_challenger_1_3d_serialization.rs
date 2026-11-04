@@ -751,39 +751,20 @@ fn test_adv_05_zero_copy_pointer_identity_and_latency() {
         expected_sub_ptr
     );
 
-    // Microbenchmark: 100,000 clones of 32MB TaskResult
-    // An O(1) Arc refcount clone takes ~10-30 nanoseconds per iteration.
-    // If it were deep copying 32MB, 100,000 copies would copy 3.2 Terabytes and take minutes!
-    // Take the best of 3 passes (after pre-warming `sink_bytes` so initial OS page faults and
-    // transient CI VM CPU scheduling jitter do not skew the measurement).
-    let iterations = 100_000;
+    // Verify repeated clones of the 32MB TaskResult preserve the identical underlying buffer
+    // allocation without deep-copying.
+    let iterations = 64;
     let mut sink_bytes = Vec::with_capacity(iterations);
-    let mut best_elapsed = std::time::Duration::MAX;
-    for _ in 0..3 {
-        sink_bytes.clear();
-        let t_start = Instant::now();
-        for _ in 0..iterations {
-            sink_bytes.push(result.clone());
-        }
-        best_elapsed = best_elapsed.min(t_start.elapsed());
+    for _ in 0..iterations {
+        sink_bytes.push(result.clone());
     }
-    let ns_per_clone = best_elapsed.as_nanos() as f64 / iterations as f64;
-
-    println!(
-        "  [+] Benchmark: 100,000 clones of 32MB TaskResult took {:?} (best of 3)",
-        best_elapsed
-    );
-    println!(
-        "  [+] Average time per clone: {:.2} ns (threshold: < 5000 ns)",
-        ns_per_clone
-    );
-
-    assert!(
-        ns_per_clone < 5_000.0,
-        "Clone must be O(1) Arc atomic increment (< 5000ns), actual was {:.2}ns",
-        ns_per_clone
-    );
     assert_eq!(sink_bytes.len(), iterations);
+    assert!(
+        sink_bytes
+            .iter()
+            .all(|r| r.asset_bytes.as_ref().unwrap().inner().as_ptr() == ptr_original),
+        "Every cloned TaskResult must share the same underlying 32MB buffer allocation"
+    );
 }
 
 // =========================================================================

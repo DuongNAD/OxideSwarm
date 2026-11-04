@@ -792,6 +792,7 @@ async fn test_mcp1_cancelled_async_submit_leaves_no_orphan_tasks_and_default_wai
         }
     }));
     let timeout_deadline = Instant::now() + Duration::from_secs(15);
+    let mut skipped_reply_task_ids: Vec<rusty_grid_core::task::TaskId> = Vec::new();
     let timeout_resp = loop {
         let remaining = timeout_deadline
             .checked_duration_since(Instant::now())
@@ -805,6 +806,19 @@ async fn test_mcp1_cancelled_async_submit_leaves_no_orphan_tasks_and_default_wai
             (200..225).contains(&id),
             "unexpected JSON-RPC response id while waiting for 300: {resp}"
         );
+        let body: Value = serde_json::from_str(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .expect("skipped submit reply text"),
+        )
+        .expect("skipped submit reply json");
+        let tid_str = body["task_id"]
+            .as_str()
+            .expect("skipped submit reply must contain task_id");
+        let tid = Uuid::parse_str(tid_str)
+            .map(rusty_grid_core::task::TaskId)
+            .expect("valid task_id uuid");
+        skipped_reply_task_ids.push(tid);
     };
     assert_eq!(timeout_resp["id"], 300);
     let timeout_body: Value = serde_json::from_str(
@@ -821,6 +835,150 @@ async fn test_mcp1_cancelled_async_submit_leaves_no_orphan_tasks_and_default_wai
         timeout_body["exit_code"], 124,
         "expected exit_code 124 from worker timeout when wait_secs is omitted, got: {timeout_body}"
     );
+
+    // After id 300 has replied, all 25 requests (200..225) have been read and processed by the
+    // MCP server. Poll with a deadline until no task is pending and assert every skipped reply's
+    // task ended Cancelled.
+    let post_300_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let tasks = master.queue().list_tasks().await;
+        let pending = tasks
+            .iter()
+            .filter(|t| {
+                matches!(
+                    format!("{:?}", t.state).as_str(),
+                    "Submitted" | "Queued" | "Scheduled" | "Running" | "Retrying"
+                )
+            })
+            .count();
+        let all_skipped_cancelled = skipped_reply_task_ids.iter().all(|tid| {
+            tasks
+                .iter()
+                .any(|t| t.task_id == *tid && format!("{:?}", t.state).contains("Cancelled"))
+        });
+        if pending == 0 && all_skipped_cancelled {
+            break;
+        }
+        assert!(
+            Instant::now() < post_300_deadline,
+            "expected 0 pending tasks and all {} skipped replies Cancelled after id 300, still have pending={pending}, tasks={:?}",
+            skipped_reply_task_ids.len(),
+            tasks.iter().map(|t| (t.task_id, &t.state)).collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+
+    // Explicit probe for the post-reply cancellation path (design 0030): submit wait:false, read
+    // its reply so it leaves `in_flight` and enters `completed_submits`, then send
+    // `notifications/cancelled` and verify the task transitions to Cancelled.
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 299,
+        "method": "tools/call",
+        "params": {
+            "name": "submit",
+            "arguments": {
+                "type": "command",
+                "command": "echo",
+                "args": ["late-cancel-probe"],
+                "require_tags": ["absent"],
+                "wait": false
+            }
+        }
+    }));
+    let probe_resp = mcp.recv_timeout(Duration::from_secs(5));
+    assert_eq!(probe_resp["id"], 299);
+    let probe_body: Value = serde_json::from_str(
+        probe_resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("probe_resp text"),
+    )
+    .expect("probe_resp json");
+    let probe_tid = Uuid::parse_str(probe_body["task_id"].as_str().expect("probe task_id"))
+        .map(rusty_grid_core::task::TaskId)
+        .expect("valid probe task_id");
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {
+            "requestId": 299,
+            "reason": "cancel after wait:false reply"
+        }
+    }));
+    let probe_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let info = master
+            .queue()
+            .get_task(&probe_tid)
+            .await
+            .expect("probe task must exist");
+        if format!("{:?}", info.state).contains("Cancelled") {
+            break;
+        }
+        assert!(
+            Instant::now() < probe_deadline,
+            "post-reply notifications/cancelled must cancel task {probe_tid}, got state {:?}",
+            info.state
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+
+    // Request-ID reuse guard (design 0030): reusing id 298 for another request (`ping`) must
+    // evict id 298 from `completed_submits` so a later `notifications/cancelled` for 298 does
+    // not cancel the older task.
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 298,
+        "method": "tools/call",
+        "params": {
+            "name": "submit",
+            "arguments": {
+                "type": "command",
+                "command": "echo",
+                "args": ["reuse-id-guard"],
+                "require_tags": ["absent"],
+                "wait": false
+            }
+        }
+    }));
+    let reuse_resp = mcp.recv_timeout(Duration::from_secs(5));
+    assert_eq!(reuse_resp["id"], 298);
+    let reuse_body: Value = serde_json::from_str(
+        reuse_resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("reuse_resp text"),
+    )
+    .expect("reuse_resp json");
+    let reuse_tid = Uuid::parse_str(reuse_body["task_id"].as_str().expect("reuse task_id"))
+        .map(rusty_grid_core::task::TaskId)
+        .expect("valid reuse task_id");
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 298,
+        "method": "ping"
+    }));
+    let ping_resp = mcp.recv_timeout(Duration::from_secs(5));
+    assert_eq!(ping_resp["id"], 298);
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {
+            "requestId": 298,
+            "reason": "cancel after id reuse"
+        }
+    }));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let reuse_info = master
+        .queue()
+        .get_task(&reuse_tid)
+        .await
+        .expect("reuse task must exist");
+    assert_eq!(
+        format!("{:?}", reuse_info.state),
+        "Queued",
+        "notifications/cancelled after request-id reuse must not cancel the older task"
+    );
+    let _ = master.queue().cancel_task(&reuse_tid, None).await;
 
     let _ = shutdown_tx.send(true);
     worker_handle.abort();

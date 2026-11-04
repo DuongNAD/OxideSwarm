@@ -2442,6 +2442,11 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
 
         let id = request.id.clone();
         let method = request.method.as_str();
+        if method != "notifications/cancelled" {
+            if let Some(key) = id.as_ref().and_then(request_id_key) {
+                completed_submits.lock().await.retain(|(k, _)| k != &key);
+            }
+        }
 
         match method {
             "initialize" => {
@@ -2479,18 +2484,39 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                                 None
                             }
                         };
-                        let task_to_cancel = if let Some(tid_mutex) = maybe_tid {
-                            *tid_mutex.lock().await
+                        let (task_to_cancel, was_in_flight) = if let Some(tid_mutex) = maybe_tid {
+                            (*tid_mutex.lock().await, true)
                         } else {
-                            let guard = completed_submits.lock().await;
-                            guard
+                            let mut guard = completed_submits.lock().await;
+                            let tid = guard
                                 .iter()
-                                .rev()
-                                .find_map(|(k, tid)| (k == &key).then_some(*tid))
+                                .rposition(|(k, _)| k == &key)
+                                .and_then(|pos| guard.remove(pos))
+                                .map(|(_, tid)| tid);
+                            (tid, false)
                         };
                         if let Some(task_id) = task_to_cancel {
                             let state_clone = Arc::clone(&state);
                             tokio::spawn(async move {
+                                if !was_in_flight {
+                                    // Post-reply cancel (design 0030): only cancel if the task is
+                                    // still non-terminal on the master.
+                                    let is_active = matches!(
+                                        state_clone
+                                            .request(&ClientMessage::GetTaskStatus { task_id })
+                                            .await,
+                                        Ok(ClientResponse::TaskStatusInfo { status, .. })
+                                            if !matches!(
+                                                status,
+                                                rusty_grid_core::TaskStatus::Completed
+                                                    | rusty_grid_core::TaskStatus::Failed
+                                                    | rusty_grid_core::TaskStatus::Cancelled
+                                            )
+                                    );
+                                    if !is_active {
+                                        return;
+                                    }
+                                }
                                 let _ = state_clone
                                     .request(&ClientMessage::CancelTask { task_id })
                                     .await;
@@ -2577,12 +2603,15 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                                     .await;
                             active_cancels_clone.lock().await.remove(&call_seq);
                             if let Some(ref key) = id_key {
-                                if let Some(tid) = *ctx.submitted_task_id.lock().await {
-                                    let mut guard = completed_submits_clone.lock().await;
-                                    if guard.len() >= 256 {
-                                        guard.pop_front();
+                                if !ctx.is_client_cancelled() && !ctx.aborted_by_cancel {
+                                    if let Some(tid) = *ctx.submitted_task_id.lock().await {
+                                        let mut guard = completed_submits_clone.lock().await;
+                                        guard.retain(|(k, _)| k != key);
+                                        if guard.len() >= 256 {
+                                            guard.pop_front();
+                                        }
+                                        guard.push_back((key.clone(), tid));
                                     }
-                                    guard.push_back((key.clone(), tid));
                                 }
                                 in_flight_clone.lock().await.remove(key);
                             }

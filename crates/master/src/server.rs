@@ -1324,6 +1324,10 @@ impl MasterServer {
                 let mut p2p_shutdown = p2p_shutdown_rx;
                 let mut reject_log = RejectLog::default();
                 loop {
+                    if *p2p_shutdown.borrow_and_update() {
+                        endpoint.close().await;
+                        break;
+                    }
                     tokio::select! {
                         incoming = endpoint.accept() => {
                             let Some(incoming) = incoming else {
@@ -1481,6 +1485,10 @@ impl MasterServer {
         let mut accept_backoff = AcceptBackoff::new();
         let mut reject_log = RejectLog::default();
         loop {
+            if *shutdown_rx.borrow_and_update() {
+                info!("Master server received shutdown signal; stopping accept loop");
+                break;
+            }
             tokio::select! {
                 accept_res = self.listener.accept() => {
                     match accept_res {

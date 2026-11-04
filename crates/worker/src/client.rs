@@ -2000,7 +2000,7 @@ impl WorkerClient {
 
         let connect_timeout = self.config.connect_timeout;
         let reset_cached_endpoint = || async {
-            if is_cached {
+            if is_cached && endpoint.is_closed() {
                 let mut guard = self.p2p_endpoint.lock().await;
                 *guard = None;
             }
