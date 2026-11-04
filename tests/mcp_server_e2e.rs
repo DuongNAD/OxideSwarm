@@ -947,7 +947,13 @@ async fn test_mcp_safe_llm_outputs_1mib_binary_and_20mib_stdout() {
     let outside = tempfile::tempdir().expect("outside dir");
     std::fs::write(outside.path().join("outside.txt"), b"secret").unwrap();
 
-    // Prepare a 64 KiB binary seed (containing non-UTF-8 bytes) and a 64 KiB text seed inside `home` (the MCP cwd).
+    // Prepare a Cargo.toml at the cwd root, a 64 KiB binary seed (containing non-UTF-8 bytes),
+    // and a 64 KiB text seed inside `home` (the MCP cwd).
+    std::fs::write(
+        home.path().join("Cargo.toml"),
+        b"[package]\nname = \"mcp-root-e2e\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
     let seed_bin: Vec<u8> = (0..65_536)
         .map(|i| ((i * 131 + 0x80) & 0xFF) as u8)
         .collect();
@@ -978,8 +984,48 @@ async fn test_mcp_safe_llm_outputs_1mib_binary_and_20mib_stdout() {
     );
     let _ = mcp.read_json_response();
 
-    // 1. Verify `submit` refuses paths outside the working directory (`..` and absolute outside path)
-    //    and symbolic links in `files`.
+    // 1. Stage `files: ["."]` and verify the task reads `Cargo.toml` at the sandbox root.
+    #[cfg(unix)]
+    let root_script = "cat Cargo.toml";
+    #[cfg(windows)]
+    let root_script = "type Cargo.toml";
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "submit",
+                "arguments": {
+                    "type": "shell",
+                    "script": root_script,
+                    "files": ["."],
+                    "wait": true,
+                    "timeout_secs": 20
+                }
+            }
+        })
+        .to_string(),
+    );
+    let root_resp = mcp.read_json_response();
+    assert_eq!(
+        root_resp["result"]["isError"], false,
+        "submit files:[\".\"] failed: {root_resp:?}"
+    );
+    let root_body: Value =
+        serde_json::from_str(root_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(root_body["exit_code"], 0);
+    assert!(
+        root_body["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("mcp-root-e2e"),
+        "expected Cargo.toml at sandbox root when staged with files:[\".\"], got: {}",
+        root_body["stdout"]
+    );
+
+    // 2. Verify `submit` refuses paths outside the working directory (`..` and absolute outside path)
+    //    and symbolic links in `files` and `output_dir`.
     mcp.send_line(
         &json!({
             "jsonrpc": "2.0",
@@ -998,6 +1044,44 @@ async fn test_mcp_safe_llm_outputs_1mib_binary_and_20mib_stdout() {
     );
     let parent_resp = mcp.read_json_response();
     assert_eq!(parent_resp["result"]["isError"], true);
+
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "submit",
+                "arguments": {
+                    "type": "command",
+                    "command": "echo",
+                    "output_dir": "../outside_out"
+                }
+            }
+        })
+        .to_string(),
+    );
+    let out_parent_resp = mcp.read_json_response();
+    assert_eq!(out_parent_resp["result"]["isError"], true);
+
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "submit",
+                "arguments": {
+                    "type": "command",
+                    "command": "echo",
+                    "output_dir": outside.path().join("escaped_out").to_string_lossy()
+                }
+            }
+        })
+        .to_string(),
+    );
+    let out_abs_resp = mcp.read_json_response();
+    assert_eq!(out_abs_resp["result"]["isError"], true);
 
     #[cfg(unix)]
     {
@@ -1023,6 +1107,33 @@ async fn test_mcp_safe_llm_outputs_1mib_binary_and_20mib_stdout() {
         assert_eq!(sym_resp["result"]["isError"], true);
         let sym_text = sym_resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(sym_text.contains("symbolic link"), "{sym_text}");
+        std::fs::remove_file(&symlink_path).unwrap();
+
+        let symlink_out = home.path().join("symlink_out_dir");
+        std::os::unix::fs::symlink(outside.path(), &symlink_out).unwrap();
+        mcp.send_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 30,
+                "method": "tools/call",
+                "params": {
+                    "name": "submit",
+                    "arguments": {
+                        "type": "command",
+                        "command": "echo",
+                        "output_dir": "symlink_out_dir"
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let sym_out_resp = mcp.read_json_response();
+        assert_eq!(sym_out_resp["result"]["isError"], true);
+        let sym_out_text = sym_out_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(sym_out_text.contains("symbolic link"), "{sym_out_text}");
+        std::fs::remove_file(&symlink_out).unwrap();
     }
 
     // 2. Submit a task that stages `seed.bin` and `chunk64k.txt` via blobs, writes a 1 MiB binary
@@ -1120,10 +1231,17 @@ echo FINAL_SUMMARY_MARKER_MCP2_OK\r\n\
         serde_json::from_str(res_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(res_body["exit_code"], 0);
     assert_eq!(res_body["truncated"], true);
+    assert_eq!(res_body["worker_truncated"], true);
+    assert_eq!(res_body["stdout_truncated"], true);
+    assert_eq!(res_body["stdout_worker_truncated"], true);
     assert!(
-        res_body["total_bytes"].as_u64().unwrap() >= 4 * 1024 * 1024,
-        "expected total_bytes >= 4 MiB, got {}",
-        res_body["total_bytes"]
+        res_body["captured_bytes"].as_u64().unwrap() >= 4 * 1024 * 1024,
+        "expected captured_bytes >= 4 MiB, got {}",
+        res_body["captured_bytes"]
+    );
+    assert_eq!(
+        res_body["stdout_captured_bytes"],
+        res_body["captured_bytes"]
     );
 
     let stdout_text = res_body["stdout"].as_str().unwrap();

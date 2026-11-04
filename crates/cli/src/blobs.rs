@@ -14,14 +14,16 @@
 //!   place; a path that would lead through a symbolic link in the destination is refused.
 
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use rusty_grid_core::blob::{
-    hash_file, validate_blob_path, validate_task_inputs, BlobFile, BlobId, TaskInput, TreeManifest,
-    SANDBOX_ROOT,
+    hash_reader, open_regular_file_nofollow, validate_blob_path, validate_task_inputs, BlobFile,
+    BlobId, TaskInput, TreeManifest, SANDBOX_ROOT,
 };
 use rusty_grid_core::blob_transfer::{
     download_blob, for_each_concurrently, missing_blobs, upload_blob, BlobChannel, BlobError,
@@ -33,10 +35,31 @@ use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport}
 
 use crate::connect::connect_master;
 
+/// Default maximum number of regular files staged in one `scan_inputs` call.
+pub const DEFAULT_MAX_INPUT_FILES: usize = 1_000;
+/// Default maximum aggregate byte size of regular files staged in one `scan_inputs` call (256 MiB).
+pub const DEFAULT_MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Caps on the number and total size of regular files scanned into [`PreparedInputs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputLimits {
+    pub max_files: usize,
+    pub max_bytes: u64,
+}
+
+impl Default for InputLimits {
+    fn default() -> Self {
+        Self {
+            max_files: DEFAULT_MAX_INPUT_FILES,
+            max_bytes: DEFAULT_MAX_INPUT_BYTES,
+        }
+    }
+}
+
 /// Where the content of a blob to upload comes from.
 #[derive(Clone)]
 enum LocalSource {
-    File(PathBuf),
+    File(Arc<std::fs::File>),
     Bytes(Vec<u8>),
 }
 
@@ -64,6 +87,11 @@ impl PreparedInputs {
     /// The distinct blobs the inputs need (files and directory manifests).
     pub fn blob_count(&self) -> usize {
         self.blobs.len()
+    }
+
+    /// True if `id` is among the prepared blobs.
+    pub fn has_blob(&self, id: &BlobId) -> bool {
+        self.blobs.contains_key(id)
     }
 }
 
@@ -168,24 +196,47 @@ fn is_executable(meta: &std::fs::Metadata) -> bool {
 
 /// Hashes the files and directories named by `specs` (`LOCAL[:SANDBOX]`) into task inputs.
 pub fn scan_inputs(specs: &[String]) -> Result<PreparedInputs, String> {
-    let mut prepared = PreparedInputs::default();
+    let mut parsed = Vec::with_capacity(specs.len());
     for spec in specs {
-        let (local, dest) = parse_input_spec(spec)?;
-        let meta =
-            std::fs::metadata(&local).map_err(|e| format!("--input {}: {e}", local.display()))?;
+        parsed.push(parse_input_spec(spec)?);
+    }
+    scan_input_paths(&parsed)
+}
+
+/// Hashes the pre-parsed `(local_path, optional_sandbox_dest)` pairs into task inputs using
+/// [`InputLimits::default`].
+pub fn scan_input_paths(specs: &[(PathBuf, Option<String>)]) -> Result<PreparedInputs, String> {
+    scan_input_paths_with_limits(specs, InputLimits::default())
+}
+
+/// Hashes the pre-parsed `(local_path, optional_sandbox_dest)` pairs into task inputs, enforcing
+/// `limits` on the number of regular files and their aggregate byte size.
+pub fn scan_input_paths_with_limits(
+    specs: &[(PathBuf, Option<String>)],
+    limits: InputLimits,
+) -> Result<PreparedInputs, String> {
+    let mut prepared = PreparedInputs::default();
+    for (local, dest) in specs {
+        let symlink_meta = std::fs::symlink_metadata(local)
+            .map_err(|e| format!("--input {}: {e}", local.display()))?;
+        if symlink_meta.file_type().is_symlink() {
+            return Err(format!(
+                "--input {}: symbolic links are not sent",
+                local.display()
+            ));
+        }
+        let is_dir = symlink_meta.is_dir();
         let dest = match dest {
-            Some(dest) => normalize_destination(&dest, meta.is_dir())?,
-            None => default_destination(&local, meta.is_dir())?,
+            Some(dest) => normalize_destination(dest, is_dir)?,
+            None => default_destination(local, is_dir)?,
         };
-        if meta.is_file() {
-            let (id, size) =
-                hash_file(&local).map_err(|e| format!("--input {}: {e}", local.display()))?;
+        if symlink_meta.is_file() {
+            let (id, size, executable) = prepared.add_file_from_path(local, limits)?;
             prepared
                 .inputs
-                .push(TaskInput::file(&dest, id, size, is_executable(&meta)));
-            prepared.add_file(id, size, local);
-        } else if meta.is_dir() {
-            let files = prepared.scan_directory(&local)?;
+                .push(TaskInput::file(&dest, id, size, executable));
+        } else if is_dir {
+            let files = prepared.scan_directory(local, limits)?;
             let manifest = TreeManifest::new(files)
                 .map_err(|e| format!("--input {}: {e}", local.display()))?;
             let encoded = manifest.encode();
@@ -212,17 +263,59 @@ pub fn scan_inputs(specs: &[String]) -> Result<PreparedInputs, String> {
 }
 
 impl PreparedInputs {
-    fn add_file(&mut self, id: BlobId, size: u64, path: PathBuf) {
+    /// Opens `path` once with `O_NOFOLLOW`, inspects the handle with `fstat` (`file.metadata()`),
+    /// enforces `limits`, hashes from the open handle, rewinds it, and stores it for upload.
+    fn add_file_from_path(
+        &mut self,
+        path: &Path,
+        limits: InputLimits,
+    ) -> Result<(BlobId, u64, bool), String> {
+        if self.files >= limits.max_files {
+            return Err(format!(
+                "--input {}: input count exceeds the limit of {} files",
+                path.display(),
+                limits.max_files
+            ));
+        }
+        let (mut file, meta) = open_regular_file_nofollow(path)
+            .map_err(|e| format!("--input {}: {e}", path.display()))?;
+        let remaining = limits.max_bytes.saturating_sub(self.bytes);
+        if meta.len() > remaining {
+            return Err(format!(
+                "--input {}: total input size ({} bytes) exceeds the limit of {} bytes",
+                path.display(),
+                self.bytes.saturating_add(meta.len()),
+                limits.max_bytes
+            ));
+        }
+        let (id, size) = hash_reader((&mut file).take(remaining.saturating_add(1)))
+            .map_err(|e| format!("--input {}: {e}", path.display()))?;
+        if size > remaining {
+            return Err(format!(
+                "--input {}: total input size ({} bytes) exceeds the limit of {} bytes",
+                path.display(),
+                self.bytes.saturating_add(size),
+                limits.max_bytes
+            ));
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("--input {}: {e}", path.display()))?;
+        let executable = is_executable(&meta);
         self.files += 1;
         self.bytes += size;
-        self.blobs.entry(id).or_insert(LocalBlob {
+        self.blobs.entry(id).or_insert_with(|| LocalBlob {
             size,
-            source: LocalSource::File(path),
+            source: LocalSource::File(Arc::new(file)),
         });
+        Ok((id, size, executable))
     }
 
     /// The regular files below `root`, with paths relative to it.
-    fn scan_directory(&mut self, root: &Path) -> Result<Vec<BlobFile>, String> {
+    fn scan_directory(
+        &mut self,
+        root: &Path,
+        limits: InputLimits,
+    ) -> Result<Vec<BlobFile>, String> {
         let mut files = Vec::new();
         let mut stack = vec![(root.to_path_buf(), String::new())];
         while let Some((dir, rel_dir)) = stack.pop() {
@@ -251,18 +344,13 @@ impl PreparedInputs {
                 if file_type.is_dir() {
                     stack.push((path, rel));
                 } else if file_type.is_file() {
-                    let meta = entry
-                        .metadata()
-                        .map_err(|e| format!("--input {}: {e}", path.display()))?;
-                    let (id, size) =
-                        hash_file(&path).map_err(|e| format!("--input {}: {e}", path.display()))?;
+                    let (id, size, executable) = self.add_file_from_path(&path, limits)?;
                     files.push(BlobFile {
                         path: rel,
                         id,
                         size,
-                        executable: is_executable(&meta),
+                        executable,
                     });
-                    self.add_file(id, size, path);
                 } else if file_type.is_symlink() {
                     self.skipped
                         .push(format!("{} (symbolic links are not sent)", path.display()));
@@ -339,9 +427,11 @@ pub async fn upload_inputs<C: BlobChannel>(
         .collect();
     let bytes = for_each_concurrently(jobs, |(id, blob)| async move {
         match blob.source {
-            LocalSource::File(path) => {
-                let file = tokio::fs::File::open(path).await?;
-                upload_blob(channel, id, blob.size, file).await
+            LocalSource::File(file) => {
+                let mut std_file = file.try_clone()?;
+                std_file.seek(SeekFrom::Start(0))?;
+                let tokio_file = tokio::fs::File::from_std(std_file);
+                upload_blob(channel, id, blob.size, tokio_file).await
             }
             LocalSource::Bytes(bytes) => {
                 upload_blob(channel, id, blob.size, std::io::Cursor::new(bytes)).await
@@ -420,6 +510,20 @@ pub async fn download_outputs<C: BlobChannel>(
     outputs: &[BlobFile],
     dest_dir: &Path,
 ) -> Result<Vec<PathBuf>, String> {
+    if let Ok(meta) = std::fs::symlink_metadata(dest_dir) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "cannot use output directory '{}': it is a symbolic link",
+                dest_dir.display()
+            ));
+        }
+        if !meta.is_dir() {
+            return Err(format!(
+                "cannot use output directory '{}': exists and is not a directory",
+                dest_dir.display()
+            ));
+        }
+    }
     std::fs::create_dir_all(dest_dir).map_err(|e| {
         format!(
             "cannot create the output directory '{}': {e}",
@@ -552,6 +656,106 @@ mod tests {
         // The same tree scanned again has the same id: nothing would be uploaded twice.
         let again = scan_inputs(&[format!("{}:work", proj.display())]).unwrap();
         assert_eq!(again.inputs, prepared.inputs);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_once_handle_prevents_symlink_swap_between_scan_and_upload() {
+        struct RecordingChannel {
+            received: std::sync::Mutex<Vec<u8>>,
+        }
+        impl BlobChannel for RecordingChannel {
+            async fn call(&self, request: BlobRequest) -> Result<BlobReply, BlobError> {
+                match request {
+                    BlobRequest::Missing { ids } => Ok(BlobReply::Missing { ids }),
+                    BlobRequest::Write {
+                        id,
+                        total_size,
+                        offset,
+                        data,
+                    } => {
+                        let received = offset + data.len() as u64;
+                        self.received
+                            .lock()
+                            .unwrap()
+                            .extend_from_slice(data.as_bytes());
+                        Ok(BlobReply::Written {
+                            id,
+                            received,
+                            complete: received >= total_size,
+                        })
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("input.txt");
+        let secret_path = dir.path().join("secret.txt");
+        std::fs::write(&file_path, b"original-safe-bytes").unwrap();
+        std::fs::write(&secret_path, b"swapped-secret-bytes").unwrap();
+
+        // Direct symlink is refused at scan time.
+        let link_path = dir.path().join("direct_link.txt");
+        std::os::unix::fs::symlink(&secret_path, &link_path).unwrap();
+        let direct_err = scan_input_paths(&[(link_path, Some("link.txt".to_string()))])
+            .err()
+            .expect("direct symlink must be refused");
+        assert!(direct_err.contains("symbolic link"), "{direct_err}");
+
+        // Scan regular file, then swap the path on disk with a symlink to `secret.txt` before uploading.
+        let prepared = scan_input_paths(&[(file_path.clone(), Some("input.txt".to_string()))])
+            .expect("regular file scan succeeds");
+        std::fs::remove_file(&file_path).unwrap();
+        std::os::unix::fs::symlink(&secret_path, &file_path).unwrap();
+
+        let channel = RecordingChannel {
+            received: std::sync::Mutex::new(Vec::new()),
+        };
+        let report = upload_inputs(&channel, &prepared)
+            .await
+            .expect("upload from kept file handle succeeds");
+        assert_eq!(report.uploaded, 1);
+        assert_eq!(
+            channel.received.lock().unwrap().as_slice(),
+            b"original-safe-bytes",
+            "upload must read from the already-open regular file descriptor, never following a swapped-in symlink"
+        );
+    }
+
+    #[test]
+    fn input_limits_cap_file_count_and_aggregate_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"0123456789").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"0123456789").unwrap();
+
+        let specs = vec![
+            (dir.path().join("a.txt"), Some("a.txt".to_string())),
+            (dir.path().join("b.txt"), Some("b.txt".to_string())),
+        ];
+
+        let err_count = scan_input_paths_with_limits(
+            &specs,
+            InputLimits {
+                max_files: 1,
+                max_bytes: 1024,
+            },
+        )
+        .err()
+        .expect("exceeding max_files must fail");
+        assert!(err_count.contains("limit of 1 files"), "{err_count}");
+
+        let err_bytes = scan_input_paths_with_limits(
+            &specs,
+            InputLimits {
+                max_files: 10,
+                max_bytes: 15,
+            },
+        )
+        .err()
+        .expect("exceeding max_bytes must fail");
+        assert!(err_bytes.contains("limit of 15 bytes"), "{err_bytes}");
     }
 
     #[cfg(unix)]

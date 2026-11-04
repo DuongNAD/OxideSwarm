@@ -4242,4 +4242,96 @@ mod process_tree_tests {
         assert!(!truncated_exact);
         assert_eq!(captured_exact.as_bytes(), exact);
     }
+
+    #[tokio::test]
+    async fn test_read_bounded_stream_chunked_boundaries_exact_plus_one_and_many_wraps() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        struct ChunkedSlice<'a> {
+            data: &'a [u8],
+            pos: usize,
+            chunk_size: usize,
+        }
+
+        impl AsyncRead for ChunkedSlice<'_> {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.pos >= self.data.len() {
+                    return Poll::Ready(Ok(()));
+                }
+                let avail = self.data.len() - self.pos;
+                let n = avail.min(self.chunk_size).min(buf.remaining());
+                buf.put_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let max_len = 4096 * 4 + 37;
+        let master_input: Vec<u8> = (0..max_len).map(|i| ((i * 73 + 19) & 0xFF) as u8).collect();
+
+        for cap in [1usize, 2, 15, 16, 1024, 1025, 4096] {
+            let head_cap = cap / 2;
+            let tail_cap = cap - head_cap;
+            let lengths = [
+                cap.saturating_sub(1),
+                cap,
+                cap + 1,
+                head_cap + 1 + tail_cap,
+                cap * 4 + 37,
+            ];
+            for len in lengths {
+                let input = &master_input[..len];
+                for chunk_size in [1usize, 2, 7, 64, 511, 512, 513, 1024, 1025, 4096, 8192] {
+                    let reader = ChunkedSlice {
+                        data: input,
+                        pos: 0,
+                        chunk_size,
+                    };
+                    let (captured, truncated) = read_bounded_stream(reader, cap).await;
+                    let bytes = captured.as_bytes();
+                    if len <= cap {
+                        assert!(
+                            !truncated,
+                            "cap={cap} len={len} chunk_size={chunk_size}: must not truncate"
+                        );
+                        assert_eq!(
+                            bytes, input,
+                            "cap={cap} len={len} chunk_size={chunk_size}: exact bytes must match"
+                        );
+                    } else {
+                        assert!(
+                            truncated,
+                            "cap={cap} len={len} chunk_size={chunk_size}: must flag truncated"
+                        );
+                        assert_eq!(
+                            bytes.len(),
+                            cap + TRUNCATION_NOTICE.len(),
+                            "cap={cap} len={len} chunk_size={chunk_size}: truncated len mismatch"
+                        );
+                        assert_eq!(
+                            &bytes[..head_cap],
+                            &input[..head_cap],
+                            "cap={cap} len={len} chunk_size={chunk_size}: head mismatch"
+                        );
+                        assert_eq!(
+                            &bytes[head_cap..head_cap + TRUNCATION_NOTICE.len()],
+                            TRUNCATION_NOTICE,
+                            "cap={cap} len={len} chunk_size={chunk_size}: notice mismatch"
+                        );
+                        assert_eq!(
+                            &bytes[head_cap + TRUNCATION_NOTICE.len()..],
+                            &input[len - tail_cap..],
+                            "cap={cap} len={len} chunk_size={chunk_size}: tail mismatch"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

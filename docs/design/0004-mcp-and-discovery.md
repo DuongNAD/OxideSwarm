@@ -1,7 +1,7 @@
 # 0004: Model Context Protocol server and subnet-isolated discovery fallback
 
 Status: Implemented
-Created: 2026-10-23    Updated: 2026-11-01
+Created: 2026-10-23    Updated: 2026-11-04
 
 ## Summary
 
@@ -68,8 +68,8 @@ Implemented in `crates/cli/src/mcp.rs` and `crates/cli/src/config.rs`.
 |---|---|---|
 | `status` | `task_id` (optional string), `workers` (optional bool) | Returns overall cluster status, active task counts, and worker counts, or execution state of a specific task. |
 | `workers` | `connected_only`, `os`, `arch`, `gpu_only` | Lists registered compute workers, hardware capabilities, and tags matching the given filters. |
-| `submit` | `type`, `command`, `args`, `script`, `interpreter`, `stdin`, `env`, `os`, `arch`, `worker`, `require_tags`, `gpu`, `matrix_dim`, `files`, `outputs`, `output_dir`, `max_output_bytes`, `wait`, `timeout_secs`, `wait_secs`, `max_retries` | Submits a computation task to the grid with content-addressed blob input staging (`files` restricted to non-symlink paths inside the working directory), output glob collection (`outputs`), optional download directory (`output_dir`) and inline stream budget (`max_output_bytes`, default 16 KiB head + tail), placement constraints, and client wait deadline (`wait_secs`). |
-| `task_result` | `task_id`, `wait`, `timeout_secs`, `wait_secs`, `output_dir`, `max_output_bytes` | Retrieves execution outcome, exit code, bounded head+tail `stdout` and `stderr` (default 16 KiB per stream), `truncated` and `total_bytes` metadata, execution duration, and output artifact metadata (downloading output blobs to `output_dir` when given, without inline `data_preview`). |
+| `submit` | `type`, `command`, `args`, `script`, `interpreter`, `stdin`, `env`, `os`, `arch`, `worker`, `require_tags`, `gpu`, `matrix_dim`, `files`, `outputs`, `output_dir`, `max_output_bytes`, `wait`, `timeout_secs`, `wait_secs`, `max_retries` | Submits a computation task to the grid with content-addressed blob input staging (`files` restricted to non-symlink paths inside the working directory, mapping `.` to `SANDBOX_ROOT`), output glob collection (`outputs`), optional download directory (`output_dir`, restricted to non-symlink paths inside the working directory and created directory-by-directory), inline stream budget (`max_output_bytes`, default 16 KiB head + tail budgeted across the JSON-RPC escaped length of both streams), placement constraints, and client wait deadline (`wait_secs`). |
+| `task_result` | `task_id`, `wait`, `timeout_secs`, `wait_secs`, `output_dir`, `max_output_bytes` | Retrieves execution outcome, exit code, bounded head+tail `stdout` and `stderr` (default 16 KiB escaped budget across both streams), `captured_bytes` (`stdout_captured_bytes`, `stderr_captured_bytes`), `truncated` (`stdout_truncated`, `stderr_truncated`), `worker_truncated` (`stdout_worker_truncated`, `stderr_worker_truncated`), execution duration, and output artifact metadata (downloading output blobs to `output_dir` inside the working directory when given, without inline `data_preview`). |
 | `cancel` | `task_id` | Cancels a queued or running task on the master by UUID. |
 | `doctor` | `expect_workers`, `timeout_secs`, `gpu_dim`, `spread_tasks`, `skip_gpu`, `skip_spread` | Runs cluster diagnostic checks C1–C6 and returns complete health check results. |
 
@@ -136,13 +136,17 @@ Implemented in `crates/core/src/discovery.rs` and `crates/master/src/server.rs`.
 - The MCP protocol conforms to Anthropic's `2024-11-05` standard and interoperates with standard MCP clients.
 - Discovery probe endpoints (`/api/discovery/probe`, `/api/rendezvous/*`) are public endpoints that verify signatures internally, allowing discovery before Bearer tokens are issued.
 - Mixed versions: masters without discovery probe support fall back to direct IP configuration without protocol errors.
+- MCP `submit` and `task_result` artifact entries no longer carry an inline `data_preview` field; callers that need file contents pass `output_dir` so output blobs are written directly to disk without UTF-8 corruption or context-window blow-ups.
+- MCP `submit` `files` and `outputs` use the content-addressed blob plane of [design 0006](0006-content-addressed-data-plane.md) and therefore require a Master with an active blob store (`~/.oxideswarm/blobs` or `master --blob-dir`) and workers advertising `ProtocolCapabilities::BLOB_TRANSFER`.
+- Output size and truncation fields in MCP task result bodies are `captured_bytes` (`stdout_captured_bytes`, `stderr_captured_bytes` — the byte count captured by the worker, up to 10 MiB plus the 59-byte worker notice per stream), `truncated` (`stdout_truncated`, `stderr_truncated` — whether either MCP or the worker cut the stream short), and `worker_truncated` (`stdout_worker_truncated`, `stderr_worker_truncated` — whether the worker's 10 MiB capture cap cut the stream short).
 
 ## Security
 
 - All discovery probes and rendezvous leases require HMAC-SHA256 validation using `cluster.secret`. Malicious actors on the network cannot impersonate the master.
 - Fresh 16-byte nonces ensure that discovery probes are single-use and cannot be replayed.
 - The MCP server strictly forbids unauthenticated connections to non-loopback or auto-discovered addresses (exiting with code `6` before reading standard input) unless `--insecure`, `RUSTY_GRID_INSECURE=1`, or `[status] insecure = true` is set (`RUSTY_GRID_INSECURE=0` overrides `[status] insecure = true`). Skipping `./rusty-grid.toml` and `./rusty-grid.json` in the working directory stops a cloned repository from auto-loading its own config file into a bare `oxideswarm mcp` invocation; however, a relative `--config`, `RUSTY_GRID_CONFIG`, `OXIDESWARM_HOME`, `--secret-file`, `OXIDESWARM_SECRET_FILE`, or `secret_file` configured by the user still resolves against the working directory.
-- `submit` `files` validates every local path against the MCP server's working directory with `symlink_metadata` before hashing blobs, refusing `..`, paths outside the working directory, and symbolic links (including symbolic links inside staged directories) so a repository cannot steer an agent into uploading files from outside the workspace.
+- `submit` `files` validates every local path against the MCP server's working directory with `symlink_metadata` before hashing blobs (passing checked `(PathBuf, Option<String>)` pairs directly to `scan_input_paths` without re-parsing `:` in paths), refusing `..`, paths outside the working directory, and symbolic links (including symbolic links inside staged directories). Each regular file is opened once with `O_NOFOLLOW` (Unix) / `FILE_FLAG_OPEN_REPARSE_POINT` (Windows), checked via `fstat` on the open handle, hashed and uploaded from that same descriptor (`spawn_blocking` for hashing), and bounded by file-count and aggregate-byte caps (`1,000` files, `256 MiB`).
+- `submit` and `task_result` `output_dir` apply the same working-directory boundary as `files`: `prepare_mcp_output_dir_in_dir` rejects `..`, paths outside the working directory, and symbolic links at every path component, creating missing directories one component at a time and writing output files via atomic temp-file renames after verifying that neither intermediate directories nor an existing destination file are symbolic links.
 
 ## Test plan
 
@@ -168,4 +172,4 @@ Implemented in `crates/core/src/discovery.rs` and `crates/master/src/server.rs`.
 - 2026-10-23: Implemented W1–W6 on branch `feat/m5c-mcp-and-discovery`.
 - 2026-10-23: Verified via `cargo test -p rusty_grid_cli --test mcp_server_e2e` and `discovery_fallback_e2e` (5 passing tests). Status marked Implemented.
 - 2026-11-01: Removed the unauthenticated `--sse` HTTP surface (`SEC-1`) and enforced startup secret validation via `client_secret` using `[status]` for `master`, `secret`, and `insecure` while skipping working-directory config files (`SEC-2`).
-- 2026-11-04: Moved MCP `submit` / `task_result` file transfer to content-addressed blobs, refused symlinks and paths outside the working directory in `submit` `files`, added `output_dir` and `max_output_bytes` (16 KiB head + tail default), added `truncated` and `total_bytes`, and removed `data_preview` (`MCP-2`).
+- 2026-11-04: Moved MCP `submit` / `task_result` file transfer to content-addressed blobs, enforced working-directory and no-symlink rules on both `files` (mapping `.` to `SANDBOX_ROOT`, opening once with `O_NOFOLLOW`) and `output_dir` (creating directories one by one), budgeted `max_output_bytes` (16 KiB head + tail default) across the escaped JSON-RPC length of both streams, added `captured_bytes`, `truncated`, and `worker_truncated`, and removed `data_preview` (`MCP-2`).

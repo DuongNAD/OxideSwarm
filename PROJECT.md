@@ -89,7 +89,7 @@ OxideSwarm/
 | **Master Grid** | Memory Bounding | LRU task eviction and TTL bounding for terminal states in TaskQueue | Implemented |
 | **CLI** | Cluster Check | `oxideswarm doctor`: connection, workers, pinned in-process / process / GPU probes, spreading (checks C1-C6) | Implemented |
 | **CLI** | Task Inputs | `submit --stdin-file`, `--script-file`, `--interpreter`, `--env`; `--matrix-dim` / `--work-group-size` for GPU tasks | Implemented |
-| **Worker Engine** | Execution Runner | Bounded stdout/stderr capture, cancellation, configurable process priority | Implemented |
+| **Worker Engine** | Execution Runner | Bounded head-and-tail stdout/stderr capture ([design 0022](docs/design/0022-head-and-tail-stream-capture.md)), cancellation, configurable process priority | Implemented |
 | **Worker Engine** | Child Containment | Atomic Windows Job Objects (`kill-on-close` via `CREATE_SUSPENDED`) and Linux `PR_SET_PDEATHSIG` process tree binding | Implemented |
 | **Worker Engine** | GPU Acceleration | Hardware `wgpu` compute engine (Metal, Vulkan, DX12) and simulated CPU SIMD fallback | Implemented |
 | **Android Bridge** | In-Process JNI | `liboxideworker.so` cdylib running the Android worker inside Tokio runtime threads (the Android app is a worker only) | Implemented |
@@ -97,7 +97,7 @@ OxideSwarm/
 | **Agent Mesh** | Relay Hub | Axum WebSocket hub routing envelopes with token authentication and SHA-256 validation | Implemented |
 | **Agent Mesh** | Grid Bridge | `--grid-master` CLI integration routing `grid_*` commands to live master | Implemented |
 | **Mobile Coordination** | Dynamic Throttling & Arbitrage | Multi-tier thermal/battery throttling, RRC adaptive keepalive, 5-rule refusal matrix, $S_{\text{auth}}$ election, cryptographic lease tickets, fast pre-sleep evacuation ([design 0002](docs/design/0002-mobile-coordination.md)) | Implemented |
-| **File Staging** | Task input and output files | `submit --input` (files and directories) and `--output` patterns as BLAKE3 blobs through a bounded master store and worker cache, nothing sent twice, `RustCompilation` artifacts returned ([design 0006](docs/design/0006-content-addressed-data-plane.md)); inline staging for the MCP server ([design 0003](docs/design/0003-distributed-file-staging.md)) | Implemented |
+| **File Staging** | Task input and output files | `submit --input` (files and directories) and `--output` patterns as BLAKE3 blobs through a bounded master store and worker cache across both the CLI and the MCP server, nothing sent twice, `RustCompilation` artifacts returned ([design 0006](docs/design/0006-content-addressed-data-plane.md)); legacy inline staging retained for wire compatibility ([design 0003](docs/design/0003-distributed-file-staging.md)) | Implemented |
 | **AI Tooling** | MCP Server | Model Context Protocol server over JSON-RPC 2.0 stdio (`oxideswarm mcp`) exposing `status`, `workers`, `submit`, `task_result`, `doctor` ([design 0004](docs/design/0004-mcp-and-discovery.md)) | Implemented |
 | **Discovery** | Subnet-Isolated Fallback | 3-tier discovery hierarchy: UDP broadcast, authenticated HTTP probe (`GET /api/discovery/probe`), and signed rendezvous registry (`OXIDESWARM_RENDEZVOUS`) ([design 0004](docs/design/0004-mcp-and-discovery.md)) | Implemented |
 
