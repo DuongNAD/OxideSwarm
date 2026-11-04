@@ -375,6 +375,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--default-retry-max <N>` (alias `--max-retries`) | `3` (`RUSTY_GRID_DEFAULT_RETRY_MAX`, `RUSTY_GRID_MAX_RETRIES`, `[master].default_retry_max`) | Default maximum execution retries per task |
 | `--max-host-cpu-pct <PCT>` | `85.0` (`RUSTY_GRID_MAX_HOST_CPU_PCT`, `[master].max_host_cpu_pct`) | Host CPU percentage ceiling before anti-stuttering backpressure throttles dispatch |
 | `--preserve-gpu <BOOL>` | `true` (`RUSTY_GRID_PRESERVE_GPU`, `[master].preserve_gpu`) | Reserve GPU workers for GPU-requiring tasks when CPU-only workers are available |
+| `--fail-unfulfillable-tasks [BOOL]` | `false` (`RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, `[master].fail_unfulfillable_tasks`) | When at least one worker is registered, immediately fail tasks whose required capabilities or placement constraints no registered worker can satisfy (`--fail-unfulfillable-tasks` with no value sets `true`) |
 | `--p2p` | `false` (`RUSTY_GRID_P2P`, `[master].p2p`) | Enable Iroh QUIC/DERP P2P endpoint for NAT traversal |
 | `--p2p-ticket-file <PATH>` | `RUSTY_GRID_P2P_TICKET_FILE`, `[master].p2p_ticket_file` | File path where the generated P2P connection ticket is written |
 | `--p2p-key-file <PATH>` (alias `--key-file`) | `~/.oxideswarm/master_key.bin` (`RUSTY_GRID_P2P_KEY_FILE`, `[master].p2p_key_file`) | Persistent P2P secret key file for stable NodeId and ticket across restarts |
@@ -527,6 +528,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_REAPER_INTERVAL_SECS` | Master | Frequency of dead-worker reaper evaluation sweeps (`--reaper-interval-secs`; default `1`) |
 | `RUSTY_GRID_MAX_HOST_CPU_PCT` | Master | Host CPU % threshold for anti-stuttering backpressure (`--max-host-cpu-pct`; default `85.0`) |
 | `RUSTY_GRID_PRESERVE_GPU` | Master | Flag to preserve GPU workers for GPU-specific workloads (`--preserve-gpu`; default `true`) |
+| `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS` | Master | Immediately fail tasks whose required capabilities or placement constraints no registered worker can satisfy (`--fail-unfulfillable-tasks`; default `false`) |
 | `RUSTY_GRID_P2P` | Master | Enables Iroh QUIC/DERP P2P WAN endpoint (`--p2p`) |
 | `RUSTY_GRID_P2P_TICKET_FILE` | Master | File path where generated P2P ticket string is written (`--p2p-ticket-file`) |
 | `RUSTY_GRID_P2P_KEY_FILE` | Master | File path where master P2P identity key is persisted (`--p2p-key-file`) |
