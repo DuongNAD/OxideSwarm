@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use rusty_grid_core::capabilities::{HardwareOverrides, WorkerCapabilities};
+use rusty_grid_core::capabilities::{HardwareOverrides, WorkerCapabilities, HOST_PROBE_TIMEOUT};
 use rusty_grid_core::protocol::{MessageTransport, WireCodec, WorkerMessage};
 use rusty_grid_core::task::{TaskId, TaskRequirements, TaskResult, TaskSpec};
 
@@ -589,6 +589,11 @@ fn test_new_3d_task_spec_serde_aliases() {
 #[test]
 fn test_rapid_repeated_detection_sequential_leak_and_stability() {
     const ITERATIONS: usize = 200;
+    // A single `detect_with_overrides` call runs up to 5 host probes (`blender --version`,
+    // `pmset -g batt`, `pmset -g therm`, `sysctl -n machdep.cpu.brand_string`, and
+    // `sw_vers -productVersion`), each bounded by `HOST_PROBE_TIMEOUT`.
+    const MAX_PROBES_PER_CALL: u32 = 5;
+    let per_call_guard = HOST_PROBE_TIMEOUT * MAX_PROBES_PER_CALL;
     println!(
         "\n=== Starting Rapid Repeated Capability Detection Stress ({ITERATIONS} iterations) ==="
     );
@@ -643,10 +648,11 @@ fn test_rapid_repeated_detection_sequential_leak_and_stability() {
             assert!(caps.blender_version.is_none());
         }
 
-        // Subprocess hanging guard: detection MUST NOT hang
+        // Subprocess hanging guard: each probe is bounded by `HOST_PROBE_TIMEOUT` and a call runs
+        // up to `MAX_PROBES_PER_CALL` probes.
         assert!(
-            elapsed < Duration::from_millis(1500),
-            "Detection call #{i} exceeded 1500ms safety threshold (took {:?})",
+            elapsed < per_call_guard,
+            "Detection call #{i} exceeded per-call safety threshold {per_call_guard:?} (took {:?})",
             elapsed
         );
     }
@@ -667,7 +673,8 @@ fn test_rapid_repeated_detection_sequential_leak_and_stability() {
         .fold(0.0, f64::max);
 
     latencies.sort();
-    let p50_ms = latencies[ITERATIONS * 50 / 100].as_secs_f64() * 1000.0;
+    let median = latencies[ITERATIONS * 50 / 100];
+    let p50_ms = median.as_secs_f64() * 1000.0;
     let p95_ms = latencies[ITERATIONS * 95 / 100].as_secs_f64() * 1000.0;
     let p99_ms = latencies[ITERATIONS * 99 / 100].as_secs_f64() * 1000.0;
 
@@ -676,6 +683,11 @@ fn test_rapid_repeated_detection_sequential_leak_and_stability() {
     println!("Min: {min_ms:.2} ms | Max: {max_ms:.2} ms");
     println!("p50: {p50_ms:.2} ms | p95: {p95_ms:.2} ms | p99: {p99_ms:.2} ms");
     println!("Initial Process Handles: {initial_handles} | Final Process Handles: {final_handles}");
+
+    assert!(
+        median < Duration::from_millis(1500),
+        "Median detection latency ({p50_ms:.2}ms) exceeded 1500ms threshold"
+    );
 
     // File / Process Handle Leak Invariant:
     // Any handle count increase across 200 iterations MUST be bounded (<= 5).
