@@ -158,7 +158,7 @@ merge.
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 | | Planned |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 | | Planned |
 | DOC-4 | Complete the CLI and environment reference | P2 | M | INT-4 | | Planned |
-| DOC-5 | Document the 3D subsystem | P2 | S | 3D-1 | | Planned |
+| DOC-5 | Document the 3D subsystem | P2 | S | 3D-1 | | Implemented |
 | DOC-6 | Correct the minimum Rust version | P1 | S | INT-4 | | Planned |
 | DOC-7 | Add an MCP client setup guide | P2 | S | SEC-2 | | Planned |
 | REL-1 | Restore the Apache licence text | P0 | S | | | Planned |
@@ -198,7 +198,7 @@ merge.
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 | | Planned |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 | | Planned |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Planned |
-| REL-5 | Contributor and security files | P3 | S | REL-1 | | Implemented |
+| REL-5 | Contributor and security files | P3 | S | REL-1 | | Planned |
 
 ## Phase 0: integrate open work
 
@@ -756,10 +756,11 @@ The standard in `docs/README.md` requires "only what the code does". These items
 
 ### DOC-5: Document the 3D subsystem
 
+- **Status:** Implemented (`win/doc-5-3d-subsystem`, design `0023`)
 - **Evidence:** Reproduced. A grep of all tracked Markdown finds no mention.
 - **Problem:** `crates/worker/src/gen3d`, `crates/worker/src/autorig`, `TaskSpec::Generative3D`,
   `TaskSpec::AutoRig` and `engines/` have no design record and no `README.md` section. No installer
-  ships `engines/`, and `crates/worker/src/gen3d/runner.rs:69-73` finds the script by a relative path.
+  ships `engines/`, and `crates/worker/src/gen3d/runner.rs:128-132` finds the script by a relative path.
 - **Do:** Add a design record, a `README.md` section and a `CLAUDE.md` entry. State the limits. Ship
   `engines/` or set `OXIDESWARM_GEN3D_SCRIPT` in the installers.
 - **Done when:** `CLAUDE.md` and a design record describe both modules.
@@ -1248,7 +1249,6 @@ Each item below needs a design record before code.
 
 ### REL-5: Contributor and security files
 
-- **Status:** Implemented (`win/rel-5-contributor-and-security-files`)
 - **Evidence:** Reproduced.
 - **Problem:** No `CONTRIBUTING`, `CHANGELOG`, issue template or dependabot configuration exists.
   `docs/SECURITY.md:172` offers only a public issue for security reports.
@@ -1273,4 +1273,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-04: The Unix default sandbox base became `<temp>/rusty_grid-<euid>/sandboxes`. The worker now refuses
   a `rusty_grid-<euid>` that another local user could change (work item SEC-8 of design 0021).
 - 2026-11-04: REL-3 completed on branch `win/rel-3-repo-hygiene`; added `test_reports/` and `**/jniLibs/**/*.so` to `.gitignore` with a regression check in `tests/test_launcher_scripts.py`.
-- 2026-11-04: REL-5 completed on branch `win/rel-5-contributor-and-security-files`; added `CONTRIBUTING.md`, `CHANGELOG.md`, `.github/ISSUE_TEMPLATE/bug_report.md`, `.github/ISSUE_TEMPLATE/feature_request.md`, `.github/ISSUE_TEMPLATE/config.yml`, and `.github/dependabot.yml`, and updated `docs/SECURITY.md` with the private GitHub Security Advisories vulnerability reporting route.
+- 2026-11-04: DOC-5 completed on branch `win/doc-5-3d-subsystem`; added `docs/design/0023-generative-3d-and-autorig-subsystem.md`, documented `gen3d`, `autorig`, and `engines/` (including `3D-2` and `3D-3` limits) in `README.md` and `CLAUDE.md`, and updated the macOS, Windows, and Android Termux worker installers to deploy `engines/` and set `OXIDESWARM_GEN3D_SCRIPT`.

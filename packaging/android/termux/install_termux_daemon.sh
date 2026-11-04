@@ -122,6 +122,17 @@ else
     log_err "start_worker.sh not found in script directory: ${SCRIPT_DIR}"
 fi
 
+# Deploy 3D subsystem driver scripts (engines/) when present alongside the checkout
+ENGINES_DEST="${HOME}/.local/share/oxideswarm/engines"
+for eng_cand in "${SCRIPT_DIR}/../../../engines" "${SCRIPT_DIR}/engines"; do
+    if [ -d "$eng_cand" ]; then
+        mkdir -p "${ENGINES_DEST}"
+        cp -R "$eng_cand/." "${ENGINES_DEST}/"
+        log_ok "Installed 3D engine scripts to ${ENGINES_DEST}"
+        break
+    fi
+done
+
 # 5. Configure Default Configuration File
 CONFIG_DIR="${HOME}/.config/oxideswarm"
 CONFIG_FILE="${CONFIG_DIR}/rusty-grid.toml"
@@ -173,6 +184,9 @@ else
 #!/data/data/com.termux/files/usr/bin/bash
 termux-wake-lock
 sleep 10
+if [ -f "$HOME/.local/share/oxideswarm/engines/generative_3d/entrypoint.py" ]; then
+    export OXIDESWARM_GEN3D_SCRIPT="$HOME/.local/share/oxideswarm/engines/generative_3d/entrypoint.py"
+fi
 if [ -x "$PREFIX/bin/start_worker.sh" ]; then
     "$PREFIX/bin/start_worker.sh" --daemon
 fi
