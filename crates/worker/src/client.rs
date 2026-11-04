@@ -307,6 +307,8 @@ pub struct WorkerConfig {
     pub cuda: Option<bool>,
     /// Explicitly disable CUDA capability (CLI `--no-cuda`).
     pub no_cuda: bool,
+    /// Explicitly disable host battery and mobile capability probing (`RUSTY_GRID_NO_BATTERY`).
+    pub no_battery: bool,
 }
 
 impl WorkerConfig {
@@ -332,6 +334,7 @@ impl WorkerConfig {
             vram_mb: None,
             cuda: None,
             no_cuda: false,
+            no_battery: false,
             max_concurrency: None,
             process_priority: None,
             default_heartbeat_interval: Duration::from_secs(3),
@@ -461,6 +464,11 @@ impl WorkerConfig {
 
     pub fn with_no_cuda(mut self, no_cuda: bool) -> Self {
         self.no_cuda = no_cuda;
+        self
+    }
+
+    pub fn with_no_battery(mut self, no_battery: bool) -> Self {
+        self.no_battery = no_battery;
         self
     }
 
@@ -1040,6 +1048,7 @@ impl WorkerClient {
             vram_mb: config.vram_mb,
             cuda: config.cuda,
             no_cuda: config.no_cuda,
+            no_battery: config.no_battery,
         };
         let mut capabilities = WorkerCapabilities::detect_with_overrides(overrides);
         let concurrency_permits = config
@@ -1134,6 +1143,13 @@ impl WorkerClient {
         };
         let master_beacon = Arc::new(RwLock::new(initial_beacon));
 
+        if config.no_battery {
+            warn!(
+                worker_id = %worker_id,
+                "Host battery and thermal protection is disabled (no_battery=true); this worker will accept tasks regardless of battery level or thermal state"
+            );
+        }
+
         info!(
             worker_id = %worker_id,
             name = %capabilities.name,
@@ -1219,6 +1235,26 @@ impl WorkerClient {
         simulate_gpu: bool,
     ) -> Self {
         let mut config = WorkerConfig::new(master_addr);
+        config.enable_redirection_portal = false;
+        if let Some(n) = name {
+            config = config.with_name(n);
+        }
+        if let Some(c) = cores {
+            config = config.with_cores(c);
+        }
+        config = config.with_simulate_gpu(simulate_gpu);
+        Self::new(config)
+    }
+
+    /// Test-only constructor initializing `WorkerClient` with host battery probing and the
+    /// redirection portal disabled so tests do not depend on the test runner's battery state.
+    pub fn for_testing(
+        master_addr: impl Into<String>,
+        name: Option<String>,
+        cores: Option<usize>,
+        simulate_gpu: bool,
+    ) -> Self {
+        let mut config = WorkerConfig::new(master_addr).with_no_battery(true);
         config.enable_redirection_portal = false;
         if let Some(n) = name {
             config = config.with_name(n);
@@ -1354,14 +1390,16 @@ impl WorkerClient {
 
         // A worker that reads its own battery (a laptop, Termux) keeps the shared reading fresh;
         // one fed by a platform app is updated by that app instead.
-        let _mobile_poller = (!self.mobile_fed_externally && self.mobile.snapshot().is_some())
-            .then(|| {
-                AbortOnDrop(spawn_mobile_poller(
-                    self.mobile.clone(),
-                    MOBILE_POLL_INTERVAL,
-                    detect_live_mobile_status,
-                ))
-            });
+        let _mobile_poller = (!self.mobile_fed_externally
+            && !self.config.no_battery
+            && self.mobile.snapshot().is_some())
+        .then(|| {
+            AbortOnDrop(spawn_mobile_poller(
+                self.mobile.clone(),
+                MOBILE_POLL_INTERVAL,
+                detect_live_mobile_status,
+            ))
+        });
 
         loop {
             if *shutdown_rx.borrow() {
@@ -3096,7 +3134,12 @@ mod tests {
     // (These read `RUSTY_GRID_ENABLE_PHYSICAL_GPU` through the policy; run them without it set.)
 
     fn gpu_test_client(config: WorkerConfig) -> WorkerClient {
-        WorkerClient::new(config.with_name("gpu-policy-test").with_cores(2))
+        WorkerClient::new(
+            config
+                .with_name("gpu-policy-test")
+                .with_cores(2)
+                .with_no_battery(true),
+        )
     }
 
     #[test]
@@ -3229,14 +3272,73 @@ mod tests {
             .with_worker_id(id)
             .with_name("gpu-worker")
             .with_cores(8)
-            .with_simulate_gpu(true);
+            .with_simulate_gpu(true)
+            .with_no_battery(true);
 
         let client = WorkerClient::new(config);
         assert_eq!(client.worker_id(), id);
         assert_eq!(client.capabilities().cpu_cores, 8);
         assert!(client.capabilities().can_execute_gpu());
         assert!(client.capabilities().is_simulated_gpu);
+        assert!(client.capabilities().mobile.is_none());
         assert_eq!(client.concurrency_semaphore().available_permits(), 8);
+    }
+
+    #[test]
+    fn test_worker_config_no_battery_disables_host_battery_probe() {
+        rusty_grid_core::capabilities::with_test_battery_probe((Some(10), Some(false)), || {
+            let default_cfg = WorkerConfig::new("127.0.0.1:9999");
+            assert!(!default_cfg.no_battery);
+            let default_client = WorkerClient::new(default_cfg);
+            assert_eq!(
+                default_client
+                    .capabilities()
+                    .mobile
+                    .as_ref()
+                    .and_then(|m| m.battery_pct),
+                Some(10),
+                "without with_no_battery(true), WorkerClient::new must observe the 10 % battery probe"
+            );
+            assert_eq!(
+                default_client
+                    .mobile_telemetry()
+                    .snapshot()
+                    .and_then(|s| s.battery_pct),
+                Some(10),
+                "without with_no_battery(true), a 10 % discharging battery probe must populate mobile_telemetry()"
+            );
+
+            let from_opts_client =
+                WorkerClient::from_options("127.0.0.1:9999", Some("opts".into()), Some(2), false);
+            assert_eq!(
+                from_opts_client
+                    .capabilities()
+                    .mobile
+                    .as_ref()
+                    .and_then(|m| m.battery_pct),
+                Some(10),
+                "WorkerClient::from_options must keep host battery protection enabled"
+            );
+
+            let no_bat_cfg = WorkerConfig::new("127.0.0.1:9999").with_no_battery(true);
+            assert!(no_bat_cfg.no_battery);
+            let client = WorkerClient::new(no_bat_cfg);
+            assert!(
+                client.capabilities().mobile.is_none(),
+                "with_no_battery(true) must suppress host battery detection even when the battery probe reports 10 %"
+            );
+            assert!(
+                client.mobile_telemetry().snapshot().is_none(),
+                "with_no_battery(true) must leave mobile telemetry handle empty unless fed externally"
+            );
+
+            let testing_client =
+                WorkerClient::for_testing("127.0.0.1:9999", Some("test".into()), Some(2), false);
+            assert!(
+                testing_client.capabilities().mobile.is_none(),
+                "WorkerClient::for_testing must suppress host battery detection"
+            );
+        });
     }
 
     /// Design 0021: a task is refused before anything touches the sandbox base when its private
@@ -3256,7 +3358,11 @@ mod tests {
         std::fs::create_dir(&elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
 
-        let mut client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_cores(2));
+        let mut client = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_cores(2)
+                .with_no_battery(true),
+        );
         client.sandbox_base_dir = sandbox_cfg.base_dir.clone();
         client.runner = Arc::new(TaskRunner::new(
             client.worker_id(),
@@ -3297,7 +3403,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_client_handle_assign_and_cancel_task() {
-        let config = WorkerConfig::new("127.0.0.1:9999").with_cores(4);
+        let config = WorkerConfig::new("127.0.0.1:9999")
+            .with_cores(4)
+            .with_no_battery(true);
         let client = WorkerClient::new(config);
         let (tx, mut rx) = mpsc::channel(16);
 
@@ -3349,7 +3457,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_assign_task_that_was_cancelled_before_it_arrived_is_refused_not_run() {
-        let config = WorkerConfig::new("127.0.0.1:9999").with_cores(4);
+        let config = WorkerConfig::new("127.0.0.1:9999")
+            .with_cores(4)
+            .with_no_battery(true);
         let client = WorkerClient::new(config);
         let (tx, mut rx) = mpsc::channel(16);
         let task = Task::new(
@@ -3396,7 +3506,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_client_concurrency_bounded_by_cores() {
-        let config = WorkerConfig::new("127.0.0.1:9999").with_cores(2);
+        let config = WorkerConfig::new("127.0.0.1:9999")
+            .with_cores(2)
+            .with_no_battery(true);
         let client = WorkerClient::new(config);
         assert_eq!(client.concurrency_semaphore().available_permits(), 2);
         assert_eq!(client.heartbeat_tracker().active_tasks(), 0);
@@ -3439,7 +3551,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_client_mobile_battery_rejection() {
-        let client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999"));
+        let client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_no_battery(true));
         // Inject low battery mobile capabilities. The gate reads the live handle, not the
         // snapshot detected at startup, so that is where a platform app (or the poller) writes.
         client
@@ -3480,7 +3592,7 @@ mod tests {
     #[tokio::test]
     async fn test_worker_client_backoff_reset_on_register_ack() {
         let (client_io, master_io) = tokio::io::duplex(4096);
-        let config = WorkerConfig::new("127.0.0.1:9999");
+        let config = WorkerConfig::new("127.0.0.1:9999").with_no_battery(true);
         let client = WorkerClient::new(config);
         let worker_id = client.worker_id();
 
@@ -3527,7 +3639,7 @@ mod tests {
     #[tokio::test]
     async fn test_worker_refuses_register_ack_with_protocol_version_1() {
         let (client_io, master_io) = tokio::io::duplex(4096);
-        let client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999"));
+        let client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_no_battery(true));
         let worker_id = client.worker_id();
 
         tokio::spawn(async move {
@@ -3635,7 +3747,8 @@ mod tests {
         WorkerClient::new(
             WorkerConfig::new("127.0.0.1:9999")
                 .with_cores(cores)
-                .with_sandbox_base_dir(dir),
+                .with_sandbox_base_dir(dir)
+                .with_no_battery(true),
         )
     }
 
@@ -3959,7 +4072,8 @@ mod tests {
             WorkerConfig::new("127.0.0.1:9999")
                 .with_cores(1)
                 .with_sandbox_base_dir(dir.path())
-                .with_keep_sandboxes(true),
+                .with_keep_sandboxes(true)
+                .with_no_battery(true),
         );
         let (tx, mut rx) = mpsc::channel(16);
         let task = Task::new(
@@ -4509,7 +4623,8 @@ mod tests {
             WorkerConfig::new(addr.to_string())
                 .with_cores(2)
                 .with_sandbox_base_dir(dir.path())
-                .with_redirection_portal(false),
+                .with_redirection_portal(false)
+                .with_no_battery(true),
         );
         let (stop_tx, stop_rx) = watch::channel(false);
         let worker = tokio::spawn(async move { client.run(stop_rx).await });
@@ -4645,7 +4760,7 @@ mod tests {
     #[tokio::test]
     async fn test_register_carries_the_live_mobile_state_not_the_startup_snapshot() {
         let (client_io, master_io) = tokio::io::duplex(4096);
-        let client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999"));
+        let client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_no_battery(true));
         let worker_id = client.worker_id();
         // The phone has drained since the worker started.
         client
@@ -4717,7 +4832,8 @@ mod tests {
                 .with_cores(1)
                 .with_mobile_telemetry(handle.clone())
                 .with_sandbox_base_dir(dir.path())
-                .with_redirection_portal(false),
+                .with_redirection_portal(false)
+                .with_no_battery(true),
         );
         let (stop_tx, stop_rx) = watch::channel(false);
         let worker = tokio::spawn(async move { client.run(stop_rx).await });
@@ -4805,7 +4921,9 @@ mod tests {
     fn test_external_telemetry_handle_is_shared_with_the_client() {
         let handle = MobileTelemetryHandle::default();
         let client = WorkerClient::new(
-            WorkerConfig::new("127.0.0.1:9999").with_mobile_telemetry(handle.clone()),
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_mobile_telemetry(handle.clone())
+                .with_no_battery(true),
         );
         handle.update(MobileLiveStatus {
             battery_pct: Some(33),
@@ -4826,15 +4944,23 @@ mod tests {
         let path = dir.path().join("worker_id");
 
         // Default: a fresh id every time, and nothing is written.
-        let a = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999")).worker_id();
-        let b = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999")).worker_id();
+        let a = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_no_battery(true))
+            .worker_id();
+        let b = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_no_battery(true))
+            .worker_id();
         assert_ne!(a, b);
 
         // With a file: the same id across "restarts".
-        let first =
-            WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_worker_id_file(&path));
-        let second =
-            WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_worker_id_file(&path));
+        let first = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_worker_id_file(&path)
+                .with_no_battery(true),
+        );
+        let second = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_worker_id_file(&path)
+                .with_no_battery(true),
+        );
         assert_eq!(first.worker_id(), second.worker_id());
         assert_eq!(
             std::fs::read_to_string(&path).unwrap().trim(),
@@ -4846,7 +4972,8 @@ mod tests {
         let third = WorkerClient::new(
             WorkerConfig::new("127.0.0.1:9999")
                 .with_worker_id_file(&path)
-                .with_worker_id(explicit),
+                .with_worker_id(explicit)
+                .with_no_battery(true),
         );
         assert_eq!(third.worker_id(), explicit);
         assert_eq!(
@@ -4861,8 +4988,16 @@ mod tests {
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, "a file, not a directory").unwrap();
         let path = blocker.join("worker_id");
-        let a = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_worker_id_file(&path));
-        let b = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_worker_id_file(&path));
+        let a = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_worker_id_file(&path)
+                .with_no_battery(true),
+        );
+        let b = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_worker_id_file(&path)
+                .with_no_battery(true),
+        );
         assert_ne!(
             a.worker_id(),
             b.worker_id(),
@@ -4872,7 +5007,7 @@ mod tests {
 
     #[test]
     fn test_dead_peer_timeout_scales_with_the_heartbeat_interval() {
-        let client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999"));
+        let client = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_no_battery(true));
         assert_eq!(
             client.dead_peer_timeout(Duration::from_secs(3)),
             Duration::from_secs(12)
@@ -4883,7 +5018,9 @@ mod tests {
             "never twitchier than the floor"
         );
         let tuned = WorkerClient::new(
-            WorkerConfig::new("127.0.0.1:9999").with_dead_peer_timeout(Duration::from_millis(700)),
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_dead_peer_timeout(Duration::from_millis(700))
+                .with_no_battery(true),
         );
         assert_eq!(
             tuned.dead_peer_timeout(Duration::from_secs(3)),
@@ -4897,7 +5034,8 @@ mod tests {
         let mut client = WorkerClient::new(
             WorkerConfig::new("127.0.0.1:9")
                 .with_p2p_ticket("this is not a ticket")
-                .with_redirection_portal(false),
+                .with_redirection_portal(false)
+                .with_no_battery(true),
         );
         let (_tx, rx) = watch::channel(false);
         let result = tokio::time::timeout(Duration::from_secs(5), client.run(rx))
@@ -4915,7 +5053,8 @@ mod tests {
         let mut client = WorkerClient::new(
             WorkerConfig::new("127.0.0.1:9")
                 .with_sandbox_base_dir(blocker.join("sandboxes"))
-                .with_redirection_portal(false),
+                .with_redirection_portal(false)
+                .with_no_battery(true),
         );
         let (_tx, rx) = watch::channel(false);
         let result = tokio::time::timeout(Duration::from_secs(5), client.run(rx))
@@ -4946,7 +5085,8 @@ mod tests {
                     format!("os:{}", std::env::consts::OS),
                     "slots:99".into(),
                 ])
-                .with_redirection_portal(false),
+                .with_redirection_portal(false)
+                .with_no_battery(true),
         );
         assert_eq!(
             client.capabilities().tags,
@@ -4966,7 +5106,8 @@ mod tests {
             let mut client = WorkerClient::new(
                 WorkerConfig::new("127.0.0.1:9")
                     .with_tags(vec![bad.into()])
-                    .with_redirection_portal(false),
+                    .with_redirection_portal(false)
+                    .with_no_battery(true),
             );
             let (_tx, rx) = watch::channel(false);
             let result = tokio::time::timeout(Duration::from_secs(5), client.run(rx))
@@ -4996,28 +5137,39 @@ mod tests {
     #[test]
     fn test_concurrency_permits_default_to_cores_minus_one_unless_configured() {
         // Detected cores: headroom.
-        let detected = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999"));
+        let detected = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_no_battery(true));
         assert_eq!(
             detected.concurrency_semaphore().available_permits(),
             default_max_concurrency(detected.capabilities().cpu_cores)
         );
         // Cores the owner named are offered in full; an explicit limit always wins.
-        let named = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_cores(6));
+        let named = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_cores(6)
+                .with_no_battery(true),
+        );
         assert_eq!(named.concurrency_semaphore().available_permits(), 6);
         let limited = WorkerClient::new(
             WorkerConfig::new("127.0.0.1:9999")
                 .with_cores(6)
-                .with_max_concurrency(2),
+                .with_max_concurrency(2)
+                .with_no_battery(true),
         );
         assert_eq!(limited.concurrency_semaphore().available_permits(), 2);
-        let all = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_max_concurrency(64));
+        let all = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_max_concurrency(64)
+                .with_no_battery(true),
+        );
         assert_eq!(all.concurrency_semaphore().available_permits(), 64);
     }
 
     #[test]
     fn test_process_priority_reaches_the_runner() {
         let client = WorkerClient::new(
-            WorkerConfig::new("127.0.0.1:9999").with_process_priority(ProcessPriority::Idle),
+            WorkerConfig::new("127.0.0.1:9999")
+                .with_process_priority(ProcessPriority::Idle)
+                .with_no_battery(true),
         );
         assert_eq!(
             client.runner().config().process_priority,
@@ -5426,7 +5578,8 @@ mod tests {
             WorkerConfig::new(proxy_addr.to_string())
                 .with_cores(1)
                 .with_sandbox_base_dir(worker_dir.path())
-                .with_redirection_portal(false),
+                .with_redirection_portal(false)
+                .with_no_battery(true),
         );
         let (stop_tx, stop_rx) = watch::channel(false);
         let worker_task = tokio::spawn(async move { client.run(stop_rx).await });
@@ -5614,6 +5767,7 @@ mod tests {
                 .with_cores(2)
                 .with_no_gpu(true)
                 .with_no_cuda(true)
+                .with_no_battery(true)
                 .with_blender_path(script.to_string_lossy().to_string()),
         );
         let elapsed = started.elapsed();
@@ -5682,6 +5836,7 @@ mod tests {
                 .with_cores(2)
                 .with_no_gpu(true)
                 .with_no_cuda(true)
+                .with_no_battery(true)
                 .with_sandbox_base_dir(dir.join("sandboxes"))
                 .with_blender_path(script_str.clone()),
         );

@@ -330,7 +330,7 @@ async fn test_end_to_end_mid_task_checkpoint_and_resumption_on_worker_disconnect
 
     // 2. Connect Worker 1
     let (w1_shutdown_tx, w1_shutdown_rx) = watch::channel(false);
-    let mut w1 = WorkerClient::from_options(
+    let mut w1 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("checkpoint-w1".into()),
         Some(1),
@@ -434,7 +434,7 @@ async fn test_end_to_end_mid_task_checkpoint_and_resumption_on_worker_disconnect
 
     // 7. Spawn Worker 2 to resume execution
     let (_w2_shutdown_tx, w2_shutdown_rx) = watch::channel(false);
-    let mut w2 = WorkerClient::from_options(
+    let mut w2 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("checkpoint-w2".into()),
         Some(1),

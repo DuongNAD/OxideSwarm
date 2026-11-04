@@ -114,6 +114,7 @@ async fn spawn_cluster() -> (
     let master_addr = master.server_addr().to_string();
 
     let worker_cfg = WorkerConfig::new(&master_addr)
+        .with_no_battery(true)
         .with_name("mcp1-worker")
         .with_cores(4)
         .with_ram_mb(4096)
@@ -1120,6 +1121,7 @@ async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_sec
     let master_addr = master.server_addr().to_string();
 
     let worker_cfg = WorkerConfig::new(&master_addr)
+        .with_no_battery(true)
         .with_name("mcp1-auth-worker")
         .with_cores(4)
         .with_ram_mb(4096)

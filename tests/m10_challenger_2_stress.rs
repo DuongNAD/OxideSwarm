@@ -85,7 +85,7 @@ async fn test_malformed_queries_to_api_tasks() {
 
     // Register 1 worker
     let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
-    let mut worker = WorkerClient::from_options(
+    let mut worker = WorkerClient::for_testing(
         master.server_addr().to_string(),
         Some("stress-query-worker".into()),
         Some(4),
@@ -329,7 +329,7 @@ async fn test_non_uuid_and_nonexistent_task_ids() {
 
     // Submit 1 real task and wait for completion
     let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
-    let mut worker = WorkerClient::from_options(
+    let mut worker = WorkerClient::for_testing(
         master.server_addr().to_string(),
         Some("stress-uuid-worker".into()),
         Some(2),
@@ -624,7 +624,7 @@ async fn test_concurrent_rest_bombardment_under_load() {
 
     for i in 0..2 {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut worker = WorkerClient::from_options(
+        let mut worker = WorkerClient::for_testing(
             master.server_addr().to_string(),
             Some(format!("bombard-worker-{i}")),
             Some(2),

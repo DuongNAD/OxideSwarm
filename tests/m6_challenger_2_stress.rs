@@ -849,6 +849,7 @@ async fn test_e2e_adversarial_cluster_backpressure_and_mobile_coexistence() {
     // Worker 1: Standard CPU Worker (4 cores)
     let temp_1 = TempDir::new().unwrap();
     let w1_cfg = WorkerConfig::new(cluster.master_addr.to_string())
+        .with_no_battery(true)
         .with_name("desktop-cpu-healthy")
         .with_cores(4)
         .with_sandbox_base_dir(temp_1.path());
@@ -857,6 +858,7 @@ async fn test_e2e_adversarial_cluster_backpressure_and_mobile_coexistence() {
     // Worker 2: GPU Worker (8 cores, simulated GPU)
     let temp_2 = TempDir::new().unwrap();
     let w2_cfg = WorkerConfig::new(cluster.master_addr.to_string())
+        .with_no_battery(true)
         .with_name("gpu-node")
         .with_cores(8)
         .with_simulate_gpu(true)

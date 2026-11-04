@@ -752,6 +752,7 @@ fn isolate_command(cmd: &mut std::process::Command, home: &std::path::Path) {
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
         .env("OXIDESWARM_HOME", home.join(".oxideswarm"))
+        .env("RUSTY_GRID_NO_BATTERY", "1")
         .env_remove("OXIDESWARM_SECRET")
         .env_remove("RUSTY_GRID_SECRET")
         .env_remove("OXIDESWARM_SECRET_FILE")

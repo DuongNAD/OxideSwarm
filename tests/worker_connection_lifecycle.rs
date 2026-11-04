@@ -139,6 +139,7 @@ fn start_worker(addr: SocketAddr, tweak: impl FnOnce(WorkerConfig) -> WorkerConf
     let sandbox = tempfile::tempdir().unwrap();
     let config = tweak(
         WorkerConfig::new(addr.to_string())
+            .with_no_battery(true)
             .with_name("lifecycle-worker")
             .with_cores(4)
             .with_no_blender(true)

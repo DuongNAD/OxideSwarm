@@ -164,6 +164,7 @@ async fn test_pure_relay_dialing_fallback_under_udp_block() {
     // Spawn Worker with pure relay ticket
     let worker_sandbox = temp_dir.path().join("worker_sandbox");
     let worker_config = WorkerConfig::new("auto")
+        .with_no_battery(true)
         .with_name("pure-relay-worker")
         .with_cores(2)
         .with_sandbox_base_dir(&worker_sandbox)
@@ -300,6 +301,7 @@ async fn test_normal_dialing_direct_p2p_and_path_introspection() {
     // Spawn Worker with complete ticket (including direct socket addresses)
     let worker_sandbox = temp_dir.path().join("worker_sandbox");
     let worker_config = WorkerConfig::new("auto")
+        .with_no_battery(true)
         .with_name("direct-p2p-worker")
         .with_cores(2)
         .with_sandbox_base_dir(&worker_sandbox)
@@ -394,6 +396,7 @@ async fn test_ticket_determinism_and_reconnection() {
     // 2. Start Worker with Ticket 1
     let worker_sandbox = temp_dir.path().join("worker_reconnect_sb");
     let worker_config = WorkerConfig::new("auto")
+        .with_no_battery(true)
         .with_name("reconnecting-worker")
         .with_cores(2)
         .with_sandbox_base_dir(&worker_sandbox)

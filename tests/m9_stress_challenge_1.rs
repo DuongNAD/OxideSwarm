@@ -87,6 +87,7 @@ impl ManagedWorker {
         let temp_dir = tempfile::tempdir().expect("worker tempdir");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let config = WorkerConfig::new(master_addr)
+            .with_no_battery(true)
             .with_name(name)
             .with_cores(cores)
             .with_simulate_gpu(simulate_gpu)
@@ -294,7 +295,7 @@ async fn test_stress_tcp_rst_vs_graceful_disconnect() {
 
     // 1. Worker 1: Graceful worker (starts first)
     let (w1_tx, w1_rx) = watch::channel(false);
-    let mut w1 = WorkerClient::from_options(
+    let mut w1 = WorkerClient::for_testing(
         master_addr.to_string(),
         Some("w-graceful".into()),
         Some(1),
@@ -342,7 +343,7 @@ async fn test_stress_tcp_rst_vs_graceful_disconnect() {
 
     // 2. Spawn Worker 3: Survivor worker
     let (_w3_tx, w3_rx) = watch::channel(false);
-    let mut w3 = WorkerClient::from_options(
+    let mut w3 = WorkerClient::for_testing(
         master_addr.to_string(),
         Some("w-survivor".into()),
         Some(4),
@@ -419,7 +420,7 @@ async fn test_stress_tcp_rst_vs_graceful_disconnect() {
     // 3. Now test abrupt TCP drop / crash:
     // Spawn Worker 2 (abrupt crash worker)
     let (_w2_tx, w2_rx) = watch::channel(false);
-    let mut w2 = WorkerClient::from_options(
+    let mut w2 = WorkerClient::for_testing(
         master_addr.to_string(),
         Some("w-abrupt".into()),
         Some(1),
@@ -540,10 +541,10 @@ async fn test_stress_immediate_failover_latency_under_load() {
     let (_w2_tx, w2_rx) = watch::channel(false);
 
     let mut w1 =
-        WorkerClient::from_options(master_addr.clone(), Some("load-w1".into()), Some(8), false);
+        WorkerClient::for_testing(master_addr.clone(), Some("load-w1".into()), Some(8), false);
     let w1_id = w1.worker_id();
     let mut w2 =
-        WorkerClient::from_options(master_addr.clone(), Some("load-w2".into()), Some(8), false);
+        WorkerClient::for_testing(master_addr.clone(), Some("load-w2".into()), Some(8), false);
     let w2_id = w2.worker_id();
 
     tokio::spawn(async move {
@@ -792,7 +793,7 @@ async fn test_stress_concurrent_max_retries_and_waiters_resolution() {
 
     // Spawn Worker 1
     let (_w1_tx, w1_rx) = watch::channel(false);
-    let mut w1 = WorkerClient::from_options(
+    let mut w1 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("w-retry-1".into()),
         Some(4),
@@ -877,7 +878,7 @@ async fn test_stress_concurrent_max_retries_and_waiters_resolution() {
 
     // Spawn Worker 2 (Attempt 2)
     let (_w2_tx, w2_rx) = watch::channel(false);
-    let mut w2 = WorkerClient::from_options(
+    let mut w2 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("w-retry-2".into()),
         Some(4),
@@ -935,7 +936,7 @@ async fn test_stress_concurrent_max_retries_and_waiters_resolution() {
 
     // Spawn Worker 3 (Attempt 3 -> will exceed max_retries = 2!)
     let (_w3_tx, w3_rx) = watch::channel(false);
-    let mut w3 = WorkerClient::from_options(
+    let mut w3 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("w-retry-3".into()),
         Some(4),
