@@ -2506,12 +2506,7 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                                             .request(&ClientMessage::GetTaskStatus { task_id })
                                             .await,
                                         Ok(ClientResponse::TaskStatusInfo { status, .. })
-                                            if !matches!(
-                                                status,
-                                                rusty_grid_core::TaskStatus::Completed
-                                                    | rusty_grid_core::TaskStatus::Failed
-                                                    | rusty_grid_core::TaskStatus::Cancelled
-                                            )
+                                            if !status.is_terminal()
                                     );
                                     if !is_active {
                                         return;

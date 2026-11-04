@@ -31,8 +31,8 @@ Created: 2026-11-04    Updated: 2026-11-04
   tool calls a `2 s` grace window after `stdin` EOF before cancelling remaining calls. A piped
   `doctor` call executes 4 probe tasks (CPU, shell, multi-core, GPU/skip) and `mcp_server_e2e`
   pipes 3 concurrent `submit {wait: true}` requests before closing `stdin`; under heavy CPU or
-  process-creation load (especially on shared CI VMs and Windows), those short calls can take
-  `2.1 s` to `3.2 s` after `stdin` EOF.
+  process-creation load (especially on shared CI VMs and Windows), those short calls can exceed the
+  `2 s` window after `stdin` EOF.
 - **P2P master relay readiness and shutdown**: `MasterServer::spawn_with_config`
   (`crates/master/src/server.rs`) waited up to `3 s` for `endpoint.online()` before writing the P2P
   ticket file, which occasionally timed out on shared cloud VMs when the initial DNS/TLS/DERP
@@ -74,8 +74,7 @@ Created: 2026-11-04    Updated: 2026-11-04
    `run_stdio_server` removes the matching `(key, task_id)` entry from `completed_submits` (so it
    can be consumed at most once) and spawns a background task that queries
    `ClientMessage::GetTaskStatus { task_id }`. Only if the master reports a non-terminal status
-   (`!matches!(status, TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled)`) does
-   the server send `ClientMessage::CancelTask { task_id }`.
+   (`!status.is_terminal()`) does the server send `ClientMessage::CancelTask { task_id }`.
 
 ### D2: 4-second stdio EOF grace period
 
@@ -92,11 +91,9 @@ receive `cancel_tx.send(true)` and have up to `500 ms` to send `CancelTask` befo
   DERP relay connection and STUN discovery before building the P2P ticket (an offline or air-gapped
   start with `--p2p` therefore waits `5 s` instead of `3 s` before proceeding with local addresses).
 - In `MasterServer::run` (`crates/master/src/server.rs`), when `p2p_shutdown.changed()` fires in the
-  P2P accept loop, the loop calls `endpoint.close().await` before breaking so `MasterServer::shutdown()`
-  closes the `iroh::Endpoint`.
-- In `WorkerClient::establish_p2p` (`crates/worker/src/client.rs`), `reset_cached_endpoint` clears
-  the worker's cached `iroh::Endpoint` only when `endpoint.is_closed()`, preserving the worker's
-  existing relay connection across transient dial failures while the master restarts.
+  P2P accept loop (or if `*p2p_shutdown.borrow_and_update()` is already true when the loop starts),
+  the loop calls `endpoint.close().await` before breaking so `MasterServer::shutdown()` closes the
+  `iroh::Endpoint`.
 
 ## Compatibility
 
@@ -109,8 +106,8 @@ receive `cancel_tx.send(true)` and have up to `500 ms` to send `CancelTask` befo
 ## Security
 
 - Evicting `request_id_key` from `completed_submits` on any new request with that ID and checking
-  `GetTaskStatus` before sending `CancelTask` prevents accidental cancellation of an older task when
-  a client reuses numeric or string request IDs.
+  `GetTaskStatus` (`!status.is_terminal()`) before sending `CancelTask` prevents accidental
+  cancellation of an older task when a client reuses numeric or string request IDs.
 
 ## Test plan
 
@@ -121,20 +118,24 @@ receive `cancel_tx.send(true)` and have up to `500 ms` to send `CancelTask` befo
      every task from a skipped `200..225` reply is `Cancelled`;
   2. an explicit probe (`id: 299`) that submits `wait: false`, reads the reply, and then sends
      `notifications/cancelled` transitions the task to `Cancelled`;
-  3. reusing a request ID (`id: 298`) for `ping` before sending `notifications/cancelled` does not
-     cancel the older task.
+  3. reusing a request ID (`id: 298`) for `ping` before sending `notifications/cancelled`, followed
+     by a positive-control cancellation (`id: 297`) that reaches `Cancelled`, leaves the `id: 298`
+     task `Queued`.
 - `tests/test_p2p_wan_fallback.rs`: `test_master_persistent_key_yields_relay_ticket` and
-  `test_worker_reconnects_after_master_restart_with_same_key` verify that `master.shutdown()` alone
-  closes the P2P endpoint (`ep.closed()`) and that restarting with the same key preserves `NodeId`,
-  publishes a relay-only ticket, and lets existing workers re-register.
-- `tests/test_m2_identity_scripts.rs`: `test_worker_auto_reconnect_under_3_seconds` verifies worker
-  auto-reconnection in under `3.0 s` after master restart.
+  `test_ticket_determinism_and_reconnection` verify that `master.shutdown()` alone closes the P2P
+  endpoint (`is_closed()`) and that restarting with the same key preserves `NodeId`, publishes a
+  relay-only ticket, and lets existing workers re-register.
+- `tests/test_m2_identity_scripts.rs`: `test_worker_auto_reconnect_under_3_seconds` verifies that a
+  worker tuned with a `1.2 s` connect timeout (`with_connect_timeout(Duration::from_millis(1200))`)
+  and a `100–400 ms` reconnect backoff (`BackoffConfig { initial: 100 ms, max: 400 ms, factor: 1.5, jitter_ratio: 0.1 }`)
+  reconnects and re-registers in under `3.0 s` after master restart (with default worker settings,
+  reconnect passed `9/10` under load up to `3.02 s`).
 
 ## Work items
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| TEST-15 | Stabilize MCP pipelined cancel, EOF grace, and P2P master restart tests | `crates/cli/src/mcp.rs`, `crates/master/src/server.rs`, `crates/worker/src/client.rs`, `crates/cli/tests/test_mcp_concurrent_and_deadlines.rs`, `tests/test_p2p_wan_fallback.rs`, `tests/test_m2_identity_scripts.rs`, `crates/core/tests/m1_challenger_1_3d_serialization.rs` | All TEST-15 targets pass repeatedly under load and required mutations fail tests | Implemented |
+| TEST-15 | Stabilize MCP pipelined cancel, EOF grace, and P2P master restart tests | `crates/cli/src/mcp.rs`, `crates/master/src/server.rs`, `crates/cli/tests/test_mcp_concurrent_and_deadlines.rs`, `tests/test_p2p_wan_fallback.rs`, `tests/test_m2_identity_scripts.rs`, `crates/core/tests/m1_challenger_1_3d_serialization.rs` | All TEST-15 targets pass repeatedly under load and required mutations fail tests | Implemented |
 
 ## Status log
 

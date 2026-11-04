@@ -960,6 +960,36 @@ async fn test_mcp1_cancelled_async_submit_leaves_no_orphan_tasks_and_default_wai
     }));
     let ping_resp = mcp.recv_timeout(Duration::from_secs(5));
     assert_eq!(ping_resp["id"], 298);
+
+    // Submit a positive-control task (`id: 297`) whose post-reply cancellation proves the MCP
+    // server has processed the preceding `notifications/cancelled` for `id: 298` without a fixed sleep.
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 297,
+        "method": "tools/call",
+        "params": {
+            "name": "submit",
+            "arguments": {
+                "type": "command",
+                "command": "echo",
+                "args": ["reuse-positive-control"],
+                "require_tags": ["absent"],
+                "wait": false
+            }
+        }
+    }));
+    let control_resp = mcp.recv_timeout(Duration::from_secs(5));
+    assert_eq!(control_resp["id"], 297);
+    let control_body: Value = serde_json::from_str(
+        control_resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("control_resp text"),
+    )
+    .expect("control_resp json");
+    let control_tid = Uuid::parse_str(control_body["task_id"].as_str().expect("control task_id"))
+        .map(rusty_grid_core::task::TaskId)
+        .expect("valid control task_id");
+
     mcp.send(&json!({
         "jsonrpc": "2.0",
         "method": "notifications/cancelled",
@@ -968,7 +998,31 @@ async fn test_mcp1_cancelled_async_submit_leaves_no_orphan_tasks_and_default_wai
             "reason": "cancel after id reuse"
         }
     }));
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {
+            "requestId": 297,
+            "reason": "positive control after 298"
+        }
+    }));
+    let control_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let info = master
+            .queue()
+            .get_task(&control_tid)
+            .await
+            .expect("control task must exist");
+        if format!("{:?}", info.state) == "Cancelled" {
+            break;
+        }
+        assert!(
+            Instant::now() < control_deadline,
+            "positive-control task {control_tid} (id 297) must become Cancelled, got {:?}",
+            info.state
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     let reuse_info = master
         .queue()
         .get_task(&reuse_tid)

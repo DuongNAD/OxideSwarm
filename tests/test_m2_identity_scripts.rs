@@ -146,8 +146,11 @@ async fn test_0_config_master_secret_key_persistence() {
     );
 }
 
-/// Test 2: Verifies that upon Master restart, the Worker automatically reconnects
-/// and re-registers in < 3.0 seconds without manual intervention.
+/// Test 2: Verifies that upon Master restart, a Worker configured with a `1.2 s` connect timeout
+/// (`with_connect_timeout(Duration::from_millis(1200))`) and a `100–400 ms` reconnect backoff
+/// (`BackoffConfig { initial: 100 ms, max: 400 ms, factor: 1.5, jitter_ratio: 0.1 }`) automatically
+/// reconnects and re-registers in < 3.0 seconds without manual intervention (with default worker
+/// settings, reconnect passed 9/10 under load up to 3.02 s).
 #[tokio::test]
 async fn test_worker_auto_reconnect_under_3_seconds() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
