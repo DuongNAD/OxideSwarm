@@ -91,7 +91,7 @@ Status values use the fixed vocabulary: `Implemented`, `Partial`, `Planned`, or 
 | **18. Task placement & cluster check** | Workers advertise `os:`, `arch:` and `slots:` (`--max-concurrency` or default headroom) tags plus user tags (`worker --tag`); `submit --os`, `--arch`, `--worker`, `--require-tag` pin a task through `require:` task tags, so the wire format is unchanged. `submit --stdin-file`, `--script-file`, `--interpreter` and `--env` send input with the task; `--matrix-dim` sizes a GPU task. `oxideswarm cancel <ID>` and `oxideswarm result <ID> [--wait] [--output-dir <DIR>]` cancel tasks or fetch results asynchronously ([design 0010](docs/design/0010-cli-cancel-and-result.md)). `oxideswarm doctor` checks connection, every worker, process start-up, every GPU and spreading. Design: [docs/design/0001-two-node-readiness.md](docs/design/0001-two-node-readiness.md), [docs/design/0014-worker-max-concurrency-slots-tag.md](docs/design/0014-worker-max-concurrency-slots-tag.md). | Implemented |
 | **19. Mobile coordination & battery governance** | Multi-tier throttling $C_{\text{eff}} = \min(C_{\text{bat}}, C_{\text{therm}})$, RRC adaptive keepalive (10s/25s/60s), and pre-sleep evacuation; the 5-rule mobile master refusal matrix (`check_mobile_master_eligibility`, not called in production) and automatic coordinator election (`ClaimMasterRole`, never constructed in production though three `server.rs` handlers answer it and keep serving) are design only (there is no automatic failover; see row 8). Design: [docs/design/0002-mobile-coordination.md](docs/design/0002-mobile-coordination.md). | Partial |
 | **20. Task input and output files** | `submit --input LOCAL[:SANDBOX]` sends files and whole directories, `--output PATTERN` (`*`, `?`, `**`) brings files back into `--output-dir`. Files move as BLAKE3-named blobs through a bounded store on the master (`~/.oxideswarm/blobs`, `master --blob-dir` / `--blob-store-mb`) in 4 MiB chunks: a client uploads only the blobs the master lacks, a worker fetches only the blobs its cache lacks (`worker --blob-cache-mb`), so an unchanged file is not sent twice. Outputs are capped per task (`worker --output-limit-mb`); `RustCompilation` returns the library or binary it built. Both the CLI and the MCP server (`oxideswarm mcp`) use this content-addressed blob plane. Design: [docs/design/0006-content-addressed-data-plane.md](docs/design/0006-content-addressed-data-plane.md). The older inline staging (at most 32 MiB, retained for wire compatibility and library callers) is [design 0003](docs/design/0003-distributed-file-staging.md). Task output validation and mandatory harvesting failure semantics are documented in [docs/design/0013-task-output-validation-and-harvesting.md](docs/design/0013-task-output-validation-and-harvesting.md). | Partial |
-| **21. Model Context Protocol (MCP) server** | Concurrent JSON-RPC 2.0 stdio MCP server (`oxideswarm mcp`) exposing 6 core cluster tools (`status`, `workers`, `submit`, `task_result`, `cancel`, `doctor`) with content-addressed blob staging (`files`, `outputs`, `output_dir`), bounded head-and-tail stream formatting (`max_output_bytes`, `captured_bytes`, `truncated`, `worker_truncated`), client wait deadlines (`wait_secs`), `notifications/cancelled`, `notifications/progress`, and strict stdout hygiene. Design: [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md), [docs/design/0012-mcp-concurrent-deadlines-and-cancel.md](docs/design/0012-mcp-concurrent-deadlines-and-cancel.md), [docs/design/0022-head-and-tail-stream-capture.md](docs/design/0022-head-and-tail-stream-capture.md). | Implemented |
+| **21. Model Context Protocol (MCP) server** | Concurrent JSON-RPC 2.0 stdio MCP server (`oxideswarm mcp`) exposing 6 core cluster tools (`status`, `workers`, `submit`, `task_result`, `cancel`, `doctor`) with content-addressed blob staging (`files`, `outputs`, `output_dir`), bounded head-and-tail stream formatting (`max_output_bytes`, `captured_bytes`, `truncated`, `worker_truncated`), client wait deadlines (`wait_secs`), `notifications/cancelled`, `notifications/progress`, and strict stdout hygiene (`submit` still has a default `.unwrap_or("echo")` fallback in `crates/cli/src/mcp.rs`; see `MCP-3` in [docs/BACKLOG.md](docs/BACKLOG.md)). Design: [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md), [docs/design/0012-mcp-concurrent-deadlines-and-cancel.md](docs/design/0012-mcp-concurrent-deadlines-and-cancel.md), [docs/design/0022-head-and-tail-stream-capture.md](docs/design/0022-head-and-tail-stream-capture.md). | Partial |
 | **22. 3D generative engine names & CPU fallback** | 3D generation tasks (`submit --prompt <PROMPT>`) default to CPU-capable procedural SDF generation and succeed on CPU-only worker nodes without requiring a GPU or `--gpu`. The `--engine` flag strictly enforces supported engines (`sdf`, `triposr`, `auto`), refusing unknown engine names with an informative error rather than silently falling back to `auto`. Design: [docs/design/0015-engine-names-and-cpu-fallback.md](docs/design/0015-engine-names-and-cpu-fallback.md). | Implemented |
 | **23. Generative 3D & Procedural SDF** | Pure Rust procedural Signed Distance Field (SDF) mesh generation (`Procedural-SDF-PureRust`) for default (`auto`) and procedural (`sdf`) tiers, honest failure on missing neural model checkpoints, client-side pre-submission validation, and virtual environment isolation. Design: [docs/design/0017-honest-3d-sdf-fallback.md](docs/design/0017-honest-3d-sdf-fallback.md). | Implemented |
 | **24. Agent Mesh command hardening & process controls** | Restricts mesh nodes to 5 advertised commands (`echo`, `ping`, `system_info`, `sha256_verify`, `shell_exec`); unadvertised commands return exit 127. `--no-shell` flag filters out `shell_exec` capability and rejects execution requests with 127. Child processes inherit no stdin (`DEVNULL`), output is capped at 1 MiB per stream, and 5 secret env vars are stripped from parent environment inheritance. Design: [docs/design/0011-agent-mesh-hardening.md](docs/design/0011-agent-mesh-hardening.md). | Implemented |
@@ -101,9 +101,9 @@ Status values use the fixed vocabulary: `Implemented`, `Partial`, `Planned`, or 
 
 | Platform | Target | Verified Path | Date | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| **macOS (Apple Silicon)** | `aarch64-apple-darwin` | CI run `40269419930` at `3a1c120` and `41276400780` at `b76d85b` (`fmt`, `clippy`, `cargo test --workspace --lib --locked`, `audit`: Pass); `./test_integration.sh` (Pass), `./run_chaos_test.sh` (Pass), `python3 tests/test_launcher_scripts.py` (Pass), `cargo test --workspace --no-fail-fast` (`1392 passed, 19 failed in 9 test targets`) at `3a1c120` | 2026-11-01 | Recorded in [docs/BACKLOG.md](docs/BACKLOG.md) (`Test baseline` at `3a1c120` and status log for `b76d85b`) |
-| **Windows 11 (x86_64)** | `x86_64-pc-windows-msvc` | `cargo test --workspace` (`1132 passed, 0 failed`) and live 2-worker loopback cluster `oxideswarm doctor --expect-workers 2 --gpu-dim 1024` (`8 passed, 0 failed`, including Vulkan `1024x1024` GEMM on RTX 5060 Ti and C6 spread, recorded in [docs/design/0001-two-node-readiness.md](docs/design/0001-two-node-readiness.md) and [docs/guides/two-machine-cluster.md](docs/guides/two-machine-cluster.md)); CI runs `40269419930` (`3a1c120`) and `41276400780` (`b76d85b`) (`fmt`, `clippy`, `cargo test --workspace --lib --locked`: Pass) | 2026-10-23 / 2026-11-01 | `.ps1`, `.cmd`, and `.vbs` files are checked statically by `tests/test_launcher_scripts.py`, not executed in tests |
-| **Ubuntu Linux (x86_64)** | `x86_64-unknown-linux-gnu` | GitHub Actions CI run `40269419930` at `3a1c120` and `41276400780` at `b76d85b` (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo check -p rusty_grid_master --no-default-features --locked`, `cargo test --workspace --lib --locked`, `cargo audit`: Pass) | 2026-11-01 | Recorded in [docs/BACKLOG.md](docs/BACKLOG.md) (`Test baseline` at `3a1c120` and `INT-1` status log at `b76d85b`) |
+| **macOS (Apple Silicon)** | `aarch64-apple-darwin` | CI run `40269419930` at `3a1c120` and `41276400780` at `c92d1dd` (merge of PR #4, containing `b76d85b`; `fmt`, `clippy`, `cargo test --workspace --lib --locked`, `audit`: Pass); `./test_integration.sh` (Pass), `./run_chaos_test.sh` (Pass), `python3 tests/test_launcher_scripts.py` (Pass), `cargo test --workspace --no-fail-fast` (`1392 passed, 19 failed in 9 test targets`) at `3a1c120` | 2026-11-01 | Recorded in [docs/BACKLOG.md](docs/BACKLOG.md) (`Test baseline` at `3a1c120` and status log for `b76d85b` / merge `c92d1dd`) |
+| **Windows 11 (x86_64)** | `x86_64-pc-windows-msvc` | `cargo test --workspace` (`1132 passed, 0 failed`) and live 2-worker loopback cluster `oxideswarm doctor --expect-workers 2 --gpu-dim 1024` (`8 passed, 0 failed`, including Vulkan `1024x1024` GEMM on RTX 5060 Ti and C6 spread, recorded in [docs/design/0001-two-node-readiness.md](docs/design/0001-two-node-readiness.md) and [docs/guides/two-machine-cluster.md](docs/guides/two-machine-cluster.md)); CI runs `40269419930` (`3a1c120`) and `41276400780` (`c92d1dd`, merge of PR #4 containing `b76d85b`) (`fmt`, `clippy`, `cargo test --workspace --lib --locked`: Pass) | 2026-10-23 / 2026-11-01 | `.ps1`, `.cmd`, and `.vbs` files are checked statically by `tests/test_launcher_scripts.py`, not executed in tests |
+| **Ubuntu Linux (x86_64)** | `x86_64-unknown-linux-gnu` | GitHub Actions CI run `40269419930` at `3a1c120` and `41276400780` at `c92d1dd` (merge of PR #4, containing `b76d85b`; `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo check -p rusty_grid_master --no-default-features --locked`, `cargo test --workspace --lib --locked`, `cargo audit`: Pass) | 2026-11-01 | Recorded in [docs/BACKLOG.md](docs/BACKLOG.md) (`Test baseline` at `3a1c120` and `INT-1` status log at `b76d85b` / merge `c92d1dd`) |
 | **Android (ARM64)** | `aarch64-linux-android` | Not run on a device. Host-side checks at `3a1c120` ([docs/BACKLOG.md](docs/BACKLOG.md)): `crates/android_bridge` unit tests in CI run `40269419930` (`cargo test --workspace --lib --locked`: Pass), and `packaging/android/termux/start_worker.sh` executed in a sandbox by `tests/test_launcher_scripts.py:325-359` (Pass) | 2026-11-01 | Not run on `aarch64-linux-android` hardware; Kotlin app (`packaging/android/app/`) does not compile yet (see `AND-1` in [docs/BACKLOG.md](docs/BACKLOG.md)) |
 
 ---
@@ -113,8 +113,8 @@ Status values use the fixed vocabulary: `Implemented`, `Partial`, `Planned`, or 
 | # | Limitation / Goal | Status | Technical details |
 |---|---|---|---|
 | **1** | Encrypted TCP stream transport | Implemented | After the cluster handshake (version 2) every frame is a ChaCha20-Poly1305 record (`0x04`) with directional keys derived from `cluster.secret`; a tampered, injected, replayed or reordered frame ends the connection, and peers that speak handshake version 1 are refused. No forward secrecy (see [docs/SECURITY.md](docs/SECURITY.md)). Secret-less loopback dev/test runs stay plaintext. Documented in [docs/design/0005-cluster-auth-v2-record-layer.md](docs/design/0005-cluster-auth-v2-record-layer.md). |
-| **2** | Automatic master failover & election | Design only | Authority scoring ($S_{\text{auth}}$), the 5-rule mobile refusal matrix (`check_mobile_master_eligibility`, not called in production), and `MasterLeaseTicket` exist in `crates/core/src/arbitrage.rs`, `ROLE_ARBITRAGE` is advertised (`protocol.rs:81`), and three `server.rs` handlers (`:3123`, `:3463`, `:4080`) check a claim against a hardcoded incumbent (`3500` at `:3134`), take `AcceptedAndStepDown` without a secret (`:3147-3151`), answer `RoleHandoverAck { accepted: true, task_queue_snapshot }` (`:3168`), and keep serving; however, nothing constructs `ClaimMasterRole` in production and there is no automatic failover or election (`switch_role.sh` and `windows/switch_role.cmd` are manual; see row 8 above and `FEAT-6` in [docs/BACKLOG.md](docs/BACKLOG.md)). Dynamic worker battery/thermal throttling ($C_{\text{eff}} = \min(C_{\text{bat}}, C_{\text{therm}})$) is documented in [docs/design/0002-mobile-coordination.md](docs/design/0002-mobile-coordination.md). |
-| **3** | MCP server for AI agents | Implemented | Concurrent JSON-RPC 2.0 stdio Model Context Protocol (MCP) server (`oxideswarm mcp`) exposing `status`, `workers`, `submit`, `task_result`, `doctor`, and `cancel` tools with client wait deadlines (`wait_secs`), `notifications/cancelled`, and strict stdout transport hygiene. Documented in [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md) and [docs/design/0012-mcp-concurrent-deadlines-and-cancel.md](docs/design/0012-mcp-concurrent-deadlines-and-cancel.md). |
+| **2** | Automatic master failover & election | Design only | Authority scoring ($S_{\text{auth}}$), the 5-rule mobile refusal matrix (`check_mobile_master_eligibility`, not called in production), and `MasterLeaseTicket` exist in `crates/core/src/arbitrage.rs`, `ProtocolCapabilities::ROLE_ARBITRAGE` (`1 << 7`, `protocol.rs:65`) is advertised, and the three `WorkerMessage::ClaimMasterRole` arms in `crates/master/src/server.rs` check a claim against a hardcoded incumbent (`3500`), accept `AcceptedAndStepDown` without a secret, answer `RoleHandoverAck { accepted: true, task_queue_snapshot }`, and keep serving; however, nothing constructs `ClaimMasterRole` in production and there is no automatic failover or election (`switch_role.sh` and `windows/switch_role.cmd` are manual; see row 8 above and `FEAT-6` in [docs/BACKLOG.md](docs/BACKLOG.md)). Dynamic worker battery/thermal throttling ($C_{\text{eff}} = \min(C_{\text{bat}}, C_{\text{therm}})$) is documented in [docs/design/0002-mobile-coordination.md](docs/design/0002-mobile-coordination.md). |
+| **3** | MCP server for AI agents | Partial | Concurrent JSON-RPC 2.0 stdio Model Context Protocol (MCP) server (`oxideswarm mcp`) exposing `status`, `workers`, `submit`, `task_result`, `doctor`, and `cancel` tools with content-addressed blob staging, bounded head-and-tail stream formatting, client wait deadlines (`wait_secs`), `notifications/cancelled`, and strict stdout transport hygiene; remaining argument validation gaps are tracked under `MCP-3` (e.g. `.unwrap_or("echo")` in `crates/cli/src/mcp.rs`) in [docs/BACKLOG.md](docs/BACKLOG.md). Documented in [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md), [docs/design/0012-mcp-concurrent-deadlines-and-cancel.md](docs/design/0012-mcp-concurrent-deadlines-and-cancel.md), and [docs/design/0022-head-and-tail-stream-capture.md](docs/design/0022-head-and-tail-stream-capture.md). |
 | **4** | Real GPU scheduler preference | Implemented | Master scheduler strictly prioritizes idle hardware GPU (`wgpu`) workers over simulated GPU (`--simulate-gpu`) workers for `requires_gpu` tasks, dispatching to simulated workers only when no hardware GPU is available. |
 | **5** | Android app cluster secret auth | Partial | `crates/android_bridge` exposes the `nativeSetClusterSecret` JNI export, and Kotlin `WorkerEngine` accepts `clusterSecret` to authenticate against protected masters (the Kotlin app itself does not compile yet; see `AND-1` in [docs/BACKLOG.md](docs/BACKLOG.md)). |
 | **6** | Task input and output files | Partial | Files and directories move as content-addressed blobs across both the CLI and the MCP server (master store, worker cache, 4 MiB chunks, nothing sent twice; [design 0006](docs/design/0006-content-addressed-data-plane.md)). Not yet: compression, pipelined uploads from the CLI (one request in flight per connection, slow for thousands of small files over a high-latency link), `.gitignore`-aware selection (send `src` and `Cargo.toml` rather than a whole project with its `target/`), and symbolic links and empty directories inside input trees. Output validation, symlink rejection and mandatory harvest failure semantics are specified in [design 0013](docs/design/0013-task-output-validation-and-harvesting.md). |
@@ -346,15 +346,160 @@ or `~/.oxideswarm/cluster.secret`.
 Exit code `6` means authentication failed. Remote or auto-discovered masters are refused without a secret unless
 you pass `--insecure` (`RUSTY_GRID_INSECURE=1`, or `insecure = true` under `[master]`, `[worker]`, `[submit]`, or `[status]` in `rusty-grid.toml`).
 
+### Complete CLI Flag Reference (`oxideswarm` / `rusty-grid`)
+
+Every subcommand inherits the global flags below and responds to `--help` (`-h`) and `--version` (`-V`).
+
+#### Global Flags (`oxideswarm [GLOBAL_FLAGS] <SUBCOMMAND>`)
+| Flag / Alias | Default / Env / Config | Description |
+| :--- | :--- | :--- |
+| `-c`, `--config <PATH>` | `RUSTY_GRID_CONFIG`, `./rusty-grid.{toml,json}`, `~/.oxideswarm/rusty-grid.toml` | Path to configuration file (`oxideswarm mcp` skips working-directory config files unless `--config` or `RUSTY_GRID_CONFIG` is set) |
+| `-v`, `--verbose` | `RUST_LOG=debug` | Enable verbose debug logging |
+| `-q`, `--quiet` | `RUST_LOG=error` | Suppress informational output (errors only) |
+| `--secret-file <PATH>` | `OXIDESWARM_SECRET_FILE`, `secret_file`, `~/.oxideswarm/cluster.secret` | File containing the 64-hex-character cluster secret (mode `0600`) |
+| `--secret <HEX>` | `OXIDESWARM_SECRET`, `secret` | Cluster secret as 64 hex characters (hidden from `--help` because command-line arguments are visible in `ps`; prefer `--secret-file` or `OXIDESWARM_SECRET_FILE`) |
+| `-h`, `--help` | — | Print help information |
+| `-V`, `--version` | — | Print version information |
+
+#### `oxideswarm master` Flags
+| Flag / Alias | Default / Env / Config | Description |
+| :--- | :--- | :--- |
+| `--listen <ADDR>` | `127.0.0.1:8088` (`RUSTY_GRID_MASTER_LISTEN`, `RUSTY_GRID_LISTEN`, `[master].listen`) | Grid TCP listen address (`0.0.0.0:8088` to accept workers on other machines) |
+| `--port-file <PATH>` (alias `--portfile`) | `RUSTY_GRID_PORT_FILE`, `[master].port_file` | File path where the bound TCP grid port number is written |
+| `--heartbeat-interval-secs <SECS>` (alias `--heartbeat-interval`) | `3` (`RUSTY_GRID_HEARTBEAT_INTERVAL_SECS`, `[master].heartbeat_interval_secs`) | Expected worker heartbeat interval in seconds |
+| `--heartbeat-timeout-secs <SECS>` (alias `--heartbeat-timeout`) | `10` (`RUSTY_GRID_HEARTBEAT_TIMEOUT_SECS`, `[master].heartbeat_timeout_secs`) | Seconds without a heartbeat before a worker is marked dead |
+| `--reaper-interval-secs <SECS>` (alias `--reaper-interval`) | `1` (`RUSTY_GRID_REAPER_INTERVAL_SECS`, `[master].reaper_interval_secs`) | Interval in seconds between dead-worker reaper sweeps |
+| `--max-queue-size <N>` | `[master].max_queue_size` (parsed, not used yet) | **Parsed, not used yet** — parsed by the CLI/config (`cli_app.rs:201`, `config.rs:46`), but not read by `TaskQueue` (`--max-active-mb` bounds active queue memory instead) |
+| `--scheduler-policy <POLICY>` | `[master].scheduler_policy` (parsed, not used yet) | **Parsed, not used yet** — parsed by the CLI/config (`cli_app.rs:207`, `config.rs:48`), but not read by `WorkloadScheduler`, which always runs the weighted least-loaded policy |
+| `--default-retry-max <N>` (alias `--max-retries`) | `3` (`RUSTY_GRID_DEFAULT_RETRY_MAX`, `RUSTY_GRID_MAX_RETRIES`, `[master].default_retry_max`) | Default maximum execution retries per task |
+| `--max-host-cpu-pct <PCT>` | `85.0` (`RUSTY_GRID_MAX_HOST_CPU_PCT`, `[master].max_host_cpu_pct`) | Host CPU percentage ceiling before anti-stuttering backpressure throttles dispatch |
+| `--preserve-gpu <BOOL>` | `true` (`RUSTY_GRID_PRESERVE_GPU`, `[master].preserve_gpu`) | Reserve GPU workers for GPU-requiring tasks when CPU-only workers are available |
+| `--p2p` | `false` (`RUSTY_GRID_P2P`, `[master].p2p`) | Enable Iroh QUIC/DERP P2P endpoint for NAT traversal |
+| `--p2p-ticket-file <PATH>` | `RUSTY_GRID_P2P_TICKET_FILE`, `[master].p2p_ticket_file` | File path where the generated P2P connection ticket is written |
+| `--p2p-key-file <PATH>` (alias `--key-file`) | `~/.oxideswarm/master_key.bin` (`RUSTY_GRID_P2P_KEY_FILE`, `[master].p2p_key_file`) | Persistent P2P secret key file for stable NodeId and ticket across restarts |
+| `--ephemeral-key` | `false` (`RUSTY_GRID_EPHEMERAL_KEY`) | Force a random ephemeral P2P key instead of persisting `master_key.bin` |
+| `--wire-codec <CODEC>` | `bincode` (CLI flag only; `RUSTY_GRID_WIRE_CODEC` and `[master].wire_codec` do not take effect because clap's `default_value = "bincode"` is passed as `Some(args.wire_codec)` in `cli_app.rs:1246`) | Wire format codec: `bincode` or `json` |
+| `--web-ui-addr <ADDR>` | `127.0.0.1:8080` | Bind address for the embedded HTTP web dashboard (`0.0.0.0:8080` exposes it on the LAN) |
+| `--dashboard-port <PORT>` | `8080` (`RUSTY_GRID_DASHBOARD_PORT`, `OXIDE_SWARM_DASHBOARD_PORT`, `[master].dashboard_port`) | HTTP port for the embedded web dashboard (ignored if `--web-ui-addr` is given) |
+| `--dashboard-port-file <PATH>` | `RUSTY_GRID_DASHBOARD_PORT_FILE`, `OXIDE_SWARM_DASHBOARD_PORT_FILE`, `[master].dashboard_port_file` | File path where the bound dashboard HTTP port number is written |
+| `--dev` | `false` (`OXIDE_DEV_MODE`) | Enable local development mode (bypasses dashboard token auth on loopback interfaces only) |
+| `--auth-token <TOKEN:NAME:SCOPES>` | Repeatable | Register an explicit dashboard API bearer token with comma-separated scopes (`admin`, `submit`, `observer`) |
+| `--insecure` | `false` (`RUSTY_GRID_INSECURE`, `[master].insecure`) | Allow a non-loopback or `--p2p` master to run without a cluster secret |
+| `--max-retained-tasks <N>` | `10000` (`RUSTY_GRID_MAX_RETAINED_TASKS`, `[master].max_retained_tasks`) | Finished tasks retained in memory before evicting the oldest |
+| `--max-retained-mb <MB>` | `256` (`RUSTY_GRID_MAX_RETAINED_MB`, `[master].max_retained_mb`) | Megabytes of finished-task payload and output retained in memory |
+| `--max-active-mb <MB>` | `256` (`RUSTY_GRID_MAX_ACTIVE_MB`, `[master].max_active_mb`) | Megabytes of active (queued, scheduled, running, retrying) task payloads held at once (minimum `1`) |
+| `--blob-dir <DIR>` | `~/.oxideswarm/blobs` (`RUSTY_GRID_BLOB_DIR`, `[master].blob_dir`) | Directory of the content-addressed blob store for task input and output files |
+| `--blob-store-mb <MB>` | `4096` (`RUSTY_GRID_BLOB_STORE_MB`, `[master].blob_store_mb`) | Megabytes the master blob store holds before LRU eviction of unreferenced blobs |
+| `--mapreduce-parallelism <N>` | `256` (`RUSTY_GRID_MAPREDUCE_PARALLELISM`, `[master].mapreduce_parallelism`) | Maximum map or reduce chunk tasks of one `mapreduce` job in flight at once |
+| `--max-connections <N>` | `1024` (`RUSTY_GRID_MAX_CONNECTIONS`, `[master].max_connections`) | Maximum concurrent connections kept open on the grid port |
+| `--max-pending-handshakes <N>` | `64` (`RUSTY_GRID_MAX_PENDING_HANDSHAKES`, `[master].max_pending_handshakes`) | Maximum connections allowed in the pre-authentication handshake state at once |
+| `--rendezvous <URL>` | `OXIDESWARM_RENDEZVOUS`, `RUSTY_GRID_RENDEZVOUS` | URL of Tier 3 HTTP rendezvous registry for cross-subnet discovery |
+
+#### `oxideswarm worker` Flags
+| Flag / Alias | Default / Env / Config | Description |
+| :--- | :--- | :--- |
+| `--master <ADDR\|auto>` | `127.0.0.1:8088` (`RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[worker].master`) | Master grid port address (`HOST:8088`, bare `HOST`, or `auto` for LAN discovery) |
+| `--p2p-ticket <TICKET>` | `RUSTY_GRID_P2P_TICKET`, `[worker].p2p_ticket` | Iroh P2P connection ticket for joining a remote master across NAT/WAN |
+| `--name <NAME>` | Hostname (`RUSTY_GRID_WORKER_NAME`, `RUSTY_GRID_NAME`, `[worker].name`) | Worker node name override; persists worker UUID in `~/.oxideswarm/worker_id.<NAME>` |
+| `--tag <TAG>` | Repeatable (`RUSTY_GRID_WORKER_TAGS`, `[worker].tags`) | User tag advertised to the master and matched by `submit --require-tag` |
+| `--cores <N>` (alias `--cpu-cores`) | Auto-detected (`RUSTY_GRID_CORES`, `RUSTY_GRID_CPU_CORES`, `[worker].cores`) | Override advertised CPU core count |
+| `--ram-mb <MB>` (aliases `--override-ram-mb`, `--ram`) | Auto-detected (`RUSTY_GRID_RAM_MB`, `RUSTY_GRID_OVERRIDE_RAM_MB`, `[worker].ram_mb`) | Override advertised RAM in megabytes |
+| `--gpu` | `false` (`RUSTY_GRID_GPU`, `RUSTY_GRID_ENABLE_GPU`, `[worker].gpu`) | Insist on a real hardware wgpu adapter (warns if unavailable or built without `gpu-wgpu`) |
+| `--no-gpu` | `false` (`RUSTY_GRID_NO_GPU`, `[worker].no_gpu`) | Never probe or advertise a GPU |
+| `--simulate-gpu` | `false` (`RUSTY_GRID_SIMULATE_GPU`, `[worker].simulate_gpu`) | Test mode: advertise a simulated GPU backed by CPU execution (`is_simulated_gpu = true`) |
+| `--gpu-name <NAME>` | Auto-detected (`RUSTY_GRID_GPU_NAME`, `[worker].gpu_name`) | Override advertised GPU model name |
+| `--vram-mb <MB>` | Auto-detected (`RUSTY_GRID_VRAM_MB`, `RUSTY_GRID_GPU_VRAM_MB`, `OXIDE_SWARM_VRAM_MB`, `[worker].vram_mb`) | Override advertised GPU VRAM in megabytes |
+| `--cuda` | Auto-detected (`RUSTY_GRID_CUDA`, `RUSTY_GRID_ENABLE_CUDA`, `OXIDE_SWARM_CUDA`, `[worker].cuda`) | Explicitly advertise CUDA support |
+| `--no-cuda` | `false` (`RUSTY_GRID_NO_CUDA`, `RUSTY_GRID_DISABLE_CUDA`, `OXIDE_SWARM_NO_CUDA`, `[worker].no_cuda`) | Explicitly disable CUDA support |
+| `--blender` | Auto-detected (`RUSTY_GRID_BLENDER`, `RUSTY_GRID_ENABLE_BLENDER`, `[worker].blender`) | Explicitly advertise headless Blender capability |
+| `--no-blender` | `false` (`RUSTY_GRID_NO_BLENDER`, `RUSTY_GRID_DISABLE_BLENDER`, `OXIDE_SWARM_NO_BLENDER`, `[worker].no_blender`) | Explicitly disable headless Blender capability |
+| `--blender-path <PATH>` | Auto-detected (`RUSTY_GRID_BLENDER_PATH`, `OXIDE_SWARM_BLENDER_PATH`, `BLENDER_PATH`, `[worker].blender_path`) | Path to Blender executable |
+| `--blender-version <VER>` | Auto-detected (`RUSTY_GRID_BLENDER_VERSION`, `[worker].blender_version`) | Override advertised Blender version string |
+| `--max-concurrency <N>` (alias `--max-concurrent-tasks`) | `max(1, cores - 1)` (`cores` when `--cores <N>` is given; `RUSTY_GRID_MAX_CONCURRENCY`, `RUSTY_GRID_MAX_CONCURRENT_TASKS`, `[worker].max_concurrency`) | Maximum concurrent tasks executed simultaneously on this worker |
+| `--heartbeat-interval-secs <SECS>` (alias `--heartbeat-interval`) | `3` (`RUSTY_GRID_HEARTBEAT_INTERVAL_SECS`, `[worker].heartbeat_interval_secs`) | Fallback heartbeat interval in seconds |
+| `--sandbox-base-dir <DIR>` | `<TMPDIR or temp dir>/rusty_grid-<euid>/sandboxes` on Unix (private mode `0700`, [design 0021](docs/design/0021-private-default-sandbox-base.md)) and `%TEMP%\rusty_grid\sandboxes` on Windows (`RUSTY_GRID_SANDBOX_BASE_DIR`, `[worker].sandbox_base_dir`) | Base directory for isolated task execution sandboxes (used as given when set explicitly) |
+| `--task-priority <PRIORITY>` | `below-normal` (`RUSTY_GRID_TASK_PRIORITY`) | OS scheduling priority for task child processes: `normal`, `below-normal`, or `idle` |
+| `--keep-sandboxes` | `false` (`RUSTY_GRID_KEEP_SANDBOXES`, `[worker].keep_sandboxes`) | Retain task sandbox directories after execution for debugging |
+| `--blob-cache-mb <MB>` | `2048` (`RUSTY_GRID_BLOB_CACHE_MB`, `[worker].blob_cache_mb`) | Megabytes of task input/output blobs cached in `<sandbox_base_dir>/cache/blobs` |
+| `--output-limit-mb <MB>` | `1024` (`RUSTY_GRID_OUTPUT_LIMIT_MB`, `[worker].output_limit_mb`) | Maximum megabytes of output files one task may return |
+| `--no-portal` | `false` (`RUSTY_GRID_NO_PORTAL`, `[worker].no_portal`) | Disable the worker standby HTTP redirect portal on `0.0.0.0:8080` |
+| `--wire-codec <CODEC>` | `bincode` (CLI flag only; `RUSTY_GRID_WIRE_CODEC` and `[worker].wire_codec` do not take effect because clap's `default_value = "bincode"` is passed as `Some(args.wire_codec)` in `cli_app.rs:1525`) | Wire format codec: `bincode` or `json` |
+| `--insecure` | `false` (`RUSTY_GRID_INSECURE`, `[worker].insecure`) | Allow connecting to a remote, `auto`, or P2P master without a cluster secret |
+| `--rendezvous <URL>` | `OXIDESWARM_RENDEZVOUS`, `RUSTY_GRID_RENDEZVOUS` | URL of Tier 3 HTTP rendezvous registry for cross-subnet discovery |
+
+#### `oxideswarm submit` Flags
+| Flag / Alias | Default / Env / Config | Description |
+| :--- | :--- | :--- |
+| `--master <ADDR\|auto>` | `127.0.0.1:8088` (`RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[submit].master`) | Master grid port address (`HOST:8088`, bare `HOST`, or `auto`) |
+| `--type <TYPE>` (alias `--task-type`) | `generic` | Task type: `command` (`generic`), `shell`, `gpu`, `3d`, or `autorig` |
+| `--command <CMD>` | — | Executable name or shell snippet to run on the worker |
+| `-- <ARGS>...` | — | Trailing command arguments passed to `--command` |
+| `--cores <N>` | `1` | Minimum CPU cores required on the assigned worker |
+| `--ram-mb <MB>` (alias `--ram`) | `0` | Minimum RAM in megabytes required on the assigned worker |
+| `--gpu` | `false` | Require a worker that advertises a GPU |
+| `--timeout-secs <SECS>` | `60` (CLI flag only; `[submit].timeout_secs` in `config.rs:138` is parsed from TOML, not read yet) | Task execution timeout in seconds |
+| `--max-retries <N>` | Master default | Maximum execution retries for this task |
+| `--wait` | `false` (implied by `--output` and `-o`) | Wait synchronously for task completion and print output |
+| `--json` | `false` | Emit submission/result output as JSON |
+| `--os <OS>` | — | Pin to worker OS: `macos` (`mac`, `darwin`, `osx`), `windows` (`win`), `linux`, `android` |
+| `--arch <ARCH>` | — | Pin to worker CPU architecture: `x86_64` (`amd64`, `x64`), `aarch64` (`arm64`) |
+| `--worker <NAME\|ID>` | — | Pin to a specific worker by name (case-insensitive) or UUID prefix |
+| `--require-tag <TAG>` | Repeatable | Require a worker carrying this user tag (`worker --tag`) |
+| `--stdin-file <PATH>` | — | Command tasks: send a local file (at most 32 MiB) as standard input |
+| `--script-file <PATH>` | — | Shell tasks: send a local script file (at most 32 MiB) to execute |
+| `--interpreter <PROG>` | `sh` / `cmd.exe` | Shell tasks: run the script with `<PROG>` (e.g. `python3`, `bash`) |
+| `--env <KEY=VALUE>` | Repeatable | Set an environment variable in the task process |
+| `--input <LOCAL[:SANDBOX]>` (alias `--file`) | Repeatable | Stage a local file or directory into the worker's task sandbox (deduplicated via blob store) |
+| `--output <PATTERN>` (alias `--expected-output`) | Repeatable | Glob/path pattern of sandbox files to collect after execution (implies `--wait`) |
+| `--output-dir <DIR>` | Current directory | Local directory where collected `--output` files are written |
+| `--matrix-dim <N>` | `64` | GPU tasks: square matrix dimension $N \times N$ (up to `8192` on physical GPU, `2048` on simulated GPU) |
+| `--work-group-size <N>` | `16` | GPU tasks: compute shader workgroup tile edge length |
+| `--prompt <TEXT>` | — | 3D generation tasks: text prompt describing the mesh to synthesize |
+| `--image <IMAGE_PATH>` | — | 3D generation tasks: input image path (PNG, JPEG, WebP) |
+| `--quality <QUALITY>` | `standard` | 3D generation quality preset: `fast`, `standard`, or `high` |
+| `--engine <ENGINE>` | `auto` | 3D generation engine: `auto`, `sdf` (CPU procedural SDF), or `triposr` (Python `engines/generative_3d/entrypoint.py`) |
+| `--export-texture` | `true` | 3D generation tasks: bake PBR UV texture maps into the output `.glb` |
+| `--no-export-texture` | `false` | 3D generation tasks: disable texture map generation |
+| `--input-mesh <MESH_PATH>` | — | Auto-rigging tasks: input mesh file (`.glb`, `.gltf`, or `.obj`) |
+| `--rig-preset <PRESET>` | `biped` | Auto-rigging skeletal preset: `biped`, `quadruped`, or `generic` |
+| `--embed-animations <ANIMATIONS>` | — | Comma-separated animation clips to embed (e.g. `idle,walk,turnaround`) |
+| `--preferred-provider <PROVIDER>` | `builtin` | Auto-rigging provider: `builtin` (Rust skinning) or `blender` (headless Blender `engines/autorig/blender_rig.py`) |
+| `-o`, `--output-asset <OUTPUT_PATH>` (alias `--glb-output`) | — | Destination path to write the generated or rigged `.glb` asset |
+| `--insecure` | `false` (`RUSTY_GRID_INSECURE`, `[submit].insecure`) | Allow submitting to a remote or `auto` master without a cluster secret |
+
+#### Inspection, MapReduce, Doctor, Secret, Mode & MCP Subcommands
+| Subcommand | Flags / Aliases | Description |
+| :--- | :--- | :--- |
+| `oxideswarm status` | `--master <ADDR\|auto>`, `--task-id <UUID>` (alias `--task`), `--workers`, `--json`, `--insecure` | Query cluster summary metrics, a specific task's status (`--task-id`), or connected workers (`--workers`) |
+| `oxideswarm workers` | `--master <ADDR\|auto>`, `--json`, `--insecure` | List connected workers with OS/arch, cores, RAM, GPU, tags, and running task counts |
+| `oxideswarm result <ID>` | `<ID>`, `--master <ADDR\|auto>`, `-w` / `--wait`, `--json`, `--output-dir <DIR>`, `--insecure` | Fetch stdout/stderr, exit code, and output blobs for task `<ID>` |
+| `oxideswarm cancel <ID>` | `<ID>`, `--master <ADDR\|auto>`, `--json`, `--insecure` | Cancel a queued or running task `<ID>` and terminate its worker process tree |
+| `oxideswarm mapreduce` | `--master <ADDR\|auto>`, `--input <FILE_OR_TEXT>` (required, repeatable), `--mapper <NAME_OR_SCRIPT>` (default `word_count`), `--map-cmd <CMD>`, `--reducer <NAME_OR_SCRIPT>` (default `sum`), `--reduce-cmd <CMD>`, `--chunks <N>` (default `4`), `--timeout-secs <SECS>` (default `60`), `--json`, `--insecure` | Partition inputs across workers, run built-in (`word_count`, `line_count`, `identity` / `sum`, `count`, `max`, `min`, `concat`), local script (`--mapper` / `--reducer`), or worker command (`--map-cmd` / `--reduce-cmd`) stages |
+| `oxideswarm doctor` | `--master <ADDR\|auto>`, `--expect-workers <N>` (default `1`), `--probe-timeout-secs <SECS>` (default `60`), `--gpu-dim <N>` (default `512`), `--spread-tasks <N>`, `--skip-gpu`, `--skip-spread`, `--json`, `--insecure` | End-to-end cluster verification across C1 (master reachable), C2 (worker count), C3 (pinned echo per worker), C4 (shell script per worker), C5 (GPU GEMM probe), and C6 (multi-worker spread) |
+| `oxideswarm secret generate` | `--out <PATH>`, `--force`, `--print` | Generate a 256-bit random cluster secret file (`0600` permissions; default `~/.oxideswarm/cluster.secret`) |
+| `oxideswarm secret show` | `--raw`, `--dashboard-token` | Show the resolved secret source + fingerprint, raw 64-char hex (`--raw`), or derived dashboard admin bearer token (`--dashboard-token`) |
+| `oxideswarm mode [MODE] [ACTION]` | `[MODE]` (`test`, `dev`, `doc`, `research`), `[ACTION]`, `-a` / `--action-opt <ACTION>`, `--iterations <N>` (default `5`), `-i` / `--interactive`, `--json` | Run or inspect workflow modes (`test`, `dev`, `doc`, `research`) or open the interactive menu (`--interactive`) |
+| `oxideswarm mcp` | `--master <ADDR\|auto>`, `--insecure` | Run the Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio |
+
+#### `agent-mesh` CLI Subcommands (`crates/agent_mesh`)
+| Subcommand | Flags | Description |
+| :--- | :--- | :--- |
+| `agent-mesh hub` | `-p` / `--port <PORT>` (default `8088`), `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--insecure`, `--grid-master [<ADDR>]` (`OXIDE_GRID_MASTER`), `--secret <SECRET>` (`OXIDESWARM_SECRET`), `--max-active-mb <MB>` (`RUSTY_GRID_MAX_ACTIVE_MB`) | Start the WebSocket/HTTP Agent Mesh Relay Hub (and optional co-hosted Grid Master when `--grid-master` is passed) |
+| `agent-mesh node` | `--hub <URL>` (default `ws://127.0.0.1:8088/ws`), `-n` / `--name <NAME>`, `-r` / `--role <ROLE>` (default `worker`), `--no-shell` (`OXIDE_MESH_NO_SHELL`), `--token <TOKEN>` (`OXIDE_MESH_TOKEN`) | Connect a persistent agent mesh node to the hub |
+| `agent-mesh submit` | `--hub <URL>`, `--cmd <CMD>`, `--target-node <ID>`, `--target-os <OS>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`) | Dispatch a shell command to a mesh node via the hub |
+| `agent-mesh compile` | `--hub <URL>`, `--file <FILE>`, `--target-os <OS>` (default `linux`), `--target-node <ID>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`) | Send a Rust source file through the hub to the embedded Grid Master for distributed compilation |
+| `agent-mesh status` | `--hub <URL>` (default `http://127.0.0.1:8088`), `--token <TOKEN>` (`OXIDE_MESH_TOKEN`) | Query connected agent mesh nodes from the hub |
+
 ### Network Port Topology
 
 | Port | Protocol | Component | Role & Port Conflict Guidance |
 | :--- | :--- | :--- | :--- |
 | **8088** | TCP | Master Grid Coordinator | Primary cluster communication port for worker node registration, heartbeat exchanges, task distribution, and CLI client requests (`submit`, `status`, `workers`, `mapreduce`). Protected by mutual HMAC-SHA256 handshake (`cluster_auth`). |
-| **8088** | TCP (WS/HTTP) | Agent Mesh Relay Hub | Default listener for `agent-mesh hub`. **Critical Port Conflict:** The default binding `127.0.0.1:8088` collides with the Master Grid port when co-located on the same physical host. Operators MUST bind the Hub to alternate ports (e.g. `--listen 0.0.0.0:8090`) when co-locating services. |
+| **8088** | TCP (WS/HTTP) | Agent Mesh Relay Hub | Default listener for `agent-mesh hub`. **Critical Port Conflict:** The default binding `127.0.0.1:8088` collides with the Master Grid port when co-located on the same physical host. Operators MUST bind the Hub to alternate ports (e.g. `--port 8090`) when co-locating services. |
 | **8080** | HTTP | Master Dashboard & Worker Standby | Embedded Axum web server providing cluster telemetry, live status graphs, task submission, and WebSocket streams (`/ws`). Bound to loopback by default; requires explicit `--web-ui-addr 0.0.0.0:8080` to expose across LAN. Protected by RBAC bearer tokens or derived cluster admin token (`oxs1-dashboard-admin`). When a standalone worker runs without a master, it binds `0.0.0.0:8080` to serve an HTTP 307 redirect to the discovered Master (`worker --no-portal` turns that off). |
 | **8089** | UDP | Master Discovery Beacon | Master broadcasts cluster address and optional dashboard URL to subnet broadcast (`255.255.255.255:8089`). When a cluster secret is present, beacon payloads include HMAC-SHA256 signatures to prevent rogue discovery spoofing. Workers with `--master auto` listen here. |
 | **8085** | TCP (HTTP) | Cross-Machine Sync Probe | Standalone reachability probe used strictly by `scripts/sync_network` to verify LAN connectivity between nodes using cloud-shared mailboxes. Completely independent of the Rust grid runtime. |
+| **8086** | TCP (HTTP, removed) | Former Secret Bootstrap Helper | Previously used by the removed `agent_bridge.py serve-secret` plain-HTTP secret transfer helper (`SEC-4`). No component opens port 8086; cluster secrets must be copied over an authenticated channel (`scp`, `sftp`, `adb push`, or physical media). |
 
 ### Environment Variables Inventory
 
@@ -364,77 +509,101 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 #### Tier A: Core Authentication & Configuration Engine
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
-| `OXIDESWARM_SECRET` | Global | 64-character hex cluster secret for mutual node authentication |
-| `OXIDESWARM_SECRET_FILE` | Global | File path pointing to cluster secret (mode 0600; preferred over inline hex) |
-| `RUSTY_GRID_CONFIG` | Global | Path to TOML or JSON configuration file |
+| `OXIDESWARM_SECRET` | Global & Agent Mesh | 64-character hex cluster secret for mutual node authentication (`--secret`) |
+| `OXIDESWARM_SECRET_FILE` | Global | File path pointing to cluster secret (`--secret-file`, mode `0600`; preferred over inline hex) |
+| `RUSTY_GRID_CONFIG` | Global | Path to TOML or JSON configuration file (`--config`) |
+| `OXIDESWARM_HOME` | Global & Launchers | Base state directory override for `cluster.secret`, `master_key.bin`, `worker_id`, `blobs`, and launcher PID/log files (default: `~/.oxideswarm` or `%USERPROFILE%\.oxideswarm`) |
+| `RUST_LOG` | Global | Standard `tracing_subscriber::EnvFilter` directive overriding `--verbose` / `--quiet` |
 
 #### Tier B: Master Coordinator & Scheduling
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
-| `RUSTY_GRID_MASTER_LISTEN` | Master | Primary listen socket address for grid coordinator |
+| `RUSTY_GRID_MASTER_LISTEN` | Master | Primary listen socket address for grid coordinator (`--listen`) |
 | `RUSTY_GRID_LISTEN` | Master | Fallback alias for coordinator listen address |
-| `RUSTY_GRID_PORT_FILE` | Master | File path where bound TCP port number is written |
-| `RUSTY_GRID_HEARTBEAT_INTERVAL_SECS` | Master | Heartbeat interval advertised to workers |
-| `RUSTY_GRID_HEARTBEAT_TIMEOUT_SECS` | Master | Liveness timeout before worker is marked dead |
-| `RUSTY_GRID_REAPER_INTERVAL_SECS` | Master | Frequency of dead-worker reaper evaluation sweeps |
-| `RUSTY_GRID_MAX_HOST_CPU_PCT` | Master | Host CPU % threshold for anti-stuttering backpressure |
-| `RUSTY_GRID_PRESERVE_GPU` | Master | Flag to preserve GPU workers for GPU-specific workloads |
-| `RUSTY_GRID_P2P` | Master | Enables Iroh QUIC/DERP P2P WAN endpoint |
-| `RUSTY_GRID_P2P_TICKET_FILE` | Master | File path where generated P2P ticket string is written |
-| `RUSTY_GRID_P2P_KEY_FILE` | Master | File path where master P2P identity key is persisted |
-| `RUSTY_GRID_EPHEMERAL_KEY` | Master | Forces generation of ephemeral P2P key without file persistence |
-| `RUSTY_GRID_WIRE_CODEC` | Master | Serialization wire codec (`bincode` or `json`) |
-| `RUSTY_GRID_DEFAULT_RETRY_MAX` | Master | Default task retry ceiling on failure |
-| `RUSTY_GRID_MAX_RETRIES` | Master | Secondary alias for default task retry ceiling |
-| `RUSTY_GRID_MAX_RETAINED_TASKS` | Master | Maximum count of finished tasks retained in memory (`--max-retained-tasks`; default 10000) |
-| `RUSTY_GRID_MAX_RETAINED_MB` | Master | Maximum megabytes of finished task payloads and output retained (`--max-retained-mb`; default 256) |
-| `RUSTY_GRID_MAX_ACTIVE_MB` | Master & Agent Mesh | Maximum megabytes of active (non-terminal) task payloads held in the queue (`--max-active-mb` on `oxideswarm master` and `agent-mesh hub`; default 256, minimum 1) |
+| `RUSTY_GRID_PORT_FILE` | Master | File path where bound TCP port number is written (`--port-file`) |
+| `RUSTY_GRID_HEARTBEAT_INTERVAL_SECS` | Master & Worker | Heartbeat interval in seconds (`--heartbeat-interval-secs`; default `3`) |
+| `RUSTY_GRID_HEARTBEAT_TIMEOUT_SECS` | Master | Liveness timeout before worker is marked dead (`--heartbeat-timeout-secs`; default `10`) |
+| `RUSTY_GRID_REAPER_INTERVAL_SECS` | Master | Frequency of dead-worker reaper evaluation sweeps (`--reaper-interval-secs`; default `1`) |
+| `RUSTY_GRID_MAX_HOST_CPU_PCT` | Master | Host CPU % threshold for anti-stuttering backpressure (`--max-host-cpu-pct`; default `85.0`) |
+| `RUSTY_GRID_PRESERVE_GPU` | Master | Flag to preserve GPU workers for GPU-specific workloads (`--preserve-gpu`; default `true`) |
+| `RUSTY_GRID_P2P` | Master | Enables Iroh QUIC/DERP P2P WAN endpoint (`--p2p`) |
+| `RUSTY_GRID_P2P_TICKET_FILE` | Master | File path where generated P2P ticket string is written (`--p2p-ticket-file`) |
+| `RUSTY_GRID_P2P_KEY_FILE` | Master | File path where master P2P identity key is persisted (`--p2p-key-file`) |
+| `RUSTY_GRID_EPHEMERAL_KEY` | Master | Forces generation of ephemeral P2P key without file persistence (`--ephemeral-key`) |
+| `RUSTY_GRID_WIRE_CODEC` | Master & Worker | Read by `resolve_string` in `cli_app.rs` (`:1246`, `:1525`), but currently shadowed by clap's `default_value = "bincode"` on `--wire-codec` (pass `--wire-codec` on the command line instead) |
+| `RUSTY_GRID_DEFAULT_RETRY_MAX` | Master | Default task retry ceiling on failure (`--default-retry-max`; default `3`) |
+| `RUSTY_GRID_MAX_RETRIES` | Master | Secondary alias for default task retry ceiling (`--max-retries`) |
+| `RUSTY_GRID_MAX_RETAINED_TASKS` | Master | Maximum count of finished tasks retained in memory (`--max-retained-tasks`; default `10000`) |
+| `RUSTY_GRID_MAX_RETAINED_MB` | Master | Maximum megabytes of finished task payloads and output retained (`--max-retained-mb`; default `256`) |
+| `RUSTY_GRID_MAX_ACTIVE_MB` | Master & Agent Mesh | Maximum megabytes of active (non-terminal) task payloads held in the queue (`--max-active-mb` on `oxideswarm master` and `agent-mesh hub`; default `256`, minimum `1`) |
 | `RUSTY_GRID_BLOB_DIR` | Master | Directory of the blob store of task input and output files (`--blob-dir`; default `~/.oxideswarm/blobs`) |
-| `RUSTY_GRID_BLOB_STORE_MB` | Master | Megabytes the blob store holds before evicting least recently used files (`--blob-store-mb`; default 4096) |
-| `RUSTY_GRID_MAPREDUCE_PARALLELISM` | Master | Maximum concurrent in-flight map/reduce chunk tasks |
-| `RUSTY_GRID_MAX_CONNECTIONS` | Master | Maximum concurrent TCP connections allowed on grid port |
-| `RUSTY_GRID_MAX_PENDING_HANDSHAKES` | Master | Maximum connections permitted in pre-auth handshake state |
-| `RUSTY_GRID_INSECURE` | Master, Worker, CLI & MCP | Allows the master to bind non-loopback or a worker, client, or `mcp` server to connect to a remote or auto-discovered master without a cluster secret |
-| `RUSTY_GRID_DASHBOARD_PORT` | Master | HTTP listener port for embedded web dashboard |
+| `RUSTY_GRID_BLOB_STORE_MB` | Master | Megabytes the blob store holds before evicting least recently used files (`--blob-store-mb`; default `4096`) |
+| `RUSTY_GRID_MAPREDUCE_PARALLELISM` | Master | Maximum concurrent in-flight map/reduce chunk tasks (`--mapreduce-parallelism`; default `256`) |
+| `RUSTY_GRID_MAX_CONNECTIONS` | Master | Maximum concurrent TCP connections allowed on grid port (`--max-connections`; default `1024`) |
+| `RUSTY_GRID_MAX_PENDING_HANDSHAKES` | Master | Maximum connections permitted in pre-auth handshake state (`--max-pending-handshakes`; default `64`) |
+| `RUSTY_GRID_INSECURE` | Master, Worker, CLI & MCP | Allows the master to bind non-loopback or a worker, client, or `mcp` server to connect to a remote or auto-discovered master without a cluster secret (`--insecure`) |
+| `RUSTY_GRID_DASHBOARD_PORT` | Master | HTTP listener port for embedded web dashboard (`--dashboard-port`; default `8080`) |
 | `OXIDE_SWARM_DASHBOARD_PORT` | Master | Alternative alias for dashboard HTTP port |
-| `RUSTY_GRID_DASHBOARD_PORT_FILE` | Master | File path where bound dashboard HTTP port is written |
+| `RUSTY_GRID_DASHBOARD_PORT_FILE` | Master | File path where bound dashboard HTTP port is written (`--dashboard-port-file`) |
 | `OXIDE_SWARM_DASHBOARD_PORT_FILE` | Master | Alternative alias for dashboard port file |
-| `RUSTY_GRID_DISABLE_WEB_UI` | Master | Disables embedding of Axum web dashboard server |
-| `RUSTY_GRID_ENABLE_WEB_UI` | Master | Explicit override to force-enable web dashboard server |
-| `RUSTY_GRID_DISABLE_DISCOVERY` | Master | Disables UDP discovery beacon listener/broadcaster |
-| `OXIDESWARM_RENDEZVOUS` | Master | HTTP rendezvous registry URL for publishing coordinator address lease |
-| `OXIDE_DEV_MODE` | Master | Enables dashboard local development bypass on loopback interfaces |
+| `RUSTY_GRID_DISABLE_WEB_UI` | Master | Disables embedding of Axum web dashboard server when set |
+| `RUSTY_GRID_ENABLE_WEB_UI` | Master | Explicit override to force-enable web dashboard server (`1` or `true`) |
+| `RUSTY_GRID_DISABLE_DISCOVERY` | Master | Disables UDP discovery beacon listener/broadcaster when set |
+| `OXIDESWARM_RENDEZVOUS` | Master & Worker | HTTP rendezvous registry URL for publishing or discovering the coordinator address lease (`--rendezvous`) |
+| `RUSTY_GRID_RENDEZVOUS` | Master & Worker | Secondary alias for `OXIDESWARM_RENDEZVOUS` |
+| `OXIDE_DEV_MODE` | Master | Enables dashboard local development bypass on loopback interfaces (`1` or `true`; equivalent to `--dev`) |
 
-#### Tier C: Worker Node Engine
+#### Tier C: Worker Node Engine, GPU, CUDA, Blender & 3D Subsystem
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
-| `RUSTY_GRID_MASTER_ADDR` | Worker | Target Master grid address (`HOST:PORT`) |
-| `RUSTY_GRID_MASTER` | Worker | Secondary alias for Master grid address |
-| `OXIDESWARM_RENDEZVOUS` | Worker | HTTP rendezvous registry URL for discovering active master address |
-| `RUSTY_GRID_P2P_TICKET` | Worker | Iroh P2P connection ticket for remote NAT traversal |
-| `RUSTY_GRID_WORKER_NAME` | Worker | Advertised worker name (persists ID to `~/.oxideswarm/worker_id.<NAME>`) |
+| `RUSTY_GRID_MASTER_ADDR` | Worker & CLI | Target Master grid address (`--master HOST:PORT` or `auto`) |
+| `RUSTY_GRID_MASTER` | Worker & CLI | Secondary alias for Master grid address |
+| `RUSTY_GRID_P2P_TICKET` | Worker | Iroh P2P connection ticket for remote NAT traversal (`--p2p-ticket`) |
+| `RUSTY_GRID_WORKER_NAME` | Worker | Advertised worker name (`--name`; persists UUID to `~/.oxideswarm/worker_id.<NAME>`) |
 | `RUSTY_GRID_NAME` | Worker | Secondary alias for worker name |
 | `RUSTY_GRID_WORKER_TAGS` | Worker | Comma-separated user tags advertised to the master (`--tag`; matched by `submit --require-tag`) |
 | `RUSTY_GRID_WORKER_ID_FILE` | Worker | Explicit file path where worker node UUID is persisted |
-| `RUSTY_GRID_CORES` | Worker | Advertised CPU core count override |
-| `RUSTY_GRID_CPU_CORES` | Worker | Secondary alias for advertised CPU core count |
-| `RUSTY_GRID_RAM_MB` | Worker | Advertised RAM in Megabytes override |
-| `RUSTY_GRID_OVERRIDE_RAM_MB` | Worker | Secondary alias for advertised RAM override |
-| `RUSTY_GRID_GPU` | Worker | Request real GPU activation |
+| `RUSTY_GRID_CORES` | Worker | Advertised CPU core count override (`--cores`) |
+| `RUSTY_GRID_CPU_CORES` | Worker | Secondary alias for advertised CPU core count (`--cpu-cores`) |
+| `RUSTY_GRID_RAM_MB` | Worker | Advertised RAM in megabytes override (`--ram-mb`) |
+| `RUSTY_GRID_OVERRIDE_RAM_MB` | Worker | Secondary alias for advertised RAM override (`--override-ram-mb`) |
+| `RUSTY_GRID_GPU` | Worker | Insist on real GPU activation (`--gpu`) |
 | `RUSTY_GRID_ENABLE_GPU` | Worker | Secondary alias to request GPU activation |
-| `RUSTY_GRID_NO_GPU` | Worker | Forcefully suppresses GPU discovery and advertising |
-| `RUSTY_GRID_SIMULATE_GPU` | Worker | Advertises simulated GPU executing GEMM on CPU SIMD fallback |
-| `RUSTY_GRID_GPU_NAME` | Worker | Custom advertised GPU model string |
-| `RUSTY_GRID_ENABLE_PHYSICAL_GPU` | Worker | Force-enables hardware wgpu engine initialization without `--gpu` |
-| `RUSTY_GRID_REQUIRE_GPU` | Worker | In tests, asserts that failure to initialize physical GPU is fatal |
-| `RUSTY_GRID_REQUIRE_BLENDER` | Worker | In tests, asserts that a missing host Blender binary is fatal instead of skipping (`1` or `true`) |
-| `RUSTY_GRID_MAX_CONCURRENCY` | Worker | Maximum simultaneous concurrent tasks executed |
-| `RUSTY_GRID_MAX_CONCURRENT_TASKS` | Worker | Secondary alias for maximum concurrent tasks |
+| `RUSTY_GRID_NO_GPU` | Worker | Forcefully suppresses GPU discovery and advertising (`--no-gpu`) |
+| `RUSTY_GRID_SIMULATE_GPU` | Worker | Advertises simulated GPU executing GEMM on CPU fallback (`--simulate-gpu`) |
+| `RUSTY_GRID_GPU_NAME` | Worker | Custom advertised GPU model string (`--gpu-name`) |
+| `RUSTY_GRID_VRAM_MB` | Worker | Override advertised GPU VRAM in megabytes (`--vram-mb`) |
+| `RUSTY_GRID_GPU_VRAM_MB` | Worker | Secondary alias for advertised GPU VRAM override |
+| `OXIDE_SWARM_VRAM_MB` | Worker | Fallback env alias read by capability detection for GPU VRAM in megabytes |
+| `RUSTY_GRID_CUDA` | Worker | Explicitly advertise NVIDIA CUDA support (`--cuda`) |
+| `RUSTY_GRID_ENABLE_CUDA` | Worker | Secondary alias to advertise CUDA support |
+| `OXIDE_SWARM_CUDA` | Worker | Fallback env alias read by capability detection for CUDA support |
+| `RUSTY_GRID_NO_CUDA` | Worker | Explicitly disable CUDA support (`--no-cuda`) |
+| `RUSTY_GRID_DISABLE_CUDA` | Worker | Secondary alias to disable CUDA support |
+| `OXIDE_SWARM_NO_CUDA` | Worker | Fallback env alias read by capability detection to disable CUDA support |
+| `CUDA_PATH` / `CUDA_HOME` / `CUDA_ROOT` | Worker | Standard NVIDIA CUDA toolkit installation directories inspected during host capability probing |
+| `RUSTY_GRID_BLENDER` | Worker | Explicitly advertise headless Blender capability (`--blender`) |
+| `RUSTY_GRID_ENABLE_BLENDER` | Worker | Secondary alias to advertise Blender capability |
+| `RUSTY_GRID_NO_BLENDER` | Worker | Explicitly disable headless Blender capability (`--no-blender`) |
+| `RUSTY_GRID_DISABLE_BLENDER` | Worker | Secondary alias to disable Blender capability |
+| `OXIDE_SWARM_NO_BLENDER` | Worker | Fallback env alias read by capability detection to disable Blender capability |
+| `RUSTY_GRID_BLENDER_PATH` | Worker | Explicit path to the host Blender executable (`--blender-path`) |
+| `OXIDE_SWARM_BLENDER_PATH` | Worker | Secondary alias for the host Blender executable path |
+| `BLENDER_PATH` | Worker | Standard fallback environment variable for the host Blender executable path |
+| `RUSTY_GRID_BLENDER_VERSION` | Worker | Override advertised Blender version string (`--blender-version`) |
+| `OXIDESWARM_PYTHON` | Worker (3D) | Explicit Python 3 interpreter path for Tier 1 3D generation (`engines/generative_3d/entrypoint.py`) |
+| `RUSTY_GRID_PYTHON` | Worker (3D) | Secondary alias for `OXIDESWARM_PYTHON` |
+| `OXIDESWARM_GEN3D_SCRIPT` | Worker (3D) | Explicit path to `engines/generative_3d/entrypoint.py` when the worker runs outside the repository checkout |
+| `RUSTY_GRID_ENABLE_PHYSICAL_GPU` | Worker | Force-enables hardware wgpu engine initialization when set to `1` |
+| `RUSTY_GRID_REQUIRE_GPU` | Worker (Tests) | In tests (`1`), asserts that failure to initialize a physical GPU is fatal instead of skipping |
+| `RUSTY_GRID_REQUIRE_BLENDER` | Worker (Tests) | In tests (`1` or `true`), asserts that a missing host Blender binary is fatal instead of skipping |
+| `RUSTY_GRID_MAX_CONCURRENCY` | Worker | Maximum simultaneous concurrent tasks executed (`--max-concurrency`) |
+| `RUSTY_GRID_MAX_CONCURRENT_TASKS` | Worker | Secondary alias for maximum concurrent tasks (`--max-concurrent-tasks`) |
 | `RUSTY_GRID_SANDBOX_BASE_DIR` | Worker | Base filesystem directory for task execution sandboxes, used as given (`--sandbox-base-dir` outranks it). Without either, the worker uses `<TMPDIR or temp dir>/rusty_grid-<euid>/sandboxes` on Unix, private to its user ([design 0021](docs/design/0021-private-default-sandbox-base.md)), and `%TEMP%\rusty_grid\sandboxes` on Windows |
-| `RUSTY_GRID_TASK_PRIORITY` | Worker | Process scheduling priority: `normal`, `below-normal`, or `idle` |
-| `RUSTY_GRID_KEEP_SANDBOXES` | Worker | Retains task working directories upon completion |
-| `RUSTY_GRID_BLOB_CACHE_MB` | Worker | Megabytes of task input and output files cached in `<sandbox base>/cache/blobs` (`--blob-cache-mb`; default 2048) |
-| `RUSTY_GRID_OUTPUT_LIMIT_MB` | Worker | Megabytes of output files one task may bring back; more fails the task (`--output-limit-mb`; default 1024) |
+| `RUSTY_GRID_TASK_PRIORITY` | Worker | Process scheduling priority (`--task-priority`): `normal`, `below-normal`, or `idle` |
+| `RUSTY_GRID_KEEP_SANDBOXES` | Worker | Retains task working directories upon completion (`--keep-sandboxes`) |
+| `RUSTY_GRID_BLOB_CACHE_MB` | Worker | Megabytes of task input and output files cached in `<sandbox base>/cache/blobs` (`--blob-cache-mb`; default `2048`) |
+| `RUSTY_GRID_OUTPUT_LIMIT_MB` | Worker | Megabytes of output files one task may bring back; more fails the task (`--output-limit-mb`; default `1024`) |
 | `RUSTY_GRID_NO_PORTAL` | Worker | Leaves out the standby portal on `0.0.0.0:8080` (`--no-portal`), e.g. for a second worker on one machine |
 
 #### Tier D: Task Child Process Injection Environment
@@ -447,26 +616,33 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 #### Tier E: Subnet Discovery & Network Helpers
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
-| `OXIDESWARM_DISCOVERY_CANDIDATES` | Discovery | Comma-separated list of candidate IP addresses probed during auto-discovery |
+| `OXIDESWARM_DISCOVERY_CANDIDATES` | Discovery | Comma-separated list of candidate IP addresses (`IP` or `IP:PORT`) probed during Tier 2 unicast discovery |
+| `RUSTY_GRID_DISCOVERY_CANDIDATES` | Discovery | Secondary alias for `OXIDESWARM_DISCOVERY_CANDIDATES` |
 | `OXIDESWARM_RENDEZVOUS` | Discovery | Tier 3 HTTP rendezvous registry URL for discovery fallback on isolated subnets |
+| `RUSTY_GRID_RENDEZVOUS` | Discovery | Secondary alias for `OXIDESWARM_RENDEZVOUS` |
 
 #### Tier F: Agent Mesh Framework
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
-| `OXIDE_MESH_TOKEN` | Agent Mesh | Bearer token for authenticating nodes and HTTP API requests against hub |
-| `OXIDE_MESH_NO_SHELL` | Agent Mesh / Launchers | When set to `1`, disables `shell_exec` command execution on node launchers |
+| `OXIDE_MESH_TOKEN` | Agent Mesh | Shared token authenticating `agent-mesh` nodes and HTTP API callers against `agent-mesh hub` (`--token`; stripped from child task environments) |
+| `OXIDE_MESH_NO_SHELL` | Agent Mesh / Launchers | When set to `1`, disables `shell_exec` command execution on node launchers (`--no-shell`) |
+| `OXIDE_GRID_MASTER` | Agent Mesh | Bind address for the embedded Grid Master inside `agent-mesh hub` (`--grid-master`) |
 
-#### Tier G: Platform Packaging, Service Automation & Launchers
+#### Tier G: Platform Packaging, Service Automation, Agent Hub & Launchers
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
-| `OXIDESWARM_HOME` | Launchers | Custom state directory override (default: `~/.oxideswarm` / `%USERPROFILE%\.oxideswarm`) |
-| `OXIDESWARM_BIN` | Launchers | Explicit binary path override for shell launchers |
-| `OXIDESWARM_CLUSTER_PORT` | Launchers | TCP port override used by `switch_role.sh` / `windows\start_master.cmd` (default: 8088) |
-| `OXIDESWARM_DASHBOARD_PORT` | Launchers | Dashboard port override used by shell/cmd launchers (default: 8080) |
+| `OXIDESWARM_HOME` | Global & Launchers | Custom state directory override (default: `~/.oxideswarm` / `%USERPROFILE%\.oxideswarm`) |
+| `OXIDESWARM_BIN` | Launchers | Explicit binary path override for shell and PowerShell launchers |
+| `OXIDESWARM_CLUSTER_PORT` | Launchers | TCP port override used by `switch_role.sh` / `windows\oxctl.ps1` (default: `8088`) |
+| `OXIDESWARM_DASHBOARD_PORT` | Launchers | Dashboard port override used by `switch_role.sh` / `windows\oxctl.ps1` (default: `8080`) |
 | `OXIDESWARM_WORKER_NAME` | Launchers | Worker node name assigned by launcher automation scripts |
 | `OXIDESWARM_CARGO_FEATURES` | Launchers | Cargo features used during automated on-demand compilation (default: `gpu-wgpu`) |
 | `OXIDESWARM_P2P_TICKET` | Windows Service | Ticket storage variable used by Windows PowerShell service wrappers |
-| `OXIDESWARM_SYNC_DIR` | Sync Probe | Base directory override for cross-machine sync network probe |
+| `OXIDESWARM_CONFIG` | Windows Service | Machine-level config path read by `packaging/windows/ServiceWrapper.cs` |
+| `OXIDESWARM_LOG_DIR` | Windows Service | Machine-level log directory read by `packaging/windows/ServiceWrapper.cs` |
+| `OXIDESWARM_AGENT_HUB` | Agent Bridge | Google Drive / shared folder path for `scripts/agent_bridge.py` |
+| `OXIDESWARM_EVENT_KIND` / `OXIDESWARM_EVENT_FILE` / `OXIDESWARM_EVENT_TITLE` / `OXIDESWARM_EVENT_PRIORITY` / `OXIDESWARM_EVENT_FROM` | Agent Bridge | Event metadata variables passed to `--on-event` hooks by `scripts/agent_bridge.py watch` |
+| `OXIDESWARM_SYNC_DIR` | Sync Probe | Base directory override for `scripts/sync_network/sync_network.py` |
 | `OXIDE_ROOT` | Benchmarks | Root workspace directory override used by benchmark runners |
 | `OX_SCRIPT_ROOT` | Test Suite | Custom script root used by `test_launcher_scripts.py` for regression verification |
 

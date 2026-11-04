@@ -123,7 +123,7 @@ adb shell am start -n com.oxideswarm.worker/.MainActivity
 1. **Grant Notification Permission:** On Android 13+, tap "Allow" when prompted for notification permissions (required for foreground service visibility).
 2. **Exempt from Battery Optimizations:** Tap the **"Disable Battery Optimization"** button. Android will display a system dialog asking to let the app always run in the background. Tap **"Allow"**.
 3. **Configure Coordinator Address:** Enter the master's *cluster* address, IP and port **8088** (e.g. `192.168.1.100:8088`), or a P2P ticket. Not 8080: that is the dashboard.
-4. **Tap "Start Worker":** The worker connects, displays an ongoing status notification, and begins heartbeating every 3 seconds.
+4. **Tap "Start Worker":** The worker connects, displays an ongoing status notification, and begins sending RRC-aware adaptive heartbeats (`10 s` while a task is active on cellular, `25 s` when idle on cellular, `60 s` on Wi-Fi/Ethernet, with `3 s` as the non-adaptive fallback default).
 
 > **Cluster secret:** paste the master's secret (hex) into the secret field before tapping Start; a master with a
 > non-loopback `--listen` requires it. The app keeps it in its own preferences file (`worker_secure_tokens.xml`), which
@@ -215,11 +215,11 @@ The OxideSwarm worker automatically detects and advertises mobile-specific hardw
 | :--- | :--- | :--- |
 | **Battery Percentage** | `/sys/class/power_supply/battery/capacity` | Current state of charge (0–100%) |
 | **Charging Status** | `/sys/class/power_supply/battery/status` | `Charging`, `Discharging`, `Full` |
-| **Thermal Throttling** | `/sys/class/thermal/thermal_zone*/temp` | Evaluates temperatures across all zones; flags throttling if > 75°C |
+| **Thermal Throttling** | `/sys/class/thermal/thermal_zone*/temp` | `detect_thermal_throttling` (`crates/core/src/capabilities.rs:1087`) flags kernel zone throttling at `temp >= 75_000` ($\ge 75^\circ\text{C}$), while `MobileLiveStatus` evaluates battery/skin thermal tiers at `37°C`, `40°C`, and `42°C` |
 | **Cooling State** | `/sys/class/thermal/cooling_device*/cur_state` | Hardware governor throttling level |
 | **SoC Model** | `getprop ro.soc.model` / `/proc/cpuinfo` | Identifies Qualcomm Snapdragon, MediaTek Dimensity, Google Tensor, etc. |
 
-The Master coordinator's scheduler automatically factors this telemetry into dynamic load balancing, throttling task assignment if the mobile device exceeds 75°C or drops below 15% battery while discharging.
+On the phone, the JNI bridge computes multi-tier battery and thermal status locally (`MobileLiveStatus::compute_battery_tier` and `MobileLiveStatus::compute_thermal_tier` in `crates/android_bridge/src/lib.rs:415-416` and `crates/core/src/capabilities.rs`): thermal tiers scale concurrency at `> 37.0°C` (`Warm`, half concurrency), `> 40.0°C` (`Hot`, max 1 task, no GPU/compile or multi-core tasks), and `> 42.0°C` (`Critical`, 0 tasks), and discharging battery tiers scale concurrency at `< 50%` (`Low`, half concurrency, no GPU/compile), `< 30%` (`SubLow`, max 1 task, no GPU/compile or multi-core tasks), and `< 15%` (`Critical`, 0 tasks). Because `MobileCapabilities::live_status()` currently sets `battery_temperature` and `thermal_tier` to `None` and `WorkerRegistry::update_mobile_telemetry` (`crates/master/src/registry.rs:615`) uses `MobileCapabilities::with_live_status`, the Master scheduler currently sees all four battery tiers on Android workers (`effective_scheduler_battery_tier`) but only `ThermalTier::Normal` or `ThermalTier::Warm` (via `thermal_throttled`) until `MOB-2` lands.
 
 ---
 
@@ -243,7 +243,7 @@ adb shell input keyevent 26
 adb shell dumpsys deviceidle force-idle
 adb shell dumpsys deviceidle step deep
 
-# 4. Confirm Master continues receiving heartbeats every 3s
+# 4. Confirm Master continues receiving adaptive heartbeats (10s / 25s / 60s)
 ```
 
 ---

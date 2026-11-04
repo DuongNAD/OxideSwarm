@@ -142,7 +142,7 @@ The master queue tracks active and retained payload memory in `crates/master/src
 ## Compatibility
 
 - Workers advertising `ProtocolCapabilities::FILE_STAGING` receive tasks with staged files.
-- If a client attempts to submit staged files to an older master or worker lacking the capability, the master rejects submission with `CapabilityMismatch`.
+- `TaskView::required_features` (`crates/master/src/queue.rs`) requires `ProtocolCapabilities::FILE_STAGING` whenever `task.staged_files` or `task.expected_outputs` is non-empty, and `WorkloadScheduler` (`crates/master/src/scheduler.rs`) skips workers lacking `required_features`, leaving the task queued with `ScheduleSkipReason::ClusterLacksCapability(String)` (`crates/master/src/scheduler.rs:203-208`) until a capable worker connects.
 - Existing tasks without staged files incur zero wire overhead (empty vectors serialize to single byte prefixes).
 
 ## Security

@@ -4472,4 +4472,116 @@ max_active_mb = 768
         assert_eq!(esc_prog, r"\\srv\share\m.exe");
         assert_eq!(esc_args, vec!["tr", "-d", r"\r"]);
     }
+
+    /// Verifies that every long flag and alias in `Cli::command()` appears inside the
+    /// `README.md` reference section (or summary table row) for its own subcommand.
+    #[test]
+    fn test_every_cli_long_flag_is_documented_in_readme() {
+        use clap::CommandFactory;
+
+        fn collect_long_flags(
+            cmd: &clap::Command,
+            path: &str,
+            out: &mut Vec<(String, String, bool)>,
+        ) {
+            for arg in cmd.get_arguments() {
+                let is_global_or_builtin = path == "oxideswarm"
+                    || arg.is_global_set()
+                    || matches!(arg.get_long(), Some("help" | "version"));
+                if let Some(long) = arg.get_long() {
+                    out.push((path.to_string(), format!("--{long}"), is_global_or_builtin));
+                }
+                if let Some(aliases) = arg.get_all_aliases() {
+                    for alias in aliases {
+                        out.push((path.to_string(), format!("--{alias}"), is_global_or_builtin));
+                    }
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                if sub.get_name() == "help" {
+                    continue;
+                }
+                let sub_path = format!("{path} {}", sub.get_name());
+                collect_long_flags(sub, &sub_path, out);
+            }
+        }
+
+        fn section_between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+            let s = text
+                .find(start)
+                .unwrap_or_else(|| panic!("missing heading in README.md: {start}"));
+            let rest = &text[s..];
+            let e = rest
+                .find(end)
+                .unwrap_or_else(|| panic!("missing heading in README.md after {start}: {end}"));
+            &rest[..e]
+        }
+
+        let readme = include_str!("../../../README.md");
+        let global_sec = section_between(
+            readme,
+            "#### Global Flags",
+            "#### `oxideswarm master` Flags",
+        );
+        let master_sec = section_between(
+            readme,
+            "#### `oxideswarm master` Flags",
+            "#### `oxideswarm worker` Flags",
+        );
+        let worker_sec = section_between(
+            readme,
+            "#### `oxideswarm worker` Flags",
+            "#### `oxideswarm submit` Flags",
+        );
+        let submit_sec = section_between(
+            readme,
+            "#### `oxideswarm submit` Flags",
+            "#### Inspection, MapReduce, Doctor, Secret, Mode & MCP Subcommands",
+        );
+        let subcmd_table_sec = section_between(
+            readme,
+            "#### Inspection, MapReduce, Doctor, Secret, Mode & MCP Subcommands",
+            "#### `agent-mesh` CLI Subcommands",
+        );
+
+        let subcommand_scope = |sub: &str, is_global: bool| -> &str {
+            if is_global || sub == "oxideswarm" || sub == "oxideswarm secret" {
+                return global_sec;
+            }
+            match sub {
+                "oxideswarm master" => master_sec,
+                "oxideswarm worker" => worker_sec,
+                "oxideswarm submit" => submit_sec,
+                other => {
+                    let row_prefix = format!("| `{other}");
+                    subcmd_table_sec
+                        .lines()
+                        .find(|line| line.starts_with(&row_prefix))
+                        .unwrap_or_else(|| {
+                            panic!("missing subcommand row in README.md for `{other}`")
+                        })
+                }
+            }
+        };
+
+        let cmd = Cli::command();
+        let mut flags = Vec::new();
+        collect_long_flags(&cmd, "oxideswarm", &mut flags);
+        assert!(!flags.is_empty(), "Cli::command() must expose long flags");
+
+        let missing: Vec<String> = flags
+            .into_iter()
+            .filter(|(sub, flag, is_global)| {
+                let scope = subcommand_scope(sub, *is_global);
+                !scope.contains(flag.as_str())
+            })
+            .map(|(sub, flag, _)| format!("{sub}: {flag}"))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "Every CLI long flag and alias in Cli::command() must be documented in its subcommand section of README.md; missing:\n{}",
+            missing.join("\n")
+        );
+    }
 }

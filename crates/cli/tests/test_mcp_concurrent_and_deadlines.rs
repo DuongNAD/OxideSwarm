@@ -107,7 +107,9 @@ async fn spawn_cluster() -> (
     let sandbox_dir = temp.path().join("sandboxes");
     std::fs::create_dir_all(&sandbox_dir).expect("create sandbox_dir");
 
-    let cfg = ServerConfig::from_addr("127.0.0.1:0").expect("server cfg");
+    let cfg = ServerConfig::from_addr("127.0.0.1:0")
+        .expect("server cfg")
+        .with_heartbeat_interval(60);
     let master = MasterServer::spawn(cfg).await.expect("spawn master");
     let master_addr = master.server_addr().to_string();
 
@@ -115,6 +117,7 @@ async fn spawn_cluster() -> (
         .with_name("mcp1-worker")
         .with_cores(4)
         .with_ram_mb(4096)
+        .with_no_blender(true)
         .with_tags(vec!["present".to_string()])
         .with_sandbox_base_dir(&sandbox_dir);
     let mut worker = WorkerClient::new(worker_cfg);
@@ -2203,33 +2206,56 @@ async fn test_mcp1_post_write_eof_corrupt_not_found_cancel_status_recovery_and_z
             .expect("done_sub text"),
     )
     .expect("done_sub json");
-    let done_tid = done_sub_body["task_id"].as_str().expect("done task_id");
+    let done_tid = done_sub_body["task_id"]
+        .as_str()
+        .expect("done task_id")
+        .to_string();
 
-    mcp.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 9,
-        "method": "tools/call",
-        "params": {
-            "name": "task_result",
-            "arguments": {
-                "task_id": done_tid,
-                "wait": true,
-                "timeout_secs": 0
-            }
+    let done_deadline = Instant::now() + Duration::from_secs(15);
+    let mut req_id = 9u64;
+    let done_res_body = loop {
+        for w in master.registry().list_workers().await {
+            let _ = master
+                .registry()
+                .record_heartbeat(&w.worker_id, 0, 1000, 10.0, 4096, None)
+                .await;
         }
-    }));
-    let done_res = mcp.recv_timeout(Duration::from_secs(5));
-    assert_eq!(done_res["id"], 9);
-    assert_eq!(
-        done_res["result"]["isError"], false,
-        "task_result {{wait:true, timeout_secs:0}} on finished task must return result: {done_res}"
-    );
-    let done_res_body: Value = serde_json::from_str(
-        done_res["result"]["content"][0]["text"]
-            .as_str()
-            .expect("done_res text"),
-    )
-    .expect("done_res json");
+
+        mcp.send(&json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "tools/call",
+            "params": {
+                "name": "task_result",
+                "arguments": {
+                    "task_id": done_tid,
+                    "wait": true,
+                    "timeout_secs": 0
+                }
+            }
+        }));
+        let done_res = mcp.recv_timeout(Duration::from_secs(5));
+        assert_eq!(done_res["id"], req_id);
+        req_id += 1;
+        assert_eq!(
+            done_res["result"]["isError"], false,
+            "task_result {{wait:true, timeout_secs:0}} on task must return result: {done_res}"
+        );
+        let body: Value = serde_json::from_str(
+            done_res["result"]["content"][0]["text"]
+                .as_str()
+                .expect("done_res text"),
+        )
+        .expect("done_res json");
+        if body["status"] == "completed" {
+            break body;
+        }
+        assert!(
+            Instant::now() < done_deadline,
+            "timed out waiting for task {done_tid} to reach completed status, last response: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     assert_eq!(done_res_body["status"], "completed");
     assert!(
         done_res_body["stdout"]

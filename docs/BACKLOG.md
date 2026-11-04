@@ -1258,7 +1258,7 @@ Each item below needs a design record before code.
 Add one dated line per finished item, newest last.
 
 - 2026-11-01: Backlog written from a code audit and the runs in the test baseline.
-- 2026-11-01: INT-1 completed; pull request 3 merged (`b76d85b`) and `master` CI run `41276400780` passed.
+- 2026-11-01: INT-1 completed; pull request 3 (`b76d85b`) and pull request 4 (`c92d1dd`) merged and `master` CI run `41276400780` passed.
 - 2026-11-01: INT-2 completed; closed pull requests 1 and 2, deleted merged remote branches, and copied PR 2 CI details into TEST-6 (`origin/claude/trusting-wing-d9a27c` kept until TEST-6).
 - 2026-11-01: INT-3 completed; rebased `d0dddb8` (cluster auth v2 and record-layer hardening) onto `master` and verified all gates plus `tests/cluster_record_layer_e2e.rs`.
 - 2026-11-01: INT-4 completed; rebased `fae2622` (content-addressed data plane, design 0006) onto `master` after `INT-3` and verified all gates plus `tests/blob_transfer_e2e.rs`.
