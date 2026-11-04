@@ -68,6 +68,7 @@ impl WorkerNode {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let config = WorkerConfig::new(master_addr)
+            .with_no_battery(true)
             .with_name(name)
             .with_cores(cores)
             .with_simulate_gpu(simulate_gpu)

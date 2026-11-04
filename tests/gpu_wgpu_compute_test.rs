@@ -452,7 +452,7 @@ async fn test_e2e_cluster_gpu_task_distribution() {
     let (w2_tx, w2_rx) = watch::channel(false);
 
     // Worker 1: CPU-only worker (2 cores, no GPU)
-    let mut w1 = WorkerClient::from_options(
+    let mut w1 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("worker-cpu-only".into()),
         Some(2),
@@ -461,7 +461,7 @@ async fn test_e2e_cluster_gpu_task_distribution() {
     let w1_id = w1.worker_id();
 
     // Worker 2: GPU-capable worker (4 cores, simulated GPU)
-    let mut w2 = WorkerClient::from_options(
+    let mut w2 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("worker-gpu-accelerated".into()),
         Some(4),
@@ -1054,7 +1054,7 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
     let (w3_tx, w3_rx) = watch::channel(false);
 
     // Worker 1: 4 CPU cores, CPU-only
-    let mut w1 = WorkerClient::from_options(
+    let mut w1 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("cluster-cpu-1".into()),
         Some(4),
@@ -1063,7 +1063,7 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
     let w1_id = w1.worker_id();
 
     // Worker 2: 4 CPU cores, CPU-only
-    let mut w2 = WorkerClient::from_options(
+    let mut w2 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("cluster-cpu-2".into()),
         Some(4),
@@ -1072,7 +1072,7 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
     let w2_id = w2.worker_id();
 
     // Worker 3: 2 CPU cores, Simulated GPU enabled
-    let mut w3 = WorkerClient::from_options(
+    let mut w3 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("cluster-gpu-3".into()),
         Some(2),

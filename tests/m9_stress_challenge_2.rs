@@ -145,10 +145,10 @@ async fn test_boundary_max_retries_0_immediate_failure_on_crash() {
     let (_w2_tx, w2_rx) = watch::channel(false);
 
     let mut w1 =
-        WorkerClient::from_options(master_addr.clone(), Some("b0-w1".into()), Some(2), false);
+        WorkerClient::for_testing(master_addr.clone(), Some("b0-w1".into()), Some(2), false);
     let w1_id = w1.worker_id();
     let mut w2 =
-        WorkerClient::from_options(master_addr.clone(), Some("b0-w2".into()), Some(2), false);
+        WorkerClient::for_testing(master_addr.clone(), Some("b0-w2".into()), Some(2), false);
     let w2_id = w2.worker_id();
 
     let h1 = tokio::spawn(async move {
@@ -284,7 +284,7 @@ async fn test_boundary_max_retries_1_single_retry_then_failure() {
 
     let (_w1_tx, w1_rx) = watch::channel(false);
     let mut w1 =
-        WorkerClient::from_options(master_addr.clone(), Some("b1-w1".into()), Some(1), false);
+        WorkerClient::for_testing(master_addr.clone(), Some("b1-w1".into()), Some(1), false);
     let w1_id = w1.worker_id();
     let h1 = tokio::spawn(async move {
         let _ = w1.run(w1_rx).await;
@@ -355,7 +355,7 @@ async fn test_boundary_max_retries_1_single_retry_then_failure() {
     // 3. Spawn w2 -> takes task
     let (_w2_tx, w2_rx) = watch::channel(false);
     let mut w2 =
-        WorkerClient::from_options(master_addr.clone(), Some("b1-w2".into()), Some(1), false);
+        WorkerClient::for_testing(master_addr.clone(), Some("b1-w2".into()), Some(1), false);
     let h2 = tokio::spawn(async move {
         let _ = w2.run(w2_rx).await;
     });
@@ -406,7 +406,7 @@ async fn test_boundary_max_retries_1_single_retry_then_failure() {
     // Spawn a 3rd worker to verify it is NEVER given this task
     let (_w3_tx, w3_rx) = watch::channel(false);
     let mut w3 =
-        WorkerClient::from_options(master_addr.clone(), Some("b1-w3".into()), Some(1), false);
+        WorkerClient::for_testing(master_addr.clone(), Some("b1-w3".into()), Some(1), false);
     let w3_id = w3.worker_id();
     let _h3 = tokio::spawn(async move {
         let _ = w3.run(w3_rx).await;
@@ -458,7 +458,7 @@ async fn test_boundary_max_retries_5_overrides_lower_server_default() {
     // to rapidly and deterministically test all 5 retry boundary steps
     for cycle in 1..=5 {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut worker = WorkerClient::from_options(
+        let mut worker = WorkerClient::for_testing(
             master_addr.clone(),
             Some(format!("w-cycle-{cycle}")),
             Some(1),
@@ -518,7 +518,7 @@ async fn test_boundary_max_retries_5_overrides_lower_server_default() {
 
     // Now spawn the 6th worker: accepts task, then disconnects -> exhausts max_retries (5)
     let (shutdown_tx6, shutdown_rx6) = watch::channel(false);
-    let mut w6 = WorkerClient::from_options(
+    let mut w6 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("w-cycle-6".into()),
         Some(1),
@@ -722,7 +722,7 @@ async fn test_client_wait_task_unblocks_promptly_on_crash() {
 
     let (_w1_tx, w1_rx) = watch::channel(false);
     let mut w1 =
-        WorkerClient::from_options(master_addr.clone(), Some("wait-w1".into()), Some(1), false);
+        WorkerClient::for_testing(master_addr.clone(), Some("wait-w1".into()), Some(1), false);
     let h1 = tokio::spawn(async move {
         let _ = w1.run(w1_rx).await;
     });
@@ -899,10 +899,10 @@ async fn test_client_wait_task_preserves_resolution_across_mid_flight_failover()
     let (_w2_tx, w2_rx) = watch::channel(false);
 
     let mut w1 =
-        WorkerClient::from_options(master_addr.clone(), Some("mid-w1".into()), Some(2), false);
+        WorkerClient::for_testing(master_addr.clone(), Some("mid-w1".into()), Some(2), false);
     let w1_id = w1.worker_id();
     let mut w2 =
-        WorkerClient::from_options(master_addr.clone(), Some("mid-w2".into()), Some(2), false);
+        WorkerClient::for_testing(master_addr.clone(), Some("mid-w2".into()), Some(2), false);
     let _w2_id = w2.worker_id();
 
     let h1 = tokio::spawn(async move {
@@ -1005,7 +1005,7 @@ async fn test_multiple_concurrent_client_waiters_fanout() {
     let master_addr = master.server_addr().to_string();
 
     let (_w1_tx, w1_rx) = watch::channel(false);
-    let mut w1 = WorkerClient::from_options(
+    let mut w1 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("fanout-w1".into()),
         Some(1),
@@ -1107,7 +1107,7 @@ async fn test_tcp_wire_client_submit_wait_resolution() {
 
     // Spawn worker
     let (_w1_tx, w1_rx) = watch::channel(false);
-    let mut w1 = WorkerClient::from_options(
+    let mut w1 = WorkerClient::for_testing(
         master_addr.to_string(),
         Some("wire-w1".into()),
         Some(1),

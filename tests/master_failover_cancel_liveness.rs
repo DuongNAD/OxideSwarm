@@ -798,7 +798,7 @@ async fn test_get_task_result_end_to_end_with_a_real_worker_in_both_codecs() {
     let addr = master.server_addr().to_string();
     let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
     let mut worker =
-        WorkerClient::from_options(addr.clone(), Some("real-worker".into()), Some(2), false);
+        WorkerClient::for_testing(addr.clone(), Some("real-worker".into()), Some(2), false);
     tokio::spawn(async move {
         let _ = worker.run(worker_shutdown_rx).await;
     });

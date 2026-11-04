@@ -43,6 +43,7 @@ fn plugged_in() -> MobileTelemetryHandle {
 /// Starts a worker for the master at `addr` in this process; stop it with the sender.
 fn spawn_worker(addr: &str, sandbox: &Path) -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
     let worker_config = WorkerConfig::new(addr.to_string())
+        .with_no_battery(true)
         .with_name("blob-e2e-worker")
         .with_cores(2)
         .with_ram_mb(4096)
@@ -650,6 +651,7 @@ async fn test_worker_pins_output_files_from_collection_through_upload() {
 
     let sandbox_dir = tempfile::tempdir().unwrap();
     let worker_config = WorkerConfig::new(addr.clone())
+        .with_no_battery(true)
         .with_name("blob-e2e-pin-worker")
         .with_cores(8)
         .with_max_concurrency(8)
@@ -821,7 +823,7 @@ async fn test_master_and_worker_refuse_protocol_version_1_at_registration() {
 
     // 2. Worker refuses a RegisterAck with protocol version 1.
     let (client_io, master_io) = tokio::io::duplex(4096);
-    let worker = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999"));
+    let worker = WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_no_battery(true));
     let wid = worker.worker_id();
     tokio::spawn(async move {
         let mut master_transport = MessageTransport::new(master_io);

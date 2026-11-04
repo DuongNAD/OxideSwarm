@@ -52,10 +52,10 @@ async fn test_worker_crash_recovery() {
     let (_w2_shutdown_tx, w2_shutdown_rx) = watch::channel(false);
 
     let mut w1 =
-        WorkerClient::from_options(master_addr.clone(), Some("crash-w1".into()), Some(2), false);
+        WorkerClient::for_testing(master_addr.clone(), Some("crash-w1".into()), Some(2), false);
     let w1_id = w1.worker_id();
     let mut w2 =
-        WorkerClient::from_options(master_addr.clone(), Some("crash-w2".into()), Some(2), false);
+        WorkerClient::for_testing(master_addr.clone(), Some("crash-w2".into()), Some(2), false);
     let w2_id = w2.worker_id();
 
     let w1_handle = tokio::spawn(async move {
@@ -174,14 +174,14 @@ async fn test_immediate_graceful_disconnect() {
     let (w1_shutdown_tx, w1_shutdown_rx) = watch::channel(false);
     let (_w2_shutdown_tx, w2_shutdown_rx) = watch::channel(false);
 
-    let mut w1 = WorkerClient::from_options(
+    let mut w1 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("graceful-w1".into()),
         Some(2),
         false,
     );
     let w1_id = w1.worker_id();
-    let mut w2 = WorkerClient::from_options(
+    let mut w2 = WorkerClient::for_testing(
         master_addr.clone(),
         Some("graceful-w2".into()),
         Some(2),
@@ -309,7 +309,7 @@ async fn test_max_retries_exhaustion() {
     let master_addr = master.server_addr().to_string();
 
     let (_w1_tx, w1_rx) = watch::channel(false);
-    let mut w1 = WorkerClient::from_options(master_addr.clone(), Some("w1".into()), Some(1), false);
+    let mut w1 = WorkerClient::for_testing(master_addr.clone(), Some("w1".into()), Some(1), false);
     let w1_id = w1.worker_id();
     let h1 = tokio::spawn(async move {
         let _ = w1.run(w1_rx).await;
@@ -376,7 +376,7 @@ async fn test_max_retries_exhaustion() {
 
     // 2. Spawn w2 -> takes task -> kill w2 (retry 2)
     let (_w2_tx, w2_rx) = watch::channel(false);
-    let mut w2 = WorkerClient::from_options(master_addr.clone(), Some("w2".into()), Some(1), false);
+    let mut w2 = WorkerClient::for_testing(master_addr.clone(), Some("w2".into()), Some(1), false);
     let h2 = tokio::spawn(async move {
         let _ = w2.run(w2_rx).await;
     });
@@ -414,7 +414,7 @@ async fn test_max_retries_exhaustion() {
 
     // 3. Spawn w3 -> takes task -> kill w3 -> max_retries (2) exceeded!
     let (_w3_tx, w3_rx) = watch::channel(false);
-    let mut w3 = WorkerClient::from_options(master_addr.clone(), Some("w3".into()), Some(1), false);
+    let mut w3 = WorkerClient::for_testing(master_addr.clone(), Some("w3".into()), Some(1), false);
     let h3 = tokio::spawn(async move {
         let _ = w3.run(w3_rx).await;
     });
