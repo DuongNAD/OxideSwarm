@@ -3329,10 +3329,26 @@ mod tests {
                 }
             }
         }
-        struct WarnCollector(Arc<std::sync::Mutex<Vec<String>>>);
+        struct WarnCollector {
+            warnings: Arc<std::sync::Mutex<Vec<String>>>,
+            thread_id: std::thread::ThreadId,
+        }
         impl tracing::Subscriber for WarnCollector {
+            fn register_callsite(
+                &self,
+                metadata: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                if *metadata.level() <= tracing::Level::WARN {
+                    tracing::subscriber::Interest::always()
+                } else {
+                    tracing::subscriber::Interest::never()
+                }
+            }
             fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
                 *metadata.level() <= tracing::Level::WARN
+            }
+            fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+                Some(tracing::metadata::LevelFilter::WARN)
             }
             fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
                 tracing::span::Id::from_u64(1)
@@ -3341,10 +3357,12 @@ mod tests {
             fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
             }
             fn event(&self, event: &tracing::Event<'_>) {
-                if *event.metadata().level() == tracing::Level::WARN {
+                if *event.metadata().level() == tracing::Level::WARN
+                    && std::thread::current().id() == self.thread_id
+                {
                     let mut v = WarnVisitor::default();
                     event.record(&mut v);
-                    self.0.lock().unwrap().push(v.0);
+                    self.warnings.lock().unwrap().push(v.0);
                 }
             }
             fn enter(&self, _span: &tracing::span::Id) {}
@@ -3353,10 +3371,24 @@ mod tests {
 
         let warnings: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber = WarnCollector(warnings.clone());
+        let thread_id = std::thread::current().id();
+        let dispatch = tracing::Dispatch::new(WarnCollector {
+            warnings: warnings.clone(),
+            thread_id,
+        });
+        // Keep a second `Dispatch` alive in `tracing_core`'s global `LOCKED_DISPATCHERS` registry so
+        // `DISPATCHERS.has_just_one` is `false`. Otherwise, in `tracing-core 0.1.x`, if another test
+        // thread hits the `no_battery` callsite for the first time while only one scoped `Dispatch`
+        // exists, `DefaultCallsite::register` uses `Rebuilder::JustOne` (`dispatcher::get_default` on
+        // that other thread, which is `NoSubscriber`) and caches `Interest::never()`.
+        let _second_dispatch = tracing::Dispatch::new(WarnCollector {
+            warnings: warnings.clone(),
+            thread_id,
+        });
 
-        tracing::subscriber::with_default(subscriber, || {
+        tracing::dispatcher::with_default(&dispatch, || {
             rusty_grid_core::capabilities::with_test_battery_probe((Some(10), Some(false)), || {
+                tracing::callsite::rebuild_interest_cache();
                 let default_cfg = WorkerConfig::new("127.0.0.1:9999");
                 assert!(!default_cfg.no_battery);
                 let default_client = WorkerClient::new(default_cfg);
@@ -3403,6 +3435,7 @@ mod tests {
                 );
 
                 warnings.lock().unwrap().clear();
+                tracing::callsite::rebuild_interest_cache();
                 let no_bat_cfg = WorkerConfig::new("127.0.0.1:9999").with_no_battery(true);
                 assert!(no_bat_cfg.no_battery);
                 let client = WorkerClient::new(no_bat_cfg);
