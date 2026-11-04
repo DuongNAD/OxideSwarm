@@ -509,7 +509,7 @@ impl MasterServer {
 
             // Await home DERP relay connection and STUN discovery before serializing ticket.
             // Timeout gracefully so offline/air-gapped environments don't hang indefinitely.
-            match tokio::time::timeout(Duration::from_secs(3), endpoint.online()).await {
+            match tokio::time::timeout(Duration::from_secs(5), endpoint.online()).await {
                 Ok(_) => {
                     info!(
                         "Master connected to home DERP relay and discovered public network paths"
@@ -1460,6 +1460,7 @@ impl MasterServer {
                         }
                         res = p2p_shutdown.changed() => {
                             if res.is_err() || *p2p_shutdown.borrow() {
+                                endpoint.close().await;
                                 break;
                             }
                         }

@@ -141,10 +141,15 @@ fn start_worker(addr: SocketAddr, tweak: impl FnOnce(WorkerConfig) -> WorkerConf
         WorkerConfig::new(addr.to_string())
             .with_name("lifecycle-worker")
             .with_cores(4)
+            .with_no_blender(true)
             .with_redirection_portal(false)
             .with_sandbox_base_dir(sandbox.path()),
     );
+    let has_explicit_mobile = config.mobile_telemetry.is_some();
     let mut client = WorkerClient::new(config);
+    if !has_explicit_mobile {
+        client.mobile_telemetry().set(None);
+    }
     client.set_backoff_config(BackoffConfig::new(
         Duration::from_millis(50),
         Duration::from_millis(300),
@@ -674,7 +679,7 @@ async fn test_a_slow_but_progressing_upload_is_not_mistaken_for_a_dead_master() 
     #[cfg(windows)]
     let timeout = Duration::from_millis(15000);
     #[cfg(not(windows))]
-    let timeout = Duration::from_millis(1200);
+    let timeout = Duration::from_millis(1800);
     let worker = start_worker(master.addr, |c| {
         c.with_dead_peer_timeout(timeout)
             .with_max_output_bytes(BIG + 1024)
@@ -688,7 +693,7 @@ async fn test_a_slow_but_progressing_upload_is_not_mistaken_for_a_dead_master() 
         .await
         .unwrap();
 
-    // Switch to paced raw reads (13 MB/s): about 3 s for the part that does not fit the socket buffers.
+    // Switch to paced raw reads (~10 MB/s): ~3.5 s for the part that does not fit the socket buffers.
     let parts = transport.into_inner().into_parts();
     let mut slow = SlowFrames {
         stream: parts.io,
@@ -699,14 +704,43 @@ async fn test_a_slow_but_progressing_upload_is_not_mistaken_for_a_dead_master() 
     #[cfg(windows)]
     let (chunk, pause) = (512 * 1024, Duration::from_millis(5));
     #[cfg(not(windows))]
-    let (chunk, pause) = (128 * 1024, Duration::from_millis(10));
+    let (chunk, pause) = (128 * 1024, Duration::from_millis(12));
     while let Some(msg) = slow.next(chunk, pause).await {
+        if let WorkerMessage::Heartbeat { timestamp, .. } = &msg {
+            // Answer any heartbeat that arrived before the bulk TaskResult frame started
+            // so subprocess startup latency before the upload begins does not count as silence.
+            let ack = rusty_grid_core::protocol::serialize_message(
+                &MasterMessage::HeartbeatAck {
+                    timestamp: *timestamp,
+                },
+                rusty_grid_core::protocol::WireCodec::Bincode,
+            )
+            .unwrap();
+            let mut framed = Vec::with_capacity(4 + ack.len());
+            framed.extend_from_slice(&(ack.len() as u32).to_be_bytes());
+            framed.extend_from_slice(&ack);
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut slow.stream, &framed).await;
+        }
         if is_result_of(&msg, big_id) {
             delivered = Some(msg);
             break;
         }
     }
     let elapsed = started.elapsed();
+    // Acknowledge completion of the upload so the post-upload `quiet_for(300ms)` window tests
+    // whether the worker dropped *during* the upload rather than timing out *after* the worker's
+    // `send_msg` returned while `SlowFrames` drained the kernel socket buffer.
+    {
+        let ack = rusty_grid_core::protocol::serialize_message(
+            &MasterMessage::HeartbeatAck { timestamp: 0 },
+            rusty_grid_core::protocol::WireCodec::Bincode,
+        )
+        .unwrap();
+        let mut framed = Vec::with_capacity(4 + ack.len());
+        framed.extend_from_slice(&(ack.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&ack);
+        let _ = tokio::io::AsyncWriteExt::write_all(&mut slow.stream, &framed).await;
+    }
     match delivered {
         Some(WorkerMessage::TaskResult {
             stdout, exit_code, ..
@@ -717,7 +751,7 @@ async fn test_a_slow_but_progressing_upload_is_not_mistaken_for_a_dead_master() 
         other => panic!("the result was never delivered (upload took {elapsed:?}): {other:?}"),
     }
     assert!(
-        elapsed > Duration::from_millis(1500),
+        elapsed > Duration::from_millis(1800),
         "the test must outlast the dead-peer timeout to mean anything (took {elapsed:?})"
     );
     assert!(

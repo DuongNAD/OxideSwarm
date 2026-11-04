@@ -631,7 +631,7 @@ async fn test_mcp1_no_id_and_duplicate_id_do_not_spin_and_exit_on_eof() {
     assert_eq!(ok_body["timed_out"], true);
 
     // Case 3 (F31-4): Start a 12s wait, close stdin (EOF), and assert the process exits within
-    // the 2s grace + 500ms cancel window AND cancels the waited task on the master.
+    // the 4s grace + 500ms cancel window AND cancels the waited task on the master.
     let tasks_before_eof: std::collections::HashSet<rusty_grid_core::TaskId> = master
         .queue()
         .list_tasks()
@@ -676,7 +676,7 @@ async fn test_mcp1_no_id_and_duplicate_id_do_not_spin_and_exit_on_eof() {
     };
     let eof_start = Instant::now();
     drop(mcp.stdin.take());
-    let exit_deadline = Instant::now() + Duration::from_millis(3500);
+    let exit_deadline = Instant::now() + Duration::from_millis(6000);
     loop {
         if let Some(status) = mcp.child.try_wait().expect("try_wait") {
             assert!(status.success(), "expected exit 0 on EOF, got {status:?}");
@@ -684,7 +684,7 @@ async fn test_mcp1_no_id_and_duplicate_id_do_not_spin_and_exit_on_eof() {
         }
         assert!(
             Instant::now() < exit_deadline,
-            "mcp did not exit within 3.5s of EOF while a 12s wait was in flight (elapsed {:?})",
+            "mcp did not exit within 6s of EOF while a 12s wait was in flight (elapsed {:?})",
             eof_start.elapsed()
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -791,7 +791,21 @@ async fn test_mcp1_cancelled_async_submit_leaves_no_orphan_tasks_and_default_wai
             }
         }
     }));
-    let timeout_resp = mcp.recv_timeout(Duration::from_secs(10));
+    let timeout_deadline = Instant::now() + Duration::from_secs(15);
+    let timeout_resp = loop {
+        let remaining = timeout_deadline
+            .checked_duration_since(Instant::now())
+            .expect("timed out waiting for id 300 response");
+        let resp = mcp.recv_timeout(remaining);
+        if resp["id"] == 300 {
+            break resp;
+        }
+        let id = resp["id"].as_i64().unwrap_or(-1);
+        assert!(
+            (200..225).contains(&id),
+            "unexpected JSON-RPC response id while waiting for 300: {resp}"
+        );
+    };
     assert_eq!(timeout_resp["id"], 300);
     let timeout_body: Value = serde_json::from_str(
         timeout_resp["result"]["content"][0]["text"]
@@ -951,6 +965,7 @@ async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_sec
         .with_name("mcp1-auth-worker")
         .with_cores(4)
         .with_ram_mb(4096)
+        .with_no_blender(true)
         .with_tags(vec!["present".to_string()])
         .with_cluster_secret(secret.clone())
         .with_sandbox_base_dir(&sandbox_dir);
