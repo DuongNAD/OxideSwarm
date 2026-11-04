@@ -3154,6 +3154,24 @@ impl Drop for P2pConnGuard {
     }
 }
 
+fn reject_master_role_claim(
+    ticket: &rusty_grid_core::arbitrage::MasterLeaseTicket,
+) -> MasterMessage {
+    warn!(
+        claimant_master_id = %ticket.master_id,
+        authority_score = ticket.authority_score,
+        "Refusing ClaimMasterRole: automatic master failover is not supported"
+    );
+    MasterMessage::RoleHandoverAck {
+        accepted: false,
+        reason: Some(
+            "Automatic master failover is not supported; use manual role switching".into(),
+        ),
+        task_queue_snapshot: Vec::new(),
+        connected_workers: Vec::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
@@ -3264,88 +3282,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             (worker_id, capabilities, protocol_version, features)
         }
         WorkerMessage::ClaimMasterRole { ticket } => {
-            let now_epoch_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-
-            let verdict = if let Some(ref secret) = cluster_secret {
-                let incumbent_ticket = rusty_grid_core::arbitrage::MasterLeaseTicket::issue(
-                    ticket.cluster_id,
-                    Uuid::nil(),
-                    1,
-                    3500,
-                    now_epoch_ms,
-                    std::time::Duration::from_millis(
-                        rusty_grid_core::arbitrage::LEASE_VALIDITY_DURATION_MS,
-                    ),
-                    secret,
-                );
-                rusty_grid_core::arbitrage::evaluate_master_claim(
-                    &incumbent_ticket,
-                    &ticket,
-                    secret,
-                    now_epoch_ms,
-                )
-            } else if ticket.authority_score < rusty_grid_core::arbitrage::ELECTION_THRESHOLD_SCORE
-            {
-                rusty_grid_core::arbitrage::ClaimVerdict::RejectedInferiorScore
-            } else {
-                rusty_grid_core::arbitrage::ClaimVerdict::AcceptedAndStepDown
-            };
-
-            match verdict {
-                rusty_grid_core::arbitrage::ClaimVerdict::AcceptedAndStepDown => {
-                    let queue_snapshot = queue.get_schedulable_tasks().await;
-                    let connected_workers = registry
-                        .list_workers()
-                        .await
-                        .into_iter()
-                        .filter(|w| {
-                            w.status == crate::registry::WorkerStatus::Connected
-                                || w.status == crate::registry::WorkerStatus::Busy
-                        })
-                        .map(|w| w.capabilities)
-                        .collect();
-
-                    let ack = MasterMessage::RoleHandoverAck {
-                        accepted: true,
-                        reason: None,
-                        task_queue_snapshot: queue_snapshot,
-                        connected_workers,
-                    };
-                    let _ = transport.send_msg(&ack).await;
-                    info!(
-                        new_master = %ticket.master_id,
-                        score = ticket.authority_score,
-                        "Master role claim accepted during handshake; coordinator step-down complete"
-                    );
-                    return Ok(());
-                }
-                rusty_grid_core::arbitrage::ClaimVerdict::RejectedInferiorScore => {
-                    let ack = MasterMessage::RoleHandoverAck {
-                        accepted: false,
-                        reason: Some(format!(
-                            "Claimant authority score {} does not exceed incumbent authority score",
-                            ticket.authority_score
-                        )),
-                        task_queue_snapshot: Vec::new(),
-                        connected_workers: Vec::new(),
-                    };
-                    let _ = transport.send_msg(&ack).await;
-                    return Ok(());
-                }
-                rusty_grid_core::arbitrage::ClaimVerdict::RejectedInvalidTicket(err) => {
-                    let ack = MasterMessage::RoleHandoverAck {
-                        accepted: false,
-                        reason: Some(format!("Invalid lease ticket: {err}")),
-                        task_queue_snapshot: Vec::new(),
-                        connected_workers: Vec::new(),
-                    };
-                    let _ = transport.send_msg(&ack).await;
-                    return Ok(());
-                }
-            }
+            let ack = reject_master_role_claim(&ticket);
+            let _ = transport.send_msg(&ack).await;
+            return Ok(());
         }
         other => {
             let reject_ack = MasterMessage::RegisterAck {
@@ -3517,7 +3456,6 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     });
 
     // 7. Inbound reader loop
-    let mut handover_accepted = false;
     loop {
         tokio::select! {
             inbound_res = reader.recv_msg::<WorkerMessage>() => {
@@ -3631,87 +3569,8 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                 ).await;
                             }
                             WorkerMessage::ClaimMasterRole { ticket } => {
-                                let now_epoch_ms = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as u64)
-                                    .unwrap_or(0);
-
-                                let verdict = if let Some(ref secret) = cluster_secret {
-                                    let incumbent_ticket = rusty_grid_core::arbitrage::MasterLeaseTicket::issue(
-                                        ticket.cluster_id,
-                                        Uuid::nil(),
-                                        1,
-                                        3500,
-                                        now_epoch_ms,
-                                        std::time::Duration::from_millis(
-                                            rusty_grid_core::arbitrage::LEASE_VALIDITY_DURATION_MS,
-                                        ),
-                                        secret,
-                                    );
-                                    rusty_grid_core::arbitrage::evaluate_master_claim(
-                                        &incumbent_ticket,
-                                        &ticket,
-                                        secret,
-                                        now_epoch_ms,
-                                    )
-                                } else if ticket.authority_score < rusty_grid_core::arbitrage::ELECTION_THRESHOLD_SCORE {
-                                    rusty_grid_core::arbitrage::ClaimVerdict::RejectedInferiorScore
-                                } else {
-                                    rusty_grid_core::arbitrage::ClaimVerdict::AcceptedAndStepDown
-                                };
-
-                                match verdict {
-                                    rusty_grid_core::arbitrage::ClaimVerdict::AcceptedAndStepDown => {
-                                        let queue_snapshot = queue.get_schedulable_tasks().await;
-                                        let connected_workers = registry
-                                            .list_workers()
-                                            .await
-                                            .into_iter()
-                                            .filter(|w| {
-                                                w.status == crate::registry::WorkerStatus::Connected
-                                                    || w.status == crate::registry::WorkerStatus::Busy
-                                            })
-                                            .map(|w| w.capabilities)
-                                            .collect();
-
-                                        let ack = MasterMessage::RoleHandoverAck {
-                                            accepted: true,
-                                            reason: None,
-                                            task_queue_snapshot: queue_snapshot,
-                                            connected_workers,
-                                        };
-                                        let _ = outbound_tx.send(ack).await;
-                                        info!(
-                                            worker_id = %worker_id,
-                                            new_master = %ticket.master_id,
-                                            score = ticket.authority_score,
-                                            "Master role claim accepted during active session; coordinator step-down complete"
-                                        );
-                                        handover_accepted = true;
-                                        break;
-                                    }
-                                    rusty_grid_core::arbitrage::ClaimVerdict::RejectedInferiorScore => {
-                                        let ack = MasterMessage::RoleHandoverAck {
-                                            accepted: false,
-                                            reason: Some(format!(
-                                                "Claimant authority score {} does not exceed incumbent authority score",
-                                                ticket.authority_score
-                                            )),
-                                            task_queue_snapshot: Vec::new(),
-                                            connected_workers: Vec::new(),
-                                        };
-                                        let _ = outbound_tx.send(ack).await;
-                                    }
-                                    rusty_grid_core::arbitrage::ClaimVerdict::RejectedInvalidTicket(err) => {
-                                        let ack = MasterMessage::RoleHandoverAck {
-                                            accepted: false,
-                                            reason: Some(format!("Invalid lease ticket: {err}")),
-                                            task_queue_snapshot: Vec::new(),
-                                            connected_workers: Vec::new(),
-                                        };
-                                        let _ = outbound_tx.send(ack).await;
-                                    }
-                                }
+                                let ack = reject_master_role_claim(&ticket);
+                                let _ = outbound_tx.send(ack).await;
                             }
                             WorkerMessage::Register { .. } => {
                                 warn!(worker_id = %worker_id, "Ignoring unexpected Register message on active connection");
@@ -3772,20 +3631,6 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     }
 
     // 8. Cleanup upon disconnect
-    if handover_accepted {
-        info!(
-            worker_id = %worker_id,
-            "Handover accepted; stepping down cleanly without marking new master as disconnected"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        #[cfg(feature = "p2p")]
-        if let Some(ref guard) = _p2p_guard {
-            guard.unlist().await;
-        }
-        writer_task.abort();
-        return Ok(());
-    }
-
     handle_worker_disconnect_with_broadcast(
         &registry,
         &queue,
@@ -3921,6 +3766,11 @@ async fn handle_multiplexed_connection<
                 ));
             }
             (worker_id, capabilities, protocol_version, features)
+        }
+        WorkerMessage::ClaimMasterRole { ticket } => {
+            let ack = reject_master_role_claim(&ticket);
+            let _ = ctrl_transport.send_msg(&ack).await;
+            return Ok(());
         }
         other => {
             let reject_ack = MasterMessage::RegisterAck {
@@ -4195,7 +4045,6 @@ async fn handle_multiplexed_connection<
     });
 
     // 7. Multiplexed inbound reader loop
-    let mut handover_accepted = false;
     loop {
         tokio::select! {
             ctrl_res = ctrl_reader.recv_msg::<WorkerMessage>() => {
@@ -4290,87 +4139,8 @@ async fn handle_multiplexed_connection<
                                 ).await;
                             }
                             WorkerMessage::ClaimMasterRole { ticket } => {
-                                let now_epoch_ms = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as u64)
-                                    .unwrap_or(0);
-
-                                let verdict = if let Some(ref secret) = cluster_secret {
-                                    let incumbent_ticket = rusty_grid_core::arbitrage::MasterLeaseTicket::issue(
-                                        ticket.cluster_id,
-                                        Uuid::nil(),
-                                        1,
-                                        3500,
-                                        now_epoch_ms,
-                                        std::time::Duration::from_millis(
-                                            rusty_grid_core::arbitrage::LEASE_VALIDITY_DURATION_MS,
-                                        ),
-                                        secret,
-                                    );
-                                    rusty_grid_core::arbitrage::evaluate_master_claim(
-                                        &incumbent_ticket,
-                                        &ticket,
-                                        secret,
-                                        now_epoch_ms,
-                                    )
-                                } else if ticket.authority_score < rusty_grid_core::arbitrage::ELECTION_THRESHOLD_SCORE {
-                                    rusty_grid_core::arbitrage::ClaimVerdict::RejectedInferiorScore
-                                } else {
-                                    rusty_grid_core::arbitrage::ClaimVerdict::AcceptedAndStepDown
-                                };
-
-                                match verdict {
-                                    rusty_grid_core::arbitrage::ClaimVerdict::AcceptedAndStepDown => {
-                                        let queue_snapshot = queue.get_schedulable_tasks().await;
-                                        let connected_workers = registry
-                                            .list_workers()
-                                            .await
-                                            .into_iter()
-                                            .filter(|w| {
-                                                w.status == crate::registry::WorkerStatus::Connected
-                                                    || w.status == crate::registry::WorkerStatus::Busy
-                                            })
-                                            .map(|w| w.capabilities)
-                                            .collect();
-
-                                        let ack = MasterMessage::RoleHandoverAck {
-                                            accepted: true,
-                                            reason: None,
-                                            task_queue_snapshot: queue_snapshot,
-                                            connected_workers,
-                                        };
-                                        let _ = ctrl_sender.send(ack).await;
-                                        info!(
-                                            worker_id = %worker_id,
-                                            new_master = %ticket.master_id,
-                                            score = ticket.authority_score,
-                                            "Master role claim accepted during active multiplexed session; coordinator step-down complete"
-                                        );
-                                        handover_accepted = true;
-                                        break;
-                                    }
-                                    rusty_grid_core::arbitrage::ClaimVerdict::RejectedInferiorScore => {
-                                        let ack = MasterMessage::RoleHandoverAck {
-                                            accepted: false,
-                                            reason: Some(format!(
-                                                "Claimant authority score {} does not exceed incumbent authority score",
-                                                ticket.authority_score
-                                            )),
-                                            task_queue_snapshot: Vec::new(),
-                                            connected_workers: Vec::new(),
-                                        };
-                                        let _ = ctrl_sender.send(ack).await;
-                                    }
-                                    rusty_grid_core::arbitrage::ClaimVerdict::RejectedInvalidTicket(err) => {
-                                        let ack = MasterMessage::RoleHandoverAck {
-                                            accepted: false,
-                                            reason: Some(format!("Invalid lease ticket: {err}")),
-                                            task_queue_snapshot: Vec::new(),
-                                            connected_workers: Vec::new(),
-                                        };
-                                        let _ = ctrl_sender.send(ack).await;
-                                    }
-                                }
+                                let ack = reject_master_role_claim(&ticket);
+                                let _ = ctrl_sender.send(ack).await;
                             }
                             WorkerMessage::BlobRequest { request_id, request } => {
                                 serve_worker_blob_request(blob_service.as_ref(), &outbound_tx, request_id, request).await;
@@ -4493,22 +4263,6 @@ async fn handle_multiplexed_connection<
     }
 
     // 8. Cleanup upon disconnect
-    if handover_accepted {
-        info!(
-            worker_id = %worker_id,
-            "Handover accepted; stepping down cleanly without marking new master as disconnected"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        #[cfg(feature = "p2p")]
-        if let Some(ref guard) = _p2p_guard {
-            guard.unlist().await;
-        }
-        ctrl_writer_task.abort();
-        data_writer_task.abort();
-        router_task.abort();
-        return Ok(());
-    }
-
     handle_worker_disconnect_with_broadcast(
         &registry,
         &queue,
@@ -5967,6 +5721,410 @@ mod tests {
 
         let _ = stop_tx.send(true);
         mux_conn.abort();
+    }
+
+    #[tokio::test]
+    async fn test_claim_master_role_is_refused_with_and_without_secret_and_sends_no_tasks() {
+        use rusty_grid_core::arbitrage::{MasterLeaseTicket, LEASE_VALIDITY_DURATION_MS};
+        use rusty_grid_core::cluster_auth::client_handshake;
+        use rusty_grid_core::task::{TaskRequirements, TaskSpec};
+
+        for with_secret in [false, true] {
+            let secret = with_secret.then(|| ClusterSecret::generate().unwrap());
+            let registry = WorkerRegistry::new();
+            let queue = TaskQueue::new();
+            let scheduler_notify = Arc::new(tokio::sync::Notify::new());
+            let waiters: WaiterMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+            let (stop_tx, stop_rx) = watch::channel(false);
+
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let signing_secret = secret
+                .clone()
+                .unwrap_or_else(|| ClusterSecret::generate().unwrap());
+            let high_score_ticket = MasterLeaseTicket::issue(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                10,
+                9500,
+                now_ms,
+                Duration::from_millis(LEASE_VALIDITY_DURATION_MS),
+                &signing_secret,
+            );
+
+            let assert_refused_ack = |ack: MasterMessage, context: &str| match ack {
+                MasterMessage::RoleHandoverAck {
+                    accepted,
+                    reason,
+                    task_queue_snapshot,
+                    connected_workers,
+                } => {
+                    assert!(
+                        !accepted,
+                        "ClaimMasterRole must be refused ({context}, with_secret={with_secret})"
+                    );
+                    assert_eq!(
+                        reason.as_deref(),
+                        Some(
+                            "Automatic master failover is not supported; use manual role switching"
+                        ),
+                        "unexpected refusal reason ({context}, with_secret={with_secret})"
+                    );
+                    assert!(
+                        task_queue_snapshot.is_empty(),
+                        "refused ClaimMasterRole must not leak task_queue_snapshot ({context}, with_secret={with_secret})"
+                    );
+                    assert!(
+                        connected_workers.is_empty(),
+                        "refused ClaimMasterRole must not leak connected_workers ({context}, with_secret={with_secret})"
+                    );
+                }
+                other => panic!(
+                    "expected RoleHandoverAck ({context}, with_secret={with_secret}), got {other:?}"
+                ),
+            };
+
+            let spawn_tcp = |m_end: tokio::io::DuplexStream, port: u16| {
+                let reg_clone = registry.clone();
+                let queue_clone = queue.clone();
+                let notify_clone = Arc::clone(&scheduler_notify);
+                let waiters_clone = Arc::clone(&waiters);
+                let stop_rx_clone = stop_rx.clone();
+                let secret_clone = secret.clone();
+                tokio::spawn(async move {
+                    handle_connection(
+                        m_end,
+                        SocketAddr::from(([127, 0, 0, 1], port)),
+                        reg_clone,
+                        queue_clone,
+                        notify_clone,
+                        waiters_clone,
+                        10,
+                        Duration::from_secs(5),
+                        stop_rx_clone,
+                        None,
+                        WireCodec::Bincode,
+                        secret_clone,
+                        None,
+                        4,
+                        None,
+                        #[cfg(feature = "dashboard")]
+                        None,
+                        #[cfg(feature = "p2p")]
+                        None,
+                        #[cfg(feature = "p2p")]
+                        None,
+                    )
+                    .await
+                })
+            };
+
+            let spawn_mux = |c_master: tokio::io::DuplexStream,
+                             d_master: tokio::io::DuplexStream,
+                             port: u16| {
+                let reg_clone = registry.clone();
+                let queue_clone = queue.clone();
+                let notify_clone = Arc::clone(&scheduler_notify);
+                let waiters_clone = Arc::clone(&waiters);
+                let stop_rx_clone = stop_rx.clone();
+                let secret_clone = secret.clone();
+                tokio::spawn(async move {
+                    handle_multiplexed_connection(
+                        c_master,
+                        d_master,
+                        SocketAddr::from(([127, 0, 0, 1], port)),
+                        reg_clone,
+                        queue_clone,
+                        notify_clone,
+                        waiters_clone,
+                        10,
+                        Duration::from_secs(5),
+                        stop_rx_clone,
+                        None,
+                        WireCodec::Bincode,
+                        secret_clone,
+                        None,
+                        None,
+                        #[cfg(feature = "dashboard")]
+                        None,
+                        #[cfg(feature = "p2p")]
+                        None,
+                        #[cfg(feature = "p2p")]
+                        None,
+                    )
+                    .await
+                })
+            };
+
+            // 1. Before any task is queued: send ClaimMasterRole as handshake message on handle_connection.
+            {
+                let (m_end, w_end) = tokio::io::duplex(64 * 1024);
+                let conn_task = spawn_tcp(m_end, 50001);
+
+                let mut w_transport = MessageTransport::new(w_end);
+                if let Some(ref sec) = secret {
+                    let key = client_handshake(&mut w_transport, sec).await.unwrap();
+                    w_transport.enable_encryption(&key, EndpointRole::Client);
+                }
+                w_transport
+                    .send_msg(&WorkerMessage::ClaimMasterRole {
+                        ticket: high_score_ticket.clone(),
+                    })
+                    .await
+                    .unwrap();
+                let ack = w_transport
+                    .recv_msg::<MasterMessage>()
+                    .await
+                    .unwrap()
+                    .expect("handshake ClaimMasterRole must receive RoleHandoverAck");
+                assert_refused_ack(ack, "pre-queue handshake");
+                conn_task.await.unwrap().unwrap();
+                assert!(registry.list_workers().await.is_empty());
+            }
+
+            // 2. Queue a task so the queue is non-empty, then test TCP handshake, multiplexed handshake,
+            //    active TCP session, and active multiplexed session.
+            let queued_task = Task::new(
+                TaskSpec::command("echo", vec!["queued-task".into()]),
+                TaskRequirements::generic(1, 64),
+            );
+            queue.submit(queued_task).await.unwrap();
+            assert_eq!(queue.get_schedulable_tasks().await.len(), 1);
+
+            // 2a. TCP handshake ClaimMasterRole after a task is queued.
+            {
+                let (m_end, w_end) = tokio::io::duplex(64 * 1024);
+                let conn_task = spawn_tcp(m_end, 50002);
+
+                let mut w_transport = MessageTransport::new(w_end);
+                if let Some(ref sec) = secret {
+                    let key = client_handshake(&mut w_transport, sec).await.unwrap();
+                    w_transport.enable_encryption(&key, EndpointRole::Client);
+                }
+                w_transport
+                    .send_msg(&WorkerMessage::ClaimMasterRole {
+                        ticket: high_score_ticket.clone(),
+                    })
+                    .await
+                    .unwrap();
+                let ack = w_transport
+                    .recv_msg::<MasterMessage>()
+                    .await
+                    .unwrap()
+                    .expect("post-queue handshake ClaimMasterRole must receive RoleHandoverAck");
+                assert_refused_ack(ack, "post-queue TCP handshake");
+                conn_task.await.unwrap().unwrap();
+                assert!(
+                    registry.list_workers().await.is_empty(),
+                    "refused TCP handshake claim must not register a worker"
+                );
+            }
+
+            // 2b. Multiplexed (P2P) handshake ClaimMasterRole as first control message after a task is queued.
+            {
+                let (c_master, c_worker) = tokio::io::duplex(64 * 1024);
+                let (d_master, _d_worker) = tokio::io::duplex(64 * 1024);
+                let mux_hs_task = spawn_mux(c_master, d_master, 50003);
+
+                let mut ctrl_transport = MessageTransport::new(c_worker);
+                if let Some(ref sec) = secret {
+                    let key = client_handshake(&mut ctrl_transport, sec).await.unwrap();
+                    ctrl_transport.enable_encryption(&key, EndpointRole::Client);
+                }
+                ctrl_transport
+                    .send_msg(&WorkerMessage::ClaimMasterRole {
+                        ticket: high_score_ticket.clone(),
+                    })
+                    .await
+                    .unwrap();
+                let ack = ctrl_transport
+                    .recv_msg::<MasterMessage>()
+                    .await
+                    .unwrap()
+                    .expect(
+                        "post-queue mux handshake ClaimMasterRole must receive RoleHandoverAck",
+                    );
+                assert_refused_ack(ack, "post-queue multiplexed handshake");
+                mux_hs_task.await.unwrap().unwrap();
+                assert!(
+                    registry.list_workers().await.is_empty(),
+                    "refused multiplexed handshake claim must not register a worker"
+                );
+            }
+
+            // 2c. Active registered session on handle_connection.
+            {
+                let (m_end, w_end) = tokio::io::duplex(64 * 1024);
+                let conn_task = spawn_tcp(m_end, 50004);
+
+                let mut w_transport = MessageTransport::new(w_end);
+                if let Some(ref sec) = secret {
+                    let key = client_handshake(&mut w_transport, sec).await.unwrap();
+                    w_transport.enable_encryption(&key, EndpointRole::Client);
+                }
+                let worker_id = Uuid::new_v4();
+                w_transport
+                    .send_msg(&WorkerMessage::Register {
+                        worker_id,
+                        capabilities: WorkerCapabilities::new(
+                            "feat6-worker",
+                            2,
+                            4096,
+                            false,
+                            false,
+                            None,
+                        ),
+                        protocol_version: PROTOCOL_VERSION_CURRENT,
+                        features: ProtocolCapabilities::all_supported()
+                            | ProtocolCapabilities::ROLE_ARBITRAGE,
+                    })
+                    .await
+                    .unwrap();
+                match w_transport.recv_msg::<MasterMessage>().await.unwrap() {
+                    Some(MasterMessage::RegisterAck {
+                        accepted: true,
+                        features,
+                        ..
+                    }) => {
+                        assert!(
+                            !features.contains(ProtocolCapabilities::ROLE_ARBITRAGE),
+                            "negotiated features must not include ROLE_ARBITRAGE"
+                        );
+                    }
+                    other => panic!("expected RegisterAck, got {other:?}"),
+                }
+
+                w_transport
+                    .send_msg(&WorkerMessage::ClaimMasterRole {
+                        ticket: high_score_ticket.clone(),
+                    })
+                    .await
+                    .unwrap();
+                let ack = w_transport
+                    .recv_msg::<MasterMessage>()
+                    .await
+                    .unwrap()
+                    .expect("active session ClaimMasterRole must receive RoleHandoverAck");
+                assert_refused_ack(ack, "post-queue active TCP session");
+                assert_eq!(
+                    registry.get_worker(worker_id).await.map(|w| w.status),
+                    Some(crate::registry::WorkerStatus::Connected),
+                    "worker must remain Connected in registry after refused ClaimMasterRole on active TCP session"
+                );
+
+                // Session remains alive and responds to Heartbeat after refusal.
+                w_transport
+                    .send_msg(&WorkerMessage::Heartbeat {
+                        worker_id,
+                        timestamp: 42,
+                        active_tasks: 0,
+                        cpu_usage_pct: 10.0,
+                        ram_available_mb: 2048,
+                    })
+                    .await
+                    .unwrap();
+                match w_transport.recv_msg::<MasterMessage>().await.unwrap() {
+                    Some(MasterMessage::HeartbeatAck { timestamp: 42 }) => {}
+                    other => {
+                        panic!("expected HeartbeatAck after refused ClaimMasterRole, got {other:?}")
+                    }
+                }
+                assert_eq!(
+                    registry.get_worker(worker_id).await.map(|w| w.status),
+                    Some(crate::registry::WorkerStatus::Connected)
+                );
+                conn_task.abort();
+            }
+
+            // 2d. Active multiplexed session on handle_multiplexed_connection.
+            {
+                let (c_master, c_worker) = tokio::io::duplex(64 * 1024);
+                let (d_master, _d_worker) = tokio::io::duplex(64 * 1024);
+                let mux_task = spawn_mux(c_master, d_master, 50005);
+
+                let mut ctrl_transport = MessageTransport::new(c_worker);
+                if let Some(ref sec) = secret {
+                    let key = client_handshake(&mut ctrl_transport, sec).await.unwrap();
+                    ctrl_transport.enable_encryption(&key, EndpointRole::Client);
+                }
+                let mux_worker_id = Uuid::new_v4();
+                ctrl_transport
+                    .send_msg(&WorkerMessage::Register {
+                        worker_id: mux_worker_id,
+                        capabilities: WorkerCapabilities::new(
+                            "feat6-mux-worker",
+                            2,
+                            4096,
+                            false,
+                            false,
+                            None,
+                        ),
+                        protocol_version: PROTOCOL_VERSION_CURRENT,
+                        features: ProtocolCapabilities::all_supported()
+                            | ProtocolCapabilities::ROLE_ARBITRAGE,
+                    })
+                    .await
+                    .unwrap();
+                match ctrl_transport.recv_msg::<MasterMessage>().await.unwrap() {
+                    Some(MasterMessage::RegisterAck {
+                        accepted: true,
+                        features,
+                        ..
+                    }) => {
+                        assert!(
+                            !features.contains(ProtocolCapabilities::ROLE_ARBITRAGE),
+                            "mux negotiated features must not include ROLE_ARBITRAGE"
+                        );
+                    }
+                    other => panic!("expected mux RegisterAck, got {other:?}"),
+                }
+
+                ctrl_transport
+                    .send_msg(&WorkerMessage::ClaimMasterRole {
+                        ticket: high_score_ticket.clone(),
+                    })
+                    .await
+                    .unwrap();
+                let ack = ctrl_transport
+                    .recv_msg::<MasterMessage>()
+                    .await
+                    .unwrap()
+                    .expect("mux active session ClaimMasterRole must receive RoleHandoverAck");
+                assert_refused_ack(ack, "post-queue active multiplexed session");
+                assert_eq!(
+                    registry.get_worker(mux_worker_id).await.map(|w| w.status),
+                    Some(crate::registry::WorkerStatus::Connected),
+                    "worker must remain Connected in registry after refused ClaimMasterRole on active multiplexed session"
+                );
+
+                // Multiplexed control lane remains alive and responds to Heartbeat after refusal.
+                ctrl_transport
+                    .send_msg(&WorkerMessage::Heartbeat {
+                        worker_id: mux_worker_id,
+                        timestamp: 84,
+                        active_tasks: 0,
+                        cpu_usage_pct: 12.0,
+                        ram_available_mb: 2048,
+                    })
+                    .await
+                    .unwrap();
+                match ctrl_transport.recv_msg::<MasterMessage>().await.unwrap() {
+                    Some(MasterMessage::HeartbeatAck { timestamp: 84 }) => {}
+                    other => {
+                        panic!("expected mux HeartbeatAck after refused ClaimMasterRole, got {other:?}")
+                    }
+                }
+                assert_eq!(
+                    registry.get_worker(mux_worker_id).await.map(|w| w.status),
+                    Some(crate::registry::WorkerStatus::Connected)
+                );
+
+                let _ = stop_tx.send(true);
+                mux_task.abort();
+            }
+        }
     }
 
     #[tokio::test]
