@@ -49,7 +49,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # CLI parsing & time utilities
 clap = { version = "4.5", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
-toml = "0.8"
+toml = "1.1"
 
 # System monitoring
 sysinfo = "0.30"
