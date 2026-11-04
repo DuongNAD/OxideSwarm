@@ -2341,7 +2341,7 @@ impl WorkerClient {
         );
 
         let dead_after = if let Some(status) = self.mobile.live_status() {
-            let iv = status.recommended_keepalive_interval(0);
+            let iv = status.recommended_keepalive_interval_or(0, heartbeat_interval);
             self.dead_peer_timeout(iv)
         } else {
             self.dead_peer_timeout(heartbeat_interval)

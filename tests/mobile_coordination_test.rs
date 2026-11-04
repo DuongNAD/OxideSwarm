@@ -314,20 +314,21 @@ fn test_multi_tier_thermal_battery_throttling_policy() {
 
 /// Test 2: Adaptive dual-tier keepalive controller (§4.2) and dynamic master timeout.
 /// Verifies:
-/// - Worker heartbeat interval: 60s for Wi-Fi/Ethernet, 25s for Cellular idle, 10s for Cellular active tasks.
+/// - Worker heartbeat interval: 60s for Wi-Fi/Ethernet idle, 25s for Cellular idle, 10s for active tasks on any link.
+/// - Laptop / unknown network_type keeps the negotiated interval.
 /// - Master dead-peer window calculation: W_dead = max(2s, 4 * tau).
 /// - Dynamic silence window enforcement in WorkerEntry and WorkerRegistry.
 #[tokio::test]
 async fn test_adaptive_rrc_keepalive_controller_and_dynamic_master_timeout() {
     // 1. Worker heartbeat interval derivation
-    // Wi-Fi or Ethernet
+    // Wi-Fi or Ethernet (60s when idle, 10s when active)
     assert_eq!(
         calculate_keepalive_interval("wifi", 0),
         Duration::from_secs(60)
     );
     assert_eq!(
         calculate_keepalive_interval("Wi-Fi", 5),
-        Duration::from_secs(60)
+        Duration::from_secs(10)
     );
     assert_eq!(
         calculate_keepalive_interval("ethernet", 0),
@@ -335,7 +336,7 @@ async fn test_adaptive_rrc_keepalive_controller_and_dynamic_master_timeout() {
     );
     assert_eq!(
         calculate_keepalive_interval("LAN", 2),
-        Duration::from_secs(60)
+        Duration::from_secs(10)
     );
 
     // Cellular Idle (0 active tasks) -> 25s (prevents RRC sleep desync without draining battery)
@@ -378,6 +379,25 @@ async fn test_adaptive_rrc_keepalive_controller_and_dynamic_master_timeout() {
     assert_eq!(
         live_wifi.recommended_keepalive_interval(0),
         Duration::from_secs(60)
+    );
+    assert_eq!(
+        live_wifi.recommended_keepalive_interval(1),
+        Duration::from_secs(10)
+    );
+
+    let live_laptop = MobileLiveStatus {
+        battery_pct: Some(75),
+        is_charging: Some(false),
+        network_type: None,
+        ..Default::default()
+    };
+    assert_eq!(
+        live_laptop.recommended_keepalive_interval_or(0, Duration::from_secs(1)),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        live_laptop.recommended_keepalive_interval_or(1, Duration::from_secs(1)),
+        Duration::from_secs(1)
     );
 
     let live_cell_idle = MobileLiveStatus {

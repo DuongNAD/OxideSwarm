@@ -226,6 +226,7 @@ pub enum HeartbeatOutcome {
 
 struct WorkerRegistryInner {
     workers: HashMap<Uuid, WorkerEntry>,
+    network_types: HashMap<Uuid, String>,
     next_session_id: u64,
 }
 
@@ -249,6 +250,7 @@ impl WorkerRegistry {
         Self {
             inner: Arc::new(RwLock::new(WorkerRegistryInner {
                 workers: HashMap::new(),
+                network_types: HashMap::new(),
                 next_session_id: 1,
             })),
         }
@@ -335,14 +337,16 @@ impl WorkerRegistry {
                 .capabilities
                 .mobile
                 .as_ref()
-                .map(|m| m.live_status().recommended_keepalive_interval(0));
+                .and_then(|m| m.live_status().adaptive_keepalive_interval(0));
+            inner.network_types.remove(&worker_id);
             tracing::info!(worker_id = %worker_id, session_id = session_id, superseded = ?superseded_session, "Rebound existing worker registration");
         } else {
             let ram = capabilities.ram_mb;
             let hb_interval = capabilities
                 .mobile
                 .as_ref()
-                .map(|m| m.live_status().recommended_keepalive_interval(0));
+                .and_then(|m| m.live_status().adaptive_keepalive_interval(0));
+            inner.network_types.remove(&worker_id);
             let entry = WorkerEntry {
                 worker_id,
                 session_id,
@@ -432,6 +436,7 @@ impl WorkerRegistry {
     /// Unconditionally removes a worker from the registry (closing any active abort handle).
     pub async fn remove_worker(&self, worker_id: &Uuid) -> Option<WorkerInfo> {
         let mut inner = self.inner.write().await;
+        inner.network_types.remove(worker_id);
         if let Some(entry) = inner.workers.remove(worker_id) {
             if let Some(abort) = entry.abort_handle.clone() {
                 abort_unless_current(abort);
@@ -456,6 +461,7 @@ impl WorkerRegistry {
         }
         let count = to_remove.len();
         for id in to_remove {
+            inner.network_types.remove(&id);
             if let Some(entry) = inner.workers.remove(&id) {
                 if let Some(abort) = entry.abort_handle {
                     abort_unless_current(abort);
@@ -525,6 +531,7 @@ impl WorkerRegistry {
         expected_session: Option<u64>,
     ) -> GridResult<HeartbeatOutcome> {
         let mut inner = self.inner.write().await;
+        let known_net = inner.network_types.get(worker_id).cloned();
         let entry = inner
             .workers
             .get_mut(worker_id)
@@ -547,27 +554,11 @@ impl WorkerRegistry {
         entry.reported_active_tasks = active_tasks;
         entry.cpu_usage_pct = cpu_usage_pct;
         entry.ram_available_mb = ram_available_mb;
-        if let Some(ref mob) = entry.capabilities.mobile {
-            let live = mob.live_status();
-            let is_cellular = live.network_type.as_ref().is_some_and(|net| {
-                let n = net.to_ascii_lowercase();
-                n.contains("cellular")
-                    || n.contains("mobile")
-                    || n.contains("lte")
-                    || n.contains("5g")
-                    || n.contains("4g")
-                    || n.contains("3g")
-                    || n.contains("cgnat")
-            }) || entry
-                .heartbeat_interval
-                .is_some_and(|d| d < Duration::from_secs(60));
-
-            if is_cellular {
-                entry.heartbeat_interval =
-                    Some(live.recommended_keepalive_interval(entry.active_tasks));
-            } else if entry.heartbeat_interval.is_none() {
-                entry.heartbeat_interval = Some(Duration::from_secs(60));
-            }
+        if let Some(ref net) = known_net {
+            let active = entry.visible_active_tasks();
+            entry.heartbeat_interval = Some(
+                rusty_grid_core::capabilities::calculate_keepalive_interval(net, active),
+            );
         }
         let revive = entry.status == WorkerStatus::Disconnected && expected_session.is_some();
         if entry.status != WorkerStatus::Disconnected || revive {
@@ -610,7 +601,18 @@ impl WorkerRegistry {
                 return Ok(false);
             }
         }
-        entry.heartbeat_interval = Some(status.recommended_keepalive_interval(entry.active_tasks));
+        let active = entry.visible_active_tasks();
+        entry.heartbeat_interval = status.adaptive_keepalive_interval(active);
+        let known_net = status
+            .network_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| {
+                !s.is_empty()
+                    && !s.eq_ignore_ascii_case("unknown")
+                    && !s.eq_ignore_ascii_case("none")
+            })
+            .map(str::to_string);
         let updated = match entry.capabilities.mobile.as_ref() {
             Some(current) => current.with_live_status(status),
             // The worker registered without mobile data but now reports some (an app feeding
@@ -625,6 +627,14 @@ impl WorkerRegistry {
         };
         let changed = entry.capabilities.mobile.as_ref() != Some(&updated);
         entry.capabilities.mobile = Some(updated);
+        match known_net {
+            Some(net) => {
+                inner.network_types.insert(*worker_id, net);
+            }
+            None => {
+                inner.network_types.remove(worker_id);
+            }
+        }
         Ok(changed)
     }
 
@@ -639,6 +649,7 @@ impl WorkerRegistry {
         session_id: u64,
     ) -> GridResult<mpsc::Sender<MasterMessage>> {
         let mut inner = self.inner.write().await;
+        let known_net = inner.network_types.get(worker_id).cloned();
         let entry = inner
             .workers
             .get_mut(worker_id)
@@ -647,6 +658,12 @@ impl WorkerRegistry {
             return Err(GridError::ConnectionClosed);
         }
         entry.active_tasks += 1;
+        if let Some(ref net) = known_net {
+            let active = entry.visible_active_tasks();
+            entry.heartbeat_interval = Some(
+                rusty_grid_core::capabilities::calculate_keepalive_interval(net, active),
+            );
+        }
         if entry.status == WorkerStatus::Connected {
             entry.status = WorkerStatus::Busy;
         }
@@ -658,9 +675,16 @@ impl WorkerRegistry {
     /// its books from zero, so its counter is left alone.
     pub async fn release_dispatch(&self, worker_id: &Uuid, session_id: u64) {
         let mut inner = self.inner.write().await;
+        let known_net = inner.network_types.get(worker_id).cloned();
         if let Some(entry) = inner.workers.get_mut(worker_id) {
             if entry.session_id == session_id {
                 entry.active_tasks = entry.active_tasks.saturating_sub(1);
+                if let Some(ref net) = known_net {
+                    let active = entry.visible_active_tasks();
+                    entry.heartbeat_interval = Some(
+                        rusty_grid_core::capabilities::calculate_keepalive_interval(net, active),
+                    );
+                }
                 if entry.status == WorkerStatus::Busy && entry.visible_active_tasks() == 0 {
                     entry.status = WorkerStatus::Connected;
                 }
@@ -732,11 +756,18 @@ impl WorkerRegistry {
     /// Atomically increments the active task count for a worker and updates status to Busy.
     pub async fn increment_active_tasks(&self, worker_id: &Uuid) -> GridResult<usize> {
         let mut inner = self.inner.write().await;
+        let known_net = inner.network_types.get(worker_id).cloned();
         let entry = inner
             .workers
             .get_mut(worker_id)
             .ok_or(GridError::WorkerNotFound(*worker_id))?;
         entry.active_tasks += 1;
+        if let Some(ref net) = known_net {
+            let active = entry.visible_active_tasks();
+            entry.heartbeat_interval = Some(
+                rusty_grid_core::capabilities::calculate_keepalive_interval(net, active),
+            );
+        }
         if entry.status == WorkerStatus::Connected {
             entry.status = WorkerStatus::Busy;
         }
@@ -746,11 +777,18 @@ impl WorkerRegistry {
     /// Atomically decrements the active task count for a worker and updates status to Connected if 0.
     pub async fn decrement_active_tasks(&self, worker_id: &Uuid) -> GridResult<usize> {
         let mut inner = self.inner.write().await;
+        let known_net = inner.network_types.get(worker_id).cloned();
         let entry = inner
             .workers
             .get_mut(worker_id)
             .ok_or(GridError::WorkerNotFound(*worker_id))?;
         entry.active_tasks = entry.active_tasks.saturating_sub(1);
+        if let Some(ref net) = known_net {
+            let active = entry.visible_active_tasks();
+            entry.heartbeat_interval = Some(
+                rusty_grid_core::capabilities::calculate_keepalive_interval(net, active),
+            );
+        }
         if entry.status == WorkerStatus::Busy && entry.visible_active_tasks() == 0 {
             entry.status = WorkerStatus::Connected;
         }
@@ -1911,5 +1949,113 @@ mod tests {
         let workers = registry.list_active_workers().await;
         assert_eq!(placed(vec![multi_core()], workers.clone()), 0);
         assert_eq!(placed(vec![compile()], workers), 0);
+    }
+
+    #[tokio::test]
+    async fn test_adaptive_keepalive_registry_intervals_for_laptop_wifi_and_cellular() {
+        let registry = WorkerRegistry::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let id = Uuid::new_v4();
+        let session = registry
+            .register(
+                id,
+                phone_caps(85, false, false),
+                "127.0.0.1:9033".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 1. Battery worker without network_type (e.g. laptop) keeps negotiated/reaper timeout (None).
+        {
+            let inner = registry.inner.read().await;
+            assert_eq!(inner.workers[&id].heartbeat_interval, None);
+        }
+        registry
+            .record_heartbeat(&id, 0, 100, 10.0, 4096, Some(session))
+            .await
+            .unwrap();
+        registry
+            .update_mobile_telemetry(
+                &id,
+                Some(session),
+                MobileLiveStatus {
+                    battery_pct: Some(84),
+                    is_charging: Some(false),
+                    network_type: None,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let inner = registry.inner.read().await;
+            assert_eq!(inner.workers[&id].heartbeat_interval, None);
+        }
+
+        // 2. Wi-Fi idle -> 60s; Wi-Fi with 1 active task -> 10s (40s dead-worker window).
+        registry
+            .update_mobile_telemetry(
+                &id,
+                Some(session),
+                MobileLiveStatus {
+                    battery_pct: Some(84),
+                    is_charging: Some(false),
+                    network_type: Some("wifi".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let inner = registry.inner.read().await;
+            assert_eq!(
+                inner.workers[&id].heartbeat_interval,
+                Some(Duration::from_secs(60))
+            );
+        }
+        registry
+            .record_heartbeat(&id, 1, 101, 50.0, 4096, Some(session))
+            .await
+            .unwrap();
+        {
+            let inner = registry.inner.read().await;
+            let entry = &inner.workers[&id];
+            assert_eq!(entry.heartbeat_interval, Some(Duration::from_secs(10)));
+            let base = entry.last_heartbeat_instant;
+            assert!(!entry.is_silent(base + Duration::from_secs(39), Duration::from_secs(5)));
+            assert!(entry.is_silent(base + Duration::from_secs(41), Duration::from_secs(5)));
+        }
+
+        // 3. Cellular idle stays 25s across heartbeats; cellular active -> 10s.
+        registry
+            .record_heartbeat(&id, 0, 102, 5.0, 4096, Some(session))
+            .await
+            .unwrap();
+        registry
+            .update_mobile_telemetry(
+                &id,
+                Some(session),
+                MobileLiveStatus {
+                    battery_pct: Some(80),
+                    is_charging: Some(false),
+                    network_type: Some("cellular".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        registry
+            .record_heartbeat(&id, 0, 103, 5.0, 4096, Some(session))
+            .await
+            .unwrap();
+        {
+            let inner = registry.inner.read().await;
+            assert_eq!(
+                inner.workers[&id].heartbeat_interval,
+                Some(Duration::from_secs(25))
+            );
+        }
     }
 }

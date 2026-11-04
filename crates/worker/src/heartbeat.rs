@@ -461,12 +461,11 @@ pub fn spawn_adaptive_heartbeat_task(
     let tracker_clone = Arc::clone(&tracker);
 
     let join_handle = tokio::spawn(async move {
-        let mut current_interval = interval;
-        if let Some(ref mob) = mobile {
-            if let Some(status) = mob.live_status() {
-                current_interval = status.recommended_keepalive_interval(0);
-            }
-        }
+        let mut current_interval = mobile
+            .as_ref()
+            .and_then(|mob| mob.live_status())
+            .map(|status| status.recommended_keepalive_interval_or(0, interval))
+            .unwrap_or(interval);
         let mut ticker = tokio::time::interval(current_interval);
         // Skip the immediate initial tick so first heartbeat is sent after interval has elapsed
         ticker.tick().await;
@@ -477,16 +476,16 @@ pub fn spawn_adaptive_heartbeat_task(
                     let now_sec = current_epoch_secs();
                     let active = tracker_clone.active_tasks.load(Ordering::Relaxed);
 
-                    // Dynamically adapt keepalive interval based on cellular status and active tasks
-                    if let Some(ref mob) = mobile {
-                        if let Some(status) = mob.live_status() {
-                            let recommended = status.recommended_keepalive_interval(active);
-                            if recommended != current_interval {
-                                current_interval = recommended;
-                                ticker = tokio::time::interval(current_interval);
-                                ticker.tick().await;
-                            }
-                        }
+                    // Dynamically adapt keepalive interval based on network status and active tasks
+                    let recommended = mobile
+                        .as_ref()
+                        .and_then(|mob| mob.live_status())
+                        .map(|status| status.recommended_keepalive_interval_or(active, interval))
+                        .unwrap_or(interval);
+                    if recommended != current_interval {
+                        current_interval = recommended;
+                        ticker = tokio::time::interval(current_interval);
+                        ticker.tick().await;
                     }
 
                     // Read current system telemetry from non-blocking background sampler
@@ -840,5 +839,52 @@ mod tests {
         assert_eq!(tracker.decrement_active_tasks(), 0);
         assert_eq!(tracker.decrement_active_tasks(), 0);
         assert_eq!(tracker.active_tasks(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_adaptive_heartbeat_keeps_negotiated_interval_for_laptop_and_10s_for_active_wifi()
+    {
+        let wifi_one_task = MobileLiveStatus {
+            network_type: Some("wifi".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            wifi_one_task.recommended_keepalive_interval_or(1, Duration::from_secs(3)),
+            Duration::from_secs(10)
+        );
+
+        let negotiated = Duration::from_millis(25);
+        let laptop_handle = MobileTelemetryHandle::new(Some(MobileCapabilities {
+            os_version: "macOS 14.5".into(),
+            soc_model: "Apple M2".into(),
+            battery_pct: Some(80),
+            is_charging: Some(false),
+            thermal_throttled: false,
+        }));
+        assert_eq!(
+            laptop_handle
+                .live_status()
+                .unwrap()
+                .recommended_keepalive_interval_or(0, negotiated),
+            negotiated
+        );
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let tracker = Arc::new(HeartbeatTracker::new(active));
+        let (tx, mut rx) = mpsc::channel(8);
+        let hb = spawn_adaptive_heartbeat_task(
+            Uuid::new_v4(),
+            negotiated,
+            tx,
+            Arc::clone(&tracker),
+            Some(laptop_handle),
+        );
+
+        let first = tokio::time::timeout(Duration::from_millis(250), rx.recv())
+            .await
+            .expect("laptop worker must heartbeat at the negotiated interval, not 60s")
+            .expect("heartbeat message");
+        assert!(matches!(first, WorkerMessage::Heartbeat { .. }));
+        hb.stop().await;
     }
 }

@@ -176,27 +176,38 @@ impl MobileLiveStatus {
         calculate_effective_concurrency(max_cores, bat, therm)
     }
 
+    /// Calculates the RRC-aware heartbeat interval when a mobile network type is known.
+    ///
+    /// Returns `None` when `network_type` is absent or unknown (for example on a battery-powered
+    /// laptop), signalling that the caller should keep the master-negotiated heartbeat interval.
+    pub fn adaptive_keepalive_interval(&self, active_tasks: usize) -> Option<Duration> {
+        let net = self.network_type.as_deref()?.trim();
+        if net.is_empty() || net.eq_ignore_ascii_case("unknown") || net.eq_ignore_ascii_case("none")
+        {
+            return None;
+        }
+        Some(calculate_keepalive_interval(net, active_tasks))
+    }
+
+    /// Returns the RRC-aware keepalive interval when `network_type` is known, or `negotiated`
+    /// when `network_type` is unknown (such as on a laptop).
+    pub fn recommended_keepalive_interval_or(
+        &self,
+        active_tasks: usize,
+        negotiated: Duration,
+    ) -> Duration {
+        self.adaptive_keepalive_interval(active_tasks)
+            .unwrap_or(negotiated)
+    }
+
     /// Calculates RRC-aware heartbeat interval in seconds.
     pub fn recommended_keepalive_interval(&self, active_tasks: usize) -> Duration {
-        let is_cellular = self.network_type.as_ref().is_some_and(|net| {
-            let n = net.to_ascii_lowercase();
-            n.contains("cellular")
-                || n.contains("mobile")
-                || n.contains("lte")
-                || n.contains("5g")
-                || n.contains("4g")
-                || n.contains("3g")
-                || n.contains("cgnat")
-        });
-
-        if is_cellular {
-            if active_tasks > 0 {
-                Duration::from_secs(10)
-            } else {
-                Duration::from_secs(25)
-            }
-        } else {
-            Duration::from_secs(60)
+        if active_tasks > 0 {
+            return Duration::from_secs(10);
+        }
+        match self.adaptive_keepalive_interval(active_tasks) {
+            Some(interval) => interval,
+            None => Duration::from_secs(60),
         }
     }
 }
@@ -265,21 +276,20 @@ pub fn is_task_eligible(
 
 /// Calculates RRC-aware heartbeat interval in seconds.
 pub fn calculate_keepalive_interval(network_type: &str, active_tasks: usize) -> Duration {
+    if active_tasks > 0 {
+        return Duration::from_secs(10);
+    }
     let n = network_type.to_ascii_lowercase();
     let is_cellular = n.contains("cellular")
         || n.contains("mobile")
         || n.contains("lte")
-        || n.contains("5g")
+        || (n.contains("5g") && !n.contains("5ghz") && !n.contains("5 ghz"))
         || n.contains("4g")
         || n.contains("3g")
         || n.contains("cgnat");
 
     if is_cellular {
-        if active_tasks > 0 {
-            Duration::from_secs(10)
-        } else {
-            Duration::from_secs(25)
-        }
+        Duration::from_secs(25)
     } else {
         Duration::from_secs(60)
     }
@@ -2243,8 +2253,16 @@ mod tests {
             Duration::from_secs(60)
         );
         assert_eq!(
-            calculate_keepalive_interval("ethernet", 2),
+            calculate_keepalive_interval("wifi", 1),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("ethernet", 0),
             Duration::from_secs(60)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("ethernet", 2),
+            Duration::from_secs(10)
         );
         assert_eq!(
             calculate_keepalive_interval("cellular", 0),
@@ -2253,6 +2271,40 @@ mod tests {
         assert_eq!(
             calculate_keepalive_interval("5G LTE", 1),
             Duration::from_secs(10)
+        );
+
+        let wifi_status = MobileLiveStatus {
+            network_type: Some("wifi".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            wifi_status.recommended_keepalive_interval(0),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            wifi_status.recommended_keepalive_interval(1),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            wifi_status.recommended_keepalive_interval_or(1, Duration::from_secs(1)),
+            Duration::from_secs(10)
+        );
+
+        let laptop_status = MobileLiveStatus {
+            battery_pct: Some(80),
+            is_charging: Some(false),
+            network_type: None,
+            ..Default::default()
+        };
+        assert_eq!(laptop_status.adaptive_keepalive_interval(0), None);
+        assert_eq!(laptop_status.adaptive_keepalive_interval(1), None);
+        assert_eq!(
+            laptop_status.recommended_keepalive_interval_or(0, Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            laptop_status.recommended_keepalive_interval_or(1, Duration::from_secs(1)),
+            Duration::from_secs(1)
         );
     }
 
