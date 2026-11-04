@@ -197,7 +197,7 @@ pub struct MasterArgs {
     )]
     pub reaper_interval_secs: Option<u64>,
 
-    #[arg(long, help = "Maximum queue capacity")]
+    #[arg(long, help = "Maximum queued or running tasks allowed at once")]
     pub max_queue_size: Option<usize>,
 
     #[arg(long, help = "Maximum execution retries for failed tasks")]
@@ -1018,6 +1018,24 @@ fn resolve_scheduler_policy(
     }
 }
 
+/// Build the `SchedulerConfig` for `oxideswarm master`, resolving `--scheduler-policy` /
+/// `RUSTY_GRID_SCHEDULER_POLICY` / `[master].scheduler_policy` and carrying `preserve_gpu`
+/// and `max_host_cpu`.
+fn build_master_scheduler_config(
+    flag: Option<String>,
+    cfg_val: Option<String>,
+    preserve_gpu: bool,
+    max_host_cpu: f32,
+) -> Result<SchedulerConfig, String> {
+    let scheduler_policy = resolve_scheduler_policy(flag, cfg_val)?;
+    Ok(SchedulerConfig {
+        policy: scheduler_policy,
+        preserve_gpu_for_gpu_tasks: preserve_gpu,
+        max_host_cpu_pct: max_host_cpu,
+        ..Default::default()
+    })
+}
+
 /// Resolve `--wire-codec` / `RUSTY_GRID_WIRE_CODEC` / config `wire_codec`,
 /// returning an error on unknown codec names.
 fn resolve_wire_codec(flag: Option<String>, cfg_val: Option<String>) -> Result<WireCodec, String> {
@@ -1270,17 +1288,30 @@ async fn run_master(
             return ExitCode::FAILURE;
         }
     };
-    let scheduler_policy = match resolve_scheduler_policy(
+    let sched_config = match build_master_scheduler_config(
         args.scheduler_policy,
         master_cfg.as_ref().and_then(|m| m.scheduler_policy.clone()),
+        preserve_gpu,
+        max_host_cpu,
     ) {
-        Ok(policy) => policy,
+        Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("--scheduler-policy: {e}");
             return ExitCode::FAILURE;
         }
     };
+    let wire_codec = match resolve_wire_codec(
+        args.wire_codec,
+        master_cfg.as_ref().and_then(|m| m.wire_codec.clone()),
+    ) {
+        Ok(codec) => codec,
+        Err(e) => {
+            eprintln!("--wire-codec: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     server_config = server_config
+        .with_wire_codec(wire_codec)
         .with_max_terminal_tasks(max_retained_tasks)
         .with_max_terminal_bytes(
             usize::try_from(max_retained_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX),
@@ -1344,18 +1375,6 @@ async fn run_master(
         server_config = server_config.with_p2p_key_file(kf);
     }
 
-    let wire_codec = match resolve_wire_codec(
-        args.wire_codec,
-        master_cfg.as_ref().and_then(|m| m.wire_codec.clone()),
-    ) {
-        Ok(codec) => codec,
-        Err(e) => {
-            eprintln!("--wire-codec: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    server_config = server_config.with_wire_codec(wire_codec);
-
     let dashboard_port = resolve_opt_u16(
         args.dashboard_port,
         &["RUSTY_GRID_DASHBOARD_PORT", "OXIDE_SWARM_DASHBOARD_PORT"],
@@ -1399,13 +1418,6 @@ async fn run_master(
             server_config.auth_config.add_token(token, name, &scopes);
         }
     }
-
-    let sched_config = SchedulerConfig {
-        policy: scheduler_policy,
-        preserve_gpu_for_gpu_tasks: preserve_gpu,
-        max_host_cpu_pct: max_host_cpu,
-        ..Default::default()
-    };
 
     let reaper_config = ReaperConfig::new(
         Duration::from_secs(reaper_interval),
@@ -4732,7 +4744,8 @@ max_active_mb = 768
         );
         assert!(apply_max_queue_size(base, Some(0), None).is_err());
 
-        //    - `resolve_scheduler_policy` parses known policies and rejects unknown ones.
+        //    - `resolve_scheduler_policy` and `build_master_scheduler_config` parse known policies,
+        //      carry `policy` into `SchedulerConfig`, and reject unknown ones.
         assert_eq!(
             resolve_scheduler_policy(None, None).unwrap(),
             SchedulingPolicy::WeightedLeastLoaded
@@ -4747,6 +4760,24 @@ max_active_mb = 768
             SchedulingPolicy::RoundRobin
         );
         assert!(resolve_scheduler_policy(Some("bogus-policy".into()), None).is_err());
+
+        let built_sched_cfg = build_master_scheduler_config(
+            Some("round-robin".into()),
+            Some("least-loaded".into()),
+            false,
+            72.5,
+        )
+        .unwrap();
+        assert_eq!(
+            built_sched_cfg.policy,
+            SchedulingPolicy::RoundRobin,
+            "SchedulerConfig built by run_master must carry the parsed scheduler_policy"
+        );
+        assert!(!built_sched_cfg.preserve_gpu_for_gpu_tasks);
+        assert_eq!(built_sched_cfg.max_host_cpu_pct, 72.5);
+        assert!(
+            build_master_scheduler_config(Some("bogus-policy".into()), None, true, 85.0).is_err()
+        );
 
         //    - `resolve_worker_target`: explicit `--master` beats config `p2p_ticket`.
         let cfg_with_bad_ticket = WorkerFileConfig {
@@ -4775,6 +4806,42 @@ max_active_mb = 768
 
         // 2. Startup validation: `--max-queue-size 0`, `--scheduler-policy bogus`, and
         //    `--wire-codec bogus` (on master and worker) fail immediately with `ExitCode::FAILURE`.
+        //    Even on an exposed bind (`--listen 0.0.0.0:0`), a bad `--wire-codec` is rejected
+        //    before secret setup so a fresh `OXIDESWARM_HOME` remains empty.
+        let fresh_home = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var("OXIDESWARM_HOME").ok();
+        std::env::set_var("OXIDESWARM_HOME", fresh_home.path());
+        let bad_exposed_cli = Cli::try_parse_from([
+            "oxideswarm",
+            "master",
+            "--listen",
+            "0.0.0.0:0",
+            "--wire-codec",
+            "xml",
+        ])
+        .unwrap();
+        let Commands::Master(bad_exposed_args) = bad_exposed_cli.command else {
+            panic!("expected Master");
+        };
+        let bad_exposed_code = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_master(bad_exposed_args, None, SecretOpts::default()),
+        )
+        .await
+        .expect("bad exposed master --wire-codec must exit immediately");
+        match prev_home {
+            Some(v) => std::env::set_var("OXIDESWARM_HOME", v),
+            None => std::env::remove_var("OXIDESWARM_HOME"),
+        }
+        assert_eq!(bad_exposed_code, ExitCode::FAILURE);
+        assert!(
+            std::fs::read_dir(fresh_home.path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "fresh OXIDESWARM_HOME must stay empty when --wire-codec validation fails"
+        );
+
         for bad_master_argv in [
             vec![
                 "oxideswarm",
@@ -4838,9 +4905,21 @@ max_active_mb = 768
         .expect("bad worker --wire-codec must exit immediately");
         assert_eq!(bad_w_code, ExitCode::FAILURE);
 
+        // Client commands also reject an invalid `RUSTY_GRID_WIRE_CODEC` instead of silently ignoring it.
+        std::env::set_var("RUSTY_GRID_WIRE_CODEC", "xml");
+        let bad_client_err = connect_master("127.0.0.1:8088", Some(&test_secret))
+            .await
+            .err()
+            .expect("client connect_master must reject invalid RUSTY_GRID_WIRE_CODEC");
+        assert!(
+            matches!(bad_client_err, GridError::Config(ref msg) if msg.contains("RUSTY_GRID_WIRE_CODEC")),
+            "expected GridError::Config for bad RUSTY_GRID_WIRE_CODEC, got: {bad_client_err:?}"
+        );
+        std::env::remove_var("RUSTY_GRID_WIRE_CODEC");
+
         // 3. `--max-queue-size 2` rejects the 3rd submit, and `RUSTY_GRID_WIRE_CODEC=json`
         //    takes effect on the master when `--wire-codec` is omitted on the CLI.
-        //    Also test `[submit] timeout_secs` via `run_submit_with_secret`.
+        //    Also test `[submit] timeout_secs` via `run_submit_with_secret` and `run_mapreduce`.
         let tmp_blob = tempfile::tempdir().unwrap();
         let probe_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let master_addr = probe_listener.local_addr().unwrap();
@@ -4854,6 +4933,11 @@ max_active_mb = 768
             resolved_env_codec,
             WireCodec::Json,
             "RUSTY_GRID_WIRE_CODEC=json must beat config file and default"
+        );
+        assert_eq!(
+            resolve_wire_codec(Some("bincode".into()), Some("json".into())).unwrap(),
+            WireCodec::Bincode,
+            "--wire-codec CLI flag must beat RUSTY_GRID_WIRE_CODEC env var and config file"
         );
 
         let master_cli = Cli::try_parse_from([
@@ -4876,19 +4960,28 @@ max_active_mb = 768
         };
         let master_task = tokio::spawn(run_master(master_args, None, secret_opts.clone()));
 
-        let mut connected = None;
+        let mut bound = false;
         for _ in 0..50 {
-            if let Ok(t) = connect_master(&master_addr_str, Some(&test_secret)).await {
-                connected = Some(t);
+            if tokio::net::TcpStream::connect(&master_addr).await.is_ok() {
+                bound = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        assert!(bound, "master bound and accepted probe connection");
+        // Clear `RUSTY_GRID_WIRE_CODEC` BEFORE connecting the client so the client speaks
+        // `WireCodec::Bincode` (0x02). A master configured with `RUSTY_GRID_WIRE_CODEC=json`
+        // must still reply in `WireCodec::Json` (0x01) instead of mirroring the client's bincode.
         std::env::remove_var("RUSTY_GRID_WIRE_CODEC");
 
-        // Verify on the wire that `RUSTY_GRID_WIRE_CODEC=json` caused the master to encode
-        // its response frame with `WireCodec::Json` (`WIRE_FORMAT_JSON` 0x01).
-        let mut transport = connected.expect("master bound and accepted connection");
+        let mut transport = connect_master(&master_addr_str, Some(&test_secret))
+            .await
+            .expect("bincode client connected to json master");
+        assert_eq!(
+            transport.codec(),
+            WireCodec::Bincode,
+            "client transport must send bincode after RUSTY_GRID_WIRE_CODEC is cleared"
+        );
         transport
             .send_msg(&ClientMessage::ClusterStatus)
             .await
@@ -4902,7 +4995,7 @@ max_active_mb = 768
         assert_eq!(
             detected_codec,
             WireCodec::Json,
-            "master started with RUSTY_GRID_WIRE_CODEC=json must emit WireCodec::Json (0x01)"
+            "master started with RUSTY_GRID_WIRE_CODEC=json must emit WireCodec::Json (0x01) even to a bincode client"
         );
 
         // Submit 1st task (without `--timeout-secs`, with `[submit] timeout_secs = 42` in ConfigFile):
@@ -4945,7 +5038,7 @@ max_active_mb = 768
             "3rd submit must fail when --max-queue-size 2 is full"
         );
 
-        // Also verify via direct transport that the error message is `QueueFull` ("at capacity (2)").
+        // Also verify via direct transport that the error message is `QueueFull` with actionable guidance.
         let third_direct = exchange(
             &mut transport,
             &master_addr_str,
@@ -4964,8 +5057,10 @@ max_active_mb = 768
         match third_direct {
             ClientResponse::Error { message } => {
                 assert!(
-                    message.contains("Task queue is full (capacity: 2)"),
-                    "expected QueueFull (2) error message, got: {message}"
+                    message.contains(
+                        "Task queue is full (2 queued or running tasks; wait, or raise --max-queue-size)"
+                    ),
+                    "expected actionable QueueFull (2) error message, got: {message}"
                 );
             }
             other => panic!("expected ClientResponse::Error for 3rd submit, got {other:?}"),
@@ -4973,14 +5068,15 @@ max_active_mb = 768
 
         master_task.abort();
 
-        // 4. Verify `[submit] timeout_secs` sets `task.requirements.timeout_secs` on the wire
-        //    when `--timeout-secs` is not passed on the CLI, and that `--timeout-secs` overrides it.
+        // 4. Verify `[submit] timeout_secs` sets `timeout_secs` on the wire for both `submit`
+        //    and `mapreduce` when `--timeout-secs` is omitted on the CLI, and yields when
+        //    `--timeout-secs` is explicitly passed.
         let capture_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let capture_addr = capture_listener.local_addr().unwrap().to_string();
         let server_secret = test_secret.clone();
         let capture_server = tokio::spawn(async move {
             let mut timeouts = Vec::new();
-            for _ in 0..2 {
+            for _ in 0..4 {
                 let (stream, _) = capture_listener.accept().await.unwrap();
                 let mut t = MessageTransport::new(stream);
                 let session_key =
@@ -5004,7 +5100,27 @@ max_active_mb = 768
                             .await
                             .unwrap();
                     }
-                    other => panic!("expected SubmitTask, got {other:?}"),
+                    Some(rusty_grid_core::protocol::InboundMessage::Client(
+                        ClientMessage::SubmitMapReduce { job },
+                    )) => {
+                        timeouts.push(job.timeout_secs);
+                        t.send_msg(&ClientResponse::MapReduceCompleted {
+                            result: rusty_grid_core::mapreduce::MapReduceResult {
+                                job_id: job.job_id,
+                                status: "Completed".into(),
+                                output: std::collections::HashMap::new(),
+                                map_tasks_total: 1,
+                                map_tasks_completed: 1,
+                                reduce_tasks_total: 1,
+                                reduce_tasks_completed: 1,
+                                execution_time_ms: 1,
+                                error: None,
+                            },
+                        })
+                        .await
+                        .unwrap();
+                    }
+                    other => panic!("expected SubmitTask or SubmitMapReduce, got {other:?}"),
                 }
             }
             timeouts
@@ -5033,14 +5149,65 @@ max_active_mb = 768
             "from-cli",
         ]);
         assert_eq!(
-            run_submit_with_secret(s_override, Some(cfg_timeout_42), secret_opts).await,
+            run_submit_with_secret(
+                s_override,
+                Some(cfg_timeout_42.clone()),
+                secret_opts.clone()
+            )
+            .await,
             ExitCode::SUCCESS
         );
+
+        let mr_default_cli = Cli::try_parse_from([
+            "oxideswarm",
+            "mapreduce",
+            "--master",
+            &capture_addr,
+            "--input",
+            "hello world",
+            "--chunks",
+            "1",
+        ])
+        .unwrap();
+        let Commands::Mapreduce(mr_default_args) = mr_default_cli.command else {
+            panic!("expected Mapreduce");
+        };
+        assert_eq!(
+            run_mapreduce(
+                mr_default_args,
+                Some(cfg_timeout_42.clone()),
+                secret_opts.clone()
+            )
+            .await,
+            ExitCode::SUCCESS
+        );
+
+        let mr_override_cli = Cli::try_parse_from([
+            "oxideswarm",
+            "mapreduce",
+            "--master",
+            &capture_addr,
+            "--input",
+            "hello world",
+            "--chunks",
+            "1",
+            "--timeout-secs",
+            "15",
+        ])
+        .unwrap();
+        let Commands::Mapreduce(mr_override_args) = mr_override_cli.command else {
+            panic!("expected Mapreduce");
+        };
+        assert_eq!(
+            run_mapreduce(mr_override_args, Some(cfg_timeout_42), secret_opts).await,
+            ExitCode::SUCCESS
+        );
+
         let captured_timeouts = capture_server.await.unwrap();
         assert_eq!(
             captured_timeouts,
-            vec![42, 15],
-            "[submit].timeout_secs must set 42 when --timeout-secs is omitted and yield to 15 when --timeout-secs 15 is passed"
+            vec![42, 15, 42, 15],
+            "[submit].timeout_secs must set 42 for both submit and mapreduce when --timeout-secs is omitted and yield to 15 when --timeout-secs 15 is passed"
         );
     }
 }

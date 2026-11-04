@@ -162,10 +162,26 @@ pub async fn resolve_master_addr(addr: &str, secret: Option<&ClusterSecret>) -> 
 /// Without a secret the Master is only told apart from an open one on the first reply: a Master
 /// that requires the secret answers the first request with an authentication rejection, which
 /// the transport reports as `GridError::AuthRequired`.
+/// Resolves `RUSTY_GRID_WIRE_CODEC` for a client connection, returning a `GridError::Config`
+/// if the environment variable is set to an unknown codec name.
+pub fn resolve_client_wire_codec() -> GridResult<rusty_grid_core::protocol::WireCodec> {
+    match std::env::var("RUSTY_GRID_WIRE_CODEC")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => raw
+            .parse::<rusty_grid_core::protocol::WireCodec>()
+            .map_err(|e| GridError::Config(format!("RUSTY_GRID_WIRE_CODEC: {e}"))),
+        None => Ok(rusty_grid_core::protocol::WireCodec::default()),
+    }
+}
+
 pub async fn connect_master(
     addr: &str,
     secret: Option<&ClusterSecret>,
 ) -> GridResult<MessageTransport<TcpStream>> {
+    let codec = resolve_client_wire_codec()?;
     let addr = resolve_master_addr(addr, secret).await?;
 
     let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
@@ -185,10 +201,6 @@ pub async fn connect_master(
     // Best effort: a failure here only costs latency / dead-peer detection.
     let _ = configure_tcp_stream(&stream);
 
-    let codec = std::env::var("RUSTY_GRID_WIRE_CODEC")
-        .ok()
-        .and_then(|s| s.parse::<rusty_grid_core::protocol::WireCodec>().ok())
-        .unwrap_or_default();
     let mut transport = MessageTransport::with_codec(stream, codec);
     if let Some(secret) = secret {
         let session_key =

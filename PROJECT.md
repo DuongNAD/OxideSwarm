@@ -86,7 +86,7 @@ OxideSwarm/
 | **Core Protocol** | Task Placement | `require:` task tags (os, arch, worker, tag) and worker tags (`os:`, `arch:`, user tags); no wire change ([design 0001](docs/design/0001-two-node-readiness.md)) | Implemented |
 | **Master Grid** | 8-State Task FSM | `Submitted` ➔ `Queued` ➔ `Scheduled` ➔ `Running` ➔ `Completed`/`Failed`/`Retrying`/`Cancelled` | Implemented |
 | **Master Grid** | Scheduler & Dispatch | Weighted least-loaded scheduling, real-GPU priority over simulated GPU, batch dispatch, anti-stuttering backpressure | Implemented |
-| **Master Grid** | Memory Bounding | Finish-order eviction of terminal tasks in `TaskQueue` with count and byte-size bounds (TTL pruning is off by default) | Implemented |
+| **Master Grid** | Memory Bounding | Finish-order eviction of terminal tasks in `TaskQueue` with count and byte-size bounds (`--max-retained-tasks`, `--max-retained-mb`) and active queue caps (`--max-queue-size`, `--max-active-mb`) | Implemented |
 | **CLI** | Cluster Check | `oxideswarm doctor`: connection, workers, pinned in-process / process / GPU probes, spreading (checks C1-C6) | Implemented |
 | **CLI** | Task Inputs | `submit --stdin-file`, `--script-file`, `--interpreter`, `--env`; `--matrix-dim` / `--work-group-size` for GPU tasks | Implemented |
 | **Worker Engine** | Execution Runner | Bounded stdout/stderr capture, cancellation, configurable process priority | Implemented |

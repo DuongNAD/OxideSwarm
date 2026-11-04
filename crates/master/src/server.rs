@@ -5959,4 +5959,79 @@ mod tests {
         let _ = stop_tx.send(true);
         mux_conn.abort();
     }
+
+    #[tokio::test]
+    async fn test_master_server_bind_enforces_max_queue_size_and_json_wire_codec() {
+        use rusty_grid_core::task::{TaskRequirements, TaskSpec};
+        let server_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_max_queue_size(Some(1))
+            .with_wire_codec(WireCodec::Json);
+        let server = MasterServer::bind(server_cfg, WorkerRegistry::new())
+            .await
+            .unwrap();
+        let addr = server.local_addr;
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let server_task = tokio::spawn(server.run(stop_rx));
+
+        // Connect with a Bincode client and submit 1st task: master must reply in Json and accept.
+        let stream1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client1 = MessageTransport::with_codec(stream1, WireCodec::Bincode);
+        client1
+            .send_msg(&ClientMessage::SubmitTask {
+                task: Task::new(
+                    TaskSpec::command("echo", vec!["first".into()]),
+                    TaskRequirements::generic(1, 30),
+                ),
+                wait: false,
+            })
+            .await
+            .unwrap();
+        let (reply1, codec1) = client1
+            .recv_msg_with_codec::<ClientResponse>()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            codec1,
+            WireCodec::Json,
+            "MasterServer::bind with WireCodec::Json must reply in Json even to a Bincode client"
+        );
+        assert!(
+            matches!(reply1, ClientResponse::TaskSubmitted { .. }),
+            "1st submit must succeed under max_queue_size = Some(1), got: {reply1:?}"
+        );
+
+        // Submit 2nd task while 1st task is queued: must be rejected by `max_queue_size = Some(1)`.
+        let stream2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client2 = MessageTransport::with_codec(stream2, WireCodec::Bincode);
+        client2
+            .send_msg(&ClientMessage::SubmitTask {
+                task: Task::new(
+                    TaskSpec::command("echo", vec!["second".into()]),
+                    TaskRequirements::generic(1, 30),
+                ),
+                wait: false,
+            })
+            .await
+            .unwrap();
+        let (reply2, codec2) = client2
+            .recv_msg_with_codec::<ClientResponse>()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(codec2, WireCodec::Json);
+        match reply2 {
+            ClientResponse::Error { message } => {
+                assert!(
+                    message.contains(
+                        "Task queue is full (1 queued or running tasks; wait, or raise --max-queue-size)"
+                    ),
+                    "expected actionable QueueFull(1) error from MasterServer::bind, got: {message}"
+                );
+            }
+            other => panic!("expected ClientResponse::Error for 2nd submit, got {other:?}"),
+        }
+
+        server_task.abort();
+    }
 }

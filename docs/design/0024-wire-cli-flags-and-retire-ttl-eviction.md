@@ -41,19 +41,21 @@ Before this change (`SCHED-2` in `docs/BACKLOG.md`):
 - `ServerConfig` (`crates/master/src/server.rs`) gains `pub max_queue_size: Option<usize>` (default `None`) and builder `ServerConfig::with_max_queue_size(mut self, max: Option<usize>) -> Self`.
 - Both `MasterServer::bind` and `MasterServer::spawn_with_config` pass `config.max_queue_size` as the `max_size` argument to `TaskQueue::with_retention_limits`.
 - In `crates/cli/src/cli_app.rs`, `apply_max_queue_size` resolves `--max-queue-size` > `RUSTY_GRID_MAX_QUEUE_SIZE` > `[master].max_queue_size`. Passing `0` returns an error (`"--max-queue-size / max_queue_size must be at least 1 (got 0)"`) and `run_master` exits with `ExitCode::FAILURE`.
-- When active (non-terminal) tasks in `TaskQueue` reach `max_queue_size`, `TaskQueue::submit` returns `GridError::QueueFull { capacity }`.
+- When queued or running (non-terminal) tasks in `TaskQueue` reach `max_queue_size`, `TaskQueue::submit` returns `GridError::QueueFull { capacity }`, formatted as `"Task queue is full ({capacity} queued or running tasks; wait, or raise --max-queue-size)"`, and `oxideswarm submit` prints the error and exits `1` (`ExitCode::FAILURE`).
 
 ### D2 Scheduler policy selection (`--scheduler-policy`)
 
 - `SchedulingPolicy` (`crates/master/src/scheduler.rs`) implements `Display` and `FromStr`, accepting `"weighted"` / `"weighted-least-loaded"`, `"least-loaded"` / `"leastloaded"`, and `"round-robin"` / `"roundrobin"` / `"rr"` (case-insensitive, with `_` normalized to `-`).
-- `resolve_scheduler_policy` in `crates/cli/src/cli_app.rs` resolves `--scheduler-policy` > `RUSTY_GRID_SCHEDULER_POLICY` > `[master].scheduler_policy` (defaulting to `SchedulingPolicy::WeightedLeastLoaded`) and passes the parsed policy into `SchedulerConfig::policy`. Unknown values print `--scheduler-policy: Unknown scheduler policy '...'` to stderr and exit with `ExitCode::FAILURE`.
+- `WorkloadScheduler` (`crates/master/src/scheduler.rs`) persists `rr_cursor: AtomicUsize` across scheduling passes and sorts schedulable workers by `worker_id` in `schedule_batch`, so `SchedulingPolicy::RoundRobin` rotates evenly from one `schedule_once` / `schedule_batch` pass to the next rather than resetting to `0` on each pass.
+- `resolve_scheduler_policy` and `build_master_scheduler_config` in `crates/cli/src/cli_app.rs` resolve `--scheduler-policy` > `RUSTY_GRID_SCHEDULER_POLICY` > `[master].scheduler_policy` (defaulting to `SchedulingPolicy::WeightedLeastLoaded`) and construct `SchedulerConfig { policy: scheduler_policy, ... }` for `run_master`. Unknown values print `--scheduler-policy: Unknown scheduler policy '...'` to stderr and exit with `ExitCode::FAILURE`.
 
 ### D3 Wire codec resolution and outbound master codec (`--wire-codec`, `RUSTY_GRID_WIRE_CODEC`)
 
 - `MasterArgs::wire_codec` and `WorkerArgs::wire_codec` (`crates/cli/src/cli_app.rs`) are changed from `String` (`default_value = "bincode"`) to `Option<String>`.
 - `resolve_wire_codec` resolves `--wire-codec` > `RUSTY_GRID_WIRE_CODEC` > `[master|worker].wire_codec` and parses the value via `WireCodec::from_str` (`crates/core/src/protocol.rs`, which trims whitespace before matching `"bincode"` / `"bin"` / `"binary"` or `"json"`), defaulting to `WireCodec::Bincode` when unset and exiting with `ExitCode::FAILURE` on invalid values.
+- In `run_master`, `--wire-codec` is validated alongside `--max-queue-size` and `--scheduler-policy` before `decide_master_secret`, so an invalid `--wire-codec` on a non-loopback or `--p2p` master exits `1` without creating `~/.oxideswarm/cluster.secret` or printing secret bootstrap instructions.
 - In `handle_connection` and `handle_multiplexed_connection` (`crates/master/src/server.rs`), the master mirrors the peer's `detected_codec` only when `wire_codec == WireCodec::Bincode` (the default); when the master is explicitly configured with `WireCodec::Json`, its outbound transport keeps `WireCodec::Json`.
-- `connect_master` (`crates/cli/src/connect.rs`) reads `RUSTY_GRID_WIRE_CODEC` when constructing the client `MessageTransport`.
+- `connect_master` (`crates/cli/src/connect.rs`) validates `RUSTY_GRID_WIRE_CODEC` via `resolve_client_wire_codec()` before connecting, returning `GridError::Config("RUSTY_GRID_WIRE_CODEC: ...")` (so client subcommands exit `1` on invalid values) and constructing the client `MessageTransport` with the resolved codec.
 
 ### D4 Config-file fallback for submission timeout (`[submit].timeout_secs`)
 
@@ -77,19 +79,20 @@ Before this change (`SCHED-2` in `docs/BACKLOG.md`):
 ## Compatibility
 
 - Wire format: unchanged. Both `WireCodec::Bincode` (`0x02`) and `WireCodec::Json` (`0x01`) are existing frame formats (`crates/core/src/protocol.rs`), and receivers decode each frame using its 1-byte format discriminator regardless of the outbound codec setting.
-- CLI and config: existing valid invocations and config files continue to work. Config files or environment variables that previously set `max_queue_size`, `scheduler_policy`, `wire_codec`, or `[submit].timeout_secs` now take effect instead of being ignored. Invalid values for `--max-queue-size 0`, `--scheduler-policy`, or `--wire-codec` now fail fast at process start with `ExitCode::FAILURE`.
+- CLI and config: existing valid invocations and config files continue to work. Config files or environment variables that previously set `max_queue_size`, `scheduler_policy`, `wire_codec`, or `[submit].timeout_secs` now take effect instead of being ignored. Invalid values for `--max-queue-size 0`, `--scheduler-policy`, `--wire-codec`, or `RUSTY_GRID_WIRE_CODEC` (on master, worker, or client commands) now fail fast with exit code `1` (`ExitCode::FAILURE`).
 
 ## Security
 
 - Bounding active task count via `--max-queue-size` complements the 256 MiB active byte cap (`--max-active-mb`, [design 0008](0008-oversized-task-results-and-active-queue-budget.md)), letting operators cap the number of small tasks held in memory at once. Refusing `--max-queue-size 0` at startup prevents accidental denial of service where every submission is rejected.
-- Failing closed on unknown `--wire-codec` and `--scheduler-policy` values prevents silent misconfiguration.
+- Failing closed on unknown `--wire-codec` and `--scheduler-policy` values (before generating a default `cluster.secret`) prevents silent misconfiguration and unwanted side effects.
 
 ## Test plan
 
 - Unit and in-process integration test `cli_app::tests::test_sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticket` in `crates/cli/src/cli_app.rs`:
-  - verifies `apply_max_queue_size` (including rejection of `0`), `resolve_scheduler_policy` (including rejection of unknown policies), and `resolve_worker_target` (confirming `--master` overrides `[worker].p2p_ticket`);
-  - verifies `run_master` and `run_worker` return `ExitCode::FAILURE` immediately on `--max-queue-size 0`, `--scheduler-policy not-a-policy`, `--wire-codec xml`, and `--wire-codec protobuf`;
-  - starts `run_master` with `--max-queue-size 2`, `--scheduler-policy round-robin`, and `RUSTY_GRID_WIRE_CODEC=json`, asserts the master encodes its `ClusterStatus` reply with `WireCodec::Json` (`0x01`), verifies the first two `run_submit_with_secret` calls succeed while the third fails with `Task queue is full (capacity: 2)`, and verifies `[submit].timeout_secs = 42` sets `task.requirements.timeout_secs == 42` on the wire when `--timeout-secs` is omitted and yields to `15` when `--timeout-secs 15` is passed.
+  - verifies `apply_max_queue_size` (including rejection of `0`), `resolve_scheduler_policy`, `build_master_scheduler_config` (confirming `SchedulerConfig.policy` carries the parsed policy), `resolve_wire_codec` (confirming `--wire-codec` beats `RUSTY_GRID_WIRE_CODEC` and config `wire_codec`), and `resolve_worker_target` (confirming `--master` overrides `[worker].p2p_ticket`);
+  - verifies `run_master`, `run_worker`, and `connect_master` fail immediately on `--max-queue-size 0`, `--scheduler-policy not-a-policy`, `--wire-codec xml` (leaving a fresh `OXIDESWARM_HOME` empty even with `--listen 0.0.0.0:0`), `--wire-codec protobuf`, and `RUSTY_GRID_WIRE_CODEC=xml`;
+  - starts `run_master` with `--max-queue-size 2`, `--scheduler-policy round-robin`, and `RUSTY_GRID_WIRE_CODEC=json`, clears `RUSTY_GRID_WIRE_CODEC` before connecting so the client sends `WireCodec::Bincode` (`0x02`) and asserts the master encodes its `ClusterStatus` reply with `WireCodec::Json` (`0x01`), verifies the first two `run_submit_with_secret` calls succeed while the third exits `1` with `"Task queue is full (2 queued or running tasks; wait, or raise --max-queue-size)"`, and verifies `[submit].timeout_secs = 42` sets `timeout_secs == 42` on the wire for both `oxideswarm submit` and `oxideswarm mapreduce` when `--timeout-secs` is omitted and yields to `15` when `--timeout-secs 15` is passed.
+- Unit tests `scheduler::tests::test_round_robin_rotates_across_schedule_once_passes` and `server::tests::test_master_server_bind_enforces_max_queue_size_and_json_wire_codec` in `crates/master`.
 - Existing CLI and master scheduling suites (`cargo test -p rusty_grid_cli --lib`, `cargo test -p rusty_grid_master --lib`, `cargo test -p rusty_grid_cli --test test_bug2_cli_flags --test test_challenger_m4_cli_adversarial`, `cargo test --test master_limits_and_scheduling`).
 
 ## Work items
