@@ -542,5 +542,270 @@ class Send(BridgeCase):
             self.assertIn("invalid choice", res.stderr.decode("utf-8"))
 
 
+class Diagnose(BridgeCase):
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(self.repo)
+        with open(os.path.join(self.repo, "Cargo.toml"), "w", encoding="utf-8") as f:
+            f.write("[workspace]\nmembers = []\n")
+        for cmd in (
+            ["git", "init", "-q"],
+            ["git", "config", "user.email", "test@oxideswarm.invalid"],
+            ["git", "config", "user.name", "OxideSwarm Test"],
+            ["git", "add", "Cargo.toml"],
+            ["git", "commit", "-q", "-m", "initial"],
+        ):
+            subprocess.run(
+                cmd,
+                cwd=self.repo,
+                env=self.env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+
+    def argv(self, *args, use_hub=True):
+        if "--repo" not in args:
+            args = ("--repo", self.repo, *args)
+        return super().argv(*args, use_hub=use_hub)
+
+    def write_local_secret(self, secret_text="shared-cluster-secret-value"):
+        ox_home = self.env["OXIDESWARM_HOME"]
+        os.makedirs(ox_home, exist_ok=True)
+        with open(os.path.join(ox_home, "cluster.secret"), "w", encoding="utf-8") as f:
+            f.write(secret_text + "\n")
+
+    def write_peer_node_state(
+        self,
+        peer_short=PEER,
+        age_minutes=0,
+        git_head=None,
+        git_branch="master",
+        secret_sha256_12=None,
+        raw_updated_at=None,
+    ):
+        if raw_updated_at is not None:
+            updated_at = raw_updated_at
+        else:
+            moment = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=age_minutes)
+            updated_at = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+        state = {
+            "agent_id": f"agent-{peer_short}",
+            "hostname": "peer-host",
+            "platform": "peer-os",
+            "arch": "x86_64",
+            "updated_at_utc": updated_at,
+            "lan_ip": "127.0.0.1",
+            "local_ports": {
+                "master_cluster_8088_listening": False,
+                "dashboard_8080_listening": False,
+            },
+            "git": {
+                "found": bool(git_head),
+                "git_head": git_head,
+                "git_branch": git_branch,
+                "git_dirty": False,
+                "dirty_count": 0,
+            },
+            "security_and_config": {
+                "secret_exists": bool(secret_sha256_12),
+                "secret_sha256_12": secret_sha256_12,
+                "config_exists": False,
+                "stale_p2p_ticket_in_config": False,
+            },
+        }
+        with open(os.path.join(self.nodes, f"{peer_short}_state.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+
+    def test_diagnose_without_peer_reports_unknown_and_exits_non_zero(self):
+        self.write_local_secret()
+        res = self.run_bridge("diagnose")
+        output = res.stdout.decode("utf-8")
+        self.assertNotEqual(res.returncode, 0, output)
+        self.assertIn("STATUS: UNKNOWN", output)
+        self.assertIn("[PEER UNKNOWN]", output)
+        self.assertNotIn("STATUS: HEALTHY", output)
+
+    def test_diagnose_with_stale_or_invalid_peer_reports_unknown_and_exits_non_zero(self):
+        self.write_local_secret()
+        hb = self.run_bridge("heartbeat")
+        self.assertEqual(hb.returncode, 0, hb.stderr)
+        with open(os.path.join(self.nodes, f"{SELF}_state.json"), encoding="utf-8") as f:
+            self_state = json.load(f)
+        head = self_state["git"].get("git_head")
+        fp = self_state["security_and_config"].get("secret_sha256_12")
+
+        # 1. Peer state older than PEER_STALE_MINUTES (10 min old).
+        self.write_peer_node_state(age_minutes=10, git_head=head, secret_sha256_12=fp)
+        res = self.run_bridge("diagnose")
+        output = res.stdout.decode("utf-8")
+        self.assertNotEqual(res.returncode, 0, output)
+        self.assertIn("STATUS: UNKNOWN", output)
+        self.assertIn("[PEER STALE]", output)
+        self.assertNotIn("STATUS: HEALTHY", output)
+
+        # 2. Peer state with invalid updated_at_utc.
+        self.write_peer_node_state(raw_updated_at="not-a-timestamp", git_head=head, secret_sha256_12=fp)
+        res = self.run_bridge("diagnose")
+        output = res.stdout.decode("utf-8")
+        self.assertNotEqual(res.returncode, 0, output)
+        self.assertIn("STATUS: UNKNOWN", output)
+        self.assertIn("[PEER UNKNOWN]", output)
+        self.assertNotIn("STATUS: HEALTHY", output)
+
+    def test_diagnose_exits_zero_when_peer_is_fresh_and_synchronized(self):
+        self.write_local_secret()
+        self.assertEqual(self.run_bridge("heartbeat").returncode, 0)
+        with open(os.path.join(self.nodes, f"{SELF}_state.json"), encoding="utf-8") as f:
+            self_state = json.load(f)
+        head = self_state["git"].get("git_head")
+        fp = self_state["security_and_config"].get("secret_sha256_12")
+
+        self.write_peer_node_state(age_minutes=0, git_head=head, secret_sha256_12=fp)
+        res = self.run_bridge("diagnose")
+        output = res.stdout.decode("utf-8")
+        self.assertEqual(res.returncode, 0, output)
+        self.assertIn("STATUS: HEALTHY", output)
+
+    def test_diagnose_without_git_checkout_reports_unknown_and_exits_non_zero(self):
+        self.write_local_secret()
+        self.assertEqual(self.run_bridge("heartbeat").returncode, 0)
+        with open(os.path.join(self.nodes, f"{SELF}_state.json"), encoding="utf-8") as f:
+            self_state = json.load(f)
+        head = self_state["git"].get("git_head")
+        fp = self_state["security_and_config"].get("secret_sha256_12")
+        self.write_peer_node_state(age_minutes=0, git_head=head, secret_sha256_12=fp)
+
+        no_git_repo = os.path.join(self.tmp, "archive-export")
+        os.makedirs(no_git_repo)
+        with open(os.path.join(no_git_repo, "Cargo.toml"), "w", encoding="utf-8") as f:
+            f.write("[workspace]\nmembers = []\n")
+
+        res = self.run_bridge("--repo", no_git_repo, "diagnose")
+        output = res.stdout.decode("utf-8")
+        self.assertNotEqual(res.returncode, 0, output)
+        self.assertIn("UNKNOWN (no git checkout)", output)
+        self.assertIn("STATUS: UNKNOWN", output)
+        self.assertNotIn("STATUS: HEALTHY", output)
+
+        if not os.path.exists(os.path.join(ROOT, ".git")):
+            res_default = subprocess.run(
+                [sys.executable, SCRIPT, "--hub-dir", self.hub, "diagnose"],
+                cwd=self.tmp,
+                env=self.env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=WAIT,
+            )
+            out_default = res_default.stdout.decode("utf-8")
+            self.assertNotEqual(res_default.returncode, 0, out_default)
+            self.assertIn("UNKNOWN (no git checkout)", out_default)
+            self.assertIn("STATUS: UNKNOWN", out_default)
+            self.assertNotIn("STATUS: HEALTHY", out_default)
+
+    def test_diagnose_exits_non_zero_on_git_drift_auth_mismatch_and_config_issues(self):
+        self.write_local_secret()
+        self.assertEqual(self.run_bridge("heartbeat").returncode, 0)
+        with open(os.path.join(self.nodes, f"{SELF}_state.json"), encoding="utf-8") as f:
+            self_state = json.load(f)
+        head = self_state["git"].get("git_head")
+        fp = self_state["security_and_config"].get("secret_sha256_12")
+
+        # 1. Git drift -> non-zero exit
+        self.write_peer_node_state(age_minutes=0, git_head="deadbeefcafe", secret_sha256_12=fp)
+        res = self.run_bridge("diagnose")
+        output = res.stdout.decode("utf-8")
+        self.assertNotEqual(res.returncode, 0, output)
+        self.assertIn("[GIT DRIFT]", output)
+        self.assertNotIn("STATUS: HEALTHY", output)
+
+        # 2. Secret fingerprint mismatch -> non-zero exit
+        self.write_peer_node_state(age_minutes=0, git_head=head, secret_sha256_12="000000000000")
+        res = self.run_bridge("diagnose")
+        output = res.stdout.decode("utf-8")
+        self.assertNotEqual(res.returncode, 0, output)
+        self.assertIn("[AUTH MISMATCH]", output)
+        self.assertNotIn("STATUS: HEALTHY", output)
+
+        # 3. Stale p2p_ticket in rusty-grid.toml -> non-zero exit
+        self.write_peer_node_state(age_minutes=0, git_head=head, secret_sha256_12=fp)
+        cfg_path = os.path.join(self.env["OXIDESWARM_HOME"], "rusty-grid.toml")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            f.write('p2p_ticket = "oxticket1..."\n')
+        res = self.run_bridge("diagnose")
+        output = res.stdout.decode("utf-8")
+        self.assertNotEqual(res.returncode, 0, output)
+        self.assertIn("[LOCAL CRITICAL]", output)
+        self.assertNotIn("STATUS: HEALTHY", output)
+
+    def test_two_simulated_agents_on_one_platform_do_not_collide(self):
+        self.write_local_secret()
+
+        # Agent A (`--agent-id mac-a`) and Agent B (`--agent-id agent-mac-b`) run on the same host.
+        res_a = self.run_bridge("heartbeat", "--agent-id", "mac-a")
+        self.assertEqual(res_a.returncode, 0, res_a.stderr)
+        res_b = self.run_bridge("--agent-id", "agent-mac-b", "heartbeat")
+        self.assertEqual(res_b.returncode, 0, res_b.stderr)
+
+        path_a = os.path.join(self.nodes, "mac-a_state.json")
+        path_b = os.path.join(self.nodes, "mac-b_state.json")
+        default_path = os.path.join(self.nodes, f"{SELF}_state.json")
+        self.assertTrue(os.path.exists(path_a), "mac-a must write its own state file")
+        self.assertTrue(os.path.exists(path_b), "mac-b must write its own state file")
+        self.assertFalse(os.path.exists(default_path), "default platform state file must not be touched")
+
+        with open(path_a, encoding="utf-8") as f:
+            state_a = json.load(f)
+        with open(path_b, encoding="utf-8") as f:
+            state_b = json.load(f)
+        self.assertEqual(state_a["agent_id"], "agent-mac-a")
+        self.assertEqual(state_b["agent_id"], "agent-mac-b")
+
+        # Both agents diagnose against each other cleanly without colliding.
+        diag_a = self.run_bridge("diagnose", "--agent-id", "mac-a")
+        out_a = diag_a.stdout.decode("utf-8")
+        self.assertEqual(diag_a.returncode, 0, out_a)
+        self.assertIn("Self: agent-mac-a, Peer: agent-mac-b", out_a)
+        self.assertIn("STATUS: HEALTHY", out_a)
+
+        diag_b = self.run_bridge("diagnose", "--agent-id", "mac-b")
+        out_b = diag_b.stdout.decode("utf-8")
+        self.assertEqual(diag_b.returncode, 0, out_b)
+        self.assertIn("Self: agent-mac-b, Peer: agent-mac-a", out_b)
+        self.assertIn("STATUS: HEALTHY", out_b)
+
+        # Mailboxes are isolated per agent-id as well.
+        send_res = self.run_bridge("send", "--agent-id", "mac-a", "--title", "Ping", "--body", "From A to B")
+        self.assertEqual(send_res.returncode, 0, send_res.stderr)
+        inbox_b = self.run_bridge("inbox", "--agent-id", "mac-b").stdout.decode("utf-8")
+        self.assertIn("From A to B", inbox_b)
+        inbox_a = self.run_bridge("inbox", "--agent-id", "mac-a").stdout.decode("utf-8")
+        self.assertIn("No unread messages", inbox_a)
+
+    def test_no_owner_paths_or_private_gateway_in_source(self):
+        import hashlib
+        import re
+
+        with open(SCRIPT, encoding="utf-8") as f:
+            source = f.read()
+        # Store SHA-256 digests rather than literal owner strings so this test file passes
+        # the repository-wide REL-2 guard in tests/test_launcher_scripts.py.
+        forbidden_digests = {
+            "ed4c1136c28a4257e7acd5c4542269a3bd012403399910eee9c91c2481977714",
+            "da188019722950874ae0a04eb811a02d1f69e240c642dbde975888909ba6d55c",
+            "c5eb5a4cc76a5cdb16e79864b9ccd26c3553f0c396d0a21bafb7be71c1efcd8c",
+        }
+        tokens = set(re.findall(r"[A-Za-z0-9_.-]+", source))
+        found = [
+            tok
+            for tok in sorted(tokens)
+            if hashlib.sha256(tok.encode("utf-8")).hexdigest() in forbidden_digests
+        ]
+        self.assertEqual(found, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

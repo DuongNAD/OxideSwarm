@@ -162,7 +162,7 @@ merge.
 | DOC-6 | Correct the minimum Rust version | P1 | S | INT-4 | | Planned |
 | DOC-7 | Add an MCP client setup guide | P2 | S | SEC-2 | | Planned |
 | REL-1 | Restore the Apache licence text | P0 | S | | | Planned |
-| REL-2 | Remove owner data from tracked files | P1 | M | INT-4 | D5 | Implemented |
+| REL-2 | Remove owner data from tracked files | P1 | M | INT-4 | D5 | Planned |
 | REL-3 | Small repository hygiene | P2 | S | INT-4 | | Implemented |
 | CLI-1 | Add `cancel` and `result` commands | P1 | M | INT-4 | | Planned |
 | MCP-1 | Make the MCP server concurrent, with deadlines | P1 | M | SEC-2 | | Planned |
@@ -1272,4 +1272,3 @@ Add one dated line per finished item, newest last.
 - 2026-11-04: The Unix default sandbox base became `<temp>/rusty_grid-<euid>/sandboxes`. The worker now refuses
   a `rusty_grid-<euid>` that another local user could change (work item SEC-8 of design 0021).
 - 2026-11-04: REL-3 completed on branch `win/rel-3-repo-hygiene`; added `test_reports/` and `**/jniLibs/**/*.so` to `.gitignore` with a regression check in `tests/test_launcher_scripts.py`.
-- 2026-11-04: REL-2 completed on branch `win/rel-2-remove-owner-data`; removed `scripts/sync_network/ping_success.txt` and `scripts/run_milestones_1_and_2.ps1`, scrubbed owner-specific paths and addresses from `scripts/agent_bridge.py`, `scripts/sync_network/sync_network.py`, `ANDROID_ARCHITECTURE.md`, and test/doc fixtures (replacing with RFC 5737 `192.0.2.x` / `198.51.100.x` addresses), and extended `test_no_owner_specific_values_or_name_pattern_kills_in_scripts` in `tests/test_launcher_scripts.py` to scan all tracked text files using SHA-256 digests.
