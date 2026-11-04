@@ -2383,6 +2383,8 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
     });
 
     let in_flight: Arc<Mutex<HashMap<String, InFlightCall>>> = Arc::new(Mutex::new(HashMap::new()));
+    let completed_submits: Arc<Mutex<std::collections::VecDeque<(String, TaskId)>>> =
+        Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let active_cancels: Arc<Mutex<HashMap<u64, watch::Sender<bool>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let mut next_call_seq = 1u64;
@@ -2440,6 +2442,11 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
 
         let id = request.id.clone();
         let method = request.method.as_str();
+        if method != "notifications/cancelled" {
+            if let Some(key) = id.as_ref().and_then(request_id_key) {
+                completed_submits.lock().await.retain(|(k, _)| k != &key);
+            }
+        }
 
         match method {
             "initialize" => {
@@ -2477,16 +2484,38 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                                 None
                             }
                         };
-                        if let Some(tid_mutex) = maybe_tid {
-                            let maybe_tid_val = *tid_mutex.lock().await;
-                            if let Some(task_id) = maybe_tid_val {
-                                let state_clone = Arc::clone(&state);
-                                tokio::spawn(async move {
-                                    let _ = state_clone
-                                        .request(&ClientMessage::CancelTask { task_id })
-                                        .await;
-                                });
-                            }
+                        let (task_to_cancel, was_in_flight) = if let Some(tid_mutex) = maybe_tid {
+                            (*tid_mutex.lock().await, true)
+                        } else {
+                            let mut guard = completed_submits.lock().await;
+                            let tid = guard
+                                .iter()
+                                .rposition(|(k, _)| k == &key)
+                                .and_then(|pos| guard.remove(pos))
+                                .map(|(_, tid)| tid);
+                            (tid, false)
+                        };
+                        if let Some(task_id) = task_to_cancel {
+                            let state_clone = Arc::clone(&state);
+                            tokio::spawn(async move {
+                                if !was_in_flight {
+                                    // Post-reply cancel (design 0030): only cancel if the task is
+                                    // still non-terminal on the master.
+                                    let is_active = matches!(
+                                        state_clone
+                                            .request(&ClientMessage::GetTaskStatus { task_id })
+                                            .await,
+                                        Ok(ClientResponse::TaskStatusInfo { status, .. })
+                                            if !status.is_terminal()
+                                    );
+                                    if !is_active {
+                                        return;
+                                    }
+                                }
+                                let _ = state_clone
+                                    .request(&ClientMessage::CancelTask { task_id })
+                                    .await;
+                            });
                         }
                     }
                 }
@@ -2559,6 +2588,7 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                         };
                         let state_clone = Arc::clone(&state);
                         let in_flight_clone = Arc::clone(&in_flight);
+                        let completed_submits_clone = Arc::clone(&completed_submits);
                         let active_cancels_clone = Arc::clone(&active_cancels);
                         let out_tx_clone = out_tx.clone();
 
@@ -2568,6 +2598,16 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                                     .await;
                             active_cancels_clone.lock().await.remove(&call_seq);
                             if let Some(ref key) = id_key {
+                                if !ctx.is_client_cancelled() && !ctx.aborted_by_cancel {
+                                    if let Some(tid) = *ctx.submitted_task_id.lock().await {
+                                        let mut guard = completed_submits_clone.lock().await;
+                                        guard.retain(|(k, _)| k != key);
+                                        if guard.len() >= 256 {
+                                            guard.pop_front();
+                                        }
+                                        guard.push_back((key.clone(), tid));
+                                    }
+                                }
                                 in_flight_clone.lock().await.remove(key);
                             }
                             if ctx.is_client_cancelled() || ctx.aborted_by_cancel {
@@ -2610,9 +2650,9 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
     }
 
     // Give in-flight calls (such as piped one-shot `doctor` or short `submit {wait: true}` calls)
-    // a 2s grace window to finish naturally and emit their JSON-RPC replies, then cancel any
+    // a 4s grace window to finish naturally and emit their JSON-RPC replies, then cancel any
     // remaining long-running waits and bound cleanup to 500ms before aborting.
-    let grace_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let grace_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
     while !call_tasks.is_empty() {
         match tokio::time::timeout_at(grace_deadline, call_tasks.join_next()).await {
             Ok(Some(_)) => continue,
