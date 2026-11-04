@@ -441,7 +441,7 @@ async fn test_stress_high_throughput_concurrency() {
     let mut worker_handles = Vec::with_capacity(num_workers);
 
     for w_idx in 0..num_workers {
-        let mut worker = WorkerClient::from_options(
+        let mut worker = WorkerClient::for_testing(
             master_addr.to_string(),
             Some(format!("stress-worker-{w_idx}")),
             Some(2),

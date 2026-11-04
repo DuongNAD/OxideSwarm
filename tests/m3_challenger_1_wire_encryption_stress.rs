@@ -597,6 +597,7 @@ async fn test_adversarial_unauthenticated_worker_lifecycle_loopback() {
     let master_addr = master.server_addr();
 
     let mut worker_config = WorkerConfig::new(master_addr.to_string())
+        .with_no_battery(true)
         .with_handshake_timeout(Duration::from_secs(3))
         .with_redirection_portal(false);
     worker_config.default_heartbeat_interval = Duration::from_millis(100);
@@ -896,6 +897,7 @@ async fn test_adversarial_protocol_version_mismatch_master_ack_rejection() {
     });
 
     let config = WorkerConfig::new(server_addr.to_string())
+        .with_no_battery(true)
         .with_handshake_timeout(Duration::from_secs(2))
         .with_redirection_portal(false);
     let worker = WorkerClient::new(config);

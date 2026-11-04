@@ -231,6 +231,7 @@ impl ChallengerCluster {
         for i in 0..num_workers {
             let temp_dir = TempDir::new().expect("worker tempdir");
             let worker_cfg = WorkerConfig::new(master_addr.to_string())
+                .with_no_battery(true)
                 .with_name(&format!("challenger-w{}", i + 1))
                 .with_cores(4)
                 .with_ram_mb(8192)
@@ -601,6 +602,7 @@ async fn test_challenger_orphaned_task_survives_zero_workers() {
     // Spawn brand new replacement worker
     let temp_dir = TempDir::new().unwrap();
     let worker_cfg = WorkerConfig::new(cluster.master_addr.to_string())
+        .with_no_battery(true)
         .with_name("late-rescuer")
         .with_cores(4)
         .with_ram_mb(8192)

@@ -534,6 +534,7 @@ async fn test_capability_queries_under_connect_disconnect_stress() {
                 // `pmset` and `sw_vers`), so build it off the runtime threads the queries run on.
                 // Blender detection would launch Blender itself on every reconnect: turn it off.
                 let config = WorkerConfig::new(m_addr.clone())
+                    .with_no_battery(true)
                     .with_name(worker_name.clone())
                     .with_cores(4)
                     .with_simulate_gpu(is_gpu)

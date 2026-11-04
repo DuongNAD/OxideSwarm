@@ -523,6 +523,7 @@ async fn test_e2e_full_cluster_file_staging_and_artifact_retrieval() {
 
     let temp_worker_dir = tempfile::tempdir().expect("worker tempdir");
     let worker_cfg = WorkerConfig::new(master_addr.to_string())
+        .with_no_battery(true)
         .with_name("e2e-staging-worker")
         .with_cores(2)
         .with_ram_mb(4096)

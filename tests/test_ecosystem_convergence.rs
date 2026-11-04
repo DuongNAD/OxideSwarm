@@ -73,6 +73,7 @@ impl ConvergenceCluster {
         for i in 0..num_workers {
             let temp_dir = tempfile::tempdir().expect("worker tempdir");
             let cfg = WorkerConfig::new(master_addr.clone())
+                .with_no_battery(true)
                 .with_name(format!("convergence-worker-{}", i + 1))
                 .with_cores(4)
                 .with_simulate_gpu(true)
