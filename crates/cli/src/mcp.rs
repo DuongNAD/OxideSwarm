@@ -432,7 +432,8 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "description": "Whether to include full worker summaries in cluster status"
                     }
-                }
+                },
+                "required": []
             }),
         },
         ToolDefinition {
@@ -457,7 +458,8 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "description": "Show only workers with GPU support"
                     }
-                }
+                },
+                "required": []
             }),
         },
         ToolDefinition {
@@ -568,7 +570,19 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "description": "Maximum escaped bytes of stdout and stderr combined to return inline (head + tail, default: 16384)"
                     }
-                }
+                },
+                "required": [],
+                "anyOf": [
+                    { "required": ["command"] },
+                    {
+                        "properties": { "type": { "const": "shell" } },
+                        "required": ["type", "script"]
+                    },
+                    {
+                        "properties": { "type": { "const": "gpu" } },
+                        "required": ["type"]
+                    }
+                ]
             }),
         },
         ToolDefinition {
@@ -649,7 +663,8 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "description": "Skip workload spread check C6 (default: false)"
                     }
-                }
+                },
+                "required": []
             }),
         },
     ]
@@ -718,6 +733,202 @@ impl ToolCallContext {
     }
 }
 
+fn check_opt_bool(obj: &serde_json::Map<String, Value>, key: &str) -> Result<(), String> {
+    if let Some(v) = obj.get(key) {
+        if !v.is_null() && !v.is_boolean() {
+            return Err(format!("Property '{key}' must be a boolean"));
+        }
+    }
+    Ok(())
+}
+
+fn check_opt_str<'a>(
+    obj: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| format!("Property '{key}' must be a string")),
+    }
+}
+
+fn check_opt_u64(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("Property '{key}' must be a non-negative integer")),
+    }
+}
+
+fn check_opt_str_array(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<Vec<String>>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| format!("Property '{key}' must be an array of strings"))?;
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| format!("Property '{key}' must be an array of strings"))?;
+                out.push(s.to_string());
+            }
+            Ok(Some(out))
+        }
+    }
+}
+
+/// Validates tool name and arguments against the MCP tool input schemas before execution.
+pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
+    let obj = args
+        .as_object()
+        .ok_or_else(|| "Tool 'arguments' must be a JSON object".to_string())?;
+
+    match name {
+        "status" => {
+            if let Some(tid) = check_opt_str(obj, "task_id")? {
+                Uuid::parse_str(tid).map_err(|e| format!("Invalid task_id UUID '{tid}': {e}"))?;
+            }
+            check_opt_bool(obj, "workers")?;
+            Ok(())
+        }
+        "workers" => {
+            check_opt_bool(obj, "connected_only")?;
+            check_opt_str(obj, "os")?;
+            check_opt_str(obj, "arch")?;
+            check_opt_bool(obj, "gpu_only")?;
+            Ok(())
+        }
+        "submit" => {
+            let raw_type = check_opt_str(obj, "type")?.unwrap_or("command");
+            let task_type = raw_type.to_lowercase();
+            if !matches!(task_type.as_str(), "command" | "shell" | "gpu") {
+                return Err(format!(
+                    "Invalid task 'type': '{raw_type}' (expected 'command', 'shell', or 'gpu')"
+                ));
+            }
+
+            let cmd_opt = check_opt_str(obj, "command")?;
+            let script_opt = check_opt_str(obj, "script")?;
+            match task_type.as_str() {
+                "command" => {
+                    if cmd_opt.is_none_or(|c| c.trim().is_empty()) {
+                        return Err(
+                            "Command task requires a non-empty 'command' property".to_string()
+                        );
+                    }
+                }
+                "shell" => {
+                    let has_script = script_opt.is_some_and(|s| !s.trim().is_empty());
+                    let has_cmd = cmd_opt.is_some_and(|c| !c.trim().is_empty());
+                    if !has_script && !has_cmd {
+                        return Err(
+                            "Shell task requires a non-empty 'script' or 'command' property"
+                                .to_string(),
+                        );
+                    }
+                }
+                "gpu" => {}
+                _ => unreachable!(),
+            }
+
+            check_opt_str_array(obj, "args")?;
+            check_opt_str(obj, "interpreter")?;
+            check_opt_str(obj, "stdin")?;
+            if let Some(env_val) = obj.get("env") {
+                if !env_val.is_null() {
+                    let env_obj = env_val.as_object().ok_or_else(|| {
+                        "Property 'env' must be an object mapping strings to strings".to_string()
+                    })?;
+                    for (k, v) in env_obj {
+                        if !v.is_string() {
+                            return Err(format!("Environment variable '{k}' must be a string"));
+                        }
+                    }
+                }
+            }
+            check_opt_u64(obj, "cores")?;
+            check_opt_u64(obj, "ram_mb")?;
+            check_opt_bool(obj, "gpu")?;
+            let os_opt = check_opt_str(obj, "os")?;
+            let arch_opt = check_opt_str(obj, "arch")?;
+            let worker_opt = check_opt_str(obj, "worker")?;
+            let req_tags = check_opt_str_array(obj, "require_tags")?;
+
+            let mut placement_tags = Vec::new();
+            if let Some(os) = os_opt {
+                placement_tags.push(format!("{REQUIRE_PREFIX}os={os}"));
+            }
+            if let Some(arch) = arch_opt {
+                placement_tags.push(format!("{REQUIRE_PREFIX}arch={arch}"));
+            }
+            if let Some(worker) = worker_opt {
+                placement_tags.push(format!("{REQUIRE_PREFIX}worker={worker}"));
+            }
+            if let Some(tags) = req_tags {
+                for t in tags {
+                    placement_tags.push(format!("{REQUIRE_PREFIX}tag={t}"));
+                }
+            }
+            Placement::from_task_tags(&placement_tags)
+                .map_err(|e| format!("Invalid placement constraints: {e}"))?;
+
+            check_opt_u64(obj, "timeout_secs")?;
+            check_opt_u64(obj, "wait_secs")?;
+            check_opt_u64(obj, "max_retries")?;
+            check_opt_bool(obj, "wait")?;
+            check_opt_u64(obj, "matrix_dim")?;
+            check_opt_u64(obj, "work_group_size")?;
+            check_opt_str_array(obj, "files")?;
+            if let Some(outputs) = check_opt_str_array(obj, "outputs")? {
+                if !outputs.is_empty() {
+                    rusty_grid_core::blob::validate_output_patterns(&outputs)
+                        .map_err(|e| format!("Expected outputs error: {e}"))?;
+                }
+            }
+            check_opt_str(obj, "output_dir")?;
+            check_opt_u64(obj, "max_output_bytes")?;
+            Ok(())
+        }
+        "task_result" => {
+            let tid = check_opt_str(obj, "task_id")?
+                .ok_or_else(|| "Missing required property 'task_id'".to_string())?;
+            Uuid::parse_str(tid).map_err(|e| format!("Invalid task_id UUID '{tid}': {e}"))?;
+            check_opt_bool(obj, "wait")?;
+            check_opt_u64(obj, "timeout_secs")?;
+            check_opt_u64(obj, "wait_secs")?;
+            check_opt_str(obj, "output_dir")?;
+            check_opt_u64(obj, "max_output_bytes")?;
+            Ok(())
+        }
+        "cancel" => {
+            let tid = check_opt_str(obj, "task_id")?
+                .ok_or_else(|| "Missing required property 'task_id'".to_string())?;
+            Uuid::parse_str(tid).map_err(|e| format!("Invalid task_id UUID '{tid}': {e}"))?;
+            Ok(())
+        }
+        "doctor" => {
+            check_opt_u64(obj, "expect_workers")?;
+            check_opt_u64(obj, "timeout_secs")?;
+            check_opt_u64(obj, "gpu_dim")?;
+            check_opt_u64(obj, "spread_tasks")?;
+            check_opt_bool(obj, "skip_gpu")?;
+            check_opt_bool(obj, "skip_spread")?;
+            Ok(())
+        }
+        other => Err(format!("Unknown tool: '{other}'")),
+    }
+}
+
 pub async fn call_tool(state: &McpState, name: &str, args: &Value) -> ToolCallResult {
     let mut ctx = ToolCallContext::default();
     call_tool_with_context(state, name, args, &mut ctx).await
@@ -729,6 +940,9 @@ pub async fn call_tool_with_context(
     args: &Value,
     ctx: &mut ToolCallContext,
 ) -> ToolCallResult {
+    if let Err(err) = validate_tool_arguments(name, args) {
+        return ToolCallResult::error(err);
+    }
     match name {
         "status" => tool_status(state, args).await,
         "workers" => tool_workers(state, args).await,
@@ -778,13 +992,28 @@ async fn tool_status(state: &McpState, args: &Value) -> ToolCallResult {
             Err(e) => ToolCallResult::error(e),
         }
     } else {
-        // Query cluster workers & summary
-        match state.request(&ClientMessage::ListWorkers).await {
-            Ok(ClientResponse::WorkerList { workers }) => {
+        // Query cluster status & summary via ClientMessage::ClusterStatus
+        match state.request(&ClientMessage::ClusterStatus).await {
+            Ok(ClientResponse::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+                active_bytes,
+                max_active_bytes,
+            }) => {
                 let connected_count = workers
                     .iter()
                     .filter(|w| tag_value(&w.tags, STATE_TAG_PREFIX) != Some("disconnected"))
                     .count();
+
+                let cluster_status = if connected_count > 0 {
+                    "ok"
+                } else {
+                    "no_workers"
+                };
 
                 let include_workers = args
                     .get("workers")
@@ -792,10 +1021,17 @@ async fn tool_status(state: &McpState, args: &Value) -> ToolCallResult {
                     .unwrap_or(false);
 
                 let mut summary = json!({
-                    "cluster_status": "ok",
+                    "cluster_status": cluster_status,
                     "master": state.master_addr,
                     "total_workers": workers.len(),
                     "connected_workers": connected_count,
+                    "total_tasks": total_tasks,
+                    "pending_tasks": pending_tasks,
+                    "running_tasks": running_tasks,
+                    "completed_tasks": completed_tasks,
+                    "failed_tasks": failed_tasks,
+                    "active_bytes": active_bytes,
+                    "max_active_bytes": max_active_bytes,
                 });
 
                 if include_workers {
@@ -1512,13 +1748,21 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
             }
         }
         "shell" => {
-            let script = match args.get("script").and_then(Value::as_str) {
+            let script = match args
+                .get("script")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
                 Some(s) => s.to_string(),
-                None => match args.get("command").and_then(Value::as_str) {
+                None => match args
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .filter(|c| !c.trim().is_empty())
+                {
                     Some(c) => c.to_string(),
                     None => {
                         return ToolCallResult::error(
-                            "Shell task requires 'script' or 'command' property",
+                            "Shell task requires a non-empty 'script' or 'command' property",
                         )
                     }
                 },
@@ -1533,13 +1777,19 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                 env: env_map,
             }
         }
-        _ => {
-            // Command
-            let program = args
+        "command" => {
+            let program = match args
                 .get("command")
                 .and_then(Value::as_str)
-                .unwrap_or("echo")
-                .to_string();
+                .filter(|c| !c.trim().is_empty())
+            {
+                Some(c) => c.to_string(),
+                None => {
+                    return ToolCallResult::error(
+                        "Command task requires a non-empty 'command' property",
+                    )
+                }
+            };
 
             let cmd_args: Vec<String> = args
                 .get("args")
@@ -1550,13 +1800,7 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                         .map(str::to_string)
                         .collect()
                 })
-                .unwrap_or_else(|| {
-                    if program == "echo" {
-                        vec!["Hello from OxideSwarm MCP".to_string()]
-                    } else {
-                        Vec::new()
-                    }
-                });
+                .unwrap_or_default();
 
             let stdin = args
                 .get("stdin")
@@ -1570,6 +1814,11 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
                 working_dir: None,
                 stdin,
             }
+        }
+        other => {
+            return ToolCallResult::error(format!(
+                "Invalid task 'type': '{other}' (expected 'command', 'shell', or 'gpu')"
+            ));
         }
     };
 
@@ -2325,8 +2574,15 @@ async fn tool_doctor(state: &McpState, args: &Value) -> ToolCallResult {
         .await
         .unwrap_or_else(|_| state.master_addr.clone());
     let report = run_doctor(&target_addr, state.secret.as_ref(), &options).await;
+    let is_error = report.failed() || report.auth_failed;
     match serde_json::to_value(&report) {
-        Ok(val) => ToolCallResult::ok_json(&val),
+        Ok(val) => {
+            let text = serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
+            ToolCallResult {
+                content: vec![ToolContent::Text { text }],
+                is_error,
+            }
+        }
         Err(e) => ToolCallResult::error(format!("Failed to serialize doctor report: {e}")),
     }
 }
@@ -2415,40 +2671,174 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
             continue;
         }
 
-        let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
-            Ok(req) => req,
+        let raw_val: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
             Err(e) => {
-                let err_resp = JsonRpcResponse::error(
-                    None,
-                    PARSE_ERROR,
-                    format!("Invalid JSON-RPC frame: {e}"),
-                    None,
-                );
+                let err_resp =
+                    JsonRpcResponse::error(None, PARSE_ERROR, format!("Invalid JSON: {e}"), None);
                 send_response_line(&out_tx, &err_resp);
                 continue;
             }
         };
 
-        if request.jsonrpc != "2.0" {
+        let Some(map) = raw_val.as_object() else {
             let err_resp = JsonRpcResponse::error(
-                request.id,
+                None,
                 INVALID_REQUEST,
-                "Protocol version must be '2.0'",
+                "JSON-RPC request must be a JSON object",
+                None,
+            );
+            send_response_line(&out_tx, &err_resp);
+            continue;
+        };
+
+        let has_id = map.contains_key("id");
+        let id = map.get("id").cloned();
+        if has_id
+            && !id
+                .as_ref()
+                .is_some_and(|v| v.is_string() || v.is_number() || v.is_null())
+        {
+            let err_resp = JsonRpcResponse::error(
+                None,
+                INVALID_REQUEST,
+                "Request 'id' must be a string, number, or null",
                 None,
             );
             send_response_line(&out_tx, &err_resp);
             continue;
         }
 
-        let id = request.id.clone();
-        let method = request.method.as_str();
+        let method_opt = map
+            .get("method")
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+        let valid_version = map.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
+        let valid_params = map
+            .get("params")
+            .is_none_or(|p| p.is_null() || p.is_object() || p.is_array());
+
+        if !has_id {
+            if let Some(ref method) = method_opt {
+                if valid_version && valid_params {
+                    match method.as_str() {
+                        "notifications/initialized" => {
+                            eprintln!(
+                                "[mcp] Client handshake completed: notifications/initialized received"
+                            );
+                        }
+                        "notifications/cancelled" => {
+                            let params = map.get("params").cloned().unwrap_or(Value::Null);
+                            if let Some(req_id) =
+                                params.get("requestId").or_else(|| params.get("id"))
+                            {
+                                if let Some(key) = request_id_key(req_id) {
+                                    let maybe_tid = {
+                                        let guard = in_flight.lock().await;
+                                        if let Some(call) = guard.get(&key) {
+                                            call.client_cancelled
+                                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                                            let _ = call.cancel_tx.send(true);
+                                            Some(Arc::clone(&call.submitted_task_id))
+                                        } else {
+                                            None
+                                        }
+                                    };
+                                    let (task_to_cancel, was_in_flight) =
+                                        if let Some(tid_mutex) = maybe_tid {
+                                            (*tid_mutex.lock().await, true)
+                                        } else {
+                                            let mut guard = completed_submits.lock().await;
+                                            let tid = guard
+                                                .iter()
+                                                .rposition(|(k, _)| k == &key)
+                                                .and_then(|pos| guard.remove(pos))
+                                                .map(|(_, tid)| tid);
+                                            (tid, false)
+                                        };
+                                    if let Some(task_id) = task_to_cancel {
+                                        let state_clone = Arc::clone(&state);
+                                        tokio::spawn(async move {
+                                            if !was_in_flight {
+                                                // Post-reply cancel (design 0030): only cancel if the task is
+                                                // still non-terminal on the master.
+                                                let is_active = matches!(
+                                                    state_clone
+                                                        .request(&ClientMessage::GetTaskStatus {
+                                                            task_id
+                                                        })
+                                                        .await,
+                                                    Ok(ClientResponse::TaskStatusInfo {
+                                                        status,
+                                                        ..
+                                                    }) if !status.is_terminal()
+                                                );
+                                                if !is_active {
+                                                    return;
+                                                }
+                                            }
+                                            let _ = state_clone
+                                                .request(&ClientMessage::CancelTask { task_id })
+                                                .await;
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // Drop messages without an id silently (JSON-RPC 2.0 notifications).
+                continue;
+            } else {
+                let err_resp = JsonRpcResponse::error(
+                    None,
+                    INVALID_REQUEST,
+                    "Missing or invalid 'method' field",
+                    None,
+                );
+                send_response_line(&out_tx, &err_resp);
+                continue;
+            }
+        }
+
+        if !valid_version {
+            let err_resp =
+                JsonRpcResponse::error(id, INVALID_REQUEST, "Protocol version must be '2.0'", None);
+            send_response_line(&out_tx, &err_resp);
+            continue;
+        }
+
+        let Some(method) = method_opt else {
+            let err_resp = JsonRpcResponse::error(
+                id,
+                INVALID_REQUEST,
+                "Missing or invalid 'method' field",
+                None,
+            );
+            send_response_line(&out_tx, &err_resp);
+            continue;
+        };
+
+        if !valid_params {
+            let err_resp = JsonRpcResponse::error(
+                id,
+                INVALID_REQUEST,
+                "Request 'params' must be an object or array",
+                None,
+            );
+            send_response_line(&out_tx, &err_resp);
+            continue;
+        }
+
         if method != "notifications/cancelled" {
             if let Some(key) = id.as_ref().and_then(request_id_key) {
                 completed_submits.lock().await.retain(|(k, _)| k != &key);
             }
         }
 
-        match method {
+        match method.as_str() {
             "initialize" => {
                 let resp = JsonRpcResponse::success(
                     id,
@@ -2465,61 +2855,6 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                 );
                 send_response_line(&out_tx, &resp);
             }
-            "notifications/initialized" => {
-                // Initialized notification has no response
-                eprintln!("[mcp] Client handshake completed: notifications/initialized received");
-            }
-            "notifications/cancelled" => {
-                let params = request.params.unwrap_or(Value::Null);
-                if let Some(req_id) = params.get("requestId").or_else(|| params.get("id")) {
-                    if let Some(key) = request_id_key(req_id) {
-                        let maybe_tid = {
-                            let guard = in_flight.lock().await;
-                            if let Some(call) = guard.get(&key) {
-                                call.client_cancelled
-                                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                                let _ = call.cancel_tx.send(true);
-                                Some(Arc::clone(&call.submitted_task_id))
-                            } else {
-                                None
-                            }
-                        };
-                        let (task_to_cancel, was_in_flight) = if let Some(tid_mutex) = maybe_tid {
-                            (*tid_mutex.lock().await, true)
-                        } else {
-                            let mut guard = completed_submits.lock().await;
-                            let tid = guard
-                                .iter()
-                                .rposition(|(k, _)| k == &key)
-                                .and_then(|pos| guard.remove(pos))
-                                .map(|(_, tid)| tid);
-                            (tid, false)
-                        };
-                        if let Some(task_id) = task_to_cancel {
-                            let state_clone = Arc::clone(&state);
-                            tokio::spawn(async move {
-                                if !was_in_flight {
-                                    // Post-reply cancel (design 0030): only cancel if the task is
-                                    // still non-terminal on the master.
-                                    let is_active = matches!(
-                                        state_clone
-                                            .request(&ClientMessage::GetTaskStatus { task_id })
-                                            .await,
-                                        Ok(ClientResponse::TaskStatusInfo { status, .. })
-                                            if !status.is_terminal()
-                                    );
-                                    if !is_active {
-                                        return;
-                                    }
-                                }
-                                let _ = state_clone
-                                    .request(&ClientMessage::CancelTask { task_id })
-                                    .await;
-                            });
-                        }
-                    }
-                }
-            }
             "ping" => {
                 let resp = JsonRpcResponse::success(id, json!({}));
                 send_response_line(&out_tx, &resp);
@@ -2530,111 +2865,138 @@ pub async fn run_stdio_server(state: Arc<McpState>) -> ExitCode {
                 send_response_line(&out_tx, &resp);
             }
             "tools/call" => {
-                let params = request.params.unwrap_or(Value::Null);
-                let tool_name = params
+                let params = map.get("params").cloned().unwrap_or(Value::Null);
+                let Some(params_obj) = params.as_object() else {
+                    let resp = JsonRpcResponse::error(
+                        id,
+                        INVALID_PARAMS,
+                        "tools/call 'params' must be a JSON object",
+                        None,
+                    );
+                    send_response_line(&out_tx, &resp);
+                    continue;
+                };
+                let Some(name) = params_obj
                     .get("name")
                     .and_then(Value::as_str)
-                    .map(str::to_string);
-                let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                else {
+                    let resp = JsonRpcResponse::error(
+                        id,
+                        INVALID_PARAMS,
+                        "Missing or invalid 'name' in tools/call parameters",
+                        None,
+                    );
+                    send_response_line(&out_tx, &resp);
+                    continue;
+                };
 
-                match tool_name {
-                    Some(name) => {
-                        let id_key = id.as_ref().and_then(request_id_key);
-                        if let Some(ref key) = id_key {
-                            let guard = in_flight.lock().await;
-                            if guard.contains_key(key) {
-                                drop(guard);
-                                let resp = JsonRpcResponse::error(
-                                    id,
-                                    INVALID_REQUEST,
-                                    format!("Duplicate in-flight request id: {key}"),
-                                    None,
-                                );
-                                send_response_line(&out_tx, &resp);
-                                continue;
-                            }
-                        }
-
-                        let (cancel_tx, cancel_rx) = watch::channel(false);
-                        let client_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        let submitted_task_id = Arc::new(Mutex::new(None));
-                        let call_seq = next_call_seq;
-                        next_call_seq = next_call_seq.wrapping_add(1);
-                        active_cancels
-                            .lock()
-                            .await
-                            .insert(call_seq, cancel_tx.clone());
-
-                        if let Some(ref key) = id_key {
-                            in_flight.lock().await.insert(
-                                key.clone(),
-                                InFlightCall {
-                                    cancel_tx: cancel_tx.clone(),
-                                    client_cancelled: Arc::clone(&client_cancelled),
-                                    submitted_task_id: Arc::clone(&submitted_task_id),
-                                },
-                            );
-                        }
-
-                        let progress_token = extract_progress_token(&params, &arguments);
-                        let mut ctx = ToolCallContext {
-                            cancel_tx,
-                            cancel_rx,
-                            client_cancelled,
-                            aborted_by_cancel: false,
-                            submitted_task_id,
-                            progress_token,
-                            out_tx: Some(out_tx.clone()),
-                        };
-                        let state_clone = Arc::clone(&state);
-                        let in_flight_clone = Arc::clone(&in_flight);
-                        let completed_submits_clone = Arc::clone(&completed_submits);
-                        let active_cancels_clone = Arc::clone(&active_cancels);
-                        let out_tx_clone = out_tx.clone();
-
-                        call_tasks.spawn(async move {
-                            let tool_result =
-                                call_tool_with_context(&state_clone, &name, &arguments, &mut ctx)
-                                    .await;
-                            active_cancels_clone.lock().await.remove(&call_seq);
-                            if let Some(ref key) = id_key {
-                                if !ctx.is_client_cancelled() && !ctx.aborted_by_cancel {
-                                    if let Some(tid) = *ctx.submitted_task_id.lock().await {
-                                        let mut guard = completed_submits_clone.lock().await;
-                                        guard.retain(|(k, _)| k != key);
-                                        if guard.len() >= 256 {
-                                            guard.pop_front();
-                                        }
-                                        guard.push_back((key.clone(), tid));
-                                    }
-                                }
-                                in_flight_clone.lock().await.remove(key);
-                            }
-                            if ctx.is_client_cancelled() || ctx.aborted_by_cancel {
-                                return;
-                            }
-                            let resp = match serde_json::to_value(&tool_result) {
-                                Ok(val) => JsonRpcResponse::success(id, val),
-                                Err(e) => JsonRpcResponse::error(
-                                    id,
-                                    INTERNAL_ERROR,
-                                    format!("Serialization error: {e}"),
-                                    None,
-                                ),
-                            };
-                            send_response_line(&out_tx_clone, &resp);
-                        });
-                    }
-                    None => {
+                let arguments = match params_obj.get("arguments") {
+                    None | Some(Value::Null) => json!({}),
+                    Some(v) if v.is_object() => v.clone(),
+                    Some(_) => {
                         let resp = JsonRpcResponse::error(
                             id,
                             INVALID_PARAMS,
-                            "Missing 'name' in tools/call parameters",
+                            "Tool 'arguments' must be a JSON object",
                             None,
                         );
                         send_response_line(&out_tx, &resp);
+                        continue;
+                    }
+                };
+
+                if let Err(err_msg) = validate_tool_arguments(&name, &arguments) {
+                    let resp = JsonRpcResponse::error(id, INVALID_PARAMS, err_msg, None);
+                    send_response_line(&out_tx, &resp);
+                    continue;
+                }
+
+                let id_key = id.as_ref().and_then(request_id_key);
+                if let Some(ref key) = id_key {
+                    let guard = in_flight.lock().await;
+                    if guard.contains_key(key) {
+                        drop(guard);
+                        let resp = JsonRpcResponse::error(
+                            id,
+                            INVALID_REQUEST,
+                            format!("Duplicate in-flight request id: {key}"),
+                            None,
+                        );
+                        send_response_line(&out_tx, &resp);
+                        continue;
                     }
                 }
+
+                let (cancel_tx, cancel_rx) = watch::channel(false);
+                let client_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let submitted_task_id = Arc::new(Mutex::new(None));
+                let call_seq = next_call_seq;
+                next_call_seq = next_call_seq.wrapping_add(1);
+                active_cancels
+                    .lock()
+                    .await
+                    .insert(call_seq, cancel_tx.clone());
+
+                if let Some(ref key) = id_key {
+                    in_flight.lock().await.insert(
+                        key.clone(),
+                        InFlightCall {
+                            cancel_tx: cancel_tx.clone(),
+                            client_cancelled: Arc::clone(&client_cancelled),
+                            submitted_task_id: Arc::clone(&submitted_task_id),
+                        },
+                    );
+                }
+
+                let progress_token = extract_progress_token(&params, &arguments);
+                let mut ctx = ToolCallContext {
+                    cancel_tx,
+                    cancel_rx,
+                    client_cancelled,
+                    aborted_by_cancel: false,
+                    submitted_task_id,
+                    progress_token,
+                    out_tx: Some(out_tx.clone()),
+                };
+                let state_clone = Arc::clone(&state);
+                let in_flight_clone = Arc::clone(&in_flight);
+                let completed_submits_clone = Arc::clone(&completed_submits);
+                let active_cancels_clone = Arc::clone(&active_cancels);
+                let out_tx_clone = out_tx.clone();
+
+                call_tasks.spawn(async move {
+                    let tool_result =
+                        call_tool_with_context(&state_clone, &name, &arguments, &mut ctx).await;
+                    active_cancels_clone.lock().await.remove(&call_seq);
+                    if let Some(ref key) = id_key {
+                        if !ctx.is_client_cancelled() && !ctx.aborted_by_cancel {
+                            if let Some(tid) = *ctx.submitted_task_id.lock().await {
+                                let mut guard = completed_submits_clone.lock().await;
+                                guard.retain(|(k, _)| k != key);
+                                if guard.len() >= 256 {
+                                    guard.pop_front();
+                                }
+                                guard.push_back((key.clone(), tid));
+                            }
+                        }
+                        in_flight_clone.lock().await.remove(key);
+                    }
+                    if ctx.is_client_cancelled() || ctx.aborted_by_cancel {
+                        return;
+                    }
+                    let resp = match serde_json::to_value(&tool_result) {
+                        Ok(val) => JsonRpcResponse::success(id, val),
+                        Err(e) => JsonRpcResponse::error(
+                            id,
+                            INTERNAL_ERROR,
+                            format!("Serialization error: {e}"),
+                            None,
+                        ),
+                    };
+                    send_response_line(&out_tx_clone, &resp);
+                });
             }
             other => {
                 // Unknown method
@@ -3009,5 +3371,41 @@ mod tests {
         assert_eq!(body_custom_cap["worker_truncated"], true);
         assert_eq!(body_custom_cap["stdout_worker_truncated"], true);
         assert_eq!(body_custom_cap["truncated"], true);
+    }
+
+    #[test]
+    fn test_mcp3_tool_schemas_and_argument_validation() {
+        let tools = available_tools();
+        assert_eq!(tools.len(), 6);
+        for t in &tools {
+            assert!(
+                t.input_schema.get("required").is_some_and(|r| r.is_array()),
+                "tool '{}' schema must include a 'required' array",
+                t.name
+            );
+        }
+
+        // Empty submit (`submit {}`) is rejected without falling back to demo echo.
+        assert!(validate_tool_arguments("submit", &json!({})).is_err());
+        assert!(validate_tool_arguments("submit", &json!({"type": "command"})).is_err());
+        assert!(validate_tool_arguments("submit", &json!({"command": "   "})).is_err());
+        assert!(
+            validate_tool_arguments("submit", &json!({"type": "unknown", "command": "echo"}))
+                .is_err()
+        );
+        assert!(validate_tool_arguments("submit", &json!({"type": "shell"})).is_err());
+        assert!(validate_tool_arguments("submit", &json!({"command": "echo"})).is_ok());
+        assert!(
+            validate_tool_arguments("submit", &json!({"type": "shell", "script": "echo ok"}))
+                .is_ok()
+        );
+        assert!(validate_tool_arguments("submit", &json!({"type": "gpu"})).is_ok());
+
+        // Unknown tool, invalid UUIDs, and negative integers are rejected.
+        assert!(validate_tool_arguments("unknown_tool", &json!({})).is_err());
+        assert!(validate_tool_arguments("status", &json!({"task_id": "not-a-uuid"})).is_err());
+        assert!(validate_tool_arguments("task_result", &json!({})).is_err());
+        assert!(validate_tool_arguments("cancel", &json!({})).is_err());
+        assert!(validate_tool_arguments("doctor", &json!({"expect_workers": -1})).is_err());
     }
 }

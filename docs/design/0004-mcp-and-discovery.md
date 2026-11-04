@@ -1,6 +1,6 @@
 # 0004: Model Context Protocol server and subnet-isolated discovery fallback
 
-Status: Partial
+Status: Implemented
 Created: 2026-10-23    Updated: 2026-11-04
 
 ## Summary
@@ -50,11 +50,18 @@ oxideswarm mcp --master 127.0.0.1:8088
 ```
 
 Supported lifecycle endpoints:
-- `initialize`: Returns protocol version (`2024-11-05`), server capabilities (`tools: {}`), and server info (`name: "oxideswarm-mcp"`, `version: "0.1.0"`).
-- `notifications/initialized`: Confirms client initialization.
+- `initialize`: Returns protocol version (`2024-11-05`), server capabilities (`tools: {}`), and server info (`name: "oxideswarm"`, `version: env!("CARGO_PKG_VERSION")`).
+- `notifications/initialized`: Confirms client initialization (no response emitted on `stdout`).
+- `notifications/cancelled`: Cancels an in-flight tool call (and its submitted task) or a recently completed `submit {wait: false}` task (design 0030), emitting no response on `stdout`.
 - `ping`: Liveness check responding with `{}`.
-- `tools/list`: Returns JSON schemas for all six tools.
-- `tools/call`: Executes the requested tool against the master cluster.
+- `tools/list`: Returns JSON schemas (each carrying a `required` array) for all six tools.
+- `tools/call`: Validates the tool name and arguments against the tool schema before executing the requested tool against the master cluster.
+
+JSON-RPC 2.0 error and notification rules (`MCP-3`):
+- Malformed JSON syntax returns `PARSE_ERROR` (`-32700`).
+- Valid JSON that is not a Request object, carries an invalid `id` type, lacks `jsonrpc: "2.0"`, or lacks a non-empty string `method` returns `INVALID_REQUEST` (`-32600`).
+- Messages that carry a string `method` and no `id` member are JSON-RPC 2.0 notifications and are dropped silently on `stdout` after handling `notifications/initialized` and `notifications/cancelled`.
+- Unknown tool names and invalid tool arguments in `tools/call` return `INVALID_PARAMS` (`-32602`) before any task is queued.
 
 Connection resilience: `McpState` reuses `crates/cli/src/connect.rs::connect_master` with lazy connection caching and transparent reconnection if the socket drops.
 
@@ -66,12 +73,12 @@ Implemented in `crates/cli/src/mcp.rs` and `crates/cli/src/config.rs`.
 
 | Tool | Parameters | Functionality |
 |---|---|---|
-| `status` | `task_id` (optional string), `workers` (optional bool) | Returns overall cluster status, active task counts, and worker counts, or execution state of a specific task. |
+| `status` | `task_id` (optional string), `workers` (optional bool) | Queries `ClientMessage::ClusterStatus` when `task_id` is omitted, returning `cluster_status` (`"ok"` when `connected_workers > 0`, `"no_workers"` otherwise), `total_tasks`, `pending_tasks`, `running_tasks`, `completed_tasks`, `failed_tasks`, `active_bytes`, `max_active_bytes`, `total_workers`, and `connected_workers` (plus `workers` when requested), or queries `ClientMessage::GetTaskStatus` for a specific `task_id`. |
 | `workers` | `connected_only`, `os`, `arch`, `gpu_only` | Lists registered compute workers, hardware capabilities, and tags matching the given filters. |
-| `submit` | `type`, `command`, `args`, `script`, `interpreter`, `stdin`, `env`, `os`, `arch`, `worker`, `require_tags`, `cores`, `ram_mb`, `gpu`, `matrix_dim`, `work_group_size`, `files`, `outputs`, `output_dir`, `max_output_bytes`, `wait`, `timeout_secs`, `wait_secs`, `max_retries` | Submits a computation task to the grid with content-addressed blob input staging (`files` restricted to non-symlink paths inside the working directory, mapping `.` to `SANDBOX_ROOT`), output glob collection (`outputs`), optional download directory (`output_dir`, restricted to non-symlink paths inside the working directory and created directory-by-directory), inline stream budget (`max_output_bytes`, default 16 KiB head + tail budgeted across the JSON-RPC escaped length of both streams), placement constraints, and client wait deadline (`wait_secs`). Note: when `type` is `"command"` (or omitted), `script` and `interpreter` are ignored and an omitted `command` defaults to `echo "Hello from OxideSwarm MCP"` (`MCP-3`). |
+| `submit` | `type`, `command`, `args`, `script`, `interpreter`, `stdin`, `env`, `os`, `arch`, `worker`, `require_tags`, `cores`, `ram_mb`, `gpu`, `matrix_dim`, `work_group_size`, `files`, `outputs`, `output_dir`, `max_output_bytes`, `wait`, `timeout_secs`, `wait_secs`, `max_retries` | Submits a computation task to the grid with content-addressed blob input staging (`files` restricted to non-symlink paths inside the working directory, mapping `.` to `SANDBOX_ROOT`), output glob collection (`outputs`), optional download directory (`output_dir`, restricted to non-symlink paths inside the working directory and created directory-by-directory), inline stream budget (`max_output_bytes`, default 16 KiB head + tail budgeted across the JSON-RPC escaped length of both streams), placement constraints, and client wait deadline (`wait_secs`). Requires a non-empty `command` when `type` is `"command"` (or omitted), requires a non-empty `script` or `command` when `type` is `"shell"`, and rejects unknown `type` values with `INVALID_PARAMS` (`-32602`). |
 | `task_result` | `task_id`, `wait`, `timeout_secs`, `wait_secs`, `output_dir`, `max_output_bytes` | Retrieves execution outcome, exit code, bounded head+tail `stdout` and `stderr` (default 16 KiB escaped budget across both streams), `captured_bytes` (`stdout_captured_bytes`, `stderr_captured_bytes`), `truncated` (`stdout_truncated`, `stderr_truncated`), `worker_truncated` (`stdout_worker_truncated`, `stderr_worker_truncated`), execution duration, and output artifact metadata (downloading output blobs to `output_dir` inside the working directory when given, without inline `data_preview`). |
 | `cancel` | `task_id` | Cancels a queued or running task on the master by UUID. |
-| `doctor` | `expect_workers`, `timeout_secs`, `gpu_dim`, `spread_tasks`, `skip_gpu`, `skip_spread` | Runs cluster diagnostic checks C1–C6 and returns complete health check results. |
+| `doctor` | `expect_workers`, `timeout_secs`, `gpu_dim`, `spread_tasks`, `skip_gpu`, `skip_spread` | Runs cluster diagnostic checks C1–C6 and returns complete health check results, setting `isError: true` whenever `report.failed() || report.auth_failed`. |
 
 Implemented in `crates/cli/src/mcp.rs`.
 
@@ -159,7 +166,7 @@ Implemented in `crates/core/src/discovery.rs` and `crates/master/src/server.rs`.
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| W1 | MCP stdio protocol engine | `crates/cli/src/mcp.rs` | JSON-RPC 2.0 lifecycle and 6 tools implemented (`MCP-3` strict argument validation still open) | Partial |
+| W1 | MCP stdio protocol engine | `crates/cli/src/mcp.rs` | JSON-RPC 2.0 lifecycle, strict error/notification framing, and 6 tools implemented | Implemented |
 | W2 | CLI MCP subcommand and stdout hygiene | `crates/cli/src/cli_app.rs` | `oxideswarm mcp` command added, tracing routed to `stderr` | Implemented |
 | W3 | Authenticated HTTP discovery probe | `crates/core/src/discovery.rs`, `crates/master/src/web_ui.rs` | `/api/discovery/probe` handler and client probe with nonce HMAC | Implemented |
 | W4 | Rendezvous registry service | `crates/core/src/discovery.rs`, `crates/master/src/web_ui.rs`, `crates/master/src/server.rs` | Signed lease registration and lookup with sanitised address | Implemented |
@@ -174,3 +181,4 @@ Implemented in `crates/core/src/discovery.rs` and `crates/master/src/server.rs`.
 - 2026-11-01: Removed the unauthenticated `--sse` HTTP surface (`SEC-1`) and enforced startup secret validation via `client_secret` using `[status]` for `master`, `secret`, and `insecure` while skipping working-directory config files (`SEC-2`).
 - 2026-11-04: Documented all `submit` schema arguments (`cores`, `ram_mb`, `work_group_size`) and current command fallback behaviour in D2, noted that anonymous reads of `GET /api/rendezvous/master` drop `p2p_ticket` in D5, and set status to `Partial` while `MCP-2` and `MCP-3` remain open (`DOC-3`).
 - 2026-11-04: Moved MCP `submit` / `task_result` file transfer to content-addressed blobs, enforced working-directory and no-symlink rules on both `files` (mapping `.` to `SANDBOX_ROOT`, opening once with `O_NOFOLLOW`) and `output_dir` (creating directories one by one), budgeted `max_output_bytes` (16 KiB head + tail default) across the escaped JSON-RPC length of both streams, added `captured_bytes`, `truncated`, and `worker_truncated`, and removed `data_preview` (`MCP-2`).
+- 2026-11-04: Separated JSON-RPC `-32700` (`PARSE_ERROR`) from `-32600` (`INVALID_REQUEST`), dropped notifications without an `id` silently on `stdout`, returned `-32602` (`INVALID_PARAMS`) for unknown tools and invalid arguments (removing the demo `echo` fallback on `submit` and rejecting unknown `type` values), added `required` to all six tool schemas, switched `status` to `ClientMessage::ClusterStatus`, set `isError: true` on failed `doctor` reports, and marked status `Implemented` (`MCP-3`).
