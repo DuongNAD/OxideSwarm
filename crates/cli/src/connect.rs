@@ -185,7 +185,11 @@ pub async fn connect_master(
     // Best effort: a failure here only costs latency / dead-peer detection.
     let _ = configure_tcp_stream(&stream);
 
-    let mut transport = MessageTransport::new(stream);
+    let codec = std::env::var("RUSTY_GRID_WIRE_CODEC")
+        .ok()
+        .and_then(|s| s.parse::<rusty_grid_core::protocol::WireCodec>().ok())
+        .unwrap_or_default();
+    let mut transport = MessageTransport::with_codec(stream, codec);
     if let Some(secret) = secret {
         let session_key =
             tokio::time::timeout(AUTH_TIMEOUT, client_handshake(&mut transport, secret))

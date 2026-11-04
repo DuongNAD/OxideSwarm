@@ -368,8 +368,8 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--heartbeat-interval-secs <SECS>` (alias `--heartbeat-interval`) | `3` (`RUSTY_GRID_HEARTBEAT_INTERVAL_SECS`, `[master].heartbeat_interval_secs`) | Expected worker heartbeat interval in seconds |
 | `--heartbeat-timeout-secs <SECS>` (alias `--heartbeat-timeout`) | `10` (`RUSTY_GRID_HEARTBEAT_TIMEOUT_SECS`, `[master].heartbeat_timeout_secs`) | Seconds without a heartbeat before a worker is marked dead |
 | `--reaper-interval-secs <SECS>` (alias `--reaper-interval`) | `1` (`RUSTY_GRID_REAPER_INTERVAL_SECS`, `[master].reaper_interval_secs`) | Interval in seconds between dead-worker reaper sweeps |
-| `--max-queue-size <N>` | `[master].max_queue_size` (parsed, not used yet) | **Parsed, not used yet** — parsed by the CLI/config (`cli_app.rs:201`, `config.rs:46`), but not read by `TaskQueue` (`--max-active-mb` bounds active queue memory instead) |
-| `--scheduler-policy <POLICY>` | `[master].scheduler_policy` (parsed, not used yet) | **Parsed, not used yet** — parsed by the CLI/config (`cli_app.rs:207`, `config.rs:48`), but not read by `WorkloadScheduler`, which always runs the weighted least-loaded policy |
+| `--max-queue-size <N>` | Unbounded by count (`RUSTY_GRID_MAX_QUEUE_SIZE`, `[master].max_queue_size`) | Maximum active (non-terminal) tasks allowed in the queue at once (minimum `1`; `--max-active-mb` also bounds active queue memory) |
+| `--scheduler-policy <POLICY>` | `weighted` (`RUSTY_GRID_SCHEDULER_POLICY`, `[master].scheduler_policy`) | Load-balancing policy across eligible workers: `weighted` (`weighted-least-loaded`), `least-loaded`, or `round-robin` |
 | `--default-retry-max <N>` (alias `--max-retries`) | `3` (`RUSTY_GRID_DEFAULT_RETRY_MAX`, `RUSTY_GRID_MAX_RETRIES`, `[master].default_retry_max`) | Default maximum execution retries per task |
 | `--max-host-cpu-pct <PCT>` | `85.0` (`RUSTY_GRID_MAX_HOST_CPU_PCT`, `[master].max_host_cpu_pct`) | Host CPU percentage ceiling before anti-stuttering backpressure throttles dispatch |
 | `--preserve-gpu <BOOL>` | `true` (`RUSTY_GRID_PRESERVE_GPU`, `[master].preserve_gpu`) | Reserve GPU workers for GPU-requiring tasks when CPU-only workers are available |
@@ -377,7 +377,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--p2p-ticket-file <PATH>` | `RUSTY_GRID_P2P_TICKET_FILE`, `[master].p2p_ticket_file` | File path where the generated P2P connection ticket is written |
 | `--p2p-key-file <PATH>` (alias `--key-file`) | `~/.oxideswarm/master_key.bin` (`RUSTY_GRID_P2P_KEY_FILE`, `[master].p2p_key_file`) | Persistent P2P secret key file for stable NodeId and ticket across restarts |
 | `--ephemeral-key` | `false` (`RUSTY_GRID_EPHEMERAL_KEY`) | Force a random ephemeral P2P key instead of persisting `master_key.bin` |
-| `--wire-codec <CODEC>` | `bincode` (CLI flag only; `RUSTY_GRID_WIRE_CODEC` and `[master].wire_codec` do not take effect because clap's `default_value = "bincode"` is passed as `Some(args.wire_codec)` in `cli_app.rs:1246`) | Wire format codec: `bincode` or `json` |
+| `--wire-codec <CODEC>` | `bincode` (`RUSTY_GRID_WIRE_CODEC`, `[master].wire_codec`) | Wire format codec: `bincode` or `json` |
 | `--web-ui-addr <ADDR>` | `127.0.0.1:8080` | Bind address for the embedded HTTP web dashboard (`0.0.0.0:8080` exposes it on the LAN) |
 | `--dashboard-port <PORT>` | `8080` (`RUSTY_GRID_DASHBOARD_PORT`, `OXIDE_SWARM_DASHBOARD_PORT`, `[master].dashboard_port`) | HTTP port for the embedded web dashboard (ignored if `--web-ui-addr` is given) |
 | `--dashboard-port-file <PATH>` | `RUSTY_GRID_DASHBOARD_PORT_FILE`, `OXIDE_SWARM_DASHBOARD_PORT_FILE`, `[master].dashboard_port_file` | File path where the bound dashboard HTTP port number is written |
@@ -422,7 +422,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--blob-cache-mb <MB>` | `2048` (`RUSTY_GRID_BLOB_CACHE_MB`, `[worker].blob_cache_mb`) | Megabytes of task input/output blobs cached in `<sandbox_base_dir>/cache/blobs` |
 | `--output-limit-mb <MB>` | `1024` (`RUSTY_GRID_OUTPUT_LIMIT_MB`, `[worker].output_limit_mb`) | Maximum megabytes of output files one task may return |
 | `--no-portal` | `false` (`RUSTY_GRID_NO_PORTAL`, `[worker].no_portal`) | Disable the worker standby HTTP redirect portal on `0.0.0.0:8080` |
-| `--wire-codec <CODEC>` | `bincode` (CLI flag only; `RUSTY_GRID_WIRE_CODEC` and `[worker].wire_codec` do not take effect because clap's `default_value = "bincode"` is passed as `Some(args.wire_codec)` in `cli_app.rs:1525`) | Wire format codec: `bincode` or `json` |
+| `--wire-codec <CODEC>` | `bincode` (`RUSTY_GRID_WIRE_CODEC`, `[worker].wire_codec`) | Wire format codec: `bincode` or `json` |
 | `--insecure` | `false` (`RUSTY_GRID_INSECURE`, `[worker].insecure`) | Allow connecting to a remote, `auto`, or P2P master without a cluster secret |
 | `--rendezvous <URL>` | `OXIDESWARM_RENDEZVOUS`, `RUSTY_GRID_RENDEZVOUS` | URL of Tier 3 HTTP rendezvous registry for cross-subnet discovery |
 
@@ -436,7 +436,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--cores <N>` | `1` | Minimum CPU cores required on the assigned worker |
 | `--ram-mb <MB>` (alias `--ram`) | `0` | Minimum RAM in megabytes required on the assigned worker |
 | `--gpu` | `false` | Require a worker that advertises a GPU |
-| `--timeout-secs <SECS>` | `60` (CLI flag only; `[submit].timeout_secs` in `config.rs:138` is parsed from TOML, not read yet) | Task execution timeout in seconds |
+| `--timeout-secs <SECS>` | `60` (`[submit].timeout_secs`) | Task execution timeout in seconds |
 | `--max-retries <N>` | Master default | Maximum execution retries for this task |
 | `--wait` | `false` (implied by `--output` and `-o`) | Wait synchronously for task completion and print output |
 | `--json` | `false` | Emit submission/result output as JSON |
@@ -529,7 +529,9 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_P2P_TICKET_FILE` | Master | File path where generated P2P ticket string is written (`--p2p-ticket-file`) |
 | `RUSTY_GRID_P2P_KEY_FILE` | Master | File path where master P2P identity key is persisted (`--p2p-key-file`) |
 | `RUSTY_GRID_EPHEMERAL_KEY` | Master | Forces generation of ephemeral P2P key without file persistence (`--ephemeral-key`) |
-| `RUSTY_GRID_WIRE_CODEC` | Master & Worker | Read by `resolve_string` in `cli_app.rs` (`:1246`, `:1525`), but currently shadowed by clap's `default_value = "bincode"` on `--wire-codec` (pass `--wire-codec` on the command line instead) |
+| `RUSTY_GRID_MAX_QUEUE_SIZE` | Master | Maximum active (non-terminal) tasks held in the queue (`--max-queue-size`; minimum `1`) |
+| `RUSTY_GRID_SCHEDULER_POLICY` | Master | Load-balancing policy (`--scheduler-policy`: `weighted`, `least-loaded`, or `round-robin`; default `weighted`) |
+| `RUSTY_GRID_WIRE_CODEC` | Master & Worker | Wire format serialization codec (`--wire-codec`: `bincode` or `json`; default `bincode`) |
 | `RUSTY_GRID_DEFAULT_RETRY_MAX` | Master | Default task retry ceiling on failure (`--default-retry-max`; default `3`) |
 | `RUSTY_GRID_MAX_RETRIES` | Master | Secondary alias for default task retry ceiling (`--max-retries`) |
 | `RUSTY_GRID_MAX_RETAINED_TASKS` | Master | Maximum count of finished tasks retained in memory (`--max-retained-tasks`; default `10000`) |

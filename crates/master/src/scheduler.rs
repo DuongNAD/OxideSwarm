@@ -52,6 +52,37 @@ pub enum SchedulingPolicy {
     RoundRobin,
 }
 
+impl SchedulingPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::WeightedLeastLoaded => "weighted",
+            Self::LeastLoaded => "least-loaded",
+            Self::RoundRobin => "round-robin",
+        }
+    }
+}
+
+impl std::fmt::Display for SchedulingPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SchedulingPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "weighted" | "weighted-least-loaded" => Ok(Self::WeightedLeastLoaded),
+            "least-loaded" | "leastloaded" => Ok(Self::LeastLoaded),
+            "round-robin" | "roundrobin" | "rr" => Ok(Self::RoundRobin),
+            other => Err(format!(
+                "Unknown scheduler policy '{other}' (expected 'weighted', 'least-loaded', or 'round-robin')"
+            )),
+        }
+    }
+}
+
 /// Configuration options for the `WorkloadScheduler`.
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {

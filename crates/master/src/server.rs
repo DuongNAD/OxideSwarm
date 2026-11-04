@@ -121,6 +121,8 @@ pub struct ServerConfig {
     /// Byte cap for active (non-terminal) tasks in the queue
     /// (default: [`DEFAULT_MAX_ACTIVE_BYTES`], 256 MiB).
     pub max_active_bytes: usize,
+    /// Optional task-count capacity for active (non-terminal) tasks in the queue (`None` = unbounded by count).
+    pub max_queue_size: Option<usize>,
     /// Tasks of one Map/Reduce job submitted at once (default: [`DEFAULT_MAPREDUCE_PARALLELISM`]);
     /// keep it above the cluster's total slots so every device works.
     pub mapreduce_parallelism: usize,
@@ -175,6 +177,7 @@ impl Default for ServerConfig {
             max_terminal_tasks: DEFAULT_MAX_TERMINAL_TASKS,
             max_terminal_bytes: DEFAULT_MAX_TERMINAL_BYTES,
             max_active_bytes: DEFAULT_MAX_ACTIVE_BYTES,
+            max_queue_size: None,
             mapreduce_parallelism: DEFAULT_MAPREDUCE_PARALLELISM,
             implicit_local_dashboard: false,
             rendezvous_url: None,
@@ -363,6 +366,12 @@ impl ServerConfig {
         self
     }
 
+    /// Sets the task-count cap of active (non-terminal) tasks in the queue (`None` = unbounded by count).
+    pub fn with_max_queue_size(mut self, max: Option<usize>) -> Self {
+        self.max_queue_size = max;
+        self
+    }
+
     /// Sets how many tasks of one Map/Reduce job may be in flight at once (at least 1).
     pub fn with_mapreduce_parallelism(mut self, parallelism: usize) -> Self {
         self.mapreduce_parallelism = parallelism.max(1);
@@ -454,7 +463,7 @@ impl MasterServer {
     pub async fn bind(config: ServerConfig, registry: WorkerRegistry) -> GridResult<Self> {
         let queue = TaskQueue::with_retention_limits(
             crate::queue::RetryPolicy::default(),
-            None,
+            config.max_queue_size,
             config.max_terminal_tasks,
             config.max_terminal_bytes,
             config.max_active_bytes,
@@ -638,7 +647,7 @@ impl MasterServer {
         };
         let queue = TaskQueue::with_retention_limits(
             retry_policy,
-            None,
+            config.max_queue_size,
             config.max_terminal_tasks,
             config.max_terminal_bytes,
             config.max_active_bytes,
@@ -3180,7 +3189,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // Authenticated and speaking: this peer no longer counts against the pre-auth budget.
     drop(handshake_permit);
 
-    transport.set_outbound_codec(detected_codec);
+    if wire_codec == WireCodec::Bincode {
+        transport.set_outbound_codec(detected_codec);
+    }
 
     let worker_msg = match first_msg {
         InboundMessage::Client(client_msg) => {
@@ -3849,7 +3860,9 @@ async fn handle_multiplexed_connection<
     .await?;
     drop(handshake_permit);
 
-    ctrl_transport.set_outbound_codec(detected_codec);
+    if wire_codec == WireCodec::Bincode {
+        ctrl_transport.set_outbound_codec(detected_codec);
+    }
 
     let worker_msg = match first_msg {
         InboundMessage::Worker(wm) => wm,
