@@ -12,11 +12,15 @@ use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
+use tokio_rustls::rustls::pki_types::CertificateDer;
+use tokio_tungstenite::{
+    connect_async_tls_with_config, tungstenite::protocol::Message as WsMessage, Connector,
+};
 use tracing::{info, warn};
 
 /// How long `connect` waits for the hub to accept or reject the registration before it carries on
@@ -45,12 +49,59 @@ impl fmt::Display for RegistrationRejected {
 
 impl std::error::Error for RegistrationRejected {}
 
+/// Parses one or more X.509 certificates from PEM (`-----BEGIN CERTIFICATE-----`) or raw DER bytes.
+pub(crate) fn parse_certificates_pem_or_der(
+    raw: &[u8],
+) -> Result<Vec<CertificateDer<'static>>, Box<dyn std::error::Error + Send + Sync>> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let trimmed = raw
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .map_or(&[][..], |idx| &raw[idx..]);
+    if trimmed.is_empty() {
+        return Err("TLS CA certificate data is empty".into());
+    }
+    if trimmed.starts_with(b"-----BEGIN") {
+        let pem_str = std::str::from_utf8(trimmed)
+            .map_err(|e| format!("TLS CA PEM is not valid UTF-8: {e}"))?;
+        const BEGIN_TAG: &str = "-----BEGIN CERTIFICATE-----";
+        const END_TAG: &str = "-----END CERTIFICATE-----";
+        let mut certs = Vec::new();
+        let mut rest = pem_str;
+        while let Some(start_idx) = rest.find(BEGIN_TAG) {
+            let after_begin = &rest[start_idx + BEGIN_TAG.len()..];
+            let end_idx = after_begin
+                .find(END_TAG)
+                .ok_or("unterminated -----BEGIN CERTIFICATE----- block in TLS CA PEM")?;
+            let b64_body: String = after_begin[..end_idx]
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
+            let der = STANDARD
+                .decode(&b64_body)
+                .map_err(|e| format!("invalid base64 in TLS CA PEM certificate: {e}"))?;
+            certs.push(CertificateDer::from(der));
+            rest = &after_begin[end_idx + END_TAG.len()..];
+        }
+        if certs.is_empty() {
+            return Err("no -----BEGIN CERTIFICATE----- block found in TLS CA PEM".into());
+        }
+        Ok(certs)
+    } else {
+        Ok(vec![CertificateDer::from(raw.to_vec())])
+    }
+}
+
 pub struct AgentMeshClient {
     hub_url: String,
     node_id: String,
     platform: String,
     hostname: String,
     token: Option<String>,
+    tls_ca_bytes: Option<Vec<u8>>,
+    tls_ca_file: Option<PathBuf>,
     tx: Arc<RwLock<Option<mpsc::UnboundedSender<WsMessage>>>>,
     pending: Arc<RwLock<HashMap<CorrelationId, oneshot::Sender<AgentMeshEnvelope>>>>,
     received_payloads: Arc<RwLock<Vec<AgentMeshEnvelope>>>,
@@ -72,6 +123,8 @@ impl AgentMeshClient {
             platform: platform.into(),
             hostname,
             token: None,
+            tls_ca_bytes: None,
+            tls_ca_file: None,
             tx: Arc::new(RwLock::new(None)),
             pending: Arc::new(RwLock::new(HashMap::new())),
             received_payloads: Arc::new(RwLock::new(Vec::new())),
@@ -85,6 +138,20 @@ impl AgentMeshClient {
     /// here). Needed for any hub started with a token.
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
+        self
+    }
+
+    /// Adds a custom trusted root CA certificate (PEM or DER bytes) for `wss://` connections
+    /// behind a private TLS-terminating proxy.
+    pub fn with_tls_ca_pem(mut self, pem_or_der: impl Into<Vec<u8>>) -> Self {
+        self.tls_ca_bytes = Some(pem_or_der.into());
+        self
+    }
+
+    /// Adds a custom trusted root CA certificate file (PEM or DER) for `wss://` connections
+    /// behind a private TLS-terminating proxy (`--tls-ca` / `OXIDE_MESH_TLS_CA`).
+    pub fn with_tls_ca_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.tls_ca_file = Some(path.into());
         self
     }
 
@@ -114,10 +181,69 @@ impl AgentMeshClient {
         self.received_payloads.read().await.clone()
     }
 
+    fn build_tls_connector(
+        &self,
+    ) -> Result<Option<Connector>, Box<dyn std::error::Error + Send + Sync>> {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        if !self
+            .hub_url
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("wss://")
+        {
+            return Ok(None);
+        }
+
+        let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
+        let native = rustls_native_certs::load_native_certs();
+        if !native.errors.is_empty() {
+            warn!(
+                "native root CA certificate loading warnings: {:?}",
+                native.errors
+            );
+        }
+        root_store.add_parsable_certificates(native.certs);
+
+        if let Some(ref ca_path) = self.tls_ca_file {
+            let file_bytes = std::fs::read(ca_path).map_err(|e| {
+                format!(
+                    "failed to read TLS CA certificate file '{}': {e}",
+                    ca_path.display()
+                )
+            })?;
+            for cert in parse_certificates_pem_or_der(&file_bytes)? {
+                root_store.add(cert).map_err(|e| {
+                    format!("invalid TLS CA certificate in '{}': {e}", ca_path.display())
+                })?;
+            }
+        }
+
+        if let Some(ref ca_bytes) = self.tls_ca_bytes {
+            for cert in parse_certificates_pem_or_der(ca_bytes)? {
+                root_store
+                    .add(cert)
+                    .map_err(|e| format!("invalid custom TLS CA certificate: {e}"))?;
+            }
+        }
+
+        if root_store.is_empty() {
+            return Err("no root CA certificates available for wss:// connection".into());
+        }
+
+        let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+        let client_config = tokio_rustls::rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        Ok(Some(Connector::Rustls(Arc::new(client_config))))
+    }
+
     /// Establishes the WebSocket connection to the Hub and spawns the read/write message pump.
     pub async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Connecting to OxideRelay Hub at {}...", self.hub_url);
-        let (ws_stream, _) = connect_async(&self.hub_url).await?;
+        let connector = self.build_tls_connector()?;
+        let (ws_stream, _) =
+            connect_async_tls_with_config(&self.hub_url, None, false, connector).await?;
         let (mut ws_write, mut ws_read) = ws_stream.split();
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<WsMessage>();
@@ -876,6 +1002,159 @@ mod tests {
         }
 
         node1.close().await;
+        hub.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_client_wss_connect_via_tls_terminating_proxy() {
+        use crate::hub::HubConfig;
+        use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio_rustls::TlsAcceptor;
+
+        // 2-tier test PKI (Root CA + Leaf Server cert for DNS:localhost, IP:127.0.0.1, valid 2020-2050).
+        const TEST_CA_CERT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----\n\
+MIIBjDCCATOgAwIBAgIUMlvNj4y57eOdSdZ0r3zcxjAFbsEwCgYIKoZIzj0EAwIw\n\
+IjEgMB4GA1UEAwwXT3hpZGVTd2FybSBUZXN0IFJvb3QgQ0EwIBcNMjAwMTAxMDAw\n\
+MDAwWhgPMjA1MDAxMDEwMDAwMDBaMCIxIDAeBgNVBAMMF094aWRlU3dhcm0gVGVz\n\
+dCBSb290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAETY444lJJMdAHeSBX\n\
+wvPTkiv45m+/eJ6yVHgPlPuUX9m8okW4kjqTD5JhXNvCB2dPKdD+YboTZQIZeVj8\n\
+xvFfaqNFMEMwEgYDVR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8BAf8EBAMCAQYwHQYD\n\
+VR0OBBYEFHy5T82QT2/9zkmoxGs/EjRZJFl3MAoGCCqGSM49BAMCA0cAMEQCIFRj\n\
+apldfOTWEx06cpnXJqHJo+VoxgE/Kip8CHjM9y+8AiBXTzOUhosxsPqhV34Twqsh\n\
+zC9OUvrQtLpd8bRPrinEaw==\n\
+-----END CERTIFICATE-----\n";
+
+        const TEST_LEAF_CERT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----\n\
+MIIBzjCCAXOgAwIBAgIUUngAWhOYIllPM97OedSgO69AqggwCgYIKoZIzj0EAwIw\n\
+IjEgMB4GA1UEAwwXT3hpZGVTd2FybSBUZXN0IFJvb3QgQ0EwIBcNMjAwMTAxMDAw\n\
+MDAwWhgPMjA1MDAxMDEwMDAwMDBaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMG\n\
+ByqGSM49AgEGCCqGSM49AwEHA0IABDRXTWxzNcmvNTWMWev+xvyil1XahAIRL25i\n\
+FA4SYwmDLzzEN5mFBqKK0KCT/Ox9oFgpGYuWEGxpU+wdDUvYYA+jgZIwgY8wDAYD\n\
+VR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEw\n\
+GgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMB0GA1UdDgQWBBSaFp2p2iStfj9f\n\
+ho6ZsLnbdGGrETAfBgNVHSMEGDAWgBR8uU/NkE9v/c5JqMRrPxI0WSRZdzAKBggq\n\
+hkjOPQQDAgNJADBGAiEAyFra27z7uxhofsgb4SnBNVIM5ZqfLzKUiC5oW7PwAmgC\n\
+IQCZvZxY711l2QX2kji8K/IW8724U/QAjTP++GTg4BTeUQ==\n\
+-----END CERTIFICATE-----\n";
+
+        const TEST_LEAF_KEY_PKCS8_DER: &[u8] = &[
+            0x30, 0x81, 0x87, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce,
+            0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04,
+            0x6d, 0x30, 0x6b, 0x02, 0x01, 0x01, 0x04, 0x20, 0x78, 0x7d, 0x64, 0x9a, 0x2b, 0xa3,
+            0x08, 0x44, 0xc1, 0x8b, 0xe7, 0xe9, 0xbd, 0x19, 0xbc, 0x58, 0xfd, 0x81, 0xec, 0x75,
+            0x0f, 0x86, 0xa9, 0x1d, 0x46, 0x71, 0x02, 0xa5, 0x68, 0x9b, 0x0f, 0x20, 0xa1, 0x44,
+            0x03, 0x42, 0x00, 0x04, 0x34, 0x57, 0x4d, 0x6c, 0x73, 0x35, 0xc9, 0xaf, 0x35, 0x35,
+            0x8c, 0x59, 0xeb, 0xfe, 0xc6, 0xfc, 0xa2, 0x97, 0x55, 0xda, 0x84, 0x02, 0x11, 0x2f,
+            0x6e, 0x62, 0x14, 0x0e, 0x12, 0x63, 0x09, 0x83, 0x2f, 0x3c, 0xc4, 0x37, 0x99, 0x85,
+            0x06, 0xa2, 0x8a, 0xd0, 0xa0, 0x93, 0xfc, 0xec, 0x7d, 0xa0, 0x58, 0x29, 0x19, 0x8b,
+            0x96, 0x10, 0x6c, 0x69, 0x53, 0xec, 0x1d, 0x0d, 0x4b, 0xd8, 0x60, 0x0f,
+        ];
+
+        let hub_token = "mesh-wss-proxy-secret-token-0123456789";
+        let hub = AgentMeshHub::with_config(HubConfig::default().with_auth_token(hub_token));
+        let hub_port = hub.start("127.0.0.1:0").await.expect("Hub failed to start");
+
+        let leaf_certs = parse_certificates_pem_or_der(TEST_LEAF_CERT_PEM.as_bytes()).unwrap();
+        let leaf_key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(TEST_LEAF_KEY_PKCS8_DER.to_vec()));
+        let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+        let server_config = tokio_rustls::rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(leaf_certs, leaf_key)
+            .expect("valid test server TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind TLS proxy");
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        let proxy_task = tokio::spawn(async move {
+            while let Ok((inbound, _)) = proxy_listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tls_stream) = acceptor.accept(inbound).await {
+                        if let Ok(mut upstream) =
+                            tokio::net::TcpStream::connect(("127.0.0.1", hub_port)).await
+                        {
+                            let _ =
+                                tokio::io::copy_bidirectional(&mut tls_stream, &mut upstream).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let wss_url = format!("wss://localhost:{proxy_port}/ws");
+
+        // 1. Without trusting the proxy CA, TLS certificate verification must reject the connection.
+        let untrusted_client =
+            AgentMeshClient::new(&wss_url, "untrusted-node", "windows").with_token(hub_token);
+        let untrusted_err = untrusted_client
+            .connect()
+            .await
+            .expect_err("untrusted TLS proxy cert must be rejected");
+        assert!(
+            !untrusted_err.to_string().contains("TlsFeatureNotEnabled"),
+            "TLS feature must be enabled, got: {untrusted_err}"
+        );
+
+        // 2. With the proxy CA trusted via PEM bytes and via a CA file, nodes register and route commands over wss://.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let ca_file = tmp_dir.path().join("mesh-proxy-ca.pem");
+        std::fs::write(&ca_file, TEST_CA_CERT_PEM).unwrap();
+
+        let node1 = AgentMeshClient::new(&wss_url, "wss-sender", "windows")
+            .with_token(hub_token)
+            .with_tls_ca_pem(TEST_CA_CERT_PEM.as_bytes().to_vec());
+        let node2 = AgentMeshClient::new(&wss_url, "wss-executor", "linux")
+            .with_token(hub_token)
+            .with_tls_ca_file(&ca_file);
+
+        node1
+            .connect()
+            .await
+            .expect("node1 wss:// connection must succeed");
+        node2
+            .connect()
+            .await
+            .expect("node2 wss:// connection must succeed");
+
+        let nodes = node1
+            .query_node_list(Some(3000))
+            .await
+            .expect("query_node_list over wss:// must succeed");
+        assert_eq!(nodes.len(), 2);
+
+        let res = node1
+            .send_command(
+                "wss-executor",
+                "echo",
+                serde_json::json!({"message": "Hello over TLS wss://"}),
+                Some(3000),
+            )
+            .await
+            .expect("send_command over wss:// must succeed");
+        match res {
+            AgentMeshEnvelope::CommandResponse {
+                status,
+                exit_code,
+                stdout,
+                ..
+            } => {
+                assert_eq!(status, "success");
+                assert_eq!(exit_code, 0);
+                assert_eq!(stdout, "Hello over TLS wss://");
+            }
+            other => panic!("Expected CommandResponse over wss://, got {other:?}"),
+        }
+
+        node1.close().await;
+        node2.close().await;
+        proxy_task.abort();
         hub.stop().await;
     }
 }

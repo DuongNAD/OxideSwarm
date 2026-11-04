@@ -6,8 +6,9 @@ The **OxideSwarm Agent Mesh** is a communication layer enabling coding agents an
 > arbitrary programs, with the rights of the account the node runs under. The hub therefore:
 > * listens on `127.0.0.1:8088` by default; a non-loopback `--listen` needs `--token` (or `OXIDE_MESH_TOKEN`),
 >   or the explicit `--insecure` flag, which lets anyone who reaches the port run commands on every node;
-> * does **not** encrypt: `ws://` sends the token and every command in clear text. Use `wss://` behind a TLS
->   proxy, or a VPN / SSH tunnel;
+> * does **not** encrypt on its own listener: `ws://` sends the token and every command in clear text. Use `wss://`
+>   behind a TLS-terminating proxy (pass `--tls-ca <PEM/DER>` / `OXIDE_MESH_TLS_CA` when the proxy uses a private CA),
+>   or a VPN / SSH tunnel;
 > * must **never be published to the Internet** (no quick tunnels, no router port forward).
 >
 > This mesh is separate from the compute grid (master/workers, `README.md`), which has its own cluster secret and encrypts post-handshake TCP traffic via ChaCha20-Poly1305 (`0x04`).

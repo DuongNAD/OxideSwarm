@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_master::server::{MasterServer, ServerConfig};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, Level};
@@ -81,6 +81,11 @@ pub enum Commands {
         #[arg(long, env = "OXIDE_MESH_TOKEN", hide_env_values = true)]
         token: Option<String>,
 
+        /// Path to an additional trusted CA certificate (PEM or DER) for `wss://` hubs behind a
+        /// private TLS-terminating proxy
+        #[arg(long, env = "OXIDE_MESH_TLS_CA")]
+        tls_ca: Option<PathBuf>,
+
         /// Disable shell command execution (refuse shell_exec)
         #[arg(long)]
         no_shell: bool,
@@ -115,6 +120,11 @@ pub enum Commands {
         /// Hub token (visible in `ps`; prefer the OXIDE_MESH_TOKEN environment variable)
         #[arg(long, env = "OXIDE_MESH_TOKEN", hide_env_values = true)]
         token: Option<String>,
+
+        /// Path to an additional trusted CA certificate (PEM or DER) for `wss://` hubs behind a
+        /// private TLS-terminating proxy
+        #[arg(long, env = "OXIDE_MESH_TLS_CA")]
+        tls_ca: Option<PathBuf>,
     },
 
     /// Query the catalog of active nodes connected to the Hub
@@ -130,6 +140,11 @@ pub enum Commands {
         /// Hub token (visible in `ps`; prefer the OXIDE_MESH_TOKEN environment variable)
         #[arg(long, env = "OXIDE_MESH_TOKEN", hide_env_values = true)]
         token: Option<String>,
+
+        /// Path to an additional trusted CA certificate (PEM or DER) for `wss://` hubs behind a
+        /// private TLS-terminating proxy
+        #[arg(long, env = "OXIDE_MESH_TLS_CA")]
+        tls_ca: Option<PathBuf>,
     },
 
     /// Send a data payload to a target node with SHA-256 validation
@@ -153,6 +168,11 @@ pub enum Commands {
         /// Hub token (visible in `ps`; prefer the OXIDE_MESH_TOKEN environment variable)
         #[arg(long, env = "OXIDE_MESH_TOKEN", hide_env_values = true)]
         token: Option<String>,
+
+        /// Path to an additional trusted CA certificate (PEM or DER) for `wss://` hubs behind a
+        /// private TLS-terminating proxy
+        #[arg(long, env = "OXIDE_MESH_TLS_CA")]
+        tls_ca: Option<PathBuf>,
     },
 }
 
@@ -162,18 +182,22 @@ fn client_token(token: Option<String>) -> Option<String> {
     token.filter(|t| !t.is_empty())
 }
 
-/// Builds a client for `hub_url`, presenting `token` if there is one.
+/// Builds a client for `hub_url`, presenting `token` and `tls_ca` if provided.
 fn build_client(
     hub_url: &str,
     node_id: &str,
     platform: &str,
     token: Option<String>,
+    tls_ca: Option<PathBuf>,
 ) -> AgentMeshClient {
-    let client = AgentMeshClient::new(hub_url, node_id, platform);
-    match client_token(token) {
-        Some(t) => client.with_token(t),
-        None => client,
+    let mut client = AgentMeshClient::new(hub_url, node_id, platform);
+    if let Some(t) = client_token(token) {
+        client = client.with_token(t);
     }
+    if let Some(ca) = tls_ca.filter(|p| !p.as_os_str().is_empty()) {
+        client = client.with_tls_ca_file(ca);
+    }
+    client
 }
 
 /// The cluster secret for the master that `hub --grid-master` embeds.
@@ -345,6 +369,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             id,
             platform,
             token,
+            tls_ca,
             no_shell,
         } => {
             let host_os = std::env::consts::OS.to_string();
@@ -363,7 +388,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             println!();
 
-            let mut client = build_client(&hub, &node_id, &plat, token);
+            let mut client = build_client(&hub, &node_id, &plat, token, tls_ca);
             if no_shell {
                 client = client.with_no_shell(true);
             }
@@ -378,13 +403,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             args,
             timeout_ms,
             token,
+            tls_ca,
         } => {
             let parsed_args: serde_json::Value = match serde_json::from_str(&args) {
                 Ok(v) => v,
                 Err(_) => serde_json::json!({ "cmd": args }),
             };
 
-            let client = build_client(&hub, &from, std::env::consts::OS, token);
+            let client = build_client(&hub, &from, std::env::consts::OS, token, tls_ca);
             client.connect().await?;
             tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -433,8 +459,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             client.close().await;
         }
 
-        Commands::List { hub, from, token } => {
-            let client = build_client(&hub, &from, std::env::consts::OS, token);
+        Commands::List {
+            hub,
+            from,
+            token,
+            tls_ca,
+        } => {
+            let client = build_client(&hub, &from, std::env::consts::OS, token, tls_ca);
             client.connect().await?;
             tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -455,8 +486,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             to,
             payload,
             token,
+            tls_ca,
         } => {
-            let client = build_client(&hub, &from, std::env::consts::OS, token);
+            let client = build_client(&hub, &from, std::env::consts::OS, token, tls_ca);
             client.connect().await?;
             tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -552,5 +584,25 @@ mod tests {
         let err = grid_master_max_active_bytes(Some(0))
             .expect_err("0 MiB active cap must be refused at start");
         assert!(err.to_string().contains("at least 1 MiB"), "{err}");
+    }
+
+    #[test]
+    fn client_commands_accept_tls_ca_flag() {
+        let cli = Cli::try_parse_from([
+            "agent-mesh",
+            "node",
+            "--hub",
+            "wss://localhost:8443/ws",
+            "--tls-ca",
+            "proxy-ca.pem",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Node { hub, tls_ca, .. } => {
+                assert_eq!(hub, "wss://localhost:8443/ws");
+                assert_eq!(tls_ca.as_deref(), Some(Path::new("proxy-ca.pem")));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
