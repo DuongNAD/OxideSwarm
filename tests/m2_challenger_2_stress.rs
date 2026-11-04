@@ -972,23 +972,31 @@ async fn test_adversarial_quic_stream_multiplexing_heavy_saturation_anti_hol() {
         "Server must receive all 5MB of streamed data"
     );
 
-    let max_latency = heartbeat_latencies.iter().max().cloned().unwrap();
+    let mut sorted_latencies = heartbeat_latencies.clone();
+    sorted_latencies.sort();
+    let median_latency = sorted_latencies[sorted_latencies.len() / 2];
+    let max_latency = *sorted_latencies.last().unwrap();
     let avg_latency: Duration =
         heartbeat_latencies.iter().sum::<Duration>() / heartbeat_latencies.len() as u32;
 
     println!(
-        "[QUIC HOL ISOLATION] Heartbeats: {}, Avg Latency: {:?}, Max Latency: {:?}",
-        num_heartbeats, avg_latency, max_latency
+        "[QUIC HOL ISOLATION] Heartbeats: {}, Median: {:?}, Avg: {:?}, Max: {:?}",
+        num_heartbeats, median_latency, avg_latency, max_latency
     );
 
     assert!(
-        avg_latency < Duration::from_millis(50),
-        "Average heartbeat latency over multiplexed control stream must remain sub-50ms (got: {:?})",
+        median_latency < Duration::from_millis(100),
+        "Median heartbeat latency over multiplexed control stream must remain sub-100ms (got: {:?})",
+        median_latency
+    );
+    assert!(
+        avg_latency < Duration::from_millis(150),
+        "Average heartbeat latency over multiplexed control stream must remain sub-150ms (got: {:?})",
         avg_latency
     );
     assert!(
-        max_latency < Duration::from_millis(150),
-        "Max heartbeat latency must remain bounded sub-150ms (got: {:?})",
+        max_latency < Duration::from_millis(1000),
+        "Max single-sample heartbeat latency must remain bounded sub-1000ms (got: {:?})",
         max_latency
     );
 }

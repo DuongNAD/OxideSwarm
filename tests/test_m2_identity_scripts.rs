@@ -17,109 +17,133 @@ use rusty_grid_master::server::{default_master_key_file, MasterServer, ServerCon
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 
 /// Test 1: Verifies that when P2P is enabled without an explicit key file, Master
-/// automatically defaults to ~/.oxideswarm/master_key.bin and produces identical tickets.
+/// automatically defaults to ~/.oxideswarm/master_key.bin and produces tickets with the same node id.
 #[tokio::test]
 async fn test_0_config_master_secret_key_persistence() {
+    const CHILD_MODE_ENV: &str = "OXIDESWARM_TEST_0_CONFIG_MODE";
+
+    match std::env::var(CHILD_MODE_ENV).as_deref() {
+        Ok("oxideswarm_home_override") => {
+            let custom_ox_dir = PathBuf::from(
+                std::env::var_os("OXIDESWARM_HOME").expect("OXIDESWARM_HOME set in child process"),
+            );
+            assert_eq!(
+                default_master_key_file().expect("default key with OXIDESWARM_HOME"),
+                custom_ox_dir.join("master_key.bin")
+            );
+            return;
+        }
+        Ok("home_default") => {
+            let mock_home =
+                PathBuf::from(std::env::var_os("HOME").expect("HOME set in child process"));
+            let default_key = default_master_key_file().expect("default key path resolved");
+            assert_eq!(
+                default_key,
+                mock_home.join(".oxideswarm").join("master_key.bin"),
+                "Default key must point to ~/.oxideswarm/master_key.bin"
+            );
+
+            let ticket_file1 = mock_home.join("master1.ticket");
+            let master_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+            // Run 1: 0-config P2P (no p2p_key_file specified)
+            let config1 = ServerConfig::new(master_bind)
+                .with_p2p(true)
+                .with_p2p_ticket_file(&ticket_file1);
+
+            let master1 = MasterServer::spawn(config1).await.expect("spawn master 1");
+            let ticket1 = tokio::fs::read_to_string(&ticket_file1)
+                .await
+                .expect("read ticket 1");
+
+            // Verify master_key.bin was created and is 32 bytes
+            assert!(
+                default_key.exists(),
+                "Default master_key.bin must exist after master startup"
+            );
+            let key_data = tokio::fs::read(&default_key)
+                .await
+                .expect("read default key");
+            assert_eq!(
+                key_data.len(),
+                32,
+                "Secret key must be a genuine 32-byte Ed25519 binary key"
+            );
+
+            master1.shutdown().expect("shutdown master 1");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            // Run 2: Restart Master with 0-config P2P
+            let ticket_file2 = mock_home.join("master2.ticket");
+            let config2 = ServerConfig::new(master_bind)
+                .with_p2p(true)
+                .with_p2p_ticket_file(&ticket_file2);
+
+            let master2 = MasterServer::spawn(config2).await.expect("spawn master 2");
+            let ticket2 = tokio::fs::read_to_string(&ticket_file2)
+                .await
+                .expect("read ticket 2");
+
+            let addr1 = rusty_grid_core::transport::parse_p2p_ticket(ticket1.trim())
+                .expect("parse ticket 1");
+            let addr2 = rusty_grid_core::transport::parse_p2p_ticket(ticket2.trim())
+                .expect("parse ticket 2");
+            assert_eq!(
+                addr1.id, addr2.id,
+                "P2P ticket node id must be deterministic across master restarts using default key persistence"
+            );
+
+            master2.shutdown().expect("shutdown master 2");
+            return;
+        }
+        _ => {}
+    }
+
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let mock_home = temp_dir.path().join("mock_user_home");
     std::fs::create_dir_all(&mock_home).expect("create mock home");
-
-    struct EnvGuard {
-        orig_home: Option<std::ffi::OsString>,
-        orig_userprofile: Option<std::ffi::OsString>,
-        orig_oxideswarm_home: Option<std::ffi::OsString>,
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.orig_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match &self.orig_userprofile {
-                Some(v) => std::env::set_var("USERPROFILE", v),
-                None => std::env::remove_var("USERPROFILE"),
-            }
-            match &self.orig_oxideswarm_home {
-                Some(v) => std::env::set_var("OXIDESWARM_HOME", v),
-                None => std::env::remove_var("OXIDESWARM_HOME"),
-            }
-        }
-    }
-
-    let _guard = EnvGuard {
-        orig_home: std::env::var_os("HOME"),
-        orig_userprofile: std::env::var_os("USERPROFILE"),
-        orig_oxideswarm_home: std::env::var_os("OXIDESWARM_HOME"),
-    };
-
-    // Override HOME and USERPROFILE for isolated test execution, and ensure OXIDESWARM_HOME does not leak
-    std::env::set_var("HOME", &mock_home);
-    std::env::set_var("USERPROFILE", &mock_home);
-    std::env::remove_var("OXIDESWARM_HOME");
-
-    let default_key = default_master_key_file().expect("default key path resolved");
-    assert_eq!(
-        default_key,
-        mock_home.join(".oxideswarm").join("master_key.bin"),
-        "Default key must point to ~/.oxideswarm/master_key.bin"
-    );
-
-    // Verify OXIDESWARM_HOME override takes precedence
     let custom_ox_dir = temp_dir.path().join("custom_oxideswarm");
-    std::env::set_var("OXIDESWARM_HOME", &custom_ox_dir);
-    assert_eq!(
-        default_master_key_file().expect("default key with OXIDESWARM_HOME"),
-        custom_ox_dir.join("master_key.bin")
-    );
-    std::env::remove_var("OXIDESWARM_HOME");
+    let current_exe = std::env::current_exe().expect("resolve current test binary");
 
-    let ticket_file1 = temp_dir.path().join("master1.ticket");
-    let master_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-
-    // Run 1: 0-config P2P (no p2p_key_file specified)
-    let config1 = ServerConfig::new(master_bind)
-        .with_p2p(true)
-        .with_p2p_ticket_file(&ticket_file1);
-
-    let master1 = MasterServer::spawn(config1).await.expect("spawn master 1");
-    let ticket1 = tokio::fs::read_to_string(&ticket_file1)
-        .await
-        .expect("read ticket 1");
-
-    // Verify master_key.bin was created and is 32 bytes
+    // Verify OXIDESWARM_HOME override takes precedence in a child process with its own env
+    let override_out = Command::new(&current_exe)
+        .args([
+            "--exact",
+            "test_0_config_master_secret_key_persistence",
+            "--nocapture",
+        ])
+        .env(CHILD_MODE_ENV, "oxideswarm_home_override")
+        .env("HOME", &mock_home)
+        .env("USERPROFILE", &mock_home)
+        .env("OXIDESWARM_HOME", &custom_ox_dir)
+        .output()
+        .expect("spawn child for OXIDESWARM_HOME override");
     assert!(
-        default_key.exists(),
-        "Default master_key.bin must exist after master startup"
-    );
-    let key_data = tokio::fs::read(&default_key)
-        .await
-        .expect("read default key");
-    assert_eq!(
-        key_data.len(),
-        32,
-        "Secret key must be a genuine 32-byte Ed25519 binary key"
+        override_out.status.success(),
+        "OXIDESWARM_HOME child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&override_out.stdout),
+        String::from_utf8_lossy(&override_out.stderr)
     );
 
-    master1.shutdown().expect("shutdown master 1");
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Run 2: Restart Master with 0-config P2P
-    let ticket_file2 = temp_dir.path().join("master2.ticket");
-    let config2 = ServerConfig::new(master_bind)
-        .with_p2p(true)
-        .with_p2p_ticket_file(&ticket_file2);
-
-    let master2 = MasterServer::spawn(config2).await.expect("spawn master 2");
-    let ticket2 = tokio::fs::read_to_string(&ticket_file2)
-        .await
-        .expect("read ticket 2");
-
-    assert_eq!(
-        ticket1, ticket2,
-        "P2P ticket must be 100% deterministic across master restarts using default key persistence"
+    // Verify 0-config default HOME persistence and node id stability in a child process with its own HOME
+    let home_out = Command::new(&current_exe)
+        .args([
+            "--exact",
+            "test_0_config_master_secret_key_persistence",
+            "--nocapture",
+        ])
+        .env(CHILD_MODE_ENV, "home_default")
+        .env("HOME", &mock_home)
+        .env("USERPROFILE", &mock_home)
+        .env_remove("OXIDESWARM_HOME")
+        .output()
+        .expect("spawn child for 0-config HOME default");
+    assert!(
+        home_out.status.success(),
+        "0-config HOME child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&home_out.stdout),
+        String::from_utf8_lossy(&home_out.stderr)
     );
-
-    master2.shutdown().expect("shutdown master 2");
 }
 
 /// Test 2: Verifies that upon Master restart, the Worker automatically reconnects

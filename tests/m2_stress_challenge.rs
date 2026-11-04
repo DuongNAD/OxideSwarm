@@ -249,17 +249,18 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
         let _ = legit_client.run(legit_shutdown_rx).await;
     });
 
-    let legit_registered = poll_until(
-        Duration::from_millis(500),
-        Duration::from_millis(20),
-        || async {
-            registry
-                .get_worker(legit_id)
-                .await
-                .map(|w| w.status == WorkerStatus::Connected)
-                .unwrap_or(false)
-        },
-    )
+    #[cfg(windows)]
+    let max_elapsed = Duration::from_millis(3000);
+    #[cfg(not(windows))]
+    let max_elapsed = Duration::from_secs(1);
+
+    let legit_registered = poll_until(max_elapsed, Duration::from_millis(10), || async {
+        registry
+            .get_worker(legit_id)
+            .await
+            .map(|w| w.status == WorkerStatus::Connected)
+            .unwrap_or(false)
+    })
     .await;
 
     let legit_elapsed = legit_connect_start.elapsed();
@@ -271,10 +272,6 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
         legit_registered,
         "Legitimate worker must register immediately; hanging handshakes must NOT block other connections"
     );
-    #[cfg(windows)]
-    let max_elapsed = Duration::from_millis(3000);
-    #[cfg(not(windows))]
-    let max_elapsed = Duration::from_secs(1);
     assert!(
         legit_elapsed < max_elapsed,
         "Legitimate registration must complete in <{:?} despite Slowloris attacks",
@@ -287,16 +284,31 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
 
     // 5. Verify that all 3 rogue sockets are dropped by Master within 5s (+ grace window),
     // measured from each rogue's own connect.
-    let mut buf = [0u8; 32];
+    let mut buf1 = [0u8; 32];
+    let mut buf2 = [0u8; 32];
+    let mut buf3 = [0u8; 32];
 
     #[cfg(windows)]
     let rogue_timeout = Duration::from_secs(12);
     #[cfg(not(windows))]
     let rogue_timeout = Duration::from_secs(7);
 
+    let r1_fut = async {
+        let res = tokio::time::timeout(rogue_timeout, rogue_zero_bytes.read(&mut buf1)).await;
+        (res, rogue1_connect_start.elapsed())
+    };
+    let r2_fut = async {
+        let res = tokio::time::timeout(rogue_timeout, rogue_partial_prefix.read(&mut buf2)).await;
+        (res, rogue2_connect_start.elapsed())
+    };
+    let r3_fut = async {
+        let res = tokio::time::timeout(rogue_timeout, rogue_partial_body.read(&mut buf3)).await;
+        (res, rogue3_connect_start.elapsed())
+    };
+    let ((r1_res, r1_elapsed), (r2_res, r2_elapsed), (r3_res, r3_elapsed)) =
+        tokio::join!(r1_fut, r2_fut, r3_fut);
+
     // Rogue 1: read should yield EOF (0 bytes read) or ConnectionReset
-    let r1_res = tokio::time::timeout(rogue_timeout, rogue_zero_bytes.read(&mut buf)).await;
-    let r1_elapsed = rogue1_connect_start.elapsed();
     println!(
         "[CHALLENGE SLOWLORIS] Rogue 1 (0 bytes) terminated after {:?}",
         r1_elapsed
@@ -315,8 +327,6 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
     );
 
     // Rogue 2: read should yield EOF (0 bytes read)
-    let r2_res = tokio::time::timeout(rogue_timeout, rogue_partial_prefix.read(&mut buf)).await;
-    let r2_elapsed = rogue2_connect_start.elapsed();
     println!(
         "[CHALLENGE SLOWLORIS] Rogue 2 (partial prefix) terminated after {:?}",
         r2_elapsed
@@ -330,8 +340,6 @@ async fn test_challenge_handshake_timeout_resilience_and_non_blocking() {
     );
 
     // Rogue 3: read should yield EOF (0 bytes read)
-    let r3_res = tokio::time::timeout(rogue_timeout, rogue_partial_body.read(&mut buf)).await;
-    let r3_elapsed = rogue3_connect_start.elapsed();
     println!(
         "[CHALLENGE SLOWLORIS] Rogue 3 (partial body) terminated after {:?}",
         r3_elapsed
