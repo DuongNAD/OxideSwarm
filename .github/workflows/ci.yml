@@ -60,8 +60,9 @@ jobs:
         run: cargo check -p rusty_grid_master --no-default-features --locked
 
   test:
-    # Unit tests only (`ox-mode test quick`). The full `cargo test --workspace` suite is slow and
-    # includes timing-sensitive stress and P2P tests, so it stays a local check.
+    # Workspace unit tests (`cargo test --workspace --lib`), `agent_mesh` sandbox integration tests
+    # (`test_sec6_mesh_sandbox`), and Rust hub + Python agent interop suites (`test_agent_mesh_rust_hub_cross_interop.py`).
+    # The full `cargo test --workspace` suite includes timing-sensitive stress and P2P tests, so it stays a local check.
     name: unit tests (${{ matrix.os }})
     if: github.event_name != 'schedule'
     strategy:
