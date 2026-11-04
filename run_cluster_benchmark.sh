@@ -264,7 +264,7 @@ prepare_phone() {
 }
 start_node_b() {
     if [[ "$PHONE_MODE" == true ]]; then
-        PHONE_WORKER_PID="$(phone_sh "nohup $PHONE_BIN_REMOTE worker --master ${LAN_IP}:${MASTER_PORT} --name $NODE_B_NAME --secret-file $PHONE_SECRET_REMOTE > /data/local/tmp/oxideswarm_bench_worker.log 2>&1 & echo \$!" | tr -d '\r\n')"
+        PHONE_WORKER_PID="$(phone_sh "nohup $PHONE_BIN_REMOTE worker --master ${LAN_IP}:${MASTER_PORT} --name $NODE_B_NAME --secret-file $PHONE_SECRET_REMOTE --sandbox-base-dir /data/local/tmp/rusty_grid/sandboxes > /data/local/tmp/oxideswarm_bench_worker.log 2>&1 & echo \$!" | tr -d '\r\n')"
         [[ "$PHONE_WORKER_PID" =~ ^[0-9]+$ ]] || { log_err "could not start the phone worker"; exit 1; }
     else
         start_local_worker "$NODE_B_NAME" "${WORK}/sandbox_b" "${RAW_LOG_DIR}/node_b_worker.log"
