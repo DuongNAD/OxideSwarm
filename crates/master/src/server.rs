@@ -121,6 +121,8 @@ pub struct ServerConfig {
     /// Byte cap for active (non-terminal) tasks in the queue
     /// (default: [`DEFAULT_MAX_ACTIVE_BYTES`], 256 MiB).
     pub max_active_bytes: usize,
+    /// Optional task-count capacity for active (non-terminal) tasks in the queue (`None` = unbounded by count).
+    pub max_queue_size: Option<usize>,
     /// Tasks of one Map/Reduce job submitted at once (default: [`DEFAULT_MAPREDUCE_PARALLELISM`]);
     /// keep it above the cluster's total slots so every device works.
     pub mapreduce_parallelism: usize,
@@ -175,6 +177,7 @@ impl Default for ServerConfig {
             max_terminal_tasks: DEFAULT_MAX_TERMINAL_TASKS,
             max_terminal_bytes: DEFAULT_MAX_TERMINAL_BYTES,
             max_active_bytes: DEFAULT_MAX_ACTIVE_BYTES,
+            max_queue_size: None,
             mapreduce_parallelism: DEFAULT_MAPREDUCE_PARALLELISM,
             implicit_local_dashboard: false,
             rendezvous_url: None,
@@ -363,6 +366,12 @@ impl ServerConfig {
         self
     }
 
+    /// Sets the task-count cap of active (non-terminal) tasks in the queue (`None` = unbounded by count).
+    pub fn with_max_queue_size(mut self, max: Option<usize>) -> Self {
+        self.max_queue_size = max;
+        self
+    }
+
     /// Sets how many tasks of one Map/Reduce job may be in flight at once (at least 1).
     pub fn with_mapreduce_parallelism(mut self, parallelism: usize) -> Self {
         self.mapreduce_parallelism = parallelism.max(1);
@@ -454,7 +463,7 @@ impl MasterServer {
     pub async fn bind(config: ServerConfig, registry: WorkerRegistry) -> GridResult<Self> {
         let queue = TaskQueue::with_retention_limits(
             crate::queue::RetryPolicy::default(),
-            None,
+            config.max_queue_size,
             config.max_terminal_tasks,
             config.max_terminal_bytes,
             config.max_active_bytes,
@@ -638,7 +647,7 @@ impl MasterServer {
         };
         let queue = TaskQueue::with_retention_limits(
             retry_policy,
-            None,
+            config.max_queue_size,
             config.max_terminal_tasks,
             config.max_terminal_bytes,
             config.max_active_bytes,
@@ -3180,7 +3189,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // Authenticated and speaking: this peer no longer counts against the pre-auth budget.
     drop(handshake_permit);
 
-    transport.set_outbound_codec(detected_codec);
+    if wire_codec == WireCodec::Bincode {
+        transport.set_outbound_codec(detected_codec);
+    }
 
     let worker_msg = match first_msg {
         InboundMessage::Client(client_msg) => {
@@ -3849,7 +3860,9 @@ async fn handle_multiplexed_connection<
     .await?;
     drop(handshake_permit);
 
-    ctrl_transport.set_outbound_codec(detected_codec);
+    if wire_codec == WireCodec::Bincode {
+        ctrl_transport.set_outbound_codec(detected_codec);
+    }
 
     let worker_msg = match first_msg {
         InboundMessage::Worker(wm) => wm,
@@ -5945,5 +5958,80 @@ mod tests {
 
         let _ = stop_tx.send(true);
         mux_conn.abort();
+    }
+
+    #[tokio::test]
+    async fn test_master_server_bind_enforces_max_queue_size_and_json_wire_codec() {
+        use rusty_grid_core::task::{TaskRequirements, TaskSpec};
+        let server_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_max_queue_size(Some(1))
+            .with_wire_codec(WireCodec::Json);
+        let server = MasterServer::bind(server_cfg, WorkerRegistry::new())
+            .await
+            .unwrap();
+        let addr = server.local_addr;
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let server_task = tokio::spawn(server.run(stop_rx));
+
+        // Connect with a Bincode client and submit 1st task: master must reply in Json and accept.
+        let stream1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client1 = MessageTransport::with_codec(stream1, WireCodec::Bincode);
+        client1
+            .send_msg(&ClientMessage::SubmitTask {
+                task: Task::new(
+                    TaskSpec::command("echo", vec!["first".into()]),
+                    TaskRequirements::generic(1, 30),
+                ),
+                wait: false,
+            })
+            .await
+            .unwrap();
+        let (reply1, codec1) = client1
+            .recv_msg_with_codec::<ClientResponse>()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            codec1,
+            WireCodec::Json,
+            "MasterServer::bind with WireCodec::Json must reply in Json even to a Bincode client"
+        );
+        assert!(
+            matches!(reply1, ClientResponse::TaskSubmitted { .. }),
+            "1st submit must succeed under max_queue_size = Some(1), got: {reply1:?}"
+        );
+
+        // Submit 2nd task while 1st task is queued: must be rejected by `max_queue_size = Some(1)`.
+        let stream2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client2 = MessageTransport::with_codec(stream2, WireCodec::Bincode);
+        client2
+            .send_msg(&ClientMessage::SubmitTask {
+                task: Task::new(
+                    TaskSpec::command("echo", vec!["second".into()]),
+                    TaskRequirements::generic(1, 30),
+                ),
+                wait: false,
+            })
+            .await
+            .unwrap();
+        let (reply2, codec2) = client2
+            .recv_msg_with_codec::<ClientResponse>()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(codec2, WireCodec::Json);
+        match reply2 {
+            ClientResponse::Error { message } => {
+                assert!(
+                    message.contains(
+                        "Task queue is full (1 queued or running tasks; wait, or raise --max-queue-size)"
+                    ),
+                    "expected actionable QueueFull(1) error from MasterServer::bind, got: {message}"
+                );
+            }
+            other => panic!("expected ClientResponse::Error for 2nd submit, got {other:?}"),
+        }
+
+        server_task.abort();
     }
 }

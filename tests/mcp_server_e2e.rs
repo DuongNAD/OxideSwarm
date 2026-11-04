@@ -38,10 +38,12 @@ impl TestCluster {
         let secret = ClusterSecret::from_bytes(&[secret_seed; 32]).expect("valid secret");
         let secret_hex = secret.to_hex();
 
+        let blob_dir = tempfile::tempdir().expect("blob store dir");
         let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
             .with_web_ui(true)
             .with_web_ui_addr("127.0.0.1:0".parse().unwrap())
-            .with_cluster_secret(secret.clone());
+            .with_cluster_secret(secret.clone())
+            .with_blob_store(blob_dir.path(), 64 * 1024 * 1024);
 
         let master = MasterServer::spawn_with_config(
             server_config,
@@ -59,7 +61,7 @@ impl TestCluster {
             secret,
             secret_hex,
             workers: Vec::new(),
-            _sandbox_dirs: Vec::new(),
+            _sandbox_dirs: vec![blob_dir],
         };
 
         // Spawn a test worker
@@ -936,5 +938,339 @@ master = "192.0.2.10:8088"
         status_remote.code(),
         Some(6),
         "[status] master without --master or a secret must exit 6"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_mcp_safe_llm_outputs_1mib_binary_and_20mib_stdout() {
+    let cluster = TestCluster::spawn(0x6C).await;
+    let home = tempfile::tempdir().expect("temp home");
+    let outside = tempfile::tempdir().expect("outside dir");
+    std::fs::write(outside.path().join("outside.txt"), b"secret").unwrap();
+
+    // Prepare a Cargo.toml at the cwd root, a 64 KiB binary seed (containing non-UTF-8 bytes),
+    // and a 64 KiB text seed inside `home` (the MCP cwd).
+    std::fs::write(
+        home.path().join("Cargo.toml"),
+        b"[package]\nname = \"mcp-root-e2e\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let seed_bin: Vec<u8> = (0..65_536)
+        .map(|i| ((i * 131 + 0x80) & 0xFF) as u8)
+        .collect();
+    std::fs::write(home.path().join("seed.bin"), &seed_bin).unwrap();
+    let chunk64k = vec![b'A'; 65_536];
+    std::fs::write(home.path().join("chunk64k.txt"), &chunk64k).unwrap();
+
+    let mut expected_1mib = Vec::with_capacity(1024 * 1024);
+    for _ in 0..16 {
+        expected_1mib.extend_from_slice(&seed_bin);
+    }
+    let expected_hash = rusty_grid_core::blob::BlobId::of(&expected_1mib).to_hex();
+
+    let mut mcp = McpProcess::spawn(home.path(), &cluster.master_addr, Some(&cluster.secret_hex));
+
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {} },
+                "clientInfo": { "name": "mcp2-test", "version": "1.0" }
+            }
+        })
+        .to_string(),
+    );
+    let _ = mcp.read_json_response();
+
+    // 1. Stage `files: ["."]` and verify the task reads `Cargo.toml` at the sandbox root.
+    #[cfg(unix)]
+    let root_script = "cat Cargo.toml";
+    #[cfg(windows)]
+    let root_script = "type Cargo.toml";
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "submit",
+                "arguments": {
+                    "type": "shell",
+                    "script": root_script,
+                    "files": ["."],
+                    "wait": true,
+                    "timeout_secs": 20
+                }
+            }
+        })
+        .to_string(),
+    );
+    let root_resp = mcp.read_json_response();
+    assert_eq!(
+        root_resp["result"]["isError"], false,
+        "submit files:[\".\"] failed: {root_resp:?}"
+    );
+    let root_body: Value =
+        serde_json::from_str(root_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(root_body["exit_code"], 0);
+    assert!(
+        root_body["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("mcp-root-e2e"),
+        "expected Cargo.toml at sandbox root when staged with files:[\".\"], got: {}",
+        root_body["stdout"]
+    );
+
+    // 2. Verify `submit` refuses paths outside the working directory (`..` and absolute outside path)
+    //    and symbolic links in `files` and `output_dir`.
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "submit",
+                "arguments": {
+                    "type": "command",
+                    "command": "echo",
+                    "files": ["../outside.txt"]
+                }
+            }
+        })
+        .to_string(),
+    );
+    let parent_resp = mcp.read_json_response();
+    assert_eq!(parent_resp["result"]["isError"], true);
+
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "submit",
+                "arguments": {
+                    "type": "command",
+                    "command": "echo",
+                    "output_dir": "../outside_out"
+                }
+            }
+        })
+        .to_string(),
+    );
+    let out_parent_resp = mcp.read_json_response();
+    assert_eq!(out_parent_resp["result"]["isError"], true);
+
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "submit",
+                "arguments": {
+                    "type": "command",
+                    "command": "echo",
+                    "output_dir": outside.path().join("escaped_out").to_string_lossy()
+                }
+            }
+        })
+        .to_string(),
+    );
+    let out_abs_resp = mcp.read_json_response();
+    assert_eq!(out_abs_resp["result"]["isError"], true);
+
+    #[cfg(unix)]
+    {
+        let symlink_path = home.path().join("symlink_escape.txt");
+        std::os::unix::fs::symlink(outside.path().join("outside.txt"), &symlink_path).unwrap();
+        mcp.send_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "submit",
+                    "arguments": {
+                        "type": "command",
+                        "command": "echo",
+                        "files": ["symlink_escape.txt"]
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let sym_resp = mcp.read_json_response();
+        assert_eq!(sym_resp["result"]["isError"], true);
+        let sym_text = sym_resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(sym_text.contains("symbolic link"), "{sym_text}");
+        std::fs::remove_file(&symlink_path).unwrap();
+
+        let symlink_out = home.path().join("symlink_out_dir");
+        std::os::unix::fs::symlink(outside.path(), &symlink_out).unwrap();
+        mcp.send_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 30,
+                "method": "tools/call",
+                "params": {
+                    "name": "submit",
+                    "arguments": {
+                        "type": "command",
+                        "command": "echo",
+                        "output_dir": "symlink_out_dir"
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let sym_out_resp = mcp.read_json_response();
+        assert_eq!(sym_out_resp["result"]["isError"], true);
+        let sym_out_text = sym_out_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(sym_out_text.contains("symbolic link"), "{sym_out_text}");
+        std::fs::remove_file(&symlink_out).unwrap();
+    }
+
+    // 2. Submit a task that stages `seed.bin` and `chunk64k.txt` via blobs, writes a 1 MiB binary
+    //    output `out.bin`, and writes 20 MiB of stdout ending in `FINAL_SUMMARY_MARKER_MCP2_OK`.
+    #[cfg(unix)]
+    let script = "\
+cat seed.bin seed.bin seed.bin seed.bin > b256k.bin
+cat b256k.bin b256k.bin b256k.bin b256k.bin > out.bin
+echo START_OF_20MIB_STDOUT
+cat chunk64k.txt chunk64k.txt chunk64k.txt chunk64k.txt > t256k.txt
+cat t256k.txt t256k.txt t256k.txt t256k.txt > t1m.txt
+cat t1m.txt t1m.txt t1m.txt t1m.txt t1m.txt > t5m.txt
+cat t5m.txt t5m.txt t5m.txt t5m.txt
+echo FINAL_SUMMARY_MARKER_MCP2_OK
+";
+    #[cfg(windows)]
+    let script = "\
+copy /b seed.bin+seed.bin+seed.bin+seed.bin b256k.bin >nul\r\n\
+copy /b b256k.bin+b256k.bin+b256k.bin+b256k.bin out.bin >nul\r\n\
+echo START_OF_20MIB_STDOUT\r\n\
+copy /b chunk64k.txt+chunk64k.txt+chunk64k.txt+chunk64k.txt t256k.txt >nul\r\n\
+copy /b t256k.txt+t256k.txt+t256k.txt+t256k.txt t1m.txt >nul\r\n\
+copy /b t1m.txt+t1m.txt+t1m.txt+t1m.txt+t1m.txt t5m.txt >nul\r\n\
+type t5m.txt\r\n\
+type t5m.txt\r\n\
+type t5m.txt\r\n\
+type t5m.txt\r\n\
+echo FINAL_SUMMARY_MARKER_MCP2_OK\r\n\
+";
+
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "submit",
+                "arguments": {
+                    "type": "shell",
+                    "script": script,
+                    "files": ["seed.bin", "chunk64k.txt"],
+                    "outputs": ["out.bin"],
+                    "wait": false
+                }
+            }
+        })
+        .to_string(),
+    );
+    let submit_resp = mcp.read_json_response();
+    assert_eq!(
+        submit_resp["result"]["isError"], false,
+        "submit failed: {submit_resp:?}"
+    );
+    let submit_body: Value = serde_json::from_str(
+        submit_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let task_id = submit_body["task_id"].as_str().unwrap();
+
+    // 3. Call `task_result` with `output_dir` and `max_output_bytes: 4096`.
+    let out_dir = home.path().join("downloaded_outputs");
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "task_result",
+                "arguments": {
+                    "task_id": task_id,
+                    "wait": true,
+                    "timeout_secs": 30,
+                    "output_dir": out_dir.to_string_lossy(),
+                    "max_output_bytes": 4096
+                }
+            }
+        })
+        .to_string(),
+    );
+    let res_resp = mcp.read_json_response();
+    let raw_reply_line = mcp.lines_received.last().expect("last reply line");
+    assert!(
+        raw_reply_line.len() < 8 * 1024,
+        "JSON-RPC reply ({} bytes) must be under 8 KiB",
+        raw_reply_line.len()
+    );
+    assert_eq!(
+        res_resp["result"]["isError"], false,
+        "task_result failed: {res_resp:?}"
+    );
+
+    let res_body: Value =
+        serde_json::from_str(res_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(res_body["exit_code"], 0);
+    assert_eq!(res_body["truncated"], true);
+    assert_eq!(res_body["worker_truncated"], true);
+    assert_eq!(res_body["stdout_truncated"], true);
+    assert_eq!(res_body["stdout_worker_truncated"], true);
+    assert!(
+        res_body["captured_bytes"].as_u64().unwrap() >= 4 * 1024 * 1024,
+        "expected captured_bytes >= 4 MiB, got {}",
+        res_body["captured_bytes"]
+    );
+    assert_eq!(
+        res_body["stdout_captured_bytes"],
+        res_body["captured_bytes"]
+    );
+
+    let stdout_text = res_body["stdout"].as_str().unwrap();
+    assert!(
+        stdout_text.contains("START_OF_20MIB_STDOUT"),
+        "expected head banner in truncated stdout, got len {}",
+        stdout_text.len()
+    );
+    assert!(
+        stdout_text.contains("FINAL_SUMMARY_MARKER_MCP2_OK"),
+        "expected final marker at end of 20 MiB stdout to be preserved in tail, got: {stdout_text}"
+    );
+
+    let artifacts = res_body["artifacts"].as_array().expect("artifacts array");
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0]["path"], "out.bin");
+    assert_eq!(artifacts[0]["size_bytes"], 1024 * 1024);
+    assert_eq!(artifacts[0]["blob_id"], expected_hash);
+    assert!(
+        artifacts[0].get("data_preview").is_none(),
+        "data_preview must be removed from artifacts"
+    );
+
+    let downloaded_bytes = std::fs::read(out_dir.join("out.bin")).expect("downloaded out.bin");
+    assert_eq!(downloaded_bytes.len(), 1024 * 1024);
+    let actual_hash = rusty_grid_core::blob::BlobId::of(&downloaded_bytes).to_hex();
+    assert_eq!(
+        actual_hash, expected_hash,
+        "downloaded 1 MiB binary must match expected BLAKE3 hash without UTF-8 corruption"
     );
 }

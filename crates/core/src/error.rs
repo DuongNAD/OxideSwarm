@@ -149,7 +149,9 @@ pub enum GridError {
     },
 
     /// Task queue capacity reached.
-    #[error("Task queue is full (capacity: {capacity})")]
+    #[error(
+        "Task queue is full ({capacity} queued or running tasks; wait, or raise --max-queue-size)"
+    )]
     QueueFull {
         /// Maximum capacity limit.
         capacity: usize,

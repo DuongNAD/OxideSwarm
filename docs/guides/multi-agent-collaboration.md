@@ -27,7 +27,7 @@ python scripts/agent_bridge.py heartbeat
 python scripts/agent_bridge.py inbox
 ```
 
-Each agent writes only its own state file (`nodes/mac_state.json` or `nodes/win_state.json`) using atomic temporary-file replacement (`atomic_write` in `scripts/agent_bridge.py`) so concurrent syncs never collide.
+Each agent writes only its own state file (`nodes/mac_state.json` or `nodes/win_state.json`, or `nodes/<id>_state.json` when `--agent-id <id>` is passed) using atomic temporary-file replacement (`atomic_write` in `scripts/agent_bridge.py`) so concurrent syncs never collide.
 
 ### 2. Run cross-machine root-cause diagnostics
 
@@ -43,7 +43,8 @@ On Windows (PowerShell, repository root):
 python scripts/agent_bridge.py diagnose
 ```
 
-`diagnose` compares `mac_state.json` and `win_state.json` and checks:
+`diagnose` compares `mac_state.json` and `win_state.json` (or `--agent-id` / `--peer-id` state files when multiple agents share one platform) and checks:
+- **Peer freshness**: reports `STATUS: UNKNOWN` and exits non-zero when the peer state file is missing or older than 5 minutes.
 - **Git commit parity**: `git_head` and `git_dirty` across both checkouts.
 - **Cluster secret parity**: compares the 12-character SHA-256 prefix (`secret_sha256_12`) of `~/.oxideswarm/cluster.secret` without writing secret bytes to cloud storage.
 - **Stale P2P ticket hazard**: flags an active `p2p_ticket` in `~/.oxideswarm/rusty-grid.toml` that would cause a worker to ignore `--master <MASTER_IP>:8088`.
