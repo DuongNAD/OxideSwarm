@@ -245,40 +245,91 @@ fn augment_windows_path(existing_path: &str) -> String {
 }
 
 #[cfg(windows)]
+fn has_windows_exec_ext(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "exe" | "com" | "cmd" | "bat"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_valid_windows_executable(path: &Path) -> bool {
+    if !path.is_file() || !has_windows_exec_ext(path) {
+        return false;
+    }
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if matches!(ext.to_ascii_lowercase().as_str(), "exe" | "com") => {
+            use std::io::Read;
+            let mut magic = [0u8; 2];
+            std::fs::File::open(path)
+                .and_then(|mut f| f.read_exact(&mut magic))
+                .map(|()| &magic == b"MZ")
+                .unwrap_or(false)
+        }
+        _ => true,
+    }
+}
+
+#[cfg(windows)]
+fn probe_candidate_in_dir(dir: &Path, bare_name: &str) -> Option<String> {
+    if has_windows_exec_ext(Path::new(bare_name)) {
+        let candidate = dir.join(bare_name);
+        if is_valid_windows_executable(&candidate) {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    for ext in &[".exe", ".com", ".cmd", ".bat"] {
+        let candidate_ext = dir.join(format!("{bare_name}{ext}"));
+        if is_valid_windows_executable(&candidate_ext) {
+            return Some(candidate_ext.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
 fn resolve_windows_executable(program: &str, effective_path: &str) -> String {
     let p = Path::new(program);
-    if p.is_file() {
-        return program.to_string();
-    }
-    for ext in &[".exe", ".cmd", ".bat"] {
-        let with_ext = format!("{program}{ext}");
-        if Path::new(&with_ext).is_file() {
-            return with_ext;
+    let has_path_sep = program.contains('/') || program.contains('\\') || program.contains(':');
+    if has_path_sep {
+        if is_valid_windows_executable(p) {
+            return program.to_string();
+        }
+        for ext in &[".exe", ".com", ".cmd", ".bat"] {
+            let with_ext = format!("{program}{ext}");
+            if is_valid_windows_executable(Path::new(&with_ext)) {
+                return with_ext;
+            }
         }
     }
 
     let bare_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(program);
 
-    // Fast path: check Git for Windows usr/bin first
-    for base in &[r"C:\Program Files\Git\usr\bin", r"C:\Program Files\Git\bin"] {
-        let base_path = Path::new(base);
-        for ext in &[".exe", ".cmd", ".bat", ""] {
-            let candidate = base_path.join(format!("{bare_name}{ext}"));
-            if candidate.is_file() {
-                return candidate.to_string_lossy().to_string();
-            }
+    for dir in std::env::split_paths(effective_path) {
+        if let Some(found) = probe_candidate_in_dir(&dir, bare_name) {
+            return found;
         }
     }
 
-    for dir in std::env::split_paths(effective_path) {
-        let candidate = dir.join(bare_name);
-        if candidate.is_file() {
-            return candidate.to_string_lossy().to_string();
+    for base in &[r"C:\Program Files\Git\usr\bin", r"C:\Program Files\Git\bin"] {
+        if let Some(found) = probe_candidate_in_dir(Path::new(base), bare_name) {
+            return found;
         }
-        for ext in &[".exe", ".cmd", ".bat"] {
-            let candidate_ext = dir.join(format!("{bare_name}{ext}"));
-            if candidate_ext.is_file() {
-                return candidate_ext.to_string_lossy().to_string();
+    }
+
+    if !has_path_sep {
+        if is_valid_windows_executable(p) {
+            return program.to_string();
+        }
+        for ext in &[".exe", ".com", ".cmd", ".bat"] {
+            let with_ext = format!("{program}{ext}");
+            if is_valid_windows_executable(Path::new(&with_ext)) {
+                return with_ext;
             }
         }
     }
@@ -3728,6 +3779,59 @@ mod outcome_tests {
             observed_capped_err,
             "capped read check ('is more than {max_bytes} bytes') must trigger when file grows during read"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_resolve_windows_executable_skips_extensionless_and_invalid_pe_files() {
+        let fake_dir = tempfile::tempdir().unwrap();
+        let sandbox_dir = tempfile::tempdir().unwrap();
+        // Place an extensionless 'cmd' file and a 0-byte 'xcopy.exe' stub ahead of System32 on PATH.
+        // Without executable-extension and MZ-header validation, resolving bare 'cmd' or 'xcopy'
+        // picks these non-Win32 files and fails CreateProcessW with os error 193.
+        std::fs::write(fake_dir.path().join("cmd"), b"#!/bin/sh\necho not-win32\n").unwrap();
+        std::fs::write(fake_dir.path().join("xcopy.exe"), b"").unwrap();
+
+        let sys_path = std::env::var("PATH").unwrap_or_default();
+        let poisoned_path = format!("{};{sys_path}", fake_dir.path().display());
+
+        let resolved_cmd = resolve_windows_executable("cmd", &poisoned_path);
+        assert!(
+            resolved_cmd.to_ascii_lowercase().ends_with("cmd.exe"),
+            "bare 'cmd' must resolve to cmd.exe, not extensionless file: {resolved_cmd}"
+        );
+        assert_ne!(
+            Path::new(&resolved_cmd),
+            fake_dir.path().join("cmd"),
+            "extensionless file must never be selected on Windows"
+        );
+
+        let resolved_xcopy = resolve_windows_executable("xcopy", &poisoned_path);
+        assert_ne!(
+            Path::new(&resolved_xcopy),
+            fake_dir.path().join("xcopy.exe"),
+            "0-byte .exe stub without MZ header must be skipped"
+        );
+
+        let runner = runner_in(sandbox_dir.path());
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), poisoned_path);
+        let task = Task::new(
+            TaskSpec::Command {
+                program: "cmd".into(),
+                args: vec!["/C".into(), "echo".into(), "win32-spawn-ok".into()],
+                env,
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 10),
+        );
+        let res = runner.execute_task(&task, None, None).await;
+        assert!(
+            res.is_success(),
+            "cmd must spawn cleanly even when an extensionless 'cmd' precedes System32 on PATH: {res:?}"
+        );
+        assert_eq!(res.stdout_str().trim(), "win32-spawn-ok");
     }
 }
 
