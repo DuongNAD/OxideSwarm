@@ -70,10 +70,10 @@ environment variable directly.
 ### D2: Single CLI environment variable (`RUSTY_GRID_NO_BATTERY`) and start-up warning
 
 `resolve_no_battery` (`crates/cli/src/cli_app.rs`) calls
-`resolve_bool(None, &["RUSTY_GRID_NO_BATTERY"], None, false)`. Neither `WorkerFileConfig` nor
-`WorkerHardwareConfig` (`crates/cli/src/config.rs`) defines a `no_battery` field, so a
-`rusty-grid.toml` file in the working directory or home directory cannot turn battery protection
-off.
+`resolve_bool(None, &["RUSTY_GRID_NO_BATTERY"], None, false)`, which accepts `1`, `true`, `yes`, or
+`on` (case-insensitive). Neither `WorkerFileConfig` nor `WorkerHardwareConfig`
+(`crates/cli/src/config.rs`) defines a `no_battery` field, so a `rusty-grid.toml` file in the
+working directory or home directory cannot turn battery protection off.
 
 When `config.no_battery` is `true`:
 - `WorkerClient::new` (`crates/worker/src/client.rs`) logs a `tracing::warn!` event stating

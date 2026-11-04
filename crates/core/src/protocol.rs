@@ -61,7 +61,8 @@ impl ProtocolCapabilities {
     pub const BATCH_DISPATCH: Self = Self(1 << 5);
     /// Distributed file staging and output artifact collection.
     pub const FILE_STAGING: Self = Self(1 << 6);
-    /// Autonomous role arbitrage, lease tickets, and graceful role handover.
+    /// Autonomous role arbitrage, lease tickets, and graceful role handover (design-only;
+    /// not advertised in [`ProtocolCapabilities::all_supported`]).
     pub const ROLE_ARBITRAGE: Self = Self(1 << 7);
     /// Cellular RRC-aware adaptive keepalive intervals.
     pub const ADAPTIVE_KEEPALIVE: Self = Self(1 << 8);
@@ -78,7 +79,6 @@ impl ProtocolCapabilities {
                 | Self::EXTENDED_ERROR_INFO.0
                 | Self::BATCH_DISPATCH.0
                 | Self::FILE_STAGING.0
-                | Self::ROLE_ARBITRAGE.0
                 | Self::ADAPTIVE_KEEPALIVE.0
                 | Self::BLOB_TRANSFER.0,
         )
@@ -4586,5 +4586,13 @@ mod tests {
             }
             other => panic!("expected LegacyBinaryClientResponse::ClusterStatus, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_all_supported_does_not_advertise_role_arbitrage() {
+        assert!(
+            !ProtocolCapabilities::all_supported().contains(ProtocolCapabilities::ROLE_ARBITRAGE),
+            "ROLE_ARBITRAGE is design-only and must not be advertised in all_supported()"
+        );
     }
 }
