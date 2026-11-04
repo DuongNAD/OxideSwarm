@@ -381,13 +381,7 @@ pub fn save_output_artifacts(
     artifacts: &[OutputArtifact],
     output_dir: &Path,
 ) -> Result<Vec<PathBuf>, String> {
-    if let Ok(meta) = std::fs::symlink_metadata(output_dir) {
-        if meta.file_type().is_symlink() {
-            return Err(format!(
-                "Failed to create output directory {}: destination is a symbolic link",
-                output_dir.display()
-            ));
-        }
+    if let Ok(meta) = std::fs::metadata(output_dir) {
         if !meta.is_dir() {
             return Err(format!(
                 "Failed to create output directory {}: exists and is not a directory",

@@ -1416,9 +1416,23 @@ async fn test_mcp1_slow_6mb_response_succeeds_and_post_submit_cancel_check_fires
     )
     .expect("parse big json");
     assert_eq!(
-        big_body["stdout"].as_str().map(str::len),
+        big_body["stdout_captured_bytes"].as_u64(),
         Some(6 * 1024 * 1024),
-        "expected full 6 MB stdout"
+        "expected full 6 MB stdout_captured_bytes: {big_body}"
+    );
+    assert_eq!(big_body["stdout_truncated"].as_bool(), Some(true));
+    assert_eq!(big_body["stdout_worker_truncated"].as_bool(), Some(false));
+    let big_stdout = big_body["stdout"].as_str().expect("stdout string");
+    assert!(
+        big_stdout.len() <= 16_384,
+        "default max_output_bytes (16384) must bound stdout: len={}",
+        big_stdout.len()
+    );
+    assert!(
+        big_stdout.starts_with("AAAA")
+            && big_stdout.ends_with("AAAA")
+            && big_stdout.contains("\n...[truncated "),
+        "expected head + tail with truncation notice in stdout"
     );
 
     // 2. Mutant B (mcp.rs:1174): Cancel an in-flight `submit {wait: false}` at 50ms while

@@ -619,13 +619,7 @@ pub async fn download_outputs<C: BlobChannel>(
     outputs: &[BlobFile],
     dest_dir: &Path,
 ) -> Result<Vec<PathBuf>, String> {
-    if let Ok(meta) = std::fs::symlink_metadata(dest_dir) {
-        if meta.file_type().is_symlink() {
-            return Err(format!(
-                "cannot use output directory '{}': it is a symbolic link",
-                dest_dir.display()
-            ));
-        }
+    if let Ok(meta) = std::fs::metadata(dest_dir) {
         if !meta.is_dir() {
             return Err(format!(
                 "cannot use output directory '{}': exists and is not a directory",
