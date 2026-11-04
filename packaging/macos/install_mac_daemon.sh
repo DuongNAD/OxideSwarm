@@ -477,6 +477,13 @@ else
     <string>${RUN_USER}</string>"
 fi
 
+GEN3D_ENV_XML=""
+if [[ -f "${WORK_DIR}/engines/generative_3d/entrypoint.py" ]] || [[ "$DRY_RUN" == true && -f "${REPO_ENGINES_DIR}/generative_3d/entrypoint.py" ]]; then
+    GEN3D_ENV_XML="
+        <key>OXIDESWARM_GEN3D_SCRIPT</key>
+        <string>${WORK_DIR}/engines/generative_3d/entrypoint.py</string>"
+fi
+
 PLIST_CONTENT="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
 <plist version=\"1.0\">
@@ -523,9 +530,7 @@ $(echo -e "${PROG_ARGS_XML}")
         <key>HOME</key>
         <string>${RUN_HOME}</string>
         <key>RUST_LOG</key>
-        <string>info</string>
-        <key>OXIDESWARM_GEN3D_SCRIPT</key>
-        <string>${WORK_DIR}/engines/generative_3d/entrypoint.py</string>
+        <string>info</string>${GEN3D_ENV_XML}
     </dict>
 
     <!-- High Performance Grid Resource Limits -->

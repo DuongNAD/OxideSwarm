@@ -389,6 +389,15 @@ class ShellLauncherTests(unittest.TestCase):
         self.assertNotIn("--master", out.split("ProgramArguments", 1)[1].split("</array>", 1)[0],
                          "no master address / ticket in the world-readable plist")
         self.assertNotIn(":8080", out)
+        self.assertIn("<key>OXIDESWARM_GEN3D_SCRIPT</key>", out,
+                      "checkout with engines/ must set OXIDESWARM_GEN3D_SCRIPT in the plist")
+
+        # When installed from a layout without engines/, OXIDESWARM_GEN3D_SCRIPT must stay unset
+        copied = self.copy_script("packaging/macos/install_mac_daemon.sh")
+        no_eng = self.run_script(["bash", copied, "--dry-run", "--master", "192.0.2.1:8088", "--insecure", "--yes"])
+        self.assertEqual(no_eng.returncode, 0, no_eng.stdout)
+        self.assertNotIn("OXIDESWARM_GEN3D_SCRIPT", no_eng.stdout,
+                         "install without engines/ must leave OXIDESWARM_GEN3D_SCRIPT unset")
 
     def test_agent_mesh_launchers_propagate_no_shell_option(self):
         """Verifies that ubuntu, macos, and termux launchers propagate --no-shell to the agent."""
@@ -571,6 +580,7 @@ class StaticRepositoryChecks(unittest.TestCase):
         wrapper = read(os.path.join(ROOT, "packaging", "windows", "ServiceWrapper.cs"))
         self.assertNotIn("--p2p-ticket", wrapper)
         self.assertNotRegex(ps1, r"SetEnvironmentVariable\(\"OXIDESWARM_P2P_TICKET\",\s*\$P2pTicket")
+        self.assertNotRegex(ps1, r"SetEnvironmentVariable\(\"OXIDESWARM_GEN3D_SCRIPT\"")
 
     def test_cmd_pairing_script_does_not_strip_quotes_from_the_ticket(self):
         text = read(os.path.join(ROOT, "connect_remote.cmd"))

@@ -649,6 +649,7 @@ if ($ServiceMethod -eq "WinSW") {
             $xmlDoc.Save($serviceXmlPath)
         } else {
             # Generate XML directly
+            $gen3dEnvLine = if (Test-Path $gen3dScriptPath) { "`r`n  <env name=`"OXIDESWARM_GEN3D_SCRIPT`" value=`"$gen3dScriptPath`" />" } else { "" }
             $xmlContent = @"
 <service>
   <id>$ServiceName</id>
@@ -671,8 +672,7 @@ if ($ServiceMethod -eq "WinSW") {
     <sizeThreshold>10240</sizeThreshold>
     <keepFiles>5</keepFiles>
   </log>
-  <env name="RUST_LOG" value="info" />
-  <env name="OXIDESWARM_GEN3D_SCRIPT" value="$gen3dScriptPath" />
+  <env name="RUST_LOG" value="info" />$gen3dEnvLine
 </service>
 "@
             [System.IO.File]::WriteAllText($serviceXmlPath, $xmlContent, (New-Object System.Text.UTF8Encoding($false)))
@@ -843,7 +843,6 @@ Write-Host "[OK] SCM Failure Recovery configured successfully." -ForegroundColor
 [Environment]::SetEnvironmentVariable("OXIDESWARM_BIN", $destWorkerBin, [EnvironmentVariableTarget]::Machine)
 [Environment]::SetEnvironmentVariable("OXIDESWARM_CONFIG", $ConfigPath, [EnvironmentVariableTarget]::Machine)
 [Environment]::SetEnvironmentVariable("OXIDESWARM_LOG_DIR", $LogDir, [EnvironmentVariableTarget]::Machine)
-[Environment]::SetEnvironmentVariable("OXIDESWARM_GEN3D_SCRIPT", $gen3dScriptPath, [EnvironmentVariableTarget]::Machine)
 # Older installers stored the ticket machine-wide, where it overrode every later configuration.
 [Environment]::SetEnvironmentVariable("OXIDESWARM_P2P_TICKET", $null, [EnvironmentVariableTarget]::Machine)
 Write-Host "[OK] Configured system environment variables for worker." -ForegroundColor Green
