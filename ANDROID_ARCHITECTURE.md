@@ -651,7 +651,7 @@ When symmetric CGNAT or carrier firewalls prevent direct UDP hole punching, Oxid
 
 ### 4.4 QUIC Connection Migration (RFC 9000 §9) for Seamless Roaming
 
-When an Android user leaves home or office, their connection transitions from Wi-Fi (`192.168.1.147`) to Cellular (`100.72.14.82`).
+When an Android user leaves home or office, their connection transitions from Wi-Fi (`192.0.2.10`) to Cellular (`198.51.100.20`).
 
 #### The Failure of Legacy TCP/TLS
 Under TCP/TLS:

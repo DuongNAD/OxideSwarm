@@ -287,7 +287,6 @@ pub struct TaskEntry {
     pub submitted_instant: Instant,
     pub scheduled_instant: Option<Instant>,
     pub started_instant: Option<Instant>,
-    pub finished_instant: Option<Instant>,
     pub retry_after_instant: Option<Instant>,
     /// Total re-dispatches of this task: execution retries plus `failover_count`.
     pub retry_count: u32,
@@ -761,38 +760,6 @@ impl TaskQueueInner {
         }
         evicted
     }
-
-    fn prune_terminal_older_than(&mut self, ttl: Duration) -> usize {
-        let now = Instant::now();
-        let mut evicted = 0;
-        let mut remaining = std::collections::VecDeque::new();
-        while let Some(task_id) = self.terminal_order.pop_front() {
-            let should_evict = if let Some(entry) = self.tasks.get(&task_id) {
-                if entry.state.is_terminal() {
-                    if let Some(finished) = entry.finished_instant {
-                        now.duration_since(finished) >= ttl
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if should_evict {
-                self.remove_retained(&task_id);
-                evicted += 1;
-            } else if self.tasks.contains_key(&task_id) {
-                remaining.push_back(task_id);
-            } else {
-                self.terminal_sizes.remove(&task_id);
-            }
-        }
-        self.terminal_order = remaining;
-        evicted
-    }
 }
 
 /// Thread-safe in-memory Task Queue and lifecycle coordinator.
@@ -962,7 +929,6 @@ impl TaskQueue {
             submitted_instant: now_instant,
             scheduled_instant: None,
             started_instant: None,
-            finished_instant: None,
             retry_after_instant: None,
             retry_count: 0,
             failover_count: 0,
@@ -1031,7 +997,6 @@ impl TaskQueue {
             submitted_instant: now_instant,
             scheduled_instant: None,
             started_instant: None,
-            finished_instant: None,
             retry_after_instant: None,
             retry_count: 0,
             failover_count: 0,
@@ -1738,13 +1703,11 @@ impl TaskQueue {
                     });
                 }
                 entry.state = TaskState::Completed;
-                entry.finished_instant = Some(now_instant);
                 entry.result = Some(result);
                 (TaskState::Completed, ResultDisposition::Terminal)
             } else if result.exit_code == 130 {
                 // Task cancellation from worker
                 entry.state = TaskState::Cancelled;
-                entry.finished_instant = Some(now_instant);
                 entry.error_message = result.error.clone().or_else(|| Some("Cancelled".into()));
                 entry.result = Some(result);
                 (TaskState::Cancelled, ResultDisposition::Terminal)
@@ -1809,7 +1772,6 @@ impl TaskQueue {
             } else {
                 // Unrecoverable or exhausted failure
                 entry.state = TaskState::Failed;
-                entry.finished_instant = Some(now_instant);
                 entry.error_message = result.error.clone();
                 entry.result = Some(result);
                 (TaskState::Failed, ResultDisposition::Terminal)
@@ -1880,7 +1842,6 @@ impl TaskQueue {
             });
         }
         entry.state = TaskState::Failed;
-        entry.finished_instant = Some(Instant::now());
         entry.error_message = result.error.clone();
         entry.result = Some(result);
 
@@ -2024,7 +1985,6 @@ impl TaskQueue {
                 entry.state = TaskState::Failed;
                 entry.assigned_worker_id = None;
                 entry.assigned_session = None;
-                entry.finished_instant = Some(now_instant);
                 let err_msg = format!(
                     "Task execution failed: maximum retry limit ({cap}) reached after worker eviction (Worker disconnected and retries exhausted ({used}/{cap}), last failure on worker {worker_id}: {reason})"
                 );
@@ -2196,7 +2156,6 @@ impl TaskQueue {
         let mut recorded = None;
         if let Some(entry) = inner.tasks.get_mut(task_id) {
             entry.state = TaskState::Cancelled;
-            entry.finished_instant = Some(Instant::now());
             entry.error_message = cancel_reason;
             if entry.result.is_none() {
                 entry.result = Some(cancel_result);
@@ -2327,14 +2286,6 @@ impl TaskQueue {
     pub async fn evict_terminal_tasks(&self, max_retained: usize) -> usize {
         let mut inner = self.inner.write().await;
         inner.evict_terminal_tasks(max_retained)
-    }
-
-    /// Evicts terminal tasks (Completed, Failed, Cancelled) whose execution completed older than `ttl`.
-    ///
-    /// Returns the number of evicted tasks.
-    pub async fn prune_terminal_older_than(&self, ttl: Duration) -> usize {
-        let mut inner = self.inner.write().await;
-        inner.prune_terminal_older_than(ttl)
     }
 }
 
@@ -2622,14 +2573,6 @@ mod tests {
         assert!(queue.get_task(&ids[2]).await.is_none());
         assert!(queue.get_task(&ids[3]).await.is_none());
         assert!(queue.get_task(&ids[4]).await.is_some());
-
-        // TTL pruning
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let pruned = queue
-            .prune_terminal_older_than(Duration::from_millis(10))
-            .await;
-        assert_eq!(pruned, 1);
-        assert!(queue.get_task(&ids[4]).await.is_none());
     }
 
     fn echo_task(label: &str) -> Task {

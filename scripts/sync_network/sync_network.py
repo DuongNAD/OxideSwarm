@@ -57,8 +57,8 @@ def find_sync_dir(cli_dir=None):
         os.path.join(user_profile, "Google Drive", "Drive của tôi", "OxideSwarm_Sync"),
         os.path.join(user_profile, "Google Drive", "My Drive", "OxideSwarm_Sync"),
         # Fallback local testing directories
-        os.path.join(user_home, "teamwork_projects", "oxideswarm_sync"),
-        os.path.join(user_home, "teamwork_projects", "OxideSwarm_Sync"),
+        os.path.join(user_home, "oxideswarm_sync"),
+        os.path.join(user_home, "OxideSwarm_Sync"),
     ]
 
     for account_dir in sorted(glob.glob(os.path.join(user_home, "Library", "CloudStorage", "GoogleDrive-*"))):

@@ -52,6 +52,37 @@ pub enum SchedulingPolicy {
     RoundRobin,
 }
 
+impl SchedulingPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::WeightedLeastLoaded => "weighted",
+            Self::LeastLoaded => "least-loaded",
+            Self::RoundRobin => "round-robin",
+        }
+    }
+}
+
+impl std::fmt::Display for SchedulingPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SchedulingPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "weighted" | "weighted-least-loaded" => Ok(Self::WeightedLeastLoaded),
+            "least-loaded" | "leastloaded" => Ok(Self::LeastLoaded),
+            "round-robin" | "roundrobin" | "rr" => Ok(Self::RoundRobin),
+            other => Err(format!(
+                "Unknown scheduler policy '{other}' (expected 'weighted', 'least-loaded', or 'round-robin')"
+            )),
+        }
+    }
+}
+
 /// Configuration options for the `WorkloadScheduler`.
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
@@ -771,12 +802,12 @@ impl<'a> Engine<'a> {
                         .collect();
                     if !real_candidates.is_empty() {
                         let idx = self.rr_cursor % real_candidates.len();
-                        self.rr_cursor += 1;
+                        self.rr_cursor = self.rr_cursor.wrapping_add(1);
                         return real_candidates[idx];
                     }
                 }
                 let idx = self.rr_cursor % candidates.len();
-                self.rr_cursor += 1;
+                self.rr_cursor = self.rr_cursor.wrapping_add(1);
                 candidates[idx]
             }
             SchedulingPolicy::LeastLoaded => {
@@ -840,6 +871,8 @@ pub struct WorkloadScheduler {
     /// its `wait = true` client.
     waiters: Option<WaiterMap>,
     gpu_demand: std::sync::Mutex<GpuDemand>,
+    /// Persistent round-robin cursor across scheduling passes (`schedule_once` / `schedule_batch`).
+    rr_cursor: std::sync::atomic::AtomicUsize,
 }
 
 impl WorkloadScheduler {
@@ -857,6 +890,7 @@ impl WorkloadScheduler {
             trigger,
             waiters: None,
             gpu_demand: std::sync::Mutex::new(GpuDemand::default()),
+            rr_cursor: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1016,7 +1050,7 @@ impl WorkloadScheduler {
         }
 
         // Step 2: Active workers (checked before touching the queue: no worker, nothing to clone)
-        let workers = self.registry.list_schedulable_workers().await;
+        let mut workers = self.registry.list_schedulable_workers().await;
         if workers.is_empty() {
             let mut report = ScheduleReport::default();
             for task_id in self.queue.ready_task_ids(max_batch_size).await {
@@ -1026,6 +1060,7 @@ impl WorkloadScheduler {
             }
             return Ok(report);
         }
+        workers.sort_by_key(|w| w.worker_id);
 
         let loads = self.queue.assigned_loads().await;
         let (gpu_waiting, gpu_recent) = self.gpu_demand(&workers).await;
@@ -1036,6 +1071,7 @@ impl WorkloadScheduler {
             gpu_waiting,
             gpu_recent,
         );
+        engine.rr_cursor = self.rr_cursor.load(std::sync::atomic::Ordering::Relaxed);
 
         // Step 3: Walk the queue
         let mut report = ScheduleReport::default();
@@ -1095,6 +1131,8 @@ impl WorkloadScheduler {
                 }
             }
         }
+        self.rr_cursor
+            .store(engine.rr_cursor, std::sync::atomic::Ordering::Relaxed);
         if placements.is_empty() {
             return Ok(report);
         }
@@ -2912,6 +2950,63 @@ mod tests {
             single_report.assignments.len(),
             1,
             "an 8-core worker with slots:1 must take at most 1 task at a time"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_round_robin_rotates_across_schedule_once_passes() {
+        let registry = WorkerRegistry::new();
+        let queue = TaskQueue::new();
+        let notify = Arc::new(Notify::new());
+        let scheduler = WorkloadScheduler::new(
+            SchedulerConfig {
+                policy: SchedulingPolicy::RoundRobin,
+                ..Default::default()
+            },
+            registry.clone(),
+            queue.clone(),
+            notify,
+        );
+
+        let mut worker_ids = Vec::new();
+        let mut receivers = Vec::new();
+        for i in 0..3 {
+            let wid = Uuid::from_u128((i + 1) as u128);
+            let mut caps =
+                WorkerCapabilities::new(format!("rr-worker-{i}"), 4, 8192, false, false, None);
+            caps.tags.push("slots:4".into());
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            registry
+                .register(wid, caps, "127.0.0.1:9000".parse().unwrap(), tx, None)
+                .await
+                .unwrap();
+            worker_ids.push(wid);
+            receivers.push(rx);
+        }
+
+        // Submit 6 tasks one at a time, running `schedule_once()` after each submission.
+        let mut counts: HashMap<Uuid, usize> =
+            worker_ids.iter().copied().map(|id| (id, 0usize)).collect();
+        for i in 0..6 {
+            let task = Task::new(
+                TaskSpec::shell_script(format!("echo rr-{i}")),
+                TaskRequirements::generic(1, 30),
+            );
+            queue.submit(task).await.unwrap();
+            let report = scheduler.schedule_once().await.unwrap();
+            assert_eq!(
+                report.assignments.len(),
+                1,
+                "pass {i} must assign the newly submitted task"
+            );
+            *counts.get_mut(&report.assignments[0].worker_id).unwrap() += 1;
+        }
+
+        let per_worker: Vec<usize> = worker_ids.iter().map(|id| counts[id]).collect();
+        assert_eq!(
+            per_worker,
+            vec![2, 2, 2],
+            "round-robin across 6 single-task schedule_once passes on 3 4-slot workers must distribute 2, 2, 2"
         );
     }
 }

@@ -22,7 +22,9 @@ Mutation check: OX_SCRIPT_ROOT=/path/to/an/older/checkout python3 tests/test_lau
 Nothing here touches the real ~/.oxideswarm, needs a built binary, the network or root.
 """
 
+import fnmatch
 import glob
+import hashlib
 import os
 import re
 import shutil
@@ -95,17 +97,65 @@ def read_bytes(path):
         return f.read()
 
 
-def tracked_or_present(patterns):
-    """Files under ROOT matching the glob patterns (git is not required)."""
-    skip = ("/target/", "/.git/", "/.agents/", "/node_modules/", "/__pycache__/")
+SKIP_DIRS = {
+    "target",
+    ".git",
+    ".agents",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "build",
+    ".gradle",
+    ".idea",
+    "test_reports",
+}
+
+
+def tracked_or_present(patterns, root=None):
+    """Files under root (default ROOT) matching the glob patterns, pruning build/cache dirs."""
+    base = ROOT if root is None else root
     found = []
-    for pattern in patterns:
-        for path in glob.glob(os.path.join(ROOT, "**", pattern), recursive=True):
-            norm = path.replace("\\", "/")
-            if any(s in norm for s in skip) or not os.path.isfile(path):
-                continue
-            found.append(path)
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for fname in filenames:
+            if any(fnmatch.fnmatch(fname, pat) for pat in patterns):
+                path = os.path.join(dirpath, fname)
+                if os.path.isfile(path):
+                    found.append(path)
     return sorted(set(found))
+
+
+def tracked_text_files(root=None):
+    """All tracked text files under root (falls back to walking root when git is unavailable)."""
+    base = ROOT if root is None else root
+    files = []
+    res = subprocess.run(
+        ["git", "-C", base, "ls-files"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    if res.returncode == 0 and res.stdout.strip():
+        for rel in res.stdout.splitlines():
+            parts = rel.replace("\\", "/").split("/")
+            if any(part in SKIP_DIRS for part in parts[:-1]):
+                continue
+            p = os.path.join(base, rel)
+            if os.path.isfile(p):
+                files.append(p)
+    else:
+        files = tracked_or_present(["*"], root=base)
+    binary_exts = (".png", ".ico", ".woff2", ".ttf", ".glb", ".bin", ".so", ".dll", ".exe", ".jar", ".keystore")
+    out = []
+    for p in sorted(set(files)):
+        if p.lower().endswith(binary_exts):
+            continue
+        raw = read_bytes(p)
+        if b"\x00" in raw[:8192]:
+            continue
+        out.append(p)
+    return out
 
 
 @unittest.skipIf(IS_WINDOWS, "the shell launchers need bash")
@@ -511,26 +561,52 @@ class StaticRepositoryChecks(unittest.TestCase):
         self.assertEqual(bad, [])
 
     def test_no_owner_specific_values_or_name_pattern_kills_in_scripts(self):
-        forbidden = {
-            r"DESKTOP-3EPV830": "the owner's PC name",
-            r"R5CWC3QQ52H": "the owner's phone serial",
-            r"192\.168\.1\.(144|123|147|156|166)\b": "the owner's LAN addresses",
-            r"duonganhdn2000": "the owner's e-mail address",
+        # SHA-256 digests of lowercased forbidden owner tokens/paths so this test file itself
+        # never stores literal owner hostnames, serials, LAN IPs, e-mail addresses, or paths.
+        # Note: digests of short values such as IPv4 addresses are trivially reversible by
+        # brute force (only 2^32 candidates); they are used here only so no literal owner
+        # value appears in the committed tree, not for cryptographic secrecy.
+        forbidden_owner_hashes = {
+            "143def99c87ddb0f21b0ff7eaa44b4eba2f5e8168a6b1c6df2a89aea733b9a51": "the owner's PC name",
+            "0eb1180c49728d6bcd1dd05f4f904d64ac2423e7a4a406dac2c5c58ea4051b6e": "the owner's phone serial",
+            "2aa1693e357a3c25f0858772628394d0994a33bc57d47c1d94577ac7307a2ebd": "the owner's LAN address",
+            "b29a2f994fdaf479ec46efd1afc4fbd5a6be90a44f337cb05b939a95019a3572": "the owner's LAN address",
+            "e82f0a1129889229d878e2cd15e82f987fb83bcd686a1c23b32d467e78be93bc": "the owner's LAN address",
+            "d635ad9424c6dee43e680e6e639c7bd2084c7f88a18e027531fe404ad915c9d0": "the owner's LAN address",
+            "cc08f6ad8f7a8865c991e25a2e998ab1dd35bc094a4f47be8a1a6d92f9f962f0": "the owner's LAN address",
+            "adbeebbc313a24f7a44027b2407f780c7b21018bd6f5bfb195810d6f8ef47563": "the owner's overlay/cellular address",
+            "70aa0938747ee97a3e704d1541f2b8fe5dd0b488900600cc0a8d24c566096e3f": "the owner's e-mail address",
+            "ed4c1136c28a4257e7acd5c4542269a3bd012403399910eee9c91c2481977714": "the owner's workspace directory",
+            "2c12c92d538559a4299f30e55d0bb68b14b0a0f1bcd317596449b006ef50f611": "the owner's Windows node identifier",
+            "439c9613bd51465cb70f3bbbfc4611edfc0c399cf34639c25f44d7f51dde6e15": "the owner's macOS node identifier",
+            "6754388f2f7a7d48653f0f7265b1df465ad540be4fdbafb7bd21c2486af7a924": "the owner's checkout path",
+        }
+        offenders = []
+        for path in tracked_text_files():
+            rel = os.path.relpath(path, ROOT)
+            text = read(path)
+            for line_no, line in enumerate(text.splitlines(), 1):
+                lower = line.lower()
+                norm_slashes = re.sub(r"[\\/]+", "/", lower)
+                candidates = set(re.findall(r"[a-z0-9_.-]+", lower))
+                candidates.update(re.findall(r"[a-z0-9_-]+", lower))
+                candidates.update(re.findall(r"[a-z]:/[a-z0-9_-]+/[a-z0-9_-]+", norm_slashes))
+                for tok in candidates:
+                    digest = hashlib.sha256(tok.encode("utf-8")).hexdigest()
+                    if digest in forbidden_owner_hashes:
+                        offenders.append("%s:%d: %s (%s)" % (rel, line_no, forbidden_owner_hashes[digest], tok))
+
+        kill_patterns = {
             r"\bpkill\b(?!\s*\")": "a name-pattern kill",
             r"taskkill[^\n]*/IM\b": "a kill by image name",
             r"\bkillall\b": "a name-pattern kill",
         }
-        skip = {
-            # historical milestone script of the author's two machines (not a launcher)
-            os.path.join("scripts", "run_milestones_1_and_2.ps1"),
-        }
-        offenders = []
         for path in tracked_or_present(["*.sh", "*.cmd", "*.ps1", "*.vbs"]):
             rel = os.path.relpath(path, ROOT)
-            if rel in skip or rel.startswith("tests" + os.sep):
+            if rel.startswith("tests" + os.sep):
                 continue
             text = read(path)
-            for pattern, why in forbidden.items():
+            for pattern, why in kill_patterns.items():
                 # comments that merely mention the old behaviour ("never pkill ...") are fine
                 for line in text.splitlines():
                     stripped = line.strip()
@@ -631,6 +707,28 @@ class StaticRepositoryChecks(unittest.TestCase):
                 0,
                 f".gitignore must ignore {rel} (git check-ignore exited with {proc.returncode})",
             )
+
+    def test_fallback_scan_without_git_skips_target_and_cache_dirs(self):
+        """Verify tracked_text_files fallback in a non-git directory (e.g. git archive) skips target/."""
+        tmp = tempfile.mkdtemp(prefix="ox_archive_scan_")
+        try:
+            src_dir = os.path.join(tmp, "crates", "core", "src")
+            target_dir = os.path.join(tmp, "target", "debug", "deps")
+            git_dir = os.path.join(tmp, ".git", "logs")
+            os.makedirs(src_dir)
+            os.makedirs(target_dir)
+            os.makedirs(git_dir)
+            keep_file = os.path.join(src_dir, "lib.rs")
+            with open(keep_file, "w", encoding="utf-8") as f:
+                f.write("// clean source\n")
+            with open(os.path.join(target_dir, "artifact.d"), "w", encoding="utf-8") as f:
+                f.write("build artifact inside target/\n")
+            with open(os.path.join(git_dir, "HEAD"), "w", encoding="utf-8") as f:
+                f.write("git log inside .git/\n")
+            scanned = tracked_text_files(root=tmp)
+            self.assertEqual(scanned, [keep_file])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

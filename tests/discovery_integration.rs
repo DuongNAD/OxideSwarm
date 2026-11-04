@@ -144,7 +144,7 @@ async fn test_standby_worker_redirection_portal_and_http_probing() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let portal_port = 29003;
-    let target_master = "192.168.1.123:8088".to_string();
+    let target_master = "192.0.2.20:8088".to_string();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     tokio::spawn(async move {
@@ -167,8 +167,8 @@ async fn test_standby_worker_redirection_portal_and_http_probing() {
     let resp = String::from_utf8_lossy(&buf[..n]);
 
     assert!(resp.contains("307 Temporary Redirect"));
-    assert!(resp.contains("Location: http://192.168.1.123:8080"));
-    assert!(resp.contains("X-OxideSwarm-Master: 192.168.1.123:8088"));
+    assert!(resp.contains("Location: http://192.0.2.20:8080"));
+    assert!(resp.contains("X-OxideSwarm-Master: 192.0.2.20:8088"));
 
     // 2. HTTP GET /api/status -> JSON status with WORKER_PORTAL role
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", portal_port))
@@ -185,7 +185,7 @@ async fn test_standby_worker_redirection_portal_and_http_probing() {
     assert!(resp.contains("200 OK"));
     assert!(resp.contains("application/json"));
     assert!(resp.contains("\"role\":\"WORKER_PORTAL\""));
-    assert!(resp.contains("http://192.168.1.123:8080"));
+    assert!(resp.contains("http://192.0.2.20:8080"));
 
     let _ = shutdown_tx.send(true);
 }

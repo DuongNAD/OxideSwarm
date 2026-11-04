@@ -837,10 +837,9 @@ async fn api_submit_task(
         Err(rusty_grid_core::GridError::Config(message)) => {
             json_error(StatusCode::BAD_REQUEST, message)
         }
-        Err(rusty_grid_core::GridError::QueueFull { capacity }) => json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("task queue is full ({capacity} active tasks)"),
-        ),
+        Err(e @ rusty_grid_core::GridError::QueueFull { .. }) => {
+            json_error(StatusCode::SERVICE_UNAVAILABLE, e.to_string())
+        }
         Err(e @ rusty_grid_core::GridError::QueueByteLimitExceeded { .. }) => {
             let status = if e.is_transient() {
                 StatusCode::SERVICE_UNAVAILABLE
