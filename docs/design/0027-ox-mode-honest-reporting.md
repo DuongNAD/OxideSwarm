@@ -25,7 +25,7 @@ Moves the `ox-mode` workflow-mode execution engine out of `crates/core` into `cr
    `rusty_grid_core::protocol` constants (`PROTOCOL_VERSION_CURRENT`, `PROTOCOL_VERSION_MIN_COMPATIBLE`,
    `MAX_FRAME_SIZE` = 64 MiB), workspace crates parsed from `Cargo.toml`, and design records on disk
    (`docs/design/*.md`), replacing the static template that contained outdated claims.
-6. `doc verify` checks relative markdown links (`[label](target)` outside code fences and inline code
+6. `doc verify` checks relative markdown links (outside code fences and inline code
    spans) in addition to file existence, heading counts, and balanced code fences.
 
 ## Context
@@ -80,6 +80,6 @@ Previously (`MODE-1` in `docs/BACKLOG.md`):
    - `export_specification` generates `target/docs/OXIDESWARM_SPECIFICATION.md` from live
      `rusty_grid_core::protocol` constants, `Cargo.toml` workspace members, and `docs/design/*.md`
      headings.
-   - `verify_documentation` parses `[label](target)` links outside fenced code blocks and inline code
+   - `verify_documentation` parses markdown link targets outside fenced code blocks and inline code
      spans, resolves relative file paths against each document's directory, and fails when any target
      is missing.
