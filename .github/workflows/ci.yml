@@ -14,12 +14,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A newer push to a pull request cancels its older run; runs for pushes to master are never cancelled.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # [profile.dev] has `debug = true`. Line tables keep file:line in panics and backtraces while keeping
+  # the ~60 test binaries small enough for the runners' disks and the cache.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 # The toolchain is pinned (`dtolnay/rust-toolchain@<version>`) so that a new stable release and its
 # new lints cannot turn CI red on an unchanged tree. Bump it in every job at once, deliberately,
@@ -54,14 +58,36 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          cache-on-failure: true
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: master compiles without default features (dashboard, p2p)
         if: matrix.os == 'ubuntu-latest'
         run: cargo check -p rusty_grid_master --no-default-features --locked
 
+  gpu-wgpu:
+    name: gpu-wgpu (${{ matrix.os }})
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          cache-on-failure: true
+      - run: cargo clippy -p rusty_grid_cli --all-targets --features gpu-wgpu --locked -- -D warnings
+      - run: cargo test -p rusty_grid_cli --lib --features gpu-wgpu --locked
+
   test:
-    # Unit tests only (`ox-mode test quick`). The full `cargo test --workspace` suite is slow and
-    # includes timing-sensitive stress and P2P tests, so it stays a local check.
     name: unit tests (${{ matrix.os }})
     if: github.event_name != 'schedule'
     strategy:
@@ -74,10 +100,13 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          cache-on-failure: true
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.x"
-      - run: pip install websockets
+          python-version: '3.12'
+      - run: python -m pip install --disable-pip-version-check websockets
       - run: cargo test --workspace --lib --locked
       - name: run agent mesh integration tests
         run: cargo test -p agent_mesh --test test_sec6_mesh_sandbox --locked
@@ -85,6 +114,34 @@ jobs:
         run: cargo build -p agent_mesh --locked
       - name: run Rust hub + Python agent interop suites
         run: python tests/test_agent_mesh_rust_hub_cross_interop.py
+
+  workspace-test:
+    # Full Cargo workspace test suite (`tests/` and `crates/*/tests/` included).
+    # Tests bind 127.0.0.1:0 and give child processes a temporary HOME, so they need no fixed ports
+    # and never touch the runner's ~/.oxideswarm.
+    name: workspace tests (${{ matrix.os }})
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+      # tests/test_ecosystem_convergence.rs runs scripts/agent_node.py (as `python3`, or `python` on
+      # Windows), which needs the `websockets` package.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: python -m pip install websockets
+        run: python -m pip install --disable-pip-version-check websockets
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          cache-on-failure: true
+      - run: cargo test --workspace --locked --no-fail-fast
 
   sec5-hardened-runner:
     name: sec5 hardened runner (${{ matrix.os }})
@@ -99,7 +156,35 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          cache-on-failure: true
       - run: cargo test -p rusty_grid_worker --test test_sec5_hardened_runner --locked
+
+  launcher-scripts:
+    name: launcher scripts (${{ matrix.os }})
+    if: github.event_name != 'schedule'
+    # tests/test_launcher_scripts.py globs the whole checkout, target/ included, and gets slow once a
+    # target/ directory exists. Keep cargo and rust-cache out of this job so that the script always runs
+    # without any build: it runs the launchers against fake binaries.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: python3 tests/test_launcher_scripts.py
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            # The launchers must work with macOS's own /bin/bash 3.2: run them with it, not with a newer
+            # Homebrew bash that may come first on the runner's PATH.
+            export PATH="/bin:$PATH"
+          fi
+          bash -c 'echo "bash $BASH_VERSION ($(command -v bash))"'
+          python3 --version
+          python3 tests/test_launcher_scripts.py
 
   agent-bridge:
     # The bridge also runs on the owner's Windows machine, and this is the only check of that path.
@@ -115,8 +200,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.x"
-      - run: pip install websockets
+          python-version: '3.12'
+      - run: python -m pip install --disable-pip-version-check websockets
       - run: python tests/test_agent_bridge.py
       - run: python tests/test_launcher_scripts.py
       - run: python tests/test_m1_challenger_hygiene.py
