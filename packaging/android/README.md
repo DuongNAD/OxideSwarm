@@ -287,4 +287,4 @@ packaging/android/
 
 ---
 **Maintained by:** OxideSwarm Core Engineering Team  
-**License:** Apache-2.0 / MIT
+**License:** Apache-2.0
