@@ -597,6 +597,23 @@ class StaticRepositoryChecks(unittest.TestCase):
             self.assertIn("OXIDE_MESH_NO_SHELL", text, f"{path} must support OXIDE_MESH_NO_SHELL")
             self.assertIn("--no-shell", text, f"{path} must support --no-shell")
 
+    def test_gitignore_covers_test_reports_and_jnilibs_so_files(self):
+        for rel in (
+            "test_reports/chaos_test_report.md",
+            "packaging/android/app/app/src/main/jniLibs/arm64-v8a/liboxideworker.so",
+        ):
+            proc = subprocess.run(
+                ["git", "check-ignore", "-q", rel],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f".gitignore must ignore {rel} (git check-ignore exited with {proc.returncode})",
+            )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
