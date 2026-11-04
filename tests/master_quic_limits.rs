@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use iroh::endpoint::presets::N0;
+use iroh::endpoint::presets::Minimal;
 use iroh::endpoint::RelayMode;
 
 use rusty_grid_core::transport::{parse_p2p_ticket, GRID_ALPN, STREAM_CONTROL};
@@ -22,6 +22,7 @@ async fn spawn_p2p_master(config: ServerConfig, handshake_timeout_secs: u64) -> 
     MasterServer::spawn(
         config
             .with_p2p(true)
+            .with_p2p_minimal_preset(true)
             .with_ephemeral_key(true)
             .with_web_ui(false)
             .with_discovery(false)
@@ -34,7 +35,7 @@ async fn spawn_p2p_master(config: ServerConfig, handshake_timeout_secs: u64) -> 
 async fn dial(master: &MasterHandle) -> Result<iroh::endpoint::Connection, String> {
     let ticket = master.p2p_ticket().expect("p2p ticket");
     let addr = parse_p2p_ticket(ticket).expect("parse ticket");
-    let client = iroh::Endpoint::builder(N0)
+    let client = iroh::Endpoint::builder(Minimal)
         .alpns(vec![GRID_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
         .bind()
@@ -135,7 +136,8 @@ async fn test_workers_over_quic_release_the_pre_auth_slot_once_registered() {
             .with_name(format!("quic-worker-{i}"))
             .with_cores(1)
             .with_sandbox_base_dir(sandbox.path())
-            .with_p2p_ticket(&ticket);
+            .with_p2p_ticket(&ticket)
+            .with_p2p_minimal_preset(true);
         let mut worker = WorkerClient::new(config);
         let (tx, rx) = watch::channel(false);
         tokio::spawn(async move {

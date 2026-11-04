@@ -257,6 +257,7 @@ async fn test_master_p2p_default_key_creates_isolated_key_without_host_mutation(
     // Master MUST use default_master_key_file() which now resolves to <sandbox_dir>/master_key.bin.
     let config1 = ServerConfig::new(master_bind)
         .with_p2p(true)
+        .with_p2p_minimal_preset(true)
         .with_p2p_ticket_file(&ticket_file);
 
     let master1 = MasterServer::spawn(config1)
@@ -291,6 +292,7 @@ async fn test_master_p2p_default_key_creates_isolated_key_without_host_mutation(
     let ticket_file2 = sandbox_dir.join("isolated_master_2.ticket");
     let config2 = ServerConfig::new(master_bind)
         .with_p2p(true)
+        .with_p2p_minimal_preset(true)
         .with_p2p_ticket_file(&ticket_file2);
 
     let master2 = MasterServer::spawn(config2)

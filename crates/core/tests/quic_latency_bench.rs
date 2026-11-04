@@ -13,14 +13,14 @@ async fn benchmark_iroh_quic_stream_rtt() {
     use std::time::Instant;
     use uuid::Uuid;
 
-    let endpoint1 = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+    let endpoint1 = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
         .alpns(vec![GRID_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
         .bind()
         .await
         .expect("bind endpoint 1");
 
-    let endpoint2 = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+    let endpoint2 = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
         .alpns(vec![GRID_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
         .bind()

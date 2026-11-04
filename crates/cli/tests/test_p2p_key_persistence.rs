@@ -35,6 +35,7 @@ fn cli(home: &Path) -> Command {
         .env_remove("RUSTY_GRID_EPHEMERAL_KEY")
         .env("RUSTY_GRID_DISABLE_DISCOVERY", "1")
         .env("RUSTY_GRID_DISABLE_WEB_UI", "1")
+        .env("RUSTY_GRID_P2P_MINIMAL", "1")
         .env("NO_COLOR", "1")
         .stdin(Stdio::null());
     cmd
@@ -488,6 +489,7 @@ async fn test_port_and_ticket_files_removed_on_shutdown() {
     let eph_cfg = ServerConfig::new(bind)
         .with_port_file(&eph_port)
         .with_p2p(true)
+        .with_p2p_minimal_preset(true)
         .with_ephemeral_key(true)
         .with_p2p_ticket_file(&eph_ticket);
 
@@ -524,6 +526,7 @@ async fn test_port_and_ticket_files_removed_on_shutdown() {
     let persist_cfg = ServerConfig::new(bind)
         .with_port_file(&persist_port)
         .with_p2p(true)
+        .with_p2p_minimal_preset(true)
         .with_p2p_key_file(&persist_key)
         .with_p2p_ticket_file(&persist_ticket);
 

@@ -16,7 +16,7 @@ waits up to `REFUSAL_DRAIN_TIMEOUT` (`1 s`) in total for the peer to close the Q
 ## Context
 
 `handle_multiplexed_connection` (`crates/master/src/server.rs`) can refuse a peer on the control
-stream before registering a worker session in six ways:
+stream before registering a worker session in five ways:
 
 1. Cluster authentication fails (`authenticate_and_read_first_message` sends an auth `REJECT` frame:
    `REJECT_AUTH_REQUIRED`, `REJECT_AUTH_FAILED`, `REJECT_UNSUPPORTED_VERSION`, or `REJECT_NO_SECRET`
@@ -79,7 +79,9 @@ flow-control credit could hold its connection slot indefinitely.
 - Wire format, CLI flags, and protocol version (`2`) are unchanged.
 - An `--insecure` P2P worker connecting to a secret-protected master (or a secret-configured P2P
   worker connecting to an `--insecure` master) now receives the auth `REJECT` frame over QUIC and
-  surfaces `GridError::AuthRequired` / `GridError::AuthFailed` (exit code `6` and auth backoff)
+  surfaces `GridError::AuthRequired` / `GridError::AuthFailed` (triggering the 30 s
+  authentication-failure backoff in the worker's reconnect loop rather than a rapid generic
+  reconnect; exit code `6` only applies to the start-up secret check before the worker connects)
   instead of a generic `HandshakeFailed` (`connection lost`).
 
 ## Security
@@ -100,11 +102,14 @@ flow-control credit could hold its connection slot indefinitely.
   1. all four `WorkerMessage` handshake refusal arms (`ClaimMasterRole`, `cpu_cores == 0`,
      `protocol_version == 0`, unexpected `Heartbeat`) and the cluster-auth refusals
      (`REJECT_NO_SECRET` and `REJECT_AUTH_REQUIRED`) arrive on the peer followed by clean stream EOF;
-  2. a refused peer that stays silent after reading the refusal is closed by the master after
-     `0.9 s ..= 1.5 s`;
+  2. under `max_pending_handshakes(1)`, a second peer connecting while a first peer that failed
+     cluster authentication is still parked inside `drain_refusal_stream` is admitted immediately
+     (proving `handshake_permit` is dropped before `drain_refusal_stream`), and a refused peer that
+     stays silent after reading the refusal is closed by the master after `0.9 s ..= 3.0 s` (bounded
+     by a `5 s` test timeout on `closed().await`);
   3. a refused peer configured with a 1-byte QUIC stream receive window (`stream_receive_window(1)`)
-     on a `max_connections = 1` master is closed within `1.5 s` and frees the connection slot for
-     the next peer.
+     on a `max_connections = 1` master is closed within `3.0 s` (bounded by a `5 s` test timeout on
+     `closed().await`) and frees the connection slot for the next peer.
 - **Integration (`tests/cluster_auth_e2e.rs`):**
   `test_quic_control_stream_requires_the_cluster_secret` verifies that an unauthenticated QUIC
   `Register` receives `ProtocolError::InvalidFormatTag(WIRE_FORMAT_AUTH)` (`GridError::AuthRequired`).

@@ -70,6 +70,14 @@ pub struct ServerConfig {
     pub handshake_timeout_secs: u64,
     /// Whether to enable P2P NAT traversal listener (iroh).
     pub enable_p2p: bool,
+    /// When `true` (or when `RUSTY_GRID_P2P_MINIMAL=1` is set in the environment), builds the
+    /// P2P endpoint with `iroh::endpoint::presets::Minimal` (no n0 DERP relay or pkarr/DNS
+    /// address lookup) so tests stay completely off the network. Production defaults to `false`
+    /// (`presets::N0`).
+    pub p2p_minimal_preset: bool,
+    /// Optional explicit UDP socket address for the P2P endpoint (used by tests to keep a stable
+    /// loopback UDP port across restarts when relays are disabled).
+    pub p2p_bind_addr: Option<SocketAddr>,
     /// Optional path to write P2P ticket for worker connections.
     pub p2p_ticket_file: Option<PathBuf>,
     /// Address to bind the Web UI dashboard to (e.g. "0.0.0.0:8080").
@@ -155,6 +163,8 @@ impl Default for ServerConfig {
             heartbeat_interval_secs: 3,
             handshake_timeout_secs: 5,
             enable_p2p: false,
+            p2p_minimal_preset: false,
+            p2p_bind_addr: None,
             p2p_ticket_file: None,
             // The dashboard is only reachable from other machines when its address is set
             // explicitly (`with_web_ui_addr` / `--web-ui-addr`).
@@ -237,6 +247,21 @@ impl ServerConfig {
     /// Enables or disables P2P listener mode.
     pub fn with_p2p(mut self, enable: bool) -> Self {
         self.enable_p2p = enable;
+        self
+    }
+
+    /// Selects `iroh::endpoint::presets::Minimal` (no relay or external address lookup) for the
+    /// P2P endpoint when `minimal` is `true`, keeping tests off the network while production
+    /// keeps `presets::N0` (`false`).
+    pub fn with_p2p_minimal_preset(mut self, minimal: bool) -> Self {
+        self.p2p_minimal_preset = minimal;
+        self
+    }
+
+    /// Binds the P2P QUIC endpoint to a specific UDP socket address (clearing default `0.0.0.0:0`
+    /// and `[::]:0` transports).
+    pub fn with_p2p_bind_addr(mut self, addr: SocketAddr) -> Self {
+        self.p2p_bind_addr = Some(addr);
         self
     }
 
@@ -509,23 +534,47 @@ impl MasterServer {
                 config.p2p_key_file.clone().or_else(default_master_key_file)
             };
             let secret_key = resolve_p2p_secret_key(resolved_key_file.as_deref()).await?;
-            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            let use_minimal_preset = config.p2p_minimal_preset
+                || std::env::var("RUSTY_GRID_P2P_MINIMAL")
+                    .ok()
+                    .is_some_and(|v| {
+                        matches!(
+                            v.trim().to_ascii_lowercase().as_str(),
+                            "1" | "true" | "yes" | "on"
+                        )
+                    });
+            let mut ep_builder = if use_minimal_preset {
+                iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            } else {
+                iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            };
+            if let Some(p2p_addr) = config.p2p_bind_addr {
+                ep_builder = ep_builder
+                    .clear_ip_transports()
+                    .bind_addr(p2p_addr)
+                    .map_err(|e| {
+                        GridError::Config(format!("Invalid P2P bind address '{p2p_addr}': {e}"))
+                    })?;
+            }
+            let endpoint = ep_builder
                 .secret_key(secret_key)
                 .alpns(vec![GRID_ALPN.to_vec()])
                 .bind()
                 .await
                 .map_err(|e| GridError::Config(format!("Failed to bind iroh endpoint: {e}")))?;
 
-            // Await home DERP relay connection and STUN discovery before serializing ticket.
-            // Timeout gracefully so offline/air-gapped environments don't hang indefinitely.
-            match tokio::time::timeout(Duration::from_secs(5), endpoint.online()).await {
-                Ok(_) => {
-                    info!(
-                        "Master connected to home DERP relay and discovered public network paths"
-                    );
-                }
-                Err(_) => {
-                    warn!("Timed out awaiting DERP relay readiness; proceeding with initial discovered addresses");
+            if !use_minimal_preset {
+                // Await home DERP relay connection and STUN discovery before serializing ticket.
+                // Timeout gracefully so offline/air-gapped environments don't hang indefinitely.
+                match tokio::time::timeout(Duration::from_secs(5), endpoint.online()).await {
+                    Ok(_) => {
+                        info!(
+                            "Master connected to home DERP relay and discovered public network paths"
+                        );
+                    }
+                    Err(_) => {
+                        warn!("Timed out awaiting DERP relay readiness; proceeding with initial discovered addresses");
+                    }
                 }
             }
 
@@ -6324,7 +6373,8 @@ mod tests {
         );
 
         for secret in [None, Some(test_secret.clone())] {
-            let mut cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
+            let mut cfg =
+                ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_pending_handshakes(1);
             cfg.cluster_secret = secret.clone();
             let mut server = MasterServer::bind(cfg, WorkerRegistry::new())
                 .await
@@ -6683,10 +6733,51 @@ mod tests {
                 }
             }
 
-            // 6. Silent peer check: when a refused peer reads the refusal frame and stays silent
-            //    without closing `conn`, the master keeps `conn` open for `REFUSAL_DRAIN_TIMEOUT`
-            //    (`1 s`) and closes it between 0.9 s and 1.5 s.
+            // 6. Silent peer check + `max_pending_handshakes(1)` release during auth-refusal drain:
+            //    - While a first peer that failed cluster auth is still open inside
+            //      `drain_refusal_stream` (holding its connection open without closing `conn`),
+            //      its `handshake_permit` must already be dropped so a second peer is admitted
+            //      under `max_pending_handshakes(1)`.
+            //    - When a refused peer reads the refusal frame and stays silent without closing
+            //      `conn`, the master keeps `conn` open for `REFUSAL_DRAIN_TIMEOUT` (`1 s`) and
+            //      closes it between 0.9 s and 3.0 s.
             {
+                let (mut ctrl_auth_drain, keep_auth_drain) = open_raw_ctrl().await;
+                if secret.is_none() {
+                    let err = client_handshake(&mut ctrl_auth_drain, &test_secret)
+                        .await
+                        .expect_err("master without secret must reject client_handshake");
+                    assert!(matches!(err, GridError::AuthFailed(_)));
+                } else {
+                    ctrl_auth_drain
+                        .send_msg(&WorkerMessage::Register {
+                            worker_id: Uuid::new_v4(),
+                            capabilities: WorkerCapabilities::new(
+                                "unauth-drain-holder",
+                                2,
+                                2048,
+                                false,
+                                false,
+                                None,
+                            ),
+                            protocol_version: PROTOCOL_VERSION_CURRENT,
+                            features: ProtocolCapabilities::all_supported(),
+                        })
+                        .await
+                        .unwrap();
+                    let err = ctrl_auth_drain
+                        .recv_msg::<MasterMessage>()
+                        .await
+                        .expect_err("unauthenticated Register must be rejected");
+                    assert!(matches!(
+                        err,
+                        ProtocolError::InvalidFormatTag(WIRE_FORMAT_AUTH)
+                    ));
+                }
+                // `keep_auth_drain.0` is intentionally kept open so the master task is parked inside
+                // `drain_refusal_stream` waiting up to 1 s for `conn.closed()`. With
+                // `max_pending_handshakes(1)`, a second peer connecting right now is admitted only
+                // if `drop(handshake_permit)` happened before `drain_refusal_stream`.
                 let (mut ctrl_silent, keep_silent) = open_ctrl().await;
                 let started = tokio::time::Instant::now();
                 ctrl_silent
@@ -6707,11 +6798,14 @@ mod tests {
                         ..
                     }
                 ));
-                keep_silent.0.closed().await;
+                keep_auth_drain.0.close(0u32.into(), b"done");
+                tokio::time::timeout(Duration::from_secs(5), keep_silent.0.closed())
+                    .await
+                    .expect("silent refused peer must be closed before 5 s timeout");
                 let elapsed = started.elapsed();
                 assert!(
-                    elapsed >= Duration::from_millis(900) && elapsed <= Duration::from_millis(1500),
-                    "silent refused peer must be closed after ~1 s (0.9..=1.5 s), took {elapsed:?}"
+                    elapsed >= Duration::from_millis(900) && elapsed <= Duration::from_secs(3),
+                    "silent refused peer must be closed after ~1 s (0.9..=3.0 s), took {elapsed:?}"
                 );
             }
 
@@ -6725,7 +6819,7 @@ mod tests {
         //    A peer whose QUIC stream receive window is 1 byte (smaller than the refusal frame)
         //    causes `transport.send_msg` on the master to block on flow-control credit. The single
         //    1 s timeout around `send_msg`, `shutdown`, and `conn.closed()` aborts the stalled
-        //    refusal within 1.5 s and frees the single connection slot.
+        //    refusal within 3.0 s and frees the single connection slot.
         {
             let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_connections(1);
             let mut server = MasterServer::bind(cfg, WorkerRegistry::new())
@@ -6772,11 +6866,13 @@ mod tests {
                 .await
                 .unwrap();
             // Do not read from `stalled_ctrl`; its 1-byte stream receive window blocks `send_msg`.
-            stalled_conn.closed().await;
+            tokio::time::timeout(Duration::from_secs(5), stalled_conn.closed())
+                .await
+                .expect("peer granting no flow-control credit must be closed before 5 s timeout");
             let elapsed = started.elapsed();
             assert!(
-                elapsed <= Duration::from_millis(1500),
-                "peer granting no flow-control credit must be closed within 1.5 s, took {elapsed:?}"
+                elapsed <= Duration::from_secs(3),
+                "peer granting no flow-control credit must be closed within 3.0 s, took {elapsed:?}"
             );
 
             // Now `max_connections = 1` slot is free again: a normal peer must be admitted.

@@ -339,6 +339,7 @@ async fn test_adversarial_master_generated_ticket_compatibility() {
     let master_cfg = ServerConfig::from_addr("127.0.0.1:0")
         .expect("valid addr")
         .with_p2p(true)
+        .with_p2p_minimal_preset(true)
         .with_ephemeral_key(true)
         .with_web_ui(false);
     let master = MasterServer::spawn(master_cfg)
@@ -491,6 +492,7 @@ fn test_adversarial_double_start_and_double_stop_idempotency() {
 #[tokio::test]
 async fn test_adversarial_worker_connect_via_master_p2p_ticket() {
     let _guard = ADVERSARIAL_TEST_LOCK.lock().await;
+    std::env::set_var("RUSTY_GRID_P2P_MINIMAL", "1");
 
     stop_worker_impl();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -501,6 +503,7 @@ async fn test_adversarial_worker_connect_via_master_p2p_ticket() {
     let master_cfg = ServerConfig::from_addr("127.0.0.1:0")
         .expect("valid addr")
         .with_p2p(true)
+        .with_p2p_minimal_preset(true)
         .with_ephemeral_key(true)
         .with_web_ui(false);
     let master = MasterServer::spawn(master_cfg)
