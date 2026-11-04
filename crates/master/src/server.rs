@@ -5764,19 +5764,17 @@ mod tests {
                 ),
             };
 
-            // 1. Before any task is queued: send ClaimMasterRole as handshake message on handle_connection.
-            {
-                let (m_end, w_end) = tokio::io::duplex(64 * 1024);
+            let spawn_tcp = |m_end: tokio::io::DuplexStream, port: u16| {
                 let reg_clone = registry.clone();
                 let queue_clone = queue.clone();
                 let notify_clone = Arc::clone(&scheduler_notify);
                 let waiters_clone = Arc::clone(&waiters);
                 let stop_rx_clone = stop_rx.clone();
                 let secret_clone = secret.clone();
-                let conn_task = tokio::spawn(async move {
+                tokio::spawn(async move {
                     handle_connection(
                         m_end,
-                        "127.0.0.1:50001".parse().unwrap(),
+                        SocketAddr::from(([127, 0, 0, 1], port)),
                         reg_clone,
                         queue_clone,
                         notify_clone,
@@ -5798,7 +5796,50 @@ mod tests {
                         None,
                     )
                     .await
-                });
+                })
+            };
+
+            let spawn_mux = |c_master: tokio::io::DuplexStream,
+                             d_master: tokio::io::DuplexStream,
+                             port: u16| {
+                let reg_clone = registry.clone();
+                let queue_clone = queue.clone();
+                let notify_clone = Arc::clone(&scheduler_notify);
+                let waiters_clone = Arc::clone(&waiters);
+                let stop_rx_clone = stop_rx.clone();
+                let secret_clone = secret.clone();
+                tokio::spawn(async move {
+                    handle_multiplexed_connection(
+                        c_master,
+                        d_master,
+                        SocketAddr::from(([127, 0, 0, 1], port)),
+                        reg_clone,
+                        queue_clone,
+                        notify_clone,
+                        waiters_clone,
+                        10,
+                        Duration::from_secs(5),
+                        stop_rx_clone,
+                        None,
+                        WireCodec::Bincode,
+                        secret_clone,
+                        None,
+                        None,
+                        #[cfg(feature = "dashboard")]
+                        None,
+                        #[cfg(feature = "p2p")]
+                        None,
+                        #[cfg(feature = "p2p")]
+                        None,
+                    )
+                    .await
+                })
+            };
+
+            // 1. Before any task is queued: send ClaimMasterRole as handshake message on handle_connection.
+            {
+                let (m_end, w_end) = tokio::io::duplex(64 * 1024);
+                let conn_task = spawn_tcp(m_end, 50001);
 
                 let mut w_transport = MessageTransport::new(w_end);
                 if let Some(ref sec) = secret {
@@ -5818,9 +5859,11 @@ mod tests {
                     .expect("handshake ClaimMasterRole must receive RoleHandoverAck");
                 assert_refused_ack(ack, "pre-queue handshake");
                 conn_task.await.unwrap().unwrap();
+                assert!(registry.list_workers().await.is_empty());
             }
 
-            // 2. Queue a task so the queue is non-empty, then test handshake, active session, and multiplexed session.
+            // 2. Queue a task so the queue is non-empty, then test TCP handshake, multiplexed handshake,
+            //    active TCP session, and active multiplexed session.
             let queued_task = Task::new(
                 TaskSpec::command("echo", vec!["queued-task".into()]),
                 TaskRequirements::generic(1, 64),
@@ -5828,41 +5871,10 @@ mod tests {
             queue.submit(queued_task).await.unwrap();
             assert_eq!(queue.get_schedulable_tasks().await.len(), 1);
 
-            // 2a. Handshake ClaimMasterRole after a task is queued.
+            // 2a. TCP handshake ClaimMasterRole after a task is queued.
             {
                 let (m_end, w_end) = tokio::io::duplex(64 * 1024);
-                let reg_clone = registry.clone();
-                let queue_clone = queue.clone();
-                let notify_clone = Arc::clone(&scheduler_notify);
-                let waiters_clone = Arc::clone(&waiters);
-                let stop_rx_clone = stop_rx.clone();
-                let secret_clone = secret.clone();
-                let conn_task = tokio::spawn(async move {
-                    handle_connection(
-                        m_end,
-                        "127.0.0.1:50002".parse().unwrap(),
-                        reg_clone,
-                        queue_clone,
-                        notify_clone,
-                        waiters_clone,
-                        10,
-                        Duration::from_secs(5),
-                        stop_rx_clone,
-                        None,
-                        WireCodec::Bincode,
-                        secret_clone,
-                        None,
-                        4,
-                        None,
-                        #[cfg(feature = "dashboard")]
-                        None,
-                        #[cfg(feature = "p2p")]
-                        None,
-                        #[cfg(feature = "p2p")]
-                        None,
-                    )
-                    .await
-                });
+                let conn_task = spawn_tcp(m_end, 50002);
 
                 let mut w_transport = MessageTransport::new(w_end);
                 if let Some(ref sec) = secret {
@@ -5880,45 +5892,50 @@ mod tests {
                     .await
                     .unwrap()
                     .expect("post-queue handshake ClaimMasterRole must receive RoleHandoverAck");
-                assert_refused_ack(ack, "post-queue handshake");
+                assert_refused_ack(ack, "post-queue TCP handshake");
                 conn_task.await.unwrap().unwrap();
+                assert!(
+                    registry.list_workers().await.is_empty(),
+                    "refused TCP handshake claim must not register a worker"
+                );
             }
 
-            // 2b. Active registered session on handle_connection.
+            // 2b. Multiplexed (P2P) handshake ClaimMasterRole as first control message after a task is queued.
+            {
+                let (c_master, c_worker) = tokio::io::duplex(64 * 1024);
+                let (d_master, _d_worker) = tokio::io::duplex(64 * 1024);
+                let mux_hs_task = spawn_mux(c_master, d_master, 50003);
+
+                let mut ctrl_transport = MessageTransport::new(c_worker);
+                if let Some(ref sec) = secret {
+                    let key = client_handshake(&mut ctrl_transport, sec).await.unwrap();
+                    ctrl_transport.enable_encryption(&key, EndpointRole::Client);
+                }
+                ctrl_transport
+                    .send_msg(&WorkerMessage::ClaimMasterRole {
+                        ticket: high_score_ticket.clone(),
+                    })
+                    .await
+                    .unwrap();
+                let ack = ctrl_transport
+                    .recv_msg::<MasterMessage>()
+                    .await
+                    .unwrap()
+                    .expect(
+                        "post-queue mux handshake ClaimMasterRole must receive RoleHandoverAck",
+                    );
+                assert_refused_ack(ack, "post-queue multiplexed handshake");
+                mux_hs_task.await.unwrap().unwrap();
+                assert!(
+                    registry.list_workers().await.is_empty(),
+                    "refused multiplexed handshake claim must not register a worker"
+                );
+            }
+
+            // 2c. Active registered session on handle_connection.
             {
                 let (m_end, w_end) = tokio::io::duplex(64 * 1024);
-                let reg_clone = registry.clone();
-                let queue_clone = queue.clone();
-                let notify_clone = Arc::clone(&scheduler_notify);
-                let waiters_clone = Arc::clone(&waiters);
-                let stop_rx_clone = stop_rx.clone();
-                let secret_clone = secret.clone();
-                let conn_task = tokio::spawn(async move {
-                    let _ = handle_connection(
-                        m_end,
-                        "127.0.0.1:50003".parse().unwrap(),
-                        reg_clone,
-                        queue_clone,
-                        notify_clone,
-                        waiters_clone,
-                        10,
-                        Duration::from_secs(5),
-                        stop_rx_clone,
-                        None,
-                        WireCodec::Bincode,
-                        secret_clone,
-                        None,
-                        4,
-                        None,
-                        #[cfg(feature = "dashboard")]
-                        None,
-                        #[cfg(feature = "p2p")]
-                        None,
-                        #[cfg(feature = "p2p")]
-                        None,
-                    )
-                    .await;
-                });
+                let conn_task = spawn_tcp(m_end, 50004);
 
                 let mut w_transport = MessageTransport::new(w_end);
                 if let Some(ref sec) = secret {
@@ -5969,6 +5986,11 @@ mod tests {
                     .unwrap()
                     .expect("active session ClaimMasterRole must receive RoleHandoverAck");
                 assert_refused_ack(ack, "post-queue active TCP session");
+                assert_eq!(
+                    registry.get_worker(worker_id).await.map(|w| w.status),
+                    Some(crate::registry::WorkerStatus::Connected),
+                    "worker must remain Connected in registry after refused ClaimMasterRole on active TCP session"
+                );
 
                 // Session remains alive and responds to Heartbeat after refusal.
                 w_transport
@@ -5987,45 +6009,18 @@ mod tests {
                         panic!("expected HeartbeatAck after refused ClaimMasterRole, got {other:?}")
                     }
                 }
+                assert_eq!(
+                    registry.get_worker(worker_id).await.map(|w| w.status),
+                    Some(crate::registry::WorkerStatus::Connected)
+                );
                 conn_task.abort();
             }
 
-            // 2c. Active multiplexed session on handle_multiplexed_connection.
+            // 2d. Active multiplexed session on handle_multiplexed_connection.
             {
                 let (c_master, c_worker) = tokio::io::duplex(64 * 1024);
                 let (d_master, _d_worker) = tokio::io::duplex(64 * 1024);
-                let reg_clone = registry.clone();
-                let queue_clone = queue.clone();
-                let notify_clone = Arc::clone(&scheduler_notify);
-                let waiters_clone = Arc::clone(&waiters);
-                let stop_rx_clone = stop_rx.clone();
-                let secret_clone = secret.clone();
-                let mux_task = tokio::spawn(async move {
-                    let _ = handle_multiplexed_connection(
-                        c_master,
-                        d_master,
-                        "127.0.0.1:50004".parse().unwrap(),
-                        reg_clone,
-                        queue_clone,
-                        notify_clone,
-                        waiters_clone,
-                        10,
-                        Duration::from_secs(5),
-                        stop_rx_clone,
-                        None,
-                        WireCodec::Bincode,
-                        secret_clone,
-                        None,
-                        None,
-                        #[cfg(feature = "dashboard")]
-                        None,
-                        #[cfg(feature = "p2p")]
-                        None,
-                        #[cfg(feature = "p2p")]
-                        None,
-                    )
-                    .await;
-                });
+                let mux_task = spawn_mux(c_master, d_master, 50005);
 
                 let mut ctrl_transport = MessageTransport::new(c_worker);
                 if let Some(ref sec) = secret {
@@ -6076,6 +6071,33 @@ mod tests {
                     .unwrap()
                     .expect("mux active session ClaimMasterRole must receive RoleHandoverAck");
                 assert_refused_ack(ack, "post-queue active multiplexed session");
+                assert_eq!(
+                    registry.get_worker(mux_worker_id).await.map(|w| w.status),
+                    Some(crate::registry::WorkerStatus::Connected),
+                    "worker must remain Connected in registry after refused ClaimMasterRole on active multiplexed session"
+                );
+
+                // Multiplexed control lane remains alive and responds to Heartbeat after refusal.
+                ctrl_transport
+                    .send_msg(&WorkerMessage::Heartbeat {
+                        worker_id: mux_worker_id,
+                        timestamp: 84,
+                        active_tasks: 0,
+                        cpu_usage_pct: 12.0,
+                        ram_available_mb: 2048,
+                    })
+                    .await
+                    .unwrap();
+                match ctrl_transport.recv_msg::<MasterMessage>().await.unwrap() {
+                    Some(MasterMessage::HeartbeatAck { timestamp: 84 }) => {}
+                    other => {
+                        panic!("expected mux HeartbeatAck after refused ClaimMasterRole, got {other:?}")
+                    }
+                }
+                assert_eq!(
+                    registry.get_worker(mux_worker_id).await.map(|w| w.status),
+                    Some(crate::registry::WorkerStatus::Connected)
+                );
 
                 let _ = stop_tx.send(true);
                 mux_task.abort();
