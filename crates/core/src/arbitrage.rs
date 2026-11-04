@@ -198,11 +198,18 @@ pub fn evaluate_mobile_master_refusal_matrix(
 }
 
 /// Helper identifying cellular or metered network descriptors.
-pub fn is_cellular_or_metered(net_lower: &str) -> bool {
+///
+/// Matches `"5g"` only as a standalone cellular token (e.g. `"5g"`, `"5G NR"`, `"5G-NR"`),
+/// not when embedded inside a frequency band such as `"5ghz"`.
+pub fn is_cellular_or_metered(net: &str) -> bool {
+    let net_lower = net.to_ascii_lowercase();
+    let has_5g_cellular_token = net_lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == "5g" || token == "5gnr");
     net_lower.contains("cell")
         || net_lower.contains("mobile")
         || net_lower.contains("lte")
-        || net_lower.contains("5g")
+        || has_5g_cellular_token
         || net_lower.contains("4g")
         || net_lower.contains("3g")
         || net_lower.contains("cgnat")
@@ -336,10 +343,10 @@ pub fn calculate_authority_score(
             || net_lower.contains("gigabit")
         {
             1500
-        } else if net_lower.contains("5g")
-            || net_lower.contains("wifi6")
+        } else if net_lower.contains("wifi6")
             || net_lower.contains("wifi 6")
             || net_lower.contains("5ghz")
+            || net_lower.contains("5 ghz")
         {
             1000
         } else if net_lower.contains("wifi") || net_lower.contains("wlan") {
@@ -765,5 +772,98 @@ mod tests {
             tampered.verify(Some(&secret), now + 5_000),
             Err(LeaseValidationError::SignatureMismatch)
         );
+    }
+
+    #[test]
+    fn test_network_type_5g_cellular_vs_5ghz_wifi() {
+        for cellular_net in ["5g", "5G NR"] {
+            assert!(
+                is_cellular_or_metered(cellular_net),
+                "expected '{cellular_net}' to be classified as cellular"
+            );
+
+            let telem = MobileEnvironmentTelemetry {
+                is_charging: Some(true),
+                battery_pct: Some(90),
+                network_type: Some(cellular_net.into()),
+                thermal_throttled: false,
+                battery_temperature: Some(30.0),
+                has_fgs_active: true,
+            };
+            assert!(
+                matches!(
+                    check_mobile_master_eligibility(&telem),
+                    Err(MasterRefusalReason::CellularOrMeteredNetwork { .. })
+                ),
+                "expected mobile refusal for cellular network '{cellular_net}'"
+            );
+
+            let desktop_eval = calculate_authority_score(
+                PlatformType::LinuxServer,
+                Some(true),
+                None,
+                Some(cellular_net),
+                false,
+                None,
+                0,
+                false,
+            );
+            assert_eq!(
+                desktop_eval.net_weight, -2000,
+                "expected net_weight -2000 for cellular network '{cellular_net}'"
+            );
+        }
+
+        for wifi_5ghz_net in ["wifi 5ghz", "5GHz", "wifi6"] {
+            assert!(
+                !is_cellular_or_metered(wifi_5ghz_net),
+                "expected '{wifi_5ghz_net}' NOT to be classified as cellular"
+            );
+
+            let telem = MobileEnvironmentTelemetry {
+                is_charging: Some(true),
+                battery_pct: Some(90),
+                network_type: Some(wifi_5ghz_net.into()),
+                thermal_throttled: false,
+                battery_temperature: Some(30.0),
+                has_fgs_active: true,
+            };
+            assert_eq!(
+                check_mobile_master_eligibility(&telem),
+                Ok(()),
+                "expected mobile eligibility to succeed for '{wifi_5ghz_net}'"
+            );
+
+            let desktop_eval = calculate_authority_score(
+                PlatformType::LinuxServer,
+                Some(true),
+                None,
+                Some(wifi_5ghz_net),
+                false,
+                None,
+                0,
+                false,
+            );
+            assert_eq!(
+                desktop_eval.net_weight, 1000,
+                "expected net_weight +1000 for 5 GHz / Wi-Fi 6 network '{wifi_5ghz_net}'"
+            );
+
+            let android_eval = calculate_authority_score(
+                PlatformType::Android,
+                Some(true),
+                Some(90),
+                Some(wifi_5ghz_net),
+                false,
+                Some(30.0),
+                0,
+                true,
+            );
+            assert_eq!(
+                android_eval.net_weight, 1000,
+                "expected Android net_weight +1000 for '{wifi_5ghz_net}'"
+            );
+            assert!(android_eval.is_eligible);
+        }
     }
 }
