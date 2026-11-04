@@ -35,6 +35,10 @@ PID_FILE="${STATE_DIR}/worker.pid"            # the supervisor (this script)
 CHILD_PID_FILE="${STATE_DIR}/worker.child.pid" # the rusty-grid worker it supervises
 LOG_FILE="${STATE_DIR}/worker.log"
 SANDBOX_DIR="${HOME}/.cache/oxideswarm/sandboxes"
+ENGINES_DIR="${HOME}/.local/share/oxideswarm/engines"
+if [ -z "${OXIDESWARM_GEN3D_SCRIPT:-}" ] && [ -f "${ENGINES_DIR}/generative_3d/entrypoint.py" ]; then
+    export OXIDESWARM_GEN3D_SCRIPT="${ENGINES_DIR}/generative_3d/entrypoint.py"
+fi
 
 mkdir -p "${CONFIG_DIR}" "${STATE_DIR}" "${SANDBOX_DIR}"
 
