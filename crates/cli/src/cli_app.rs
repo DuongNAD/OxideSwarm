@@ -928,11 +928,18 @@ pub async fn run_cli() -> ExitCode {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_log_filter(log_level))),
     );
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
     let is_mcp = matches!(cli.command, Commands::Mcp(_));
     let _ = if is_mcp {
         builder.with_writer(std::io::stderr).try_init()
     } else {
-        builder.try_init()
+        builder
+            .with_writer(
+                std::io::stderr
+                    .with_max_level(tracing::Level::WARN)
+                    .or_else(std::io::stdout),
+            )
+            .try_init()
     };
 
     let config_file = match if is_mcp {
@@ -1432,11 +1439,6 @@ async fn run_master(
         enable_p2p = enable_p2p,
         "Starting RustyGrid Master"
     );
-    if p2p_minimal {
-        eprintln!(
-            "Warning: P2P minimal preset is enabled (RUSTY_GRID_P2P_MINIMAL); DERP relay and pkarr/DNS address lookup are disabled, so workers behind NAT cannot connect"
-        );
-    }
 
     let handle =
         match MasterServer::spawn_with_config(server_config, sched_config, reaper_config).await {
@@ -1921,11 +1923,6 @@ async fn run_worker(
     if no_battery {
         eprintln!(
             "Warning: host battery and thermal protection is disabled (RUSTY_GRID_NO_BATTERY); this worker will accept tasks regardless of battery level or thermal state"
-        );
-    }
-    if p2p_minimal {
-        eprintln!(
-            "Warning: P2P minimal preset is enabled (RUSTY_GRID_P2P_MINIMAL); DERP relay and pkarr/DNS address lookup are disabled"
         );
     }
     match peer_outcome {
@@ -5390,23 +5387,5 @@ max_active_mb = 768
         std::env::remove_var("RUSTY_GRID_NO_BATTERY");
         std::env::remove_var("OXIDE_SWARM_NO_BATTERY");
         std::env::remove_var("RUSTY_GRID_DISABLE_BATTERY");
-
-        std::env::remove_var("RUSTY_GRID_P2P_MINIMAL");
-        assert!(!resolve_p2p_minimal());
-        for val in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] {
-            std::env::set_var("RUSTY_GRID_P2P_MINIMAL", val);
-            assert!(
-                resolve_p2p_minimal(),
-                "RUSTY_GRID_P2P_MINIMAL={val} must resolve to true"
-            );
-        }
-        for val in ["0", "false", "no", "off", ""] {
-            std::env::set_var("RUSTY_GRID_P2P_MINIMAL", val);
-            assert!(
-                !resolve_p2p_minimal(),
-                "RUSTY_GRID_P2P_MINIMAL={val} must resolve to false"
-            );
-        }
-        std::env::remove_var("RUSTY_GRID_P2P_MINIMAL");
     }
 }

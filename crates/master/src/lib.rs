@@ -416,6 +416,44 @@ path = "../../tests/registered_e2e.rs"
         out
     }
 
+    fn extract_fn_body<'a>(src: &'a str, fn_header: &str) -> Option<&'a str> {
+        let idx = src.find(fn_header)?;
+        let after = &src[idx..];
+        let brace_offset = after.find('{')?;
+        let body_start = &after[brace_offset..];
+        let bytes = body_start.as_bytes();
+        let mut depth = 0usize;
+        let mut i = 0usize;
+        let mut in_string = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_string {
+                if b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    in_string = false;
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(&body_start[..=i]);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
     fn check_test_source_for_non_minimal_p2p(
         label: &str,
         raw_src: &str,
@@ -427,6 +465,20 @@ path = "../../tests/registered_e2e.rs"
             violations.push(format!(
                 "{label}: uses presets::N0 in non-ignored test code"
             ));
+        }
+        if active.contains("\"--p2p\"")
+            && (active.contains("fn cli(") || active.contains("Command::new"))
+        {
+            let has_minimal_env = if let Some(cli_body) = extract_fn_body(&active, "fn cli(") {
+                cli_body.contains(".env(\"RUSTY_GRID_P2P_MINIMAL\"")
+            } else {
+                active.contains(".env(\"RUSTY_GRID_P2P_MINIMAL\"")
+            };
+            if !has_minimal_env {
+                violations.push(format!(
+                    "{label}: spawns --p2p binary without .env(\"RUSTY_GRID_P2P_MINIMAL\", ...)"
+                ));
+            }
         }
         for stmt in active.split(';') {
             if stmt.contains(".with_p2p(true)") && !stmt.contains(".with_p2p_minimal_preset(true)")
@@ -440,6 +492,14 @@ path = "../../tests/registered_e2e.rs"
             {
                 violations.push(format!(
                     "{label}: uses .with_p2p_ticket(...) without .with_p2p_minimal_preset(true)"
+                ));
+            }
+            if stmt.contains("start_worker_impl(")
+                && stmt.contains("Some(")
+                && !active.contains("set_p2p_minimal_preset_for_testing(true)")
+            {
+                violations.push(format!(
+                    "{label}: uses start_worker_impl(..., Some(...), ...) without set_p2p_minimal_preset_for_testing(true)"
                 ));
             }
         }
@@ -475,7 +535,8 @@ path = "../../tests/registered_e2e.rs"
                     .strip_prefix(workspace_root)
                     .unwrap_or(&path)
                     .display()
-                    .to_string();
+                    .to_string()
+                    .replace('\\', "/");
                 check_test_source_for_non_minimal_p2p(&rel, &src, &mut violations);
             }
         }
@@ -550,6 +611,8 @@ async fn good_offline_test() {
 #[tokio::test]
 async fn bad_missing_minimal() {
     let _cfg = ServerConfig::new(addr).with_p2p(true);
+    let _cmd = Command::new("rusty-grid").arg("master").arg("--p2p");
+    let _started = start_worker_impl("127.0.0.1:0".into(), Some(ticket), "w".into(), 2, 1024, false, 2);
 }
 "#,
         )
@@ -559,8 +622,12 @@ async fn bad_missing_minimal() {
         assert_eq!(
             violations,
             vec![
+                "tests/sample_p2p.rs: spawns --p2p binary without .env(\"RUSTY_GRID_P2P_MINIMAL\", ...)"
+                    .to_string(),
                 "tests/sample_p2p.rs: uses .with_p2p(true) without .with_p2p_minimal_preset(true)"
-                    .to_string()
+                    .to_string(),
+                "tests/sample_p2p.rs: uses start_worker_impl(..., Some(...), ...) without set_p2p_minimal_preset_for_testing(true)"
+                    .to_string(),
             ]
         );
     }

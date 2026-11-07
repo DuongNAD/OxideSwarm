@@ -1005,6 +1005,7 @@ mod tests {
 
     fn reset_test_state() {
         stop_worker_impl();
+        set_p2p_minimal_preset_for_testing(false);
         let ws = get_worker_state();
         *ws.telemetry.lock().unwrap() = MobileTelemetry::default();
         ws.mobile.set(None);
@@ -1125,6 +1126,7 @@ mod tests {
     fn test_worker_that_fails_after_starting_reports_the_reason_in_its_status() {
         let _guard = TEST_MUTEX.lock().unwrap();
         reset_test_state();
+        set_p2p_minimal_preset_for_testing(true);
         let dir = scratch_dir("bad-ticket");
         assert!(set_sandbox_dir_impl(
             dir.join("sandboxes").display().to_string()

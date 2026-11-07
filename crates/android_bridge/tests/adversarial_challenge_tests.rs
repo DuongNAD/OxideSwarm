@@ -492,7 +492,14 @@ fn test_adversarial_double_start_and_double_stop_idempotency() {
 #[tokio::test]
 async fn test_adversarial_worker_connect_via_master_p2p_ticket() {
     let _guard = ADVERSARIAL_TEST_LOCK.lock().await;
+    struct MinimalPresetGuard;
+    impl Drop for MinimalPresetGuard {
+        fn drop(&mut self) {
+            oxideworker::set_p2p_minimal_preset_for_testing(false);
+        }
+    }
     oxideworker::set_p2p_minimal_preset_for_testing(true);
+    let _minimal_preset_guard = MinimalPresetGuard;
 
     stop_worker_impl();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -526,9 +533,8 @@ async fn test_adversarial_worker_connect_via_master_p2p_ticket() {
     );
     assert!(started, "Worker supervisor should spawn");
 
-    // Settle connection. Setting up the P2P connection can take several seconds (address
-    // discovery, and iroh's public relays when no direct path works), and 5 s was not enough on
-    // CI, so poll for up to 30 s.
+    // Settle connection: local P2P QUIC handshake and registration over the minimal preset
+    // endpoint; poll for up to 30 s so slow CI runners have headroom.
     let mut connected = false;
     for _ in 0..600 {
         if master.list_workers().await.map(|w| w.len()).unwrap_or(0) >= 1 {
@@ -544,6 +550,5 @@ async fn test_adversarial_worker_connect_via_master_p2p_ticket() {
     );
 
     assert!(stop_worker_impl());
-    oxideworker::set_p2p_minimal_preset_for_testing(false);
     let _ = master.shutdown();
 }

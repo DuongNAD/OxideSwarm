@@ -523,16 +523,15 @@ impl MasterServer {
             None => None,
         };
 
-        if config.p2p_minimal_preset {
-            warn!(
-                "P2P minimal preset is enabled (p2p_minimal_preset=true); DERP relay and pkarr/DNS address lookup are disabled, so workers behind NAT cannot connect"
-            );
-        }
-
         #[cfg(feature = "p2p")]
         let p2p_active_conns = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         #[cfg(feature = "p2p")]
         let (p2p_endpoint, p2p_ticket) = if config.enable_p2p || config.p2p_key_file.is_some() {
+            if config.p2p_minimal_preset {
+                warn!(
+                    "P2P minimal preset is enabled (p2p_minimal_preset=true); DERP relay and pkarr/DNS address lookup are disabled, so workers behind NAT cannot connect"
+                );
+            }
             let resolved_key_file = if config.ephemeral_key {
                 config.p2p_key_file.clone()
             } else {
@@ -7001,6 +7000,24 @@ mod tests {
                     "without with_p2p_minimal_preset(true), MasterServer::spawn must not emit the minimal preset warning"
                 );
                 let _ = m1.shutdown();
+
+                warnings.lock().unwrap().clear();
+                tracing::callsite::rebuild_interest_cache();
+                let p2p_off_min_cfg =
+                    ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_p2p_minimal_preset(true);
+                let m_off = MasterServer::spawn(p2p_off_min_cfg)
+                    .await
+                    .expect("spawn m_off");
+                assert!(
+                    !warnings
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|w| w
+                            .contains("P2P minimal preset is enabled (p2p_minimal_preset=true)")),
+                    "when P2P is off, MasterServer::spawn must not warn about P2P minimal preset"
+                );
+                let _ = m_off.shutdown();
 
                 warnings.lock().unwrap().clear();
                 tracing::callsite::rebuild_interest_cache();

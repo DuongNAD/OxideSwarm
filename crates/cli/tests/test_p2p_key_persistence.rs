@@ -558,3 +558,159 @@ async fn test_port_and_ticket_files_removed_on_shutdown() {
 
     let _ = PathBuf::from(&persist_ticket);
 }
+
+#[test]
+fn test_p2p_minimal_env_warns_on_stderr_and_writes_ticket_under_3s() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let ticket_file = dir.join("minimal_cli.ticket");
+
+    // 1. With RUSTY_GRID_P2P_MINIMAL=1 (set by `cli(dir)`), `master --listen 127.0.0.1:0 --p2p
+    //    --ephemeral-key` writes its P2P ticket in under 3 s and emits the minimal preset warning
+    //    once on stderr.
+    let mut m_cmd = cli(dir);
+    m_cmd
+        .args([
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--p2p",
+            "--ephemeral-key",
+            "--insecure",
+            "--p2p-ticket-file",
+        ])
+        .arg(&ticket_file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let started = Instant::now();
+    let mut m_child = m_cmd.spawn().expect("spawn master with minimal preset");
+    let m_stderr_pipe = m_child.stderr.take().expect("take master stderr");
+    let m_stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut { m_stderr_pipe }, &mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    let ticket = wait_for_non_empty_file(&ticket_file, Duration::from_secs(3))
+        .expect("ticket must be written in under 3 s when RUSTY_GRID_P2P_MINIMAL=1");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "ticket write took {:?} (>= 3 s); CLI minimal preset wiring was not applied",
+        elapsed
+    );
+    let _ = m_child.kill();
+    let _ = m_child.wait();
+    let m_stderr = m_stderr_reader.join().expect("join master stderr reader");
+    assert_eq!(
+        m_stderr
+            .matches("P2P minimal preset is enabled (p2p_minimal_preset=true)")
+            .count(),
+        1,
+        "master must emit the P2P minimal preset warning exactly once on stderr, got: {m_stderr:?}"
+    );
+
+    // 2. With RUSTY_GRID_P2P_MINIMAL=1, `worker --p2p-ticket <ticket>` also forwards the preset
+    //    into WorkerConfig and emits the warning once on stderr.
+    let mut w_cmd = cli(dir);
+    w_cmd
+        .args([
+            "worker",
+            "--p2p-ticket",
+            &ticket,
+            "--insecure",
+            "--no-gpu",
+            "--no-cuda",
+            "--no-blender",
+            "--no-portal",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut w_child = w_cmd.spawn().expect("spawn worker with minimal preset");
+    let mut w_stdout_pipe = w_child.stdout.take().expect("take worker stdout");
+    let w_stderr_pipe = w_child.stderr.take().expect("take worker stderr");
+    let w_stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut { w_stderr_pipe }, &mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+    let w_stdout_reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(&mut w_stdout_pipe);
+        for line in reader.lines().map_while(Result::ok) {
+            if line.contains("RustyGrid Worker started") {
+                break;
+            }
+        }
+    });
+    let w_deadline = Instant::now() + Duration::from_secs(3);
+    while !w_stdout_reader.is_finished() && Instant::now() < w_deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = w_child.kill();
+    let _ = w_child.wait();
+    let _ = w_stdout_reader.join();
+    let w_stderr = w_stderr_reader.join().expect("join worker stderr reader");
+    assert_eq!(
+        w_stderr
+            .matches("P2P minimal preset is enabled (p2p_minimal_preset=true)")
+            .count(),
+        1,
+        "worker must emit the P2P minimal preset warning exactly once on stderr, got: {w_stderr:?}"
+    );
+
+    // 3. Without RUSTY_GRID_P2P_MINIMAL, the warning does not appear on stderr.
+    let mut no_min_cmd = cli(dir);
+    no_min_cmd
+        .env_remove("RUSTY_GRID_P2P_MINIMAL")
+        .args([
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--p2p",
+            "--ephemeral-key",
+            "--insecure",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut no_min_child = no_min_cmd
+        .spawn()
+        .expect("spawn master without minimal preset");
+    let mut no_min_stdout = no_min_child
+        .stdout
+        .take()
+        .expect("take no_min master stdout");
+    let no_min_stderr_pipe = no_min_child
+        .stderr
+        .take()
+        .expect("take no_min master stderr");
+    let no_min_stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut { no_min_stderr_pipe }, &mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+    let no_min_stdout_reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(&mut no_min_stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if line.contains("Starting RustyGrid Master") {
+                break;
+            }
+        }
+    });
+    let no_min_deadline = Instant::now() + Duration::from_secs(3);
+    while !no_min_stdout_reader.is_finished() && Instant::now() < no_min_deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    std::thread::sleep(Duration::from_millis(250));
+    let _ = no_min_child.kill();
+    let _ = no_min_child.wait();
+    let _ = no_min_stdout_reader.join();
+    let no_min_stderr = no_min_stderr_reader
+        .join()
+        .expect("join no_min stderr reader");
+    assert!(
+        !no_min_stderr.contains("P2P minimal preset is enabled"),
+        "without RUSTY_GRID_P2P_MINIMAL, master must not emit the minimal preset warning, got: {no_min_stderr:?}"
+    );
+}
