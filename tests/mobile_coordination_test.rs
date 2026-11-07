@@ -437,17 +437,17 @@ async fn test_adaptive_rrc_keepalive_controller_and_dynamic_master_timeout() {
     );
 
     // 3. Dynamic WorkerEntry silence evaluation
-    let now = Instant::now();
+    let base = Instant::now();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let caps = WorkerCapabilities::new("dyn-worker", 4, 8192, false, false, None);
-    let mut entry = WorkerEntry {
+    let entry = WorkerEntry {
         worker_id: Uuid::new_v4(),
         session_id: 1,
         capabilities: caps.clone(),
         status: WorkerStatus::Connected,
-        last_heartbeat_instant: now - Duration::from_secs(50),
+        last_heartbeat_instant: base,
         last_heartbeat_timestamp: 0,
-        registered_at_instant: now - Duration::from_secs(100),
+        registered_at_instant: base,
         registered_timestamp: 0,
         active_tasks: 0,
         reported_active_tasks: 0,
@@ -466,10 +466,9 @@ async fn test_adaptive_rrc_keepalive_controller_and_dynamic_master_timeout() {
     };
 
     // Test silence predicate at various simulated durations
-    assert!(!entry.is_silent(now, Duration::from_secs(5)));
+    assert!(!entry.is_silent(base + Duration::from_secs(50), Duration::from_secs(5)));
     // When last heartbeat was 105s ago, it exceeds the 100s window
-    entry.last_heartbeat_instant = now - Duration::from_secs(105);
-    assert!(entry.is_silent(now, Duration::from_secs(5)));
+    assert!(entry.is_silent(base + Duration::from_secs(105), Duration::from_secs(5)));
 
     // 4. Verify registry dynamic mobile telemetry update
     let registry = WorkerRegistry::new();
