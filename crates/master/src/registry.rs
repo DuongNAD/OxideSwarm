@@ -902,18 +902,19 @@ impl WorkerRegistry {
     }
 
     #[cfg(test)]
-    pub(crate) async fn backdate_last_heartbeat(&self, worker_id: &Uuid, age: Duration) {
-        let mut inner = self.inner.write().await;
-        if let Some(entry) = inner.workers.get_mut(worker_id) {
-            entry.last_heartbeat_instant = Instant::now() - age;
-        }
+    pub(crate) async fn last_heartbeat_instant(&self, worker_id: &Uuid) -> Option<Instant> {
+        let inner = self.inner.read().await;
+        inner
+            .workers
+            .get(worker_id)
+            .map(|entry| entry.last_heartbeat_instant)
     }
 
     #[cfg(test)]
     pub(crate) async fn expire_preserved_thermal(&self, worker_id: &Uuid) {
         let mut inner = self.inner.write().await;
         if let Some(entry) = inner.workers.get_mut(worker_id) {
-            entry.preserved_thermal_until = Some(Instant::now() - Duration::from_millis(1));
+            entry.preserved_thermal_until = Some(Instant::now());
         }
     }
 
@@ -1089,8 +1090,15 @@ impl WorkerRegistry {
     /// A worker counts as alive while it heartbeats *or* its connection delivers any bytes (see
     /// [`RxClock`]); a connection that goes completely silent is reaped after `timeout` as before.
     pub async fn reap_stale_sessions(&self, timeout: Duration) -> Vec<(Uuid, u64)> {
-        let now = Instant::now();
+        self.reap_stale_sessions_at(Instant::now(), timeout).await
+    }
 
+    /// Like [`reap_stale_sessions`](Self::reap_stale_sessions), evaluated at `now`.
+    pub async fn reap_stale_sessions_at(
+        &self,
+        now: Instant,
+        timeout: Duration,
+    ) -> Vec<(Uuid, u64)> {
         // Phase 1: Read lock candidate identification
         let candidates: Vec<Uuid> = {
             let inner = self.inner.read().await;
@@ -1111,7 +1119,7 @@ impl WorkerRegistry {
         // Phase 2: Targeted write lock mutation
         let mut reaped = Vec::with_capacity(candidates.len());
         let mut inner = self.inner.write().await;
-        let now = Instant::now();
+        let now = now.max(Instant::now());
 
         for id in candidates {
             if let Some(entry) = inner.workers.get_mut(&id) {
