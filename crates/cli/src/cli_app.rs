@@ -5741,4 +5741,29 @@ fail_unfulfillable_tasks = false
         std::env::remove_var("OXIDE_SWARM_NO_BATTERY");
         std::env::remove_var("RUSTY_GRID_DISABLE_BATTERY");
     }
+
+    #[test]
+    fn test_resolve_p2p_minimal_only_accepts_rusty_grid_p2p_minimal_env() {
+        std::env::remove_var("RUSTY_GRID_P2P_MINIMAL");
+        assert!(!resolve_p2p_minimal());
+
+        for disabled in ["0", "false", "no", "off", ""] {
+            std::env::set_var("RUSTY_GRID_P2P_MINIMAL", disabled);
+            assert!(
+                !resolve_p2p_minimal(),
+                "RUSTY_GRID_P2P_MINIMAL={disabled:?} must resolve to false"
+            );
+        }
+
+        for enabled in ["1", "true", "TRUE", "yes", "on"] {
+            std::env::set_var("RUSTY_GRID_P2P_MINIMAL", enabled);
+            assert!(
+                resolve_p2p_minimal(),
+                "RUSTY_GRID_P2P_MINIMAL={enabled:?} must resolve to true"
+            );
+        }
+
+        std::env::remove_var("RUSTY_GRID_P2P_MINIMAL");
+        assert!(!resolve_p2p_minimal());
+    }
 }

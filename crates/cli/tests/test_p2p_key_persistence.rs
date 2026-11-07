@@ -619,7 +619,11 @@ fn test_p2p_minimal_env_warns_on_stderr_and_writes_ticket_under_3s() {
         1,
         "master must emit the P2P minimal preset warning exactly once on stderr, got: {m_stderr:?}"
     );
-    for forbidden in ["relay.n0.iroh.link", "dns.iroh.link", "pkarr"] {
+    for forbidden in [
+        "relay.n0.iroh.link",
+        "dns.iroh.link",
+        "iroh::address_lookup",
+    ] {
         assert!(
             !m_stdout.contains(forbidden) && !m_stderr.contains(forbidden),
             "master with RUSTY_GRID_P2P_MINIMAL=1 must not contact {forbidden}, stdout={m_stdout:?}, stderr={m_stderr:?}"
@@ -681,7 +685,11 @@ fn test_p2p_minimal_env_warns_on_stderr_and_writes_ticket_under_3s() {
         1,
         "worker must emit the P2P minimal preset warning exactly once on stderr, got: {w_stderr:?}"
     );
-    for forbidden in ["relay.n0.iroh.link", "dns.iroh.link", "pkarr"] {
+    for forbidden in [
+        "relay.n0.iroh.link",
+        "dns.iroh.link",
+        "iroh::address_lookup",
+    ] {
         assert!(
             !w_stdout.contains(forbidden) && !w_stderr.contains(forbidden),
             "worker with RUSTY_GRID_P2P_MINIMAL=1 must not contact {forbidden}, stdout={w_stdout:?}, stderr={w_stderr:?}"
