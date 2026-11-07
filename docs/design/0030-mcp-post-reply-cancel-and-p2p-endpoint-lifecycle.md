@@ -96,12 +96,17 @@ receive `cancel_tx.send(true)` and have up to `500 ms` to send `CancelTask` befo
   `iroh::Endpoint`.
 - For offline and loopback P2P tests (`TEST-16`), `ServerConfig::with_p2p_minimal_preset(true)`
   (`crates/master/src/server.rs`), `WorkerConfig::with_p2p_minimal_preset(true)`
-  (`crates/worker/src/client.rs`), and the `RUSTY_GRID_P2P_MINIMAL=1` environment variable build
-  `iroh::Endpoint` with `iroh::endpoint::presets::Minimal` (no n0 DERP relay connection or pkarr/DNS
-  address lookup) and skip the `5 s` `endpoint.online()` relay wait, while production defaults remain
-  `presets::N0` (`false`). `ServerConfig::with_p2p_bind_addr(SocketAddr)` allows restart tests
-  (`tests/test_m2_identity_scripts.rs`) to re-bind the same loopback UDP address across a master
-  restart without needing a public DERP relay.
+  (`crates/worker/src/client.rs`), and the `RUSTY_GRID_P2P_MINIMAL` environment variable (`1`,
+  `true`, `yes`, or `on`, resolved only in the CLI layer `crates/cli/src/cli_app.rs` and not read
+  directly by the libraries) build `iroh::Endpoint` with `iroh::endpoint::presets::Minimal` (no n0
+  DERP relay connection or pkarr/DNS address lookup), skip the `5 s` `endpoint.online()` relay
+  wait, and emit a start-up `tracing::warn!` (plus `stderr` warning in the CLI), while production
+  defaults remain `presets::N0` (`false`). For in-process Android bridge tests,
+  `crates/android_bridge/src/lib.rs` provides `set_p2p_minimal_preset_for_testing(bool)`.
+  `ServerConfig::with_p2p_bind_addr(SocketAddr)` allows restart tests
+  (`tests/test_m2_identity_scripts.rs`) to bind `127.0.0.1:0` on run 1, read the OS-assigned
+  loopback UDP port from the published ticket, and re-bind that port on run 2 without needing a
+  public DERP relay.
 
 ## Compatibility
 
@@ -149,4 +154,5 @@ receive `cancel_tx.send(true)` and have up to `500 ms` to send `CancelTask` befo
 ## Status log
 
 - 2026-11-04: Implemented and verified against review feedback on pull request 83.
-- 2026-11-04: Added `with_p2p_minimal_preset(true)`, `with_p2p_bind_addr`, and `RUSTY_GRID_P2P_MINIMAL=1` (`TEST-16`) so workspace P2P tests run offline with `iroh::endpoint::presets::Minimal`.
+- 2026-11-04: Added `with_p2p_minimal_preset(true)`, `with_p2p_bind_addr`, and `RUSTY_GRID_P2P_MINIMAL` (`1`, `true`, `yes`, or `on`) (`TEST-16`) so workspace P2P tests run offline with `iroh::endpoint::presets::Minimal`.
+- 2026-11-07: Restricted `RUSTY_GRID_P2P_MINIMAL` resolution to `crates/cli/src/cli_app.rs`, added startup warnings when `p2p_minimal_preset` is active, added `set_p2p_minimal_preset_for_testing` to `crates/android_bridge`, added a weekly CI job for ignored relay tests, and added a source scan test guarding against non-minimal P2P in non-ignored tests.

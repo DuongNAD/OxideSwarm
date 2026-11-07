@@ -1208,12 +1208,15 @@ async fn run_master(
         3,
     );
 
+    let p2p_minimal = resolve_p2p_minimal();
+
     if let Some(pf) = port_file {
         server_config = server_config.with_port_file(pf);
     }
     server_config = server_config
         .with_heartbeat_interval(heartbeat_interval)
         .with_p2p(enable_p2p)
+        .with_p2p_minimal_preset(p2p_minimal)
         .with_ephemeral_key(ephemeral_key)
         .with_max_retries(default_retry_max);
 
@@ -1429,6 +1432,11 @@ async fn run_master(
         enable_p2p = enable_p2p,
         "Starting RustyGrid Master"
     );
+    if p2p_minimal {
+        eprintln!(
+            "Warning: P2P minimal preset is enabled (RUSTY_GRID_P2P_MINIMAL); DERP relay and pkarr/DNS address lookup are disabled, so workers behind NAT cannot connect"
+        );
+    }
 
     let handle =
         match MasterServer::spawn_with_config(server_config, sched_config, reaper_config).await {
@@ -1728,6 +1736,7 @@ async fn run_worker(
     );
 
     let no_battery = resolve_no_battery();
+    let p2p_minimal = resolve_p2p_minimal();
 
     let max_concurrency = resolve_opt_usize(
         args.max_concurrency,
@@ -1794,6 +1803,9 @@ async fn run_worker(
     }
     if let Some(ticket) = p2p_ticket {
         config = config.with_p2p_ticket(ticket);
+    }
+    if p2p_minimal {
+        config = config.with_p2p_minimal_preset(true);
     }
     if let Some(n) = name {
         config = config.with_name(n);
@@ -1911,6 +1923,11 @@ async fn run_worker(
             "Warning: host battery and thermal protection is disabled (RUSTY_GRID_NO_BATTERY); this worker will accept tasks regardless of battery level or thermal state"
         );
     }
+    if p2p_minimal {
+        eprintln!(
+            "Warning: P2P minimal preset is enabled (RUSTY_GRID_P2P_MINIMAL); DERP relay and pkarr/DNS address lookup are disabled"
+        );
+    }
     match peer_outcome {
         PeerSecretOutcome::Authenticated => println!("Cluster authentication: enabled"),
         PeerSecretOutcome::OpenLocalOnly => println!(
@@ -1947,6 +1964,13 @@ async fn run_worker(
 /// legacy alias names cannot disable battery/thermal protection).
 pub(crate) fn resolve_no_battery() -> bool {
     resolve_bool(None, &["RUSTY_GRID_NO_BATTERY"], None, false)
+}
+
+/// Reads `RUSTY_GRID_P2P_MINIMAL` (`1`, `true`, `yes`, or `on`, case-insensitive) from the process
+/// environment (and nowhere else: config files and alias names cannot disable DERP relay / address
+/// lookup).
+pub(crate) fn resolve_p2p_minimal() -> bool {
+    resolve_bool(None, &["RUSTY_GRID_P2P_MINIMAL"], None, false)
 }
 
 /// Resolves when the worker is asked to stop: Ctrl-C, and the signals a service manager, `kill`
@@ -5243,9 +5267,6 @@ max_active_mb = 768
         );
 
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("OXIDESWARM_HOME", dir.path());
-        std::env::remove_var("OXIDESWARM_SECRET");
-        std::env::remove_var("OXIDESWARM_SECRET_FILE");
         let cfg_path = dir.path().join("rusty-grid.toml");
         std::fs::write(
             &cfg_path,
@@ -5257,6 +5278,15 @@ max_active_mb = 768
             loaded.as_ref().and_then(|c| c.worker.as_ref()).is_some(),
             "config file with unknown no_battery keys must still load"
         );
+
+        // Pass an explicit cluster secret via Tier 1 (`SecretOpts::value`) so `run_worker` never
+        // consults `OXIDESWARM_SECRET`, `OXIDESWARM_SECRET_FILE`, or `OXIDESWARM_HOME`
+        // (`~/.oxideswarm/cluster.secret`), avoiding process-wide environment mutations.
+        let secret = ClusterSecret::from_bytes(&[0x55; 32]).unwrap();
+        let secret_opts = SecretOpts {
+            value: Some(SecretText(secret.to_hex())),
+            file: None,
+        };
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5274,6 +5304,17 @@ max_active_mb = 768
                             .expect("run_worker must connect to local listener")
                             .unwrap();
                     let mut transport = MessageTransport::new(stream);
+                    let session_key = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        rusty_grid_core::cluster_auth::server_handshake(&mut transport, &secret),
+                    )
+                    .await
+                    .expect("run_worker must complete OXS-AUTH handshake in time")
+                    .expect("OXS-AUTH handshake must succeed");
+                    transport.enable_encryption(
+                        &session_key,
+                        rusty_grid_core::protocol::EndpointRole::Server,
+                    );
                     match tokio::time::timeout(
                         Duration::from_secs(5),
                         transport.recv_msg::<rusty_grid_core::protocol::WorkerMessage>(),
@@ -5309,11 +5350,6 @@ max_active_mb = 768
                         panic!("expected Worker");
                     };
                     w_args
-                };
-
-                let secret_opts = SecretOpts {
-                    value: None,
-                    file: None,
                 };
 
                 // 1. With `no_battery = true` in `rusty-grid.toml` (and alias env vars set), `run_worker`
@@ -5354,5 +5390,23 @@ max_active_mb = 768
         std::env::remove_var("RUSTY_GRID_NO_BATTERY");
         std::env::remove_var("OXIDE_SWARM_NO_BATTERY");
         std::env::remove_var("RUSTY_GRID_DISABLE_BATTERY");
+
+        std::env::remove_var("RUSTY_GRID_P2P_MINIMAL");
+        assert!(!resolve_p2p_minimal());
+        for val in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] {
+            std::env::set_var("RUSTY_GRID_P2P_MINIMAL", val);
+            assert!(
+                resolve_p2p_minimal(),
+                "RUSTY_GRID_P2P_MINIMAL={val} must resolve to true"
+            );
+        }
+        for val in ["0", "false", "no", "off", ""] {
+            std::env::set_var("RUSTY_GRID_P2P_MINIMAL", val);
+            assert!(
+                !resolve_p2p_minimal(),
+                "RUSTY_GRID_P2P_MINIMAL={val} must resolve to false"
+            );
+        }
+        std::env::remove_var("RUSTY_GRID_P2P_MINIMAL");
     }
 }

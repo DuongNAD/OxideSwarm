@@ -53,6 +53,7 @@ impl MobileTelemetry {
 /// Global state representing the in-process worker instance.
 struct WorkerState {
     running: AtomicBool,
+    p2p_minimal_preset: AtomicBool,
     worker_id: Mutex<Option<Uuid>>,
     p2p_ticket: Mutex<Option<String>>,
     cluster_secret: Mutex<Option<ClusterSecret>>,
@@ -73,6 +74,7 @@ impl WorkerState {
     fn new() -> Self {
         Self {
             running: AtomicBool::new(false),
+            p2p_minimal_preset: AtomicBool::new(false),
             worker_id: Mutex::new(None),
             p2p_ticket: Mutex::new(None),
             cluster_secret: Mutex::new(None),
@@ -106,6 +108,15 @@ pub fn set_sandbox_dir_impl(dir: String) -> bool {
     let dir = dir.trim();
     *get_worker_state().sandbox_dir.lock().unwrap() = (!dir.is_empty()).then(|| PathBuf::from(dir));
     true
+}
+
+/// Selects `iroh::endpoint::presets::Minimal` (no relay or external address lookup) for the
+/// in-process Android worker's P2P endpoint during tests.
+#[doc(hidden)]
+pub fn set_p2p_minimal_preset_for_testing(enabled: bool) {
+    get_worker_state()
+        .p2p_minimal_preset
+        .store(enabled, Ordering::SeqCst);
 }
 
 /// Configures or clears the shared cluster secret for worker authentication against the Master node.
@@ -180,6 +191,9 @@ pub fn start_worker_impl(
     let mut config = WorkerConfig::new(&master_addr);
     if let Some(ticket) = p2p_ticket.as_ref().filter(|t| !t.trim().is_empty()) {
         config = config.with_p2p_ticket(ticket.clone());
+    }
+    if state.p2p_minimal_preset.load(Ordering::SeqCst) {
+        config = config.with_p2p_minimal_preset(true);
     }
     if !worker_name.is_empty() {
         config = config.with_name(&worker_name);

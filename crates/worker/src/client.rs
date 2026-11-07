@@ -214,10 +214,10 @@ pub struct WorkerConfig {
     /// Optional P2P connection ticket for connecting over iroh QUIC NAT traversal. When
     /// `master_addr` is also set, a failed P2P dial falls back to TCP.
     pub p2p_ticket: Option<String>,
-    /// When `true` (or when `RUSTY_GRID_P2P_MINIMAL=1` is set in the environment), builds the
-    /// worker's iroh P2P endpoint with `iroh::endpoint::presets::Minimal` (no n0 DERP relay or
-    /// pkarr/DNS address lookup) so tests stay off the network. Production defaults to `false`
-    /// (`presets::N0`).
+    /// When `true`, builds the worker's iroh P2P endpoint with
+    /// `iroh::endpoint::presets::Minimal` (no n0 DERP relay or pkarr/DNS address lookup) so tests
+    /// stay off the network. Production defaults to `false` (`presets::N0`); the CLI resolves
+    /// `RUSTY_GRID_P2P_MINIMAL`.
     pub p2p_minimal_preset: bool,
     /// Worker UUID. If `None`, it is read from `worker_id_file` / the default id file when
     /// persistence is enabled (see [`WorkerConfig::with_persistent_worker_id`]), otherwise generated
@@ -1163,6 +1163,12 @@ impl WorkerClient {
                 "Host battery and thermal protection is disabled (no_battery=true); this worker will accept tasks regardless of battery level or thermal state"
             );
         }
+        if config.p2p_minimal_preset {
+            warn!(
+                worker_id = %worker_id,
+                "P2P minimal preset is enabled (p2p_minimal_preset=true); DERP relay and pkarr/DNS address lookup are disabled"
+            );
+        }
 
         info!(
             worker_id = %worker_id,
@@ -2037,16 +2043,7 @@ impl WorkerClient {
         let (endpoint, is_cached) = match ep_guard.as_ref() {
             Some(ep) => (ep.clone(), true),
             None => {
-                let use_minimal_preset = self.config.p2p_minimal_preset
-                    || std::env::var("RUSTY_GRID_P2P_MINIMAL")
-                        .ok()
-                        .is_some_and(|v| {
-                            matches!(
-                                v.trim().to_ascii_lowercase().as_str(),
-                                "1" | "true" | "yes" | "on"
-                            )
-                        });
-                let ep_builder = if use_minimal_preset {
+                let ep_builder = if self.config.p2p_minimal_preset {
                     iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
                 } else {
                     iroh::Endpoint::builder(iroh::endpoint::presets::N0)
@@ -3467,8 +3464,50 @@ mod tests {
                     testing_client.capabilities().mobile.is_none(),
                     "WorkerClient::for_testing must suppress host battery detection"
                 );
+
+                warnings.lock().unwrap().clear();
+                tracing::callsite::rebuild_interest_cache();
+                let _ =
+                    WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_no_battery(true));
+                assert!(
+                    !warnings
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|w| w.contains("P2P minimal preset is enabled (p2p_minimal_preset=true)")),
+                    "without with_p2p_minimal_preset(true), WorkerClient::new must not emit the p2p_minimal_preset warning"
+                );
+
+                warnings.lock().unwrap().clear();
+                tracing::callsite::rebuild_interest_cache();
+                let min_cfg = WorkerConfig::new("127.0.0.1:9999")
+                    .with_no_battery(true)
+                    .with_p2p_minimal_preset(true);
+                assert!(min_cfg.p2p_minimal_preset);
+                let _ = WorkerClient::new(min_cfg);
+                assert!(
+                    warnings
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|w| w.contains("P2P minimal preset is enabled (p2p_minimal_preset=true)")),
+                    "with_p2p_minimal_preset(true) must emit a tracing::warn! when WorkerClient::new initializes, got: {:?}",
+                    *warnings.lock().unwrap()
+                );
             });
         });
+
+        let client_source = include_str!("client.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(
+            !client_source
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains("RUSTY_GRID_P2P_MINIMAL")),
+            "crates/worker/src/client.rs library code must not read RUSTY_GRID_P2P_MINIMAL from the environment"
+        );
     }
 
     /// Design 0021: a task is refused before anything touches the sandbox base when its private
@@ -5164,6 +5203,7 @@ mod tests {
         let mut client = WorkerClient::new(
             WorkerConfig::new("127.0.0.1:9")
                 .with_p2p_ticket("this is not a ticket")
+                .with_p2p_minimal_preset(true)
                 .with_redirection_portal(false)
                 .with_no_battery(true),
         );

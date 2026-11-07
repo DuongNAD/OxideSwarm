@@ -70,10 +70,9 @@ pub struct ServerConfig {
     pub handshake_timeout_secs: u64,
     /// Whether to enable P2P NAT traversal listener (iroh).
     pub enable_p2p: bool,
-    /// When `true` (or when `RUSTY_GRID_P2P_MINIMAL=1` is set in the environment), builds the
-    /// P2P endpoint with `iroh::endpoint::presets::Minimal` (no n0 DERP relay or pkarr/DNS
-    /// address lookup) so tests stay completely off the network. Production defaults to `false`
-    /// (`presets::N0`).
+    /// When `true`, builds the P2P endpoint with `iroh::endpoint::presets::Minimal` (no n0 DERP
+    /// relay or pkarr/DNS address lookup) so tests stay completely off the network. Production
+    /// defaults to `false` (`presets::N0`); the CLI resolves `RUSTY_GRID_P2P_MINIMAL`.
     pub p2p_minimal_preset: bool,
     /// Optional explicit UDP socket address for the P2P endpoint (used by tests to keep a stable
     /// loopback UDP port across restarts when relays are disabled).
@@ -524,6 +523,12 @@ impl MasterServer {
             None => None,
         };
 
+        if config.p2p_minimal_preset {
+            warn!(
+                "P2P minimal preset is enabled (p2p_minimal_preset=true); DERP relay and pkarr/DNS address lookup are disabled, so workers behind NAT cannot connect"
+            );
+        }
+
         #[cfg(feature = "p2p")]
         let p2p_active_conns = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         #[cfg(feature = "p2p")]
@@ -534,16 +539,7 @@ impl MasterServer {
                 config.p2p_key_file.clone().or_else(default_master_key_file)
             };
             let secret_key = resolve_p2p_secret_key(resolved_key_file.as_deref()).await?;
-            let use_minimal_preset = config.p2p_minimal_preset
-                || std::env::var("RUSTY_GRID_P2P_MINIMAL")
-                    .ok()
-                    .is_some_and(|v| {
-                        matches!(
-                            v.trim().to_ascii_lowercase().as_str(),
-                            "1" | "true" | "yes" | "on"
-                        )
-                    });
-            let mut ep_builder = if use_minimal_preset {
+            let mut ep_builder = if config.p2p_minimal_preset {
                 iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
             } else {
                 iroh::Endpoint::builder(iroh::endpoint::presets::N0)
@@ -563,7 +559,7 @@ impl MasterServer {
                 .await
                 .map_err(|e| GridError::Config(format!("Failed to bind iroh endpoint: {e}")))?;
 
-            if !use_minimal_preset {
+            if !config.p2p_minimal_preset {
                 // Await home DERP relay connection and STUN discovery before serializing ticket.
                 // Timeout gracefully so offline/air-gapped environments don't hang indefinitely.
                 match tokio::time::timeout(Duration::from_secs(5), endpoint.online()).await {
@@ -6915,5 +6911,127 @@ mod tests {
             master_ep.close().await;
             let _ = server_task.await;
         }
+    }
+
+    #[test]
+    fn test_master_spawn_warns_when_p2p_minimal_preset_is_enabled_and_ignores_env() {
+        #[derive(Default)]
+        struct WarnVisitor(String);
+        impl tracing::field::Visit for WarnVisitor {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "message" {
+                    self.0.push_str(value);
+                }
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    use std::fmt::Write;
+                    let _ = write!(&mut self.0, "{value:?}");
+                }
+            }
+        }
+        struct WarnCollector {
+            warnings: Arc<std::sync::Mutex<Vec<String>>>,
+            thread_id: std::thread::ThreadId,
+        }
+        impl tracing::Subscriber for WarnCollector {
+            fn register_callsite(
+                &self,
+                metadata: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                if *metadata.level() <= tracing::Level::WARN {
+                    tracing::subscriber::Interest::always()
+                } else {
+                    tracing::subscriber::Interest::never()
+                }
+            }
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                *metadata.level() <= tracing::Level::WARN
+            }
+            fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+                Some(tracing::metadata::LevelFilter::WARN)
+            }
+            fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+            fn event(&self, event: &tracing::Event<'_>) {
+                if *event.metadata().level() == tracing::Level::WARN
+                    && std::thread::current().id() == self.thread_id
+                {
+                    let mut v = WarnVisitor::default();
+                    event.record(&mut v);
+                    self.warnings.lock().unwrap().push(v.0);
+                }
+            }
+            fn enter(&self, _span: &tracing::span::Id) {}
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
+
+        let warnings: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let thread_id = std::thread::current().id();
+        let dispatch = tracing::Dispatch::new(WarnCollector {
+            warnings: warnings.clone(),
+            thread_id,
+        });
+        let _second_dispatch = tracing::Dispatch::new(WarnCollector {
+            warnings: warnings.clone(),
+            thread_id,
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tracing::dispatcher::with_default(&dispatch, || {
+            rt.block_on(async {
+                tracing::callsite::rebuild_interest_cache();
+                let default_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
+                assert!(!default_cfg.p2p_minimal_preset);
+                let m1 = MasterServer::spawn(default_cfg).await.expect("spawn m1");
+                assert!(
+                    !warnings
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|w| w.contains("P2P minimal preset is enabled (p2p_minimal_preset=true)")),
+                    "without with_p2p_minimal_preset(true), MasterServer::spawn must not emit the minimal preset warning"
+                );
+                let _ = m1.shutdown();
+
+                warnings.lock().unwrap().clear();
+                tracing::callsite::rebuild_interest_cache();
+                let min_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+                    .with_p2p(true)
+                    .with_p2p_minimal_preset(true)
+                    .with_ephemeral_key(true);
+                let m2 = MasterServer::spawn(min_cfg).await.expect("spawn m2");
+                assert!(
+                    warnings
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|w| w.contains("P2P minimal preset is enabled (p2p_minimal_preset=true)")),
+                    "with_p2p_minimal_preset(true) must emit a tracing::warn! on MasterServer::spawn, got: {:?}",
+                    *warnings.lock().unwrap()
+                );
+                let _ = m2.shutdown();
+            });
+        });
+
+        let server_source = include_str!("server.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(
+            !server_source
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains("RUSTY_GRID_P2P_MINIMAL")),
+            "crates/master/src/server.rs library code must not read RUSTY_GRID_P2P_MINIMAL from the environment"
+        );
     }
 }

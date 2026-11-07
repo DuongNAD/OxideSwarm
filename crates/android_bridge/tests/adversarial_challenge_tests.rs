@@ -492,7 +492,7 @@ fn test_adversarial_double_start_and_double_stop_idempotency() {
 #[tokio::test]
 async fn test_adversarial_worker_connect_via_master_p2p_ticket() {
     let _guard = ADVERSARIAL_TEST_LOCK.lock().await;
-    std::env::set_var("RUSTY_GRID_P2P_MINIMAL", "1");
+    oxideworker::set_p2p_minimal_preset_for_testing(true);
 
     stop_worker_impl();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -544,5 +544,6 @@ async fn test_adversarial_worker_connect_via_master_p2p_ticket() {
     );
 
     assert!(stop_worker_impl());
+    oxideworker::set_p2p_minimal_preset_for_testing(false);
     let _ = master.shutdown();
 }

@@ -160,24 +160,27 @@ async fn test_worker_auto_reconnect_under_3_seconds() {
     let ticket_file = temp_dir.path().join("fast_reconnect_master.ticket");
 
     let master_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    // Reserve a loopback UDP port so that with `presets::Minimal` (offline, no DERP relay),
-    // Master Run 1 and Master Run 2 share the same direct P2P address as well as the same NodeId.
-    let udp_probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP probe");
-    let p2p_bind = udp_probe.local_addr().expect("local UDP addr");
-    drop(udp_probe);
+    let p2p_ephemeral: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     let config1 = ServerConfig::new(master_bind)
         .with_p2p(true)
         .with_p2p_minimal_preset(true)
-        .with_p2p_bind_addr(p2p_bind)
+        .with_p2p_bind_addr(p2p_ephemeral)
         .with_p2p_key_file(&key_file)
         .with_p2p_ticket_file(&ticket_file);
 
-    // 1. Spawn Master Run 1
+    // 1. Spawn Master Run 1 and read the OS-assigned loopback UDP port from its ticket
     let master1 = MasterServer::spawn(config1).await.expect("spawn master 1");
     let ticket1 = tokio::fs::read_to_string(&ticket_file)
         .await
         .expect("read ticket 1");
+    let p2p_bind: SocketAddr = rusty_grid_core::transport::parse_p2p_ticket(ticket1.trim())
+        .expect("parse ticket 1")
+        .ip_addrs()
+        .find(|addr| addr.ip().is_loopback())
+        .copied()
+        .expect("ticket 1 must contain master1's bound loopback UDP address");
+    assert_ne!(p2p_bind.port(), 0, "master1 must bind a non-zero UDP port");
 
     // 2. Start Worker with Ticket 1
     let worker_sandbox = temp_dir.path().join("worker_reconnect_sb");
@@ -241,13 +244,6 @@ async fn test_worker_auto_reconnect_under_3_seconds() {
     }
     drop(ep1);
     drop(master1);
-    while std::net::UdpSocket::bind(p2p_bind).is_err() {
-        assert!(
-            tokio::time::Instant::now() < close_deadline,
-            "master1 UDP socket must be released after shutdown"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 
     // 4. Start Master Run 2 with same persistent key and loopback P2P UDP address
     let config2 = ServerConfig::new(master_bind)
@@ -257,7 +253,16 @@ async fn test_worker_auto_reconnect_under_3_seconds() {
         .with_p2p_key_file(&key_file)
         .with_p2p_ticket_file(&ticket_file);
 
-    let master2 = MasterServer::spawn(config2).await.expect("spawn master 2");
+    let master2 = loop {
+        match MasterServer::spawn(config2.clone()).await {
+            Ok(m) => break m,
+            Err(e) if tokio::time::Instant::now() < close_deadline => {
+                let _ = e;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("spawn master 2 failed after master 1 shutdown: {e}"),
+        }
+    };
     let restart_start = std::time::Instant::now();
 
     // 5. Measure reconnect time: Worker must re-register within 3.0 seconds
