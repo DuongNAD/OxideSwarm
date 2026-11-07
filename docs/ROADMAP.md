@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: Draft, waiting for the owner's decisions Q1 to Q5
+Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07
 Created: 2026-11-07    Updated: 2026-11-07
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
@@ -12,7 +12,7 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
 - Today one master on a trusted network runs command tasks on macOS, Windows, Linux and Android
   workers. Transport is authenticated and encrypted, files move as content-addressed blobs, and an
   MCP server lets coding agents submit work.
-- Proposed purpose: **a coding agent runs builds and tests on the machines its owner already has.**
+- Purpose: **a coding agent runs builds and tests on the machines its owner already has.**
   Work that serves this purpose goes first.
 - Order: close the open foundations, make the master durable and tasks isolated, build persistent
   agent workspaces, then ship a release. Android, master failover, 3D and language model inference
@@ -53,7 +53,7 @@ Each row is a limit a user meets today, and the item that removes it.
 | The Android app does not compile | There is no Android worker app to install | AND-1 |
 | GPU compute is a seeded matrix benchmark | No user workload runs on the GPU | FEAT-9 (decision D6) |
 
-## Proposed purpose
+## Purpose
 
 ### The user story
 
@@ -182,7 +182,7 @@ After the first release, in order of value to the user story:
 
 ## What waits, and why
 
-| Area | Items | Why it waits | Proposal |
+| Area | Items | Why it waits | Plan |
 |---|---|---|---|
 | 3D generation and rigging | 3D-2, 3D-3 | It does not serve the user story. `gen3d` and `autorig` are compiled into every worker, because the worker crate has no Cargo feature for them | Freeze. Move them behind an opt-in feature when FEAT-11 splits the modules |
 | Language model inference | LLM-1 to LLM-5 ([design 0038](design/0038-large-language-model-inference.md)) | LLM-2 needs FEAT-1 and FEAT-8. LLM-4 is a new transport | LLM-1 (a guide and a script, size S) can start at any time. LLM-2 to LLM-5 start after Phase C |
@@ -191,7 +191,9 @@ After the first release, in order of value to the user story:
 
 ## Decisions for the owner
 
-| ID | Question | Proposal |
+The owner accepted each proposal on 2026-11-07.
+
+| ID | Question | Decision |
 |---|---|---|
 | Q1 | Is "a coding agent runs builds and tests on the machines its owner has" the purpose? | Yes |
 | Q2 | Freeze 3D and move it behind an opt-in Cargo feature? | Yes, together with FEAT-11 |
@@ -212,3 +214,4 @@ After the first release, in order of value to the user story:
 ## Status log
 
 - 2026-11-07: Draft written from the completion backlog at `master` `5c518b5` and from design 0038.
+- 2026-11-07: The owner accepted Q1 to Q5. Status set to Accepted.
