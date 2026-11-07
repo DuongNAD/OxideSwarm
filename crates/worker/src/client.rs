@@ -41,8 +41,6 @@ use rusty_grid_core::capabilities::{
 use rusty_grid_core::cluster_auth::{client_handshake, ClusterSecret, WIRE_FORMAT_AUTH};
 use rusty_grid_core::discovery::{is_valid_host, sanitize_host_port, sanitize_http_origin};
 use rusty_grid_core::error::{GridError, GridResult};
-#[cfg(test)]
-use rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE;
 use rusty_grid_core::protocol::{
     format_incompatible_version_error, is_protocol_version_compatible, master_features,
     EndpointRole, MasterMessage, MessageReader, MessageTransport, MessageWriter,
@@ -3266,6 +3264,7 @@ async fn run_portal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE;
     use rusty_grid_core::task::TaskRequirements;
 
     #[test]

@@ -912,7 +912,7 @@ async fn test_adversarial_protocol_version_mismatch_master_ack_rejection() {
     match run_res.unwrap_err() {
         GridError::HandshakeFailed(msg) => {
             assert!(
-                msg.contains("Incompatible Master protocol version: 0"),
+                msg.contains("Incompatible protocol version 0"),
                 "Expected incompatible version error, got: {msg}"
             );
         }

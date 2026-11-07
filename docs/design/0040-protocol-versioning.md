@@ -48,22 +48,27 @@ Before this change:
 
 ## Non-goals
 
-- Supporting simultaneous multi-version translation of arbitrary historical `Task` struct layouts
-  across incompatible major wire versions (`PROTOCOL_VERSION_MIN_COMPATIBLE` equals
-  `PROTOCOL_VERSION_CURRENT = 3`).
+- Rolling multi-version wire compatibility across different protocol versions: because both sides
+  enforce `PROTOCOL_VERSION_MIN_COMPATIBLE..=PROTOCOL_VERSION_CURRENT` (`3..=3`), **every bump of
+  `PROTOCOL_VERSION_CURRENT` breaks older peers** (an older v3 peer will refuse a v4 peer even if
+  the change was purely additive). All nodes in a cluster must run matching builds.
 - Replacing `bincode` 1.x in this pull request (see D4 for the migration plan).
 
 ## Design
 
-### D1: Golden-bytes version-bump enforcement (`crates/core/src/wire_layout_tests.rs`)
+### D1: Golden-bytes version-bump enforcement (`crates/core/src/wire_layout_tests.rs`, `.github/workflows/ci.yml`)
 
 `render_wire_layout` writes `# protocol_version: 3` and `# protocol_version_min_compatible: 3` at
-the top of `crates/core/tests/data/wire_layout.txt`. `verify_version_bump_for_layout_change`
-compares the recorded layout and versions against `current_wire_layout()`,
-`PROTOCOL_VERSION_CURRENT`, and `PROTOCOL_VERSION_MIN_COMPATIBLE` both during normal test runs and
-before `UPDATE_WIRE_LAYOUT=1` overwrites `wire_layout.txt`:
+the top of `crates/core/tests/data/wire_layout.txt`. Both header lines are mandatory in normal and
+`UPDATE_WIRE_LAYOUT=1` runs (`try_parse_wire_layout_versions` fails if either header or the file
+itself is missing in update mode, preventing bypass via `rm wire_layout.txt` or header deletion).
+`verify_version_bump_for_layout_change` compares the recorded layout and versions against
+`current_wire_layout()`, `PROTOCOL_VERSION_CURRENT`, and `PROTOCOL_VERSION_MIN_COMPATIBLE` during
+normal test runs, in `UPDATE_WIRE_LAYOUT=1` mode, and against `origin/master`'s copy in
+`wire_layout_file_bumps_version_when_body_differs_from_origin_master` (which CI runs after fetching
+`origin/master`):
 
-- If any canonical encoding differs from `wire_layout.txt` and
+- If any canonical encoding differs from `wire_layout.txt` (or `origin/master`'s copy) and
   `PROTOCOL_VERSION_CURRENT <= recorded_version`, the test fails and refuses to overwrite
   `wire_layout.txt`.
 - If any previously recorded variant changed its bytes or was removed and
@@ -88,11 +93,14 @@ before `UPDATE_WIRE_LAYOUT=1` overwrites `wire_layout.txt`:
 - `ADAPTIVE_KEEPALIVE`: gates cellular/idle keepalive scaling in `run_session` and
   `spawn_adaptive_heartbeat_task`.
 
-### D3: Client-path protocol versioning (`crates/core/src/protocol.rs`, `crates/master/src/server.rs`)
+### D3: Client-path protocol versioning (`crates/core/src/protocol.rs`, `crates/master/src/server.rs`, `crates/cli/src/connect.rs`)
 
 - Every variant of `BinaryClientMessage` and `BinaryClientResponse` appends
   `protocol_version: u32`, and every variant of `HumanClientMessage` and `HumanClientResponse`
   carries `#[serde(default = "default_protocol_version")] protocol_version: u32`.
+- `default_protocol_version()` returns `LEGACY_UNVERSIONED_PROTOCOL_VERSION = 2`, so any JSON peer
+  that omits `"protocol_version"` (such as `{"type":"ClusterStatus"}`) is treated as protocol
+  version `2` and refused with `ProtocolError::IncompatibleVersion { peer_version: 2, .. }`.
 - `deserialize_message` uses `bincode_exact_deserialize` (`.with_fixint_encoding().reject_trailing_bytes()`)
   and checks `is_protocol_version_compatible(ver)` on `ClientMessage`, `ClientResponse` (except
   `ClientResponse::Error`, which is always decoded so refusal messages reach the caller), and
@@ -100,7 +108,14 @@ before `UPDATE_WIRE_LAYOUT=1` overwrites `wire_layout.txt`:
 - `LegacyV2BinaryClientMessage` and `LegacyV2BinaryClientResponse` allow a v3 Master or v3 client
   to recognize an unversioned v2 bincode frame and return
   `ProtocolError::IncompatibleVersion { peer_version: 2, current_version: 3, min_compatible_version: 3 }`
-  instead of a raw bincode EOF error.
+  (mapped to `GridError::IncompatibleVersion` without the worker `"Registration handshake failed:"`
+  prefix) instead of a raw bincode EOF error.
+- In `connect_master` (`crates/cli/src/connect.rs`), before returning the connected transport to
+  any command (`submit`, `cancel`, `status`, `doctor`, `mcp`, ...), the client sends a
+  side-effect-free `ClientMessage::ClusterStatus` probe and verifies the `ClientResponse::ClusterStatus`
+  reply. Because a legacy v2 Master's bincode fallback ignores trailing bytes on `SubmitTask` and
+  `CancelTask`, probing `ClusterStatus` inside `connect_master` guarantees a v3 client refuses a v2
+  Master before any state-changing frame is ever transmitted.
 - When `authenticate_and_read_first_message` or `handle_client_connection` on the Master receives
   `ProtocolError::IncompatibleVersion { peer_version, .. }`, it replies with
   `ClientResponse::Error { message: format_incompatible_version_error("client", peer_version) }`
@@ -127,11 +142,24 @@ Because `WireCodec` and the 1-byte frame discriminator (`0x01` JSON, `0x02` Binc
 ## Compatibility
 
 - `PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE` are bumped from `2` to `3`.
+  Every bump of `PROTOCOL_VERSION_CURRENT` breaks older peers (`MIN == CURRENT`); all nodes in a
+  cluster must run the same protocol version.
+- **Upgrade order — master first:** Always upgrade and restart the Master before upgrading workers
+  and clients:
+  - An upgraded v3 Master immediately refuses v2 workers (`RegisterAck { accepted: false }`) and v2
+    clients (`ClientResponse::Error`) before registering the worker or accepting any client task.
+  - Conversely, a v3 worker connecting to an un-upgraded v2 Master sends `Register { protocol_version: 3 }`,
+    which the v2 Master accepts (`protocol_version >= 2`) before replying with
+    `RegisterAck { accepted: true, protocol_version: 2 }`. The v3 worker then rejects version `2`
+    in `perform_handshake`, drops the connection, and retries with backoff; during that window the
+    worker briefly appears in the v2 Master's `workers` list and any task the v2 Master assigns to
+    it is requeued when the socket closes.
 - A v2 worker connecting to a v3 Master (or a v3 worker connecting to a v2/v4 Master) is refused
-  with `Incompatible worker/Master protocol version <N> (supported: 3..=3; upgrade both master and worker to matching builds)`.
-- A v2 client connecting to a v3 Master (or a v3 client connecting to a v2/v4 Master) receives
-  `ClientResponse::Error` / `GridError::HandshakeFailed` naming both the peer version and the
-  supported version range `3..=3`.
+  with `Incompatible protocol version <N> from worker/Master (supported: 3..=3; upgrade both master and worker to matching builds)`.
+- A v2 client connecting to a v3 Master (or a v3 client connecting to a v2/v4 Master) is refused
+  during `connect_master`'s pre-flight `ClusterStatus` check with `ClientResponse::Error` /
+  `GridError::IncompatibleVersion` naming both the peer version and the supported version range
+  `3..=3`, before any state-changing request (`SubmitTask`, `CancelTask`) is sent.
 
 ## Security
 

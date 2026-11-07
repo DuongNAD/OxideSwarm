@@ -5201,40 +5201,60 @@ max_active_mb = 768
                     &session_key,
                     rusty_grid_core::protocol::EndpointRole::Server,
                 );
-                match t
+                while let Some(in_msg) = t
                     .recv_msg::<rusty_grid_core::protocol::InboundMessage>()
                     .await
                     .unwrap()
                 {
-                    Some(rusty_grid_core::protocol::InboundMessage::Client(
-                        ClientMessage::SubmitTask { task, .. },
-                    )) => {
-                        timeouts.push(task.requirements.timeout_secs);
-                        t.send_msg(&ClientResponse::TaskSubmitted { task_id: task.id })
+                    match in_msg {
+                        rusty_grid_core::protocol::InboundMessage::Client(
+                            ClientMessage::ClusterStatus,
+                        ) => {
+                            t.send_msg(&ClientResponse::ClusterStatus {
+                                total_tasks: 0,
+                                pending_tasks: 0,
+                                running_tasks: 0,
+                                completed_tasks: 0,
+                                failed_tasks: 0,
+                                active_bytes: 0,
+                                max_active_bytes: 0,
+                                workers: vec![],
+                            })
                             .await
                             .unwrap();
+                        }
+                        rusty_grid_core::protocol::InboundMessage::Client(
+                            ClientMessage::SubmitTask { task, .. },
+                        ) => {
+                            timeouts.push(task.requirements.timeout_secs);
+                            t.send_msg(&ClientResponse::TaskSubmitted { task_id: task.id })
+                                .await
+                                .unwrap();
+                            break;
+                        }
+                        rusty_grid_core::protocol::InboundMessage::Client(
+                            ClientMessage::SubmitMapReduce { job },
+                        ) => {
+                            timeouts.push(job.timeout_secs);
+                            t.send_msg(&ClientResponse::MapReduceCompleted {
+                                result: rusty_grid_core::mapreduce::MapReduceResult {
+                                    job_id: job.job_id,
+                                    status: "Completed".into(),
+                                    output: std::collections::HashMap::new(),
+                                    map_tasks_total: 1,
+                                    map_tasks_completed: 1,
+                                    reduce_tasks_total: 1,
+                                    reduce_tasks_completed: 1,
+                                    execution_time_ms: 1,
+                                    error: None,
+                                },
+                            })
+                            .await
+                            .unwrap();
+                            break;
+                        }
+                        other => panic!("expected SubmitTask or SubmitMapReduce, got {other:?}"),
                     }
-                    Some(rusty_grid_core::protocol::InboundMessage::Client(
-                        ClientMessage::SubmitMapReduce { job },
-                    )) => {
-                        timeouts.push(job.timeout_secs);
-                        t.send_msg(&ClientResponse::MapReduceCompleted {
-                            result: rusty_grid_core::mapreduce::MapReduceResult {
-                                job_id: job.job_id,
-                                status: "Completed".into(),
-                                output: std::collections::HashMap::new(),
-                                map_tasks_total: 1,
-                                map_tasks_completed: 1,
-                                reduce_tasks_total: 1,
-                                reduce_tasks_completed: 1,
-                                execution_time_ms: 1,
-                                error: None,
-                            },
-                        })
-                        .await
-                        .unwrap();
-                    }
-                    other => panic!("expected SubmitTask or SubmitMapReduce, got {other:?}"),
                 }
             }
             timeouts
@@ -5466,9 +5486,16 @@ fail_unfulfillable_tasks = false
         // under `RoundRobin`, one goes to `rr-w1` and one goes to `rr-w2`.
         let mut worker_transports = Vec::new();
         for (w_name, cores, cpu_pct) in [("rr-w1", 8usize, 0.0f32), ("rr-w2", 2usize, 50.0f32)] {
-            let mut wt = connect_master(&rr_addr_str, Some(&test_secret))
-                .await
-                .unwrap();
+            let stream = tokio::net::TcpStream::connect(&rr_addr_str).await.unwrap();
+            let mut wt = MessageTransport::new(stream);
+            let session_key =
+                rusty_grid_core::cluster_auth::client_handshake(&mut wt, &test_secret)
+                    .await
+                    .unwrap();
+            wt.enable_encryption(
+                &session_key,
+                rusty_grid_core::protocol::EndpointRole::Client,
+            );
             let w_id = uuid::Uuid::new_v4();
             let mut caps = rusty_grid_core::capabilities::WorkerCapabilities::new(
                 w_name, cores, 8192, false, false, None,
@@ -5770,5 +5797,92 @@ fail_unfulfillable_tasks = false
                 "RUSTY_GRID_P2P_MINIMAL={enabled:?} must resolve to true"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_v3_submit_against_fake_v2_master_never_sends_submit_task_and_leaves_no_marker() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        let marker_for_srv = marker.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_str = listener.local_addr().unwrap().to_string();
+
+        let saw_submit_task = Arc::new(AtomicBool::new(false));
+        let saw_submit_srv = Arc::clone(&saw_submit_task);
+        let frames_received = Arc::new(AtomicUsize::new(0));
+        let frames_srv = Arc::clone(&frames_received);
+
+        let srv_handle = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let mut t = MessageTransport::new(stream);
+                while let Ok(Some(raw_frame)) = t.recv_raw_frame().await {
+                    frames_srv.fetch_add(1, Ordering::SeqCst);
+                    if raw_frame.len() >= 5
+                        && raw_frame[0] == rusty_grid_core::protocol::WIRE_FORMAT_BINCODE
+                    {
+                        let tag = u32::from_le_bytes(raw_frame[1..5].try_into().unwrap());
+                        if tag == 0 {
+                            // Variant 0 of BinaryClientMessage is SubmitTask: simulate a v2 master
+                            // that ignores the trailing protocol_version and executes the command.
+                            saw_submit_srv.store(true, Ordering::SeqCst);
+                            let _ = std::fs::write(&marker_for_srv, b"ran on v2 master");
+                            break;
+                        }
+                        if tag == 3 {
+                            // Variant 3 is ClusterStatus: reply with an unversioned v2
+                            // BinaryClientResponse::ClusterStatus (tag 4 + 7 u64 fields + 0-len vec).
+                            let mut v2_resp = vec![rusty_grid_core::protocol::WIRE_FORMAT_BINCODE];
+                            v2_resp.extend_from_slice(&4u32.to_le_bytes());
+                            for _ in 0..8 {
+                                v2_resp.extend_from_slice(&0u64.to_le_bytes());
+                            }
+                            let _ = t.send_raw_frame(v2_resp.into()).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        let secret_opts = SecretOpts {
+            value: None,
+            file: None,
+        };
+        let marker_str = marker.to_string_lossy().to_string();
+        let s_args = submit_args(&[
+            "--master",
+            &addr_str,
+            "--wait",
+            "--command",
+            "touch",
+            "--",
+            &marker_str,
+        ]);
+        let exit = run_submit_with_secret(s_args, None, secret_opts).await;
+
+        let _ = srv_handle.await;
+
+        assert_eq!(
+            exit,
+            ExitCode::FAILURE,
+            "v3 submit against v2 master must exit 1"
+        );
+        assert!(
+            !saw_submit_task.load(Ordering::SeqCst),
+            "fake v2 master must never receive a SubmitTask frame"
+        );
+        assert!(
+            !marker.exists(),
+            "mixed v3 CLI -> v2 master run must leave no marker file at {}",
+            marker.display()
+        );
+        assert_eq!(
+            frames_received.load(Ordering::SeqCst),
+            1,
+            "only the pre-flight ClusterStatus probe should be sent before refusing the v2 master"
+        );
     }
 }

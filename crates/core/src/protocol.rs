@@ -31,10 +31,12 @@ pub const WIRE_FORMAT_ENCRYPTED: u8 = 0x04;
 pub const PROTOCOL_VERSION_CURRENT: u32 = 3;
 /// Minimum wire protocol version compatible with this build.
 pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 3;
+/// Protocol version assumed when a JSON peer omits `protocol_version`.
+pub const LEGACY_UNVERSIONED_PROTOCOL_VERSION: u32 = 2;
 
-/// Default protocol version used in deserialization fallbacks.
+/// Default protocol version used in deserialization fallbacks when `protocol_version` is omitted.
 pub const fn default_protocol_version() -> u32 {
-    PROTOCOL_VERSION_CURRENT
+    LEGACY_UNVERSIONED_PROTOCOL_VERSION
 }
 
 /// Returns `true` when `peer_version` is within the supported inclusive range
@@ -46,10 +48,15 @@ pub const fn is_protocol_version_compatible(peer_version: u32) -> bool {
 /// Formats a human-readable refusal message when a peer speaks an incompatible wire protocol
 /// version.
 pub fn format_incompatible_version_error(peer_role: &str, peer_version: u32) -> String {
+    let upgrade_targets = if peer_role.eq_ignore_ascii_case("master") {
+        "master and worker/client".to_string()
+    } else {
+        format!("master and {peer_role}")
+    };
     format!(
-        "Incompatible {peer_role} protocol version {peer_version} \
+        "Incompatible protocol version {peer_version} from {peer_role} \
          (supported: {PROTOCOL_VERSION_MIN_COMPATIBLE}..={PROTOCOL_VERSION_CURRENT}; \
-         upgrade both master and {peer_role} to matching builds)"
+         upgrade both {upgrade_targets} to matching builds)"
     )
 }
 
@@ -2866,7 +2873,8 @@ impl<'de> Deserialize<'de> for ClientResponse {
 
 /// Serializes a [`ClientMessage`] stamped with an explicit `protocol_version` (for version-skew
 /// tests). Normal callers use [`serialize_message`], which stamps [`PROTOCOL_VERSION_CURRENT`].
-pub fn serialize_client_message_with_version(
+#[cfg(test)]
+fn serialize_client_message_with_version(
     msg: &ClientMessage,
     protocol_version: u32,
     codec: WireCodec,
@@ -2885,7 +2893,8 @@ pub fn serialize_client_message_with_version(
 
 /// Serializes a [`ClientResponse`] stamped with an explicit `protocol_version` (for version-skew
 /// tests). Normal callers use [`serialize_message`], which stamps [`PROTOCOL_VERSION_CURRENT`].
-pub fn serialize_client_response_with_version(
+#[cfg(test)]
+fn serialize_client_response_with_version(
     msg: &ClientResponse,
     protocol_version: u32,
     codec: WireCodec,
@@ -5202,6 +5211,50 @@ mod tests {
                 assert_eq!(peer_version, 2);
             }
             other => panic!("expected IncompatibleVersion(2) for legacy v2 frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unversioned_json_client_message_and_response_refused_with_version_2() {
+        let raw_json_req = br#"{"type":"ClusterStatus"}"#;
+        let mut framed_json_req = vec![WIRE_FORMAT_JSON];
+        framed_json_req.extend_from_slice(raw_json_req);
+
+        for frame in [raw_json_req.as_slice(), framed_json_req.as_slice()] {
+            match deserialize_message::<ClientMessage>(frame) {
+                Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                    assert_eq!(peer_version, LEGACY_UNVERSIONED_PROTOCOL_VERSION);
+                    assert_eq!(peer_version, 2);
+                }
+                other => {
+                    panic!("expected IncompatibleVersion(2) for unversioned JSON ClientMessage, got {other:?}")
+                }
+            }
+            match deserialize_message::<InboundMessage>(frame) {
+                Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                    assert_eq!(peer_version, LEGACY_UNVERSIONED_PROTOCOL_VERSION);
+                    assert_eq!(peer_version, 2);
+                }
+                other => {
+                    panic!("expected IncompatibleVersion(2) for unversioned JSON InboundMessage, got {other:?}")
+                }
+            }
+        }
+
+        let raw_json_resp = br#"{"type":"ClusterStatus","total_tasks":0,"pending_tasks":0,"running_tasks":0,"completed_tasks":0,"failed_tasks":0,"workers":[]}"#;
+        let mut framed_json_resp = vec![WIRE_FORMAT_JSON];
+        framed_json_resp.extend_from_slice(raw_json_resp);
+
+        for frame in [raw_json_resp.as_slice(), framed_json_resp.as_slice()] {
+            match deserialize_message::<ClientResponse>(frame) {
+                Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                    assert_eq!(peer_version, LEGACY_UNVERSIONED_PROTOCOL_VERSION);
+                    assert_eq!(peer_version, 2);
+                }
+                other => {
+                    panic!("expected IncompatibleVersion(2) for unversioned JSON ClientResponse, got {other:?}")
+                }
+            }
         }
     }
 }

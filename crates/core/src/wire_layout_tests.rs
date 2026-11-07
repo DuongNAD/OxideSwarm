@@ -993,26 +993,95 @@ fn render_wire_layout(layout: &BTreeMap<String, String>) -> String {
 }
 
 /// Parses `# protocol_version: <N>` and `# protocol_version_min_compatible: <M>` from the header
-/// comments of [`WIRE_LAYOUT_FILE`], defaulting to `(2, 2)` for pre-v3 files that lacked those
-/// headers.
-fn parse_wire_layout_versions(text: &str) -> (u32, u32) {
-    let mut version = 2u32;
-    let mut min_compatible = 2u32;
+/// comments of [`WIRE_LAYOUT_FILE`]. Both header lines are mandatory.
+fn try_parse_wire_layout_versions(text: &str) -> Result<(u32, u32), String> {
+    let mut version: Option<u32> = None;
+    let mut min_compatible: Option<u32> = None;
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("# protocol_version:") {
-            version = rest
-                .trim()
-                .parse::<u32>()
-                .expect("valid # protocol_version header in wire_layout.txt");
+            let parsed = rest.trim().parse::<u32>().map_err(|e| {
+                format!("invalid `# protocol_version:` header in {WIRE_LAYOUT_FILE}: {e}")
+            })?;
+            version = Some(parsed);
         } else if let Some(rest) = line.strip_prefix("# protocol_version_min_compatible:") {
-            min_compatible = rest
-                .trim()
-                .parse::<u32>()
-                .expect("valid # protocol_version_min_compatible header in wire_layout.txt");
+            let parsed = rest.trim().parse::<u32>().map_err(|e| {
+                format!(
+                    "invalid `# protocol_version_min_compatible:` header in {WIRE_LAYOUT_FILE}: {e}"
+                )
+            })?;
+            min_compatible = Some(parsed);
         }
     }
-    (version, min_compatible)
+    let version = version
+        .ok_or_else(|| format!("missing `# protocol_version: <N>` header in {WIRE_LAYOUT_FILE}"))?;
+    let min_compatible = min_compatible.ok_or_else(|| {
+        format!("missing `# protocol_version_min_compatible: <M>` header in {WIRE_LAYOUT_FILE}")
+    })?;
+    Ok((version, min_compatible))
+}
+
+fn parse_wire_layout_versions(text: &str) -> (u32, u32) {
+    try_parse_wire_layout_versions(text).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Validates that [`WIRE_LAYOUT_FILE`] already exists on disk, has both `# protocol_version`
+/// headers, and satisfies [`verify_version_bump_for_layout_change`] before `UPDATE_WIRE_LAYOUT=1`
+/// is allowed to overwrite it.
+fn validate_wire_layout_update_from_existing(
+    existing_text: Result<String, std::io::Error>,
+    current_version: u32,
+    current_min_compatible: u32,
+    current: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let existing_text = existing_text.map_err(|e| {
+        format!(
+            "cannot update {WIRE_LAYOUT_FILE}: existing file is missing or unreadable ({e}); \
+             restore {WIRE_LAYOUT_FILE} from git before running with {UPDATE_ENV}=1"
+        )
+    })?;
+    let (recorded_ver, recorded_min) = try_parse_wire_layout_versions(&existing_text)?;
+    let recorded_layout = parse_wire_layout(&existing_text);
+    if recorded_layout.is_empty() {
+        return Err(format!(
+            "cannot update {WIRE_LAYOUT_FILE}: existing file contains no recorded message encodings"
+        ));
+    }
+    verify_version_bump_for_layout_change(
+        recorded_ver,
+        recorded_min,
+        &recorded_layout,
+        current_version,
+        current_min_compatible,
+        current,
+    )
+}
+
+/// Compares the working tree's [`WIRE_LAYOUT_FILE`] against `origin/master`'s copy, requiring the
+/// recorded `# protocol_version` header to increase whenever the body changed.
+fn verify_wire_layout_file_against_baseline(
+    current_text: &str,
+    baseline_text: &str,
+) -> Result<(), String> {
+    let (current_ver, current_min) = try_parse_wire_layout_versions(current_text)?;
+    let current_layout = parse_wire_layout(current_text);
+    let has_baseline_headers = baseline_text
+        .lines()
+        .any(|l| l.trim().starts_with("# protocol_version"));
+    let (base_ver, base_min) = if has_baseline_headers {
+        try_parse_wire_layout_versions(baseline_text)?
+    } else {
+        (2, 2)
+    };
+    let base_layout = parse_wire_layout(baseline_text);
+    verify_version_bump_for_layout_change(
+        base_ver,
+        base_min,
+        &base_layout,
+        current_ver,
+        current_min,
+        &current_layout,
+    )
 }
 
 /// Enforces that any wire layout change relative to [`WIRE_LAYOUT_FILE`] bumps
@@ -1238,19 +1307,13 @@ fn bincode_encoding_matches_the_recorded_wire_layout() {
 
     let path = wire_layout_path();
     if std::env::var_os(UPDATE_ENV).is_some_and(|value| value == "1") {
-        if let Ok(existing_text) = std::fs::read_to_string(&path) {
-            let (recorded_ver, recorded_min) = parse_wire_layout_versions(&existing_text);
-            let recorded_layout = parse_wire_layout(&existing_text);
-            if let Err(reason) = verify_version_bump_for_layout_change(
-                recorded_ver,
-                recorded_min,
-                &recorded_layout,
-                PROTOCOL_VERSION_CURRENT,
-                PROTOCOL_VERSION_MIN_COMPATIBLE,
-                &current,
-            ) {
-                panic!("{reason}");
-            }
+        if let Err(reason) = validate_wire_layout_update_from_existing(
+            std::fs::read_to_string(&path),
+            PROTOCOL_VERSION_CURRENT,
+            PROTOCOL_VERSION_MIN_COMPATIBLE,
+            &current,
+        ) {
+            panic!("{reason}");
         }
         let dir = path
             .parent()
@@ -1388,4 +1451,84 @@ fn changed_task_layout_fails_without_version_bump() {
         &mutated,
     )
     .expect("bumping both current and min_compatible version must allow the layout update");
+
+    // 4. Deleting wire_layout.txt or stripping its `# protocol_version` headers in update mode
+    // (`UPDATE_WIRE_LAYOUT=1`) is rejected rather than falling back to version 2.
+    let err_missing_file = validate_wire_layout_update_from_existing(
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file not found",
+        )),
+        PROTOCOL_VERSION_CURRENT,
+        PROTOCOL_VERSION_MIN_COMPATIBLE,
+        &mutated,
+    )
+    .unwrap_err();
+    assert!(
+        err_missing_file.contains("existing file is missing"),
+        "unexpected error for missing file: {err_missing_file}"
+    );
+
+    let full_text = render_wire_layout(&baseline);
+    let stripped_headers: String = full_text
+        .lines()
+        .filter(|l| !l.trim().starts_with("# protocol_version"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let err_missing_headers = validate_wire_layout_update_from_existing(
+        Ok(stripped_headers),
+        PROTOCOL_VERSION_CURRENT,
+        PROTOCOL_VERSION_MIN_COMPATIBLE,
+        &mutated,
+    )
+    .unwrap_err();
+    assert!(
+        err_missing_headers.contains("missing `# protocol_version"),
+        "unexpected error for missing headers: {err_missing_headers}"
+    );
+
+    // 5. A branch that modifies the wire layout body and regenerates wire_layout.txt without
+    // bumping the header version above the baseline copy fails the baseline comparison check.
+    let mutated_file_without_bump = render_wire_layout(&mutated);
+    let err_baseline =
+        verify_wire_layout_file_against_baseline(&mutated_file_without_bump, &full_text)
+            .unwrap_err();
+    assert!(
+        err_baseline.contains("Bump PROTOCOL_VERSION_CURRENT"),
+        "unexpected baseline comparison error: {err_baseline}"
+    );
+}
+
+#[test]
+fn wire_layout_file_bumps_version_when_body_differs_from_origin_master() {
+    let path = wire_layout_path();
+    let current_text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let has_origin_master = std::process::Command::new("git")
+        .current_dir(manifest_dir)
+        .args(["rev-parse", "--verify", "--quiet", "origin/master"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !has_origin_master {
+        return;
+    }
+    let output = std::process::Command::new("git")
+        .current_dir(manifest_dir)
+        .args([
+            "show",
+            "origin/master:crates/core/tests/data/wire_layout.txt",
+        ])
+        .output()
+        .expect("run git show origin/master:crates/core/tests/data/wire_layout.txt");
+    assert!(
+        output.status.success(),
+        "git show origin/master:crates/core/tests/data/wire_layout.txt failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let baseline_text =
+        String::from_utf8(output.stdout).expect("origin/master wire_layout.txt is UTF-8");
+    if let Err(reason) = verify_wire_layout_file_against_baseline(&current_text, &baseline_text) {
+        panic!("{reason}");
+    }
 }

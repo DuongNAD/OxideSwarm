@@ -159,9 +159,9 @@ pub async fn resolve_master_addr(addr: &str, secret: Option<&ClusterSecret>) -> 
 /// prove it holds the same one, `Timeout` when the handshake stalls. Print them with
 /// [`report_master_failure`].
 ///
-/// Without a secret the Master is only told apart from an open one on the first reply: a Master
-/// that requires the secret answers the first request with an authentication rejection, which
-/// the transport reports as `GridError::AuthRequired`.
+/// Without a secret the Master is told apart from an open one on the pre-flight `ClusterStatus`
+/// probe: a Master that requires the secret answers that first request with an authentication
+/// rejection, which `connect_master` reports as `GridError::AuthRequired`.
 /// Resolves `RUSTY_GRID_WIRE_CODEC` for a client connection, returning a `GridError::Config`
 /// if the environment variable is set to an unknown codec name.
 pub fn resolve_client_wire_codec() -> GridResult<rusty_grid_core::protocol::WireCodec> {
@@ -212,7 +212,39 @@ pub async fn connect_master(
                 })??;
         transport.enable_encryption(&session_key, EndpointRole::Client);
     }
-    Ok(transport)
+
+    // Verify protocol version compatibility with a side-effect-free ClusterStatus request before
+    // any caller sends a state-changing message (such as SubmitTask or CancelTask).
+    let probe_future = async {
+        transport
+            .send_msg(&rusty_grid_core::protocol::ClientMessage::ClusterStatus)
+            .await?;
+        transport
+            .recv_msg::<rusty_grid_core::protocol::ClientResponse>()
+            .await
+    };
+    let probe_reply = tokio::time::timeout(AUTH_TIMEOUT, probe_future)
+        .await
+        .map_err(|_| GridError::Timeout {
+            operation: "protocol_version_check".into(),
+            duration_secs: AUTH_TIMEOUT.as_secs(),
+        })?
+        .map_err(GridError::from)?;
+    match probe_reply {
+        Some(rusty_grid_core::protocol::ClientResponse::ClusterStatus { .. }) => Ok(transport),
+        Some(rusty_grid_core::protocol::ClientResponse::Error { message }) => {
+            if message.contains("Incompatible protocol version") {
+                Err(GridError::IncompatibleVersion(message))
+            } else {
+                Err(GridError::ConnectionFailed(message))
+            }
+        }
+        Some(other) => Err(GridError::UnexpectedMessage {
+            expected: "ClusterStatus".into(),
+            actual: format!("{other:?}"),
+        }),
+        None => Err(GridError::ConnectionClosed),
+    }
 }
 
 /// One-line, actionable text for an authentication error from `master_addr`, or `None` for any
@@ -591,7 +623,7 @@ mod tests {
         }
     }
 
-    /// A master that authenticates with `secret`, then answers one `ClusterStatus` request.
+    /// A master that authenticates with `secret`, then answers `ClusterStatus` requests.
     async fn serve_one_client(secret: ClusterSecret) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -605,7 +637,7 @@ mod tests {
                         Err(_) => return,
                     };
                     t.enable_encryption(&session_key, EndpointRole::Server);
-                    if let Ok(Some(ClientMessage::ClusterStatus)) =
+                    while let Ok(Some(ClientMessage::ClusterStatus)) =
                         t.recv_msg::<ClientMessage>().await
                     {
                         let _ = t
@@ -654,19 +686,10 @@ mod tests {
     #[tokio::test]
     async fn test_connect_master_without_secret_learns_about_auth_on_first_reply() {
         let addr = serve_one_client(secret(5)).await;
-        let mut transport = connect_master(&addr.to_string(), None)
+        let err = connect_master(&addr.to_string(), None)
             .await
-            .expect("plain TCP connect succeeds; the rejection arrives with the first reply");
-        transport
-            .send_msg(&ClientMessage::ClusterStatus)
-            .await
-            .unwrap();
-        let err: GridError = transport
-            .recv_msg::<ClientResponse>()
-            .await
-            .map(|_| ())
-            .map_err(GridError::from)
-            .expect_err("an unauthenticated request must not be answered");
+            .err()
+            .expect("an unauthenticated probe must be rejected by a secret-requiring master");
         assert!(matches!(err, GridError::AuthRequired(_)), "got {err:?}");
     }
 }

@@ -46,6 +46,10 @@ pub enum GridError {
     #[error("Registration handshake failed: {0}")]
     HandshakeFailed(String),
 
+    /// Remote peer speaks an incompatible wire protocol version.
+    #[error("{0}")]
+    IncompatibleVersion(String),
+
     /// Network connection abruptly closed by remote peer or EOF encountered.
     #[error("Connection closed unexpectedly")]
     ConnectionClosed,
@@ -206,6 +210,7 @@ impl GridError {
             GridError::FrameTooLarge { .. } => "FRAME_TOO_LARGE",
             GridError::UnexpectedMessage { .. } => "UNEXPECTED_MESSAGE",
             GridError::HandshakeFailed(_) => "HANDSHAKE_FAILED",
+            GridError::IncompatibleVersion(_) => "INCOMPATIBLE_VERSION",
             GridError::ConnectionClosed => "CONNECTION_CLOSED",
             GridError::ConnectionFailed(_) => "CONNECTION_FAILED",
             GridError::Timeout { .. } => "TIMEOUT",
@@ -306,7 +311,7 @@ impl From<ProtocolError> for GridError {
             ProtocolError::UnexpectedEof => GridError::ConnectionClosed,
             ProtocolError::ConnectionClosed => GridError::ConnectionClosed,
             ProtocolError::IncompatibleVersion { .. } => {
-                GridError::HandshakeFailed(err.to_string())
+                GridError::IncompatibleVersion(err.to_string())
             }
             ProtocolError::Violation(msg) => GridError::Framing(msg),
         }
