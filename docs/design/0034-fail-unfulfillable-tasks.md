@@ -20,20 +20,21 @@ Before this change (`SCHED-3` in `docs/BACKLOG.md`):
 
 ## Goals
 
-- **G1** Run the static unfulfillability check in `Engine::place` against every registered worker in `WorkerRegistry` (`registered` from `WorkerRegistry::scheduler_snapshot`, including `WorkerStatus::Disconnected` and cooling-down `excluded_until` workers), so tasks are never failed while a matching worker is still registered.
+- **G1** Run the static unfulfillability check in `Engine::place` whenever at least one connected (`WorkerStatus::Connected` or `WorkerStatus::Busy`) worker is schedulable, checking against every registered worker in `WorkerRegistry` (`registered` from `WorkerRegistry::scheduler_snapshot`, including `WorkerStatus::Disconnected` and cooling-down `excluded_until` workers), so tasks are never failed while a matching worker is still registered. A task whose only matching worker is `WorkerStatus::Disconnected` waits in `TaskState::Queued` until that worker reconnects or is pruned `1 hour` after its last heartbeat (`ReaperConfig::stale_worker_timeout` in `crates/master/src/reaper.rs:31`, which has no CLI flag, so a `--wait` client blocks that long unless `--timeout-secs` expires first).
 - **G2** Expose `SchedulerConfig::with_fail_unfulfillable_tasks(mut self, fail: bool) -> Self` and wire `--fail-unfulfillable-tasks` (`RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, `[master].fail_unfulfillable_tasks`, default `false`) on `oxideswarm master`.
 - **G3** Transition each `(task_id, reason)` in `report.unfulfillable` from `TaskState::Queued` to `TaskState::Failed` via `TaskQueue::fail_unfulfillable_task`, wake `self.waiters`, and broadcast `DashboardStreamMessage::TaskUpdated` and `DashboardStreamMessage::StatsUpdated`, while avoiding redundant queue scans on saturated clusters when neither the registry nor the ready queue has changed.
 
 ## Non-goals
 
 - Changing the default (`false`) when `--fail-unfulfillable-tasks` is not enabled.
-- Failing tasks when no worker is schedulable (`workers.is_empty()` returns `ScheduleSkipReason::NoEligibleWorkers`).
+- Failing tasks when no connected worker is schedulable (`workers.is_empty()` returns `ScheduleSkipReason::NoEligibleWorkers` before `Engine::place` runs).
 
 ## Design
 
 ### D1 Static capability and placement check against all registered workers (`Engine::place`)
 
-- `WorkerRegistry::scheduler_snapshot(&self) -> (Vec<WorkerInfo>, Vec<WorkerInfo>, u64)` (`crates/master/src/registry.rs`) returns `(schedulable, registered, registration_epoch)` under a single read lock, where `registered` includes `WorkerStatus::Disconnected` and cooling-down (`excluded_until`) workers, and `registration_epoch` increments in `register_session`, `remove_worker`, and `prune_stale_workers`.
+- `WorkloadScheduler::schedule_batch` (`crates/master/src/scheduler.rs`) requires at least one connected, schedulable worker (`!workers.is_empty()`) before walking `ready_queue` through `Engine::place`.
+- `WorkerRegistry::scheduler_snapshot(&self) -> (Vec<WorkerInfo>, Vec<WorkerInfo>, u64)` (`crates/master/src/registry.rs`) returns `(schedulable, registered, registration_epoch)` under a single read lock, where `registered` includes `WorkerStatus::Disconnected` and cooling-down (`excluded_until`) workers, and `registration_epoch` increments in `register_session`, `remove_worker`, and `prune_stale_workers`. Because a `WorkerStatus::Disconnected` worker stays in `registered` until `prune_stale_workers` removes it `1 hour` after its last heartbeat (`ReaperConfig::stale_worker_timeout: Some(Duration::from_secs(3600))` in `crates/master/src/reaper.rs:31`, with no CLI flag), a task whose only matching worker is `Disconnected` stays `Queued` (and any `--wait` client blocks) until that worker reconnects, is pruned after 1 hour, or the client's `--timeout-secs` elapses.
 - `Engine` (`crates/master/src/scheduler.rs`) stores `seats: Vec<Seat<'a>>` (built from `workers`) and `registered: &'a [WorkerInfo]`, plus `dead: HashMap<Shape, Verdict>` so repeated tasks of the same `Shape` within a pass reuse the cached `Verdict::Skip` or `Verdict::Unfulfillable` without re-checking workers.
 - `Engine::place(&mut self, view: &TaskView) -> Verdict` returns:
   - `Verdict::Unfulfillable(format!("Invalid placement constraints: {e}"))` when `view.placement` is `Err(e)`.
@@ -44,7 +45,7 @@ Before this change (`SCHED-3` in `docs/BACKLOG.md`):
     - If `nobody_fits` (`!self.registered.iter().any(|w| statically_fits(&view.requirements, w) && placement_admits(placement, w) && (!view.requires_gpu || w.capabilities.can_execute_gpu()) && w.features.contains(view.required_features))`): `Verdict::Unfulfillable(format!("No registered worker satisfies task requirements (cpu_cores={}, ram_mb={}, gpu={})", view.requirements.cpu_cores, view.requirements.ram_mb, view.requires_gpu))`.
   - `Verdict::Skip(ScheduleSkipReason)` when no seat in `self.seats` can run the task right now.
   - `Verdict::Placed(usize)` when a seat in `self.seats` is selected.
-- `WorkloadScheduler` stores `last_unfulfillable_sweep: std::sync::Mutex<Option<(u64, u64)>>` tracking `(registration_epoch, ready_epoch)` (where `TaskQueue::ready_epoch` increments whenever a task enters `ready_queue` via `TaskQueueInner::insert_ready`). When `engine.free_slots == 0` and `last_unfulfillable_sweep == Some((reg_epoch, ready_epoch))`, `schedule_batch` skips scanning `ready_views`.
+- `WorkloadScheduler` stores `unfulfillable_sweep: std::sync::Mutex<UnfulfillableSweep>` tracking `epochs: Option<(u64, u64)>` (`(registration_epoch, ready_epoch)`, where `TaskQueue::ready_epoch` increments whenever a task enters `ready_queue` via `TaskQueueInner::insert_ready`), `cursor: Option<QueueOrderKey>`, and `completed: bool`. When `ready_queue` is longer than `max_scan_per_pass`, saturated passes (`engine.free_slots == 0`) resume from `cursor` and set `completed = true` once `ready_views` reaches the end of the queue (`next == None`), after which subsequent saturated passes with unchanged `(registration_epoch, ready_epoch)` make no `ready_views` call.
 
 ### D2 Queue transition and waiter notification (`TaskQueue::fail_unfulfillable_task`)
 
@@ -72,6 +73,7 @@ Before this change (`SCHED-3` in `docs/BACKLOG.md`):
 
 - Unit tests in `scheduler::tests` (`crates/master/src/scheduler.rs`):
   - `test_fail_unfulfillable_tasks_default_false_keeps_queued_and_true_fails_with_reason_and_wakes_waiter`
+  - `test_fail_unfulfillable_tasks_sweep_cursor_scans_large_queue_once_across_saturated_passes`
   - `test_fail_unfulfillable_tasks_keeps_gpu_task_queued_when_gpu_worker_is_disconnected_until_pruned`
   - `test_fail_unfulfillable_tasks_keeps_gpu_task_queued_when_gpu_worker_is_cooling_down_until_pruned`
   - `test_fail_unfulfillable_tasks_combined_placement_and_gpu_checks_in_nobody_fits`
@@ -87,4 +89,4 @@ Before this change (`SCHED-3` in `docs/BACKLOG.md`):
 ## Status log
 
 - 2026-11-04: Implemented `SchedulerConfig::fail_unfulfillable_tasks`, `TaskQueue::fail_unfulfillable_task`, and `--fail-unfulfillable-tasks` (`RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, `[master].fail_unfulfillable_tasks`), plus the `SCHED-2` follow-up tests and source-prefixed error diagnostics (`SCHED-3`).
-- 2026-11-07: Checked static fulfillability against all registered workers (`WorkerRegistry::scheduler_snapshot`, including `Disconnected` and cooling-down workers until pruned by `prune_stale_workers`), cached verdicts per `Shape` in `Engine::dead` and tracked `(registration_epoch, ready_epoch)` in `WorkloadScheduler::last_unfulfillable_sweep`, added combined placement/GPU `nobody_fits` and `resolve_fail_unfulfillable_tasks` tests, and aligned this design record with the codebase.
+- 2026-11-07: Checked static fulfillability against all registered workers (`WorkerRegistry::scheduler_snapshot`, including `Disconnected` and cooling-down workers until pruned by `prune_stale_workers`), cached verdicts per `Shape` in `Engine::dead` and tracked `(registration_epoch, ready_epoch)` and sweep `cursor` in `WorkloadScheduler::unfulfillable_sweep`, added combined placement/GPU `nobody_fits`, multi-pass sweep cursor, and `resolve_fail_unfulfillable_tasks` tests, and aligned this design record with the codebase.

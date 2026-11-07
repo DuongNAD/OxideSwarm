@@ -1081,7 +1081,9 @@ impl TaskQueue {
             None => Bound::Unbounded,
         };
         let mut views = Vec::with_capacity(limit.min(256));
-        for key in inner.ready_queue.range((lower, Bound::Unbounded)) {
+        let mut range = inner.ready_queue.range((lower, Bound::Unbounded));
+        let mut last_key = None;
+        for key in &mut range {
             let Some(entry) = inner
                 .tasks
                 .get(&key.task_id)
@@ -1093,10 +1095,19 @@ impl TaskQueue {
             view.avoid = entry.avoid_workers.clone();
             views.push(view);
             if views.len() >= limit {
-                return (views, Some(*key));
+                last_key = Some(*key);
+                break;
             }
         }
-        (views, None)
+        let next = last_key.filter(|_| {
+            range.any(|k| {
+                inner
+                    .tasks
+                    .get(&k.task_id)
+                    .is_some_and(|e| e.state == TaskState::Queued)
+            })
+        });
+        (views, next)
     }
 
     /// Monotonic counter incremented whenever a task enters `ready_queue`.

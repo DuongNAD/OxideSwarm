@@ -916,6 +916,15 @@ struct GpuDemand {
     last_waiting: bool,
 }
 
+/// Progress of the unfulfillability sweep across `ready_queue` for a given
+/// `(registration_epoch, ready_epoch)` pair.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct UnfulfillableSweep {
+    epochs: Option<(u64, u64)>,
+    cursor: Option<QueueOrderKey>,
+    completed: bool,
+}
+
 /// Autonomous workload-specific scheduling engine.
 pub struct WorkloadScheduler {
     config: SchedulerConfig,
@@ -928,10 +937,11 @@ pub struct WorkloadScheduler {
     gpu_demand: std::sync::Mutex<GpuDemand>,
     /// Persistent round-robin cursor across scheduling passes (`schedule_once` / `schedule_batch`).
     rr_cursor: std::sync::atomic::AtomicUsize,
-    /// `(registration_epoch, ready_epoch)` of the last scheduling pass that walked `ready_queue`
-    /// to completion under `fail_unfulfillable_tasks`, so a pass with `free_slots == 0` does not
-    /// rescan the queue unless the registry or ready queue changed.
-    last_unfulfillable_sweep: std::sync::Mutex<Option<(u64, u64)>>,
+    /// Sweep progress across `ready_queue` under `fail_unfulfillable_tasks` for the current
+    /// `(registration_epoch, ready_epoch)`, keeping a cursor across saturated passes when the
+    /// queue exceeds `max_scan_per_pass` and recording completion once the end of the queue is
+    /// reached so subsequent saturated passes with unchanged epochs make no `ready_views` call.
+    unfulfillable_sweep: std::sync::Mutex<UnfulfillableSweep>,
 }
 
 impl WorkloadScheduler {
@@ -950,7 +960,7 @@ impl WorkloadScheduler {
             waiters: None,
             gpu_demand: std::sync::Mutex::new(GpuDemand::default()),
             rr_cursor: std::sync::atomic::AtomicUsize::new(0),
-            last_unfulfillable_sweep: std::sync::Mutex::new(None),
+            unfulfillable_sweep: std::sync::Mutex::new(UnfulfillableSweep::default()),
         }
     }
 
@@ -1136,18 +1146,32 @@ impl WorkloadScheduler {
 
         let ready_epoch = self.queue.ready_epoch().await;
         let sweep_state = (reg_epoch, ready_epoch);
-        let need_unfulfillable_sweep = self.config.fail_unfulfillable_tasks
-            && *self
-                .last_unfulfillable_sweep
+        let (need_unfulfillable_sweep, sweep_cursor) = if self.config.fail_unfulfillable_tasks {
+            let mut state = self
+                .unfulfillable_sweep
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                != Some(sweep_state);
+                .unwrap_or_else(|e| e.into_inner());
+            if state.epochs != Some(sweep_state) {
+                *state = UnfulfillableSweep {
+                    epochs: Some(sweep_state),
+                    cursor: None,
+                    completed: false,
+                };
+            }
+            (!state.completed, state.cursor)
+        } else {
+            (false, None)
+        };
 
         // Step 3: Walk the queue
         let mut report = ScheduleReport::default();
         let mut placements: Vec<(TaskId, usize)> = Vec::new();
         if (engine.free_slots > 0 || need_unfulfillable_sweep) && max_batch_size > 0 {
-            let mut cursor: Option<QueueOrderKey> = None;
+            let mut cursor: Option<QueueOrderKey> = if engine.free_slots == 0 {
+                sweep_cursor
+            } else {
+                None
+            };
             let mut scanned = 0usize;
             let scan_budget = self.config.max_scan_per_pass.max(1);
             'scan: loop {
@@ -1177,9 +1201,10 @@ impl WorkloadScheduler {
                             if view.requires_gpu {
                                 self.note_gpu_demand();
                             }
-                            if placements.len() >= max_batch_size
-                                || (engine.free_slots == 0 && !need_unfulfillable_sweep)
-                            {
+                            if placements.len() >= max_batch_size {
+                                engine.free_slots = 0;
+                            }
+                            if engine.free_slots == 0 && !need_unfulfillable_sweep {
                                 break 'scan;
                             }
                         }
@@ -1198,13 +1223,31 @@ impl WorkloadScheduler {
                     }
                 }
                 match next {
-                    Some(key) => cursor = Some(key),
+                    Some(key) => {
+                        cursor = Some(key);
+                        if self.config.fail_unfulfillable_tasks {
+                            let mut state = self
+                                .unfulfillable_sweep
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            if state.epochs == Some(sweep_state) && !state.completed {
+                                state.cursor = Some(match state.cursor {
+                                    Some(prev) if prev > key => prev,
+                                    _ => key,
+                                });
+                            }
+                        }
+                    }
                     None => {
                         if self.config.fail_unfulfillable_tasks {
                             *self
-                                .last_unfulfillable_sweep
+                                .unfulfillable_sweep
                                 .lock()
-                                .unwrap_or_else(|e| e.into_inner()) = Some(sweep_state);
+                                .unwrap_or_else(|e| e.into_inner()) = UnfulfillableSweep {
+                                epochs: Some(sweep_state),
+                                cursor: None,
+                                completed: true,
+                            };
                         }
                         break;
                     }
@@ -3259,6 +3302,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fail_unfulfillable_tasks_sweep_cursor_scans_large_queue_once_across_saturated_passes(
+    ) {
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+        // 1 worker with 1 CPU slot.
+        let (_w_id, _w_sess, _w_rx) = register_worker(&registry, "cpu-1c", 1, 4096, false).await;
+
+        // 6 tasks (exceeding `max_scan_per_pass = 3`). The 6th task is unfulfillable (requires GPU).
+        for i in 0..5 {
+            let mut req = TaskRequirements::generic(1, 30);
+            req.ram_mb = 256;
+            queue
+                .submit(Task::new(
+                    TaskSpec::shell_script(format!("echo cpu-{i}")),
+                    req,
+                ))
+                .await
+                .unwrap();
+        }
+        let t_gpu_tail = queue.submit(gpu_task()).await.unwrap();
+
+        let mut cfg = SchedulerConfig::default().with_fail_unfulfillable_tasks(true);
+        cfg.max_scan_per_pass = 3;
+        let sched = WorkloadScheduler::new(cfg, registry.clone(), queue.clone(), notify)
+            .with_waiters(waiters);
+
+        assert_eq!(queue.ready_views_call_count(), 0);
+
+        // Pass 1: places task 1 (saturating the 1-core worker) and scans tasks 1..=3.
+        let r1 = sched.schedule_once().await.unwrap();
+        assert_eq!(r1.assignments.len(), 1);
+        assert!(r1.unfulfillable.is_empty());
+        assert_eq!(queue.ready_views_call_count(), 1);
+        assert_eq!(
+            queue.get_state(&t_gpu_tail).await,
+            Some(crate::queue::TaskState::Queued)
+        );
+
+        // Pass 2 (first saturated pass, `free_slots == 0`, epochs unchanged): resumes from the
+        // sweep cursor, scans tasks 4..=6, fails `t_gpu_tail`, and reaches the end of the queue.
+        let r2 = sched.schedule_once().await.unwrap();
+        assert!(r2.assignments.is_empty());
+        assert_eq!(r2.unfulfillable.len(), 1);
+        assert_eq!(r2.unfulfillable[0].0, t_gpu_tail);
+        assert_eq!(queue.ready_views_call_count(), 2);
+        assert_eq!(
+            queue.get_state(&t_gpu_tail).await,
+            Some(crate::queue::TaskState::Failed)
+        );
+
+        // Pass 3 (second saturated pass, `free_slots == 0`, epochs unchanged): must make 0
+        // `ready_views` calls because the sweep reached the end of the queue in Pass 2.
+        let r3 = sched.schedule_once().await.unwrap();
+        assert!(r3.assignments.is_empty());
+        assert!(r3.unfulfillable.is_empty());
+        assert_eq!(
+            queue.ready_views_call_count(),
+            2,
+            "second saturated pass with unchanged epochs must make no ready_views call"
+        );
+    }
+
+    #[tokio::test]
     async fn test_fail_unfulfillable_tasks_keeps_gpu_task_queued_when_gpu_worker_is_disconnected_until_pruned(
     ) {
         let (registry, queue, waiters, notify) = scheduler_fixture().await;
@@ -3270,6 +3375,14 @@ mod tests {
         // Mark the GPU worker Disconnected (not yet pruned).
         assert!(registry.mark_disconnected(&gpu_id).await.unwrap());
 
+        // Submit a 2-core CPU task to saturate `cpu-w1` on Pass 1 so Pass 2 has `free_slots == 0`
+        // and relies on `prune_stale_workers` bumping `registration_epoch` to trigger the sweep.
+        let mut req_fill = TaskRequirements::generic(2, 30);
+        req_fill.ram_mb = 512;
+        let _t_fill = queue
+            .submit(Task::new(TaskSpec::shell_script("echo fill"), req_fill))
+            .await
+            .unwrap();
         let t_gpu = queue.submit(gpu_task()).await.unwrap();
         let pin_constraint = format!("require:worker={gpu_id}");
         let t_pinned = queue
@@ -3285,8 +3398,10 @@ mod tests {
         )
         .with_waiters(waiters);
 
-        // Pass 1 while `gpu-w1` is Disconnected (still registered): both tasks must stay Queued.
+        // Pass 1 while `gpu-w1` is Disconnected (still registered): saturates `cpu-w1` and keeps
+        // both GPU/pinned tasks Queued.
         let r1 = sched.schedule_once().await.unwrap();
+        assert_eq!(r1.assignments.len(), 1);
         assert!(
             r1.unfulfillable.is_empty(),
             "tasks matching a Disconnected (unpruned) worker must not be failed: {:?}",
