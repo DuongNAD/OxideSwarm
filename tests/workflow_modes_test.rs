@@ -2,10 +2,10 @@
 
 use rusty_grid_cli::mode::{
     execute_mode_action, export_specification, find_workspace_root, generate_research_report,
-    get_mode_descriptors, launch_local_dev_cluster_with_ports, probe_cluster_health_with_root,
-    probe_cluster_health_with_secret, run_distributed_benchmark, run_hardware_profile,
-    run_micro_benchmarks, run_mode_cli, run_watch_check, verify_documentation, ModeCliArgs,
-    WorkflowMode,
+    get_mode_descriptors, launch_local_dev_cluster_with_ports, probe_cluster_health_with_secret,
+    run_distributed_benchmark, run_hardware_profile, run_micro_benchmarks,
+    run_mode_cli_with_secret, run_watch_check, stop_local_dev_cluster, verify_documentation,
+    ModeCliArgs, WorkflowMode,
 };
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::protocol::MAX_FRAME_SIZE;
@@ -179,6 +179,10 @@ fn test_research_mode_profile_and_bench() {
         bench.metrics["codec_decoded_task_id"],
         bench.metrics["expected_task_id"]
     );
+    assert_eq!(
+        bench.metrics["codec_verified_iters"], 10_000,
+        "every iteration of the Bincode benchmark loop must verify a unique roundtrip"
+    );
     assert!(bench.stdout.contains("Bincode Wire Codec Roundtrip"));
     let serde_ops = bench.metrics["serde_ops_per_sec"].as_u64().unwrap_or(0);
     assert!(
@@ -199,14 +203,30 @@ fn test_research_mode_profile_and_bench() {
     let fn_start = mode_cli_src
         .find("pub fn run_micro_benchmarks()")
         .expect("find run_micro_benchmarks");
-    let fn_body = &mode_cli_src[fn_start..fn_start + 3500];
+    let fn_body = &mode_cli_src[fn_start..fn_start + 4000];
+    let t2_start_pos = fn_body
+        .find("let t2_start = Instant::now();")
+        .expect("find t2_start timer");
+    let t2_end_pos = fn_body
+        .find("let t2_dur = t2_start.elapsed();")
+        .expect("find t2_dur timer");
+    let before_t2 = &fn_body[..t2_start_pos];
+    let timed_t2 = &fn_body[t2_start_pos..t2_end_pos];
     assert!(
-        fn_body.contains("serialize_message(") && fn_body.contains("deserialize_message("),
-        "run_micro_benchmarks must benchmark serialize_message + deserialize_message"
+        !before_t2.contains("serialize_message(") && !before_t2.contains("deserialize_message("),
+        "serialize_message / deserialize_message must not be called outside the timed t2 loop"
+    );
+    let loop_pos = timed_t2
+        .find("for i in 0..codec_iters")
+        .expect("find codec_iters loop inside timed region");
+    let loop_body = &timed_t2[loop_pos..];
+    assert!(
+        loop_body.contains("serialize_message(") && loop_body.contains("deserialize_message("),
+        "run_micro_benchmarks must call serialize_message + deserialize_message inside the timed for-loop"
     );
     assert!(
-        !fn_body.contains("extend_from_slice"),
-        "run_micro_benchmarks must not use a fake Vec::extend_from_slice byte-copy loop"
+        !fn_body.contains("extend_from_slice") && !fn_body.contains("copy_from_slice"),
+        "run_micro_benchmarks must not use a fake byte-copy loop"
     );
 }
 
@@ -371,6 +391,8 @@ async fn test_dev_status_against_protected_master_exits_nonzero() {
     let dash_port = master.dashboard_addr().expect("dashboard addr").port();
 
     let temp = tempfile::tempdir().expect("tempdir");
+    let temp_home = temp.path().join("home");
+    std::fs::create_dir_all(&temp_home).expect("create temp_home");
     std::fs::write(
         temp.path().join(".dev_cluster.json"),
         serde_json::json!({ "web_ui_port": dash_port }).to_string(),
@@ -378,7 +400,7 @@ async fn test_dev_status_against_protected_master_exits_nonzero() {
     .expect("write .dev_cluster.json");
 
     // 1. Direct engine probe against protected master returns failure with HTTP 401
-    let probe_res = probe_cluster_health_with_root(Some(dash_port), temp.path());
+    let probe_res = probe_cluster_health_with_secret(Some(dash_port), temp.path(), None);
     assert!(
         !probe_res.success,
         "dev status against protected master (401) must fail"
@@ -392,15 +414,19 @@ async fn test_dev_status_against_protected_master_exits_nonzero() {
     );
 
     // 2. CLI runner exits non-zero against protected master
-    let exit_code = run_mode_cli(ModeCliArgs {
-        mode: Some("dev".to_string()),
-        action: Some("status".to_string()),
-        action_opt: None,
-        iterations: 1,
-        port: Some(dash_port),
-        json: true,
-        interactive: false,
-    })
+    let exit_code = run_mode_cli_with_secret(
+        ModeCliArgs {
+            mode: Some("dev".to_string()),
+            action: Some("status".to_string()),
+            action_opt: None,
+            iterations: 1,
+            port: Some(dash_port),
+            json: true,
+            interactive: false,
+        },
+        temp.path(),
+        None,
+    )
     .await;
     assert_ne!(
         exit_code, 0,
@@ -410,6 +436,11 @@ async fn test_dev_status_against_protected_master_exits_nonzero() {
     // 3. Binary invocation (`ox-mode dev status --port <dash_port>`) exits non-zero
     let ox_mode_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_ox-mode"));
     let out = std::process::Command::new(&ox_mode_bin)
+        .env("HOME", &temp_home)
+        .env("USERPROFILE", &temp_home)
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_CONFIG")
         .args(["dev", "status", "--port", &dash_port.to_string(), "--json"])
         .output()
         .expect("spawn ox-mode dev status");
@@ -437,6 +468,8 @@ async fn test_dev_status_closed_port_fails_while_another_master_is_up() {
     let dash_port = master.dashboard_addr().expect("dashboard addr").port();
 
     let temp = tempfile::tempdir().expect("tempdir");
+    let temp_home = temp.path().join("home");
+    std::fs::create_dir_all(&temp_home).expect("create temp_home");
     std::fs::write(
         temp.path().join(".dev_cluster.json"),
         serde_json::json!({ "web_ui_port": dash_port }).to_string(),
@@ -444,7 +477,7 @@ async fn test_dev_status_closed_port_fails_while_another_master_is_up() {
     .expect("write .dev_cluster.json");
 
     // Without explicit --port, fallback to .dev_cluster.json succeeds against dash_port
-    let default_res = probe_cluster_health_with_root(None, temp.path());
+    let default_res = probe_cluster_health_with_secret(None, temp.path(), None);
     assert!(
         default_res.success,
         "probe without explicit port should succeed via .dev_cluster.json: {}",
@@ -462,22 +495,26 @@ async fn test_dev_status_closed_port_fails_while_another_master_is_up() {
     };
 
     // With explicit --port <closed_port>, must probe ONLY closed_port and fail (no fallback to .dev_cluster.json)
-    let explicit_res = probe_cluster_health_with_root(Some(closed_port), temp.path());
+    let explicit_res = probe_cluster_health_with_secret(Some(closed_port), temp.path(), None);
     assert!(
         !explicit_res.success,
         "explicit --port on closed port must fail even when another master is listed in .dev_cluster.json"
     );
     assert_eq!(explicit_res.exit_code, Some(1));
 
-    let exit_code = run_mode_cli(ModeCliArgs {
-        mode: Some("dev".to_string()),
-        action: Some("status".to_string()),
-        action_opt: None,
-        iterations: 1,
-        port: Some(closed_port),
-        json: true,
-        interactive: false,
-    })
+    let exit_code = run_mode_cli_with_secret(
+        ModeCliArgs {
+            mode: Some("dev".to_string()),
+            action: Some("status".to_string()),
+            action_opt: None,
+            iterations: 1,
+            port: Some(closed_port),
+            json: true,
+            interactive: false,
+        },
+        temp.path(),
+        None,
+    )
     .await;
     assert_ne!(
         exit_code, 0,
@@ -487,6 +524,11 @@ async fn test_dev_status_closed_port_fails_while_another_master_is_up() {
     let ox_mode_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_ox-mode"));
     let out = std::process::Command::new(&ox_mode_bin)
         .current_dir(temp.path())
+        .env("HOME", &temp_home)
+        .env("USERPROFILE", &temp_home)
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_CONFIG")
         .args([
             "dev",
             "status",
@@ -508,6 +550,8 @@ async fn test_dev_status_closed_port_fails_while_another_master_is_up() {
 async fn test_dev_status_succeeds_against_cluster_with_secret() {
     let secret = ClusterSecret::generate().expect("generate secret");
     let temp = tempfile::tempdir().expect("tempdir");
+    let temp_home = temp.path().join("home");
+    std::fs::create_dir_all(&temp_home).expect("create temp_home");
     let secret_path = temp.path().join("cluster.secret");
     secret
         .save_file(&secret_path, true)
@@ -550,6 +594,10 @@ async fn test_dev_status_succeeds_against_cluster_with_secret() {
     // 3. Binary invocation with OXIDESWARM_SECRET_FILE succeeds and exits 0
     let ox_mode_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_ox-mode"));
     let out = std::process::Command::new(&ox_mode_bin)
+        .env("HOME", &temp_home)
+        .env("USERPROFILE", &temp_home)
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("RUSTY_GRID_CONFIG")
         .env("OXIDESWARM_SECRET_FILE", &secret_path)
         .args(["dev", "status", "--port", &dash_port.to_string(), "--json"])
         .output()
@@ -567,6 +615,106 @@ async fn test_dev_status_succeeds_against_cluster_with_secret() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dev_status_never_sends_token_to_guessed_ports_or_3000() {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    let secret = ClusterSecret::generate().expect("generate secret");
+    let admin_token = rusty_grid_master::dashboard_admin_token(&secret);
+    let temp = tempfile::tempdir().expect("tempdir");
+    let temp_home = temp.path().join("home");
+    let oxide_dir = temp_home.join(".oxideswarm");
+    std::fs::create_dir_all(&oxide_dir).expect("create .oxideswarm");
+    let secret_path = oxide_dir.join("cluster.secret");
+    secret
+        .save_file(&secret_path, true)
+        .expect("save secret file");
+
+    // 1. If 127.0.0.1:3000 is available on this host, bind a fake listener on 3000 and verify
+    //    `dev status` (without `--port`) never connects or leaks the token to 3000.
+    let captured_3000 = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener_3000 = std::net::TcpListener::bind("127.0.0.1:3000").ok();
+    let handle_3000 = listener_3000.map(|listener| {
+        let _ = listener.set_nonblocking(true);
+        let cap = Arc::clone(&captured_3000);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+            while std::time::Instant::now() < deadline {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    cap.lock().unwrap().push(req);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"OxideSwarm\"\r\nContent-Length: 0\r\n\r\n",
+                    );
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        })
+    });
+
+    let _ = probe_cluster_health_with_secret(None, temp.path(), Some(&secret));
+
+    let ox_mode_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_ox-mode"));
+    let _ = std::process::Command::new(&ox_mode_bin)
+        .current_dir(temp.path())
+        .env("HOME", &temp_home)
+        .env("USERPROFILE", &temp_home)
+        .env("OXIDESWARM_SECRET_FILE", &secret_path)
+        .env_remove("RUSTY_GRID_DASHBOARD_PORT")
+        .args(["dev", "status", "--json"])
+        .output()
+        .expect("spawn ox-mode dev status without --port");
+
+    if let Some(h) = handle_3000 {
+        let _ = h.join();
+    }
+    let reqs_3000 = captured_3000.lock().unwrap();
+    assert!(
+        reqs_3000.iter().all(|r| !r.contains(&admin_token)),
+        "fake listener on 127.0.0.1:3000 must never receive the dashboard Admin token"
+    );
+    assert!(
+        reqs_3000.is_empty(),
+        "dev status must not probe guessed port 3000, got {} requests",
+        reqs_3000.len()
+    );
+
+    // 2. Even on an explicit `--port` or `.dev_cluster.json` port, a fake server that responds
+    //    200 OK or 401 without `WWW-Authenticate: Bearer realm="OxideSwarm"` must never receive the token.
+    let fake_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake listener on ephemeral port");
+    let fake_port = fake_listener.local_addr().expect("local_addr").port();
+    let captured_fake = Arc::new(Mutex::new(Vec::<String>::new()));
+    let cap_fake_clone = Arc::clone(&captured_fake);
+    let fake_handle = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = fake_listener.accept() {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            cap_fake_clone.lock().unwrap().push(req);
+            let _ = stream.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"OtherService\"\r\nContent-Length: 0\r\n\r\n",
+            );
+        }
+    });
+
+    let fake_res = probe_cluster_health_with_secret(Some(fake_port), temp.path(), Some(&secret));
+    assert!(!fake_res.success);
+    let _ = fake_handle.join();
+    let fake_reqs = captured_fake.lock().unwrap();
+    assert_eq!(fake_reqs.len(), 1);
+    assert!(
+        !fake_reqs[0].contains(&admin_token) && !fake_reqs[0].contains("Authorization:"),
+        "initial probe and non-OxideSwarm 401 must never receive Authorization Bearer token"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_dev_cluster_fails_when_port_is_held() {
     let held_listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("bind held tcp port for master");
@@ -578,24 +726,35 @@ async fn test_dev_cluster_fails_when_port_is_held() {
 
     let temp = tempfile::tempdir().expect("tempdir");
     let res = launch_local_dev_cluster_with_ports(temp.path(), held_port, free_web_port).await;
+    let json_exists_after_launch = temp.path().join(".dev_cluster.json").exists();
+    let pids_exist_after_launch = temp.path().join(".dev_cluster.pids").exists();
+    // Always run cleanup in case a regression left child processes behind.
+    let _ = stop_local_dev_cluster(temp.path()).await;
+    drop(held_listener);
+
     assert!(
         !res.success,
         "launch_local_dev_cluster_with_ports must fail when the master TCP port is already held"
     );
     assert_eq!(res.exit_code, Some(1));
     assert!(
-        !temp.path().join(".dev_cluster.json").exists(),
-        "failed dev cluster launch must clean up .dev_cluster.json"
+        !json_exists_after_launch && !pids_exist_after_launch,
+        "failed dev cluster launch must clean up .dev_cluster.json and .dev_cluster.pids"
     );
-    drop(held_listener);
 }
 
 #[test]
 fn test_cli_binary_mode_subcommand() {
     let root = find_workspace_root();
     let ox_mode_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_ox-mode"));
+    let temp = tempfile::tempdir().expect("tempdir");
 
     let output = std::process::Command::new(&ox_mode_bin)
+        .env("HOME", temp.path())
+        .env("USERPROFILE", temp.path())
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_CONFIG")
         .args(["doc", "verify", "--json"])
         .current_dir(&root)
         .output()
@@ -657,8 +816,14 @@ fn test_bash_script_invocation() {
     if !script.exists() {
         return;
     }
+    let temp = tempfile::tempdir().expect("tempdir");
 
     let output = std::process::Command::new(&bash_bin)
+        .env("HOME", temp.path())
+        .env("USERPROFILE", temp.path())
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_CONFIG")
         .arg(&script)
         .args(["doc", "verify", "--json"])
         .current_dir(&root)

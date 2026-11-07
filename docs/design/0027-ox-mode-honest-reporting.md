@@ -55,14 +55,14 @@ Behaviour before this change (`MODE-1` in `docs/BACKLOG.md`):
 
 - `probe_cluster_health(port: Option<u16>)`, `probe_cluster_health_with_root(port: Option<u16>, workspace_root: &Path)`, and `probe_cluster_health_with_secret(port: Option<u16>, workspace_root: &Path, secret: Option<&ClusterSecret>)` keep `port` as `Option<u16>`:
   - when `Some(p)` is passed (`ox-mode dev status --port <P>` or `RUSTY_GRID_DASHBOARD_PORT=<P>`), only port `p` is probed (no fallback to `.dev_cluster.json` or default ports);
-  - when `None` is passed, `dev status` checks `.dev_cluster.json` (`web_ui_port`) and falls back to HTTP dashboard defaults `8080` and `3000` (excluding grid TCP port `8088`).
-- `probe_cluster_health_with_root` resolves the cluster secret via `resolve_cluster_secret(None, None)` and derives the dashboard admin Bearer token via `rusty_grid_master::dashboard_admin_token(&secret)`, sending `Authorization: Bearer <token>` on `GET /api/status`. HTTP `401`/`403` or non-2xx responses set `success = false` and `exit_code = Some(1)`.
+  - when `None` is passed, `dev status` checks `.dev_cluster.json` (`web_ui_port`) and falls back only to HTTP dashboard default `8080` (dropping port `3000` and excluding grid TCP port `8088`).
+- `resolve_dashboard_bearer_token()` resolves the cluster secret via `load_config_file(None)` and `SecretOpts::default().resolve(config.as_ref(), section)` across `[Status, Master, Submit, Worker]` and derives the dashboard admin Bearer token via `rusty_grid_master::dashboard_admin_token(&secret)`. On `GET /api/status`, the initial request is always sent without an `Authorization` header; `Authorization: Bearer <token>` is sent only on retry to an explicit `--port` or `.dev_cluster.json` port after receiving HTTP `401` with `WWW-Authenticate: Bearer realm="OxideSwarm"`. HTTP `401`/`403` or non-2xx responses set `success = false` and `exit_code = Some(1)`.
 
 ### D5 Summed test counts in `test quick`, verified `test lint` / `test flaky`, and checked `doc build`
 
 - `parse_cargo_test_counts(stdout: &str) -> (usize, usize)` sums `passed;` and `failed;` across every `test result:` line emitted by `cargo test --workspace --lib`.
 - `evaluate_lint_outcomes` and `run_flaky_detection_with` require every step/iteration to succeed (`clippy_ok && fmt_ok` and `passed_runs == iterations`).
-- `finalize_doc_build_output` verifies that `target/doc/rusty_grid_core/index.html` exists after `cargo doc --workspace --no-deps`; if missing, `run_doc_build` fails with `exit_code = Some(1)`.
+- `finalize_doc_build_output` (and `resolve_cargo_target_dir`) verifies that `<CARGO_TARGET_DIR or target>/doc/rusty_grid_core/index.html` exists after `cargo doc --workspace --no-deps`; if missing, `run_doc_build` fails with `exit_code = Some(1)`.
 
 ### D6 Generated `doc export` and relative-link checking in `doc verify`
 
@@ -76,7 +76,11 @@ Behaviour before this change (`MODE-1` in `docs/BACKLOG.md`):
 
 ## Security
 
-- `ox-mode dev status` never sends the raw cluster secret over HTTP; it derives the domain-separated dashboard Bearer token via `rusty_grid_master::dashboard_admin_token(&secret)` (`BLAKE3 derive_key("oxideswarm-dashboard-admin-token-v1", secret)`).
+- `ox-mode dev status` never sends the raw cluster secret over HTTP; it derives the domain-separated dashboard Bearer token via `rusty_grid_master::dashboard_admin_token(&secret)` using `HMAC-SHA256(secret, "oxs1-dashboard-admin")` (`crates/master/src/auth.rs:12-19`).
+- To prevent leaking the Admin dashboard token to unverified or guessed local ports:
+  1. Port `3000` is dropped from default candidate probing (`dev status` without `--port` checks only `.dev_cluster.json` `web_ui_port`, then `8080`).
+  2. The Bearer token is never allowed on unconfigured fallback ports; it is permitted only when probing an explicit `--port` or the port recorded in `.dev_cluster.json`.
+  3. `http_get_local_status` always sends its first `GET /api/status` request without an `Authorization` header and only retries with `Authorization: Bearer <token>` if the server responds `401 Unauthorized` with a `WWW-Authenticate` header containing `Bearer realm="OxideSwarm"`.
 - Token-protected masters that return `401 Unauthorized` or `403 Forbidden` when no matching credential is available are reported as unhealthy (`exit_code = 1`) rather than healthy with 0 workers.
 
 ## Test plan

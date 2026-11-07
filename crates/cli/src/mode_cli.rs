@@ -458,7 +458,7 @@ fn resolve_dashboard_bearer_token() -> Option<String> {
 fn http_get_local_status_once(
     port: u16,
     bearer_token: Option<&str>,
-) -> Result<(u16, String), String> {
+) -> Result<(u16, bool, String), String> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(750))
         .map_err(|e| format!("connect 127.0.0.1:{port}: {e}"))?;
@@ -493,16 +493,27 @@ fn http_get_local_status_once(
         .ok_or_else(|| {
             format!("invalid HTTP status line from 127.0.0.1:{port}: '{status_line}'")
         })?;
-    Ok((status_code, body.to_string()))
+    let has_oxideswarm_challenge = head.lines().skip(1).any(|line| {
+        if let Some((name, val)) = line.split_once(':') {
+            name.trim().eq_ignore_ascii_case("www-authenticate")
+                && val.contains("Bearer realm=\"OxideSwarm\"")
+        } else {
+            false
+        }
+    });
+    Ok((status_code, has_oxideswarm_challenge, body.to_string()))
 }
 
 /// Performs a synchronous HTTP/1.1 GET against `127.0.0.1:<port>/api/status`,
 /// returning `(http_status_code, response_body)`.
+///
+/// Never sends the Bearer token on the initial probe; only retries with `Authorization: Bearer`
+/// if the server returns `401` with `WWW-Authenticate: Bearer realm="OxideSwarm"`.
 fn http_get_local_status(port: u16, bearer_token: Option<&str>) -> Result<(u16, String), String> {
-    let (status_code, body) = http_get_local_status_once(port, bearer_token)?;
-    if status_code == 401 && bearer_token.is_some() {
-        if let Ok((retry_code, retry_body)) = http_get_local_status_once(port, None) {
-            if (200..300).contains(&retry_code) {
+    let (status_code, has_oxideswarm_challenge, body) = http_get_local_status_once(port, None)?;
+    if status_code == 401 && has_oxideswarm_challenge {
+        if let Some(token) = bearer_token.filter(|t| !t.is_empty()) {
+            if let Ok((retry_code, _, retry_body)) = http_get_local_status_once(port, Some(token)) {
                 return Ok((retry_code, retry_body));
             }
         }
@@ -511,7 +522,7 @@ fn http_get_local_status(port: u16, bearer_token: Option<&str>) -> Result<(u16, 
 }
 
 /// Probes the health and status of a running local master node.
-/// When `port` is `Some(p)`, probes only `p`; when `None`, checks `.dev_cluster.json` then HTTP ports `8080` and `3000`.
+/// When `port` is `Some(p)`, probes only `p`; when `None`, checks `.dev_cluster.json` then HTTP port `8080`.
 pub fn probe_cluster_health(port: Option<u16>) -> ModeExecutionResult {
     probe_cluster_health_with_root(port, &find_workspace_root())
 }
@@ -560,11 +571,9 @@ fn probe_cluster_health_with_bearer(
                 }
             }
         }
-        // Only HTTP dashboard ports (8088 is the default cluster TCP port, not HTTP).
-        for fallback in [8080u16, 3000u16] {
-            if !candidate_ports.contains(&fallback) {
-                candidate_ports.push(fallback);
-            }
+        // Only default HTTP dashboard port 8080 (3000 and grid TCP port 8088 are never guessed).
+        if !candidate_ports.contains(&8080u16) {
+            candidate_ports.push(8080u16);
         }
         from_cluster_file
     };
@@ -573,7 +582,14 @@ fn probe_cluster_health_with_bearer(
 
     for &p in &candidate_ports {
         let url = format!("http://127.0.0.1:{}/api/status", p);
-        match http_get_local_status(p, bearer_token) {
+        // Only allow sending the dashboard admin Bearer token to an explicit `--port` or `.dev_cluster.json` port,
+        // never to an unconfigured fallback port.
+        let port_token = if configured_port == Some(p) {
+            bearer_token
+        } else {
+            None
+        };
+        match http_get_local_status(p, port_token) {
             Ok((status_code, body)) if (200..300).contains(&status_code) => {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
                     let has_workers_array =
@@ -642,10 +658,25 @@ fn probe_cluster_health_with_bearer(
 // 3. DOCUMENTATION & SPECIFICATION ENGINE
 // ==============================================================================
 
-/// Verifies that the generated rustdoc HTML index exists on disk before reporting `doc build` success.
-pub fn finalize_doc_build_output(workspace_root: &Path, res: &mut ModeExecutionResult) {
+/// Resolves the Cargo target directory for `workspace_root`, honouring `CARGO_TARGET_DIR` when set.
+pub fn resolve_cargo_target_dir(workspace_root: &Path) -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(val) if !val.is_empty() => {
+            let p = PathBuf::from(val);
+            if p.is_absolute() {
+                p
+            } else {
+                workspace_root.join(p)
+            }
+        }
+        _ => workspace_root.join("target"),
+    }
+}
+
+/// Verifies that the generated rustdoc HTML index exists inside `target_dir` before reporting `doc build` success.
+pub fn finalize_doc_build_output_with_target_dir(target_dir: &Path, res: &mut ModeExecutionResult) {
     if res.success {
-        let doc_index = workspace_root.join("target/doc/rusty_grid_core/index.html");
+        let doc_index = target_dir.join("doc/rusty_grid_core/index.html");
         if doc_index.is_file() {
             res.stdout.push_str(&format!(
                 "\nDocumentation built successfully!\nHTML Index: {}\n",
@@ -660,6 +691,12 @@ pub fn finalize_doc_build_output(workspace_root: &Path, res: &mut ModeExecutionR
             );
         }
     }
+}
+
+/// Verifies that the generated rustdoc HTML index exists on disk before reporting `doc build` success.
+pub fn finalize_doc_build_output(workspace_root: &Path, res: &mut ModeExecutionResult) {
+    let target_dir = resolve_cargo_target_dir(workspace_root);
+    finalize_doc_build_output_with_target_dir(&target_dir, res);
 }
 
 /// Builds rustdoc for all workspace crates.
@@ -1148,24 +1185,34 @@ pub fn run_micro_benchmarks() -> ModeExecutionResult {
     // Benchmark 2: Real Bincode wire-protocol serialize_message + deserialize_message roundtrip
     let codec_iters = 10_000usize;
     let expected_task_id = dummy_task.id.to_string();
-    let wire_msg = MasterMessage::AssignTask { task: dummy_task };
+    let mut wire_task = dummy_task;
     let t2_start = Instant::now();
     let mut wire_bytes_total = 0usize;
     let mut codec_frame_bytes = 0usize;
     let mut codec_wire_discriminator = 0u8;
     let mut codec_decoded_task_id = String::new();
+    let mut codec_verified_iters = 0usize;
     for i in 0..codec_iters {
+        let expected_timeout = (i as u64) + 1;
+        wire_task.requirements.timeout_secs = expected_timeout;
+        let wire_msg = MasterMessage::AssignTask {
+            task: wire_task.clone(),
+        };
         let encoded =
             serialize_message(&wire_msg, WireCodec::Bincode).expect("Bincode wire serialize");
         wire_bytes_total += encoded.len();
         let (decoded, codec): (MasterMessage, WireCodec) =
             deserialize_message(&encoded).expect("Bincode wire deserialize");
-        if i == 0 {
-            codec_frame_bytes = encoded.len();
-            codec_wire_discriminator = encoded.first().copied().unwrap_or(0);
-            if codec == WireCodec::Bincode {
-                if let MasterMessage::AssignTask { task } = decoded {
-                    codec_decoded_task_id = task.id.to_string();
+        let disc = encoded.first().copied().unwrap_or(0);
+        if codec == WireCodec::Bincode && disc == 0x02 {
+            if let MasterMessage::AssignTask { task } = decoded {
+                if task.requirements.timeout_secs == expected_timeout {
+                    codec_verified_iters += 1;
+                    if i == 0 {
+                        codec_frame_bytes = encoded.len();
+                        codec_wire_discriminator = disc;
+                        codec_decoded_task_id = task.id.to_string();
+                    }
                 }
             }
         }
@@ -1178,7 +1225,8 @@ pub fn run_micro_benchmarks() -> ModeExecutionResult {
     res.duration_ms = start.elapsed().as_millis() as u64;
     res.success = codec_frame_bytes > 5
         && codec_wire_discriminator == 0x02
-        && codec_decoded_task_id == expected_task_id;
+        && codec_decoded_task_id == expected_task_id
+        && codec_verified_iters == codec_iters;
     res.exit_code = Some(if res.success { 0 } else { 1 });
 
     let stdout = format!(
@@ -1204,6 +1252,7 @@ pub fn run_micro_benchmarks() -> ModeExecutionResult {
     res = res.with_metric("codec_wire_discriminator", codec_wire_discriminator);
     res = res.with_metric("codec_decoded_task_id", codec_decoded_task_id);
     res = res.with_metric("expected_task_id", expected_task_id);
+    res = res.with_metric("codec_verified_iters", codec_verified_iters);
 
     res
 }
@@ -1542,11 +1591,30 @@ fn extract_count(line: &str, keyword: &str) -> Option<usize> {
 
 /// Executes the mode CLI workflow.
 pub async fn run_mode_cli(args: ModeCliArgs) -> i32 {
-    rusty_grid_core::mode::set_mode_runner_hook(execute_mode_action);
     let workspace_root = find_workspace_root();
+    let bearer_token = resolve_dashboard_bearer_token();
+    run_mode_cli_with_bearer(args, &workspace_root, bearer_token.as_deref()).await
+}
+
+/// Executes the mode CLI workflow with an explicit workspace root and optional `ClusterSecret`.
+pub async fn run_mode_cli_with_secret(
+    args: ModeCliArgs,
+    workspace_root: &Path,
+    secret: Option<&ClusterSecret>,
+) -> i32 {
+    let bearer_token = secret.map(rusty_grid_master::dashboard_admin_token);
+    run_mode_cli_with_bearer(args, workspace_root, bearer_token.as_deref()).await
+}
+
+async fn run_mode_cli_with_bearer(
+    args: ModeCliArgs,
+    workspace_root: &Path,
+    bearer_token: Option<&str>,
+) -> i32 {
+    rusty_grid_core::mode::set_mode_runner_hook(execute_mode_action);
 
     if args.mode.is_none() || args.interactive {
-        return run_interactive_menu(&workspace_root).await;
+        return run_interactive_menu(workspace_root).await;
     }
 
     let mode_str = args.mode.as_deref().unwrap_or("");
@@ -1574,9 +1642,9 @@ pub async fn run_mode_cli(args: ModeCliArgs) -> i32 {
 
     let result =
         if parsed_mode == WorkflowMode::Dev && action_str.trim().eq_ignore_ascii_case("status") {
-            probe_cluster_health_with_root(args.port, &workspace_root)
+            probe_cluster_health_with_bearer(args.port, workspace_root, bearer_token)
         } else {
-            execute_single_action(parsed_mode, &action_str, args.iterations, &workspace_root).await
+            execute_single_action(parsed_mode, &action_str, args.iterations, workspace_root).await
         };
 
     if args.json {
@@ -1622,6 +1690,43 @@ pub async fn execute_single_action(
     execute_mode_action(mode, &action_clean, workspace_root)
 }
 
+fn write_cluster_tracking_files(
+    pid_file: &Path,
+    json_file: &Path,
+    master_pid: u32,
+    master_tcp_port: u16,
+    web_ui_port: u16,
+    spawned_pids: &[String],
+) -> io::Result<()> {
+    fs::write(pid_file, spawned_pids.join("\n"))?;
+    let cluster_json = serde_json::json!({
+        "master_pid": master_pid,
+        "master_tcp": format!("127.0.0.1:{}", master_tcp_port),
+        "web_ui_port": web_ui_port,
+        "web_ui_url": format!("http://127.0.0.1:{}", web_ui_port),
+        "pids": spawned_pids,
+    });
+    let json_str = serde_json::to_string_pretty(&cluster_json)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    fs::write(json_file, json_str)
+}
+
+fn cleanup_failed_cluster_launch(
+    raw_pids: &[u32],
+    pid_file: &Path,
+    json_file: &Path,
+    isolated_home: Option<&Path>,
+) {
+    for &pid in raw_pids {
+        let _ = terminate_process(pid);
+    }
+    let _ = fs::remove_file(pid_file);
+    let _ = fs::remove_file(json_file);
+    if let Some(home) = isolated_home {
+        let _ = fs::remove_dir_all(home);
+    }
+}
+
 /// Spawns local dev cluster: 1 Master with Web UI + 2 Workers in background with PID tracking,
 /// verifying that all children stay alive and both workers appear in `/api/status`.
 pub async fn launch_local_dev_cluster(workspace_root: &Path) -> ModeExecutionResult {
@@ -1644,15 +1749,30 @@ pub async fn launch_local_dev_cluster_with_ports(
         let _ = stop_local_dev_cluster(workspace_root).await;
     }
 
-    let bin_rel = if cfg!(windows) {
-        "target/debug/rusty-grid.exe"
+    // When workspace_root is a temporary/non-workspace directory (e.g. during integration tests),
+    // isolate child HOME/USERPROFILE and config inside workspace_root so the host's real HOME is never touched.
+    let isolated_home = if workspace_root.join("Cargo.toml").exists() {
+        None
     } else {
-        "target/debug/rusty-grid"
+        let home_dir = workspace_root.join(".dev_cluster_home");
+        let _ = fs::create_dir_all(&home_dir);
+        let _ = fs::write(home_dir.join("rusty-grid.toml"), "");
+        Some(home_dir)
     };
-    let mut target_bin = workspace_root.join(bin_rel);
+
+    let bin_name = if cfg!(windows) {
+        "rusty-grid.exe"
+    } else {
+        "rusty-grid"
+    };
+    let mut target_bin = resolve_cargo_target_dir(workspace_root)
+        .join("debug")
+        .join(bin_name);
     if !target_bin.exists() {
         let fallback_root = find_workspace_root();
-        let fallback_bin = fallback_root.join(bin_rel);
+        let fallback_bin = resolve_cargo_target_dir(&fallback_root)
+            .join("debug")
+            .join(bin_name);
         if fallback_bin.exists() {
             target_bin = fallback_bin;
         } else {
@@ -1688,14 +1808,39 @@ pub async fn launch_local_dev_cluster_with_ports(
     let mut spawned_pids = Vec::new();
     let mut raw_pids = Vec::new();
 
-    let master_res = Command::new(&target_bin)
-        .args([
+    let mut master_cmd = Command::new(&target_bin);
+    if let Some(ref home_dir) = isolated_home {
+        let cfg_path = home_dir.join("rusty-grid.toml");
+        let blob_dir = home_dir.join("blobs");
+        master_cmd
+            .env("HOME", home_dir)
+            .env("USERPROFILE", home_dir)
+            .env_remove("OXIDESWARM_SECRET")
+            .env_remove("OXIDESWARM_SECRET_FILE")
+            .env_remove("RUSTY_GRID_CONFIG")
+            .arg("--config")
+            .arg(&cfg_path);
+        master_cmd.args([
             "master",
             "--listen",
             &format!("127.0.0.1:{}", master_tcp_port),
             "--web-ui-addr",
             &format!("127.0.0.1:{}", web_ui_port),
-        ])
+            "--ephemeral-key",
+            "--blob-dir",
+        ]);
+        master_cmd.arg(&blob_dir);
+    } else {
+        master_cmd.args([
+            "master",
+            "--listen",
+            &format!("127.0.0.1:{}", master_tcp_port),
+            "--web-ui-addr",
+            &format!("127.0.0.1:{}", web_ui_port),
+            "--ephemeral-key",
+        ]);
+    }
+    let master_res = master_cmd
         .current_dir(workspace_root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1709,6 +1854,12 @@ pub async fn launch_local_dev_cluster_with_ports(
             child
         }
         Err(e) => {
+            cleanup_failed_cluster_launch(
+                &raw_pids,
+                &pid_file,
+                &json_file,
+                isolated_home.as_deref(),
+            );
             res.success = false;
             res.exit_code = Some(1);
             res.stderr = format!("Failed to spawn Master: {}", e);
@@ -1717,11 +1868,29 @@ pub async fn launch_local_dev_cluster_with_ports(
     };
     let master_pid = master_child.id();
 
+    if let Err(e) = write_cluster_tracking_files(
+        &pid_file,
+        &json_file,
+        master_pid,
+        master_tcp_port,
+        web_ui_port,
+        &spawned_pids,
+    ) {
+        cleanup_failed_cluster_launch(&raw_pids, &pid_file, &json_file, isolated_home.as_deref());
+        res.duration_ms = start.elapsed().as_millis() as u64;
+        res.success = false;
+        res.exit_code = Some(1);
+        res.stderr = format!(
+            "Failed to write cluster tracking files ({}): {}",
+            pid_file.display(),
+            e
+        );
+        return res;
+    }
+
     tokio::time::sleep(Duration::from_millis(250)).await;
     if let Ok(Some(status)) = master_child.try_wait() {
-        for pid in &raw_pids {
-            let _ = terminate_process(*pid);
-        }
+        cleanup_failed_cluster_launch(&raw_pids, &pid_file, &json_file, isolated_home.as_deref());
         res.duration_ms = start.elapsed().as_millis() as u64;
         res.success = false;
         res.exit_code = Some(1);
@@ -1731,8 +1900,20 @@ pub async fn launch_local_dev_cluster_with_ports(
         return res;
     }
 
-    let w1_res = Command::new(&target_bin)
-        .args([
+    let mut w1_cmd = Command::new(&target_bin);
+    if let Some(ref home_dir) = isolated_home {
+        let cfg_path = home_dir.join("rusty-grid.toml");
+        let sandbox_dir = home_dir.join("sandboxes");
+        let _ = fs::create_dir_all(&sandbox_dir);
+        w1_cmd
+            .env("HOME", home_dir)
+            .env("USERPROFILE", home_dir)
+            .env_remove("OXIDESWARM_SECRET")
+            .env_remove("OXIDESWARM_SECRET_FILE")
+            .env_remove("RUSTY_GRID_CONFIG")
+            .arg("--config")
+            .arg(&cfg_path);
+        w1_cmd.args([
             "worker",
             "--master",
             &format!("127.0.0.1:{}", master_tcp_port),
@@ -1742,7 +1923,25 @@ pub async fn launch_local_dev_cluster_with_ports(
             "4",
             "--ram",
             "8192",
-        ])
+            "--no-portal",
+            "--sandbox-base-dir",
+        ]);
+        w1_cmd.arg(&sandbox_dir);
+    } else {
+        w1_cmd.args([
+            "worker",
+            "--master",
+            &format!("127.0.0.1:{}", master_tcp_port),
+            "--name",
+            "dev-worker-cpu-1",
+            "--cores",
+            "4",
+            "--ram",
+            "8192",
+            "--no-portal",
+        ]);
+    }
+    let w1_res = w1_cmd
         .current_dir(workspace_root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1756,9 +1955,12 @@ pub async fn launch_local_dev_cluster_with_ports(
             child
         }
         Err(e) => {
-            for pid in &raw_pids {
-                let _ = terminate_process(*pid);
-            }
+            cleanup_failed_cluster_launch(
+                &raw_pids,
+                &pid_file,
+                &json_file,
+                isolated_home.as_deref(),
+            );
             res.duration_ms = start.elapsed().as_millis() as u64;
             res.success = false;
             res.exit_code = Some(1);
@@ -1767,8 +1969,40 @@ pub async fn launch_local_dev_cluster_with_ports(
         }
     };
 
-    let w2_res = Command::new(&target_bin)
-        .args([
+    if let Err(e) = write_cluster_tracking_files(
+        &pid_file,
+        &json_file,
+        master_pid,
+        master_tcp_port,
+        web_ui_port,
+        &spawned_pids,
+    ) {
+        cleanup_failed_cluster_launch(&raw_pids, &pid_file, &json_file, isolated_home.as_deref());
+        res.duration_ms = start.elapsed().as_millis() as u64;
+        res.success = false;
+        res.exit_code = Some(1);
+        res.stderr = format!(
+            "Failed to write cluster tracking files ({}): {}",
+            pid_file.display(),
+            e
+        );
+        return res;
+    }
+
+    let mut w2_cmd = Command::new(&target_bin);
+    if let Some(ref home_dir) = isolated_home {
+        let cfg_path = home_dir.join("rusty-grid.toml");
+        let sandbox_dir = home_dir.join("sandboxes");
+        let _ = fs::create_dir_all(&sandbox_dir);
+        w2_cmd
+            .env("HOME", home_dir)
+            .env("USERPROFILE", home_dir)
+            .env_remove("OXIDESWARM_SECRET")
+            .env_remove("OXIDESWARM_SECRET_FILE")
+            .env_remove("RUSTY_GRID_CONFIG")
+            .arg("--config")
+            .arg(&cfg_path);
+        w2_cmd.args([
             "worker",
             "--master",
             &format!("127.0.0.1:{}", master_tcp_port),
@@ -1779,7 +2013,26 @@ pub async fn launch_local_dev_cluster_with_ports(
             "--ram",
             "16384",
             "--simulate-gpu",
-        ])
+            "--no-portal",
+            "--sandbox-base-dir",
+        ]);
+        w2_cmd.arg(&sandbox_dir);
+    } else {
+        w2_cmd.args([
+            "worker",
+            "--master",
+            &format!("127.0.0.1:{}", master_tcp_port),
+            "--name",
+            "dev-worker-sim-gpu-2",
+            "--cores",
+            "8",
+            "--ram",
+            "16384",
+            "--simulate-gpu",
+            "--no-portal",
+        ]);
+    }
+    let w2_res = w2_cmd
         .current_dir(workspace_root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1793,9 +2046,12 @@ pub async fn launch_local_dev_cluster_with_ports(
             child
         }
         Err(e) => {
-            for pid in &raw_pids {
-                let _ = terminate_process(*pid);
-            }
+            cleanup_failed_cluster_launch(
+                &raw_pids,
+                &pid_file,
+                &json_file,
+                isolated_home.as_deref(),
+            );
             res.duration_ms = start.elapsed().as_millis() as u64;
             res.success = false;
             res.exit_code = Some(1);
@@ -1804,7 +2060,34 @@ pub async fn launch_local_dev_cluster_with_ports(
         }
     };
 
-    let bearer_token = resolve_dashboard_bearer_token();
+    if let Err(e) = write_cluster_tracking_files(
+        &pid_file,
+        &json_file,
+        master_pid,
+        master_tcp_port,
+        web_ui_port,
+        &spawned_pids,
+    ) {
+        cleanup_failed_cluster_launch(&raw_pids, &pid_file, &json_file, isolated_home.as_deref());
+        res.duration_ms = start.elapsed().as_millis() as u64;
+        res.success = false;
+        res.exit_code = Some(1);
+        res.stderr = format!(
+            "Failed to write cluster tracking files ({}): {}",
+            pid_file.display(),
+            e
+        );
+        return res;
+    }
+
+    let bearer_token = if let Some(ref home_dir) = isolated_home {
+        let secret_file = home_dir.join(".oxideswarm").join("cluster.secret");
+        ClusterSecret::load_file(&secret_file)
+            .ok()
+            .map(|s| rusty_grid_master::dashboard_admin_token(&s))
+    } else {
+        resolve_dashboard_bearer_token()
+    };
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut cluster_ready = false;
     let mut failure_reason = format!(
@@ -1820,9 +2103,12 @@ pub async fn launch_local_dev_cluster_with_ports(
             match child.try_wait() {
                 Ok(Some(status)) => {
                     failure_reason = format!("{label} exited prematurely with {status}");
-                    for pid in &raw_pids {
-                        let _ = terminate_process(*pid);
-                    }
+                    cleanup_failed_cluster_launch(
+                        &raw_pids,
+                        &pid_file,
+                        &json_file,
+                        isolated_home.as_deref(),
+                    );
                     res.duration_ms = start.elapsed().as_millis() as u64;
                     res.success = false;
                     res.exit_code = Some(1);
@@ -1832,9 +2118,12 @@ pub async fn launch_local_dev_cluster_with_ports(
                 Ok(None) => {}
                 Err(e) => {
                     failure_reason = format!("Failed to check status of {label}: {e}");
-                    for pid in &raw_pids {
-                        let _ = terminate_process(*pid);
-                    }
+                    cleanup_failed_cluster_launch(
+                        &raw_pids,
+                        &pid_file,
+                        &json_file,
+                        isolated_home.as_deref(),
+                    );
                     res.duration_ms = start.elapsed().as_millis() as u64;
                     res.success = false;
                     res.exit_code = Some(1);
@@ -1868,46 +2157,11 @@ pub async fn launch_local_dev_cluster_with_ports(
     }
 
     if !cluster_ready {
-        for pid in &raw_pids {
-            let _ = terminate_process(*pid);
-        }
+        cleanup_failed_cluster_launch(&raw_pids, &pid_file, &json_file, isolated_home.as_deref());
         res.duration_ms = start.elapsed().as_millis() as u64;
         res.success = false;
         res.exit_code = Some(1);
         res.stderr = failure_reason;
-        return res;
-    }
-
-    if let Err(e) = fs::write(&pid_file, spawned_pids.join("\n")) {
-        for pid in &raw_pids {
-            let _ = terminate_process(*pid);
-        }
-        res.duration_ms = start.elapsed().as_millis() as u64;
-        res.success = false;
-        res.exit_code = Some(1);
-        res.stderr = format!("Failed to write {}: {}", pid_file.display(), e);
-        return res;
-    }
-
-    let cluster_json = serde_json::json!({
-        "master_pid": master_pid,
-        "master_tcp": format!("127.0.0.1:{}", master_tcp_port),
-        "web_ui_port": web_ui_port,
-        "web_ui_url": format!("http://127.0.0.1:{}", web_ui_port),
-        "pids": spawned_pids,
-    });
-    if let Err(e) = serde_json::to_string_pretty(&cluster_json)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        .and_then(|s| fs::write(&json_file, s))
-    {
-        for pid in &raw_pids {
-            let _ = terminate_process(*pid);
-        }
-        let _ = fs::remove_file(&pid_file);
-        res.duration_ms = start.elapsed().as_millis() as u64;
-        res.success = false;
-        res.exit_code = Some(1);
-        res.stderr = format!("Failed to write {}: {}", json_file.display(), e);
         return res;
     }
 
@@ -1938,8 +2192,10 @@ pub async fn stop_local_dev_cluster(workspace_root: &Path) -> ModeExecutionResul
 
     let pid_file = workspace_root.join(".dev_cluster.pids");
     let json_file = workspace_root.join(".dev_cluster.json");
+    let isolated_home = workspace_root.join(".dev_cluster_home");
 
     if !pid_file.exists() && !json_file.exists() {
+        let _ = fs::remove_dir_all(&isolated_home);
         res.success = true;
         res.exit_code = Some(0);
         res.stdout = "No running dev cluster tracking files found.".to_string();
@@ -1989,6 +2245,7 @@ pub async fn stop_local_dev_cluster(workspace_root: &Path) -> ModeExecutionResul
 
     let _ = fs::remove_file(&pid_file);
     let _ = fs::remove_file(&json_file);
+    let _ = fs::remove_dir_all(&isolated_home);
 
     res.duration_ms = start.elapsed().as_millis() as u64;
     res.success = true;
@@ -2582,11 +2839,28 @@ test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         let mut doc_res = ModeExecutionResult::new(WorkflowMode::Doc, "build");
         doc_res.success = true;
         doc_res.exit_code = Some(0);
-        finalize_doc_build_output(temp.path(), &mut doc_res);
+        finalize_doc_build_output_with_target_dir(
+            &temp.path().join("missing_target"),
+            &mut doc_res,
+        );
         assert!(
             !doc_res.success,
             "finalize_doc_build_output must fail when index.html was not produced"
         );
         assert_eq!(doc_res.exit_code, Some(1));
+
+        let custom_target = temp.path().join("custom_cargo_target");
+        let doc_dir = custom_target.join("doc/rusty_grid_core");
+        std::fs::create_dir_all(&doc_dir).expect("create doc dir");
+        std::fs::write(doc_dir.join("index.html"), "<html></html>").expect("write index.html");
+        let mut custom_doc_res = ModeExecutionResult::new(WorkflowMode::Doc, "build");
+        custom_doc_res.success = true;
+        custom_doc_res.exit_code = Some(0);
+        finalize_doc_build_output_with_target_dir(&custom_target, &mut custom_doc_res);
+        assert!(
+            custom_doc_res.success,
+            "finalize_doc_build_output must succeed when index.html exists in custom CARGO_TARGET_DIR"
+        );
+        assert_eq!(custom_doc_res.exit_code, Some(0));
     }
 }
