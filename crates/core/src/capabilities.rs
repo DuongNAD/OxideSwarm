@@ -176,27 +176,38 @@ impl MobileLiveStatus {
         calculate_effective_concurrency(max_cores, bat, therm)
     }
 
+    /// Calculates the RRC-aware heartbeat interval when a mobile network type is known.
+    ///
+    /// Returns `None` when `network_type` is absent or unknown (for example on a battery-powered
+    /// laptop), signalling that the caller should keep the master-negotiated heartbeat interval.
+    pub fn adaptive_keepalive_interval(&self, active_tasks: usize) -> Option<Duration> {
+        let net = self.network_type.as_deref()?.trim();
+        if net.is_empty() || net.eq_ignore_ascii_case("unknown") || net.eq_ignore_ascii_case("none")
+        {
+            return None;
+        }
+        Some(calculate_keepalive_interval(net, active_tasks))
+    }
+
+    /// Returns the RRC-aware keepalive interval when `network_type` is known, or `negotiated`
+    /// when `network_type` is unknown (such as on a laptop).
+    pub fn recommended_keepalive_interval_or(
+        &self,
+        active_tasks: usize,
+        negotiated: Duration,
+    ) -> Duration {
+        self.adaptive_keepalive_interval(active_tasks)
+            .unwrap_or(negotiated)
+    }
+
     /// Calculates RRC-aware heartbeat interval in seconds.
     pub fn recommended_keepalive_interval(&self, active_tasks: usize) -> Duration {
-        let is_cellular = self.network_type.as_ref().is_some_and(|net| {
-            let n = net.to_ascii_lowercase();
-            n.contains("cellular")
-                || n.contains("mobile")
-                || n.contains("lte")
-                || n.contains("5g")
-                || n.contains("4g")
-                || n.contains("3g")
-                || n.contains("cgnat")
-        });
-
-        if is_cellular {
-            if active_tasks > 0 {
-                Duration::from_secs(10)
-            } else {
-                Duration::from_secs(25)
-            }
-        } else {
-            Duration::from_secs(60)
+        if active_tasks > 0 {
+            return Duration::from_secs(10);
+        }
+        match self.adaptive_keepalive_interval(active_tasks) {
+            Some(interval) => interval,
+            None => Duration::from_secs(60),
         }
     }
 }
@@ -265,21 +276,24 @@ pub fn is_task_eligible(
 
 /// Calculates RRC-aware heartbeat interval in seconds.
 pub fn calculate_keepalive_interval(network_type: &str, active_tasks: usize) -> Duration {
+    if active_tasks > 0 {
+        return Duration::from_secs(10);
+    }
     let n = network_type.to_ascii_lowercase();
+    let is_wifi = n.contains("wifi") || n.contains("wi-fi") || n.contains("wlan");
+    let has_5g_token = !is_wifi
+        && n.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|token| token == "5g" || token == "5gnr");
     let is_cellular = n.contains("cellular")
         || n.contains("mobile")
         || n.contains("lte")
-        || n.contains("5g")
+        || has_5g_token
         || n.contains("4g")
         || n.contains("3g")
         || n.contains("cgnat");
 
     if is_cellular {
-        if active_tasks > 0 {
-            Duration::from_secs(10)
-        } else {
-            Duration::from_secs(25)
-        }
+        Duration::from_secs(25)
     } else {
         Duration::from_secs(60)
     }
@@ -873,6 +887,18 @@ pub fn with_test_battery_probe<R>(reading: (Option<u8>, Option<bool>), f: impl F
 
 /// Auto-detects mobile hardware attributes and real-time battery/thermal status.
 /// Returns `None` on standard desktop/server environments without battery unless on Android.
+///
+/// Platform sensing coverage:
+/// - **Android:** reads `/sys/class/power_supply` (with `/system/bin/dumpsys battery` fallback) and
+///   `/system/bin/dumpsys thermalservice` / `/sys/class/thermal`; at runtime the Android app pushes
+///   full [`MobileLiveStatus`] readings (including `battery_temperature`, `network_type`,
+///   `battery_tier`, and `thermal_tier`) via `OxideWorkerBridge.nativeUpdateMobileTelemetry`.
+/// - **Linux:** reads `/sys/class/power_supply` (`BAT0`/`BAT1`/`battery`) and `/sys/class/thermal`.
+/// - **macOS:** reads battery percentage and power source via `pmset -g batt`; does not probe
+///   battery/die temperature (`thermal_throttled` is `false`, `battery_temperature` is `None`).
+/// - **Windows:** does not probe host battery or thermal sensors (`detect_battery` returns
+///   `(None, None)` and `detect_thermal_throttling` returns `false`), so this function returns
+///   `None` unless `TEST_BATTERY_PROBE` is set in tests.
 pub fn detect_mobile_capabilities() -> Option<MobileCapabilities> {
     let is_android = is_android_env();
     let (battery_pct, is_charging) = detect_battery();
@@ -895,7 +921,9 @@ pub fn detect_mobile_capabilities() -> Option<MobileCapabilities> {
 
 /// Re-reads only the battery and thermal state (no SoC / OS probing), cheap enough to run every
 /// few seconds. Returns `None` on a machine without a readable battery that is not Android, i.e.
-/// exactly when [`detect_mobile_capabilities`] would. Blocking (sysfs reads, `pmset`/`dumpsys`
+/// exactly when [`detect_mobile_capabilities`] would (including on Windows when no test probe is
+/// active). On macOS, `pmset -g batt` supplies `battery_pct` and `is_charging` while
+/// `battery_temperature` and `network_type` remain `None`. Blocking (sysfs reads, `pmset`/`dumpsys`
 /// child processes): call it from `spawn_blocking`.
 pub fn detect_live_mobile_status() -> Option<MobileLiveStatus> {
     let (battery_pct, is_charging) = detect_battery();
@@ -922,6 +950,9 @@ fn is_android_env() -> bool {
         || std::path::Path::new("/system/bin/getprop").exists()
 }
 
+/// Probes battery charge percentage and charging state on Linux/Android (`/sys/class/power_supply`
+/// and `/system/bin/dumpsys battery`) and macOS (`pmset -g batt`). Windows has no host battery
+/// probe and returns `(None, None)`.
 fn detect_battery() -> (Option<u8>, Option<bool>) {
     if let Some(reading) = TEST_BATTERY_PROBE.with(|c| c.get()) {
         return reading;
@@ -1117,6 +1148,9 @@ fn parse_pmset_batt(text: &str) -> (Option<u8>, Option<bool>) {
     }
 }
 
+/// Probes OS/sysfs thermal throttling state on Android (`/system/bin/dumpsys thermalservice`) and
+/// Linux (`/sys/class/thermal`). macOS and Windows do not expose `/sys/class/thermal` and return
+/// `false`.
 fn detect_thermal_throttling() -> bool {
     // 1. Android dumpsys thermalservice check
     if is_android_env() {
@@ -2243,16 +2277,82 @@ mod tests {
             Duration::from_secs(60)
         );
         assert_eq!(
-            calculate_keepalive_interval("ethernet", 2),
+            calculate_keepalive_interval("wifi-5g", 0),
             Duration::from_secs(60)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("wi-fi 5g", 0),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("wlan-5g", 0),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("wifi 5ghz", 0),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("wifi", 1),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("ethernet", 0),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("ethernet", 2),
+            Duration::from_secs(10)
         );
         assert_eq!(
             calculate_keepalive_interval("cellular", 0),
             Duration::from_secs(25)
         );
         assert_eq!(
+            calculate_keepalive_interval("5g", 0),
+            Duration::from_secs(25)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("5G NR", 0),
+            Duration::from_secs(25)
+        );
+        assert_eq!(
             calculate_keepalive_interval("5G LTE", 1),
             Duration::from_secs(10)
+        );
+
+        let wifi_status = MobileLiveStatus {
+            network_type: Some("wifi".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            wifi_status.recommended_keepalive_interval(0),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            wifi_status.recommended_keepalive_interval(1),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            wifi_status.recommended_keepalive_interval_or(1, Duration::from_secs(1)),
+            Duration::from_secs(10)
+        );
+
+        let laptop_status = MobileLiveStatus {
+            battery_pct: Some(80),
+            is_charging: Some(false),
+            network_type: None,
+            ..Default::default()
+        };
+        assert_eq!(laptop_status.adaptive_keepalive_interval(0), None);
+        assert_eq!(laptop_status.adaptive_keepalive_interval(1), None);
+        assert_eq!(
+            laptop_status.recommended_keepalive_interval_or(0, Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            laptop_status.recommended_keepalive_interval_or(1, Duration::from_secs(1)),
+            Duration::from_secs(1)
         );
     }
 

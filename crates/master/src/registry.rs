@@ -99,6 +99,8 @@ pub struct WorkerEntry {
     pub heartbeat_interval: Option<Duration>,
     /// Negotiated protocol capabilities (Requirement R2).
     pub features: ProtocolCapabilities,
+    /// Latest live mobile telemetry snapshot reported by the worker (or seeded from `capabilities.mobile`).
+    pub mobile_status: Option<MobileLiveStatus>,
 }
 
 /// Dynamically calculates the Master dead-peer liveness timeout window for a worker ($W_{\text{dead}} = \max(2\text{s}, 4 \times \tau_{\text{worker}})$).
@@ -123,6 +125,9 @@ pub struct WorkerInfo {
     pub ram_available_mb: u64,
     #[serde(default)]
     pub features: ProtocolCapabilities,
+    /// Latest live mobile telemetry snapshot reported by the worker (or seeded from `capabilities.mobile`).
+    #[serde(default)]
+    pub mobile_status: Option<MobileLiveStatus>,
 }
 
 impl WorkerInfo {
@@ -138,6 +143,7 @@ impl WorkerInfo {
         remote_addr: String,
     ) -> Self {
         let ram = capabilities.ram_mb;
+        let mobile_status = capabilities.mobile.as_ref().map(|m| m.live_status());
         Self {
             worker_id,
             session_id,
@@ -150,6 +156,7 @@ impl WorkerInfo {
             cpu_usage_pct: 0.0,
             ram_available_mb: ram,
             features: ProtocolCapabilities::empty(),
+            mobile_status,
         }
     }
 }
@@ -199,6 +206,7 @@ impl WorkerEntry {
             cpu_usage_pct: self.cpu_usage_pct,
             ram_available_mb: self.ram_available_mb,
             features: self.features,
+            mobile_status: self.mobile_status.clone(),
         }
     }
 }
@@ -331,18 +339,35 @@ impl WorkerRegistry {
             // A fresh Register carries a fresh capability snapshot, so a past rejection streak no longer applies.
             existing.consecutive_rejections = 0;
             existing.excluded_until = None;
+            existing.mobile_status = match (
+                existing.mobile_status.take(),
+                existing.capabilities.mobile.as_ref(),
+            ) {
+                (Some(mut prev), Some(m)) => {
+                    prev.battery_pct = m.battery_pct;
+                    prev.is_charging = m.is_charging;
+                    prev.thermal_throttled = m.thermal_throttled;
+                    Some(prev)
+                }
+                (_, maybe_m) => maybe_m.map(|m| m.live_status()),
+            };
+            // Keep a 4 × 60 s window for a worker with `capabilities.mobile` until its first
+            // `MobileTelemetry` of the session reports whether a mobile `network_type` is present.
             existing.heartbeat_interval = existing
                 .capabilities
                 .mobile
                 .as_ref()
-                .map(|m| m.live_status().recommended_keepalive_interval(0));
+                .map(|_| Duration::from_secs(60));
             tracing::info!(worker_id = %worker_id, session_id = session_id, superseded = ?superseded_session, "Rebound existing worker registration");
         } else {
             let ram = capabilities.ram_mb;
-            let hb_interval = capabilities
-                .mobile
-                .as_ref()
-                .map(|m| m.live_status().recommended_keepalive_interval(0));
+            let mobile_status = capabilities.mobile.as_ref().map(|m| m.live_status());
+            let hb_interval = mobile_status.as_ref().map(|_| Duration::from_secs(60));
+            // Give a live worker connection with `capabilities.mobile` up to 50 ms to deliver its
+            // immediate post-RegisterAck `MobileTelemetry` frame before the background scheduler
+            // places queued work on the un-hydrated `Register` snapshot.
+            let excluded_until = (mobile_status.is_some() && !features.is_empty())
+                .then(|| now_instant + Duration::from_millis(50));
             let entry = WorkerEntry {
                 worker_id,
                 session_id,
@@ -362,8 +387,9 @@ impl WorkerRegistry {
                 ram_available_mb: ram,
                 rx_clock: None,
                 consecutive_rejections: 0,
-                excluded_until: None,
+                excluded_until,
                 heartbeat_interval: hb_interval,
+                mobile_status,
             };
             inner.workers.insert(worker_id, entry);
             tracing::info!(worker_id = %worker_id, session_id = session_id, "Registered new worker");
@@ -547,26 +573,9 @@ impl WorkerRegistry {
         entry.reported_active_tasks = active_tasks;
         entry.cpu_usage_pct = cpu_usage_pct;
         entry.ram_available_mb = ram_available_mb;
-        if let Some(ref mob) = entry.capabilities.mobile {
-            let live = mob.live_status();
-            let is_cellular = live.network_type.as_ref().is_some_and(|net| {
-                let n = net.to_ascii_lowercase();
-                n.contains("cellular")
-                    || n.contains("mobile")
-                    || n.contains("lte")
-                    || n.contains("5g")
-                    || n.contains("4g")
-                    || n.contains("3g")
-                    || n.contains("cgnat")
-            }) || entry
-                .heartbeat_interval
-                .is_some_and(|d| d < Duration::from_secs(60));
-
-            if is_cellular {
-                entry.heartbeat_interval =
-                    Some(live.recommended_keepalive_interval(entry.active_tasks));
-            } else if entry.heartbeat_interval.is_none() {
-                entry.heartbeat_interval = Some(Duration::from_secs(60));
+        if let Some(ref status) = entry.mobile_status {
+            if let Some(iv) = status.adaptive_keepalive_interval(active_tasks) {
+                entry.heartbeat_interval = Some(iv);
             }
         }
         let revive = entry.status == WorkerStatus::Disconnected && expected_session.is_some();
@@ -591,9 +600,10 @@ impl WorkerRegistry {
     /// Applies a worker's live battery/thermal report to its advertised capabilities.
     ///
     /// `Register` only carries the snapshot taken when the worker connected; the scheduler's
-    /// battery and thermal gates (and the dashboard) read `capabilities.mobile`, so without this
-    /// a phone that registered at 90% and has since drained to 4% would keep receiving heavy
-    /// work. A report from a superseded session is ignored. Returns whether anything changed.
+    /// battery and thermal gates (and the dashboard) read `mobile_status` and
+    /// `capabilities.mobile`, so without this a phone that registered at 90% and has since drained
+    /// to 4% (or heated to 45°C) would keep receiving heavy work. A report from a superseded
+    /// session is ignored. Returns whether anything changed.
     pub async fn update_mobile_telemetry(
         &self,
         worker_id: &Uuid,
@@ -610,9 +620,22 @@ impl WorkerRegistry {
                 return Ok(false);
             }
         }
-        entry.heartbeat_interval = Some(status.recommended_keepalive_interval(entry.active_tasks));
+        let mut status = status;
+        if status.network_type.is_none() {
+            status.network_type = entry
+                .mobile_status
+                .as_ref()
+                .and_then(|prev| prev.network_type.clone());
+        }
+        let candidate = status.adaptive_keepalive_interval(entry.reported_active_tasks);
+        entry.heartbeat_interval = match (entry.heartbeat_interval, candidate) {
+            (Some(prev), Some(next)) if entry.active_tasks > entry.reported_active_tasks => {
+                Some(prev.max(next))
+            }
+            (_, next) => next,
+        };
         let updated = match entry.capabilities.mobile.as_ref() {
-            Some(current) => current.with_live_status(status),
+            Some(current) => current.with_live_status(status.clone()),
             // The worker registered without mobile data but now reports some (an app feeding
             // platform telemetry): there is no OS/SoC descriptor to keep.
             None => MobileCapabilities {
@@ -623,8 +646,13 @@ impl WorkerRegistry {
                 thermal_throttled: status.thermal_throttled,
             },
         };
-        let changed = entry.capabilities.mobile.as_ref() != Some(&updated);
+        let changed = entry.capabilities.mobile.as_ref() != Some(&updated)
+            || entry.mobile_status.as_ref() != Some(&status);
         entry.capabilities.mobile = Some(updated);
+        entry.mobile_status = Some(status);
+        if entry.consecutive_rejections == 0 {
+            entry.excluded_until = None;
+        }
         Ok(changed)
     }
 
@@ -661,6 +689,16 @@ impl WorkerRegistry {
         if let Some(entry) = inner.workers.get_mut(worker_id) {
             if entry.session_id == session_id {
                 entry.active_tasks = entry.active_tasks.saturating_sub(1);
+                if let Some(ref status) = entry.mobile_status {
+                    let active = entry.visible_active_tasks();
+                    if let Some(candidate) = status.adaptive_keepalive_interval(active) {
+                        entry.heartbeat_interval = Some(
+                            entry
+                                .heartbeat_interval
+                                .map_or(candidate, |prev| prev.max(candidate)),
+                        );
+                    }
+                }
                 if entry.status == WorkerStatus::Busy && entry.visible_active_tasks() == 0 {
                     entry.status = WorkerStatus::Connected;
                 }
@@ -751,10 +789,38 @@ impl WorkerRegistry {
             .get_mut(worker_id)
             .ok_or(GridError::WorkerNotFound(*worker_id))?;
         entry.active_tasks = entry.active_tasks.saturating_sub(1);
+        if let Some(ref status) = entry.mobile_status {
+            let active = entry.visible_active_tasks();
+            if let Some(candidate) = status.adaptive_keepalive_interval(active) {
+                entry.heartbeat_interval = Some(
+                    entry
+                        .heartbeat_interval
+                        .map_or(candidate, |prev| prev.max(candidate)),
+                );
+            }
+        }
         if entry.status == WorkerStatus::Busy && entry.visible_active_tasks() == 0 {
             entry.status = WorkerStatus::Connected;
         }
         Ok(entry.active_tasks)
+    }
+
+    /// Returns the last mobile `network_type` reported by `worker_id`, if any.
+    pub async fn worker_network_type(&self, worker_id: &Uuid) -> Option<String> {
+        let inner = self.inner.read().await;
+        inner
+            .workers
+            .get(worker_id)
+            .and_then(|e| e.mobile_status.as_ref())
+            .and_then(|s| s.network_type.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn backdate_last_heartbeat(&self, worker_id: &Uuid, age: Duration) {
+        let mut inner = self.inner.write().await;
+        if let Some(entry) = inner.workers.get_mut(worker_id) {
+            entry.last_heartbeat_instant = Instant::now() - age;
+        }
     }
 
     /// Retrieves a single worker's metadata snapshot.
@@ -1911,5 +1977,250 @@ mod tests {
         let workers = registry.list_active_workers().await;
         assert_eq!(placed(vec![multi_core()], workers.clone()), 0);
         assert_eq!(placed(vec![compile()], workers), 0);
+    }
+
+    #[tokio::test]
+    async fn test_adaptive_keepalive_registry_intervals_for_laptop_wifi_and_cellular() {
+        let registry = WorkerRegistry::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let id = Uuid::new_v4();
+        let session = registry
+            .register(
+                id,
+                phone_caps(85, false, false),
+                "127.0.0.1:9033".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 1. A newly registered mobile worker keeps a 4 × 60 s window (`Some(60s)`) until its
+        // first `MobileTelemetry` of the session; a battery laptop (`network_type: None`) then
+        // switches to the negotiated/reaper timeout (`None`).
+        {
+            let inner = registry.inner.read().await;
+            assert_eq!(
+                inner.workers[&id].heartbeat_interval,
+                Some(Duration::from_secs(60))
+            );
+        }
+        registry
+            .record_heartbeat(&id, 0, 100, 10.0, 4096, Some(session))
+            .await
+            .unwrap();
+        registry
+            .update_mobile_telemetry(
+                &id,
+                Some(session),
+                MobileLiveStatus {
+                    battery_pct: Some(84),
+                    is_charging: Some(false),
+                    network_type: None,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let inner = registry.inner.read().await;
+            assert_eq!(inner.workers[&id].heartbeat_interval, None);
+        }
+
+        // 2. Wi-Fi idle -> 60s; dispatching a task does NOT lower the interval before the worker's
+        // next heartbeat; Wi-Fi heartbeat with 1 active task -> 10s (40s dead-worker window).
+        registry
+            .update_mobile_telemetry(
+                &id,
+                Some(session),
+                MobileLiveStatus {
+                    battery_pct: Some(84),
+                    is_charging: Some(false),
+                    network_type: Some("wifi".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let inner = registry.inner.read().await;
+            assert_eq!(
+                inner.workers[&id].heartbeat_interval,
+                Some(Duration::from_secs(60))
+            );
+        }
+        registry.reserve_dispatch(&id, session).await.unwrap();
+        {
+            let inner = registry.inner.read().await;
+            assert_eq!(
+                inner.workers[&id].heartbeat_interval,
+                Some(Duration::from_secs(60)),
+                "reserve_dispatch must not lower heartbeat_interval before the worker heartbeats"
+            );
+        }
+        registry
+            .record_heartbeat(&id, 1, 101, 50.0, 4096, Some(session))
+            .await
+            .unwrap();
+        {
+            let inner = registry.inner.read().await;
+            let entry = &inner.workers[&id];
+            assert_eq!(entry.heartbeat_interval, Some(Duration::from_secs(10)));
+            let base = entry.last_heartbeat_instant;
+            assert!(!entry.is_silent(base + Duration::from_secs(39), Duration::from_secs(5)));
+            assert!(entry.is_silent(base + Duration::from_secs(41), Duration::from_secs(5)));
+        }
+
+        // 3. Cellular idle stays 25s across heartbeats; cellular active -> 10s.
+        registry.decrement_active_tasks(&id).await.unwrap();
+        registry
+            .record_heartbeat(&id, 0, 102, 5.0, 4096, Some(session))
+            .await
+            .unwrap();
+        registry
+            .update_mobile_telemetry(
+                &id,
+                Some(session),
+                MobileLiveStatus {
+                    battery_pct: Some(80),
+                    is_charging: Some(false),
+                    network_type: Some("cellular".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        registry
+            .record_heartbeat(&id, 0, 103, 5.0, 4096, Some(session))
+            .await
+            .unwrap();
+        {
+            let inner = registry.inner.read().await;
+            assert_eq!(
+                inner.workers[&id].heartbeat_interval,
+                Some(Duration::from_secs(25))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mobile_thermal_state_kept_on_master_gates_hot_to_one_slot_and_critical_to_zero() {
+        use crate::scheduler::{SchedulerConfig, WorkloadScheduler};
+        use rusty_grid_core::capabilities::ThermalTier;
+        use rusty_grid_core::task::{Task, TaskSpec};
+
+        let registry = WorkerRegistry::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let id = Uuid::new_v4();
+        let session = registry
+            .register(
+                id,
+                phone_caps(90, true, false),
+                "127.0.0.1:9034".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let config = SchedulerConfig::default();
+        let light_tasks: Vec<Task> = (0..4)
+            .map(|i| {
+                Task::new(
+                    TaskSpec::command("echo", vec![i.to_string()]),
+                    TaskRequirements::generic(1, 60),
+                )
+            })
+            .collect();
+        let multi_core = Task::new(
+            TaskSpec::command("true", vec![]),
+            TaskRequirements::generic(2, 60),
+        );
+
+        // 1. Hot telemetry (explicit tier or >40°C temperature): at most 1 slot assigned out of 4
+        // queued 1-core tasks on a 4-core phone, and 0 for a 2-core task.
+        let changed = registry
+            .update_mobile_telemetry(
+                &id,
+                Some(session),
+                MobileLiveStatus {
+                    battery_pct: Some(90),
+                    is_charging: Some(true),
+                    thermal_throttled: false,
+                    battery_temperature: Some(41.5),
+                    thermal_tier: Some(ThermalTier::Hot),
+                    network_type: Some("cellular".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(changed, "new thermal telemetry must report a state change");
+
+        let workers = registry.list_schedulable_workers().await;
+        assert_eq!(
+            workers[0]
+                .mobile_status
+                .as_ref()
+                .and_then(|s| s.thermal_tier),
+            Some(ThermalTier::Hot)
+        );
+        let hot_report = WorkloadScheduler::matchmake(&config, &light_tasks, &workers);
+        assert_eq!(
+            hot_report.assignments.len(),
+            1,
+            "Hot thermal telemetry on a 4-core phone must yield at most 1 slot"
+        );
+        let hot_multicore =
+            WorkloadScheduler::matchmake(&config, std::slice::from_ref(&multi_core), &workers);
+        assert_eq!(
+            hot_multicore.assignments.len(),
+            0,
+            "Hot thermal telemetry must reject multi-core work"
+        );
+
+        // 2. Critical telemetry (explicit tier or >42°C temperature): 0 assignments even for a
+        // 1-core command task.
+        let changed = registry
+            .update_mobile_telemetry(
+                &id,
+                Some(session),
+                MobileLiveStatus {
+                    battery_pct: Some(90),
+                    is_charging: Some(true),
+                    thermal_throttled: false,
+                    battery_temperature: Some(45.0),
+                    thermal_tier: Some(ThermalTier::Critical),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            changed,
+            "transition from Hot to Critical must report a change"
+        );
+
+        // Cellular interval stays 25s across heartbeats even when a subsequent telemetry frame
+        // omitted `network_type`.
+        registry
+            .record_heartbeat(&id, 0, 200, 10.0, 4096, Some(session))
+            .await
+            .unwrap();
+        {
+            let inner = registry.inner.read().await;
+            assert_eq!(
+                inner.workers[&id].heartbeat_interval,
+                Some(Duration::from_secs(25))
+            );
+        }
+
+        let workers = registry.list_schedulable_workers().await;
+        let crit_report = WorkloadScheduler::matchmake(&config, &light_tasks, &workers);
+        assert_eq!(
+            crit_report.assignments.len(),
+            0,
+            "Critical thermal telemetry (45°C) must yield 0 assignments"
+        );
     }
 }

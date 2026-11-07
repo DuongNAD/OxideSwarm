@@ -371,6 +371,36 @@ struct Engine<'a> {
     reserved: Vec<bool>,
 }
 
+/// Returns the latest [`MobileLiveStatus`] for `worker`, preferring the live telemetry snapshot
+/// stored on [`WorkerInfo::mobile_status`] and falling back to [`MobileCapabilities::live_status`]
+/// when only the registration snapshot is present.
+fn effective_mobile_live_status(worker: &WorkerInfo) -> Option<MobileLiveStatus> {
+    match (&worker.mobile_status, &worker.capabilities.mobile) {
+        (Some(live), Some(cap)) => Some(MobileLiveStatus {
+            battery_pct: live.battery_pct.or(cap.battery_pct),
+            is_charging: live.is_charging.or(cap.is_charging),
+            thermal_throttled: live.thermal_throttled || cap.thermal_throttled,
+            battery_temperature: live.battery_temperature,
+            network_type: live.network_type.clone(),
+            battery_tier: live.battery_tier,
+            thermal_tier: live.thermal_tier,
+        }),
+        (Some(live), None) => Some(live.clone()),
+        (None, Some(cap)) => Some(cap.live_status()),
+        (None, None) => None,
+    }
+}
+
+/// Returns the effective [`ThermalTier`] for scheduling on `worker`, combining any explicit tier
+/// from [`MobileLiveStatus::thermal_tier`] with the tier derived from battery temperature and the
+/// OS throttle flag (`max` so neither a high temperature reading nor an explicit tier is ignored).
+fn effective_scheduler_thermal_tier(live: &MobileLiveStatus) -> ThermalTier {
+    let computed =
+        MobileLiveStatus::compute_thermal_tier(live.battery_temperature, live.thermal_throttled);
+    live.thermal_tier
+        .map_or(computed, |tier| tier.max(computed))
+}
+
 /// Returns the effective [`BatteryTier`] for scheduling on `worker`.
 ///
 /// Desktop/laptop operating systems (`macOS`, `Windows`, non-Android `Linux`) populate
@@ -381,7 +411,7 @@ struct Engine<'a> {
 /// GPU and compilation workloads.
 fn effective_scheduler_battery_tier(
     worker: &WorkerInfo,
-    mobile: &rusty_grid_core::capabilities::MobileCapabilities,
+    mobile: Option<&rusty_grid_core::capabilities::MobileCapabilities>,
     live: &MobileLiveStatus,
 ) -> BatteryTier {
     let raw = live.battery_tier.unwrap_or_else(|| {
@@ -390,7 +420,9 @@ fn effective_scheduler_battery_tier(
     if raw == BatteryTier::Critical {
         return BatteryTier::Critical;
     }
-    let os = mobile.os_version.to_ascii_lowercase();
+    let os = mobile
+        .map(|m| m.os_version.to_ascii_lowercase())
+        .unwrap_or_default();
     let is_mobile_os = os.contains("android")
         || os.contains("ios")
         || worker
@@ -437,15 +469,13 @@ impl<'a> Engine<'a> {
                 };
                 let mut max_slots = config.effective_max_concurrency(worker);
                 let mut max_tasks = config.effective_max_tasks(worker);
-                if let Some(ref mobile) = worker.capabilities.mobile {
-                    let live = mobile.live_status();
-                    let bat = effective_scheduler_battery_tier(worker, mobile, &live);
-                    let therm = live.thermal_tier.unwrap_or_else(|| {
-                        MobileLiveStatus::compute_thermal_tier(
-                            live.battery_temperature,
-                            live.thermal_throttled,
-                        )
-                    });
+                if let Some(live) = effective_mobile_live_status(worker) {
+                    let bat = effective_scheduler_battery_tier(
+                        worker,
+                        worker.capabilities.mobile.as_ref(),
+                        &live,
+                    );
+                    let therm = effective_scheduler_thermal_tier(&live);
                     let eff =
                         calculate_effective_concurrency(worker.capabilities.cpu_cores, bat, therm);
                     max_slots = max_slots.min(eff);
@@ -633,18 +663,15 @@ impl<'a> Engine<'a> {
             }
 
             // Stage 4: Mobile & Environmental Constraints via capability tags and mobile telemetry
+            let live_mobile = effective_mobile_live_status(worker);
             let is_thermal_throttled = worker
                 .capabilities
                 .tags
                 .iter()
                 .any(|t| t == "thermal_throttled")
-                || worker
-                    .capabilities
-                    .mobile
-                    .as_ref()
-                    .is_some_and(|m| m.thermal_throttled);
+                || live_mobile.as_ref().is_some_and(|m| m.thermal_throttled);
             let is_low_battery = worker.capabilities.tags.iter().any(|t| t == "low_battery")
-                || worker.capabilities.mobile.as_ref().is_some_and(|m| {
+                || live_mobile.as_ref().is_some_and(|m| {
                     m.battery_pct
                         .is_some_and(|pct| pct < config.mobile_min_battery_pct)
                         && m.is_charging == Some(false)
@@ -657,15 +684,13 @@ impl<'a> Engine<'a> {
                 continue;
             }
 
-            if let Some(ref mobile) = worker.capabilities.mobile {
-                let live = mobile.live_status();
-                let bat = effective_scheduler_battery_tier(worker, mobile, &live);
-                let therm = live.thermal_tier.unwrap_or_else(|| {
-                    MobileLiveStatus::compute_thermal_tier(
-                        live.battery_temperature,
-                        live.thermal_throttled,
-                    )
-                });
+            if let Some(ref live) = live_mobile {
+                let bat = effective_scheduler_battery_tier(
+                    worker,
+                    worker.capabilities.mobile.as_ref(),
+                    live,
+                );
+                let therm = effective_scheduler_thermal_tier(live);
                 let is_charging = live.is_charging.unwrap_or(false);
 
                 // Zero effective concurrency means complete load-shedding
@@ -1350,6 +1375,7 @@ mod tests {
             cpu_usage_pct: 0.0,
             ram_available_mb: ram_mb,
             features: ProtocolCapabilities::all_supported(),
+            mobile_status: None,
         }
     }
 
@@ -3007,6 +3033,110 @@ mod tests {
             per_worker,
             vec![2, 2, 2],
             "round-robin across 6 single-task schedule_once passes on 3 4-slot workers must distribute 2, 2, 2"
+        );
+    }
+
+    #[test]
+    fn test_mobile_status_thermal_tiers_hot_caps_to_one_slot_and_critical_sheds_all_load() {
+        let config = SchedulerConfig::default();
+
+        let mut phone = make_worker("pixel-9-pro", 8, 12288, false, false);
+        phone.capabilities.tags.push("os:android".into());
+        phone.capabilities.mobile = Some(rusty_grid_core::capabilities::MobileCapabilities {
+            os_version: "Android 15 (API 35)".into(),
+            soc_model: "Tensor G4".into(),
+            battery_pct: Some(85),
+            is_charging: Some(true),
+            thermal_throttled: false,
+        });
+
+        let light_tasks: Vec<Task> = (0..6)
+            .map(|i| {
+                Task::new(
+                    TaskSpec::shell_script(format!("echo light-{i}")),
+                    TaskRequirements::generic(1, 30),
+                )
+            })
+            .collect();
+        let multi_core = Task::new(
+            TaskSpec::shell_script("echo multi"),
+            TaskRequirements::generic(2, 30),
+        );
+        let compile = Task::new(
+            TaskSpec::rust_compilation("crate", Default::default(), vec![]),
+            TaskRequirements::generic(1, 60),
+        );
+
+        // Hot via explicit thermal_tier: at most 1 slot across 6 1-core tasks, 0 for 2-core or compile.
+        phone.mobile_status = Some(MobileLiveStatus {
+            battery_pct: Some(85),
+            is_charging: Some(true),
+            thermal_throttled: false,
+            battery_temperature: Some(41.0),
+            thermal_tier: Some(ThermalTier::Hot),
+            ..Default::default()
+        });
+        let hot_report =
+            WorkloadScheduler::matchmake(&config, &light_tasks, std::slice::from_ref(&phone));
+        assert_eq!(
+            hot_report.assignments.len(),
+            1,
+            "Hot thermal tier on an 8-core phone must cap concurrency to at most 1 slot"
+        );
+        assert_eq!(
+            WorkloadScheduler::matchmake(
+                &config,
+                std::slice::from_ref(&multi_core),
+                std::slice::from_ref(&phone),
+            )
+            .assignments
+            .len(),
+            0,
+            "Hot thermal tier must reject multi-core tasks"
+        );
+        assert_eq!(
+            WorkloadScheduler::matchmake(
+                &config,
+                std::slice::from_ref(&compile),
+                std::slice::from_ref(&phone),
+            )
+            .assignments
+            .len(),
+            0,
+            "Hot thermal tier must reject heavy compilation tasks even while charging"
+        );
+
+        // Critical via explicit thermal_tier: 0 assignments.
+        phone.mobile_status = Some(MobileLiveStatus {
+            battery_pct: Some(85),
+            is_charging: Some(true),
+            thermal_throttled: false,
+            thermal_tier: Some(ThermalTier::Critical),
+            ..Default::default()
+        });
+        assert_eq!(
+            WorkloadScheduler::matchmake(&config, &light_tasks, std::slice::from_ref(&phone))
+                .assignments
+                .len(),
+            0,
+            "Critical thermal tier must shed all load"
+        );
+
+        // Critical via 45°C temperature alone (thermal_tier = None, thermal_throttled = false): 0 assignments.
+        phone.mobile_status = Some(MobileLiveStatus {
+            battery_pct: Some(85),
+            is_charging: Some(true),
+            thermal_throttled: false,
+            battery_temperature: Some(45.0),
+            thermal_tier: None,
+            ..Default::default()
+        });
+        assert_eq!(
+            WorkloadScheduler::matchmake(&config, &light_tasks, std::slice::from_ref(&phone))
+                .assignments
+                .len(),
+            0,
+            "A phone at 45°C must receive 0 assignments even when thermal_throttled is false"
         );
     }
 }
