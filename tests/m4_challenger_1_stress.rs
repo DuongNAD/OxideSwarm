@@ -589,6 +589,7 @@ fn test_adversarial_pure_matchmake_spread_under_varied_topologies() {
             cpu_usage_pct: 0.0,
             ram_available_mb: 8192,
             features: Default::default(),
+            mobile_status: None,
         }
     }
 

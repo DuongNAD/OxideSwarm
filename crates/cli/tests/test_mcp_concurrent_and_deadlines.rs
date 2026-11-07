@@ -550,10 +550,11 @@ async fn test_mcp1_no_id_and_duplicate_id_do_not_spin_and_exit_on_eof() {
     }));
     let _ = mcp.recv_timeout(Duration::from_secs(5));
 
-    // Case 1 (F31-1): `tools/call` with no `id` followed by `ping`.
+    // Case 1 (F31-1): `tools/call` with `"id": null` (`request_id_key == None`) followed by `ping`.
     // Both must be answered and the server must not spin on a dropped watch::Sender.
     mcp.send(&json!({
         "jsonrpc": "2.0",
+        "id": null,
         "method": "tools/call",
         "params": {
             "name": "submit",

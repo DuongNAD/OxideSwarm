@@ -282,3 +282,94 @@ async fn test_unattached_hub_returns_err_bridge_not_configured() {
     client.close().await;
     hub.stop().await;
 }
+
+#[tokio::test]
+async fn test_agent_mesh_cli_tls_ca_missing_and_empty_env() {
+    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_agent-mesh"));
+    let temp = tempfile::tempdir().expect("tempdir");
+    let missing_ca = temp.path().join("missing-ca.pem");
+
+    let ephemeral = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let closed_port = ephemeral.local_addr().expect("local_addr").port();
+    drop(ephemeral);
+    let closed_hub_url = format!("wss://127.0.0.1:{closed_port}/ws");
+
+    // 1. `agent-mesh node --tls-ca missing.pem` must exit non-zero at startup instead of looping forever.
+    let mut cmd_flag = tokio::process::Command::new(&bin);
+    cmd_flag
+        .kill_on_drop(true)
+        .env("HOME", temp.path())
+        .env("USERPROFILE", temp.path())
+        .env_remove("OXIDE_MESH_TLS_CA")
+        .args([
+            "node",
+            "--hub",
+            &closed_hub_url,
+            "--tls-ca",
+            missing_ca.to_str().unwrap(),
+        ]);
+    let out_flag = tokio::time::timeout(std::time::Duration::from_secs(20), cmd_flag.output())
+        .await
+        .expect("agent-mesh node --tls-ca missing.pem timed out after 20s")
+        .expect("spawn agent-mesh node --tls-ca missing.pem");
+    assert!(
+        !out_flag.status.success(),
+        "agent-mesh node --tls-ca missing.pem must exit non-zero"
+    );
+    let stderr_flag = String::from_utf8_lossy(&out_flag.stderr);
+    assert!(
+        stderr_flag.contains("failed to read TLS CA certificate file"),
+        "expected missing CA error in stderr, got: {stderr_flag}"
+    );
+
+    // 2. `agent-mesh node` with `OXIDE_MESH_TLS_CA=missing.pem` (env var only) must also exit non-zero.
+    let mut cmd_env = tokio::process::Command::new(&bin);
+    cmd_env
+        .kill_on_drop(true)
+        .env("HOME", temp.path())
+        .env("USERPROFILE", temp.path())
+        .env("OXIDE_MESH_TLS_CA", &missing_ca)
+        .args(["node", "--hub", &closed_hub_url]);
+    let out_env = tokio::time::timeout(std::time::Duration::from_secs(20), cmd_env.output())
+        .await
+        .expect("agent-mesh node with OXIDE_MESH_TLS_CA=missing.pem timed out after 20s")
+        .expect("spawn agent-mesh node with OXIDE_MESH_TLS_CA=missing.pem");
+    assert!(
+        !out_env.status.success(),
+        "agent-mesh node with OXIDE_MESH_TLS_CA=missing.pem must exit non-zero"
+    );
+    let stderr_env = String::from_utf8_lossy(&out_env.stderr);
+    assert!(
+        stderr_env.contains("failed to read TLS CA certificate file"),
+        "expected missing CA error in stderr from OXIDE_MESH_TLS_CA, got: {stderr_env}"
+    );
+
+    // 3. `OXIDE_MESH_TLS_CA=""` must mean unset and allow `agent-mesh list` to succeed.
+    let hub = AgentMeshHub::new();
+    let port = hub.start("127.0.0.1:0").await.expect("hub start");
+    let hub_url = format!("ws://127.0.0.1:{port}/ws");
+
+    let mut cmd_empty = tokio::process::Command::new(&bin);
+    cmd_empty
+        .kill_on_drop(true)
+        .env("HOME", temp.path())
+        .env("USERPROFILE", temp.path())
+        .env("OXIDE_MESH_TLS_CA", "")
+        .args(["list", "--hub", &hub_url]);
+    let out_empty = tokio::time::timeout(std::time::Duration::from_secs(20), cmd_empty.output())
+        .await
+        .expect("agent-mesh list with OXIDE_MESH_TLS_CA='' timed out after 20s")
+        .expect("spawn agent-mesh list with OXIDE_MESH_TLS_CA=''");
+    assert!(
+        out_empty.status.success(),
+        "agent-mesh list with OXIDE_MESH_TLS_CA='' must exit 0, stderr: {}",
+        String::from_utf8_lossy(&out_empty.stderr)
+    );
+    let stdout_empty = String::from_utf8_lossy(&out_empty.stdout);
+    assert!(
+        stdout_empty.contains("Connected Nodes"),
+        "expected Connected Nodes in stdout, got: {stdout_empty}"
+    );
+
+    hub.stop().await;
+}

@@ -618,6 +618,9 @@ pub struct WorkerClient {
     mobile: MobileTelemetryHandle,
     /// True when the platform app feeds `mobile`, so the worker must not poll the OS itself.
     mobile_fed_externally: bool,
+    /// Optional delay before sending the session's initial `MobileTelemetry` after `RegisterAck`
+    /// (used by integration tests to simulate slow LTE / relay round trips).
+    initial_telemetry_delay: Duration,
     /// Base directory the runner creates `<task id>` sandboxes in.
     sandbox_base_dir: PathBuf,
     /// Source of [`TaskExecutionHandle::attempt`].
@@ -1194,6 +1197,7 @@ impl WorkerClient {
             master_beacon,
             mobile,
             mobile_fed_externally,
+            initial_telemetry_delay: Duration::ZERO,
             sandbox_base_dir,
             next_attempt: Arc::new(AtomicU64::new(0)),
             cancelled_unseen: std::sync::Mutex::new(VecDeque::new()),
@@ -1342,6 +1346,13 @@ impl WorkerClient {
         self.backoff_config = config;
     }
 
+    /// Delays the session's initial `WorkerMessage::MobileTelemetry` frame after `RegisterAck` by
+    /// `delay` (for testing slow LTE / relay round-trip delivery).
+    #[doc(hidden)]
+    pub fn set_initial_telemetry_delay(&mut self, delay: Duration) {
+        self.initial_telemetry_delay = delay;
+    }
+
     /// Returns the active backoff configuration.
     pub fn backoff_config(&self) -> &BackoffConfig {
         &self.backoff_config
@@ -1411,6 +1422,7 @@ impl WorkerClient {
         // A worker that reads its own battery (a laptop, Termux) keeps the shared reading fresh;
         // one fed by a platform app is updated by that app instead.
         let _mobile_poller = (!self.mobile_fed_externally
+            && !self.mobile.is_externally_fed()
             && !self.config.no_battery
             && self.mobile.snapshot().is_some())
         .then(|| {
@@ -2365,22 +2377,56 @@ impl WorkerClient {
             Some(self.mobile.clone()),
         );
 
-        let dead_after = if let Some(status) = self.mobile.live_status() {
-            let iv = status.recommended_keepalive_interval(0);
+        let mut dead_after = {
+            let active = self.heartbeat_tracker.active_tasks.load(Ordering::Relaxed);
+            let iv = self
+                .mobile
+                .live_status()
+                .map(|status| {
+                    status
+                        .recommended_keepalive_interval_or(0, heartbeat_interval)
+                        .max(status.recommended_keepalive_interval_or(active, heartbeat_interval))
+                })
+                .unwrap_or(heartbeat_interval)
+                .max(heartbeat_interval);
             self.dead_peer_timeout(iv)
-        } else {
-            self.dead_peer_timeout(heartbeat_interval)
         };
         let mut watchdog = tokio::time::interval(
             (dead_after / 8).clamp(Duration::from_millis(25), Duration::from_secs(1)),
         );
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut telemetry = tokio::time::interval(MOBILE_TELEMETRY_CHECK_INTERVAL);
+        let mut telemetry = if self.initial_telemetry_delay > Duration::ZERO {
+            tokio::time::interval_at(
+                tokio::time::Instant::now() + self.initial_telemetry_delay,
+                MOBILE_TELEMETRY_CHECK_INTERVAL,
+            )
+        } else {
+            tokio::time::interval(MOBILE_TELEMETRY_CHECK_INTERVAL)
+        };
         telemetry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // `Register` just carried the current reading, so only a *change* is worth a message.
-        let mut last_reported: Option<MobileLiveStatus> = self.mobile.live_status();
+        // `Register` carries only `MobileCapabilities` (no `network_type`, `battery_temperature`,
+        // or tiers), so send one `MobileTelemetry` right after `RegisterAck` when the Master
+        // announced `mobile-telemetry` (unless a test configured `initial_telemetry_delay`).
+        let mut last_reported: Option<MobileLiveStatus> = None;
         // Only to a Master that said it can read the report (an older one would drop us for it).
         let report_telemetry = self.master_takes_mobile_telemetry.load(Ordering::Acquire);
+        if report_telemetry && self.initial_telemetry_delay.is_zero() {
+            if let Some(status) = self.mobile.live_status() {
+                let report = WorkerMessage::MobileTelemetry {
+                    worker_id,
+                    battery_pct: status.battery_pct,
+                    is_charging: status.is_charging,
+                    thermal_throttled: status.thermal_throttled,
+                    battery_temperature: status.battery_temperature,
+                    network_type: status.network_type.clone(),
+                    battery_tier: status.battery_tier,
+                    thermal_tier: status.thermal_tier,
+                };
+                if session.control_tx.try_send(report).is_ok() {
+                    last_reported = Some(status);
+                }
+            }
+        }
         let mut farewell: Option<WorkerMessage> = None;
         // Blob requests ride the data queue: the QUIC data stream, never the control stream.
         let blob_client = self
@@ -2455,6 +2501,23 @@ impl WorkerClient {
                 // Dead-peer watchdog: nothing received for `dead_after` (and no frame upload making
                 // progress) means the Master is gone even though the socket still accepts writes.
                 _ = watchdog.tick() => {
+                    let active = self.heartbeat_tracker.active_tasks.load(Ordering::Relaxed);
+                    let current_iv = self
+                        .mobile
+                        .live_status()
+                        .map(|status| {
+                            status
+                                .recommended_keepalive_interval_or(0, heartbeat_interval)
+                                .max(
+                                    status.recommended_keepalive_interval_or(
+                                        active,
+                                        heartbeat_interval,
+                                    ),
+                                )
+                        })
+                        .unwrap_or(heartbeat_interval)
+                        .max(heartbeat_interval);
+                    dead_after = dead_after.max(self.dead_peer_timeout(current_iv));
                     let silence = session.clock.silence();
                     if silence > dead_after {
                         warn!(
