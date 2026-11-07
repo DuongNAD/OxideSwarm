@@ -105,6 +105,8 @@ OxideSwarm/
 
 ## 5. Milestone Roadmap
 
+Milestones M1 to M5 are past work. The direction after the completion backlog is in [docs/ROADMAP.md](docs/ROADMAP.md).
+
 | Milestone | Scope | Deliverables & Verification | Status |
 | :--- | :--- | :--- | :--- |
 | **M1: Baseline Hygiene & Doc Rewrite** | Fix clippy blocker, normalize script line endings, remove legacy status files, update inbound links, repair ANDROID_ARCHITECTURE anchors, translate Vietnamese content, full doc rewrite | Clippy clean (`-D warnings`), launcher scripts tests pass, doc mode verification passes | Implemented |

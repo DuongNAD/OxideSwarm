@@ -32,6 +32,7 @@ before adding or changing a document.
 | [design/0038-large-language-model-inference.md](design/0038-large-language-model-inference.md) | Planned: language model inference on the grid, by expert routing to local model servers and by llama.cpp RPC over an authenticated tunnel (`LLM-1` to `LLM-5`) | Contributors |
 | [design/0039-agent-workspaces.md](design/0039-agent-workspaces.md) | Accepted, not built: persistent workspaces for coding agents on workers, synced from a local directory, with affinity and one task per workspace, plus P2P for clients and `cargo` builds (`FEAT-4`, `FEAT-10`) | Contributors |
 | [BACKLOG.md](BACKLOG.md) | Open work in execution order, each item with files and a check | Coding agents, contributors |
+| [ROADMAP.md](ROADMAP.md) | Direction after the backlog: the purpose, phases A to E, what waits, and the owner's decisions | Owner, contributors |
 
 ## Document types
 
@@ -41,6 +42,7 @@ before adding or changing a document.
 | Guide | `docs/guides/<slug>.md` | One task from start to finish, with a check that it worked | Goal, Prerequisites, Steps, Verify, Troubleshooting |
 | Design record | `docs/design/NNNN-<slug>.md`, numbered in order | Why and how a change is made, and its work items | See the template below |
 | Backlog | `docs/BACKLOG.md` | Open work in execution order | Index table; per item: Evidence, Problem, Do, Done when |
+| Roadmap | `docs/ROADMAP.md` | Direction and order of the work beyond single items | Status line, Summary, Where the project stands, Phases with exit checks, Decisions, Status log |
 
 ## Writing standard
 
