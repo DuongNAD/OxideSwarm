@@ -1,7 +1,7 @@
 # Roadmap
 
 Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07
-Created: 2026-11-07    Updated: 2026-11-07
+Created: 2026-11-07    Updated: 2026-11-08
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
 project is for, the order of the work, and what waits. Item IDs refer to [BACKLOG.md](BACKLOG.md)
@@ -48,7 +48,7 @@ Each row is a limit a user meets today, and the item that removes it.
 | Clients connect over TCP only (`connect_master` in `crates/cli/src/connect.rs`) | A client on another network cannot reach a master that is reachable only over P2P | FEAT-4 |
 | `RustCompilation` runs bare `rustc` on one file | A crate with dependencies does not build | FEAT-10 |
 | Input trees carry no symbolic links or empty directories, and do not read `.gitignore` | The client picks paths by hand, or sends a whole project with its `target/` | FEAT-4 |
-| The protocol version is not enforced, and clients send none | Mixed versions can fail without a clear message | FEAT-8 |
+| The master checks a worker's protocol version at registration, but nothing forces a version bump when the wire layout changes, and clients send no version | Mixed versions can fail without a clear message | FEAT-8 |
 | There is no release | A user must build from source | REL-4 |
 | The Android app does not compile | There is no Android worker app to install | AND-1 |
 | GPU compute is a seeded matrix benchmark | No user workload runs on the GPU | FEAT-9 (decision D6) |
@@ -107,15 +107,15 @@ other tools lack.
 
 Goal: finish the short open items, and make CI block on the full suite.
 
-| Item | Work | State on 2026-11-07 |
+| Item | Work | State on 2026-11-08 (`master` `5df82df`) |
 |---|---|---|
-| SCHED-3 | Give impossible tasks an outcome | Pull request 96 open |
+| SCHED-3 | Give impossible tasks an outcome | Implemented (pull requests 96, 107) |
 | MODE-1 | Make `ox-mode` report only what happened | Pull request 92 open |
-| TEST-16 | Keep the iroh tests off the network | Pull request 95 open. It has no section in BACKLOG |
+| TEST-16 | Keep the iroh tests off the network | Implemented (pull request 95). The follow-up TEST-16b is pull request 109. Neither has a section in BACKLOG |
 | TEST-4 | Record a full-suite run with a dummy `cluster.secret` in `HOME` | Partial |
 | TEST-6 | Remove `continue-on-error` from `workspace-test` and make every job required on `master` | Partial. The owner sets the required checks |
-| FEAT-8 | Make the layout tests force a version bump, version the client path, and plan the move off `bincode` 1.x | Partial. Dependabot pull request 86 proposes `bincode` 3 |
-| MOB-3 | Do not charge evacuation to retry budgets | Planned |
+| FEAT-8 | Make the layout tests force a version bump, version the client path, and plan the move off `bincode` 1.x | Partial. Pull request 110 open. Dependabot pull request 86 proposes `bincode` 3 |
+| MOB-3 | Do not charge evacuation to retry budgets | Pull request 108 open |
 | FEAT-11 | Remove dead code and merge the two connection loops in `server.rs` | Planned. Do it before Phase B changes `server.rs` |
 
 **Exit check:** no CI job has `continue-on-error`, every job is required on `master`, and the items
@@ -139,14 +139,14 @@ FEAT-1 a master restart loses a long build.
 
 ### Phase C: agent workspaces
 
-Goal: the user story works between two real machines. This phase needs a design record before code
-(BACKLOG Phase 5 rule).
+Goal: the user story works between two real machines. The design record is
+`design/0039-agent-workspaces.md` (Accepted). Its work items W1 to W11 carry out the steps below.
 
 | ID | Work | Removes |
 |---|---|---|
 | WS-1 | A named workspace per worker that outlives a task. It holds its own build cache, such as `target/`, under a size bound with least-recently-used eviction | FEAT-4: fresh sandbox per task |
-| WS-2 | Source by commit: the client sends the blob tree of the tracked files, or a git bundle, and the worker checks out that exact commit. Symbolic links and empty directories are kept | FEAT-4: `.gitignore`, links, empty directories |
-| WS-3 | P2P tickets in `connect_master`, so every client and the MCP server reach a P2P-only master | FEAT-4: TCP-only clients |
+| WS-2 | Source by tree sync: the client sends its working directory as a blob tree that follows `.gitignore` and leaves out `.git/`. Only changed files cross the network, files deleted locally are deleted on the worker, and build output stays. Workers need no `git`. Symbolic links and empty directories come later (design 0039, W11) | FEAT-4: whole-project uploads, `.gitignore` |
+| WS-3 | P2P tickets in `connect_master`, with a `STREAM_CLIENT` stream tag, so every client and the MCP server reach a P2P-only master | FEAT-4: TCP-only clients |
 | WS-4 | `cargo build --offline` when `Cargo.toml` is present, and a `tool:rustc` worker tag | FEAT-10 |
 | WS-5 | MCP tools for workspaces, with timeouts suited to builds rather than the 60 s default | FEAT-4: default timeout |
 | WS-6 | Pipelined and compressed uploads from the client | The input-file limits listed in `README.md` |
@@ -178,7 +178,10 @@ After the first release, in order of value to the user story:
    renewed leases and a fencing epoch (decision D1).
 4. **AND-1 to AND-4:** the Android app. Phones add little to build and test, so the app is built when
    a user needs it.
-5. **MESH-2, MESH-3:** after decision Q3.
+5. **MESH-2:** deliver relay data to a consumer. It belongs to the mesh's relay role, which
+   decision Q3 keeps. **MESH-3** adds grid features to the mesh, which Q3 rules out. Only its
+   security part goes ahead, at any time: remove the fallback in which `parse_binary_data` reads a
+   hub-local file that a peer names (`crates/agent_mesh/src/bridge.rs`).
 
 ## What waits, and why
 
@@ -187,7 +190,8 @@ After the first release, in order of value to the user story:
 | 3D generation and rigging | 3D-2, 3D-3 | It does not serve the user story. `gen3d` and `autorig` are compiled into every worker, because the worker crate has no Cargo feature for them | Freeze. Move them behind an opt-in feature when FEAT-11 splits the modules |
 | Language model inference | LLM-1 to LLM-5 ([design 0038](design/0038-large-language-model-inference.md)) | LLM-2 needs FEAT-1 and FEAT-8. LLM-4 is a new transport | LLM-1 (a guide and a script, size S) can start at any time. LLM-2 to LLM-5 start after Phase C |
 | GPU kernels | FEAT-9 | Decision D6 keeps GPU compute a benchmark | State "benchmark only" in `README.md` and `PROJECT.md`, as FEAT-9 asks |
-| Agent Mesh grid features | MESH-2, MESH-3 | MCP already lets agents submit work. Two agent interfaces split the effort | Decision Q3 |
+| Agent Mesh grid features | MESH-3 | MCP already lets agents submit work. Two agent interfaces split the effort | Not built (decision Q3). The removal of the hub-local file fallback is a security fix and may land at any time |
+| Agent Mesh relay data | MESH-2 | It does not serve the user story | Phase E |
 
 ## Decisions for the owner
 
@@ -215,3 +219,6 @@ The owner accepted each proposal on 2026-11-07.
 
 - 2026-11-07: Draft written from the completion backlog at `master` `5c518b5` and from design 0038.
 - 2026-11-07: The owner accepted Q1 to Q5. Status set to Accepted.
+- 2026-11-08: Phase A states updated at `master` `5df82df`. WS-2 follows design 0039, a tree
+  sync instead of a commit checkout. Decision Q3 applied to MESH-2 and MESH-3. The protocol version
+  row corrected: the master does check a worker's version.
