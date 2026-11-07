@@ -1,88 +1,90 @@
 # 0034: Fail unfulfillable tasks when no registered worker can satisfy requirements or placement constraints
 
 Status: Implemented
-Created: 2026-11-04    Updated: 2026-11-04
+Created: 2026-11-04    Updated: 2026-11-07
 
 ## Summary
 
-Add `SchedulerConfig::fail_unfulfillable_tasks` (`--fail-unfulfillable-tasks`, `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, `[master].fail_unfulfillable_tasks`, default `false`) so that when at least one worker is registered in `WorkerRegistry`, `WorkloadScheduler::schedule_batch` immediately transitions a task that no registered worker could ever satisfy (by static hardware/engine capabilities or `PlacementConstraints`) to `TaskStatus::Failed` with a descriptive reason, wakes any `--wait` caller, and broadcasts `DashboardEvent::TaskStatusChange` and `DashboardEvent::TaskCompleted`.
+Wire `SchedulerConfig::fail_unfulfillable_tasks` (`--fail-unfulfillable-tasks`, `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, `[master].fail_unfulfillable_tasks`, default `false`) so that when `WorkloadScheduler::schedule_batch` runs with at least one schedulable worker, any queued task whose static capabilities, protocol features, or `Placement` constraints no registered worker in `WorkerRegistry` can satisfy is transitioned from `TaskState::Queued` to `TaskState::Failed` via `TaskQueue::fail_unfulfillable_task`, wakes any `wait = true` caller in `WaiterMap`, and broadcasts `DashboardStreamMessage::TaskUpdated` and `DashboardStreamMessage::StatsUpdated`.
 
 ## Context
 
 Before this change (`SCHED-3` in `docs/BACKLOG.md`):
 
-- In `Engine::place` (`crates/master/src/scheduler.rs`), when no currently schedulable worker matched a queued task (for example, `require:tag=nothing` or a GPU requirement when only CPU workers exist), `place` returned `None`.
-- In `WorkloadScheduler::schedule_batch` (`crates/master/src/scheduler.rs`), a `None` placement caused the loop to increment `skipped_tasks`, push the task back onto `TaskQueue` (`self.queue.requeue(task)`), and `break` out of the scheduling batch without inspecting subsequent queued tasks.
-- A task whose static hardware capabilities or placement constraints no registered worker could satisfy remained in `TaskStatus::Queued` forever (`oxideswarm submit --wait` hung until client timeout or manual cancellation), and also blocked the head of the scheduling batch on each pass.
+- `Engine::place` (`crates/master/src/scheduler.rs`) already skipped unplaceable tasks without head-of-line blocking (`Verdict::Skip`) and returned `Verdict::Unfulfillable` when `view.placement` was `Err`, or when `fail_unfulfillable_tasks` was `true` and `view.requires_gpu && !self.any_gpu_worker`, `nobody_has_features`, or `nobody_matches` held across `self.seats`.
+- However:
+  1. `Engine::place` did not check whether any worker satisfied the combined static resource, GPU, feature, and placement requirements (`statically_fits`, `placement_admits`, `can_execute_gpu`, `features.contains`), so a task requiring more CPU cores or RAM than any matching worker had returned `Verdict::Skip(ScheduleSkipReason::AllEligibleWorkersSaturated)` instead of `Verdict::Unfulfillable`.
+  2. `Engine` checked only `list_schedulable_workers()`, which excludes workers that are `WorkerStatus::Disconnected` (not yet removed by `prune_stale_workers`) or cooling down under `excluded_until` after `record_rejection`.
+  3. `WorkloadScheduler::schedule_batch` recorded `report.unfulfillable` on `ScheduleReport` without transitioning those tasks in `TaskQueue` or notifying `self.waiters`.
+  4. `SchedulerConfig::fail_unfulfillable_tasks` had no builder method, CLI flag (`--fail-unfulfillable-tasks`), environment variable (`RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`), or config field (`[master].fail_unfulfillable_tasks`).
 
 ## Goals
 
-- **G1** Distinguish between transient unavailability (no workers registered yet, or a matching registered worker is currently busy/overloaded/disconnected) and permanent unfulfillability across all currently registered workers (`all_workers`).
-- **G2** Add `SchedulerConfig::fail_unfulfillable_tasks: bool` (default `false` so workloads that submit tasks before matching workers join continue to queue by default) and expose it via `--fail-unfulfillable-tasks` (`RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, `[master].fail_unfulfillable_tasks`) on `oxideswarm master`.
-- **G3** When `fail_unfulfillable_tasks` is `true` and at least one worker is registered, transition any unfulfillable queued task to `TaskStatus::Failed` with an actionable reason naming the unsatisfied placement constraints or task requirements, notify `wait_for_task` callers (`oxideswarm submit --wait`), broadcast the status change to the dashboard, and continue scheduling remaining tasks in the batch.
+- **G1** Run the static unfulfillability check in `Engine::place` against every registered worker in `WorkerRegistry` (`registered` from `WorkerRegistry::scheduler_snapshot`, including `WorkerStatus::Disconnected` and cooling-down `excluded_until` workers), so tasks are never failed while a matching worker is still registered.
+- **G2** Expose `SchedulerConfig::with_fail_unfulfillable_tasks(mut self, fail: bool) -> Self` and wire `--fail-unfulfillable-tasks` (`RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, `[master].fail_unfulfillable_tasks`, default `false`) on `oxideswarm master`.
+- **G3** Transition each `(task_id, reason)` in `report.unfulfillable` from `TaskState::Queued` to `TaskState::Failed` via `TaskQueue::fail_unfulfillable_task`, wake `self.waiters`, and broadcast `DashboardStreamMessage::TaskUpdated` and `DashboardStreamMessage::StatsUpdated`, while avoiding redundant queue scans on saturated clusters when neither the registry nor the ready queue has changed.
 
 ## Non-goals
 
-- Changing the default (`false`) when `--fail-unfulfillable-tasks` is not enabled: clusters where workers join dynamically after task submission rely on tasks waiting in `TaskStatus::Queued` by default.
-- Failing tasks when zero workers are registered in `WorkerRegistry` (`!all_workers.is_empty()` is required before a task can be declared unfulfillable).
+- Changing the default (`false`) when `--fail-unfulfillable-tasks` is not enabled.
+- Failing tasks when no worker is schedulable (`workers.is_empty()` returns `ScheduleSkipReason::NoEligibleWorkers`).
 
 ## Design
 
-### D1 Capability and placement check against all registered workers (`Engine::place`)
+### D1 Static capability and placement check against all registered workers (`Engine::place`)
 
-- `PlacementDecision` (`crates/master/src/scheduler.rs`) is an internal enum returned by `Engine::place`:
-  - `PlacementDecision::Assigned(Uuid)` when a schedulable worker is selected.
-  - `PlacementDecision::Defer` when no currently schedulable worker can run the task right now, but either `all_workers` is empty or at least one registered worker in `all_workers` satisfies the task's static capability and placement constraints (so the worker is merely busy, overloaded, or temporarily unavailable).
-  - `PlacementDecision::Unfulfillable(String)` when `!all_workers.is_empty()` and no registered worker in `all_workers` satisfies both `PlacementConstraints::matches_worker` and `WorkerCapabilities::can_execute(&task.requirements, &task.spec)`.
-- Reason formatting:
-  - If placement constraints (`PlacementConstraints::from_task_tags(&task.tags)`) are non-empty and no registered worker in `all_workers` matches `placement.matches_worker(&w.capabilities, w.worker_id)`, the reason is `"No registered worker matches the placement constraints ({placement})"`.
-  - Otherwise, the reason is `"No registered worker satisfies the task requirements (cpu_cores={}, min_ram_mb={}, requires_gpu={}, task_type={:?})"`.
+- `WorkerRegistry::scheduler_snapshot(&self) -> (Vec<WorkerInfo>, Vec<WorkerInfo>, u64)` (`crates/master/src/registry.rs`) returns `(schedulable, registered, registration_epoch)` under a single read lock, where `registered` includes `WorkerStatus::Disconnected` and cooling-down (`excluded_until`) workers, and `registration_epoch` increments in `register_session`, `remove_worker`, and `prune_stale_workers`.
+- `Engine` (`crates/master/src/scheduler.rs`) stores `seats: Vec<Seat<'a>>` (built from `workers`) and `registered: &'a [WorkerInfo]`, plus `dead: HashMap<Shape, Verdict>` so repeated tasks of the same `Shape` within a pass reuse the cached `Verdict::Skip` or `Verdict::Unfulfillable` without re-checking workers.
+- `Engine::place(&mut self, view: &TaskView) -> Verdict` returns:
+  - `Verdict::Unfulfillable(format!("Invalid placement constraints: {e}"))` when `view.placement` is `Err(e)`.
+  - When `self.config.fail_unfulfillable_tasks` is `true`, checks `self.registered`:
+    - If `view.requires_gpu && !self.any_gpu_worker`: `Verdict::Unfulfillable("Cluster lacks workers with GPU capabilities".into())`.
+    - If `nobody_has_features`: `Verdict::Unfulfillable(format!("Cluster lacks workers with {} capability", feature_names(view.required_features)))`.
+    - If `nobody_matches`: `Verdict::Unfulfillable(format!("No registered worker matches the placement constraints ({placement})"))`.
+    - If `nobody_fits` (`!self.registered.iter().any(|w| statically_fits(&view.requirements, w) && placement_admits(placement, w) && (!view.requires_gpu || w.capabilities.can_execute_gpu()) && w.features.contains(view.required_features))`): `Verdict::Unfulfillable(format!("No registered worker satisfies task requirements (cpu_cores={}, ram_mb={}, gpu={})", view.requirements.cpu_cores, view.requirements.ram_mb, view.requires_gpu))`.
+  - `Verdict::Skip(ScheduleSkipReason)` when no seat in `self.seats` can run the task right now.
+  - `Verdict::Placed(usize)` when a seat in `self.seats` is selected.
+- `WorkloadScheduler` stores `last_unfulfillable_sweep: std::sync::Mutex<Option<(u64, u64)>>` tracking `(registration_epoch, ready_epoch)` (where `TaskQueue::ready_epoch` increments whenever a task enters `ready_queue` via `TaskQueueInner::insert_ready`). When `engine.free_slots == 0` and `last_unfulfillable_sweep == Some((reg_epoch, ready_epoch))`, `schedule_batch` skips scanning `ready_views`.
 
 ### D2 Queue transition and waiter notification (`TaskQueue::fail_unfulfillable_task`)
 
-- `TaskQueue::fail_unfulfillable_task(&self, task: Task, reason: String) -> Result<TaskResult>` (`crates/master/src/queue.rs`) transitions a task that was popped from the ready queue directly to `TaskStatus::Failed` without incrementing `retry_count` or re-queuing it:
-  - Constructs `TaskResult::failure(task_id, Vec::new(), 1, reason, 0)`.
-  - Stores the terminal `TaskEntry` (`TaskStatus::Failed`), enforces terminal retention limits (`enforce_retention_limits`), and wakes any `wait_for_task` subscriber via `notify.notify_waiters()`.
-- `BatchScheduleReport` (`crates/master/src/scheduler.rs`) gains `pub unfulfillable: Vec<(Uuid, String)>`.
-- In `WorkloadScheduler::schedule_batch`, when `Engine::place` returns `PlacementDecision::Unfulfillable(reason)`:
-  - If `self.config.fail_unfulfillable_tasks` is `true`, `schedule_batch` calls `self.queue.fail_unfulfillable_task(task, reason)`, appends `(task_id, reason)` to `report.unfulfillable`, increments `report.skipped_tasks`, and continues the loop to schedule subsequent tasks in the batch rather than breaking early.
-  - If `self.config.fail_unfulfillable_tasks` is `false`, `schedule_batch` requeues the task (`self.queue.requeue(task)`) and keeps it in `TaskStatus::Queued`.
-- In `crates/master/src/server.rs`, the background scheduler loop iterates `report.unfulfillable` and broadcasts `DashboardEvent::TaskStatusChange` (`status: "Failed"`) and `DashboardEvent::TaskCompleted` (`success: false`) for each failed unfulfillable task.
+- `pub async fn fail_unfulfillable_task(&self, task_id: &TaskId, reason: String) -> Option<TaskResult>` (`crates/master/src/queue.rs`):
+  - Verifies `entry.state == TaskState::Queued`, removes `QueueOrderKey` from `inner.ready_queue`, constructs `TaskResult::failure(Uuid::nil(), *task_id, 1, "", "", 0, Some(reason.clone()))`, sets `entry.state = TaskState::Failed`, `entry.error_message = Some(reason)`, and `entry.result = Some(result.clone())`, and calls `inner.track_terminal_task(*task_id)` to release active bytes and enforce terminal retention limits.
+- In `WorkloadScheduler::schedule_batch` (`crates/master/src/scheduler.rs`), for each `(task_id, reason)` in `&report.unfulfillable`, if `self.queue.fail_unfulfillable_task(task_id, reason.clone()).await` returns `Some(result)`, the scheduler logs `warn!(task_id = %task_id, reason = %reason, "Failing unfulfillable task")` and sends `result.clone()` to any waiting channels removed from `self.waiters`.
+- In `crates/master/src/server.rs`, when `!report.assignments.is_empty() || !report.unfulfillable.is_empty()`, the scheduler loop sends `DashboardStreamMessage::TaskUpdated(info)` for each `(task_id, _)` in `&report.unfulfillable` and `DashboardStreamMessage::StatsUpdated(sched_queue.stats().await)`.
 
 ### D3 CLI, environment, and config wiring
 
-- `MasterArgs` (`crates/cli/src/cli_app.rs`) gains `--fail-unfulfillable-tasks [BOOL]` (`Option<bool>`, with `num_args = 0..=1` and `default_missing_value = "true"`, so bare `--fail-unfulfillable-tasks` sets `Some(true)` while `--fail-unfulfillable-tasks false` sets `Some(false)`).
+- `MasterArgs` (`crates/cli/src/cli_app.rs`) gains `--fail-unfulfillable-tasks [BOOL]` (`pub fail_unfulfillable_tasks: Option<bool>`, with `num_args = 0..=1` and `default_missing_value = "true"`).
 - `MasterFileConfig` (`crates/cli/src/config.rs`) gains `pub fail_unfulfillable_tasks: Option<bool>`.
-- `run_master` resolves `fail_unfulfillable_tasks` via `resolve_bool(args.fail_unfulfillable_tasks, &["RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS"], master_cfg.and_then(|m| m.fail_unfulfillable_tasks), false)` and passes it to `build_master_scheduler_config`.
+- `resolve_fail_unfulfillable_tasks(flag: Option<bool>, master_cfg: Option<&MasterFileConfig>) -> bool` (`crates/cli/src/cli_app.rs`) calls `resolve_bool(flag, &["RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS"], master_cfg.and_then(|m| m.fail_unfulfillable_tasks), false)`, and `run_master` passes the result into `build_master_scheduler_config`.
 
 ## Compatibility
 
 - Wire format: unchanged. Unfulfillable tasks produce standard `ClientResponse::TaskCompleted` / `TaskResult` (`exit_code: 1`, `error: Some(reason)`) responses.
-- Default behaviour: unchanged (`fail_unfulfillable_tasks = false`). Existing deployments that submit tasks before matching workers register see no change unless `--fail-unfulfillable-tasks`, `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS=true`, or `[master] fail_unfulfillable_tasks = true` is set.
+- Default behaviour: unchanged (`fail_unfulfillable_tasks = false`).
 
 ## Security
 
-- Failing unfulfillable tasks when `fail_unfulfillable_tasks` is enabled prevents tasks with impossible placement tags or hardware requirements from occupying active queue slots (`--max-queue-size` and `--max-active-mb`, [design 0024](0024-wire-cli-flags-and-retire-ttl-eviction.md)) or stalling head-of-line scheduling indefinitely.
+- Failing unfulfillable tasks when `fail_unfulfillable_tasks` is enabled prevents tasks with impossible placement constraints or resource requirements from occupying active queue slots (`--max-queue-size` and `--max-active-mb`, [design 0024](0024-wire-cli-flags-and-retire-ttl-eviction.md)).
 
 ## Test plan
 
-- Unit test `scheduler::tests::test_fail_unfulfillable_tasks_default_false_keeps_queued_and_true_fails_with_reason_and_wakes_waiter` (`crates/master/src/scheduler.rs`):
-  - registers one worker without `tag=nothing`;
-  - verifies that with `SchedulerConfig::default()` (`fail_unfulfillable_tasks == false`), a task requiring `require:tag=nothing` stays `TaskStatus::Queued` after `schedule_once()`;
-  - verifies that with `SchedulerConfig::default().with_fail_unfulfillable_tasks(true)`, `schedule_once()` transitions the task to `TaskStatus::Failed`, populates `report.unfulfillable` and `TaskResult.error` with `"No registered worker matches the placement constraints (tag=nothing)"`, and wakes a concurrent `queue.wait_for_task(task_id)` caller immediately.
-- Live `run_master` test in `cli_app::tests::test_sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticket` (`crates/cli/src/cli_app.rs`):
-  - verifies `resolve_bool` precedence for `fail_unfulfillable_tasks` (`CLI > RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS > [master].fail_unfulfillable_tasks > false`);
-  - starts `run_master` with `--scheduler-policy round-robin --fail-unfulfillable-tasks`, connects two simulated workers (`rr-w1` and `rr-w2`), and verifies `run_submit_with_secret` with `--require-tag nothing --wait` exits with `ExitCode::FAILURE` and returns `TaskResult.error == Some("No registered worker matches the placement constraints (tag=nothing)")`.
-- Mutation checks:
-  - Setting `sched_config.policy = SchedulingPolicy::WeightedLeastLoaded` at `MasterServer::spawn_with_config` in `run_master` causes `test_sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticket` to fail (`wt2` times out waiting for `AssignTask`).
-  - Setting `sched_config.fail_unfulfillable_tasks = false` at `MasterServer::spawn_with_config` in `run_master` causes `test_sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticket` to fail (`--wait` times out).
+- Unit tests in `scheduler::tests` (`crates/master/src/scheduler.rs`):
+  - `test_fail_unfulfillable_tasks_default_false_keeps_queued_and_true_fails_with_reason_and_wakes_waiter`
+  - `test_fail_unfulfillable_tasks_keeps_gpu_task_queued_when_gpu_worker_is_disconnected_until_pruned`
+  - `test_fail_unfulfillable_tasks_keeps_gpu_task_queued_when_gpu_worker_is_cooling_down_until_pruned`
+  - `test_fail_unfulfillable_tasks_combined_placement_and_gpu_checks_in_nobody_fits`
+- Live `run_master` and precedence test in `cli_app::tests::test_sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticket` (`crates/cli/src/cli_app.rs`).
+- Multiplexed control and data lane codec test in `server::tests::test_master_server_bind_enforces_max_queue_size_and_json_wire_codec` (`crates/master/src/server.rs`).
 
 ## Work items
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| `SCHED-3` | Add `fail_unfulfillable_tasks` (`--fail-unfulfillable-tasks`, `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, `[master].fail_unfulfillable_tasks`) to transition unfulfillable tasks to `TaskStatus::Failed` with a descriptive reason and wake `--wait` callers | `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/master/src/server.rs`, `crates/cli/src/config.rs`, `crates/cli/src/cli_app.rs`, `README.md`, `docs/README.md` | Submitting `--require-tag nothing` against a worker without that tag stays `Queued` under default and transitions to `Failed` with a descriptive reason under `--fail-unfulfillable-tasks`, waking `--wait` | Implemented |
+| `SCHED-3` | Add `fail_unfulfillable_tasks` (`--fail-unfulfillable-tasks`, `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, `[master].fail_unfulfillable_tasks`) to transition unfulfillable tasks to `TaskState::Failed` with a descriptive reason and wake `--wait` callers | `crates/master/src/registry.rs`, `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/master/src/server.rs`, `crates/cli/src/config.rs`, `crates/cli/src/cli_app.rs`, `README.md`, `docs/README.md` | Submitting `--require-tag nothing` against a worker without that tag stays `Queued` under default and transitions to `Failed` with a descriptive reason under `--fail-unfulfillable-tasks`, waking `--wait` | Implemented |
 
 ## Status log
 
 - 2026-11-04: Implemented `SchedulerConfig::fail_unfulfillable_tasks`, `TaskQueue::fail_unfulfillable_task`, and `--fail-unfulfillable-tasks` (`RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, `[master].fail_unfulfillable_tasks`), plus the `SCHED-2` follow-up tests and source-prefixed error diagnostics (`SCHED-3`).
+- 2026-11-07: Checked static fulfillability against all registered workers (`WorkerRegistry::scheduler_snapshot`, including `Disconnected` and cooling-down workers until pruned by `prune_stale_workers`), cached verdicts per `Shape` in `Engine::dead` and tracked `(registration_epoch, ready_epoch)` in `WorkloadScheduler::last_unfulfillable_sweep`, added combined placement/GPU `nobody_fits` and `resolve_fail_unfulfillable_tasks` tests, and aligned this design record with the codebase.

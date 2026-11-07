@@ -41,7 +41,7 @@ use rusty_grid_worker::{NoticeLevel, ProcessPriority, WorkerClient, WorkerConfig
 use crate::config::{
     load_config_file, resolve_bool, resolve_f32, resolve_opt_field, resolve_opt_string,
     resolve_opt_u16, resolve_opt_u64, resolve_opt_usize, resolve_string, resolve_u32, resolve_u64,
-    resolve_usize, ConfigFile, SecretSection, SecretText,
+    resolve_usize, ConfigFile, MasterFileConfig, SecretSection, SecretText,
 };
 use crate::connect::{
     connect_master, normalize_master_addr, report_master_failure, AUTH_EXIT_CODE,
@@ -1053,6 +1053,20 @@ fn resolve_scheduler_policy(
     }
 }
 
+/// Resolve `--fail-unfulfillable-tasks` / `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS` /
+/// `[master].fail_unfulfillable_tasks` (default `false`).
+fn resolve_fail_unfulfillable_tasks(
+    flag: Option<bool>,
+    master_cfg: Option<&MasterFileConfig>,
+) -> bool {
+    resolve_bool(
+        flag,
+        &["RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS"],
+        master_cfg.and_then(|m| m.fail_unfulfillable_tasks),
+        false,
+    )
+}
+
 /// Build the `SchedulerConfig` for `oxideswarm master`, resolving `--scheduler-policy` /
 /// `RUSTY_GRID_SCHEDULER_POLICY` / `[master].scheduler_policy` and carrying `preserve_gpu`,
 /// `max_host_cpu`, and `fail_unfulfillable_tasks`.
@@ -1200,12 +1214,8 @@ async fn run_master(
         true,
     );
 
-    let fail_unfulfillable_tasks = resolve_bool(
-        args.fail_unfulfillable_tasks,
-        &["RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS"],
-        master_cfg.as_ref().and_then(|m| m.fail_unfulfillable_tasks),
-        false,
-    );
+    let fail_unfulfillable_tasks =
+        resolve_fail_unfulfillable_tasks(args.fail_unfulfillable_tasks, master_cfg.as_ref());
 
     let p2p_ticket_file = resolve_opt_string(
         args.p2p_ticket_file.map(|p| p.display().to_string()),
@@ -5332,38 +5342,40 @@ max_active_mb = 768
         );
         std::env::remove_var("RUSTY_GRID_SCHEDULER_POLICY");
 
-        // Precedence for `fail_unfulfillable_tasks`:
+        // Precedence for `fail_unfulfillable_tasks` via `resolve_fail_unfulfillable_tasks`:
         // CLI `--fail-unfulfillable-tasks` > `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS` > `[master].fail_unfulfillable_tasks` > false
         std::env::remove_var("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS");
-        assert!(!resolve_bool(
+        let parsed_fail_true_cfg: ConfigFile = toml::from_str(
+            r#"
+[master]
+fail_unfulfillable_tasks = true
+"#,
+        )
+        .unwrap();
+        let parsed_fail_false_cfg: ConfigFile = toml::from_str(
+            r#"
+[master]
+fail_unfulfillable_tasks = false
+"#,
+        )
+        .unwrap();
+        assert!(!resolve_fail_unfulfillable_tasks(None, None));
+        assert!(resolve_fail_unfulfillable_tasks(
             None,
-            &["RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS"],
-            None,
-            false
+            parsed_fail_true_cfg.master.as_ref()
         ));
-        assert!(resolve_bool(
-            None,
-            &["RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS"],
-            Some(true),
-            false
-        ));
+        std::env::set_var("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS", "1");
+        assert!(
+            resolve_fail_unfulfillable_tasks(None, parsed_fail_false_cfg.master.as_ref()),
+            "RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS=1 must override config false"
+        );
         std::env::set_var("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS", "0");
         assert!(
-            !resolve_bool(
-                None,
-                &["RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS"],
-                Some(true),
-                false
-            ),
+            !resolve_fail_unfulfillable_tasks(None, parsed_fail_true_cfg.master.as_ref()),
             "RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS=0 must override config true"
         );
         assert!(
-            resolve_bool(
-                Some(true),
-                &["RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS"],
-                Some(false),
-                false
-            ),
+            resolve_fail_unfulfillable_tasks(Some(true), parsed_fail_false_cfg.master.as_ref()),
             "--fail-unfulfillable-tasks CLI flag must override env 0"
         );
         std::env::remove_var("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS");
@@ -5372,9 +5384,11 @@ max_active_mb = 768
         //    - `--scheduler-policy round-robin` rotates two 1-core task submissions across two
         //      connected workers (`rr-w1` with 8 cores at 0% CPU and `rr-w2` with 2 cores at 50% CPU)
         //      that `SchedulerConfig::default()` (`WeightedLeastLoaded`) would both assign to `rr-w1`.
-        //    - `--fail-unfulfillable-tasks` immediately fails a task whose placement constraints no
-        //      registered worker can satisfy (`--require-tag nothing --wait`), waking `--wait` with
-        //      `ExitCode::FAILURE` and `"No registered worker matches the placement constraints (tag=nothing)"`.
+        //    - `[master].fail_unfulfillable_tasks = true` (from parsed TOML `FileConfig`, without
+        //      passing `--fail-unfulfillable-tasks` on the CLI) immediately fails a task whose
+        //      placement constraints no registered worker can satisfy (`--require-tag nothing --wait`),
+        //      waking `--wait` with `ExitCode::FAILURE` and
+        //      `"No registered worker matches the placement constraints (tag=nothing)"`.
         let rr_blob = tempfile::tempdir().unwrap();
         let rr_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let rr_addr = rr_probe.local_addr().unwrap();
@@ -5391,7 +5405,6 @@ max_active_mb = 768
             "127.0.0.1:0",
             "--scheduler-policy",
             "round-robin",
-            "--fail-unfulfillable-tasks",
             "--blob-dir",
             &rr_blob_str,
         ])
@@ -5400,7 +5413,11 @@ max_active_mb = 768
             panic!("expected Master");
         };
         let rr_secret_opts = secret_opts;
-        let rr_master_task = tokio::spawn(run_master(rr_master_args, None, rr_secret_opts.clone()));
+        let rr_master_task = tokio::spawn(run_master(
+            rr_master_args,
+            Some(parsed_fail_true_cfg),
+            rr_secret_opts.clone(),
+        ));
 
         let mut rr_bound = false;
         for _ in 0..50 {

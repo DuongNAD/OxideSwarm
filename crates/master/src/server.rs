@@ -6306,18 +6306,25 @@ mod tests {
         server_task.abort();
 
         // Also verify multiplexed P2P (`handle_multiplexed_connection`) with `WireCodec::Json`:
-        // a worker registering with Bincode must receive its `RegisterAck` in `WireCodec::Json`.
+        // a worker registering with Bincode must receive both its `RegisterAck` (control lane)
+        // and `AssignTask` (data lane) in `WireCodec::Json`.
         let (c_master, c_worker) = tokio::io::duplex(64 * 1024);
-        let (d_master, _d_worker) = tokio::io::duplex(64 * 1024);
+        let (d_master, d_worker) = tokio::io::duplex(64 * 1024);
         let (_mux_stop_tx, mux_stop_rx) = tokio::sync::watch::channel(false);
+        let mux_reg1 = WorkerRegistry::new();
+        let mux_queue1 = TaskQueue::new();
+        let mux_notify1 = Arc::new(tokio::sync::Notify::new());
+        let reg1_clone = mux_reg1.clone();
+        let queue1_clone = mux_queue1.clone();
+        let notify1_clone = Arc::clone(&mux_notify1);
         let mux_task = tokio::spawn(async move {
             handle_multiplexed_connection(
                 c_master,
                 d_master,
                 SocketAddr::from(([127, 0, 0, 1], 50099)),
-                WorkerRegistry::new(),
-                TaskQueue::new(),
-                Arc::new(tokio::sync::Notify::new()),
+                reg1_clone,
+                queue1_clone,
+                notify1_clone,
                 Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 10,
                 Duration::from_secs(5),
@@ -6338,6 +6345,7 @@ mod tests {
         });
 
         let mut w_ctrl = MessageTransport::with_codec(c_worker, WireCodec::Bincode);
+        let mut w_data = MessageTransport::with_codec(d_worker, WireCodec::Bincode);
         w_ctrl
             .send_msg(&WorkerMessage::Register {
                 worker_id: Uuid::new_v4(),
@@ -6362,12 +6370,38 @@ mod tests {
         assert_eq!(
             mux_codec,
             WireCodec::Json,
-            "handle_multiplexed_connection with WireCodec::Json must reply in Json even to a Bincode worker"
+            "handle_multiplexed_connection with WireCodec::Json must reply in Json on ctrl_transport even to a Bincode worker"
         );
         assert!(matches!(
             mux_reply,
             MasterMessage::RegisterAck { accepted: true, .. }
         ));
+
+        mux_queue1
+            .submit(Task::new(
+                TaskSpec::command("echo", vec!["mux-json-data-lane".into()]),
+                TaskRequirements::generic(1, 30),
+            ))
+            .await
+            .unwrap();
+        let sched1 = WorkloadScheduler::new(
+            SchedulerConfig::default(),
+            mux_reg1,
+            mux_queue1,
+            mux_notify1,
+        );
+        assert_eq!(sched1.schedule_once().await.unwrap().assignments.len(), 1);
+        let (json_data_msg, json_data_codec) = w_data
+            .recv_msg_with_codec::<MasterMessage>()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            json_data_codec,
+            WireCodec::Json,
+            "handle_multiplexed_connection with WireCodec::Json must send AssignTask in Json on data_transport even to a Bincode worker"
+        );
+        assert!(matches!(json_data_msg, MasterMessage::AssignTask { .. }));
         mux_task.abort();
 
         // Conversely, when `handle_multiplexed_connection` is configured with `WireCodec::Bincode`
