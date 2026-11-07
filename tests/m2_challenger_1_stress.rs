@@ -298,19 +298,19 @@ async fn test_read_bounded_stream_binary_overflow_and_drain() {
 #[cfg(feature = "p2p")]
 #[tokio::test]
 async fn test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation() {
-    use iroh::endpoint::presets::N0;
+    use iroh::endpoint::presets::Minimal;
     use iroh::endpoint::RelayMode;
     use rusty_grid_core::transport::GRID_ALPN;
 
     // Bind server and client endpoints on loopback
-    let ep_server = iroh::Endpoint::builder(N0)
+    let ep_server = iroh::Endpoint::builder(Minimal)
         .alpns(vec![GRID_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
         .bind()
         .await
         .expect("bind server");
 
-    let ep_client = iroh::Endpoint::builder(N0)
+    let ep_client = iroh::Endpoint::builder(Minimal)
         .alpns(vec![GRID_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
         .bind()
@@ -690,6 +690,7 @@ fn make_test_worker(
         cpu_usage_pct: 0.0,
         ram_available_mb: ram_mb,
         features: Default::default(),
+        mobile_status: None,
     }
 }
 

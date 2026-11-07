@@ -86,6 +86,7 @@ fn create_mock_worker_info(
         cpu_usage_pct,
         ram_available_mb: ram_mb,
         features: Default::default(),
+        mobile_status: None,
     }
 }
 

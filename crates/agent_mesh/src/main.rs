@@ -4,6 +4,7 @@
 //! query active node inventory, and route commands/payloads across nodes.
 
 use agent_mesh::{AgentGridBridge, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub, HubConfig};
+use clap::builder::{OsStringValueParser, TypedValueParser};
 use clap::{Parser, Subcommand};
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_master::server::{MasterServer, ServerConfig};
@@ -83,7 +84,11 @@ pub enum Commands {
 
         /// Path to an additional trusted CA certificate (PEM or DER) for `wss://` hubs behind a
         /// private TLS-terminating proxy
-        #[arg(long, env = "OXIDE_MESH_TLS_CA", value_parser = parse_tls_ca_arg)]
+        #[arg(
+            long,
+            env = "OXIDE_MESH_TLS_CA",
+            value_parser = OsStringValueParser::new().map(PathBuf::from)
+        )]
         tls_ca: Option<PathBuf>,
 
         /// Disable shell command execution (refuse shell_exec)
@@ -123,7 +128,11 @@ pub enum Commands {
 
         /// Path to an additional trusted CA certificate (PEM or DER) for `wss://` hubs behind a
         /// private TLS-terminating proxy
-        #[arg(long, env = "OXIDE_MESH_TLS_CA", value_parser = parse_tls_ca_arg)]
+        #[arg(
+            long,
+            env = "OXIDE_MESH_TLS_CA",
+            value_parser = OsStringValueParser::new().map(PathBuf::from)
+        )]
         tls_ca: Option<PathBuf>,
     },
 
@@ -143,7 +152,11 @@ pub enum Commands {
 
         /// Path to an additional trusted CA certificate (PEM or DER) for `wss://` hubs behind a
         /// private TLS-terminating proxy
-        #[arg(long, env = "OXIDE_MESH_TLS_CA", value_parser = parse_tls_ca_arg)]
+        #[arg(
+            long,
+            env = "OXIDE_MESH_TLS_CA",
+            value_parser = OsStringValueParser::new().map(PathBuf::from)
+        )]
         tls_ca: Option<PathBuf>,
     },
 
@@ -171,15 +184,13 @@ pub enum Commands {
 
         /// Path to an additional trusted CA certificate (PEM or DER) for `wss://` hubs behind a
         /// private TLS-terminating proxy
-        #[arg(long, env = "OXIDE_MESH_TLS_CA", value_parser = parse_tls_ca_arg)]
+        #[arg(
+            long,
+            env = "OXIDE_MESH_TLS_CA",
+            value_parser = OsStringValueParser::new().map(PathBuf::from)
+        )]
         tls_ca: Option<PathBuf>,
     },
-}
-
-/// Custom value parser for `--tls-ca` / `OXIDE_MESH_TLS_CA` that accepts an empty string
-/// (unlike clap's default `PathBufValueParser`, which rejects `OXIDE_MESH_TLS_CA=""` with exit 2).
-fn parse_tls_ca_arg(raw: &str) -> Result<PathBuf, std::convert::Infallible> {
-    Ok(PathBuf::from(raw))
 }
 
 /// An unset or empty token means "no token" for a client (an empty OXIDE_MESH_TOKEN is how a shell

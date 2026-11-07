@@ -10,6 +10,14 @@ static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[test]
 fn test_p2p_ticket_and_worker_config() {
     let _guard = TEST_LOCK.blocking_lock();
+    struct MinimalPresetGuard;
+    impl Drop for MinimalPresetGuard {
+        fn drop(&mut self) {
+            oxideworker::set_p2p_minimal_preset_for_testing(false);
+        }
+    }
+    oxideworker::set_p2p_minimal_preset_for_testing(true);
+    let _minimal_preset_guard = MinimalPresetGuard;
     stop_worker_impl();
     let tmp = tempfile::tempdir().expect("tempdir");
     assert!(set_sandbox_dir_impl(
