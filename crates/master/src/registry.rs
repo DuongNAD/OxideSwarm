@@ -234,6 +234,7 @@ pub enum HeartbeatOutcome {
 
 struct WorkerRegistryInner {
     workers: HashMap<Uuid, WorkerEntry>,
+    network_types: HashMap<Uuid, Option<String>>,
     next_session_id: u64,
 }
 
@@ -257,6 +258,7 @@ impl WorkerRegistry {
         Self {
             inner: Arc::new(RwLock::new(WorkerRegistryInner {
                 workers: HashMap::new(),
+                network_types: HashMap::new(),
                 next_session_id: 1,
             })),
         }
@@ -358,11 +360,13 @@ impl WorkerRegistry {
                 .mobile
                 .as_ref()
                 .map(|_| Duration::from_secs(60));
+            inner.network_types.remove(&worker_id);
             tracing::info!(worker_id = %worker_id, session_id = session_id, superseded = ?superseded_session, "Rebound existing worker registration");
         } else {
             let ram = capabilities.ram_mb;
             let mobile_status = capabilities.mobile.as_ref().map(|m| m.live_status());
             let hb_interval = mobile_status.as_ref().map(|_| Duration::from_secs(60));
+            inner.network_types.remove(&worker_id);
             // Give a live worker connection with `capabilities.mobile` up to 50 ms to deliver its
             // immediate post-RegisterAck `MobileTelemetry` frame before the background scheduler
             // places queued work on the un-hydrated `Register` snapshot.
@@ -458,6 +462,7 @@ impl WorkerRegistry {
     /// Unconditionally removes a worker from the registry (closing any active abort handle).
     pub async fn remove_worker(&self, worker_id: &Uuid) -> Option<WorkerInfo> {
         let mut inner = self.inner.write().await;
+        inner.network_types.remove(worker_id);
         if let Some(entry) = inner.workers.remove(worker_id) {
             if let Some(abort) = entry.abort_handle.clone() {
                 abort_unless_current(abort);
@@ -482,6 +487,7 @@ impl WorkerRegistry {
         }
         let count = to_remove.len();
         for id in to_remove {
+            inner.network_types.remove(&id);
             if let Some(entry) = inner.workers.remove(&id) {
                 if let Some(abort) = entry.abort_handle {
                     abort_unless_current(abort);
@@ -551,6 +557,7 @@ impl WorkerRegistry {
         expected_session: Option<u64>,
     ) -> GridResult<HeartbeatOutcome> {
         let mut inner = self.inner.write().await;
+        let has_telemetry = inner.network_types.contains_key(worker_id);
         let entry = inner
             .workers
             .get_mut(worker_id)
@@ -573,10 +580,11 @@ impl WorkerRegistry {
         entry.reported_active_tasks = active_tasks;
         entry.cpu_usage_pct = cpu_usage_pct;
         entry.ram_available_mb = ram_available_mb;
-        if let Some(ref status) = entry.mobile_status {
-            if let Some(iv) = status.adaptive_keepalive_interval(active_tasks) {
-                entry.heartbeat_interval = Some(iv);
-            }
+        if has_telemetry {
+            entry.heartbeat_interval = entry
+                .mobile_status
+                .as_ref()
+                .and_then(|status| status.adaptive_keepalive_interval(active_tasks));
         }
         let revive = entry.status == WorkerStatus::Disconnected && expected_session.is_some();
         if entry.status != WorkerStatus::Disconnected || revive {
@@ -611,6 +619,11 @@ impl WorkerRegistry {
         status: MobileLiveStatus,
     ) -> GridResult<bool> {
         let mut inner = self.inner.write().await;
+        let had_reported_net = inner
+            .network_types
+            .get(worker_id)
+            .and_then(|n| n.as_ref())
+            .is_some();
         let entry = inner
             .workers
             .get_mut(worker_id)
@@ -621,6 +634,17 @@ impl WorkerRegistry {
             }
         }
         let mut status = status;
+        status.network_type = status
+            .network_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| {
+                !s.is_empty()
+                    && !s.eq_ignore_ascii_case("unknown")
+                    && !s.eq_ignore_ascii_case("none")
+            })
+            .map(str::to_string);
+        let known_net = status.network_type.clone();
         if status.network_type.is_none() {
             status.network_type = entry
                 .mobile_status
@@ -628,10 +652,17 @@ impl WorkerRegistry {
                 .and_then(|prev| prev.network_type.clone());
         }
         let candidate = status.adaptive_keepalive_interval(entry.reported_active_tasks);
+        // Never shorten an already-established dead-peer window on a telemetry push: the worker
+        // keeps its old heartbeat timer until its next tick (or restarts its timer when the new
+        // reading is shorter and sends a Heartbeat within that shorter interval). `record_heartbeat`
+        // applies the shortened or `None` window once the worker's next Heartbeat arrives.
         entry.heartbeat_interval = match (entry.heartbeat_interval, candidate) {
-            (Some(prev), Some(next)) if entry.active_tasks > entry.reported_active_tasks => {
+            (Some(prev), Some(next))
+                if had_reported_net || entry.active_tasks > entry.reported_active_tasks =>
+            {
                 Some(prev.max(next))
             }
+            (Some(prev), None) => Some(prev),
             (_, next) => next,
         };
         let updated = match entry.capabilities.mobile.as_ref() {
@@ -653,6 +684,7 @@ impl WorkerRegistry {
         if entry.consecutive_rejections == 0 {
             entry.excluded_until = None;
         }
+        inner.network_types.insert(*worker_id, known_net);
         Ok(changed)
     }
 
@@ -809,10 +841,10 @@ impl WorkerRegistry {
     pub async fn worker_network_type(&self, worker_id: &Uuid) -> Option<String> {
         let inner = self.inner.read().await;
         inner
-            .workers
+            .network_types
             .get(worker_id)
-            .and_then(|e| e.mobile_status.as_ref())
-            .and_then(|s| s.network_type.clone())
+            .and_then(|n| n.as_ref())
+            .cloned()
     }
 
     #[cfg(test)]
@@ -1996,8 +2028,9 @@ mod tests {
             .unwrap();
 
         // 1. A newly registered mobile worker keeps a 4 × 60 s window (`Some(60s)`) until its
-        // first `MobileTelemetry` of the session; a battery laptop (`network_type: None`) then
-        // switches to the negotiated/reaper timeout (`None`).
+        // first `MobileTelemetry` AND next `Heartbeat` of the session; a battery laptop
+        // (`network_type: None`) keeps `Some(60s)` across `update_mobile_telemetry` and switches
+        // to the negotiated/reaper timeout (`None`) on its next `record_heartbeat`.
         {
             let inner = registry.inner.read().await;
             assert_eq!(
@@ -2005,10 +2038,6 @@ mod tests {
                 Some(Duration::from_secs(60))
             );
         }
-        registry
-            .record_heartbeat(&id, 0, 100, 10.0, 4096, Some(session))
-            .await
-            .unwrap();
         registry
             .update_mobile_telemetry(
                 &id,
@@ -2020,6 +2049,18 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
+            .unwrap();
+        {
+            let inner = registry.inner.read().await;
+            assert_eq!(
+                inner.workers[&id].heartbeat_interval,
+                Some(Duration::from_secs(60)),
+                "update_mobile_telemetry with network_type=None must preserve the previous window until the next heartbeat"
+            );
+        }
+        registry
+            .record_heartbeat(&id, 0, 100, 10.0, 4096, Some(session))
             .await
             .unwrap();
         {

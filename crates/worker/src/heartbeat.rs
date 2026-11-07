@@ -350,6 +350,7 @@ pub struct MobileTelemetryHandle {
     inner: Arc<RwLock<Option<MobileCapabilities>>>,
     live: Arc<RwLock<Option<MobileLiveStatus>>>,
     externally_fed: Arc<AtomicBool>,
+    notify: Arc<Notify>,
 }
 
 impl MobileTelemetryHandle {
@@ -360,6 +361,7 @@ impl MobileTelemetryHandle {
             inner: Arc::new(RwLock::new(initial)),
             live: Arc::new(RwLock::new(live)),
             externally_fed: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
         }
     }
 
@@ -389,6 +391,7 @@ impl MobileTelemetryHandle {
             .live
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = live;
+        self.notify.notify_waiters();
     }
 
     /// Replaces the fast-changing readings. The OS / SoC descriptors are kept; if nothing was set
@@ -426,6 +429,7 @@ impl MobileTelemetryHandle {
             .live
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(status);
+        self.notify.notify_waiters();
     }
 
     /// The fast-changing readings alone, `None` while nothing is known.
@@ -554,6 +558,24 @@ pub fn spawn_adaptive_heartbeat_task(
                     }
                 }
                 _ = tracker_clone.active_notify.notified() => {
+                    let active = tracker_clone.active_tasks.load(Ordering::Relaxed);
+                    let recommended = mobile
+                        .as_ref()
+                        .and_then(|mob| mob.live_status())
+                        .map(|status| status.recommended_keepalive_interval_or(active, interval))
+                        .unwrap_or(interval);
+                    if recommended < current_interval {
+                        current_interval = recommended;
+                        ticker = tokio::time::interval(current_interval);
+                        ticker.tick().await;
+                    }
+                }
+                _ = async {
+                    match &mobile {
+                        Some(mob) => mob.notify.notified().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     let active = tracker_clone.active_tasks.load(Ordering::Relaxed);
                     let recommended = mobile
                         .as_ref()
@@ -932,6 +954,124 @@ mod tests {
             .expect("laptop worker must heartbeat at the negotiated interval, not 60s")
             .expect("heartbeat message");
         assert!(matches!(first, WorkerMessage::Heartbeat { .. }));
+        hb.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_mobile_poller_does_not_overwrite_externally_fed_handle() {
+        let handle = MobileTelemetryHandle::new(Some(MobileCapabilities {
+            os_version: "macOS".into(),
+            soc_model: "Apple M2".into(),
+            battery_pct: Some(90),
+            is_charging: Some(true),
+            thermal_throttled: false,
+        }));
+        assert!(!handle.is_externally_fed());
+
+        // External caller feeds explicit mobile telemetry (e.g. JNI callback or test fixture).
+        handle.update(MobileLiveStatus {
+            battery_pct: Some(64),
+            is_charging: Some(false),
+            network_type: Some("wifi".into()),
+            ..Default::default()
+        });
+        assert!(handle.is_externally_fed());
+
+        let poller = spawn_mobile_poller(handle.clone(), Duration::from_millis(15), fake_probe);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        poller.abort();
+
+        let live = handle.live_status().unwrap();
+        assert_eq!(live.battery_pct, Some(64));
+        assert_eq!(live.is_charging, Some(false));
+        assert_eq!(live.network_type.as_deref(), Some("wifi"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_adaptive_heartbeat_restarts_timer_when_active_tasks_rises_or_telemetry_interval_shortens(
+    ) {
+        let negotiated = Duration::from_secs(3);
+        let handle = MobileTelemetryHandle::new(None);
+        handle.update(MobileLiveStatus {
+            battery_pct: Some(85),
+            is_charging: Some(false),
+            network_type: Some("wifi".into()),
+            ..Default::default()
+        });
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let tracker = Arc::new(HeartbeatTracker::new(active));
+        let (tx, mut rx) = mpsc::channel(8);
+        let hb = spawn_adaptive_heartbeat_task(
+            Uuid::new_v4(),
+            negotiated,
+            tx,
+            Arc::clone(&tracker),
+            Some(handle.clone()),
+        );
+
+        // Give the spawned task a yield to arm its 60 s Wi-Fi idle timer.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "idle Wi-Fi worker must not heartbeat at 5 s"
+        );
+
+        // 1. Transition active_tasks 0 -> 1: the timer must immediately restart to 10 s instead
+        // of waiting the remaining 55 s of the 60 s Wi-Fi idle tick.
+        tracker.increment_active_tasks();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        let msg = rx
+            .try_recv()
+            .expect("heartbeat must fire within 11 s after active_tasks rises from 0 to 1");
+        assert!(matches!(
+            msg,
+            WorkerMessage::Heartbeat {
+                active_tasks: 1,
+                ..
+            }
+        ));
+
+        // 2. Return to idle (60 s Wi-Fi) on the next tick, then switch network_type to None:
+        // the timer must immediately restart to the 3 s negotiated interval.
+        tracker.decrement_active_tasks();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        let idle_msg = rx
+            .try_recv()
+            .expect("tick at 10 s transitions worker back to 60 s Wi-Fi idle");
+        assert!(matches!(
+            idle_msg,
+            WorkerMessage::Heartbeat {
+                active_tasks: 0,
+                ..
+            }
+        ));
+
+        handle.update(MobileLiveStatus {
+            battery_pct: Some(85),
+            is_charging: Some(false),
+            network_type: None,
+            ..Default::default()
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        let unknown_net_msg = rx.try_recv().expect(
+            "heartbeat must fire within 4 s after network_type switches from wifi (60 s) to None (3 s)",
+        );
+        assert!(matches!(
+            unknown_net_msg,
+            WorkerMessage::Heartbeat {
+                active_tasks: 0,
+                ..
+            }
+        ));
+
         hb.stop().await;
     }
 }
