@@ -339,11 +339,18 @@ impl WorkerRegistry {
             // A fresh Register carries a fresh capability snapshot, so a past rejection streak no longer applies.
             existing.consecutive_rejections = 0;
             existing.excluded_until = None;
-            existing.mobile_status = existing
-                .capabilities
-                .mobile
-                .as_ref()
-                .map(|m| m.live_status());
+            existing.mobile_status = match (
+                existing.mobile_status.take(),
+                existing.capabilities.mobile.as_ref(),
+            ) {
+                (Some(mut prev), Some(m)) => {
+                    prev.battery_pct = m.battery_pct;
+                    prev.is_charging = m.is_charging;
+                    prev.thermal_throttled = m.thermal_throttled;
+                    Some(prev)
+                }
+                (_, maybe_m) => maybe_m.map(|m| m.live_status()),
+            };
             // Keep a 4 × 60 s window for a worker with `capabilities.mobile` until its first
             // `MobileTelemetry` of the session reports whether a mobile `network_type` is present.
             existing.heartbeat_interval = existing
@@ -355,9 +362,12 @@ impl WorkerRegistry {
         } else {
             let ram = capabilities.ram_mb;
             let mobile_status = capabilities.mobile.as_ref().map(|m| m.live_status());
-            let hb_interval = mobile_status
-                .as_ref()
-                .map(|_| Duration::from_secs(60));
+            let hb_interval = mobile_status.as_ref().map(|_| Duration::from_secs(60));
+            // Give a live worker connection with `capabilities.mobile` up to 50 ms to deliver its
+            // immediate post-RegisterAck `MobileTelemetry` frame before the background scheduler
+            // places queued work on the un-hydrated `Register` snapshot.
+            let excluded_until = (mobile_status.is_some() && !features.is_empty())
+                .then(|| now_instant + Duration::from_millis(50));
             let entry = WorkerEntry {
                 worker_id,
                 session_id,
@@ -377,7 +387,7 @@ impl WorkerRegistry {
                 ram_available_mb: ram,
                 rx_clock: None,
                 consecutive_rejections: 0,
-                excluded_until: None,
+                excluded_until,
                 heartbeat_interval: hb_interval,
                 mobile_status,
             };
@@ -640,6 +650,9 @@ impl WorkerRegistry {
             || entry.mobile_status.as_ref() != Some(&status);
         entry.capabilities.mobile = Some(updated);
         entry.mobile_status = Some(status);
+        if entry.consecutive_rejections == 0 {
+            entry.excluded_until = None;
+        }
         Ok(changed)
     }
 

@@ -1015,15 +1015,17 @@ async fn test_wifi_phone_with_short_reaper_timeout_reports_wifi_within_3s_and_st
         let _ = worker.run(w_shutdown_rx).await;
     });
 
-    // Check 1: master sees network_type == "wifi" within 3 s.
+    // Check 1: master sees mobile_status.network_type == "wifi" within 3 s.
     let saw_wifi = wait_for(
         Duration::from_secs(3),
         Duration::from_millis(50),
         || async {
             master
                 .registry()
-                .worker_network_type(&w_id)
+                .get_worker(w_id)
                 .await
+                .and_then(|info| info.mobile_status)
+                .and_then(|s| s.network_type)
                 .as_deref()
                 == Some("wifi")
         },
@@ -1031,7 +1033,7 @@ async fn test_wifi_phone_with_short_reaper_timeout_reports_wifi_within_3s_and_st
     .await;
     assert!(
         saw_wifi,
-        "Master must receive initial MobileTelemetry with network_type=wifi within 3 s"
+        "Master must receive initial MobileTelemetry with mobile_status.network_type=wifi within 3 s"
     );
 
     let initial_info = master
@@ -1255,6 +1257,143 @@ async fn test_worker_with_1s_negotiated_interval_does_not_reconnect_within_15s_a
         "Worker must not reconnect within 15 s after Wi-Fi is reported with a 1 s negotiated interval"
     );
     assert_eq!(after_15s.status, WorkerStatus::Connected);
+
+    let _ = w_shutdown_tx.send(true);
+    let _ = master.shutdown();
+}
+
+/// Integration test for Finding 4 (PR #99):
+/// A phone set to `ThermalTier::Critical` (`45 °C`) before `run` gets 0 assignments within 3 s of
+/// registering, and again within 3 s after a forced reconnect.
+#[tokio::test]
+async fn test_critical_thermal_phone_gets_zero_assignments_after_register_and_after_forced_reconnect(
+) {
+    use rusty_grid_master::reaper::ReaperConfig;
+    use rusty_grid_master::scheduler::SchedulerConfig;
+    use rusty_grid_worker::backoff::BackoffConfig;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3);
+    let reaper_config = ReaperConfig::new(Duration::from_millis(200), Duration::from_secs(10));
+    let master =
+        MasterServer::spawn_with_config(server_config, SchedulerConfig::default(), reaper_config)
+            .await
+            .expect("master spawn");
+    let master_addr = master.server_addr().to_string();
+
+    // Queue a 1-core task before the Critical phone even connects.
+    let task = Task::new(
+        TaskSpec::BuiltinTest {
+            test_name: "critical_thermal_gate".into(),
+            iterations: 1,
+            duration_ms: 500,
+            should_fail: false,
+            require_gpu: false,
+        },
+        TaskRequirements::generic(1, 60),
+    );
+    let task_id = master.submit_task(task).await.expect("submit task");
+
+    let (w_shutdown_tx, w_shutdown_rx) = watch::channel(false);
+    let w_id = Uuid::new_v4();
+    let config = WorkerConfig::new(&master_addr)
+        .with_no_battery(true)
+        .with_name("critical-thermal-phone")
+        .with_cores(4)
+        .with_worker_id(w_id)
+        .with_sandbox_base_dir(temp_dir.path().join("w_crit"));
+    let mut worker = WorkerClient::new(config);
+    worker.set_backoff_config(BackoffConfig {
+        initial: Duration::from_millis(100),
+        max: Duration::from_millis(300),
+        factor: 1.5,
+        jitter_ratio: 0.0,
+    });
+    worker.mobile_telemetry().update(MobileLiveStatus {
+        battery_pct: Some(85),
+        is_charging: Some(true),
+        thermal_throttled: false,
+        battery_temperature: Some(45.0),
+        network_type: Some("wifi".into()),
+        battery_tier: Some(BatteryTier::Normal),
+        thermal_tier: Some(ThermalTier::Critical),
+    });
+
+    tokio::spawn(async move {
+        let _ = worker.run(w_shutdown_rx).await;
+    });
+
+    // Wait for registration and initial MobileTelemetry delivery.
+    let saw_critical = wait_for(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        || async {
+            master
+                .registry()
+                .get_worker(w_id)
+                .await
+                .and_then(|info| info.mobile_status)
+                .and_then(|s| s.thermal_tier)
+                == Some(ThermalTier::Critical)
+        },
+    )
+    .await;
+    assert!(
+        saw_critical,
+        "Master must observe ThermalTier::Critical within 3 s of registration"
+    );
+
+    // Wait 3 s after registering: the Critical phone must receive 0 assignments.
+    tokio::time::sleep(Duration::from_millis(3100)).await;
+    let t_info_1 = master.get_task_info(task_id).await.unwrap();
+    assert_eq!(
+        t_info_1.state,
+        TaskState::Queued,
+        "Critical thermal phone must get 0 assignments within 3 s of registering"
+    );
+    assert_eq!(t_info_1.assigned_worker_id, None);
+    let w_info_1 = master.registry().get_worker(w_id).await.unwrap();
+    assert_eq!(w_info_1.session_id, 1);
+    assert_eq!(w_info_1.active_tasks, 0);
+
+    // Force a disconnect so the worker reconnects on session 2.
+    master
+        .registry()
+        .mark_disconnected(&w_id)
+        .await
+        .expect("mark_disconnected");
+
+    let reconnected = wait_for(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        || async {
+            master
+                .registry()
+                .get_worker(w_id)
+                .await
+                .is_some_and(|info| {
+                    info.session_id >= 2
+                        && info.status == WorkerStatus::Connected
+                        && info.mobile_status.as_ref().and_then(|s| s.thermal_tier)
+                            == Some(ThermalTier::Critical)
+                })
+        },
+    )
+    .await;
+    assert!(
+        reconnected,
+        "Worker must reconnect on a new session and retain ThermalTier::Critical"
+    );
+
+    // Wait 3 s after the forced reconnect: still 0 assignments.
+    tokio::time::sleep(Duration::from_millis(3100)).await;
+    let t_info_2 = master.get_task_info(task_id).await.unwrap();
+    assert_eq!(
+        t_info_2.state,
+        TaskState::Queued,
+        "Critical thermal phone must get 0 assignments within 3 s after a forced reconnect"
+    );
+    assert_eq!(t_info_2.assigned_worker_id, None);
 
     let _ = w_shutdown_tx.send(true);
     let _ = master.shutdown();
