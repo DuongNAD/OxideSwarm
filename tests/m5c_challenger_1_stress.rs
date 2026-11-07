@@ -287,6 +287,11 @@ async fn test_mcp_protocol_framing_stress() {
         mcp.send_line(garbage);
         let resp = mcp.read_json_response();
         assert_eq!(resp["jsonrpc"], "2.0", "case {idx}: jsonrpc must be 2.0");
+        assert_eq!(
+            resp.get("id"),
+            Some(&Value::Null),
+            "case {idx} ('{garbage}') must include \"id\": null"
+        );
         assert!(
             resp.get("error").is_some(),
             "case {idx} ('{garbage}') must return error object"
@@ -313,6 +318,11 @@ async fn test_mcp_protocol_framing_stress() {
         assert_eq!(
             resp["jsonrpc"], "2.0",
             "non-request case {idx}: jsonrpc must be 2.0"
+        );
+        assert_eq!(
+            resp.get("id"),
+            Some(&Value::Null),
+            "non-request case {idx} ('{non_req}') must include \"id\": null"
         );
         let err_code = resp["error"]["code"].as_i64().expect("error code");
         assert_eq!(
@@ -447,6 +457,36 @@ async fn test_mcp_protocol_framing_stress() {
             "varied id case {idx} id echo mismatch"
         );
         assert_eq!(resp["result"], json!({}));
+    }
+
+    // 1.6b Invalid id types (boolean, array, object) return INVALID_REQUEST (-32600) with "id": null
+    let bad_id_cases = [
+        json!(true),
+        json!(false),
+        json!([1, 2]),
+        json!({"nested": "id"}),
+    ];
+    for (idx, bad_id) in bad_id_cases.iter().enumerate() {
+        mcp.send_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": bad_id,
+                "method": "ping"
+            })
+            .to_string(),
+        );
+        let resp = mcp.read_json_response();
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(
+            resp.get("id"),
+            Some(&Value::Null),
+            "bad id case {idx} ({bad_id}) must include \"id\": null"
+        );
+        let err_code = resp["error"]["code"].as_i64().expect("error code");
+        assert_eq!(
+            err_code, -32600,
+            "bad id case {idx} ({bad_id}) expected INVALID_REQUEST (-32600), got {err_code}"
+        );
     }
 
     // 1.7 Stream liveness check: After all the stress above, server responds cleanly to tools/list

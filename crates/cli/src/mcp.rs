@@ -97,7 +97,6 @@ pub struct JsonRpcRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRpcResponse {
     pub jsonrpc: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
@@ -471,11 +470,11 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                     "type": {
                         "type": "string",
                         "enum": ["command", "shell", "gpu"],
-                        "description": "Task type (default: command)"
+                        "description": "Task type (default: command). Requires 'command' when 'command' (or omitted); requires 'script' or 'command' when 'shell'"
                     },
                     "command": {
                         "type": "string",
-                        "description": "Command executable to run, or shell script string if type is shell"
+                        "description": "Command executable to run (required when type is 'command' or omitted; also accepted as shell script string when type is 'shell' and 'script' is omitted)"
                     },
                     "args": {
                         "type": "array",
@@ -484,7 +483,7 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                     },
                     "script": {
                         "type": "string",
-                        "description": "Explicit script content for shell tasks"
+                        "description": "Explicit script content for shell tasks (when type is 'shell', either 'script' or 'command' is required)"
                     },
                     "interpreter": {
                         "type": "string",
@@ -571,18 +570,7 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "description": "Maximum escaped bytes of stdout and stderr combined to return inline (head + tail, default: 16384)"
                     }
                 },
-                "required": [],
-                "anyOf": [
-                    { "required": ["command"] },
-                    {
-                        "properties": { "type": { "const": "shell" } },
-                        "required": ["type", "script"]
-                    },
-                    {
-                        "properties": { "type": { "const": "gpu" } },
-                        "required": ["type"]
-                    }
-                ]
+                "required": []
             }),
         },
         ToolDefinition {
@@ -3383,6 +3371,14 @@ mod tests {
                 "tool '{}' schema must include a 'required' array",
                 t.name
             );
+            for forbidden in ["anyOf", "oneOf", "allOf"] {
+                assert!(
+                    t.input_schema.get(forbidden).is_none(),
+                    "tool '{}' schema must not have top-level '{}' (rejected by Claude Messages API)",
+                    t.name,
+                    forbidden
+                );
+            }
         }
 
         // Empty submit (`submit {}`) is rejected without falling back to demo echo.
@@ -3407,5 +3403,59 @@ mod tests {
         assert!(validate_tool_arguments("task_result", &json!({})).is_err());
         assert!(validate_tool_arguments("cancel", &json!({})).is_err());
         assert!(validate_tool_arguments("doctor", &json!({"expect_workers": -1})).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_mcp3_status_reports_no_workers_and_total_tasks_against_workerless_master() {
+        use rusty_grid_master::reaper::ReaperConfig;
+        use rusty_grid_master::scheduler::SchedulerConfig;
+        use rusty_grid_master::server::{MasterServer, ServerConfig};
+
+        let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_web_ui(false);
+        let master = MasterServer::spawn_with_config(
+            server_config,
+            SchedulerConfig::default(),
+            ReaperConfig::default(),
+        )
+        .await
+        .expect("master starts");
+
+        let state = McpState::new(master.server_addr().to_string(), None);
+
+        // 1. Fresh master with 0 workers reports `"cluster_status": "no_workers"` and `total_tasks: 0`.
+        let status_empty = call_tool(&state, "status", &json!({})).await;
+        assert!(!status_empty.is_error);
+        let empty_val: Value = serde_json::from_str(match &status_empty.content[0] {
+            ToolContent::Text { text } => text,
+        })
+        .unwrap();
+        assert_eq!(empty_val["cluster_status"], "no_workers");
+        assert_eq!(empty_val["connected_workers"], 0);
+        assert_eq!(empty_val["total_workers"], 0);
+        assert_eq!(empty_val["total_tasks"], 0);
+        assert_eq!(empty_val["pending_tasks"], 0);
+
+        // 2. Submitting a task (`wait: false`) increments `total_tasks` and `pending_tasks` while
+        // `cluster_status` remains `"no_workers"`.
+        let submit_res = call_tool(
+            &state,
+            "submit",
+            &json!({"type": "command", "command": "echo", "args": ["queued"], "wait": false}),
+        )
+        .await;
+        assert!(!submit_res.is_error);
+
+        let status_queued = call_tool(&state, "status", &json!({})).await;
+        assert!(!status_queued.is_error);
+        let queued_val: Value = serde_json::from_str(match &status_queued.content[0] {
+            ToolContent::Text { text } => text,
+        })
+        .unwrap();
+        assert_eq!(queued_val["cluster_status"], "no_workers");
+        assert_eq!(queued_val["connected_workers"], 0);
+        assert_eq!(queued_val["total_tasks"], 1);
+        assert_eq!(queued_val["pending_tasks"], 1);
+
+        let _ = master.shutdown();
     }
 }

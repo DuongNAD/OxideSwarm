@@ -54,12 +54,13 @@ Supported lifecycle endpoints:
 - `notifications/initialized`: Confirms client initialization (no response emitted on `stdout`).
 - `notifications/cancelled`: Cancels an in-flight tool call (and its submitted task) or a recently completed `submit {wait: false}` task (design 0030), emitting no response on `stdout`.
 - `ping`: Liveness check responding with `{}`.
-- `tools/list`: Returns JSON schemas (each carrying a `required` array) for all six tools.
+- `tools/list`: Returns JSON schemas (each carrying a `required` array and no top-level `anyOf`, `oneOf`, or `allOf`, so schemas are accepted by the Claude Messages API when forwarded by Claude Code) for all six tools.
 - `tools/call`: Validates the tool name and arguments against the tool schema before executing the requested tool against the master cluster.
 
 JSON-RPC 2.0 error and notification rules (`MCP-3`):
-- Malformed JSON syntax returns `PARSE_ERROR` (`-32700`).
-- Valid JSON that is not a Request object, carries an invalid `id` type, lacks `jsonrpc: "2.0"`, or lacks a non-empty string `method` returns `INVALID_REQUEST` (`-32600`).
+- Malformed JSON syntax returns `PARSE_ERROR` (`-32700`) with `"id": null`.
+- Valid JSON that is not a Request object, carries an invalid `id` type (`boolean`, `array`, or `object`), lacks `jsonrpc: "2.0"`, or lacks a non-empty string `method` returns `INVALID_REQUEST` (`-32600`) with `"id": null` when the request `id` is unknown or invalid.
+- Although MCP `2024-11-05` states that client request IDs must not be `null`, an explicit `"id": null` member on a request is accepted and echoed as `"id": null` for base JSON-RPC 2.0 compatibility (`tests/m5c_challenger_1_stress.rs` 1.6 and `crates/cli/tests/test_mcp_concurrent_and_deadlines.rs` `F31-1`), with `request_id_key` returning `None` so it cannot collide in `in_flight` or be targeted by `notifications/cancelled`.
 - Messages that carry a string `method` and no `id` member are JSON-RPC 2.0 notifications and are dropped silently on `stdout` after handling `notifications/initialized` and `notifications/cancelled`.
 - Unknown tool names and invalid tool arguments in `tools/call` return `INVALID_PARAMS` (`-32602`) before any task is queued.
 

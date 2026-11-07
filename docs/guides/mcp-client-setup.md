@@ -108,13 +108,14 @@ printf '%s\n%s\n%s\n' \
   | <OXIDESWARM_BIN> mcp --master 127.0.0.1:8088
 ```
 
-Expected output on `stdout` when the master is running (three JSON-RPC `2.0` lines, with
-`"cluster_status": "ok"` in response `id: 3`):
+Expected output on `stdout` when the master is running with no workers registered yet (three
+JSON-RPC `2.0` lines, with `"cluster_status": "no_workers"` in response `id: 3`, or `"ok"` when at
+least one worker is connected):
 
 ```text
 {"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"oxideswarm","version":"0.1.0"}}}
 {"jsonrpc":"2.0","id":2,"result":{"tools":[{"description":"Query cluster status, worker counts, or execution state of a specific task ID.","inputSchema":...,"name":"status"},...]}}
-{"jsonrpc":"2.0","id":3,"result":{"content":[{"text":"{\n  \"cluster_status\": \"ok\",\n  \"connected_workers\": 0,\n  \"master\": \"127.0.0.1:8088\",\n  \"total_workers\": 0\n}","type":"text"}],"isError":false}}
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"text":"{\n  \"active_bytes\": 0,\n  \"cluster_status\": \"no_workers\",\n  \"completed_tasks\": 0,\n  \"connected_workers\": 0,\n  \"failed_tasks\": 0,\n  \"master\": \"127.0.0.1:8088\",\n  \"max_active_bytes\": 268435456,\n  \"pending_tasks\": 0,\n  \"running_tasks\": 0,\n  \"total_tasks\": 0,\n  \"total_workers\": 0\n}","type":"text"}],"isError":false}}
 ```
 
 If the master is stopped or unreachable, response `id: 3` reports `"isError": true`:
