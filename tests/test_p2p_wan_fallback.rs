@@ -22,7 +22,10 @@ use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 
 /// Verifies that binding Master with a persistent key file publishes a valid ticket
 /// that contains the discovered N0 home DERP relay URL and remains deterministic across restarts.
+///
+/// Requires live outbound network access to the n0 DERP relay (`relay.n0.iroh.link`).
 #[tokio::test]
+#[ignore = "requires outbound network access to the n0 DERP relay (relay.n0.iroh.link)"]
 async fn test_master_persistent_key_yields_relay_ticket() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let key_file = temp_dir.path().join("master_p2p.key");
@@ -123,7 +126,10 @@ async fn test_master_persistent_key_yields_relay_ticket() {
 /// Verifies that dialing Master via a pure Relay ticket (with all direct IP addresses stripped,
 /// simulating a firewall blocking UDP direct hole-punching) succeeds in establishing
 /// connection, registering worker, and executing tasks over DERP relay.
+///
+/// Requires live outbound network access to the n0 DERP relay (`relay.n0.iroh.link`).
 #[tokio::test]
+#[ignore = "requires outbound network access to the n0 DERP relay (relay.n0.iroh.link)"]
 async fn test_pure_relay_dialing_fallback_under_udp_block() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let key_file = temp_dir.path().join("relay_master.key");
@@ -287,6 +293,7 @@ async fn test_normal_dialing_direct_p2p_and_path_introspection() {
     let master_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let config = ServerConfig::new(master_bind)
         .with_p2p(true)
+        .with_p2p_minimal_preset(true)
         .with_ephemeral_key(true)
         .with_p2p_ticket_file(&ticket_file);
 
@@ -305,7 +312,8 @@ async fn test_normal_dialing_direct_p2p_and_path_introspection() {
         .with_name("direct-p2p-worker")
         .with_cores(2)
         .with_sandbox_base_dir(&worker_sandbox)
-        .with_p2p_ticket(&raw_ticket);
+        .with_p2p_ticket(&raw_ticket)
+        .with_p2p_minimal_preset(true);
 
     let mut worker = WorkerClient::new(worker_config);
     let worker_id = worker.worker_id();
@@ -375,7 +383,10 @@ async fn test_normal_dialing_direct_p2p_and_path_introspection() {
 
 /// Verifies that after Master restarts with the persistent key file, the ticket
 /// remains identical and a reconnecting Worker automatically re-registers with Master.
+///
+/// Requires live outbound network access to the n0 DERP relay (`relay.n0.iroh.link`).
 #[tokio::test]
+#[ignore = "requires outbound network access to the n0 DERP relay (relay.n0.iroh.link)"]
 async fn test_ticket_determinism_and_reconnection() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let key_file = temp_dir.path().join("restart_master.key");

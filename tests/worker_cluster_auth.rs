@@ -416,6 +416,7 @@ async fn test_p2p_worker_authenticates_on_the_control_stream() {
     let master = MasterServer::spawn(
         ServerConfig::new("127.0.0.1:0".parse().unwrap())
             .with_p2p(true)
+            .with_p2p_minimal_preset(true)
             .with_p2p_key_file(dir.path().join("master.key"))
             .with_p2p_ticket_file(&ticket_file)
             .with_cluster_secret(secret.clone()),
@@ -436,6 +437,7 @@ async fn test_p2p_worker_authenticates_on_the_control_stream() {
             .with_cores(2)
             .with_redirection_portal(false)
             .with_p2p_ticket(&ticket)
+            .with_p2p_minimal_preset(true)
             .with_cluster_secret(secret.clone()),
     );
     assert!(
@@ -451,6 +453,7 @@ async fn test_p2p_worker_authenticates_on_the_control_stream() {
             .with_cores(2)
             .with_redirection_portal(false)
             .with_p2p_ticket(&ticket)
+            .with_p2p_minimal_preset(true)
             .with_cluster_secret(self::secret(21)),
     );
     let anonymous = RunningWorker::start(
@@ -459,7 +462,8 @@ async fn test_p2p_worker_authenticates_on_the_control_stream() {
             .with_name("p2p-no-secret")
             .with_cores(2)
             .with_redirection_portal(false)
-            .with_p2p_ticket(&ticket),
+            .with_p2p_ticket(&ticket)
+            .with_p2p_minimal_preset(true),
     );
     tokio::time::sleep(Duration::from_secs(6)).await;
     let names: Vec<String> = master

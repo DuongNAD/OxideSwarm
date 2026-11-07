@@ -654,7 +654,7 @@ mod quic {
     }
 
     async fn local_client() -> iroh::Endpoint {
-        iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
             .relay_mode(iroh::endpoint::RelayMode::Disabled)
             .alpns(vec![GRID_ALPN.to_vec()])
             .bind()
@@ -667,6 +667,7 @@ mod quic {
         let secret = secret(20);
         let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
             .with_p2p(true)
+            .with_p2p_minimal_preset(true)
             .with_ephemeral_key(true)
             .with_handshake_timeout(3)
             .with_cluster_secret(secret.clone());

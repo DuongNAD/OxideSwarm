@@ -936,11 +936,18 @@ pub async fn run_cli() -> ExitCode {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_log_filter(log_level))),
     );
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
     let is_mcp = matches!(cli.command, Commands::Mcp(_));
     let _ = if is_mcp {
         builder.with_writer(std::io::stderr).try_init()
     } else {
-        builder.try_init()
+        builder
+            .with_writer(
+                std::io::stderr
+                    .with_max_level(tracing::Level::WARN)
+                    .or_else(std::io::stdout),
+            )
+            .try_init()
     };
 
     let config_file = match if is_mcp {
@@ -1268,12 +1275,15 @@ async fn run_master(
         3,
     );
 
+    let p2p_minimal = resolve_p2p_minimal();
+
     if let Some(pf) = port_file {
         server_config = server_config.with_port_file(pf);
     }
     server_config = server_config
         .with_heartbeat_interval(heartbeat_interval)
         .with_p2p(enable_p2p)
+        .with_p2p_minimal_preset(p2p_minimal)
         .with_ephemeral_key(ephemeral_key)
         .with_max_retries(default_retry_max);
 
@@ -1789,6 +1799,7 @@ async fn run_worker(
     );
 
     let no_battery = resolve_no_battery();
+    let p2p_minimal = resolve_p2p_minimal();
 
     let max_concurrency = resolve_opt_usize(
         args.max_concurrency,
@@ -1855,6 +1866,9 @@ async fn run_worker(
     }
     if let Some(ticket) = p2p_ticket {
         config = config.with_p2p_ticket(ticket);
+    }
+    if p2p_minimal {
+        config = config.with_p2p_minimal_preset(true);
     }
     if let Some(n) = name {
         config = config.with_name(n);
@@ -2008,6 +2022,13 @@ async fn run_worker(
 /// legacy alias names cannot disable battery/thermal protection).
 pub(crate) fn resolve_no_battery() -> bool {
     resolve_bool(None, &["RUSTY_GRID_NO_BATTERY"], None, false)
+}
+
+/// Reads `RUSTY_GRID_P2P_MINIMAL` (`1`, `true`, `yes`, or `on`, case-insensitive) from the process
+/// environment (and nowhere else: config files and alias names cannot disable DERP relay / address
+/// lookup).
+pub(crate) fn resolve_p2p_minimal() -> bool {
+    resolve_bool(None, &["RUSTY_GRID_P2P_MINIMAL"], None, false)
 }
 
 /// Resolves when the worker is asked to stop: Ctrl-C, and the signals a service manager, `kill`
@@ -5604,22 +5625,145 @@ fail_unfulfillable_tasks = false
         .unwrap();
         let loaded = crate::config::load_config_file(Some(&cfg_path)).unwrap();
         assert!(
-            loaded.and_then(|c| c.worker).is_some(),
-            "config file with unknown no_battery keys must still load without enabling no_battery"
-        );
-        assert!(
-            !resolve_no_battery(),
-            "a config file must never be able to disable battery protection"
+            loaded.as_ref().and_then(|c| c.worker.as_ref()).is_some(),
+            "config file with unknown no_battery keys must still load"
         );
 
-        std::env::set_var("RUSTY_GRID_NO_BATTERY", "1");
-        assert!(
-            resolve_no_battery(),
-            "RUSTY_GRID_NO_BATTERY=1 must disable host battery probing in the CLI layer"
-        );
+        // Pass an explicit cluster secret via Tier 1 (`SecretOpts::value`) so `run_worker` never
+        // consults `OXIDESWARM_SECRET`, `OXIDESWARM_SECRET_FILE`, or `OXIDESWARM_HOME`
+        // (`~/.oxideswarm/cluster.secret`), avoiding process-wide environment mutations.
+        let secret = ClusterSecret::from_bytes(&[0x55; 32]).unwrap();
+        let secret_opts = SecretOpts {
+            value: Some(SecretText(secret.to_hex())),
+            file: None,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rusty_grid_core::capabilities::with_test_battery_probe((Some(10), Some(false)), || {
+            rt.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let master_addr = listener.local_addr().unwrap().to_string();
+
+                let accept_register = || async {
+                    let (stream, _) =
+                        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                            .await
+                            .expect("run_worker must connect to local listener")
+                            .unwrap();
+                    let mut transport = MessageTransport::new(stream);
+                    let session_key = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        rusty_grid_core::cluster_auth::server_handshake(&mut transport, &secret),
+                    )
+                    .await
+                    .expect("run_worker must complete OXS-AUTH handshake in time")
+                    .expect("OXS-AUTH handshake must succeed");
+                    transport.enable_encryption(
+                        &session_key,
+                        rusty_grid_core::protocol::EndpointRole::Server,
+                    );
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        transport.recv_msg::<rusty_grid_core::protocol::WorkerMessage>(),
+                    )
+                    .await
+                    .expect("run_worker must send Register")
+                    .unwrap()
+                    {
+                        Some(rusty_grid_core::protocol::WorkerMessage::Register {
+                            capabilities,
+                            ..
+                        }) => capabilities,
+                        other => panic!("expected WorkerMessage::Register, got {other:?}"),
+                    }
+                };
+
+                let make_worker_args = |sandbox_sub: &str| {
+                    let sb = dir.path().join(sandbox_sub);
+                    let cli = Cli::try_parse_from([
+                        "oxideswarm",
+                        "worker",
+                        "--master",
+                        &master_addr,
+                        "--no-gpu",
+                        "--no-cuda",
+                        "--no-blender",
+                        "--no-portal",
+                        "--sandbox-base-dir",
+                        sb.to_str().unwrap(),
+                    ])
+                    .unwrap();
+                    let Commands::Worker(w_args) = cli.command else {
+                        panic!("expected Worker");
+                    };
+                    w_args
+                };
+
+                // 1. With `no_battery = true` in `rusty-grid.toml` (and alias env vars set), `run_worker`
+                //    must still probe the 10% simulated battery and advertise `battery_pct == Some(10)`.
+                let w_task1 = tokio::spawn(run_worker(
+                    make_worker_args("sb1"),
+                    loaded.clone(),
+                    secret_opts.clone(),
+                ));
+                let caps_from_cfg = accept_register().await;
+                w_task1.abort();
+                assert_eq!(
+                    caps_from_cfg.mobile.as_ref().and_then(|m| m.battery_pct),
+                    Some(10),
+                    "no_battery = true in rusty-grid.toml must not disable battery probing in run_worker"
+                );
+
+                // 2. With `RUSTY_GRID_NO_BATTERY=1` in the environment, `run_worker` disables battery probing.
+                std::env::set_var("RUSTY_GRID_NO_BATTERY", "1");
+                assert!(
+                    resolve_no_battery(),
+                    "RUSTY_GRID_NO_BATTERY=1 must disable host battery probing in the CLI layer"
+                );
+                let w_task2 = tokio::spawn(run_worker(
+                    make_worker_args("sb2"),
+                    loaded,
+                    secret_opts,
+                ));
+                let caps_from_env = accept_register().await;
+                w_task2.abort();
+                assert!(
+                    caps_from_env.mobile.is_none(),
+                    "RUSTY_GRID_NO_BATTERY=1 must suppress host battery probing in run_worker"
+                );
+            });
+        });
 
         std::env::remove_var("RUSTY_GRID_NO_BATTERY");
         std::env::remove_var("OXIDE_SWARM_NO_BATTERY");
         std::env::remove_var("RUSTY_GRID_DISABLE_BATTERY");
+    }
+
+    #[test]
+    fn test_resolve_p2p_minimal_only_accepts_rusty_grid_p2p_minimal_env() {
+        std::env::remove_var("RUSTY_GRID_P2P_MINIMAL");
+        assert!(!resolve_p2p_minimal());
+
+        for disabled in ["0", "false", "no", "off", ""] {
+            std::env::set_var("RUSTY_GRID_P2P_MINIMAL", disabled);
+            assert!(
+                !resolve_p2p_minimal(),
+                "RUSTY_GRID_P2P_MINIMAL={disabled:?} must resolve to false"
+            );
+        }
+
+        for enabled in ["1", "true", "TRUE", "yes", "on"] {
+            std::env::set_var("RUSTY_GRID_P2P_MINIMAL", enabled);
+            assert!(
+                resolve_p2p_minimal(),
+                "RUSTY_GRID_P2P_MINIMAL={enabled:?} must resolve to true"
+            );
+        }
+
+        std::env::remove_var("RUSTY_GRID_P2P_MINIMAL");
+        assert!(!resolve_p2p_minimal());
     }
 }

@@ -4,8 +4,9 @@ on:
   push:
     branches: [master]
   pull_request:
-  # Weekly run so that RustSec advisories published against an unchanged Cargo.lock still show up.
-  # Only the audit job runs on the schedule.
+  # Weekly run so that RustSec advisories published against an unchanged Cargo.lock still show up
+  # and the ignored live Iroh DERP relay P2P tests run against the public relay network.
+  # Only the audit and p2p-wan-relay jobs run on the schedule.
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
@@ -227,3 +228,16 @@ jobs:
           tool: cargo-audit
       # Fails on vulnerabilities; "unmaintained" notices (bincode 1.x, paste) are reported as warnings.
       - run: cargo audit
+
+  p2p-wan-relay:
+    name: p2p wan relay (ignored)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - run: cargo test -p rusty_grid_cli --test test_p2p_wan_fallback --locked -- --ignored
