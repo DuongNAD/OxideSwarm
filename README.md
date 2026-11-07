@@ -629,7 +629,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
 | `OXIDE_MESH_TOKEN` | Agent Mesh | Shared token authenticating `agent-mesh` nodes and HTTP API callers against `agent-mesh hub` (`--token`; stripped from child task environments) |
-| `OXIDE_MESH_TLS_CA` | Agent Mesh | Path to an additional trusted CA certificate (PEM or DER) for `wss://` hub connections behind a private TLS proxy (`--tls-ca`) |
+| `OXIDE_MESH_TLS_CA` | Agent Mesh | Path to an additional trusted CA certificate (PEM or DER) for `wss://` hub connections behind a private TLS proxy (`--tls-ca`; proxy leaf certificate must have `CA:FALSE` and `subjectAltName`, signed by a `CA:TRUE` root) |
 | `OXIDE_MESH_NO_SHELL` | Agent Mesh / Launchers | When set to `1`, disables `shell_exec` command execution on node launchers (`--no-shell`) |
 | `OXIDE_GRID_MASTER` | Agent Mesh | Bind address for the embedded Grid Master inside `agent-mesh hub` (`--grid-master`) |
 

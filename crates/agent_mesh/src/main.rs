@@ -83,7 +83,7 @@ pub enum Commands {
 
         /// Path to an additional trusted CA certificate (PEM or DER) for `wss://` hubs behind a
         /// private TLS-terminating proxy
-        #[arg(long, env = "OXIDE_MESH_TLS_CA")]
+        #[arg(long, env = "OXIDE_MESH_TLS_CA", value_parser = parse_tls_ca_arg)]
         tls_ca: Option<PathBuf>,
 
         /// Disable shell command execution (refuse shell_exec)
@@ -123,7 +123,7 @@ pub enum Commands {
 
         /// Path to an additional trusted CA certificate (PEM or DER) for `wss://` hubs behind a
         /// private TLS-terminating proxy
-        #[arg(long, env = "OXIDE_MESH_TLS_CA")]
+        #[arg(long, env = "OXIDE_MESH_TLS_CA", value_parser = parse_tls_ca_arg)]
         tls_ca: Option<PathBuf>,
     },
 
@@ -143,7 +143,7 @@ pub enum Commands {
 
         /// Path to an additional trusted CA certificate (PEM or DER) for `wss://` hubs behind a
         /// private TLS-terminating proxy
-        #[arg(long, env = "OXIDE_MESH_TLS_CA")]
+        #[arg(long, env = "OXIDE_MESH_TLS_CA", value_parser = parse_tls_ca_arg)]
         tls_ca: Option<PathBuf>,
     },
 
@@ -171,15 +171,26 @@ pub enum Commands {
 
         /// Path to an additional trusted CA certificate (PEM or DER) for `wss://` hubs behind a
         /// private TLS-terminating proxy
-        #[arg(long, env = "OXIDE_MESH_TLS_CA")]
+        #[arg(long, env = "OXIDE_MESH_TLS_CA", value_parser = parse_tls_ca_arg)]
         tls_ca: Option<PathBuf>,
     },
+}
+
+/// Custom value parser for `--tls-ca` / `OXIDE_MESH_TLS_CA` that accepts an empty string
+/// (unlike clap's default `PathBufValueParser`, which rejects `OXIDE_MESH_TLS_CA=""` with exit 2).
+fn parse_tls_ca_arg(raw: &str) -> Result<PathBuf, std::convert::Infallible> {
+    Ok(PathBuf::from(raw))
 }
 
 /// An unset or empty token means "no token" for a client (an empty OXIDE_MESH_TOKEN is how a shell
 /// unsets a variable it cannot remove).
 fn client_token(token: Option<String>) -> Option<String> {
     token.filter(|t| !t.is_empty())
+}
+
+/// An unset or empty `--tls-ca` / `OXIDE_MESH_TLS_CA` means "no custom CA file".
+fn client_tls_ca(tls_ca: Option<PathBuf>) -> Option<PathBuf> {
+    tls_ca.filter(|p| !p.as_os_str().is_empty())
 }
 
 /// Builds a client for `hub_url`, presenting `token` and `tls_ca` if provided.
@@ -194,7 +205,7 @@ fn build_client(
     if let Some(t) = client_token(token) {
         client = client.with_token(t);
     }
-    if let Some(ca) = tls_ca.filter(|p| !p.as_os_str().is_empty()) {
+    if let Some(ca) = client_tls_ca(tls_ca) {
         client = client.with_tls_ca_file(ca);
     }
     client
@@ -392,6 +403,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if no_shell {
                 client = client.with_no_shell(true);
             }
+            client.validate_tls_config()?;
             client.run_daemon().await;
         }
 
@@ -587,22 +599,96 @@ mod tests {
     }
 
     #[test]
-    fn client_commands_accept_tls_ca_flag() {
+    fn client_commands_accept_tls_ca_flag_and_empty_env_value() {
+        use clap::CommandFactory;
+
         let cli = Cli::try_parse_from([
             "agent-mesh",
             "node",
             "--hub",
-            "wss://localhost:8443/ws",
+            "wss://127.0.0.1:8443/ws",
             "--tls-ca",
             "proxy-ca.pem",
         ])
         .unwrap();
         match cli.command {
             Commands::Node { hub, tls_ca, .. } => {
-                assert_eq!(hub, "wss://localhost:8443/ws");
-                assert_eq!(tls_ca.as_deref(), Some(Path::new("proxy-ca.pem")));
+                assert_eq!(hub, "wss://127.0.0.1:8443/ws");
+                assert_eq!(
+                    client_tls_ca(tls_ca).as_deref(),
+                    Some(Path::new("proxy-ca.pem"))
+                );
             }
             other => panic!("unexpected {other:?}"),
         }
+
+        // Empty value (as when OXIDE_MESH_TLS_CA="" is set in the environment) must parse cleanly and resolve to None.
+        for sub in ["node", "list"] {
+            let parsed = Cli::try_parse_from(["agent-mesh", sub, "--tls-ca", ""])
+                .expect("empty --tls-ca / OXIDE_MESH_TLS_CA must not fail clap parsing");
+            let raw_ca = match parsed.command {
+                Commands::Node { tls_ca, .. } | Commands::List { tls_ca, .. } => tls_ca,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert!(
+                client_tls_ca(raw_ca).is_none(),
+                "empty --tls-ca / OXIDE_MESH_TLS_CA must resolve to None"
+            );
+        }
+
+        // Every client subcommand (`node`, `send`, `list`, `data`) must bind `--tls-ca` to `OXIDE_MESH_TLS_CA`.
+        let cmd = Cli::command();
+        for sub_name in ["node", "send", "list", "data"] {
+            let sub = cmd
+                .find_subcommand(sub_name)
+                .unwrap_or_else(|| panic!("missing subcommand {sub_name}"));
+            let tls_ca_arg = sub
+                .get_arguments()
+                .find(|a| a.get_id().as_str() == "tls_ca")
+                .unwrap_or_else(|| panic!("subcommand {sub_name} missing tls_ca arg"));
+            assert_eq!(
+                tls_ca_arg.get_env(),
+                Some(std::ffi::OsStr::new("OXIDE_MESH_TLS_CA")),
+                "subcommand {sub_name} must bind --tls-ca to OXIDE_MESH_TLS_CA"
+            );
+        }
+    }
+
+    #[test]
+    fn build_client_forwards_tls_ca_and_rejects_missing_ca_file() {
+        let missing = PathBuf::from("non_existent_mesh_test_ca_12345.pem");
+        let client_wss = build_client(
+            "wss://127.0.0.1:8443/ws",
+            "node-test",
+            "windows",
+            None,
+            Some(missing.clone()),
+        );
+        let err_wss = client_wss
+            .validate_tls_config()
+            .expect_err("build_client must forward tls_ca so missing file fails on wss://");
+        assert!(
+            err_wss
+                .to_string()
+                .contains("failed to read TLS CA certificate file"),
+            "unexpected error: {err_wss}"
+        );
+
+        let client_ws = build_client(
+            "ws://127.0.0.1:8088/ws",
+            "node-test",
+            "windows",
+            None,
+            Some(missing),
+        );
+        let err_ws = client_ws
+            .validate_tls_config()
+            .expect_err("build_client must forward tls_ca so missing file fails on ws:// too");
+        assert!(
+            err_ws
+                .to_string()
+                .contains("failed to read TLS CA certificate file"),
+            "unexpected error: {err_ws}"
+        );
     }
 }
