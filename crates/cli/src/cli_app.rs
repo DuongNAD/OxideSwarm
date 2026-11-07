@@ -2024,11 +2024,20 @@ pub(crate) fn resolve_no_battery() -> bool {
     resolve_bool(None, &["RUSTY_GRID_NO_BATTERY"], None, false)
 }
 
+/// Parses a `RUSTY_GRID_P2P_MINIMAL` environment value (`1`, `true`, `yes`, or `on`,
+/// case-insensitive). Config files and alias names cannot disable DERP relay / address lookup.
+pub(crate) fn resolve_p2p_minimal_from(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
 /// Reads `RUSTY_GRID_P2P_MINIMAL` (`1`, `true`, `yes`, or `on`, case-insensitive) from the process
 /// environment (and nowhere else: config files and alias names cannot disable DERP relay / address
 /// lookup).
 pub(crate) fn resolve_p2p_minimal() -> bool {
-    resolve_bool(None, &["RUSTY_GRID_P2P_MINIMAL"], None, false)
+    resolve_p2p_minimal_from(std::env::var("RUSTY_GRID_P2P_MINIMAL").ok().as_deref())
 }
 
 /// Resolves when the worker is asked to stop: Ctrl-C, and the signals a service manager, `kill`
@@ -5744,26 +5753,22 @@ fail_unfulfillable_tasks = false
 
     #[test]
     fn test_resolve_p2p_minimal_only_accepts_rusty_grid_p2p_minimal_env() {
-        std::env::remove_var("RUSTY_GRID_P2P_MINIMAL");
-        assert!(!resolve_p2p_minimal());
+        assert!(!resolve_p2p_minimal_from(None));
 
-        for disabled in ["0", "false", "no", "off", ""] {
-            std::env::set_var("RUSTY_GRID_P2P_MINIMAL", disabled);
+        for disabled in ["0", "false", "FALSE", "no", "off", "", "   ", "2"] {
             assert!(
-                !resolve_p2p_minimal(),
+                !resolve_p2p_minimal_from(Some(disabled)),
                 "RUSTY_GRID_P2P_MINIMAL={disabled:?} must resolve to false"
             );
         }
 
-        for enabled in ["1", "true", "TRUE", "yes", "on"] {
-            std::env::set_var("RUSTY_GRID_P2P_MINIMAL", enabled);
+        for enabled in [
+            "1", "true", "TRUE", "yes", "YES", "on", "ON", " 1 ", " true ",
+        ] {
             assert!(
-                resolve_p2p_minimal(),
+                resolve_p2p_minimal_from(Some(enabled)),
                 "RUSTY_GRID_P2P_MINIMAL={enabled:?} must resolve to true"
             );
         }
-
-        std::env::remove_var("RUSTY_GRID_P2P_MINIMAL");
-        assert!(!resolve_p2p_minimal());
     }
 }
