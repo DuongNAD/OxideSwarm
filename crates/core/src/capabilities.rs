@@ -280,10 +280,14 @@ pub fn calculate_keepalive_interval(network_type: &str, active_tasks: usize) -> 
         return Duration::from_secs(10);
     }
     let n = network_type.to_ascii_lowercase();
+    let is_wifi = n.contains("wifi") || n.contains("wi-fi") || n.contains("wlan");
+    let has_5g_token = !is_wifi
+        && n.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|token| token == "5g" || token == "5gnr");
     let is_cellular = n.contains("cellular")
         || n.contains("mobile")
         || n.contains("lte")
-        || (n.contains("5g") && !n.contains("5ghz") && !n.contains("5 ghz"))
+        || has_5g_token
         || n.contains("4g")
         || n.contains("3g")
         || n.contains("cgnat");
@@ -2273,6 +2277,22 @@ mod tests {
             Duration::from_secs(60)
         );
         assert_eq!(
+            calculate_keepalive_interval("wifi-5g", 0),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("wi-fi 5g", 0),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("wlan-5g", 0),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("wifi 5ghz", 0),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
             calculate_keepalive_interval("wifi", 1),
             Duration::from_secs(10)
         );
@@ -2286,6 +2306,14 @@ mod tests {
         );
         assert_eq!(
             calculate_keepalive_interval("cellular", 0),
+            Duration::from_secs(25)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("5g", 0),
+            Duration::from_secs(25)
+        );
+        assert_eq!(
+            calculate_keepalive_interval("5G NR", 0),
             Duration::from_secs(25)
         );
         assert_eq!(
