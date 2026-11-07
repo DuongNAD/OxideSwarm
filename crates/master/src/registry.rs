@@ -26,10 +26,10 @@ pub const RX_LIVENESS_CEILING_FACTOR: u32 = 60;
 pub const REJECTION_COOLDOWN_BASE: Duration = Duration::from_secs(5);
 /// Upper bound of the rejection cooldown.
 pub const REJECTION_COOLDOWN_MAX: Duration = Duration::from_secs(60);
-/// Maximum time a newly registered mobile worker connection is held back from scheduling while
-/// waiting for its first post-`RegisterAck` `WorkerMessage::MobileTelemetry` frame
+/// Maximum time a newly registered or re-registered mobile worker connection is held back from
+/// scheduling while waiting for its first post-`RegisterAck` `WorkerMessage::MobileTelemetry` frame
 /// (`2 × MOBILE_TELEMETRY_CHECK_INTERVAL`).
-pub const MOBILE_INITIAL_TELEMETRY_HOLD: Duration = Duration::from_secs(2);
+pub const MOBILE_INITIAL_TELEMETRY_HOLD: Duration = Duration::from_secs(4);
 /// Maximum time a re-registered mobile worker retains the previous session's `battery_temperature`
 /// and `thermal_tier` when the new session has not yet sent `WorkerMessage::MobileTelemetry`.
 pub const PRESERVED_THERMAL_TTL: Duration = Duration::from_secs(10);
@@ -360,7 +360,15 @@ impl WorkerRegistry {
             existing.rx_clock = None;
             // A fresh Register carries a fresh capability snapshot, so a past rejection streak no longer applies.
             existing.consecutive_rejections = 0;
-            existing.excluded_until = None;
+            // Hold a re-registering mobile worker until its first post-RegisterAck
+            // `MobileTelemetry` frame arrives (capped at `MOBILE_INITIAL_TELEMETRY_HOLD`) so a
+            // phone that was Normal in session 1 and heated up while disconnected is not scheduled
+            // before its new session's telemetry arrives.
+            existing.excluded_until = existing
+                .capabilities
+                .mobile
+                .as_ref()
+                .map(|_| now_instant + MOBILE_INITIAL_TELEMETRY_HOLD);
             let thermal_expired = existing
                 .preserved_thermal_until
                 .is_some_and(|until| now_instant >= until);
@@ -415,8 +423,9 @@ impl WorkerRegistry {
             // `MobileTelemetry` frame arrives (capped at `MOBILE_INITIAL_TELEMETRY_HOLD`, i.e.
             // `2 × MOBILE_TELEMETRY_CHECK_INTERVAL`) so the background scheduler does not place
             // queued work on the un-hydrated `Register` snapshot over slow LTE or relay links.
-            let excluded_until = (mobile_status.is_some() && !features.is_empty())
-                .then(|| now_instant + MOBILE_INITIAL_TELEMETRY_HOLD);
+            let excluded_until = mobile_status
+                .as_ref()
+                .map(|_| now_instant + MOBILE_INITIAL_TELEMETRY_HOLD);
             let entry = WorkerEntry {
                 worker_id,
                 session_id,
@@ -907,6 +916,14 @@ impl WorkerRegistry {
         let mut inner = self.inner.write().await;
         if let Some(entry) = inner.workers.get_mut(worker_id) {
             entry.preserved_thermal_until = Some(Instant::now() - Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn expire_initial_telemetry_hold(&self, worker_id: &Uuid) {
+        let mut inner = self.inner.write().await;
+        if let Some(entry) = inner.workers.get_mut(worker_id) {
+            entry.excluded_until = None;
         }
     }
 
@@ -2374,6 +2391,9 @@ mod tests {
             )
             .await
             .unwrap();
+        // Expire the 4 s initial telemetry hold so that `list_schedulable_workers` tests the 10 s
+        // `PRESERVED_THERMAL_TTL` retention specifically.
+        registry.expire_initial_telemetry_hold(&id).await;
         let workers = registry.list_schedulable_workers().await;
         let report_before_telemetry =
             WorkloadScheduler::matchmake(&config, std::slice::from_ref(&task), &workers);
@@ -2516,5 +2536,99 @@ mod tests {
                 "sentinel network_type {sentinel:?} must retain the 25 s cellular interval instead of dropping to None"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_reregister_holds_normal_mobile_worker_until_telemetry_or_hold_cap() {
+        use crate::scheduler::{SchedulerConfig, WorkloadScheduler};
+        use rusty_grid_core::capabilities::{BatteryTier, ThermalTier};
+        use rusty_grid_core::task::{Task, TaskSpec};
+
+        assert_eq!(
+            MOBILE_INITIAL_TELEMETRY_HOLD,
+            Duration::from_secs(4),
+            "MOBILE_INITIAL_TELEMETRY_HOLD must be 4 s (2 × 2 s MOBILE_TELEMETRY_CHECK_INTERVAL)"
+        );
+
+        let registry = WorkerRegistry::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let id = Uuid::new_v4();
+        let config = SchedulerConfig::default();
+        let task = Task::new(
+            TaskSpec::command("echo", vec!["1".into()]),
+            TaskRequirements::generic(1, 60),
+        );
+
+        // Session 1: registers and reports Normal battery and thermal state.
+        let s1 = registry
+            .register(
+                id,
+                phone_caps(90, true, false),
+                "127.0.0.1:9038".parse().unwrap(),
+                tx.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        registry
+            .update_mobile_telemetry(
+                &id,
+                Some(s1),
+                MobileLiveStatus {
+                    battery_pct: Some(90),
+                    is_charging: Some(true),
+                    thermal_throttled: false,
+                    battery_temperature: Some(33.0),
+                    battery_tier: Some(BatteryTier::Normal),
+                    thermal_tier: Some(ThermalTier::Normal),
+                    network_type: Some("wifi".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let workers_s1 = registry.list_schedulable_workers().await;
+        assert_eq!(
+            WorkloadScheduler::matchmake(&config, std::slice::from_ref(&task), &workers_s1)
+                .assignments
+                .len(),
+            1,
+            "Healthy phone in session 1 must receive 1 slot after telemetry"
+        );
+
+        // Session 2: re-registers with mobile data. Before session 2's first telemetry arrives,
+        // `matchmake` (fed by `list_schedulable_workers`) must return 0 assignments.
+        let _s2 = registry
+            .register(
+                id,
+                phone_caps(90, true, false),
+                "127.0.0.1:9038".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+        let workers_before_telemetry = registry.list_schedulable_workers().await;
+        assert_eq!(
+            WorkloadScheduler::matchmake(
+                &config,
+                std::slice::from_ref(&task),
+                &workers_before_telemetry,
+            )
+            .assignments
+            .len(),
+            0,
+            "Worker that was Normal in session 1 and re-registers must get 0 from matchmake before telemetry"
+        );
+
+        // After `MOBILE_INITIAL_TELEMETRY_HOLD` (4 s) expires, `matchmake` returns 1 assignment.
+        registry.expire_initial_telemetry_hold(&id).await;
+        let workers_after_cap = registry.list_schedulable_workers().await;
+        assert_eq!(
+            WorkloadScheduler::matchmake(&config, std::slice::from_ref(&task), &workers_after_cap)
+                .assignments
+                .len(),
+            1,
+            "Worker that was Normal in session 1 and re-registers must get 1 from matchmake after the hold cap"
+        );
     }
 }

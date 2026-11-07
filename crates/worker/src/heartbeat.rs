@@ -391,7 +391,7 @@ impl MobileTelemetryHandle {
             .live
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = live;
-        self.notify.notify_waiters();
+        self.notify.notify_one();
     }
 
     /// Replaces the fast-changing readings. The OS / SoC descriptors are kept; if nothing was set
@@ -429,7 +429,7 @@ impl MobileTelemetryHandle {
             .live
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(status);
-        self.notify.notify_waiters();
+        self.notify.notify_one();
     }
 
     /// The fast-changing readings alone, `None` while nothing is known.
