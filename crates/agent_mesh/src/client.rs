@@ -167,10 +167,10 @@ impl AgentMeshClient {
         self.received_payloads.read().await.clone()
     }
 
-    /// Validates any configured custom TLS CA certificate file or bytes and builds the `Connector`
-    /// for `wss://` URLs. On plain `ws://` URLs, still validates `--tls-ca` so a missing or
-    /// malformed CA file fails fast, logs a warning if a custom CA was passed on `ws://`, and
-    /// returns `Ok(None)`.
+    /// Validates any configured custom TLS CA certificate file or bytes and verifies that the TLS
+    /// `Connector` can be constructed for `wss://` URLs. On plain `ws://` URLs, still validates
+    /// `--tls-ca` so a missing or malformed CA file fails fast, logs a warning if a custom CA was
+    /// passed on `ws://`, and returns `Ok(())`.
     pub fn validate_tls_config(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.build_tls_connector().map(|_| ())
     }
