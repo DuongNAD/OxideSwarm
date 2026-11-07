@@ -342,10 +342,6 @@ mod tests {
             .await
             .unwrap();
         registry
-            .record_heartbeat(&worker_id, 0, 100, 12.0, 6000, Some(session))
-            .await
-            .unwrap();
-        registry
             .update_mobile_telemetry(
                 &worker_id,
                 Some(session),
@@ -356,6 +352,10 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
+            .unwrap();
+        registry
+            .record_heartbeat(&worker_id, 0, 100, 12.0, 6000, Some(session))
             .await
             .unwrap();
 

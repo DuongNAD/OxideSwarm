@@ -1258,3 +1258,99 @@ async fn test_worker_with_1s_negotiated_interval_does_not_reconnect_within_15s_a
     let _ = w_shutdown_tx.send(true);
     let _ = master.shutdown();
 }
+
+/// Integration test for Round-2 Item 1:
+/// An idle Wi-Fi phone that switches to `network_type: None` (for example while Wi-Fi roams)
+/// restarts its heartbeat timer to the negotiated interval and keeps the master's 4 × 60 s window
+/// until its next heartbeat, staying in session 1 for 25 s with a 10 s reaper.
+#[tokio::test]
+async fn test_idle_wifi_phone_switching_to_unknown_network_stays_in_session_1_for_25s_with_10s_reaper(
+) {
+    use rusty_grid_master::reaper::ReaperConfig;
+    use rusty_grid_master::scheduler::SchedulerConfig;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let server_config =
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_heartbeat_interval(3);
+    let reaper_config = ReaperConfig::new(Duration::from_millis(250), Duration::from_secs(10));
+    let master =
+        MasterServer::spawn_with_config(server_config, SchedulerConfig::default(), reaper_config)
+            .await
+            .expect("master spawn");
+    let master_addr = master.server_addr().to_string();
+
+    let (w_shutdown_tx, w_shutdown_rx) = watch::channel(false);
+    let w_id = Uuid::new_v4();
+    let config = WorkerConfig::new(&master_addr)
+        .with_no_battery(true)
+        .with_name("wifi-phone-roaming")
+        .with_cores(2)
+        .with_worker_id(w_id)
+        .with_sandbox_base_dir(temp_dir.path().join("w_roaming"));
+    let mut worker = WorkerClient::new(config);
+    let mobile_handle = worker.mobile_telemetry();
+    mobile_handle.update(MobileLiveStatus {
+        battery_pct: Some(85),
+        is_charging: Some(false),
+        network_type: Some("wifi".into()),
+        ..Default::default()
+    });
+
+    tokio::spawn(async move {
+        let _ = worker.run(w_shutdown_rx).await;
+    });
+
+    assert!(
+        wait_for(
+            Duration::from_secs(3),
+            Duration::from_millis(50),
+            || async {
+                master
+                    .registry()
+                    .worker_network_type(&w_id)
+                    .await
+                    .as_deref()
+                    == Some("wifi")
+            }
+        )
+        .await,
+        "Idle Wi-Fi phone must register and report network_type=wifi"
+    );
+    assert_eq!(
+        master.registry().get_worker(w_id).await.unwrap().session_id,
+        1
+    );
+
+    // After ~1 s on Wi-Fi (while the worker's heartbeat ticker was armed for 60 s), switch
+    // network_type to None (simulating Wi-Fi roaming / activeNetwork without capabilities).
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    mobile_handle.update(MobileLiveStatus {
+        battery_pct: Some(85),
+        is_charging: Some(false),
+        network_type: None,
+        ..Default::default()
+    });
+
+    assert!(
+        wait_for(
+            Duration::from_secs(3),
+            Duration::from_millis(50),
+            || async { master.registry().worker_network_type(&w_id).await.is_none() }
+        )
+        .await,
+        "Master must observe network_type=None after telemetry update"
+    );
+
+    // Wait 25 s with the 10 s reaper running: the phone must remain Connected in session 1.
+    tokio::time::sleep(Duration::from_millis(25_200)).await;
+
+    let info = master.registry().get_worker(w_id).await.unwrap();
+    assert_eq!(
+        info.session_id, 1,
+        "Idle Wi-Fi phone switching to network_type=None must stay in session 1 for 25 s with a 10 s reaper"
+    );
+    assert_eq!(info.status, WorkerStatus::Connected);
+
+    let _ = w_shutdown_tx.send(true);
+    let _ = master.shutdown();
+}

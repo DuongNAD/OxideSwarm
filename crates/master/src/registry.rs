@@ -226,7 +226,7 @@ pub enum HeartbeatOutcome {
 
 struct WorkerRegistryInner {
     workers: HashMap<Uuid, WorkerEntry>,
-    network_types: HashMap<Uuid, String>,
+    network_types: HashMap<Uuid, Option<String>>,
     next_session_id: u64,
 }
 
@@ -556,10 +556,10 @@ impl WorkerRegistry {
         entry.reported_active_tasks = active_tasks;
         entry.cpu_usage_pct = cpu_usage_pct;
         entry.ram_available_mb = ram_available_mb;
-        if let Some(ref net) = known_net {
-            entry.heartbeat_interval = Some(
-                rusty_grid_core::capabilities::calculate_keepalive_interval(net, active_tasks),
-            );
+        if let Some(reported_net) = known_net {
+            entry.heartbeat_interval = reported_net.as_deref().map(|net| {
+                rusty_grid_core::capabilities::calculate_keepalive_interval(net, active_tasks)
+            });
         }
         let revive = entry.status == WorkerStatus::Disconnected && expected_session.is_some();
         if entry.status != WorkerStatus::Disconnected || revive {
@@ -593,6 +593,11 @@ impl WorkerRegistry {
         status: MobileLiveStatus,
     ) -> GridResult<bool> {
         let mut inner = self.inner.write().await;
+        let had_reported_net = inner
+            .network_types
+            .get(worker_id)
+            .and_then(|n| n.as_ref())
+            .is_some();
         let entry = inner
             .workers
             .get_mut(worker_id)
@@ -602,14 +607,8 @@ impl WorkerRegistry {
                 return Ok(false);
             }
         }
-        let candidate = status.adaptive_keepalive_interval(entry.reported_active_tasks);
-        entry.heartbeat_interval = match (entry.heartbeat_interval, candidate) {
-            (Some(prev), Some(next)) if entry.active_tasks > entry.reported_active_tasks => {
-                Some(prev.max(next))
-            }
-            (_, next) => next,
-        };
-        let known_net = status
+        let mut status = status;
+        status.network_type = status
             .network_type
             .as_deref()
             .map(str::trim)
@@ -619,6 +618,21 @@ impl WorkerRegistry {
                     && !s.eq_ignore_ascii_case("none")
             })
             .map(str::to_string);
+        let candidate = status.adaptive_keepalive_interval(entry.reported_active_tasks);
+        // Never shorten an already-established dead-peer window on a telemetry push: the worker
+        // keeps its old heartbeat timer until its next tick (or restarts its timer when the new
+        // reading is shorter and sends a Heartbeat within that shorter interval). `record_heartbeat`
+        // applies the shortened or `None` window once the worker's next Heartbeat arrives.
+        entry.heartbeat_interval = match (entry.heartbeat_interval, candidate) {
+            (Some(prev), Some(next))
+                if had_reported_net || entry.active_tasks > entry.reported_active_tasks =>
+            {
+                Some(prev.max(next))
+            }
+            (Some(prev), None) => Some(prev),
+            (_, next) => next,
+        };
+        let known_net = status.network_type.clone();
         let updated = match entry.capabilities.mobile.as_ref() {
             Some(current) => current.with_live_status(status),
             // The worker registered without mobile data but now reports some (an app feeding
@@ -633,14 +647,7 @@ impl WorkerRegistry {
         };
         let changed = entry.capabilities.mobile.as_ref() != Some(&updated);
         entry.capabilities.mobile = Some(updated);
-        match known_net {
-            Some(net) => {
-                inner.network_types.insert(*worker_id, net);
-            }
-            None => {
-                inner.network_types.remove(worker_id);
-            }
-        }
+        inner.network_types.insert(*worker_id, known_net);
         Ok(changed)
     }
 
@@ -674,7 +681,11 @@ impl WorkerRegistry {
     /// its books from zero, so its counter is left alone.
     pub async fn release_dispatch(&self, worker_id: &Uuid, session_id: u64) {
         let mut inner = self.inner.write().await;
-        let known_net = inner.network_types.get(worker_id).cloned();
+        let known_net = inner
+            .network_types
+            .get(worker_id)
+            .and_then(|n| n.as_ref())
+            .cloned();
         if let Some(entry) = inner.workers.get_mut(worker_id) {
             if entry.session_id == session_id {
                 entry.active_tasks = entry.active_tasks.saturating_sub(1);
@@ -773,7 +784,11 @@ impl WorkerRegistry {
     /// Atomically decrements the active task count for a worker and updates status to Connected if 0.
     pub async fn decrement_active_tasks(&self, worker_id: &Uuid) -> GridResult<usize> {
         let mut inner = self.inner.write().await;
-        let known_net = inner.network_types.get(worker_id).cloned();
+        let known_net = inner
+            .network_types
+            .get(worker_id)
+            .and_then(|n| n.as_ref())
+            .cloned();
         let entry = inner
             .workers
             .get_mut(worker_id)
@@ -798,7 +813,11 @@ impl WorkerRegistry {
     /// Returns the last mobile `network_type` reported by `worker_id`, if any.
     pub async fn worker_network_type(&self, worker_id: &Uuid) -> Option<String> {
         let inner = self.inner.read().await;
-        inner.network_types.get(worker_id).cloned()
+        inner
+            .network_types
+            .get(worker_id)
+            .and_then(|n| n.as_ref())
+            .cloned()
     }
 
     #[cfg(test)]
@@ -1982,8 +2001,9 @@ mod tests {
             .unwrap();
 
         // 1. A newly registered mobile worker keeps a 4 × 60 s window (`Some(60s)`) until its
-        // first `MobileTelemetry` of the session; a battery laptop (`network_type: None`) then
-        // switches to the negotiated/reaper timeout (`None`).
+        // first `MobileTelemetry` AND next `Heartbeat` of the session; a battery laptop
+        // (`network_type: None`) keeps `Some(60s)` across `update_mobile_telemetry` and switches
+        // to the negotiated/reaper timeout (`None`) on its next `record_heartbeat`.
         {
             let inner = registry.inner.read().await;
             assert_eq!(
@@ -1991,10 +2011,6 @@ mod tests {
                 Some(Duration::from_secs(60))
             );
         }
-        registry
-            .record_heartbeat(&id, 0, 100, 10.0, 4096, Some(session))
-            .await
-            .unwrap();
         registry
             .update_mobile_telemetry(
                 &id,
@@ -2006,6 +2022,18 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
+            .unwrap();
+        {
+            let inner = registry.inner.read().await;
+            assert_eq!(
+                inner.workers[&id].heartbeat_interval,
+                Some(Duration::from_secs(60)),
+                "update_mobile_telemetry with network_type=None must preserve the previous window until the next heartbeat"
+            );
+        }
+        registry
+            .record_heartbeat(&id, 0, 100, 10.0, 4096, Some(session))
             .await
             .unwrap();
         {
