@@ -303,6 +303,8 @@ pub struct HardwareOverrides {
     pub vram_mb: Option<u64>,
     pub cuda: Option<bool>,
     pub no_cuda: bool,
+    /// Disables host battery and mobile capability probing (`pmset`, `/sys/class/power_supply`, `dumpsys`).
+    pub no_battery: bool,
 }
 
 /// Represents the hardware resources and computational capabilities of a Worker node.
@@ -672,7 +674,11 @@ impl WorkerCapabilities {
             false
         };
 
-        let mobile = detect_mobile_capabilities();
+        let mobile = if overrides.no_battery {
+            None
+        } else {
+            detect_mobile_capabilities()
+        };
 
         Self {
             name,
@@ -841,6 +847,30 @@ fn detect_physical_gpu() -> (bool, bool, Option<String>) {
     (false, false, None)
 }
 
+std::thread_local! {
+    static TEST_BATTERY_PROBE: std::cell::Cell<Option<(Option<u8>, Option<bool>)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Overrides the host battery reading returned by `detect_battery` on the current thread for the
+/// duration of `f`. Used by unit tests to simulate a discharging battery on any host (such as a
+/// headless CI runner without a battery).
+pub fn with_test_battery_probe<R>(reading: (Option<u8>, Option<bool>), f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<(Option<u8>, Option<bool>)>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_BATTERY_PROBE.with(|c| c.set(self.0));
+        }
+    }
+    let prev = TEST_BATTERY_PROBE.with(|c| {
+        let prev = c.get();
+        c.set(Some(reading));
+        prev
+    });
+    let _reset = Reset(prev);
+    f()
+}
+
 /// Auto-detects mobile hardware attributes and real-time battery/thermal status.
 /// Returns `None` on standard desktop/server environments without battery unless on Android.
 pub fn detect_mobile_capabilities() -> Option<MobileCapabilities> {
@@ -893,6 +923,9 @@ fn is_android_env() -> bool {
 }
 
 fn detect_battery() -> (Option<u8>, Option<bool>) {
+    if let Some(reading) = TEST_BATTERY_PROBE.with(|c| c.get()) {
+        return reading;
+    }
     // 1. Linux/Android sysfs: /sys/class/power_supply
     let (sysfs_pct, sysfs_charging) =
         parse_sysfs_power_supply(std::path::Path::new("/sys/class/power_supply"));

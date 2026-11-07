@@ -1009,6 +1009,7 @@ impl PipelineCluster {
         for i in 0..num_workers {
             let temp_dir = TempDir::new().expect("worker tempdir");
             let worker_cfg = WorkerConfig::new(master_addr.to_string())
+                .with_no_battery(true)
                 .with_name(&format!("e2e-worker-{}", i + 1))
                 .with_cores(4)
                 .with_ram_mb(8192)
@@ -1707,6 +1708,7 @@ async fn test_adversarial_worker_crash_rescheduling() {
 
     let mut w1 = WorkerClient::new(
         WorkerConfig::new(master_addr.clone())
+            .with_no_battery(true)
             .with_name("crash-w1")
             .with_cores(4)
             .with_ram_mb(8192)
@@ -1718,6 +1720,7 @@ async fn test_adversarial_worker_crash_rescheduling() {
 
     let mut w2 = WorkerClient::new(
         WorkerConfig::new(master_addr.clone())
+            .with_no_battery(true)
             .with_name("crash-w2")
             .with_cores(4)
             .with_ram_mb(8192)

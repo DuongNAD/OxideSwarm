@@ -547,6 +547,7 @@ async fn test_cli_deeply_nested_output_directory_creation() {
     // 2. Spawn in-process Worker
     let worker_temp = TempDir::new().unwrap();
     let worker_cfg = WorkerConfig::new(master_addr.to_string())
+        .with_no_battery(true)
         .with_name("worker-cli-adversarial")
         .with_cores(4)
         .with_ram_mb(8192)

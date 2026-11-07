@@ -35,6 +35,7 @@ async fn spawn_master(secret: Option<&ClusterSecret>) -> MasterHandle {
 
 fn worker_config(addr: SocketAddr, name: &str, secret: Option<&ClusterSecret>) -> WorkerConfig {
     let mut config = WorkerConfig::new(addr.to_string())
+        .with_no_battery(true)
         .with_name(name)
         .with_cores(2)
         .with_redirection_portal(false);
@@ -430,6 +431,7 @@ async fn test_p2p_worker_authenticates_on_the_control_stream() {
     // The iroh ticket only addresses the master; the right secret is what lets a worker in.
     let good = RunningWorker::start(
         WorkerConfig::new("auto")
+            .with_no_battery(true)
             .with_name("p2p-authed")
             .with_cores(2)
             .with_redirection_portal(false)
@@ -444,6 +446,7 @@ async fn test_p2p_worker_authenticates_on_the_control_stream() {
     // Same ticket, wrong or missing secret: connected at the QUIC level, refused at OXS-AUTH.
     let wrong = RunningWorker::start(
         WorkerConfig::new("auto")
+            .with_no_battery(true)
             .with_name("p2p-wrong-secret")
             .with_cores(2)
             .with_redirection_portal(false)
@@ -452,6 +455,7 @@ async fn test_p2p_worker_authenticates_on_the_control_stream() {
     );
     let anonymous = RunningWorker::start(
         WorkerConfig::new("auto")
+            .with_no_battery(true)
             .with_name("p2p-no-secret")
             .with_cores(2)
             .with_redirection_portal(false)

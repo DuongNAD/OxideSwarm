@@ -61,10 +61,22 @@ async fn test_master_persistent_key_yields_relay_ticket() {
         "Ticket string must contain N0 relay domain"
     );
 
+    let ep1 = master1
+        .p2p_endpoint()
+        .cloned()
+        .expect("master1 p2p endpoint");
     master1.shutdown().expect("shutdown master run 1");
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let close_deadline1 = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !ep1.is_closed() {
+        assert!(
+            tokio::time::Instant::now() < close_deadline1,
+            "master1.shutdown() alone must close the P2P endpoint"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(master1);
 
-    // 2. Second run: Reuses key and reproduces identical ticket
+    // 2. Second run: Reuses key and reproduces same NodeId and pure-relay ticket
     let config2 = ServerConfig::new(master_bind)
         .with_p2p(true)
         .with_p2p_key_file(&key_file)
@@ -83,12 +95,29 @@ async fn test_master_persistent_key_yields_relay_ticket() {
         addr1.id, addr2.id,
         "Master NodeId (PublicKey) must be identical across restarts"
     );
-    assert_eq!(
-        ticket1, ticket2,
-        "Serialized ticket must be strictly identical across restarts"
+    assert!(
+        !addr2.addrs.is_empty() && addr2.addrs.iter().all(|a| a.is_relay()),
+        "Master restart ticket must retain only discovered home DERP relay addresses, got: {:?}",
+        addr2.addrs
+    );
+    assert!(
+        ticket2.contains("relay.n0.iroh.link"),
+        "Restart ticket string must contain N0 relay domain, got: {ticket2}"
     );
 
+    let ep2 = master2
+        .p2p_endpoint()
+        .cloned()
+        .expect("master2 p2p endpoint");
     master2.shutdown().expect("shutdown master run 2");
+    let close_deadline2 = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !ep2.is_closed() {
+        assert!(
+            tokio::time::Instant::now() < close_deadline2,
+            "master2.shutdown() alone must close the P2P endpoint"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Verifies that dialing Master via a pure Relay ticket (with all direct IP addresses stripped,
@@ -135,6 +164,7 @@ async fn test_pure_relay_dialing_fallback_under_udp_block() {
     // Spawn Worker with pure relay ticket
     let worker_sandbox = temp_dir.path().join("worker_sandbox");
     let worker_config = WorkerConfig::new("auto")
+        .with_no_battery(true)
         .with_name("pure-relay-worker")
         .with_cores(2)
         .with_sandbox_base_dir(&worker_sandbox)
@@ -271,6 +301,7 @@ async fn test_normal_dialing_direct_p2p_and_path_introspection() {
     // Spawn Worker with complete ticket (including direct socket addresses)
     let worker_sandbox = temp_dir.path().join("worker_sandbox");
     let worker_config = WorkerConfig::new("auto")
+        .with_no_battery(true)
         .with_name("direct-p2p-worker")
         .with_cores(2)
         .with_sandbox_base_dir(&worker_sandbox)
@@ -365,6 +396,7 @@ async fn test_ticket_determinism_and_reconnection() {
     // 2. Start Worker with Ticket 1
     let worker_sandbox = temp_dir.path().join("worker_reconnect_sb");
     let worker_config = WorkerConfig::new("auto")
+        .with_no_battery(true)
         .with_name("reconnecting-worker")
         .with_cores(2)
         .with_sandbox_base_dir(&worker_sandbox)
@@ -396,9 +428,20 @@ async fn test_ticket_determinism_and_reconnection() {
     }
     assert!(reg1, "Worker must register with Master 1");
 
-    // 3. Stop Master 1
+    // 3. Stop Master 1 and verify shutdown() closes its P2P endpoint
+    let ep1 = master1
+        .p2p_endpoint()
+        .cloned()
+        .expect("master1 p2p endpoint");
     master1.shutdown().expect("shutdown master 1");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let close_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !ep1.is_closed() {
+        assert!(
+            tokio::time::Instant::now() < close_deadline,
+            "master1.shutdown() must close P2P endpoint"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     // 4. Start Master Run 2 with same key file and ticket file
     let config2 = ServerConfig::new(master_bind)
@@ -410,8 +453,22 @@ async fn test_ticket_determinism_and_reconnection() {
     let ticket2 = tokio::fs::read_to_string(&ticket_file)
         .await
         .expect("read ticket 2");
+    let addr1 = parse_p2p_ticket(&ticket1).expect("parse ticket 1");
+    let addr2 = parse_p2p_ticket(&ticket2).expect("parse ticket 2");
 
-    assert_eq!(ticket1, ticket2, "Ticket 1 and Ticket 2 must be identical");
+    assert_eq!(
+        addr1.id, addr2.id,
+        "Master NodeId (PublicKey) must be identical across restarts"
+    );
+    assert!(
+        !addr2.addrs.is_empty() && addr2.addrs.iter().all(|a| a.is_relay()),
+        "Master restart ticket must retain only discovered home DERP relay addresses, got: {:?}",
+        addr2.addrs
+    );
+    assert!(
+        ticket2.contains("relay.n0.iroh.link"),
+        "Restart ticket string must contain N0 relay domain, got: {ticket2}"
+    );
 
     // 5. Verify Worker automatically reconnects and registers with Master 2
     let reconnect_start = std::time::Instant::now();

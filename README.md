@@ -608,6 +608,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_BLOB_CACHE_MB` | Worker | Megabytes of task input and output files cached in `<sandbox base>/cache/blobs` (`--blob-cache-mb`; default `2048`) |
 | `RUSTY_GRID_OUTPUT_LIMIT_MB` | Worker | Megabytes of output files one task may bring back; more fails the task (`--output-limit-mb`; default `1024`) |
 | `RUSTY_GRID_NO_PORTAL` | Worker | Leaves out the standby portal on `0.0.0.0:8080` (`--no-portal`), e.g. for a second worker on one machine |
+| `RUSTY_GRID_NO_BATTERY` | Worker | Disables host battery and thermal probing in `oxideswarm worker` (`1`, `true`, `yes`, or `on`), logging a startup warning ([design 0028](docs/design/0028-host-battery-probe-override.md)) |
 
 #### Tier D: Task Child Process Injection Environment
 | Variable | Component | Purpose |

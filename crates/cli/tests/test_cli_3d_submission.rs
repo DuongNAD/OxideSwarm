@@ -55,6 +55,7 @@ async fn test_cli_3d_sdf_submission_and_export() {
     // 2. Spawn in-process Worker
     let worker_temp = TempDir::new().unwrap();
     let worker_cfg = WorkerConfig::new(master_addr.to_string())
+        .with_no_battery(true)
         .with_name("worker-3d")
         .with_cores(4)
         .with_ram_mb(8192)
@@ -140,6 +141,7 @@ async fn test_cli_autorig_submission_and_export() {
     // 2. Spawn in-process Worker
     let worker_temp = TempDir::new().unwrap();
     let worker_cfg = WorkerConfig::new(master_addr.to_string())
+        .with_no_battery(true)
         .with_name("worker-autorig")
         .with_cores(4)
         .with_ram_mb(8192)
@@ -275,6 +277,7 @@ async fn test_cli_3d_default_submit_succeeds_on_cpu_worker() {
     // 2. Spawn in-process Worker (CPU only, 0 GPU capabilities)
     let worker_temp = TempDir::new().unwrap();
     let worker_cfg = WorkerConfig::new(master_addr.to_string())
+        .with_no_battery(true)
         .with_name("worker-cpu-3d")
         .with_cores(2)
         .with_ram_mb(4096)
@@ -353,6 +356,7 @@ async fn test_cli_3d_triposr_fails_honestly_on_cpu_worker() {
     // 2. Spawn in-process Worker (CPU only)
     let worker_temp = TempDir::new().unwrap();
     let worker_cfg = WorkerConfig::new(master_addr.to_string())
+        .with_no_battery(true)
         .with_name("worker-cpu-triposr")
         .with_cores(2)
         .with_ram_mb(4096)
@@ -429,6 +433,7 @@ async fn test_cli_3d_trellis_rejected_immediately_on_cpu_worker() {
     // 2. Spawn in-process standard CPU Worker (CPU-only cluster)
     let worker_temp = TempDir::new().unwrap();
     let worker_cfg = WorkerConfig::new(master_addr.to_string())
+        .with_no_battery(true)
         .with_name("worker-cpu-3d")
         .with_cores(4)
         .with_ram_mb(8192)

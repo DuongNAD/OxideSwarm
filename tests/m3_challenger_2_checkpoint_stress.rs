@@ -67,7 +67,7 @@ async fn test_adversarial_disconnect_race_during_checkpoint_emission() {
 
     let (w1_shutdown_tx, w1_shutdown_rx) = watch::channel(false);
     let mut w1 =
-        WorkerClient::from_options(master_addr.clone(), Some("race-w1".into()), Some(1), false);
+        WorkerClient::for_testing(master_addr.clone(), Some("race-w1".into()), Some(1), false);
     let w1_id = w1.worker_id();
 
     let w1_handle = tokio::spawn(async move {
@@ -147,7 +147,7 @@ async fn test_adversarial_disconnect_race_during_checkpoint_emission() {
     // Spawn Worker 2 to resume from checkpoint
     let (_w2_shutdown_tx, w2_shutdown_rx) = watch::channel(false);
     let mut w2 =
-        WorkerClient::from_options(master_addr.clone(), Some("race-w2".into()), Some(1), false);
+        WorkerClient::for_testing(master_addr.clone(), Some("race-w2".into()), Some(1), false);
     let w2_id = w2.worker_id();
 
     let _w2_handle = tokio::spawn(async move {

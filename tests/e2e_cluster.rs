@@ -100,6 +100,7 @@ impl TestCluster {
     ) -> Uuid {
         let temp_dir = tempfile::tempdir().expect("failed to create worker tempdir");
         let cfg = WorkerConfig::new(self.master_addr.to_string())
+            .with_no_battery(true)
             .with_name(name)
             .with_cores(cores)
             .with_ram_mb(ram_mb)
@@ -320,6 +321,7 @@ async fn test_tier1_f1_registration_reconnection_same_worker_id() {
 
     let temp1 = tempfile::tempdir().unwrap();
     let cfg1 = WorkerConfig::new(cluster.master_addr.to_string())
+        .with_no_battery(true)
         .with_worker_id(wid)
         .with_name("persistent-worker")
         .with_cores(2)
@@ -355,6 +357,7 @@ async fn test_tier1_f1_registration_reconnection_same_worker_id() {
     // Reconnect worker with identical UUID
     let temp2 = tempfile::tempdir().unwrap();
     let cfg2 = WorkerConfig::new(cluster.master_addr.to_string())
+        .with_no_battery(true)
         .with_worker_id(wid)
         .with_name("persistent-worker")
         .with_cores(2)
@@ -454,6 +457,7 @@ async fn test_tier1_f2_capabilities_gpu_physical_flag() {
     let mut cluster = TestCluster::new().await;
     let temp = tempfile::tempdir().unwrap();
     let cfg = WorkerConfig::new(cluster.master_addr.to_string())
+        .with_no_battery(true)
         .with_name("gpu-phys-worker")
         .with_cores(8)
         .with_gpu(true)
@@ -527,6 +531,7 @@ async fn test_tier1_f2_capabilities_no_gpu_override_clears_gpu() {
     let mut cluster = TestCluster::new().await;
     let temp = tempfile::tempdir().unwrap();
     let cfg = WorkerConfig::new(cluster.master_addr.to_string())
+        .with_no_battery(true)
         .with_name("override-no-gpu-worker")
         .with_gpu(true)
         .with_no_gpu(true)
@@ -1073,6 +1078,7 @@ async fn test_tier2_bva_max_concurrency_limit_throttles_worker() {
     let mut cluster = TestCluster::new().await;
     let temp = tempfile::tempdir().unwrap();
     let cfg = WorkerConfig::new(cluster.master_addr.to_string())
+        .with_no_battery(true)
         .with_name("concurrency-limited-worker")
         .with_cores(4)
         .with_max_concurrency(1)
@@ -1272,6 +1278,7 @@ async fn test_tier2_bva_large_output_stream_truncation() {
     let mut cluster = TestCluster::new().await;
     let temp = tempfile::tempdir().unwrap();
     let cfg = WorkerConfig::new(cluster.master_addr.to_string())
+        .with_no_battery(true)
         .with_name("output-limit-worker")
         .with_cores(2)
         .with_max_output_bytes(1024 * 64) // 64 KB limit

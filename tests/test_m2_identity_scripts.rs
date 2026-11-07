@@ -146,8 +146,11 @@ async fn test_0_config_master_secret_key_persistence() {
     );
 }
 
-/// Test 2: Verifies that upon Master restart, the Worker automatically reconnects
-/// and re-registers in < 3.0 seconds without manual intervention.
+/// Test 2: Verifies that upon Master restart, a Worker configured with a `1.2 s` connect timeout
+/// (`with_connect_timeout(Duration::from_millis(1200))`) and a `100–400 ms` reconnect backoff
+/// (`BackoffConfig { initial: 100 ms, max: 400 ms, factor: 1.5, jitter_ratio: 0.1 }`) automatically
+/// reconnects and re-registers in < 3.0 seconds without manual intervention (with default worker
+/// settings, reconnect passed 9/10 under load up to 3.02 s).
 #[tokio::test]
 async fn test_worker_auto_reconnect_under_3_seconds() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
@@ -169,12 +172,20 @@ async fn test_worker_auto_reconnect_under_3_seconds() {
     // 2. Start Worker with Ticket 1
     let worker_sandbox = temp_dir.path().join("worker_reconnect_sb");
     let worker_config = WorkerConfig::new("auto")
+        .with_no_battery(true)
         .with_name("fast-reconnect-worker")
         .with_cores(2)
         .with_sandbox_base_dir(&worker_sandbox)
-        .with_p2p_ticket(&ticket1);
+        .with_p2p_ticket(&ticket1)
+        .with_connect_timeout(Duration::from_millis(1200));
 
     let mut worker = WorkerClient::new(worker_config);
+    worker.set_backoff_config(rusty_grid_worker::backoff::BackoffConfig {
+        initial: Duration::from_millis(100),
+        max: Duration::from_millis(400),
+        factor: 1.5,
+        jitter_ratio: 0.1,
+    });
     let worker_id = worker.worker_id();
     let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
 
@@ -203,9 +214,20 @@ async fn test_worker_auto_reconnect_under_3_seconds() {
         "Worker must register with Master 1 initially"
     );
 
-    // 3. Stop Master 1
+    // 3. Stop Master 1 and wait for its P2P endpoint to close
+    let ep1 = master1
+        .p2p_endpoint()
+        .cloned()
+        .expect("master1 p2p endpoint");
     master1.shutdown().expect("shutdown master 1");
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    let close_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !ep1.is_closed() {
+        assert!(
+            tokio::time::Instant::now() < close_deadline,
+            "master1.shutdown() must close P2P endpoint"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     // 4. Start Master Run 2 with same persistent key
     let config2 = ServerConfig::new(master_bind)

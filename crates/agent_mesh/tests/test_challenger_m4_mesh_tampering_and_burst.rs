@@ -374,6 +374,7 @@ async fn test_adv_websocket_delivery_ack_and_correlation_routing() {
     // 3. Spawn Worker
     let worker_temp = TempDir::new().unwrap();
     let worker_cfg = WorkerConfig::new(master_addr)
+        .with_no_battery(true)
         .with_name("worker-burst-1")
         .with_cores(4)
         .with_ram_mb(8192)
@@ -527,6 +528,7 @@ async fn test_adv_high_concurrency_mesh_burst() {
     for i in 0..2 {
         let temp = TempDir::new().unwrap();
         let cfg = WorkerConfig::new(master_addr.clone())
+            .with_no_battery(true)
             .with_name(&format!("burst-worker-{i}"))
             .with_cores(4)
             .with_ram_mb(8192)

@@ -419,7 +419,7 @@ async fn test_worker_without_secret_support_never_registers_with_a_secret_master
     let addr = master.server_addr().to_string();
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut worker = WorkerClient::from_options(addr, Some("plain-worker".into()), Some(2), false);
+    let mut worker = WorkerClient::for_testing(addr, Some("plain-worker".into()), Some(2), false);
     let handle = tokio::spawn(async move {
         let _ = worker.run(shutdown_rx).await;
     });
@@ -690,10 +690,15 @@ mod quic {
         )
         .await
         {
-            Ok(Ok(Some(answer))) => {
-                panic!("unauthenticated QUIC Register was answered: {answer:?}")
+            Ok(Err(ProtocolError::InvalidFormatTag(WIRE_FORMAT_AUTH))) => {
+                let grid_err: GridError = ProtocolError::InvalidFormatTag(WIRE_FORMAT_AUTH).into();
+                assert!(matches!(grid_err, GridError::AuthRequired(_)));
             }
-            Ok(_) => {}
+            Ok(other) => {
+                panic!(
+                    "expected InvalidFormatTag(WIRE_FORMAT_AUTH) on unauthenticated QUIC Register, got: {other:?}"
+                )
+            }
             Err(_) => panic!("master left the unauthenticated QUIC stream hanging"),
         }
 

@@ -120,6 +120,7 @@ impl TestCluster {
         // 3. Connect a worker node to master so tasks can execute
         let sandbox = tempfile::tempdir().expect("worker tempdir");
         let worker_cfg = WorkerConfig::new(master_addr.to_string())
+            .with_no_battery(true)
             .with_name("mesh-test-worker")
             .with_cores(4)
             .with_simulate_gpu(true)
