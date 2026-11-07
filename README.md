@@ -81,7 +81,7 @@ Status values use the fixed vocabulary: `Implemented`, `Partial`, `Planned`, or 
 | **8. Role swapping** | [switch_role.sh](switch_role.sh) (macOS/Linux) and [windows/switch_role.cmd](windows/switch_role.cmd): stop whatever this launcher started, start the new role, wait until it is up (the macOS/Linux script also checks that a worker registered) and print the next steps. Takes a few seconds. There is **no automatic failover or election**; a person (or script) decides. | Implemented |
 | **9. Master discovery & fallback** | Multi-tier coordinator discovery: Tier 1 LAN UDP beacon on `:8089` (`--master auto`) and the `:8080` standby HTTP 307 redirect portal work; Tier 2 HTTP probe (`GET /api/discovery/probe?nonce=<hex>`, served on the dashboard listener, which is loopback by default) and Tier 3 rendezvous registry (`--rendezvous <URL>` / `OXIDESWARM_RENDEZVOUS`) have remaining gaps (see `FEAT-7` in [docs/BACKLOG.md](docs/BACKLOG.md)). Design: [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md). | Partial |
 | **10. Web dashboard** | Axum server serving the SPA `crates/master/src/dashboard.html` (no CDN) plus REST, `/ws` and SSE. Loopback by default; reachable from phones/LAN only when you pass `--web-ui-addr 0.0.0.0:8080` (or `switch_role.sh master --dashboard-lan`); every request off the dev bypass needs the token printed by `oxideswarm secret show --dashboard-token`. | Implemented |
-| **11. Workflow modes (`ox-mode`)** | `test` (quick / lint / flaky / full), `dev` (fast check / local cluster / watch / status with HTTP status verification via `--port` or `RUSTY_GRID_DASHBOARD_PORT`), `doc` (build / verify with relative-link checks / generated spec summary export), `research` (profile / bench with Bincode wire-codec roundtrips / labeled synthetic scheduling simulation / report). Design: [docs/design/0027-ox-mode-honest-reporting.md](docs/design/0027-ox-mode-honest-reporting.md). | Implemented |
+| **11. Workflow modes (`ox-mode`)** | `test` (quick / lint / flaky / full), `dev` (fast check / local cluster on `127.0.0.1:9090` and `127.0.0.1:8080` with automatic ephemeral-port fallback when either port is in use / watch / status discovering the dashboard port through `.dev_cluster.json` or `--port` / `RUSTY_GRID_DASHBOARD_PORT`), `doc` (build / verify with relative-link checks / generated spec summary export), `research` (profile / bench with Bincode wire-codec roundtrips / labeled synthetic scheduling simulation / report). Design: [docs/design/0027-ox-mode-honest-reporting.md](docs/design/0027-ox-mode-honest-reporting.md). | Implemented |
 | **12. Benchmarks & chaos** | [run_cluster_benchmark.sh](run_cluster_benchmark.sh) measures parallel SHA-256 task throughput across two local worker processes (or a phone with `--adb-id`), and [run_chaos_test.sh](run_chaos_test.sh) starts its own cluster, kills a worker that holds running tasks, and verifies re-execution. | Implemented |
 | **13. Zero-copy I/O & QUIC multiplexing** | `bytes::Bytes` payloads; two iroh streams per connection (`STREAM_CONTROL = 0x01`, `STREAM_DATA = 0x02`) so bulk data cannot block heartbeats; scheduler micro-batching. | Implemented |
 | **14. Mid-task checkpointing** | `WorkerMessage::Checkpoint` / `MasterMessage::AssignTaskWithCheckpoint`: `WorkerClient` passes the checkpoint sender to every task (`client.rs:1670`), and `BuiltinTest`, `Generative3D`, and `AutoRig` emit `WorkerMessage::Checkpoint` (`runner.rs:2087`, `:2225`, `:2315`), but `Generative3D` and `AutoRig` ignore the checkpoint on resume (`_checkpoint`, `runner.rs:1909`, `:2286`) and only the hash branch of `BuiltinTest` resumes (`runner.rs:903-908`). | Partial |
@@ -258,8 +258,11 @@ OxideSwarm includes a unified CLI management tool:
 ./ox-mode test lint
 ./ox-mode test flaky --iterations 5
 
-# Development Mode (Live-reload file watcher):
+# Development Mode (Live-reload file watcher and local dev cluster):
 ./ox-mode dev watch
+./ox-mode dev cluster   # binds 127.0.0.1:9090 and 127.0.0.1:8080 (or falls back to free ephemeral ports recorded in .dev_cluster.json)
+./ox-mode dev status    # probes the dashboard port from .dev_cluster.json (or --port / 8080)
+./ox-mode dev stop
 
 # Research & Performance Profiling Mode:
 ./ox-mode research bench

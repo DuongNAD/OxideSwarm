@@ -621,9 +621,36 @@ async fn test_dev_status_succeeds_against_cluster_with_secret() {
     let _ = master.shutdown();
 }
 
+fn read_http_request_headers(
+    stream: &mut std::net::TcpStream,
+    timeout: std::time::Duration,
+) -> String {
+    use std::io::Read;
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(timeout));
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&chunk[..n]);
+                if raw.windows(4).any(|w| w == b"\r\n\r\n") || raw.windows(2).any(|w| w == b"\n\n")
+                {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_dev_status_never_sends_token_to_guessed_ports_or_3000() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::sync::{Arc, Mutex};
 
     // 1. Default fallback port list must be only [8080] (port 3000 and grid port 8088 are never guessed).
@@ -656,10 +683,9 @@ async fn test_dev_status_never_sends_token_to_guessed_ports_or_3000() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
         while std::time::Instant::now() < deadline {
             if let Ok((mut stream, _)) = fallback_listener.accept() {
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let _ = stream.set_nonblocking(false);
+                let req =
+                    read_http_request_headers(&mut stream, std::time::Duration::from_millis(500));
                 let _ = stream.write_all(
                     b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"OxideSwarm\"\r\nContent-Length: 0\r\n\r\n",
                 );
@@ -669,14 +695,12 @@ async fn test_dev_status_never_sends_token_to_guessed_ports_or_3000() {
                 // Wait briefly in case a buggy implementation attempts a retry with Authorization.
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 if let Ok((mut retry_stream, _)) = fallback_listener.accept() {
-                    let _ =
-                        retry_stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
-                    let mut retry_buf = [0u8; 4096];
-                    let rn = retry_stream.read(&mut retry_buf).unwrap_or(0);
-                    cap_fb
-                        .lock()
-                        .unwrap()
-                        .push(String::from_utf8_lossy(&retry_buf[..rn]).into_owned());
+                    let _ = retry_stream.set_nonblocking(false);
+                    let retry_req = read_http_request_headers(
+                        &mut retry_stream,
+                        std::time::Duration::from_millis(200),
+                    );
+                    cap_fb.lock().unwrap().push(retry_req);
                 }
                 break;
             } else {
@@ -692,7 +716,13 @@ async fn test_dev_status_never_sends_token_to_guessed_ports_or_3000() {
         &[fallback_port],
     );
     assert!(!fb_res.success);
-    assert_eq!(fb_res.metrics["http_status"], 401);
+    assert_eq!(
+        fb_res.metrics.get("http_status"),
+        Some(&serde_json::json!(401)),
+        "expected HTTP 401 from fallback listener, got metrics={:?}, stderr={}",
+        fb_res.metrics,
+        fb_res.stderr
+    );
 
     let _ = fb_handle.join();
     let reqs_fb = captured_fallback.lock().unwrap();
@@ -718,10 +748,8 @@ async fn test_dev_status_never_sends_token_to_guessed_ports_or_3000() {
     let cap_fake_clone = Arc::clone(&captured_fake);
     let fake_handle = std::thread::spawn(move || {
         if let Ok((mut stream, _)) = fake_listener.accept() {
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-            let mut buf = [0u8; 4096];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let _ = stream.set_nonblocking(false);
+            let req = read_http_request_headers(&mut stream, std::time::Duration::from_millis(500));
             cap_fake_clone.lock().unwrap().push(req);
             let _ = stream.write_all(
                 b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"OtherService\"\r\nContent-Length: 0\r\n\r\n",
@@ -742,7 +770,7 @@ async fn test_dev_status_never_sends_token_to_guessed_ports_or_3000() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_dev_cluster_never_sends_token_when_web_ui_port_is_held() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -773,10 +801,9 @@ async fn test_dev_cluster_never_sends_token_when_web_ui_port_is_held() {
     let listener_handle = std::thread::spawn(move || {
         while !stop_clone.load(Ordering::Relaxed) {
             if let Ok((mut stream, _)) = web_listener.accept() {
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let _ = stream.set_nonblocking(false);
+                let req =
+                    read_http_request_headers(&mut stream, std::time::Duration::from_millis(500));
                 cap_clone.lock().unwrap().push(req);
                 let _ = stream.write_all(
                     b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"OxideSwarm\"\r\nContent-Length: 0\r\n\r\n",
