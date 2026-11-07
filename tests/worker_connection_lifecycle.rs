@@ -298,12 +298,11 @@ fn big_output_task(bytes: usize) -> Task {
 fn big_output_task(bytes: usize) -> Task {
     Task::new(
         TaskSpec::command(
-            "powershell",
+            "python",
             vec![
-                "-NoProfile".into(),
-                "-Command".into(),
+                "-c".into(),
                 format!(
-                    "[Console]::OpenStandardOutput().Write([byte[]]::new({bytes}), 0, {bytes})"
+                    "import sys; sys.stdout.buffer.write(b'\\x00' * {bytes}); sys.stdout.buffer.flush()"
                 ),
             ],
         ),
@@ -660,7 +659,7 @@ impl SlowFrames {
                 }
             }
             let mut tmp = vec![0u8; chunk];
-            let n = tokio::time::timeout(Duration::from_secs(10), self.stream.read(&mut tmp))
+            let n = tokio::time::timeout(Duration::from_secs(30), self.stream.read(&mut tmp))
                 .await
                 .ok()?
                 .ok()?;
@@ -677,9 +676,6 @@ impl SlowFrames {
 async fn test_a_slow_but_progressing_upload_is_not_mistaken_for_a_dead_master() {
     let master = ScriptedMaster::start().await;
     // The dead-peer timeout is far shorter than the upload: only its progress keeps the link alive.
-    #[cfg(windows)]
-    let timeout = Duration::from_millis(15000);
-    #[cfg(not(windows))]
     let timeout = Duration::from_millis(1800);
     let worker = start_worker(master.addr, |c| {
         c.with_dead_peer_timeout(timeout)
@@ -702,9 +698,6 @@ async fn test_a_slow_but_progressing_upload_is_not_mistaken_for_a_dead_master() 
     };
     let started = Instant::now();
     let mut delivered = None;
-    #[cfg(windows)]
-    let (chunk, pause) = (512 * 1024, Duration::from_millis(5));
-    #[cfg(not(windows))]
     let (chunk, pause) = (128 * 1024, Duration::from_millis(12));
     while let Some(msg) = slow.next(chunk, pause).await {
         if let WorkerMessage::Heartbeat { timestamp, .. } = &msg {

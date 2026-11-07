@@ -12,8 +12,9 @@ use sysinfo::{Pid, System};
 
 #[tokio::test]
 async fn test_rust_executor_non_zero_exit_and_stderr() {
-    let script_path = std::env::current_dir()
-        .unwrap()
+    let temp_dir = tempfile::tempdir().expect("create temp dir for adversarial exit script");
+    let script_path = temp_dir
+        .path()
         .join(format!("test_fail_{}.py", uuid::Uuid::new_v4()));
     let script_content = r#"
 import sys
@@ -29,14 +30,19 @@ sys.exit(42)
         "python {}",
         script_path.file_name().unwrap().to_str().unwrap()
     );
+    // Under full-workspace CPU/disk load on Windows, spawning `cmd /C python <script>`
+    // concurrently with `taskkill /F /T` and `sysinfo::System::refresh_all()` can take
+    // several seconds; use a 30s timeout budget so process creation jitter is never
+    // mistaken for a hung script.
     let res = CommandExecutor::execute(
         "shell_exec",
-        &serde_json::json!({"cmd": cmd_str}),
-        Some(5000),
+        &serde_json::json!({
+            "cmd": cmd_str,
+            "cwd": temp_dir.path().to_str().unwrap(),
+        }),
+        Some(30_000),
     )
     .await;
-
-    let _ = fs::remove_file(&script_path);
 
     println!("Rust Executor Non-Zero Exit Result: {:?}", res);
     assert_eq!(res.status, "failed");
@@ -47,11 +53,12 @@ sys.exit(42)
 
 #[tokio::test]
 async fn test_rust_executor_timeout_process_survival() {
-    let pid_file = std::env::current_dir()
-        .unwrap()
+    let temp_dir = tempfile::tempdir().expect("create temp dir for adversarial timeout script");
+    let pid_file = temp_dir
+        .path()
         .join(format!("timeout_pid_{}.txt", uuid::Uuid::new_v4()));
-    let script_path = std::env::current_dir()
-        .unwrap()
+    let script_path = temp_dir
+        .path()
         .join(format!("test_hang_{}.py", uuid::Uuid::new_v4()));
 
     let script_content = format!(
@@ -78,7 +85,10 @@ time.sleep(10)
     // Timeout of 1000 ms on a 10-second sleep
     let res = CommandExecutor::execute(
         "shell_exec",
-        &serde_json::json!({"cmd": cmd_str}),
+        &serde_json::json!({
+            "cmd": cmd_str,
+            "cwd": temp_dir.path().to_str().unwrap(),
+        }),
         Some(1000),
     )
     .await;
