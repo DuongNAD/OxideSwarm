@@ -1,7 +1,7 @@
 # 0039: Persistent workspaces for coding agents
 
-Status: Draft
-Created: 2026-11-07    Updated: 2026-11-07
+Status: Accepted. Nothing is built yet
+Created: 2026-11-07    Updated: 2026-11-08
 
 ## Summary
 
@@ -13,9 +13,8 @@ Created: 2026-11-07    Updated: 2026-11-07
   workspace to the worker that holds it, and runs the tasks of one workspace one at a time.
 - An agent uses it through one new field of the MCP `submit` tool, and a person through
   `submit --workspace NAME`. Workers offer workspaces only when started with `--workspaces`.
-- This is Phase C of the roadmap (`docs/ROADMAP.md`, pull request 103) and the design FEAT-4
-  asks for. FEAT-10 and P2P
-  connections for clients are work items here as well.
+- This is Phase C of the roadmap (`docs/ROADMAP.md`) and the design FEAT-4 asks for. FEAT-10 and
+  P2P connections for clients are work items here as well.
 
 ## Context
 
@@ -71,8 +70,15 @@ cannot be sent through MCP at all.
 - `WorkspaceRef { name: String, source: Option<WorkspaceSource> }`.
 - `WorkspaceSource::Tree { manifest: BlobId, manifest_size: u64 }` is the tree to sync before the
   run. `None` runs in the workspace as it is, and fails when the worker does not hold it.
-- A name is 1 to 64 bytes of ASCII letters, digits, `.`, `_` and `-`, and does not start with `.`.
-  `Task::validate` refuses any other name, so a name can never form a path.
+- A name is 1 to 64 bytes of lowercase ASCII letters, digits, `.`, `_` and `-`. It starts with a
+  letter or a digit and does not end with `.`. Its part before the first `.` is not a Windows device
+  name (`WINDOWS_RESERVED_NAMES` in `crates/worker/src/sandbox.rs`: `con`, `prn`, `aux`, `nul`,
+  `com1` to `com9`, `lpt1` to `lpt9`). `Task::validate` refuses any other name, so a name can never
+  form a path or a device.
+- Names are lowercase because the file systems of macOS and Windows ignore case by default. `Foo`
+  and `foo` would be one directory there, but two keys for the master (D4) and for the worker's lock
+  (D2), and two tasks could then run in one directory. Windows also drops a trailing `.`, so `foo.`
+  and `foo` would be one directory.
 - In a workspace task, `TaskSpec::Command { working_dir }` is relative to the workspace root, with
   the same checks as today. `ShellScript` runs at the workspace root.
 - Workspace tasks accept `Command` and `ShellScript` only. `Task::validate` refuses a workspace with
@@ -92,43 +98,80 @@ New module `crates/worker/src/workspace.rs`:
   link. It is not under the sandbox base, because the operating system may empty a temporary
   directory.
 - **Layout.** `<root>/<name>/tree/` holds the files and is the task's current directory.
-  `<root>/<name>/state.json` holds the synced manifest id, the state (`Ready` or `Syncing`), the last
-  use and the measured size. `<root>/<name>/tmp/` is the task's `TMPDIR`, emptied before each task.
+  `<root>/<name>/state.json` holds the state (`Ready` or `Syncing`), the records and pending paths of
+  D3, the last use and the measured size. `<root>/<name>/tmp/` is the task's `TMPDIR`, emptied before
+  each task. `<root>/<name>/lock` is the lock file below.
 - **Opt-in.** Only a worker started with `--workspaces` (`RUSTY_GRID_WORKSPACES=1`, config
   `workspaces = true`) advertises `ProtocolCapabilities::WORKSPACES`. The option stays off by default
   at least until FEAT-3 is Implemented.
-- **Bounds.** `--workspace-limit-mb` (default 20,480) and `--max-workspaces` (default 8). After each
-  task the worker measures the workspace, with a cap on directory entries. It then evicts whole
-  workspaces, least recently used first, until the total fits. It never evicts a workspace that has a
-  task. A single workspace above the limit stays, and the task's stderr carries a warning.
-- **Lock.** One task per workspace at a time, enforced by an in-process lock keyed by name. The
-  master already avoids a second task (D4). The lock is the safety net.
+- **Bounds.** `--workspace-limit-mb` (default 20,480) and `--max-workspaces` (default 8) apply to the
+  whole root. After each task the worker measures the workspace, with a cap on directory entries. It
+  then evicts whole workspaces, least recently used first, until the total fits. It skips a
+  workspace whose lock it cannot take. A workspace that alone exceeds the limit is evicted as soon
+  as its task ends, so the next task in it starts cold. The task's stderr carries a warning with the
+  size and the limit. A `target/` that grows with every commit therefore cannot fill the disk.
+- **Lock.** One task per workspace at a time. The worker holds an exclusive lock on
+  `<root>/<name>/lock` (`std::fs::File::try_lock`, stable since Rust 1.89) during the sync, the run
+  and the measurement, and takes it before it evicts the workspace. An in-process map keyed by name
+  serialises the tasks of one worker before they reach the file. The file lock matters when two
+  workers share one root, as workers started under one `HOME` do (`test_integration.sh` starts
+  three). The master already avoids a second task (D4). The lock is the safety net.
+- **Store lock.** Measuring the root and choosing what to evict happen under an exclusive lock on
+  `<root>/store.lock`, so two workers on one root never evict against stale totals.
 - **Environment.** The task gets `RUSTY_GRID_WORKSPACE` (the name) and `RUSTY_GRID_WORKSPACE_DIR`
   (the tree path) in addition to the variables `execute_process_supervised` sets today.
 
 ### D3 Sync
 
+`state.json` keeps two lists, so the worker never needs an old manifest blob, which the blob cache
+may have evicted:
+
+- **Records:** for each path of the last completed sync, the blob id, and the size and modification
+  time of the file as the sync left it.
+- **Pending paths:** the paths of every manifest whose sync started after the last completed one.
+
 Before the run, when the task carries a `WorkspaceSource`:
 
-1. Write `state: Syncing` to `state.json` and flush it.
+1. Add the paths of the new manifest to the pending paths, write `state: Syncing`, and flush
+   `state.json`.
 2. Fetch the blobs the cache lacks, through the existing `BlobClient`.
-3. For each file of the new manifest: keep it if it is a regular file whose size and modification
-   time match the values the last sync recorded. Otherwise compare its BLAKE3 hash with the id.
-   Write a file that differs to a temporary name in its directory, set its executable bit, and
-   rename it over the old one.
-4. Delete each file that the previous manifest listed and the new one does not. Then remove the
-   directories this left empty. Files no manifest ever listed, such as `target/`, stay.
-5. Write `state: Ready` with the new manifest id, the recorded sizes and times, and flush it.
+3. For each file of the new manifest, keep it only when all of these hold: the records list its
+   path with the same blob id as the new manifest, and the file is a regular file whose size and
+   modification time equal the record. Otherwise hash the file. When the hash differs from the
+   id, write the blob to a temporary name in the same directory, set the executable bit, and rename
+   it over the old file.
+4. Delete each path that the records or the pending paths list and the new manifest does not. Then
+   remove the directories this left empty. Files no manifest ever listed, such as `target/`, stay.
+5. Replace the records with the new manifest's paths, ids, sizes and times. Clear the pending
+   paths, write `state: Ready`, and flush `state.json`.
 
 Rules:
 
-- When the new manifest id equals the recorded one and the state is `Ready`, step 3 checks only
-  sizes and times. A task that edited a tracked file is therefore caught by its time.
-- A workspace found in `Syncing` (a crash during a sync) is synced with every file hashed.
+- A file whose content changed on the client has a new blob id, so step 3 always rewrites it, even
+  when its size is the same. Example: `assert_eq!(x, 1)` changed to `assert_eq!(x, 2)`.
+- When nothing changed on the client, step 3 hashes no file. A task that edited a tracked file
+  changed its modification time, so the next sync hashes it and restores it.
+- A workspace found in `Syncing` (a crash or a failed sync) is synced with every file hashed.
+  Step 4 also deletes the files that the interrupted sync wrote and the new manifest drops, because
+  their paths are still pending. Without this, a test file that the client deleted after a failed
+  sync, such as `tests/new.rs`, would stay, and `cargo test` would still build it.
 - Paths come from a validated `TreeManifest` (`validate_blob_path`). Every parent directory must be
   a real directory, never a symbolic link. A manifest path where the tree has a directory or a
-  symbolic link fails the task with a message that names the path.
-- A failed sync fails the task before anything runs. The workspace stays in `Syncing`.
+  symbolic link fails the task with a message that names the path. Step 4 deletes regular files
+  only, and never follows a link.
+- A failed sync fails the task before anything runs. The workspace stays in `Syncing`, and the next
+  sync repairs it.
+
+Why a tree and not a git bundle: FEAT-4 suggests "a git or bundle source", and the draft design
+0042 (pull request 111) proposed a git bundle plus a binary patch. This design syncs a tree
+instead, for four reasons:
+
+- Workers need no `git`, and run no `git` command on content an agent sent, so no hook or
+  repository setting can act on the worker.
+- Uncommitted edits and new files travel the same way as committed ones, with no patch to apply.
+- Deduplication works per file through the blob store. After a commit, only the changed files
+  cross the network, while a bundle of `HEAD` is a new blob after every commit.
+- The worker keeps no history. That is a non-goal.
 
 ### D4 Master: features, affinity, one task at a time
 
@@ -181,8 +224,13 @@ Rules:
 - `connect_master` accepts a P2P ticket as well as `HOST:PORT`. It reuses `parse_p2p_ticket`,
   `GRID_ALPN` and `GridStream::P2p`. The worker's private `establish_p2p` becomes a shared helper in
   `crates/core/src/transport.rs`.
-- The master's P2P handler accepts `InboundMessage::Client` after the cluster handshake instead of
-  refusing it. Blob requests of clients go on the data stream.
+- A client opens one bidirectional stream and writes a new tag `STREAM_CLIENT` (`0x03`) as its
+  first byte. Workers keep `STREAM_CONTROL` (`0x01`) and `STREAM_DATA` (`0x02`) on two streams.
+  The master's P2P accept loop (`server.rs`, where it reads the first tag today) runs the cluster
+  handshake on that one stream and hands it to the client handler. The multiplexed worker path
+  keeps refusing `InboundMessage::Client`, as it does today. This tag comes from the draft design
+  0042 (pull request 111).
+- The client's iroh endpoint lives as long as its connection, and closes when the connection drops.
 - The MCP server and `BlobConnection` use `GridStream` instead of `TcpStream`.
 - A ticket always needs a cluster secret (`master_requires_secret`), as for workers.
 
@@ -201,8 +249,9 @@ Rules:
 ## Compatibility
 
 - `Task` gains a field, and bincode is positional. Every node must run one build.
-  `PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE` move to 3, so the master and the
-  worker refuse a version 2 peer at registration.
+  `PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE` move up by one, so the master
+  refuses an older worker at registration. FEAT-8 (pull request 110) moves them to 3, so this
+  design takes the number after the one `master` has when W1 lands.
 - Clients carry no version today, so an old client and a new master can fail without a clear
   message. FEAT-8 adds a client version, and should land before this design ships.
 - `ClientMessage::ListWorkspaces` and `ClientResponse::Workspaces` are appended last. An older
@@ -210,6 +259,10 @@ Rules:
 - A worker without `--workspaces`, or an older one, never advertises `WORKSPACES`. A workspace task
   then waits as `ClusterLacksCapability`, or fails when the master is configured to fail
   unplaceable tasks (SCHED-3).
+- `tool:` becomes a reserved tag prefix (D8). A user tag that starts with `tool:` is then refused,
+  as tags with the other six prefixes are. Such a tag must be renamed before the upgrade.
+- A P2P client sends `STREAM_CLIENT` (D7). An older master reads it as an invalid first tag and
+  closes the connection, so the client says the master may be older.
 - Upgrade order as in `DEPLOYMENT.md` 3.5: the master first, then workers and clients.
 
 ## Security
@@ -231,10 +284,13 @@ Rules:
 
 ## Test plan
 
-- **Unit:** name validation and `Task::validate` refusals (`task.rs`). Sync cases in
-  `workspace.rs`: a new file, a changed file, a deleted file, an untracked file that stays, a
-  tracked path over an untracked file, a symbolic link in a parent, recovery from `Syncing`, the
-  unchanged fast path, eviction order and the lock. Scheduler cases: affinity first, `require:worker`
+- **Unit:** name validation and `Task::validate` refusals (`task.rs`): uppercase letters, a
+  trailing `.`, `con` and `nul.txt`. Sync cases in `workspace.rs`: a new file, a changed file, a
+  changed file of the same size, a deleted file, an untracked file that stays, a tracked path over
+  an untracked file, a symbolic link in a parent, recovery from `Syncing`, a file written by a
+  failed sync and dropped by the next manifest, the unchanged fast path, eviction order, eviction of
+  a single workspace above the limit, and the lock. Two stores on one root never sync one workspace
+  at the same time. Scheduler cases: affinity first, `require:worker`
   wins, no second task of one workspace in a pass. Scan cases: `.gitignore`, `.git/` skipped,
   limits. Both codecs round-trip the new field. `crates/core/src/wire_layout_tests.rs` and
   `crates/core/tests/data/wire_layout.txt` record the new layout.
@@ -254,7 +310,7 @@ Roadmap Phase C names these steps WS-1 to WS-7. The column "Roadmap" maps them.
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| W1 | `Task::workspace`, `WorkspaceRef`, name rules, the `WORKSPACES` bit, protocol version 3, both mirrors and all four `From` impls. Needs FEAT-8. Roadmap WS-1 | `crates/core/src/task.rs`, `crates/core/src/protocol.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt` | Both codecs round-trip, the layout test records version 3, and `Task::validate` refuses bad names | Planned |
+| W1 | `Task::workspace`, `WorkspaceRef`, name rules, the `WORKSPACES` bit, the next protocol version, both mirrors and all four `From` impls. Needs FEAT-8. Roadmap WS-1 | `crates/core/src/task.rs`, `crates/core/src/protocol.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt` | Both codecs round-trip, the layout test records the new version, and `Task::validate` refuses bad names | Planned |
 | W2 | The workspace store, sync, lock, bounds and worker options. Roadmap WS-1, WS-2 | `crates/worker/src/workspace.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `README.md` | The sync unit tests of the test plan pass | Planned |
 | W3 | Required feature, affinity, one task per workspace. Roadmap WS-1 | `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/master/src/server.rs` | The scheduler unit tests of the test plan pass | Planned |
 | W4 | Source selection with `.gitignore` and limits. Roadmap WS-2 | `crates/cli/src/blobs.rs`, `crates/cli/Cargo.toml` | The scan unit tests pass, and `cargo audit` passes with the `ignore` crate | Planned |
@@ -274,3 +330,9 @@ off by default until FEAT-3 is Implemented.
 
 - 2026-11-07: Draft written from the code at `master` `5c518b5`, after the owner accepted the
   roadmap decisions Q1 to Q5.
+- 2026-11-08: Review fixes. Step 3 of the sync keeps a file only when its recorded blob id equals
+  the new one. Pending paths delete the files of an interrupted sync. Names are lowercase and refuse
+  Windows device names. A file lock guards workspaces that two workers share. A workspace above the
+  limit is evicted when its task ends. The protocol version moves to the number after FEAT-8's. The
+  owner chose this design over the draft design 0042 (pull request 111), and took two parts of it:
+  the Windows device names and the `STREAM_CLIENT` tag. Status set to Accepted.
