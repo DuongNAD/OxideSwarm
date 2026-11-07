@@ -1,7 +1,7 @@
 # 0030: MCP post-reply cancellation, EOF grace window, and P2P endpoint lifecycle
 
 Status: Implemented
-Created: 2026-11-04    Updated: 2026-11-04
+Created: 2026-11-04    Updated: 2026-11-07
 
 ## Summary
 
@@ -100,17 +100,22 @@ receive `cancel_tx.send(true)` and have up to `500 ms` to send `CancelTask` befo
   `true`, `yes`, or `on`, resolved only in the CLI layer `crates/cli/src/cli_app.rs` and not read
   directly by the libraries) build `iroh::Endpoint` with `iroh::endpoint::presets::Minimal` (no n0
   DERP relay connection or pkarr/DNS address lookup), skip the `5 s` `endpoint.online()` relay
-  wait, and emit a start-up `tracing::warn!` (plus `stderr` warning in the CLI), while production
-  defaults remain `presets::N0` (`false`). For in-process Android bridge tests,
-  `crates/android_bridge/src/lib.rs` provides `set_p2p_minimal_preset_for_testing(bool)`.
-  `ServerConfig::with_p2p_bind_addr(SocketAddr)` allows restart tests
-  (`tests/test_m2_identity_scripts.rs`) to bind `127.0.0.1:0` on run 1, read the OS-assigned
-  loopback UDP port from the published ticket, and re-bind that port on run 2 without needing a
-  public DERP relay.
+  wait, and emit a start-up `tracing::warn!`, while production defaults remain `presets::N0`
+  (`false`). In `run_cli` (`crates/cli/src/cli_app.rs`), the tracing subscriber routes `WARN` and
+  `ERROR` events to `std::io::stderr` (and `INFO`/`DEBUG`/`TRACE` to `std::io::stdout`) for all
+  non-`mcp` commands (`mcp` continues to send all tracing levels to `stderr` so `stdout` stays pure
+  JSON-RPC). For in-process Android bridge tests, `crates/android_bridge/src/lib.rs` provides
+  `set_p2p_minimal_preset_for_testing(bool)`. `ServerConfig::with_p2p_bind_addr(SocketAddr)` allows
+  restart tests (`tests/test_m2_identity_scripts.rs`) to bind `127.0.0.1:0` on run 1, read the
+  OS-assigned loopback UDP port from the published ticket, and re-bind that port on run 2 without
+  needing a public DERP relay.
 
 ## Compatibility
 
 - Wire protocol and CLI flags are unchanged.
+- For non-`mcp` CLI commands, `WARN` and `ERROR` tracing lines are written to `stderr` rather than
+  `stdout`; under the macOS launchd plist (`packaging/macos/com.oxideswarm.worker.plist`), worker
+  `WARN` and `ERROR` lines now appear in `worker.err.log` instead of `worker.log`.
 - Existing persistent P2P master keys (`~/.oxideswarm/master_key.bin`) preserve the same `NodeId`
   and publish a relay-only ticket across restarts; even if iroh selects a different regional
   `*.relay.n0.iroh.link` node on restart, existing workers holding the previous ticket reconnect
@@ -155,4 +160,4 @@ receive `cancel_tx.send(true)` and have up to `500 ms` to send `CancelTask` befo
 
 - 2026-11-04: Implemented and verified against review feedback on pull request 83.
 - 2026-11-04: Added `with_p2p_minimal_preset(true)`, `with_p2p_bind_addr`, and `RUSTY_GRID_P2P_MINIMAL` (`1`, `true`, `yes`, or `on`) (`TEST-16`) so workspace P2P tests run offline with `iroh::endpoint::presets::Minimal`.
-- 2026-11-07: Restricted `RUSTY_GRID_P2P_MINIMAL` resolution to `crates/cli/src/cli_app.rs`, added startup warnings when `p2p_minimal_preset` is active, added `set_p2p_minimal_preset_for_testing` to `crates/android_bridge`, added a weekly CI job for ignored relay tests, and added a source scan test guarding against non-minimal P2P in non-ignored tests.
+- 2026-11-07: Restricted `RUSTY_GRID_P2P_MINIMAL` resolution to `crates/cli/src/cli_app.rs`, routed `WARN`/`ERROR` tracing events to `stderr` for non-`mcp` CLI commands (`worker.err.log` under launchd), added startup warnings when `p2p_minimal_preset` is active, added `set_p2p_minimal_preset_for_testing` to `crates/android_bridge`, added a weekly CI job for ignored relay tests, and added a source scan test guarding against non-minimal P2P (including `.env_remove("RUSTY_GRID_P2P_MINIMAL")` and non-truthy env overrides) in non-ignored tests.

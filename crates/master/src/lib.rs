@@ -479,6 +479,28 @@ path = "../../tests/registered_e2e.rs"
                     "{label}: spawns --p2p binary without .env(\"RUSTY_GRID_P2P_MINIMAL\", ...)"
                 ));
             }
+            let compact: String = active.chars().filter(|c| !c.is_whitespace()).collect();
+            if compact.contains(".env_remove(\"RUSTY_GRID_P2P_MINIMAL\")") {
+                violations.push(format!(
+                    "{label}: removes RUSTY_GRID_P2P_MINIMAL in non-ignored --p2p test"
+                ));
+            }
+            let env_prefix = ".env(\"RUSTY_GRID_P2P_MINIMAL\",";
+            let mut search_rest = compact.as_str();
+            while let Some(idx) = search_rest.find(env_prefix) {
+                let after = &search_rest[idx + env_prefix.len()..];
+                let val = after.split(')').next().unwrap_or("");
+                let normalized = val.to_ascii_lowercase();
+                if !matches!(
+                    normalized.as_str(),
+                    "\"1\"" | "\"true\"" | "\"yes\"" | "\"on\""
+                ) {
+                    violations.push(format!(
+                        "{label}: sets RUSTY_GRID_P2P_MINIMAL to non-enabled value {val} in non-ignored --p2p test"
+                    ));
+                }
+                search_rest = after;
+            }
         }
         for stmt in active.split(';') {
             if stmt.contains(".with_p2p(true)") && !stmt.contains(".with_p2p_minimal_preset(true)")
@@ -618,10 +640,34 @@ async fn bad_missing_minimal() {
         )
         .unwrap();
 
+        std::fs::write(
+            tests_dir.join("sample_env_override.rs"),
+            r#"
+fn cli() -> Command {
+    let mut c = Command::new("rusty-grid");
+    c.env("RUSTY_GRID_P2P_MINIMAL", "1");
+    c
+}
+
+#[test]
+fn bad_env_remove_and_false() {
+    let mut c1 = cli();
+    c1.env_remove("RUSTY_GRID_P2P_MINIMAL").args(["master", "--p2p"]);
+    let mut c2 = cli();
+    c2.env("RUSTY_GRID_P2P_MINIMAL", "0").args(["master", "--p2p"]);
+}
+"#,
+        )
+        .unwrap();
+
         let violations = find_non_minimal_p2p_in_tests(tmp.path());
         assert_eq!(
             violations,
             vec![
+                "tests/sample_env_override.rs: removes RUSTY_GRID_P2P_MINIMAL in non-ignored --p2p test"
+                    .to_string(),
+                "tests/sample_env_override.rs: sets RUSTY_GRID_P2P_MINIMAL to non-enabled value \"0\" in non-ignored --p2p test"
+                    .to_string(),
                 "tests/sample_p2p.rs: spawns --p2p binary without .env(\"RUSTY_GRID_P2P_MINIMAL\", ...)"
                     .to_string(),
                 "tests/sample_p2p.rs: uses .with_p2p(true) without .with_p2p_minimal_preset(true)"

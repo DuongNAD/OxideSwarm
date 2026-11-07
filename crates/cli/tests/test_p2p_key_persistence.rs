@@ -564,12 +564,14 @@ fn test_p2p_minimal_env_warns_on_stderr_and_writes_ticket_under_3s() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
     let ticket_file = dir.join("minimal_cli.ticket");
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "iroh=debug,info".to_string());
 
     // 1. With RUSTY_GRID_P2P_MINIMAL=1 (set by `cli(dir)`), `master --listen 127.0.0.1:0 --p2p
-    //    --ephemeral-key` writes its P2P ticket in under 3 s and emits the minimal preset warning
-    //    once on stderr.
+    //    --ephemeral-key` writes its P2P ticket in under 3 s, emits the minimal preset warning
+    //    once on stderr, and makes no relay or pkarr connection attempts.
     let mut m_cmd = cli(dir);
     m_cmd
+        .env("RUST_LOG", &rust_log)
         .args([
             "master",
             "--listen",
@@ -584,7 +586,13 @@ fn test_p2p_minimal_env_warns_on_stderr_and_writes_ticket_under_3s() {
         .stderr(Stdio::piped());
     let started = Instant::now();
     let mut m_child = m_cmd.spawn().expect("spawn master with minimal preset");
+    let m_stdout_pipe = m_child.stdout.take().expect("take master stdout");
     let m_stderr_pipe = m_child.stderr.take().expect("take master stderr");
+    let m_stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut { m_stdout_pipe }, &mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    });
     let m_stderr_reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = std::io::Read::read_to_end(&mut { m_stderr_pipe }, &mut buf);
@@ -601,7 +609,9 @@ fn test_p2p_minimal_env_warns_on_stderr_and_writes_ticket_under_3s() {
     );
     let _ = m_child.kill();
     let _ = m_child.wait();
+    let m_stdout = m_stdout_reader.join().expect("join master stdout reader");
     let m_stderr = m_stderr_reader.join().expect("join master stderr reader");
+    eprint!("{m_stdout}{m_stderr}");
     assert_eq!(
         m_stderr
             .matches("P2P minimal preset is enabled (p2p_minimal_preset=true)")
@@ -609,11 +619,19 @@ fn test_p2p_minimal_env_warns_on_stderr_and_writes_ticket_under_3s() {
         1,
         "master must emit the P2P minimal preset warning exactly once on stderr, got: {m_stderr:?}"
     );
+    for forbidden in ["relay.n0.iroh.link", "dns.iroh.link", "pkarr"] {
+        assert!(
+            !m_stdout.contains(forbidden) && !m_stderr.contains(forbidden),
+            "master with RUSTY_GRID_P2P_MINIMAL=1 must not contact {forbidden}, stdout={m_stdout:?}, stderr={m_stderr:?}"
+        );
+    }
 
     // 2. With RUSTY_GRID_P2P_MINIMAL=1, `worker --p2p-ticket <ticket>` also forwards the preset
-    //    into WorkerConfig and emits the warning once on stderr.
+    //    into WorkerConfig, emits the warning once on stderr, and makes no relay or pkarr
+    //    connection attempts.
     let mut w_cmd = cli(dir);
     w_cmd
+        .env("RUST_LOG", &rust_log)
         .args([
             "worker",
             "--p2p-ticket",
@@ -636,12 +654,16 @@ fn test_p2p_minimal_env_warns_on_stderr_and_writes_ticket_under_3s() {
     });
     let w_stdout_reader = std::thread::spawn(move || {
         use std::io::BufRead;
+        let mut collected = String::new();
         let reader = std::io::BufReader::new(&mut w_stdout_pipe);
         for line in reader.lines().map_while(Result::ok) {
+            collected.push_str(&line);
+            collected.push('\n');
             if line.contains("RustyGrid Worker started") {
                 break;
             }
         }
+        collected
     });
     let w_deadline = Instant::now() + Duration::from_secs(3);
     while !w_stdout_reader.is_finished() && Instant::now() < w_deadline {
@@ -649,8 +671,9 @@ fn test_p2p_minimal_env_warns_on_stderr_and_writes_ticket_under_3s() {
     }
     let _ = w_child.kill();
     let _ = w_child.wait();
-    let _ = w_stdout_reader.join();
+    let w_stdout = w_stdout_reader.join().expect("join worker stdout reader");
     let w_stderr = w_stderr_reader.join().expect("join worker stderr reader");
+    eprint!("{w_stdout}{w_stderr}");
     assert_eq!(
         w_stderr
             .matches("P2P minimal preset is enabled (p2p_minimal_preset=true)")
@@ -658,8 +681,22 @@ fn test_p2p_minimal_env_warns_on_stderr_and_writes_ticket_under_3s() {
         1,
         "worker must emit the P2P minimal preset warning exactly once on stderr, got: {w_stderr:?}"
     );
+    for forbidden in ["relay.n0.iroh.link", "dns.iroh.link", "pkarr"] {
+        assert!(
+            !w_stdout.contains(forbidden) && !w_stderr.contains(forbidden),
+            "worker with RUSTY_GRID_P2P_MINIMAL=1 must not contact {forbidden}, stdout={w_stdout:?}, stderr={w_stderr:?}"
+        );
+    }
+}
 
-    // 3. Without RUSTY_GRID_P2P_MINIMAL, the warning does not appear on stderr.
+#[test]
+#[ignore = "requires outbound network to relay.n0.iroh.link"]
+fn test_p2p_default_env_omits_minimal_preset_warning_on_stderr() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+
+    // Without RUSTY_GRID_P2P_MINIMAL, `master --p2p` uses `presets::N0` and does not emit the
+    // minimal preset warning on stderr.
     let mut no_min_cmd = cli(dir);
     no_min_cmd
         .env_remove("RUSTY_GRID_P2P_MINIMAL")
