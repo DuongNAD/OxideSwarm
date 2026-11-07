@@ -1056,6 +1056,7 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
     assert_eq!(final_info.exit_code, Some(0));
     assert_eq!(final_info.retry_count, 0);
     assert_eq!(final_info.failover_count, 0);
+    assert_eq!(final_info.evacuation_count, 2);
     assert_eq!(final_info.assigned_worker_id, Some(w3_id));
 
     let _ = master.shutdown();

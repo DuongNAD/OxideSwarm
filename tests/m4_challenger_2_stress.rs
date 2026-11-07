@@ -1074,6 +1074,7 @@ async fn test_adversarial_direct_task_queue_retry_policy_exhaustion() {
         backoff_multiplier: 1.5,
         retry_on_execution_failure: false,
         retry_on_worker_disconnect: true,
+        ..Default::default()
     };
 
     let queue = TaskQueue::with_config(policy, None);
@@ -1177,6 +1178,7 @@ async fn test_adversarial_retry_exhaustion_on_execution_failure() {
         backoff_multiplier: 1.0,
         retry_on_execution_failure: true,
         retry_on_worker_disconnect: false,
+        ..Default::default()
     };
 
     let queue = TaskQueue::with_config(policy, None);
