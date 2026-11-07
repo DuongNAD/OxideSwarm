@@ -59,6 +59,7 @@ fn make_test_worker(
         remote_addr: "127.0.0.1:9000".into(),
         cpu_usage_pct: 0.0,
         ram_available_mb: ram_mb,
+        mobile_status: None,
     }
 }
 

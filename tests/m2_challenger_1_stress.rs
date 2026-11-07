@@ -690,6 +690,7 @@ fn make_test_worker(
         cpu_usage_pct: 0.0,
         ram_available_mb: ram_mb,
         features: Default::default(),
+        mobile_status: None,
     }
 }
 
