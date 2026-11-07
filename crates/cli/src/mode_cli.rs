@@ -1775,6 +1775,27 @@ fn try_reap_spawned_cluster_child(pid: u32) -> bool {
     false
 }
 
+fn reap_spawned_cluster_child_after_exit(pid: u32) {
+    if let Ok(mut guard) = SPAWNED_CLUSTER_CHILDREN.lock() {
+        guard.retain_mut(|child| {
+            if child.id() == pid {
+                if matches!(child.try_wait(), Ok(None)) {
+                    let _ = child.wait();
+                }
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
+fn reap_all_exited_cluster_children() {
+    if let Ok(mut guard) = SPAWNED_CLUSTER_CHILDREN.lock() {
+        guard.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+    }
+}
+
 fn query_process_start_time(pid: u32) -> Option<u64> {
     let mut sys = System::new();
     let sys_pid = sysinfo::Pid::from_u32(pid);
@@ -1832,10 +1853,66 @@ fn cleanup_failed_cluster_launch(
     }
 }
 
+#[cfg(windows)]
+fn clear_current_process_stdio_inherit_flags() {
+    use std::os::windows::io::AsRawHandle;
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    extern "system" {
+        fn SetHandleInformation(
+            h_object: *mut std::ffi::c_void,
+            dw_mask: u32,
+            dw_flags: u32,
+        ) -> i32;
+    }
+    for h in [
+        io::stdin().as_raw_handle(),
+        io::stdout().as_raw_handle(),
+        io::stderr().as_raw_handle(),
+    ] {
+        if !h.is_null() {
+            // SAFETY: `h` is a valid OS handle from `std::io::{stdin,stdout,stderr}`. Clearing
+            // `HANDLE_FLAG_INHERIT` stops `CreateProcessW(..., bInheritHandles=TRUE, ...)` from
+            // leaking `ox-mode`'s piped stdout/stderr handles into detached `rusty-grid` children.
+            unsafe {
+                let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
 /// Spawns local dev cluster: 1 Master with Web UI + 2 Workers in background with PID tracking,
 /// verifying that all children stay alive and both workers appear in `/api/status`.
 pub async fn launch_local_dev_cluster(workspace_root: &Path) -> ModeExecutionResult {
-    launch_local_dev_cluster_with_ports(workspace_root, 9090, 8080).await
+    let pid_file = workspace_root.join(".dev_cluster.pids");
+    let json_file = workspace_root.join(".dev_cluster.json");
+    if pid_file.exists() || json_file.exists() {
+        let stop_res = stop_local_dev_cluster(workspace_root).await;
+        if !stop_res.success {
+            let mut res = ModeExecutionResult::new(WorkflowMode::Dev, "cluster");
+            res.success = false;
+            res.exit_code = stop_res.exit_code.or(Some(1));
+            res.stderr = format!(
+                "Failed to stop existing dev cluster before launch: {}",
+                if stop_res.stderr.is_empty() {
+                    &stop_res.stdout
+                } else {
+                    &stop_res.stderr
+                }
+            );
+            return res;
+        }
+    }
+    let master_tcp_port = std::net::TcpListener::bind("127.0.0.1:9090")
+        .or_else(|_| std::net::TcpListener::bind("127.0.0.1:0"))
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .unwrap_or(9090);
+    let web_ui_port = std::net::TcpListener::bind("127.0.0.1:8080")
+        .or_else(|_| std::net::TcpListener::bind("127.0.0.1:0"))
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .unwrap_or(8080);
+    launch_local_dev_cluster_with_ports(workspace_root, master_tcp_port, web_ui_port).await
 }
 
 /// Spawns local dev cluster on the specified `master_tcp_port` and `web_ui_port`,
@@ -1890,6 +1967,17 @@ pub async fn launch_local_dev_cluster_with_ports(
         .join("debug")
         .join(bin_name);
     if !target_bin.exists() {
+        if let Ok(exe) = std::env::current_exe() {
+            for ancestor in exe.ancestors().skip(1).take(2) {
+                let cand = ancestor.join(bin_name);
+                if cand.exists() {
+                    target_bin = cand;
+                    break;
+                }
+            }
+        }
+    }
+    if !target_bin.exists() {
         let fallback_root = find_workspace_root();
         let fallback_bin = resolve_cargo_target_dir(&fallback_root)
             .join("debug")
@@ -1930,6 +2018,9 @@ pub async fn launch_local_dev_cluster_with_ports(
     let mut pid_start_times: std::collections::BTreeMap<String, u64> =
         std::collections::BTreeMap::new();
 
+    #[cfg(windows)]
+    clear_current_process_stdio_inherit_flags();
+
     let mut master_cmd = Command::new(&target_bin);
     if let Some(ref home_dir) = isolated_home {
         let cfg_path = home_dir.join("rusty-grid.toml");
@@ -1967,6 +2058,7 @@ pub async fn launch_local_dev_cluster_with_ports(
     }
     let master_res = master_cmd
         .current_dir(workspace_root)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
@@ -2084,6 +2176,7 @@ pub async fn launch_local_dev_cluster_with_ports(
     }
     let w1_res = w1_cmd
         .current_dir(workspace_root)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
@@ -2185,6 +2278,7 @@ pub async fn launch_local_dev_cluster_with_ports(
     }
     let w2_res = w2_cmd
         .current_dir(workspace_root)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
@@ -2431,13 +2525,20 @@ fn is_oxideswarm_cluster_process(proc: &sysinfo::Process) -> bool {
     false
 }
 
-fn has_dev_cluster_cmdline_signature(proc: &sysinfo::Process) -> bool {
-    proc.cmd().iter().any(|arg| {
-        arg == "--dashboard-port-file"
-            || arg == "dev-worker-cpu-1"
-            || arg == "dev-worker-sim-gpu-2"
-            || arg.contains(".dev_cluster.dashboard_port")
-    })
+fn has_dev_cluster_cmdline_signature(proc: &sysinfo::Process, workspace_root: &Path) -> bool {
+    let dash_port_path = workspace_root.join(".dev_cluster.dashboard_port");
+    let home_path = workspace_root.join(".dev_cluster_home");
+    let dash_str = dash_port_path.to_string_lossy();
+    let home_str = home_path.to_string_lossy();
+    let has_workspace_path = proc
+        .cmd()
+        .iter()
+        .any(|arg| arg.contains(dash_str.as_ref()) || arg.contains(home_str.as_ref()))
+        || proc.cwd().map(|cwd| cwd == workspace_root).unwrap_or(false);
+    let has_cluster_role = proc.cmd().iter().any(|arg| {
+        arg == "--dashboard-port-file" || arg == "dev-worker-cpu-1" || arg == "dev-worker-sim-gpu-2"
+    });
+    has_workspace_path && has_cluster_role
 }
 
 fn signal_verified_process(sys: &System, pid: u32) -> bool {
@@ -2476,41 +2577,57 @@ fn is_unix_process_zombie_or_gone(pid: u32) -> bool {
     }
 }
 
-fn is_process_exited_or_zombie(pid: u32) -> bool {
+fn is_process_exited_or_zombie(sys: &mut System, pid: u32) -> bool {
     if try_reap_spawned_cluster_child(pid) {
         return true;
     }
     let sys_pid = sysinfo::Pid::from_u32(pid);
-    // Construct a fresh `System` on each check: in `sysinfo` 0.30 on macOS, calling
-    // `refresh_process` on an existing `System` does not update `ProcessStatus` when a
-    // process transitions to `Zombie`.
-    let mut fresh_sys = System::new();
-    if !fresh_sys.refresh_process(sys_pid) {
-        return true;
+    #[cfg(windows)]
+    {
+        // On Windows, `sys` holds an `OpenProcess` handle from `refresh_processes()`. Calling
+        // `sys.refresh_process(sys_pid)` on the existing `System` invokes `refresh_existing_process`
+        // (`GetExitCodeProcess` != `STILL_ACTIVE`) and drops the handle once the process exits,
+        // whereas a fresh `System::new().refresh_process(sys_pid)` would go through `new_from_pid`
+        // (`OpenProcess` without checking the exit code) and report the dead process as still alive.
+        if !sys.refresh_process(sys_pid) {
+            reap_spawned_cluster_child_after_exit(pid);
+            return true;
+        }
     }
     #[cfg(unix)]
     {
+        let _ = sys;
+        // On Unix/macOS, construct a fresh `System` on each check because calling `refresh_process`
+        // on an existing `System` in `sysinfo` 0.30 does not update `ProcessStatus` when a process
+        // transitions to `Zombie`, and also check `ps -o stat=`.
+        let mut fresh_sys = System::new();
+        if !fresh_sys.refresh_process(sys_pid) {
+            reap_spawned_cluster_child_after_exit(pid);
+            return true;
+        }
         if let Some(proc) = fresh_sys.process(sys_pid) {
             if matches!(proc.status(), sysinfo::ProcessStatus::Zombie) {
+                reap_spawned_cluster_child_after_exit(pid);
                 return true;
             }
         }
         if is_unix_process_zombie_or_gone(pid) {
+            reap_spawned_cluster_child_after_exit(pid);
             return true;
         }
     }
     false
 }
 
-async fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+async fn wait_for_process_exit(sys: &mut System, pid: u32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if is_process_exited_or_zombie(pid) {
+        if is_process_exited_or_zombie(sys, pid) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    is_process_exited_or_zombie(pid)
+    is_process_exited_or_zombie(sys, pid)
 }
 
 /// Stops running dev cluster child processes cleanly with ownership verification and exit waiting.
@@ -2652,13 +2769,14 @@ where
             continue;
         }
 
-        // Verify ownership by matching recorded `sysinfo` start time at spawn or dev-cluster
-        // command-line arguments (`--dashboard-port-file`, `dev-worker-cpu-1`, `dev-worker-sim-gpu-2`),
-        // falling back to the tracking file timestamp only when neither is available.
+        // Verify ownership by matching recorded `sysinfo` start time at spawn (a start-time
+        // mismatch always rejects the PID, even if its command line looks like a dev cluster),
+        // or falling back to this workspace's command-line signature / tracking file timestamp
+        // when no start time was recorded for the PID.
         let proc_start = proc.start_time();
-        let has_cmdline = has_dev_cluster_cmdline_signature(proc);
+        let has_cmdline = has_dev_cluster_cmdline_signature(proc, workspace_root);
         if let Some(&expected_start) = recorded_start_times.get(&pid) {
-            if proc_start > 0 && proc_start.abs_diff(expected_start) > 2 && !has_cmdline {
+            if proc_start.abs_diff(expected_start) > 2 {
                 skipped += 1;
                 continue;
             }
@@ -2673,15 +2791,17 @@ where
 
         if signal_fn(&sys, pid) {
             signalled += 1;
-            if wait_for_process_exit(pid, Duration::from_secs(3)).await {
+            if wait_for_process_exit(&mut sys, pid, Duration::from_secs(3)).await {
                 exited += 1;
             }
-        } else if is_process_exited_or_zombie(pid) {
+        } else if is_process_exited_or_zombie(&mut sys, pid) {
             skipped += 1;
         } else {
             signal_failed += 1;
         }
     }
+
+    reap_all_exited_cluster_children();
 
     let timed_out = signalled.saturating_sub(exited);
     res.duration_ms = start.elapsed().as_millis() as u64;

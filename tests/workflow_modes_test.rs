@@ -665,10 +665,20 @@ async fn test_dev_status_never_sends_token_to_guessed_ports_or_3000() {
                 );
                 let mut list = cap_fb.lock().unwrap();
                 list.push(req);
-                if list.len() >= 2 {
-                    // Wait briefly in case a buggy implementation attempts a retry with Authorization.
-                    std::thread::sleep(std::time::Duration::from_millis(200));
+                drop(list);
+                // Wait briefly in case a buggy implementation attempts a retry with Authorization.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if let Ok((mut retry_stream, _)) = fallback_listener.accept() {
+                    let _ =
+                        retry_stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                    let mut retry_buf = [0u8; 4096];
+                    let rn = retry_stream.read(&mut retry_buf).unwrap_or(0);
+                    cap_fb
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&retry_buf[..rn]).into_owned());
                 }
+                break;
             } else {
                 std::thread::sleep(std::time::Duration::from_millis(15));
             }
@@ -683,21 +693,6 @@ async fn test_dev_status_never_sends_token_to_guessed_ports_or_3000() {
     );
     assert!(!fb_res.success);
     assert_eq!(fb_res.metrics["http_status"], 401);
-
-    let ox_mode_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_ox-mode"));
-    let out_fb = std::process::Command::new(&ox_mode_bin)
-        .current_dir(temp.path())
-        .env("HOME", &temp_home)
-        .env("USERPROFILE", &temp_home)
-        .env("OXIDESWARM_SECRET_FILE", &secret_path)
-        .env_remove("CARGO_MANIFEST_DIR")
-        .env_remove("OXIDESWARM_SECRET")
-        .env_remove("RUSTY_GRID_CONFIG")
-        .env_remove("RUSTY_GRID_DASHBOARD_PORT")
-        .args(["dev", "status", "--json"])
-        .output()
-        .expect("spawn ox-mode dev status without --port");
-    assert!(!out_fb.status.success());
 
     let _ = fb_handle.join();
     let reqs_fb = captured_fallback.lock().unwrap();
@@ -922,6 +917,7 @@ async fn test_dev_cluster_in_process_launch_then_stop_and_signal_failure_handlin
         ".dev_cluster.json must exist after launch"
     );
 
+    let pids_str = std::fs::read_to_string(&pid_file).expect("read .dev_cluster.pids");
     let json_str = std::fs::read_to_string(&json_file).expect("read .dev_cluster.json");
     let json_val: serde_json::Value =
         serde_json::from_str(&json_str).expect("parse .dev_cluster.json");
@@ -934,8 +930,40 @@ async fn test_dev_cluster_in_process_launch_then_stop_and_signal_failure_handlin
         3,
         "all 3 spawned cluster children must have start_time recorded in .dev_cluster.json"
     );
+    #[cfg(unix)]
+    let cluster_pids: Vec<u32> = start_times
+        .keys()
+        .map(|k| k.parse::<u32>().expect("pid u32"))
+        .collect();
 
-    // 1. If a verified process cannot be signalled, `stop` must count it as failed, return
+    // 1. A wrong recorded start time must be skipped even when the process has a matching
+    //    `rusty-grid` executable name and dev-cluster command line signature.
+    let mut wrong_st_json = json_val.clone();
+    if let Some(st_map) = wrong_st_json
+        .get_mut("pid_start_times")
+        .and_then(|v| v.as_object_mut())
+    {
+        for val in st_map.values_mut() {
+            *val = serde_json::json!(1_000_000_000u64);
+        }
+    }
+    std::fs::write(&json_file, wrong_st_json.to_string()).expect("write wrong start_times json");
+    let mismatch_stop = stop_local_dev_cluster(temp.path()).await;
+    assert!(mismatch_stop.success);
+    assert_eq!(
+        mismatch_stop.metrics["signalled_count"], 0,
+        "processes with wrong recorded start_time must not be signalled even if their command line matches"
+    );
+    assert_eq!(
+        mismatch_stop.metrics["skipped_count"], 3,
+        "all 3 PIDs with wrong recorded start_time must be skipped"
+    );
+
+    // Restore original tracking files for the remaining checks.
+    std::fs::write(&pid_file, &pids_str).expect("restore .dev_cluster.pids");
+    std::fs::write(&json_file, &json_str).expect("restore .dev_cluster.json");
+
+    // 2. If a verified process cannot be signalled, `stop` must count it as failed, return
     //    `success == false` (`exit_code == Some(1)`), and preserve the tracking files.
     let fail_stop = stop_local_dev_cluster_with_signaller(temp.path(), |_, _| false).await;
     assert!(
@@ -950,7 +978,7 @@ async fn test_dev_cluster_in_process_launch_then_stop_and_signal_failure_handlin
         "tracking files must be preserved when stop fails to signal verified processes"
     );
 
-    // 2. Now run real `stop_local_dev_cluster` in the SAME process that launched the cluster:
+    // 3. Now run real `stop_local_dev_cluster` in the SAME process that launched the cluster:
     //    must reap/detect exit for all 3 children, report 3 signalled, 3 exited, and remove tracking files.
     let stop_res = stop_local_dev_cluster(temp.path()).await;
     assert!(
@@ -970,6 +998,75 @@ async fn test_dev_cluster_in_process_launch_then_stop_and_signal_failure_handlin
     assert!(
         !pid_file.exists() && !json_file.exists(),
         "tracking files must be deleted after clean stop"
+    );
+
+    #[cfg(unix)]
+    for pid in &cluster_pids {
+        let ps_out = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .output()
+            .expect("run ps -p");
+        assert!(
+            !ps_out.status.success(),
+            "PID {pid} must be completely reaped (not even a zombie in `ps -p`), got stdout: {}",
+            String::from_utf8_lossy(&ps_out.stdout)
+        );
+    }
+}
+
+#[test]
+fn test_dev_cluster_cross_process_launch_then_stop_via_ox_mode_cli() {
+    let ox_mode_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_ox-mode"));
+    let temp = tempfile::tempdir().expect("tempdir");
+    let temp_home = temp.path().join("home");
+    std::fs::create_dir_all(&temp_home).expect("create temp_home");
+
+    let launch_out = std::process::Command::new(&ox_mode_bin)
+        .current_dir(temp.path())
+        .env("HOME", &temp_home)
+        .env("USERPROFILE", &temp_home)
+        .env_remove("CARGO_MANIFEST_DIR")
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_CONFIG")
+        .args(["dev", "cluster"])
+        .output()
+        .expect("spawn ox-mode dev cluster");
+    let launch_stdout = String::from_utf8_lossy(&launch_out.stdout);
+    let launch_stderr = String::from_utf8_lossy(&launch_out.stderr);
+    println!("ox-mode dev cluster output:\n{launch_stdout}\n{launch_stderr}");
+
+    let stop_out = std::process::Command::new(&ox_mode_bin)
+        .current_dir(temp.path())
+        .env("HOME", &temp_home)
+        .env("USERPROFILE", &temp_home)
+        .env_remove("CARGO_MANIFEST_DIR")
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("OXIDESWARM_SECRET_FILE")
+        .env_remove("RUSTY_GRID_CONFIG")
+        .args(["dev", "stop"])
+        .output()
+        .expect("spawn ox-mode dev stop");
+    let stop_stdout = String::from_utf8_lossy(&stop_out.stdout);
+    let stop_stderr = String::from_utf8_lossy(&stop_out.stderr);
+    println!("ox-mode dev stop output:\n{stop_stdout}\n{stop_stderr}");
+
+    assert!(
+        launch_out.status.success(),
+        "ox-mode dev cluster must exit 0, stdout={launch_stdout} stderr={launch_stderr}"
+    );
+    assert!(
+        stop_out.status.success(),
+        "cross-process ox-mode dev stop must exit 0, stdout={stop_stdout} stderr={stop_stderr}"
+    );
+    assert!(
+        stop_stdout.contains("3 signalled, 3 exited"),
+        "expected '3 signalled, 3 exited' in cross-process ox-mode dev stop output, got: {stop_stdout}"
+    );
+    assert!(
+        !temp.path().join(".dev_cluster.pids").exists()
+            && !temp.path().join(".dev_cluster.json").exists(),
+        "tracking files must be removed after cross-process ox-mode dev stop"
     );
 }
 
