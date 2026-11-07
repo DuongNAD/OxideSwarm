@@ -314,20 +314,21 @@ fn test_multi_tier_thermal_battery_throttling_policy() {
 
 /// Test 2: Adaptive dual-tier keepalive controller (§4.2) and dynamic master timeout.
 /// Verifies:
-/// - Worker heartbeat interval: 60s for Wi-Fi/Ethernet, 25s for Cellular idle, 10s for Cellular active tasks.
+/// - Worker heartbeat interval: 60s for Wi-Fi/Ethernet idle, 25s for Cellular idle, 10s for active tasks on any link.
+/// - Laptop / unknown network_type keeps the negotiated interval.
 /// - Master dead-peer window calculation: W_dead = max(2s, 4 * tau).
 /// - Dynamic silence window enforcement in WorkerEntry and WorkerRegistry.
 #[tokio::test]
 async fn test_adaptive_rrc_keepalive_controller_and_dynamic_master_timeout() {
     // 1. Worker heartbeat interval derivation
-    // Wi-Fi or Ethernet
+    // Wi-Fi or Ethernet (60s when idle, 10s when active)
     assert_eq!(
         calculate_keepalive_interval("wifi", 0),
         Duration::from_secs(60)
     );
     assert_eq!(
         calculate_keepalive_interval("Wi-Fi", 5),
-        Duration::from_secs(60)
+        Duration::from_secs(10)
     );
     assert_eq!(
         calculate_keepalive_interval("ethernet", 0),
@@ -335,7 +336,7 @@ async fn test_adaptive_rrc_keepalive_controller_and_dynamic_master_timeout() {
     );
     assert_eq!(
         calculate_keepalive_interval("LAN", 2),
-        Duration::from_secs(60)
+        Duration::from_secs(10)
     );
 
     // Cellular Idle (0 active tasks) -> 25s (prevents RRC sleep desync without draining battery)
@@ -378,6 +379,25 @@ async fn test_adaptive_rrc_keepalive_controller_and_dynamic_master_timeout() {
     assert_eq!(
         live_wifi.recommended_keepalive_interval(0),
         Duration::from_secs(60)
+    );
+    assert_eq!(
+        live_wifi.recommended_keepalive_interval(1),
+        Duration::from_secs(10)
+    );
+
+    let live_laptop = MobileLiveStatus {
+        battery_pct: Some(75),
+        is_charging: Some(false),
+        network_type: None,
+        ..Default::default()
+    };
+    assert_eq!(
+        live_laptop.recommended_keepalive_interval_or(0, Duration::from_secs(1)),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        live_laptop.recommended_keepalive_interval_or(1, Duration::from_secs(1)),
+        Duration::from_secs(1)
     );
 
     let live_cell_idle = MobileLiveStatus {
@@ -948,5 +968,293 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
     assert_eq!(final_info.retry_count, 1);
     assert_eq!(final_info.assigned_worker_id, Some(survivor_id));
 
+    let _ = master.shutdown();
+}
+
+/// Integration test for Finding 1:
+/// With a real MasterServer using a short reaper timeout (2 s) and a WorkerClient whose mobile
+/// handle says Wi-Fi before `run`, verifies:
+/// 1. The master records `network_type == "wifi"` within 3 s of registration.
+/// 2. The worker stays in one session (`session_id == 1`, `Connected`) for at least 8 s.
+#[tokio::test]
+async fn test_wifi_phone_with_short_reaper_timeout_reports_wifi_within_3s_and_stays_in_one_session_for_8s(
+) {
+    use rusty_grid_master::reaper::ReaperConfig;
+    use rusty_grid_master::scheduler::SchedulerConfig;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap());
+    let reaper_config = ReaperConfig::new(Duration::from_millis(200), Duration::from_secs(2));
+    let master =
+        MasterServer::spawn_with_config(server_config, SchedulerConfig::default(), reaper_config)
+            .await
+            .expect("master spawn");
+    let master_addr = master.server_addr().to_string();
+
+    let (w_shutdown_tx, w_shutdown_rx) = watch::channel(false);
+    let w_id = Uuid::new_v4();
+    let config = WorkerConfig::new(&master_addr)
+        .with_no_battery(true)
+        .with_name("wifi-phone-1")
+        .with_cores(4)
+        .with_worker_id(w_id)
+        .with_sandbox_base_dir(temp_dir.path().join("w1"));
+    let mut worker = WorkerClient::new(config);
+    worker.mobile_telemetry().update(MobileLiveStatus {
+        battery_pct: Some(85),
+        is_charging: Some(false),
+        thermal_throttled: false,
+        battery_temperature: Some(34.0),
+        network_type: Some("wifi".into()),
+        battery_tier: Some(BatteryTier::Normal),
+        thermal_tier: Some(ThermalTier::Normal),
+    });
+
+    tokio::spawn(async move {
+        let _ = worker.run(w_shutdown_rx).await;
+    });
+
+    // Check 1: master sees network_type == "wifi" within 3 s.
+    let saw_wifi = wait_for(
+        Duration::from_secs(3),
+        Duration::from_millis(50),
+        || async {
+            master
+                .registry()
+                .worker_network_type(&w_id)
+                .await
+                .as_deref()
+                == Some("wifi")
+        },
+    )
+    .await;
+    assert!(
+        saw_wifi,
+        "Master must receive initial MobileTelemetry with network_type=wifi within 3 s"
+    );
+
+    let initial_info = master
+        .registry()
+        .get_worker(w_id)
+        .await
+        .expect("worker must be registered");
+    assert_eq!(initial_info.session_id, 1);
+    assert_eq!(initial_info.status, WorkerStatus::Connected);
+
+    // Check 2: worker stays in session 1 for at least 8 s despite the 2 s reaper timeout.
+    tokio::time::sleep(Duration::from_millis(8200)).await;
+    let after_8s = master
+        .registry()
+        .get_worker(w_id)
+        .await
+        .expect("worker must still be present after 8 s");
+    assert_eq!(
+        after_8s.session_id, 1,
+        "Wi-Fi phone must stay in one session for at least 8 s (no reap loop)"
+    );
+    assert_eq!(after_8s.status, WorkerStatus::Connected);
+
+    let _ = w_shutdown_tx.send(true);
+    let _ = master.shutdown();
+}
+
+/// Integration test for Finding 2:
+/// A 50 s task dispatched to a Wi-Fi phone right after it registers finishes in one session
+/// (`session_id == 1`) with `retry_count == 0`.
+#[tokio::test]
+async fn test_50s_task_on_wifi_phone_finishes_in_one_session_with_zero_retries() {
+    use rusty_grid_master::reaper::ReaperConfig;
+    use rusty_grid_master::scheduler::SchedulerConfig;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3);
+    let reaper_config = ReaperConfig::new(Duration::from_millis(500), Duration::from_secs(10));
+    let master =
+        MasterServer::spawn_with_config(server_config, SchedulerConfig::default(), reaper_config)
+            .await
+            .expect("master spawn");
+    let master_addr = master.server_addr().to_string();
+
+    let (w_shutdown_tx, w_shutdown_rx) = watch::channel(false);
+    let w_id = Uuid::new_v4();
+    let config = WorkerConfig::new(&master_addr)
+        .with_no_battery(true)
+        .with_name("wifi-phone-50s")
+        .with_cores(4)
+        .with_worker_id(w_id)
+        .with_sandbox_base_dir(temp_dir.path().join("w_50s"));
+    let mut worker = WorkerClient::new(config);
+    worker.mobile_telemetry().update(MobileLiveStatus {
+        battery_pct: Some(90),
+        is_charging: Some(true),
+        thermal_throttled: false,
+        battery_temperature: Some(33.0),
+        network_type: Some("wifi".into()),
+        battery_tier: Some(BatteryTier::Normal),
+        thermal_tier: Some(ThermalTier::Normal),
+    });
+
+    tokio::spawn(async move {
+        let _ = worker.run(w_shutdown_rx).await;
+    });
+
+    assert!(
+        wait_for(
+            Duration::from_secs(3),
+            Duration::from_millis(50),
+            || async {
+                master
+                    .registry()
+                    .worker_network_type(&w_id)
+                    .await
+                    .as_deref()
+                    == Some("wifi")
+            }
+        )
+        .await,
+        "Wi-Fi phone must register and report network_type=wifi"
+    );
+
+    // Dispatch a 50 s task right after the Wi-Fi phone registers.
+    let task = Task::new(
+        TaskSpec::BuiltinTest {
+            test_name: "wifi_50s_task".into(),
+            iterations: 1,
+            duration_ms: 50_000,
+            should_fail: false,
+            require_gpu: false,
+        },
+        TaskRequirements::generic(1, 120),
+    );
+    let task_id = master.submit_task(task).await.expect("submit 50s task");
+
+    let completed = wait_for(
+        Duration::from_secs(60),
+        Duration::from_millis(250),
+        || async {
+            master
+                .get_task_info(task_id)
+                .await
+                .map(|i| i.state == TaskState::Completed || i.state == TaskState::Failed)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    assert!(
+        completed,
+        "50 s task on Wi-Fi phone must finish within 60 s"
+    );
+
+    let task_info = master.get_task_info(task_id).await.unwrap();
+    assert_eq!(task_info.state, TaskState::Completed);
+    assert_eq!(task_info.exit_code, Some(0));
+    assert_eq!(
+        task_info.retry_count, 0,
+        "50 s task on Wi-Fi phone must finish with retry_count == 0"
+    );
+
+    let worker_info = master.registry().get_worker(w_id).await.unwrap();
+    assert_eq!(
+        worker_info.session_id, 1,
+        "Wi-Fi phone must finish the 50 s task in its original session (session_id == 1)"
+    );
+
+    let _ = w_shutdown_tx.send(true);
+    let _ = master.shutdown();
+}
+
+/// Integration test for Finding 3:
+/// With a 1 s negotiated heartbeat interval, once Wi-Fi is reported (`network_type = "wifi"`),
+/// the worker's dead-peer watchdog (`dead_after`) adapts to the 60 s Wi-Fi interval instead of
+/// timing out after 4 × 1 s = 4 s, so no reconnect occurs within 15 s.
+#[tokio::test]
+async fn test_worker_with_1s_negotiated_interval_does_not_reconnect_within_15s_after_wifi_reported()
+{
+    use rusty_grid_master::reaper::ReaperConfig;
+    use rusty_grid_master::scheduler::SchedulerConfig;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let server_config =
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_heartbeat_interval(1);
+    let reaper_config = ReaperConfig::new(Duration::from_millis(250), Duration::from_secs(10));
+    let master =
+        MasterServer::spawn_with_config(server_config, SchedulerConfig::default(), reaper_config)
+            .await
+            .expect("master spawn");
+    let master_addr = master.server_addr().to_string();
+
+    let (w_shutdown_tx, w_shutdown_rx) = watch::channel(false);
+    let w_id = Uuid::new_v4();
+    let mut config = WorkerConfig::new(&master_addr)
+        .with_no_battery(true)
+        .with_name("wifi-phone-1s-negotiated")
+        .with_cores(2)
+        .with_worker_id(w_id)
+        .with_sandbox_base_dir(temp_dir.path().join("w_1s"));
+    config.default_heartbeat_interval = Duration::from_secs(1);
+    let mut worker = WorkerClient::new(config);
+    let mobile_handle = worker.mobile_telemetry();
+    // Start without network_type so the session opens at the 1 s negotiated interval (4 s dead_after),
+    // then report Wi-Fi right after registration.
+    mobile_handle.update(MobileLiveStatus {
+        battery_pct: Some(80),
+        is_charging: Some(false),
+        network_type: None,
+        ..Default::default()
+    });
+
+    tokio::spawn(async move {
+        let _ = worker.run(w_shutdown_rx).await;
+    });
+
+    assert!(
+        wait_for(
+            Duration::from_secs(3),
+            Duration::from_millis(50),
+            || async { master.registry().get_worker(w_id).await.is_some() }
+        )
+        .await,
+        "Worker must register"
+    );
+
+    mobile_handle.update(MobileLiveStatus {
+        battery_pct: Some(80),
+        is_charging: Some(false),
+        network_type: Some("wifi".into()),
+        ..Default::default()
+    });
+
+    assert!(
+        wait_for(
+            Duration::from_secs(3),
+            Duration::from_millis(50),
+            || async {
+                master
+                    .registry()
+                    .worker_network_type(&w_id)
+                    .await
+                    .as_deref()
+                    == Some("wifi")
+            }
+        )
+        .await,
+        "Master must observe network_type=wifi"
+    );
+
+    let session_at_wifi = master.registry().get_worker(w_id).await.unwrap().session_id;
+    assert_eq!(session_at_wifi, 1);
+
+    // Wait 15 s after Wi-Fi is reported: with 1 s negotiated interval (4 s old dead_after) and
+    // 60 s Wi-Fi heartbeats, the worker must NOT declare the master dead or reconnect.
+    tokio::time::sleep(Duration::from_millis(15_200)).await;
+
+    let after_15s = master.registry().get_worker(w_id).await.unwrap();
+    assert_eq!(
+        after_15s.session_id, 1,
+        "Worker must not reconnect within 15 s after Wi-Fi is reported with a 1 s negotiated interval"
+    );
+    assert_eq!(after_15s.status, WorkerStatus::Connected);
+
+    let _ = w_shutdown_tx.send(true);
     let _ = master.shutdown();
 }
