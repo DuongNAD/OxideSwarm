@@ -256,6 +256,7 @@ struct WorkerRegistryInner {
     workers: HashMap<Uuid, WorkerEntry>,
     network_types: HashMap<Uuid, Option<String>>,
     next_session_id: u64,
+    registration_epoch: u64,
 }
 
 /// Central in-memory registry of all worker nodes connected to the Master.
@@ -280,6 +281,7 @@ impl WorkerRegistry {
                 workers: HashMap::new(),
                 network_types: HashMap::new(),
                 next_session_id: 1,
+                registration_epoch: 0,
             })),
         }
     }
@@ -444,6 +446,7 @@ impl WorkerRegistry {
             inner.workers.insert(worker_id, entry);
             tracing::info!(worker_id = %worker_id, session_id = session_id, "Registered new worker");
         }
+        inner.registration_epoch = inner.registration_epoch.wrapping_add(1);
 
         Ok(Registration {
             session_id,
@@ -510,6 +513,7 @@ impl WorkerRegistry {
         let mut inner = self.inner.write().await;
         inner.network_types.remove(worker_id);
         if let Some(entry) = inner.workers.remove(worker_id) {
+            inner.registration_epoch = inner.registration_epoch.wrapping_add(1);
             if let Some(abort) = entry.abort_handle.clone() {
                 abort_unless_current(abort);
             }
@@ -539,6 +543,9 @@ impl WorkerRegistry {
                     abort_unless_current(abort);
                 }
             }
+        }
+        if count > 0 {
+            inner.registration_epoch = inner.registration_epoch.wrapping_add(1);
         }
         count
     }
@@ -950,6 +957,26 @@ impl WorkerRegistry {
             .filter(|e| !matches!(e.excluded_until, Some(until) if until > now))
             .map(|e| e.to_info())
             .collect()
+    }
+
+    /// Returns `(schedulable_workers, registered_workers, registration_epoch)` under a single read
+    /// lock so a scheduling pass sees a consistent snapshot of currently schedulable workers and
+    /// all registered workers (including `Disconnected` and cooling-down ones).
+    pub async fn scheduler_snapshot(&self) -> (Vec<WorkerInfo>, Vec<WorkerInfo>, u64) {
+        let inner = self.inner.read().await;
+        let now = Instant::now();
+        let mut schedulable = Vec::with_capacity(inner.workers.len());
+        let mut registered = Vec::with_capacity(inner.workers.len());
+        for e in inner.workers.values() {
+            let info = e.to_info();
+            if e.status != WorkerStatus::Disconnected
+                && !matches!(e.excluded_until, Some(until) if until > now)
+            {
+                schedulable.push(info.clone());
+            }
+            registered.push(info);
+        }
+        (schedulable, registered, inner.registration_epoch)
     }
 
     /// Returns available (Connected and idle) workers ready for task assignment.

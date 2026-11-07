@@ -555,6 +555,8 @@ struct TaskQueueInner {
     active_sizes: HashMap<TaskId, usize>,
     /// Sum of `active_sizes`.
     active_bytes: usize,
+    /// Monotonically incremented whenever a task is inserted into `ready_queue`.
+    ready_epoch: u64,
 }
 
 /// Bytes one blob reference (id, size, flags) is charged in addition to its path.
@@ -760,12 +762,20 @@ impl TaskQueueInner {
         }
         evicted
     }
+
+    fn insert_ready(&mut self, key: QueueOrderKey) {
+        if self.ready_queue.insert(key) {
+            self.ready_epoch = self.ready_epoch.wrapping_add(1);
+        }
+    }
 }
 
 /// Thread-safe in-memory Task Queue and lifecycle coordinator.
 #[derive(Clone)]
 pub struct TaskQueue {
     inner: Arc<RwLock<TaskQueueInner>>,
+    #[cfg(test)]
+    ready_views_calls: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Default for TaskQueue {
@@ -833,7 +843,10 @@ impl TaskQueue {
                 terminal_bytes: 0,
                 active_sizes: HashMap::new(),
                 active_bytes: 0,
+                ready_epoch: 0,
             })),
+            #[cfg(test)]
+            ready_views_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -943,7 +956,7 @@ impl TaskQueue {
         inner.tasks.insert(task_id, entry);
         inner.active_sizes.insert(task_id, entry_bytes);
         inner.active_bytes = inner.active_bytes.saturating_add(entry_bytes);
-        inner.ready_queue.insert(QueueOrderKey {
+        inner.insert_ready(QueueOrderKey {
             priority_rev: Reverse(0),
             sequence,
             task_id,
@@ -1020,7 +1033,7 @@ impl TaskQueue {
         inner.tasks.insert(task_id, entry);
         inner.active_sizes.insert(task_id, entry_bytes);
         inner.active_bytes = inner.active_bytes.saturating_add(entry_bytes);
-        inner.ready_queue.insert(QueueOrderKey {
+        inner.insert_ready(QueueOrderKey {
             priority_rev: Reverse(priority),
             sequence,
             task_id,
@@ -1059,13 +1072,18 @@ impl TaskQueue {
         after: Option<QueueOrderKey>,
         limit: usize,
     ) -> (Vec<TaskView>, Option<QueueOrderKey>) {
+        #[cfg(test)]
+        self.ready_views_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let inner = self.inner.read().await;
         let lower = match after {
             Some(key) => Bound::Excluded(key),
             None => Bound::Unbounded,
         };
         let mut views = Vec::with_capacity(limit.min(256));
-        for key in inner.ready_queue.range((lower, Bound::Unbounded)) {
+        let mut range = inner.ready_queue.range((lower, Bound::Unbounded));
+        let mut last_key = None;
+        for key in &mut range {
             let Some(entry) = inner
                 .tasks
                 .get(&key.task_id)
@@ -1077,10 +1095,31 @@ impl TaskQueue {
             view.avoid = entry.avoid_workers.clone();
             views.push(view);
             if views.len() >= limit {
-                return (views, Some(*key));
+                last_key = Some(*key);
+                break;
             }
         }
-        (views, None)
+        let next = last_key.filter(|_| {
+            range.any(|k| {
+                inner
+                    .tasks
+                    .get(&k.task_id)
+                    .is_some_and(|e| e.state == TaskState::Queued)
+            })
+        });
+        (views, next)
+    }
+
+    /// Monotonic counter incremented whenever a task enters `ready_queue`.
+    pub async fn ready_epoch(&self) -> u64 {
+        self.inner.read().await.ready_epoch
+    }
+
+    /// Number of [`ready_views`](Self::ready_views) calls made on this queue (for tests).
+    #[cfg(test)]
+    pub fn ready_views_call_count(&self) -> u64 {
+        self.ready_views_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Ids of up to `limit` queued tasks in priority-FIFO order, without cloning any task.
@@ -1358,7 +1397,7 @@ impl TaskQueue {
             (entry.priority, entry.sequence)
         };
 
-        inner.ready_queue.insert(QueueOrderKey {
+        inner.insert_ready(QueueOrderKey {
             priority_rev: Reverse(priority),
             sequence,
             task_id: *task_id,
@@ -1421,7 +1460,7 @@ impl TaskQueue {
         if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
             tasks.remove(task_id);
         }
-        inner.ready_queue.insert(QueueOrderKey {
+        inner.insert_ready(QueueOrderKey {
             priority_rev: Reverse(priority),
             sequence,
             task_id: *task_id,
@@ -1782,7 +1821,7 @@ impl TaskQueue {
             inner.delayed_retries.insert(key);
         }
         if let Some(key) = ready_key_to_insert {
-            inner.ready_queue.insert(key);
+            inner.insert_ready(key);
         }
 
         if res_state.is_terminal() {
@@ -1847,6 +1886,43 @@ impl TaskQueue {
 
         inner.track_terminal_task(task_id);
         Ok(ResultDisposition::Terminal)
+    }
+
+    /// Fails a queued task terminally when no registered worker in the cluster can satisfy its
+    /// capabilities or placement constraints (`SchedulerConfig::fail_unfulfillable_tasks`), or
+    /// when its placement constraints are syntactically invalid.
+    ///
+    /// Returns `Some(TaskResult)` when the task transitioned from `Queued` to `Failed`, or `None`
+    /// if the task was already scheduled, cancelled, or finished in the meantime.
+    pub async fn fail_unfulfillable_task(
+        &self,
+        task_id: &TaskId,
+        reason: String,
+    ) -> Option<TaskResult> {
+        let mut inner = self.inner.write().await;
+        let (priority, sequence) = {
+            let entry = inner.tasks.get(task_id)?;
+            if entry.state != TaskState::Queued {
+                return None;
+            }
+            (entry.priority, entry.sequence)
+        };
+
+        inner.ready_queue.remove(&QueueOrderKey {
+            priority_rev: Reverse(priority),
+            sequence,
+            task_id: *task_id,
+        });
+
+        let result = TaskResult::failure(Uuid::nil(), *task_id, 1, "", "", 0, Some(reason.clone()));
+
+        if let Some(entry) = inner.tasks.get_mut(task_id) {
+            entry.state = TaskState::Failed;
+            entry.error_message = Some(reason);
+            entry.result = Some(result.clone());
+        }
+        inner.track_terminal_task(*task_id);
+        Some(result)
     }
 
     // --- Worker Disconnect & Failover ---
@@ -2011,7 +2087,7 @@ impl TaskQueue {
         }
         for key in ready_to_insert {
             let tid = key.task_id;
-            inner.ready_queue.insert(key);
+            inner.insert_ready(key);
             inner.update_active_task(tid);
         }
         for tid in terminal_to_track {
@@ -2059,7 +2135,7 @@ impl TaskQueue {
                 }
             };
             if let Some(k) = key {
-                inner.ready_queue.insert(k);
+                inner.insert_ready(k);
             }
         }
 

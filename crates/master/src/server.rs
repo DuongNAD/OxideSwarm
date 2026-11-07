@@ -782,9 +782,14 @@ impl MasterServer {
                             let _ = &report;
                             #[cfg(feature = "dashboard")]
                             if let Some(ref b_tx) = sched_broadcast_tx {
-                                if !report.assignments.is_empty() {
+                                if !report.assignments.is_empty() || !report.unfulfillable.is_empty() {
                                     for assignment in &report.assignments {
                                         if let Some(info) = sched_queue.get_task(&assignment.task_id).await {
+                                            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
+                                        }
+                                    }
+                                    for (task_id, _) in &report.unfulfillable {
+                                        if let Some(info) = sched_queue.get_task(task_id).await {
                                             let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
                                         }
                                     }
@@ -798,9 +803,14 @@ impl MasterServer {
                             let _ = &report;
                             #[cfg(feature = "dashboard")]
                             if let Some(ref b_tx) = sched_broadcast_tx {
-                                if !report.assignments.is_empty() {
+                                if !report.assignments.is_empty() || !report.unfulfillable.is_empty() {
                                     for assignment in &report.assignments {
                                         if let Some(info) = sched_queue.get_task(&assignment.task_id).await {
+                                            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
+                                        }
+                                    }
+                                    for (task_id, _) in &report.unfulfillable {
+                                        if let Some(info) = sched_queue.get_task(task_id).await {
                                             let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
                                         }
                                     }
@@ -3741,7 +3751,7 @@ async fn handle_multiplexed_connection<
         StampedStream::new(ctrl_stream, rx_clock.clone()),
         wire_codec,
     );
-    let data_transport = MessageTransport::with_codec(
+    let mut data_transport = MessageTransport::with_codec(
         StampedStream::new(data_stream, rx_clock.clone()),
         wire_codec,
     );
@@ -3784,6 +3794,7 @@ async fn handle_multiplexed_connection<
 
     if wire_codec == WireCodec::Bincode {
         ctrl_transport.set_outbound_codec(detected_codec);
+        data_transport.set_outbound_codec(detected_codec);
     }
 
     let worker_msg = match first_msg {
@@ -6293,6 +6304,204 @@ mod tests {
         }
 
         server_task.abort();
+
+        // Also verify multiplexed P2P (`handle_multiplexed_connection`) with `WireCodec::Json`:
+        // a worker registering with Bincode must receive both its `RegisterAck` (control lane)
+        // and `AssignTask` (data lane) in `WireCodec::Json`.
+        let (c_master, c_worker) = tokio::io::duplex(64 * 1024);
+        let (d_master, d_worker) = tokio::io::duplex(64 * 1024);
+        let (_mux_stop_tx, mux_stop_rx) = tokio::sync::watch::channel(false);
+        let mux_reg1 = WorkerRegistry::new();
+        let mux_queue1 = TaskQueue::new();
+        let mux_notify1 = Arc::new(tokio::sync::Notify::new());
+        let reg1_clone = mux_reg1.clone();
+        let queue1_clone = mux_queue1.clone();
+        let notify1_clone = Arc::clone(&mux_notify1);
+        let mux_task = tokio::spawn(async move {
+            handle_multiplexed_connection(
+                c_master,
+                d_master,
+                SocketAddr::from(([127, 0, 0, 1], 50099)),
+                reg1_clone,
+                queue1_clone,
+                notify1_clone,
+                Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                10,
+                Duration::from_secs(5),
+                mux_stop_rx,
+                None,
+                WireCodec::Json,
+                None,
+                None,
+                None,
+                #[cfg(feature = "dashboard")]
+                None,
+                #[cfg(feature = "p2p")]
+                None,
+                #[cfg(feature = "p2p")]
+                None,
+            )
+            .await
+        });
+
+        let mut w_ctrl = MessageTransport::with_codec(c_worker, WireCodec::Bincode);
+        let mut w_data = MessageTransport::with_codec(d_worker, WireCodec::Bincode);
+        w_ctrl
+            .send_msg(&WorkerMessage::Register {
+                worker_id: Uuid::new_v4(),
+                capabilities: WorkerCapabilities::new(
+                    "mux-json-check",
+                    2,
+                    4096,
+                    false,
+                    false,
+                    None,
+                ),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: rusty_grid_core::protocol::ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        let (mux_reply, mux_codec) = w_ctrl
+            .recv_msg_with_codec::<MasterMessage>()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mux_codec,
+            WireCodec::Json,
+            "handle_multiplexed_connection with WireCodec::Json must reply in Json on ctrl_transport even to a Bincode worker"
+        );
+        assert!(matches!(
+            mux_reply,
+            MasterMessage::RegisterAck { accepted: true, .. }
+        ));
+
+        mux_queue1
+            .submit(Task::new(
+                TaskSpec::command("echo", vec!["mux-json-data-lane".into()]),
+                TaskRequirements::generic(1, 30),
+            ))
+            .await
+            .unwrap();
+        let sched1 = WorkloadScheduler::new(
+            SchedulerConfig::default(),
+            mux_reg1,
+            mux_queue1,
+            mux_notify1,
+        );
+        assert_eq!(sched1.schedule_once().await.unwrap().assignments.len(), 1);
+        let (json_data_msg, json_data_codec) = w_data
+            .recv_msg_with_codec::<MasterMessage>()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            json_data_codec,
+            WireCodec::Json,
+            "handle_multiplexed_connection with WireCodec::Json must send AssignTask in Json on data_transport even to a Bincode worker"
+        );
+        assert!(matches!(json_data_msg, MasterMessage::AssignTask { .. }));
+        mux_task.abort();
+
+        // Conversely, when `handle_multiplexed_connection` is configured with `WireCodec::Bincode`
+        // (default), a worker registering with `WireCodec::Json` must have `detected_codec` mirrored
+        // onto BOTH `ctrl_transport` (`RegisterAck`) and `data_transport` (`AssignTask`).
+        let (c_master2, c_worker2) = tokio::io::duplex(64 * 1024);
+        let (d_master2, d_worker2) = tokio::io::duplex(64 * 1024);
+        let (_mux_stop_tx2, mux_stop_rx2) = tokio::sync::watch::channel(false);
+        let mux_reg2 = WorkerRegistry::new();
+        let mux_queue2 = TaskQueue::new();
+        let mux_notify2 = Arc::new(tokio::sync::Notify::new());
+        let reg2_clone = mux_reg2.clone();
+        let queue2_clone = mux_queue2.clone();
+        let notify2_clone = Arc::clone(&mux_notify2);
+        let mux_task2 = tokio::spawn(async move {
+            handle_multiplexed_connection(
+                c_master2,
+                d_master2,
+                SocketAddr::from(([127, 0, 0, 1], 50100)),
+                reg2_clone,
+                queue2_clone,
+                notify2_clone,
+                Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                10,
+                Duration::from_secs(5),
+                mux_stop_rx2,
+                None,
+                WireCodec::Bincode,
+                None,
+                None,
+                None,
+                #[cfg(feature = "dashboard")]
+                None,
+                #[cfg(feature = "p2p")]
+                None,
+                #[cfg(feature = "p2p")]
+                None,
+            )
+            .await
+        });
+
+        let mut w_ctrl2 = MessageTransport::with_codec(c_worker2, WireCodec::Json);
+        let mut w_data2 = MessageTransport::with_codec(d_worker2, WireCodec::Json);
+        w_ctrl2
+            .send_msg(&WorkerMessage::Register {
+                worker_id: Uuid::new_v4(),
+                capabilities: WorkerCapabilities::new(
+                    "mux-mirror-check",
+                    2,
+                    4096,
+                    false,
+                    false,
+                    None,
+                ),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: rusty_grid_core::protocol::ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        let (mux_reply2, mux_codec2) = w_ctrl2
+            .recv_msg_with_codec::<MasterMessage>()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mux_codec2,
+            WireCodec::Json,
+            "handle_multiplexed_connection with WireCodec::Bincode must mirror detected Json codec onto ctrl_transport"
+        );
+        assert!(matches!(
+            mux_reply2,
+            MasterMessage::RegisterAck { accepted: true, .. }
+        ));
+
+        mux_queue2
+            .submit(Task::new(
+                TaskSpec::command("echo", vec!["mux-data-lane".into()]),
+                TaskRequirements::generic(1, 30),
+            ))
+            .await
+            .unwrap();
+        let sched2 = WorkloadScheduler::new(
+            SchedulerConfig::default(),
+            mux_reg2,
+            mux_queue2,
+            mux_notify2,
+        );
+        assert_eq!(sched2.schedule_once().await.unwrap().assignments.len(), 1);
+        let (data_msg, data_codec) = w_data2
+            .recv_msg_with_codec::<MasterMessage>()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            data_codec,
+            WireCodec::Json,
+            "handle_multiplexed_connection with WireCodec::Bincode must mirror detected Json codec onto data_transport"
+        );
+        assert!(matches!(data_msg, MasterMessage::AssignTask { .. }));
+        mux_task2.abort();
     }
 
     #[cfg(feature = "p2p")]

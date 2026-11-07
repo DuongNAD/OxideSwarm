@@ -15,7 +15,7 @@
 //!    4-core worker that keeps being topped up with 1-core jobs) holds back the worker closest to
 //!    having room for it, so the tasks behind it cannot refill that worker.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify};
@@ -216,6 +216,13 @@ impl SchedulerConfig {
         self.max_batch_size = size;
         self
     }
+
+    /// Sets whether tasks whose capabilities or placement constraints no registered worker can
+    /// satisfy are failed immediately during scheduling passes.
+    pub fn with_fail_unfulfillable_tasks(mut self, fail: bool) -> Self {
+        self.fail_unfulfillable_tasks = fail;
+        self
+    }
 }
 
 /// Matchmaking decision pairing a task with an eligible worker.
@@ -344,6 +351,7 @@ impl Seat<'_> {
 }
 
 /// What the engine decided for one task.
+#[derive(Clone)]
 enum Verdict {
     /// Placed on the worker at this index of the engine's workers.
     Placed(usize),
@@ -356,6 +364,10 @@ enum Verdict {
 struct Engine<'a> {
     config: &'a SchedulerConfig,
     seats: Vec<Seat<'a>>,
+    /// All registered workers in the cluster (including `Disconnected` and cooling-down ones),
+    /// used by `fail_unfulfillable_tasks` so tasks are not failed while their matching worker is
+    /// still registered.
+    registered: &'a [WorkerInfo],
     rr_cursor: usize,
     /// A GPU task that some GPU worker could run is waiting (see
     /// `SchedulerConfig::preserve_gpu_for_gpu_tasks`).
@@ -363,7 +375,7 @@ struct Engine<'a> {
     /// GPU work was seen within `gpu_demand_window`.
     gpu_recent: bool,
     any_gpu_worker: bool,
-    dead: HashSet<Shape>,
+    dead: HashMap<Shape, Verdict>,
     /// Slots still free across the cluster; the pass stops looking once this reaches zero.
     free_slots: usize,
     /// Seats held back for a task ahead in the queue that is waiting for slots to free up on them
@@ -452,6 +464,7 @@ impl<'a> Engine<'a> {
     fn new(
         config: &'a SchedulerConfig,
         workers: &'a [WorkerInfo],
+        registered: &'a [WorkerInfo],
         loads: Option<&HashMap<Uuid, AssignedLoad>>,
         gpu_waiting: bool,
         gpu_recent: bool,
@@ -497,14 +510,42 @@ impl<'a> Engine<'a> {
             .sum();
         Self {
             config,
-            any_gpu_worker: workers.iter().any(|w| w.capabilities.can_execute_gpu()),
+            any_gpu_worker: registered.iter().any(|w| w.capabilities.can_execute_gpu()),
+            registered,
             reserved: vec![false; seats.len()],
             seats,
             rr_cursor: 0,
             gpu_waiting,
             gpu_recent: gpu_recent || gpu_waiting,
-            dead: HashSet::new(),
+            dead: HashMap::new(),
             free_slots,
+        }
+    }
+
+    fn skip_reason(&self, view: &TaskView, placement: &Placement) -> ScheduleSkipReason {
+        if view.requires_gpu {
+            ScheduleSkipReason::NoGpuWorkersAvailable
+        } else if !view.required_features.is_empty()
+            && !self
+                .seats
+                .iter()
+                .any(|seat| seat.worker.features.contains(view.required_features))
+        {
+            ScheduleSkipReason::ClusterLacksCapability(format!(
+                "cluster lacks workers with {} capability",
+                feature_names(view.required_features)
+            ))
+        } else if !placement.is_empty()
+            && !self
+                .seats
+                .iter()
+                .any(|seat| placement_admits(placement, seat.worker))
+        {
+            ScheduleSkipReason::ClusterLacksCapability(format!(
+                "no worker matches the placement constraints ({placement})"
+            ))
+        } else {
+            ScheduleSkipReason::AllEligibleWorkersSaturated
         }
     }
 
@@ -513,48 +554,61 @@ impl<'a> Engine<'a> {
             Ok(placement) => placement,
             Err(e) => return Verdict::Unfulfillable(format!("Invalid placement constraints: {e}")),
         };
-        if view.requires_gpu && self.config.fail_unfulfillable_tasks && !self.any_gpu_worker {
-            return Verdict::Unfulfillable("Cluster lacks workers with GPU capabilities".into());
-        }
-        let nobody_has_features = !view.required_features.is_empty()
-            && !self
-                .seats
-                .iter()
-                .any(|seat| seat.worker.features.contains(view.required_features));
-        if nobody_has_features && self.config.fail_unfulfillable_tasks {
-            return Verdict::Unfulfillable(format!(
-                "Cluster lacks workers with {} capability",
-                feature_names(view.required_features)
-            ));
-        }
-        let nobody_matches = !placement.is_empty()
-            && !self
-                .seats
-                .iter()
-                .any(|seat| placement_admits(placement, seat.worker));
-        if nobody_matches && self.config.fail_unfulfillable_tasks {
-            return Verdict::Unfulfillable(format!(
-                "No registered worker matches the placement constraints ({placement})"
-            ));
-        }
-        let skip_reason = if view.requires_gpu {
-            ScheduleSkipReason::NoGpuWorkersAvailable
-        } else if nobody_has_features {
-            ScheduleSkipReason::ClusterLacksCapability(format!(
-                "cluster lacks workers with {} capability",
-                feature_names(view.required_features)
-            ))
-        } else if nobody_matches {
-            ScheduleSkipReason::ClusterLacksCapability(format!(
-                "no worker matches the placement constraints ({placement})"
-            ))
-        } else {
-            ScheduleSkipReason::AllEligibleWorkersSaturated
-        };
-
         let shape = Shape::of(view, placement);
-        if self.dead.contains(&shape) {
-            return Verdict::Skip(skip_reason);
+        if let Some(verdict) = self.dead.get(&shape) {
+            return verdict.clone();
+        }
+        if self.config.fail_unfulfillable_tasks {
+            if view.requires_gpu && !self.any_gpu_worker {
+                let verdict =
+                    Verdict::Unfulfillable("Cluster lacks workers with GPU capabilities".into());
+                self.dead.insert(shape, verdict.clone());
+                return verdict;
+            }
+            let nobody_has_features = !view.required_features.is_empty()
+                && !self
+                    .registered
+                    .iter()
+                    .any(|w| w.features.contains(view.required_features));
+            if nobody_has_features {
+                let verdict = Verdict::Unfulfillable(format!(
+                    "Cluster lacks workers with {} capability",
+                    feature_names(view.required_features)
+                ));
+                self.dead.insert(shape, verdict.clone());
+                return verdict;
+            }
+            let nobody_matches = !placement.is_empty()
+                && !self
+                    .registered
+                    .iter()
+                    .any(|w| placement_admits(placement, w));
+            if nobody_matches {
+                let verdict = Verdict::Unfulfillable(format!(
+                    "No registered worker matches the placement constraints ({placement})"
+                ));
+                self.dead.insert(shape, verdict.clone());
+                return verdict;
+            }
+            let nobody_fits = !self.registered.iter().any(|w| {
+                statically_fits(&view.requirements, w)
+                    && placement_admits(placement, w)
+                    && (!view.requires_gpu || w.capabilities.can_execute_gpu())
+                    && w.features.contains(view.required_features)
+            });
+            if nobody_fits {
+                let verdict = Verdict::Unfulfillable(format!(
+                    "No registered worker satisfies task requirements (cpu_cores={}, ram_mb={}, gpu={})",
+                    view.requirements.cpu_cores, view.requirements.ram_mb, view.requires_gpu
+                ));
+                self.dead.insert(shape, verdict.clone());
+                return verdict;
+            }
+        }
+        if self.free_slots == 0 {
+            let verdict = Verdict::Skip(self.skip_reason(view, placement));
+            self.dead.insert(shape, verdict.clone());
+            return verdict;
         }
 
         let weight = view.requirements.cpu_cores.max(1);
@@ -567,8 +621,9 @@ impl<'a> Engine<'a> {
         }
         if candidates.is_empty() {
             self.hold_back(&full, weight);
-            self.dead.insert(shape);
-            return Verdict::Skip(skip_reason);
+            let verdict = Verdict::Skip(self.skip_reason(view, placement));
+            self.dead.insert(shape, verdict.clone());
+            return verdict;
         }
 
         let chosen = self.rank(view, &mut candidates);
@@ -886,6 +941,15 @@ struct GpuDemand {
     last_waiting: bool,
 }
 
+/// Progress of the unfulfillability sweep across `ready_queue` for a given
+/// `(registration_epoch, ready_epoch)` pair.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct UnfulfillableSweep {
+    epochs: Option<(u64, u64)>,
+    cursor: Option<QueueOrderKey>,
+    completed: bool,
+}
+
 /// Autonomous workload-specific scheduling engine.
 pub struct WorkloadScheduler {
     config: SchedulerConfig,
@@ -898,6 +962,11 @@ pub struct WorkloadScheduler {
     gpu_demand: std::sync::Mutex<GpuDemand>,
     /// Persistent round-robin cursor across scheduling passes (`schedule_once` / `schedule_batch`).
     rr_cursor: std::sync::atomic::AtomicUsize,
+    /// Sweep progress across `ready_queue` under `fail_unfulfillable_tasks` for the current
+    /// `(registration_epoch, ready_epoch)`, keeping a cursor across saturated passes when the
+    /// queue exceeds `max_scan_per_pass` and recording completion once the end of the queue is
+    /// reached so subsequent saturated passes with unchanged epochs make no `ready_views` call.
+    unfulfillable_sweep: std::sync::Mutex<UnfulfillableSweep>,
 }
 
 impl WorkloadScheduler {
@@ -916,6 +985,7 @@ impl WorkloadScheduler {
             waiters: None,
             gpu_demand: std::sync::Mutex::new(GpuDemand::default()),
             rr_cursor: std::sync::atomic::AtomicUsize::new(0),
+            unfulfillable_sweep: std::sync::Mutex::new(UnfulfillableSweep::default()),
         }
     }
 
@@ -973,7 +1043,7 @@ impl WorkloadScheduler {
             .collect();
         // GPU-capable work in the batch itself is "waiting".
         let gpu_waiting = views.iter().any(|v| v.requires_gpu);
-        let mut engine = Engine::new(config, workers, None, gpu_waiting, false);
+        let mut engine = Engine::new(config, workers, workers, None, gpu_waiting, false);
         for (task, view) in tasks.iter().zip(&views) {
             match engine.place(view) {
                 Verdict::Placed(idx) => {
@@ -1075,7 +1145,7 @@ impl WorkloadScheduler {
         }
 
         // Step 2: Active workers (checked before touching the queue: no worker, nothing to clone)
-        let mut workers = self.registry.list_schedulable_workers().await;
+        let (mut workers, registered, reg_epoch) = self.registry.scheduler_snapshot().await;
         if workers.is_empty() {
             let mut report = ScheduleReport::default();
             for task_id in self.queue.ready_task_ids(max_batch_size).await {
@@ -1092,22 +1162,63 @@ impl WorkloadScheduler {
         let mut engine = Engine::new(
             &self.config,
             &workers,
+            &registered,
             Some(&loads),
             gpu_waiting,
             gpu_recent,
         );
         engine.rr_cursor = self.rr_cursor.load(std::sync::atomic::Ordering::Relaxed);
 
+        let ready_epoch = self.queue.ready_epoch().await;
+        let sweep_state = (reg_epoch, ready_epoch);
+        let (need_unfulfillable_sweep, sweep_cursor) = if self.config.fail_unfulfillable_tasks {
+            let mut state = self
+                .unfulfillable_sweep
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if state.epochs != Some(sweep_state) {
+                *state = UnfulfillableSweep {
+                    epochs: Some(sweep_state),
+                    cursor: None,
+                    completed: false,
+                };
+            }
+            (!state.completed, state.cursor)
+        } else {
+            (false, None)
+        };
+
         // Step 3: Walk the queue
         let mut report = ScheduleReport::default();
         let mut placements: Vec<(TaskId, usize)> = Vec::new();
-        if engine.free_slots > 0 && max_batch_size > 0 {
-            let mut cursor: Option<QueueOrderKey> = None;
+        if (engine.free_slots > 0 || need_unfulfillable_sweep) && max_batch_size > 0 {
+            let mut cursor: Option<QueueOrderKey> = if engine.free_slots == 0 {
+                sweep_cursor
+            } else {
+                None
+            };
             let mut scanned = 0usize;
+            let mut sweeping_from_cursor = engine.free_slots == 0;
             let scan_budget = self.config.max_scan_per_pass.max(1);
             'scan: loop {
                 let page_limit = SCAN_PAGE.min(scan_budget.saturating_sub(scanned));
                 if page_limit == 0 {
+                    if !sweeping_from_cursor
+                        && need_unfulfillable_sweep
+                        && sweep_cursor.is_some()
+                        && self
+                            .unfulfillable_sweep
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .cursor
+                            == sweep_cursor
+                    {
+                        sweeping_from_cursor = true;
+                        engine.free_slots = 0;
+                        cursor = sweep_cursor;
+                        scanned = 0;
+                        continue 'scan;
+                    }
                     break;
                 }
                 let (views, next) = self.queue.ready_views(cursor, page_limit).await;
@@ -1132,7 +1243,10 @@ impl WorkloadScheduler {
                             if view.requires_gpu {
                                 self.note_gpu_demand();
                             }
-                            if placements.len() >= max_batch_size || engine.free_slots == 0 {
+                            if placements.len() >= max_batch_size {
+                                engine.free_slots = 0;
+                            }
+                            if engine.free_slots == 0 && !need_unfulfillable_sweep {
                                 break 'scan;
                             }
                         }
@@ -1141,7 +1255,7 @@ impl WorkloadScheduler {
                                 report.skipped.push((view.task_id, reason));
                             }
                             // A worker held back for this task may have been the last one with room.
-                            if engine.free_slots == 0 {
+                            if engine.free_slots == 0 && !need_unfulfillable_sweep {
                                 break 'scan;
                             }
                         }
@@ -1151,13 +1265,60 @@ impl WorkloadScheduler {
                     }
                 }
                 match next {
-                    Some(key) => cursor = Some(key),
-                    None => break,
+                    Some(key) => {
+                        cursor = Some(key);
+                        if self.config.fail_unfulfillable_tasks {
+                            let mut state = self
+                                .unfulfillable_sweep
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            if state.epochs == Some(sweep_state) && !state.completed {
+                                state.cursor = Some(match state.cursor {
+                                    Some(prev) if prev > key => prev,
+                                    _ => key,
+                                });
+                            }
+                        }
+                    }
+                    None => {
+                        if self.config.fail_unfulfillable_tasks {
+                            *self
+                                .unfulfillable_sweep
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = UnfulfillableSweep {
+                                epochs: Some(sweep_state),
+                                cursor: None,
+                                completed: true,
+                            };
+                        }
+                        break;
+                    }
                 }
             }
         }
         self.rr_cursor
             .store(engine.rr_cursor, std::sync::atomic::Ordering::Relaxed);
+        for (task_id, reason) in &report.unfulfillable {
+            if let Some(result) = self
+                .queue
+                .fail_unfulfillable_task(task_id, reason.clone())
+                .await
+            {
+                warn!(
+                    task_id = %task_id,
+                    reason = %reason,
+                    "Failing unfulfillable task"
+                );
+                if let Some(ref waiters) = self.waiters {
+                    let mut lock = waiters.write().await;
+                    if let Some(senders) = lock.remove(task_id) {
+                        for tx in senders {
+                            let _ = tx.send(result.clone());
+                        }
+                    }
+                }
+            }
+        }
         if placements.is_empty() {
             return Ok(report);
         }
@@ -3137,6 +3298,606 @@ mod tests {
                 .len(),
             0,
             "A phone at 45°C must receive 0 assignments even when thermal_throttled is false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fail_unfulfillable_tasks_default_false_keeps_queued_and_true_fails_with_reason_and_wakes_waiter(
+    ) {
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+        assert!(
+            !SchedulerConfig::default().fail_unfulfillable_tasks,
+            "fail_unfulfillable_tasks must default to false"
+        );
+
+        let unplaceable_task = || constrained_task(&["require:tag=nothing"]);
+
+        // 1. With 0 workers registered, even `fail_unfulfillable_tasks: true` keeps tasks queued.
+        let t_no_workers = queue.submit(unplaceable_task()).await.unwrap();
+        let sched_strict = WorkloadScheduler::new(
+            SchedulerConfig::default().with_fail_unfulfillable_tasks(true),
+            registry.clone(),
+            queue.clone(),
+            notify.clone(),
+        )
+        .with_waiters(waiters.clone());
+        let r0 = sched_strict.schedule_once().await.unwrap();
+        assert!(r0.unfulfillable.is_empty());
+        assert_eq!(
+            queue.get_state(&t_no_workers).await,
+            Some(crate::queue::TaskState::Queued),
+            "when no workers are registered, tasks must stay Queued"
+        );
+        let _ = queue.cancel_task(&t_no_workers, None).await;
+
+        // 2. Register a 1-core CPU worker (`slots:1`) and verify `fail_unfulfillable_tasks: false`
+        //    leaves an unplaceable task Queued.
+        let (_w_id, _w_sess, mut w_rx) = register_worker(&registry, "cpu-w1", 1, 4096, false).await;
+        let t_default = queue.submit(unplaceable_task()).await.unwrap();
+        let sched_default = WorkloadScheduler::new(
+            SchedulerConfig::default(),
+            registry.clone(),
+            queue.clone(),
+            notify.clone(),
+        )
+        .with_waiters(waiters.clone());
+        let r_def = sched_default.schedule_once().await.unwrap();
+        assert!(r_def.unfulfillable.is_empty());
+        assert_eq!(
+            queue.get_state(&t_default).await,
+            Some(crate::queue::TaskState::Queued),
+            "with fail_unfulfillable_tasks=false, unplaceable task must stay Queued"
+        );
+
+        // 3. With `fail_unfulfillable_tasks: true`, register a waiter on `t_default` and run a pass:
+        //    even if we also submit a normal CPU task that fills `cpu-w1`'s single slot first, AND
+        //    a second normal CPU task behind it (which is temporarily blocked by busy slots, not
+        //    unfulfillable), `t_default` and a second unplaceable task submitted when `free_slots == 0`
+        //    are failed immediately with the mismatch reason, active_bytes drops, and the waiter wakes!
+        let (wait_tx, wait_rx) = tokio::sync::oneshot::channel();
+        waiters.write().await.insert(t_default, vec![wait_tx]);
+
+        let t_fits_1 = queue.submit(cmd_task("runs-first")).await.unwrap();
+        let t_fits_2 = queue.submit(cmd_task("waits-for-slot")).await.unwrap();
+
+        let r_strict1 = sched_strict.schedule_once().await.unwrap();
+        assert_eq!(r_strict1.assignments.len(), 1);
+        assert_eq!(r_strict1.assignments[0].task_id, t_fits_1);
+        assert!(matches!(
+            w_rx.recv().await,
+            Some(MasterMessage::AssignTask { .. })
+        ));
+        assert_eq!(r_strict1.unfulfillable.len(), 1);
+        assert_eq!(r_strict1.unfulfillable[0].0, t_default);
+        assert_eq!(
+            r_strict1.unfulfillable[0].1,
+            "No registered worker matches the placement constraints (tag=nothing)"
+        );
+        assert_eq!(
+            queue.get_state(&t_default).await,
+            Some(crate::queue::TaskState::Failed)
+        );
+        assert_eq!(
+            queue.get_state(&t_fits_2).await,
+            Some(crate::queue::TaskState::Queued),
+            "a task that fits an existing worker's capabilities when idle must stay Queued while slots are busy"
+        );
+
+        let waited_res = wait_rx
+            .await
+            .expect("waiter on unfulfillable task must be notified");
+        assert_eq!(waited_res.task_id, t_default);
+        assert_eq!(waited_res.exit_code, 1);
+        assert_eq!(
+            waited_res.error.as_deref(),
+            Some("No registered worker matches the placement constraints (tag=nothing)")
+        );
+
+        // 4. Now `cpu-w1` has 0 free slots (`t_fits_1` is still running). Submit another
+        //    unplaceable task (`gpu_task()`) and a 16-core CPU task (`nobody_fits`), and verify
+        //    `schedule_once()` STILL fails both even when `engine.free_slots == 0`, releasing
+        //    their active payload budget.
+        let active_before = queue.active_retained_bytes().await;
+        let t_gpu_when_busy = queue.submit(gpu_task()).await.unwrap();
+        let t_16c_when_busy = queue
+            .submit(Task::new(
+                TaskSpec::shell_script("echo 16-cores".to_string()),
+                TaskRequirements::generic(16, 30),
+            ))
+            .await
+            .unwrap();
+        assert!(queue.active_retained_bytes().await > active_before);
+
+        let r_strict2 = sched_strict.schedule_once().await.unwrap();
+        assert!(r_strict2.assignments.is_empty());
+        assert_eq!(r_strict2.unfulfillable.len(), 2);
+        assert_eq!(r_strict2.unfulfillable[0].0, t_gpu_when_busy);
+        assert_eq!(
+            r_strict2.unfulfillable[0].1,
+            "Cluster lacks workers with GPU capabilities"
+        );
+        assert_eq!(r_strict2.unfulfillable[1].0, t_16c_when_busy);
+        assert_eq!(
+            r_strict2.unfulfillable[1].1,
+            "No registered worker satisfies task requirements (cpu_cores=16, ram_mb=512, gpu=false)"
+        );
+        assert_eq!(
+            queue.get_state(&t_gpu_when_busy).await,
+            Some(crate::queue::TaskState::Failed)
+        );
+        assert_eq!(
+            queue.get_state(&t_16c_when_busy).await,
+            Some(crate::queue::TaskState::Failed)
+        );
+        assert_eq!(
+            queue.active_retained_bytes().await,
+            active_before,
+            "failing unfulfillable tasks must release their active payload bytes"
+        );
+
+        // 5. With `free_slots == 0` and an unchanged registry and queue, a subsequent scheduling
+        //    pass must not scan the queue again (`ready_views_call_count` does not increase).
+        let calls_before = queue.ready_views_call_count();
+        let r_strict3 = sched_strict.schedule_once().await.unwrap();
+        assert!(r_strict3.assignments.is_empty());
+        assert!(r_strict3.unfulfillable.is_empty());
+        assert_eq!(
+            queue.ready_views_call_count(),
+            calls_before,
+            "a pass with 0 free slots and an unchanged registry must not scan the queue again"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fail_unfulfillable_tasks_sweep_cursor_scans_large_queue_once_across_saturated_passes(
+    ) {
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+        // 1 worker with 1 CPU slot.
+        let (_w_id, _w_sess, _w_rx) = register_worker(&registry, "cpu-1c", 1, 4096, false).await;
+
+        // 6 tasks (exceeding `max_scan_per_pass = 3`). The 6th task is unfulfillable (requires GPU).
+        for i in 0..5 {
+            let mut req = TaskRequirements::generic(1, 30);
+            req.ram_mb = 256;
+            queue
+                .submit(Task::new(
+                    TaskSpec::shell_script(format!("echo cpu-{i}")),
+                    req,
+                ))
+                .await
+                .unwrap();
+        }
+        let t_gpu_tail = queue.submit(gpu_task()).await.unwrap();
+
+        let mut cfg = SchedulerConfig::default().with_fail_unfulfillable_tasks(true);
+        cfg.max_scan_per_pass = 3;
+        let sched = WorkloadScheduler::new(cfg, registry.clone(), queue.clone(), notify)
+            .with_waiters(waiters);
+
+        assert_eq!(queue.ready_views_call_count(), 0);
+
+        // Pass 1: places task 1 (saturating the 1-core worker) and scans tasks 1..=3.
+        let r1 = sched.schedule_once().await.unwrap();
+        assert_eq!(r1.assignments.len(), 1);
+        assert!(r1.unfulfillable.is_empty());
+        assert_eq!(queue.ready_views_call_count(), 1);
+        assert_eq!(
+            queue.get_state(&t_gpu_tail).await,
+            Some(crate::queue::TaskState::Queued)
+        );
+
+        // Pass 2 (first saturated pass, `free_slots == 0`, epochs unchanged): resumes from the
+        // sweep cursor, scans tasks 4..=6, fails `t_gpu_tail`, and reaches the end of the queue.
+        let r2 = sched.schedule_once().await.unwrap();
+        assert!(r2.assignments.is_empty());
+        assert_eq!(r2.unfulfillable.len(), 1);
+        assert_eq!(r2.unfulfillable[0].0, t_gpu_tail);
+        assert_eq!(queue.ready_views_call_count(), 2);
+        assert_eq!(
+            queue.get_state(&t_gpu_tail).await,
+            Some(crate::queue::TaskState::Failed)
+        );
+
+        // Pass 3 (second saturated pass, `free_slots == 0`, epochs unchanged): must make 0
+        // `ready_views` calls because the sweep reached the end of the queue in Pass 2.
+        let r3 = sched.schedule_once().await.unwrap();
+        assert!(r3.assignments.is_empty());
+        assert!(r3.unfulfillable.is_empty());
+        assert_eq!(
+            queue.ready_views_call_count(),
+            2,
+            "second saturated pass with unchanged epochs must make no ready_views call"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fail_unfulfillable_tasks_keeps_gpu_task_queued_when_gpu_worker_is_disconnected_until_pruned(
+    ) {
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+        let (_cpu_id, _cpu_sess, _cpu_rx) =
+            register_worker(&registry, "cpu-w1", 2, 4096, false).await;
+        let (gpu_id, _gpu_sess, _gpu_rx) =
+            register_worker(&registry, "gpu-w1", 4, 8192, true).await;
+
+        // Mark the GPU worker Disconnected (not yet pruned).
+        assert!(registry.mark_disconnected(&gpu_id).await.unwrap());
+
+        // Submit a 2-core CPU task to saturate `cpu-w1` on Pass 1 so Pass 2 has `free_slots == 0`
+        // and relies on `prune_stale_workers` bumping `registration_epoch` to trigger the sweep.
+        let mut req_fill = TaskRequirements::generic(2, 30);
+        req_fill.ram_mb = 512;
+        let _t_fill = queue
+            .submit(Task::new(TaskSpec::shell_script("echo fill"), req_fill))
+            .await
+            .unwrap();
+        let t_gpu = queue.submit(gpu_task()).await.unwrap();
+        let pin_constraint = format!("require:worker={gpu_id}");
+        let t_pinned = queue
+            .submit(constrained_task(&[&pin_constraint]))
+            .await
+            .unwrap();
+
+        let sched = WorkloadScheduler::new(
+            SchedulerConfig::default().with_fail_unfulfillable_tasks(true),
+            registry.clone(),
+            queue.clone(),
+            notify,
+        )
+        .with_waiters(waiters);
+
+        // Pass 1 while `gpu-w1` is Disconnected (still registered): saturates `cpu-w1` and keeps
+        // both GPU/pinned tasks Queued.
+        let r1 = sched.schedule_once().await.unwrap();
+        assert_eq!(r1.assignments.len(), 1);
+        assert!(
+            r1.unfulfillable.is_empty(),
+            "tasks matching a Disconnected (unpruned) worker must not be failed: {:?}",
+            r1.unfulfillable
+        );
+        assert_eq!(
+            queue.get_state(&t_gpu).await,
+            Some(crate::queue::TaskState::Queued)
+        );
+        assert_eq!(
+            queue.get_state(&t_pinned).await,
+            Some(crate::queue::TaskState::Queued)
+        );
+
+        // Prune `gpu-w1` from the registry: now the next pass must fail both tasks.
+        assert_eq!(registry.prune_stale_workers(Duration::ZERO).await, 1);
+        let r2 = sched.schedule_once().await.unwrap();
+        assert_eq!(r2.unfulfillable.len(), 2);
+        assert_eq!(
+            queue.get_state(&t_gpu).await,
+            Some(crate::queue::TaskState::Failed)
+        );
+        assert_eq!(
+            queue.get_state(&t_pinned).await,
+            Some(crate::queue::TaskState::Failed)
+        );
+        assert_eq!(
+            queue
+                .get_task(&t_gpu)
+                .await
+                .unwrap()
+                .error_message
+                .as_deref(),
+            Some("Cluster lacks workers with GPU capabilities")
+        );
+        assert_eq!(
+            queue
+                .get_task(&t_pinned)
+                .await
+                .unwrap()
+                .error_message
+                .as_deref(),
+            Some(
+                format!("No registered worker matches the placement constraints (worker={gpu_id})")
+                    .as_str()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fail_unfulfillable_tasks_keeps_gpu_task_queued_when_gpu_worker_is_cooling_down_until_pruned(
+    ) {
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+        let (_cpu_id, _cpu_sess, _cpu_rx) =
+            register_worker(&registry, "cpu-w1", 2, 4096, false).await;
+        let (gpu_id, _gpu_sess, _gpu_rx) =
+            register_worker(&registry, "gpu-w1", 4, 8192, true).await;
+
+        // Put `gpu-w1` into rejection cooldown (`excluded_until` set in the future).
+        for _ in 0..3 {
+            registry.record_rejection(&gpu_id, None).await;
+        }
+        assert!(
+            registry
+                .list_schedulable_workers()
+                .await
+                .iter()
+                .all(|w| w.worker_id != gpu_id),
+            "cooling-down GPU worker must be excluded from list_schedulable_workers"
+        );
+
+        let t_gpu = queue.submit(gpu_task()).await.unwrap();
+        let pin_constraint = format!("require:worker={gpu_id}");
+        let t_pinned = queue
+            .submit(constrained_task(&[&pin_constraint]))
+            .await
+            .unwrap();
+
+        let sched = WorkloadScheduler::new(
+            SchedulerConfig::default().with_fail_unfulfillable_tasks(true),
+            registry.clone(),
+            queue.clone(),
+            notify,
+        )
+        .with_waiters(waiters);
+
+        // Pass 1 while `gpu-w1` is cooling down: both tasks must stay Queued.
+        let r1 = sched.schedule_once().await.unwrap();
+        assert!(
+            r1.unfulfillable.is_empty(),
+            "tasks matching a cooling-down worker must not be failed: {:?}",
+            r1.unfulfillable
+        );
+        assert_eq!(
+            queue.get_state(&t_gpu).await,
+            Some(crate::queue::TaskState::Queued)
+        );
+        assert_eq!(
+            queue.get_state(&t_pinned).await,
+            Some(crate::queue::TaskState::Queued)
+        );
+
+        // Disconnect and prune `gpu-w1`: now the next pass must fail both tasks.
+        assert!(registry.mark_disconnected(&gpu_id).await.unwrap());
+        assert_eq!(registry.prune_stale_workers(Duration::ZERO).await, 1);
+        let r2 = sched.schedule_once().await.unwrap();
+        assert_eq!(r2.unfulfillable.len(), 2);
+        assert_eq!(
+            queue.get_state(&t_gpu).await,
+            Some(crate::queue::TaskState::Failed)
+        );
+        assert_eq!(
+            queue.get_state(&t_pinned).await,
+            Some(crate::queue::TaskState::Failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fail_unfulfillable_tasks_combined_placement_and_gpu_checks_in_nobody_fits() {
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+
+        // Register:
+        // 1. Small Linux CPU worker (2 cores, os:linux)
+        // 2. Large macOS CPU worker (16 cores, os:macos, no GPU)
+        // 3. Small macOS GPU worker (2 cores, os:macos, GPU)
+        let (tx1, _rx1) = tokio::sync::mpsc::channel(16);
+        let mut caps_linux_small =
+            WorkerCapabilities::new("linux-small", 2, 4096, false, false, None);
+        caps_linux_small.tags = vec!["os:linux".into(), "slots:2".into()];
+        registry
+            .register(
+                Uuid::new_v4(),
+                caps_linux_small,
+                "127.0.0.1:9101".parse().unwrap(),
+                tx1,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (tx2, _rx2) = tokio::sync::mpsc::channel(16);
+        let mut caps_macos_big =
+            WorkerCapabilities::new("macos-big", 16, 16384, false, false, None);
+        caps_macos_big.tags = vec!["os:macos".into(), "slots:16".into()];
+        registry
+            .register(
+                Uuid::new_v4(),
+                caps_macos_big,
+                "127.0.0.1:9102".parse().unwrap(),
+                tx2,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (tx3, _rx3) = tokio::sync::mpsc::channel(16);
+        let mut caps_gpu_small =
+            WorkerCapabilities::new("macos-gpu-small", 2, 4096, true, false, None);
+        caps_gpu_small.tags = vec!["os:macos".into(), "slots:2".into()];
+        registry
+            .register(
+                Uuid::new_v4(),
+                caps_gpu_small,
+                "127.0.0.1:9103".parse().unwrap(),
+                tx3,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Task A: requires `os=linux` AND 8 CPU cores. `linux-small` matches `os=linux` (2 cores),
+        // `macos-big` has 16 cores (`os:macos`), so no single worker satisfies both.
+        let t_linux_8c = queue
+            .submit(
+                Task::new(
+                    TaskSpec::shell_script("echo linux-8c"),
+                    TaskRequirements::generic(8, 30),
+                )
+                .with_tags(vec!["require:os=linux".into()]),
+            )
+            .await
+            .unwrap();
+
+        // Task B: requires GPU AND 8 CPU cores. `macos-gpu-small` has GPU (2 cores), `macos-big`
+        // has 16 cores (CPU-only), so no single worker satisfies both.
+        let mut req_gpu_8c = TaskRequirements::generic(8, 30);
+        req_gpu_8c.gpu_required = true;
+        let t_gpu_8c = queue
+            .submit(Task::new(TaskSpec::shell_script("echo gpu-8c"), req_gpu_8c))
+            .await
+            .unwrap();
+
+        let sched = WorkloadScheduler::new(
+            SchedulerConfig::default().with_fail_unfulfillable_tasks(true),
+            registry,
+            queue.clone(),
+            notify,
+        )
+        .with_waiters(waiters);
+
+        let report = sched.schedule_once().await.unwrap();
+        assert_eq!(report.unfulfillable.len(), 2);
+        assert_eq!(
+            queue.get_state(&t_linux_8c).await,
+            Some(crate::queue::TaskState::Failed)
+        );
+        assert_eq!(
+            queue
+                .get_task(&t_linux_8c)
+                .await
+                .unwrap()
+                .error_message
+                .as_deref(),
+            Some("No registered worker satisfies task requirements (cpu_cores=8, ram_mb=512, gpu=false)")
+        );
+        assert_eq!(
+            queue.get_state(&t_gpu_8c).await,
+            Some(crate::queue::TaskState::Failed)
+        );
+        assert_eq!(
+            queue
+                .get_task(&t_gpu_8c)
+                .await
+                .unwrap()
+                .error_message
+                .as_deref(),
+            Some("No registered worker satisfies task requirements (cpu_cores=8, ram_mb=512, gpu=true)")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fail_unfulfillable_tasks_cursor_resets_on_epoch_change_and_placement_ignores_sweep_cursor(
+    ) {
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+        let (w_id, w_sess, _w_rx) = register_worker(&registry, "cpu-1c", 1, 4096, false).await;
+
+        let mut cpu_ids = Vec::new();
+        for i in 0..6 {
+            let mut req = TaskRequirements::generic(1, 30);
+            req.ram_mb = 256;
+            cpu_ids.push(
+                queue
+                    .submit(Task::new(
+                        TaskSpec::shell_script(format!("echo cpu-{i}")),
+                        req,
+                    ))
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let mut cfg = SchedulerConfig::default().with_fail_unfulfillable_tasks(true);
+        cfg.max_scan_per_pass = 3;
+        let sched = WorkloadScheduler::new(cfg, registry.clone(), queue.clone(), notify)
+            .with_waiters(waiters);
+
+        // Pass 1: assigns task 1 (`cpu_ids[0]`), scans tasks 1..=3, and stores a partial sweep cursor at task 3.
+        let r1 = sched.schedule_once().await.unwrap();
+        assert_eq!(r1.assignments.len(), 1);
+        assert_eq!(r1.assignments[0].task_id, cpu_ids[0]);
+
+        // Rule A: Submit a priority-10 GPU task while the partial sweep cursor sits at task 3 (`cpu_ids[2]`).
+        // Its `QueueOrderKey` sits at the front of `ready_queue`, BEFORE `sweep.cursor`. Because
+        // `submit_with_priority` bumps `ready_epoch`, the next saturated pass must reset `sweep.cursor`
+        // to `None` and fail `t_prio_gpu`.
+        let t_prio_gpu = queue.submit_with_priority(gpu_task(), 10).await.unwrap();
+        let r2 = sched.schedule_once().await.unwrap();
+        assert!(r2.assignments.is_empty());
+        assert_eq!(
+            r2.unfulfillable.len(),
+            1,
+            "epoch change must reset the sweep cursor so a newly submitted priority-10 GPU task ahead of the old cursor is failed"
+        );
+        assert_eq!(r2.unfulfillable[0].0, t_prio_gpu);
+        assert_eq!(
+            queue.get_state(&t_prio_gpu).await,
+            Some(crate::queue::TaskState::Failed)
+        );
+
+        // Rule B: Now `sweep.cursor` is at task 3 (`cpu_ids[2]`) again after Pass 2 scanned 3 items
+        // (`t_prio_gpu`, `cpu_ids[1]`, `cpu_ids[2]`). Completing task 1 (`cpu_ids[0]`) frees a slot
+        // without changing `(registration_epoch, ready_epoch)`. The next pass has `free_slots > 0`,
+        // so it must start placement from the head of the queue (`None`) and assign task 2 (`cpu_ids[1]`),
+        // NOT resume placement from `sweep.cursor`.
+        queue
+            .record_result_from(
+                w_id,
+                Some(w_sess),
+                rusty_grid_core::task::TaskResult::success(w_id, cpu_ids[0], "", 1, false),
+            )
+            .await
+            .unwrap();
+        registry.decrement_active_tasks(&w_id).await.unwrap();
+
+        let r3 = sched.schedule_once().await.unwrap();
+        assert_eq!(r3.assignments.len(), 1);
+        assert_eq!(
+            r3.assignments[0].task_id, cpu_ids[1],
+            "a pass with free slots must walk from the head of the queue and assign task 2, not start at the sweep cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fail_unfulfillable_tasks_continues_sweep_beyond_scan_budget_when_unused_free_slot_remains(
+    ) {
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+        // One 4-core CPU worker (which will be busy with a 4-core task) and one 1-core CPU worker (idle).
+        let (_w4_id, _w4_sess, _w4_rx) = register_worker(&registry, "cpu-4c", 4, 8192, false).await;
+        let (_w1_id, _w1_sess, _w1_rx) = register_worker(&registry, "cpu-1c", 1, 4096, false).await;
+
+        let mut cfg = SchedulerConfig::default().with_fail_unfulfillable_tasks(true);
+        cfg.max_scan_per_pass = 3;
+        let sched = WorkloadScheduler::new(cfg, registry.clone(), queue.clone(), notify)
+            .with_waiters(waiters);
+
+        // Fill the 4-core worker with a 4-core task so only the 1-core worker has a free slot.
+        let _t_busy_4c = queue.submit(wide_task(4)).await.unwrap();
+        let r0 = sched.schedule_once().await.unwrap();
+        assert_eq!(r0.assignments.len(), 1);
+
+        // Enqueue five 2-core tasks (none fit the idle 1-core worker) followed by a GPU task at the end.
+        for _ in 0..5 {
+            queue.submit(wide_task(2)).await.unwrap();
+        }
+        let t_gpu_tail = queue.submit(gpu_task()).await.unwrap();
+
+        // Pass 1 scans the first 3 2-core tasks (`cursor` advances to task 3).
+        let r1 = sched.schedule_once().await.unwrap();
+        assert!(r1.assignments.is_empty());
+        assert!(r1.unfulfillable.is_empty());
+        assert_eq!(
+            queue.get_state(&t_gpu_tail).await,
+            Some(crate::queue::TaskState::Queued)
+        );
+
+        // Pass 2 still has `free_slots == 1` (the idle 1-core worker). After the placement walk
+        // scans the first 3 2-core tasks without placing anything or advancing past the sweep cursor,
+        // the scheduler continues the sweep from the cursor and fails `t_gpu_tail`.
+        let r2 = sched.schedule_once().await.unwrap();
+        assert!(r2.assignments.is_empty());
+        assert_eq!(
+            r2.unfulfillable.len(),
+            1,
+            "sweep must continue past scan_budget even when an unusable free slot remains"
+        );
+        assert_eq!(r2.unfulfillable[0].0, t_gpu_tail);
+        assert_eq!(
+            queue.get_state(&t_gpu_tail).await,
+            Some(crate::queue::TaskState::Failed)
         );
     }
 }

@@ -41,7 +41,7 @@ use rusty_grid_worker::{NoticeLevel, ProcessPriority, WorkerClient, WorkerConfig
 use crate::config::{
     load_config_file, resolve_bool, resolve_f32, resolve_opt_field, resolve_opt_string,
     resolve_opt_u16, resolve_opt_u64, resolve_opt_usize, resolve_string, resolve_u32, resolve_u64,
-    resolve_usize, ConfigFile, SecretSection, SecretText,
+    resolve_usize, ConfigFile, MasterFileConfig, SecretSection, SecretText,
 };
 use crate::connect::{
     connect_master, normalize_master_addr, report_master_failure, AUTH_EXIT_CODE,
@@ -214,6 +214,14 @@ pub struct MasterArgs {
 
     #[arg(long, help = "Preserve GPU-capable workers for GPU-specific workloads")]
     pub preserve_gpu: Option<bool>,
+
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help = "Immediately fail tasks whose capabilities or placement constraints no registered worker can satisfy"
+    )]
+    pub fail_unfulfillable_tasks: Option<bool>,
 
     #[arg(long, help = "Enable native P2P QUIC endpoint for NAT traversal")]
     pub p2p: bool,
@@ -1006,41 +1014,90 @@ fn apply_max_queue_size(
     Ok(config.with_max_queue_size(max_queue_size))
 }
 
+/// Resolve a string option across CLI > Env > Config while keeping the name of the source
+/// (`flag_label`, `env_name`, or `cfg_label`) that supplied the value.
+fn resolve_sourced_string<'a>(
+    flag_label: &'a str,
+    flag: Option<String>,
+    env_name: &'a str,
+    cfg_label: &'a str,
+    cfg_val: Option<String>,
+) -> Option<(&'a str, String)> {
+    if let Some(v) = flag {
+        return Some((flag_label, v));
+    }
+    if let Ok(val_str) = std::env::var(env_name) {
+        let trimmed = val_str.trim();
+        if !trimmed.is_empty() {
+            return Some((env_name, trimmed.to_string()));
+        }
+    }
+    cfg_val.map(|v| (cfg_label, v))
+}
+
 /// Resolve `--scheduler-policy` / `RUSTY_GRID_SCHEDULER_POLICY` / `[master].scheduler_policy`,
-/// returning an error on unknown policy names.
+/// returning an error prefixed with the source name on unknown policy names.
 fn resolve_scheduler_policy(
     flag: Option<String>,
     cfg_val: Option<String>,
 ) -> Result<rusty_grid_master::scheduler::SchedulingPolicy, String> {
-    match resolve_opt_string(flag, &["RUSTY_GRID_SCHEDULER_POLICY"], cfg_val) {
-        Some(raw) => raw.parse(),
+    match resolve_sourced_string(
+        "--scheduler-policy",
+        flag,
+        "RUSTY_GRID_SCHEDULER_POLICY",
+        "scheduler_policy",
+        cfg_val,
+    ) {
+        Some((source, raw)) => raw.parse().map_err(|e| format!("{source}: {e}")),
         None => Ok(rusty_grid_master::scheduler::SchedulingPolicy::default()),
     }
 }
 
+/// Resolve `--fail-unfulfillable-tasks` / `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS` /
+/// `[master].fail_unfulfillable_tasks` (default `false`).
+fn resolve_fail_unfulfillable_tasks(
+    flag: Option<bool>,
+    master_cfg: Option<&MasterFileConfig>,
+) -> bool {
+    resolve_bool(
+        flag,
+        &["RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS"],
+        master_cfg.and_then(|m| m.fail_unfulfillable_tasks),
+        false,
+    )
+}
+
 /// Build the `SchedulerConfig` for `oxideswarm master`, resolving `--scheduler-policy` /
-/// `RUSTY_GRID_SCHEDULER_POLICY` / `[master].scheduler_policy` and carrying `preserve_gpu`
-/// and `max_host_cpu`.
+/// `RUSTY_GRID_SCHEDULER_POLICY` / `[master].scheduler_policy` and carrying `preserve_gpu`,
+/// `max_host_cpu`, and `fail_unfulfillable_tasks`.
 fn build_master_scheduler_config(
     flag: Option<String>,
     cfg_val: Option<String>,
     preserve_gpu: bool,
     max_host_cpu: f32,
+    fail_unfulfillable_tasks: bool,
 ) -> Result<SchedulerConfig, String> {
     let scheduler_policy = resolve_scheduler_policy(flag, cfg_val)?;
     Ok(SchedulerConfig {
         policy: scheduler_policy,
         preserve_gpu_for_gpu_tasks: preserve_gpu,
         max_host_cpu_pct: max_host_cpu,
+        fail_unfulfillable_tasks,
         ..Default::default()
     })
 }
 
 /// Resolve `--wire-codec` / `RUSTY_GRID_WIRE_CODEC` / config `wire_codec`,
-/// returning an error on unknown codec names.
+/// returning an error prefixed with the source name on unknown codec names.
 fn resolve_wire_codec(flag: Option<String>, cfg_val: Option<String>) -> Result<WireCodec, String> {
-    match resolve_opt_string(flag, &["RUSTY_GRID_WIRE_CODEC"], cfg_val) {
-        Some(raw) => raw.parse(),
+    match resolve_sourced_string(
+        "--wire-codec",
+        flag,
+        "RUSTY_GRID_WIRE_CODEC",
+        "wire_codec",
+        cfg_val,
+    ) {
+        Some((source, raw)) => raw.parse().map_err(|e| format!("{source}: {e}")),
         None => Ok(WireCodec::Bincode),
     }
 }
@@ -1156,6 +1213,9 @@ async fn run_master(
         master_cfg.as_ref().and_then(|m| m.preserve_gpu),
         true,
     );
+
+    let fail_unfulfillable_tasks =
+        resolve_fail_unfulfillable_tasks(args.fail_unfulfillable_tasks, master_cfg.as_ref());
 
     let p2p_ticket_file = resolve_opt_string(
         args.p2p_ticket_file.map(|p| p.display().to_string()),
@@ -1293,20 +1353,21 @@ async fn run_master(
         master_cfg.as_ref().and_then(|m| m.scheduler_policy.clone()),
         preserve_gpu,
         max_host_cpu,
+        fail_unfulfillable_tasks,
     ) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("--scheduler-policy: {e}");
+            eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
     let wire_codec = match resolve_wire_codec(
         args.wire_codec,
-        master_cfg.as_ref().and_then(|m| m.wire_codec.clone()),
+        master_cfg.as_ref().and_then(|w| w.wire_codec.clone()),
     ) {
         Ok(codec) => codec,
         Err(e) => {
-            eprintln!("--wire-codec: {e}");
+            eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1883,7 +1944,7 @@ async fn run_worker(
     ) {
         Ok(codec) => codec,
         Err(e) => {
-            eprintln!("--wire-codec: {e}");
+            eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
@@ -4782,6 +4843,7 @@ max_active_mb = 768
             Some("least-loaded".into()),
             false,
             72.5,
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -4791,9 +4853,15 @@ max_active_mb = 768
         );
         assert!(!built_sched_cfg.preserve_gpu_for_gpu_tasks);
         assert_eq!(built_sched_cfg.max_host_cpu_pct, 72.5);
-        assert!(
-            build_master_scheduler_config(Some("bogus-policy".into()), None, true, 85.0).is_err()
-        );
+        assert!(built_sched_cfg.fail_unfulfillable_tasks);
+        assert!(build_master_scheduler_config(
+            Some("bogus-policy".into()),
+            None,
+            true,
+            85.0,
+            false
+        )
+        .is_err());
 
         //    - `resolve_worker_target`: explicit `--master` beats config `p2p_ticket`.
         let cfg_with_bad_ticket = WorkerFileConfig {
@@ -5215,7 +5283,7 @@ max_active_mb = 768
             panic!("expected Mapreduce");
         };
         assert_eq!(
-            run_mapreduce(mr_override_args, Some(cfg_timeout_42), secret_opts).await,
+            run_mapreduce(mr_override_args, Some(cfg_timeout_42), secret_opts.clone()).await,
             ExitCode::SUCCESS
         );
 
@@ -5225,6 +5293,291 @@ max_active_mb = 768
             vec![42, 15, 42, 15],
             "[submit].timeout_secs must set 42 for both submit and mapreduce when --timeout-secs is omitted and yield to 15 when --timeout-secs 15 is passed"
         );
+
+        // 5. Source-prefixed error strings for `resolve_wire_codec` and `resolve_scheduler_policy`:
+        //    CLI flag -> `--wire-codec: ...` / `--scheduler-policy: ...`
+        //    Env var  -> `RUSTY_GRID_WIRE_CODEC: ...` / `RUSTY_GRID_SCHEDULER_POLICY: ...`
+        //    Config   -> `wire_codec: ...` / `scheduler_policy: ...`
+        std::env::remove_var("RUSTY_GRID_WIRE_CODEC");
+        std::env::remove_var("RUSTY_GRID_SCHEDULER_POLICY");
+        assert!(
+            resolve_wire_codec(Some("xml".into()), None)
+                .unwrap_err()
+                .starts_with("--wire-codec: "),
+            "CLI wire codec error must start with '--wire-codec: '"
+        );
+        assert!(
+            resolve_wire_codec(None, Some("xml".into()))
+                .unwrap_err()
+                .starts_with("wire_codec: "),
+            "Config wire codec error must start with 'wire_codec: '"
+        );
+        std::env::set_var("RUSTY_GRID_WIRE_CODEC", "xml");
+        assert!(
+            resolve_wire_codec(None, Some("json".into()))
+                .unwrap_err()
+                .starts_with("RUSTY_GRID_WIRE_CODEC: "),
+            "Env wire codec error must start with 'RUSTY_GRID_WIRE_CODEC: '"
+        );
+        std::env::remove_var("RUSTY_GRID_WIRE_CODEC");
+
+        assert!(
+            resolve_scheduler_policy(Some("bogus".into()), None)
+                .unwrap_err()
+                .starts_with("--scheduler-policy: "),
+            "CLI scheduler policy error must start with '--scheduler-policy: '"
+        );
+        assert!(
+            resolve_scheduler_policy(None, Some("bogus".into()))
+                .unwrap_err()
+                .starts_with("scheduler_policy: "),
+            "Config scheduler policy error must start with 'scheduler_policy: '"
+        );
+        std::env::set_var("RUSTY_GRID_SCHEDULER_POLICY", "bogus");
+        assert!(
+            resolve_scheduler_policy(None, Some("round-robin".into()))
+                .unwrap_err()
+                .starts_with("RUSTY_GRID_SCHEDULER_POLICY: "),
+            "Env scheduler policy error must start with 'RUSTY_GRID_SCHEDULER_POLICY: '"
+        );
+        std::env::remove_var("RUSTY_GRID_SCHEDULER_POLICY");
+
+        // Precedence for `fail_unfulfillable_tasks` via `resolve_fail_unfulfillable_tasks`:
+        // CLI `--fail-unfulfillable-tasks` > `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS` > `[master].fail_unfulfillable_tasks` > false
+        std::env::remove_var("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS");
+        let parsed_fail_true_cfg: ConfigFile = toml::from_str(
+            r#"
+[master]
+fail_unfulfillable_tasks = true
+"#,
+        )
+        .unwrap();
+        let parsed_fail_false_cfg: ConfigFile = toml::from_str(
+            r#"
+[master]
+fail_unfulfillable_tasks = false
+"#,
+        )
+        .unwrap();
+        assert!(!resolve_fail_unfulfillable_tasks(None, None));
+        assert!(resolve_fail_unfulfillable_tasks(
+            None,
+            parsed_fail_true_cfg.master.as_ref()
+        ));
+        std::env::set_var("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS", "1");
+        assert!(
+            resolve_fail_unfulfillable_tasks(None, parsed_fail_false_cfg.master.as_ref()),
+            "RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS=1 must override config false"
+        );
+        std::env::set_var("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS", "0");
+        assert!(
+            !resolve_fail_unfulfillable_tasks(None, parsed_fail_true_cfg.master.as_ref()),
+            "RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS=0 must override config true"
+        );
+        assert!(
+            resolve_fail_unfulfillable_tasks(Some(true), parsed_fail_false_cfg.master.as_ref()),
+            "--fail-unfulfillable-tasks CLI flag must override env 0"
+        );
+        std::env::remove_var("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS");
+
+        // 6. Live `run_master` verification of `sched_config`:
+        //    - `--scheduler-policy round-robin` rotates two 1-core task submissions across two
+        //      connected workers (`rr-w1` with 8 cores at 0% CPU and `rr-w2` with 2 cores at 50% CPU)
+        //      that `SchedulerConfig::default()` (`WeightedLeastLoaded`) would both assign to `rr-w1`.
+        //    - `[master].fail_unfulfillable_tasks = true` (from parsed TOML `FileConfig`, without
+        //      passing `--fail-unfulfillable-tasks` on the CLI) immediately fails a task whose
+        //      placement constraints no registered worker can satisfy (`--require-tag nothing --wait`),
+        //      waking `--wait` with `ExitCode::FAILURE` and
+        //      `"No registered worker matches the placement constraints (tag=nothing)"`.
+        let rr_blob = tempfile::tempdir().unwrap();
+        let rr_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let rr_addr = rr_probe.local_addr().unwrap();
+        drop(rr_probe);
+        let rr_addr_str = rr_addr.to_string();
+        let rr_blob_str = rr_blob.path().to_str().unwrap().to_string();
+
+        let rr_master_cli = Cli::try_parse_from([
+            "oxideswarm",
+            "master",
+            "--listen",
+            &rr_addr_str,
+            "--web-ui-addr",
+            "127.0.0.1:0",
+            "--scheduler-policy",
+            "round-robin",
+            "--blob-dir",
+            &rr_blob_str,
+        ])
+        .unwrap();
+        let Commands::Master(rr_master_args) = rr_master_cli.command else {
+            panic!("expected Master");
+        };
+        let rr_secret_opts = secret_opts;
+        let rr_master_task = tokio::spawn(run_master(
+            rr_master_args,
+            Some(parsed_fail_true_cfg),
+            rr_secret_opts.clone(),
+        ));
+
+        let mut rr_bound = false;
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(&rr_addr).await.is_ok() {
+                rr_bound = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(rr_bound, "round-robin master bound");
+
+        // Connect two simulated workers over TCP to `rr_addr_str`:
+        // - `rr-w1`: 8 cores (`slots:8`), 0% CPU usage -> weighted ratio 0/8=0.0 on task 1, 1/8=0.125 on task 2.
+        // - `rr-w2`: 2 cores (`slots:2`), 50% CPU usage -> weighted ratio 0/2 + 0.5*0.50 = 0.250 on both tasks.
+        // Under `WeightedLeastLoaded` (`SchedulerConfig::default()`), both tasks go to `rr-w1`;
+        // under `RoundRobin`, one goes to `rr-w1` and one goes to `rr-w2`.
+        let mut worker_transports = Vec::new();
+        for (w_name, cores, cpu_pct) in [("rr-w1", 8usize, 0.0f32), ("rr-w2", 2usize, 50.0f32)] {
+            let mut wt = connect_master(&rr_addr_str, Some(&test_secret))
+                .await
+                .unwrap();
+            let w_id = uuid::Uuid::new_v4();
+            let mut caps = rusty_grid_core::capabilities::WorkerCapabilities::new(
+                w_name, cores, 8192, false, false, None,
+            );
+            caps.tags.push(format!("slots:{cores}"));
+            wt.send_msg(&rusty_grid_core::protocol::WorkerMessage::Register {
+                worker_id: w_id,
+                capabilities: caps,
+                protocol_version: rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT,
+                features: rusty_grid_core::protocol::ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+            let ack = wt
+                .recv_msg::<rusty_grid_core::protocol::MasterMessage>()
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                ack,
+                rusty_grid_core::protocol::MasterMessage::RegisterAck { accepted: true, .. }
+            ));
+            if cpu_pct > 0.0 {
+                wt.send_msg(&rusty_grid_core::protocol::WorkerMessage::Heartbeat {
+                    worker_id: w_id,
+                    timestamp: 1,
+                    active_tasks: 0,
+                    cpu_usage_pct: cpu_pct,
+                    ram_available_mb: 8192,
+                })
+                .await
+                .unwrap();
+                let hb_ack = wt
+                    .recv_msg::<rusty_grid_core::protocol::MasterMessage>()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    hb_ack,
+                    rusty_grid_core::protocol::MasterMessage::HeartbeatAck { .. }
+                ));
+            }
+            worker_transports.push(wt);
+        }
+
+        // 6a. Submit an unplaceable task (`--require-tag nothing --wait`): must fail immediately!
+        let unfulfillable_sub = submit_args(&[
+            "--master",
+            &rr_addr_str,
+            "--require-tag",
+            "nothing",
+            "--wait",
+            "--",
+            "echo",
+            "impossible",
+        ]);
+        let unfulfillable_code = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_submit_with_secret(unfulfillable_sub, None, rr_secret_opts.clone()),
+        )
+        .await
+        .expect("--fail-unfulfillable-tasks must wake --wait immediately instead of hanging");
+        assert_eq!(
+            unfulfillable_code,
+            ExitCode::FAILURE,
+            "unplaceable task with --wait must exit with FAILURE when --fail-unfulfillable-tasks is active"
+        );
+
+        // Also check via direct client transport that a submitted unfulfillable task's `TaskCompleted`
+        // response carries the exact mismatch reason.
+        let mut rr_client = connect_master(&rr_addr_str, Some(&test_secret))
+            .await
+            .unwrap();
+        let bad_task = Task::new(
+            TaskSpec::command("echo", vec!["nope".into()]),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_tags(vec!["require:tag=nothing".to_string()]);
+        let bad_direct = exchange(
+            &mut rr_client,
+            &rr_addr_str,
+            true,
+            &ClientMessage::SubmitTask {
+                task: bad_task,
+                wait: true,
+            },
+            "submit failed",
+        )
+        .await
+        .unwrap();
+        match bad_direct {
+            ClientResponse::TaskCompleted { result, .. } => {
+                assert_eq!(result.exit_code, 1);
+                assert_eq!(
+                    result.error.as_deref(),
+                    Some("No registered worker matches the placement constraints (tag=nothing)")
+                );
+            }
+            other => panic!(
+                "expected ClientResponse::TaskCompleted for unfulfillable wait=true, got {other:?}"
+            ),
+        }
+
+        // 6b. Submit 2 placeable tasks and verify `round-robin` assigns one to `rr-w1` and one to `rr-w2`.
+        let [mut wt1, mut wt2] = <[_; 2]>::try_from(worker_transports).ok().unwrap();
+
+        for label in ["rr-1", "rr-2"] {
+            let sub_rr = submit_args(&["--master", &rr_addr_str, "--", "echo", label]);
+            assert_eq!(
+                run_submit_with_secret(sub_rr, None, rr_secret_opts.clone()).await,
+                ExitCode::SUCCESS
+            );
+        }
+
+        let got_wt1 = tokio::time::timeout(
+            Duration::from_secs(3),
+            wt1.recv_msg::<rusty_grid_core::protocol::MasterMessage>(),
+        )
+        .await
+        .expect("wt1 must receive one AssignTask under round-robin")
+        .unwrap();
+        assert!(matches!(
+            got_wt1,
+            Some(rusty_grid_core::protocol::MasterMessage::AssignTask { .. })
+        ));
+
+        let got_wt2 = tokio::time::timeout(
+            Duration::from_secs(3),
+            wt2.recv_msg::<rusty_grid_core::protocol::MasterMessage>(),
+        )
+        .await
+        .expect("wt2 must receive one AssignTask under round-robin (WeightedLeastLoaded would send both to wt1)")
+        .unwrap();
+        assert!(matches!(
+            got_wt2,
+            Some(rusty_grid_core::protocol::MasterMessage::AssignTask { .. })
+        ));
+
+        rr_master_task.abort();
     }
 
     #[test]
