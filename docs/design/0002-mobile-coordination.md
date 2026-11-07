@@ -1,7 +1,7 @@
 # 0002: Mobile coordination: thermal and battery throttling, adaptive keepalive and role arbitrage
 
 Status: Partial
-Created: 2026-10-23    Updated: 2026-11-04
+Created: 2026-10-23    Updated: 2026-11-07
 
 ## Summary
 
@@ -78,7 +78,13 @@ The master calculates the dead peer window dynamically from the worker's reporte
 
 $$W_{\text{dead}} = \max(2\text{ s}, 4 \times \tau_{\text{worker}})$$
 
-Implemented in `crates/core/src/capabilities.rs` (`MobileLiveStatus::adaptive_keepalive_interval`, `MobileLiveStatus::recommended_keepalive_interval_or`, `MobileLiveStatus::recommended_keepalive_interval`, `calculate_keepalive_interval`), `crates/worker/src/heartbeat.rs` (`spawn_adaptive_heartbeat_task`), `crates/worker/src/client.rs` (`run_session`), and `crates/master/src/registry.rs` (`calculate_master_dead_peer_window`). When `network_type` is absent or unknown (such as on a battery-powered laptop), the worker and master keep the negotiated heartbeat interval (`MOB-1`).
+Implemented in `crates/core/src/capabilities.rs` (`MobileLiveStatus::adaptive_keepalive_interval`, `MobileLiveStatus::recommended_keepalive_interval_or`, `MobileLiveStatus::recommended_keepalive_interval`, `calculate_keepalive_interval`), `crates/worker/src/heartbeat.rs` (`spawn_adaptive_heartbeat_task`), `crates/worker/src/client.rs` (`run_session`), and `crates/master/src/registry.rs` (`calculate_master_dead_peer_window`).
+
+When a worker registers with `capabilities.mobile`, `Register` carries only `MobileCapabilities` (no `network_type`), so:
+- The master seeds a $4 \times 60\text{ s}$ ($240\text{ s}$) dead-peer window on `Register` until the worker sends its first `WorkerMessage::MobileTelemetry` of the session.
+- A worker connected to a master announcing `mobile-telemetry` sends an initial `MobileTelemetry` frame immediately after `RegisterAck` (`last_reported` starts at `None`). When `network_type` is absent or unknown (such as on a battery-powered laptop), both the worker and the master use the negotiated heartbeat interval (`None` in `WorkerEntry::heartbeat_interval`, falling back to the reaper's `--heartbeat-timeout`).
+- The master never lowers `heartbeat_interval` at task dispatch (`reserve_dispatch` / `increment_active_tasks`); it lowers the interval to $10\text{ s}$ only in `record_heartbeat` once the worker itself reports `active_tasks > 0`, while the worker's `HeartbeatTracker` notifies `spawn_adaptive_heartbeat_task` to reset its ticker immediately when `active_tasks` rises from `0` to `1`.
+- The worker's dead-peer watchdog (`dead_after` in `run_session`) recomputes its silence threshold on every watchdog tick from the longest interval `spawn_adaptive_heartbeat_task` can pick (`MOB-1`).
 
 ### D3 Strict five-rule mobile master refusal matrix
 
@@ -147,6 +153,7 @@ Implemented in `crates/worker/src/client.rs` (`set_evacuation_reason_hook`, `cur
 - Wire format carries lease tickets and disconnect reasons inside existing protocol enums (`WorkerMessage::ClaimMasterRole`, `WorkerMessage::Disconnecting`).
 - Uses protocol version 2 (`PROTOCOL_VERSION_CURRENT = 2`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 2`, `crates/core/src/protocol.rs:31-33`); capability bit `ProtocolCapabilities::ROLE_ARBITRAGE = Self(1 << 7)` (`crates/core/src/protocol.rs:66`) is reserved for design-only role arbitrage and is not advertised in `ProtocolCapabilities::all_supported()`.
 - Unaware nodes ignore role arbitration frames and continue operating as normal workers.
+- **Rolling upgrade window (`MOB-1`, `DEPLOYMENT.md` §3.5):** Restarting the master before upgrading workers leaves pre-`MOB-1` battery-powered laptop workers heartbeating every $60\text{ s}$ when idle. On `Register`, the master grants a $4 \times 60\text{ s}$ ($240\text{ s}$) window until the first `MobileTelemetry` of the session; if an older laptop worker emits a `MobileTelemetry` frame with `network_type: None` on a battery percentage change before its binary is upgraded, the master switches that session's dead-peer window to `--heartbeat-timeout` ($10\text{ s}$ default) and will reap and reconnect the old laptop worker after $10\text{ s}$ of idle silence until the worker is upgraded (or `--heartbeat-timeout` is set $\ge 240\text{ s}$ during the upgrade window).
 
 ## Security
 
@@ -181,3 +188,4 @@ Implemented in `crates/worker/src/client.rs` (`set_evacuation_reason_hook`, `cur
 - 2026-11-04: Aligned D1–D6 symbols, battery tiers (`50/30/15`), thermal tiers (`37/40/42`), authority weights, 4-stage tie-breaking, `MasterLeaseTicket` canonical bytes, and fast evacuation hooks with the code; marked Android coordinator role as removed by decision D2 (`SEC-3`) and updated record status to `Partial` (`DOC-3`).
 - 2026-11-04: Removed `ROLE_ARBITRAGE` from `ProtocolCapabilities::all_supported()` and replaced all `WorkerMessage::ClaimMasterRole` arms in `crates/master/src/server.rs` with `reject_master_role_claim` returning `RoleHandoverAck { accepted: false, task_queue_snapshot: Vec::new(), connected_workers: Vec::new() }`; marked W4 as `Design only` per decision D1 (`FEAT-6`, [0026](0026-refuse-claim-master-role.md)).
 - 2026-11-04: Returned 10s keepalive when `active_tasks > 0` on any link, kept the negotiated interval when `network_type` is unknown, and marked W3 as `Implemented` (`MOB-1`).
+- 2026-11-07: Kept a $4 \times 60\text{ s}$ registration window until the session's first `MobileTelemetry`, sent an initial `MobileTelemetry` immediately after `RegisterAck`, deferred lowering `heartbeat_interval` until `record_heartbeat` reports `active_tasks > 0`, recomputed worker `dead_after` from the longest adaptive interval, and documented the `DEPLOYMENT.md` §3.5 laptop upgrade window (`MOB-1`).
