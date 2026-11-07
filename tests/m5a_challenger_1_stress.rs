@@ -144,6 +144,7 @@ fn make_test_worker_entry(
         heartbeat_interval: tau,
         features: Default::default(),
         mobile_status: None,
+        preserved_thermal_until: None,
     }
 }
 

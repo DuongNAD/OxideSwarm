@@ -462,6 +462,7 @@ async fn test_adaptive_rrc_keepalive_controller_and_dynamic_master_timeout() {
         heartbeat_interval: Some(Duration::from_secs(25)), // 4 * 25s = 100s window
         features: Default::default(),
         mobile_status: None,
+        preserved_thermal_until: None,
     };
 
     // Test silence predicate at various simulated durations
@@ -1405,6 +1406,13 @@ async fn test_critical_thermal_phone_gets_zero_assignments_after_register_and_af
         factor: 1.5,
         jitter_ratio: 0.0,
     });
+    // Delay the session's first MobileTelemetry by 250 ms (both on initial connect and on
+    // reconnect) so the scheduler ticks multiple times before telemetry arrives:
+    // - on session 1, this verifies `MOBILE_INITIAL_TELEMETRY_HOLD` (Item 7: 200+ ms telemetry
+    //   delay yields 0 assignments);
+    // - on session 2, this verifies `register_session` preserves `ThermalTier::Critical` across
+    //   reconnect before session 2's first telemetry arrives (Item 5).
+    worker.set_initial_telemetry_delay(Duration::from_millis(250));
     worker.mobile_telemetry().update(MobileLiveStatus {
         battery_pct: Some(85),
         is_charging: Some(true),

@@ -26,6 +26,13 @@ pub const RX_LIVENESS_CEILING_FACTOR: u32 = 60;
 pub const REJECTION_COOLDOWN_BASE: Duration = Duration::from_secs(5);
 /// Upper bound of the rejection cooldown.
 pub const REJECTION_COOLDOWN_MAX: Duration = Duration::from_secs(60);
+/// Maximum time a newly registered mobile worker connection is held back from scheduling while
+/// waiting for its first post-`RegisterAck` `WorkerMessage::MobileTelemetry` frame
+/// (`2 × MOBILE_TELEMETRY_CHECK_INTERVAL`).
+pub const MOBILE_INITIAL_TELEMETRY_HOLD: Duration = Duration::from_secs(2);
+/// Maximum time a re-registered mobile worker retains the previous session's `battery_temperature`
+/// and `thermal_tier` when the new session has not yet sent `WorkerMessage::MobileTelemetry`.
+pub const PRESERVED_THERMAL_TTL: Duration = Duration::from_secs(10);
 
 /// Aborts a connection task unless the caller *is* that task.
 ///
@@ -101,6 +108,9 @@ pub struct WorkerEntry {
     pub features: ProtocolCapabilities,
     /// Latest live mobile telemetry snapshot reported by the worker (or seeded from `capabilities.mobile`).
     pub mobile_status: Option<MobileLiveStatus>,
+    /// Deadline after which a `battery_temperature` / `thermal_tier` carried over from a previous
+    /// session expires if the new session never sends `WorkerMessage::MobileTelemetry`.
+    pub preserved_thermal_until: Option<Instant>,
 }
 
 /// Dynamically calculates the Master dead-peer liveness timeout window for a worker ($W_{\text{dead}} = \max(2\text{s}, 4 \times \tau_{\text{worker}})$).
@@ -194,6 +204,16 @@ impl WorkerEntry {
     }
 
     pub fn to_info(&self) -> WorkerInfo {
+        let mut mobile_status = self.mobile_status.clone();
+        if self
+            .preserved_thermal_until
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            if let Some(ref mut status) = mobile_status {
+                status.battery_temperature = None;
+                status.thermal_tier = None;
+            }
+        }
         WorkerInfo {
             worker_id: self.worker_id,
             session_id: self.session_id,
@@ -206,7 +226,7 @@ impl WorkerEntry {
             cpu_usage_pct: self.cpu_usage_pct,
             ram_available_mb: self.ram_available_mb,
             features: self.features,
-            mobile_status: self.mobile_status.clone(),
+            mobile_status,
         }
     }
 }
@@ -341,6 +361,12 @@ impl WorkerRegistry {
             // A fresh Register carries a fresh capability snapshot, so a past rejection streak no longer applies.
             existing.consecutive_rejections = 0;
             existing.excluded_until = None;
+            let thermal_expired = existing
+                .preserved_thermal_until
+                .is_some_and(|until| now_instant >= until);
+            if thermal_expired {
+                existing.preserved_thermal_until = None;
+            }
             existing.mobile_status = match (
                 existing.mobile_status.take(),
                 existing.capabilities.mobile.as_ref(),
@@ -349,10 +375,28 @@ impl WorkerRegistry {
                     prev.battery_pct = m.battery_pct;
                     prev.is_charging = m.is_charging;
                     prev.thermal_throttled = m.thermal_throttled;
+                    // `Register` carries a fresh `battery_pct` and `is_charging` snapshot, so any
+                    // cached `battery_tier` from the previous session must be cleared.
+                    prev.battery_tier = None;
+                    if thermal_expired {
+                        prev.battery_temperature = None;
+                        prev.thermal_tier = None;
+                    }
                     Some(prev)
                 }
                 (_, maybe_m) => maybe_m.map(|m| m.live_status()),
             };
+            if existing
+                .mobile_status
+                .as_ref()
+                .is_some_and(|s| s.battery_temperature.is_some() || s.thermal_tier.is_some())
+            {
+                existing
+                    .preserved_thermal_until
+                    .get_or_insert(now_instant + PRESERVED_THERMAL_TTL);
+            } else {
+                existing.preserved_thermal_until = None;
+            }
             // Keep a 4 × 60 s window for a worker with `capabilities.mobile` until its first
             // `MobileTelemetry` of the session reports whether a mobile `network_type` is present.
             existing.heartbeat_interval = existing
@@ -367,11 +411,12 @@ impl WorkerRegistry {
             let mobile_status = capabilities.mobile.as_ref().map(|m| m.live_status());
             let hb_interval = mobile_status.as_ref().map(|_| Duration::from_secs(60));
             inner.network_types.remove(&worker_id);
-            // Give a live worker connection with `capabilities.mobile` up to 50 ms to deliver its
-            // immediate post-RegisterAck `MobileTelemetry` frame before the background scheduler
-            // places queued work on the un-hydrated `Register` snapshot.
+            // Hold a newly registered mobile worker connection until its first post-RegisterAck
+            // `MobileTelemetry` frame arrives (capped at `MOBILE_INITIAL_TELEMETRY_HOLD`, i.e.
+            // `2 × MOBILE_TELEMETRY_CHECK_INTERVAL`) so the background scheduler does not place
+            // queued work on the un-hydrated `Register` snapshot over slow LTE or relay links.
             let excluded_until = (mobile_status.is_some() && !features.is_empty())
-                .then(|| now_instant + Duration::from_millis(50));
+                .then(|| now_instant + MOBILE_INITIAL_TELEMETRY_HOLD);
             let entry = WorkerEntry {
                 worker_id,
                 session_id,
@@ -394,6 +439,7 @@ impl WorkerRegistry {
                 excluded_until,
                 heartbeat_interval: hb_interval,
                 mobile_status,
+                preserved_thermal_until: None,
             };
             inner.workers.insert(worker_id, entry);
             tracing::info!(worker_id = %worker_id, session_id = session_id, "Registered new worker");
@@ -681,6 +727,7 @@ impl WorkerRegistry {
             || entry.mobile_status.as_ref() != Some(&status);
         entry.capabilities.mobile = Some(updated);
         entry.mobile_status = Some(status);
+        entry.preserved_thermal_until = None;
         if entry.consecutive_rejections == 0 {
             entry.excluded_until = None;
         }
@@ -852,6 +899,14 @@ impl WorkerRegistry {
         let mut inner = self.inner.write().await;
         if let Some(entry) = inner.workers.get_mut(worker_id) {
             entry.last_heartbeat_instant = Instant::now() - age;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn expire_preserved_thermal(&self, worker_id: &Uuid) {
+        let mut inner = self.inner.write().await;
+        if let Some(entry) = inner.workers.get_mut(worker_id) {
+            entry.preserved_thermal_until = Some(Instant::now() - Duration::from_millis(1));
         }
     }
 
@@ -2263,5 +2318,203 @@ mod tests {
             0,
             "Critical thermal telemetry (45°C) must yield 0 assignments"
         );
+    }
+
+    #[tokio::test]
+    async fn test_reregister_preserves_critical_thermal_until_telemetry_or_expiry_and_clears_battery_tier(
+    ) {
+        use crate::scheduler::{SchedulerConfig, WorkloadScheduler};
+        use rusty_grid_core::capabilities::{BatteryTier, ThermalTier};
+        use rusty_grid_core::task::{Task, TaskSpec};
+
+        let registry = WorkerRegistry::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let id = Uuid::new_v4();
+        let config = SchedulerConfig::default();
+        let task = Task::new(
+            TaskSpec::command("echo", vec!["1".into()]),
+            TaskRequirements::generic(1, 60),
+        );
+
+        // 1. Item 5: register -> Critical thermal report -> re-register -> 0 slots from matchmake
+        // before any telemetry of the new session arrives.
+        let s1 = registry
+            .register(
+                id,
+                phone_caps(90, true, false),
+                "127.0.0.1:9035".parse().unwrap(),
+                tx.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        registry
+            .update_mobile_telemetry(
+                &id,
+                Some(s1),
+                MobileLiveStatus {
+                    battery_pct: Some(90),
+                    is_charging: Some(true),
+                    thermal_throttled: false,
+                    battery_temperature: Some(45.0),
+                    thermal_tier: Some(ThermalTier::Critical),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let _s2 = registry
+            .register(
+                id,
+                phone_caps(90, true, false),
+                "127.0.0.1:9035".parse().unwrap(),
+                tx.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        let workers = registry.list_schedulable_workers().await;
+        let report_before_telemetry =
+            WorkloadScheduler::matchmake(&config, std::slice::from_ref(&task), &workers);
+        assert_eq!(
+            report_before_telemetry.assignments.len(),
+            0,
+            "Re-registered phone must keep Critical thermal state and receive 0 slots before new telemetry arrives"
+        );
+
+        // 2. Item 6 (thermal expiry): if the new session never sends MobileTelemetry, the kept
+        // thermal tier expires after PRESERVED_THERMAL_TTL so the worker is not idle forever.
+        registry.expire_preserved_thermal(&id).await;
+        let workers_after_expiry = registry.list_schedulable_workers().await;
+        let report_after_expiry = WorkloadScheduler::matchmake(
+            &config,
+            std::slice::from_ref(&task),
+            &workers_after_expiry,
+        );
+        assert_eq!(
+            report_after_expiry.assignments.len(),
+            1,
+            "Once preserved_thermal_until expires without MobileTelemetry, the phone must receive 1 slot"
+        );
+
+        // 3. Item 6 (battery_tier cleared on re-register): a phone at BatteryTier::Critical (5 %)
+        // that registers again at 100 % and charging gets 1 slot immediately.
+        let bat_id = Uuid::new_v4();
+        let b1 = registry
+            .register(
+                bat_id,
+                phone_caps(5, false, false),
+                "127.0.0.1:9036".parse().unwrap(),
+                tx.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        registry
+            .update_mobile_telemetry(
+                &bat_id,
+                Some(b1),
+                MobileLiveStatus {
+                    battery_pct: Some(5),
+                    is_charging: Some(false),
+                    battery_tier: Some(BatteryTier::Critical),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let _b2 = registry
+            .register(
+                bat_id,
+                phone_caps(100, true, false),
+                "127.0.0.1:9036".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+        let bat_worker = registry.get_worker(bat_id).await.unwrap();
+        assert_eq!(
+            bat_worker
+                .mobile_status
+                .as_ref()
+                .and_then(|s| s.battery_tier),
+            None,
+            "battery_tier must be cleared on re-registration because Register carries a fresh battery reading"
+        );
+        let bat_report =
+            WorkloadScheduler::matchmake(&config, std::slice::from_ref(&task), &[bat_worker]);
+        assert_eq!(
+            bat_report.assignments.len(),
+            1,
+            "Phone re-registering at 100% charging after BatteryTier::Critical must receive 1 slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_none_and_empty_network_strings_treated_as_none_before_retention() {
+        let registry = WorkerRegistry::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let id = Uuid::new_v4();
+        let session = registry
+            .register(
+                id,
+                phone_caps(85, false, false),
+                "127.0.0.1:9037".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        registry
+            .update_mobile_telemetry(
+                &id,
+                Some(session),
+                MobileLiveStatus {
+                    battery_pct: Some(85),
+                    is_charging: Some(false),
+                    network_type: Some("cellular".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        for sentinel in ["unknown", "none", ""] {
+            registry
+                .update_mobile_telemetry(
+                    &id,
+                    Some(session),
+                    MobileLiveStatus {
+                        battery_pct: Some(84),
+                        is_charging: Some(false),
+                        network_type: Some(sentinel.into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            registry
+                .record_heartbeat(&id, 0, 300, 5.0, 4096, Some(session))
+                .await
+                .unwrap();
+            let inner = registry.inner.read().await;
+            let entry = &inner.workers[&id];
+            assert_eq!(
+                entry
+                    .mobile_status
+                    .as_ref()
+                    .and_then(|s| s.network_type.as_deref()),
+                Some("cellular"),
+                "sentinel network_type {sentinel:?} must be sanitized to None before retention"
+            );
+            assert_eq!(
+                entry.heartbeat_interval,
+                Some(Duration::from_secs(25)),
+                "sentinel network_type {sentinel:?} must retain the 25 s cellular interval instead of dropping to None"
+            );
+        }
     }
 }

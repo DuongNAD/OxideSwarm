@@ -604,6 +604,9 @@ pub struct WorkerClient {
     mobile: MobileTelemetryHandle,
     /// True when the platform app feeds `mobile`, so the worker must not poll the OS itself.
     mobile_fed_externally: bool,
+    /// Optional delay before sending the session's initial `MobileTelemetry` after `RegisterAck`
+    /// (used by integration tests to simulate slow LTE / relay round trips).
+    initial_telemetry_delay: Duration,
     /// Base directory the runner creates `<task id>` sandboxes in.
     sandbox_base_dir: PathBuf,
     /// Source of [`TaskExecutionHandle::attempt`].
@@ -1174,6 +1177,7 @@ impl WorkerClient {
             master_beacon,
             mobile,
             mobile_fed_externally,
+            initial_telemetry_delay: Duration::ZERO,
             sandbox_base_dir,
             next_attempt: Arc::new(AtomicU64::new(0)),
             cancelled_unseen: std::sync::Mutex::new(VecDeque::new()),
@@ -1320,6 +1324,13 @@ impl WorkerClient {
     /// Sets the reconnection backoff configuration.
     pub fn set_backoff_config(&mut self, config: BackoffConfig) {
         self.backoff_config = config;
+    }
+
+    /// Delays the session's initial `WorkerMessage::MobileTelemetry` frame after `RegisterAck` by
+    /// `delay` (for testing slow LTE / relay round-trip delivery).
+    #[doc(hidden)]
+    pub fn set_initial_telemetry_delay(&mut self, delay: Duration) {
+        self.initial_telemetry_delay = delay;
     }
 
     /// Returns the active backoff configuration.
@@ -2359,15 +2370,22 @@ impl WorkerClient {
             (dead_after / 8).clamp(Duration::from_millis(25), Duration::from_secs(1)),
         );
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut telemetry = tokio::time::interval(MOBILE_TELEMETRY_CHECK_INTERVAL);
+        let mut telemetry = if self.initial_telemetry_delay > Duration::ZERO {
+            tokio::time::interval_at(
+                tokio::time::Instant::now() + self.initial_telemetry_delay,
+                MOBILE_TELEMETRY_CHECK_INTERVAL,
+            )
+        } else {
+            tokio::time::interval(MOBILE_TELEMETRY_CHECK_INTERVAL)
+        };
         telemetry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // `Register` carries only `MobileCapabilities` (no `network_type`, `battery_temperature`,
         // or tiers), so send one `MobileTelemetry` right after `RegisterAck` when the Master
-        // announced `mobile-telemetry`.
+        // announced `mobile-telemetry` (unless a test configured `initial_telemetry_delay`).
         let mut last_reported: Option<MobileLiveStatus> = None;
         // Only to a Master that said it can read the report (an older one would drop us for it).
         let report_telemetry = self.master_takes_mobile_telemetry.load(Ordering::Acquire);
-        if report_telemetry {
+        if report_telemetry && self.initial_telemetry_delay.is_zero() {
             if let Some(status) = self.mobile.live_status() {
                 let report = WorkerMessage::MobileTelemetry {
                     worker_id,
