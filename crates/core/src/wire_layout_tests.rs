@@ -37,8 +37,8 @@ use crate::capabilities::{BatteryTier, MobileCapabilities, ThermalTier, WorkerCa
 use crate::mapreduce::{MapFunctionSpec, MapReduceJobSpec, MapReduceResult, ReduceFunctionSpec};
 use crate::protocol::{
     deserialize_message, serialize_message, ClientMessage, ClientResponse, InboundMessage,
-    MasterMessage, ProtocolCapabilities, WireCodec, WorkerMessage, WIRE_FORMAT_BINCODE,
-    WIRE_FORMAT_JSON,
+    MasterMessage, ProtocolCapabilities, WireCodec, WorkerMessage, PROTOCOL_VERSION_CURRENT,
+    PROTOCOL_VERSION_MIN_COMPATIBLE, WIRE_FORMAT_BINCODE, WIRE_FORMAT_JSON,
 };
 use crate::task::{
     AutoRigSpec, Bytes, CheckpointData, Generative3DSpec, OutputArtifact, StagedFile, Task, TaskId,
@@ -981,10 +981,96 @@ fn to_hex(bytes: &[u8]) -> String {
 
 fn render_wire_layout(layout: &BTreeMap<String, String>) -> String {
     let mut text = String::from(HEADER);
+    let _ = writeln!(text, "# protocol_version: {PROTOCOL_VERSION_CURRENT}");
+    let _ = writeln!(
+        text,
+        "# protocol_version_min_compatible: {PROTOCOL_VERSION_MIN_COMPATIBLE}"
+    );
     for (key, hex) in layout {
         let _ = writeln!(text, "{key} {hex}");
     }
     text
+}
+
+/// Parses `# protocol_version: <N>` and `# protocol_version_min_compatible: <M>` from the header
+/// comments of [`WIRE_LAYOUT_FILE`], defaulting to `(2, 2)` for pre-v3 files that lacked those
+/// headers.
+fn parse_wire_layout_versions(text: &str) -> (u32, u32) {
+    let mut version = 2u32;
+    let mut min_compatible = 2u32;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("# protocol_version:") {
+            version = rest
+                .trim()
+                .parse::<u32>()
+                .expect("valid # protocol_version header in wire_layout.txt");
+        } else if let Some(rest) = line.strip_prefix("# protocol_version_min_compatible:") {
+            min_compatible = rest
+                .trim()
+                .parse::<u32>()
+                .expect("valid # protocol_version_min_compatible header in wire_layout.txt");
+        }
+    }
+    (version, min_compatible)
+}
+
+/// Enforces that any wire layout change relative to [`WIRE_LAYOUT_FILE`] bumps
+/// `PROTOCOL_VERSION_CURRENT`, and bumps `PROTOCOL_VERSION_MIN_COMPATIBLE` to `current_version`
+/// whenever an existing variant's encoding changed or was removed.
+fn verify_version_bump_for_layout_change(
+    recorded_version: u32,
+    recorded_min_compatible: u32,
+    recorded: &BTreeMap<String, String>,
+    current_version: u32,
+    current_min_compatible: u32,
+    current: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let differences = layout_differences(recorded, current);
+    if differences.is_empty() {
+        if current_version < recorded_version {
+            return Err(format!(
+                "PROTOCOL_VERSION_CURRENT ({current_version}) regressed below the recorded \
+                 protocol_version ({recorded_version}) in {WIRE_LAYOUT_FILE}"
+            ));
+        }
+        if current_min_compatible > current_version {
+            return Err(format!(
+                "PROTOCOL_VERSION_MIN_COMPATIBLE ({current_min_compatible}) exceeds \
+                 PROTOCOL_VERSION_CURRENT ({current_version})"
+            ));
+        }
+        return Ok(());
+    }
+
+    if current_version <= recorded_version {
+        return Err(format!(
+            "The bincode encoding of {} canonical message(s) differs from {WIRE_LAYOUT_FILE}, \
+             but PROTOCOL_VERSION_CURRENT is still {current_version} (recorded: \
+             {recorded_version}). Bump PROTOCOL_VERSION_CURRENT in crates/core/src/protocol.rs \
+             before regenerating {WIRE_LAYOUT_FILE}:\n\n    {}",
+            differences.len(),
+            differences.join("\n    ")
+        ));
+    }
+
+    let existing_variant_changed_or_removed = recorded
+        .iter()
+        .any(|(key, before)| current.get(key) != Some(before));
+    if existing_variant_changed_or_removed
+        && (current_min_compatible <= recorded_min_compatible
+            || current_min_compatible < current_version)
+    {
+        return Err(format!(
+            "An existing canonical message encoding changed or was removed relative to \
+             {WIRE_LAYOUT_FILE} (recorded protocol_version {recorded_version}, \
+             min_compatible {recorded_min_compatible}), so older peers cannot decode the new \
+             wire layout. Bump PROTOCOL_VERSION_MIN_COMPATIBLE to {current_version} (got \
+             {current_min_compatible}) in crates/core/src/protocol.rs."
+        ));
+    }
+
+    Ok(())
 }
 
 /// Reads the recorded layout: blank lines and `#` comments are skipped, every other line is
@@ -1152,6 +1238,20 @@ fn bincode_encoding_matches_the_recorded_wire_layout() {
 
     let path = wire_layout_path();
     if std::env::var_os(UPDATE_ENV).is_some_and(|value| value == "1") {
+        if let Ok(existing_text) = std::fs::read_to_string(&path) {
+            let (recorded_ver, recorded_min) = parse_wire_layout_versions(&existing_text);
+            let recorded_layout = parse_wire_layout(&existing_text);
+            if let Err(reason) = verify_version_bump_for_layout_change(
+                recorded_ver,
+                recorded_min,
+                &recorded_layout,
+                PROTOCOL_VERSION_CURRENT,
+                PROTOCOL_VERSION_MIN_COMPATIBLE,
+                &current,
+            ) {
+                panic!("{reason}");
+            }
+        }
         let dir = path
             .parent()
             .expect("the layout file has a parent directory");
@@ -1159,7 +1259,8 @@ fn bincode_encoding_matches_the_recorded_wire_layout() {
         std::fs::write(&path, render_wire_layout(&current))
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         eprintln!(
-            "{UPDATE_ENV}=1: wrote {} encodings to {}",
+            "{UPDATE_ENV}=1: wrote {} encodings (protocol_version={PROTOCOL_VERSION_CURRENT}, \
+             min_compatible={PROTOCOL_VERSION_MIN_COMPATIBLE}) to {}",
             current.len(),
             path.display()
         );
@@ -1172,19 +1273,119 @@ fn bincode_encoding_matches_the_recorded_wire_layout() {
             path.display()
         )
     });
-    let differences = layout_differences(&parse_wire_layout(&text), &current);
+    let (recorded_ver, recorded_min) = parse_wire_layout_versions(&text);
+    let recorded_layout = parse_wire_layout(&text);
+    if let Err(reason) = verify_version_bump_for_layout_change(
+        recorded_ver,
+        recorded_min,
+        &recorded_layout,
+        PROTOCOL_VERSION_CURRENT,
+        PROTOCOL_VERSION_MIN_COMPATIBLE,
+        &current,
+    ) {
+        panic!("{reason}");
+    }
+    let differences = layout_differences(&recorded_layout, &current);
     assert!(
         differences.is_empty(),
         "The bincode encoding of {} canonical message(s) differs from {WIRE_LAYOUT_FILE}:\n\n    \
          {}\n\nIf a message type changed (a field or variant added, removed, moved or retyped, in \
          the message or in a type it carries), this is a wire format change: bincode is \
          positional, so new fields go after the existing ones, and peers built before the change \
-         must still decode every frame (see \"Wire protocol\" in CLAUDE.md). Record it in a design \
-         record (docs/design/NNNN-<slug>.md). If only a canonical value in \
-         crates/core/src/wire_layout_tests.rs changed, no design record is needed.\n\nThen \
+         must still decode every frame (see \"Wire protocol\" in CLAUDE.md). Bump \
+         PROTOCOL_VERSION_CURRENT (and PROTOCOL_VERSION_MIN_COMPATIBLE if breaking) and record it \
+         in a design record (docs/design/NNNN-<slug>.md).\n\nThen \
          regenerate the file with\n{REGENERATE}\n(PowerShell keeps the variable for the session: \
          `Remove-Item Env:{UPDATE_ENV}` afterwards.)\n",
         differences.len(),
         differences.join("\n    ")
     );
+    assert_eq!(
+        (recorded_ver, recorded_min),
+        (PROTOCOL_VERSION_CURRENT, PROTOCOL_VERSION_MIN_COMPATIBLE),
+        "{WIRE_LAYOUT_FILE} records protocol_version ({recorded_ver}, min {recorded_min}), \
+         but code has ({PROTOCOL_VERSION_CURRENT}, min {PROTOCOL_VERSION_MIN_COMPATIBLE}); \
+         regenerate with\n{REGENERATE}"
+    );
+}
+
+#[test]
+fn changed_task_layout_fails_without_version_bump() {
+    let baseline = current_wire_layout();
+
+    // Simulate changing `Task`'s wire layout (e.g. adding a `priority: u32` field to `Task`),
+    // which alters the bincode bytes of every message carrying a `Task`.
+    #[derive(Serialize)]
+    struct MutatedTask {
+        base: Task,
+        added_field: u32,
+    }
+    #[derive(Serialize)]
+    #[allow(dead_code, clippy::large_enum_variant)]
+    enum MutatedMasterMessage {
+        RegisterAck,
+        HeartbeatAck,
+        AssignTask { task: MutatedTask },
+    }
+    let mutated_assign = MutatedMasterMessage::AssignTask {
+        task: MutatedTask {
+            base: task(1, command_spec()),
+            added_field: 0xdead_beef,
+        },
+    };
+    let mutated_assign_hex = to_hex(&bincode_frame("MutatedAssignTask", &mutated_assign)[1..]);
+
+    let mut mutated = baseline.clone();
+    mutated.insert("MasterMessage::AssignTask".to_string(), mutated_assign_hex);
+
+    let diffs = layout_differences(&baseline, &mutated);
+    assert_eq!(diffs.len(), 1);
+    assert!(
+        diffs[0].contains("MasterMessage::AssignTask"),
+        "expected AssignTask difference, got: {:?}",
+        diffs
+    );
+
+    // 1. Without bumping PROTOCOL_VERSION_CURRENT, the guard rejects the layout change even if
+    // someone tries to regenerate wire_layout.txt.
+    let err_no_bump = verify_version_bump_for_layout_change(
+        PROTOCOL_VERSION_CURRENT,
+        PROTOCOL_VERSION_MIN_COMPATIBLE,
+        &baseline,
+        PROTOCOL_VERSION_CURRENT,
+        PROTOCOL_VERSION_MIN_COMPATIBLE,
+        &mutated,
+    )
+    .unwrap_err();
+    assert!(
+        err_no_bump.contains("Bump PROTOCOL_VERSION_CURRENT"),
+        "unexpected error: {err_no_bump}"
+    );
+
+    // 2. Bumping PROTOCOL_VERSION_CURRENT without bumping PROTOCOL_VERSION_MIN_COMPATIBLE is also
+    // rejected because an existing message variant changed its wire bytes.
+    let err_min_not_bumped = verify_version_bump_for_layout_change(
+        PROTOCOL_VERSION_CURRENT,
+        PROTOCOL_VERSION_MIN_COMPATIBLE,
+        &baseline,
+        PROTOCOL_VERSION_CURRENT + 1,
+        PROTOCOL_VERSION_MIN_COMPATIBLE,
+        &mutated,
+    )
+    .unwrap_err();
+    assert!(
+        err_min_not_bumped.contains("Bump PROTOCOL_VERSION_MIN_COMPATIBLE"),
+        "unexpected error: {err_min_not_bumped}"
+    );
+
+    // 3. Bumping both PROTOCOL_VERSION_CURRENT and PROTOCOL_VERSION_MIN_COMPATIBLE succeeds.
+    verify_version_bump_for_layout_change(
+        PROTOCOL_VERSION_CURRENT,
+        PROTOCOL_VERSION_MIN_COMPATIBLE,
+        &baseline,
+        PROTOCOL_VERSION_CURRENT + 1,
+        PROTOCOL_VERSION_CURRENT + 1,
+        &mutated,
+    )
+    .expect("bumping both current and min_compatible version must allow the layout update");
 }

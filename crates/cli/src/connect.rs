@@ -249,7 +249,14 @@ pub fn report_master_failure(
         GridError::ConnectionFailed(message) => eprintln!("{message}"),
         GridError::ConnectionClosed | GridError::Io(_) if !had_secret => {
             eprintln!(
-                "{what}: {err}\nHint: if the Master at {master_addr} requires a cluster secret, pass --secret-file PATH or set OXIDESWARM_SECRET (or copy ~/.oxideswarm/cluster.secret from the Master machine)"
+                "{what}: {err}\nHint: if the Master at {master_addr} requires a cluster secret, pass --secret-file PATH or set OXIDESWARM_SECRET (or copy ~/.oxideswarm/cluster.secret from the Master machine); if the Master is running an older or newer build, upgrade both Master and CLI to protocol version {}",
+                rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT
+            );
+        }
+        GridError::ConnectionClosed | GridError::Io(_) => {
+            eprintln!(
+                "{what}: {err}\nHint: if the Master at {master_addr} is running an older or newer build, upgrade both Master and CLI to protocol version {}",
+                rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT
             );
         }
         other => eprintln!("{what}: {other}"),

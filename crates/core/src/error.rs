@@ -305,6 +305,9 @@ impl From<ProtocolError> for GridError {
             ProtocolError::FrameTooLarge { size, max } => GridError::FrameTooLarge { size, max },
             ProtocolError::UnexpectedEof => GridError::ConnectionClosed,
             ProtocolError::ConnectionClosed => GridError::ConnectionClosed,
+            ProtocolError::IncompatibleVersion { .. } => {
+                GridError::HandshakeFailed(err.to_string())
+            }
             ProtocolError::Violation(msg) => GridError::Framing(msg),
         }
     }
