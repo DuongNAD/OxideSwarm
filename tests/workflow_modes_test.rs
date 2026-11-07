@@ -5,8 +5,9 @@ use rusty_grid_cli::mode::{
     get_mode_descriptors, launch_local_dev_cluster_with_ports,
     probe_cluster_health_with_fallback_ports, probe_cluster_health_with_secret,
     run_distributed_benchmark, run_hardware_profile, run_micro_benchmarks,
-    run_mode_cli_with_secret, run_watch_check, stop_local_dev_cluster, verify_documentation,
-    ModeCliArgs, WorkflowMode, DEFAULT_FALLBACK_STATUS_PORTS,
+    run_mode_cli_with_secret, run_watch_check, stop_local_dev_cluster,
+    stop_local_dev_cluster_with_signaller, verify_documentation, ModeCliArgs, WorkflowMode,
+    DEFAULT_FALLBACK_STATUS_PORTS,
 };
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::protocol::MAX_FRAME_SIZE;
@@ -689,10 +690,6 @@ async fn test_dev_status_never_sends_token_to_guessed_ports_or_3000() {
         .env("HOME", &temp_home)
         .env("USERPROFILE", &temp_home)
         .env("OXIDESWARM_SECRET_FILE", &secret_path)
-        .env(
-            "OXIDESWARM_STATUS_FALLBACK_PORTS",
-            fallback_port.to_string(),
-        )
         .env_remove("CARGO_MANIFEST_DIR")
         .env_remove("OXIDESWARM_SECRET")
         .env_remove("RUSTY_GRID_CONFIG")
@@ -706,8 +703,8 @@ async fn test_dev_status_never_sends_token_to_guessed_ports_or_3000() {
     let reqs_fb = captured_fallback.lock().unwrap();
     assert_eq!(
         reqs_fb.len(),
-        2,
-        "fallback listener must receive exactly 1 unauthenticated probe per dev status call (no auth retry), got {} requests",
+        1,
+        "fallback listener must receive exactly 1 unauthenticated probe (no auth retry), got {} requests",
         reqs_fb.len()
     );
     assert!(
@@ -806,6 +803,11 @@ async fn test_dev_cluster_never_sends_token_when_web_ui_port_is_held() {
         "launch_local_dev_cluster_with_ports must fail when web_ui_port is held by another listener"
     );
     assert_eq!(res.exit_code, Some(1));
+    assert!(
+        res.stderr.contains("did not appear within 8s"),
+        "expected failure message to state that the dashboard port file did not appear within 8s, got: {}",
+        res.stderr
+    );
 
     let reqs = captured.lock().unwrap();
     assert!(
@@ -825,13 +827,22 @@ async fn test_dev_cluster_never_sends_token_when_web_ui_port_is_held() {
 async fn test_dev_stop_skips_unrelated_and_stale_pids_and_reports_honestly() {
     let temp = tempfile::tempdir().expect("tempdir");
 
-    // Spawn an unrelated background process (`python -c "import time; time.sleep(60)"`)
-    let mut unrelated = std::process::Command::new("python")
-        .args(["-c", "import time; time.sleep(60)"])
+    // Spawn an unrelated background process using stock OS utilities (`sleep` on Unix, `ping` on Windows)
+    // so stock macOS machines without `python` on PATH can run this test.
+    #[cfg(unix)]
+    let mut unrelated = std::process::Command::new("sleep")
+        .arg("60")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("spawn unrelated python sleep process");
+        .expect("spawn unrelated sleep process");
+    #[cfg(windows)]
+    let mut unrelated = std::process::Command::new("ping")
+        .args(["-n", "60", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn unrelated ping process");
     let unrelated_pid = unrelated.id();
     let self_pid = std::process::id();
 
@@ -864,6 +875,7 @@ async fn test_dev_stop_skips_unrelated_and_stale_pids_and_reports_honestly() {
     assert!(stop_res.success);
     assert_eq!(stop_res.metrics["signalled_count"], 0);
     assert_eq!(stop_res.metrics["exited_count"], 0);
+    assert_eq!(stop_res.metrics["signal_failed_count"], 0);
     assert_eq!(
         stop_res.metrics["skipped_count"], 5,
         "expected 5 invalid/stale/unrelated entries skipped (unrelated, 0, 1, self_pid, u64 overflow), got: {:?}",
@@ -876,6 +888,88 @@ async fn test_dev_stop_skips_unrelated_and_stale_pids_and_reports_honestly() {
                 .contains("stale/unrelated PID entry(ies) skipped"),
         "expected honest stop summary reporting skipped stale entries, got: {}",
         stop_res.stdout
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dev_cluster_in_process_launch_then_stop_and_signal_failure_handling() {
+    let master_tcp_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral master tcp port");
+        l.local_addr().expect("local_addr").port()
+    };
+    let web_ui_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral web ui port");
+        l.local_addr().expect("local_addr").port()
+    };
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let launch_res =
+        launch_local_dev_cluster_with_ports(temp.path(), master_tcp_port, web_ui_port).await;
+    assert!(
+        launch_res.success,
+        "in-process dev cluster launch must succeed, got stderr: {}",
+        launch_res.stderr
+    );
+
+    let pid_file = temp.path().join(".dev_cluster.pids");
+    let json_file = temp.path().join(".dev_cluster.json");
+    assert!(
+        pid_file.exists(),
+        ".dev_cluster.pids must exist after launch"
+    );
+    assert!(
+        json_file.exists(),
+        ".dev_cluster.json must exist after launch"
+    );
+
+    let json_str = std::fs::read_to_string(&json_file).expect("read .dev_cluster.json");
+    let json_val: serde_json::Value =
+        serde_json::from_str(&json_str).expect("parse .dev_cluster.json");
+    let start_times = json_val
+        .get("pid_start_times")
+        .and_then(|v| v.as_object())
+        .expect("pid_start_times map in .dev_cluster.json");
+    assert_eq!(
+        start_times.len(),
+        3,
+        "all 3 spawned cluster children must have start_time recorded in .dev_cluster.json"
+    );
+
+    // 1. If a verified process cannot be signalled, `stop` must count it as failed, return
+    //    `success == false` (`exit_code == Some(1)`), and preserve the tracking files.
+    let fail_stop = stop_local_dev_cluster_with_signaller(temp.path(), |_, _| false).await;
+    assert!(
+        !fail_stop.success,
+        "stop must fail when verified cluster processes cannot be signalled"
+    );
+    assert_eq!(fail_stop.exit_code, Some(1));
+    assert_eq!(fail_stop.metrics["signal_failed_count"], 3);
+    assert_eq!(fail_stop.metrics["signalled_count"], 0);
+    assert!(
+        pid_file.exists() && json_file.exists(),
+        "tracking files must be preserved when stop fails to signal verified processes"
+    );
+
+    // 2. Now run real `stop_local_dev_cluster` in the SAME process that launched the cluster:
+    //    must reap/detect exit for all 3 children, report 3 signalled, 3 exited, and remove tracking files.
+    let stop_res = stop_local_dev_cluster(temp.path()).await;
+    assert!(
+        stop_res.success,
+        "in-process stop_local_dev_cluster must succeed, got stdout={} stderr={}",
+        stop_res.stdout, stop_res.stderr
+    );
+    assert_eq!(stop_res.exit_code, Some(0));
+    assert_eq!(stop_res.metrics["signalled_count"], 3);
+    assert_eq!(stop_res.metrics["exited_count"], 3);
+    assert_eq!(stop_res.metrics["signal_failed_count"], 0);
+    assert!(
+        stop_res.stdout.contains("3 signalled, 3 exited"),
+        "expected '3 signalled, 3 exited' in stdout, got: {}",
+        stop_res.stdout
+    );
+    assert!(
+        !pid_file.exists() && !json_file.exists(),
+        "tracking files must be deleted after clean stop"
     );
 }
 
