@@ -218,19 +218,19 @@ fn test_quic_stream_header_constants() {
 #[cfg(feature = "p2p")]
 #[tokio::test]
 async fn test_quic_stream_multiplexing_isolation_and_anti_hol_blocking() {
-    use iroh::endpoint::presets::N0;
+    use iroh::endpoint::presets::Minimal;
     use iroh::endpoint::RelayMode;
     use rusty_grid_core::transport::GRID_ALPN;
 
     // 1. Bind two independent Iroh QUIC endpoints on loopback
-    let ep_server = iroh::Endpoint::builder(N0)
+    let ep_server = iroh::Endpoint::builder(Minimal)
         .alpns(vec![GRID_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
         .bind()
         .await
         .expect("bind server endpoint");
 
-    let ep_client = iroh::Endpoint::builder(N0)
+    let ep_client = iroh::Endpoint::builder(Minimal)
         .alpns(vec![GRID_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
         .bind()

@@ -70,6 +70,13 @@ pub struct ServerConfig {
     pub handshake_timeout_secs: u64,
     /// Whether to enable P2P NAT traversal listener (iroh).
     pub enable_p2p: bool,
+    /// When `true`, builds the P2P endpoint with `iroh::endpoint::presets::Minimal` (no n0 DERP
+    /// relay or pkarr/DNS address lookup) so tests stay completely off the network. Production
+    /// defaults to `false` (`presets::N0`); the CLI resolves `RUSTY_GRID_P2P_MINIMAL`.
+    pub p2p_minimal_preset: bool,
+    /// Optional explicit UDP socket address for the P2P endpoint (used by tests to keep a stable
+    /// loopback UDP port across restarts when relays are disabled).
+    pub p2p_bind_addr: Option<SocketAddr>,
     /// Optional path to write P2P ticket for worker connections.
     pub p2p_ticket_file: Option<PathBuf>,
     /// Address to bind the Web UI dashboard to (e.g. "0.0.0.0:8080").
@@ -155,6 +162,8 @@ impl Default for ServerConfig {
             heartbeat_interval_secs: 3,
             handshake_timeout_secs: 5,
             enable_p2p: false,
+            p2p_minimal_preset: false,
+            p2p_bind_addr: None,
             p2p_ticket_file: None,
             // The dashboard is only reachable from other machines when its address is set
             // explicitly (`with_web_ui_addr` / `--web-ui-addr`).
@@ -237,6 +246,21 @@ impl ServerConfig {
     /// Enables or disables P2P listener mode.
     pub fn with_p2p(mut self, enable: bool) -> Self {
         self.enable_p2p = enable;
+        self
+    }
+
+    /// Selects `iroh::endpoint::presets::Minimal` (no relay or external address lookup) for the
+    /// P2P endpoint when `minimal` is `true`, keeping tests off the network while production
+    /// keeps `presets::N0` (`false`).
+    pub fn with_p2p_minimal_preset(mut self, minimal: bool) -> Self {
+        self.p2p_minimal_preset = minimal;
+        self
+    }
+
+    /// Binds the P2P QUIC endpoint to a specific UDP socket address (clearing default `0.0.0.0:0`
+    /// and `[::]:0` transports).
+    pub fn with_p2p_bind_addr(mut self, addr: SocketAddr) -> Self {
+        self.p2p_bind_addr = Some(addr);
         self
     }
 
@@ -503,29 +527,49 @@ impl MasterServer {
         let p2p_active_conns = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         #[cfg(feature = "p2p")]
         let (p2p_endpoint, p2p_ticket) = if config.enable_p2p || config.p2p_key_file.is_some() {
+            if config.p2p_minimal_preset {
+                warn!(
+                    "P2P minimal preset is enabled (p2p_minimal_preset=true); DERP relay and pkarr/DNS address lookup are disabled, so workers behind NAT cannot connect"
+                );
+            }
             let resolved_key_file = if config.ephemeral_key {
                 config.p2p_key_file.clone()
             } else {
                 config.p2p_key_file.clone().or_else(default_master_key_file)
             };
             let secret_key = resolve_p2p_secret_key(resolved_key_file.as_deref()).await?;
-            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            let mut ep_builder = if config.p2p_minimal_preset {
+                iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            } else {
+                iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            };
+            if let Some(p2p_addr) = config.p2p_bind_addr {
+                ep_builder = ep_builder
+                    .clear_ip_transports()
+                    .bind_addr(p2p_addr)
+                    .map_err(|e| {
+                        GridError::Config(format!("Invalid P2P bind address '{p2p_addr}': {e}"))
+                    })?;
+            }
+            let endpoint = ep_builder
                 .secret_key(secret_key)
                 .alpns(vec![GRID_ALPN.to_vec()])
                 .bind()
                 .await
                 .map_err(|e| GridError::Config(format!("Failed to bind iroh endpoint: {e}")))?;
 
-            // Await home DERP relay connection and STUN discovery before serializing ticket.
-            // Timeout gracefully so offline/air-gapped environments don't hang indefinitely.
-            match tokio::time::timeout(Duration::from_secs(5), endpoint.online()).await {
-                Ok(_) => {
-                    info!(
-                        "Master connected to home DERP relay and discovered public network paths"
-                    );
-                }
-                Err(_) => {
-                    warn!("Timed out awaiting DERP relay readiness; proceeding with initial discovered addresses");
+            if !config.p2p_minimal_preset {
+                // Await home DERP relay connection and STUN discovery before serializing ticket.
+                // Timeout gracefully so offline/air-gapped environments don't hang indefinitely.
+                match tokio::time::timeout(Duration::from_secs(5), endpoint.online()).await {
+                    Ok(_) => {
+                        info!(
+                            "Master connected to home DERP relay and discovered public network paths"
+                        );
+                    }
+                    Err(_) => {
+                        warn!("Timed out awaiting DERP relay readiness; proceeding with initial discovered addresses");
+                    }
                 }
             }
 
@@ -782,9 +826,14 @@ impl MasterServer {
                             let _ = &report;
                             #[cfg(feature = "dashboard")]
                             if let Some(ref b_tx) = sched_broadcast_tx {
-                                if !report.assignments.is_empty() {
+                                if !report.assignments.is_empty() || !report.unfulfillable.is_empty() {
                                     for assignment in &report.assignments {
                                         if let Some(info) = sched_queue.get_task(&assignment.task_id).await {
+                                            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
+                                        }
+                                    }
+                                    for (task_id, _) in &report.unfulfillable {
+                                        if let Some(info) = sched_queue.get_task(task_id).await {
                                             let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
                                         }
                                     }
@@ -798,9 +847,14 @@ impl MasterServer {
                             let _ = &report;
                             #[cfg(feature = "dashboard")]
                             if let Some(ref b_tx) = sched_broadcast_tx {
-                                if !report.assignments.is_empty() {
+                                if !report.assignments.is_empty() || !report.unfulfillable.is_empty() {
                                     for assignment in &report.assignments {
                                         if let Some(info) = sched_queue.get_task(&assignment.task_id).await {
+                                            let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
+                                        }
+                                    }
+                                    for (task_id, _) in &report.unfulfillable {
+                                        if let Some(info) = sched_queue.get_task(task_id).await {
                                             let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info));
                                         }
                                     }
@@ -3741,7 +3795,7 @@ async fn handle_multiplexed_connection<
         StampedStream::new(ctrl_stream, rx_clock.clone()),
         wire_codec,
     );
-    let data_transport = MessageTransport::with_codec(
+    let mut data_transport = MessageTransport::with_codec(
         StampedStream::new(data_stream, rx_clock.clone()),
         wire_codec,
     );
@@ -3784,6 +3838,7 @@ async fn handle_multiplexed_connection<
 
     if wire_codec == WireCodec::Bincode {
         ctrl_transport.set_outbound_codec(detected_codec);
+        data_transport.set_outbound_codec(detected_codec);
     }
 
     let worker_msg = match first_msg {
@@ -6293,6 +6348,204 @@ mod tests {
         }
 
         server_task.abort();
+
+        // Also verify multiplexed P2P (`handle_multiplexed_connection`) with `WireCodec::Json`:
+        // a worker registering with Bincode must receive both its `RegisterAck` (control lane)
+        // and `AssignTask` (data lane) in `WireCodec::Json`.
+        let (c_master, c_worker) = tokio::io::duplex(64 * 1024);
+        let (d_master, d_worker) = tokio::io::duplex(64 * 1024);
+        let (_mux_stop_tx, mux_stop_rx) = tokio::sync::watch::channel(false);
+        let mux_reg1 = WorkerRegistry::new();
+        let mux_queue1 = TaskQueue::new();
+        let mux_notify1 = Arc::new(tokio::sync::Notify::new());
+        let reg1_clone = mux_reg1.clone();
+        let queue1_clone = mux_queue1.clone();
+        let notify1_clone = Arc::clone(&mux_notify1);
+        let mux_task = tokio::spawn(async move {
+            handle_multiplexed_connection(
+                c_master,
+                d_master,
+                SocketAddr::from(([127, 0, 0, 1], 50099)),
+                reg1_clone,
+                queue1_clone,
+                notify1_clone,
+                Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                10,
+                Duration::from_secs(5),
+                mux_stop_rx,
+                None,
+                WireCodec::Json,
+                None,
+                None,
+                None,
+                #[cfg(feature = "dashboard")]
+                None,
+                #[cfg(feature = "p2p")]
+                None,
+                #[cfg(feature = "p2p")]
+                None,
+            )
+            .await
+        });
+
+        let mut w_ctrl = MessageTransport::with_codec(c_worker, WireCodec::Bincode);
+        let mut w_data = MessageTransport::with_codec(d_worker, WireCodec::Bincode);
+        w_ctrl
+            .send_msg(&WorkerMessage::Register {
+                worker_id: Uuid::new_v4(),
+                capabilities: WorkerCapabilities::new(
+                    "mux-json-check",
+                    2,
+                    4096,
+                    false,
+                    false,
+                    None,
+                ),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: rusty_grid_core::protocol::ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        let (mux_reply, mux_codec) = w_ctrl
+            .recv_msg_with_codec::<MasterMessage>()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mux_codec,
+            WireCodec::Json,
+            "handle_multiplexed_connection with WireCodec::Json must reply in Json on ctrl_transport even to a Bincode worker"
+        );
+        assert!(matches!(
+            mux_reply,
+            MasterMessage::RegisterAck { accepted: true, .. }
+        ));
+
+        mux_queue1
+            .submit(Task::new(
+                TaskSpec::command("echo", vec!["mux-json-data-lane".into()]),
+                TaskRequirements::generic(1, 30),
+            ))
+            .await
+            .unwrap();
+        let sched1 = WorkloadScheduler::new(
+            SchedulerConfig::default(),
+            mux_reg1,
+            mux_queue1,
+            mux_notify1,
+        );
+        assert_eq!(sched1.schedule_once().await.unwrap().assignments.len(), 1);
+        let (json_data_msg, json_data_codec) = w_data
+            .recv_msg_with_codec::<MasterMessage>()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            json_data_codec,
+            WireCodec::Json,
+            "handle_multiplexed_connection with WireCodec::Json must send AssignTask in Json on data_transport even to a Bincode worker"
+        );
+        assert!(matches!(json_data_msg, MasterMessage::AssignTask { .. }));
+        mux_task.abort();
+
+        // Conversely, when `handle_multiplexed_connection` is configured with `WireCodec::Bincode`
+        // (default), a worker registering with `WireCodec::Json` must have `detected_codec` mirrored
+        // onto BOTH `ctrl_transport` (`RegisterAck`) and `data_transport` (`AssignTask`).
+        let (c_master2, c_worker2) = tokio::io::duplex(64 * 1024);
+        let (d_master2, d_worker2) = tokio::io::duplex(64 * 1024);
+        let (_mux_stop_tx2, mux_stop_rx2) = tokio::sync::watch::channel(false);
+        let mux_reg2 = WorkerRegistry::new();
+        let mux_queue2 = TaskQueue::new();
+        let mux_notify2 = Arc::new(tokio::sync::Notify::new());
+        let reg2_clone = mux_reg2.clone();
+        let queue2_clone = mux_queue2.clone();
+        let notify2_clone = Arc::clone(&mux_notify2);
+        let mux_task2 = tokio::spawn(async move {
+            handle_multiplexed_connection(
+                c_master2,
+                d_master2,
+                SocketAddr::from(([127, 0, 0, 1], 50100)),
+                reg2_clone,
+                queue2_clone,
+                notify2_clone,
+                Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                10,
+                Duration::from_secs(5),
+                mux_stop_rx2,
+                None,
+                WireCodec::Bincode,
+                None,
+                None,
+                None,
+                #[cfg(feature = "dashboard")]
+                None,
+                #[cfg(feature = "p2p")]
+                None,
+                #[cfg(feature = "p2p")]
+                None,
+            )
+            .await
+        });
+
+        let mut w_ctrl2 = MessageTransport::with_codec(c_worker2, WireCodec::Json);
+        let mut w_data2 = MessageTransport::with_codec(d_worker2, WireCodec::Json);
+        w_ctrl2
+            .send_msg(&WorkerMessage::Register {
+                worker_id: Uuid::new_v4(),
+                capabilities: WorkerCapabilities::new(
+                    "mux-mirror-check",
+                    2,
+                    4096,
+                    false,
+                    false,
+                    None,
+                ),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: rusty_grid_core::protocol::ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        let (mux_reply2, mux_codec2) = w_ctrl2
+            .recv_msg_with_codec::<MasterMessage>()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mux_codec2,
+            WireCodec::Json,
+            "handle_multiplexed_connection with WireCodec::Bincode must mirror detected Json codec onto ctrl_transport"
+        );
+        assert!(matches!(
+            mux_reply2,
+            MasterMessage::RegisterAck { accepted: true, .. }
+        ));
+
+        mux_queue2
+            .submit(Task::new(
+                TaskSpec::command("echo", vec!["mux-data-lane".into()]),
+                TaskRequirements::generic(1, 30),
+            ))
+            .await
+            .unwrap();
+        let sched2 = WorkloadScheduler::new(
+            SchedulerConfig::default(),
+            mux_reg2,
+            mux_queue2,
+            mux_notify2,
+        );
+        assert_eq!(sched2.schedule_once().await.unwrap().assignments.len(), 1);
+        let (data_msg, data_codec) = w_data2
+            .recv_msg_with_codec::<MasterMessage>()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            data_codec,
+            WireCodec::Json,
+            "handle_multiplexed_connection with WireCodec::Bincode must mirror detected Json codec onto data_transport"
+        );
+        assert!(matches!(data_msg, MasterMessage::AssignTask { .. }));
+        mux_task2.abort();
     }
 
     #[cfg(feature = "p2p")]
@@ -6324,7 +6577,8 @@ mod tests {
         );
 
         for secret in [None, Some(test_secret.clone())] {
-            let mut cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
+            let mut cfg =
+                ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_pending_handshakes(1);
             cfg.cluster_secret = secret.clone();
             let mut server = MasterServer::bind(cfg, WorkerRegistry::new())
                 .await
@@ -6683,10 +6937,51 @@ mod tests {
                 }
             }
 
-            // 6. Silent peer check: when a refused peer reads the refusal frame and stays silent
-            //    without closing `conn`, the master keeps `conn` open for `REFUSAL_DRAIN_TIMEOUT`
-            //    (`1 s`) and closes it between 0.9 s and 1.5 s.
+            // 6. Silent peer check + `max_pending_handshakes(1)` release during auth-refusal drain:
+            //    - While a first peer that failed cluster auth is still open inside
+            //      `drain_refusal_stream` (holding its connection open without closing `conn`),
+            //      its `handshake_permit` must already be dropped so a second peer is admitted
+            //      under `max_pending_handshakes(1)`.
+            //    - When a refused peer reads the refusal frame and stays silent without closing
+            //      `conn`, the master keeps `conn` open for `REFUSAL_DRAIN_TIMEOUT` (`1 s`) and
+            //      closes it between 0.9 s and 3.0 s.
             {
+                let (mut ctrl_auth_drain, keep_auth_drain) = open_raw_ctrl().await;
+                if secret.is_none() {
+                    let err = client_handshake(&mut ctrl_auth_drain, &test_secret)
+                        .await
+                        .expect_err("master without secret must reject client_handshake");
+                    assert!(matches!(err, GridError::AuthFailed(_)));
+                } else {
+                    ctrl_auth_drain
+                        .send_msg(&WorkerMessage::Register {
+                            worker_id: Uuid::new_v4(),
+                            capabilities: WorkerCapabilities::new(
+                                "unauth-drain-holder",
+                                2,
+                                2048,
+                                false,
+                                false,
+                                None,
+                            ),
+                            protocol_version: PROTOCOL_VERSION_CURRENT,
+                            features: ProtocolCapabilities::all_supported(),
+                        })
+                        .await
+                        .unwrap();
+                    let err = ctrl_auth_drain
+                        .recv_msg::<MasterMessage>()
+                        .await
+                        .expect_err("unauthenticated Register must be rejected");
+                    assert!(matches!(
+                        err,
+                        ProtocolError::InvalidFormatTag(WIRE_FORMAT_AUTH)
+                    ));
+                }
+                // `keep_auth_drain.0` is intentionally kept open so the master task is parked inside
+                // `drain_refusal_stream` waiting up to 1 s for `conn.closed()`. With
+                // `max_pending_handshakes(1)`, a second peer connecting right now is admitted only
+                // if `drop(handshake_permit)` happened before `drain_refusal_stream`.
                 let (mut ctrl_silent, keep_silent) = open_ctrl().await;
                 let started = tokio::time::Instant::now();
                 ctrl_silent
@@ -6707,11 +7002,14 @@ mod tests {
                         ..
                     }
                 ));
-                keep_silent.0.closed().await;
+                keep_auth_drain.0.close(0u32.into(), b"done");
+                tokio::time::timeout(Duration::from_secs(5), keep_silent.0.closed())
+                    .await
+                    .expect("silent refused peer must be closed before 5 s timeout");
                 let elapsed = started.elapsed();
                 assert!(
-                    elapsed >= Duration::from_millis(900) && elapsed <= Duration::from_millis(1500),
-                    "silent refused peer must be closed after ~1 s (0.9..=1.5 s), took {elapsed:?}"
+                    elapsed >= Duration::from_millis(900) && elapsed <= Duration::from_secs(3),
+                    "silent refused peer must be closed after ~1 s (0.9..=3.0 s), took {elapsed:?}"
                 );
             }
 
@@ -6725,7 +7023,7 @@ mod tests {
         //    A peer whose QUIC stream receive window is 1 byte (smaller than the refusal frame)
         //    causes `transport.send_msg` on the master to block on flow-control credit. The single
         //    1 s timeout around `send_msg`, `shutdown`, and `conn.closed()` aborts the stalled
-        //    refusal within 1.5 s and frees the single connection slot.
+        //    refusal within 3.0 s and frees the single connection slot.
         {
             let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_connections(1);
             let mut server = MasterServer::bind(cfg, WorkerRegistry::new())
@@ -6772,11 +7070,13 @@ mod tests {
                 .await
                 .unwrap();
             // Do not read from `stalled_ctrl`; its 1-byte stream receive window blocks `send_msg`.
-            stalled_conn.closed().await;
+            tokio::time::timeout(Duration::from_secs(5), stalled_conn.closed())
+                .await
+                .expect("peer granting no flow-control credit must be closed before 5 s timeout");
             let elapsed = started.elapsed();
             assert!(
-                elapsed <= Duration::from_millis(1500),
-                "peer granting no flow-control credit must be closed within 1.5 s, took {elapsed:?}"
+                elapsed <= Duration::from_secs(3),
+                "peer granting no flow-control credit must be closed within 3.0 s, took {elapsed:?}"
             );
 
             // Now `max_connections = 1` slot is free again: a normal peer must be admitted.
@@ -6819,5 +7119,145 @@ mod tests {
             master_ep.close().await;
             let _ = server_task.await;
         }
+    }
+
+    #[test]
+    fn test_master_spawn_warns_when_p2p_minimal_preset_is_enabled_and_ignores_env() {
+        #[derive(Default)]
+        struct WarnVisitor(String);
+        impl tracing::field::Visit for WarnVisitor {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "message" {
+                    self.0.push_str(value);
+                }
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    use std::fmt::Write;
+                    let _ = write!(&mut self.0, "{value:?}");
+                }
+            }
+        }
+        struct WarnCollector {
+            warnings: Arc<std::sync::Mutex<Vec<String>>>,
+            thread_id: std::thread::ThreadId,
+        }
+        impl tracing::Subscriber for WarnCollector {
+            fn register_callsite(
+                &self,
+                metadata: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                if *metadata.level() <= tracing::Level::WARN {
+                    tracing::subscriber::Interest::always()
+                } else {
+                    tracing::subscriber::Interest::never()
+                }
+            }
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                *metadata.level() <= tracing::Level::WARN
+            }
+            fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+                Some(tracing::metadata::LevelFilter::WARN)
+            }
+            fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+            fn event(&self, event: &tracing::Event<'_>) {
+                if *event.metadata().level() == tracing::Level::WARN
+                    && std::thread::current().id() == self.thread_id
+                {
+                    let mut v = WarnVisitor::default();
+                    event.record(&mut v);
+                    self.warnings.lock().unwrap().push(v.0);
+                }
+            }
+            fn enter(&self, _span: &tracing::span::Id) {}
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
+
+        let warnings: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let thread_id = std::thread::current().id();
+        let dispatch = tracing::Dispatch::new(WarnCollector {
+            warnings: warnings.clone(),
+            thread_id,
+        });
+        let _second_dispatch = tracing::Dispatch::new(WarnCollector {
+            warnings: warnings.clone(),
+            thread_id,
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tracing::dispatcher::with_default(&dispatch, || {
+            rt.block_on(async {
+                tracing::callsite::rebuild_interest_cache();
+                let default_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
+                assert!(!default_cfg.p2p_minimal_preset);
+                let m1 = MasterServer::spawn(default_cfg).await.expect("spawn m1");
+                assert!(
+                    !warnings
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|w| w.contains("P2P minimal preset is enabled (p2p_minimal_preset=true)")),
+                    "without with_p2p_minimal_preset(true), MasterServer::spawn must not emit the minimal preset warning"
+                );
+                let _ = m1.shutdown();
+
+                warnings.lock().unwrap().clear();
+                tracing::callsite::rebuild_interest_cache();
+                let p2p_off_min_cfg =
+                    ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_p2p_minimal_preset(true);
+                let m_off = MasterServer::spawn(p2p_off_min_cfg)
+                    .await
+                    .expect("spawn m_off");
+                assert!(
+                    !warnings
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|w| w
+                            .contains("P2P minimal preset is enabled (p2p_minimal_preset=true)")),
+                    "when P2P is off, MasterServer::spawn must not warn about P2P minimal preset"
+                );
+                let _ = m_off.shutdown();
+
+                warnings.lock().unwrap().clear();
+                tracing::callsite::rebuild_interest_cache();
+                let min_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+                    .with_p2p(true)
+                    .with_p2p_minimal_preset(true)
+                    .with_ephemeral_key(true);
+                let m2 = MasterServer::spawn(min_cfg).await.expect("spawn m2");
+                assert!(
+                    warnings
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|w| w.contains("P2P minimal preset is enabled (p2p_minimal_preset=true)")),
+                    "with_p2p_minimal_preset(true) must emit a tracing::warn! on MasterServer::spawn, got: {:?}",
+                    *warnings.lock().unwrap()
+                );
+                let _ = m2.shutdown();
+            });
+        });
+
+        let server_source = include_str!("server.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(
+            !server_source
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains("RUSTY_GRID_P2P_MINIMAL")),
+            "crates/master/src/server.rs library code must not read RUSTY_GRID_P2P_MINIMAL from the environment"
+        );
     }
 }

@@ -316,4 +316,365 @@ path = "../../tests/registered_e2e.rs"
             ]
         );
     }
+
+    fn strip_rust_comments(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let bytes = src.as_bytes();
+        let mut i = 0;
+        let mut in_string = false;
+        while i < bytes.len() {
+            if in_string {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    out.push(bytes[i] as char);
+                    out.push(bytes[i + 1] as char);
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    in_string = false;
+                }
+                out.push(bytes[i] as char);
+                i += 1;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_string = true;
+                out.push('"');
+                i += 1;
+                continue;
+            }
+            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    if bytes[i] == b'\n' {
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+        out
+    }
+
+    fn strip_ignored_functions(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(ig_idx) = rest.find("#[ignore") {
+            out.push_str(&rest[..ig_idx]);
+            let after_ig = &rest[ig_idx..];
+            let Some(fn_offset) = after_ig.find("fn ") else {
+                break;
+            };
+            let after_fn = &after_ig[fn_offset..];
+            let Some(brace_offset) = after_fn.find('{') else {
+                break;
+            };
+            let body_start = &after_fn[brace_offset..];
+            let mut depth = 0usize;
+            let mut in_string = false;
+            let bytes = body_start.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if in_string {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'"' {
+                        in_string = false;
+                    }
+                    i += 1;
+                    continue;
+                }
+                match bytes[i] {
+                    b'"' => in_string = true,
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            rest = &body_start[i..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn extract_fn_body<'a>(src: &'a str, fn_header: &str) -> Option<&'a str> {
+        let idx = src.find(fn_header)?;
+        let after = &src[idx..];
+        let brace_offset = after.find('{')?;
+        let body_start = &after[brace_offset..];
+        let bytes = body_start.as_bytes();
+        let mut depth = 0usize;
+        let mut i = 0usize;
+        let mut in_string = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_string {
+                if b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    in_string = false;
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(&body_start[..=i]);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn check_test_source_for_non_minimal_p2p(
+        label: &str,
+        raw_src: &str,
+        violations: &mut Vec<String>,
+    ) {
+        let uncommented = strip_rust_comments(raw_src);
+        let active = strip_ignored_functions(&uncommented);
+        if active.contains("presets::N0") {
+            violations.push(format!(
+                "{label}: uses presets::N0 in non-ignored test code"
+            ));
+        }
+        if active.contains("\"--p2p\"")
+            && (active.contains("fn cli(") || active.contains("Command::new"))
+        {
+            let has_minimal_env = if let Some(cli_body) = extract_fn_body(&active, "fn cli(") {
+                cli_body.contains(".env(\"RUSTY_GRID_P2P_MINIMAL\"")
+            } else {
+                active.contains(".env(\"RUSTY_GRID_P2P_MINIMAL\"")
+            };
+            if !has_minimal_env {
+                violations.push(format!(
+                    "{label}: spawns --p2p binary without .env(\"RUSTY_GRID_P2P_MINIMAL\", ...)"
+                ));
+            }
+            let compact: String = active.chars().filter(|c| !c.is_whitespace()).collect();
+            if compact.contains(".env_remove(\"RUSTY_GRID_P2P_MINIMAL\")") {
+                violations.push(format!(
+                    "{label}: removes RUSTY_GRID_P2P_MINIMAL in non-ignored --p2p test"
+                ));
+            }
+            let env_prefix = ".env(\"RUSTY_GRID_P2P_MINIMAL\",";
+            let mut search_rest = compact.as_str();
+            while let Some(idx) = search_rest.find(env_prefix) {
+                let after = &search_rest[idx + env_prefix.len()..];
+                let val = after.split(')').next().unwrap_or("");
+                let normalized = val.to_ascii_lowercase();
+                if !matches!(
+                    normalized.as_str(),
+                    "\"1\"" | "\"true\"" | "\"yes\"" | "\"on\""
+                ) {
+                    violations.push(format!(
+                        "{label}: sets RUSTY_GRID_P2P_MINIMAL to non-enabled value {val} in non-ignored --p2p test"
+                    ));
+                }
+                search_rest = after;
+            }
+        }
+        for stmt in active.split(';') {
+            if stmt.contains(".with_p2p(true)") && !stmt.contains(".with_p2p_minimal_preset(true)")
+            {
+                violations.push(format!(
+                    "{label}: uses .with_p2p(true) without .with_p2p_minimal_preset(true)"
+                ));
+            }
+            if stmt.contains(".with_p2p_ticket(")
+                && !stmt.contains(".with_p2p_minimal_preset(true)")
+            {
+                violations.push(format!(
+                    "{label}: uses .with_p2p_ticket(...) without .with_p2p_minimal_preset(true)"
+                ));
+            }
+            if stmt.contains("start_worker_impl(")
+                && stmt.contains("Some(")
+                && !active.contains("set_p2p_minimal_preset_for_testing(true)")
+            {
+                violations.push(format!(
+                    "{label}: uses start_worker_impl(..., Some(...), ...) without set_p2p_minimal_preset_for_testing(true)"
+                ));
+            }
+        }
+    }
+
+    fn collect_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    fn find_non_minimal_p2p_in_tests(workspace_root: &Path) -> Vec<String> {
+        let mut violations = Vec::new();
+        let mut test_files = Vec::new();
+        collect_rs_files(&workspace_root.join("tests"), &mut test_files);
+        if let Ok(crates) = std::fs::read_dir(workspace_root.join("crates")) {
+            for entry in crates.flatten() {
+                collect_rs_files(&entry.path().join("tests"), &mut test_files);
+            }
+        }
+        test_files.sort();
+        for path in test_files {
+            if let Ok(src) = std::fs::read_to_string(&path) {
+                let rel = path
+                    .strip_prefix(workspace_root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string()
+                    .replace('\\', "/");
+                check_test_source_for_non_minimal_p2p(&rel, &src, &mut violations);
+            }
+        }
+
+        let mut src_files = Vec::new();
+        if let Ok(crates) = std::fs::read_dir(workspace_root.join("crates")) {
+            for entry in crates.flatten() {
+                collect_rs_files(&entry.path().join("src"), &mut src_files);
+            }
+        }
+        src_files.sort();
+        for path in src_files {
+            let rel = path
+                .strip_prefix(workspace_root)
+                .unwrap_or(&path)
+                .display()
+                .to_string()
+                .replace('\\', "/");
+            if rel == "crates/master/src/lib.rs" {
+                continue;
+            }
+            if let Ok(src) = std::fs::read_to_string(&path) {
+                if let Some((_, test_tail)) = src.split_once("#[cfg(test)]") {
+                    check_test_source_for_non_minimal_p2p(&rel, test_tail, &mut violations);
+                }
+            }
+        }
+
+        violations
+    }
+
+    #[test]
+    fn test_non_ignored_tests_use_minimal_p2p_preset() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+        let violations = find_non_minimal_p2p_in_tests(workspace_root);
+        assert!(
+            violations.is_empty(),
+            "non-ignored test code must use presets::Minimal and .with_p2p_minimal_preset(true): {violations:?}"
+        );
+    }
+
+    #[test]
+    fn test_find_non_minimal_p2p_in_tests_detects_missing_preset_and_allows_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tests_dir = tmp.path().join("tests");
+        std::fs::create_dir_all(&tests_dir).unwrap();
+
+        std::fs::write(
+            tests_dir.join("sample_p2p.rs"),
+            r#"
+#[tokio::test]
+#[ignore = "live relay test"]
+async fn ignored_live_relay() {
+    let _ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0).bind().await;
+    let _cfg = ServerConfig::new(addr).with_p2p(true);
+    let _w = WorkerConfig::new("auto").with_p2p_ticket("t");
+}
+
+#[tokio::test]
+async fn good_offline_test() {
+    let _cfg = ServerConfig::new(addr)
+        .with_p2p(true)
+        .with_p2p_minimal_preset(true);
+    let _w = WorkerConfig::new("auto")
+        .with_p2p_ticket("t")
+        .with_p2p_minimal_preset(true);
+}
+
+#[tokio::test]
+async fn bad_missing_minimal() {
+    let _cfg = ServerConfig::new(addr).with_p2p(true);
+    let _cmd = Command::new("rusty-grid").arg("master").arg("--p2p");
+    let _started = start_worker_impl("127.0.0.1:0".into(), Some(ticket), "w".into(), 2, 1024, false, 2);
+}
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            tests_dir.join("sample_env_override.rs"),
+            r#"
+fn cli() -> Command {
+    let mut c = Command::new("rusty-grid");
+    c.env("RUSTY_GRID_P2P_MINIMAL", "1");
+    c
+}
+
+#[test]
+fn bad_env_remove_and_false() {
+    let mut c1 = cli();
+    c1.env_remove("RUSTY_GRID_P2P_MINIMAL").args(["master", "--p2p"]);
+    let mut c2 = cli();
+    c2.env("RUSTY_GRID_P2P_MINIMAL", "0").args(["master", "--p2p"]);
+}
+"#,
+        )
+        .unwrap();
+
+        let violations = find_non_minimal_p2p_in_tests(tmp.path());
+        assert_eq!(
+            violations,
+            vec![
+                "tests/sample_env_override.rs: removes RUSTY_GRID_P2P_MINIMAL in non-ignored --p2p test"
+                    .to_string(),
+                "tests/sample_env_override.rs: sets RUSTY_GRID_P2P_MINIMAL to non-enabled value \"0\" in non-ignored --p2p test"
+                    .to_string(),
+                "tests/sample_p2p.rs: spawns --p2p binary without .env(\"RUSTY_GRID_P2P_MINIMAL\", ...)"
+                    .to_string(),
+                "tests/sample_p2p.rs: uses .with_p2p(true) without .with_p2p_minimal_preset(true)"
+                    .to_string(),
+                "tests/sample_p2p.rs: uses start_worker_impl(..., Some(...), ...) without set_p2p_minimal_preset_for_testing(true)"
+                    .to_string(),
+            ]
+        );
+    }
 }

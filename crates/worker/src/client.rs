@@ -214,6 +214,11 @@ pub struct WorkerConfig {
     /// Optional P2P connection ticket for connecting over iroh QUIC NAT traversal. When
     /// `master_addr` is also set, a failed P2P dial falls back to TCP.
     pub p2p_ticket: Option<String>,
+    /// When `true`, builds the worker's iroh P2P endpoint with
+    /// `iroh::endpoint::presets::Minimal` (no n0 DERP relay or pkarr/DNS address lookup) so tests
+    /// stay off the network. Production defaults to `false` (`presets::N0`); the CLI resolves
+    /// `RUSTY_GRID_P2P_MINIMAL`.
+    pub p2p_minimal_preset: bool,
     /// Worker UUID. If `None`, it is read from `worker_id_file` / the default id file when
     /// persistence is enabled (see [`WorkerConfig::with_persistent_worker_id`]), otherwise generated
     /// once at client initialization; either way it is preserved across reconnects.
@@ -316,6 +321,7 @@ impl WorkerConfig {
         Self {
             master_addr: master_addr.into(),
             p2p_ticket: None,
+            p2p_minimal_preset: false,
             worker_id: None,
             worker_id_file: None,
             persist_worker_id: false,
@@ -367,6 +373,14 @@ impl WorkerConfig {
 
     pub fn with_p2p_ticket(mut self, ticket: impl Into<String>) -> Self {
         self.p2p_ticket = Some(ticket.into());
+        self
+    }
+
+    /// Selects `iroh::endpoint::presets::Minimal` (no relay or external address lookup) for the
+    /// worker's P2P endpoint when `minimal` is `true`, keeping tests off the network while
+    /// production keeps `presets::N0` (`false`).
+    pub fn with_p2p_minimal_preset(mut self, minimal: bool) -> Self {
+        self.p2p_minimal_preset = minimal;
         self
     }
 
@@ -1150,6 +1164,12 @@ impl WorkerClient {
             warn!(
                 worker_id = %worker_id,
                 "Host battery and thermal protection is disabled (no_battery=true); this worker will accept tasks regardless of battery level or thermal state"
+            );
+        }
+        if config.p2p_minimal_preset {
+            warn!(
+                worker_id = %worker_id,
+                "P2P minimal preset is enabled (p2p_minimal_preset=true); DERP relay and pkarr/DNS address lookup are disabled"
             );
         }
 
@@ -2035,7 +2055,12 @@ impl WorkerClient {
         let (endpoint, is_cached) = match ep_guard.as_ref() {
             Some(ep) => (ep.clone(), true),
             None => {
-                let ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                let ep_builder = if self.config.p2p_minimal_preset {
+                    iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                } else {
+                    iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                };
+                let ep = ep_builder
                     .alpns(vec![rusty_grid_core::transport::GRID_ALPN.to_vec()])
                     .bind()
                     .await
@@ -3349,59 +3374,203 @@ mod tests {
 
     #[test]
     fn test_worker_config_no_battery_disables_host_battery_probe() {
-        rusty_grid_core::capabilities::with_test_battery_probe((Some(10), Some(false)), || {
-            let default_cfg = WorkerConfig::new("127.0.0.1:9999");
-            assert!(!default_cfg.no_battery);
-            let default_client = WorkerClient::new(default_cfg);
-            assert_eq!(
-                default_client
-                    .capabilities()
-                    .mobile
-                    .as_ref()
-                    .and_then(|m| m.battery_pct),
-                Some(10),
-                "without with_no_battery(true), WorkerClient::new must observe the 10 % battery probe"
-            );
-            assert_eq!(
-                default_client
-                    .mobile_telemetry()
-                    .snapshot()
-                    .and_then(|s| s.battery_pct),
-                Some(10),
-                "without with_no_battery(true), a 10 % discharging battery probe must populate mobile_telemetry()"
-            );
+        #[derive(Default)]
+        struct WarnVisitor(String);
+        impl tracing::field::Visit for WarnVisitor {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "message" {
+                    self.0.push_str(value);
+                }
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    use std::fmt::Write;
+                    let _ = write!(&mut self.0, "{value:?}");
+                }
+            }
+        }
+        struct WarnCollector {
+            warnings: Arc<std::sync::Mutex<Vec<String>>>,
+            thread_id: std::thread::ThreadId,
+        }
+        impl tracing::Subscriber for WarnCollector {
+            fn register_callsite(
+                &self,
+                metadata: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                if *metadata.level() <= tracing::Level::WARN {
+                    tracing::subscriber::Interest::always()
+                } else {
+                    tracing::subscriber::Interest::never()
+                }
+            }
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                *metadata.level() <= tracing::Level::WARN
+            }
+            fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+                Some(tracing::metadata::LevelFilter::WARN)
+            }
+            fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+            fn event(&self, event: &tracing::Event<'_>) {
+                if *event.metadata().level() == tracing::Level::WARN
+                    && std::thread::current().id() == self.thread_id
+                {
+                    let mut v = WarnVisitor::default();
+                    event.record(&mut v);
+                    self.warnings.lock().unwrap().push(v.0);
+                }
+            }
+            fn enter(&self, _span: &tracing::span::Id) {}
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
 
-            let from_opts_client =
-                WorkerClient::from_options("127.0.0.1:9999", Some("opts".into()), Some(2), false);
-            assert_eq!(
-                from_opts_client
-                    .capabilities()
-                    .mobile
-                    .as_ref()
-                    .and_then(|m| m.battery_pct),
-                Some(10),
-                "WorkerClient::from_options must keep host battery protection enabled"
-            );
-
-            let no_bat_cfg = WorkerConfig::new("127.0.0.1:9999").with_no_battery(true);
-            assert!(no_bat_cfg.no_battery);
-            let client = WorkerClient::new(no_bat_cfg);
-            assert!(
-                client.capabilities().mobile.is_none(),
-                "with_no_battery(true) must suppress host battery detection even when the battery probe reports 10 %"
-            );
-            assert!(
-                client.mobile_telemetry().snapshot().is_none(),
-                "with_no_battery(true) must leave mobile telemetry handle empty unless fed externally"
-            );
-
-            let testing_client =
-                WorkerClient::for_testing("127.0.0.1:9999", Some("test".into()), Some(2), false);
-            assert!(
-                testing_client.capabilities().mobile.is_none(),
-                "WorkerClient::for_testing must suppress host battery detection"
-            );
+        let warnings: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let thread_id = std::thread::current().id();
+        let dispatch = tracing::Dispatch::new(WarnCollector {
+            warnings: warnings.clone(),
+            thread_id,
         });
+        // Keep a second `Dispatch` alive in `tracing_core`'s global `LOCKED_DISPATCHERS` registry so
+        // `DISPATCHERS.has_just_one` is `false`. Otherwise, in `tracing-core 0.1.x`, if another test
+        // thread hits the `no_battery` callsite for the first time while only one scoped `Dispatch`
+        // exists, `DefaultCallsite::register` uses `Rebuilder::JustOne` (`dispatcher::get_default` on
+        // that other thread, which is `NoSubscriber`) and caches `Interest::never()`.
+        let _second_dispatch = tracing::Dispatch::new(WarnCollector {
+            warnings: warnings.clone(),
+            thread_id,
+        });
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            rusty_grid_core::capabilities::with_test_battery_probe((Some(10), Some(false)), || {
+                tracing::callsite::rebuild_interest_cache();
+                let default_cfg = WorkerConfig::new("127.0.0.1:9999");
+                assert!(!default_cfg.no_battery);
+                let default_client = WorkerClient::new(default_cfg);
+                assert!(
+                    !warnings
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|w| w.contains("Host battery and thermal protection is disabled (no_battery=true)")),
+                    "without with_no_battery(true), WorkerClient::new must not emit the no_battery warning"
+                );
+                assert_eq!(
+                    default_client
+                        .capabilities()
+                        .mobile
+                        .as_ref()
+                        .and_then(|m| m.battery_pct),
+                    Some(10),
+                    "without with_no_battery(true), WorkerClient::new must observe the 10 % battery probe"
+                );
+                assert_eq!(
+                    default_client
+                        .mobile_telemetry()
+                        .snapshot()
+                        .and_then(|s| s.battery_pct),
+                    Some(10),
+                    "without with_no_battery(true), a 10 % discharging battery probe must populate mobile_telemetry()"
+                );
+
+                let from_opts_client = WorkerClient::from_options(
+                    "127.0.0.1:9999",
+                    Some("opts".into()),
+                    Some(2),
+                    false,
+                );
+                assert_eq!(
+                    from_opts_client
+                        .capabilities()
+                        .mobile
+                        .as_ref()
+                        .and_then(|m| m.battery_pct),
+                    Some(10),
+                    "WorkerClient::from_options must keep host battery protection enabled"
+                );
+
+                warnings.lock().unwrap().clear();
+                tracing::callsite::rebuild_interest_cache();
+                let no_bat_cfg = WorkerConfig::new("127.0.0.1:9999").with_no_battery(true);
+                assert!(no_bat_cfg.no_battery);
+                let client = WorkerClient::new(no_bat_cfg);
+                assert!(
+                    warnings
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|w| w.contains("Host battery and thermal protection is disabled (no_battery=true)")),
+                    "with_no_battery(true) must emit a tracing::warn! when WorkerClient::new initializes, got: {:?}",
+                    *warnings.lock().unwrap()
+                );
+                assert!(
+                    client.capabilities().mobile.is_none(),
+                    "with_no_battery(true) must suppress host battery detection even when the battery probe reports 10 %"
+                );
+                assert!(
+                    client.mobile_telemetry().snapshot().is_none(),
+                    "with_no_battery(true) must leave mobile telemetry handle empty unless fed externally"
+                );
+
+                let testing_client = WorkerClient::for_testing(
+                    "127.0.0.1:9999",
+                    Some("test".into()),
+                    Some(2),
+                    false,
+                );
+                assert!(
+                    testing_client.capabilities().mobile.is_none(),
+                    "WorkerClient::for_testing must suppress host battery detection"
+                );
+
+                warnings.lock().unwrap().clear();
+                tracing::callsite::rebuild_interest_cache();
+                let _ =
+                    WorkerClient::new(WorkerConfig::new("127.0.0.1:9999").with_no_battery(true));
+                assert!(
+                    !warnings
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|w| w.contains("P2P minimal preset is enabled (p2p_minimal_preset=true)")),
+                    "without with_p2p_minimal_preset(true), WorkerClient::new must not emit the p2p_minimal_preset warning"
+                );
+
+                warnings.lock().unwrap().clear();
+                tracing::callsite::rebuild_interest_cache();
+                let min_cfg = WorkerConfig::new("127.0.0.1:9999")
+                    .with_no_battery(true)
+                    .with_p2p_minimal_preset(true);
+                assert!(min_cfg.p2p_minimal_preset);
+                let _ = WorkerClient::new(min_cfg);
+                assert!(
+                    warnings
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|w| w.contains("P2P minimal preset is enabled (p2p_minimal_preset=true)")),
+                    "with_p2p_minimal_preset(true) must emit a tracing::warn! when WorkerClient::new initializes, got: {:?}",
+                    *warnings.lock().unwrap()
+                );
+            });
+        });
+
+        let client_source = include_str!("client.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(
+            !client_source
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains("RUSTY_GRID_P2P_MINIMAL")),
+            "crates/worker/src/client.rs library code must not read RUSTY_GRID_P2P_MINIMAL from the environment"
+        );
     }
 
     /// Design 0021: a task is refused before anything touches the sandbox base when its private
@@ -5097,6 +5266,7 @@ mod tests {
         let mut client = WorkerClient::new(
             WorkerConfig::new("127.0.0.1:9")
                 .with_p2p_ticket("this is not a ticket")
+                .with_p2p_minimal_preset(true)
                 .with_redirection_portal(false)
                 .with_no_battery(true),
         );

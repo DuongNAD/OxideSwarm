@@ -510,65 +510,29 @@ fn test_keepalive_interval_network_transitions_and_dead_peer_window() {
 // ============================================================================
 #[tokio::test]
 async fn test_worker_entry_and_registry_dead_peer_window_lifecycle() {
-    let now = Instant::now();
+    let base = Instant::now();
     let id = Uuid::new_v4();
 
     // 1. Cellular active worker (tau = 10s, W_dead = 40s)
-    let entry_cell_active = make_test_worker_entry(
-        id,
-        Some(Duration::from_secs(10)),
-        now - Duration::from_secs(35),
-        2,
-    );
+    let entry_cell_active = make_test_worker_entry(id, Some(Duration::from_secs(10)), base, 2);
     // At 35s, it is within 40s window -> NOT silent
-    assert!(!entry_cell_active.is_silent(now, Duration::from_secs(5)));
-
-    let entry_cell_active_dead = make_test_worker_entry(
-        id,
-        Some(Duration::from_secs(10)),
-        now - Duration::from_secs(45),
-        2,
-    );
+    assert!(!entry_cell_active.is_silent(base + Duration::from_secs(35), Duration::from_secs(5)));
     // At 45s, it exceeds 40s window -> SILENT
-    assert!(entry_cell_active_dead.is_silent(now, Duration::from_secs(5)));
+    assert!(entry_cell_active.is_silent(base + Duration::from_secs(45), Duration::from_secs(5)));
 
     // 2. Cellular idle worker (tau = 25s, W_dead = 100s)
-    let entry_cell_idle = make_test_worker_entry(
-        id,
-        Some(Duration::from_secs(25)),
-        now - Duration::from_secs(95),
-        0,
-    );
+    let entry_cell_idle = make_test_worker_entry(id, Some(Duration::from_secs(25)), base, 0);
     // At 95s, within 100s window -> NOT silent
-    assert!(!entry_cell_idle.is_silent(now, Duration::from_secs(5)));
-
-    let entry_cell_idle_dead = make_test_worker_entry(
-        id,
-        Some(Duration::from_secs(25)),
-        now - Duration::from_secs(105),
-        0,
-    );
+    assert!(!entry_cell_idle.is_silent(base + Duration::from_secs(95), Duration::from_secs(5)));
     // At 105s, exceeds 100s window -> SILENT
-    assert!(entry_cell_idle_dead.is_silent(now, Duration::from_secs(5)));
+    assert!(entry_cell_idle.is_silent(base + Duration::from_secs(105), Duration::from_secs(5)));
 
     // 3. Wi-Fi worker (tau = 60s, W_dead = 240s)
-    let entry_wifi = make_test_worker_entry(
-        id,
-        Some(Duration::from_secs(60)),
-        now - Duration::from_secs(235),
-        0,
-    );
+    let entry_wifi = make_test_worker_entry(id, Some(Duration::from_secs(60)), base, 0);
     // At 235s, within 240s window -> NOT silent
-    assert!(!entry_wifi.is_silent(now, Duration::from_secs(5)));
-
-    let entry_wifi_dead = make_test_worker_entry(
-        id,
-        Some(Duration::from_secs(60)),
-        now - Duration::from_secs(245),
-        0,
-    );
+    assert!(!entry_wifi.is_silent(base + Duration::from_secs(235), Duration::from_secs(5)));
     // At 245s, exceeds 240s window -> SILENT
-    assert!(entry_wifi_dead.is_silent(now, Duration::from_secs(5)));
+    assert!(entry_wifi.is_silent(base + Duration::from_secs(245), Duration::from_secs(5)));
 
     // 4. Registry dynamic telemetry update
     let registry = WorkerRegistry::new();

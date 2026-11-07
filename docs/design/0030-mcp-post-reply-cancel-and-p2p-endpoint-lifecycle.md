@@ -1,7 +1,7 @@
 # 0030: MCP post-reply cancellation, EOF grace window, and P2P endpoint lifecycle
 
 Status: Implemented
-Created: 2026-11-04    Updated: 2026-11-04
+Created: 2026-11-04    Updated: 2026-11-07
 
 ## Summary
 
@@ -94,10 +94,28 @@ receive `cancel_tx.send(true)` and have up to `500 ms` to send `CancelTask` befo
   P2P accept loop (or if `*p2p_shutdown.borrow_and_update()` is already true when the loop starts),
   the loop calls `endpoint.close().await` before breaking so `MasterServer::shutdown()` closes the
   `iroh::Endpoint`.
+- For offline and loopback P2P tests (`TEST-16`), `ServerConfig::with_p2p_minimal_preset(true)`
+  (`crates/master/src/server.rs`), `WorkerConfig::with_p2p_minimal_preset(true)`
+  (`crates/worker/src/client.rs`), and the `RUSTY_GRID_P2P_MINIMAL` environment variable (`1`,
+  `true`, `yes`, or `on`, resolved only in the CLI layer `crates/cli/src/cli_app.rs` and not read
+  directly by the libraries) build `iroh::Endpoint` with `iroh::endpoint::presets::Minimal` (no n0
+  DERP relay connection or pkarr/DNS address lookup), skip the `5 s` `endpoint.online()` relay
+  wait, and emit a start-up `tracing::warn!`, while production defaults remain `presets::N0`
+  (`false`). In `run_cli` (`crates/cli/src/cli_app.rs`), the tracing subscriber routes `WARN` and
+  `ERROR` events to `std::io::stderr` (and `INFO`/`DEBUG`/`TRACE` to `std::io::stdout`) for all
+  non-`mcp` commands (`mcp` continues to send all tracing levels to `stderr` so `stdout` stays pure
+  JSON-RPC). For in-process Android bridge tests, `crates/android_bridge/src/lib.rs` provides
+  `set_p2p_minimal_preset_for_testing(bool)`. `ServerConfig::with_p2p_bind_addr(SocketAddr)` allows
+  restart tests (`tests/test_m2_identity_scripts.rs`) to bind `127.0.0.1:0` on run 1, read the
+  OS-assigned loopback UDP port from the published ticket, and re-bind that port on run 2 without
+  needing a public DERP relay.
 
 ## Compatibility
 
 - Wire protocol and CLI flags are unchanged.
+- For non-`mcp` CLI commands, `WARN` and `ERROR` tracing lines are written to `stderr` rather than
+  `stdout`; under the macOS launchd plist (`packaging/macos/com.oxideswarm.worker.plist`), worker
+  `WARN` and `ERROR` lines now appear in `worker.err.log` instead of `worker.log`.
 - Existing persistent P2P master keys (`~/.oxideswarm/master_key.bin`) preserve the same `NodeId`
   and publish a relay-only ticket across restarts; even if iroh selects a different regional
   `*.relay.n0.iroh.link` node on restart, existing workers holding the previous ticket reconnect
@@ -136,7 +154,10 @@ receive `cancel_tx.send(true)` and have up to `500 ms` to send `CancelTask` befo
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
 | TEST-15 | Stabilize MCP pipelined cancel, EOF grace, and P2P master restart tests | `crates/cli/src/mcp.rs`, `crates/master/src/server.rs`, `crates/cli/tests/test_mcp_concurrent_and_deadlines.rs`, `tests/test_p2p_wan_fallback.rs`, `tests/test_m2_identity_scripts.rs`, `crates/core/tests/m1_challenger_1_3d_serialization.rs` | All TEST-15 targets pass repeatedly under load and required mutations fail tests | Implemented |
+| TEST-16 | Keep workspace P2P tests off the external network (`presets::Minimal`) and mark live DERP relay tests `#[ignore]` | `crates/master/src/server.rs`, `crates/worker/src/client.rs`, `crates/core/src/transport.rs`, `crates/core/tests/quic_latency_bench.rs`, `tests/cluster_auth_e2e.rs`, `tests/m2_challenger_1_stress.rs`, `tests/m2_challenger_2_stress.rs`, `tests/m4_challenger_1_state_isolation.rs`, `tests/master_failover_cancel_liveness.rs`, `tests/master_quic_limits.rs`, `tests/test_m2_identity_scripts.rs`, `tests/test_m4_dashboard_telemetry.rs`, `tests/test_p2p_wan_fallback.rs`, `tests/worker_cluster_auth.rs`, `tests/worker_connection_lifecycle.rs`, `tests/zero_copy_quic_test.rs`, `crates/cli/tests/test_p2p_key_persistence.rs`, `crates/android_bridge/tests/adversarial_challenge_tests.rs` | Workspace P2P tests pass with non-loopback outbound network denied (`sandbox-exec`), and the 3 live DERP relay tests in `tests/test_p2p_wan_fallback.rs` are marked `#[ignore]` | Implemented |
 
 ## Status log
 
 - 2026-11-04: Implemented and verified against review feedback on pull request 83.
+- 2026-11-04: Added `with_p2p_minimal_preset(true)`, `with_p2p_bind_addr`, and `RUSTY_GRID_P2P_MINIMAL` (`1`, `true`, `yes`, or `on`) (`TEST-16`) so workspace P2P tests run offline with `iroh::endpoint::presets::Minimal`.
+- 2026-11-07: Restricted `RUSTY_GRID_P2P_MINIMAL` resolution to `crates/cli/src/cli_app.rs`, routed `WARN`/`ERROR` tracing events to `stderr` for non-`mcp` CLI commands (`worker.err.log` under launchd), added startup warnings when `p2p_minimal_preset` is active, added `set_p2p_minimal_preset_for_testing` to `crates/android_bridge`, added a weekly CI job for ignored relay tests, and added a source scan test guarding against non-minimal P2P (including `.env_remove("RUSTY_GRID_P2P_MINIMAL")` and non-truthy env overrides) in non-ignored tests.

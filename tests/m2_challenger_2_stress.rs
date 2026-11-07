@@ -803,7 +803,7 @@ async fn test_reaper_monotonic_clock_immune_to_worker_reported_epoch_skew() {
 #[cfg(feature = "p2p")]
 #[tokio::test]
 async fn test_adversarial_quic_stream_multiplexing_heavy_saturation_anti_hol() {
-    use iroh::endpoint::presets::N0;
+    use iroh::endpoint::presets::Minimal;
     use iroh::endpoint::RelayMode;
     use rusty_grid_core::transport::{
         BiStream, GridStream, GRID_ALPN, STREAM_CONTROL, STREAM_DATA,
@@ -811,14 +811,14 @@ async fn test_adversarial_quic_stream_multiplexing_heavy_saturation_anti_hol() {
     use tokio::io::AsyncWriteExt;
 
     // 1. Setup loopback QUIC endpoints
-    let ep_server = iroh::Endpoint::builder(N0)
+    let ep_server = iroh::Endpoint::builder(Minimal)
         .alpns(vec![GRID_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
         .bind()
         .await
         .expect("bind server endpoint");
 
-    let ep_client = iroh::Endpoint::builder(N0)
+    let ep_client = iroh::Endpoint::builder(Minimal)
         .alpns(vec![GRID_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
         .bind()
@@ -1013,7 +1013,7 @@ async fn test_adversarial_quic_stream_multiplexing_heavy_saturation_anti_hol() {
 #[cfg(feature = "p2p")]
 #[tokio::test]
 async fn test_adversarial_master_multiplexed_heartbeat_under_backpressured_data_lane() {
-    use iroh::endpoint::presets::N0;
+    use iroh::endpoint::presets::Minimal;
     use iroh::endpoint::RelayMode;
     use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
     use rusty_grid_core::transport::{
@@ -1033,6 +1033,7 @@ async fn test_adversarial_master_multiplexed_heartbeat_under_backpressured_data_
     // Configure master server with P2P
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_p2p(true)
+        .with_p2p_minimal_preset(true)
         .with_ephemeral_key(true)
         .with_heartbeat_interval(5)
         .with_handshake_timeout(5);
@@ -1056,7 +1057,7 @@ async fn test_adversarial_master_multiplexed_heartbeat_under_backpressured_data_
     let master_handle = tokio::spawn(async move { master.run(master_shutdown_rx).await });
 
     // Client connects via Iroh QUIC
-    let ep_client = iroh::Endpoint::builder(N0)
+    let ep_client = iroh::Endpoint::builder(Minimal)
         .alpns(vec![GRID_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
         .bind()
