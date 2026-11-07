@@ -809,12 +809,14 @@ fn test_master_lease_ticket_lifecycle_and_role_handover() {
 }
 
 /// Test 6: Pre-sleep fast task evacuation (< 50ms) without task loss (§5.4).
-/// Spawns a loopback MasterServer and two WorkerClients. Submits a task.
-/// While running, triggers fast evacuation on the active worker.
+/// Spawns a loopback MasterServer and WorkerClients. Submits a task with `max_retries = 1`.
+/// Triggers repeated fast evacuations across two workers (`w1`/`w2` -> survivor -> `w3`).
 /// Verifies:
-/// - Evacuation and task reassignment completes in < 50ms.
-/// - Task completes on surviving worker with exit code 0 and retry_count == 1.
-/// - No task loss occurs.
+/// - Each evacuation and task reassignment completes in < 100ms (< 50ms design target).
+/// - Repeated evacuations do not charge `retry_count` or `failover_count` (both remain 0) and
+///   do not exhaust the task's `max_retries = 1` budget (`MOB-3`).
+/// - Task completes on the final surviving worker with exit code 0, `retry_count == 0`,
+///   and `failover_count == 0`.
 #[tokio::test]
 async fn test_fast_evacuation_under_50ms_without_task_loss() {
     // Also test JNI bridge fast evacuation API directly
@@ -827,14 +829,16 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let sandbox_path = temp_dir.path().to_path_buf();
 
-    let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3);
+    let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_max_retries(1)
+        .with_max_failovers(1);
     let master = MasterServer::spawn(server_config)
         .await
         .expect("master spawn");
     let master_addr = master.server_addr().to_string();
 
     let (w1_shutdown_tx, w1_shutdown_rx) = watch::channel(false);
-    let (_w2_shutdown_tx, w2_shutdown_rx) = watch::channel(false);
+    let (w2_shutdown_tx, w2_shutdown_rx) = watch::channel(false);
 
     let mut config1 = WorkerConfig::new(&master_addr)
         .with_no_battery(true)
@@ -878,16 +882,16 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
         "Both workers must be registered"
     );
 
-    // Submit long-running BuiltinTest task (2000ms duration)
+    // Submit long-running BuiltinTest task (2500ms duration) with max_retries = 1
     let task = Task::new(
         TaskSpec::BuiltinTest {
             test_name: "evacuation_resilience".into(),
             iterations: 100,
-            duration_ms: 2000,
+            duration_ms: 2500,
             should_fail: false,
             require_gpu: false,
         },
-        TaskRequirements::generic(1, 30),
+        TaskRequirements::generic(1, 30).with_max_retries(1),
     );
     let task_id = master.submit_task(task).await.expect("task submit");
 
@@ -910,15 +914,15 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
 
     let info = master.get_task_info(task_id).await.unwrap();
     let initial_worker = info.assigned_worker_id.expect("must be assigned");
-    let (active_shutdown_tx, survivor_id) = if initial_worker == w1_id {
-        (w1_shutdown_tx, w2_id)
+    let (first_shutdown_tx, second_worker_id, second_shutdown_tx) = if initial_worker == w1_id {
+        (w1_shutdown_tx, w2_id, w2_shutdown_tx)
     } else {
-        (_w2_shutdown_tx, w1_id)
+        (w2_shutdown_tx, w1_id, w1_shutdown_tx)
     };
 
-    // Trigger fast evacuation with emergency pre-sleep reason
+    // Trigger 1st fast evacuation with emergency pre-sleep reason
     let evacuation_start = Instant::now();
-    let _ = active_shutdown_tx.send(true);
+    let _ = first_shutdown_tx.send(true);
 
     // Assert fast task evacuation & reassignment occurs within 50ms (or 100ms loopback tolerance)
     let reassigned = wait_for(
@@ -926,7 +930,7 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
         Duration::from_millis(5),
         || async {
             if let Ok(info) = master.get_task_info(task_id).await {
-                info.assigned_worker_id == Some(survivor_id)
+                info.assigned_worker_id == Some(second_worker_id)
                     && (info.state == TaskState::Scheduled || info.state == TaskState::Running)
             } else {
                 false
@@ -945,8 +949,91 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
         "Evacuation and reassignment exceeded fast deadline: {:?}",
         evacuation_elapsed
     );
+    let after_first = master.get_task_info(task_id).await.unwrap();
+    assert_eq!(after_first.retry_count, 0);
+    assert_eq!(after_first.failover_count, 0);
 
-    // Wait for task to complete successfully on survivor worker
+    // Wait for task to enter Running on second_worker_id, then register a 3rd worker and evacuate a second time
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(task_id)
+                    .await
+                    .map(|i| {
+                        i.assigned_worker_id == Some(second_worker_id)
+                            && i.state == TaskState::Running
+                    })
+                    .unwrap_or(false)
+            }
+        )
+        .await,
+        "Task must enter Running state on second worker before second evacuation"
+    );
+
+    let (_w3_shutdown_tx, w3_shutdown_rx) = watch::channel(false);
+    let w3_id = Uuid::new_v4();
+    let config3 = WorkerConfig::new(&master_addr)
+        .with_no_battery(true)
+        .with_name("evac-worker-3")
+        .with_cores(2)
+        .with_worker_id(w3_id)
+        .with_sandbox_base_dir(sandbox_path.join("w3"));
+    let mut w3 = WorkerClient::new(config3);
+    tokio::spawn(async move {
+        let _ = w3.run(w3_shutdown_rx).await;
+    });
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|workers| {
+                        workers.iter().any(|w| {
+                            w.worker_id == w3_id
+                                && w.status == rusty_grid_master::registry::WorkerStatus::Connected
+                        })
+                    })
+                    .unwrap_or(false)
+            }
+        )
+        .await,
+        "Third worker must register and be Connected before second evacuation"
+    );
+
+    let second_evac_start = Instant::now();
+    let _ = second_shutdown_tx.send(true);
+    let reassigned_second = wait_for(
+        Duration::from_millis(100),
+        Duration::from_millis(5),
+        || async {
+            if let Ok(info) = master.get_task_info(task_id).await {
+                info.assigned_worker_id == Some(w3_id)
+                    && (info.state == TaskState::Scheduled || info.state == TaskState::Running)
+            } else {
+                false
+            }
+        },
+    )
+    .await;
+    let second_evac_elapsed = second_evac_start.elapsed();
+    assert!(
+        reassigned_second,
+        "Second pre-sleep evacuation must immediately reassign task to w3 (elapsed: {:?})",
+        second_evac_elapsed
+    );
+    assert!(
+        second_evac_elapsed < Duration::from_millis(100),
+        "Second evacuation exceeded fast deadline: {:?}",
+        second_evac_elapsed
+    );
+
+    // Wait for task to complete successfully on w3
     let completed = wait_for(
         Duration::from_secs(6),
         Duration::from_millis(50),
@@ -961,14 +1048,15 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
     .await;
     assert!(
         completed,
-        "Task must complete on survivor worker without data loss"
+        "Task must complete on third worker after repeated evacuations without data loss"
     );
 
     let final_info = master.get_task_info(task_id).await.unwrap();
     assert_eq!(final_info.state, TaskState::Completed);
     assert_eq!(final_info.exit_code, Some(0));
-    assert_eq!(final_info.retry_count, 1);
-    assert_eq!(final_info.assigned_worker_id, Some(survivor_id));
+    assert_eq!(final_info.retry_count, 0);
+    assert_eq!(final_info.failover_count, 0);
+    assert_eq!(final_info.assigned_worker_id, Some(w3_id));
 
     let _ = master.shutdown();
 }

@@ -2562,6 +2562,76 @@ pub async fn handle_worker_disconnect_with_broadcast(
     .await;
 }
 
+/// Unregisters a worker session that announced a graceful drain (`WorkerMessage::Disconnecting`),
+/// returns its in-flight tasks to `Queued` without charging `retry_count` or `failover_count`,
+/// notifies dashboard subscribers, and pokes the scheduler (`MOB-3`).
+pub async fn handle_worker_evacuate_with_broadcast(
+    registry: &WorkerRegistry,
+    queue: &TaskQueue,
+    scheduler_notify: &tokio::sync::Notify,
+    worker_id: &Uuid,
+    session_id: Option<u64>,
+    reason: &str,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<
+        &tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
+) {
+    let unregistered = registry
+        .unregister(worker_id, session_id)
+        .await
+        .unwrap_or(false);
+    if !unregistered {
+        debug!(worker_id = %worker_id, "Worker drain unregister skipped (stale session or already handled)");
+        return;
+    }
+
+    info!(
+        worker_id = %worker_id,
+        reason = %reason,
+        "Worker announced drain; evacuating in-flight tasks without charging retry budgets"
+    );
+
+    #[cfg(feature = "dashboard")]
+    if let Some(b_tx) = broadcast_tx {
+        let _ = b_tx.send(
+            crate::dashboard::dto::DashboardStreamMessage::WorkerDisconnected {
+                worker_id: *worker_id,
+                reason: reason.to_string(),
+            },
+        );
+    }
+
+    let affected_tasks = queue
+        .handle_session_evacuated(worker_id, session_id, reason)
+        .await;
+    if affected_tasks.is_empty() {
+        return;
+    }
+
+    info!(
+        worker_id = %worker_id,
+        count = affected_tasks.len(),
+        tasks = ?affected_tasks,
+        "Re-enqueued evacuated tasks for immediate reassignment"
+    );
+
+    #[cfg(feature = "dashboard")]
+    if let Some(b_tx) = broadcast_tx {
+        for task_id in &affected_tasks {
+            if let Some(info) = queue.get_task(task_id).await {
+                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                    info,
+                ));
+            }
+        }
+        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+            queue.stats().await,
+        ));
+    }
+
+    scheduler_notify.notify_one();
+}
+
 /// Fails over the in-flight tasks of one worker session: re-enqueues those with budget left,
 /// fails the rest, wakes the clients of tasks that became terminal and pokes the scheduler.
 /// With `session_id = Some(s)` only tasks dispatched on that session are touched.
@@ -3572,15 +3642,13 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             }
                             WorkerMessage::Disconnecting { worker_id: id, reason } => {
                                 info!(worker_id = %id, reason = %reason, "Worker announced graceful disconnection");
-                                handle_worker_disconnect_with_broadcast(
+                                handle_worker_evacuate_with_broadcast(
                                     &registry,
                                     &queue,
                                     &scheduler_notify,
-                                    Some(&waiters),
                                     &worker_id,
                                     Some(session_id),
                                     &format!("Worker graceful disconnect: {reason}"),
-                                    true,
                                     #[cfg(feature = "dashboard")]
                                     broadcast_tx.as_ref(),
                                 ).await;
@@ -4200,15 +4268,13 @@ async fn handle_multiplexed_connection<
                             }
                             WorkerMessage::Disconnecting { worker_id: id, reason } => {
                                 info!(worker_id = %id, reason = %reason, "Worker announced graceful disconnection on control stream");
-                                handle_worker_disconnect_with_broadcast(
+                                handle_worker_evacuate_with_broadcast(
                                     &registry,
                                     &queue,
                                     &scheduler_notify,
-                                    Some(&waiters),
                                     &worker_id,
                                     Some(session_id),
                                     &format!("Worker graceful disconnect: {reason}"),
-                                    true,
                                     #[cfg(feature = "dashboard")]
                                     broadcast_tx.as_ref(),
                                 ).await;

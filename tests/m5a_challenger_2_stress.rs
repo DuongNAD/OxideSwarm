@@ -1022,8 +1022,13 @@ async fn test_pre_sleep_fast_evacuation_under_multi_task_load() {
 
         if w1_tasks.contains(&tid) {
             assert_eq!(
-                final_info.retry_count, 1,
-                "Evacuated task {} must have retry_count == 1",
+                final_info.retry_count, 0,
+                "Evacuated task {} must not charge retry_count",
+                tid
+            );
+            assert_eq!(
+                final_info.failover_count, 0,
+                "Evacuated task {} must not charge failover_count",
                 tid
             );
         }

@@ -292,6 +292,8 @@ pub struct TaskEntry {
     pub retry_count: u32,
     /// Re-dispatches caused by infrastructure (worker lost, reaped, superseded, or refused the task
     /// unrun), tracked apart from execution retries so network churn cannot exhaust `max_retries`.
+    /// Announced worker drains (`WorkerMessage::Disconnecting`, handled by
+    /// [`TaskQueue::handle_session_evacuated`]) do not increment `retry_count` or `failover_count`.
     pub failover_count: u32,
     /// Times a worker handed this task back without running it.
     pub rejection_count: u32,
@@ -315,6 +317,7 @@ impl TaskEntry {
             gpu_required: self.task.requirements.gpu_required || self.task.spec.requires_gpu(),
             assigned_worker_id: self.assigned_worker_id,
             retry_count: self.retry_count,
+            failover_count: self.failover_count,
             submitted_at_utc: self.submitted_at_utc,
             execution_time_ms: self.result.as_ref().map(|r| r.execution_time_ms),
             exit_code: self.result.as_ref().map(|r| r.exit_code),
@@ -332,6 +335,8 @@ pub struct TaskInfo {
     pub gpu_required: bool,
     pub assigned_worker_id: Option<Uuid>,
     pub retry_count: u32,
+    #[serde(default)]
+    pub failover_count: u32,
     pub submitted_at_utc: u64,
     pub execution_time_ms: Option<u64>,
     pub exit_code: Option<i32>,
@@ -1927,6 +1932,103 @@ impl TaskQueue {
 
     // --- Worker Disconnect & Failover ---
 
+    /// Returns all active tasks assigned to a draining worker (`WorkerMessage::Disconnecting`) to
+    /// `Queued` immediately without charging `retry_count` or `failover_count`.
+    /// See [`handle_session_evacuated`](Self::handle_session_evacuated).
+    pub async fn handle_worker_evacuated(&self, worker_id: &Uuid, reason: &str) -> Vec<TaskId> {
+        self.handle_session_evacuated(worker_id, None, reason).await
+    }
+
+    /// Returns the in-flight tasks of one draining worker session (`WorkerMessage::Disconnecting`)
+    /// to `Queued` immediately without charging `retry_count` or `failover_count`.
+    ///
+    /// Unlike an unannounced disconnect or heartbeat timeout
+    /// ([`handle_session_disconnected`](Self::handle_session_disconnected)), an announced drain is a
+    /// voluntary evacuation (such as mobile pre-sleep evacuation or graceful worker shutdown), so
+    /// neither `retry_count` nor `failover_count` increases and tasks return to `ready_queue` even
+    /// when their retry or failover budget is `0`.
+    pub async fn handle_session_evacuated(
+        &self,
+        worker_id: &Uuid,
+        session_id: Option<u64>,
+        reason: &str,
+    ) -> Vec<TaskId> {
+        let mut guard = self.inner.write().await;
+        let inner = &mut *guard;
+
+        let mut assigned: HashSet<TaskId> = inner
+            .worker_assignments
+            .get(worker_id)
+            .cloned()
+            .unwrap_or_default();
+
+        for (id, entry) in &inner.tasks {
+            if entry.assigned_worker_id == Some(*worker_id) && entry.state.is_active() {
+                assigned.insert(*id);
+            }
+        }
+
+        let mut affected = Vec::with_capacity(assigned.len());
+        let mut ready_to_insert = Vec::new();
+
+        for task_id in assigned {
+            let Some(entry) = inner.tasks.get_mut(&task_id) else {
+                continue;
+            };
+            let session_matches = match (session_id, entry.assigned_session) {
+                (Some(swept), Some(assigned)) => assigned <= swept,
+                _ => true,
+            };
+            if !entry.state.is_active()
+                || entry.assigned_worker_id != Some(*worker_id)
+                || !session_matches
+            {
+                continue;
+            }
+
+            affected.push(task_id);
+            if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
+                tasks.remove(&task_id);
+            }
+
+            tracing::debug!(
+                task_id = %task_id,
+                worker_id = %worker_id,
+                session_id = ?session_id,
+                reason = %reason,
+                "Returning task from announced worker drain to ready_queue without charging retry budget"
+            );
+
+            entry.state = TaskState::Queued;
+            entry.assigned_worker_id = None;
+            entry.assigned_session = None;
+            entry.scheduled_instant = None;
+            entry.started_instant = None;
+            entry.retry_after_instant = None;
+            ready_to_insert.push(QueueOrderKey {
+                priority_rev: Reverse(entry.priority),
+                sequence: entry.sequence,
+                task_id,
+            });
+        }
+
+        if inner
+            .worker_assignments
+            .get(worker_id)
+            .is_some_and(|tasks| tasks.is_empty())
+        {
+            inner.worker_assignments.remove(worker_id);
+        }
+
+        for key in ready_to_insert {
+            let tid = key.task_id;
+            inner.insert_ready(key);
+            inner.update_active_task(tid);
+        }
+
+        affected
+    }
+
     /// Reaps all tasks assigned to a disconnected or timed-out worker, whatever session they were
     /// dispatched on. See [`handle_session_disconnected`](Self::handle_session_disconnected).
     pub async fn handle_worker_disconnected(
@@ -1949,11 +2051,12 @@ impl TaskQueue {
     /// each other: when a connection is aborted before its own sweep ran (the worker id
     /// re-registered a third time, the reaper fired), the next sweep of that worker still recovers
     /// the tasks it left on a session that no longer exists.
-    /// If `immediate_reschedule` is true (e.g. graceful worker disconnect), tasks are
+    /// If `immediate_reschedule` is true (e.g. superseded session), tasks are
     /// re-enqueued directly to `ready_queue` with 0ms delay.
     /// Otherwise, exponential backoff is scheduled via `delayed_retries`.
     /// Infrastructure failovers are counted in `failover_count` against `max_failovers`,
-    /// not against the task's execution retry budget.
+    /// not against the task's execution retry budget; announced drains use
+    /// [`handle_session_evacuated`](Self::handle_session_evacuated) instead so neither counter is charged.
     /// Returns the list of affected TaskIds.
     pub async fn handle_session_disconnected(
         &self,
@@ -3074,6 +3177,50 @@ mod tests {
         queue.schedule_task(&id, w).await.unwrap();
         queue.handle_worker_disconnected(&w, "crash", true).await;
         assert_eq!(queue.get_state(&id).await, Some(TaskState::Failed));
+    }
+
+    #[tokio::test]
+    async fn test_repeated_evacuations_leave_failover_and_retry_counts_at_zero_and_preserve_budgets(
+    ) {
+        let policy = RetryPolicy {
+            max_retries: 1,
+            max_failovers: 2,
+            ..Default::default()
+        };
+        let queue = TaskQueue::with_config(policy, None);
+        let id = queue
+            .submit(Task::new(
+                TaskSpec::command("echo", vec!["evac".into()]),
+                TaskRequirements::generic(1, 10).with_max_retries(0),
+            ))
+            .await
+            .unwrap();
+
+        for round in 1..=5u64 {
+            let w = Uuid::new_v4();
+            let scheduled = queue
+                .schedule_tasks_batch_in_sessions(&[(id, w, round)])
+                .await;
+            assert_eq!(scheduled.len(), 1, "round {round} must schedule");
+            queue.mark_running_from(w, Some(round), &id).await.unwrap();
+
+            let affected = if round % 2 == 1 {
+                queue
+                    .handle_session_evacuated(&w, Some(round), "FAST_PRE_SLEEP_BATTERY_LOW")
+                    .await
+            } else {
+                queue
+                    .handle_worker_evacuated(&w, "Graceful worker shutdown")
+                    .await
+            };
+            assert_eq!(affected, vec![id]);
+
+            let info = queue.get_task(&id).await.unwrap();
+            assert_eq!(info.state, TaskState::Queued, "round {round}");
+            assert_eq!(info.retry_count, 0, "round {round}");
+            assert_eq!(info.failover_count, 0, "round {round}");
+            assert_eq!(info.assigned_worker_id, None, "round {round}");
+        }
     }
 
     /// The exact texts `WorkerClient` and the task runner emit when they refuse to run a task.
