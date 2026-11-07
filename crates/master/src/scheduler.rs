@@ -129,7 +129,11 @@ pub struct SchedulerConfig {
     pub max_batch_size: usize,
     /// Maximum number of queued tasks one pass examines while looking for placeable ones
     /// (default: 20,000; at least 1). Tasks no worker can take right now are skipped, not counted against
-    /// `max_batch_size`, so a backlog of them does not starve the tasks behind it.
+    /// `max_batch_size`, so a backlog of them does not starve the tasks behind it. When
+    /// `fail_unfulfillable_tasks` is enabled and a pass with free slots exhausts `max_scan_per_pass`
+    /// from the head of the queue without advancing `unfulfillable_sweep.cursor`, the pass continues
+    /// the unfulfillable sweep from `cursor` for up to one additional `max_scan_per_pass` window
+    /// (examining at most `2 * max_scan_per_pass` tasks in that pass).
     pub max_scan_per_pass: usize,
 }
 
@@ -3899,5 +3903,66 @@ mod tests {
             queue.get_state(&t_gpu_tail).await,
             Some(crate::queue::TaskState::Failed)
         );
+    }
+
+    #[tokio::test]
+    async fn test_fail_unfulfillable_tasks_does_not_report_gpu_task_twice_when_placement_walk_moves_past_cursor(
+    ) {
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+        // One 4-core CPU worker (busy with a 4-core task so 2-core tasks are fulfillable in the
+        // cluster) and one 1-core CPU worker (free).
+        let (_w4_id, _w4_sess, _w4_rx) = register_worker(&registry, "cpu-4c", 4, 8192, false).await;
+        let (w1_id, _w1_sess, _w1_rx) = register_worker(&registry, "cpu-1c", 1, 4096, false).await;
+
+        let mut cfg = SchedulerConfig::default().with_fail_unfulfillable_tasks(true);
+        cfg.max_scan_per_pass = 3;
+        let sched = WorkloadScheduler::new(cfg, registry.clone(), queue.clone(), notify)
+            .with_waiters(waiters);
+
+        // Occupy the 4-core worker so only the 1-core worker has a free slot.
+        let _t_busy_4c = queue.submit(wide_task(4)).await.unwrap();
+        let r0 = sched.schedule_once().await.unwrap();
+        assert_eq!(r0.assignments.len(), 1);
+
+        // Enqueue:
+        //   pos 1: 1-core CPU task `t1` (fits `w1_id`)
+        //   pos 2: 2-core CPU task `t2` (skipped on `w1_id`)
+        //   pos 3: 2-core CPU task `t3` (skipped on `w1_id`)
+        //   pos 4: GPU task `t_gpu` (unfulfillable)
+        //   pos 5: 2-core CPU task `t5` (keeps `next.is_some()` after `t_gpu`)
+        let t1 = queue.submit(wide_task(1)).await.unwrap();
+        let _t2 = queue.submit(wide_task(2)).await.unwrap();
+        let _t3 = queue.submit(wide_task(2)).await.unwrap();
+        let t_gpu = queue.submit(gpu_task()).await.unwrap();
+        let _t5 = queue.submit(wide_task(2)).await.unwrap();
+
+        // Pass 1 (`max_scan_per_pass = 3`): places `t1` on `w1_id` (removing `t1` from
+        // `ready_queue`) and skips `t2` and `t3`, setting `unfulfillable_sweep.cursor` to `t3`.
+        let r1 = sched.schedule_once().await.unwrap();
+        assert_eq!(r1.assignments.len(), 1);
+        assert_eq!(r1.assignments[0].task_id, t1);
+        assert!(r1.unfulfillable.is_empty());
+
+        // Complete `t1` so `w1_id` has 1 free slot again without changing `ready_epoch`.
+        queue
+            .record_result(rusty_grid_core::task::TaskResult::success(
+                w1_id, t1, "", 1, false,
+            ))
+            .await
+            .unwrap();
+        registry.decrement_active_tasks(&w1_id).await.unwrap();
+
+        // Pass 2 (`max_scan_per_pass = 3`): the placement walk from `None` now sees `[t2, t3, t_gpu]`,
+        // advancing `unfulfillable_sweep.cursor` past the old `sweep_cursor` (`t3`) to `t_gpu`.
+        // The `cursor == sweep_cursor` guard must prevent the continuation from re-scanning from
+        // `t3` and reporting `t_gpu` a second time in `r2.unfulfillable`.
+        let r2 = sched.schedule_once().await.unwrap();
+        assert!(r2.assignments.is_empty());
+        assert_eq!(
+            r2.unfulfillable.len(),
+            1,
+            "t_gpu must be reported once in report.unfulfillable when the placement walk already moved past sweep_cursor"
+        );
+        assert_eq!(r2.unfulfillable[0].0, t_gpu);
     }
 }

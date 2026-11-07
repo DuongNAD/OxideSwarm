@@ -470,14 +470,20 @@ mod tests {
             "Cellular phone with 25 s interval must survive past the 50 ms default reaper timeout"
         );
 
+        let cell_hb = registry
+            .last_heartbeat_instant(&cell_id)
+            .await
+            .expect("cellular last_heartbeat_instant");
+        let wifi_hb = registry
+            .last_heartbeat_instant(&wifi_id)
+            .await
+            .expect("wifi last_heartbeat_instant");
+
         // At 95 s of silence: cellular (100 s window) and Wi-Fi (240 s window) are both still Connected.
-        registry
-            .backdate_last_heartbeat(&cell_id, Duration::from_secs(95))
-            .await;
-        registry
-            .backdate_last_heartbeat(&wifi_id, Duration::from_secs(235))
-            .await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(registry
+            .reap_stale_sessions_at(cell_hb + Duration::from_secs(95), Duration::from_millis(50))
+            .await
+            .is_empty());
         assert_eq!(
             registry.get_worker(cell_id).await.unwrap().status,
             WorkerStatus::Connected
@@ -487,11 +493,14 @@ mod tests {
             WorkerStatus::Connected
         );
 
-        // At 105 s of silence, cellular (4 × 25 s = 100 s) is reaped while Wi-Fi at 235 s stays Connected.
-        registry
-            .backdate_last_heartbeat(&cell_id, Duration::from_secs(105))
+        // At 105 s of silence, cellular (4 × 25 s = 100 s) is reaped while Wi-Fi stays Connected.
+        let reaped_at_105 = registry
+            .reap_stale_sessions_at(
+                cell_hb + Duration::from_secs(105),
+                Duration::from_millis(50),
+            )
             .await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(reaped_at_105, vec![(cell_id, cell_session)]);
         assert_eq!(
             registry.get_worker(cell_id).await.unwrap().status,
             WorkerStatus::Disconnected
@@ -501,11 +510,27 @@ mod tests {
             WorkerStatus::Connected
         );
 
+        // At 235 s of silence, Wi-Fi (4 × 60 s = 240 s) is still Connected.
+        assert!(registry
+            .reap_stale_sessions_at(
+                wifi_hb + Duration::from_secs(235),
+                Duration::from_millis(50),
+            )
+            .await
+            .is_empty());
+        assert_eq!(
+            registry.get_worker(wifi_id).await.unwrap().status,
+            WorkerStatus::Connected
+        );
+
         // At 245 s of silence, Wi-Fi (4 × 60 s = 240 s) is reaped.
-        registry
-            .backdate_last_heartbeat(&wifi_id, Duration::from_secs(245))
+        let reaped_at_245 = registry
+            .reap_stale_sessions_at(
+                wifi_hb + Duration::from_secs(245),
+                Duration::from_millis(50),
+            )
             .await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(reaped_at_245, vec![(wifi_id, wifi_session)]);
         assert_eq!(
             registry.get_worker(wifi_id).await.unwrap().status,
             WorkerStatus::Disconnected
