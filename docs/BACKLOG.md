@@ -126,9 +126,9 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-07, at `master` `5c518b5`: 46 items Implemented, 3 Partial and 21 Planned. Two of
-the Planned items have an open pull request. "Pull requests" lists them by number, and "(open)"
-marks one that is not merged yet.
+On 2026-11-08, at `master` `5df82df`: 47 items Implemented, 3 Partial and 20 Planned. "Pull
+requests" lists them by number, "(open)" marks one that is not merged yet, and "(design)" marks a
+design record that builds nothing.
 
 | ID | Item | Priority | Size | Needs | Owner | Status | Pull requests |
 |---|---|---|---|---|---|---|---|
@@ -173,10 +173,10 @@ marks one that is not merged yet.
 | MCP-3 | Correct JSON-RPC and argument handling | P2 | S | MCP-1 |  | Implemented | 97 |
 | SCHED-1 | Respect `--max-concurrency` on the master | P1 | S | INT-4 |  | Implemented | 34, 38 |
 | SCHED-2 | Wire or delete dead flags | P1 | M | INT-4 |  | Implemented | 78 |
-| SCHED-3 | Give impossible tasks an outcome | P2 | S | INT-4 |  | Planned | 96 (open) |
+| SCHED-3 | Give impossible tasks an outcome | P2 | S | INT-4 |  | Implemented | 96, 107 |
 | MOB-1 | Fix the adaptive keepalive | P1 | S | INT-4 |  | Implemented | 98 |
 | MOB-2 | Keep thermal state on the master | P1 | M | INT-4 |  | Implemented | 99 |
-| MOB-3 | Do not charge evacuation to retry budgets | P2 | S | INT-4 |  | Planned |  |
+| MOB-3 | Do not charge evacuation to retry budgets | P2 | S | INT-4 |  | Planned | 108 (open) |
 | 3D-2 | Wire VRAM and Blender routing | P2 | M | BUG-3 |  | Planned |  |
 | 3D-3 | Make AutoRig options real or refuse them | P2 | M | SEC-5 |  | Planned |  |
 | MR-1 | Let a CLI user ship a mapper and reducer | P2 | S | INT-4 |  | Implemented | 33 |
@@ -192,11 +192,11 @@ marks one that is not merged yet.
 | FEAT-1 | Master durability | P1 | L | TEST-6 |  | Planned |  |
 | FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 |  | Planned |  |
 | FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Planned |  |
-| FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Planned |  |
+| FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Planned | 105 (design) |
 | FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 |  | Planned |  |
 | FEAT-6 | Master failover | P3 | L | FEAT-1 | D1 | Implemented | 81 |
 | FEAT-7 | Usable rendezvous discovery | P3 | M | INT-4 |  | Planned |  |
-| FEAT-8 | Real protocol versioning | P2 | M | INT-4 |  | Partial | 40 |
+| FEAT-8 | Real protocol versioning | P2 | M | INT-4 |  | Partial | 40, 110 (open) |
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Planned |  |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Planned |  |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Planned |  |
@@ -1329,3 +1329,13 @@ Add one dated line per finished item, newest last.
 - 2026-11-07: Items found after the audit have no section in this file: BUG-6 to BUG-17, TEST-8
   to TEST-16, SEC-8, BRIDGE-2 and BRIDGE-3. Each has a merged pull request except TEST-16
   (pull request 95, open).
+- 2026-11-08: Index synced with `master` `5df82df`.
+  - SCHED-3 is Implemented: 2026-11-07, pull requests 96, 107.
+  - TEST-16 merged on 2026-11-07 in pull request 95. Its follow-up TEST-16b is pull request 109,
+    open.
+  - Open pull requests: MODE-1 (92), MOB-3 (108), FEAT-8 (110).
+  - FEAT-4: design 0039 (pull request 105) is Accepted and builds nothing yet. The draft design
+    0042 (pull request 111) was not taken.
+- 2026-11-08: The roadmap (`ROADMAP.md`) sets the order after this backlog. Its decision Q2 freezes
+  3D-2 and 3D-3. Its decision Q3 drops the grid features of MESH-3, and keeps only the removal of
+  the hub-local file fallback in `parse_binary_data`. These items stay Planned.
