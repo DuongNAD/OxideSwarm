@@ -46,10 +46,11 @@ Behaviour before this change (`MODE-1` in `docs/BACKLOG.md`):
 - `run_distributed_benchmark` uses generic synthetic worker profiles (`sim-cpu-node-a`, `sim-cpu-node-b`, `sim-gpu-node`, `sim-mobile-node`), prints `=== In-Memory Synthetic Scheduling Simulation (not a live cluster) ===` and `Status: [COMPLETED - SYNTHETIC SIMULATION]`, and sets metric `"simulation_only": true`.
 - `generate_research_report` checks both `fs::create_dir_all` and `fs::write` on `target/research_report.json` and returns `success = false` (`exit_code = Some(1)`) on any I/O error.
 
-### D3 Fail non-CLI `dev cluster` / `dev stop` and verify child readiness in `launch_local_dev_cluster`
+### D3 Fail non-CLI `dev cluster` / `dev stop`, verify `--dashboard-port-file` and child readiness in `launch_local_dev_cluster`, and verify PID ownership in `stop_local_dev_cluster`
 
 - `execute_mode_action` returns `success = false` (`exit_code = Some(1)`) for `(WorkflowMode::Dev, "cluster")` and `(WorkflowMode::Dev, "stop")`, and the Launch/Stop Cluster buttons are removed from `crates/master/src/dashboard.html`.
-- `launch_local_dev_cluster` (and `launch_local_dev_cluster_with_ports`) checks worker spawn errors, calls `try_wait()` on the master and both worker children (`dev-worker-cpu-1`, `dev-worker-sim-gpu-2`), and polls `/api/status` on `web_ui_port` until both worker names appear or a deadline expires. On any child exit or readiness timeout, it kills started PIDs, removes `.dev_cluster.json`, and returns `success = false` (`exit_code = Some(1)`).
+- `launch_local_dev_cluster` (and `launch_local_dev_cluster_with_ports`) starts the master with `--dashboard-port-file <workspace_root>/.dev_cluster.dashboard_port`, checks worker spawn errors, calls `try_wait()` on the master and both worker children (`dev-worker-cpu-1`, `dev-worker-sim-gpu-2`), and waits for `.dev_cluster.dashboard_port` to confirm the master bound `web_ui_port` before polling `/api/status` or sending any Bearer token. On any child exit, missing dashboard port bind, or readiness timeout, it kills and reaps the spawned `Child` handles directly, removes `.dev_cluster.pids`, `.dev_cluster.json`, and `.dev_cluster.dashboard_port`, and returns `success = false` (`exit_code = Some(1)`).
+- `stop_local_dev_cluster` refuses `pid <= 1` and `ox-mode`'s own PID, parses JSON `"master_pid"` with `u32::try_from` (never truncating `u64` via `as u32`), verifies via `sysinfo` that each target process executable name is `rusty-grid` / `oxideswarm` and its start time matches the tracking file timestamp, signals verified processes, waits up to 3 s for exit, and reports `signalled`, `exited`, and `skipped` (stale/unrelated) counts honestly. `.dev_cluster.*` and `.dev_cluster_home/` are gitignored in `.gitignore`.
 
 ### D4 Strict `--port` probing and cluster-secret Bearer auth in `dev status`
 
@@ -78,9 +79,11 @@ Behaviour before this change (`MODE-1` in `docs/BACKLOG.md`):
 
 - `ox-mode dev status` never sends the raw cluster secret over HTTP; it derives the domain-separated dashboard Bearer token via `rusty_grid_master::dashboard_admin_token(&secret)` using `HMAC-SHA256(secret, "oxs1-dashboard-admin")` (`crates/master/src/auth.rs:12-19`).
 - To prevent leaking the Admin dashboard token to unverified or guessed local ports:
-  1. Port `3000` is dropped from default candidate probing (`dev status` without `--port` checks only `.dev_cluster.json` `web_ui_port`, then `8080`).
+  1. Port `3000` is dropped from default candidate probing (`dev status` without `--port` checks only `.dev_cluster.json` `web_ui_port`, then `DEFAULT_FALLBACK_STATUS_PORTS = &[8080]`).
   2. The Bearer token is never allowed on unconfigured fallback ports; it is permitted only when probing an explicit `--port` or the port recorded in `.dev_cluster.json`.
   3. `http_get_local_status` always sends its first `GET /api/status` request without an `Authorization` header and only retries with `Authorization: Bearer <token>` if the server responds `401 Unauthorized` with a `WWW-Authenticate` header containing `Bearer realm="OxideSwarm"`.
+  4. `launch_local_dev_cluster_with_ports` passes `--dashboard-port-file` to the spawned master and never polls `http_get_local_status(web_ui_port, ...)` or sends the Admin Bearer token until `.dev_cluster.dashboard_port` confirms that our newly spawned master bound `web_ui_port` (preventing token disclosure when another process already holds `web_ui_port` and the master continues RPC without a Web UI per `crates/master/src/server.rs:714-721`).
+- To prevent `ox-mode dev stop` (or `dev cluster` pre-clean) from killing arbitrary processes via stale or reused PIDs in `.dev_cluster.pids` / `.dev_cluster.json`, `stop_local_dev_cluster` refuses `pid <= 1` and `std::process::id()`, checks executable identity (`rusty-grid` / `oxideswarm`) and process start time against the tracking file timestamp via `sysinfo`, and skips any non-matching or stale entry.
 - Token-protected masters that return `401 Unauthorized` or `403 Forbidden` when no matching credential is available are reported as unhealthy (`exit_code = 1`) rather than healthy with 0 workers.
 
 ## Test plan

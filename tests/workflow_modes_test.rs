@@ -2,10 +2,11 @@
 
 use rusty_grid_cli::mode::{
     execute_mode_action, export_specification, find_workspace_root, generate_research_report,
-    get_mode_descriptors, launch_local_dev_cluster_with_ports, probe_cluster_health_with_secret,
+    get_mode_descriptors, launch_local_dev_cluster_with_ports,
+    probe_cluster_health_with_fallback_ports, probe_cluster_health_with_secret,
     run_distributed_benchmark, run_hardware_profile, run_micro_benchmarks,
     run_mode_cli_with_secret, run_watch_check, stop_local_dev_cluster, verify_documentation,
-    ModeCliArgs, WorkflowMode,
+    ModeCliArgs, WorkflowMode, DEFAULT_FALLBACK_STATUS_PORTS,
 };
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::protocol::MAX_FRAME_SIZE;
@@ -436,8 +437,10 @@ async fn test_dev_status_against_protected_master_exits_nonzero() {
     // 3. Binary invocation (`ox-mode dev status --port <dash_port>`) exits non-zero
     let ox_mode_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_ox-mode"));
     let out = std::process::Command::new(&ox_mode_bin)
+        .current_dir(temp.path())
         .env("HOME", &temp_home)
         .env("USERPROFILE", &temp_home)
+        .env_remove("CARGO_MANIFEST_DIR")
         .env_remove("OXIDESWARM_SECRET")
         .env_remove("OXIDESWARM_SECRET_FILE")
         .env_remove("RUSTY_GRID_CONFIG")
@@ -526,6 +529,7 @@ async fn test_dev_status_closed_port_fails_while_another_master_is_up() {
         .current_dir(temp.path())
         .env("HOME", &temp_home)
         .env("USERPROFILE", &temp_home)
+        .env_remove("CARGO_MANIFEST_DIR")
         .env_remove("OXIDESWARM_SECRET")
         .env_remove("OXIDESWARM_SECRET_FILE")
         .env_remove("RUSTY_GRID_CONFIG")
@@ -594,8 +598,10 @@ async fn test_dev_status_succeeds_against_cluster_with_secret() {
     // 3. Binary invocation with OXIDESWARM_SECRET_FILE succeeds and exits 0
     let ox_mode_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_ox-mode"));
     let out = std::process::Command::new(&ox_mode_bin)
+        .current_dir(temp.path())
         .env("HOME", &temp_home)
         .env("USERPROFILE", &temp_home)
+        .env_remove("CARGO_MANIFEST_DIR")
         .env_remove("OXIDESWARM_SECRET")
         .env_remove("RUSTY_GRID_CONFIG")
         .env("OXIDESWARM_SECRET_FILE", &secret_path)
@@ -619,6 +625,11 @@ async fn test_dev_status_never_sends_token_to_guessed_ports_or_3000() {
     use std::io::{Read, Write};
     use std::sync::{Arc, Mutex};
 
+    // 1. Default fallback port list must be only [8080] (port 3000 and grid port 8088 are never guessed).
+    assert_eq!(DEFAULT_FALLBACK_STATUS_PORTS, &[8080]);
+    assert!(!DEFAULT_FALLBACK_STATUS_PORTS.contains(&3000));
+    assert!(!DEFAULT_FALLBACK_STATUS_PORTS.contains(&8088));
+
     let secret = ClusterSecret::generate().expect("generate secret");
     let admin_token = rusty_grid_master::dashboard_admin_token(&secret);
     let temp = tempfile::tempdir().expect("tempdir");
@@ -630,60 +641,83 @@ async fn test_dev_status_never_sends_token_to_guessed_ports_or_3000() {
         .save_file(&secret_path, true)
         .expect("save secret file");
 
-    // 1. If 127.0.0.1:3000 is available on this host, bind a fake listener on 3000 and verify
-    //    `dev status` (without `--port`) never connects or leaks the token to 3000.
-    let captured_3000 = Arc::new(Mutex::new(Vec::<String>::new()));
-    let listener_3000 = std::net::TcpListener::bind("127.0.0.1:3000").ok();
-    let handle_3000 = listener_3000.map(|listener| {
-        let _ = listener.set_nonblocking(true);
-        let cap = Arc::clone(&captured_3000);
-        std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
-            while std::time::Instant::now() < deadline {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-                    let mut buf = [0u8; 4096];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    cap.lock().unwrap().push(req);
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"OxideSwarm\"\r\nContent-Length: 0\r\n\r\n",
-                    );
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+    // 2. Test the fallback port rule deterministically on an ephemeral port:
+    //    A fake OxideSwarm-realm listener (`WWW-Authenticate: Bearer realm="OxideSwarm"`) on the
+    //    unconfigured fallback port must receive the unauthenticated `GET /api/status` probe,
+    //    and `dev status` must NEVER retry or send `Authorization: Bearer <token>` to it.
+    let fallback_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind fallback listener");
+    let fallback_port = fallback_listener.local_addr().expect("local_addr").port();
+    let _ = fallback_listener.set_nonblocking(true);
+    let captured_fallback = Arc::new(Mutex::new(Vec::<String>::new()));
+    let cap_fb = Arc::clone(&captured_fallback);
+    let fb_handle = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < deadline {
+            if let Ok((mut stream, _)) = fallback_listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"OxideSwarm\"\r\nContent-Length: 0\r\n\r\n",
+                );
+                let mut list = cap_fb.lock().unwrap();
+                list.push(req);
+                if list.len() >= 2 {
+                    // Wait briefly in case a buggy implementation attempts a retry with Authorization.
+                    std::thread::sleep(std::time::Duration::from_millis(200));
                 }
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(15));
             }
-        })
+        }
     });
 
-    let _ = probe_cluster_health_with_secret(None, temp.path(), Some(&secret));
+    let fb_res = probe_cluster_health_with_fallback_ports(
+        None,
+        temp.path(),
+        Some(&secret),
+        &[fallback_port],
+    );
+    assert!(!fb_res.success);
+    assert_eq!(fb_res.metrics["http_status"], 401);
 
     let ox_mode_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_ox-mode"));
-    let _ = std::process::Command::new(&ox_mode_bin)
+    let out_fb = std::process::Command::new(&ox_mode_bin)
         .current_dir(temp.path())
         .env("HOME", &temp_home)
         .env("USERPROFILE", &temp_home)
         .env("OXIDESWARM_SECRET_FILE", &secret_path)
+        .env(
+            "OXIDESWARM_STATUS_FALLBACK_PORTS",
+            fallback_port.to_string(),
+        )
+        .env_remove("CARGO_MANIFEST_DIR")
+        .env_remove("OXIDESWARM_SECRET")
+        .env_remove("RUSTY_GRID_CONFIG")
         .env_remove("RUSTY_GRID_DASHBOARD_PORT")
         .args(["dev", "status", "--json"])
         .output()
         .expect("spawn ox-mode dev status without --port");
+    assert!(!out_fb.status.success());
 
-    if let Some(h) = handle_3000 {
-        let _ = h.join();
-    }
-    let reqs_3000 = captured_3000.lock().unwrap();
-    assert!(
-        reqs_3000.iter().all(|r| !r.contains(&admin_token)),
-        "fake listener on 127.0.0.1:3000 must never receive the dashboard Admin token"
+    let _ = fb_handle.join();
+    let reqs_fb = captured_fallback.lock().unwrap();
+    assert_eq!(
+        reqs_fb.len(),
+        2,
+        "fallback listener must receive exactly 1 unauthenticated probe per dev status call (no auth retry), got {} requests",
+        reqs_fb.len()
     );
     assert!(
-        reqs_3000.is_empty(),
-        "dev status must not probe guessed port 3000, got {} requests",
-        reqs_3000.len()
+        reqs_fb
+            .iter()
+            .all(|r| !r.contains(&admin_token) && !r.contains("Authorization:")),
+        "fallback port must never receive Authorization Bearer token even when replying with OxideSwarm 401 challenge"
     );
 
-    // 2. Even on an explicit `--port` or `.dev_cluster.json` port, a fake server that responds
+    // 3. Even on an explicit `--port` or `.dev_cluster.json` port, a fake server that responds
     //    200 OK or 401 without `WWW-Authenticate: Bearer realm="OxideSwarm"` must never receive the token.
     let fake_listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake listener on ephemeral port");
@@ -711,6 +745,137 @@ async fn test_dev_status_never_sends_token_to_guessed_ports_or_3000() {
     assert!(
         !fake_reqs[0].contains(&admin_token) && !fake_reqs[0].contains("Authorization:"),
         "initial probe and non-OxideSwarm 401 must never receive Authorization Bearer token"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dev_cluster_never_sends_token_when_web_ui_port_is_held() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let secret = ClusterSecret::generate().expect("generate secret");
+    let admin_token = rusty_grid_master::dashboard_admin_token(&secret);
+    let isolated_secret_dir = temp.path().join(".dev_cluster_home").join(".oxideswarm");
+    std::fs::create_dir_all(&isolated_secret_dir).expect("create isolated .oxideswarm");
+    secret
+        .save_file(&isolated_secret_dir.join("cluster.secret"), true)
+        .expect("save secret in isolated home");
+
+    let free_master_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral master port");
+        l.local_addr().expect("local_addr").port()
+    };
+
+    let web_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind held web_ui_port listener");
+    let held_web_port = web_listener.local_addr().expect("local_addr").port();
+    let _ = web_listener.set_nonblocking(true);
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_clone = Arc::clone(&stop_flag);
+    let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+    let cap_clone = Arc::clone(&captured);
+
+    let listener_handle = std::thread::spawn(move || {
+        while !stop_clone.load(Ordering::Relaxed) {
+            if let Ok((mut stream, _)) = web_listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                cap_clone.lock().unwrap().push(req);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"OxideSwarm\"\r\nContent-Length: 0\r\n\r\n",
+                );
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    });
+
+    let res =
+        launch_local_dev_cluster_with_ports(temp.path(), free_master_port, held_web_port).await;
+    stop_flag.store(true, Ordering::Relaxed);
+    let _ = listener_handle.join();
+    let _ = stop_local_dev_cluster(temp.path()).await;
+
+    assert!(
+        !res.success,
+        "launch_local_dev_cluster_with_ports must fail when web_ui_port is held by another listener"
+    );
+    assert_eq!(res.exit_code, Some(1));
+
+    let reqs = captured.lock().unwrap();
+    assert!(
+        reqs.iter()
+            .all(|r| !r.contains("Authorization:") && !r.contains(&admin_token)),
+        "fake listener holding web_ui_port must never receive Authorization Bearer token, got: {:?}",
+        *reqs
+    );
+    assert!(
+        reqs.is_empty(),
+        "dev cluster must not poll web_ui_port before --dashboard-port-file confirms the master bound it, got {} requests",
+        reqs.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dev_stop_skips_unrelated_and_stale_pids_and_reports_honestly() {
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    // Spawn an unrelated background process (`python -c "import time; time.sleep(60)"`)
+    let mut unrelated = std::process::Command::new("python")
+        .args(["-c", "import time; time.sleep(60)"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn unrelated python sleep process");
+    let unrelated_pid = unrelated.id();
+    let self_pid = std::process::id();
+
+    std::fs::write(
+        temp.path().join(".dev_cluster.pids"),
+        format!("master:{unrelated_pid}\nworker_cpu:0\nworker_gpu:1\nworker_self:{self_pid}\n"),
+    )
+    .expect("write .dev_cluster.pids");
+    std::fs::write(
+        temp.path().join(".dev_cluster.json"),
+        serde_json::json!({
+            "master_pid": 4_294_967_297u64,
+            "pids": [format!("master:{unrelated_pid}")]
+        })
+        .to_string(),
+    )
+    .expect("write .dev_cluster.json");
+
+    let stop_res = stop_local_dev_cluster(temp.path()).await;
+
+    // Unrelated process must still be alive (`try_wait() == Ok(None)`)
+    let child_status = unrelated.try_wait().expect("try_wait on unrelated process");
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
+
+    assert!(
+        child_status.is_none(),
+        "unrelated process (PID {unrelated_pid}) must survive `dev stop`, but exited with {child_status:?}"
+    );
+    assert!(stop_res.success);
+    assert_eq!(stop_res.metrics["signalled_count"], 0);
+    assert_eq!(stop_res.metrics["exited_count"], 0);
+    assert_eq!(
+        stop_res.metrics["skipped_count"], 5,
+        "expected 5 invalid/stale/unrelated entries skipped (unrelated, 0, 1, self_pid, u64 overflow), got: {:?}",
+        stop_res.metrics
+    );
+    assert!(
+        stop_res.stdout.contains("0 signalled, 0 exited")
+            && stop_res
+                .stdout
+                .contains("stale/unrelated PID entry(ies) skipped"),
+        "expected honest stop summary reporting skipped stale entries, got: {}",
+        stop_res.stdout
     );
 }
 

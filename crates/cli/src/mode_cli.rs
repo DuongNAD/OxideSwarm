@@ -521,6 +521,22 @@ fn http_get_local_status(port: u16, bearer_token: Option<&str>) -> Result<(u16, 
     Ok((status_code, body))
 }
 
+/// Default fallback ports probed by `dev status` when `--port` and `.dev_cluster.json` are absent.
+pub const DEFAULT_FALLBACK_STATUS_PORTS: &[u16] = &[8080];
+
+fn default_fallback_status_ports() -> Vec<u16> {
+    if let Ok(raw) = std::env::var("OXIDESWARM_STATUS_FALLBACK_PORTS") {
+        let parsed: Vec<u16> = raw
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u16>().ok())
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    DEFAULT_FALLBACK_STATUS_PORTS.to_vec()
+}
+
 /// Probes the health and status of a running local master node.
 /// When `port` is `Some(p)`, probes only `p`; when `None`, checks `.dev_cluster.json` then HTTP port `8080`.
 pub fn probe_cluster_health(port: Option<u16>) -> ModeExecutionResult {
@@ -533,7 +549,13 @@ pub fn probe_cluster_health_with_root(
     workspace_root: &Path,
 ) -> ModeExecutionResult {
     let bearer_token = resolve_dashboard_bearer_token();
-    probe_cluster_health_with_bearer(port, workspace_root, bearer_token.as_deref())
+    let fallbacks = default_fallback_status_ports();
+    probe_cluster_health_with_bearer_and_fallbacks(
+        port,
+        workspace_root,
+        bearer_token.as_deref(),
+        &fallbacks,
+    )
 }
 
 /// Probes the health and status of a running local master node using an explicit `ClusterSecret` (if any).
@@ -542,14 +564,40 @@ pub fn probe_cluster_health_with_secret(
     workspace_root: &Path,
     secret: Option<&ClusterSecret>,
 ) -> ModeExecutionResult {
+    let fallbacks = default_fallback_status_ports();
+    probe_cluster_health_with_fallback_ports(port, workspace_root, secret, &fallbacks)
+}
+
+/// Probes the health and status of a running local master node with an explicit fallback port list.
+pub fn probe_cluster_health_with_fallback_ports(
+    port: Option<u16>,
+    workspace_root: &Path,
+    secret: Option<&ClusterSecret>,
+    fallback_ports: &[u16],
+) -> ModeExecutionResult {
     let bearer_token = secret.map(rusty_grid_master::dashboard_admin_token);
-    probe_cluster_health_with_bearer(port, workspace_root, bearer_token.as_deref())
+    probe_cluster_health_with_bearer_and_fallbacks(
+        port,
+        workspace_root,
+        bearer_token.as_deref(),
+        fallback_ports,
+    )
 }
 
 fn probe_cluster_health_with_bearer(
     port: Option<u16>,
     workspace_root: &Path,
     bearer_token: Option<&str>,
+) -> ModeExecutionResult {
+    let fallbacks = default_fallback_status_ports();
+    probe_cluster_health_with_bearer_and_fallbacks(port, workspace_root, bearer_token, &fallbacks)
+}
+
+fn probe_cluster_health_with_bearer_and_fallbacks(
+    port: Option<u16>,
+    workspace_root: &Path,
+    bearer_token: Option<&str>,
+    fallback_ports: &[u16],
 ) -> ModeExecutionResult {
     let start = Instant::now();
     let mut res = ModeExecutionResult::new(WorkflowMode::Dev, "status");
@@ -565,15 +613,18 @@ fn probe_cluster_health_with_bearer(
         if let Ok(content) = fs::read_to_string(&cluster_file) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(p) = v.get("web_ui_port").and_then(|p| p.as_u64()) {
-                    let p_u16 = p as u16;
-                    from_cluster_file = Some(p_u16);
-                    candidate_ports.push(p_u16);
+                    if let Ok(p_u16) = u16::try_from(p) {
+                        from_cluster_file = Some(p_u16);
+                        candidate_ports.push(p_u16);
+                    }
                 }
             }
         }
-        // Only default HTTP dashboard port 8080 (3000 and grid TCP port 8088 are never guessed).
-        if !candidate_ports.contains(&8080u16) {
-            candidate_ports.push(8080u16);
+        // Append default fallback HTTP dashboard port(s) (8080 by default; 3000 and grid TCP port 8088 are never guessed).
+        for &fp in fallback_ports {
+            if !candidate_ports.contains(&fp) {
+                candidate_ports.push(fp);
+            }
         }
         from_cluster_file
     };
@@ -1690,6 +1741,13 @@ pub async fn execute_single_action(
     execute_mode_action(mode, &action_clean, workspace_root)
 }
 
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn write_cluster_tracking_files(
     pid_file: &Path,
     json_file: &Path,
@@ -1704,6 +1762,7 @@ fn write_cluster_tracking_files(
         "master_tcp": format!("127.0.0.1:{}", master_tcp_port),
         "web_ui_port": web_ui_port,
         "web_ui_url": format!("http://127.0.0.1:{}", web_ui_port),
+        "launched_at_unix": current_unix_secs(),
         "pids": spawned_pids,
     });
     let json_str = serde_json::to_string_pretty(&cluster_json)
@@ -1712,16 +1771,19 @@ fn write_cluster_tracking_files(
 }
 
 fn cleanup_failed_cluster_launch(
-    raw_pids: &[u32],
+    children: &mut [&mut std::process::Child],
     pid_file: &Path,
     json_file: &Path,
+    dash_port_file: &Path,
     isolated_home: Option<&Path>,
 ) {
-    for &pid in raw_pids {
-        let _ = terminate_process(pid);
+    for child in children {
+        let _ = child.kill();
+        let _ = child.wait();
     }
     let _ = fs::remove_file(pid_file);
     let _ = fs::remove_file(json_file);
+    let _ = fs::remove_file(dash_port_file);
     if let Some(home) = isolated_home {
         let _ = fs::remove_dir_all(home);
     }
@@ -1745,9 +1807,11 @@ pub async fn launch_local_dev_cluster_with_ports(
 
     let pid_file = workspace_root.join(".dev_cluster.pids");
     let json_file = workspace_root.join(".dev_cluster.json");
+    let dash_port_file = workspace_root.join(".dev_cluster.dashboard_port");
     if pid_file.exists() || json_file.exists() {
         let _ = stop_local_dev_cluster(workspace_root).await;
     }
+    let _ = fs::remove_file(&dash_port_file);
 
     // When workspace_root is a temporary/non-workspace directory (e.g. during integration tests),
     // isolate child HOME/USERPROFILE and config inside workspace_root so the host's real HOME is never touched.
@@ -1806,7 +1870,6 @@ pub async fn launch_local_dev_cluster_with_ports(
     }
 
     let mut spawned_pids = Vec::new();
-    let mut raw_pids = Vec::new();
 
     let mut master_cmd = Command::new(&target_bin);
     if let Some(ref home_dir) = isolated_home {
@@ -1826,9 +1889,10 @@ pub async fn launch_local_dev_cluster_with_ports(
             &format!("127.0.0.1:{}", master_tcp_port),
             "--web-ui-addr",
             &format!("127.0.0.1:{}", web_ui_port),
-            "--ephemeral-key",
-            "--blob-dir",
+            "--dashboard-port-file",
         ]);
+        master_cmd.arg(&dash_port_file);
+        master_cmd.args(["--ephemeral-key", "--blob-dir"]);
         master_cmd.arg(&blob_dir);
     } else {
         master_cmd.args([
@@ -1837,8 +1901,10 @@ pub async fn launch_local_dev_cluster_with_ports(
             &format!("127.0.0.1:{}", master_tcp_port),
             "--web-ui-addr",
             &format!("127.0.0.1:{}", web_ui_port),
-            "--ephemeral-key",
+            "--dashboard-port-file",
         ]);
+        master_cmd.arg(&dash_port_file);
+        master_cmd.arg("--ephemeral-key");
     }
     let master_res = master_cmd
         .current_dir(workspace_root)
@@ -1850,14 +1916,14 @@ pub async fn launch_local_dev_cluster_with_ports(
         Ok(child) => {
             let pid = child.id();
             spawned_pids.push(format!("master:{}", pid));
-            raw_pids.push(pid);
             child
         }
         Err(e) => {
             cleanup_failed_cluster_launch(
-                &raw_pids,
+                &mut [],
                 &pid_file,
                 &json_file,
+                &dash_port_file,
                 isolated_home.as_deref(),
             );
             res.success = false;
@@ -1876,7 +1942,13 @@ pub async fn launch_local_dev_cluster_with_ports(
         web_ui_port,
         &spawned_pids,
     ) {
-        cleanup_failed_cluster_launch(&raw_pids, &pid_file, &json_file, isolated_home.as_deref());
+        cleanup_failed_cluster_launch(
+            &mut [&mut master_child],
+            &pid_file,
+            &json_file,
+            &dash_port_file,
+            isolated_home.as_deref(),
+        );
         res.duration_ms = start.elapsed().as_millis() as u64;
         res.success = false;
         res.exit_code = Some(1);
@@ -1890,7 +1962,13 @@ pub async fn launch_local_dev_cluster_with_ports(
 
     tokio::time::sleep(Duration::from_millis(250)).await;
     if let Ok(Some(status)) = master_child.try_wait() {
-        cleanup_failed_cluster_launch(&raw_pids, &pid_file, &json_file, isolated_home.as_deref());
+        cleanup_failed_cluster_launch(
+            &mut [&mut master_child],
+            &pid_file,
+            &json_file,
+            &dash_port_file,
+            isolated_home.as_deref(),
+        );
         res.duration_ms = start.elapsed().as_millis() as u64;
         res.success = false;
         res.exit_code = Some(1);
@@ -1951,14 +2029,14 @@ pub async fn launch_local_dev_cluster_with_ports(
         Ok(child) => {
             let pid = child.id();
             spawned_pids.push(format!("worker_cpu:{}", pid));
-            raw_pids.push(pid);
             child
         }
         Err(e) => {
             cleanup_failed_cluster_launch(
-                &raw_pids,
+                &mut [&mut master_child],
                 &pid_file,
                 &json_file,
+                &dash_port_file,
                 isolated_home.as_deref(),
             );
             res.duration_ms = start.elapsed().as_millis() as u64;
@@ -1977,7 +2055,13 @@ pub async fn launch_local_dev_cluster_with_ports(
         web_ui_port,
         &spawned_pids,
     ) {
-        cleanup_failed_cluster_launch(&raw_pids, &pid_file, &json_file, isolated_home.as_deref());
+        cleanup_failed_cluster_launch(
+            &mut [&mut master_child, &mut w1_child],
+            &pid_file,
+            &json_file,
+            &dash_port_file,
+            isolated_home.as_deref(),
+        );
         res.duration_ms = start.elapsed().as_millis() as u64;
         res.success = false;
         res.exit_code = Some(1);
@@ -2042,14 +2126,14 @@ pub async fn launch_local_dev_cluster_with_ports(
         Ok(child) => {
             let pid = child.id();
             spawned_pids.push(format!("worker_gpu:{}", pid));
-            raw_pids.push(pid);
             child
         }
         Err(e) => {
             cleanup_failed_cluster_launch(
-                &raw_pids,
+                &mut [&mut master_child, &mut w1_child],
                 &pid_file,
                 &json_file,
+                &dash_port_file,
                 isolated_home.as_deref(),
             );
             res.duration_ms = start.elapsed().as_millis() as u64;
@@ -2068,7 +2152,13 @@ pub async fn launch_local_dev_cluster_with_ports(
         web_ui_port,
         &spawned_pids,
     ) {
-        cleanup_failed_cluster_launch(&raw_pids, &pid_file, &json_file, isolated_home.as_deref());
+        cleanup_failed_cluster_launch(
+            &mut [&mut master_child, &mut w1_child, &mut w2_child],
+            &pid_file,
+            &json_file,
+            &dash_port_file,
+            isolated_home.as_deref(),
+        );
         res.duration_ms = start.elapsed().as_millis() as u64;
         res.success = false;
         res.exit_code = Some(1);
@@ -2091,10 +2181,11 @@ pub async fn launch_local_dev_cluster_with_ports(
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut cluster_ready = false;
     let mut failure_reason = format!(
-        "Timed out waiting for master on http://127.0.0.1:{web_ui_port}/api/status and both workers to register on 127.0.0.1:{master_tcp_port}"
+        "Master failed to bind Web UI port 127.0.0.1:{web_ui_port} (port may already be in use; dashboard port file was not written)"
     );
 
     while Instant::now() < deadline {
+        let mut child_failed: Option<String> = None;
         for (label, child) in [
             ("Master", &mut master_child),
             ("Worker dev-worker-cpu-1", &mut w1_child),
@@ -2102,36 +2193,45 @@ pub async fn launch_local_dev_cluster_with_ports(
         ] {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    failure_reason = format!("{label} exited prematurely with {status}");
-                    cleanup_failed_cluster_launch(
-                        &raw_pids,
-                        &pid_file,
-                        &json_file,
-                        isolated_home.as_deref(),
-                    );
-                    res.duration_ms = start.elapsed().as_millis() as u64;
-                    res.success = false;
-                    res.exit_code = Some(1);
-                    res.stderr = failure_reason;
-                    return res;
+                    child_failed = Some(format!("{label} exited prematurely with {status}"));
+                    break;
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    failure_reason = format!("Failed to check status of {label}: {e}");
-                    cleanup_failed_cluster_launch(
-                        &raw_pids,
-                        &pid_file,
-                        &json_file,
-                        isolated_home.as_deref(),
-                    );
-                    res.duration_ms = start.elapsed().as_millis() as u64;
-                    res.success = false;
-                    res.exit_code = Some(1);
-                    res.stderr = failure_reason;
-                    return res;
+                    child_failed = Some(format!("Failed to check status of {label}: {e}"));
+                    break;
                 }
             }
         }
+        if let Some(reason) = child_failed {
+            cleanup_failed_cluster_launch(
+                &mut [&mut master_child, &mut w1_child, &mut w2_child],
+                &pid_file,
+                &json_file,
+                &dash_port_file,
+                isolated_home.as_deref(),
+            );
+            res.duration_ms = start.elapsed().as_millis() as u64;
+            res.success = false;
+            res.exit_code = Some(1);
+            res.stderr = reason;
+            return res;
+        }
+
+        // Never poll or send the dashboard Admin token to `web_ui_port` until `--dashboard-port-file`
+        // proves that our spawned Master actually bound `web_ui_port`.
+        let dashboard_bound = fs::read_to_string(&dash_port_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            == Some(web_ui_port);
+        if !dashboard_bound {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
+        failure_reason = format!(
+            "Timed out waiting for master on http://127.0.0.1:{web_ui_port}/api/status and both workers to register on 127.0.0.1:{master_tcp_port}"
+        );
 
         if let Ok((status_code, body)) = http_get_local_status(web_ui_port, bearer_token.as_deref())
         {
@@ -2157,13 +2257,21 @@ pub async fn launch_local_dev_cluster_with_ports(
     }
 
     if !cluster_ready {
-        cleanup_failed_cluster_launch(&raw_pids, &pid_file, &json_file, isolated_home.as_deref());
+        cleanup_failed_cluster_launch(
+            &mut [&mut master_child, &mut w1_child, &mut w2_child],
+            &pid_file,
+            &json_file,
+            &dash_port_file,
+            isolated_home.as_deref(),
+        );
         res.duration_ms = start.elapsed().as_millis() as u64;
         res.success = false;
         res.exit_code = Some(1);
         res.stderr = failure_reason;
         return res;
     }
+
+    let _ = fs::remove_file(&dash_port_file);
 
     res.duration_ms = start.elapsed().as_millis() as u64;
     res.success = true;
@@ -2185,16 +2293,100 @@ pub async fn launch_local_dev_cluster_with_ports(
     res
 }
 
-/// Stops running dev cluster child processes cleanly with cross-platform termination.
+fn tracking_file_unix_secs(pid_file: &Path, json_file: &Path) -> Option<u64> {
+    if let Ok(content) = fs::read_to_string(json_file) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(ts) = val.get("launched_at_unix").and_then(|v| v.as_u64()) {
+                if ts > 0 {
+                    return Some(ts);
+                }
+            }
+        }
+    }
+    let meta = fs::metadata(pid_file)
+        .or_else(|_| fs::metadata(json_file))
+        .ok()?;
+    let mtime = meta.modified().ok()?;
+    mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+fn is_oxideswarm_cluster_process(proc: &sysinfo::Process) -> bool {
+    let matches_stem = |raw: &str| {
+        let stem = raw
+            .trim()
+            .strip_suffix(".exe")
+            .or_else(|| raw.trim().strip_suffix(".EXE"))
+            .unwrap_or(raw.trim());
+        stem.eq_ignore_ascii_case("rusty-grid") || stem.eq_ignore_ascii_case("oxideswarm")
+    };
+    if matches_stem(proc.name()) {
+        return true;
+    }
+    if let Some(exe_name) = proc
+        .exe()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+    {
+        if matches_stem(exe_name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn signal_verified_process(sys: &System, pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let _ = sys;
+        Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        sys.process(sysinfo::Pid::from_u32(pid))
+            .map(|p| p.kill())
+            .unwrap_or(false)
+    }
+}
+
+async fn wait_for_process_exit(sys: &mut System, pid: u32, timeout: Duration) -> bool {
+    let sys_pid = sysinfo::Pid::from_u32(pid);
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !sys.refresh_process(sys_pid) {
+            return true;
+        }
+        #[cfg(unix)]
+        {
+            if let Some(proc) = sys.process(sys_pid) {
+                if matches!(proc.status(), sysinfo::ProcessStatus::Zombie) {
+                    return true;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    !sys.refresh_process(sys_pid)
+}
+
+/// Stops running dev cluster child processes cleanly with ownership verification and exit waiting.
 pub async fn stop_local_dev_cluster(workspace_root: &Path) -> ModeExecutionResult {
     let mut res = ModeExecutionResult::new(WorkflowMode::Dev, "stop");
     let start = Instant::now();
 
     let pid_file = workspace_root.join(".dev_cluster.pids");
     let json_file = workspace_root.join(".dev_cluster.json");
+    let dash_port_file = workspace_root.join(".dev_cluster.dashboard_port");
     let isolated_home = workspace_root.join(".dev_cluster_home");
 
     if !pid_file.exists() && !json_file.exists() {
+        let _ = fs::remove_file(&dash_port_file);
         let _ = fs::remove_dir_all(&isolated_home);
         res.success = true;
         res.exit_code = Some(0);
@@ -2202,30 +2394,60 @@ pub async fn stop_local_dev_cluster(workspace_root: &Path) -> ModeExecutionResul
         return res;
     }
 
-    let mut pids_to_kill = Vec::new();
+    let file_unix_secs = tracking_file_unix_secs(&pid_file, &json_file);
+    let mut candidate_entries: Vec<Result<u32, String>> = Vec::new();
+    let mut seen_u64 = std::collections::HashSet::new();
+
+    let mut record_raw_pid_str = |raw_str: &str| {
+        let trimmed = raw_str.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        match trimmed.parse::<u64>() {
+            Ok(val) => {
+                if seen_u64.insert(val) {
+                    match u32::try_from(val) {
+                        Ok(pid) => candidate_entries.push(Ok(pid)),
+                        Err(_) => candidate_entries.push(Err(trimmed.to_string())),
+                    }
+                }
+            }
+            Err(_) => {
+                candidate_entries.push(Err(trimmed.to_string()));
+            }
+        }
+    };
 
     if let Ok(content) = fs::read_to_string(&pid_file) {
         for line in content.lines() {
-            if let Some((_role, pid_str)) = line.split_once(':') {
-                if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                    pids_to_kill.push(pid);
-                }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some((_role, pid_str)) = trimmed.split_once(':') {
+                record_raw_pid_str(pid_str);
+            } else {
+                record_raw_pid_str(trimmed);
             }
         }
     }
 
     if let Ok(content) = fs::read_to_string(&json_file) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(master_pid) = val.get("master_pid").and_then(|p| p.as_u64()) {
-                pids_to_kill.push(master_pid as u32);
+            if let Some(master_val) = val.get("master_pid") {
+                if let Some(master_u64) = master_val.as_u64() {
+                    record_raw_pid_str(&master_u64.to_string());
+                } else if !master_val.is_null() {
+                    record_raw_pid_str(&master_val.to_string());
+                }
             }
             if let Some(arr) = val.get("pids").and_then(|p| p.as_array()) {
                 for item in arr {
                     if let Some(line) = item.as_str() {
                         if let Some((_, pid_str)) = line.split_once(':') {
-                            if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                                pids_to_kill.push(pid);
-                            }
+                            record_raw_pid_str(pid_str);
+                        } else {
+                            record_raw_pid_str(line);
                         }
                     }
                 }
@@ -2233,44 +2455,88 @@ pub async fn stop_local_dev_cluster(workspace_root: &Path) -> ModeExecutionResul
         }
     }
 
-    pids_to_kill.sort();
-    pids_to_kill.dedup();
+    let mut sys = System::new();
+    sys.refresh_processes();
 
-    let mut stopped = 0;
-    for pid in pids_to_kill {
-        if terminate_process(pid) {
-            stopped += 1;
+    let self_pid = std::process::id();
+    let mut signalled = 0usize;
+    let mut exited = 0usize;
+    let mut skipped = 0usize;
+
+    for entry in candidate_entries {
+        let pid = match entry {
+            Ok(p) => p,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+
+        // Never signal PID <= 1 (process group / init) or ox-mode's own PID.
+        if pid <= 1 || pid == self_pid {
+            skipped += 1;
+            continue;
+        }
+
+        let sys_pid = sysinfo::Pid::from_u32(pid);
+        let Some(proc) = sys.process(sys_pid) else {
+            skipped += 1;
+            continue;
+        };
+
+        // Verify executable name matches rusty-grid / oxideswarm.
+        if !is_oxideswarm_cluster_process(proc) {
+            skipped += 1;
+            continue;
+        }
+
+        // Verify process start time against the tracking file timestamp so a reused PID after reboot
+        // or an older unrelated cluster process is never killed.
+        let proc_start = proc.start_time();
+        if proc_start > 0 {
+            if let Some(ft) = file_unix_secs {
+                if proc_start > ft.saturating_add(5) || ft > proc_start.saturating_add(120) {
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
+
+        if signal_verified_process(&sys, pid) {
+            signalled += 1;
+            if wait_for_process_exit(&mut sys, pid, Duration::from_secs(3)).await {
+                exited += 1;
+            }
+        } else if !sys.refresh_process(sys_pid) {
+            skipped += 1;
         }
     }
 
     let _ = fs::remove_file(&pid_file);
     let _ = fs::remove_file(&json_file);
+    let _ = fs::remove_file(&dash_port_file);
     let _ = fs::remove_dir_all(&isolated_home);
 
     res.duration_ms = start.elapsed().as_millis() as u64;
-    res.success = true;
-    res.exit_code = Some(0);
-    res.stdout = format!("Stopped {} dev cluster process(es) cleanly.", stopped);
-    res = res.with_metric("stopped_count", stopped);
+    res.success = signalled == exited;
+    res.exit_code = Some(if res.success { 0 } else { 1 });
+    res.stdout = format!(
+        "Dev cluster stop summary: {} signalled, {} exited, {} stale/unrelated PID entry(ies) skipped.",
+        signalled, exited, skipped
+    );
+    if !res.success {
+        res.stderr = format!(
+            "{} of {} signalled dev cluster process(es) did not exit within timeout.",
+            signalled.saturating_sub(exited),
+            signalled
+        );
+    }
+    res = res.with_metric("signalled_count", signalled);
+    res = res.with_metric("exited_count", exited);
+    res = res.with_metric("skipped_count", skipped);
+    res = res.with_metric("stopped_count", exited);
 
     res
-}
-
-fn terminate_process(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        let out = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output();
-        out.map(|o| o.status.success()).unwrap_or(false)
-    }
-    #[cfg(windows)]
-    {
-        let out = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .output();
-        out.map(|o| o.status.success()).unwrap_or(false)
-    }
 }
 
 /// Runs continuous live-reload watcher loop in the terminal.

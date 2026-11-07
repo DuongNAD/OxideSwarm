@@ -17,6 +17,8 @@ ticket.txt
 *.port
 master.port
 oxideswarm.port
+.dev_cluster.*
+.dev_cluster_home/
 /.agents/
 /scratch/
 **/scratch/
