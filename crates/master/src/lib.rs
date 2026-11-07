@@ -466,7 +466,12 @@ path = "../../tests/registered_e2e.rs"
                 "{label}: uses presets::N0 in non-ignored test code"
             ));
         }
-        if active.contains("\"--p2p\"")
+        let compact: String = active.chars().filter(|c| !c.is_whitespace()).collect();
+        let compact_without_contains = compact
+            .replace(".contains(\"--p2p\")", "")
+            .replace(".contains(\"--p2p-ticket\")", "");
+        if (compact_without_contains.contains("\"--p2p\"")
+            || compact_without_contains.contains("\"--p2p-ticket\""))
             && (active.contains("fn cli(") || active.contains("Command::new"))
         {
             let has_minimal_env = if let Some(cli_body) = extract_fn_body(&active, "fn cli(") {
@@ -476,13 +481,17 @@ path = "../../tests/registered_e2e.rs"
             };
             if !has_minimal_env {
                 violations.push(format!(
-                    "{label}: spawns --p2p binary without .env(\"RUSTY_GRID_P2P_MINIMAL\", ...)"
+                    "{label}: spawns --p2p/--p2p-ticket binary without .env(\"RUSTY_GRID_P2P_MINIMAL\", ...)"
                 ));
             }
-            let compact: String = active.chars().filter(|c| !c.is_whitespace()).collect();
             if compact.contains(".env_remove(\"RUSTY_GRID_P2P_MINIMAL\")") {
                 violations.push(format!(
-                    "{label}: removes RUSTY_GRID_P2P_MINIMAL in non-ignored --p2p test"
+                    "{label}: removes RUSTY_GRID_P2P_MINIMAL in non-ignored --p2p/--p2p-ticket test"
+                ));
+            }
+            if compact.contains(".env_clear()") {
+                violations.push(format!(
+                    "{label}: calls .env_clear() in non-ignored --p2p/--p2p-ticket test"
                 ));
             }
             let env_prefix = ".env(\"RUSTY_GRID_P2P_MINIMAL\",";
@@ -496,7 +505,7 @@ path = "../../tests/registered_e2e.rs"
                     "\"1\"" | "\"true\"" | "\"yes\"" | "\"on\""
                 ) {
                     violations.push(format!(
-                        "{label}: sets RUSTY_GRID_P2P_MINIMAL to non-enabled value {val} in non-ignored --p2p test"
+                        "{label}: sets RUSTY_GRID_P2P_MINIMAL to non-enabled value {val} in non-ignored --p2p/--p2p-ticket test"
                     ));
                 }
                 search_rest = after;
@@ -650,11 +659,24 @@ fn cli() -> Command {
 }
 
 #[test]
-fn bad_env_remove_and_false() {
+fn bad_env_remove_clear_and_false() {
     let mut c1 = cli();
     c1.env_remove("RUSTY_GRID_P2P_MINIMAL").args(["master", "--p2p"]);
     let mut c2 = cli();
     c2.env("RUSTY_GRID_P2P_MINIMAL", "0").args(["master", "--p2p"]);
+    let mut c3 = cli();
+    c3.env_clear().args(["master", "--p2p"]);
+}
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            tests_dir.join("sample_ticket_only.rs"),
+            r#"
+#[test]
+fn bad_ticket_only_worker_spawn() {
+    let _cmd = Command::new("rusty-grid").args(["worker", "--p2p-ticket", "ticket123"]);
 }
 "#,
         )
@@ -664,15 +686,19 @@ fn bad_env_remove_and_false() {
         assert_eq!(
             violations,
             vec![
-                "tests/sample_env_override.rs: removes RUSTY_GRID_P2P_MINIMAL in non-ignored --p2p test"
+                "tests/sample_env_override.rs: removes RUSTY_GRID_P2P_MINIMAL in non-ignored --p2p/--p2p-ticket test"
                     .to_string(),
-                "tests/sample_env_override.rs: sets RUSTY_GRID_P2P_MINIMAL to non-enabled value \"0\" in non-ignored --p2p test"
+                "tests/sample_env_override.rs: calls .env_clear() in non-ignored --p2p/--p2p-ticket test"
                     .to_string(),
-                "tests/sample_p2p.rs: spawns --p2p binary without .env(\"RUSTY_GRID_P2P_MINIMAL\", ...)"
+                "tests/sample_env_override.rs: sets RUSTY_GRID_P2P_MINIMAL to non-enabled value \"0\" in non-ignored --p2p/--p2p-ticket test"
+                    .to_string(),
+                "tests/sample_p2p.rs: spawns --p2p/--p2p-ticket binary without .env(\"RUSTY_GRID_P2P_MINIMAL\", ...)"
                     .to_string(),
                 "tests/sample_p2p.rs: uses .with_p2p(true) without .with_p2p_minimal_preset(true)"
                     .to_string(),
                 "tests/sample_p2p.rs: uses start_worker_impl(..., Some(...), ...) without set_p2p_minimal_preset_for_testing(true)"
+                    .to_string(),
+                "tests/sample_ticket_only.rs: spawns --p2p/--p2p-ticket binary without .env(\"RUSTY_GRID_P2P_MINIMAL\", ...)"
                     .to_string(),
             ]
         );

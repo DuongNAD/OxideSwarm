@@ -564,14 +564,16 @@ fn test_p2p_minimal_env_warns_on_stderr_and_writes_ticket_under_3s() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
     let ticket_file = dir.join("minimal_cli.ticket");
-    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "iroh=debug,info".to_string());
+    // Force `iroh=debug` in the child regardless of the parent's `RUST_LOG` so iroh relay / pkarr
+    // debug lines would always be emitted if `presets::Minimal` were not active.
+    let rust_log = "iroh=debug,info";
 
     // 1. With RUSTY_GRID_P2P_MINIMAL=1 (set by `cli(dir)`), `master --listen 127.0.0.1:0 --p2p
     //    --ephemeral-key` writes its P2P ticket in under 3 s, emits the minimal preset warning
     //    once on stderr, and makes no relay or pkarr connection attempts.
     let mut m_cmd = cli(dir);
     m_cmd
-        .env("RUST_LOG", &rust_log)
+        .env("RUST_LOG", rust_log)
         .args([
             "master",
             "--listen",
@@ -635,7 +637,7 @@ fn test_p2p_minimal_env_warns_on_stderr_and_writes_ticket_under_3s() {
     //    connection attempts.
     let mut w_cmd = cli(dir);
     w_cmd
-        .env("RUST_LOG", &rust_log)
+        .env("RUST_LOG", rust_log)
         .args([
             "worker",
             "--p2p-ticket",
