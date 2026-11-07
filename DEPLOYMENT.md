@@ -6,8 +6,11 @@ The **OxideSwarm Agent Mesh** is a communication layer enabling coding agents an
 > arbitrary programs, with the rights of the account the node runs under. The hub therefore:
 > * listens on `127.0.0.1:8088` by default; a non-loopback `--listen` needs `--token` (or `OXIDE_MESH_TOKEN`),
 >   or the explicit `--insecure` flag, which lets anyone who reaches the port run commands on every node;
-> * does **not** encrypt: `ws://` sends the token and every command in clear text. Use `wss://` behind a TLS
->   proxy, or a VPN / SSH tunnel;
+> * does **not** encrypt on its own listener: `ws://` sends the token and every command in clear text. Use `wss://`
+>   behind a TLS-terminating proxy (pass `--tls-ca <PEM/DER>` / `OXIDE_MESH_TLS_CA` when the proxy uses a private CA;
+>   the proxy certificate must be a `CA:FALSE` leaf with `subjectAltName` signed by a `CA:TRUE` root, because `rustls`
+>   refuses a single self-signed `openssl req -x509` `CA:TRUE` certificate with `CaUsedAsEndEntity`),
+>   or a VPN / SSH tunnel;
 > * must **never be published to the Internet** (no quick tunnels, no router port forward).
 >
 > This mesh is separate from the compute grid (master/workers, `README.md`), which has its own cluster secret and encrypts post-handshake TCP traffic via ChaCha20-Poly1305 (`0x04`).
@@ -315,12 +318,12 @@ The crate tests cover:
 | Subcommand | Flags | Description |
 |---|---|---|
 | `hub` | `--listen <ADDR>`, `--token <TOKEN>`, `--insecure`, `--grid-master [ADDR]` | Starts the WebSocket Relay Hub (default listen `127.0.0.1:8088`; `--grid-master` starts an embedded Master Grid for agent tasks; off loopback it needs a cluster secret or `--insecure`) |
-| `node` | `--hub <URL>`, `--id <NAME>`, `--platform <TAG>`, `--token <TOKEN>` | Starts an agent node client connected to the Hub |
-| `send` | `--hub <URL>`, `--from <ID>`, `--to <TARGET>`, `--command <CMD>`, `--args <JSON>`, `--timeout-ms <MS>`, `--token <TOKEN>` | Sends a command to a specific node and prints execution output |
-| `list` | `--hub <URL>`, `--from <ID>`, `--token <TOKEN>` | Prints all currently online nodes registered with the Hub |
-| `data` | `--hub <URL>`, `--from <ID>`, `--to <TARGET>`, `--payload <STR>`, `--token <TOKEN>` | Sends a verified data payload to a target node |
+| `node` | `--hub <URL>`, `--id <NAME>`, `--platform <TAG>`, `--token <TOKEN>`, `--tls-ca <PATH>`, `--no-shell` | Starts an agent node client connected to the Hub |
+| `send` | `--hub <URL>`, `--from <ID>`, `--to <TARGET>`, `--command <CMD>`, `--args <JSON>`, `--timeout-ms <MS>`, `--token <TOKEN>`, `--tls-ca <PATH>` | Sends a command to a specific node and prints execution output |
+| `list` | `--hub <URL>`, `--from <ID>`, `--token <TOKEN>`, `--tls-ca <PATH>` | Prints all currently online nodes registered with the Hub |
+| `data` | `--hub <URL>`, `--from <ID>`, `--to <TARGET>`, `--payload <STR>`, `--token <TOKEN>`, `--tls-ca <PATH>` | Sends a verified data payload to a target node |
 
-`--token` reads `OXIDE_MESH_TOKEN` when not given. Default hub URL for the client subcommands is `ws://127.0.0.1:8088/ws`
+`--token` reads `OXIDE_MESH_TOKEN` when not given, and `--tls-ca` reads `OXIDE_MESH_TLS_CA` (an empty value means unset). Default hub URL for the client subcommands is `ws://127.0.0.1:8088/ws`
 (add `--hub ws://127.0.0.1:8090/ws` when the hub runs on 8090 as in the examples above).
 
 ---

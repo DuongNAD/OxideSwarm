@@ -319,4 +319,199 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = handle.await;
     }
+
+    #[tokio::test]
+    async fn test_reaper_reaps_laptop_battery_worker_at_configured_reaper_timeout() {
+        use rusty_grid_core::capabilities::{MobileCapabilities, MobileLiveStatus};
+
+        let registry = WorkerRegistry::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let worker_id = Uuid::new_v4();
+        let mut caps =
+            WorkerCapabilities::new("laptop-battery-worker", 4, 8192, false, false, None);
+        caps.mobile = Some(MobileCapabilities {
+            os_version: "macOS 14.5".into(),
+            soc_model: "Apple M2".into(),
+            battery_pct: Some(78),
+            is_charging: Some(false),
+            thermal_throttled: false,
+        });
+
+        let session = registry
+            .register(worker_id, caps, "127.0.0.1:9002".parse().unwrap(), tx, None)
+            .await
+            .unwrap();
+        registry
+            .update_mobile_telemetry(
+                &worker_id,
+                Some(session),
+                MobileLiveStatus {
+                    battery_pct: Some(77),
+                    is_charging: Some(false),
+                    network_type: None,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        registry
+            .record_heartbeat(&worker_id, 0, 100, 12.0, 6000, Some(session))
+            .await
+            .unwrap();
+
+        let real_interval = Duration::from_millis(25);
+        let reaper_window = real_interval * 4;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = ReaperConfig::new(Duration::from_millis(10), reaper_window);
+        let handle = spawn_reaper(registry.clone(), config, shutdown_rx);
+
+        // Before 4 * real_interval (at 2 * real_interval), the battery worker is still Connected.
+        tokio::time::sleep(real_interval * 2).await;
+        assert_eq!(
+            registry.get_worker(worker_id).await.unwrap().status,
+            WorkerStatus::Connected
+        );
+
+        // Once 4 * real_interval has elapsed, the reaper marks the battery worker Disconnected
+        // instead of waiting 240 s (4 * 60 s).
+        tokio::time::sleep(real_interval * 4).await;
+        assert_eq!(
+            registry.get_worker(worker_id).await.unwrap().status,
+            WorkerStatus::Disconnected
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_reaper_keeps_wifi_and_cellular_phones_alive_until_four_times_interval() {
+        use rusty_grid_core::capabilities::{MobileCapabilities, MobileLiveStatus};
+
+        let registry = WorkerRegistry::new();
+        let (tx1, _rx1) = mpsc::channel(16);
+        let (tx2, _rx2) = mpsc::channel(16);
+        let wifi_id = Uuid::new_v4();
+        let cell_id = Uuid::new_v4();
+
+        let mut wifi_caps = WorkerCapabilities::new("wifi-phone", 4, 4096, false, false, None);
+        wifi_caps.mobile = Some(MobileCapabilities {
+            os_version: "Android 14".into(),
+            soc_model: "Snapdragon 8 Gen 2".into(),
+            battery_pct: Some(85),
+            is_charging: Some(false),
+            thermal_throttled: false,
+        });
+        let cell_caps = wifi_caps.clone();
+
+        let wifi_session = registry
+            .register(
+                wifi_id,
+                wifi_caps,
+                "127.0.0.1:9003".parse().unwrap(),
+                tx1,
+                None,
+            )
+            .await
+            .unwrap();
+        let cell_session = registry
+            .register(
+                cell_id,
+                cell_caps,
+                "127.0.0.1:9004".parse().unwrap(),
+                tx2,
+                None,
+            )
+            .await
+            .unwrap();
+
+        registry
+            .update_mobile_telemetry(
+                &wifi_id,
+                Some(wifi_session),
+                MobileLiveStatus {
+                    battery_pct: Some(85),
+                    is_charging: Some(false),
+                    network_type: Some("wifi".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        registry
+            .update_mobile_telemetry(
+                &cell_id,
+                Some(cell_session),
+                MobileLiveStatus {
+                    battery_pct: Some(85),
+                    is_charging: Some(false),
+                    network_type: Some("cellular".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Spawn reaper with a short 50 ms default timeout: neither the 60 s Wi-Fi phone (240 s
+        // window) nor the 25 s cellular phone (100 s window) may be reaped after 120 ms.
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = ReaperConfig::new(Duration::from_millis(15), Duration::from_millis(50));
+        let handle = spawn_reaper(registry.clone(), config, shutdown_rx);
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            registry.get_worker(wifi_id).await.unwrap().status,
+            WorkerStatus::Connected,
+            "Wi-Fi phone with 60 s interval must survive past the 50 ms default reaper timeout"
+        );
+        assert_eq!(
+            registry.get_worker(cell_id).await.unwrap().status,
+            WorkerStatus::Connected,
+            "Cellular phone with 25 s interval must survive past the 50 ms default reaper timeout"
+        );
+
+        // At 95 s of silence: cellular (100 s window) and Wi-Fi (240 s window) are both still Connected.
+        registry
+            .backdate_last_heartbeat(&cell_id, Duration::from_secs(95))
+            .await;
+        registry
+            .backdate_last_heartbeat(&wifi_id, Duration::from_secs(235))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            registry.get_worker(cell_id).await.unwrap().status,
+            WorkerStatus::Connected
+        );
+        assert_eq!(
+            registry.get_worker(wifi_id).await.unwrap().status,
+            WorkerStatus::Connected
+        );
+
+        // At 105 s of silence, cellular (4 × 25 s = 100 s) is reaped while Wi-Fi at 235 s stays Connected.
+        registry
+            .backdate_last_heartbeat(&cell_id, Duration::from_secs(105))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            registry.get_worker(cell_id).await.unwrap().status,
+            WorkerStatus::Disconnected
+        );
+        assert_eq!(
+            registry.get_worker(wifi_id).await.unwrap().status,
+            WorkerStatus::Connected
+        );
+
+        // At 245 s of silence, Wi-Fi (4 × 60 s = 240 s) is reaped.
+        registry
+            .backdate_last_heartbeat(&wifi_id, Duration::from_secs(245))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            registry.get_worker(wifi_id).await.unwrap().status,
+            WorkerStatus::Disconnected
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = handle.await;
+    }
 }

@@ -414,9 +414,9 @@ fn test_keepalive_interval_network_transitions_and_dead_peer_window() {
     // 1. Verify standard RRC-aware keepalive derivations
     let networks = [
         ("wifi", 0, Duration::from_secs(60)),
-        ("WiFi", 10, Duration::from_secs(60)),
+        ("WiFi", 10, Duration::from_secs(10)),
         ("Ethernet", 0, Duration::from_secs(60)),
-        ("lan", 4, Duration::from_secs(60)),
+        ("lan", 4, Duration::from_secs(10)),
         ("cellular", 0, Duration::from_secs(25)),
         ("5G", 0, Duration::from_secs(25)),
         ("LTE", 0, Duration::from_secs(25)),

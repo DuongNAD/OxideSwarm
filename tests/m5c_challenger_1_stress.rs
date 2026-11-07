@@ -272,7 +272,7 @@ async fn test_mcp_protocol_framing_stress() {
     // Mcp process can run framing checks against dummy master since framing errors are local to stdio loop
     let mut mcp = McpProcess::spawn(home.path(), "127.0.0.1:9", None);
 
-    // 1.1 Non-JSON raw strings
+    // 1.1 Non-JSON raw strings (PARSE_ERROR -32700)
     let raw_garbage_cases = [
         "THIS_IS_NOT_JSON",
         "<<< XML TAG >>>",
@@ -281,17 +281,17 @@ async fn test_mcp_protocol_framing_stress() {
         "{ not closed",
         "{\"jsonrpc\": \"2.0\", \"id\": 1,",
         "{\"jsonrpc\": \"2.0\", \"id\": }",
-        "[1, 2, 3]",
-        "\"raw string literal\"",
-        "12345678",
-        "null",
-        "true",
     ];
 
     for (idx, garbage) in raw_garbage_cases.iter().enumerate() {
         mcp.send_line(garbage);
         let resp = mcp.read_json_response();
         assert_eq!(resp["jsonrpc"], "2.0", "case {idx}: jsonrpc must be 2.0");
+        assert_eq!(
+            resp.get("id"),
+            Some(&Value::Null),
+            "case {idx} ('{garbage}') must include \"id\": null"
+        );
         assert!(
             resp.get("error").is_some(),
             "case {idx} ('{garbage}') must return error object"
@@ -303,13 +303,56 @@ async fn test_mcp_protocol_framing_stress() {
         );
     }
 
-    // 1.2 Empty lines and whitespace (must be skipped gracefully with no reply and no crash)
+    // 1.1b Valid JSON that is not a JSON-RPC Request object (INVALID_REQUEST -32600)
+    let non_request_json_cases = [
+        "[1, 2, 3]",
+        "\"raw string literal\"",
+        "12345678",
+        "null",
+        "true",
+    ];
+
+    for (idx, non_req) in non_request_json_cases.iter().enumerate() {
+        mcp.send_line(non_req);
+        let resp = mcp.read_json_response();
+        assert_eq!(
+            resp["jsonrpc"], "2.0",
+            "non-request case {idx}: jsonrpc must be 2.0"
+        );
+        assert_eq!(
+            resp.get("id"),
+            Some(&Value::Null),
+            "non-request case {idx} ('{non_req}') must include \"id\": null"
+        );
+        let err_code = resp["error"]["code"].as_i64().expect("error code");
+        assert_eq!(
+            err_code, -32600,
+            "non-request case {idx} ('{non_req}') expected INVALID_REQUEST (-32600), got {err_code}"
+        );
+    }
+
+    // 1.2 Empty lines, whitespace, and notifications without an id (must be dropped silently with no reply)
     mcp.send_line("");
     mcp.send_line("   ");
     mcp.send_line("\t\t\t");
     mcp.send_line("\r");
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 999999, "reason": "no-op cancel notification" }
+        })
+        .to_string(),
+    );
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/roots/list_changed"
+        })
+        .to_string(),
+    );
 
-    // Verify server is still alive after whitespace by sending a ping
+    // Verify server is still alive and emitted no reply for the notifications above by sending a ping
     mcp.send_line(
         &json!({
             "jsonrpc": "2.0",
@@ -322,11 +365,11 @@ async fn test_mcp_protocol_framing_stress() {
     assert_eq!(ping_resp["id"], 100);
     assert_eq!(ping_resp["result"], json!({}));
 
-    // 1.3 Missing required JSON-RPC fields
+    // 1.3 Missing required JSON-RPC fields (INVALID_REQUEST -32600)
     let missing_field_cases = [
-        ("{}", -32700),
-        ("{\"id\": 101, \"method\": \"ping\"}", -32700), // missing jsonrpc
-        ("{\"jsonrpc\": \"2.0\", \"id\": 102}", -32700), // missing method
+        ("{}", -32600),
+        ("{\"id\": 101, \"method\": \"ping\"}", -32600), // missing jsonrpc
+        ("{\"jsonrpc\": \"2.0\", \"id\": 102}", -32600), // missing method
     ];
 
     for (idx, (payload, expected_code)) in missing_field_cases.iter().enumerate() {
@@ -416,6 +459,36 @@ async fn test_mcp_protocol_framing_stress() {
         assert_eq!(resp["result"], json!({}));
     }
 
+    // 1.6b Invalid id types (boolean, array, object) return INVALID_REQUEST (-32600) with "id": null
+    let bad_id_cases = [
+        json!(true),
+        json!(false),
+        json!([1, 2]),
+        json!({"nested": "id"}),
+    ];
+    for (idx, bad_id) in bad_id_cases.iter().enumerate() {
+        mcp.send_line(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": bad_id,
+                "method": "ping"
+            })
+            .to_string(),
+        );
+        let resp = mcp.read_json_response();
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(
+            resp.get("id"),
+            Some(&Value::Null),
+            "bad id case {idx} ({bad_id}) must include \"id\": null"
+        );
+        let err_code = resp["error"]["code"].as_i64().expect("error code");
+        assert_eq!(
+            err_code, -32600,
+            "bad id case {idx} ({bad_id}) expected INVALID_REQUEST (-32600), got {err_code}"
+        );
+    }
+
     // 1.7 Stream liveness check: After all the stress above, server responds cleanly to tools/list
     mcp.send_line(
         &json!({
@@ -498,11 +571,11 @@ async fn test_mcp_tool_adversarial_validation() {
     );
     let unknown_tool_resp = mcp.read_json_response();
     assert_eq!(unknown_tool_resp["id"], 3);
-    assert_eq!(unknown_tool_resp["result"]["isError"], true);
-    let text = unknown_tool_resp["result"]["content"][0]["text"]
+    assert_eq!(unknown_tool_resp["error"]["code"], -32602);
+    assert!(unknown_tool_resp["error"]["message"]
         .as_str()
-        .unwrap();
-    assert!(text.contains("Unknown tool: 'non_existent_tool_xyz'"));
+        .unwrap()
+        .contains("Unknown tool: 'non_existent_tool_xyz'"));
 
     // 2.3 `status` tool adversarial validation
     // - Invalid UUID format
@@ -530,10 +603,10 @@ async fn test_mcp_tool_adversarial_validation() {
         let resp = mcp.read_json_response();
         assert_eq!(resp["id"], req_id);
         assert_eq!(
-            resp["result"]["isError"], true,
-            "bad uuid '{bad_uuid}' must yield isError=true"
+            resp["error"]["code"], -32602,
+            "bad uuid '{bad_uuid}' must yield INVALID_PARAMS (-32602): {resp}"
         );
-        let err_text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let err_text = resp["error"]["message"].as_str().unwrap();
         assert!(
             err_text.contains("Invalid task_id UUID"),
             "expected 'Invalid task_id UUID' in '{err_text}'"
@@ -653,6 +726,48 @@ async fn test_mcp_tool_adversarial_validation() {
     assert_eq!(ef_arr.len(), 1, "expected 1 connected worker");
 
     // 2.5 `submit` tool adversarial validation
+    // - Empty submit (`submit {}`) returns INVALID_PARAMS (-32602) and queues nothing
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 38,
+            "method": "tools/call",
+            "params": {
+                "name": "submit",
+                "arguments": {}
+            }
+        })
+        .to_string(),
+    );
+    let empty_submit_resp = mcp.read_json_response();
+    assert_eq!(empty_submit_resp["id"], 38);
+    assert_eq!(empty_submit_resp["error"]["code"], -32602);
+    assert!(
+        cluster.master.queue().list_tasks().await.is_empty(),
+        "submit {{}} must not queue any task on the master"
+    );
+
+    // - Unknown task type returns INVALID_PARAMS (-32602) and queues nothing
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 39,
+            "method": "tools/call",
+            "params": {
+                "name": "submit",
+                "arguments": { "type": "unknown_type", "command": "echo" }
+            }
+        })
+        .to_string(),
+    );
+    let unknown_type_resp = mcp.read_json_response();
+    assert_eq!(unknown_type_resp["id"], 39);
+    assert_eq!(unknown_type_resp["error"]["code"], -32602);
+    assert!(
+        cluster.master.queue().list_tasks().await.is_empty(),
+        "submit with unknown type must not queue any task on the master"
+    );
+
     // - Shell task missing script and command
     mcp.send_line(
         &json!({
@@ -668,11 +783,9 @@ async fn test_mcp_tool_adversarial_validation() {
     );
     let shell_missing_resp = mcp.read_json_response();
     assert_eq!(shell_missing_resp["id"], 40);
-    assert_eq!(shell_missing_resp["result"]["isError"], true);
-    let sm_text = shell_missing_resp["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap();
-    assert!(sm_text.contains("Shell task requires 'script' or 'command'"));
+    assert_eq!(shell_missing_resp["error"]["code"], -32602);
+    let sm_text = shell_missing_resp["error"]["message"].as_str().unwrap();
+    assert!(sm_text.contains("Shell task requires"));
 
     // - Non-existent staged file
     mcp.send_line(
@@ -760,10 +873,10 @@ async fn test_mcp_tool_adversarial_validation() {
         let resp = mcp.read_json_response();
         assert_eq!(resp["id"], req_id);
         assert_eq!(
-            resp["result"]["isError"], true,
-            "bad tag '{bad_tag}' must fail"
+            resp["error"]["code"], -32602,
+            "bad tag '{bad_tag}' must fail with INVALID_PARAMS (-32602): {resp}"
         );
-        let tag_err_text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let tag_err_text = resp["error"]["message"].as_str().unwrap();
         assert!(tag_err_text.contains("Invalid placement constraints"));
     }
 
@@ -783,8 +896,8 @@ async fn test_mcp_tool_adversarial_validation() {
     );
     let missing_tid_resp = mcp.read_json_response();
     assert_eq!(missing_tid_resp["id"], 70);
-    assert_eq!(missing_tid_resp["result"]["isError"], true);
-    assert!(missing_tid_resp["result"]["content"][0]["text"]
+    assert_eq!(missing_tid_resp["error"]["code"], -32602);
+    assert!(missing_tid_resp["error"]["message"]
         .as_str()
         .unwrap()
         .contains("Missing required property 'task_id'"));
@@ -804,8 +917,8 @@ async fn test_mcp_tool_adversarial_validation() {
     );
     let bad_tid_resp = mcp.read_json_response();
     assert_eq!(bad_tid_resp["id"], 71);
-    assert_eq!(bad_tid_resp["result"]["isError"], true);
-    assert!(bad_tid_resp["result"]["content"][0]["text"]
+    assert_eq!(bad_tid_resp["error"]["code"], -32602);
+    assert!(bad_tid_resp["error"]["message"]
         .as_str()
         .unwrap()
         .contains("Invalid task_id UUID"));
@@ -853,7 +966,7 @@ async fn test_mcp_tool_adversarial_validation() {
     assert_eq!(zero_timeout_resp["result"]["isError"], true);
 
     // 2.7 `doctor` tool adversarial validation
-    // - Negative worker expectation (falls back safely to default 1)
+    // - Negative worker expectation returns INVALID_PARAMS (-32602)
     mcp.send_line(
         &json!({
             "jsonrpc": "2.0",
@@ -872,15 +985,9 @@ async fn test_mcp_tool_adversarial_validation() {
     );
     let doc_neg_resp = mcp.read_json_response();
     assert_eq!(doc_neg_resp["id"], 80);
-    assert_eq!(doc_neg_resp["result"]["isError"], false);
-    let doc_neg_text = doc_neg_resp["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap();
-    let doc_neg_val: Value = serde_json::from_str(doc_neg_text).unwrap();
-    assert_eq!(doc_neg_val["checks"][0]["id"], "C1");
-    assert_eq!(doc_neg_val["checks"][0]["outcome"], "pass");
+    assert_eq!(doc_neg_resp["error"]["code"], -32602);
 
-    // - Extreme worker expectation (C2 fails cleanly without panicking)
+    // - Extreme worker expectation (C2 fails cleanly and sets isError: true)
     mcp.send_line(
         &json!({
             "jsonrpc": "2.0",
@@ -899,7 +1006,7 @@ async fn test_mcp_tool_adversarial_validation() {
     );
     let doc_ext_resp = mcp.read_json_response();
     assert_eq!(doc_ext_resp["id"], 81);
-    assert_eq!(doc_ext_resp["result"]["isError"], false);
+    assert_eq!(doc_ext_resp["result"]["isError"], true);
     let doc_ext_text = doc_ext_resp["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
@@ -985,6 +1092,8 @@ async fn test_mcp_stdout_hygiene_under_intense_stress_and_disconnection() {
         let req_id = 1000 + idx as i64;
         let args = if *tool_name == "task_result" {
             json!({ "task_id": "00000000-0000-0000-0000-000000000000" })
+        } else if *tool_name == "submit" {
+            json!({ "type": "command", "command": "echo" })
         } else {
             json!({})
         };
