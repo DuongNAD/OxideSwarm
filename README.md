@@ -486,11 +486,11 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 #### `agent-mesh` CLI Subcommands (`crates/agent_mesh`)
 | Subcommand | Flags | Description |
 | :--- | :--- | :--- |
-| `agent-mesh hub` | `-p` / `--port <PORT>` (default `8088`), `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--insecure`, `--grid-master [<ADDR>]` (`OXIDE_GRID_MASTER`), `--secret <SECRET>` (`OXIDESWARM_SECRET`), `--max-active-mb <MB>` (`RUSTY_GRID_MAX_ACTIVE_MB`) | Start the WebSocket/HTTP Agent Mesh Relay Hub (and optional co-hosted Grid Master when `--grid-master` is passed) |
-| `agent-mesh node` | `--hub <URL>` (default `ws://127.0.0.1:8088/ws`), `-n` / `--name <NAME>`, `-r` / `--role <ROLE>` (default `worker`), `--no-shell` (`OXIDE_MESH_NO_SHELL`), `--token <TOKEN>` (`OXIDE_MESH_TOKEN`) | Connect a persistent agent mesh node to the hub |
-| `agent-mesh submit` | `--hub <URL>`, `--cmd <CMD>`, `--target-node <ID>`, `--target-os <OS>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`) | Dispatch a shell command to a mesh node via the hub |
-| `agent-mesh compile` | `--hub <URL>`, `--file <FILE>`, `--target-os <OS>` (default `linux`), `--target-node <ID>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`) | Send a Rust source file through the hub to the embedded Grid Master for distributed compilation |
-| `agent-mesh status` | `--hub <URL>` (default `http://127.0.0.1:8088`), `--token <TOKEN>` (`OXIDE_MESH_TOKEN`) | Query connected agent mesh nodes from the hub |
+| `agent-mesh hub` | `-l` / `--listen <ADDR>` (default `127.0.0.1:8088`), `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--insecure`, `--grid-master [<ADDR>]` (`OXIDE_GRID_MASTER`), `--secret <SECRET>` (`OXIDESWARM_SECRET`), `--max-active-mb <MB>` (`RUSTY_GRID_MAX_ACTIVE_MB`) | Start the WebSocket/HTTP Agent Mesh Relay Hub (and optional co-hosted Grid Master when `--grid-master` is passed) |
+| `agent-mesh node` (alias `agent`) | `--hub <URL>` (default `ws://127.0.0.1:8088/ws`; supports `wss://`), `--id <ID>`, `--platform <PLATFORM>`, `--no-shell`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Connect a persistent agent mesh node to the hub |
+| `agent-mesh send` | `--hub <URL>`, `--from <ID>`, `--to <ID>`, `-c` / `--command <CMD>`, `-a` / `--args <JSON>`, `--timeout-ms <MS>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Dispatch a structured command to a mesh node via the hub |
+| `agent-mesh list` | `--hub <URL>`, `--from <ID>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Query the catalog of active nodes connected to the hub |
+| `agent-mesh data` | `--hub <URL>`, `--from <ID>`, `--to <ID>`, `--payload <TEXT>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Transmit a data payload with SHA-256 verification to a target node |
 
 ### Network Port Topology
 
@@ -631,6 +631,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
 | `OXIDE_MESH_TOKEN` | Agent Mesh | Shared token authenticating `agent-mesh` nodes and HTTP API callers against `agent-mesh hub` (`--token`; stripped from child task environments) |
+| `OXIDE_MESH_TLS_CA` | Agent Mesh | Path to an additional trusted CA certificate (PEM or DER) for `wss://` hub connections behind a private TLS proxy (`--tls-ca`; proxy leaf certificate must have `CA:FALSE` and `subjectAltName`, signed by a `CA:TRUE` root) |
 | `OXIDE_MESH_NO_SHELL` | Agent Mesh / Launchers | When set to `1`, disables `shell_exec` command execution on node launchers (`--no-shell`) |
 | `OXIDE_GRID_MASTER` | Agent Mesh | Bind address for the embedded Grid Master inside `agent-mesh hub` (`--grid-master`) |
 

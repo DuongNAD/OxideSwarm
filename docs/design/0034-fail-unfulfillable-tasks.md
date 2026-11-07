@@ -45,7 +45,7 @@ Before this change (`SCHED-3` in `docs/BACKLOG.md`):
     - If `nobody_fits` (`!self.registered.iter().any(|w| statically_fits(&view.requirements, w) && placement_admits(placement, w) && (!view.requires_gpu || w.capabilities.can_execute_gpu()) && w.features.contains(view.required_features))`): `Verdict::Unfulfillable(format!("No registered worker satisfies task requirements (cpu_cores={}, ram_mb={}, gpu={})", view.requirements.cpu_cores, view.requirements.ram_mb, view.requires_gpu))`.
   - `Verdict::Skip(ScheduleSkipReason)` when no seat in `self.seats` can run the task right now.
   - `Verdict::Placed(usize)` when a seat in `self.seats` is selected.
-- `WorkloadScheduler` stores `unfulfillable_sweep: std::sync::Mutex<UnfulfillableSweep>` tracking `epochs: Option<(u64, u64)>` (`(registration_epoch, ready_epoch)`, where `TaskQueue::ready_epoch` increments whenever a task enters `ready_queue` via `TaskQueueInner::insert_ready`), `cursor: Option<QueueOrderKey>`, and `completed: bool`. When `ready_queue` is longer than `max_scan_per_pass`, saturated passes (`engine.free_slots == 0`) resume from `cursor` and set `completed = true` once `ready_views` reaches the end of the queue (`next == None`), after which subsequent saturated passes with unchanged `(registration_epoch, ready_epoch)` make no `ready_views` call.
+- `WorkloadScheduler` stores `unfulfillable_sweep: std::sync::Mutex<UnfulfillableSweep>` tracking `epochs: Option<(u64, u64)>` (`(registration_epoch, ready_epoch)`, where `TaskQueue::ready_epoch` increments whenever a task enters `ready_queue` via `TaskQueueInner::insert_ready`), `cursor: Option<QueueOrderKey>`, and `completed: bool`. When `ready_queue` is longer than `max_scan_per_pass`, saturated passes (`engine.free_slots == 0`) resume from `cursor` (and passes with `engine.free_slots > 0` start placement from `None` and then continue the unfulfillable sweep from `cursor` if the placement walk exhausted `max_scan_per_pass` without advancing past `cursor`), setting `completed = true` once `ready_views` reaches the end of the queue (`next == None`), after which subsequent saturated passes with unchanged `(registration_epoch, ready_epoch)` make no `ready_views` call.
 
 ### D2 Queue transition and waiter notification (`TaskQueue::fail_unfulfillable_task`)
 
@@ -74,6 +74,8 @@ Before this change (`SCHED-3` in `docs/BACKLOG.md`):
 - Unit tests in `scheduler::tests` (`crates/master/src/scheduler.rs`):
   - `test_fail_unfulfillable_tasks_default_false_keeps_queued_and_true_fails_with_reason_and_wakes_waiter`
   - `test_fail_unfulfillable_tasks_sweep_cursor_scans_large_queue_once_across_saturated_passes`
+  - `test_fail_unfulfillable_tasks_cursor_resets_on_epoch_change_and_placement_ignores_sweep_cursor`
+  - `test_fail_unfulfillable_tasks_continues_sweep_beyond_scan_budget_when_unused_free_slot_remains`
   - `test_fail_unfulfillable_tasks_keeps_gpu_task_queued_when_gpu_worker_is_disconnected_until_pruned`
   - `test_fail_unfulfillable_tasks_keeps_gpu_task_queued_when_gpu_worker_is_cooling_down_until_pruned`
   - `test_fail_unfulfillable_tasks_combined_placement_and_gpu_checks_in_nobody_fits`

@@ -383,6 +383,36 @@ struct Engine<'a> {
     reserved: Vec<bool>,
 }
 
+/// Returns the latest [`MobileLiveStatus`] for `worker`, preferring the live telemetry snapshot
+/// stored on [`WorkerInfo::mobile_status`] and falling back to [`MobileCapabilities::live_status`]
+/// when only the registration snapshot is present.
+fn effective_mobile_live_status(worker: &WorkerInfo) -> Option<MobileLiveStatus> {
+    match (&worker.mobile_status, &worker.capabilities.mobile) {
+        (Some(live), Some(cap)) => Some(MobileLiveStatus {
+            battery_pct: live.battery_pct.or(cap.battery_pct),
+            is_charging: live.is_charging.or(cap.is_charging),
+            thermal_throttled: live.thermal_throttled || cap.thermal_throttled,
+            battery_temperature: live.battery_temperature,
+            network_type: live.network_type.clone(),
+            battery_tier: live.battery_tier,
+            thermal_tier: live.thermal_tier,
+        }),
+        (Some(live), None) => Some(live.clone()),
+        (None, Some(cap)) => Some(cap.live_status()),
+        (None, None) => None,
+    }
+}
+
+/// Returns the effective [`ThermalTier`] for scheduling on `worker`, combining any explicit tier
+/// from [`MobileLiveStatus::thermal_tier`] with the tier derived from battery temperature and the
+/// OS throttle flag (`max` so neither a high temperature reading nor an explicit tier is ignored).
+fn effective_scheduler_thermal_tier(live: &MobileLiveStatus) -> ThermalTier {
+    let computed =
+        MobileLiveStatus::compute_thermal_tier(live.battery_temperature, live.thermal_throttled);
+    live.thermal_tier
+        .map_or(computed, |tier| tier.max(computed))
+}
+
 /// Returns the effective [`BatteryTier`] for scheduling on `worker`.
 ///
 /// Desktop/laptop operating systems (`macOS`, `Windows`, non-Android `Linux`) populate
@@ -393,7 +423,7 @@ struct Engine<'a> {
 /// GPU and compilation workloads.
 fn effective_scheduler_battery_tier(
     worker: &WorkerInfo,
-    mobile: &rusty_grid_core::capabilities::MobileCapabilities,
+    mobile: Option<&rusty_grid_core::capabilities::MobileCapabilities>,
     live: &MobileLiveStatus,
 ) -> BatteryTier {
     let raw = live.battery_tier.unwrap_or_else(|| {
@@ -402,7 +432,9 @@ fn effective_scheduler_battery_tier(
     if raw == BatteryTier::Critical {
         return BatteryTier::Critical;
     }
-    let os = mobile.os_version.to_ascii_lowercase();
+    let os = mobile
+        .map(|m| m.os_version.to_ascii_lowercase())
+        .unwrap_or_default();
     let is_mobile_os = os.contains("android")
         || os.contains("ios")
         || worker
@@ -450,15 +482,13 @@ impl<'a> Engine<'a> {
                 };
                 let mut max_slots = config.effective_max_concurrency(worker);
                 let mut max_tasks = config.effective_max_tasks(worker);
-                if let Some(ref mobile) = worker.capabilities.mobile {
-                    let live = mobile.live_status();
-                    let bat = effective_scheduler_battery_tier(worker, mobile, &live);
-                    let therm = live.thermal_tier.unwrap_or_else(|| {
-                        MobileLiveStatus::compute_thermal_tier(
-                            live.battery_temperature,
-                            live.thermal_throttled,
-                        )
-                    });
+                if let Some(live) = effective_mobile_live_status(worker) {
+                    let bat = effective_scheduler_battery_tier(
+                        worker,
+                        worker.capabilities.mobile.as_ref(),
+                        &live,
+                    );
+                    let therm = effective_scheduler_thermal_tier(&live);
                     let eff =
                         calculate_effective_concurrency(worker.capabilities.cpu_cores, bat, therm);
                     max_slots = max_slots.min(eff);
@@ -688,18 +718,15 @@ impl<'a> Engine<'a> {
             }
 
             // Stage 4: Mobile & Environmental Constraints via capability tags and mobile telemetry
+            let live_mobile = effective_mobile_live_status(worker);
             let is_thermal_throttled = worker
                 .capabilities
                 .tags
                 .iter()
                 .any(|t| t == "thermal_throttled")
-                || worker
-                    .capabilities
-                    .mobile
-                    .as_ref()
-                    .is_some_and(|m| m.thermal_throttled);
+                || live_mobile.as_ref().is_some_and(|m| m.thermal_throttled);
             let is_low_battery = worker.capabilities.tags.iter().any(|t| t == "low_battery")
-                || worker.capabilities.mobile.as_ref().is_some_and(|m| {
+                || live_mobile.as_ref().is_some_and(|m| {
                     m.battery_pct
                         .is_some_and(|pct| pct < config.mobile_min_battery_pct)
                         && m.is_charging == Some(false)
@@ -712,15 +739,13 @@ impl<'a> Engine<'a> {
                 continue;
             }
 
-            if let Some(ref mobile) = worker.capabilities.mobile {
-                let live = mobile.live_status();
-                let bat = effective_scheduler_battery_tier(worker, mobile, &live);
-                let therm = live.thermal_tier.unwrap_or_else(|| {
-                    MobileLiveStatus::compute_thermal_tier(
-                        live.battery_temperature,
-                        live.thermal_throttled,
-                    )
-                });
+            if let Some(ref live) = live_mobile {
+                let bat = effective_scheduler_battery_tier(
+                    worker,
+                    worker.capabilities.mobile.as_ref(),
+                    live,
+                );
+                let therm = effective_scheduler_thermal_tier(live);
                 let is_charging = live.is_charging.unwrap_or(false);
 
                 // Zero effective concurrency means complete load-shedding
@@ -1173,10 +1198,27 @@ impl WorkloadScheduler {
                 None
             };
             let mut scanned = 0usize;
+            let mut sweeping_from_cursor = engine.free_slots == 0;
             let scan_budget = self.config.max_scan_per_pass.max(1);
             'scan: loop {
                 let page_limit = SCAN_PAGE.min(scan_budget.saturating_sub(scanned));
                 if page_limit == 0 {
+                    if !sweeping_from_cursor
+                        && need_unfulfillable_sweep
+                        && sweep_cursor.is_some()
+                        && self
+                            .unfulfillable_sweep
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .cursor
+                            == sweep_cursor
+                    {
+                        sweeping_from_cursor = true;
+                        engine.free_slots = 0;
+                        cursor = sweep_cursor;
+                        scanned = 0;
+                        continue 'scan;
+                    }
                     break;
                 }
                 let (views, next) = self.queue.ready_views(cursor, page_limit).await;
@@ -1494,6 +1536,7 @@ mod tests {
             cpu_usage_pct: 0.0,
             ram_available_mb: ram_mb,
             features: ProtocolCapabilities::all_supported(),
+            mobile_status: None,
         }
     }
 
@@ -3154,6 +3197,110 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_mobile_status_thermal_tiers_hot_caps_to_one_slot_and_critical_sheds_all_load() {
+        let config = SchedulerConfig::default();
+
+        let mut phone = make_worker("pixel-9-pro", 8, 12288, false, false);
+        phone.capabilities.tags.push("os:android".into());
+        phone.capabilities.mobile = Some(rusty_grid_core::capabilities::MobileCapabilities {
+            os_version: "Android 15 (API 35)".into(),
+            soc_model: "Tensor G4".into(),
+            battery_pct: Some(85),
+            is_charging: Some(true),
+            thermal_throttled: false,
+        });
+
+        let light_tasks: Vec<Task> = (0..6)
+            .map(|i| {
+                Task::new(
+                    TaskSpec::shell_script(format!("echo light-{i}")),
+                    TaskRequirements::generic(1, 30),
+                )
+            })
+            .collect();
+        let multi_core = Task::new(
+            TaskSpec::shell_script("echo multi"),
+            TaskRequirements::generic(2, 30),
+        );
+        let compile = Task::new(
+            TaskSpec::rust_compilation("crate", Default::default(), vec![]),
+            TaskRequirements::generic(1, 60),
+        );
+
+        // Hot via explicit thermal_tier: at most 1 slot across 6 1-core tasks, 0 for 2-core or compile.
+        phone.mobile_status = Some(MobileLiveStatus {
+            battery_pct: Some(85),
+            is_charging: Some(true),
+            thermal_throttled: false,
+            battery_temperature: Some(41.0),
+            thermal_tier: Some(ThermalTier::Hot),
+            ..Default::default()
+        });
+        let hot_report =
+            WorkloadScheduler::matchmake(&config, &light_tasks, std::slice::from_ref(&phone));
+        assert_eq!(
+            hot_report.assignments.len(),
+            1,
+            "Hot thermal tier on an 8-core phone must cap concurrency to at most 1 slot"
+        );
+        assert_eq!(
+            WorkloadScheduler::matchmake(
+                &config,
+                std::slice::from_ref(&multi_core),
+                std::slice::from_ref(&phone),
+            )
+            .assignments
+            .len(),
+            0,
+            "Hot thermal tier must reject multi-core tasks"
+        );
+        assert_eq!(
+            WorkloadScheduler::matchmake(
+                &config,
+                std::slice::from_ref(&compile),
+                std::slice::from_ref(&phone),
+            )
+            .assignments
+            .len(),
+            0,
+            "Hot thermal tier must reject heavy compilation tasks even while charging"
+        );
+
+        // Critical via explicit thermal_tier: 0 assignments.
+        phone.mobile_status = Some(MobileLiveStatus {
+            battery_pct: Some(85),
+            is_charging: Some(true),
+            thermal_throttled: false,
+            thermal_tier: Some(ThermalTier::Critical),
+            ..Default::default()
+        });
+        assert_eq!(
+            WorkloadScheduler::matchmake(&config, &light_tasks, std::slice::from_ref(&phone))
+                .assignments
+                .len(),
+            0,
+            "Critical thermal tier must shed all load"
+        );
+
+        // Critical via 45°C temperature alone (thermal_tier = None, thermal_throttled = false): 0 assignments.
+        phone.mobile_status = Some(MobileLiveStatus {
+            battery_pct: Some(85),
+            is_charging: Some(true),
+            thermal_throttled: false,
+            battery_temperature: Some(45.0),
+            thermal_tier: None,
+            ..Default::default()
+        });
+        assert_eq!(
+            WorkloadScheduler::matchmake(&config, &light_tasks, std::slice::from_ref(&phone))
+                .assignments
+                .len(),
+            0,
+            "A phone at 45°C must receive 0 assignments even when thermal_throttled is false"
+        );
+    }
+
     #[tokio::test]
     async fn test_fail_unfulfillable_tasks_default_false_keeps_queued_and_true_fails_with_reason_and_wakes_waiter(
     ) {
@@ -3629,6 +3776,128 @@ mod tests {
                 .error_message
                 .as_deref(),
             Some("No registered worker satisfies task requirements (cpu_cores=8, ram_mb=512, gpu=true)")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fail_unfulfillable_tasks_cursor_resets_on_epoch_change_and_placement_ignores_sweep_cursor(
+    ) {
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+        let (w_id, w_sess, _w_rx) = register_worker(&registry, "cpu-1c", 1, 4096, false).await;
+
+        let mut cpu_ids = Vec::new();
+        for i in 0..6 {
+            let mut req = TaskRequirements::generic(1, 30);
+            req.ram_mb = 256;
+            cpu_ids.push(
+                queue
+                    .submit(Task::new(
+                        TaskSpec::shell_script(format!("echo cpu-{i}")),
+                        req,
+                    ))
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let mut cfg = SchedulerConfig::default().with_fail_unfulfillable_tasks(true);
+        cfg.max_scan_per_pass = 3;
+        let sched = WorkloadScheduler::new(cfg, registry.clone(), queue.clone(), notify)
+            .with_waiters(waiters);
+
+        // Pass 1: assigns task 1 (`cpu_ids[0]`), scans tasks 1..=3, and stores a partial sweep cursor at task 3.
+        let r1 = sched.schedule_once().await.unwrap();
+        assert_eq!(r1.assignments.len(), 1);
+        assert_eq!(r1.assignments[0].task_id, cpu_ids[0]);
+
+        // Rule A: Submit a priority-10 GPU task while the partial sweep cursor sits at task 3 (`cpu_ids[2]`).
+        // Its `QueueOrderKey` sits at the front of `ready_queue`, BEFORE `sweep.cursor`. Because
+        // `submit_with_priority` bumps `ready_epoch`, the next saturated pass must reset `sweep.cursor`
+        // to `None` and fail `t_prio_gpu`.
+        let t_prio_gpu = queue.submit_with_priority(gpu_task(), 10).await.unwrap();
+        let r2 = sched.schedule_once().await.unwrap();
+        assert!(r2.assignments.is_empty());
+        assert_eq!(
+            r2.unfulfillable.len(),
+            1,
+            "epoch change must reset the sweep cursor so a newly submitted priority-10 GPU task ahead of the old cursor is failed"
+        );
+        assert_eq!(r2.unfulfillable[0].0, t_prio_gpu);
+        assert_eq!(
+            queue.get_state(&t_prio_gpu).await,
+            Some(crate::queue::TaskState::Failed)
+        );
+
+        // Rule B: Now `sweep.cursor` is at task 3 (`cpu_ids[2]`) again after Pass 2 scanned 3 items
+        // (`t_prio_gpu`, `cpu_ids[1]`, `cpu_ids[2]`). Completing task 1 (`cpu_ids[0]`) frees a slot
+        // without changing `(registration_epoch, ready_epoch)`. The next pass has `free_slots > 0`,
+        // so it must start placement from the head of the queue (`None`) and assign task 2 (`cpu_ids[1]`),
+        // NOT resume placement from `sweep.cursor`.
+        queue
+            .record_result_from(
+                w_id,
+                Some(w_sess),
+                rusty_grid_core::task::TaskResult::success(w_id, cpu_ids[0], "", 1, false),
+            )
+            .await
+            .unwrap();
+        registry.decrement_active_tasks(&w_id).await.unwrap();
+
+        let r3 = sched.schedule_once().await.unwrap();
+        assert_eq!(r3.assignments.len(), 1);
+        assert_eq!(
+            r3.assignments[0].task_id, cpu_ids[1],
+            "a pass with free slots must walk from the head of the queue and assign task 2, not start at the sweep cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fail_unfulfillable_tasks_continues_sweep_beyond_scan_budget_when_unused_free_slot_remains(
+    ) {
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+        // One 4-core CPU worker (which will be busy with a 4-core task) and one 1-core CPU worker (idle).
+        let (_w4_id, _w4_sess, _w4_rx) = register_worker(&registry, "cpu-4c", 4, 8192, false).await;
+        let (_w1_id, _w1_sess, _w1_rx) = register_worker(&registry, "cpu-1c", 1, 4096, false).await;
+
+        let mut cfg = SchedulerConfig::default().with_fail_unfulfillable_tasks(true);
+        cfg.max_scan_per_pass = 3;
+        let sched = WorkloadScheduler::new(cfg, registry.clone(), queue.clone(), notify)
+            .with_waiters(waiters);
+
+        // Fill the 4-core worker with a 4-core task so only the 1-core worker has a free slot.
+        let _t_busy_4c = queue.submit(wide_task(4)).await.unwrap();
+        let r0 = sched.schedule_once().await.unwrap();
+        assert_eq!(r0.assignments.len(), 1);
+
+        // Enqueue five 2-core tasks (none fit the idle 1-core worker) followed by a GPU task at the end.
+        for _ in 0..5 {
+            queue.submit(wide_task(2)).await.unwrap();
+        }
+        let t_gpu_tail = queue.submit(gpu_task()).await.unwrap();
+
+        // Pass 1 scans the first 3 2-core tasks (`cursor` advances to task 3).
+        let r1 = sched.schedule_once().await.unwrap();
+        assert!(r1.assignments.is_empty());
+        assert!(r1.unfulfillable.is_empty());
+        assert_eq!(
+            queue.get_state(&t_gpu_tail).await,
+            Some(crate::queue::TaskState::Queued)
+        );
+
+        // Pass 2 still has `free_slots == 1` (the idle 1-core worker). After the placement walk
+        // scans the first 3 2-core tasks without placing anything or advancing past the sweep cursor,
+        // the scheduler continues the sweep from the cursor and fails `t_gpu_tail`.
+        let r2 = sched.schedule_once().await.unwrap();
+        assert!(r2.assignments.is_empty());
+        assert_eq!(
+            r2.unfulfillable.len(),
+            1,
+            "sweep must continue past scan_budget even when an unusable free slot remains"
+        );
+        assert_eq!(r2.unfulfillable[0].0, t_gpu_tail);
+        assert_eq!(
+            queue.get_state(&t_gpu_tail).await,
+            Some(crate::queue::TaskState::Failed)
         );
     }
 }
