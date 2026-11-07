@@ -1,7 +1,7 @@
 # 0002: Mobile coordination: thermal and battery throttling, adaptive keepalive and role arbitrage
 
 Status: Partial
-Created: 2026-10-23    Updated: 2026-11-04
+Created: 2026-10-23    Updated: 2026-11-07
 
 ## Summary
 
@@ -78,7 +78,14 @@ The master calculates the dead peer window dynamically from the worker's reporte
 
 $$W_{\text{dead}} = \max(2\text{ s}, 4 \times \tau_{\text{worker}})$$
 
-Implemented in `crates/core/src/capabilities.rs` (`MobileLiveStatus::recommended_keepalive_interval`, `calculate_keepalive_interval`), `crates/worker/src/heartbeat.rs` (`spawn_adaptive_heartbeat_task`), and `crates/master/src/registry.rs` (`calculate_master_dead_peer_window`). Note: `MobileLiveStatus::recommended_keepalive_interval` currently returns `10 s` (active) and `25 s` (idle) only on cellular links and returns `60 s` on non-cellular links regardless of `active_tasks` (`MOB-1`).
+Implemented in `crates/core/src/capabilities.rs` (`MobileLiveStatus::adaptive_keepalive_interval`, `MobileLiveStatus::recommended_keepalive_interval_or`, `MobileLiveStatus::recommended_keepalive_interval`, `calculate_keepalive_interval`), `crates/worker/src/heartbeat.rs` (`spawn_adaptive_heartbeat_task`), `crates/worker/src/client.rs` (`run_session`), and `crates/master/src/registry.rs` (`calculate_master_dead_peer_window`).
+
+When a worker registers with `capabilities.mobile`, `Register` carries only `MobileCapabilities` (no `network_type`), so:
+- The master seeds a $4 \times 60\text{ s}$ ($240\text{ s}$) dead-peer window on `Register` until the worker sends its first `WorkerMessage::MobileTelemetry` and subsequent `WorkerMessage::Heartbeat` of the session.
+- A worker connected to a master announcing `mobile-telemetry` sends an initial `MobileTelemetry` frame immediately after `RegisterAck` (`last_reported` starts at `None`). When `network_type` is absent or unknown (such as on a battery-powered laptop, or while Wi-Fi roams), both the worker and the master use the negotiated heartbeat interval (`None` in `WorkerEntry::heartbeat_interval`, falling back to the reaper's `--heartbeat-timeout`).
+- The master never shortens `heartbeat_interval` on task dispatch (`reserve_dispatch` / `increment_active_tasks`) or on `update_mobile_telemetry` (preserving the existing window when a telemetry report has a shorter interval or `network_type: None`); `record_heartbeat` applies the shortened or `None` window once the worker's next `Heartbeat` arrives, while `HeartbeatTracker` and `MobileTelemetryHandle` notify `spawn_adaptive_heartbeat_task` to restart its timer immediately whenever `active_tasks` rises or a new telemetry reading gives a shorter interval.
+- Calling `MobileTelemetryHandle::set` or `MobileTelemetryHandle::update` marks the handle as externally fed (`MobileTelemetryHandle::is_externally_fed`), preventing the background host battery poller (`spawn_mobile_poller` / `update_polled` in `crates/worker/src/heartbeat.rs`) from overwriting readings pushed by the Android JNI bridge or test fixtures.
+- The worker's dead-peer watchdog (`dead_after` in `run_session`) recomputes its silence threshold on every watchdog tick from the longest interval `spawn_adaptive_heartbeat_task` can pick (`MOB-1`).
 
 ### D3 Strict five-rule mobile master refusal matrix
 
@@ -147,6 +154,9 @@ Implemented in `crates/worker/src/client.rs` (`set_evacuation_reason_hook`, `cur
 - Wire format carries lease tickets and disconnect reasons inside existing protocol enums (`WorkerMessage::ClaimMasterRole`, `WorkerMessage::Disconnecting`).
 - Uses protocol version 2 (`PROTOCOL_VERSION_CURRENT = 2`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 2`, `crates/core/src/protocol.rs:31-33`); capability bit `ProtocolCapabilities::ROLE_ARBITRAGE = Self(1 << 7)` (`crates/core/src/protocol.rs:66`) is reserved for design-only role arbitrage and is not advertised in `ProtocolCapabilities::all_supported()`.
 - Unaware nodes ignore role arbitration frames and continue operating as normal workers.
+- **Rolling upgrade windows (`MOB-1`, `DEPLOYMENT.md` §3.5):**
+  - *Pre-`MOB-1` battery-powered laptop workers:* Restarting the master before upgrading workers leaves pre-`MOB-1` battery-powered laptop workers heartbeating every $60\text{ s}$ when idle. On `Register`, the master grants a $4 \times 60\text{ s}$ ($240\text{ s}$) window; if an older laptop worker emits a `MobileTelemetry` frame with `network_type: None` on a battery percentage change and then sends a `Heartbeat` before its binary is upgraded, the master switches that session's dead-peer window to `--heartbeat-timeout` ($10\text{ s}$ default) and will reap and reconnect the old laptop worker after $10\text{ s}$ of idle silence until the worker is upgraded (or `--heartbeat-timeout` is set $\ge 240\text{ s}$ during the upgrade window).
+  - *Pre-`MOB-1` Android Wi-Fi phones:* A phone running an APK from before `MOB-1` heartbeats every $60\text{ s}$ on Wi-Fi even while executing a task (`active_tasks > 0`). Once that phone sends a `Heartbeat` with `active_tasks > 0`, the new master sets `heartbeat_interval = Some(10s)` (a $40\text{ s}$ dead-peer window). Consequently, any task longer than $\sim 40\text{ s}$ on a pre-`MOB-1` Wi-Fi phone fails over until the APK is updated (`--heartbeat-timeout` does not override this because `heartbeat_interval` is `Some(10s)`).
 
 ## Security
 
@@ -167,7 +177,7 @@ Implemented in `crates/worker/src/client.rs` (`set_evacuation_reason_hook`, `cur
 |---|---|---|---|---|
 | W1 | Arbitrage and refusal module | `crates/core/src/arbitrage.rs` | Refusal matrix, $S_{\text{auth}}$ calculation, and lease ticket types implemented with unit tests (Android coordinator role removed by D2; no production election caller) | Partial |
 | W2 | Scheduler multi-tier throttling | `crates/core/src/capabilities.rs`, `crates/master/src/scheduler.rs` | Concurrency scaled by $C_{\text{eff}} = \min(C_{\text{bat}}, C_{\text{therm}})$ in matchmaking (`MobileCapabilities` currently forwards only `thermal_throttled`, `MOB-2`) | Partial |
-| W3 | Adaptive keepalive controller | `crates/core/src/capabilities.rs`, `crates/worker/src/heartbeat.rs`, `crates/master/src/registry.rs` | 10s / 25s / 60s intervals and dynamic $W_{\text{dead}}$ calculation (non-cellular active interval stays 60s until `MOB-1`) | Partial |
+| W3 | Adaptive keepalive controller | `crates/core/src/capabilities.rs`, `crates/worker/src/heartbeat.rs`, `crates/worker/src/client.rs`, `crates/master/src/registry.rs` | 10s active on any link, 25s cellular idle, 60s Wi-Fi idle, negotiated interval when `network_type` is unknown, and dynamic $W_{\text{dead}}$ calculation (`MOB-1`) | Implemented |
 | W4 | Master lease claim handling | `crates/master/src/server.rs` | `ROLE_ARBITRAGE` (`1 << 7`, `protocol.rs:66`) is not advertised in `all_supported()`; all `WorkerMessage::ClaimMasterRole` arms in `server.rs` call `reject_master_role_claim` to refuse every claim with `RoleHandoverAck { accepted: false, task_queue_snapshot: Vec::new(), connected_workers: Vec::new() }` ([0026](0026-refuse-claim-master-role.md)); nothing constructs `ClaimMasterRole` | Design only |
 | W5 | Pre-sleep fast evacuation | `crates/worker/src/client.rs`, `crates/android_bridge/src/lib.rs`, `crates/master/src/server.rs` | `Disconnecting { worker_id, reason }` frame sent and tasks requeued via `handle_session_disconnected(..., immediate_reschedule: true)` (`< 50 ms` design target, tested at `< 100 ms` in `tests/mobile_coordination_test.rs:920`; `immediate_reschedule` still increments retry counts, `MOB-3`; Kotlin `runner/OxideWorkerBridge.kt` JNI call pending, `AND-3`) | Partial |
 | W6 | Stress test suites | `tests/mobile_coordination_test.rs`, `tests/m5a_challenger_1_stress.rs`, `tests/m5a_challenger_2_stress.rs` | All stress tests pass with 0 failures | Implemented |
@@ -180,3 +190,5 @@ Implemented in `crates/worker/src/client.rs` (`set_evacuation_reason_hook`, `cur
 - 2026-10-23: Fixed 0% battery boundary assertion in `tests/m6_challenger_2_stress.rs` to enforce full task refusal on critical battery. Status marked Implemented.
 - 2026-11-04: Aligned D1–D6 symbols, battery tiers (`50/30/15`), thermal tiers (`37/40/42`), authority weights, 4-stage tie-breaking, `MasterLeaseTicket` canonical bytes, and fast evacuation hooks with the code; marked Android coordinator role as removed by decision D2 (`SEC-3`) and updated record status to `Partial` (`DOC-3`).
 - 2026-11-04: Removed `ROLE_ARBITRAGE` from `ProtocolCapabilities::all_supported()` and replaced all `WorkerMessage::ClaimMasterRole` arms in `crates/master/src/server.rs` with `reject_master_role_claim` returning `RoleHandoverAck { accepted: false, task_queue_snapshot: Vec::new(), connected_workers: Vec::new() }`; marked W4 as `Design only` per decision D1 (`FEAT-6`, [0026](0026-refuse-claim-master-role.md)).
+- 2026-11-04: Returned 10s keepalive when `active_tasks > 0` on any link, kept the negotiated interval when `network_type` is unknown, and marked W3 as `Implemented` (`MOB-1`).
+- 2026-11-07: Kept a $4 \times 60\text{ s}$ registration window until the session's first `MobileTelemetry`, sent an initial `MobileTelemetry` immediately after `RegisterAck`, deferred lowering `heartbeat_interval` until `record_heartbeat` reports `active_tasks > 0`, recomputed worker `dead_after` from the longest adaptive interval, and documented the `DEPLOYMENT.md` §3.5 laptop upgrade window (`MOB-1`).

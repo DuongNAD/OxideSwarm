@@ -2,12 +2,12 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, trace};
 use uuid::Uuid;
@@ -28,6 +28,8 @@ pub fn current_epoch_secs() -> u64 {
 pub struct HeartbeatTracker {
     /// Number of tasks currently executing on this worker (shared with runner).
     pub active_tasks: Arc<AtomicUsize>,
+    /// Notifies the adaptive heartbeat loop when `active_tasks` transitions from `0` to `> 0`.
+    pub active_notify: Notify,
     /// UNIX timestamp in seconds of the last emitted heartbeat.
     pub last_sent_sec: AtomicU64,
     /// UNIX timestamp in seconds of the last received HeartbeatAck from master.
@@ -44,6 +46,7 @@ impl HeartbeatTracker {
     pub fn new(active_tasks: Arc<AtomicUsize>) -> Self {
         Self {
             active_tasks,
+            active_notify: Notify::new(),
             last_sent_sec: AtomicU64::new(0),
             last_ack_sec: AtomicU64::new(0),
             total_sent: AtomicU64::new(0),
@@ -97,12 +100,19 @@ impl HeartbeatTracker {
 
     /// Sets the active task count directly.
     pub fn set_active_tasks(&self, count: usize) {
-        self.active_tasks.store(count, Ordering::Release);
+        let prev = self.active_tasks.swap(count, Ordering::SeqCst);
+        if prev == 0 && count > 0 {
+            self.active_notify.notify_one();
+        }
     }
 
     /// Atomically increments the active task count and returns the new count.
     pub fn increment_active_tasks(&self) -> usize {
-        self.active_tasks.fetch_add(1, Ordering::SeqCst) + 1
+        let prev = self.active_tasks.fetch_add(1, Ordering::SeqCst);
+        if prev == 0 {
+            self.active_notify.notify_one();
+        }
+        prev + 1
     }
 
     /// Atomically decrements the active task count (never below zero) and returns the new count.
@@ -339,6 +349,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StampedStream<S> {
 pub struct MobileTelemetryHandle {
     inner: Arc<RwLock<Option<MobileCapabilities>>>,
     live: Arc<RwLock<Option<MobileLiveStatus>>>,
+    externally_fed: Arc<AtomicBool>,
+    notify: Arc<Notify>,
 }
 
 impl MobileTelemetryHandle {
@@ -348,7 +360,15 @@ impl MobileTelemetryHandle {
         Self {
             inner: Arc::new(RwLock::new(initial)),
             live: Arc::new(RwLock::new(live)),
+            externally_fed: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Whether a caller has explicitly pushed mobile telemetry into this handle via [`Self::set`]
+    /// or [`Self::update`]. When `true`, the background host battery poller must not overwrite it.
+    pub fn is_externally_fed(&self) -> bool {
+        self.externally_fed.load(Ordering::Acquire)
     }
 
     /// The current state, `None` while nothing is known.
@@ -361,6 +381,7 @@ impl MobileTelemetryHandle {
 
     /// Replaces the whole state (descriptors included).
     pub fn set(&self, mobile: Option<MobileCapabilities>) {
+        self.externally_fed.store(true, Ordering::Release);
         let live = mobile.as_ref().map(|m| m.live_status());
         *self
             .inner
@@ -370,11 +391,26 @@ impl MobileTelemetryHandle {
             .live
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = live;
+        self.notify.notify_waiters();
     }
 
     /// Replaces the fast-changing readings. The OS / SoC descriptors are kept; if nothing was set
     /// before, they read "unknown". This is what an app calls from its battery / thermal callbacks.
     pub fn update(&self, status: MobileLiveStatus) {
+        self.externally_fed.store(true, Ordering::Release);
+        self.apply_live_status(status);
+    }
+
+    /// Internal update used by [`spawn_mobile_poller`] so host battery polling never overwrites
+    /// externally pushed mobile telemetry.
+    pub(crate) fn update_polled(&self, status: MobileLiveStatus) {
+        if self.is_externally_fed() {
+            return;
+        }
+        self.apply_live_status(status);
+    }
+
+    fn apply_live_status(&self, status: MobileLiveStatus) {
         let mut guard = self
             .inner
             .write()
@@ -393,6 +429,7 @@ impl MobileTelemetryHandle {
             .live
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(status);
+        self.notify.notify_waiters();
     }
 
     /// The fast-changing readings alone, `None` while nothing is known.
@@ -443,7 +480,7 @@ pub fn spawn_mobile_poller(
         loop {
             ticker.tick().await;
             if let Ok(Some(status)) = tokio::task::spawn_blocking(probe).await {
-                handle.update(status);
+                handle.update_polled(status);
             }
         }
     })
@@ -461,12 +498,12 @@ pub fn spawn_adaptive_heartbeat_task(
     let tracker_clone = Arc::clone(&tracker);
 
     let join_handle = tokio::spawn(async move {
-        let mut current_interval = interval;
-        if let Some(ref mob) = mobile {
-            if let Some(status) = mob.live_status() {
-                current_interval = status.recommended_keepalive_interval(0);
-            }
-        }
+        let initial_active = tracker_clone.active_tasks.load(Ordering::Relaxed);
+        let mut current_interval = mobile
+            .as_ref()
+            .and_then(|mob| mob.live_status())
+            .map(|status| status.recommended_keepalive_interval_or(initial_active, interval))
+            .unwrap_or(interval);
         let mut ticker = tokio::time::interval(current_interval);
         // Skip the immediate initial tick so first heartbeat is sent after interval has elapsed
         ticker.tick().await;
@@ -477,16 +514,16 @@ pub fn spawn_adaptive_heartbeat_task(
                     let now_sec = current_epoch_secs();
                     let active = tracker_clone.active_tasks.load(Ordering::Relaxed);
 
-                    // Dynamically adapt keepalive interval based on cellular status and active tasks
-                    if let Some(ref mob) = mobile {
-                        if let Some(status) = mob.live_status() {
-                            let recommended = status.recommended_keepalive_interval(active);
-                            if recommended != current_interval {
-                                current_interval = recommended;
-                                ticker = tokio::time::interval(current_interval);
-                                ticker.tick().await;
-                            }
-                        }
+                    // Dynamically adapt keepalive interval based on network status and active tasks
+                    let recommended = mobile
+                        .as_ref()
+                        .and_then(|mob| mob.live_status())
+                        .map(|status| status.recommended_keepalive_interval_or(active, interval))
+                        .unwrap_or(interval);
+                    if recommended != current_interval {
+                        current_interval = recommended;
+                        ticker = tokio::time::interval(current_interval);
+                        ticker.tick().await;
                     }
 
                     // Read current system telemetry from non-blocking background sampler
@@ -518,6 +555,37 @@ pub fn spawn_adaptive_heartbeat_task(
                             debug!(worker_id = %worker_id, "Outbound message channel closed; terminating heartbeat task");
                             break;
                         }
+                    }
+                }
+                _ = tracker_clone.active_notify.notified() => {
+                    let active = tracker_clone.active_tasks.load(Ordering::Relaxed);
+                    let recommended = mobile
+                        .as_ref()
+                        .and_then(|mob| mob.live_status())
+                        .map(|status| status.recommended_keepalive_interval_or(active, interval))
+                        .unwrap_or(interval);
+                    if recommended < current_interval {
+                        current_interval = recommended;
+                        ticker = tokio::time::interval(current_interval);
+                        ticker.tick().await;
+                    }
+                }
+                _ = async {
+                    match &mobile {
+                        Some(mob) => mob.notify.notified().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let active = tracker_clone.active_tasks.load(Ordering::Relaxed);
+                    let recommended = mobile
+                        .as_ref()
+                        .and_then(|mob| mob.live_status())
+                        .map(|status| status.recommended_keepalive_interval_or(active, interval))
+                        .unwrap_or(interval);
+                    if recommended < current_interval {
+                        current_interval = recommended;
+                        ticker = tokio::time::interval(current_interval);
+                        ticker.tick().await;
                     }
                 }
                 _ = &mut stop_rx => {
@@ -840,5 +908,170 @@ mod tests {
         assert_eq!(tracker.decrement_active_tasks(), 0);
         assert_eq!(tracker.decrement_active_tasks(), 0);
         assert_eq!(tracker.active_tasks(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_adaptive_heartbeat_keeps_negotiated_interval_for_laptop_and_10s_for_active_wifi()
+    {
+        let wifi_one_task = MobileLiveStatus {
+            network_type: Some("wifi".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            wifi_one_task.recommended_keepalive_interval_or(1, Duration::from_secs(3)),
+            Duration::from_secs(10)
+        );
+
+        let negotiated = Duration::from_millis(25);
+        let laptop_handle = MobileTelemetryHandle::new(Some(MobileCapabilities {
+            os_version: "macOS 14.5".into(),
+            soc_model: "Apple M2".into(),
+            battery_pct: Some(80),
+            is_charging: Some(false),
+            thermal_throttled: false,
+        }));
+        assert_eq!(
+            laptop_handle
+                .live_status()
+                .unwrap()
+                .recommended_keepalive_interval_or(0, negotiated),
+            negotiated
+        );
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let tracker = Arc::new(HeartbeatTracker::new(active));
+        let (tx, mut rx) = mpsc::channel(8);
+        let hb = spawn_adaptive_heartbeat_task(
+            Uuid::new_v4(),
+            negotiated,
+            tx,
+            Arc::clone(&tracker),
+            Some(laptop_handle),
+        );
+
+        let first = tokio::time::timeout(Duration::from_millis(250), rx.recv())
+            .await
+            .expect("laptop worker must heartbeat at the negotiated interval, not 60s")
+            .expect("heartbeat message");
+        assert!(matches!(first, WorkerMessage::Heartbeat { .. }));
+        hb.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_mobile_poller_does_not_overwrite_externally_fed_handle() {
+        let handle = MobileTelemetryHandle::new(Some(MobileCapabilities {
+            os_version: "macOS".into(),
+            soc_model: "Apple M2".into(),
+            battery_pct: Some(90),
+            is_charging: Some(true),
+            thermal_throttled: false,
+        }));
+        assert!(!handle.is_externally_fed());
+
+        // External caller feeds explicit mobile telemetry (e.g. JNI callback or test fixture).
+        handle.update(MobileLiveStatus {
+            battery_pct: Some(64),
+            is_charging: Some(false),
+            network_type: Some("wifi".into()),
+            ..Default::default()
+        });
+        assert!(handle.is_externally_fed());
+
+        let poller = spawn_mobile_poller(handle.clone(), Duration::from_millis(15), fake_probe);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        poller.abort();
+
+        let live = handle.live_status().unwrap();
+        assert_eq!(live.battery_pct, Some(64));
+        assert_eq!(live.is_charging, Some(false));
+        assert_eq!(live.network_type.as_deref(), Some("wifi"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_adaptive_heartbeat_restarts_timer_when_active_tasks_rises_or_telemetry_interval_shortens(
+    ) {
+        let negotiated = Duration::from_secs(3);
+        let handle = MobileTelemetryHandle::new(None);
+        handle.update(MobileLiveStatus {
+            battery_pct: Some(85),
+            is_charging: Some(false),
+            network_type: Some("wifi".into()),
+            ..Default::default()
+        });
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let tracker = Arc::new(HeartbeatTracker::new(active));
+        let (tx, mut rx) = mpsc::channel(8);
+        let hb = spawn_adaptive_heartbeat_task(
+            Uuid::new_v4(),
+            negotiated,
+            tx,
+            Arc::clone(&tracker),
+            Some(handle.clone()),
+        );
+
+        // Give the spawned task a yield to arm its 60 s Wi-Fi idle timer.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "idle Wi-Fi worker must not heartbeat at 5 s"
+        );
+
+        // 1. Transition active_tasks 0 -> 1: the timer must immediately restart to 10 s instead
+        // of waiting the remaining 55 s of the 60 s Wi-Fi idle tick.
+        tracker.increment_active_tasks();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        let msg = rx
+            .try_recv()
+            .expect("heartbeat must fire within 11 s after active_tasks rises from 0 to 1");
+        assert!(matches!(
+            msg,
+            WorkerMessage::Heartbeat {
+                active_tasks: 1,
+                ..
+            }
+        ));
+
+        // 2. Return to idle (60 s Wi-Fi) on the next tick, then switch network_type to None:
+        // the timer must immediately restart to the 3 s negotiated interval.
+        tracker.decrement_active_tasks();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        let idle_msg = rx
+            .try_recv()
+            .expect("tick at 10 s transitions worker back to 60 s Wi-Fi idle");
+        assert!(matches!(
+            idle_msg,
+            WorkerMessage::Heartbeat {
+                active_tasks: 0,
+                ..
+            }
+        ));
+
+        handle.update(MobileLiveStatus {
+            battery_pct: Some(85),
+            is_charging: Some(false),
+            network_type: None,
+            ..Default::default()
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        let unknown_net_msg = rx.try_recv().expect(
+            "heartbeat must fire within 4 s after network_type switches from wifi (60 s) to None (3 s)",
+        );
+        assert!(matches!(
+            unknown_net_msg,
+            WorkerMessage::Heartbeat {
+                active_tasks: 0,
+                ..
+            }
+        ));
+
+        hb.stop().await;
     }
 }
