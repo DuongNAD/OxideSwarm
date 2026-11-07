@@ -126,7 +126,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-07, at `master` `4a17a0e`: 43 items Implemented, 3 Partial and 24 Planned. Five of
+On 2026-11-07, at `master` `5c518b5`: 46 items Implemented, 3 Partial and 21 Planned. Two of
 the Planned items have an open pull request. "Pull requests" lists them by number, and "(open)"
 marks one that is not merged yet.
 
@@ -174,13 +174,13 @@ marks one that is not merged yet.
 | SCHED-1 | Respect `--max-concurrency` on the master | P1 | S | INT-4 |  | Implemented | 34, 38 |
 | SCHED-2 | Wire or delete dead flags | P1 | M | INT-4 |  | Implemented | 78 |
 | SCHED-3 | Give impossible tasks an outcome | P2 | S | INT-4 |  | Planned | 96 (open) |
-| MOB-1 | Fix the adaptive keepalive | P1 | S | INT-4 |  | Planned | 98 (open) |
-| MOB-2 | Keep thermal state on the master | P1 | M | INT-4 |  | Planned | 99 (open) |
+| MOB-1 | Fix the adaptive keepalive | P1 | S | INT-4 |  | Implemented | 98 |
+| MOB-2 | Keep thermal state on the master | P1 | M | INT-4 |  | Implemented | 99 |
 | MOB-3 | Do not charge evacuation to retry budgets | P2 | S | INT-4 |  | Planned |  |
 | 3D-2 | Wire VRAM and Blender routing | P2 | M | BUG-3 |  | Planned |  |
 | 3D-3 | Make AutoRig options real or refuse them | P2 | M | SEC-5 |  | Planned |  |
 | MR-1 | Let a CLI user ship a mapper and reducer | P2 | S | INT-4 |  | Implemented | 33 |
-| MESH-1 | Make `wss://` work in the Rust mesh client | P2 | S | INT-4 |  | Planned | 94 (open) |
+| MESH-1 | Make `wss://` work in the Rust mesh client | P2 | S | INT-4 |  | Implemented | 94 |
 | MESH-2 | Deliver mesh data to a consumer | P2 | M | INT-4 |  | Planned |  |
 | MESH-3 | Attach the bridge to a running master | P2 | M | INT-4 |  | Planned |  |
 | MODE-1 | Make `ox-mode` report only what happened | P2 | M | INT-4 |  | Planned | 92 (open) |
@@ -1277,7 +1277,7 @@ Add one dated line per finished item, newest last.
   a `rusty_grid-<euid>` that another local user could change (work item SEC-8 of design 0021).
 - 2026-11-04: REL-3 completed on branch `win/rel-3-repo-hygiene`; added `test_reports/` and `**/jniLibs/**/*.so` to `.gitignore` with a regression check in `tests/test_launcher_scripts.py`.
 - 2026-11-04: DOC-5 completed on branch `win/doc-5-3d-subsystem`; added `docs/design/0023-generative-3d-and-autorig-subsystem.md`, documented `gen3d`, `autorig`, and `engines/` (including `3D-2` and `3D-3` limits) in `README.md` and `CLAUDE.md`, and updated the macOS, Windows, and Android Termux worker installers to deploy `engines/` and set `OXIDESWARM_GEN3D_SCRIPT`.
-- 2026-11-07: Index synced with the pull requests merged up to `4a17a0e` (pull request 100).
+- 2026-11-07: Index synced with the pull requests merged up to `5c518b5`.
   These items are now Implemented (date of the first merge, pull requests):
   - INT-4: 2026-11-01, pull request 6.
   - REL-1: 2026-11-01, pull requests 8, 82.
@@ -1313,7 +1313,10 @@ Add one dated line per finished item, newest last.
   - BRIDGE-1: 2026-11-04, pull request 77.
   - SCHED-2: 2026-11-04, pull request 78.
   - FEAT-6: 2026-11-04, pull request 81.
+  - MESH-1: 2026-11-07, pull request 94.
   - MCP-3: 2026-11-07, pull request 97.
+  - MOB-1: 2026-11-07, pull request 98.
+  - MOB-2: 2026-11-07, pull request 99.
 - 2026-11-07: These items are Partial:
   - TEST-4: pull request 29 fixed the six named tests. No run of the full suite with a dummy
     `cluster.secret` in `HOME` has been recorded.
@@ -1322,8 +1325,7 @@ Add one dated line per finished item, newest last.
   - FEAT-8: pull request 40 pins the bincode layout of every message in
     `crates/core/src/wire_layout_tests.rs`. Nothing forces a protocol version bump yet, and
     `ClientMessage` has no version.
-- 2026-11-07: Planned items with an open pull request: SCHED-3 (96), MOB-1 (98), MOB-2 (99),
-  MESH-1 (94) and MODE-1 (92).
+- 2026-11-07: Planned items with an open pull request: SCHED-3 (96) and MODE-1 (92).
 - 2026-11-07: Items found after the audit have no section in this file: BUG-6 to BUG-17, TEST-8
   to TEST-16, SEC-8, BRIDGE-2 and BRIDGE-3. Each has a merged pull request except TEST-16
   (pull request 95, open).
