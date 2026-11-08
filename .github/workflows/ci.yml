@@ -22,9 +22,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # [profile.dev] has `debug = true`. Line tables keep file:line in panics and backtraces while keeping
-  # the ~60 test binaries small enough for the runners' disks and the cache.
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 # The toolchain is pinned (`dtolnay/rust-toolchain@<version>`) so that a new stable release and its
 # new lints cannot turn CI red on an unchanged tree. Bump it in every job at once, deliberately,
@@ -110,9 +107,11 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install --disable-pip-version-check websockets
-      - name: verify wire_layout.txt version bump against origin/master
+      - name: verify wire_layout.txt version bump against baseline
+        env:
+          WIRE_LAYOUT_BASELINE_REF: refs/remotes/ci/wire-layout-base
         run: |
-          git fetch --no-tags --depth=1 origin master:refs/remotes/origin/master
+          git fetch --no-tags --depth=1 origin "+${{ (github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || github.base_ref || 'master' }}:refs/remotes/ci/wire-layout-base"
           cargo test -p rusty_grid_core --lib wire_layout_tests::wire_layout_file_bumps_version_when_body_differs_from_origin_master --locked -- --exact
       - run: cargo test --workspace --lib --locked
       - name: run agent mesh integration tests
@@ -126,13 +125,8 @@ jobs:
     # Full Cargo workspace test suite (`tests/` and `crates/*/tests/` included).
     # Tests bind 127.0.0.1:0 and give child processes a temporary HOME, so they need no fixed ports
     # and never touch the runner's ~/.oxideswarm.
-    # Until TEST-14 lands (fixing the timing flakes under runner load in the handshake timeout test,
-    # the rapid detection test, and `test_adversarial_quic_stream_multiplexing_heavy_saturation_anti_hol`)
-    # and TEST-12 (PR #63) merges on Windows, keep `continue-on-error: true` so full-suite results are
-    # recorded without turning pull requests red on slow runners.
     name: workspace tests (${{ matrix.os }})
     if: github.event_name != 'schedule'
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:

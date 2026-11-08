@@ -64,11 +64,20 @@ the top of `crates/core/tests/data/wire_layout.txt`. Both header lines are manda
 itself is missing in update mode, preventing bypass via `rm wire_layout.txt` or header deletion).
 `verify_version_bump_for_layout_change` compares the recorded layout and versions against
 `current_wire_layout()`, `PROTOCOL_VERSION_CURRENT`, and `PROTOCOL_VERSION_MIN_COMPATIBLE` during
-normal test runs, in `UPDATE_WIRE_LAYOUT=1` mode, and against `origin/master`'s copy in
-`wire_layout_file_bumps_version_when_body_differs_from_origin_master` (which CI runs after fetching
-`origin/master`):
+normal test runs, in `UPDATE_WIRE_LAYOUT=1` mode, and against the git baseline copy in
+`wire_layout_file_bumps_version_when_body_differs_from_origin_master`:
 
-- If any canonical encoding differs from `wire_layout.txt` (or `origin/master`'s copy) and
+- In CI (`.github/workflows/ci.yml`), the baseline step fetches `+${{ github.event.before }}` on a
+  `push` run and `+${{ github.base_ref || 'master' }}` on a `pull_request` run into the dedicated
+  ref `refs/remotes/ci/wire-layout-base` (`WIRE_LAYOUT_BASELINE_REF`), so a `push` to `master`
+  compares with the previous `master` commit and a pull request into a non-`master` branch compares
+  with its target branch.
+- Under `UPDATE_WIRE_LAYOUT=1`, `wire_layout_file_bumps_version_when_body_differs_from_origin_master`
+  skips its standalone run so it never reads a half-written file, and
+  `bincode_encoding_matches_the_recorded_wire_layout` runs `check_wire_layout_against_git_baseline`
+  after writing `crates/core/tests/data/wire_layout.txt`.
+- If any canonical encoding differs from `wire_layout.txt` (or the baseline ref's copy, named as
+  `<baseline_ref>:crates/core/tests/data/wire_layout.txt` in the failure message) and
   `PROTOCOL_VERSION_CURRENT <= recorded_version`, the test fails and refuses to overwrite
   `wire_layout.txt`.
 - If any previously recorded variant changed its bytes or was removed and
@@ -99,8 +108,10 @@ normal test runs, in `UPDATE_WIRE_LAYOUT=1` mode, and against `origin/master`'s 
   `protocol_version: u32`, and every variant of `HumanClientMessage` and `HumanClientResponse`
   carries `#[serde(default = "default_protocol_version")] protocol_version: u32`.
 - `default_protocol_version()` returns `LEGACY_UNVERSIONED_PROTOCOL_VERSION = 2`, so any JSON peer
-  that omits `"protocol_version"` (such as `{"type":"ClusterStatus"}`) is treated as protocol
-  version `2` and refused with `ProtocolError::IncompatibleVersion { peer_version: 2, .. }`.
+  that omits `"protocol_version"` — whether in `ClientMessage`, `ClientResponse`,
+  `WorkerMessage::Register`, or `MasterMessage::RegisterAck` — is treated as protocol version `2`
+  and refused (`ProtocolError::IncompatibleVersion { peer_version: 2, .. }` on the client path, or
+  `!is_protocol_version_compatible(2)` during the worker registration handshake).
 - `deserialize_message` uses `bincode_exact_deserialize` (`.with_fixint_encoding().reject_trailing_bytes()`)
   and checks `is_protocol_version_compatible(ver)` on `ClientMessage`, `ClientResponse` (except
   `ClientResponse::Error`, which is always decoded so refusal messages reach the caller), and
@@ -115,7 +126,11 @@ normal test runs, in `UPDATE_WIRE_LAYOUT=1` mode, and against `origin/master`'s 
   side-effect-free `ClientMessage::ClusterStatus` probe and verifies the `ClientResponse::ClusterStatus`
   reply. Because a legacy v2 Master's bincode fallback ignores trailing bytes on `SubmitTask` and
   `CancelTask`, probing `ClusterStatus` inside `connect_master` guarantees a v3 client refuses a v2
-  Master before any state-changing frame is ever transmitted.
+  Master before any state-changing frame is ever transmitted. Because `ClusterStatus` builds the
+  worker list on every connection (including blob and MCP pool connections, and twice for `status`),
+  `W1` of [design 0039](0039-agent-workspaces.md) will replace this probe with a small
+  `ClientMessage::Hello` / `ClientResponse::Hello` version variant appended last in the same release
+  as `0039` W1's protocol version bump.
 - When `authenticate_and_read_first_message` or `handle_client_connection` on the Master receives
   `ProtocolError::IncompatibleVersion { peer_version, .. }`, it replies with
   `ClientResponse::Error { message: format_incompatible_version_error("client", peer_version) }`
@@ -190,3 +205,8 @@ Because `WireCodec` and the 1-byte frame discriminator (`0x01` JSON, `0x02` Binc
 ## Status log
 
 - 2026-11-08: Implemented in protocol version 3 (`FEAT-8`).
+- 2026-11-08: `FEAT-8b` follow-ups: fetch `+${{ github.event.before }}` (push) or
+  `+${{ github.base_ref || 'master' }}` (PR) into `refs/remotes/ci/wire-layout-base` in CI, run the
+  baseline check after regeneration under `UPDATE_WIRE_LAYOUT=1` and name the baseline ref in
+  failure messages, document JSON `Register` / `RegisterAck` refusal when `"protocol_version"` is
+  omitted, and schedule the lightweight `Hello` version probe variant for `0039` W1.
