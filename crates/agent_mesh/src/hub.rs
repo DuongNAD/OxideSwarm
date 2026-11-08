@@ -41,7 +41,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
+    Extension, Json, Router,
 };
 use futures::{SinkExt, StreamExt};
 use ring::hmac;
@@ -534,7 +534,7 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<HubState>>,
     headers: HeaderMap,
-    peer: Option<ConnectInfo<SocketAddr>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
 ) -> Response {
     // Cross-site WebSocket hijacking: a page on any website the owner visits can open a socket to
     // a loopback hub. Browsers always send `Origin`; native clients do not.
@@ -543,7 +543,7 @@ async fn ws_handler(
         if !allowed {
             warn!(
                 "Hub: refused WebSocket upgrade from {} with foreign Origin {:?}",
-                peer.map(|ConnectInfo(a)| a.to_string())
+                peer.map(|Extension(ConnectInfo(a))| a.to_string())
                     .unwrap_or_else(|| "unknown peer".into()),
                 origin
             );
@@ -556,7 +556,7 @@ async fn ws_handler(
     }
 
     let max = state.config.max_message_bytes;
-    let peer_addr = peer.map(|ConnectInfo(a)| a);
+    let peer_addr = peer.map(|Extension(ConnectInfo(a))| a);
     ws.max_message_size(max)
         .max_frame_size(max)
         .on_upgrade(move |socket| handle_socket(socket, state, peer_addr))
@@ -615,7 +615,7 @@ impl Connection {
 
     fn queue(&self, env: &AgentMeshEnvelope) {
         if let Ok(json) = env.to_json_string() {
-            let _ = self.outbox.push(Message::Text(json));
+            let _ = self.outbox.push(Message::Text(json.into()));
         }
     }
 
@@ -867,7 +867,7 @@ impl Connection {
         let Some(outbox) = self.state.outbox_of(dest).await else {
             return Err(PushError::Closed);
         };
-        match outbox.push(Message::Text(raw_text)) {
+        match outbox.push(Message::Text(raw_text.into())) {
             Ok(()) => Ok(()),
             Err(PushError::Full) => {
                 warn!(
@@ -979,12 +979,15 @@ impl Connection {
                         tokio::spawn(async move {
                             let resp = bridge.handle_command(&req_envelope).await;
                             if let Ok(resp_json) = resp.to_json_string() {
-                                if outbox.push(Message::Text(resp_json.clone())).is_err() {
+                                if outbox
+                                    .push(Message::Text(resp_json.clone().into()))
+                                    .is_err()
+                                {
                                     // The requesting connection is gone; the node may have
                                     // reconnected, so try its current registration.
                                     let current = state_clone.outbox_of(&from_node).await;
                                     if let Some(current) = current {
-                                        let _ = current.push(Message::Text(resp_json));
+                                        let _ = current.push(Message::Text(resp_json.into()));
                                     }
                                 }
                             }
@@ -1104,7 +1107,8 @@ impl Connection {
                 };
 
                 for (nid, dest_tx) in all_txs {
-                    if dest_tx.push(Message::Text(raw_text.clone())) == Err(PushError::Full) {
+                    if dest_tx.push(Message::Text(raw_text.clone().into())) == Err(PushError::Full)
+                    {
                         warn!(
                             "Hub: node '{}' is not draining its queue; disconnecting it",
                             nid
@@ -1186,7 +1190,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<HubState>, peer: Option<Soc
                     );
                     break;
                 }
-                let _ = outbox.push(Message::Ping(Vec::new()));
+                let _ = outbox.push(Message::Ping(Vec::new().into()));
             }
 
             frame = ws_receiver.next() => {
@@ -1198,7 +1202,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<HubState>, peer: Option<Soc
 
                 match msg {
                     Message::Text(raw_text) => {
-                        if let Flow::Close { graceful: g } = conn.handle_text(raw_text).await {
+                        if let Flow::Close { graceful: g } = conn.handle_text(raw_text.to_string()).await {
                             graceful = g;
                             break;
                         }
@@ -1423,7 +1427,7 @@ mod tests {
     #[test]
     fn test_outbox_accepts_one_oversized_message_into_an_empty_queue() {
         let (outbox, mut rx) = test_outbox(4, 10);
-        assert_eq!(outbox.push(Message::Text("x".repeat(100))), Ok(()));
+        assert_eq!(outbox.push(Message::Text("x".repeat(100).into())), Ok(()));
         assert!(!outbox.is_dead());
         // ...but nothing more until it has been drained.
         assert_eq!(outbox.push(Message::Text("y".into())), Err(PushError::Full));
