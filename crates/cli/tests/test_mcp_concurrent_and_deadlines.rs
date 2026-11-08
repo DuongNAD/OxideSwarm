@@ -1545,6 +1545,20 @@ async fn test_mcp1_slow_6mb_response_succeeds_and_post_submit_cancel_check_fires
                 let mut transport = MessageTransport::new(stream);
                 while let Ok(Some(msg)) = transport.recv_msg::<ClientMessage>().await {
                     match msg {
+                        ClientMessage::ClusterStatus => {
+                            let _ = transport
+                                .send_msg(&ClientResponse::ClusterStatus {
+                                    total_tasks: 0,
+                                    pending_tasks: 0,
+                                    running_tasks: 0,
+                                    completed_tasks: 0,
+                                    failed_tasks: 0,
+                                    active_bytes: 0,
+                                    max_active_bytes: 0,
+                                    workers: Vec::new(),
+                                })
+                                .await;
+                        }
                         ClientMessage::ListWorkers => {
                             let _ = transport
                                 .send_msg(&ClientResponse::WorkerList {

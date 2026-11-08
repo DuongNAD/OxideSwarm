@@ -816,7 +816,10 @@ async fn test_master_and_worker_refuse_protocol_version_1_at_registration() {
             assert!(!accepted, "master must refuse a version 1 worker");
             assert_eq!(protocol_version, PROTOCOL_VERSION_CURRENT);
             let msg = message.unwrap_or_default();
-            assert!(msg.contains("1") && msg.contains("2"), "{msg}");
+            assert!(
+                msg.contains("1") && msg.contains(&PROTOCOL_VERSION_CURRENT.to_string()),
+                "{msg}"
+            );
         }
         other => panic!("expected RegisterAck, got {other:?}"),
     }
@@ -850,7 +853,10 @@ async fn test_master_and_worker_refuse_protocol_version_1_at_registration() {
         .await
         .expect_err("worker must refuse a version 1 RegisterAck");
     let msg = err.to_string();
-    assert!(msg.contains("1") && msg.contains("2"), "{msg}");
+    assert!(
+        msg.contains("1") && msg.contains(&PROTOCOL_VERSION_CURRENT.to_string()),
+        "{msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

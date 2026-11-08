@@ -110,6 +110,10 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install --disable-pip-version-check websockets
+      - name: verify wire_layout.txt version bump against origin/master
+        run: |
+          git fetch --no-tags --depth=1 origin master:refs/remotes/origin/master
+          cargo test -p rusty_grid_core --lib wire_layout_tests::wire_layout_file_bumps_version_when_body_differs_from_origin_master --locked -- --exact
       - run: cargo test --workspace --lib --locked
       - name: run agent mesh integration tests
         run: cargo test -p agent_mesh --test test_sec6_mesh_sandbox --locked
