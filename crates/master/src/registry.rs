@@ -801,6 +801,23 @@ impl WorkerRegistry {
         }
     }
 
+    /// Credits `count` adopted tasks (`WorkerMessage::ResumeSession`) to `session_id`'s active task
+    /// count and marks the worker `Busy` if it was `Connected`.
+    pub async fn add_adopted_tasks(&self, worker_id: &Uuid, session_id: u64, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut inner = self.inner.write().await;
+        if let Some(entry) = inner.workers.get_mut(worker_id) {
+            if entry.session_id == session_id && entry.status != WorkerStatus::Disconnected {
+                entry.active_tasks = entry.active_tasks.saturating_add(count);
+                if entry.status == WorkerStatus::Connected {
+                    entry.status = WorkerStatus::Busy;
+                }
+            }
+        }
+    }
+
     /// Records that `worker_id` handed a task back without running it (battery, capability or
     /// sandbox rejection) and excludes it from scheduling for an exponentially growing cooldown.
     ///

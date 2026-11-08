@@ -48,8 +48,8 @@ use crate::server::{
     failover_superseded_session, feature_announcement, handle_client_connection,
     handle_oversized_master_message, handle_session_task_message,
     handle_worker_disconnect_with_broadcast, handle_worker_evacuate_with_broadcast,
-    reject_master_role_claim, send_refusal_and_drain, serve_worker_blob_request, AbortOnDrop,
-    BlobService, WaiterMap,
+    reject_master_role_claim, resolve_terminal_waiters, send_refusal_and_drain,
+    serve_worker_blob_request, AbortOnDrop, BlobService, WaiterMap,
 };
 
 /// Which inbound lane delivered a [`WorkerMessage`].
@@ -585,6 +585,10 @@ impl<
 
         // 3. Register in WorkerRegistry
         let negotiated_features = worker_features & ProtocolCapabilities::all_supported();
+        let worker_supports_resume =
+            negotiated_features.contains(ProtocolCapabilities::SESSION_RESUME);
+        queue.set_worker_session_resume(worker_id, worker_supports_resume);
+
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<MasterMessage>(128);
         let registration = registry
             .register_session(
@@ -616,6 +620,18 @@ impl<
             )
             .await;
         }
+        if !worker_supports_resume {
+            let outcome = queue.adopt_session_tasks(worker_id, session_id, &[]).await;
+            if !outcome.newly_failed.is_empty() {
+                if let Some(ref bstore) = blob_store {
+                    for tid in &outcome.newly_failed {
+                        bstore.unpin_task(tid).await;
+                    }
+                }
+                resolve_terminal_waiters(&queue, &waiters, &outcome.newly_failed, Some(worker_id))
+                    .await;
+            }
+        }
 
         #[cfg(feature = "p2p")]
         let p2p_guard = match (pre_auth.p2p_conn(), pre_auth.p2p_conns()) {
@@ -643,7 +659,10 @@ impl<
             heartbeat_interval_secs,
             protocol_version: PROTOCOL_VERSION_CURRENT,
             features: negotiated_features,
-            message: Some(feature_announcement(blob_store.as_ref())),
+            message: Some(feature_announcement(
+                blob_store.as_ref(),
+                queue.session_resume_hold_secs(),
+            )),
         };
         if let Err(e) = pre_auth.send_register_ack(&ack).await {
             handle_worker_disconnect_with_broadcast(
@@ -1171,13 +1190,84 @@ impl<
             }
             (
                 LaneKind::Unified | LaneKind::Control,
-                WorkerMessage::ResumeSession { ref running, .. },
+                WorkerMessage::ResumeSession {
+                    worker_id: claimed,
+                    running,
+                },
             ) => {
-                debug!(
-                    worker_id = %worker_id,
-                    running_count = running.len(),
-                    "Ignoring ResumeSession message (session resumption not active)"
-                );
+                if claimed != worker_id {
+                    warn!(
+                        expected = %worker_id,
+                        got = %claimed,
+                        "ResumeSession worker_id mismatch; disconnecting session"
+                    );
+                    handle_worker_disconnect_with_broadcast(
+                        &self.registry,
+                        &self.queue,
+                        &self.scheduler_notify,
+                        Some(&self.waiters),
+                        &worker_id,
+                        Some(session_id),
+                        "ResumeSession worker_id mismatch",
+                        false,
+                        #[cfg(feature = "dashboard")]
+                        self.broadcast_tx.as_ref(),
+                    )
+                    .await;
+                    return false;
+                }
+                let outcome = self
+                    .queue
+                    .adopt_session_tasks(worker_id, session_id, &running)
+                    .await;
+                if !outcome.adopted.is_empty() {
+                    self.registry
+                        .add_adopted_tasks(&worker_id, session_id, outcome.adopted.len())
+                        .await;
+                    info!(
+                        worker_id = %worker_id,
+                        session_id = session_id,
+                        adopted = ?outcome.adopted,
+                        "Worker resumed session and adopted in-flight task(s)"
+                    );
+                }
+                for stale_id in outcome.stale_to_cancel {
+                    let _ = self
+                        .outbound_tx
+                        .send(MasterMessage::CancelTask {
+                            task_id: stale_id,
+                            reason: Some("Task is no longer assigned to this worker".into()),
+                        })
+                        .await;
+                }
+                if !outcome.newly_failed.is_empty() {
+                    if let Some(ref bstore) = self.blob_store {
+                        for tid in &outcome.newly_failed {
+                            bstore.unpin_task(tid).await;
+                        }
+                    }
+                    resolve_terminal_waiters(
+                        &self.queue,
+                        &self.waiters,
+                        &outcome.newly_failed,
+                        Some(worker_id),
+                    )
+                    .await;
+                }
+                #[cfg(feature = "dashboard")]
+                if let Some(ref b_tx) = self.broadcast_tx {
+                    for tid in outcome.adopted.iter().chain(outcome.newly_failed.iter()) {
+                        if let Some(info) = self.queue.get_task(tid).await {
+                            let _ = b_tx.send(
+                                crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info),
+                            );
+                        }
+                    }
+                    let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+                        self.queue.stats().await,
+                    ));
+                }
+                self.scheduler_notify.notify_one();
                 true
             }
             (LaneKind::Unified, WorkerMessage::UnknownVariant { tag, ref raw_bytes }) => {

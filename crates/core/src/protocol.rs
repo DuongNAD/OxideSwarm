@@ -97,8 +97,6 @@ impl ProtocolCapabilities {
     pub const THREE_D: Self = Self(1 << 11);
     /// Worker session resumption across transient master restarts or network drops
     /// (`WorkerMessage::ResumeSession`, `master_features::SESSION_RESUME_PREFIX`).
-    /// Not advertised in [`ProtocolCapabilities::all_supported`] until master task adoption and
-    /// worker session resume are wired (`docs/design/0046-master-durability.md` D4.1).
     pub const SESSION_RESUME: Self = Self(1 << 12);
 
     pub const fn all_supported() -> Self {
@@ -112,7 +110,8 @@ impl ProtocolCapabilities {
                 | Self::FILE_STAGING.0
                 | Self::ADAPTIVE_KEEPALIVE.0
                 | Self::BLOB_TRANSFER.0
-                | Self::THREE_D.0,
+                | Self::THREE_D.0
+                | Self::SESSION_RESUME.0,
         )
     }
 
@@ -4790,8 +4789,8 @@ mod tests {
 
         assert_eq!(ProtocolCapabilities::SESSION_RESUME.bits(), 1 << 12);
         assert!(
-            !ProtocolCapabilities::all_supported().contains(ProtocolCapabilities::SESSION_RESUME),
-            "SESSION_RESUME must not be advertised in all_supported() until adoption and worker resume are wired"
+            ProtocolCapabilities::all_supported().contains(ProtocolCapabilities::SESSION_RESUME),
+            "SESSION_RESUME must be advertised in all_supported()"
         );
         assert_eq!(SESSION_RESUME_PREFIX, "session-resume=");
         assert_eq!(MAX_SESSION_RESUME_HOLD_SECS, 3_600);

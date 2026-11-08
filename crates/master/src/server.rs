@@ -56,6 +56,13 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 /// anything, so they get a much smaller budget than established connections.
 pub const DEFAULT_MAX_PENDING_HANDSHAKES: usize = 64;
 
+/// Default session-resume hold duration in seconds (`master --session-resume-hold-secs`, default: 30).
+pub const DEFAULT_SESSION_RESUME_HOLD_SECS: u64 = 30;
+
+/// Default session-resume hold duration (`Duration::from_secs(30)`).
+pub const DEFAULT_SESSION_RESUME_HOLD: Duration =
+    Duration::from_secs(DEFAULT_SESSION_RESUME_HOLD_SECS);
+
 /// Configuration options for initializing and running a `MasterServer`.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -151,6 +158,13 @@ pub struct ServerConfig {
     /// `journal.bin`; see [`crate::store::TaskStore`]). `None` (the default) keeps the queue
     /// purely in memory.
     pub state_dir: Option<PathBuf>,
+    /// How long the master holds tasks of a `SESSION_RESUME`-capable worker on disconnect or
+    /// restart before releasing or charging failover (`Duration::ZERO` disables session resume;
+    /// defaults to 30 s when `state_dir` is set or in the CLI).
+    pub session_resume_hold: Duration,
+    /// True when `with_session_resume_hold` was called explicitly so `with_state_dir` does not
+    /// overwrite an explicit `Duration::ZERO`.
+    session_resume_hold_explicit: bool,
 }
 
 impl Default for ServerConfig {
@@ -199,6 +213,8 @@ impl Default for ServerConfig {
             rendezvous_url: None,
             blob_store: None,
             state_dir: None,
+            session_resume_hold: Duration::ZERO,
+            session_resume_hold_explicit: false,
         }
     }
 }
@@ -437,9 +453,29 @@ impl ServerConfig {
 
     /// Configures the durable task queue state directory (`store.lock`, `snapshot.bin`,
     /// `journal.bin`). When `blob_store` is not configured explicitly, it defaults to
-    /// `<dir>/blobs`.
+    /// `<dir>/blobs`, and when `session_resume_hold` was not set explicitly, it defaults to
+    /// [`DEFAULT_SESSION_RESUME_HOLD`] (30 s).
     pub fn with_state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.state_dir = Some(dir.into());
+        if !self.session_resume_hold_explicit {
+            self.session_resume_hold = DEFAULT_SESSION_RESUME_HOLD;
+        }
+        self
+    }
+
+    /// Configures the session-resume hold duration advertised in `RegisterAck` and applied to
+    /// disconnected or restarted workers (`Duration::ZERO` disables session resume; clamped to
+    /// [`rusty_grid_core::protocol::master_features::MAX_SESSION_RESUME_HOLD_SECS`]).
+    pub fn with_session_resume_hold(mut self, hold: Duration) -> Self {
+        let max_hold = Duration::from_secs(
+            rusty_grid_core::protocol::master_features::MAX_SESSION_RESUME_HOLD_SECS,
+        );
+        self.session_resume_hold = if hold.is_zero() {
+            Duration::ZERO
+        } else {
+            hold.min(max_hold)
+        };
+        self.session_resume_hold_explicit = true;
         self
     }
 }
@@ -567,9 +603,13 @@ impl MasterServer {
             None => None,
         };
 
+        queue
+            .set_session_resume_hold(config.session_resume_hold)
+            .await;
+
         if let Some((store, recovered)) = opened_task_store {
             queue
-                .attach_store_and_replay(store, recovered, Duration::ZERO)
+                .attach_store_and_replay(store, recovered, config.session_resume_hold)
                 .await?;
             if let Some(ref bstore) = blob_store {
                 queue.repin_recovered_blobs(bstore).await;
@@ -1988,11 +2028,19 @@ pub(crate) async fn serve_worker_blob_request(
 }
 
 /// The `RegisterAck` message announcing the optional features of this master.
-pub(crate) fn feature_announcement(blob_store: Option<&Arc<BlobStore>>) -> String {
+pub(crate) fn feature_announcement(
+    blob_store: Option<&Arc<BlobStore>>,
+    session_resume_hold_secs: u64,
+) -> String {
     use rusty_grid_core::protocol::master_features;
     let mut features = master_features::SUPPORTED.to_vec();
     if blob_store.is_some() {
         features.push(master_features::BLOBS);
+    }
+    let session_resume_token;
+    if session_resume_hold_secs > 0 {
+        session_resume_token = master_features::session_resume_feature(session_resume_hold_secs);
+        features.push(&session_resume_token);
     }
     master_features::announcement(&features)
 }
@@ -7161,7 +7209,8 @@ mod tests {
             let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
                 .with_web_ui(false)
                 .with_discovery(false)
-                .with_state_dir(&round_dir);
+                .with_state_dir(&round_dir)
+                .with_session_resume_hold(Duration::ZERO);
             let h = MasterServer::spawn(cfg).await.unwrap();
             let addr = h.server_addr().to_string();
             let (wtx, wrx) = tokio::sync::watch::channel(false);
