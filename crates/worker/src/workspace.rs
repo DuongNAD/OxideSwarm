@@ -114,7 +114,7 @@ pub fn default_root_with(
     let get = |k: &str| get(k).filter(|v| !v.is_empty());
     let cache: PathBuf = match platform {
         Platform::Linux => match get("XDG_CACHE_HOME") {
-            Some(x) if Path::new(&x).is_absolute() => PathBuf::from(x),
+            Some(x) if x.starts_with('/') => PathBuf::from(x),
             _ => PathBuf::from(get("HOME")?).join(".cache"),
         },
         Platform::MacOs => PathBuf::from(get("HOME")?).join("Library").join("Caches"),
@@ -1624,11 +1624,11 @@ mod tests {
                 Platform::Linux,
                 env(&[("XDG_CACHE_HOME", "/x/cache"), ("HOME", "/h")])
             ),
-            Some(Path::new("/x/cache").join(&tail))
+            Some(Path::new("/x").join("cache").join(&tail))
         );
         assert_eq!(
             default_root_with(Platform::Linux, env(&[("HOME", "/h")])),
-            Some(Path::new("/h/.cache").join(&tail))
+            Some(Path::new("/h").join(".cache").join(&tail))
         );
         // A relative or empty XDG_CACHE_HOME is ignored.
         assert_eq!(
@@ -1636,11 +1636,16 @@ mod tests {
                 Platform::Linux,
                 env(&[("XDG_CACHE_HOME", "rel"), ("HOME", "/h")])
             ),
-            Some(Path::new("/h/.cache").join(&tail))
+            Some(Path::new("/h").join(".cache").join(&tail))
         );
         assert_eq!(
             default_root_with(Platform::MacOs, env(&[("HOME", "/Users/u")])),
-            Some(Path::new("/Users/u/Library/Caches").join(&tail))
+            Some(
+                Path::new("/Users/u")
+                    .join("Library")
+                    .join("Caches")
+                    .join(&tail)
+            )
         );
         assert_eq!(
             default_root_with(
