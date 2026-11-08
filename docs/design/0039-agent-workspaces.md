@@ -1,6 +1,6 @@
 # 0039: Persistent workspaces for coding agents
 
-Status: Accepted. Nothing is built yet
+Status: Accepted. W1 is built, the rest is not
 Created: 2026-11-07    Updated: 2026-11-08
 
 ## Summary
@@ -310,7 +310,7 @@ Roadmap Phase C names these steps WS-1 to WS-7. The column "Roadmap" maps them.
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| W1 | `Task::workspace`, `WorkspaceRef`, name rules, the `WORKSPACES` bit, a lightweight `ClientMessage::Hello` / `ClientResponse::Hello` version probe variant appended last (replacing `connect_master`'s `ClusterStatus` probe from `FEAT-8b`), the next protocol version, both mirrors and all four `From` impls. Needs FEAT-8. Roadmap WS-1 | `crates/core/src/task.rs`, `crates/core/src/protocol.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/cli/src/connect.rs`, `crates/master/src/server.rs` | Both codecs round-trip, `connect_master` probes with `Hello`, the layout test records the new version, and `Task::validate` refuses bad names | Planned |
+| W1 | `Task::workspace`, `WorkspaceRef`, name rules, the `WORKSPACES` bit, a lightweight `ClientMessage::Hello` / `ClientResponse::Hello` version probe variant appended last (replacing `connect_master`'s `ClusterStatus` probe from `FEAT-8b`), the next protocol version, both mirrors and all four `From` impls. Needs FEAT-8. Roadmap WS-1 | `crates/core/src/task.rs`, `crates/core/src/protocol.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/cli/src/connect.rs`, `crates/master/src/server.rs` | Both codecs round-trip, `connect_master` probes with `Hello`, the layout test records the new version, and `Task::validate` refuses bad names | Implemented |
 | W2 | The workspace store, sync, lock, bounds and worker options. Roadmap WS-1, WS-2 | `crates/worker/src/workspace.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `README.md` | The sync unit tests of the test plan pass | Planned |
 | W3 | Required feature, affinity, one task per workspace. Roadmap WS-1 | `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/master/src/server.rs` | The scheduler unit tests of the test plan pass | Planned |
 | W4 | Source selection with `.gitignore` and limits. Roadmap WS-2 | `crates/cli/src/blobs.rs`, `crates/cli/Cargo.toml` | The scan unit tests pass, and `cargo audit` passes with the `ignore` crate | Done |
@@ -336,6 +336,15 @@ off by default until FEAT-3 is Implemented.
   limit is evicted when its task ends. The protocol version moves to the number after FEAT-8's. The
   owner chose this design over the draft design 0042 (pull request 111), and took two parts of it:
   the Windows device names and the `STREAM_CLIENT` tag. Status set to Accepted.
+- 2026-11-08: `W1` implemented in protocol version 6. `Task::workspace`, `WorkspaceRef`,
+  `WorkspaceSource::Tree` and `validate_workspace_name` are in `crates/core/src/task.rs`;
+  `Task::validate` also refuses a workspace together with a spec other than `Command` or
+  `ShellScript`, with `inputs` or `staged_files`, or with a source manifest size outside
+  `1..=MAX_MANIFEST_BYTES`. `ProtocolCapabilities::WORKSPACES` is `1 << 10` and is **not** in
+  `all_supported()` until W2 and W3 land. `ClientMessage::Hello` / `ClientResponse::Hello` replace
+  the `ClusterStatus` probe of `connect_master`. Details and the legacy decoding are in
+  `docs/design/0040-protocol-versioning.md`. The Windows device names are a lowercase copy of
+  `WINDOWS_RESERVED_NAMES` in core, which cannot depend on the worker crate.
 - 2026-11-08: W4 done. `scan_workspace_source(root, WorkspaceLimits)` in `crates/cli/src/blobs.rs`
   returns the `TreeManifest`, its blob id and the blobs for `upload_inputs`. Limits are the D5
   defaults, as constants: `DEFAULT_WORKSPACE_MAX_FILES` = 100,000 and `DEFAULT_WORKSPACE_MAX_BYTES`

@@ -123,14 +123,13 @@ normal test runs, in `UPDATE_WIRE_LAYOUT=1` mode, and against the git baseline c
   prefix) instead of a raw bincode EOF error.
 - In `connect_master` (`crates/cli/src/connect.rs`), before returning the connected transport to
   any command (`submit`, `cancel`, `status`, `doctor`, `mcp`, ...), the client sends a
-  side-effect-free `ClientMessage::ClusterStatus` probe and verifies the `ClientResponse::ClusterStatus`
-  reply. Because a legacy v2 Master's bincode fallback ignores trailing bytes on `SubmitTask` and
-  `CancelTask`, probing `ClusterStatus` inside `connect_master` guarantees a v3 client refuses a v2
-  Master before any state-changing frame is ever transmitted. Because `ClusterStatus` builds the
-  worker list on every connection (including blob and MCP pool connections, and twice for `status`),
-  `W1` of [design 0039](0039-agent-workspaces.md) will replace this probe with a small
-  `ClientMessage::Hello` / `ClientResponse::Hello` version variant appended last in the same release
-  as `0039` W1's protocol version bump.
+  side-effect-free probe and verifies the reply. Because a legacy v2 Master's bincode fallback
+  ignores trailing bytes on `SubmitTask` and `CancelTask`, probing inside `connect_master`
+  guarantees a v3 client refuses a v2 Master before any state-changing frame is ever transmitted.
+  The probe was `ClientMessage::ClusterStatus` up to protocol version 5. Because `ClusterStatus`
+  builds the worker list on every connection (including blob and MCP pool connections, and twice
+  for `status`), protocol version 6 replaced it with `ClientMessage::Hello`, answered by
+  `ClientResponse::Hello { min_compatible_version }` (both appended last; see the status log).
 - When `authenticate_and_read_first_message` or `handle_client_connection` on the Master receives
   `ProtocolError::IncompatibleVersion { peer_version, .. }`, it replies with
   `ClientResponse::Error { message: format_incompatible_version_error("client", peer_version) }`
@@ -217,3 +216,19 @@ Because `WireCodec` and the 1-byte frame discriminator (`0x01` JSON, `0x02` Binc
   `store_error: Option<String>` to `ClientResponse::ClusterStatus` (plus `LegacyV3V4BinaryClientResponse`
   fallback so a v5 client reports a clear `Incompatible protocol version 4` error from a v4 master)
   and regenerated `crates/core/tests/data/wire_layout.txt`.
+- 2026-11-08: Protocol version 6 (design 0039 `W1`): added `Task::workspace: Option<WorkspaceRef>`
+  (appended last in `Task`), `ClientMessage::Hello` and `ClientResponse::Hello { min_compatible_version }`
+  (appended last), and `ProtocolCapabilities::WORKSPACES` (`1 << 10`, kept out of `all_supported()`
+  until `0039` W2 and W3 land). `connect_master` now probes with `Hello` instead of `ClusterStatus`.
+  Older peers get a clear error in both directions: a v5 `SubmitTask` changes layout with the new
+  `Task` field, so `LegacyV5BinaryClientMessage` (with `LegacyV5Task`) lets a v6 master answer it
+  with `Incompatible protocol version 5` instead of an opaque decode error; the other v5 requests and
+  every v5 response keep the v6 layout (`Hello` was appended, nothing moved) and are refused by the
+  version check. A v6 client against a v5 master cannot be answered: the v5 master cannot decode
+  `Hello` and drops the connection; `connect_master` reports `ConnectionClosed`, an I/O error, or (for an
+  unreadable reply to the probe only) a `ConnectionFailed` that carries the "older or newer build" hint. The master journal (`store.rs`) embeds `Task`, so `STORE_FORMAT_VERSION` is 2;
+  version 1 files still open when they hold no records (`docs/design/0046-master-durability.md`).
+  Regenerated `crates/core/tests/data/wire_layout.txt`.
+- 2026-11-09: Review fixes for protocol version 6: `required_features` adds `WORKSPACES` to a task
+  with a workspace, so it waits with `ClusterLacksCapability` until workers advertise the bit (`0039`
+  W2, W3); the upgrade hint of `connect_master` also covers an undecodable reply to the `Hello` probe.

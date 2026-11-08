@@ -592,6 +592,7 @@ fn test_serde_master_message_all_variants_and_edge_cases() {
             expected_outputs: Vec::new(),
             inputs: Vec::new(),
             output_globs: Vec::new(),
+            workspace: None,
         };
 
         let assign = MasterMessage::AssignTask { task };

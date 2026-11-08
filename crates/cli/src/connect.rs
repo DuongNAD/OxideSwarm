@@ -159,7 +159,7 @@ pub async fn resolve_master_addr(addr: &str, secret: Option<&ClusterSecret>) -> 
 /// prove it holds the same one, `Timeout` when the handshake stalls. Print them with
 /// [`report_master_failure`].
 ///
-/// Without a secret the Master is told apart from an open one on the pre-flight `ClusterStatus`
+/// Without a secret the Master is told apart from an open one on the pre-flight `Hello`
 /// probe: a Master that requires the secret answers that first request with an authentication
 /// rejection, which `connect_master` reports as `GridError::AuthRequired`.
 /// Resolves `RUSTY_GRID_WIRE_CODEC` for a client connection, returning a `GridError::Config`
@@ -213,11 +213,14 @@ pub async fn connect_master(
         transport.enable_encryption(&session_key, EndpointRole::Client);
     }
 
-    // Verify protocol version compatibility with a side-effect-free ClusterStatus request before
-    // any caller sends a state-changing message (such as SubmitTask or CancelTask).
+    // Verify protocol version compatibility with a side-effect-free Hello request before any
+    // caller sends a state-changing message (such as SubmitTask or CancelTask). A Master older
+    // than protocol version 6 cannot decode Hello and closes the connection (`ConnectionClosed`,
+    // or a bincode/IO framing error when it dies mid-frame). Those failures of the probe, and only
+    // of the probe, are reported with the "older or newer build" upgrade hint.
     let probe_future = async {
         transport
-            .send_msg(&rusty_grid_core::protocol::ClientMessage::ClusterStatus)
+            .send_msg(&rusty_grid_core::protocol::ClientMessage::Hello)
             .await?;
         transport
             .recv_msg::<rusty_grid_core::protocol::ClientResponse>()
@@ -229,9 +232,15 @@ pub async fn connect_master(
             operation: "protocol_version_check".into(),
             duration_secs: AUTH_TIMEOUT.as_secs(),
         })?
-        .map_err(GridError::from)?;
+        .map_err(|e| match GridError::from(e) {
+            GridError::Framing(detail) => GridError::ConnectionFailed(format!(
+                "Failed to connect to Master at {addr}: the reply to the protocol version check could not be read ({detail}). If the Master is running an older or newer build, upgrade both Master and CLI to protocol version {}",
+                rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT
+            )),
+            other => other,
+        })?;
     match probe_reply {
-        Some(rusty_grid_core::protocol::ClientResponse::ClusterStatus { .. }) => Ok(transport),
+        Some(rusty_grid_core::protocol::ClientResponse::Hello { .. }) => Ok(transport),
         Some(rusty_grid_core::protocol::ClientResponse::Error { message }) => {
             if message.contains("Incompatible protocol version") {
                 Err(GridError::IncompatibleVersion(message))
@@ -240,7 +249,7 @@ pub async fn connect_master(
             }
         }
         Some(other) => Err(GridError::UnexpectedMessage {
-            expected: "ClusterStatus".into(),
+            expected: "Hello".into(),
             actual: format!("{other:?}"),
         }),
         None => Err(GridError::ConnectionClosed),
@@ -623,7 +632,7 @@ mod tests {
         }
     }
 
-    /// A master that authenticates with `secret`, then answers `ClusterStatus` requests.
+    /// A master that authenticates with `secret`, then answers `Hello` and `ClusterStatus` requests.
     async fn serve_one_client(secret: ClusterSecret) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -637,11 +646,13 @@ mod tests {
                         Err(_) => return,
                     };
                     t.enable_encryption(&session_key, EndpointRole::Server);
-                    while let Ok(Some(ClientMessage::ClusterStatus)) =
-                        t.recv_msg::<ClientMessage>().await
-                    {
-                        let _ = t
-                            .send_msg(&ClientResponse::ClusterStatus {
+                    while let Ok(Some(msg)) = t.recv_msg::<ClientMessage>().await {
+                        let reply = match msg {
+                            ClientMessage::Hello => ClientResponse::Hello {
+                                min_compatible_version:
+                                    rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE,
+                            },
+                            ClientMessage::ClusterStatus => ClientResponse::ClusterStatus {
                                 total_tasks: 0,
                                 pending_tasks: 0,
                                 running_tasks: 0,
@@ -651,8 +662,10 @@ mod tests {
                                 max_active_bytes: 0,
                                 store_error: None,
                                 workers: vec![],
-                            })
-                            .await;
+                            },
+                            _ => break,
+                        };
+                        let _ = t.send_msg(&reply).await;
                     }
                 });
             }

@@ -28,9 +28,9 @@ pub const WIRE_FORMAT_AUTH: u8 = 0x03;
 pub const WIRE_FORMAT_ENCRYPTED: u8 = 0x04;
 
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION_CURRENT: u32 = 5;
+pub const PROTOCOL_VERSION_CURRENT: u32 = 6;
 /// Minimum wire protocol version compatible with this build.
-pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 5;
+pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 6;
 /// Protocol version assumed when a JSON peer omits `protocol_version`.
 pub const LEGACY_UNVERSIONED_PROTOCOL_VERSION: u32 = 2;
 
@@ -92,6 +92,10 @@ impl ProtocolCapabilities {
     /// Content-addressed task inputs and output files moved through the Master's blob store
     /// (`Task::inputs`, `Task::output_globs`, see `crate::blob`).
     pub const BLOB_TRANSFER: Self = Self(1 << 9);
+    /// Persistent named workspaces (`Task::workspace`, design 0039). Reserved at `1 << 10`; not
+    /// advertised in [`ProtocolCapabilities::all_supported`] until the worker store and the
+    /// scheduler affinity (design 0039 W2, W3) land.
+    pub const WORKSPACES: Self = Self(1 << 10);
     /// Generative 3D (`TaskSpec::Generative3D`) and skeletal auto-rigging (`TaskSpec::AutoRig`)
     /// execution support (advertised by workers compiled with the `3d` Cargo feature).
     pub const THREE_D: Self = Self(1 << 11);
@@ -1990,6 +1994,11 @@ pub enum ClientMessage {
     BlobRequest {
         request: crate::blob_transfer::BlobRequest,
     },
+    /// A lightweight, side-effect-free protocol version probe, answered by
+    /// `ClientResponse::Hello`. `connect_master` sends it first on every client connection. A
+    /// Master built before protocol version 6 cannot decode it and closes the connection.
+    /// Appended last so existing variant indices do not move.
+    Hello,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2036,6 +2045,10 @@ enum HumanClientMessage {
         #[serde(default = "default_protocol_version")]
         protocol_version: u32,
     },
+    Hello {
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2072,6 +2085,9 @@ enum BinaryClientMessage {
         request: crate::blob_transfer::BlobRequest,
         protocol_version: u32,
     },
+    Hello {
+        protocol_version: u32,
+    },
 }
 
 /// Pre-v3 (protocol version 2) positional bincode layout of [`ClientMessage`], which carried no
@@ -2100,6 +2116,38 @@ enum LegacyV2BinaryClientMessage {
     },
     BlobRequest {
         request: crate::blob_transfer::BlobRequest,
+    },
+}
+
+/// Protocol v3 to v5 positional bincode layout of [`Task`], which ended at `output_globs` before
+/// `workspace` was appended in v6. Used only to read a v5 `SubmitTask` far enough to recognise it.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct LegacyV5Task {
+    id: crate::task::TaskId,
+    spec: crate::task::TaskSpec,
+    requirements: crate::task::TaskRequirements,
+    created_at_utc: u64,
+    tags: Vec<String>,
+    latest_checkpoint: Option<crate::task::CheckpointData>,
+    staged_files: Vec<crate::task::StagedFile>,
+    expected_outputs: Vec<String>,
+    inputs: Vec<crate::blob::TaskInput>,
+    output_globs: Vec<String>,
+}
+
+/// Protocol v3 to v5 positional bincode layout of [`ClientMessage`]: the same variants as v6
+/// except `Hello`, but `SubmitTask` carries a [`LegacyV5Task`]. Used only so a v6 Master can
+/// refuse a v5 client frame with [`ProtocolError::IncompatibleVersion`] instead of an opaque
+/// bincode error. Every other variant has the v6 layout and is refused by the version check of
+/// [`BinaryClientMessage`] itself.
+#[derive(Deserialize)]
+#[allow(clippy::large_enum_variant, dead_code)]
+enum LegacyV5BinaryClientMessage {
+    SubmitTask {
+        task: LegacyV5Task,
+        wait: bool,
+        protocol_version: u32,
     },
 }
 
@@ -2133,6 +2181,7 @@ impl HumanClientMessage {
                 request,
                 protocol_version,
             },
+            ClientMessage::Hello => HumanClientMessage::Hello { protocol_version },
         }
     }
 
@@ -2157,7 +2206,8 @@ impl HumanClientMessage {
             }
             | Self::BlobRequest {
                 protocol_version, ..
-            } => *protocol_version,
+            }
+            | Self::Hello { protocol_version } => *protocol_version,
         }
     }
 }
@@ -2192,6 +2242,7 @@ impl BinaryClientMessage {
                 request,
                 protocol_version,
             },
+            ClientMessage::Hello => BinaryClientMessage::Hello { protocol_version },
         }
     }
 
@@ -2216,7 +2267,8 @@ impl BinaryClientMessage {
             }
             | Self::BlobRequest {
                 protocol_version, ..
-            } => *protocol_version,
+            }
+            | Self::Hello { protocol_version } => *protocol_version,
         }
     }
 }
@@ -2248,6 +2300,7 @@ impl From<HumanClientMessage> for ClientMessage {
             HumanClientMessage::BlobRequest { request, .. } => {
                 ClientMessage::BlobRequest { request }
             }
+            HumanClientMessage::Hello { .. } => ClientMessage::Hello,
         }
     }
 }
@@ -2281,6 +2334,7 @@ impl From<BinaryClientMessage> for ClientMessage {
             BinaryClientMessage::BlobRequest { request, .. } => {
                 ClientMessage::BlobRequest { request }
             }
+            BinaryClientMessage::Hello { .. } => ClientMessage::Hello,
         }
     }
 }
@@ -2353,6 +2407,12 @@ pub enum ClientResponse {
     /// not move.
     BlobReply {
         reply: crate::blob_transfer::BlobReply,
+    },
+    /// The answer to `ClientMessage::Hello`: the oldest protocol version this Master accepts (the
+    /// newest is the `protocol_version` every response carries). Appended last so existing
+    /// variant indices do not move.
+    Hello {
+        min_compatible_version: u32,
     },
 }
 
@@ -2428,6 +2488,11 @@ enum HumanClientResponse {
         #[serde(default = "default_protocol_version")]
         protocol_version: u32,
     },
+    Hello {
+        min_compatible_version: u32,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2486,6 +2551,10 @@ enum BinaryClientResponse {
     /// not move.
     BlobReply {
         reply: crate::blob_transfer::BlobReply,
+        protocol_version: u32,
+    },
+    Hello {
+        min_compatible_version: u32,
         protocol_version: u32,
     },
 }
@@ -2662,6 +2731,12 @@ impl HumanClientResponse {
                 reply,
                 protocol_version,
             },
+            ClientResponse::Hello {
+                min_compatible_version,
+            } => HumanClientResponse::Hello {
+                min_compatible_version,
+                protocol_version,
+            },
         }
     }
 
@@ -2695,6 +2770,9 @@ impl HumanClientResponse {
                 protocol_version, ..
             }
             | Self::BlobReply {
+                protocol_version, ..
+            }
+            | Self::Hello {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -2786,6 +2864,12 @@ impl BinaryClientResponse {
                 reply,
                 protocol_version,
             },
+            ClientResponse::Hello {
+                min_compatible_version,
+            } => BinaryClientResponse::Hello {
+                min_compatible_version,
+                protocol_version,
+            },
         }
     }
 
@@ -2819,6 +2903,9 @@ impl BinaryClientResponse {
                 protocol_version, ..
             }
             | Self::BlobReply {
+                protocol_version, ..
+            }
+            | Self::Hello {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -2894,6 +2981,12 @@ impl From<HumanClientResponse> for ClientResponse {
             }
             HumanClientResponse::Error { message, .. } => ClientResponse::Error { message },
             HumanClientResponse::BlobReply { reply, .. } => ClientResponse::BlobReply { reply },
+            HumanClientResponse::Hello {
+                min_compatible_version,
+                ..
+            } => ClientResponse::Hello {
+                min_compatible_version,
+            },
         }
     }
 }
@@ -2963,6 +3056,12 @@ impl From<BinaryClientResponse> for ClientResponse {
             }
             BinaryClientResponse::Error { message, .. } => ClientResponse::Error { message },
             BinaryClientResponse::BlobReply { reply, .. } => ClientResponse::BlobReply { reply },
+            BinaryClientResponse::Hello {
+                min_compatible_version,
+                ..
+            } => ClientResponse::Hello {
+                min_compatible_version,
+            },
         }
     }
 }
@@ -3029,6 +3128,7 @@ fn serialize_client_response_with_version(
 
 /// Unified message discriminator for multiplexed connections on the Master.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum InboundMessage {
     Worker(WorkerMessage),
     Client(ClientMessage),
@@ -3036,12 +3136,14 @@ pub enum InboundMessage {
 
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 enum HumanInboundMessage {
     Worker(WorkerMessage),
     Client(ClientMessage),
 }
 
 #[derive(Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 enum BinaryInboundMessage {
     Worker(WorkerMessage),
     Client(ClientMessage),
@@ -3189,6 +3291,14 @@ fn decode_bincode_client_message(slice: &[u8]) -> Result<ClientMessage, Protocol
         Err(err) => {
             if bincode_exact_deserialize::<LegacyV2BinaryClientMessage>(slice).is_ok() {
                 return Err(incompatible_version_error(2));
+            }
+            if let Ok(LegacyV5BinaryClientMessage::SubmitTask {
+                protocol_version, ..
+            }) = bincode_exact_deserialize::<LegacyV5BinaryClientMessage>(slice)
+            {
+                if !is_protocol_version_compatible(protocol_version) {
+                    return Err(incompatible_version_error(protocol_version));
+                }
             }
             Err(ProtocolError::Bincode(err))
         }
@@ -4047,6 +4157,7 @@ mod tests {
                     expected_outputs: Vec::new(),
                     inputs: Vec::new(),
                     output_globs: Vec::new(),
+                    workspace: None,
                 },
             },
             MasterMessage::AssignTaskWithCheckpoint {
@@ -4073,6 +4184,7 @@ mod tests {
                     expected_outputs: Vec::new(),
                     inputs: Vec::new(),
                     output_globs: Vec::new(),
+                    workspace: None,
                 },
                 latest_checkpoint: Some(CheckpointData::new(
                     5,
@@ -5497,5 +5609,246 @@ mod tests {
             }
             other => panic!("expected MasterMessage::RegisterAck, got {other:?}"),
         }
+    }
+
+    // --- Protocol version 6: Task::workspace, Hello (design 0039 W1) ---------------------------
+
+    fn sample_workspace_task() -> Task {
+        Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            crate::task::TaskRequirements::default(),
+        )
+    }
+
+    /// The bytes a v5 client sent for `SubmitTask`: the v6 frame without the `workspace` tag byte
+    /// (`None`), which sits just before the one-byte `wait` and the four-byte version trailer.
+    fn v5_submit_task_frame(wait: bool) -> Vec<u8> {
+        let msg = ClientMessage::SubmitTask {
+            task: sample_workspace_task(),
+            wait,
+        };
+        let raw = serialize_client_message_with_version(&msg, 5, WireCodec::Bincode)
+            .unwrap()
+            .to_vec();
+        let len = raw.len();
+        assert_eq!(raw[len - 6], 0, "workspace None tag byte");
+        let mut v5 = raw[..len - 6].to_vec();
+        v5.extend_from_slice(&raw[len - 5..]);
+        v5
+    }
+
+    #[test]
+    fn test_protocol_6_hello_round_trips_in_both_codecs_and_is_appended_last() {
+        assert_eq!(PROTOCOL_VERSION_CURRENT, 6);
+        assert_eq!(PROTOCOL_VERSION_MIN_COMPATIBLE, 6);
+        for codec in [WireCodec::Bincode, WireCodec::Json] {
+            let raw = serialize_message(&ClientMessage::Hello, codec).unwrap();
+            let (msg, detected) = deserialize_message::<ClientMessage>(&raw).unwrap();
+            assert_eq!(msg, ClientMessage::Hello);
+            assert_eq!(detected, codec);
+            let (inbound, _) = deserialize_message::<InboundMessage>(&raw).unwrap();
+            assert!(matches!(
+                inbound,
+                InboundMessage::Client(ClientMessage::Hello)
+            ));
+
+            let resp = ClientResponse::Hello {
+                min_compatible_version: PROTOCOL_VERSION_MIN_COMPATIBLE,
+            };
+            let raw = serialize_message(&resp, codec).unwrap();
+            let (back, detected) = deserialize_message::<ClientResponse>(&raw).unwrap();
+            assert_eq!(back, resp);
+            assert_eq!(detected, codec);
+        }
+        // Bincode variant indices: Hello is the ninth request and the eleventh response, so every
+        // earlier index is unchanged.
+        let req = serialize_message(&ClientMessage::Hello, WireCodec::Bincode).unwrap();
+        assert_eq!(&req[1..5], &8u32.to_le_bytes());
+        let resp = serialize_message(
+            &ClientResponse::Hello {
+                min_compatible_version: 6,
+            },
+            WireCodec::Bincode,
+        )
+        .unwrap();
+        assert_eq!(&resp[1..5], &10u32.to_le_bytes());
+    }
+
+    #[test]
+    fn test_workspaces_bit_is_reserved_and_not_advertised() {
+        assert_eq!(ProtocolCapabilities::WORKSPACES.0, 1 << 10);
+        assert!(!ProtocolCapabilities::all_supported().contains(ProtocolCapabilities::WORKSPACES));
+    }
+
+    #[test]
+    fn test_task_workspace_round_trips_in_both_codecs() {
+        use crate::task::{WorkspaceRef, WorkspaceSource};
+        let source = WorkspaceSource::Tree {
+            manifest: crate::blob::BlobId([7; 32]),
+            manifest_size: 99,
+        };
+        for workspace in [
+            None,
+            Some(WorkspaceRef::new("agent-1")),
+            Some(WorkspaceRef {
+                name: "agent-1".into(),
+                source: Some(source),
+            }),
+        ] {
+            let mut task = sample_workspace_task();
+            task.workspace = workspace;
+            let msg = ClientMessage::SubmitTask {
+                task: task.clone(),
+                wait: true,
+            };
+            for codec in [WireCodec::Bincode, WireCodec::Json] {
+                let raw = serialize_message(&msg, codec).unwrap();
+                let (back, _) = deserialize_message::<ClientMessage>(&raw).unwrap();
+                assert_eq!(back, msg, "{codec:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_v5_submit_task_at_a_v6_master_is_refused_as_version_5() {
+        for wait in [false, true] {
+            let mut frame = v5_submit_task_frame(wait);
+            // Not decodable with the v6 layout, so the opaque error would have been a bincode one.
+            assert!(bincode_exact_deserialize::<BinaryClientMessage>(&frame[1..]).is_err());
+            match deserialize_message::<ClientMessage>(&frame) {
+                Err(ProtocolError::IncompatibleVersion {
+                    peer_version,
+                    current_version,
+                    min_compatible_version,
+                }) => {
+                    assert_eq!(peer_version, 5);
+                    assert_eq!(current_version, PROTOCOL_VERSION_CURRENT);
+                    assert_eq!(min_compatible_version, PROTOCOL_VERSION_MIN_COMPATIBLE);
+                }
+                other => panic!("expected IncompatibleVersion(5), got {other:?}"),
+            }
+            match deserialize_message::<InboundMessage>(&frame) {
+                Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                    assert_eq!(peer_version, 5);
+                }
+                other => panic!("expected InboundMessage IncompatibleVersion(5), got {other:?}"),
+            }
+            // A v4 client's frame had the same shape; its own version is reported.
+            let len = frame.len();
+            frame[len - 4..].copy_from_slice(&4u32.to_le_bytes());
+            match deserialize_message::<ClientMessage>(&frame) {
+                Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                    assert_eq!(peer_version, 4);
+                }
+                other => panic!("expected IncompatibleVersion(4), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_garbage_submit_task_is_still_an_opaque_decode_error() {
+        let mut frame = v5_submit_task_frame(true);
+        frame.truncate(frame.len() - 7);
+        assert!(matches!(
+            deserialize_message::<ClientMessage>(&frame),
+            Err(ProtocolError::Bincode(_))
+        ));
+    }
+
+    #[test]
+    fn test_v5_non_task_requests_at_a_v6_master_are_refused_as_version_5() {
+        // These have the v6 layout and are refused by the version check itself.
+        for msg in [
+            ClientMessage::ClusterStatus,
+            ClientMessage::ListWorkers,
+            ClientMessage::GetTaskStatus {
+                task_id: TaskId::new(),
+            },
+        ] {
+            for codec in [WireCodec::Bincode, WireCodec::Json] {
+                let raw = serialize_client_message_with_version(&msg, 5, codec).unwrap();
+                match deserialize_message::<InboundMessage>(&raw) {
+                    Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                        assert_eq!(peer_version, 5, "{msg:?} {codec:?}");
+                    }
+                    other => panic!("expected IncompatibleVersion(5), got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_v5_json_submit_task_without_workspace_is_refused_as_version_5() {
+        let task = serde_json::to_value(sample_workspace_task()).unwrap();
+        let mut task = task;
+        task.as_object_mut().unwrap().remove("workspace");
+        let frame = serde_json::json!({
+            "type": "SubmitTask",
+            "task": task,
+            "wait": true,
+            "protocol_version": 5,
+        });
+        let mut raw = vec![WIRE_FORMAT_JSON];
+        raw.extend_from_slice(frame.to_string().as_bytes());
+        match deserialize_message::<ClientMessage>(&raw) {
+            Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                assert_eq!(peer_version, 5);
+            }
+            other => panic!("expected IncompatibleVersion(5), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_v5_responses_at_a_v6_client_are_refused_as_version_5() {
+        // A v5 Master answers with the v6 response layout plus a version-5 trailer (Hello was
+        // appended, nothing moved), so the client reads the version and refuses it. This includes
+        // the ClusterStatus a v5 Master sends back to the old probe.
+        let responses = [
+            ClientResponse::ClusterStatus {
+                total_tasks: 1,
+                pending_tasks: 0,
+                running_tasks: 0,
+                completed_tasks: 1,
+                failed_tasks: 0,
+                workers: Vec::new(),
+                active_bytes: 0,
+                max_active_bytes: 1,
+                store_error: Some("disk".into()),
+            },
+            ClientResponse::WorkerList {
+                workers: Vec::new(),
+            },
+            ClientResponse::TaskSubmitted {
+                task_id: TaskId::new(),
+            },
+        ];
+        for resp in responses {
+            for codec in [WireCodec::Bincode, WireCodec::Json] {
+                let raw = serialize_client_response_with_version(&resp, 5, codec).unwrap();
+                match deserialize_message::<ClientResponse>(&raw) {
+                    Err(ProtocolError::IncompatibleVersion {
+                        peer_version,
+                        current_version,
+                        ..
+                    }) => {
+                        assert_eq!(peer_version, 5, "{resp:?} {codec:?}");
+                        assert_eq!(current_version, PROTOCOL_VERSION_CURRENT);
+                    }
+                    other => panic!("expected IncompatibleVersion(5), got {other:?}"),
+                }
+            }
+        }
+        // A Hello answer stamped v5 is refused as well.
+        let hello = ClientResponse::Hello {
+            min_compatible_version: 5,
+        };
+        let raw = serialize_client_response_with_version(&hello, 5, WireCodec::Bincode).unwrap();
+        assert!(matches!(
+            deserialize_message::<ClientResponse>(&raw),
+            Err(ProtocolError::IncompatibleVersion {
+                peer_version: 5,
+                ..
+            })
+        ));
     }
 }

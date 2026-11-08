@@ -5381,6 +5381,14 @@ max_active_mb = 768
                     .unwrap()
                 {
                     match in_msg {
+                        rusty_grid_core::protocol::InboundMessage::Client(ClientMessage::Hello) => {
+                            t.send_msg(&ClientResponse::Hello {
+                                min_compatible_version:
+                                    rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE,
+                            })
+                            .await
+                            .unwrap();
+                        }
                         rusty_grid_core::protocol::InboundMessage::Client(
                             ClientMessage::ClusterStatus,
                         ) => {
