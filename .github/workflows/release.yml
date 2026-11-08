@@ -1,0 +1,158 @@
+name: Release
+
+# On a `v*` tag this builds release archives for Linux, macOS and Windows (with and without
+# `gpu-wgpu`), writes SHA256SUMS and creates the GitHub release. On a pull request that touches this
+# file or the dependency manifests it runs the same build and packaging and keeps the files as
+# workflow artifacts only: no tag, no release.
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: build (${{ matrix.target }}${{ matrix.gpu && ' gpu' || '' }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04,      target: x86_64-unknown-linux-gnu,  gpu: false }
+          - { os: ubuntu-22.04,      target: x86_64-unknown-linux-gnu,  gpu: true }
+          - { os: macos-latest,     target: aarch64-apple-darwin,      gpu: false }
+          - { os: macos-latest,     target: aarch64-apple-darwin,      gpu: true }
+          - { os: macos-15-intel,   target: x86_64-apple-darwin,       gpu: false }
+          - { os: macos-15-intel,   target: x86_64-apple-darwin,       gpu: true }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,    gpu: false }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,    gpu: true }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}-${{ matrix.gpu }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+          cache-on-failure: true
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)-pr${GITHUB_SHA::7}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: |
+          features=()
+          if [ "${{ matrix.gpu }}" = "true" ]; then features=(--features gpu-wgpu); fi
+          cargo build --release --locked --target "${{ matrix.target }}" -p rusty_grid_cli --bins "${features[@]}"
+
+      - name: Package
+        id: pkg
+        run: |
+          name="oxideswarm-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
+          if [ "${{ matrix.gpu }}" = "true" ]; then name="${name}-gpu"; fi
+          bindir="target/${{ matrix.target }}/release"
+          stage="dist/${name}"
+          mkdir -p "${stage}" "dist/out"
+          case "${{ matrix.target }}" in
+            *windows*)
+              ext=zip; exe=.exe
+              installers=(packaging/windows windows)
+              ;;
+            *apple-darwin)
+              ext=tar.gz; exe=
+              installers=(packaging/macos switch_role.sh connect_remote.sh)
+              ;;
+            *)
+              ext=tar.gz; exe=
+              installers=(switch_role.sh connect_remote.sh)
+              ;;
+          esac
+          for b in oxideswarm rusty-grid ox-mode; do cp "${bindir}/${b}${exe}" "${stage}/"; done
+          cp README.md LICENSE LICENSE-MIT LICENSE-APACHE "${stage}/"
+          mkdir -p "${stage}/scripts"
+          for i in "${installers[@]}"; do cp -R "$i" "${stage}/scripts/"; done
+          if [ "$ext" = zip ]; then
+            (cd dist && 7z a -tzip "out/${name}.zip" "${name}" > /dev/null)
+          else
+            tar -C dist -czf "dist/out/${name}.tar.gz" "${name}"
+          fi
+          ls -l dist/out
+          echo "archive=${name}.${ext}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.archive }}
+          path: dist/out/${{ steps.pkg.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 14
+
+  checksums:
+    name: SHA256SUMS
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: archives
+          merge-multiple: true
+      - name: Write SHA256SUMS
+        working-directory: archives
+        run: |
+          sha256sum oxideswarm-* > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: archives/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [build, checksums]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls -l assets
+          gh release create "${GITHUB_REF_NAME}" assets/* --title "${GITHUB_REF_NAME}" --generate-notes --verify-tag
