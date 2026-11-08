@@ -6,13 +6,14 @@
 //! # Files under `<state_dir>`
 //!
 //! * `store.lock`: exclusive advisory lock held for the lifetime of the `TaskStore`.
-//! * `journal.bin`: 24-byte header, then frames `[payload_len u32 LE][blake3 32B][payload]`, where
+//! * `journal.bin`: 24-byte header, then frames `[payload_len u32 LE][len_check u32 LE][blake3 32B][payload]`, where
 //!   the payload is the bincode form of a [`JournalRecord`].
 //! * `snapshot.bin`: 24-byte header, then one frame `[payload_len u64 LE][blake3 32B][payload]`
 //!   whose payload is the JSON form of a [`SnapshotImage`] (human-readable serde representations,
 //!   so it survives protocol bumps). The length is `u64` and bounded by [`SNAPSHOT_MAX_BYTES`].
 //!
-//! The header is `[magic 8B][store_format_version u32 LE][protocol_version u32 LE][generation u64 LE]`.
+//! `len_check` is a bijective mix of `payload_len` ([`len_check`]), so a damaged length is detected
+//! without reading the payload. The header is `[magic 8B][store_format_version u32 LE][protocol_version u32 LE][generation u64 LE]`.
 //!
 //! **A change to the bincode layout of [`JournalRecord`] or of any type it contains (`Task`,
 //! `TaskState`, `RetryAttempt`, `CheckpointData`, `TaskResult`) is a change of the journal format:
@@ -49,15 +50,19 @@
 //!
 //! # Torn tails and corruption
 //!
-//! A bad final frame (short, or checksum mismatch) is a torn write: it is truncated. A bad frame
-//! is only treated as the tail if **no valid frame can be found after it** (a forward scan for any
-//! offset that parses as a frame with a matching BLAKE3). If one exists, the bad frame is in the
-//! middle of acknowledged history (bit rot, for example in a length field) and `open` refuses.
-//! A zero-filled tail (file size extended by the OS, data never written) contains no valid frame
-//! and is truncated the same way.
+//! A frame whose header check is valid but whose payload runs past the end of the file is a torn
+//! write: it is truncated, with no scan. A frame whose header check is invalid (bit rot in the
+//! length, a zero-filled tail) or whose BLAKE3 does not match is classified by looking for a valid
+//! frame after it, probing only offsets whose header check passes (linear in the tail size, with a
+//! bounded hashing budget). If one exists the bad frame is in the middle of acknowledged history
+//! and `open` refuses; otherwise it is a torn tail and is truncated. A torn payload that happens
+//! to contain journal bytes is therefore still a torn tail.
 //!
 //! The snapshot's `Bytes` fields keep the core JSON representation (a string if UTF-8, otherwise
-//! a number array, up to 4x the raw size), hence the 4 GiB snapshot bound.
+//! a number array, up to 4x the raw size), hence the 4 GiB snapshot bound. Moving them to base64
+//! later is a format change (the current reader takes a JSON string as raw UTF-8): bump
+//! [`STORE_FORMAT_VERSION`]. `compact` takes the image by value and encodes it on the writer
+//! thread, so the caller only enqueues.
 
 use std::fs::{File, OpenOptions};
 use std::future::Future;
@@ -89,8 +94,8 @@ pub const SNAPSHOT_MAGIC: &[u8; 8] = b"OXSWSNP1";
 pub const STORE_FORMAT_VERSION: u32 = 1;
 /// Size of the file header in bytes.
 pub const HEADER_LEN: usize = 24;
-/// Size of a journal frame header: `payload_len` (4) plus the BLAKE3 hash (32).
-pub const FRAME_HEADER_LEN: usize = 4 + 32;
+/// Size of a journal frame header: `payload_len` (4), `len_check` (4) and the BLAKE3 hash (32).
+pub const FRAME_HEADER_LEN: usize = 4 + 4 + 32;
 /// Size of the snapshot frame header: `payload_len` (8) plus the BLAKE3 hash (32).
 pub const SNAPSHOT_FRAME_HEADER_LEN: usize = 8 + 32;
 /// Upper bound of the snapshot payload (JSON) in bytes.
@@ -277,7 +282,7 @@ fn writer_stopped() -> GridError {
 
 enum Cmd {
     Append { frame: Vec<u8>, ack: Option<Ack> },
-    Compact { snapshot_frame: Vec<u8>, ack: Ack },
+    Compact { image: SnapshotImage, ack: Ack },
 }
 
 #[derive(Default)]
@@ -348,7 +353,7 @@ impl TaskStore {
         if let Some(s) = &snapshot {
             if s.version != PROTOCOL_VERSION_CURRENT {
                 // Self-describing JSON: carry it over to the current protocol version.
-                write_snapshot_file(&dir, s.generation, &encode_snapshot(&s.image)?)?;
+                write_snapshot_file(&dir, s.generation, &s.image)?;
             }
         }
 
@@ -361,9 +366,8 @@ impl TaskStore {
             if loaded.truncated_tail {
                 journal
                     .set_len(loaded.valid_len)
-                    .and_then(|()| journal.sync_all())
+                    .and_then(|()| sync_file_all(&journal, &dir, "journal_tail"))
                     .map_err(|e| storage_io(&journal_path, "truncate", e))?;
-                note_fsync(&dir, "journal_tail");
             }
             journal
                 .seek(SeekFrom::End(0))
@@ -439,19 +443,16 @@ impl TaskStore {
     }
 
     /// Enqueues a compaction to `image` (see the module docs for the contract) and returns an ack
-    /// that resolves when the snapshot is installed and the journal reset.
-    pub fn compact(&self, image: &SnapshotImage) -> GridResult<DurableAck> {
-        let snapshot_frame = encode_snapshot(image)?;
+    /// that resolves when the snapshot is installed and the journal reset. The image is encoded
+    /// on the writer thread.
+    pub fn compact(&self, image: SnapshotImage) -> GridResult<DurableAck> {
         let (ack, rx) = oneshot::channel();
-        self.send(Cmd::Compact {
-            snapshot_frame,
-            ack,
-        })?;
+        self.send(Cmd::Compact { image, ack })?;
         Ok(DurableAck(rx))
     }
 
     /// `compact(image)?.wait()` for non-async callers.
-    pub fn compact_blocking(&self, image: &SnapshotImage) -> GridResult<()> {
+    pub fn compact_blocking(&self, image: SnapshotImage) -> GridResult<()> {
         self.compact(image)?.wait()
     }
 
@@ -517,13 +518,8 @@ impl Writer {
         while let Some(cmd) = next {
             next = match cmd {
                 Cmd::Append { frame, ack } => self.handle_append(frame, ack, &rx),
-                Cmd::Compact {
-                    snapshot_frame,
-                    ack,
-                } => {
-                    let res = self
-                        .check_failed()
-                        .and_then(|()| self.compact(&snapshot_frame));
+                Cmd::Compact { image, ack } => {
+                    let res = self.check_failed().and_then(|()| self.compact(&image));
                     self.finish(res, std::iter::once(ack));
                     rx.recv().ok()
                 }
@@ -602,16 +598,13 @@ impl Writer {
             _ => {}
         }
         self.shared.sync_calls.fetch_add(1, Ordering::Relaxed);
-        self.journal
-            .sync_data()
-            .map_err(|e| storage_io(&self.dir.join(JOURNAL_FILE), "sync", e))?;
-        note_fsync(&self.dir, "journal_data");
-        Ok(())
+        sync_file_data(&self.journal, &self.dir, "journal_data")
+            .map_err(|e| storage_io(&self.dir.join(JOURNAL_FILE), "sync", e))
     }
 
-    fn compact(&mut self, snapshot_frame: &[u8]) -> GridResult<()> {
+    fn compact(&mut self, image: &SnapshotImage) -> GridResult<()> {
         let next = self.generation + 1;
-        write_snapshot_file(&self.dir, next, snapshot_frame)?;
+        write_snapshot_file(&self.dir, next, image)?;
         reset_journal(&mut self.journal, &self.dir, next, "journal_reset")?;
         self.generation = next;
         self.bytes = HEADER_LEN as u64;
@@ -685,16 +678,27 @@ fn note_fsync(_dir: &Path, _kind: &'static str) {
     FSYNC_LOG.lock().unwrap().push((_dir.to_path_buf(), _kind));
 }
 
+/// The only places that call `sync_all` / `sync_data`: each syncs and then records `kind`, so a
+/// test that expects a log entry fails when the sync is skipped.
+fn sync_file_all(file: &File, dir: &Path, kind: &'static str) -> std::io::Result<()> {
+    file.sync_all()?;
+    note_fsync(dir, kind);
+    Ok(())
+}
+
+fn sync_file_data(file: &File, dir: &Path, kind: &'static str) -> std::io::Result<()> {
+    file.sync_data()?;
+    note_fsync(dir, kind);
+    Ok(())
+}
+
 /// `fsync` of a directory so a create or rename in it survives a crash. A no-op on Windows,
 /// which has no directory fsync.
 fn sync_dir(dir: &Path, kind: &'static str) -> GridResult<()> {
     #[cfg(unix)]
-    {
-        File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(|e| storage_io(dir, "sync", e))?;
-        note_fsync(dir, kind);
-    }
+    File::open(dir)
+        .and_then(|d| sync_file_all(&d, dir, kind))
+        .map_err(|e| storage_io(dir, "sync", e))?;
     #[cfg(not(unix))]
     let _ = (dir, kind);
     Ok(())
@@ -803,10 +807,8 @@ fn reset_journal(
         .set_len(0)
         .and_then(|()| journal.seek(SeekFrom::Start(0)))
         .and_then(|_| journal.write_all(&header_bytes(JOURNAL_MAGIC, generation)))
-        .and_then(|()| journal.sync_all())
-        .map_err(|e| storage_io(&path, "reset", e))?;
-    note_fsync(dir, kind);
-    Ok(())
+        .and_then(|()| sync_file_all(journal, dir, kind))
+        .map_err(|e| storage_io(&path, "reset", e))
 }
 
 struct Header {
@@ -844,9 +846,22 @@ fn encode_frame(payload: &[u8]) -> GridResult<Vec<u8>> {
     }
     let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&len_check(payload.len() as u32).to_le_bytes());
     frame.extend_from_slice(blake3::hash(payload).as_bytes());
     frame.extend_from_slice(payload);
     Ok(frame)
+}
+
+/// Header check of a frame length: the murmur3 32-bit finalizer of the length (a bijection, so
+/// any change of the length alone is detected) xor a constant (so a zeroed header never passes).
+/// Cheap enough to probe every byte offset of a damaged tail.
+pub fn len_check(len: u32) -> u32 {
+    let mut x = len ^ 0x9E37_79B9;
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x85EB_CA6B);
+    x ^= x >> 13;
+    x = x.wrapping_mul(0xC2B2_AE35);
+    x ^ (x >> 16)
 }
 
 fn encode_record_frame(record: &JournalRecord) -> GridResult<Vec<u8>> {
@@ -855,8 +870,9 @@ fn encode_record_frame(record: &JournalRecord) -> GridResult<Vec<u8>> {
     encode_frame(&payload)
 }
 
-/// Returns the snapshot frame `[len u64][blake3][json]` (the part after the header).
-fn encode_snapshot(image: &SnapshotImage) -> GridResult<Vec<u8>> {
+/// Encodes `image` and writes `snapshot.bin.tmp` (header, `[len u64][blake3][json]`), syncs it,
+/// renames it over `snapshot.bin`, and syncs the directory. The JSON is not copied into a frame.
+fn write_snapshot_file(dir: &Path, generation: u64, image: &SnapshotImage) -> GridResult<()> {
     let payload = serde_json::to_vec(image)?;
     if payload.len() as u64 > SNAPSHOT_MAX_BYTES {
         return Err(GridError::Storage(format!(
@@ -864,15 +880,6 @@ fn encode_snapshot(image: &SnapshotImage) -> GridResult<Vec<u8>> {
             payload.len()
         )));
     }
-    let mut frame = Vec::with_capacity(SNAPSHOT_FRAME_HEADER_LEN + payload.len());
-    frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    frame.extend_from_slice(blake3::hash(&payload).as_bytes());
-    frame.extend_from_slice(&payload);
-    Ok(frame)
-}
-
-/// Writes `snapshot.bin.tmp`, syncs it, renames it over `snapshot.bin`, and syncs the directory.
-fn write_snapshot_file(dir: &Path, generation: u64, snapshot_frame: &[u8]) -> GridResult<()> {
     let tmp = dir.join(SNAPSHOT_TMP_FILE);
     let dest = dir.join(SNAPSHOT_FILE);
     let _ = std::fs::remove_file(&tmp);
@@ -885,10 +892,11 @@ fn write_snapshot_file(dir: &Path, generation: u64, snapshot_frame: &[u8]) -> Gr
     }
     let mut file = opts.open(&tmp).map_err(|e| storage_io(&tmp, "create", e))?;
     file.write_all(&header_bytes(SNAPSHOT_MAGIC, generation))
-        .and_then(|()| file.write_all(snapshot_frame))
-        .and_then(|()| file.sync_all())
+        .and_then(|()| file.write_all(&(payload.len() as u64).to_le_bytes()))
+        .and_then(|()| file.write_all(blake3::hash(&payload).as_bytes()))
+        .and_then(|()| file.write_all(&payload))
+        .and_then(|()| sync_file_all(&file, dir, "snapshot_file"))
         .map_err(|e| storage_io(&tmp, "write", e))?;
-    note_fsync(dir, "snapshot_file");
     drop(file);
     std::fs::rename(&tmp, &dest).map_err(|e| storage_io(&dest, "install", e))?;
     sync_dir(dir, "snapshot_dir")
@@ -950,25 +958,40 @@ struct LoadedJournal {
     stale: bool,
 }
 
-/// Looks for any offset at or after `from` that parses as a complete frame with a valid BLAKE3.
-/// Used to tell a torn tail (nothing valid follows) from damage in the middle of the history.
-fn valid_frame_follows(bytes: &[u8], from: usize) -> Option<usize> {
+enum Scan {
+    Nothing,
+    Found(usize),
+    /// Too much hashing would be needed to classify the tail; treated as corruption.
+    TooCostly,
+}
+
+/// Looks for a complete valid frame at or after `from`, probing only offsets whose header check
+/// passes. Used to tell a torn tail (nothing valid follows) from damage in the middle of the
+/// history. Hashing work is capped at a few times the file size.
+fn valid_frame_follows(bytes: &[u8], from: usize) -> Scan {
     let total = bytes.len();
+    let mut budget = 4 * total + (1 << 20);
     let mut o = from;
     while o + FRAME_HEADER_LEN <= total {
-        let len = u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize;
-        if len <= MAX_FRAME_SIZE {
-            let end = o + FRAME_HEADER_LEN + len;
-            if end <= total
-                && blake3::hash(&bytes[o + FRAME_HEADER_LEN..end]).as_bytes()
-                    == &bytes[o + 4..o + FRAME_HEADER_LEN]
-            {
-                return Some(o);
+        let len = u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+        let chk = u32::from_le_bytes(bytes[o + 4..o + 8].try_into().unwrap());
+        if chk == len_check(len) && len as usize <= MAX_FRAME_SIZE {
+            let end = o + FRAME_HEADER_LEN + len as usize;
+            if end <= total {
+                if len as usize > budget {
+                    return Scan::TooCostly;
+                }
+                budget -= len as usize;
+                if blake3::hash(&bytes[o + FRAME_HEADER_LEN..end]).as_bytes()
+                    == &bytes[o + 8..o + FRAME_HEADER_LEN]
+                {
+                    return Scan::Found(o);
+                }
             }
         }
         o += 1;
     }
-    None
+    Scan::Nothing
 }
 
 fn read_journal(path: &Path, snapshot_generation: u64) -> GridResult<LoadedJournal> {
@@ -1045,33 +1068,50 @@ fn read_journal(path: &Path, snapshot_generation: u64) -> GridResult<LoadedJourn
     let total = bytes.len();
     let mut off = HEADER_LEN;
     while off < total {
-        let remaining = total - off;
-        let bad = if remaining < FRAME_HEADER_LEN {
-            Some("short frame header")
+        // `scan_from` is where to look for later valid frames when this one is bad.
+        let bad: Option<(&str, usize)> = if total - off < FRAME_HEADER_LEN {
+            Some(("short frame header", off + 1))
         } else {
-            let len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
-            if len > MAX_FRAME_SIZE {
+            let len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            let chk = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+            if chk != len_check(len) {
+                Some(("damaged frame header", off + 1))
+            } else if len as usize > MAX_FRAME_SIZE {
                 return Err(GridError::Storage(format!(
                     "{} is corrupt: the frame at offset {off} claims {len} bytes (maximum {MAX_FRAME_SIZE})",
                     path.display()
                 )));
-            }
-            let end = off + FRAME_HEADER_LEN + len;
-            if end > total {
-                Some("short frame payload")
-            } else if blake3::hash(&bytes[off + FRAME_HEADER_LEN..end]).as_bytes()
-                != &bytes[off + 4..off + FRAME_HEADER_LEN]
-            {
-                Some("checksum mismatch")
             } else {
-                None
+                let end = off + FRAME_HEADER_LEN + len as usize;
+                if end > total {
+                    // A torn write: the header is intact and the payload never fully landed.
+                    warn!(
+                        "task store: short frame payload at offset {off} of {}; discarding the torn tail ({} records kept)",
+                        path.display(),
+                        out.records.len()
+                    );
+                    out.valid_len = off as u64;
+                    out.truncated_tail = true;
+                    return Ok(out);
+                } else if blake3::hash(&bytes[off + FRAME_HEADER_LEN..end]).as_bytes()
+                    != &bytes[off + 8..off + FRAME_HEADER_LEN]
+                {
+                    Some(("checksum mismatch", end))
+                } else {
+                    None
+                }
             }
         };
-        if let Some(why) = bad {
-            if let Some(later) = valid_frame_follows(&bytes, off + 1) {
+        if let Some((why, scan_from)) = bad {
+            let detail = match valid_frame_follows(&bytes, scan_from) {
+                Scan::Nothing => None,
+                Scan::Found(later) => Some(format!("a valid frame follows at offset {later}")),
+                Scan::TooCostly => Some("the damaged tail is too large to classify".to_string()),
+            };
+            if let Some(detail) = detail {
                 return Err(GridError::Storage(format!(
-                    "{} is corrupt: the frame at offset {off} is bad ({why}) but a valid frame \
-                     follows at offset {later}; refusing to drop acknowledged history",
+                    "{} is corrupt: the frame at offset {off} is bad ({why}) and {detail}; \
+                     refusing to drop acknowledged history",
                     path.display()
                 )));
             }
@@ -1333,8 +1373,9 @@ mod tests {
         write_all(dir.path(), &[marker(1), marker(2)]);
         let path = journal_path(dir.path());
         let mut bytes = std::fs::read(&path).unwrap();
-        bytes[HEADER_LEN..HEADER_LEN + 4]
-            .copy_from_slice(&((MAX_FRAME_SIZE as u32) + 1).to_le_bytes());
+        let huge = (MAX_FRAME_SIZE as u32) + 1;
+        bytes[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&huge.to_le_bytes());
+        bytes[HEADER_LEN + 4..HEADER_LEN + 8].copy_from_slice(&len_check(huge).to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
         expect_storage_err(TaskStore::open(dir.path()));
 
@@ -1393,7 +1434,7 @@ mod tests {
             for i in 0..5 {
                 store.append_durable_blocking(&marker(i)).unwrap();
             }
-            store.compact_blocking(&image).unwrap();
+            store.compact_blocking(image.clone()).unwrap();
             assert_eq!(store.journal_records(), 0);
             assert_eq!(store.journal_bytes(), HEADER_LEN as u64);
             store
@@ -1422,7 +1463,7 @@ mod tests {
         assert!(!store.needs_compaction());
         store.append_durable_blocking(&marker(3)).unwrap();
         assert!(store.needs_compaction());
-        store.compact_blocking(&SnapshotImage::default()).unwrap();
+        store.compact_blocking(SnapshotImage::default()).unwrap();
         assert!(!store.needs_compaction());
     }
 
@@ -1507,7 +1548,7 @@ mod tests {
         let image = image_with(2);
         {
             let (store, _) = TaskStore::open(dir.path()).unwrap();
-            store.compact_blocking(&image).unwrap();
+            store.compact_blocking(image.clone()).unwrap();
         }
         let old = PROTOCOL_VERSION_CURRENT.saturating_sub(1);
         set_header_version(&dir.path().join(SNAPSHOT_FILE), old);
@@ -1533,7 +1574,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let (store, _) = TaskStore::open(dir.path()).unwrap();
-            store.compact_blocking(&image_with(1)).unwrap();
+            store.compact_blocking(image_with(1)).unwrap();
         }
         let path = dir.path().join(SNAPSHOT_FILE);
         let mut bytes = std::fs::read(&path).unwrap();
@@ -1709,7 +1750,7 @@ mod tests {
                 store.append_durable_blocking(&submitted("x", i)).unwrap();
             }
             saved = std::fs::read(journal_path(dir.path())).unwrap();
-            store.compact_blocking(&image).unwrap();
+            store.compact_blocking(image.clone()).unwrap();
         }
         assert_eq!(header_generation(&dir.path().join(SNAPSHOT_FILE)), 1);
         assert_eq!(header_generation(&journal_path(dir.path())), 1);
@@ -1732,7 +1773,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let (store, _) = TaskStore::open(dir.path()).unwrap();
-            store.compact_blocking(&image_with(1)).unwrap();
+            store.compact_blocking(image_with(1)).unwrap();
             store.append_durable_blocking(&marker(1)).unwrap();
         }
         std::fs::remove_file(dir.path().join(SNAPSHOT_FILE)).unwrap();
@@ -1818,7 +1859,7 @@ mod tests {
         };
         {
             let (store, _) = TaskStore::open(dir.path()).unwrap();
-            store.compact_blocking(&image).unwrap();
+            store.compact_blocking(image.clone()).unwrap();
         }
         let (_s, rec) = TaskStore::open(dir.path()).unwrap();
         assert!(rec.snapshot.as_ref() == Some(&image));
@@ -1869,7 +1910,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (store, _) = TaskStore::open(dir.path()).unwrap();
         store.append_durable_blocking(&marker(1)).unwrap();
-        store.compact_blocking(&image_with(1)).unwrap();
+        store.compact_blocking(image_with(1)).unwrap();
         let log = fsync_kinds(dir.path());
         #[cfg(unix)]
         assert_subsequence(
@@ -2008,6 +2049,20 @@ mod tests {
             "header {}",
             hex(&header_bytes(JOURNAL_MAGIC, 0)[..16])
         )];
+        let states = [
+            TaskState::Submitted,
+            TaskState::Queued,
+            TaskState::Scheduled,
+            TaskState::Running,
+            TaskState::Completed,
+            TaskState::Failed,
+            TaskState::Cancelled,
+            TaskState::Retrying,
+        ];
+        lines.push(format!(
+            "TaskState {}",
+            hex(&bincode::serialize(&states).unwrap())
+        ));
         for (name, rec) in layout_records() {
             lines.push(format!(
                 "{name} {}",
@@ -2025,6 +2080,81 @@ mod tests {
             actual.replace("\r\n", "\n"),
             expected.replace("\r\n", "\n"),
             "journal byte layout changed: bump STORE_FORMAT_VERSION and re-bless"
+        );
+    }
+
+    // A torn final frame whose payload embeds a valid frame is still a torn tail.
+    #[test]
+    fn torn_frame_with_an_embedded_frame_is_still_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        write_all(dir.path(), &[marker(1), marker(2)]);
+        let inner = encode_record_frame(&marker(9)).unwrap();
+        let outer = encode_record_frame(&JournalRecord::CheckpointRecorded {
+            task_id: TaskId(Uuid::from_u128(7)),
+            checkpoint: CheckpointData {
+                sequence: 1,
+                delta_state: inner.into(),
+                timestamp: 5,
+            },
+        })
+        .unwrap();
+        let path = journal_path(dir.path());
+        let good = std::fs::metadata(&path).unwrap().len();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&outer[..outer.len() - 4]).unwrap();
+        drop(f);
+        let (s, rec) = TaskStore::open(dir.path()).unwrap();
+        assert!(rec.truncated_tail);
+        assert_eq!(rec.records.len(), 2);
+        drop(s);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), good);
+    }
+
+    fn torn_tail_open_time(tail: &[u8]) -> Duration {
+        let dir = tempfile::tempdir().unwrap();
+        write_all(dir.path(), &[marker(1)]);
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(journal_path(dir.path()))
+            .unwrap();
+        // A damaged frame header (no valid check), then garbage.
+        f.write_all(&((tail.len() + 1024) as u32).to_le_bytes())
+            .unwrap();
+        f.write_all(&[0xAB; 36]).unwrap();
+        f.write_all(tail).unwrap();
+        drop(f);
+        let t0 = Instant::now();
+        let (_s, rec) = TaskStore::open(dir.path()).unwrap();
+        assert!(rec.truncated_tail);
+        t0.elapsed()
+    }
+
+    #[test]
+    fn classifying_a_damaged_tail_is_linear() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = |n: usize| {
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect::<Vec<u8>>()
+        };
+        let random = rnd(8 << 20);
+        let t = torn_tail_open_time(&random);
+        assert!(t < Duration::from_secs(1), "8 MiB random tail took {t:?}");
+        let patterned: Vec<u8> = [0u8, 0, 1, 0]
+            .iter()
+            .copied()
+            .cycle()
+            .take(8 << 20)
+            .collect();
+        let t = torn_tail_open_time(&patterned);
+        assert!(
+            t < Duration::from_secs(1),
+            "8 MiB patterned tail took {t:?}"
         );
     }
 }

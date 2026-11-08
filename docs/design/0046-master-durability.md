@@ -121,7 +121,7 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
      time the file was written.
    - Every journal frame after the 24-byte header has the fixed layout:
      ```text
-     [payload_len: u32 LE][blake3_hash: [u8; 32]][payload: [u8; payload_len]]
+     [payload_len: u32 LE][len_check: u32 LE][blake3_hash: [u8; 32]][payload: [u8; payload_len]]
      ```
      `payload_len` is bounded by `rusty_grid_core::protocol::MAX_FRAME_SIZE` (`64 MiB`,
      `crates/core/src/protocol.rs:16`). In `journal.bin`, `payload` is a `bincode`-serialized
@@ -571,3 +571,9 @@ lands as a self-contained, reviewable unit.
   valid frame follows it, otherwise `open` refuses; a zero-filled tail is truncated; durable appends
   enqueue synchronously and return a `DurableAck`; the journal byte layout is recorded in
   `crates/master/tests/data/journal_layout.txt` and a change requires bumping `STORE_FORMAT_VERSION`.
+- **2026-11-08:** Review round 2 (still format v1): journal frames gain `len_check: u32` (a bijective
+  mix of `payload_len`). Header valid and payload past EOF is a torn tail with no scan; an invalid
+  header or a BLAKE3 mismatch probes only offsets whose `len_check` passes, so classification is
+  linear and a torn payload that embeds journal bytes still opens as a torn tail. `compact` takes
+  the `SnapshotImage` by value and encodes it on the writer thread. Moving snapshot `Bytes` to base64
+  later needs a `STORE_FORMAT_VERSION` bump (the reader takes a JSON string as raw UTF-8).
