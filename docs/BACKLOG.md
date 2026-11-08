@@ -126,7 +126,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-08, at `master` `9aa4d23`: 54 items Implemented, 2 Partial and 14 Planned. "Pull
+On 2026-11-08, at `master` `5fb5575`: 54 items Implemented, 2 Partial and 14 Planned. "Pull
 requests" lists them by number, "(open)" marks one that is not merged yet, and "(design)" marks a
 design record that builds nothing.
 
@@ -189,7 +189,7 @@ design record that builds nothing.
 | AND-2 | Keep the master across restarts | P2 | M | AND-1 | Yes | Planned |  |
 | AND-3 | Wire pre-sleep evacuation | P2 | M | AND-1 | Yes | Planned |  |
 | AND-4 | Report real worker status | P2 | M | AND-1 | Yes | Planned |  |
-| FEAT-1 | Master durability | P1 | L | TEST-6 |  | Partial | 122 (design), 141, 129 (open) |
+| FEAT-1 | Master durability | P1 | L | TEST-6 |  | Partial | 122 (design), 129, 141 |
 | FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 |  | Implemented | 123 |
 | FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Planned |  |
 | FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Planned | 105 (design) |
@@ -1381,5 +1381,10 @@ Add one dated line per finished item, newest last.
   files, outputs, result and cancel), so no further work is planned on it.
 - 2026-11-08: FEAT-1 is Partial. Of the work items in design 0046, the wire layer (`F1-b wire`,
   pull request 141) is merged: protocol version 4, `WorkerMessage::ResumeSession`, and the
-  `SESSION_RESUME` bit, which is not advertised yet. The task store (pull request 129) is open.
-  `F1-a` (replay at start), the master's adoption of resumed tasks and `F1-c` are Planned.
+  `SESSION_RESUME` bit, which is not advertised yet. The task store (`crates/master/src/store.rs`,
+  pull request 129) is merged but not used by the master yet. `F1-a` (replay at start), the
+  master's adoption of resumed tasks and `F1-c` are Planned. The review on pull request 129 lists
+  four store findings that `F1-a` should settle before the store goes live: a lost unsynced frame
+  before a surviving one stops `open`; any compaction error blocks every later write; a state
+  directory open to others is tightened instead of refused, and symbolic links in it are followed;
+  a missing journal next to a later-generation snapshot is recreated without a warning.
