@@ -522,11 +522,11 @@ pub fn discover_master_impl(timeout_ms: i64) -> String {
 }
 
 // ==============================================================================
-// JNI Exported Functions: com.oxideswarm.worker.service.OxideWorkerBridge
+// JNI Exported Functions: com.oxideswarm.worker.runner.OxideWorkerBridge
 // ==============================================================================
 
 #[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeStartWorker<
+pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeStartWorker<
     'local,
 >(
     mut env: JNIEnv<'local>,
@@ -573,46 +573,9 @@ pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nati
     }
 }
 
-/// Backward-compatible 6-argument JNI export for legacy service callers without p2p_ticket.
-#[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeStartWorkerLegacy<
-    'local,
->(
-    mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    master_addr: JString<'local>,
-    worker_name: JString<'local>,
-    cores: jint,
-    ram_mb: jlong,
-    simulate_gpu: jboolean,
-    heartbeat_interval_secs: jlong,
-) -> jboolean {
-    let master: String = match env.get_string(&master_addr) {
-        Ok(s) => s.into(),
-        Err(_) => return JNI_FALSE,
-    };
-    let name: String = match env.get_string(&worker_name) {
-        Ok(s) => s.into(),
-        Err(_) => String::new(),
-    };
-    if start_worker_impl(
-        master,
-        None,
-        name,
-        cores,
-        ram_mb,
-        simulate_gpu != 0,
-        heartbeat_interval_secs,
-    ) {
-        JNI_TRUE
-    } else {
-        JNI_FALSE
-    }
-}
-
 /// Hands the app's writable sandbox directory to the worker; call it before `nativeStartWorker`.
 #[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeSetSandboxDir<
+pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeSetSandboxDir<
     'local,
 >(
     mut env: JNIEnv<'local>,
@@ -632,7 +595,7 @@ pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nati
 
 /// Sets the shared cluster secret before starting the worker.
 #[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeSetClusterSecret<
+pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeSetClusterSecret<
     'local,
 >(
     mut env: JNIEnv<'local>,
@@ -651,7 +614,7 @@ pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nati
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeUpdateTelemetry<
+pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeUpdateTelemetry<
     'local,
 >(
     _env: JNIEnv<'local>,
@@ -668,7 +631,7 @@ pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nati
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeUpdateTelemetryDetailed<
+pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeUpdateTelemetryDetailed<
     'local,
 >(
     mut env: JNIEnv<'local>,
@@ -710,7 +673,7 @@ pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nati
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeStopWorker<
+pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeStopWorker<
     'local,
 >(
     _env: JNIEnv<'local>,
@@ -724,7 +687,7 @@ pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nati
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeIsRunning<
+pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeIsRunning<
     'local,
 >(
     _env: JNIEnv<'local>,
@@ -738,7 +701,7 @@ pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nati
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeGetWorkerStatus<
+pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeGetWorkerStatus<
     'local,
 >(
     env: JNIEnv<'local>,
@@ -752,7 +715,7 @@ pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nati
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeDiscoverMaster<
+pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeDiscoverMaster<
     'local,
 >(
     env: JNIEnv<'local>,
@@ -767,7 +730,7 @@ pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nati
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeTriggerFastEvacuation<
+pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeTriggerFastEvacuation<
     'local,
 >(
     mut env: JNIEnv<'local>,
@@ -783,190 +746,6 @@ pub extern "system" fn Java_com_oxideswarm_worker_service_OxideWorkerBridge_nati
     } else {
         JNI_FALSE
     }
-}
-
-// ==============================================================================
-// JNI Exported Functions: com.oxideswarm.worker.runner.OxideWorkerBridge
-// ==============================================================================
-
-#[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeStartWorker<
-    'local,
->(
-    env: JNIEnv<'local>,
-    class: JClass<'local>,
-    master_addr: JString<'local>,
-    p2p_ticket: JString<'local>,
-    worker_name: JString<'local>,
-    cores: jint,
-    ram_mb: jlong,
-    simulate_gpu: jboolean,
-    heartbeat_interval_secs: jlong,
-) -> jboolean {
-    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeStartWorker(
-        env,
-        class,
-        master_addr,
-        p2p_ticket,
-        worker_name,
-        cores,
-        ram_mb,
-        simulate_gpu,
-        heartbeat_interval_secs,
-    )
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeSetSandboxDir<
-    'local,
->(
-    env: JNIEnv<'local>,
-    class: JClass<'local>,
-    sandbox_dir: JString<'local>,
-) -> jboolean {
-    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeSetSandboxDir(
-        env,
-        class,
-        sandbox_dir,
-    )
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeSetClusterSecret<
-    'local,
->(
-    env: JNIEnv<'local>,
-    class: JClass<'local>,
-    cluster_secret: JString<'local>,
-) -> jboolean {
-    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeSetClusterSecret(
-        env,
-        class,
-        cluster_secret,
-    )
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeStartWorkerLegacy<
-    'local,
->(
-    env: JNIEnv<'local>,
-    class: JClass<'local>,
-    master_addr: JString<'local>,
-    worker_name: JString<'local>,
-    cores: jint,
-    ram_mb: jlong,
-    simulate_gpu: jboolean,
-    heartbeat_interval_secs: jlong,
-) -> jboolean {
-    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeStartWorkerLegacy(
-        env,
-        class,
-        master_addr,
-        worker_name,
-        cores,
-        ram_mb,
-        simulate_gpu,
-        heartbeat_interval_secs,
-    )
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeUpdateTelemetry<
-    'local,
->(
-    env: JNIEnv<'local>,
-    class: JClass<'local>,
-    battery_pct: jint,
-    is_charging: jboolean,
-    thermal_throttled: jboolean,
-) -> jboolean {
-    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeUpdateTelemetry(
-        env,
-        class,
-        battery_pct,
-        is_charging,
-        thermal_throttled,
-    )
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeUpdateTelemetryDetailed<
-    'local,
->(
-    env: JNIEnv<'local>,
-    class: JClass<'local>,
-    battery_pct: jint,
-    is_charging: jboolean,
-    thermal_throttled: jboolean,
-    battery_temperature: jfloat,
-    network_type: JString<'local>,
-) -> jboolean {
-    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeUpdateTelemetryDetailed(
-        env,
-        class,
-        battery_pct,
-        is_charging,
-        thermal_throttled,
-        battery_temperature,
-        network_type,
-    )
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeStopWorker<
-    'local,
->(
-    env: JNIEnv<'local>,
-    class: JClass<'local>,
-) -> jboolean {
-    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeStopWorker(env, class)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeIsRunning<
-    'local,
->(
-    env: JNIEnv<'local>,
-    class: JClass<'local>,
-) -> jboolean {
-    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeIsRunning(env, class)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeGetWorkerStatus<
-    'local,
->(
-    env: JNIEnv<'local>,
-    class: JClass<'local>,
-) -> jstring {
-    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeGetWorkerStatus(env, class)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeDiscoverMaster<
-    'local,
->(
-    env: JNIEnv<'local>,
-    class: JClass<'local>,
-    timeout_ms: jlong,
-) -> jstring {
-    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeDiscoverMaster(
-        env, class, timeout_ms,
-    )
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeTriggerFastEvacuation<
-    'local,
->(
-    env: JNIEnv<'local>,
-    class: JClass<'local>,
-    reason: JString<'local>,
-) -> jboolean {
-    Java_com_oxideswarm_worker_service_OxideWorkerBridge_nativeTriggerFastEvacuation(
-        env, class, reason,
-    )
 }
 
 // ==============================================================================

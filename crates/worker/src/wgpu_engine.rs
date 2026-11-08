@@ -178,12 +178,6 @@ fn select_adapter(instance: &Instance) -> Option<Adapter> {
     ranked.into_iter().next().map(|(_, adapter)| adapter)
 }
 
-/// Probes the host system for a compatible physical hardware GPU adapter (no device is created).
-/// Returns the adapter if found, or None if only CPU or no adapters are available.
-pub fn probe_physical_adapter() -> Option<AdapterInfo> {
-    select_adapter(&new_instance()).map(|a| a.get_info())
-}
-
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()

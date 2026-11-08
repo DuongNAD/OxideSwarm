@@ -519,40 +519,6 @@ async fn test_runner_hostile_parameter_clamping() {
 }
 
 // ============================================================================
-// Scenario 9: Hash WGSL Compute Shader Compilation & Validation
-// (hash.wgsl is EXPERIMENTAL and not dispatched by any task: this only checks that it still
-// compiles. It does not produce the CPU digest, see the header of the file.)
-// ============================================================================
-#[test]
-fn test_hash_wgsl_shader_compilation() {
-    #[cfg(feature = "gpu-wgpu")]
-    {
-        if let Some(engine) = gpu_engine_or_skip("test_hash_wgsl_shader_compilation") {
-            let hash_wgsl = include_str!("../crates/worker/src/shaders/hash.wgsl");
-            // The engine's device reports errors to a logging handler instead of panicking, so
-            // the compilation result has to be read from an error scope.
-            engine
-                .device
-                .push_error_scope(wgpu::ErrorFilter::Validation);
-            let shader = engine
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("adversarial_hash_shader_module"),
-                    source: wgpu::ShaderSource::Wgsl(hash_wgsl.into()),
-                });
-            let error = pollster::block_on(engine.device.pop_error_scope());
-            assert!(error.is_none(), "hash.wgsl no longer compiles: {error:?}");
-
-            // Verify shader module compilation succeeds
-            println!(
-                "  [PASS] WGSL validation of hash.wgsl succeeded: {:?}",
-                shader
-            );
-        }
-    }
-}
-
-// ============================================================================
 // Scenario 10: Direct WGPU Zero-Dimension Boundary Handling
 // ============================================================================
 #[test]

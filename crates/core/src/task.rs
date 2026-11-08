@@ -1043,6 +1043,9 @@ pub enum TaskSpec {
         input_data: Vec<u8>,
         work_group_size: u32,
         simulated_matrix_dim: u32,
+        #[deprecated(
+            note = "unused by the worker; kept on the wire until the next protocol version bump (design 0044 D1.5)"
+        )]
         compute_intensity: u32,
     },
     /// In-memory built-in test task for rapid verification.
@@ -1168,6 +1171,7 @@ enum BinaryTaskSpec {
 }
 
 impl From<TaskSpec> for HumanTaskSpec {
+    #[allow(deprecated)]
     fn from(spec: TaskSpec) -> Self {
         match spec {
             TaskSpec::Command {
@@ -1236,6 +1240,7 @@ impl From<TaskSpec> for HumanTaskSpec {
 }
 
 impl From<HumanTaskSpec> for TaskSpec {
+    #[allow(deprecated)]
     fn from(spec: HumanTaskSpec) -> Self {
         match spec {
             HumanTaskSpec::Command {
@@ -1304,6 +1309,7 @@ impl From<HumanTaskSpec> for TaskSpec {
 }
 
 impl From<TaskSpec> for BinaryTaskSpec {
+    #[allow(deprecated)]
     fn from(spec: TaskSpec) -> Self {
         match spec {
             TaskSpec::Command {
@@ -1372,6 +1378,7 @@ impl From<TaskSpec> for BinaryTaskSpec {
 }
 
 impl From<BinaryTaskSpec> for TaskSpec {
+    #[allow(deprecated)]
     fn from(spec: BinaryTaskSpec) -> Self {
         match spec {
             BinaryTaskSpec::Command {
@@ -1507,18 +1514,35 @@ impl TaskSpec {
         Self::new_rust_compilation(crate_name, source_files, compiler_flags)
     }
 
+    #[allow(deprecated)]
     pub fn new_gpu_compute(kernel_name: impl Into<String>, simulated_matrix_dim: u32) -> Self {
         Self::GpuCompute {
             kernel_name: kernel_name.into(),
             input_data: Vec::new(),
             work_group_size: default_work_group_size(),
             simulated_matrix_dim,
-            compute_intensity: 1,
+            compute_intensity: 0,
         }
     }
 
     pub fn gpu_compute(kernel_name: impl Into<String>, simulated_matrix_dim: u32) -> Self {
         Self::new_gpu_compute(kernel_name, simulated_matrix_dim)
+    }
+
+    #[allow(deprecated)]
+    pub fn gpu_compute_with_params(
+        kernel_name: impl Into<String>,
+        input_data: Vec<u8>,
+        work_group_size: u32,
+        simulated_matrix_dim: u32,
+    ) -> Self {
+        Self::GpuCompute {
+            kernel_name: kernel_name.into(),
+            input_data,
+            work_group_size,
+            simulated_matrix_dim,
+            compute_intensity: 0,
+        }
     }
 
     pub fn new_builtin_test(test_name: impl Into<String>, iterations: u32) -> Self {
@@ -2687,6 +2711,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_task_gpu_mismatch_validation() {
         // Spec requires GPU, but requirements state gpu_required = false
         let gpu_spec = TaskSpec::GpuCompute {
@@ -2710,6 +2735,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_task_spec_serde_aliases_and_defaults() {
         // Test "command" alias deserializes into `program`
         let json_cmd = r#"{"type":"Command","command":"echo","args":["hi"]}"#;
@@ -2854,6 +2880,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_task_bincode_serialization_roundtrip() {
         let specs = vec![
             TaskSpec::new_command("cargo", vec!["build".into(), "--release".into()]),
