@@ -1,7 +1,7 @@
 //! Durable task store: an append-only journal plus a self-describing snapshot (design 0046 D1-D2).
 //!
-//! `TaskStore` is a standalone module. It is not yet wired into `TaskQueue` or `MasterServer`;
-//! the integration (`--state-dir`, replay into the queue) lands separately.
+//! `TaskStore` backs `TaskQueue` and `MasterServer` when `master --state-dir`
+//! (`RUSTY_GRID_STATE_DIR` / `[master].state_dir`) is configured.
 //!
 //! # Files under `<state_dir>`
 //!

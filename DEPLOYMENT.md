@@ -271,6 +271,11 @@ executes a task on an older master. Always **upgrade and restart the master firs
 upgraded v4 master immediately refuses older workers and clients before registration or task submission, whereas a
 newer worker pointed at an un-upgraded v2 master registers before inspecting the v2 `RegisterAck`, drops the connection on
 the version mismatch, and retries with backoff (briefly appearing in the v2 master's `workers` list).
+When the master uses `--state-dir` (`RUSTY_GRID_STATE_DIR` / `[master].state_dir`), stop the old master cleanly (`SIGINT`
+or `SIGTERM`) before replacing the binary across a protocol version bump: clean shutdown compacts `journal.bin` into the
+self-describing JSON `snapshot.bin` and resets `journal.bin` to 0 records, which `TaskStore::open` upgrades across
+protocol versions automatically (`docs/design/0046-master-durability.md`); an uncompacted `journal.bin` from an older
+protocol version is refused at startup with a `GridError::Storage` message.
 With a cluster secret, nodes must also speak the same cluster authentication version: a release with version 2
 (encrypted record layer, `docs/design/0005-cluster-auth-v2-record-layer.md`) and an older one refuse each other
 during the handshake (the newer side reports that the master speaks another cluster authentication version, the

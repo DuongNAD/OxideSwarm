@@ -312,7 +312,7 @@ pub struct MasterArgs {
     #[arg(
         long,
         value_name = "DIR",
-        help = "Directory of the blob store that keeps task input and output files (default ~/.oxideswarm/blobs; env RUSTY_GRID_BLOB_DIR)"
+        help = "Directory of the blob store that keeps task input and output files (default ~/.oxideswarm/blobs, or <STATE_DIR>/blobs when --state-dir is set; env RUSTY_GRID_BLOB_DIR)"
     )]
     pub blob_dir: Option<PathBuf>,
 
@@ -322,6 +322,13 @@ pub struct MasterArgs {
         help = "Megabytes the blob store may hold before it evicts the least recently used files no queued or running task needs (default 4096; env RUSTY_GRID_BLOB_STORE_MB)"
     )]
     pub blob_store_mb: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory for durable task queue persistence (store.lock, snapshot.bin, journal.bin; env RUSTY_GRID_STATE_DIR)"
+    )]
+    pub state_dir: Option<PathBuf>,
 
     #[arg(
         long,
@@ -1394,6 +1401,18 @@ async fn run_master(
         .with_max_connections(max_connections)
         .with_max_pending_handshakes(max_pending_handshakes);
 
+    let state_dir = resolve_opt_string(
+        args.state_dir.map(|p| p.display().to_string()),
+        &["RUSTY_GRID_STATE_DIR"],
+        master_cfg.as_ref().and_then(|m| m.state_dir.clone()),
+    )
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+    .map(PathBuf::from);
+    if let Some(ref dir) = state_dir {
+        server_config = server_config.with_state_dir(dir);
+    }
+
     // Task input and output files live in a bounded, content-addressed store on disk.
     let blob_store_mb = resolve_u64(
         args.blob_store_mb,
@@ -1407,6 +1426,7 @@ async fn run_master(
         master_cfg.as_ref().and_then(|m| m.blob_dir.clone()),
     )
     .map(PathBuf::from)
+    .or_else(|| state_dir.as_ref().map(|dir| dir.join("blobs")))
     .or_else(|| crate::config::default_oxideswarm_dir().map(|dir| dir.join("blobs")));
     match &blob_dir {
         Some(dir) => {
@@ -1541,8 +1561,8 @@ async fn run_master(
         }
     }
 
-    // Await termination signal
-    let _ = tokio::signal::ctrl_c().await;
+    // Await termination signal (SIGINT or SIGTERM on Unix)
+    wait_for_worker_shutdown_signal().await;
     println!("\nRustyGrid Master shutting down...");
     let _ = handle.shutdown();
     ExitCode::SUCCESS
@@ -5914,5 +5934,33 @@ fail_unfulfillable_tasks = false
             1,
             "only the pre-flight ClusterStatus probe should be sent before refusing the v2 master"
         );
+    }
+
+    #[test]
+    fn test_master_state_dir_flag_and_env_precedence() {
+        let cli = Cli::try_parse_from(["oxideswarm", "master", "--state-dir", "/tmp/cli-state"])
+            .expect("parse master --state-dir");
+        let Commands::Master(m_args) = cli.command else {
+            panic!("expected Master");
+        };
+        assert_eq!(
+            m_args.state_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/cli-state"))
+        );
+
+        let env_key = "RUSTY_GRID_STATE_DIR";
+        std::env::set_var(env_key, "/tmp/env-state");
+        let resolved_env = resolve_opt_string(None, &[env_key], Some("/tmp/cfg-state".to_string()));
+        let resolved_cli = resolve_opt_string(
+            Some("/tmp/cli-state".to_string()),
+            &[env_key],
+            Some("/tmp/cfg-state".to_string()),
+        );
+        std::env::remove_var(env_key);
+        let resolved_cfg = resolve_opt_string(None, &[env_key], Some("/tmp/cfg-state".to_string()));
+
+        assert_eq!(resolved_cli.as_deref(), Some("/tmp/cli-state"));
+        assert_eq!(resolved_env.as_deref(), Some("/tmp/env-state"));
+        assert_eq!(resolved_cfg.as_deref(), Some("/tmp/cfg-state"));
     }
 }

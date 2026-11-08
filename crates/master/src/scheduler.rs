@@ -1152,6 +1152,18 @@ impl WorkloadScheduler {
                 "Re-enqueued backoff-elapsed retries"
             );
         }
+        let expired_failed = self.queue.release_expired_adoption_holds().await;
+        if !expired_failed.is_empty() {
+            if let Some(ref waiters) = self.waiters {
+                crate::server::resolve_terminal_waiters(
+                    &self.queue,
+                    waiters,
+                    &expired_failed,
+                    None,
+                )
+                .await;
+            }
+        }
 
         // Step 2: Active workers (checked before touching the queue: no worker, nothing to clone)
         let (mut workers, registered, reg_epoch) = self.registry.scheduler_snapshot().await;

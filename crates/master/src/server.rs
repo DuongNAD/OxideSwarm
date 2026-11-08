@@ -144,10 +144,13 @@ pub struct ServerConfig {
     /// Optional URL of rendezvous registry for cross-subnet discovery (or set OXIDESWARM_RENDEZVOUS).
     pub rendezvous_url: Option<String>,
     /// Where the blob store of task inputs and output files lives and how large it may grow (see
-    /// [`crate::blob_store`]). `None` (the default) runs without one: tasks with inputs or output
-    /// patterns are refused and workers are not told that blobs can be fetched. The CLI keeps one
-    /// under `~/.oxideswarm/blobs`.
+    /// [`crate::blob_store`]). `None` (the default) runs without one unless `state_dir` is set, in
+    /// which case it defaults to `<state_dir>/blobs`. The CLI keeps one under `~/.oxideswarm/blobs`.
     pub blob_store: Option<BlobStoreConfig>,
+    /// Optional directory for durable task queue persistence (`store.lock`, `snapshot.bin`,
+    /// `journal.bin`; see [`crate::store::TaskStore`]). `None` (the default) keeps the queue
+    /// purely in memory.
+    pub state_dir: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -195,6 +198,7 @@ impl Default for ServerConfig {
             implicit_local_dashboard: false,
             rendezvous_url: None,
             blob_store: None,
+            state_dir: None,
         }
     }
 }
@@ -430,6 +434,14 @@ impl ServerConfig {
         self.blob_store = Some(BlobStoreConfig::new(dir, max_bytes));
         self
     }
+
+    /// Configures the durable task queue state directory (`store.lock`, `snapshot.bin`,
+    /// `journal.bin`). When `blob_store` is not configured explicitly, it defaults to
+    /// `<dir>/blobs`.
+    pub fn with_state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.state_dir = Some(dir.into());
+        self
+    }
 }
 
 /// Atomically writes the bound port number to `path` using a sibling temporary file.
@@ -516,7 +528,15 @@ impl MasterServer {
         waiters: WaiterMap,
     ) -> GridResult<Self> {
         // Opened first: a store that cannot be used must not leave a ticket or port file behind.
-        let blob_store = match config.blob_store.clone() {
+        let effective_blob_store = config.blob_store.clone().or_else(|| {
+            config.state_dir.as_ref().map(|dir| {
+                BlobStoreConfig::new(
+                    dir.join("blobs"),
+                    crate::blob_store::DEFAULT_BLOB_STORE_MAX_BYTES,
+                )
+            })
+        });
+        let blob_store = match effective_blob_store {
             Some(store_config) => {
                 let opened = tokio::task::spawn_blocking(move || {
                     BlobStore::open(&store_config).map_err(|e| (store_config.dir, e))
@@ -532,6 +552,24 @@ impl MasterServer {
             }
             None => None,
         };
+
+        if let Some(ref state_dir) = config.state_dir {
+            let state_dir_clone = state_dir.clone();
+            let (store, recovered) = tokio::task::spawn_blocking(move || {
+                crate::store::TaskStore::open(&state_dir_clone)
+            })
+            .await
+            .map_err(|e| GridError::Config(format!("Task store start-up failed: {e}")))??;
+            queue
+                .attach_store_and_replay(store, recovered, Duration::ZERO)
+                .await?;
+            if let Some(ref bstore) = blob_store {
+                queue.repin_recovered_blobs(bstore).await;
+            }
+            if !queue.ready_task_ids(1).await.is_empty() {
+                scheduler_notify.notify_one();
+            }
+        }
 
         #[cfg(feature = "p2p")]
         let p2p_active_conns = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
@@ -1663,6 +1701,8 @@ impl MasterServer {
                 let _ = tokio::fs::remove_file(ticket_path).await;
             }
         }
+
+        self.queue.close_and_compact_store().await;
 
         Ok(())
     }
@@ -3866,9 +3906,12 @@ impl MasterHandle {
 
     /// Signals all Master subsystems to shut down.
     pub fn shutdown(&self) -> GridResult<()> {
-        self.shutdown_tx
+        let res = self
+            .shutdown_tx
             .send(true)
-            .map_err(|_| GridError::ConnectionClosed)
+            .map_err(|_| GridError::ConnectionClosed);
+        self.queue.close_and_compact_store_sync();
+        res
     }
 
     /// Executes an in-memory Map/Reduce job across cluster workers.
@@ -6511,5 +6554,222 @@ mod tests {
         }
 
         let _ = server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_submissions_share_group_commit_and_recover_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+
+        let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(false)
+            .with_discovery(false)
+            .with_state_dir(&state_dir);
+        let handle = MasterServer::spawn(config).await.unwrap();
+
+        let total_tasks = 1_000usize;
+        let start = std::time::Instant::now();
+        let mut join_set = tokio::task::JoinSet::new();
+        for i in 0..total_tasks {
+            let h = handle.clone();
+            join_set.spawn(async move {
+                let task = Task::new(
+                    rusty_grid_core::TaskSpec::command("echo", vec![format!("task-{i}")]),
+                    rusty_grid_core::TaskRequirements::generic(1, 10),
+                );
+                h.submit_task(task).await.unwrap()
+            });
+        }
+        let mut submitted_ids = Vec::with_capacity(total_tasks);
+        while let Some(res) = join_set.join_next().await {
+            submitted_ids.push(res.unwrap());
+        }
+        let elapsed = start.elapsed();
+        let syncs = handle.queue().store_sync_count().await.unwrap_or(0);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "1,000 concurrent durable submissions took {:?} (expected < 2s with group commit)",
+            elapsed
+        );
+        assert!(
+            syncs > 0 && syncs < 200,
+            "expected group commit to batch 1,000 submissions into < 200 syncs, got {syncs}"
+        );
+
+        handle.shutdown().unwrap();
+
+        // Reopen MasterServer on the same state_dir and verify all 1,000 tasks are recovered.
+        let config2 = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(false)
+            .with_discovery(false)
+            .with_state_dir(&state_dir);
+        let handle2 = MasterServer::spawn(config2).await.unwrap();
+        let stats = handle2.queue_stats().await.unwrap();
+        assert_eq!(stats.total, total_tasks);
+        assert_eq!(stats.queued, total_tasks);
+        for id in submitted_ids.iter().take(16) {
+            assert_eq!(handle2.queue().get_state(id).await, Some(TaskState::Queued));
+        }
+        handle2.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_state_dir_repins_input_and_output_blobs_across_restart() {
+        use rusty_grid_core::blob::{BlobFile, BlobId, TaskInput};
+        use rusty_grid_core::blob_transfer::{upload_blob, BlobChannel, BlobError};
+
+        struct StoreConn {
+            store: Arc<BlobStore>,
+            owner: u64,
+        }
+        impl BlobChannel for StoreConn {
+            async fn call(&self, request: BlobRequest) -> Result<BlobReply, BlobError> {
+                Ok(self.store.handle(self.owner, request).await)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let blob_dir = state_dir.join("blobs");
+
+        let input_bytes = vec![b'I'; 1024];
+        let output_bytes = vec![b'O'; 1024];
+        let unpinned_bytes = vec![b'U'; 512];
+        let filler_bytes = vec![b'F'; 1536];
+        let input_id = BlobId::of(&input_bytes);
+        let output_id = BlobId::of(&output_bytes);
+        let unpinned_id = BlobId::of(&unpinned_bytes);
+        let filler_id = BlobId::of(&filler_bytes);
+
+        let (queued_task_id, completed_task_id) = {
+            let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+                .with_web_ui(false)
+                .with_discovery(false)
+                .with_state_dir(&state_dir)
+                .with_blob_store(&blob_dir, 2560);
+            let handle = MasterServer::spawn(config).await.unwrap();
+            let bstore = handle.blob_store.as_ref().unwrap();
+            let conn = StoreConn {
+                store: Arc::clone(bstore),
+                owner: bstore.new_owner(),
+            };
+
+            upload_blob(&conn, input_id, input_bytes.len() as u64, &input_bytes[..])
+                .await
+                .unwrap();
+            upload_blob(
+                &conn,
+                output_id,
+                output_bytes.len() as u64,
+                &output_bytes[..],
+            )
+            .await
+            .unwrap();
+            upload_blob(
+                &conn,
+                unpinned_id,
+                unpinned_bytes.len() as u64,
+                &unpinned_bytes[..],
+            )
+            .await
+            .unwrap();
+
+            let mut queued_task = Task::new(
+                rusty_grid_core::TaskSpec::command("echo", vec!["in".into()]),
+                rusty_grid_core::TaskRequirements::generic(1, 10),
+            );
+            queued_task.inputs.push(TaskInput::file(
+                "input.bin",
+                input_id,
+                input_bytes.len() as u64,
+                false,
+            ));
+            let queued_task_id = handle.submit_task(queued_task).await.unwrap();
+
+            let completed_task = Task::new(
+                rusty_grid_core::TaskSpec::command("echo", vec!["out".into()]),
+                rusty_grid_core::TaskRequirements::generic(1, 10),
+            );
+            let completed_task_id = handle.submit_task(completed_task).await.unwrap();
+            let worker_id = Uuid::new_v4();
+            handle
+                .queue()
+                .schedule_tasks_batch_in_sessions(&[(completed_task_id, worker_id, 1)])
+                .await;
+            let mut result = TaskResult::success(worker_id, completed_task_id, "ok", 5, false);
+            result.outputs.push(BlobFile {
+                path: "output.bin".into(),
+                id: output_id,
+                size: output_bytes.len() as u64,
+                executable: false,
+            });
+            let pin = bstore.check_and_pin_outputs(&[output_id]).unwrap();
+            handle
+                .queue()
+                .record_result_from(worker_id, Some(1), result)
+                .await
+                .unwrap();
+            pin.commit_terminal(completed_task_id).await;
+
+            handle.shutdown().unwrap();
+            (queued_task_id, completed_task_id)
+        };
+
+        // Restart master on the same state_dir with the same 2560-byte blob cap.
+        // Because `repin_recovered_blobs` re-pins `input_id` and `output_id` (2048 B total),
+        // attempting to upload a 1536-byte filler blob must fail to evict either pinned blob.
+        let config2 = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(false)
+            .with_discovery(false)
+            .with_state_dir(&state_dir)
+            .with_blob_store(&blob_dir, 2560);
+        let handle2 = MasterServer::spawn(config2).await.unwrap();
+        let bstore2 = handle2.blob_store.as_ref().unwrap();
+        let conn2 = StoreConn {
+            store: Arc::clone(bstore2),
+            owner: bstore2.new_owner(),
+        };
+
+        assert_eq!(bstore2.size_of(&input_id), Some(input_bytes.len() as u64));
+        assert_eq!(bstore2.size_of(&output_id), Some(output_bytes.len() as u64));
+        assert_eq!(
+            bstore2.size_of(&unpinned_id),
+            Some(unpinned_bytes.len() as u64)
+        );
+        assert_eq!(bstore2.stats().pinned_blobs, 2);
+
+        upload_blob(
+            &conn2,
+            filler_id,
+            filler_bytes.len() as u64,
+            &filler_bytes[..],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            bstore2.size_of(&unpinned_id),
+            None,
+            "unpinned blob should be evicted first when uploading filler blob"
+        );
+        assert_eq!(
+            bstore2.size_of(&input_id),
+            Some(input_bytes.len() as u64),
+            "pinned recovered input blob must survive LRU eviction"
+        );
+        assert_eq!(
+            bstore2.size_of(&output_id),
+            Some(output_bytes.len() as u64),
+            "pinned recovered output blob must survive LRU eviction"
+        );
+        assert_eq!(
+            handle2.queue().get_state(&queued_task_id).await,
+            Some(TaskState::Queued)
+        );
+        assert_eq!(
+            handle2.queue().get_state(&completed_task_id).await,
+            Some(TaskState::Completed)
+        );
+        handle2.shutdown().unwrap();
     }
 }

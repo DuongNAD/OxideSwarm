@@ -21,6 +21,10 @@ use rusty_grid_core::task::{
     CheckpointData, Task, TaskId, TaskRequirements, TaskResult, TaskSpec, TaskStatus,
 };
 
+use crate::store::{
+    DurableAck, JournalRecord, PersistedTaskEntry, Recovered, SnapshotImage, TaskStore,
+};
+
 /// 8-State Task Lifecycle Finite State Machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -338,6 +342,13 @@ pub struct TaskEntry {
     /// assignments made without session information). Results, progress and checkpoints are only
     /// accepted from this worker *and* session, so a superseded or reaped session cannot touch it.
     pub assigned_session: Option<u64>,
+    /// When set (`Some((worker_id, hold_until))`), this `Queued` task is held for `worker_id` to
+    /// resume via `WorkerMessage::ResumeSession` until `hold_until` expires.
+    pub adoptable_by: Option<(Uuid, Instant)>,
+    /// True when a task was `Running` with effective `max_retries == 0` before a master restart
+    /// (or worker disconnect hold) and must transition to `TaskState::Failed` if not adopted
+    /// before `adoptable_by` expires.
+    pub fail_if_not_adopted: bool,
     pub retry_history: Vec<RetryAttempt>,
     pub result: Option<TaskResult>,
     pub error_message: Option<String>,
@@ -581,6 +592,29 @@ fn owned_by(entry: &TaskEntry, worker_id: &Uuid, session_id: Option<u64>) -> boo
         }
 }
 
+/// Outcome of [`TaskQueue::adopt_session_tasks`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdoptionOutcome {
+    /// Tasks adopted into `TaskState::Running` on `(worker_id, session_id)`.
+    pub adopted: Vec<TaskId>,
+    /// Tasks reported in `running` that could not be adopted (unknown, terminal, expired hold, or
+    /// owned by another worker) and must receive `MasterMessage::CancelTask`.
+    pub stale_to_cancel: Vec<TaskId>,
+    /// Tasks previously held for `worker_id` that were omitted from `running` (or whose hold
+    /// expired) and transitioned to `TaskState::Failed` (for example `Running` with
+    /// `max_retries == 0`).
+    pub newly_failed: Vec<TaskId>,
+}
+
+/// True when `entry` is in `TaskState::Queued` and eligible for scheduling now (not held in an
+/// active `adoptable_by` window and not awaiting `fail_if_not_adopted` failure).
+#[inline]
+fn is_schedulable_queued(entry: &TaskEntry, now: Instant) -> bool {
+    entry.state == TaskState::Queued
+        && !entry.fail_if_not_adopted
+        && entry.adoptable_by.is_none_or(|(_, until)| now >= until)
+}
+
 struct TaskQueueInner {
     tasks: HashMap<TaskId, TaskEntry>,
     ready_queue: BTreeSet<QueueOrderKey>,
@@ -603,6 +637,10 @@ struct TaskQueueInner {
     active_bytes: usize,
     /// Monotonically incremented whenever a task is inserted into `ready_queue`.
     ready_epoch: u64,
+    /// Optional durable task journal and snapshot store (`master --state-dir`).
+    store: Option<TaskStore>,
+    /// Guards against enqueuing duplicate background compactions while one is already running.
+    compaction_in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Bytes one blob reference (id, size, flags) is charged in addition to its path.
@@ -757,6 +795,7 @@ impl TaskQueueInner {
             .is_some_and(|entry| entry.state.is_terminal())
         {
             self.remove_retained(&oldest);
+            self.append_non_durable(&JournalRecord::TaskEvicted { task_id: oldest });
         } else {
             self.terminal_sizes.remove(&oldest);
         }
@@ -814,7 +853,110 @@ impl TaskQueueInner {
             self.ready_epoch = self.ready_epoch.wrapping_add(1);
         }
     }
+
+    fn snapshot_image(&self) -> SnapshotImage {
+        let mut tasks: Vec<PersistedTaskEntry> = self
+            .tasks
+            .values()
+            .map(|entry| PersistedTaskEntry {
+                task: entry.task.clone(),
+                priority: entry.priority,
+                sequence: entry.sequence,
+                state: entry.state,
+                assigned_worker_id: entry.assigned_worker_id,
+                submitted_at_utc: entry.submitted_at_utc,
+                retry_count: entry.retry_count,
+                failover_count: entry.failover_count,
+                evacuation_count: entry.evacuation_count,
+                rejection_count: entry.rejection_count,
+                avoid_workers: entry.avoid_workers.clone(),
+                retry_history: entry.retry_history.clone(),
+                result: entry.result.clone(),
+                error_message: entry.error_message.clone(),
+            })
+            .collect();
+        tasks.sort_unstable_by_key(|e| e.sequence);
+        SnapshotImage {
+            next_sequence: self.next_sequence,
+            tasks,
+            terminal_order: self.terminal_order.iter().copied().collect(),
+        }
+    }
+
+    fn maybe_trigger_compaction(&self) {
+        let Some(ref store) = self.store else {
+            return;
+        };
+        if !store.needs_compaction() {
+            return;
+        }
+        if self
+            .compaction_in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let image = self.snapshot_image();
+        match store.compact(image) {
+            Ok(ack) => {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let flag = self.compaction_in_flight.clone();
+                    handle.spawn(async move {
+                        if let Err(err) = ack.await {
+                            tracing::warn!(error = %err, "Background task store compaction failed");
+                        }
+                        flag.store(false, std::sync::atomic::Ordering::Release);
+                    });
+                } else {
+                    self.compaction_in_flight
+                        .store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            Err(err) => {
+                self.compaction_in_flight
+                    .store(false, std::sync::atomic::Ordering::Release);
+                tracing::warn!(error = %err, "Failed to enqueue task store compaction");
+            }
+        }
+    }
+
+    fn append_non_durable(&self, record: &JournalRecord) {
+        if let Some(ref store) = self.store {
+            if let Err(err) = store.append(record) {
+                tracing::warn!(error = %err, "Failed to append non-durable task journal record");
+            }
+            self.maybe_trigger_compaction();
+        }
+    }
+
+    fn append_durable(&self, record: &JournalRecord) -> GridResult<Option<DurableAck>> {
+        let Some(ref store) = self.store else {
+            return Ok(None);
+        };
+        let ack = store.append_durable(record)?;
+        self.maybe_trigger_compaction();
+        Ok(Some(ack))
+    }
+
+    fn append_durable_warn(&self, record: &JournalRecord) -> Option<DurableAck> {
+        match self.append_durable(record) {
+            Ok(ack) => ack,
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to enqueue durable task journal record");
+                None
+            }
+        }
+    }
 }
+
+const UNRESUMED_ZERO_RETRY_ERROR: &str =
+    "master restarted while the task ran; not re-run because max_retries is 0";
 
 /// Thread-safe in-memory Task Queue and lifecycle coordinator.
 #[derive(Clone)]
@@ -890,10 +1032,706 @@ impl TaskQueue {
                 active_sizes: HashMap::new(),
                 active_bytes: 0,
                 ready_epoch: 0,
+                store: None,
+                compaction_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             })),
             #[cfg(test)]
             ready_views_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    fn fail_unadopted_zero_retry_task(
+        inner: &mut TaskQueueInner,
+        task_id: TaskId,
+        last_worker_id: Option<Uuid>,
+        now_epoch: u64,
+    ) -> Option<JournalRecord> {
+        let (priority, sequence) = {
+            let entry = inner.tasks.get(&task_id)?;
+            if entry.state.is_terminal() {
+                return None;
+            }
+            (entry.priority, entry.sequence)
+        };
+        inner.ready_queue.remove(&QueueOrderKey {
+            priority_rev: Reverse(priority),
+            sequence,
+            task_id,
+        });
+        let msg = UNRESUMED_ZERO_RETRY_ERROR.to_string();
+        let fail_result = TaskResult::failure(
+            last_worker_id.unwrap_or_else(Uuid::nil),
+            task_id,
+            1,
+            "",
+            "",
+            0,
+            Some(msg.clone()),
+        );
+        let record = {
+            let entry = inner.tasks.get_mut(&task_id)?;
+            entry.state = TaskState::Failed;
+            entry.assigned_worker_id = None;
+            entry.assigned_session = None;
+            entry.adoptable_by = None;
+            entry.fail_if_not_adopted = false;
+            entry.error_message = Some(msg.clone());
+            entry.result = Some(fail_result.clone());
+            JournalRecord::TaskTerminal {
+                task_id,
+                state: TaskState::Failed,
+                assigned_worker_id: last_worker_id,
+                retry_count: entry.retry_count,
+                failover_count: entry.failover_count,
+                evacuation_count: entry.evacuation_count,
+                rejection_count: entry.rejection_count,
+                retry_attempt: None,
+                result: Some(fail_result),
+                error_message: Some(msg),
+                timestamp_utc: now_epoch,
+            }
+        };
+        inner.track_terminal_task(task_id);
+        Some(record)
+    }
+
+    /// Attaches a [`TaskStore`] and replays its [`Recovered`] snapshot and journal into this
+    /// queue according to design 0046 D2.5.
+    ///
+    /// Tasks that were `Scheduled` or `Running` before the restart are placed in `Queued` without
+    /// charging `retry_count`, `failover_count`, or `evacuation_count`. When `session_resume_hold`
+    /// is non-zero and the task had an `assigned_worker_id`, `adoptable_by` is set to
+    /// `(worker_id, Instant::now() + session_resume_hold)` so that worker can reclaim it via
+    /// [`adopt_session_tasks`](Self::adopt_session_tasks). Tasks that were `Running` under
+    /// effective `max_retries == 0` are marked `fail_if_not_adopted` and fail with
+    /// `"master restarted while the task ran; not re-run because max_retries is 0"` if not
+    /// adopted before `session_resume_hold` elapses (immediately when `session_resume_hold` is
+    /// `Duration::ZERO`).
+    pub async fn attach_store_and_replay(
+        &self,
+        store: TaskStore,
+        recovered: Recovered,
+        session_resume_hold: Duration,
+    ) -> GridResult<()> {
+        let mut persisted: HashMap<TaskId, PersistedTaskEntry> = HashMap::new();
+        let mut terminal_order_vec: Vec<TaskId> = Vec::new();
+        let mut max_seq: u64 = 1;
+
+        if let Some(snapshot) = recovered.snapshot {
+            max_seq = snapshot.next_sequence.max(1);
+            for entry in snapshot.tasks {
+                max_seq = max_seq.max(entry.sequence.saturating_add(1));
+                persisted.insert(entry.task.id, entry);
+            }
+            terminal_order_vec = snapshot.terminal_order;
+        }
+
+        for record in recovered.records {
+            match record {
+                JournalRecord::TaskSubmitted {
+                    task,
+                    priority,
+                    sequence,
+                    submitted_at_utc,
+                } => {
+                    max_seq = max_seq.max(sequence.saturating_add(1));
+                    let task_id = task.id;
+                    persisted.insert(
+                        task_id,
+                        PersistedTaskEntry {
+                            task: *task,
+                            priority,
+                            sequence,
+                            state: TaskState::Queued,
+                            assigned_worker_id: None,
+                            submitted_at_utc,
+                            retry_count: 0,
+                            failover_count: 0,
+                            evacuation_count: 0,
+                            rejection_count: 0,
+                            avoid_workers: Vec::new(),
+                            retry_history: Vec::new(),
+                            result: None,
+                            error_message: None,
+                        },
+                    );
+                }
+                JournalRecord::TaskDispatched {
+                    task_id, worker_id, ..
+                } => {
+                    if let Some(entry) = persisted.get_mut(&task_id) {
+                        if !entry.state.is_terminal() {
+                            entry.state = TaskState::Scheduled;
+                            entry.assigned_worker_id = Some(worker_id);
+                        }
+                    }
+                }
+                JournalRecord::TaskRunning {
+                    task_id, worker_id, ..
+                } => {
+                    if let Some(entry) = persisted.get_mut(&task_id) {
+                        if !entry.state.is_terminal() {
+                            entry.state = TaskState::Running;
+                            entry.assigned_worker_id = Some(worker_id);
+                        }
+                    }
+                }
+                JournalRecord::CheckpointRecorded {
+                    task_id,
+                    checkpoint,
+                } => {
+                    if let Some(entry) = persisted.get_mut(&task_id) {
+                        if !entry.state.is_terminal()
+                            && entry
+                                .task
+                                .latest_checkpoint
+                                .as_ref()
+                                .is_none_or(|c| checkpoint.sequence > c.sequence)
+                        {
+                            entry.task.update_checkpoint(checkpoint);
+                        }
+                    }
+                }
+                JournalRecord::TaskRequeued {
+                    task_id,
+                    state,
+                    retry_count,
+                    failover_count,
+                    evacuation_count,
+                    rejection_count,
+                    avoid_workers,
+                    retry_attempt,
+                    ..
+                } => {
+                    if let Some(entry) = persisted.get_mut(&task_id) {
+                        if !entry.state.is_terminal() {
+                            entry.state = if state == TaskState::Retrying {
+                                TaskState::Retrying
+                            } else {
+                                TaskState::Queued
+                            };
+                            entry.assigned_worker_id = None;
+                            entry.retry_count = retry_count;
+                            entry.failover_count = failover_count;
+                            entry.evacuation_count = evacuation_count;
+                            entry.rejection_count = rejection_count;
+                            entry.avoid_workers = avoid_workers;
+                            if let Some(attempt) = retry_attempt {
+                                entry.retry_history.push(attempt);
+                            }
+                        }
+                    }
+                }
+                JournalRecord::TaskAdopted {
+                    task_id, worker_id, ..
+                } => {
+                    if let Some(entry) = persisted.get_mut(&task_id) {
+                        if !entry.state.is_terminal() {
+                            entry.state = TaskState::Running;
+                            entry.assigned_worker_id = Some(worker_id);
+                        }
+                    }
+                }
+                JournalRecord::TaskTerminal {
+                    task_id,
+                    state,
+                    assigned_worker_id,
+                    retry_count,
+                    failover_count,
+                    evacuation_count,
+                    rejection_count,
+                    retry_attempt,
+                    result,
+                    error_message,
+                    ..
+                } => {
+                    if let Some(entry) = persisted.get_mut(&task_id) {
+                        entry.state = state;
+                        entry.assigned_worker_id = assigned_worker_id;
+                        entry.retry_count = retry_count;
+                        entry.failover_count = failover_count;
+                        entry.evacuation_count = evacuation_count;
+                        entry.rejection_count = rejection_count;
+                        if let Some(attempt) = retry_attempt {
+                            entry.retry_history.push(attempt);
+                        }
+                        entry.result = result;
+                        entry.error_message = error_message;
+                        if !terminal_order_vec.contains(&task_id) {
+                            terminal_order_vec.push(task_id);
+                        }
+                    }
+                }
+                JournalRecord::TaskEvicted { task_id } => {
+                    persisted.remove(&task_id);
+                    terminal_order_vec.retain(|id| *id != task_id);
+                }
+            }
+        }
+
+        let mut sorted_entries: Vec<PersistedTaskEntry> = persisted.into_values().collect();
+        sorted_entries.sort_unstable_by_key(|e| e.sequence);
+
+        let now = Instant::now();
+        let now_epoch = Utc::now().timestamp() as u64;
+        let hold_until = (!session_resume_hold.is_zero()).then(|| now + session_resume_hold);
+
+        let mut immediate_zero_retry_failures: Vec<(TaskId, Option<Uuid>)> = Vec::new();
+        let mut acks: Vec<DurableAck> = Vec::new();
+
+        {
+            let mut inner = self.inner.write().await;
+            inner.tasks.clear();
+            inner.ready_queue.clear();
+            inner.delayed_retries.clear();
+            inner.worker_assignments.clear();
+            inner.terminal_order.clear();
+            inner.terminal_sizes.clear();
+            inner.terminal_bytes = 0;
+            inner.active_sizes.clear();
+            inner.active_bytes = 0;
+            inner.next_sequence = max_seq.max(1);
+            let default_max_retries = inner.retry_policy.max_retries;
+
+            for p in sorted_entries {
+                let task_id = p.task.id;
+                let zero_retries = p
+                    .task
+                    .requirements
+                    .max_retries
+                    .unwrap_or(default_max_retries)
+                    == 0;
+                let (state, assigned_worker_id, adoptable_by, fail_if_not_adopted) = match p.state {
+                    TaskState::Completed | TaskState::Failed | TaskState::Cancelled => {
+                        (p.state, p.assigned_worker_id, None, false)
+                    }
+                    TaskState::Submitted | TaskState::Queued | TaskState::Retrying => {
+                        (TaskState::Queued, None, None, false)
+                    }
+                    TaskState::Scheduled => {
+                        let hold = match (p.assigned_worker_id, hold_until) {
+                            (Some(wid), Some(until)) => Some((wid, until)),
+                            _ => None,
+                        };
+                        (TaskState::Queued, None, hold, false)
+                    }
+                    TaskState::Running => {
+                        let hold = match (p.assigned_worker_id, hold_until) {
+                            (Some(wid), Some(until)) => Some((wid, until)),
+                            _ => None,
+                        };
+                        if zero_retries && hold.is_none() {
+                            immediate_zero_retry_failures.push((task_id, p.assigned_worker_id));
+                        }
+                        (TaskState::Queued, None, hold, zero_retries)
+                    }
+                };
+
+                let entry = TaskEntry {
+                    task: p.task,
+                    priority: p.priority,
+                    sequence: p.sequence,
+                    state,
+                    assigned_worker_id,
+                    submitted_at_utc: p.submitted_at_utc,
+                    submitted_instant: now,
+                    scheduled_instant: None,
+                    started_instant: None,
+                    retry_after_instant: None,
+                    retry_count: p.retry_count,
+                    failover_count: p.failover_count,
+                    evacuation_count: p.evacuation_count,
+                    rejection_count: p.rejection_count,
+                    avoid_workers: p.avoid_workers,
+                    assigned_session: None,
+                    adoptable_by,
+                    fail_if_not_adopted,
+                    retry_history: p.retry_history,
+                    result: p.result,
+                    error_message: p.error_message,
+                };
+
+                let is_terminal = entry.state.is_terminal();
+                let priority = entry.priority;
+                let sequence = entry.sequence;
+                let size = retained_bytes(&entry);
+                inner.tasks.insert(task_id, entry);
+
+                if !is_terminal {
+                    inner.active_sizes.insert(task_id, size);
+                    inner.active_bytes = inner.active_bytes.saturating_add(size);
+                    inner.insert_ready(QueueOrderKey {
+                        priority_rev: Reverse(priority),
+                        sequence,
+                        task_id,
+                    });
+                }
+            }
+
+            for tid in terminal_order_vec {
+                if inner.tasks.get(&tid).is_some_and(|e| e.state.is_terminal())
+                    && !inner.terminal_sizes.contains_key(&tid)
+                {
+                    let size = inner.tasks.get(&tid).map_or(0, retained_bytes);
+                    inner.terminal_sizes.insert(tid, size);
+                    inner.terminal_bytes = inner.terminal_bytes.saturating_add(size);
+                    inner.terminal_order.push_back(tid);
+                }
+            }
+            let mut unlisted_terminals: Vec<(u64, TaskId)> = inner
+                .tasks
+                .iter()
+                .filter(|(tid, e)| e.state.is_terminal() && !inner.terminal_sizes.contains_key(tid))
+                .map(|(tid, e)| (e.sequence, *tid))
+                .collect();
+            unlisted_terminals.sort_unstable_by_key(|(seq, _)| *seq);
+            for (_, tid) in unlisted_terminals {
+                let size = inner.tasks.get(&tid).map_or(0, retained_bytes);
+                inner.terminal_sizes.insert(tid, size);
+                inner.terminal_bytes = inner.terminal_bytes.saturating_add(size);
+                inner.terminal_order.push_back(tid);
+            }
+
+            inner.store = Some(store);
+            inner.enforce_terminal_limits();
+
+            for (task_id, last_worker_id) in immediate_zero_retry_failures {
+                if let Some(record) = Self::fail_unadopted_zero_retry_task(
+                    &mut inner,
+                    task_id,
+                    last_worker_id,
+                    now_epoch,
+                ) {
+                    if let Some(ack) = inner.append_durable(&record)? {
+                        acks.push(ack);
+                    }
+                }
+            }
+        }
+
+        for ack in acks {
+            ack.await?;
+        }
+        Ok(())
+    }
+
+    /// Re-pins input blobs of recovered non-terminal tasks and output blobs of recovered retained
+    /// terminal tasks in `blob_store` so they are protected from eviction until the task finishes
+    /// or is evicted (design 0046 D3).
+    pub async fn repin_recovered_blobs(&self, blob_store: &Arc<crate::blob_store::BlobStore>) {
+        use rusty_grid_core::blob::BlobId;
+        let (active_inputs, terminal_outputs) = {
+            let inner = self.inner.read().await;
+            let mut active = Vec::new();
+            let mut terminal = Vec::new();
+            for entry in inner.tasks.values() {
+                if entry.state.is_terminal() {
+                    if let Some(ref res) = entry.result {
+                        let ids: Vec<BlobId> = res.outputs.iter().map(|o| o.id).collect();
+                        if !ids.is_empty() {
+                            terminal.push((entry.task.id, ids));
+                        }
+                    }
+                } else if !entry.task.inputs.is_empty() {
+                    active.push((entry.task.id, entry.task.inputs.clone()));
+                }
+            }
+            (active, terminal)
+        };
+
+        for (task_id, inputs) in active_inputs {
+            match blob_store.resolve_inputs(&inputs).await {
+                Ok(ids) => {
+                    let missing = blob_store.pin_task(task_id, ids);
+                    if !missing.is_empty() {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            missing_count = missing.len(),
+                            "Recovered active task references blob(s) missing from the blob store"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        error = %err,
+                        "Recovered active task input blob check failed"
+                    );
+                }
+            }
+        }
+
+        for (task_id, output_ids) in terminal_outputs {
+            match blob_store.check_and_pin_outputs(&output_ids) {
+                Ok(pin) => {
+                    pin.commit_terminal(task_id).await;
+                }
+                Err(missing) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        missing_count = missing.len(),
+                        "Recovered terminal task references output blob(s) missing from the blob store"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Re-attaches tasks held in their `adoptable_by` window for `worker_id` when that worker
+    /// reconnects on `session_id` and reports `running` (design 0046 D1 / D2.5).
+    pub async fn adopt_session_tasks(
+        &self,
+        worker_id: Uuid,
+        session_id: u64,
+        running: &[TaskId],
+    ) -> AdoptionOutcome {
+        let mut outcome = AdoptionOutcome::default();
+        let mut acks: Vec<DurableAck> = Vec::new();
+
+        {
+            let mut inner = self.inner.write().await;
+            let now = Instant::now();
+            let now_epoch = Utc::now().timestamp() as u64;
+
+            for &task_id in running {
+                let can_adopt = inner.tasks.get(&task_id).is_some_and(|entry| {
+                    entry.state == TaskState::Queued
+                        && entry
+                            .adoptable_by
+                            .is_some_and(|(w, until)| w == worker_id && now < until)
+                });
+                if can_adopt {
+                    let (priority, sequence) = {
+                        let entry = inner.tasks.get(&task_id).expect("checked above");
+                        (entry.priority, entry.sequence)
+                    };
+                    inner.ready_queue.remove(&QueueOrderKey {
+                        priority_rev: Reverse(priority),
+                        sequence,
+                        task_id,
+                    });
+                    if let Some(entry) = inner.tasks.get_mut(&task_id) {
+                        entry.state = TaskState::Running;
+                        entry.assigned_worker_id = Some(worker_id);
+                        entry.assigned_session = Some(session_id);
+                        entry.started_instant = Some(now);
+                        entry.adoptable_by = None;
+                        entry.fail_if_not_adopted = false;
+                    }
+                    inner
+                        .worker_assignments
+                        .entry(worker_id)
+                        .or_default()
+                        .insert(task_id);
+                    inner.append_non_durable(&JournalRecord::TaskAdopted {
+                        task_id,
+                        worker_id,
+                        timestamp_utc: now_epoch,
+                    });
+                    outcome.adopted.push(task_id);
+                } else {
+                    let already_owned = inner.tasks.get(&task_id).is_some_and(|entry| {
+                        entry.state == TaskState::Running
+                            && entry.assigned_worker_id == Some(worker_id)
+                            && entry.assigned_session == Some(session_id)
+                    });
+                    if already_owned {
+                        outcome.adopted.push(task_id);
+                    } else {
+                        outcome.stale_to_cancel.push(task_id);
+                    }
+                }
+            }
+
+            let remaining_for_worker: Vec<(TaskId, bool)> = inner
+                .tasks
+                .iter()
+                .filter_map(|(&tid, entry)| {
+                    (entry.state == TaskState::Queued
+                        && entry.adoptable_by.is_some_and(|(w, _)| w == worker_id))
+                    .then_some((tid, entry.fail_if_not_adopted))
+                })
+                .collect();
+
+            let mut released_any = false;
+            for (task_id, fail_if_not_adopted) in remaining_for_worker {
+                if fail_if_not_adopted {
+                    if let Some(record) = Self::fail_unadopted_zero_retry_task(
+                        &mut inner,
+                        task_id,
+                        Some(worker_id),
+                        now_epoch,
+                    ) {
+                        if let Some(ack) = inner.append_durable_warn(&record) {
+                            acks.push(ack);
+                        }
+                        outcome.newly_failed.push(task_id);
+                    }
+                } else if let Some(entry) = inner.tasks.get_mut(&task_id) {
+                    entry.adoptable_by = None;
+                    released_any = true;
+                }
+            }
+            if released_any {
+                inner.ready_epoch = inner.ready_epoch.wrapping_add(1);
+            }
+        }
+
+        for ack in acks {
+            if let Err(err) = ack.await {
+                tracing::warn!(error = %err, "Failed to sync terminal journal record after session adoption");
+            }
+        }
+        outcome
+    }
+
+    /// Releases any `adoptable_by` holds whose deadline has passed, failing tasks marked
+    /// `fail_if_not_adopted` (`Running` with `max_retries == 0` before restart) and returning
+    /// their IDs so the caller can wake result waiters.
+    pub async fn release_expired_adoption_holds(&self) -> Vec<TaskId> {
+        let now = Instant::now();
+        {
+            let inner = self.inner.read().await;
+            let any_expired = inner.tasks.values().any(|entry| {
+                entry.state == TaskState::Queued
+                    && (entry.adoptable_by.is_some_and(|(_, until)| now >= until)
+                        || (entry.fail_if_not_adopted && entry.adoptable_by.is_none()))
+            });
+            if !any_expired {
+                return Vec::new();
+            }
+        }
+
+        let mut newly_failed = Vec::new();
+        let mut acks = Vec::new();
+        {
+            let mut inner = self.inner.write().await;
+            let now = Instant::now();
+            let now_epoch = Utc::now().timestamp() as u64;
+            let expired: Vec<(TaskId, Option<Uuid>, bool)> = inner
+                .tasks
+                .iter()
+                .filter_map(|(&tid, entry)| {
+                    if entry.state != TaskState::Queued {
+                        return None;
+                    }
+                    match entry.adoptable_by {
+                        Some((wid, until)) if now >= until => {
+                            Some((tid, Some(wid), entry.fail_if_not_adopted))
+                        }
+                        None if entry.fail_if_not_adopted => Some((tid, None, true)),
+                        _ => None,
+                    }
+                })
+                .collect();
+
+            let mut released_any = false;
+            for (task_id, last_worker, fail_if_not_adopted) in expired {
+                if fail_if_not_adopted {
+                    if let Some(record) = Self::fail_unadopted_zero_retry_task(
+                        &mut inner,
+                        task_id,
+                        last_worker,
+                        now_epoch,
+                    ) {
+                        if let Some(ack) = inner.append_durable_warn(&record) {
+                            acks.push(ack);
+                        }
+                        newly_failed.push(task_id);
+                    }
+                } else if let Some(entry) = inner.tasks.get_mut(&task_id) {
+                    entry.adoptable_by = None;
+                    released_any = true;
+                }
+            }
+            if released_any {
+                inner.ready_epoch = inner.ready_epoch.wrapping_add(1);
+            }
+        }
+
+        for ack in acks {
+            if let Err(err) = ack.await {
+                tracing::warn!(error = %err, "Failed to sync expired adoption failure record");
+            }
+        }
+        newly_failed
+    }
+
+    /// Writes a compacted snapshot of the current queue state to disk and resets `journal.bin`.
+    pub async fn compact_store(&self) -> GridResult<()> {
+        let ack = {
+            let inner = self.inner.write().await;
+            let Some(ref store) = inner.store else {
+                return Ok(());
+            };
+            let image = inner.snapshot_image();
+            store.compact(image)?
+        };
+        ack.await
+    }
+
+    /// Compacts the task store (if attached), detaches it from the queue, and waits for the writer
+    /// thread to flush and release `store.lock`.
+    pub async fn close_and_compact_store(&self) {
+        let (store, ack) = {
+            let mut inner = self.inner.write().await;
+            let Some(store) = inner.store.take() else {
+                return;
+            };
+            let image = inner.snapshot_image();
+            let ack = store.compact(image).ok();
+            (store, ack)
+        };
+        if let Some(ack) = ack {
+            let _ = ack.await;
+        }
+        drop(store);
+    }
+
+    /// Synchronous counterpart to [`close_and_compact_store`](Self::close_and_compact_store) for
+    /// callers such as `MasterHandle::shutdown` that run outside an `async fn`.
+    pub fn close_and_compact_store_sync(&self) {
+        if let Ok(mut inner) = self.inner.try_write() {
+            if let Some(store) = inner.store.take() {
+                let image = inner.snapshot_image();
+                let _ = store.compact(image);
+                drop(inner);
+                drop(store);
+            }
+            return;
+        }
+        let queue = self.clone();
+        let _ = std::thread::spawn(move || {
+            let mut inner = queue.inner.blocking_write();
+            if let Some(store) = inner.store.take() {
+                let image = inner.snapshot_image();
+                let _ = store.compact(image);
+                drop(inner);
+                drop(store);
+            }
+        })
+        .join();
+    }
+
+    /// Number of `sync_data()` calls performed by the attached [`TaskStore`], if any.
+    pub async fn store_sync_count(&self) -> Option<u64> {
+        self.inner
+            .read()
+            .await
+            .store
+            .as_ref()
+            .map(TaskStore::sync_count)
+    }
+
+    /// Number of records currently in `journal.bin` since the last compaction, if a [`TaskStore`]
+    /// is attached.
+    pub async fn store_journal_records(&self) -> Option<u64> {
+        self.inner
+            .read()
+            .await
+            .store
+            .as_ref()
+            .map(TaskStore::journal_records)
     }
 
     // --- Task Submission ---
@@ -941,75 +1779,97 @@ impl TaskQueue {
 
         self.check_room(entry_bytes).await?;
 
-        let mut inner = self.inner.write().await;
+        let ack = {
+            let mut inner = self.inner.write().await;
 
-        let task_ref = task_slot.as_ref().expect("task_slot checked above");
-        if let Some(existing) = inner.tasks.get(&task_ref.id) {
-            return Err(GridError::Config(format!(
-                "Task {} already exists (state {:?}); task ids must be unique, query its outcome instead of resubmitting",
-                task_ref.id, existing.state
-            )));
-        }
-
-        if let Some(cap) = inner.capacity {
-            let active_count = inner
-                .tasks
-                .values()
-                .filter(|e| !e.state.is_terminal())
-                .count();
-            if active_count >= cap {
-                return Err(GridError::QueueFull { capacity: cap });
+            let task_ref = task_slot.as_ref().expect("task_slot checked above");
+            if let Some(existing) = inner.tasks.get(&task_ref.id) {
+                return Err(GridError::Config(format!(
+                    "Task {} already exists (state {:?}); task ids must be unique, query its outcome instead of resubmitting",
+                    task_ref.id, existing.state
+                )));
             }
-        }
 
-        if inner.active_bytes.saturating_add(entry_bytes) > inner.max_active_bytes {
-            return Err(GridError::QueueByteLimitExceeded {
-                task_bytes: entry_bytes,
-                in_use_bytes: inner.active_bytes,
-                max_bytes: inner.max_active_bytes,
+            if let Some(cap) = inner.capacity {
+                let active_count = inner
+                    .tasks
+                    .values()
+                    .filter(|e| !e.state.is_terminal())
+                    .count();
+                if active_count >= cap {
+                    return Err(GridError::QueueFull { capacity: cap });
+                }
+            }
+
+            if inner.active_bytes.saturating_add(entry_bytes) > inner.max_active_bytes {
+                return Err(GridError::QueueByteLimitExceeded {
+                    task_bytes: entry_bytes,
+                    in_use_bytes: inner.active_bytes,
+                    max_bytes: inner.max_active_bytes,
+                });
+            }
+
+            let task = task_slot.take().expect("task_slot checked above");
+            let task_id = task.id;
+            let sequence = inner.next_sequence;
+            inner.next_sequence += 1;
+
+            let now_instant = Instant::now();
+            let now_epoch = Utc::now().timestamp() as u64;
+
+            let submitted_record = inner.store.is_some().then(|| JournalRecord::TaskSubmitted {
+                task: Box::new(task.clone()),
+                priority: 0,
+                sequence,
+                submitted_at_utc: now_epoch,
             });
-        }
 
-        let task = task_slot.take().expect("task_slot checked above");
-        let task_id = task.id;
-        let sequence = inner.next_sequence;
-        inner.next_sequence += 1;
+            let entry = TaskEntry {
+                task,
+                priority: 0,
+                sequence,
+                state: TaskState::Queued,
+                assigned_worker_id: None,
+                submitted_at_utc: now_epoch,
+                submitted_instant: now_instant,
+                scheduled_instant: None,
+                started_instant: None,
+                retry_after_instant: None,
+                retry_count: 0,
+                failover_count: 0,
+                evacuation_count: 0,
+                rejection_count: 0,
+                avoid_workers: Vec::new(),
+                assigned_session: None,
+                adoptable_by: None,
+                fail_if_not_adopted: false,
+                retry_history: Vec::new(),
+                result: None,
+                error_message: None,
+            };
 
-        let now_instant = Instant::now();
-        let now_epoch = Utc::now().timestamp() as u64;
+            inner.tasks.insert(task_id, entry);
+            inner.active_sizes.insert(task_id, entry_bytes);
+            inner.active_bytes = inner.active_bytes.saturating_add(entry_bytes);
+            inner.insert_ready(QueueOrderKey {
+                priority_rev: Reverse(0),
+                sequence,
+                task_id,
+            });
 
-        let entry = TaskEntry {
-            task,
-            priority: 0,
-            sequence,
-            state: TaskState::Queued,
-            assigned_worker_id: None,
-            submitted_at_utc: now_epoch,
-            submitted_instant: now_instant,
-            scheduled_instant: None,
-            started_instant: None,
-            retry_after_instant: None,
-            retry_count: 0,
-            failover_count: 0,
-            evacuation_count: 0,
-            rejection_count: 0,
-            avoid_workers: Vec::new(),
-            assigned_session: None,
-            retry_history: Vec::new(),
-            result: None,
-            error_message: None,
+            let ack = if let Some(ref record) = submitted_record {
+                inner.append_durable(record)?
+            } else {
+                None
+            };
+            (task_id, ack)
         };
 
-        inner.tasks.insert(task_id, entry);
-        inner.active_sizes.insert(task_id, entry_bytes);
-        inner.active_bytes = inner.active_bytes.saturating_add(entry_bytes);
-        inner.insert_ready(QueueOrderKey {
-            priority_rev: Reverse(0),
-            sequence,
-            task_id,
-        });
+        if let Some(durable_ack) = ack.1 {
+            durable_ack.await?;
+        }
 
-        Ok(task_id)
+        Ok(ack.0)
     }
 
     /// Submits a task with explicit scheduling priority.
@@ -1020,72 +1880,94 @@ impl TaskQueue {
     pub async fn submit_with_priority(&self, task: Task, priority: u32) -> GridResult<TaskId> {
         task.validate().map_err(GridError::Config)?;
 
-        let mut inner = self.inner.write().await;
+        let (task_id, ack) = {
+            let mut inner = self.inner.write().await;
 
-        if let Some(existing) = inner.tasks.get(&task.id) {
-            return Err(GridError::Config(format!(
-                "Task {} already exists (state {:?}); task ids must be unique, query its outcome instead of resubmitting",
-                task.id, existing.state
-            )));
-        }
-
-        if let Some(cap) = inner.capacity {
-            let active_count = inner
-                .tasks
-                .values()
-                .filter(|e| !e.state.is_terminal())
-                .count();
-            if active_count >= cap {
-                return Err(GridError::QueueFull { capacity: cap });
+            if let Some(existing) = inner.tasks.get(&task.id) {
+                return Err(GridError::Config(format!(
+                    "Task {} already exists (state {:?}); task ids must be unique, query its outcome instead of resubmitting",
+                    task.id, existing.state
+                )));
             }
-        }
 
-        let task_id = task.id;
-        let sequence = inner.next_sequence;
-        inner.next_sequence += 1;
+            if let Some(cap) = inner.capacity {
+                let active_count = inner
+                    .tasks
+                    .values()
+                    .filter(|e| !e.state.is_terminal())
+                    .count();
+                if active_count >= cap {
+                    return Err(GridError::QueueFull { capacity: cap });
+                }
+            }
 
-        let now_instant = Instant::now();
-        let now_epoch = Utc::now().timestamp() as u64;
+            let task_id = task.id;
+            let sequence = inner.next_sequence;
+            inner.next_sequence += 1;
 
-        let entry = TaskEntry {
-            task,
-            priority,
-            sequence,
-            state: TaskState::Queued,
-            assigned_worker_id: None,
-            submitted_at_utc: now_epoch,
-            submitted_instant: now_instant,
-            scheduled_instant: None,
-            started_instant: None,
-            retry_after_instant: None,
-            retry_count: 0,
-            failover_count: 0,
-            evacuation_count: 0,
-            rejection_count: 0,
-            avoid_workers: Vec::new(),
-            assigned_session: None,
-            retry_history: Vec::new(),
-            result: None,
-            error_message: None,
+            let now_instant = Instant::now();
+            let now_epoch = Utc::now().timestamp() as u64;
+
+            let submitted_record = inner.store.is_some().then(|| JournalRecord::TaskSubmitted {
+                task: Box::new(task.clone()),
+                priority,
+                sequence,
+                submitted_at_utc: now_epoch,
+            });
+
+            let entry = TaskEntry {
+                task,
+                priority,
+                sequence,
+                state: TaskState::Queued,
+                assigned_worker_id: None,
+                submitted_at_utc: now_epoch,
+                submitted_instant: now_instant,
+                scheduled_instant: None,
+                started_instant: None,
+                retry_after_instant: None,
+                retry_count: 0,
+                failover_count: 0,
+                evacuation_count: 0,
+                rejection_count: 0,
+                avoid_workers: Vec::new(),
+                assigned_session: None,
+                adoptable_by: None,
+                fail_if_not_adopted: false,
+                retry_history: Vec::new(),
+                result: None,
+                error_message: None,
+            };
+
+            let entry_bytes = retained_bytes(&entry);
+            if inner.active_bytes.saturating_add(entry_bytes) > inner.max_active_bytes {
+                return Err(GridError::QueueByteLimitExceeded {
+                    task_bytes: entry_bytes,
+                    in_use_bytes: inner.active_bytes,
+                    max_bytes: inner.max_active_bytes,
+                });
+            }
+
+            inner.tasks.insert(task_id, entry);
+            inner.active_sizes.insert(task_id, entry_bytes);
+            inner.active_bytes = inner.active_bytes.saturating_add(entry_bytes);
+            inner.insert_ready(QueueOrderKey {
+                priority_rev: Reverse(priority),
+                sequence,
+                task_id,
+            });
+
+            let ack = if let Some(ref record) = submitted_record {
+                inner.append_durable(record)?
+            } else {
+                None
+            };
+            (task_id, ack)
         };
 
-        let entry_bytes = retained_bytes(&entry);
-        if inner.active_bytes.saturating_add(entry_bytes) > inner.max_active_bytes {
-            return Err(GridError::QueueByteLimitExceeded {
-                task_bytes: entry_bytes,
-                in_use_bytes: inner.active_bytes,
-                max_bytes: inner.max_active_bytes,
-            });
+        if let Some(ack) = ack {
+            ack.await?;
         }
-
-        inner.tasks.insert(task_id, entry);
-        inner.active_sizes.insert(task_id, entry_bytes);
-        inner.active_bytes = inner.active_bytes.saturating_add(entry_bytes);
-        inner.insert_ready(QueueOrderKey {
-            priority_rev: Reverse(priority),
-            sequence,
-            task_id,
-        });
 
         Ok(task_id)
     }
@@ -1095,6 +1977,7 @@ impl TaskQueue {
     /// Returns a list of tasks currently in `Queued` state in priority-FIFO order.
     pub async fn get_schedulable_tasks(&self) -> Vec<Task> {
         let inner = self.inner.read().await;
+        let now = Instant::now();
         inner
             .ready_queue
             .iter()
@@ -1102,7 +1985,7 @@ impl TaskQueue {
                 inner
                     .tasks
                     .get(&k.task_id)
-                    .filter(|e| e.state == TaskState::Queued)
+                    .filter(|e| is_schedulable_queued(e, now))
                     .map(|e| e.task.clone())
             })
             .collect()
@@ -1124,6 +2007,7 @@ impl TaskQueue {
         self.ready_views_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let inner = self.inner.read().await;
+        let now = Instant::now();
         let lower = match after {
             Some(key) => Bound::Excluded(key),
             None => Bound::Unbounded,
@@ -1135,7 +2019,7 @@ impl TaskQueue {
             let Some(entry) = inner
                 .tasks
                 .get(&key.task_id)
-                .filter(|e| e.state == TaskState::Queued)
+                .filter(|e| is_schedulable_queued(e, now))
             else {
                 continue;
             };
@@ -1152,7 +2036,7 @@ impl TaskQueue {
                 inner
                     .tasks
                     .get(&k.task_id)
-                    .is_some_and(|e| e.state == TaskState::Queued)
+                    .is_some_and(|e| is_schedulable_queued(e, now))
             })
         });
         (views, next)
@@ -1173,6 +2057,7 @@ impl TaskQueue {
     /// Ids of up to `limit` queued tasks in priority-FIFO order, without cloning any task.
     pub async fn ready_task_ids(&self, limit: usize) -> Vec<TaskId> {
         let inner = self.inner.read().await;
+        let now = Instant::now();
         inner
             .ready_queue
             .iter()
@@ -1180,7 +2065,7 @@ impl TaskQueue {
                 inner
                     .tasks
                     .get(&k.task_id)
-                    .is_some_and(|e| e.state == TaskState::Queued)
+                    .is_some_and(|e| is_schedulable_queued(e, now))
             })
             .take(limit)
             .map(|k| k.task_id)
@@ -1190,11 +2075,12 @@ impl TaskQueue {
     /// True if any queued task satisfies `pred`. Stops at the first hit; takes no clones.
     pub async fn any_queued<F: Fn(&Task) -> bool>(&self, pred: F) -> bool {
         let inner = self.inner.read().await;
+        let now = Instant::now();
         inner.ready_queue.iter().any(|k| {
             inner
                 .tasks
                 .get(&k.task_id)
-                .is_some_and(|e| e.state == TaskState::Queued && pred(&e.task))
+                .is_some_and(|e| is_schedulable_queued(e, now) && pred(&e.task))
         })
     }
 
@@ -1212,7 +2098,7 @@ impl TaskQueue {
                 };
                 if !entry.state.is_active() {
                     continue;
-                }
+                };
                 load.tasks += 1;
                 load.slots += entry.task.requirements.cpu_cores.max(1);
                 if entry.state == TaskState::Scheduled {
@@ -1249,13 +2135,15 @@ impl TaskQueue {
         F: Fn(&TaskRequirements) -> bool,
     {
         let mut inner = self.inner.write().await;
+        let now = Instant::now();
+        let now_epoch = Utc::now().timestamp() as u64;
 
         let found_key = inner
             .ready_queue
             .iter()
             .find(|k| {
                 if let Some(entry) = inner.tasks.get(&k.task_id) {
-                    entry.state == TaskState::Queued && predicate(&entry.task.requirements)
+                    is_schedulable_queued(entry, now) && predicate(&entry.task.requirements)
                 } else {
                     false
                 }
@@ -1269,7 +2157,8 @@ impl TaskQueue {
                 entry.state = TaskState::Scheduled;
                 entry.assigned_worker_id = Some(worker_id);
                 entry.assigned_session = None;
-                entry.scheduled_instant = Some(Instant::now());
+                entry.adoptable_by = None;
+                entry.scheduled_instant = Some(now);
                 entry.task.clone()
             };
 
@@ -1278,6 +2167,12 @@ impl TaskQueue {
                 .entry(worker_id)
                 .or_default()
                 .insert(key.task_id);
+
+            inner.append_non_durable(&JournalRecord::TaskDispatched {
+                task_id: key.task_id,
+                worker_id,
+                timestamp_utc: now_epoch,
+            });
 
             Some(task)
         } else {
@@ -1292,9 +2187,11 @@ impl TaskQueue {
     /// if the task is no longer in `Queued` state (e.g. cancelled concurrently).
     pub async fn schedule_task(&self, task_id: &TaskId, worker_id: Uuid) -> Option<Task> {
         let mut inner = self.inner.write().await;
+        let now = Instant::now();
+        let now_epoch = Utc::now().timestamp() as u64;
         let priority_info = {
             let entry = inner.tasks.get(task_id)?;
-            if entry.state != TaskState::Queued {
+            if !is_schedulable_queued(entry, now) {
                 return None;
             }
             (entry.priority, entry.sequence)
@@ -1311,7 +2208,8 @@ impl TaskQueue {
             entry.state = TaskState::Scheduled;
             entry.assigned_worker_id = Some(worker_id);
             entry.assigned_session = None;
-            entry.scheduled_instant = Some(Instant::now());
+            entry.adoptable_by = None;
+            entry.scheduled_instant = Some(now);
             entry.task.clone()
         };
 
@@ -1320,6 +2218,12 @@ impl TaskQueue {
             .entry(worker_id)
             .or_default()
             .insert(*task_id);
+
+        inner.append_non_durable(&JournalRecord::TaskDispatched {
+            task_id: *task_id,
+            worker_id,
+            timestamp_utc: now_epoch,
+        });
 
         Some(task)
     }
@@ -1363,11 +2267,15 @@ impl TaskQueue {
 
         let mut inner = self.inner.write().await;
         let now = Instant::now();
+        let now_epoch = Utc::now().timestamp() as u64;
         let mut scheduled = Vec::with_capacity(assignments.len());
 
         for &(task_id, worker_id, session_id) in assignments {
             let (priority, sequence) = match inner.tasks.get(&task_id) {
-                Some(entry) if entry.state == TaskState::Queued => (entry.priority, entry.sequence),
+                Some(entry) if is_schedulable_queued(entry, now) => {
+                    (entry.priority, entry.sequence)
+                }
+                Some(entry) if entry.state == TaskState::Queued => continue,
                 Some(entry) => {
                     // A ready key can only be stale here (the entry left Queued without
                     // dropping it); keeping it would be re-offered to every scheduling pass.
@@ -1392,6 +2300,7 @@ impl TaskQueue {
                 entry.state = TaskState::Scheduled;
                 entry.assigned_worker_id = Some(worker_id);
                 entry.assigned_session = session_id;
+                entry.adoptable_by = None;
                 entry.scheduled_instant = Some(now);
                 let task = entry.task.clone();
 
@@ -1400,6 +2309,12 @@ impl TaskQueue {
                     .entry(worker_id)
                     .or_default()
                     .insert(task_id);
+
+                inner.append_non_durable(&JournalRecord::TaskDispatched {
+                    task_id,
+                    worker_id,
+                    timestamp_utc: now_epoch,
+                });
 
                 scheduled.push((task_id, worker_id, task));
             }
@@ -1435,14 +2350,25 @@ impl TaskQueue {
             }
         }
 
-        let (priority, sequence) = {
+        let (priority, sequence, record) = {
             let entry = inner
                 .tasks
                 .get_mut(task_id)
                 .ok_or(GridError::TaskNotFound(task_id.0))?;
             entry.state = TaskState::Queued;
             entry.scheduled_instant = None;
-            (entry.priority, entry.sequence)
+            let record = JournalRecord::TaskRequeued {
+                task_id: *task_id,
+                state: TaskState::Queued,
+                retry_count: entry.retry_count,
+                failover_count: entry.failover_count,
+                evacuation_count: entry.evacuation_count,
+                rejection_count: entry.rejection_count,
+                avoid_workers: entry.avoid_workers.clone(),
+                retry_attempt: None,
+                retry_delay_ms: None,
+            };
+            (entry.priority, entry.sequence, record)
         };
 
         inner.insert_ready(QueueOrderKey {
@@ -1450,6 +2376,7 @@ impl TaskQueue {
             sequence,
             task_id: *task_id,
         });
+        inner.append_non_durable(&record);
 
         Ok(())
     }
@@ -1490,7 +2417,7 @@ impl TaskQueue {
         session_id: u64,
     ) -> GridResult<bool> {
         let mut inner = self.inner.write().await;
-        let (priority, sequence) = {
+        let (priority, sequence, record) = {
             let entry = inner
                 .tasks
                 .get_mut(task_id)
@@ -1503,7 +2430,18 @@ impl TaskQueue {
             entry.assigned_worker_id = None;
             entry.assigned_session = None;
             entry.scheduled_instant = None;
-            (entry.priority, entry.sequence)
+            let record = JournalRecord::TaskRequeued {
+                task_id: *task_id,
+                state: TaskState::Queued,
+                retry_count: entry.retry_count,
+                failover_count: entry.failover_count,
+                evacuation_count: entry.evacuation_count,
+                rejection_count: entry.rejection_count,
+                avoid_workers: entry.avoid_workers.clone(),
+                retry_attempt: None,
+                retry_delay_ms: None,
+            };
+            (entry.priority, entry.sequence, record)
         };
         if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
             tasks.remove(task_id);
@@ -1513,6 +2451,7 @@ impl TaskQueue {
             sequence,
             task_id: *task_id,
         });
+        inner.append_non_durable(&record);
         Ok(true)
     }
 
@@ -1535,30 +2474,53 @@ impl TaskQueue {
         session_id: Option<u64>,
         task_id: &TaskId,
     ) -> GridResult<()> {
-        let mut inner = self.inner.write().await;
-        let entry = inner
-            .tasks
-            .get_mut(task_id)
-            .ok_or(GridError::TaskNotFound(task_id.0))?;
+        let ack = {
+            let mut inner = self.inner.write().await;
+            let zero_retries = {
+                let entry = inner
+                    .tasks
+                    .get(task_id)
+                    .ok_or(GridError::TaskNotFound(task_id.0))?;
 
-        if !owned_by(entry, &worker_id, session_id) {
-            return Err(GridError::InvalidTaskState {
-                task_id: task_id.0,
-                current: format!("{:?} (not assigned to this worker/session)", entry.state),
-                attempted: "Running".into(),
-            });
+                if !owned_by(entry, &worker_id, session_id) {
+                    return Err(GridError::InvalidTaskState {
+                        task_id: task_id.0,
+                        current: format!("{:?} (not assigned to this worker/session)", entry.state),
+                        attempted: "Running".into(),
+                    });
+                }
+
+                if !entry.state.can_transition_to(TaskState::Running) {
+                    return Err(GridError::InvalidTaskState {
+                        task_id: task_id.0,
+                        current: format!("{:?}", entry.state),
+                        attempted: "Running".into(),
+                    });
+                }
+                inner.retry_policy.zero_retries_for(entry)
+            };
+
+            if let Some(entry) = inner.tasks.get_mut(task_id) {
+                entry.state = TaskState::Running;
+                entry.started_instant = Some(Instant::now());
+            }
+
+            let record = JournalRecord::TaskRunning {
+                task_id: *task_id,
+                worker_id,
+                timestamp_utc: Utc::now().timestamp() as u64,
+            };
+            if zero_retries {
+                inner.append_durable(&record)?
+            } else {
+                inner.append_non_durable(&record);
+                None
+            }
+        };
+
+        if let Some(ack) = ack {
+            ack.await?;
         }
-
-        if !entry.state.can_transition_to(TaskState::Running) {
-            return Err(GridError::InvalidTaskState {
-                task_id: task_id.0,
-                current: format!("{:?}", entry.state),
-                attempted: "Running".into(),
-            });
-        }
-
-        entry.state = TaskState::Running;
-        entry.started_instant = Some(Instant::now());
         Ok(())
     }
 
@@ -1574,30 +2536,48 @@ impl TaskQueue {
         task_id: TaskId,
         checkpoint: CheckpointData,
     ) -> Result<(), GridError> {
-        let mut inner = self.inner.write().await;
-        let max_active = inner.max_active_bytes;
-        let active_bytes = inner.active_bytes;
-        let entry = inner
-            .tasks
-            .get_mut(&task_id)
-            .ok_or(GridError::TaskNotFound(task_id.0))?;
+        let ack = {
+            let mut inner = self.inner.write().await;
+            let max_active = inner.max_active_bytes;
+            let active_bytes = inner.active_bytes;
+            let has_store = inner.store.is_some();
+            let entry = inner
+                .tasks
+                .get_mut(&task_id)
+                .ok_or(GridError::TaskNotFound(task_id.0))?;
 
-        if entry.state.is_terminal() {
-            return Ok(());
-        }
+            if entry.state.is_terminal() {
+                return Ok(());
+            }
 
-        if let Some(task_bytes) =
-            Self::checkpoint_exceeds_active_cap(entry, &checkpoint, active_bytes, max_active)
-        {
-            return Err(GridError::QueueByteLimitExceeded {
-                task_bytes,
-                in_use_bytes: active_bytes,
-                max_bytes: max_active,
-            });
-        }
+            if let Some(task_bytes) =
+                Self::checkpoint_exceeds_active_cap(entry, &checkpoint, active_bytes, max_active)
+            {
+                return Err(GridError::QueueByteLimitExceeded {
+                    task_bytes,
+                    in_use_bytes: active_bytes,
+                    max_bytes: max_active,
+                });
+            }
 
-        if Self::apply_checkpoint(entry, checkpoint) {
-            inner.update_active_task(task_id);
+            let record_cp = has_store.then(|| checkpoint.clone());
+            if Self::apply_checkpoint(entry, checkpoint) {
+                inner.update_active_task(task_id);
+                if let Some(cp) = record_cp {
+                    inner.append_durable(&JournalRecord::CheckpointRecorded {
+                        task_id,
+                        checkpoint: cp,
+                    })?
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(ack) = ack {
+            ack.await?;
         }
         Ok(())
     }
@@ -1614,37 +2594,56 @@ impl TaskQueue {
         task_id: TaskId,
         checkpoint: CheckpointData,
     ) -> Result<bool, GridError> {
-        let mut inner = self.inner.write().await;
-        let max_active = inner.max_active_bytes;
-        let active_bytes = inner.active_bytes;
-        let entry = inner
-            .tasks
-            .get_mut(&task_id)
-            .ok_or(GridError::TaskNotFound(task_id.0))?;
+        let (applied, ack) = {
+            let mut inner = self.inner.write().await;
+            let max_active = inner.max_active_bytes;
+            let active_bytes = inner.active_bytes;
+            let has_store = inner.store.is_some();
+            let entry = inner
+                .tasks
+                .get_mut(&task_id)
+                .ok_or(GridError::TaskNotFound(task_id.0))?;
 
-        if !entry.state.is_active() || !owned_by(entry, &worker_id, session_id) {
-            tracing::debug!(
-                task_id = %task_id,
-                worker_id = %worker_id,
-                state = ?entry.state,
-                "Dropping checkpoint from a worker/session the task is not assigned to"
-            );
-            return Ok(false);
-        }
+            if !entry.state.is_active() || !owned_by(entry, &worker_id, session_id) {
+                tracing::debug!(
+                    task_id = %task_id,
+                    worker_id = %worker_id,
+                    state = ?entry.state,
+                    "Dropping checkpoint from a worker/session the task is not assigned to"
+                );
+                return Ok(false);
+            }
 
-        if let Some(task_bytes) =
-            Self::checkpoint_exceeds_active_cap(entry, &checkpoint, active_bytes, max_active)
-        {
-            return Err(GridError::QueueByteLimitExceeded {
-                task_bytes,
-                in_use_bytes: active_bytes,
-                max_bytes: max_active,
-            });
-        }
+            if let Some(task_bytes) =
+                Self::checkpoint_exceeds_active_cap(entry, &checkpoint, active_bytes, max_active)
+            {
+                return Err(GridError::QueueByteLimitExceeded {
+                    task_bytes,
+                    in_use_bytes: active_bytes,
+                    max_bytes: max_active,
+                });
+            }
 
-        let applied = Self::apply_checkpoint(entry, checkpoint);
-        if applied {
-            inner.update_active_task(task_id);
+            let record_cp = has_store.then(|| checkpoint.clone());
+            let applied = Self::apply_checkpoint(entry, checkpoint);
+            let ack = if applied {
+                inner.update_active_task(task_id);
+                if let Some(cp) = record_cp {
+                    inner.append_durable(&JournalRecord::CheckpointRecorded {
+                        task_id,
+                        checkpoint: cp,
+                    })?
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            (applied, ack)
+        };
+
+        if let Some(ack) = ack {
+            ack.await?;
         }
         Ok(applied)
     }
@@ -1727,162 +2726,238 @@ impl TaskQueue {
     ) -> GridResult<ResultOutcome> {
         let task_id = result.task_id;
 
-        let mut inner = self.inner.write().await;
-        let policy = inner.retry_policy.clone();
+        let (outcome, ack) = {
+            let mut inner = self.inner.write().await;
+            let policy = inner.retry_policy.clone();
 
-        let (state, owner) = {
-            let entry = inner
-                .tasks
-                .get(&task_id)
-                .ok_or(GridError::TaskNotFound(task_id.0))?;
-            (entry.state, owned_by(entry, &worker_id, session_id))
-        };
+            let (state, owner) = {
+                let entry = inner
+                    .tasks
+                    .get(&task_id)
+                    .ok_or(GridError::TaskNotFound(task_id.0))?;
+                (entry.state, owned_by(entry, &worker_id, session_id))
+            };
 
-        if !owner {
-            tracing::debug!(
-                task_id = %task_id,
-                worker_id = %worker_id,
-                session_id = ?session_id,
-                state = ?state,
-                "Dropping result from a worker/session the task is not assigned to"
-            );
-            return Ok(ResultOutcome {
-                disposition: ResultDisposition::Stale,
-                state,
-                rejected: false,
-            });
-        }
-
-        // Remove from worker assignment tracking
-        if let Some(tasks) = inner.worker_assignments.get_mut(&worker_id) {
-            tasks.remove(&task_id);
-        }
-
-        // If task is already terminal (e.g. Cancelled by master directive, Completed, Failed), preserve state
-        if state.is_terminal() {
-            tracing::debug!(task_id = %task_id, state = ?state, "Ignoring result for terminal task");
-            return Ok(ResultOutcome {
-                disposition: ResultDisposition::Late,
-                state,
-                rejected: false,
-            });
-        }
-
-        let now_instant = Instant::now();
-        let now_epoch = Utc::now().timestamp() as u64;
-        let rejected = is_worker_rejection(&result);
-
-        let mut delay_key_to_insert = None;
-        let mut ready_key_to_insert = None;
-
-        let (res_state, disposition) = {
-            let entry = inner
-                .tasks
-                .get_mut(&task_id)
-                .ok_or(GridError::TaskNotFound(task_id.0))?;
-
-            if result.is_success() {
-                if !entry.state.can_transition_to(TaskState::Completed) {
-                    return Err(GridError::InvalidTaskState {
-                        task_id: task_id.0,
-                        current: format!("{:?}", entry.state),
-                        attempted: "Completed".into(),
-                    });
-                }
-                entry.state = TaskState::Completed;
-                entry.result = Some(result);
-                (TaskState::Completed, ResultDisposition::Terminal)
-            } else if result.exit_code == 130 {
-                // Task cancellation from worker
-                entry.state = TaskState::Cancelled;
-                entry.error_message = result.error.clone().or_else(|| Some("Cancelled".into()));
-                entry.result = Some(result);
-                (TaskState::Cancelled, ResultDisposition::Terminal)
-            } else if rejected
-                && policy.retry_on_worker_disconnect
-                && entry.rejection_count < MAX_WORKER_REJECTIONS_PER_TASK
-                && policy.failover_budget(entry).0
-            {
-                // The worker refused to run it: that is the worker's problem, not the task's. Hand
-                // the task to somebody else without charging its execution retry budget.
-                entry.rejection_count += 1;
-                entry.failover_count += 1;
-                entry.retry_count += 1;
-                if !entry.avoid_workers.contains(&worker_id) {
-                    entry.avoid_workers.push(worker_id);
-                }
-                entry.retry_history.push(RetryAttempt {
-                    attempt: entry.retry_count,
-                    timestamp_utc: now_epoch,
-                    failed_worker_id: Some(worker_id),
-                    reason: "Worker rejected the task without running it".into(),
-                    exit_code: Some(result.exit_code),
-                    error: result.error.clone(),
+            if !owner {
+                tracing::debug!(
+                    task_id = %task_id,
+                    worker_id = %worker_id,
+                    session_id = ?session_id,
+                    state = ?state,
+                    "Dropping result from a worker/session the task is not assigned to"
+                );
+                return Ok(ResultOutcome {
+                    disposition: ResultDisposition::Stale,
+                    state,
+                    rejected: false,
                 });
-                entry.state = TaskState::Queued;
-                entry.assigned_worker_id = None;
-                entry.assigned_session = None;
-                entry.scheduled_instant = None;
-                entry.started_instant = None;
-                ready_key_to_insert = Some(QueueOrderKey {
-                    priority_rev: Reverse(entry.priority),
-                    sequence: entry.sequence,
-                    task_id,
-                });
-                (TaskState::Queued, ResultDisposition::Requeued)
-            } else if policy.retry_on_execution_failure
-                && entry.retry_count.saturating_sub(entry.failover_count) < policy.max_retries
-            {
-                entry.retry_count += 1;
-                let delay_ms = policy.calculate_backoff(entry.retry_count);
-                let retry_after = now_instant + Duration::from_millis(delay_ms);
-
-                entry.state = TaskState::Retrying;
-                entry.assigned_worker_id = None;
-                entry.assigned_session = None;
-                entry.retry_after_instant = Some(retry_after);
-                entry.retry_history.push(RetryAttempt {
-                    attempt: entry.retry_count,
-                    timestamp_utc: now_epoch,
-                    failed_worker_id: Some(worker_id),
-                    reason: "Non-zero exit code execution failure".into(),
-                    exit_code: Some(result.exit_code),
-                    error: result.error.clone(),
-                });
-
-                delay_key_to_insert = Some(DelayedRetryKey {
-                    retry_after,
-                    task_id,
-                });
-
-                (TaskState::Retrying, ResultDisposition::Requeued)
-            } else {
-                // Unrecoverable or exhausted failure
-                entry.state = TaskState::Failed;
-                entry.error_message = result.error.clone();
-                entry.result = Some(result);
-                (TaskState::Failed, ResultDisposition::Terminal)
             }
+
+            // Remove from worker assignment tracking
+            if let Some(tasks) = inner.worker_assignments.get_mut(&worker_id) {
+                tasks.remove(&task_id);
+            }
+
+            // If task is already terminal (e.g. Cancelled by master directive, Completed, Failed), preserve state
+            if state.is_terminal() {
+                tracing::debug!(task_id = %task_id, state = ?state, "Ignoring result for terminal task");
+                return Ok(ResultOutcome {
+                    disposition: ResultDisposition::Late,
+                    state,
+                    rejected: false,
+                });
+            }
+
+            let now_instant = Instant::now();
+            let now_epoch = Utc::now().timestamp() as u64;
+            let rejected = is_worker_rejection(&result);
+
+            let mut delay_key_to_insert = None;
+            let mut ready_key_to_insert = None;
+
+            let (res_state, disposition, journal_record) = {
+                let entry = inner
+                    .tasks
+                    .get_mut(&task_id)
+                    .ok_or(GridError::TaskNotFound(task_id.0))?;
+
+                if result.is_success() {
+                    if !entry.state.can_transition_to(TaskState::Completed) {
+                        return Err(GridError::InvalidTaskState {
+                            task_id: task_id.0,
+                            current: format!("{:?}", entry.state),
+                            attempted: "Completed".into(),
+                        });
+                    }
+                    entry.state = TaskState::Completed;
+                    entry.result = Some(result.clone());
+                    let record = JournalRecord::TaskTerminal {
+                        task_id,
+                        state: TaskState::Completed,
+                        assigned_worker_id: entry.assigned_worker_id,
+                        retry_count: entry.retry_count,
+                        failover_count: entry.failover_count,
+                        evacuation_count: entry.evacuation_count,
+                        rejection_count: entry.rejection_count,
+                        retry_attempt: None,
+                        result: Some(result),
+                        error_message: entry.error_message.clone(),
+                        timestamp_utc: now_epoch,
+                    };
+                    (TaskState::Completed, ResultDisposition::Terminal, record)
+                } else if result.exit_code == 130 {
+                    // Task cancellation from worker
+                    entry.state = TaskState::Cancelled;
+                    entry.error_message = result.error.clone().or_else(|| Some("Cancelled".into()));
+                    entry.result = Some(result.clone());
+                    let record = JournalRecord::TaskTerminal {
+                        task_id,
+                        state: TaskState::Cancelled,
+                        assigned_worker_id: entry.assigned_worker_id,
+                        retry_count: entry.retry_count,
+                        failover_count: entry.failover_count,
+                        evacuation_count: entry.evacuation_count,
+                        rejection_count: entry.rejection_count,
+                        retry_attempt: None,
+                        result: Some(result),
+                        error_message: entry.error_message.clone(),
+                        timestamp_utc: now_epoch,
+                    };
+                    (TaskState::Cancelled, ResultDisposition::Terminal, record)
+                } else if rejected
+                    && policy.retry_on_worker_disconnect
+                    && entry.rejection_count < MAX_WORKER_REJECTIONS_PER_TASK
+                    && policy.failover_budget(entry).0
+                {
+                    // The worker refused to run it: that is the worker's problem, not the task's. Hand
+                    // the task to somebody else without charging its execution retry budget.
+                    entry.rejection_count += 1;
+                    entry.failover_count += 1;
+                    entry.retry_count += 1;
+                    if !entry.avoid_workers.contains(&worker_id) {
+                        entry.avoid_workers.push(worker_id);
+                    }
+                    let attempt = RetryAttempt {
+                        attempt: entry.retry_count,
+                        timestamp_utc: now_epoch,
+                        failed_worker_id: Some(worker_id),
+                        reason: "Worker rejected the task without running it".into(),
+                        exit_code: Some(result.exit_code),
+                        error: result.error.clone(),
+                    };
+                    entry.retry_history.push(attempt.clone());
+                    entry.state = TaskState::Queued;
+                    entry.assigned_worker_id = None;
+                    entry.assigned_session = None;
+                    entry.scheduled_instant = None;
+                    entry.started_instant = None;
+                    ready_key_to_insert = Some(QueueOrderKey {
+                        priority_rev: Reverse(entry.priority),
+                        sequence: entry.sequence,
+                        task_id,
+                    });
+                    let record = JournalRecord::TaskRequeued {
+                        task_id,
+                        state: TaskState::Queued,
+                        retry_count: entry.retry_count,
+                        failover_count: entry.failover_count,
+                        evacuation_count: entry.evacuation_count,
+                        rejection_count: entry.rejection_count,
+                        avoid_workers: entry.avoid_workers.clone(),
+                        retry_attempt: Some(attempt),
+                        retry_delay_ms: Some(0),
+                    };
+                    (TaskState::Queued, ResultDisposition::Requeued, record)
+                } else if policy.retry_on_execution_failure
+                    && entry.retry_count.saturating_sub(entry.failover_count) < policy.max_retries
+                {
+                    entry.retry_count += 1;
+                    let delay_ms = policy.calculate_backoff(entry.retry_count);
+                    let retry_after = now_instant + Duration::from_millis(delay_ms);
+
+                    entry.state = TaskState::Retrying;
+                    entry.assigned_worker_id = None;
+                    entry.assigned_session = None;
+                    entry.retry_after_instant = Some(retry_after);
+                    let attempt = RetryAttempt {
+                        attempt: entry.retry_count,
+                        timestamp_utc: now_epoch,
+                        failed_worker_id: Some(worker_id),
+                        reason: "Non-zero exit code execution failure".into(),
+                        exit_code: Some(result.exit_code),
+                        error: result.error.clone(),
+                    };
+                    entry.retry_history.push(attempt.clone());
+
+                    delay_key_to_insert = Some(DelayedRetryKey {
+                        retry_after,
+                        task_id,
+                    });
+
+                    let record = JournalRecord::TaskRequeued {
+                        task_id,
+                        state: TaskState::Retrying,
+                        retry_count: entry.retry_count,
+                        failover_count: entry.failover_count,
+                        evacuation_count: entry.evacuation_count,
+                        rejection_count: entry.rejection_count,
+                        avoid_workers: entry.avoid_workers.clone(),
+                        retry_attempt: Some(attempt),
+                        retry_delay_ms: Some(delay_ms),
+                    };
+                    (TaskState::Retrying, ResultDisposition::Requeued, record)
+                } else {
+                    // Unrecoverable or exhausted failure
+                    entry.state = TaskState::Failed;
+                    entry.error_message = result.error.clone();
+                    entry.result = Some(result.clone());
+                    let record = JournalRecord::TaskTerminal {
+                        task_id,
+                        state: TaskState::Failed,
+                        assigned_worker_id: entry.assigned_worker_id,
+                        retry_count: entry.retry_count,
+                        failover_count: entry.failover_count,
+                        evacuation_count: entry.evacuation_count,
+                        rejection_count: entry.rejection_count,
+                        retry_attempt: None,
+                        result: Some(result),
+                        error_message: entry.error_message.clone(),
+                        timestamp_utc: now_epoch,
+                    };
+                    (TaskState::Failed, ResultDisposition::Terminal, record)
+                }
+            };
+
+            if let Some(key) = delay_key_to_insert {
+                inner.delayed_retries.insert(key);
+            }
+            if let Some(key) = ready_key_to_insert {
+                inner.insert_ready(key);
+            }
+
+            if res_state.is_terminal() {
+                inner.track_terminal_task(task_id);
+            } else {
+                inner.update_active_task(task_id);
+            }
+
+            let ack = inner.append_durable(&journal_record)?;
+
+            (
+                ResultOutcome {
+                    disposition,
+                    state: res_state,
+                    rejected,
+                },
+                ack,
+            )
         };
 
-        if let Some(key) = delay_key_to_insert {
-            inner.delayed_retries.insert(key);
-        }
-        if let Some(key) = ready_key_to_insert {
-            inner.insert_ready(key);
+        if let Some(ack) = ack {
+            ack.await?;
         }
 
-        if res_state.is_terminal() {
-            inner.track_terminal_task(task_id);
-        } else {
-            inner.update_active_task(task_id);
-        }
-
-        Ok(ResultOutcome {
-            disposition,
-            state: res_state,
-            rejected,
-        })
+        Ok(outcome)
     }
 
     /// Fails a task terminally when its assignment message exceeds `MAX_FRAME_SIZE`
@@ -1895,44 +2970,67 @@ impl TaskQueue {
         result: TaskResult,
     ) -> GridResult<ResultDisposition> {
         let task_id = result.task_id;
-        let mut inner = self.inner.write().await;
+        let ack = {
+            let mut inner = self.inner.write().await;
 
-        let (state, owner) = {
-            let entry = inner
-                .tasks
-                .get(&task_id)
-                .ok_or(GridError::TaskNotFound(task_id.0))?;
-            (entry.state, owned_by(entry, &worker_id, session_id))
+            let (state, owner) = {
+                let entry = inner
+                    .tasks
+                    .get(&task_id)
+                    .ok_or(GridError::TaskNotFound(task_id.0))?;
+                (entry.state, owned_by(entry, &worker_id, session_id))
+            };
+
+            if !owner {
+                return Ok(ResultDisposition::Stale);
+            }
+
+            if let Some(tasks) = inner.worker_assignments.get_mut(&worker_id) {
+                tasks.remove(&task_id);
+            }
+
+            if state.is_terminal() {
+                return Ok(ResultDisposition::Late);
+            }
+
+            let now_epoch = Utc::now().timestamp() as u64;
+            let record = {
+                let entry = inner
+                    .tasks
+                    .get_mut(&task_id)
+                    .ok_or(GridError::TaskNotFound(task_id.0))?;
+                if !entry.state.can_transition_to(TaskState::Failed) {
+                    return Err(GridError::InvalidTaskState {
+                        task_id: task_id.0,
+                        current: format!("{:?}", entry.state),
+                        attempted: "Failed".into(),
+                    });
+                }
+                entry.state = TaskState::Failed;
+                entry.error_message = result.error.clone();
+                entry.result = Some(result.clone());
+                JournalRecord::TaskTerminal {
+                    task_id,
+                    state: TaskState::Failed,
+                    assigned_worker_id: entry.assigned_worker_id,
+                    retry_count: entry.retry_count,
+                    failover_count: entry.failover_count,
+                    evacuation_count: entry.evacuation_count,
+                    rejection_count: entry.rejection_count,
+                    retry_attempt: None,
+                    result: Some(result),
+                    error_message: entry.error_message.clone(),
+                    timestamp_utc: now_epoch,
+                }
+            };
+
+            inner.track_terminal_task(task_id);
+            inner.append_durable(&record)?
         };
 
-        if !owner {
-            return Ok(ResultDisposition::Stale);
+        if let Some(ack) = ack {
+            ack.await?;
         }
-
-        if let Some(tasks) = inner.worker_assignments.get_mut(&worker_id) {
-            tasks.remove(&task_id);
-        }
-
-        if state.is_terminal() {
-            return Ok(ResultDisposition::Late);
-        }
-
-        let entry = inner
-            .tasks
-            .get_mut(&task_id)
-            .ok_or(GridError::TaskNotFound(task_id.0))?;
-        if !entry.state.can_transition_to(TaskState::Failed) {
-            return Err(GridError::InvalidTaskState {
-                task_id: task_id.0,
-                current: format!("{:?}", entry.state),
-                attempted: "Failed".into(),
-            });
-        }
-        entry.state = TaskState::Failed;
-        entry.error_message = result.error.clone();
-        entry.result = Some(result);
-
-        inner.track_terminal_task(task_id);
         Ok(ResultDisposition::Terminal)
     }
 
@@ -1947,29 +3045,55 @@ impl TaskQueue {
         task_id: &TaskId,
         reason: String,
     ) -> Option<TaskResult> {
-        let mut inner = self.inner.write().await;
-        let (priority, sequence) = {
-            let entry = inner.tasks.get(task_id)?;
-            if entry.state != TaskState::Queued {
-                return None;
+        let (result, ack) = {
+            let mut inner = self.inner.write().await;
+            let (priority, sequence) = {
+                let entry = inner.tasks.get(task_id)?;
+                if entry.state != TaskState::Queued {
+                    return None;
+                }
+                (entry.priority, entry.sequence)
+            };
+
+            inner.ready_queue.remove(&QueueOrderKey {
+                priority_rev: Reverse(priority),
+                sequence,
+                task_id: *task_id,
+            });
+
+            let result =
+                TaskResult::failure(Uuid::nil(), *task_id, 1, "", "", 0, Some(reason.clone()));
+            let now_epoch = Utc::now().timestamp() as u64;
+
+            let mut record = None;
+            if let Some(entry) = inner.tasks.get_mut(task_id) {
+                entry.state = TaskState::Failed;
+                entry.adoptable_by = None;
+                entry.fail_if_not_adopted = false;
+                entry.error_message = Some(reason.clone());
+                entry.result = Some(result.clone());
+                record = Some(JournalRecord::TaskTerminal {
+                    task_id: *task_id,
+                    state: TaskState::Failed,
+                    assigned_worker_id: entry.assigned_worker_id,
+                    retry_count: entry.retry_count,
+                    failover_count: entry.failover_count,
+                    evacuation_count: entry.evacuation_count,
+                    rejection_count: entry.rejection_count,
+                    retry_attempt: None,
+                    result: Some(result.clone()),
+                    error_message: Some(reason),
+                    timestamp_utc: now_epoch,
+                });
             }
-            (entry.priority, entry.sequence)
+            inner.track_terminal_task(*task_id);
+            let ack = record.and_then(|r| inner.append_durable_warn(&r));
+            (result, ack)
         };
 
-        inner.ready_queue.remove(&QueueOrderKey {
-            priority_rev: Reverse(priority),
-            sequence,
-            task_id: *task_id,
-        });
-
-        let result = TaskResult::failure(Uuid::nil(), *task_id, 1, "", "", 0, Some(reason.clone()));
-
-        if let Some(entry) = inner.tasks.get_mut(task_id) {
-            entry.state = TaskState::Failed;
-            entry.error_message = Some(reason);
-            entry.result = Some(result.clone());
+        if let Some(ack) = ack {
+            let _ = ack.await;
         }
-        inner.track_terminal_task(*task_id);
         Some(result)
     }
 
@@ -1998,104 +3122,81 @@ impl TaskQueue {
         session_id: Option<u64>,
         reason: &str,
     ) -> Vec<TaskId> {
-        let mut guard = self.inner.write().await;
-        let inner = &mut *guard;
+        let (affected, acks) = {
+            let mut guard = self.inner.write().await;
+            let inner = &mut *guard;
 
-        let mut assigned: HashSet<TaskId> = inner
-            .worker_assignments
-            .get(worker_id)
-            .cloned()
-            .unwrap_or_default();
+            let mut assigned: HashSet<TaskId> = inner
+                .worker_assignments
+                .get(worker_id)
+                .cloned()
+                .unwrap_or_default();
 
-        for (id, entry) in &inner.tasks {
-            if entry.assigned_worker_id == Some(*worker_id) && entry.state.is_active() {
-                assigned.insert(*id);
-            }
-        }
-
-        let now_epoch = Utc::now().timestamp() as u64;
-        let policy = inner.retry_policy.clone();
-
-        let mut affected = Vec::with_capacity(assigned.len());
-        let mut ready_to_insert = Vec::new();
-        let mut terminal_to_track = Vec::new();
-
-        for task_id in assigned {
-            let Some(entry) = inner.tasks.get_mut(&task_id) else {
-                continue;
-            };
-            let session_matches = match (session_id, entry.assigned_session) {
-                (Some(swept), Some(assigned)) => assigned <= swept,
-                _ => true,
-            };
-            if !entry.state.is_active()
-                || entry.assigned_worker_id != Some(*worker_id)
-                || !session_matches
-            {
-                continue;
+            for (id, entry) in &inner.tasks {
+                if entry.assigned_worker_id == Some(*worker_id) && entry.state.is_active() {
+                    assigned.insert(*id);
+                }
             }
 
-            affected.push(task_id);
-            if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
-                tasks.remove(&task_id);
-            }
+            let now_epoch = Utc::now().timestamp() as u64;
+            let policy = inner.retry_policy.clone();
 
-            let running_with_zero_retries =
-                entry.state == TaskState::Running && policy.zero_retries_for(entry);
-            if policy.retry_on_worker_disconnect
-                && !running_with_zero_retries
-                && entry.evacuation_count < policy.max_evacuations
-            {
-                entry.evacuation_count += 1;
-                tracing::debug!(
-                    task_id = %task_id,
-                    worker_id = %worker_id,
-                    session_id = ?session_id,
-                    evacuation_count = entry.evacuation_count,
-                    max_evacuations = policy.max_evacuations,
-                    reason = %reason,
-                    "Returning task from announced worker drain to ready_queue without charging retry budget"
-                );
-                entry.retry_history.push(RetryAttempt {
-                    attempt: entry.retry_count,
-                    timestamp_utc: now_epoch,
-                    failed_worker_id: Some(*worker_id),
-                    reason: reason.to_string(),
-                    exit_code: None,
-                    error: Some(format!(
-                        "Worker draining ({reason}); uncharged evacuation {}/{}",
-                        entry.evacuation_count, policy.max_evacuations
-                    )),
-                });
-                entry.state = TaskState::Queued;
-                entry.assigned_worker_id = None;
-                entry.assigned_session = None;
-                entry.scheduled_instant = None;
-                entry.started_instant = None;
-                entry.retry_after_instant = None;
-                ready_to_insert.push(QueueOrderKey {
-                    priority_rev: Reverse(entry.priority),
-                    sequence: entry.sequence,
-                    task_id,
-                });
-            } else {
-                // Past `max_evacuations` (or `Running` with `max_retries == 0`, or
-                // `!retry_on_worker_disconnect`): take the charged path with 0 ms reschedule delay.
-                let (budget_left, cap) = policy.failover_budget(entry);
-                if policy.retry_on_worker_disconnect && !running_with_zero_retries && budget_left {
-                    entry.retry_count += 1;
-                    entry.failover_count += 1;
-                    entry.assigned_worker_id = None;
-                    entry.assigned_session = None;
-                    entry.retry_history.push(RetryAttempt {
+            let mut affected = Vec::with_capacity(assigned.len());
+            let mut ready_to_insert = Vec::new();
+            let mut terminal_to_track = Vec::new();
+            let mut records = Vec::new();
+
+            for task_id in assigned {
+                let Some(entry) = inner.tasks.get_mut(&task_id) else {
+                    continue;
+                };
+                let session_matches = match (session_id, entry.assigned_session) {
+                    (Some(swept), Some(assigned)) => assigned <= swept,
+                    _ => true,
+                };
+                if !entry.state.is_active()
+                    || entry.assigned_worker_id != Some(*worker_id)
+                    || !session_matches
+                {
+                    continue;
+                }
+
+                affected.push(task_id);
+                if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
+                    tasks.remove(&task_id);
+                }
+
+                let running_with_zero_retries =
+                    entry.state == TaskState::Running && policy.zero_retries_for(entry);
+                if policy.retry_on_worker_disconnect
+                    && !running_with_zero_retries
+                    && entry.evacuation_count < policy.max_evacuations
+                {
+                    entry.evacuation_count += 1;
+                    tracing::debug!(
+                        task_id = %task_id,
+                        worker_id = %worker_id,
+                        session_id = ?session_id,
+                        evacuation_count = entry.evacuation_count,
+                        max_evacuations = policy.max_evacuations,
+                        reason = %reason,
+                        "Returning task from announced worker drain to ready_queue without charging retry budget"
+                    );
+                    let attempt = RetryAttempt {
                         attempt: entry.retry_count,
                         timestamp_utc: now_epoch,
                         failed_worker_id: Some(*worker_id),
                         reason: reason.to_string(),
                         exit_code: None,
-                        error: Some(format!("Worker evicted ({reason})")),
-                    });
+                        error: Some(format!(
+                            "Worker draining ({reason}); uncharged evacuation {}/{}",
+                            entry.evacuation_count, policy.max_evacuations
+                        )),
+                    };
+                    entry.retry_history.push(attempt.clone());
                     entry.state = TaskState::Queued;
+                    entry.assigned_worker_id = None;
+                    entry.assigned_session = None;
                     entry.scheduled_instant = None;
                     entry.started_instant = None;
                     entry.retry_after_instant = None;
@@ -2104,42 +3205,128 @@ impl TaskQueue {
                         sequence: entry.sequence,
                         task_id,
                     });
+                    records.push(JournalRecord::TaskRequeued {
+                        task_id,
+                        state: TaskState::Queued,
+                        retry_count: entry.retry_count,
+                        failover_count: entry.failover_count,
+                        evacuation_count: entry.evacuation_count,
+                        rejection_count: entry.rejection_count,
+                        avoid_workers: entry.avoid_workers.clone(),
+                        retry_attempt: Some(attempt),
+                        retry_delay_ms: Some(0),
+                    });
                 } else {
-                    let used = if entry.task.requirements.max_retries.is_some() {
-                        entry.retry_count
+                    // Past `max_evacuations` (or `Running` with `max_retries == 0`, or
+                    // `!retry_on_worker_disconnect`): take the charged path with 0 ms reschedule delay.
+                    let (budget_left, cap) = policy.failover_budget(entry);
+                    if policy.retry_on_worker_disconnect
+                        && !running_with_zero_retries
+                        && budget_left
+                    {
+                        entry.retry_count += 1;
+                        entry.failover_count += 1;
+                        entry.assigned_worker_id = None;
+                        entry.assigned_session = None;
+                        let attempt = RetryAttempt {
+                            attempt: entry.retry_count,
+                            timestamp_utc: now_epoch,
+                            failed_worker_id: Some(*worker_id),
+                            reason: reason.to_string(),
+                            exit_code: None,
+                            error: Some(format!("Worker evicted ({reason})")),
+                        };
+                        entry.retry_history.push(attempt.clone());
+                        entry.state = TaskState::Queued;
+                        entry.scheduled_instant = None;
+                        entry.started_instant = None;
+                        entry.retry_after_instant = None;
+                        ready_to_insert.push(QueueOrderKey {
+                            priority_rev: Reverse(entry.priority),
+                            sequence: entry.sequence,
+                            task_id,
+                        });
+                        records.push(JournalRecord::TaskRequeued {
+                            task_id,
+                            state: TaskState::Queued,
+                            retry_count: entry.retry_count,
+                            failover_count: entry.failover_count,
+                            evacuation_count: entry.evacuation_count,
+                            rejection_count: entry.rejection_count,
+                            avoid_workers: entry.avoid_workers.clone(),
+                            retry_attempt: Some(attempt),
+                            retry_delay_ms: Some(0),
+                        });
                     } else {
-                        entry.failover_count
-                    };
-                    entry.state = TaskState::Failed;
-                    entry.assigned_worker_id = None;
-                    entry.assigned_session = None;
-                    let err_msg = format!(
-                        "Task execution failed: maximum retry limit ({cap}) reached after worker eviction (Worker disconnected and retries exhausted ({used}/{cap}), last failure on worker {worker_id}: {reason})"
-                    );
-                    entry.error_message = Some(err_msg.clone());
-                    let fail_result =
-                        TaskResult::failure(*worker_id, task_id, 1, "", "", 0, Some(err_msg));
-                    entry.result = Some(fail_result);
-                    terminal_to_track.push(task_id);
+                        let used = if entry.task.requirements.max_retries.is_some() {
+                            entry.retry_count
+                        } else {
+                            entry.failover_count
+                        };
+                        entry.state = TaskState::Failed;
+                        entry.assigned_worker_id = None;
+                        entry.assigned_session = None;
+                        let err_msg = format!(
+                            "Task execution failed: maximum retry limit ({cap}) reached after worker eviction (Worker disconnected and retries exhausted ({used}/{cap}), last failure on worker {worker_id}: {reason})"
+                        );
+                        entry.error_message = Some(err_msg.clone());
+                        let fail_result = TaskResult::failure(
+                            *worker_id,
+                            task_id,
+                            1,
+                            "",
+                            "",
+                            0,
+                            Some(err_msg.clone()),
+                        );
+                        entry.result = Some(fail_result.clone());
+                        terminal_to_track.push(task_id);
+                        records.push(JournalRecord::TaskTerminal {
+                            task_id,
+                            state: TaskState::Failed,
+                            assigned_worker_id: None,
+                            retry_count: entry.retry_count,
+                            failover_count: entry.failover_count,
+                            evacuation_count: entry.evacuation_count,
+                            rejection_count: entry.rejection_count,
+                            retry_attempt: None,
+                            result: Some(fail_result),
+                            error_message: Some(err_msg),
+                            timestamp_utc: now_epoch,
+                        });
+                    }
                 }
             }
-        }
 
-        if inner
-            .worker_assignments
-            .get(worker_id)
-            .is_some_and(|tasks| tasks.is_empty())
-        {
-            inner.worker_assignments.remove(worker_id);
-        }
+            if inner
+                .worker_assignments
+                .get(worker_id)
+                .is_some_and(|tasks| tasks.is_empty())
+            {
+                inner.worker_assignments.remove(worker_id);
+            }
 
-        for key in ready_to_insert {
-            let tid = key.task_id;
-            inner.insert_ready(key);
-            inner.update_active_task(tid);
-        }
-        for tid in terminal_to_track {
-            inner.track_terminal_task(tid);
+            for key in ready_to_insert {
+                let tid = key.task_id;
+                inner.insert_ready(key);
+                inner.update_active_task(tid);
+            }
+            for tid in terminal_to_track {
+                inner.track_terminal_task(tid);
+            }
+
+            let mut acks = Vec::with_capacity(records.len());
+            for record in &records {
+                if let Some(ack) = inner.append_durable_warn(record) {
+                    acks.push(ack);
+                }
+            }
+
+            (affected, acks)
+        };
+
+        for ack in acks {
+            let _ = ack.await;
         }
 
         affected
@@ -2181,136 +3368,187 @@ impl TaskQueue {
         reason: &str,
         immediate_reschedule: bool,
     ) -> Vec<TaskId> {
-        let mut guard = self.inner.write().await;
-        let inner = &mut *guard;
+        let (affected, acks) = {
+            let mut guard = self.inner.write().await;
+            let inner = &mut *guard;
 
-        let mut assigned: HashSet<TaskId> = inner
-            .worker_assignments
-            .get(worker_id)
-            .cloned()
-            .unwrap_or_default();
+            let mut assigned: HashSet<TaskId> = inner
+                .worker_assignments
+                .get(worker_id)
+                .cloned()
+                .unwrap_or_default();
 
-        // Defense-in-depth: Also capture any active task in inner.tasks assigned to this worker
-        for (id, entry) in &inner.tasks {
-            if entry.assigned_worker_id == Some(*worker_id) && entry.state.is_active() {
-                assigned.insert(*id);
-            }
-        }
-
-        let now_instant = Instant::now();
-        let now_epoch = Utc::now().timestamp() as u64;
-        let policy = inner.retry_policy.clone();
-
-        let mut affected = Vec::with_capacity(assigned.len());
-        let mut delays_to_insert = Vec::new();
-        let mut ready_to_insert = Vec::new();
-        let mut terminal_to_track = Vec::new();
-
-        for task_id in assigned {
-            let Some(entry) = inner.tasks.get_mut(&task_id) else {
-                continue;
-            };
-            // Session ids only grow, and a newer session of a worker id aborts every older one,
-            // so a task on an older session than the swept one is stranded for sure.
-            let session_matches = match (session_id, entry.assigned_session) {
-                (Some(swept), Some(assigned)) => assigned <= swept,
-                _ => true,
-            };
-            if !entry.state.is_active()
-                || entry.assigned_worker_id != Some(*worker_id)
-                || !session_matches
-            {
-                continue;
+            // Defense-in-depth: Also capture any active task in inner.tasks assigned to this worker
+            for (id, entry) in &inner.tasks {
+                if entry.assigned_worker_id == Some(*worker_id) && entry.state.is_active() {
+                    assigned.insert(*id);
+                }
             }
 
-            affected.push(task_id);
-            if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
-                tasks.remove(&task_id);
-            }
+            let now_instant = Instant::now();
+            let now_epoch = Utc::now().timestamp() as u64;
+            let policy = inner.retry_policy.clone();
 
-            let (budget_left, cap) = policy.failover_budget(entry);
-            if policy.retry_on_worker_disconnect && budget_left {
-                entry.retry_count += 1;
-                entry.failover_count += 1;
-                let delay_ms = if immediate_reschedule {
-                    0
-                } else {
-                    policy.calculate_backoff(entry.failover_count)
+            let mut affected = Vec::with_capacity(assigned.len());
+            let mut delays_to_insert = Vec::new();
+            let mut ready_to_insert = Vec::new();
+            let mut terminal_to_track = Vec::new();
+            let mut records = Vec::new();
+
+            for task_id in assigned {
+                let Some(entry) = inner.tasks.get_mut(&task_id) else {
+                    continue;
                 };
+                // Session ids only grow, and a newer session of a worker id aborts every older one,
+                // so a task on an older session than the swept one is stranded for sure.
+                let session_matches = match (session_id, entry.assigned_session) {
+                    (Some(swept), Some(assigned)) => assigned <= swept,
+                    _ => true,
+                };
+                if !entry.state.is_active()
+                    || entry.assigned_worker_id != Some(*worker_id)
+                    || !session_matches
+                {
+                    continue;
+                }
 
-                entry.assigned_worker_id = None;
-                entry.assigned_session = None;
-                entry.retry_history.push(RetryAttempt {
-                    attempt: entry.retry_count,
-                    timestamp_utc: now_epoch,
-                    failed_worker_id: Some(*worker_id),
-                    reason: reason.to_string(),
-                    exit_code: None,
-                    error: Some(format!("Worker evicted ({reason})")),
-                });
+                affected.push(task_id);
+                if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
+                    tasks.remove(&task_id);
+                }
 
-                if delay_ms == 0 {
-                    // Immediate re-enqueue straight to ready_queue
-                    entry.state = TaskState::Queued;
-                    entry.scheduled_instant = None;
-                    entry.started_instant = None;
-                    entry.retry_after_instant = None;
-                    ready_to_insert.push(QueueOrderKey {
-                        priority_rev: Reverse(entry.priority),
-                        sequence: entry.sequence,
+                let (budget_left, cap) = policy.failover_budget(entry);
+                if policy.retry_on_worker_disconnect && budget_left {
+                    entry.retry_count += 1;
+                    entry.failover_count += 1;
+                    let delay_ms = if immediate_reschedule {
+                        0
+                    } else {
+                        policy.calculate_backoff(entry.failover_count)
+                    };
+
+                    entry.assigned_worker_id = None;
+                    entry.assigned_session = None;
+                    let attempt = RetryAttempt {
+                        attempt: entry.retry_count,
+                        timestamp_utc: now_epoch,
+                        failed_worker_id: Some(*worker_id),
+                        reason: reason.to_string(),
+                        exit_code: None,
+                        error: Some(format!("Worker evicted ({reason})")),
+                    };
+                    entry.retry_history.push(attempt.clone());
+
+                    let next_state = if delay_ms == 0 {
+                        // Immediate re-enqueue straight to ready_queue
+                        entry.state = TaskState::Queued;
+                        entry.scheduled_instant = None;
+                        entry.started_instant = None;
+                        entry.retry_after_instant = None;
+                        ready_to_insert.push(QueueOrderKey {
+                            priority_rev: Reverse(entry.priority),
+                            sequence: entry.sequence,
+                            task_id,
+                        });
+                        TaskState::Queued
+                    } else {
+                        // Delayed retry with exponential backoff
+                        let retry_after = now_instant + Duration::from_millis(delay_ms);
+                        entry.state = TaskState::Retrying;
+                        entry.retry_after_instant = Some(retry_after);
+                        delays_to_insert.push(DelayedRetryKey {
+                            retry_after,
+                            task_id,
+                        });
+                        TaskState::Retrying
+                    };
+
+                    records.push(JournalRecord::TaskRequeued {
                         task_id,
+                        state: next_state,
+                        retry_count: entry.retry_count,
+                        failover_count: entry.failover_count,
+                        evacuation_count: entry.evacuation_count,
+                        rejection_count: entry.rejection_count,
+                        avoid_workers: entry.avoid_workers.clone(),
+                        retry_attempt: Some(attempt),
+                        retry_delay_ms: Some(delay_ms),
                     });
                 } else {
-                    // Delayed retry with exponential backoff
-                    let retry_after = now_instant + Duration::from_millis(delay_ms);
-                    entry.state = TaskState::Retrying;
-                    entry.retry_after_instant = Some(retry_after);
-                    delays_to_insert.push(DelayedRetryKey {
-                        retry_after,
+                    // Terminal Failed state
+                    let used = if entry.task.requirements.max_retries.is_some() {
+                        entry.retry_count
+                    } else {
+                        entry.failover_count
+                    };
+                    entry.state = TaskState::Failed;
+                    entry.assigned_worker_id = None;
+                    entry.assigned_session = None;
+                    let err_msg = format!(
+                        "Task execution failed: maximum retry limit ({cap}) reached after worker eviction (Worker disconnected and retries exhausted ({used}/{cap}), last failure on worker {worker_id}: {reason})"
+                    );
+                    entry.error_message = Some(err_msg.clone());
+                    let fail_result = TaskResult::failure(
+                        *worker_id,
                         task_id,
+                        1,
+                        "",
+                        "",
+                        0,
+                        Some(err_msg.clone()),
+                    );
+                    entry.result = Some(fail_result.clone());
+                    terminal_to_track.push(task_id);
+                    records.push(JournalRecord::TaskTerminal {
+                        task_id,
+                        state: TaskState::Failed,
+                        assigned_worker_id: None,
+                        retry_count: entry.retry_count,
+                        failover_count: entry.failover_count,
+                        evacuation_count: entry.evacuation_count,
+                        rejection_count: entry.rejection_count,
+                        retry_attempt: None,
+                        result: Some(fail_result),
+                        error_message: Some(err_msg),
+                        timestamp_utc: now_epoch,
                     });
                 }
-            } else {
-                // Terminal Failed state
-                let used = if entry.task.requirements.max_retries.is_some() {
-                    entry.retry_count
-                } else {
-                    entry.failover_count
-                };
-                entry.state = TaskState::Failed;
-                entry.assigned_worker_id = None;
-                entry.assigned_session = None;
-                let err_msg = format!(
-                    "Task execution failed: maximum retry limit ({cap}) reached after worker eviction (Worker disconnected and retries exhausted ({used}/{cap}), last failure on worker {worker_id}: {reason})"
-                );
-                entry.error_message = Some(err_msg.clone());
-                let fail_result =
-                    TaskResult::failure(*worker_id, task_id, 1, "", "", 0, Some(err_msg));
-                entry.result = Some(fail_result);
-                terminal_to_track.push(task_id);
             }
-        }
 
-        if inner
-            .worker_assignments
-            .get(worker_id)
-            .is_some_and(|tasks| tasks.is_empty())
-        {
-            inner.worker_assignments.remove(worker_id);
-        }
+            if inner
+                .worker_assignments
+                .get(worker_id)
+                .is_some_and(|tasks| tasks.is_empty())
+            {
+                inner.worker_assignments.remove(worker_id);
+            }
 
-        for key in delays_to_insert {
-            let tid = key.task_id;
-            inner.delayed_retries.insert(key);
-            inner.update_active_task(tid);
-        }
-        for key in ready_to_insert {
-            let tid = key.task_id;
-            inner.insert_ready(key);
-            inner.update_active_task(tid);
-        }
-        for tid in terminal_to_track {
-            inner.track_terminal_task(tid);
+            for key in delays_to_insert {
+                let tid = key.task_id;
+                inner.delayed_retries.insert(key);
+                inner.update_active_task(tid);
+            }
+            for key in ready_to_insert {
+                let tid = key.task_id;
+                inner.insert_ready(key);
+                inner.update_active_task(tid);
+            }
+            for tid in terminal_to_track {
+                inner.track_terminal_task(tid);
+            }
+
+            let mut acks = Vec::with_capacity(records.len());
+            for record in &records {
+                if let Some(ack) = inner.append_durable_warn(record) {
+                    acks.push(ack);
+                }
+            }
+
+            (affected, acks)
+        };
+
+        for ack in acks {
+            let _ = ack.await;
         }
 
         affected
@@ -2336,16 +3574,30 @@ impl TaskQueue {
 
         let count = ready_tasks.len();
         for task_id in ready_tasks {
-            let key = {
+            let key_and_record = {
                 if let Some(entry) = inner.tasks.get_mut(&task_id) {
                     if entry.state == TaskState::Retrying {
                         entry.state = TaskState::Queued;
                         entry.retry_after_instant = None;
-                        Some(QueueOrderKey {
-                            priority_rev: Reverse(entry.priority),
-                            sequence: entry.sequence,
+                        let record = JournalRecord::TaskRequeued {
                             task_id,
-                        })
+                            state: TaskState::Queued,
+                            retry_count: entry.retry_count,
+                            failover_count: entry.failover_count,
+                            evacuation_count: entry.evacuation_count,
+                            rejection_count: entry.rejection_count,
+                            avoid_workers: entry.avoid_workers.clone(),
+                            retry_attempt: None,
+                            retry_delay_ms: None,
+                        };
+                        Some((
+                            QueueOrderKey {
+                                priority_rev: Reverse(entry.priority),
+                                sequence: entry.sequence,
+                                task_id,
+                            },
+                            record,
+                        ))
                     } else {
                         None
                     }
@@ -2353,8 +3605,9 @@ impl TaskQueue {
                     None
                 }
             };
-            if let Some(k) = key {
+            if let Some((k, record)) = key_and_record {
                 inner.insert_ready(k);
+                inner.append_non_durable(&record);
             }
         }
 
@@ -2385,85 +3638,118 @@ impl TaskQueue {
         task_id: &TaskId,
         reason: Option<String>,
     ) -> GridResult<CancelOutcome> {
-        let mut inner = self.inner.write().await;
-        let (state, priority_info, assigned_worker_id, retry_after) = {
-            let entry = inner
-                .tasks
-                .get(task_id)
-                .ok_or(GridError::TaskNotFound(task_id.0))?;
+        let (outcome, ack) = {
+            let mut inner = self.inner.write().await;
+            let (state, priority_info, assigned_worker_id, retry_after) = {
+                let entry = inner
+                    .tasks
+                    .get(task_id)
+                    .ok_or(GridError::TaskNotFound(task_id.0))?;
+                (
+                    entry.state,
+                    (entry.priority, entry.sequence),
+                    entry.assigned_worker_id,
+                    entry.retry_after_instant,
+                )
+            };
+
+            if state.is_terminal() {
+                return Ok(CancelOutcome {
+                    newly_cancelled: false,
+                    worker_to_notify: None,
+                    result: inner.tasks.get(task_id).and_then(|e| e.result.clone()),
+                });
+            }
+
+            let worker_to_notify = match state {
+                TaskState::Queued => {
+                    inner.ready_queue.remove(&QueueOrderKey {
+                        priority_rev: Reverse(priority_info.0),
+                        sequence: priority_info.1,
+                        task_id: *task_id,
+                    });
+                    None
+                }
+                TaskState::Retrying => {
+                    if let Some(after) = retry_after {
+                        inner.delayed_retries.remove(&DelayedRetryKey {
+                            retry_after: after,
+                            task_id: *task_id,
+                        });
+                    }
+                    None
+                }
+                TaskState::Scheduled | TaskState::Running => {
+                    if let Some(wid) = assigned_worker_id {
+                        if let Some(tasks) = inner.worker_assignments.get_mut(&wid) {
+                            tasks.remove(task_id);
+                        }
+                    }
+                    assigned_worker_id
+                }
+                TaskState::Submitted => None,
+                _ => None,
+            };
+
+            let cancel_reason = reason.or_else(|| Some("Cancelled by user".into()));
+            let cancel_result = TaskResult::failure(
+                assigned_worker_id.unwrap_or_else(Uuid::nil),
+                *task_id,
+                130,
+                "",
+                "",
+                0,
+                cancel_reason.clone(),
+            );
+            let now_epoch = Utc::now().timestamp() as u64;
+
+            let mut recorded = None;
+            let mut record = None;
+            if let Some(entry) = inner.tasks.get_mut(task_id) {
+                entry.state = TaskState::Cancelled;
+                entry.adoptable_by = None;
+                entry.fail_if_not_adopted = false;
+                entry.error_message = cancel_reason.clone();
+                if entry.result.is_none() {
+                    entry.result = Some(cancel_result);
+                }
+                recorded = entry.result.clone();
+                record = Some(JournalRecord::TaskTerminal {
+                    task_id: *task_id,
+                    state: TaskState::Cancelled,
+                    assigned_worker_id,
+                    retry_count: entry.retry_count,
+                    failover_count: entry.failover_count,
+                    evacuation_count: entry.evacuation_count,
+                    rejection_count: entry.rejection_count,
+                    retry_attempt: None,
+                    result: recorded.clone(),
+                    error_message: entry.error_message.clone(),
+                    timestamp_utc: now_epoch,
+                });
+            }
+            inner.track_terminal_task(*task_id);
+            let ack = if let Some(ref r) = record {
+                inner.append_durable(r)?
+            } else {
+                None
+            };
+
             (
-                entry.state,
-                (entry.priority, entry.sequence),
-                entry.assigned_worker_id,
-                entry.retry_after_instant,
+                CancelOutcome {
+                    newly_cancelled: true,
+                    worker_to_notify,
+                    result: recorded,
+                },
+                ack,
             )
         };
 
-        if state.is_terminal() {
-            return Ok(CancelOutcome {
-                newly_cancelled: false,
-                worker_to_notify: None,
-                result: inner.tasks.get(task_id).and_then(|e| e.result.clone()),
-            });
+        if let Some(ack) = ack {
+            ack.await?;
         }
 
-        let worker_to_notify = match state {
-            TaskState::Queued => {
-                inner.ready_queue.remove(&QueueOrderKey {
-                    priority_rev: Reverse(priority_info.0),
-                    sequence: priority_info.1,
-                    task_id: *task_id,
-                });
-                None
-            }
-            TaskState::Retrying => {
-                if let Some(after) = retry_after {
-                    inner.delayed_retries.remove(&DelayedRetryKey {
-                        retry_after: after,
-                        task_id: *task_id,
-                    });
-                }
-                None
-            }
-            TaskState::Scheduled | TaskState::Running => {
-                if let Some(wid) = assigned_worker_id {
-                    if let Some(tasks) = inner.worker_assignments.get_mut(&wid) {
-                        tasks.remove(task_id);
-                    }
-                }
-                assigned_worker_id
-            }
-            TaskState::Submitted => None,
-            _ => None,
-        };
-
-        let cancel_reason = reason.or_else(|| Some("Cancelled by user".into()));
-        let cancel_result = TaskResult::failure(
-            assigned_worker_id.unwrap_or_else(Uuid::nil),
-            *task_id,
-            130,
-            "",
-            "",
-            0,
-            cancel_reason.clone(),
-        );
-
-        let mut recorded = None;
-        if let Some(entry) = inner.tasks.get_mut(task_id) {
-            entry.state = TaskState::Cancelled;
-            entry.error_message = cancel_reason;
-            if entry.result.is_none() {
-                entry.result = Some(cancel_result);
-            }
-            recorded = entry.result.clone();
-        }
-        inner.track_terminal_task(*task_id);
-
-        Ok(CancelOutcome {
-            newly_cancelled: true,
-            worker_to_notify,
-            result: recorded,
-        })
+        Ok(outcome)
     }
 
     // --- Queries ---
@@ -4435,5 +5721,406 @@ mod tests {
             placed_report.assignments[1].worker_id,
             worker_with_3d.worker_id
         );
+    }
+
+    #[tokio::test]
+    async fn test_attach_store_and_replay_recovers_all_d2_5_states_and_preserves_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_id = Uuid::new_v4();
+
+        let (
+            submitted_id,
+            queued_id,
+            scheduled_id,
+            running_retryable_id,
+            running_zero_retry_id,
+            retrying_id,
+            completed_id,
+            failed_id,
+            cancelled_id,
+        ) = {
+            let (store, recovered) = TaskStore::open(dir.path()).unwrap();
+            let queue = TaskQueue::with_config(
+                RetryPolicy {
+                    retry_on_execution_failure: true,
+                    ..RetryPolicy::default()
+                },
+                None,
+            );
+            queue
+                .attach_store_and_replay(store, recovered, Duration::ZERO)
+                .await
+                .unwrap();
+
+            let submitted_task = echo_task("submitted");
+            let submitted_id = submitted_task.id;
+
+            let queued_id = queue.submit(echo_task("queued")).await.unwrap();
+
+            let scheduled_id = queue.submit(echo_task("scheduled")).await.unwrap();
+            queue
+                .schedule_tasks_batch_in_sessions(&[(scheduled_id, worker_id, 1)])
+                .await;
+
+            let running_retryable_id = queue.submit(echo_task("running-retryable")).await.unwrap();
+            queue
+                .schedule_tasks_batch_in_sessions(&[(running_retryable_id, worker_id, 1)])
+                .await;
+            queue
+                .mark_running_from(worker_id, Some(1), &running_retryable_id)
+                .await
+                .unwrap();
+            queue
+                .record_checkpoint_from(
+                    worker_id,
+                    Some(1),
+                    running_retryable_id,
+                    CheckpointData::new(3, vec![9, 8, 7]),
+                )
+                .await
+                .unwrap();
+
+            let mut zero_retry_task = echo_task("running-zero-retry");
+            zero_retry_task.requirements.max_retries = Some(0);
+            let running_zero_retry_id = queue.submit(zero_retry_task).await.unwrap();
+            queue
+                .schedule_tasks_batch_in_sessions(&[(running_zero_retry_id, worker_id, 1)])
+                .await;
+            queue
+                .mark_running_from(worker_id, Some(1), &running_zero_retry_id)
+                .await
+                .unwrap();
+
+            let retrying_id = queue.submit(echo_task("retrying")).await.unwrap();
+            queue
+                .schedule_tasks_batch_in_sessions(&[(retrying_id, worker_id, 1)])
+                .await;
+            queue
+                .mark_running_from(worker_id, Some(1), &retrying_id)
+                .await
+                .unwrap();
+            let retry_outcome = queue
+                .record_result_from(
+                    worker_id,
+                    Some(1),
+                    TaskResult::failure(worker_id, retrying_id, 2, "", "transient", 10, None),
+                )
+                .await
+                .unwrap();
+            assert_eq!(retry_outcome.state, TaskState::Retrying);
+
+            let completed_id = queue.submit(echo_task("completed")).await.unwrap();
+            queue
+                .schedule_tasks_batch_in_sessions(&[(completed_id, worker_id, 1)])
+                .await;
+            queue
+                .record_result_from(
+                    worker_id,
+                    Some(1),
+                    TaskResult::success(worker_id, completed_id, "done-out", 5, false),
+                )
+                .await
+                .unwrap();
+
+            let other_worker = Uuid::new_v4();
+            let mut fail_once_task = echo_task("failed");
+            fail_once_task.requirements.max_retries = Some(0);
+            let failed_id = queue.submit(fail_once_task).await.unwrap();
+            queue
+                .schedule_tasks_batch_in_sessions(&[(failed_id, other_worker, 99)])
+                .await;
+            queue
+                .mark_running_from(other_worker, Some(99), &failed_id)
+                .await
+                .unwrap();
+            queue
+                .handle_session_disconnected(&other_worker, Some(99), "boom", false)
+                .await;
+
+            // Inject a snapshot entry with `TaskState::Submitted` to cover all 9 D2.5 states.
+            {
+                let mut inner = queue.inner.write().await;
+                let seq = inner.next_sequence;
+                inner.next_sequence += 1;
+                inner.tasks.insert(
+                    submitted_id,
+                    TaskEntry {
+                        task: submitted_task,
+                        priority: 0,
+                        sequence: seq,
+                        state: TaskState::Submitted,
+                        assigned_worker_id: None,
+                        submitted_at_utc: 100,
+                        submitted_instant: Instant::now(),
+                        scheduled_instant: None,
+                        started_instant: None,
+                        retry_after_instant: None,
+                        retry_count: 0,
+                        failover_count: 0,
+                        evacuation_count: 0,
+                        rejection_count: 0,
+                        avoid_workers: Vec::new(),
+                        assigned_session: None,
+                        adoptable_by: None,
+                        fail_if_not_adopted: false,
+                        retry_history: Vec::new(),
+                        result: None,
+                        error_message: None,
+                    },
+                );
+            }
+
+            let cancelled_id = queue.submit(echo_task("cancelled")).await.unwrap();
+            queue
+                .cancel_task(&cancelled_id, Some("user abort".into()))
+                .await
+                .unwrap();
+
+            queue.close_and_compact_store().await;
+
+            (
+                submitted_id,
+                queued_id,
+                scheduled_id,
+                running_retryable_id,
+                running_zero_retry_id,
+                retrying_id,
+                completed_id,
+                failed_id,
+                cancelled_id,
+            )
+        };
+
+        let (store2, recovered2) = TaskStore::open(dir.path()).unwrap();
+        let recovered_queue = TaskQueue::new();
+        recovered_queue
+            .attach_store_and_replay(store2, recovered2, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recovered_queue.get_state(&submitted_id).await,
+            Some(TaskState::Queued)
+        );
+        assert_eq!(
+            recovered_queue.get_state(&queued_id).await,
+            Some(TaskState::Queued)
+        );
+
+        let sched_info = recovered_queue.get_task(&scheduled_id).await.unwrap();
+        assert_eq!(sched_info.state, TaskState::Queued);
+        assert_eq!(sched_info.retry_count, 0);
+        assert_eq!(sched_info.failover_count, 0);
+        assert_eq!(sched_info.evacuation_count, 0);
+
+        let run_info = recovered_queue
+            .get_task(&running_retryable_id)
+            .await
+            .unwrap();
+        assert_eq!(run_info.state, TaskState::Queued);
+        assert_eq!(run_info.retry_count, 0);
+        assert_eq!(run_info.failover_count, 0);
+        assert_eq!(run_info.evacuation_count, 0);
+        assert_eq!(
+            recovered_queue
+                .get_checkpoint(&running_retryable_id)
+                .await
+                .unwrap()
+                .sequence,
+            3
+        );
+
+        let zero_info = recovered_queue
+            .get_task(&running_zero_retry_id)
+            .await
+            .unwrap();
+        assert_eq!(zero_info.state, TaskState::Failed);
+        assert_eq!(
+            zero_info.error_message.as_deref(),
+            Some("master restarted while the task ran; not re-run because max_retries is 0")
+        );
+
+        let retry_info = recovered_queue.get_task(&retrying_id).await.unwrap();
+        assert_eq!(retry_info.state, TaskState::Queued);
+        assert_eq!(retry_info.retry_count, 1);
+
+        assert_eq!(
+            recovered_queue.get_state(&completed_id).await,
+            Some(TaskState::Completed)
+        );
+        assert_eq!(
+            recovered_queue
+                .get_result(&completed_id)
+                .await
+                .unwrap()
+                .stdout
+                .as_str(),
+            "done-out"
+        );
+        assert_eq!(
+            recovered_queue.get_state(&failed_id).await,
+            Some(TaskState::Failed)
+        );
+        assert_eq!(
+            recovered_queue.get_state(&cancelled_id).await,
+            Some(TaskState::Cancelled)
+        );
+
+        recovered_queue.close_and_compact_store().await;
+    }
+
+    #[tokio::test]
+    async fn test_attach_store_and_replay_adoptable_by_hold_and_adopt_session_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_id = Uuid::new_v4();
+
+        let (adopted_id, omitted_zero_retry_id, omitted_scheduled_id) = {
+            let (store, recovered) = TaskStore::open(dir.path()).unwrap();
+            let queue = TaskQueue::with_config(
+                RetryPolicy {
+                    retry_on_execution_failure: true,
+                    ..RetryPolicy::default()
+                },
+                None,
+            );
+            queue
+                .attach_store_and_replay(store, recovered, Duration::ZERO)
+                .await
+                .unwrap();
+
+            let adopted_id = queue.submit(echo_task("adopted")).await.unwrap();
+            let mut zero_task = echo_task("omitted-zero");
+            zero_task.requirements.max_retries = Some(0);
+            let omitted_zero_retry_id = queue.submit(zero_task).await.unwrap();
+            let omitted_scheduled_id = queue.submit(echo_task("omitted-scheduled")).await.unwrap();
+
+            queue
+                .schedule_tasks_batch_in_sessions(&[
+                    (adopted_id, worker_id, 1),
+                    (omitted_zero_retry_id, worker_id, 1),
+                    (omitted_scheduled_id, worker_id, 1),
+                ])
+                .await;
+            queue
+                .mark_running_from(worker_id, Some(1), &adopted_id)
+                .await
+                .unwrap();
+            queue
+                .mark_running_from(worker_id, Some(1), &omitted_zero_retry_id)
+                .await
+                .unwrap();
+
+            queue.close_and_compact_store().await;
+            (adopted_id, omitted_zero_retry_id, omitted_scheduled_id)
+        };
+
+        let (store2, recovered2) = TaskStore::open(dir.path()).unwrap();
+        let queue2 = TaskQueue::new();
+        queue2
+            .attach_store_and_replay(store2, recovered2, Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        // While held in `adoptable_by`, none of the 3 tasks is offered to a normal scheduling pass.
+        assert!(queue2.get_schedulable_tasks().await.is_empty());
+        assert!(queue2.ready_views(None, 10).await.0.is_empty());
+
+        let stale_unknown = TaskId::new();
+        let outcome = queue2
+            .adopt_session_tasks(worker_id, 7, &[adopted_id, stale_unknown])
+            .await;
+
+        assert_eq!(outcome.adopted, vec![adopted_id]);
+        assert_eq!(outcome.stale_to_cancel, vec![stale_unknown]);
+        assert_eq!(outcome.newly_failed, vec![omitted_zero_retry_id]);
+
+        assert_eq!(
+            queue2.get_state(&adopted_id).await,
+            Some(TaskState::Running)
+        );
+        let zero_info = queue2.get_task(&omitted_zero_retry_id).await.unwrap();
+        assert_eq!(zero_info.state, TaskState::Failed);
+        assert_eq!(
+            zero_info.error_message.as_deref(),
+            Some("master restarted while the task ran; not re-run because max_retries is 0")
+        );
+
+        // `omitted_scheduled_id` had its hold released when `worker_id` resumed without it.
+        let schedulable = queue2.get_schedulable_tasks().await;
+        assert_eq!(schedulable.len(), 1);
+        assert_eq!(schedulable[0].id, omitted_scheduled_id);
+
+        queue2.close_and_compact_store().await;
+    }
+
+    #[tokio::test]
+    async fn test_release_expired_adoption_holds_fails_zero_retry_and_frees_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_id = Uuid::new_v4();
+
+        let (retryable_id, zero_retry_id) = {
+            let (store, recovered) = TaskStore::open(dir.path()).unwrap();
+            let queue = TaskQueue::with_config(
+                RetryPolicy {
+                    retry_on_execution_failure: true,
+                    ..RetryPolicy::default()
+                },
+                None,
+            );
+            queue
+                .attach_store_and_replay(store, recovered, Duration::ZERO)
+                .await
+                .unwrap();
+
+            let retryable_id = queue.submit(echo_task("retryable")).await.unwrap();
+            let mut zero_task = echo_task("zero");
+            zero_task.requirements.max_retries = Some(0);
+            let zero_retry_id = queue.submit(zero_task).await.unwrap();
+
+            queue
+                .schedule_tasks_batch_in_sessions(&[
+                    (retryable_id, worker_id, 1),
+                    (zero_retry_id, worker_id, 1),
+                ])
+                .await;
+            queue
+                .mark_running_from(worker_id, Some(1), &retryable_id)
+                .await
+                .unwrap();
+            queue
+                .mark_running_from(worker_id, Some(1), &zero_retry_id)
+                .await
+                .unwrap();
+
+            queue.close_and_compact_store().await;
+            (retryable_id, zero_retry_id)
+        };
+
+        let (store2, recovered2) = TaskStore::open(dir.path()).unwrap();
+        let queue2 = TaskQueue::new();
+        queue2
+            .attach_store_and_replay(store2, recovered2, Duration::from_millis(20))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        let newly_failed = queue2.release_expired_adoption_holds().await;
+        assert_eq!(newly_failed, vec![zero_retry_id]);
+
+        let zero_info = queue2.get_task(&zero_retry_id).await.unwrap();
+        assert_eq!(zero_info.state, TaskState::Failed);
+        assert_eq!(
+            zero_info.error_message.as_deref(),
+            Some("master restarted while the task ran; not re-run because max_retries is 0")
+        );
+
+        let retryable_info = queue2.get_task(&retryable_id).await.unwrap();
+        assert_eq!(retryable_info.state, TaskState::Queued);
+        assert_eq!(retryable_info.retry_count, 0);
+        assert_eq!(retryable_info.failover_count, 0);
+        assert_eq!(retryable_info.evacuation_count, 0);
+        assert_eq!(queue2.get_schedulable_tasks().await.len(), 1);
+
+        queue2.close_and_compact_store().await;
     }
 }

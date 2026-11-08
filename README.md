@@ -278,6 +278,8 @@ or `~/.oxideswarm/cluster.secret`.
 ```bash
 # Master. Default listen is 127.0.0.1:8088 (this machine only); other machines need 0.0.0.0:8088.
 ./target/release/oxideswarm master --listen 0.0.0.0:8088
+# Persist the task queue across master restarts (snapshot.bin + journal.bin; defaults --blob-dir to <DIR>/blobs):
+./target/release/oxideswarm master --listen 0.0.0.0:8088 --state-dir ~/.oxideswarm/state
 # Raise active and finished-task memory budgets (each defaults to 256 MiB):
 ./target/release/oxideswarm master --listen 0.0.0.0:8088 --max-active-mb 512 --max-retained-mb 512
 # Dashboard on the LAN as well (explicit; default is loopback):
@@ -393,7 +395,8 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--max-retained-tasks <N>` | `10000` (`RUSTY_GRID_MAX_RETAINED_TASKS`, `[master].max_retained_tasks`) | Finished tasks retained in memory before evicting the oldest |
 | `--max-retained-mb <MB>` | `256` (`RUSTY_GRID_MAX_RETAINED_MB`, `[master].max_retained_mb`) | Megabytes of finished-task payload and output retained in memory |
 | `--max-active-mb <MB>` | `256` (`RUSTY_GRID_MAX_ACTIVE_MB`, `[master].max_active_mb`) | Megabytes of active (queued, scheduled, running, retrying) task payloads held at once (minimum `1`) |
-| `--blob-dir <DIR>` | `~/.oxideswarm/blobs` (`RUSTY_GRID_BLOB_DIR`, `[master].blob_dir`) | Directory of the content-addressed blob store for task input and output files |
+| `--state-dir <DIR>` | In-memory only (`RUSTY_GRID_STATE_DIR`, `[master].state_dir`) | Directory of the durable task queue store (`store.lock`, `snapshot.bin`, `journal.bin`, mode `0700`/`0600` on Unix; persists task specs, `env`, `stdin`, and results in plaintext and defaults `--blob-dir` to `<DIR>/blobs` when `--blob-dir` is not set) |
+| `--blob-dir <DIR>` | `<state_dir>/blobs` when `--state-dir` is set, else `~/.oxideswarm/blobs` (`RUSTY_GRID_BLOB_DIR`, `[master].blob_dir`) | Directory of the content-addressed blob store for task input and output files |
 | `--blob-store-mb <MB>` | `4096` (`RUSTY_GRID_BLOB_STORE_MB`, `[master].blob_store_mb`) | Megabytes the master blob store holds before LRU eviction of unreferenced blobs |
 | `--mapreduce-parallelism <N>` | `256` (`RUSTY_GRID_MAPREDUCE_PARALLELISM`, `[master].mapreduce_parallelism`) | Maximum map or reduce chunk tasks of one `mapreduce` job in flight at once |
 | `--max-connections <N>` | `1024` (`RUSTY_GRID_MAX_CONNECTIONS`, `[master].max_connections`) | Maximum concurrent connections kept open on the grid port |
@@ -545,7 +548,8 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_MAX_RETAINED_TASKS` | Master | Maximum count of finished tasks retained in memory (`--max-retained-tasks`; default `10000`) |
 | `RUSTY_GRID_MAX_RETAINED_MB` | Master | Maximum megabytes of finished task payloads and output retained (`--max-retained-mb`; default `256`) |
 | `RUSTY_GRID_MAX_ACTIVE_MB` | Master & Agent Mesh | Maximum megabytes of active (non-terminal) task payloads held in the queue (`--max-active-mb` on `oxideswarm master` and `agent-mesh hub`; default `256`, minimum `1`) |
-| `RUSTY_GRID_BLOB_DIR` | Master | Directory of the blob store of task input and output files (`--blob-dir`; default `~/.oxideswarm/blobs`) |
+| `RUSTY_GRID_STATE_DIR` | Master | Directory of the durable task queue store (`--state-dir`, `[master].state_dir`; persists `store.lock`, `snapshot.bin`, and `journal.bin` in plaintext with mode `0700`/`0600` on Unix and defaults `--blob-dir` to `<state_dir>/blobs`) |
+| `RUSTY_GRID_BLOB_DIR` | Master | Directory of the blob store of task input and output files (`--blob-dir`; default `<state_dir>/blobs` when `--state-dir` is set, else `~/.oxideswarm/blobs`) |
 | `RUSTY_GRID_BLOB_STORE_MB` | Master | Megabytes the blob store holds before evicting least recently used files (`--blob-store-mb`; default `4096`) |
 | `RUSTY_GRID_MAPREDUCE_PARALLELISM` | Master | Maximum concurrent in-flight map/reduce chunk tasks (`--mapreduce-parallelism`; default `256`) |
 | `RUSTY_GRID_MAX_CONNECTIONS` | Master | Maximum concurrent TCP connections allowed on grid port (`--max-connections`; default `1024`) |

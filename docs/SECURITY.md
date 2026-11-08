@@ -186,6 +186,7 @@ What the worker does limit, so that tasks stay out of the owner's way:
 | `/etc/oxideswarm/worker.toml`, `/etc/oxideswarm/cluster.secret` (macOS daemon) | ticket / master address, secret copy | 600, owned by the service account |
 | `C:\ProgramData\OxideSwarm\rusty-grid.toml`, `cluster.secret` (Windows service) | ticket / master address, secret copy | ACL: SYSTEM, Administrators, the service account |
 | `~/.oxideswarm/worker_id.<name>` (or the file named by `RUSTY_GRID_WORKER_ID_FILE`) | the id a named worker keeps across restarts; a worker without a name or id file gets a new id at each start. It is an identity, not a credential: the cluster secret is what admits a worker. Two workers with the same id displace each other at the master, so give each worker that shares a home directory its own `--name` | 600, in a 700 directory |
+| `<state_dir>/snapshot.bin`, `<state_dir>/journal.bin` (`master --state-dir` / `RUSTY_GRID_STATE_DIR`) | full `Task` and `TaskResult` payloads in plaintext, including task `env` variables, `stdin`, inline `staged_files`, `stdout`, and `stderr`. Do not pass long-lived secrets in task `env` or `stdin` on unencrypted disks ([design 0046](design/0046-master-durability.md)) | 600, in a 700 directory on Unix (`store.lock` prevents concurrent writers) |
 | `~/.oxideswarm/run/*.log` | worker / master logs (no secrets, but the master log shows addresses) | 700 directory |
 
 Tickets and secrets are never put on a command line by the shipped launchers, in a `LaunchDaemon` plist or in
