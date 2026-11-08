@@ -5684,7 +5684,7 @@ mod tests {
         assert!(rusty_grid_core::placement::validate_user_tag("iso:fs+net").is_err());
     }
 
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     #[tokio::test]
     async fn test_run_refuses_isolation_this_platform_cannot_enforce() {
         let dir = tempfile::tempdir().unwrap();

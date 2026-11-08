@@ -2632,36 +2632,40 @@ impl TaskRunner {
         #[cfg(not(windows))]
         let resolved_program = program.to_string();
 
-        // Under `--isolation fs|fs+net` the task is started through the platform's confinement
-        // (macOS: `sandbox-exec`); when that is impossible the task fails, it never runs plain.
-        let (spawn_program, spawn_args) = if self.config.isolation == IsolationLevel::Off {
-            (resolved_program.clone(), args.to_vec())
-        } else {
-            let jail = crate::isolation::Jail {
-                level: self.config.isolation,
-                host: &self.config.host_dirs,
-                protected_files: &self.config.protected_files,
-                sandbox_base: &self.config.sandbox_config.base_dir,
-                sandbox_dir: sandbox_path,
-            };
-            match crate::isolation::wrap_program(&jail, &resolved_program, args, &effective_path) {
-                Ok(wrapped) => wrapped,
-                Err(e) => {
-                    return TaskResult::failure(
-                        self.worker_id,
-                        task_id,
-                        EXIT_CODE_GENERAL_ERROR,
-                        "",
-                        format!(
-                            "Cannot run '{program}' with --isolation {}: {e}",
-                            jail.level
-                        ),
-                        start_time.elapsed().as_millis() as u64,
-                        Some(format!(
-                            "Isolation error for '{program}' ({}): {e}",
-                            jail.level
-                        )),
-                    );
+        // Under `--isolation fs|fs+net` the task is confined by the platform's mechanism (macOS:
+        // `sandbox-exec` wraps the program; Linux: a `pre_exec` hook registered below). When
+        // that is impossible the task fails, it never runs plain.
+        let jail = (self.config.isolation != IsolationLevel::Off).then(|| crate::isolation::Jail {
+            level: self.config.isolation,
+            host: &self.config.host_dirs,
+            protected_files: &self.config.protected_files,
+            sandbox_base: &self.config.sandbox_config.base_dir,
+            sandbox_dir: sandbox_path,
+        });
+        let isolation_failure = |e: &str| {
+            TaskResult::failure(
+                self.worker_id,
+                task_id,
+                EXIT_CODE_GENERAL_ERROR,
+                "",
+                format!(
+                    "Cannot run '{program}' with --isolation {}: {e}",
+                    self.config.isolation
+                ),
+                start_time.elapsed().as_millis() as u64,
+                Some(format!(
+                    "Isolation error for '{program}' ({}): {e}",
+                    self.config.isolation
+                )),
+            )
+        };
+        let (spawn_program, spawn_args) = match &jail {
+            None => (resolved_program.clone(), args.to_vec()),
+            Some(jail) => {
+                match crate::isolation::wrap_program(jail, &resolved_program, args, &effective_path)
+                {
+                    Ok(wrapped) => wrapped,
+                    Err(e) => return isolation_failure(&e),
                 }
             }
         };
@@ -2732,6 +2736,14 @@ impl TaskRunner {
         // below takes care of everything else.
         cmd.kill_on_drop(true);
         let mut configured = configure_command(&mut cmd, self.config.process_priority, task_id);
+        // After `configure_command`: the isolation hook (Linux) must run after the process-tree
+        // hook, which forks the lifeline supervisor and joins the cgroup, so that the supervisor
+        // is never restricted (design 0033 D2).
+        if let Some(jail) = &jail {
+            if let Err(e) = crate::isolation::confine_command(jail, &mut cmd) {
+                return isolation_failure(&e);
+            }
+        }
 
         #[cfg(windows)]
         if self.config.isolation != IsolationLevel::Off {
@@ -2797,7 +2809,11 @@ impl TaskRunner {
             }
         }
 
-        let mut child = match configured.spawn(&mut cmd) {
+        let spawned = configured.spawn(&mut cmd);
+        // The isolation hook owns descriptors until the command is dropped: do not keep them for
+        // the whole run of the task.
+        drop(cmd);
+        let mut child = match spawned {
             Ok(c) => c,
             Err(e) => {
                 return TaskResult::failure(

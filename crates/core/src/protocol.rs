@@ -28,9 +28,9 @@ pub const WIRE_FORMAT_AUTH: u8 = 0x03;
 pub const WIRE_FORMAT_ENCRYPTED: u8 = 0x04;
 
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION_CURRENT: u32 = 4;
+pub const PROTOCOL_VERSION_CURRENT: u32 = 5;
 /// Minimum wire protocol version compatible with this build.
-pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 4;
+pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 5;
 /// Protocol version assumed when a JSON peer omits `protocol_version`.
 pub const LEGACY_UNVERSIONED_PROTOCOL_VERSION: u32 = 2;
 
@@ -2335,6 +2335,7 @@ pub enum ClientResponse {
         workers: Vec<WorkerCapabilities>,
         active_bytes: usize,
         max_active_bytes: usize,
+        store_error: Option<String>,
     },
     WorkerList {
         workers: Vec<WorkerCapabilities>,
@@ -2395,6 +2396,8 @@ enum HumanClientResponse {
         active_bytes: usize,
         #[serde(default)]
         max_active_bytes: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        store_error: Option<String>,
         #[serde(default = "default_protocol_version")]
         protocol_version: u32,
     },
@@ -2460,6 +2463,7 @@ enum BinaryClientResponse {
         workers: Vec<WorkerCapabilities>,
         active_bytes: usize,
         max_active_bytes: usize,
+        store_error: Option<String>,
         protocol_version: u32,
     },
     WorkerList {
@@ -2537,6 +2541,46 @@ enum LegacyV2BinaryClientResponse {
     },
 }
 
+/// Protocol v3/v4 positional bincode layout of [`ClientResponse::ClusterStatus`], which carried
+/// `protocol_version` before `store_error` was added in v5.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+enum LegacyV3V4BinaryClientResponse {
+    TaskSubmitted {
+        task_id: TaskId,
+        protocol_version: u32,
+    },
+    TaskCompleted {
+        task_id: TaskId,
+        result: TaskResult,
+        protocol_version: u32,
+    },
+    TaskStatusInfo {
+        task_id: TaskId,
+        status: TaskStatus,
+        state_name: String,
+        assigned_worker: Option<Uuid>,
+        error: Option<String>,
+        protocol_version: u32,
+    },
+    TaskCancelled {
+        task_id: TaskId,
+        success: bool,
+        protocol_version: u32,
+    },
+    ClusterStatus {
+        total_tasks: usize,
+        pending_tasks: usize,
+        running_tasks: usize,
+        completed_tasks: usize,
+        failed_tasks: usize,
+        workers: Vec<WorkerCapabilities>,
+        active_bytes: usize,
+        max_active_bytes: usize,
+        protocol_version: u32,
+    },
+}
+
 impl HumanClientResponse {
     fn from_client_response(msg: ClientResponse, protocol_version: u32) -> Self {
         match msg {
@@ -2581,6 +2625,7 @@ impl HumanClientResponse {
                 workers,
                 active_bytes,
                 max_active_bytes,
+                store_error,
             } => HumanClientResponse::ClusterStatus {
                 total_tasks,
                 pending_tasks,
@@ -2590,6 +2635,7 @@ impl HumanClientResponse {
                 workers,
                 active_bytes,
                 max_active_bytes,
+                store_error,
                 protocol_version,
             },
             ClientResponse::WorkerList { workers } => HumanClientResponse::WorkerList {
@@ -2703,6 +2749,7 @@ impl BinaryClientResponse {
                 workers,
                 active_bytes,
                 max_active_bytes,
+                store_error,
             } => BinaryClientResponse::ClusterStatus {
                 total_tasks,
                 pending_tasks,
@@ -2712,6 +2759,7 @@ impl BinaryClientResponse {
                 workers,
                 active_bytes,
                 max_active_bytes,
+                store_error,
                 protocol_version,
             },
             ClientResponse::WorkerList { workers } => BinaryClientResponse::WorkerList {
@@ -2822,6 +2870,7 @@ impl From<HumanClientResponse> for ClientResponse {
                 workers,
                 active_bytes,
                 max_active_bytes,
+                store_error,
                 ..
             } => ClientResponse::ClusterStatus {
                 total_tasks,
@@ -2832,6 +2881,7 @@ impl From<HumanClientResponse> for ClientResponse {
                 workers,
                 active_bytes,
                 max_active_bytes,
+                store_error,
             },
             HumanClientResponse::WorkerList { workers, .. } => {
                 ClientResponse::WorkerList { workers }
@@ -2889,6 +2939,7 @@ impl From<BinaryClientResponse> for ClientResponse {
                 workers,
                 active_bytes,
                 max_active_bytes,
+                store_error,
                 ..
             } => ClientResponse::ClusterStatus {
                 total_tasks,
@@ -2899,6 +2950,7 @@ impl From<BinaryClientResponse> for ClientResponse {
                 workers,
                 active_bytes,
                 max_active_bytes,
+                store_error,
             },
             BinaryClientResponse::WorkerList { workers, .. } => {
                 ClientResponse::WorkerList { workers }
@@ -3153,6 +3205,12 @@ fn decode_bincode_client_response(slice: &[u8]) -> Result<ClientResponse, Protoc
             Ok(bin_resp.into())
         }
         Err(err) => {
+            if let Ok(LegacyV3V4BinaryClientResponse::ClusterStatus {
+                protocol_version, ..
+            }) = bincode_exact_deserialize::<LegacyV3V4BinaryClientResponse>(slice)
+            {
+                return Err(incompatible_version_error(protocol_version));
+            }
             if let Ok(legacy_resp) =
                 bincode_exact_deserialize::<LegacyV2BinaryClientResponse>(slice)
             {
@@ -5244,6 +5302,7 @@ mod tests {
             workers: vec![worker_cap],
             active_bytes: 601_029,
             max_active_bytes: 1_048_576,
+            store_error: None,
         };
         let encoded = serialize_message(&msg, WireCodec::Bincode).unwrap();
         assert_eq!(encoded[0], WIRE_FORMAT_BINCODE);

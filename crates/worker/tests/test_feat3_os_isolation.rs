@@ -1,16 +1,21 @@
 //! FEAT-3 (design 0033): OS-level task isolation, `--isolation off|fs|fs+net`.
 //!
-//! FEAT-3a ships the macOS implementation (`sandbox-exec`); the tests that exercise it are
-//! `#[cfg(target_os = "macos")]`. On Linux and Windows (FEAT-3b / FEAT-3c are still to come) the
-//! tests below check the other half of the contract: a worker asked for isolation it cannot
-//! enforce refuses to start and never runs a task unsandboxed.
+//! FEAT-3a ships the macOS implementation (`sandbox-exec`), FEAT-3b the Linux one (Landlock,
+//! `seccomp`, namespaces), and FEAT-3c the Windows one (per-task AppContainer profile, capability
+//! SIDs, and private Desktop); the tests that exercise them are `#[cfg(target_os = "macos")]`,
+//! `#[cfg(target_os = "linux")]`, and `#[cfg(windows)]`.
 //!
-//! Every test uses a temporary `HOME` (with a dummy `.oxideswarm/cluster.secret` and
-//! `.ssh/test_key`), its own sandbox base and loopback ports; nothing touches the developer's
+//! On Linux a kernel without Landlock skips the confinement tests with a notice, unless
+//! `RUSTY_GRID_REQUIRE_LANDLOCK=1` is set (CI sets it), which makes that a failure. On Windows,
+//! `RUSTY_GRID_REQUIRE_APPCONTAINER=1` (set in CI) likewise turns any missing host precondition
+//! into a failure via `cannot_run`.
+//!
+//! Every test uses a temporary `HOME` / `USERPROFILE` (with a dummy `.oxideswarm/cluster.secret`
+//! and `.ssh/test_key`), its own sandbox base and loopback ports; nothing touches the developer's
 //! real `~/.oxideswarm`. The real Rust toolchain is only read.
 
 #![cfg_attr(
-    not(any(target_os = "macos", windows)),
+    not(any(target_os = "macos", target_os = "linux", windows)),
     allow(dead_code, unused_imports)
 )]
 
@@ -148,6 +153,7 @@ impl Rig {
         )
     }
 
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     #[cfg(not(windows))]
     async fn run(&self, script: &str) -> TaskResult {
         self.runner
@@ -160,7 +166,7 @@ fn lines(result: &TaskResult) -> Vec<String> {
     result.stdout_str().lines().map(str::to_string).collect()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 const FS_SCRIPT: &str = r#"
 echo hello > "$RUSTY_GRID_SANDBOX_DIR/allowed.txt" && echo WRITE_OK
 [ "$(cat "$RUSTY_GRID_SANDBOX_DIR/allowed.txt")" = hello ] && echo READ_OK
@@ -461,12 +467,7 @@ cargo build --offline 2>&1
             result.stdout_str(),
             result.stderr_str()
         );
-        assert!(
-            result.stdout_str().contains("dep-ran"),
-            "stdout:\n{}\nstderr:\n{}",
-            result.stdout_str(),
-            result.stderr_str()
-        );
+        assert!(result.stdout_str().contains("dep-ran"));
     }
 
     /// The PID the worker tracks is the task itself (`sandbox-exec` execs in place), so the
@@ -995,9 +996,1097 @@ sys.stdout.write(out.decode("utf-8", "replace"))
     }
 }
 
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    /// The Landlock ABI of this kernel, or `None` (after a notice) when there is no Landlock and
+    /// the environment does not demand it.
+    fn landlock_abi() -> Option<u32> {
+        match rusty_grid_worker::isolation::landlock_abi() {
+            Ok(abi) => Some(abi),
+            Err(e) => {
+                assert!(
+                    std::env::var_os("RUSTY_GRID_REQUIRE_LANDLOCK").is_none(),
+                    "Landlock is required here (RUSTY_GRID_REQUIRE_LANDLOCK) but unavailable: {e}"
+                );
+                eprintln!("skipped: no Landlock on this kernel ({e})");
+                None
+            }
+        }
+    }
+
+    macro_rules! require_landlock {
+        () => {
+            match landlock_abi() {
+                Some(abi) => abi,
+                None => return,
+            }
+        };
+    }
+
+    /// An early return of a test whose precondition is missing: a failure when CI demands the
+    /// Linux tests (`RUSTY_GRID_REQUIRE_LANDLOCK`), a notice otherwise.
+    fn cannot_run(why: &str) {
+        assert!(
+            std::env::var_os("RUSTY_GRID_REQUIRE_LANDLOCK").is_none(),
+            "required here (RUSTY_GRID_REQUIRE_LANDLOCK) but cannot run: {why}"
+        );
+        eprintln!("skipped: {why}");
+    }
+
+    fn python3() -> bool {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// Runs `script` as a task at `level`.
+    async fn run_at(level: IsolationLevel, script: &str, extra: &[(&str, &str)]) -> TaskResult {
+        let rig = Rig::new(level, false);
+        rig.runner
+            .execute_task(&rig.task(script, extra, 120), None, None)
+            .await
+    }
+
+    fn has(result: &TaskResult, line: &str) -> bool {
+        lines(result).iter().any(|l| l == line)
+    }
+
+    const LEVELS: [IsolationLevel; 2] = [IsolationLevel::Fs, IsolationLevel::FsNet];
+
+    /// Every line the policy decides: what must work inside the sandbox and what must not work
+    /// anywhere else.
+    const FS_SCRIPT_LINUX: &str = r#"
+S="$RUSTY_GRID_SANDBOX_DIR"
+echo hello > "$S/allowed.txt" && echo WRITE_OK
+[ "$(cat "$S/allowed.txt")" = hello ] && echo READ_OK
+mkdir "$S/sub" && echo MKDIR_OK
+mv "$S/allowed.txt" "$S/sub/moved.txt" && [ -f "$S/sub/moved.txt" ] && echo RENAME_OK
+printf '#!/bin/sh\necho x\n' > "$S/run.sh" && chmod +x "$S/run.sh" && "$S/run.sh" > /dev/null && echo EXEC_OK
+echo x > /dev/null && echo DEVNULL_OK
+read -r line < /proc/self/status && echo PROC_SELF_OK
+cat "$T_SECRET" > /dev/null 2>&1 && echo LEAK_SECRET || echo DENY_SECRET
+cat "$T_KEY" > /dev/null 2>&1 && echo LEAK_KEY || echo DENY_KEY
+cat "$T_SIBLING" > /dev/null 2>&1 && echo LEAK_SIBLING || echo DENY_SIBLING
+ls "$T_BASE" > /dev/null 2>&1 && echo LEAK_LISTING || echo DENY_LISTING
+ls "$T_HOME" > /dev/null 2>&1 && echo LEAK_HOME_LISTING || echo DENY_HOME_LISTING
+( echo x > "$T_HOME/planted.txt" ) 2>/dev/null && echo LEAK_WRITE_HOME || echo DENY_WRITE_HOME
+( echo x > "$T_BASE/other_task/planted.txt" ) 2>/dev/null && echo LEAK_WRITE_SIBLING || echo DENY_WRITE_SIBLING
+( echo x > "$T_OUTSIDE" ) 2>/dev/null && echo LEAK_WRITE_TMP || echo DENY_WRITE_TMP
+ln -s "$T_KEY" "$S/symlink" && cat "$S/symlink" > /dev/null 2>&1 && echo LEAK_SYMLINK || echo DENY_SYMLINK
+ln "$T_KEY" "$S/hardlink" 2>/dev/null && echo LEAK_HARDLINK || echo DENY_HARDLINK
+cat "/proc/$T_PID/environ" > /dev/null 2>&1 && echo LEAK_ENVIRON || echo DENY_ENVIRON
+cat "/proc/$T_PID/cmdline" > /dev/null 2>&1 && echo LEAK_CMDLINE || echo DENY_CMDLINE
+"#;
+
+    const ALLOWED: [&str; 7] = [
+        "WRITE_OK",
+        "READ_OK",
+        "MKDIR_OK",
+        "RENAME_OK",
+        "EXEC_OK",
+        "DEVNULL_OK",
+        "PROC_SELF_OK",
+    ];
+    const DENIED: [&str; 12] = [
+        "SECRET",
+        "KEY",
+        "SIBLING",
+        "LISTING",
+        "HOME_LISTING",
+        "WRITE_HOME",
+        "WRITE_SIBLING",
+        "WRITE_TMP",
+        "SYMLINK",
+        "HARDLINK",
+        "ENVIRON",
+        "CMDLINE",
+    ];
+
+    /// The extra task environment of `FS_SCRIPT_LINUX`; the marker file is outside everything.
+    fn fs_env(marker: &Path) -> Vec<(String, String)> {
+        vec![
+            ("T_PID".into(), std::process::id().to_string()),
+            ("T_OUTSIDE".into(), marker.to_string_lossy().into_owned()),
+        ]
+    }
+
+    async fn run_fs_script(rig: &Rig, marker: &Path) -> TaskResult {
+        let env = fs_env(marker);
+        let extra: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        rig.runner
+            .execute_task(&rig.task(FS_SCRIPT_LINUX, &extra, 120), None, None)
+            .await
+    }
+
+    fn marker_path(tag: &str) -> PathBuf {
+        PathBuf::from(format!("/tmp/feat3b-{tag}-{}", std::process::id()))
+    }
+
+    fn assert_policy_holds(result: &TaskResult, what: &str) {
+        assert!(
+            result.is_success(),
+            "{what}: the task itself must run: {:?} / {}",
+            result.error,
+            result.stderr_str()
+        );
+        let got = lines(result);
+        for expected in ALLOWED {
+            assert!(
+                got.iter().any(|l| l == expected),
+                "{what}: missing {expected}; output was {got:?}"
+            );
+        }
+        for name in DENIED {
+            assert!(
+                got.iter().any(|l| *l == format!("DENY_{name}")),
+                "{what}: DENY_{name} missing; output was {got:?}"
+            );
+        }
+        assert!(
+            !got.iter().any(|l| l.starts_with("LEAK_")),
+            "{what}: a forbidden access succeeded: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_off_leaves_the_owners_files_readable_as_a_control() {
+        let marker = marker_path("control");
+        let rig = Rig::new(IsolationLevel::Off, false);
+        let result = run_fs_script(&rig, &marker).await;
+        let _ = std::fs::remove_file(&marker);
+        let got = lines(&result);
+        for name in DENIED {
+            let leak = format!("LEAK_{name}");
+            assert!(
+                got.contains(&leak),
+                "without isolation {leak} must succeed (otherwise the tests below prove nothing): {got:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fs_confines_a_task_to_its_sandbox() {
+        require_landlock!();
+        for level in LEVELS {
+            let marker = marker_path(&level.to_string().replace('+', "-"));
+            let rig = Rig::new(level, false);
+            let result = run_fs_script(&rig, &marker).await;
+            let planted = marker.exists();
+            let _ = std::fs::remove_file(&marker);
+            assert_policy_holds(&result, &level.to_string());
+            assert!(!planted, "{level}: the task wrote outside its sandbox");
+            assert!(
+                !rig.home.path().join("planted.txt").exists()
+                    && !rig.base.join("other_task/planted.txt").exists(),
+                "nothing was planted outside the sandbox"
+            );
+            assert_eq!(
+                std::fs::read_to_string(rig.base.join("other_task/secret.txt")).unwrap(),
+                SIBLING
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fs_holds_when_the_sandbox_base_lives_inside_the_home() {
+        require_landlock!();
+        // `~/.oxideswarm/sandboxes`: the sandbox is inside the owner's home, which the policy
+        // never grants, and must stay usable while its siblings stay hidden.
+        let marker = marker_path("inhome");
+        let rig = Rig::new(IsolationLevel::Fs, true);
+        let result = run_fs_script(&rig, &marker).await;
+        let _ = std::fs::remove_file(&marker);
+        assert_policy_holds(&result, "base inside home");
+    }
+
+    #[tokio::test]
+    async fn test_two_concurrent_tasks_cannot_read_each_others_sandbox() {
+        require_landlock!();
+        let script = r#"
+cd "$RUSTY_GRID_SANDBOX_DIR"
+echo "secret-of-$T_ME" > secret.txt
+i=0; while [ ! -e "$T_BASE/$T_PEER/secret.txt" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
+cat "$T_BASE/$T_PEER/secret.txt" 2>/dev/null && echo LEAK_PEER || echo DENY_PEER
+ls "$T_BASE/$T_PEER" > /dev/null 2>&1 && echo LEAK_LIST || echo DENY_LIST
+( echo x > "$T_BASE/$T_PEER/planted.txt" ) 2>/dev/null && echo LEAK_WRITE || echo DENY_WRITE
+echo done > done.txt
+i=0; while [ ! -e "$T_BASE/$T_PEER/done.txt" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
+sleep 1   # the peer must see this task's done.txt before the sandbox goes away
+"#;
+        for (level, must_leak) in [
+            (IsolationLevel::Off, true),
+            (IsolationLevel::Fs, false),
+            (IsolationLevel::FsNet, false),
+        ] {
+            let rig = Arc::new(Rig::new(level, false));
+            let (a, b) = (rig.task(script, &[], 120), rig.task(script, &[], 120));
+            let (id_a, id_b) = (a.id.to_string(), b.id.to_string());
+            let with_peer = |mut task: Task, me: &str, peer: &str| {
+                if let TaskSpec::Command { env, .. } = &mut task.spec {
+                    env.insert("T_ME".into(), me.into());
+                    env.insert("T_PEER".into(), peer.into());
+                }
+                task
+            };
+            let (a, b) = (with_peer(a, "a", &id_b), with_peer(b, "b", &id_a));
+            let (ra, rb) = tokio::join!(
+                rig.runner.execute_task(&a, None, None),
+                rig.runner.execute_task(&b, None, None)
+            );
+            for (who, result) in [("a", &ra), ("b", &rb)] {
+                assert!(
+                    result.is_success(),
+                    "{level}/{who}: {:?} {}",
+                    result.error,
+                    result.stderr_str()
+                );
+                let out = result.stdout_str();
+                if must_leak {
+                    assert!(
+                        out.contains("LEAK_PEER") && out.contains("LEAK_LIST"),
+                        "control {who}: {out}"
+                    );
+                } else {
+                    assert!(
+                        out.contains("DENY_PEER")
+                            && out.contains("DENY_LIST")
+                            && out.contains("DENY_WRITE")
+                            && !out.contains("secret-of-")
+                            && !out.contains("LEAK_"),
+                        "{level}/{who} read the other task's sandbox: {out}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_environment_is_moved_into_the_sandbox_and_ipc_sockets_are_removed() {
+        require_landlock!();
+        let rig = Rig::new(IsolationLevel::Fs, false);
+        let task = rig.task(
+            r#"
+echo "HOME=$HOME"; echo "TMPDIR=$TMPDIR"; echo "SANDBOX=$RUSTY_GRID_SANDBOX_DIR"
+echo "RUSTUP_HOME=$RUSTUP_HOME"; echo "CARGO_HOME=$CARGO_HOME"
+echo "SSH=${SSH_AUTH_SOCK-unset}"; echo "DBUS=${DBUS_SESSION_BUS_ADDRESS-unset}"; echo "DOCKER=${DOCKER_HOST-unset}"
+echo "TOKEN=${RUSTY_GRID_RUN_TOKEN-unset}"
+"#,
+            &[
+                ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+                ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+                ("DOCKER_HOST", "unix:///var/run/docker.sock"),
+            ],
+            60,
+        );
+        let result = rig.runner.execute_task(&task, None, None).await;
+        assert!(
+            result.is_success(),
+            "{:?} {}",
+            result.error,
+            result.stderr_str()
+        );
+        let got: HashMap<String, String> = lines(&result)
+            .iter()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        for name in ["HOME", "TMPDIR"] {
+            assert_eq!(got[name], got["SANDBOX"], "{name}");
+        }
+        assert_eq!(got["RUSTUP_HOME"], rig.host.rustup_home.to_string_lossy());
+        assert_eq!(got["CARGO_HOME"], rig.host.cargo_home.to_string_lossy());
+        assert_ne!(
+            got["TOKEN"], "unset",
+            "FEAT-2's containment token must survive"
+        );
+        for name in ["SSH", "DBUS", "DOCKER"] {
+            assert_eq!(got[name], "unset", "{name}");
+        }
+    }
+
+    /// `fs+net`: no TCP connection, and the listener sees nothing; `fs` lets it through.
+    #[tokio::test]
+    async fn test_fs_net_refuses_tcp_connections_and_fs_allows_them() {
+        require_landlock!();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        let script = r#"bash -c 'exec 3<>/dev/tcp/127.0.0.1/$T_PORT' 2>/dev/null && echo CONNECTED || echo REFUSED"#;
+
+        // Control: unconfined and under `fs` the very same connect works.
+        for level in [IsolationLevel::Off, IsolationLevel::Fs] {
+            let result = run_at(level, script, &[("T_PORT", &port)]).await;
+            assert!(has(&result, "CONNECTED"), "{level}: {:?}", lines(&result));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                listener.accept().is_ok(),
+                "{level}: the connect reached the listener"
+            );
+            while listener.accept().is_ok() {}
+        }
+
+        let result = run_at(IsolationLevel::FsNet, script, &[("T_PORT", &port)]).await;
+        assert!(
+            has(&result, "REFUSED"),
+            "{:?} {}",
+            lines(&result),
+            result.stderr_str()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("the listener must see no connection from an fs+net task: {other:?}"),
+        }
+    }
+
+    /// Which socket domains a task can create, per level (seccomp, design 0033 D2).
+    #[tokio::test]
+    async fn test_socket_domains_are_refused_by_level() {
+        require_landlock!();
+        if !python3() {
+            cannot_run("no python3");
+            return;
+        }
+        let py = r#"
+import socket
+def t(name, fam, typ):
+    try:
+        socket.socket(fam, typ).close()
+        print(name + "=OK")
+    except OSError as e:
+        print(name + "=ERR%d" % e.errno)
+t("TCP4", socket.AF_INET, socket.SOCK_STREAM)
+t("UDP4", socket.AF_INET, socket.SOCK_DGRAM)
+t("TCP6", socket.AF_INET6, socket.SOCK_STREAM)
+t("UNIX", socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    a, b = socket.socketpair(); a.close(); b.close(); print("PAIR=OK")
+except OSError as e:
+    print("PAIR=ERR%d" % e.errno)
+"#;
+        let script = r#"python3 -c "$T_PY""#;
+        let control = run_at(IsolationLevel::Off, script, &[("T_PY", py)]).await;
+        for name in ["TCP4=OK", "UDP4=OK", "UNIX=OK", "PAIR=OK"] {
+            assert!(
+                has(&control, name),
+                "control {name}: {:?} {}",
+                lines(&control),
+                control.stderr_str()
+            );
+        }
+        let control_tcp6 = has(&control, "TCP6=OK");
+        let fs = run_at(IsolationLevel::Fs, script, &[("T_PY", py)]).await;
+        for name in ["TCP4=OK", "UDP4=OK", "PAIR=OK", "UNIX=ERR13"] {
+            assert!(
+                has(&fs, name),
+                "fs {name}: {:?} {}",
+                lines(&fs),
+                fs.stderr_str()
+            );
+        }
+        assert_eq!(has(&fs, "TCP6=OK"), control_tcp6);
+        let net = run_at(IsolationLevel::FsNet, script, &[("T_PY", py)]).await;
+        for name in [
+            "TCP4=ERR13",
+            "UDP4=ERR13",
+            "TCP6=ERR13",
+            "UNIX=ERR13",
+            "PAIR=OK",
+        ] {
+            assert!(
+                has(&net, name),
+                "fs+net {name}: {:?} {}",
+                lines(&net),
+                net.stderr_str()
+            );
+        }
+    }
+
+    /// Landlock does not mediate `connect` to a pathname Unix socket (ssh-agent, docker.sock,
+    /// the D-Bus session bus); the socket filter does.
+    #[tokio::test]
+    async fn test_a_listening_unix_socket_outside_the_sandbox_cannot_be_reached() {
+        require_landlock!();
+        if !python3() {
+            cannot_run("no python3");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let py = r#"
+import os, socket
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(os.environ["T_SOCK"])
+    print("CONNECTED")
+except OSError as e:
+    print("REFUSED%d" % e.errno)
+"#;
+        let script = r#"python3 -c "$T_PY""#;
+        let extra = [("T_PY", py), ("T_SOCK", path.to_str().unwrap())];
+        let control = run_at(IsolationLevel::Off, script, &extra).await;
+        assert!(
+            has(&control, "CONNECTED"),
+            "{:?} {}",
+            lines(&control),
+            control.stderr_str()
+        );
+        assert!(
+            listener.accept().is_ok(),
+            "the control connect reached the listener"
+        );
+        for level in LEVELS {
+            let result = run_at(level, script, &extra).await;
+            assert!(
+                lines(&result).iter().any(|l| l.starts_with("REFUSED")),
+                "{level}: {:?} {}",
+                lines(&result),
+                result.stderr_str()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            match listener.accept() {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                other => panic!("{level}: the listener must see nothing: {other:?}"),
+            }
+        }
+    }
+
+    /// `fs+net` enters a private user and network namespace when the host allows unprivileged
+    /// user namespaces, with the task's ids mapped to themselves; where it does not (sysctl,
+    /// AppArmor), seccomp alone enforces the level and every other test still holds.
+    /// `RUSTY_GRID_REQUIRE_USERNS=1` (CI) turns "not entered" into a failure.
+    #[tokio::test]
+    async fn test_fs_net_enters_a_private_namespace_when_the_host_allows_it() {
+        require_landlock!();
+        let _serial = NETNS_ENV.lock().await;
+        if !python3() {
+            cannot_run("no python3");
+            return;
+        }
+        let py = r#"
+import os, socket
+print("NETNS=" + os.readlink("/proc/self/ns/net"))
+print("UID=%d" % os.getuid())
+print("GID=%d" % os.getgid())
+try:
+    socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0).close()
+    print("NETLINK=OK")
+except OSError as e:
+    print("NETLINK=ERR%d" % e.errno)
+"#;
+        // `exec` keeps the interpreter the task leader, the one process whose `/proc/self` the
+        // policy allows.
+        let script = r#"exec python3 -c "$T_PY""#;
+        let value = |result: &TaskResult, key: &str| {
+            lines(result)
+                .iter()
+                .find_map(|l| l.strip_prefix(&format!("{key}=")).map(str::to_string))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{key} missing in {:?} {}",
+                        lines(result),
+                        result.stderr_str()
+                    )
+                })
+        };
+        let worker_netns = std::fs::read_link("/proc/self/ns/net").unwrap();
+        let worker_ids = unsafe { (libc::getuid(), libc::getgid()) };
+        let fs = run_at(IsolationLevel::Fs, script, &[("T_PY", py)]).await;
+        assert_eq!(value(&fs, "NETNS"), worker_netns.to_string_lossy());
+        let net = run_at(IsolationLevel::FsNet, script, &[("T_PY", py)]).await;
+        let netns = value(&net, "NETNS");
+        let require = std::env::var_os("RUSTY_GRID_REQUIRE_USERNS").is_some();
+        if netns == worker_netns.to_string_lossy() {
+            assert!(
+                !require,
+                "the task did not enter a private network namespace"
+            );
+            eprintln!("note: no private network namespace here, seccomp only");
+            return;
+        }
+        let (uid, gid) = (value(&net, "UID"), value(&net, "GID"));
+        if uid == worker_ids.0.to_string() && gid == worker_ids.1.to_string() {
+            assert!(has(&net, "NETLINK=ERR13"), "{:?}", lines(&net));
+        } else {
+            // AppArmor (Ubuntu 24.04+) lets `unshare` succeed but strips the capabilities in the
+            // new namespace, so the id map cannot be written: the ids show as the overflow id.
+            assert!(!require, "ids are not mapped: uid {uid} gid {gid}");
+            assert_eq!((uid.as_str(), gid.as_str()), ("65534", "65534"));
+            eprintln!("note: private network namespace without an id map (restricted userns)");
+        }
+    }
+
+    /// Serialises the tests that depend on `RUSTY_GRID_ISOLATION_NO_USERNS` (process-wide).
+    static NETNS_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Without a private network namespace (here forced with `RUSTY_GRID_ISOLATION_NO_USERNS`,
+    /// like a host that forbids unprivileged user namespaces) a task shares the worker's network
+    /// namespace: netlink would list the host's sockets, routes and addresses, and
+    /// `/proc/self/net/tcp` its connections. `fs+net` must deny both.
+    #[tokio::test]
+    async fn test_fs_net_without_a_private_namespace_hides_the_hosts_sockets() {
+        require_landlock!();
+        let _serial = NETNS_ENV.lock().await;
+        if !python3() {
+            cannot_run("no python3");
+            return;
+        }
+        let py = r#"
+import os, socket
+print("NETNS=" + os.readlink("/proc/self/ns/net"))
+for name, proto in (("DIAG", 4), ("ROUTE", 0)):
+    try:
+        socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, proto).close()
+        print(name + "=OK")
+    except OSError as e:
+        print(name + "=ERR%d" % e.errno)
+try:
+    open("/proc/self/net/tcp").read()
+    print("PROCNET=OK")
+except OSError as e:
+    print("PROCNET=ERR%d" % e.errno)
+"#;
+        let script = r#"exec python3 -c "$T_PY""#;
+        let value = |result: &TaskResult, key: &str| {
+            lines(result)
+                .iter()
+                .find_map(|l| l.strip_prefix(&format!("{key}=")).map(str::to_string))
+                .unwrap_or_default()
+        };
+        let control = run_at(IsolationLevel::Off, script, &[("T_PY", py)]).await;
+        if !(has(&control, "DIAG=OK") && has(&control, "ROUTE=OK") && has(&control, "PROCNET=OK")) {
+            cannot_run(&format!(
+                "netlink or /proc/self/net unusable even unconfined: {:?}",
+                lines(&control)
+            ));
+            return;
+        }
+        eprintln!("NETLINK_CONTROL_OK");
+        let worker_netns = std::fs::read_link("/proc/self/ns/net").unwrap();
+        // SAFETY: only this and the other NETNS_ENV tests read it, and they hold the lock.
+        unsafe { std::env::set_var("RUSTY_GRID_ISOLATION_NO_USERNS", "1") };
+        let net = run_at(IsolationLevel::FsNet, script, &[("T_PY", py)]).await;
+        unsafe { std::env::remove_var("RUSTY_GRID_ISOLATION_NO_USERNS") };
+        assert_eq!(
+            value(&net, "NETNS"),
+            worker_netns.to_string_lossy(),
+            "the namespace was not entered"
+        );
+        for name in ["DIAG=ERR13", "ROUTE=ERR13", "PROCNET=ERR13"] {
+            assert!(
+                has(&net, name),
+                "{name}: {:?} {}",
+                lines(&net),
+                net.stderr_str()
+            );
+        }
+        eprintln!("NETLINK_CONFINED_DENIED {:?}", lines(&net));
+    }
+
+    /// The worker user's kernel keyring is out of reach (`EPERM`).
+    #[tokio::test]
+    async fn test_the_kernel_keyring_is_refused() {
+        require_landlock!();
+        if !python3() {
+            cannot_run("no python3");
+            return;
+        }
+        let py = r#"
+import ctypes, platform
+nr = 250 if platform.machine() == "x86_64" else 219
+libc = ctypes.CDLL(None, use_errno=True)
+# KEYCTL_GET_KEYRING_ID(0) of KEY_SPEC_USER_KEYRING (-4)
+r = libc.syscall(nr, 0, -4, 0)
+print("KEYCTL_OK" if r >= 0 else "KEYCTL_ERR%d" % ctypes.get_errno())
+"#;
+        let script = r#"python3 -c "$T_PY""#;
+        let control = run_at(IsolationLevel::Off, script, &[("T_PY", py)]).await;
+        if !has(&control, "KEYCTL_OK") {
+            eprintln!(
+                "skipped: keyctl unusable even unconfined: {:?}",
+                lines(&control)
+            );
+            return;
+        }
+        for level in LEVELS {
+            let result = run_at(level, script, &[("T_PY", py)]).await;
+            assert!(has(&result, "KEYCTL_ERR1"), "{level}: {:?}", lines(&result));
+        }
+    }
+
+    /// `io_uring` could create sockets behind the socket filter (`IORING_OP_SOCKET`), so its
+    /// setup is refused with `ENOSYS`.
+    #[tokio::test]
+    async fn test_io_uring_setup_is_refused() {
+        require_landlock!();
+        if !python3() {
+            cannot_run("no python3");
+            return;
+        }
+        let py = r#"
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+params = ctypes.create_string_buffer(120)
+fd = libc.syscall(425, 4, params)
+print("IOURING_OK" if fd >= 0 else "IOURING_ERR%d" % ctypes.get_errno())
+"#;
+        let script = r#"python3 -c "$T_PY""#;
+        let control = run_at(IsolationLevel::Off, script, &[("T_PY", py)]).await;
+        if !has(&control, "IOURING_OK") {
+            eprintln!(
+                "skipped: this kernel has no usable io_uring even unconfined: {:?}",
+                lines(&control)
+            );
+            return;
+        }
+        for level in LEVELS {
+            let result = run_at(level, script, &[("T_PY", py)]).await;
+            assert!(
+                has(&result, "IOURING_ERR38"),
+                "{level}: {:?} {}",
+                lines(&result),
+                result.stderr_str()
+            );
+        }
+    }
+
+    /// `TIOCSTI` is refused before the kernel looks at the descriptor: a task with stdin on
+    /// `/dev/null` gets `EPERM` (1) where the control gets `ENOTTY` (25).
+    #[tokio::test]
+    async fn test_tiocsti_is_refused() {
+        require_landlock!();
+        if !python3() {
+            cannot_run("no python3");
+            return;
+        }
+        let py = r#"
+import fcntl
+try:
+    fcntl.ioctl(0, 0x5412, b"x")
+    print("TIOCSTI_OK")
+except OSError as e:
+    print("TIOCSTI_ERR%d" % e.errno)
+"#;
+        let script = r#"python3 -c "$T_PY""#;
+        let control = run_at(IsolationLevel::Off, script, &[("T_PY", py)]).await;
+        assert!(
+            has(&control, "TIOCSTI_ERR25"),
+            "{:?} {}",
+            lines(&control),
+            control.stderr_str()
+        );
+        for level in LEVELS {
+            let result = run_at(level, script, &[("T_PY", py)]).await;
+            assert!(
+                has(&result, "TIOCSTI_ERR1"),
+                "{level}: {:?} {}",
+                lines(&result),
+                result.stderr_str()
+            );
+        }
+    }
+
+    /// A task cannot signal processes that are not its own, the worker included. Needs Landlock
+    /// ABI 6 (Linux 6.12); on older kernels this is a documented gap, and the test only checks
+    /// that a task can signal its own children.
+    #[tokio::test]
+    async fn test_a_task_cannot_signal_foreign_processes() {
+        let abi = require_landlock!();
+        let mut victim = std::process::Command::new("/bin/sleep")
+            .arg("120")
+            .spawn()
+            .expect("victim");
+        let pid = victim.id().to_string();
+        let script = r#"kill -0 "$VICTIM" 2>/dev/null && echo SIGNALLED || echo DENIED
+sleep 120 & kill -STOP $! && echo OWN_CHILD_OK; kill -9 $! 2>/dev/null; wait $! 2>/dev/null; true"#;
+        let control = run_at(IsolationLevel::Off, script, &[("VICTIM", &pid)]).await;
+        let control_ok = has(&control, "SIGNALLED");
+        for level in LEVELS {
+            let result = run_at(level, script, &[("VICTIM", &pid)]).await;
+            assert!(
+                has(&result, "OWN_CHILD_OK"),
+                "{level}: a task can still signal its own children: {:?}",
+                lines(&result)
+            );
+            if abi >= 6 {
+                assert!(has(&result, "DENIED"), "{level}: {:?}", lines(&result));
+            } else {
+                eprintln!(
+                    "note: Landlock ABI {abi} < 6, signals to foreign processes are not scoped"
+                );
+            }
+        }
+        let _ = victim.kill();
+        let _ = victim.wait();
+        assert!(control_ok, "the unconfined control must be able to signal");
+    }
+
+    /// A protected file (the cluster secret, the config file) inside a directory that the policy
+    /// grants stays unreadable: the grant is cut around it.
+    #[tokio::test]
+    async fn test_a_secret_file_inside_a_readable_directory_is_carved_out() {
+        require_landlock!();
+        let outside = tempfile::tempdir().unwrap();
+        let toolchain = outside.path().join("rustup");
+        std::fs::create_dir_all(toolchain.join("deep")).unwrap();
+        let secret_file = toolchain.join("deep/cluster.secret");
+        std::fs::write(&secret_file, "DUMMY-SECRETFILE-feat3b").unwrap();
+        let config_file = toolchain.join("rusty-grid.toml");
+        std::fs::write(&config_file, "secret = \"DUMMY-CONFIG-feat3b\"").unwrap();
+        std::fs::write(
+            toolchain.join("deep/neighbour.txt"),
+            "DUMMY-NEIGHBOUR-feat3b",
+        )
+        .unwrap();
+
+        let run = |level: IsolationLevel, protect: bool| {
+            let rig = Rig::new(level, false);
+            let mut host = rig.host.clone();
+            host.rustup_home = toolchain.clone();
+            let mut config = RunnerConfig::new(SandboxConfig::new(rig.base.clone()))
+                .with_isolation(level)
+                .with_host_dirs(host);
+            if protect {
+                config =
+                    config.with_protected_files(vec![secret_file.clone(), config_file.clone()]);
+            }
+            let runner = TaskRunner::new(
+                uuid::Uuid::new_v4(),
+                WorkerCapabilities::new("feat3", 4, 8192, false, false, None),
+                config,
+            );
+            let task = rig.task(
+                r#"cat "$T_A" 2>&1; echo; cat "$T_B" 2>&1; echo; cat "$T_C" 2>&1; echo END"#,
+                &[
+                    ("T_A", secret_file.to_str().unwrap()),
+                    ("T_B", config_file.to_str().unwrap()),
+                    (
+                        "T_C",
+                        toolchain.join("deep/neighbour.txt").to_str().unwrap(),
+                    ),
+                ],
+                60,
+            );
+            async move {
+                let result = runner.execute_task(&task, None, None).await;
+                drop(rig);
+                result
+            }
+        };
+        // Unprotected, the policy itself lets the task read all of it (so the cut is the cause).
+        let open = run(IsolationLevel::Fs, false).await;
+        for text in [
+            "DUMMY-SECRETFILE-feat3b",
+            "DUMMY-CONFIG-feat3b",
+            "DUMMY-NEIGHBOUR-feat3b",
+        ] {
+            assert!(open.stdout_str().contains(text), "{}", open.stdout_str());
+        }
+        for level in LEVELS {
+            let result = run(level, true).await;
+            let out = result.stdout_str();
+            assert!(
+                !out.contains("DUMMY-SECRETFILE-feat3b") && !out.contains("DUMMY-CONFIG-feat3b"),
+                "{level}: {out}"
+            );
+            assert!(out.contains("Permission denied"), "{level}: {out}");
+            assert!(
+                out.contains("DUMMY-NEIGHBOUR-feat3b"),
+                "{level}: the rest of the directory stays readable: {out}"
+            );
+        }
+    }
+
+    /// G2: `cargo build --offline` of a tiny crate works with the toolchain read-only.
+    #[tokio::test]
+    async fn test_cargo_build_offline_works_under_fs() {
+        require_landlock!();
+        let cargo = HostDirs::detect().cargo_home.join("bin/cargo");
+        if !cargo.exists() {
+            eprintln!("skipped: no rustup cargo proxy at {}", cargo.display());
+            return;
+        }
+        for level in LEVELS {
+            let rig = Rig::new(level, false);
+            let path = format!(
+                "{}:/usr/bin:/bin",
+                rig.host.cargo_home.join("bin").to_string_lossy()
+            );
+            let task = rig.task(
+                r#"
+set -e
+unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+mkdir -p tiny/src
+printf '[package]\nname = "tiny"\nversion = "0.1.0"\nedition = "2021"\n' > tiny/Cargo.toml
+echo 'fn main() { println!("tiny-ran"); }' > tiny/src/main.rs
+cd tiny
+cargo build --offline 2>&1
+./target/debug/tiny
+"#,
+                &[("PATH", &path)],
+                300,
+            );
+            let result = rig.runner.execute_task(&task, None, None).await;
+            assert!(
+                result.is_success(),
+                "{level}: {:?}\n{}\n{}",
+                result.error,
+                result.stdout_str(),
+                result.stderr_str()
+            );
+            assert!(
+                result.stdout_str().contains("tiny-ran"),
+                "{}",
+                result.stdout_str()
+            );
+        }
+    }
+
+    /// A dependency from the cached registry is compiled from `$CARGO_HOME/registry/src`, which
+    /// the policy only lets the task read.
+    #[tokio::test]
+    async fn test_cargo_build_offline_with_a_cached_dependency_under_fs() {
+        require_landlock!();
+        let real = HostDirs::detect();
+        let cargo = real.cargo_home.join("bin/cargo");
+        // A leaf crate (no required dependencies) whose source is in the local registry.
+        let cached = std::fs::read_dir(real.cargo_home.join("registry/cache"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|index| {
+                std::fs::read_dir(index.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+            })
+            .filter_map(|f| f.file_name().to_str().map(str::to_string))
+            .filter_map(|f| f.strip_suffix(".crate").map(str::to_string))
+            .find_map(|stem| {
+                let (name, version) = stem.rsplit_once('-')?;
+                ["cfg-if", "itoa", "bytes", "memchr", "smallvec", "once_cell"]
+                    .contains(&name)
+                    .then(|| (name.to_string(), version.to_string()))
+            });
+        let Some((name, version)) = cached else {
+            eprintln!(
+                "skipped: no cached leaf crate in {}",
+                real.cargo_home.display()
+            );
+            return;
+        };
+        if !cargo.exists() {
+            eprintln!("skipped: no rustup cargo proxy at {}", cargo.display());
+            return;
+        }
+        let rig = Rig::new(IsolationLevel::Fs, false);
+        let path = format!(
+            "{}:/usr/bin:/bin",
+            rig.host.cargo_home.join("bin").to_string_lossy()
+        );
+        let script = format!(
+            r#"
+set -e
+unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+mkdir -p dep/src
+printf '[package]\nname = "dep"\nversion = "0.1.0"\nedition = "2021"\n[dependencies]\n{name} = "={version}"\n' > dep/Cargo.toml
+echo 'fn main() {{ println!("dep-ran"); }}' > dep/src/main.rs
+cd dep
+cargo build --offline 2>&1
+./target/debug/dep
+"#
+        );
+        let result = rig
+            .runner
+            .execute_task(&rig.task(&script, &[("PATH", &path)], 300), None, None)
+            .await;
+        assert!(
+            result.is_success(),
+            "{name} {version}: {:?}\n{}\n{}",
+            result.error,
+            result.stdout_str(),
+            result.stderr_str()
+        );
+        assert!(result.stdout_str().contains("dep-ran"));
+    }
+
+    /// The task leader is the tracked PID (the hook runs in it, there is no wrapper), and
+    /// cancellation and the timeout still take the whole tree down, with the leader inside its
+    /// user and network namespaces too.
+    #[tokio::test]
+    async fn test_tracked_pid_is_the_task_and_cancel_and_timeout_still_kill_it() {
+        require_landlock!();
+        fn comm_of(pid: u32) -> String {
+            std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        }
+        fn alive(pid: u32) -> bool {
+            unsafe { libc::kill(pid as i32, 0) == 0 }
+        }
+
+        let rig = Arc::new(Rig::new(IsolationLevel::Fs, false));
+        let pid = Arc::new(AtomicU32::new(0));
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<String>();
+        let handle = {
+            let (rig, pid) = (Arc::clone(&rig), Arc::clone(&pid));
+            tokio::spawn(async move {
+                let task = rig.task("exec sleep 120", &[], 120);
+                rig.runner
+                    .execute_task(&task, Some(pid), Some(cancel_rx))
+                    .await
+            })
+        };
+        let tracked = wait_for_pid(&pid).await;
+        let mut name = comm_of(tracked);
+        for _ in 0..100 {
+            if name == "sleep" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            name = comm_of(tracked);
+        }
+        assert_eq!(name, "sleep", "the tracked PID must become the task itself");
+        cancel_tx.send("test".into()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(20), handle)
+            .await
+            .expect("cancellation finishes the task")
+            .unwrap();
+        assert_eq!(result.exit_code, EXIT_CODE_CANCELLED, "{:?}", result.error);
+        assert!(wait_dead(tracked).await, "the cancelled task is gone");
+        assert!(!alive(tracked));
+
+        // Timeout, with a grandchild that must go down with the group.
+        for level in LEVELS {
+            let rig = Rig::new(level, false);
+            let pid = Arc::new(AtomicU32::new(0));
+            let task = rig.task(
+                "sleep 120 & echo $! > \"$RUSTY_GRID_SANDBOX_DIR/child.pid\"; wait",
+                &[],
+                2,
+            );
+            let started = std::time::Instant::now();
+            let result = rig
+                .runner
+                .execute_task(&task, Some(Arc::clone(&pid)), None)
+                .await;
+            assert_eq!(
+                result.exit_code, EXIT_CODE_TIMEOUT,
+                "{level}: {:?}",
+                result.error
+            );
+            assert!(started.elapsed() < Duration::from_secs(30));
+            let tracked = pid.load(Ordering::Acquire);
+            assert!(tracked > 1);
+            assert!(
+                wait_dead(tracked).await,
+                "{level}: the timed-out task is gone"
+            );
+        }
+    }
+
+    async fn wait_for_pid(pid: &AtomicU32) -> u32 {
+        for _ in 0..200 {
+            let v = pid.load(Ordering::Acquire);
+            if v > 1 {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the runner never reported a child PID");
+    }
+
+    async fn wait_dead(pid: u32) -> bool {
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn test_self_check_accepts_both_levels_on_linux() {
+        require_landlock!();
+        let base = tempfile::tempdir().unwrap();
+        for level in [
+            IsolationLevel::Off,
+            IsolationLevel::Fs,
+            IsolationLevel::FsNet,
+        ] {
+            verify_isolation_support(level, base.path())
+                .await
+                .unwrap_or_else(|e| panic!("{level}: {e}"));
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(base.path()).unwrap().collect();
+        assert!(leftovers.is_empty(), "the probe cleans up after itself");
+    }
+
+    #[tokio::test]
+    async fn test_a_missing_program_fails_the_task_with_a_clear_message() {
+        require_landlock!();
+        let rig = Rig::new(IsolationLevel::Fs, false);
+        let task = Task::new(
+            TaskSpec::command("no-such-program-feat3", vec![]),
+            TaskRequirements::generic(1, 30),
+        );
+        let result = rig.runner.execute_task(&task, None, None).await;
+        assert!(!result.is_success());
+        assert!(
+            result.stderr_str().contains("no-such-program-feat3")
+                && result.stderr_str().contains("not found"),
+            "{}",
+            result.stderr_str()
+        );
+    }
+}
+
 #[cfg(windows)]
 mod windows {
     use super::*;
+
+    /// Verifies that Windows AppContainer isolation (`userenv.dll` + capability SIDs) is
+    /// supported on this host, or returns `false` (after a notice) when unavailable and the
+    /// environment does not demand it (`RUSTY_GRID_REQUIRE_APPCONTAINER`).
+    fn appcontainer_available() -> bool {
+        match rusty_grid_worker::isolation::windows::OwnedSid::oxideswarm_toolchain() {
+            Ok(_) => true,
+            Err(e) => {
+                assert!(
+                    std::env::var_os("RUSTY_GRID_REQUIRE_APPCONTAINER").is_none(),
+                    "AppContainer is required here (RUSTY_GRID_REQUIRE_APPCONTAINER) but unavailable: {e}"
+                );
+                eprintln!("skipped: no AppContainer on this Windows host ({e})");
+                false
+            }
+        }
+    }
+
+    macro_rules! require_appcontainer {
+        () => {
+            if !appcontainer_available() {
+                return;
+            }
+        };
+    }
+
+    /// An early return of a test whose precondition is missing: a failure when CI demands the
+    /// Windows tests (`RUSTY_GRID_REQUIRE_APPCONTAINER`), a notice otherwise.
+    fn cannot_run(why: &str) {
+        assert!(
+            std::env::var_os("RUSTY_GRID_REQUIRE_APPCONTAINER").is_none(),
+            "required here (RUSTY_GRID_REQUIRE_APPCONTAINER) but cannot run: {why}"
+        );
+        eprintln!("skipped: {why}");
+    }
 
     fn win_task(rig: &Rig, script: &str, extra_env: &[(&str, &str)], timeout_secs: u64) -> Task {
         let mut env = rig.env();
@@ -1082,6 +2171,7 @@ try { Set-Content -LiteralPath "$env:T_OUTSIDE\feat3_outside_marker" -Value 'x' 
 
     #[tokio::test]
     async fn test_fs_confines_a_task_to_its_sandbox() {
+        require_appcontainer!();
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             let rig = Rig::new(level, false);
             let result = rig.runner.execute_task(&run_win_fs(&rig), None, None).await;
@@ -1503,7 +2593,9 @@ try {
         match lan_udp_listener.recv_from(&mut udp_buf) {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             other => {
-                panic!("non-loopback UDP listener must see no datagram from an fs+net task: {other:?}")
+                panic!(
+                    "non-loopback UDP listener must see no datagram from an fs+net task: {other:?}"
+                )
             }
         }
         assert!(
@@ -1518,7 +2610,9 @@ try {
         );
         assert!(
             !fsnet_lines.contains(&"IPV6_OUTBOUND_ALLOWED".to_string())
-                && !fsnet_lines.iter().any(|l| l.starts_with("IPV6_OUTBOUND_OTHER")),
+                && !fsnet_lines
+                    .iter()
+                    .any(|l| l.starts_with("IPV6_OUTBOUND_OTHER")),
             "fs+net must refuse IPv6 outbound with WSAEACCES (10013), not OTHER: {:?}",
             fsnet_lines
         );
@@ -1620,11 +2714,16 @@ try {
                                     })
                                     .collect();
                                 candidates.sort();
-                                if let Some(found) = candidates.into_iter().find(|p| {
-                                    p.file_name().and_then(|n| n.to_str()).is_some_and(|s| {
-                                        s.starts_with("1.96") || s.starts_with("stable")
+                                if let Some(found) = candidates
+                                    .iter()
+                                    .find(|p| {
+                                        p.file_name().and_then(|n| n.to_str()).is_some_and(|s| {
+                                            s.starts_with("1.96") || s.starts_with("stable")
+                                        })
                                     })
-                                }) {
+                                    .cloned()
+                                    .or_else(|| candidates.into_iter().next())
+                                {
                                     return found;
                                 }
                             }
@@ -1633,6 +2732,19 @@ try {
                 }
             }
         }
+        if let Ok(out) = std::process::Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()
+        {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let p = PathBuf::from(s);
+                if p.join("bin/cargo.exe").is_file() && p.join("bin/rustc.exe").is_file() {
+                    return p;
+                }
+            }
+        }
+        cannot_run("could not locate host Rust sysroot from PATH or rustc --print sysroot");
         panic!("could not locate host Rust sysroot from PATH for staging temporary toolchain");
     }
 
@@ -2738,7 +3850,9 @@ try { Write-Output (Get-Content -LiteralPath $env:T_B -Raw -ErrorAction Stop) } 
         .await
         .expect_err("must refuse protected file readable by S-1-15-2-1");
         assert!(
-            err_leaked.to_string().contains("leaked_by_s_1_15_2_1.secret")
+            err_leaked
+                .to_string()
+                .contains("leaked_by_s_1_15_2_1.secret")
                 && err_leaked.to_string().contains("S-1-15-2-1"),
             "unexpected error for S-1-15-2-1 secret: {err_leaked}"
         );
@@ -3342,7 +4456,11 @@ try {
         .expect("prepare_worker_toolchains");
 
         let manifest = rusty_grid_worker::isolation::windows::acl_grant_manifest_path(&rig.host);
-        assert!(manifest.is_file(), "manifest must exist at {}", manifest.display());
+        assert!(
+            manifest.is_file(),
+            "manifest must exist at {}",
+            manifest.display()
+        );
         let manifest_text = std::fs::read_to_string(&manifest).expect("read manifest");
         let mut expected_paths = Vec::new();
         let mut expected_sddl_paths = Vec::new();
@@ -3419,9 +4537,9 @@ try {
     }
 }
 
-/// Where there is no implementation yet (FEAT-3b: Linux) isolation is refused
+/// Where there is no implementation on an unsupported OS, isolation is refused
 /// at start-up, and a task is refused instead of running unsandboxed.
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 mod unimplemented_platform {
     use super::*;
 

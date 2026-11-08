@@ -141,6 +141,11 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    env:
+      # Design 0033 (FEAT-3b / FEAT-3c): on Linux and Windows the isolation tests fail, instead of
+      # skipping, when the runner lacks Landlock or AppContainer / required host preconditions.
+      RUSTY_GRID_REQUIRE_LANDLOCK: "1"
+      RUSTY_GRID_REQUIRE_APPCONTAINER: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
@@ -156,6 +161,14 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
           cache-on-failure: true
       - run: cargo test --workspace --locked --no-fail-fast
+      # Design 0033 (FEAT-3b): the workspace run above is the restricted-userns case of
+      # `ubuntu-latest` (AppArmor lets `unshare` succeed without capabilities); this run has the
+      # restriction off, so the private network namespace and its id map are exercised too.
+      - name: isolation tests with unprivileged user namespaces allowed
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          RUSTY_GRID_REQUIRE_USERNS=1 cargo test -p rusty_grid_worker --test test_feat3_os_isolation --locked -- --nocapture
 
   sec5-hardened-runner:
     name: sec5 hardened runner (${{ matrix.os }})
