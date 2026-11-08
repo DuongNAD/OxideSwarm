@@ -37,8 +37,9 @@ use rusty_grid_master::queue::{RetryPolicy, TaskQueue, TaskState};
 use rusty_grid_master::reaper::ReaperConfig;
 use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::scheduler::SchedulerConfig;
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
+use rusty_grid_worker::process_tree::ProcessPriority;
 
 /// Polls `condition` every `step` until true or `timeout` elapses.
 async fn wait_for<F, Fut>(timeout: Duration, step: Duration, mut condition: F) -> bool
@@ -71,6 +72,20 @@ impl SpawnedWorker {
     }
 }
 
+/// Spawns a test MasterServer with `max_host_cpu_pct: 100.0` and a fast 20ms scheduler tick so
+/// the anti-stuttering host CPU backpressure gate (`85%` default) does not starve failover
+/// scheduling when the CI runner's cores are saturated by parallel tests.
+async fn spawn_test_master(server_cfg: ServerConfig) -> MasterHandle {
+    let sched_cfg = SchedulerConfig {
+        tick_interval: Duration::from_millis(20),
+        max_host_cpu_pct: 100.0,
+        ..Default::default()
+    };
+    MasterServer::spawn_with_config(server_cfg, sched_cfg, ReaperConfig::default())
+        .await
+        .expect("MasterServer::spawn_with_config failed")
+}
+
 /// Spawns a worker client with an isolated sandbox directory and returns its controller.
 fn spawn_test_worker(
     master_addr: String,
@@ -81,6 +96,11 @@ fn spawn_test_worker(
     let temp_dir = tempfile::tempdir().expect("failed to create worker tempdir");
     let cfg = WorkerConfig::new(master_addr)
         .with_no_battery(true)
+        .with_no_gpu(!simulate_gpu)
+        .with_no_blender(true)
+        .with_no_cuda(true)
+        .with_redirection_portal(false)
+        .with_process_priority(ProcessPriority::Normal)
         .with_name(name)
         .with_cores(cores)
         .with_simulate_gpu(simulate_gpu)
@@ -116,9 +136,7 @@ fn spawn_test_worker(
 /// to surviving workers, and complete successfully.
 #[tokio::test]
 async fn test_adversarial_worker_disconnect_multi_tasks_in_flight() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap())).await;
     let master_addr = master.server_addr().to_string();
 
     let w1 = spawn_test_worker(master_addr.clone(), "worker-chaos-1", 2, false);
@@ -277,9 +295,7 @@ async fn test_adversarial_worker_disconnect_multi_tasks_in_flight() {
 /// Verifies autonomous progression across 3 retries (retry_count == 3) ending in Completed.
 #[tokio::test]
 async fn test_adversarial_cascading_worker_disconnects_failover() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap())).await;
     let master_addr = master.server_addr().to_string();
 
     let task = Task::new(
@@ -428,9 +444,7 @@ async fn test_adversarial_cascading_worker_disconnects_failover() {
 /// Uses a raw TCP mock worker that drops socket immediately upon receiving AssignTask.
 #[tokio::test]
 async fn test_adversarial_disconnect_while_scheduled_pre_running() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap())).await;
     let master_addr = master.server_addr();
 
     // 1. Connect a raw TCP mock worker
@@ -525,9 +539,7 @@ async fn test_adversarial_disconnect_while_scheduled_pre_running() {
 ///    TaskQueue does not persist the cancellation TaskResult for queued tasks.
 #[tokio::test]
 async fn test_adversarial_cancel_queued_pre_dispatch() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("spawn failed");
+    let master = spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap())).await;
     let master_addr = master.server_addr().to_string();
 
     // Submit two tasks while ZERO workers are connected
@@ -629,6 +641,8 @@ async fn test_adversarial_cancel_queued_pre_dispatch() {
 #[tokio::test]
 async fn test_adversarial_cancel_worker_queued_concurrency_throttle() {
     let sched_cfg = SchedulerConfig {
+        tick_interval: Duration::from_millis(20),
+        max_host_cpu_pct: 100.0,
         core_concurrency_multiplier: 2.0,
         ..Default::default()
     };
@@ -744,9 +758,7 @@ async fn test_adversarial_cancel_worker_queued_concurrency_throttle() {
 /// and verifies worker immediately accepts and executes a follow-up task.
 #[tokio::test]
 async fn test_adversarial_cancel_mid_execution_and_permit_reuse() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("spawn failed");
+    let master = spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap())).await;
     let master_addr = master.server_addr().to_string();
 
     let w = spawn_test_worker(master_addr, "worker-cancel-running", 2, false);
@@ -840,9 +852,7 @@ async fn test_adversarial_cancel_mid_execution_and_permit_reuse() {
 /// Verifies every task terminates cleanly in Cancelled (130) or Completed (0), with zero deadlocks.
 #[tokio::test]
 async fn test_adversarial_rapid_concurrent_cancellations_storm() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("spawn failed");
+    let master = spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap())).await;
     let master_addr = master.server_addr().to_string();
 
     let w1 = spawn_test_worker(master_addr.clone(), "storm-w1", 2, false);
@@ -951,11 +961,9 @@ async fn test_adversarial_rapid_concurrent_cancellations_storm() {
 #[tokio::test]
 async fn test_adversarial_max_retries_exhaustion_via_worker_disconnects() {
     // Failovers are budgeted separately from max_retries; pin the failover cap to the old limit (3).
-    let master = MasterServer::spawn(
-        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_failovers(3),
-    )
-    .await
-    .expect("MasterServer::spawn failed");
+    let master =
+        spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_failovers(3))
+            .await;
     let master_addr = master.server_addr().to_string();
 
     let task = Task::new(
@@ -1253,11 +1261,9 @@ async fn test_adversarial_retry_exhaustion_on_execution_failure() {
 #[tokio::test]
 async fn test_adversarial_bug_wait_task_hangs_after_max_retries_exhaustion() {
     // Failovers are budgeted separately from max_retries; pin the failover cap to the old limit (3).
-    let master = MasterServer::spawn(
-        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_failovers(3),
-    )
-    .await
-    .expect("spawn failed");
+    let master =
+        spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_failovers(3))
+            .await;
     let master_addr = master.server_addr().to_string();
 
     let task = Task::new(
