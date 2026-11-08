@@ -144,6 +144,7 @@ design record that builds nothing.
 | SEC-5 | Run Python and Blender through the hardened runner | P0 | M | INT-4 |  | Implemented | 17 |
 | SEC-6 | Restrict Agent Mesh node commands | P0 | M | INT-4 |  | Implemented | 25 |
 | SEC-7 | Correct public route claims and redact the lease | P1 | S | INT-4 |  | Implemented | 12 |
+| SEC-9 | Private files on Windows | P1 | S | INT-4 |  | Implemented | PRNUM |
 | BUG-1 | Stop hard-linking the staging cache | P0 | S | INT-4 |  | Implemented | 16 |
 | BUG-2 | Fail a task when a declared output is missing | P0 | S | INT-4 |  | Implemented | 20 |
 | BUG-3 | Fix the default 3D submit | P0 | S | INT-4 |  | Implemented | 21, 44 |
@@ -474,6 +475,21 @@ These items remove ways to lose data or to run code without authorisation.
 - **Do:** Remove the ticket from unauthenticated reads. List every public route in
   `docs/SECURITY.md`.
 - **Done when:** A test asserts that the anonymous lease response has no ticket.
+
+### SEC-9: Private files on Windows
+
+- **Evidence:** Read; the ACL as reported from the owner's Windows machine. `C:\Users\<name>` grants
+  `Everyone:(RX)` and `BUILTIN\Users:(RX)` with inheritance.
+- **Problem:** On Unix the cluster secret and `master_key.bin` are created with mode 0600 and
+  `ClusterSecret::load_file` warns about a wider mode. On Windows the files inherit the DACL of their
+  directory, so every local account can read the secret and the master identity, and nothing warns.
+- **Do:** Create each private file (cluster secret, master key, ticket file) and the
+  `~\.oxideswarm` directory with a protected DACL for the current user, `SYSTEM` and
+  `Administrators`, applied by `CreateFileW` at creation. Warn at load, with the `icacls` fix, when
+  the DACL grants anyone else. Design 0047.
+- **Done when:** A Windows test creates a private file under a parent that grants `Everyone` read
+  and reads back a protected DACL with exactly the three allowed SIDs. A pure test covers the
+  warning check.
 
 ### BUG-1: Stop hard-linking the staging cache
 
