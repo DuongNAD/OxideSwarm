@@ -1297,34 +1297,32 @@ async fn test_mcp_server_workspace_submission_and_workspaces_tool() {
         .await
         .expect("connect workspace worker");
     let mut worker_transport = MessageTransport::new(stream);
-    client_handshake(
-        &mut worker_transport,
-        &cluster.secret,
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("workspace worker handshake");
+    let session_key = client_handshake(&mut worker_transport, &cluster.secret)
+        .await
+        .expect("workspace worker handshake");
+    worker_transport.enable_encryption(
+        &session_key,
+        rusty_grid_core::protocol::EndpointRole::Client,
+    );
 
-    let mut caps = WorkerCapabilities::new("ws-worker-e2e", 4, 4096, false);
+    let mut caps = WorkerCapabilities::new("ws-worker-e2e", 4, 4096, false, false, None);
     caps.tags = vec!["os:macos".to_string(), "arch:aarch64".to_string()];
     worker_transport
         .send_msg(&WorkerMessage::Register {
             worker_id: ws_worker_id,
             capabilities: caps,
             protocol_version: PROTOCOL_VERSION_CURRENT,
-            supported_features: ProtocolCapabilities::all_supported()
-                | ProtocolCapabilities::WORKSPACES,
-            running_tasks: Vec::new(),
+            features: ProtocolCapabilities::all_supported() | ProtocolCapabilities::WORKSPACES,
         })
         .await
         .expect("send Register");
     match worker_transport
         .recv_msg::<MasterMessage>()
         .await
-        .expect("recv Registered")
+        .expect("recv RegisterAck")
     {
-        Some(MasterMessage::Registered { .. }) => {}
-        other => panic!("expected MasterMessage::Registered, got {other:?}"),
+        Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+        other => panic!("expected MasterMessage::RegisterAck, got {other:?}"),
     }
 
     let assigned_tasks: Arc<Mutex<Vec<rusty_grid_core::task::Task>>> =
@@ -1343,7 +1341,7 @@ async fn test_mcp_server_workspace_submission_and_workspaces_tool() {
                     TaskSpec::Command { working_dir, .. } => working_dir.clone(),
                     _ => None,
                 };
-                assigned_tasks_clone.lock().await.push(*task);
+                assigned_tasks_clone.lock().await.push(task);
                 let stdout = format!("ws={ws_name} cwd={cwd:?}\n").into_bytes();
                 let _ = worker_transport
                     .send_msg(&WorkerMessage::TaskResult {
