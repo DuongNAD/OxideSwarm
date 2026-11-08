@@ -5256,5 +5256,31 @@ mod tests {
                 }
             }
         }
+
+        // Unversioned JSON Register and RegisterAck also default to protocol_version = 2 and fail
+        // `is_protocol_version_compatible`.
+        let raw_json_register = br#"{"type":"Register","worker_id":"00000000-0000-0000-0000-000000000001","capabilities":{"name":"w","cpu_cores":2,"ram_mb":1024,"has_gpu":false,"is_simulated_gpu":false,"tags":[]}}"#;
+        let (decoded_reg, _) = deserialize_message::<WorkerMessage>(raw_json_register).unwrap();
+        match decoded_reg {
+            WorkerMessage::Register {
+                protocol_version, ..
+            } => {
+                assert_eq!(protocol_version, LEGACY_UNVERSIONED_PROTOCOL_VERSION);
+                assert!(!is_protocol_version_compatible(protocol_version));
+            }
+            other => panic!("expected WorkerMessage::Register, got {other:?}"),
+        }
+
+        let raw_json_ack = br#"{"type":"RegisterAck","accepted":true,"worker_id":"00000000-0000-0000-0000-000000000001","heartbeat_interval_secs":5}"#;
+        let (decoded_ack, _) = deserialize_message::<MasterMessage>(raw_json_ack).unwrap();
+        match decoded_ack {
+            MasterMessage::RegisterAck {
+                protocol_version, ..
+            } => {
+                assert_eq!(protocol_version, LEGACY_UNVERSIONED_PROTOCOL_VERSION);
+                assert!(!is_protocol_version_compatible(protocol_version));
+            }
+            other => panic!("expected MasterMessage::RegisterAck, got {other:?}"),
+        }
     }
 }
