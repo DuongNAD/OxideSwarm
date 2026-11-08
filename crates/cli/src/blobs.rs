@@ -27,11 +27,13 @@ use rusty_grid_core::blob::{
 };
 use rusty_grid_core::blob_transfer::{
     download_blob, for_each_concurrently, missing_blobs, upload_blob, BlobChannel, BlobError,
-    BlobReply, BlobRequest,
+    BlobReply, BlobRequest, MAX_IN_FLIGHT_REQUESTS,
 };
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::error::GridResult;
-use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
+use rusty_grid_core::protocol::{
+    ClientMessage, ClientResponse, MessageReader, MessageTransport, MessageWriter,
+};
 
 use crate::connect::connect_master;
 
@@ -629,16 +631,111 @@ pub fn scan_workspace_source(
     })
 }
 
-/// A connection to the Master used only for blob requests. Requests are answered in order, one
-/// at a time.
+/// What a caller of [`BlobConnection::call`] waits on.
+type ReplySlot = tokio::sync::oneshot::Sender<Result<BlobReply, BlobError>>;
+
+/// State shared by the senders and the reader task of a [`BlobConnection`].
+#[derive(Default)]
+struct Pipeline {
+    /// One slot per request sent and not yet answered, oldest first. The Master answers the
+    /// requests of one connection in the order it received them, so the n-th reply belongs to
+    /// the n-th slot. A slot is pushed under the writer lock, in the order the frames are written.
+    waiting: std::collections::VecDeque<ReplySlot>,
+    /// Set once the connection is unusable (closed, protocol error, or a send that did not
+    /// finish): every later call fails with it.
+    broken: Option<String>,
+}
+
+impl Pipeline {
+    /// Marks the connection broken and fails everything still waiting.
+    fn break_with(&mut self, reason: String) {
+        for slot in self.waiting.drain(..) {
+            let _ = slot.send(Err(BlobError::Transport(reason.clone())));
+        }
+        self.broken.get_or_insert(reason);
+    }
+}
+
+type SharedPipeline = std::sync::Arc<std::sync::Mutex<Pipeline>>;
+
+fn lock_pipeline(p: &SharedPipeline) -> std::sync::MutexGuard<'_, Pipeline> {
+    p.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A connection to the Master used only for blob requests. Up to [`MAX_IN_FLIGHT_REQUESTS`]
+/// requests are in flight at the same time: they are written back to back and a reader task hands
+/// each reply, in arrival order, to the oldest waiting call. Nothing else is needed to match
+/// them, because the Master answers the requests of one connection in order (it reads one
+/// request, answers it, then reads the next; a client that sends faster is held back by the
+/// socket buffers, so the Master never queues more than it is reading).
 pub struct BlobConnection {
-    transport: Mutex<MessageTransport<TcpStream>>,
+    writer: Mutex<MessageWriter<tokio::io::WriteHalf<TcpStream>>>,
+    pipeline: SharedPipeline,
+    permits: tokio::sync::Semaphore,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for BlobConnection {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+/// What a master that predates blob transfer does with a `BlobRequest`: it cannot decode it and
+/// drops the connection.
+const OLD_MASTER_HINT: &str = "if the master runs an older version, restart it with this one \
+     (it cannot move files and closes the connection)";
+
+/// Reads replies and completes the oldest waiting call with each, until the connection ends.
+async fn run_blob_reader(
+    mut reader: MessageReader<tokio::io::ReadHalf<TcpStream>>,
+    pipeline: SharedPipeline,
+) {
+    loop {
+        let received = reader.recv_msg::<ClientResponse>().await;
+        let mut p = lock_pipeline(&pipeline);
+        let outcome = match received {
+            Ok(Some(ClientResponse::BlobReply { reply })) => Ok(reply),
+            Ok(Some(ClientResponse::Error { message })) => Err(BlobError::Refused(message)),
+            Ok(Some(other)) => {
+                p.break_with(format!("unexpected answer from the master: {other:?}"));
+                return;
+            }
+            Ok(None) => {
+                p.break_with(format!(
+                    "the master closed the connection; {OLD_MASTER_HINT}"
+                ));
+                return;
+            }
+            Err(e) => {
+                p.break_with(format!(
+                    "reading from the master failed: {e}; {OLD_MASTER_HINT}"
+                ));
+                return;
+            }
+        };
+        match p.waiting.pop_front() {
+            Some(slot) => {
+                let _ = slot.send(outcome);
+            }
+            None => {
+                p.break_with("the master sent an answer nobody asked for".to_string());
+                return;
+            }
+        }
+    }
 }
 
 impl BlobConnection {
     pub fn new(transport: MessageTransport<TcpStream>) -> Self {
+        let (writer, reader) = transport.split();
+        let pipeline = SharedPipeline::default();
+        let reader = tokio::spawn(run_blob_reader(reader, std::sync::Arc::clone(&pipeline)));
         Self {
-            transport: Mutex::new(transport),
+            writer: Mutex::new(writer),
+            pipeline,
+            permits: tokio::sync::Semaphore::new(MAX_IN_FLIGHT_REQUESTS),
+            reader,
         }
     }
 
@@ -648,30 +745,58 @@ impl BlobConnection {
     }
 }
 
-/// What a master that predates blob transfer does with a `BlobRequest`: it cannot decode it and
-/// drops the connection.
-const OLD_MASTER_HINT: &str = "if the master runs an older version, restart it with this one \
-     (it cannot move files and closes the connection)";
+/// Breaks the connection when a send is abandoned half way (the calling future was dropped):
+/// the Master would otherwise see a torn frame or the pipeline would lose track of its slots.
+struct SendGuard<'a> {
+    pipeline: &'a SharedPipeline,
+    armed: bool,
+}
+
+impl Drop for SendGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            lock_pipeline(self.pipeline)
+                .break_with("a blob request was abandoned while it was being sent".to_string());
+        }
+    }
+}
 
 impl BlobChannel for BlobConnection {
     async fn call(&self, request: BlobRequest) -> Result<BlobReply, BlobError> {
-        let mut transport = self.transport.lock().await;
-        transport
-            .send_msg(&ClientMessage::BlobRequest { request })
+        let _permit = self
+            .permits
+            .acquire()
             .await
-            .map_err(|e| BlobError::Transport(format!("sending to the master failed: {e}")))?;
-        match transport.recv_msg::<ClientResponse>().await {
-            Ok(Some(ClientResponse::BlobReply { reply })) => Ok(reply),
-            Ok(Some(ClientResponse::Error { message })) => Err(BlobError::Refused(message)),
-            Ok(Some(other)) => Err(BlobError::Transport(format!(
-                "unexpected answer from the master: {other:?}"
-            ))),
-            Ok(None) => Err(BlobError::Transport(format!(
-                "the master closed the connection; {OLD_MASTER_HINT}"
-            ))),
-            Err(e) => Err(BlobError::Transport(format!(
-                "reading from the master failed: {e}; {OLD_MASTER_HINT}"
-            ))),
+            .map_err(|_| BlobError::Transport("the blob connection is closed".to_string()))?;
+        let (slot, answer) = tokio::sync::oneshot::channel();
+        {
+            let mut writer = self.writer.lock().await;
+            {
+                let mut p = lock_pipeline(&self.pipeline);
+                if let Some(reason) = &p.broken {
+                    return Err(BlobError::Transport(reason.clone()));
+                }
+                p.waiting.push_back(slot);
+            }
+            let mut guard = SendGuard {
+                pipeline: &self.pipeline,
+                armed: true,
+            };
+            let sent = writer
+                .send_msg(&ClientMessage::BlobRequest { request })
+                .await;
+            guard.armed = false;
+            if let Err(e) = sent {
+                let reason = format!("sending to the master failed: {e}");
+                lock_pipeline(&self.pipeline).break_with(reason.clone());
+                return Err(BlobError::Transport(reason));
+            }
+        }
+        match answer.await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(BlobError::Transport(
+                "the blob connection ended before the master answered".to_string(),
+            )),
         }
     }
 }

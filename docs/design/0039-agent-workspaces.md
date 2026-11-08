@@ -318,7 +318,7 @@ Roadmap Phase C names these steps WS-1 to WS-7. The column "Roadmap" maps them.
 | W6 | End-to-end test | `tests/agent_workspace_e2e.rs`, `crates/cli/Cargo.toml` | The integration test of the test plan passes on Linux, macOS and Windows in CI | Planned |
 | W7 | P2P for clients, the MCP server and blob connections. Roadmap WS-3 | `crates/core/src/transport.rs`, `crates/cli/src/connect.rs`, `crates/cli/src/mcp.rs`, `crates/cli/src/blobs.rs`, `crates/master/src/server.rs` | A test submits a task and downloads its output through a ticket, and a client without a secret is refused | Planned |
 | W8 | Tool probes, `require:tool=`, and `cargo build --offline` in `RustCompilation`. Roadmap WS-4, FEAT-10 | `crates/core/src/capabilities.rs`, `crates/core/src/placement.rs`, `crates/worker/src/runner.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs` | The FEAT-10 "Done when" passes, and a `require:tool=cargo` task avoids a worker without cargo | Planned |
-| W9 | Several blob uploads in flight from one client. Roadmap WS-6 | `crates/cli/src/blobs.rs`, `crates/core/src/blob_transfer.rs` | A test with 10,000 small files sees more than one request in flight, and `blob_transfer_e2e` passes | Planned |
+| W9 | Several blob uploads in flight from one client. Roadmap WS-6 | `crates/cli/src/blobs.rs`, `crates/core/src/blob_transfer.rs` | A test with 10,000 small files sees more than one request in flight, and `blob_transfer_e2e` passes | Done |
 | W10 | Guide and live record. Roadmap WS-7 | `docs/guides/offload-cargo-test.md`, `docs/README.md` | The live run of the test plan is recorded with its date, and the guide follows the guide template | Planned |
 | W11 | Symbolic links and empty directories in manifests (`oxideswarm-tree/2`). Optional | `crates/core/src/blob.rs`, `crates/worker/src/workspace.rs`, `crates/cli/src/blobs.rs` | A link inside the tree arrives as a link, and a link that leaves the tree is refused | Planned |
 
@@ -352,3 +352,20 @@ off by default until FEAT-3 is Implemented.
   inside the root (no parent directories, no global excludes), so the result does not depend on the
   machine. The CLI flags `--workspace-max-files` and `--workspace-max-mb` and the existing `--input
   <dir>` are unchanged; W5 wires them.
+- 2026-11-09: W9 done, no wire change. `BlobConnection` (`crates/cli/src/blobs.rs`) now writes
+  requests back to back and a reader task hands each reply to the oldest waiting call; replies are
+  matched by position, which is sound because the master answers the requests of one connection in
+  arrival order (design 0006 D3). The client keeps at most `MAX_IN_FLIGHT_REQUESTS` (16) requests
+  in flight, and `TRANSFER_CONCURRENCY` (8) blobs move at the same time, so 8 were in flight in the
+  test. On the master, `handle_client_connection` now runs up to `MAX_IN_FLIGHT_REQUESTS` blob
+  requests of one connection at the same time (different blobs overlap their disk work), sends the
+  replies in request order, answers any other message only after the pending blob replies, and
+  stops reading while 16 are pending, so a client that floods requests is held back by the socket
+  buffers. Two chunks of the same blob must still be sent one after the other, which `upload_blob`
+  does. A new client works with an older master (it answers one request at a time) and an older
+  client with this master. Measured on one machine (macOS, release build, loopback, 10,000 files
+  of about 20 bytes): 42.6 s with one request in flight, 29.6 s with up to 8. The master's
+  per-blob `sync_all` bounds the gain on loopback; the larger win is a link with real latency.
+  Compression is left out: design 0006 and the non-goals above keep it out of scope, and this
+  record does not change that. The existence check stays one `Missing` request per 65,536 ids, so
+  10,000 files need one.
