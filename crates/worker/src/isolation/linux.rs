@@ -1039,7 +1039,7 @@ mod tests {
         let prog = build_filter(&X86_64, IsolationLevel::FsNet);
         assert!(prog.len() < 40, "{}", prog.len());
         assert_eq!(prog.last().unwrap().code, BPF_RET_K);
-        let aarch = build_filter(&AARCH64, IsolationLevel::Fs);
+        let aarch = build_filter(&AARCH64, IsolationLevel::FsNet);
         assert!(aarch.len() < prog.len(), "no x32 guard on aarch64");
     }
 
