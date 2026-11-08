@@ -490,6 +490,20 @@ impl TaskStore {
         self.shared.journal_bytes.load(Ordering::Relaxed)
     }
 
+    /// Returns the error reason if the store writer has failed since [`TaskStore::open`], or
+    /// `None` while durability is healthy. Once set, durability is gone until the master restarts.
+    pub fn failure_reason(&self) -> Option<String> {
+        self.shared.failed.lock().unwrap().clone()
+    }
+
+    #[doc(hidden)]
+    pub fn record_failure_for_test(&self, reason: impl Into<String>) {
+        let mut slot = self.shared.failed.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(reason.into());
+        }
+    }
+
     /// Injects a sync failure (`1`) or writer panic (`2`) for fault-injection tests.
     #[cfg(test)]
     pub(crate) fn set_inject(&self, mode: u8) {

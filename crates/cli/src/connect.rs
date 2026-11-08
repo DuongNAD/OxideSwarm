@@ -649,6 +649,7 @@ mod tests {
                                 failed_tasks: 0,
                                 active_bytes: 0,
                                 max_active_bytes: 0,
+                                store_error: None,
                                 workers: vec![],
                             })
                             .await;

@@ -3190,6 +3190,7 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                     failed_tasks: failed,
                     active_bytes: stats.active_bytes,
                     max_active_bytes: stats.max_active_bytes,
+                    store_error: stats.store_error,
                     workers,
                 };
                 send_client_response(&mut transport, &resp).await?;
@@ -7227,5 +7228,253 @@ mod tests {
             );
             h2.shutdown().unwrap();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rvb_submit_in_flight_during_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path().join("s");
+        let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(false)
+            .with_discovery(false)
+            .with_state_dir(&sd);
+        let h = MasterServer::spawn(cfg).await.unwrap();
+        let mut ids = Vec::new();
+        let mut js = Vec::new();
+        for i in 0..200 {
+            let t = Task::new(
+                rusty_grid_core::TaskSpec::command("echo", vec![format!("f{i}")]),
+                rusty_grid_core::TaskRequirements::generic(1, 10),
+            );
+            ids.push(t.id);
+            let h2 = h.clone();
+            js.push(tokio::spawn(async move { h2.submit_task(t).await }));
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        h.shutdown().unwrap();
+        let mut oks = std::collections::HashSet::new();
+        for (i, j) in js.into_iter().enumerate() {
+            if j.await.unwrap().is_ok() {
+                oks.insert(ids[i]);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let cfg2 = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(false)
+            .with_discovery(false)
+            .with_state_dir(&sd);
+        let h2 = MasterServer::spawn(cfg2).await.unwrap();
+        let mut lost = 0;
+        for id in &oks {
+            if h2.queue().get_state(id).await.is_none() {
+                lost += 1;
+            }
+        }
+        h2.shutdown().unwrap();
+        assert_eq!(lost, 0, "acknowledged submissions must survive shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rvb_hundred_results_one_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path().join("s");
+        let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(false)
+            .with_discovery(false)
+            .with_state_dir(&sd);
+        let h = MasterServer::spawn(cfg).await.unwrap();
+        let w = Uuid::new_v4();
+        let (tx, _rx) = tokio::sync::mpsc::channel(512);
+        let sid = h
+            .registry()
+            .register(
+                w,
+                WorkerCapabilities::new("w", 128, 65536, false, false, None),
+                "127.0.0.1:9997".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        let mut rxs = Vec::new();
+        for i in 0..100 {
+            let t = Task::new(
+                rusty_grid_core::TaskSpec::command("echo", vec![format!("r{i}")]),
+                rusty_grid_core::TaskRequirements::generic(1, 10),
+            );
+            let id = h.submit_task(t).await.unwrap();
+            let (a, b) = tokio::sync::oneshot::channel();
+            h.waiters.write().await.entry(id).or_default().push(a);
+            ids.push(id);
+            rxs.push(b);
+        }
+        let assign: Vec<_> = ids.iter().map(|i| (*i, w, sid)).collect();
+        h.queue().schedule_tasks_batch_in_sessions(&assign).await;
+        let s0 = h.queue().store_sync_count().await.unwrap();
+        for id in &ids {
+            handle_session_task_message(
+                WorkerMessage::TaskResult {
+                    worker_id: w,
+                    task_id: *id,
+                    exit_code: 0,
+                    stdout: "ok".into(),
+                    stderr: String::new().into(),
+                    execution_time_ms: 1,
+                    is_gpu_executed: false,
+                    device_name: None,
+                    error: None,
+                    asset_bytes: None,
+                    artifacts: Vec::new(),
+                    outputs: Vec::new(),
+                },
+                h.registry(),
+                h.queue(),
+                h.scheduler_notify(),
+                &h.waiters,
+                w,
+                sid,
+                h.blob_store.as_ref(),
+                #[cfg(feature = "dashboard")]
+                None,
+            )
+            .await;
+        }
+        for rx in rxs {
+            let res = tokio::time::timeout(Duration::from_secs(3), rx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(res.exit_code, 0);
+        }
+        let s1 = h.queue().store_sync_count().await.unwrap();
+        assert!(
+            s1 - s0 > 0 && s1 - s0 < 20,
+            "100 results should coalesce into < 20 syncs, got {}",
+            s1 - s0
+        );
+        h.shutdown().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rvb_result_after_shutdown_detach_is_not_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path().join("s");
+        let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(false)
+            .with_discovery(false)
+            .with_state_dir(&sd);
+        let h = MasterServer::spawn(cfg).await.unwrap();
+        let t = Task::new(
+            rusty_grid_core::TaskSpec::command("echo", vec!["r".into()]),
+            rusty_grid_core::TaskRequirements::generic(1, 10),
+        );
+        let id = h.submit_task(t).await.unwrap();
+        let w = Uuid::new_v4();
+        h.queue()
+            .schedule_tasks_batch_in_sessions(&[(id, w, 1)])
+            .await;
+        h.shutdown().unwrap();
+
+        let o = h
+            .queue()
+            .record_result_from(
+                w,
+                Some(1),
+                rusty_grid_core::TaskResult::success(w, id, "o", 1, false),
+            )
+            .await;
+        assert!(
+            matches!(o, Err(GridError::Storage(_))),
+            "result arriving after shutdown() detaches the store must be refused, got {o:?}"
+        );
+        assert_eq!(
+            h.queue().get_state(&id).await,
+            Some(TaskState::Scheduled),
+            "refused post-shutdown result must not transition in-memory state to Completed"
+        );
+
+        let cfg2 = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(false)
+            .with_discovery(false)
+            .with_state_dir(&sd);
+        let h2 = MasterServer::spawn(cfg2).await.unwrap();
+        assert_eq!(h2.queue().get_state(&id).await, Some(TaskState::Queued));
+        h2.shutdown().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_failed_store_is_reported_in_cluster_status_and_dashboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path().join("state");
+        let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(true)
+            .with_web_ui_addr("127.0.0.1:0".parse().unwrap())
+            .with_auth_config(crate::auth::AuthConfig::dev())
+            .with_discovery(false)
+            .with_state_dir(&sd);
+        let h = MasterServer::spawn(cfg).await.unwrap();
+        let addr = h.server_addr();
+
+        // Trigger a real store sync failure via fault injection + submit.
+        h.queue().inject_store_sync_failure(1).await;
+        let bad_task = Task::new(
+            rusty_grid_core::TaskSpec::command("echo", vec!["fail-sync".into()]),
+            rusty_grid_core::TaskRequirements::generic(1, 10),
+        );
+        let submit_res = h.submit_task(bad_task).await;
+        assert!(matches!(submit_res, Err(GridError::Storage(_))));
+
+        // 1. QueueStats and TaskQueue::store_error report the failure reason.
+        let q_stats = h.queue().stats().await;
+        assert!(
+            q_stats
+                .store_error
+                .as_deref()
+                .is_some_and(|s| s.contains("injected sync failure")),
+            "expected store_error in QueueStats, got {:?}",
+            q_stats.store_error
+        );
+
+        // 2. ClientMessage::ClusterStatus carries store_error.
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut transport = MessageTransport::new(stream);
+        transport
+            .send_msg(&ClientMessage::ClusterStatus)
+            .await
+            .unwrap();
+        match transport.recv_msg::<ClientResponse>().await.unwrap() {
+            Some(ClientResponse::ClusterStatus { store_error, .. }) => {
+                assert!(
+                    store_error
+                        .as_deref()
+                        .is_some_and(|s| s.contains("injected sync failure")),
+                    "expected store_error in ClientResponse::ClusterStatus, got {store_error:?}"
+                );
+            }
+            other => panic!("expected ClusterStatus, got {other:?}"),
+        }
+
+        // 3. Dashboard /api/status carries store_error on both ClusterStatusDto and its tasks QueueStats.
+        if let Some(dash_addr) = h.dashboard_addr() {
+            let status_dto: crate::dashboard::dto::ClusterStatusDto =
+                reqwest::get(format!("http://{dash_addr}/api/status"))
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+            assert!(
+                status_dto
+                    .store_error
+                    .as_deref()
+                    .is_some_and(|s| s.contains("injected sync failure")),
+                "expected store_error in ClusterStatusDto, got {:?}",
+                status_dto.store_error
+            );
+            assert_eq!(status_dto.tasks.store_error, status_dto.store_error);
+        }
+
+        h.shutdown().unwrap();
     }
 }

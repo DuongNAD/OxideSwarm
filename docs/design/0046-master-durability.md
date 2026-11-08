@@ -198,15 +198,23 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
    - **Submission gate vs. in-flight transition behaviour on storage failure:**
      - On `submit` / `try_submit_slot` / `submit_with_priority`, `TaskQueue` checks store health
        and enqueues `TaskSubmitted` before mutating `inner.tasks` or advancing `next_sequence`,
-       and holds off inserting the task into `ready_queue` until the `DurableAck` resolves so a
-       concurrent scheduler pass cannot dispatch an un-synced task during the `5 ms` group-commit
-       window. If the `DurableAck` fails (`Err(GridError::Storage)`), the entry is rolled back from
-       `inner.tasks`, `inner.ready_queue`, and `inner.active_sizes` before returning `Err(Storage)`.
+       and holds off inserting the task into `ready_queue` until the `DurableAck` resolves inside a
+       spawned task (`tokio::spawn`) that the caller awaits. Because the `DurableAck` resolution and
+       `ready_queue` insertion (or rollback on `Err(GridError::Storage)`) run in that spawned task,
+       a concurrent scheduler pass cannot dispatch an un-synced task during the `5 ms` group-commit
+       window, and dropping or aborting the caller's `submit` future mid-ack still completes the
+       `ready_queue` insertion (or rollback) consistently with `journal.bin` rather than leaving a
+       zombie `Queued` task outside `ready_queue`.
      - Once a task has been admitted, subsequent transitions (`record_result_from`,
        `cancel_task_detailed`, `fail_unsendable_assignment`, `requeue_task`, `mark_running_from`,
        `record_checkpoint`) commit in memory first and log a `tracing::warn!` if `append_durable`
        or `DurableAck` fails, so a degraded disk never leaks worker capacity slots, leaves task
-       blobs pinned forever, or strands awaiting clients.
+       blobs pinned forever, or strands awaiting clients. Once the store fails, durability is gone
+       until a restart; the failure reason is surfaced via `TaskStore::failure_reason()`,
+       `QueueStats::store_error`, `ClientResponse::ClusterStatus.store_error` (bumping
+       `PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE` to `5`),
+       `ClusterStatusDto::store_error`, and `oxideswarm doctor` (which records a failed `Task store`
+       check).
    - **`5 ms` group commit for `TaskSubmitted` and `TaskTerminal` (and concurrent durable records):**
      - A MapReduce job, an MCP burst of 1,000 task submissions, or a worker returning a burst of
        task results on a single connection must not execute one sequential `sync_data()` syscall per
@@ -292,7 +300,11 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
          syncs `JournalRecord::TaskTerminal`, and wakes any completion waiters.
        - Otherwise, `adoptable_by` is cleared and the task becomes eligible in `ready_queue` for
          the scheduler to dispatch.
-3. **Re-pinning blobs on replay:**
+3. **Store-health reporting, visibility before `fsync`, and clean-shutdown fencing (`D3.3`):**
+   - **Store-health reporting:** Once the store fails, durability is gone until a restart. `TaskStore::failure_reason(&self) -> Option<String>` exposes the writer's failure reason; `TaskQueue::stats()` populates `QueueStats::store_error`, which flows into `ClientResponse::ClusterStatus.store_error` (`crates/core/src/protocol.rs`, protocol version `5`), `ClusterStatusDto::store_error` (`crates/master/src/dashboard/dto.rs`), `oxideswarm status`, MCP `cluster_status`, and `oxideswarm doctor` (`crates/cli/src/doctor.rs`, which records `Outcome::Fail` on `C1 Task store` whenever `store_error` is `Some`).
+   - **Visibility and schedulability relative to `fsync`:** A task is schedulable only after its `TaskSubmitted` `DurableAck` resolves (an acknowledged `submit`), and a `Completed` result is readable in `get_task` / `get_result` immediately when `record_result_from_enqueued` commits in memory, before that result's own `fsync` (which gates `--wait` completion waiters) or a subsequent result's `fsync` completes.
+   - **Clean-shutdown boundary (`store_closed`):** When `MasterServer::run` (or `MasterHandle::shutdown`) calls `close_and_compact_store` / `close_and_compact_store_sync`, `TaskQueueInner::store_closed` is set to `true` atomically under the queue write lock before writing the final `snapshot.bin`. Once `store_closed` is `true`, new submissions (`submit_with_priority`, `try_submit_slot`) and post-shutdown results (`record_result_from_enqueued`) return `Err(GridError::Storage("task store is closed (master shutting down)"))`, and post-shutdown worker session teardown (`handle_session_disconnected`, `handle_session_evacuated`) leaves in-flight task states untouched so workers still transition to `Disconnected` in `WorkerRegistry` without charging `failover_count` after the final snapshot is written.
+4. **Re-pinning blobs on replay:**
    - When `blob_store` is enabled alongside `state_dir`, startup replay re-pins `task.inputs` for
      every recovered non-terminal task and re-pins `result.outputs` for every recovered terminal
      task so the blob store sweeper (`crates/master/src/server.rs:942-944`) does not evict their

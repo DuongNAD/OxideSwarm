@@ -24,6 +24,10 @@ pub struct ClusterStatusDto {
     /// Master's active P2P ticket for 1-click worker pairing.
     #[serde(default)]
     pub p2p_ticket: Option<String>,
+    /// Error message when the attached `TaskStore` writer has failed since startup (`None` when
+    /// durability is healthy or no `--state-dir` is configured).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_error: Option<String>,
 }
 
 /// Summary counts of connected and active worker nodes.

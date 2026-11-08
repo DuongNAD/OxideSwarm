@@ -917,7 +917,6 @@ impl<
 
     async fn run(&mut self) -> GridResult<()> {
         let default_lane = self.lanes.default_lane_kind();
-        let mut master_shutting_down = false;
         loop {
             tokio::select! {
                 inbound = self.lanes.recv_next() => {
@@ -967,7 +966,6 @@ impl<
                 }
                 res = self.shutdown_rx.changed() => {
                     if res.is_ok() && *self.shutdown_rx.borrow() {
-                        master_shutting_down = true;
                         info!(worker_id = %self.worker_id, "Master shutting down; notifying worker");
                         let _ = self
                             .lanes
@@ -979,28 +977,25 @@ impl<
                             .await;
                         break;
                     } else if res.is_err() {
-                        master_shutting_down = true;
                         break;
                     }
                 }
             }
         }
 
-        if !master_shutting_down {
-            handle_worker_disconnect_with_broadcast(
-                &self.registry,
-                &self.queue,
-                &self.scheduler_notify,
-                Some(&self.waiters),
-                &self.worker_id,
-                Some(self.session_id),
-                default_lane.cleanup_reason(),
-                false,
-                #[cfg(feature = "dashboard")]
-                self.broadcast_tx.as_ref(),
-            )
-            .await;
-        }
+        handle_worker_disconnect_with_broadcast(
+            &self.registry,
+            &self.queue,
+            &self.scheduler_notify,
+            Some(&self.waiters),
+            &self.worker_id,
+            Some(self.session_id),
+            default_lane.cleanup_reason(),
+            false,
+            #[cfg(feature = "dashboard")]
+            self.broadcast_tx.as_ref(),
+        )
+        .await;
 
         #[cfg(feature = "p2p")]
         if let Some(ref guard) = self.p2p_guard {

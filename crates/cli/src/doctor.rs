@@ -540,14 +540,19 @@ async fn run_checks(
     report: &mut DoctorReport,
 ) -> Result<(), GridError> {
     // C1: connection, authentication and a first answer (a master that wants a secret this client
-    // lacks only says so in its first reply).
+    // lacks only says so in its first reply), plus task-store health when `--state-dir` is enabled.
     let started = Instant::now();
     let mut transport = connect_master(master_addr, secret).await?;
-    let listed = match request(&mut transport, &ClientMessage::ListWorkers).await? {
-        ClientResponse::WorkerList { workers } => workers,
+    let (listed, store_error) = match request(&mut transport, &ClientMessage::ClusterStatus).await?
+    {
+        ClientResponse::ClusterStatus {
+            workers,
+            store_error,
+            ..
+        } => (workers, store_error),
         other => {
             return Err(GridError::UnexpectedMessage {
-                expected: "WorkerList".to_string(),
+                expected: "ClusterStatus".to_string(),
                 actual: format!("{other:?}"),
             })
         }
@@ -567,6 +572,15 @@ async fn run_checks(
             started.elapsed().as_millis()
         ),
     );
+    if let Some(reason) = store_error {
+        report.push(
+            "C1",
+            "Task store",
+            None,
+            Outcome::Fail,
+            format!("task store failed (durability is gone until a restart): {reason}"),
+        );
+    }
 
     // C2: who is there.
     report.workers = listed.iter().map(WorkerSummary::of).collect();

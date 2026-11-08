@@ -3165,6 +3165,7 @@ async fn run_status(
                 failed_tasks,
                 active_bytes,
                 max_active_bytes,
+                store_error,
                 workers,
             } => {
                 if args.json {
@@ -3181,20 +3182,21 @@ async fn run_status(
                             val
                         })
                         .collect();
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "total_tasks": total_tasks,
-                            "pending_tasks": pending_tasks,
-                            "running_tasks": running_tasks,
-                            "completed_tasks": completed_tasks,
-                            "failed_tasks": failed_tasks,
-                            "active_bytes": active_bytes,
-                            "max_active_bytes": max_active_bytes,
-                            "worker_count": workers.len(),
-                            "workers": enriched_workers
-                        })
-                    );
+                    let mut out = serde_json::json!({
+                        "total_tasks": total_tasks,
+                        "pending_tasks": pending_tasks,
+                        "running_tasks": running_tasks,
+                        "completed_tasks": completed_tasks,
+                        "failed_tasks": failed_tasks,
+                        "active_bytes": active_bytes,
+                        "max_active_bytes": max_active_bytes,
+                        "worker_count": workers.len(),
+                        "workers": enriched_workers
+                    });
+                    if let Some(ref err) = store_error {
+                        out["store_error"] = serde_json::Value::String(err.clone());
+                    }
+                    println!("{}", out);
                 } else {
                     println!("=== RustyGrid Cluster Status ===");
                     println!("Connected Workers: {}", workers.len());
@@ -3210,6 +3212,12 @@ async fn run_status(
                         active_bytes as f64 / (1024.0 * 1024.0),
                         max_active_bytes as f64 / (1024.0 * 1024.0),
                     );
+                    if let Some(ref err) = store_error {
+                        println!(
+                            "Task Store Error: {} (durability is gone until restart)",
+                            err
+                        );
+                    }
                     if !workers.is_empty() {
                         println!("\nWorkers:");
                         for w in &workers {
@@ -5258,6 +5266,7 @@ max_active_mb = 768
                                 failed_tasks: 0,
                                 active_bytes: 0,
                                 max_active_bytes: 0,
+                                store_error: None,
                                 workers: vec![],
                             })
                             .await

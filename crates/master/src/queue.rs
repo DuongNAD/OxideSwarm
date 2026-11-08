@@ -409,6 +409,10 @@ pub struct QueueStats {
     /// Configured active byte budget (`--max-active-mb`, default 256 MiB).
     #[serde(default)]
     pub max_active_bytes: usize,
+    /// Error message when the attached `TaskStore` writer has failed since startup (`None` when
+    /// durability is healthy or no `--state-dir` is configured).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_error: Option<String>,
 }
 
 impl QueueStats {
@@ -1930,25 +1934,31 @@ impl TaskQueue {
                 sequence,
                 task_id,
             };
-            match durable_ack.await {
-                Ok(()) => {
-                    let mut inner = self.inner.write().await;
-                    if inner
-                        .tasks
-                        .get(&task_id)
-                        .is_some_and(|e| e.state == TaskState::Queued)
-                    {
-                        inner.insert_ready(ready_key);
+            let inner_arc = Arc::clone(&self.inner);
+            tokio::spawn(async move {
+                match durable_ack.await {
+                    Ok(()) => {
+                        let mut inner = inner_arc.write().await;
+                        if inner
+                            .tasks
+                            .get(&task_id)
+                            .is_some_and(|e| e.state == TaskState::Queued)
+                        {
+                            inner.insert_ready(ready_key);
+                        }
+                        Ok(())
+                    }
+                    Err(err) => {
+                        let mut inner = inner_arc.write().await;
+                        inner.ready_queue.remove(&ready_key);
+                        inner.remove_retained(&task_id);
+                        inner.terminal_order.retain(|id| *id != task_id);
+                        Err(err)
                     }
                 }
-                Err(err) => {
-                    let mut inner = self.inner.write().await;
-                    inner.tasks.remove(&task_id);
-                    inner.ready_queue.remove(&ready_key);
-                    inner.untrack_active_task(&task_id);
-                    return Err(err);
-                }
-            }
+            })
+            .await
+            .map_err(|e| GridError::Storage(format!("submit ack worker cancelled: {e}")))??;
         }
 
         Ok(task_id)
@@ -2061,25 +2071,31 @@ impl TaskQueue {
                 sequence,
                 task_id,
             };
-            match durable_ack.await {
-                Ok(()) => {
-                    let mut inner = self.inner.write().await;
-                    if inner
-                        .tasks
-                        .get(&task_id)
-                        .is_some_and(|e| e.state == TaskState::Queued)
-                    {
-                        inner.insert_ready(ready_key);
+            let inner_arc = Arc::clone(&self.inner);
+            tokio::spawn(async move {
+                match durable_ack.await {
+                    Ok(()) => {
+                        let mut inner = inner_arc.write().await;
+                        if inner
+                            .tasks
+                            .get(&task_id)
+                            .is_some_and(|e| e.state == TaskState::Queued)
+                        {
+                            inner.insert_ready(ready_key);
+                        }
+                        Ok(())
+                    }
+                    Err(err) => {
+                        let mut inner = inner_arc.write().await;
+                        inner.ready_queue.remove(&ready_key);
+                        inner.remove_retained(&task_id);
+                        inner.terminal_order.retain(|id| *id != task_id);
+                        Err(err)
                     }
                 }
-                Err(err) => {
-                    let mut inner = self.inner.write().await;
-                    inner.tasks.remove(&task_id);
-                    inner.ready_queue.remove(&ready_key);
-                    inner.untrack_active_task(&task_id);
-                    return Err(err);
-                }
-            }
+            })
+            .await
+            .map_err(|e| GridError::Storage(format!("submit ack worker cancelled: {e}")))??;
         }
 
         Ok(task_id)
@@ -2942,6 +2958,11 @@ impl TaskQueue {
         let task_id = result.task_id;
 
         let mut inner = self.inner.write().await;
+        if inner.store_closed {
+            return Err(GridError::Storage(
+                "task store is closed (master shutting down)".into(),
+            ));
+        }
         let policy = inner.retry_policy.clone();
 
         let (state, owner) = {
@@ -4062,6 +4083,7 @@ impl TaskQueue {
             total: inner.tasks.len(),
             active_bytes: inner.active_bytes,
             max_active_bytes: inner.max_active_bytes,
+            store_error: inner.store.as_ref().and_then(|s| s.failure_reason()),
             ..Default::default()
         };
 
@@ -4079,6 +4101,21 @@ impl TaskQueue {
         }
 
         stats
+    }
+
+    /// Returns the error reason if the attached `TaskStore` writer has failed since startup, or
+    /// `None` when durability is healthy (or no `--state-dir` is configured).
+    pub async fn store_error(&self) -> Option<String> {
+        let inner = self.inner.read().await;
+        inner.store.as_ref().and_then(|s| s.failure_reason())
+    }
+
+    #[doc(hidden)]
+    pub async fn fail_store_for_test(&self, reason: impl Into<String>) {
+        let inner = self.inner.read().await;
+        if let Some(ref store) = inner.store {
+            store.record_failure_for_test(reason);
+        }
     }
 
     /// Dynamically adjusts the retention limit for terminal tasks and evicts oldest tasks exceeding this limit.
@@ -6511,10 +6548,18 @@ mod tests {
         label: &str,
         opts: crate::store::StoreOptions,
     ) -> Vec<String> {
+        compare_replay_against_live_with_retention(label, opts, DEFAULT_MAX_TERMINAL_TASKS).await
+    }
+
+    async fn compare_replay_against_live_with_retention(
+        label: &str,
+        opts: crate::store::StoreOptions,
+        retention: usize,
+    ) -> Vec<String> {
         let dir = tempfile::tempdir().unwrap();
         let (live, ids) = {
             let (store, rec) = TaskStore::open_with(dir.path(), opts.clone()).unwrap();
-            let q = TaskQueue::with_config(replay_policy(), None);
+            let q = TaskQueue::with_retention(replay_policy(), None, retention);
             q.attach_store_and_replay(store, rec, Duration::ZERO)
                 .await
                 .unwrap();
@@ -6528,7 +6573,7 @@ mod tests {
             (live, ids)
         };
         let (store, rec) = TaskStore::open_with(dir.path(), opts).unwrap();
-        if label == "journal-only" {
+        if label == "journal-only" || label == "evict-journal-only" {
             assert!(
                 rec.snapshot.is_none(),
                 "journal-only replay must have no snapshot.bin"
@@ -6539,7 +6584,7 @@ mod tests {
                 rec.records.len()
             );
         }
-        let q2 = TaskQueue::with_config(replay_policy(), None);
+        let q2 = TaskQueue::with_retention(replay_policy(), None, retention);
         q2.attach_store_and_replay(store, rec, Duration::ZERO)
             .await
             .unwrap();
@@ -6794,5 +6839,163 @@ mod tests {
         assert_eq!(returned_id, tid);
         assert_eq!(q.get_state(&tid).await, Some(TaskState::Queued));
         assert!(q.ready_task_ids(10).await.contains(&tid));
+    }
+
+    #[tokio::test]
+    async fn rvb_drop_submit_future_mid_ack_loses_task_from_ready_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = crate::store::StoreOptions {
+            group_commit_window: Duration::from_millis(150),
+            ..crate::store::StoreOptions::default()
+        };
+        let (store, rec) = TaskStore::open_with(dir.path(), opts).unwrap();
+        let q = TaskQueue::with_config(replay_policy(), None);
+        q.attach_store_and_replay(store, rec, Duration::ZERO)
+            .await
+            .unwrap();
+
+        let t = echo_task("dropped");
+        let id = t.id;
+        let q2 = q.clone();
+        let h = tokio::spawn(async move { q2.submit(t).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        h.abort();
+        let _ = h.await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let st = q.get_state(&id).await;
+        let ready = q.ready_task_ids(10).await.contains(&id);
+        assert!(
+            st.is_none() || ready,
+            "ZOMBIE: task is {st:?} but not in ready_queue (never scheduled)"
+        );
+        assert_eq!(st, Some(TaskState::Queued));
+        assert!(ready);
+    }
+
+    #[tokio::test]
+    async fn rvb_rollback_cancel_race() {
+        // Case 1: cancel while submit awaits its ack and the ack succeeds -> stays Cancelled, not in ready_queue.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = crate::store::StoreOptions {
+            group_commit_window: Duration::from_millis(150),
+            ..crate::store::StoreOptions::default()
+        };
+        let (store, rec) = TaskStore::open_with(dir.path(), opts.clone()).unwrap();
+        let q = TaskQueue::with_config(replay_policy(), None);
+        q.attach_store_and_replay(store, rec, Duration::ZERO)
+            .await
+            .unwrap();
+
+        let t = echo_task("cancel-race-ok");
+        let id = t.id;
+        let q2 = q.clone();
+        let h = tokio::spawn(async move { q2.submit(t).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let c = q.cancel_task(&id, None).await;
+        assert!(c.is_ok());
+        let r = h.await.unwrap();
+        assert!(r.is_ok());
+        assert_eq!(q.get_state(&id).await, Some(TaskState::Cancelled));
+        assert!(!q.ready_task_ids(10).await.contains(&id));
+
+        // Case 2: cancel while submit awaits its ack and the store sync fails -> rolled back cleanly.
+        let dir2 = tempfile::tempdir().unwrap();
+        let (store2, rec2) = TaskStore::open_with(dir2.path(), opts).unwrap();
+        let q_fail = TaskQueue::with_config(replay_policy(), None);
+        q_fail
+            .attach_store_and_replay(store2, rec2, Duration::ZERO)
+            .await
+            .unwrap();
+        q_fail.inject_store_sync_failure(1).await;
+
+        let t2 = echo_task("cancel-race-fail");
+        let id2 = t2.id;
+        let q_fail2 = q_fail.clone();
+        let h2 = tokio::spawn(async move { q_fail2.submit(t2).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let _ = q_fail.cancel_task(&id2, None).await;
+        let r2 = h2.await.unwrap();
+        assert!(r2.is_err());
+        assert_eq!(q_fail.get_state(&id2).await, None);
+        assert!(!q_fail.ready_task_ids(10).await.contains(&id2));
+        assert_eq!(q_fail.active_retained_bytes().await, 0);
+        assert_eq!(q_fail.terminal_retained_bytes().await, 0);
+    }
+
+    #[tokio::test]
+    async fn rvb_zero_retry_scheduled_after_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, rec) = TaskStore::open(dir.path()).unwrap();
+        let q = TaskQueue::with_config(replay_policy(), None);
+        q.attach_store_and_replay(store, rec, Duration::ZERO)
+            .await
+            .unwrap();
+        let mut t = echo_task("zero");
+        t.requirements.max_retries = Some(0);
+        let id = t.id;
+        q.submit(t).await.unwrap();
+        let mut t2 = echo_task("nonzero");
+        t2.requirements.max_retries = Some(3);
+        let id2 = t2.id;
+        q.submit(t2).await.unwrap();
+        let w = Uuid::new_v4();
+        q.schedule_tasks_batch_in_sessions(&[(id, w, 1), (id2, w, 1)])
+            .await;
+        drop(q);
+        let (store, rec) = TaskStore::open(dir.path()).unwrap();
+        let q2 = TaskQueue::with_config(replay_policy(), None);
+        q2.attach_store_and_replay(store, rec, Duration::ZERO)
+            .await
+            .unwrap();
+        let a = q2.get_task(&id).await.unwrap();
+        let b = q2.get_task(&id2).await.unwrap();
+        assert_eq!(a.state, TaskState::Failed);
+        assert_eq!(b.state, TaskState::Queued);
+    }
+
+    #[tokio::test]
+    async fn rvb_compaction_boundaries_many() {
+        let mut all = Vec::new();
+        for n in 1u64..=24 {
+            let opts = crate::store::StoreOptions {
+                compact_max_records: n,
+                ..crate::store::StoreOptions::default()
+            };
+            all.extend(compare_replay_against_live(&format!("compact@{n}"), opts).await);
+        }
+        assert!(
+            all.is_empty(),
+            "compaction boundary differences:\n{}",
+            all.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn rvb_compaction_with_eviction() {
+        let mut all = Vec::new();
+        for n in 1u64..=20 {
+            let opts = crate::store::StoreOptions {
+                compact_max_records: n,
+                ..crate::store::StoreOptions::default()
+            };
+            all.extend(
+                compare_replay_against_live_with_retention(&format!("evict-compact@{n}"), opts, 3)
+                    .await,
+            );
+        }
+        all.extend(
+            compare_replay_against_live_with_retention(
+                "evict-journal-only",
+                crate::store::StoreOptions::default(),
+                3,
+            )
+            .await,
+        );
+        assert!(
+            all.is_empty(),
+            "compaction with eviction differences:\n{}",
+            all.join("\n")
+        );
     }
 }
