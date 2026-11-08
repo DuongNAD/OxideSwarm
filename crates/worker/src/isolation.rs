@@ -90,7 +90,9 @@ pub const WINDOWS_INHERITED_ENV_VARS: [&str; 18] = [
 pub fn inherited_environment(
     vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    vars.into_iter()
+    #[allow(unused_mut)]
+    let mut kept: Vec<(std::ffi::OsString, std::ffi::OsString)> = vars
+        .into_iter()
         .filter(|(name, _)| {
             name.to_str().is_some_and(|n| {
                 INHERITED_ENV_VARS.contains(&n)
@@ -102,36 +104,36 @@ pub fn inherited_environment(
                                 .any(|w| w.eq_ignore_ascii_case(n))))
             })
         })
-        .map(|(name, val)| {
-            #[cfg(windows)]
-            if let (Some(n), Some(v)) = (name.to_str(), val.to_str()) {
-                const WIN_PATH_VARS: [&str; 13] = [
-                    "SystemRoot",
-                    "WINDIR",
-                    "COMSPEC",
-                    "ProgramFiles",
-                    "ProgramFiles(x86)",
-                    "ProgramW6432",
-                    "CommonProgramFiles",
-                    "CommonProgramFiles(x86)",
-                    "CommonProgramW6432",
-                    "ProgramData",
-                    "PUBLIC",
-                    "LOCALAPPDATA",
-                    "APPDATA",
-                ];
-                if WIN_PATH_VARS.iter().any(|w| w.eq_ignore_ascii_case(n))
-                    && (v.contains('~') || v.contains('/'))
-                {
-                    let p = Path::new(v);
-                    if p.exists() && !windows::is_reparse_point(p) {
-                        return (name, windows::normalize_win_path(p).into_os_string());
-                    }
+        .collect();
+    #[cfg(windows)]
+    for (name, val) in &mut kept {
+        if let (Some(n), Some(v)) = (name.to_str(), val.to_str()) {
+            const WIN_PATH_VARS: [&str; 13] = [
+                "SystemRoot",
+                "WINDIR",
+                "COMSPEC",
+                "ProgramFiles",
+                "ProgramFiles(x86)",
+                "ProgramW6432",
+                "CommonProgramFiles",
+                "CommonProgramFiles(x86)",
+                "CommonProgramW6432",
+                "ProgramData",
+                "PUBLIC",
+                "LOCALAPPDATA",
+                "APPDATA",
+            ];
+            if WIN_PATH_VARS.iter().any(|w| w.eq_ignore_ascii_case(n))
+                && (v.contains('~') || v.contains('/'))
+            {
+                let p = Path::new(v);
+                if p.exists() && !windows::is_reparse_point(p) {
+                    *val = windows::normalize_win_path(p).into_os_string();
                 }
             }
-            (name, val)
-        })
-        .collect()
+        }
+    }
+    kept
 }
 
 /// The directories of the host that the policy names: the owner's home (denied), and the Rust
@@ -843,15 +845,14 @@ pub mod windows {
 
     use windows_sys::Win32::Foundation::{
         CloseHandle, LocalFree, SetHandleInformation, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
-        HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+        HANDLE_FLAG_INHERIT, HLOCAL, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
         ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
         GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW, SetNamedSecurityInfoW,
         SetSecurityInfo, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, SDDL_REVISION_1, SET_ACCESS,
-        SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_WINDOW_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
-        TRUSTEE_W,
+        SE_FILE_OBJECT, SE_WINDOW_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -860,14 +861,15 @@ pub mod windows {
     use windows_sys::Win32::Security::{
         AclSizeInformation, CreateWellKnownSid, DeleteAce, DeriveCapabilitySidsFromName, EqualSid,
         FreeSid, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
-        GetSecurityDescriptorDacl, GetTokenInformation, IsValidSid, TokenUser,
-        WinBuiltinAdministratorsSid, WinBuiltinAnyPackageSid, WinBuiltinUsersSid,
-        WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid,
-        WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_FLAGS, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
-        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERITED_ACE, INHERIT_ONLY_ACE,
-        NO_INHERITANCE, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
-        SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+        GetSecurityDescriptorDacl, GetTokenInformation, IsValidSid, SetTokenInformation,
+        TokenDefaultDacl, TokenOwner, TokenUser, WinBuiltinAdministratorsSid,
+        WinBuiltinAnyPackageSid, WinBuiltinUsersSid, WinCapabilityInternetClientSid,
+        WinCapabilityPrivateNetworkClientServerSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE,
+        ACE_FLAGS, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
+        DACL_SECURITY_INFORMATION, INHERITED_ACE, INHERIT_ONLY_ACE, NO_INHERITANCE,
+        OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
+        TOKEN_ADJUST_DEFAULT, TOKEN_DEFAULT_DACL, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
         UNPROTECTED_DACL_SECURITY_INFORMATION, WELL_KNOWN_SID_TYPE,
     };
 
@@ -899,10 +901,9 @@ pub mod windows {
         ) -> i32;
     }
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-        FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-        OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+        FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_TRAVERSE, SYNCHRONIZE,
+        WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::SystemServices::{
@@ -1958,147 +1959,100 @@ pub mod windows {
         record_manifest_line(manifest_path, &line)
     }
 
-    /// Merges `entries` directly into `path`'s own security descriptor via `SE_KERNEL_OBJECT`
-    /// (`NtSetSecurityObject`) without invoking `ntmarta` tree propagation across child
-    /// directories. Used only for `NO_INHERITANCE` ACEs on directories (such as a volume root
-    /// `C:\`, `rustup_home`, or `cargo_home`) where child propagation is neither needed nor
-    /// wanted.
-    fn merge_non_inherited_entries_on_path(
-        path: &Path,
-        entries: &[EXPLICIT_ACCESS_W],
-    ) -> io::Result<()> {
-        if entries.is_empty() || !path.exists() || is_reparse_point(path) {
-            return Ok(());
-        }
-        let wide_path = to_wide(path.as_os_str());
-        let handle = unsafe {
-            CreateFileW(
-                wide_path.as_ptr(),
-                READ_CONTROL | WRITE_DAC,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS,
-                std::ptr::null_mut(),
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-            return merge_entries_on_path(path, entries);
-        }
-        let mut old_dacl: *mut ACL = std::ptr::null_mut();
-        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        let rc = unsafe {
-            GetSecurityInfo(
-                handle,
-                SE_KERNEL_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut old_dacl,
-                std::ptr::null_mut(),
-                &mut sd,
-            )
-        };
-        if rc != ERROR_SUCCESS {
-            unsafe {
-                CloseHandle(handle);
-            }
-            return merge_entries_on_path(path, entries);
-        }
-        let mut new_dacl: *mut ACL = std::ptr::null_mut();
-        let rc2 = unsafe {
-            SetEntriesInAclW(
-                entries.len() as u32,
-                entries.as_ptr(),
-                old_dacl,
-                &mut new_dacl,
-            )
-        };
-        let mut set_rc = rc2;
-        if rc2 == ERROR_SUCCESS && !new_dacl.is_null() {
-            unsafe {
-                set_rc = SetSecurityInfo(
-                    handle,
-                    SE_KERNEL_OBJECT,
-                    DACL_SECURITY_INFORMATION,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    new_dacl,
-                    std::ptr::null(),
-                );
-                LocalFree(new_dacl as HLOCAL);
-            }
-        }
-        unsafe {
-            if !sd.is_null() {
-                LocalFree(sd as HLOCAL);
-            }
-            CloseHandle(handle);
-        }
-        if set_rc != ERROR_SUCCESS {
-            return Err(io::Error::from_raw_os_error(set_rc as i32));
-        }
-        Ok(())
-    }
-
-    fn volume_root_of(path: &Path) -> Option<PathBuf> {
-        let norm = normalize_win_path(path);
-        let mut comps = norm.components();
-        match (comps.next(), comps.next()) {
-            (Some(Component::Prefix(p)), Some(Component::RootDir)) => {
-                let mut root = PathBuf::from(p.as_os_str());
-                root.push(r"\");
-                Some(root)
-            }
-            _ => None,
-        }
-    }
-
-    /// Ensures the volume root of `path` (e.g. `C:\`) grants non-inherited
-    /// `FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE` (no `FILE_LIST_DIRECTORY`) to
-    /// `oxideswarm.toolchain`, `CurrentUser`, and `BUILTIN\Users`.
+    /// Ensures the current process token's `TokenOwner` is `CurrentUser` (`TokenUser`) and its
+    /// `TokenDefaultDacl` includes an explicit `GENERIC_ALL` (`0x1000_0000`) allow ACE for
+    /// `CurrentUser`.
     ///
-    /// Why: on stock `windows-latest` (`windows-2025`), `C:\` has no AppContainer ACE, so
-    /// `GetFileAttributesExW(L"C:\\")` inside `powershell.exe`'s
-    /// `FileSystemProvider.InitializeDefaultDrives()` fails with `ERROR_ACCESS_DENIED (5)` and
-    /// prevents mounting the `C:` `PSDrive` and auto-loading `Microsoft.PowerShell.Utility`.
-    fn ensure_volume_root_traverse(path: &Path, toolchain_sid: PSID) {
-        let Some(root) = volume_root_of(path) else {
-            return;
-        };
-        let traverse_mask = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
-        let mut entries = Vec::with_capacity(3);
-        if !dacl_already_grants_sid(&root, toolchain_sid, traverse_mask) {
-            entries.push(explicit_access(
-                toolchain_sid,
-                traverse_mask,
-                GRANT_ACCESS,
-                NO_INHERITANCE,
-            ));
-        }
-        if let Ok(user_sid) = OwnedSid::current_user() {
-            if !dacl_already_grants_sid(&root, user_sid.as_psid(), traverse_mask) {
-                entries.push(explicit_access(
-                    user_sid.as_psid(),
-                    traverse_mask,
-                    GRANT_ACCESS,
-                    NO_INHERITANCE,
-                ));
+    /// Why: when the worker runs under an elevated Administrator token (such as `runneradmin` on
+    /// GitHub Actions `windows-latest`), Windows sets `TokenOwner = BUILTIN\Administrators` (`BA`)
+    /// and `TokenDefaultDacl = D:(A;;GA;;;BA)(A;;GA;;;SY)` — with NO ACE for `TokenUser` itself.
+    /// When `CreateProcessW` creates an AppContainer token via `SepCreateLowBoxToken`, the kernel
+    /// copies the parent's `TokenDefaultDacl` and appends `(A;;GA;;;<AppContainerSid>)`, while
+    /// marking `BUILTIN\Administrators` (`BA`) as `SE_GROUP_USE_FOR_DENY_ONLY`. Consequently, when
+    /// any process inside the AppContainer (`cargo.exe` spawning `rustc -vV`, `CreatePipe(NULL, 0)`,
+    /// or `powershell.exe` / CLR initializing internal anonymous pipes/events) creates an object
+    /// with a `NULL` security descriptor and reopens it via `NtOpenFile`, Stage 1 of
+    /// `SepAccessCheck` (normal user/group SIDs) fails with `STATUS_ACCESS_DENIED` (`os error 5`)
+    /// because `BA` is deny-only and `TokenUser` is absent from `TokenDefaultDacl`.
+    ///
+    /// Adding `CurrentUser:(GA)` to the worker's `TokenDefaultDacl` does NOT add any AppContainer
+    /// or capability SID to host-created objects (so host pipes/events remain 100% blocked to
+    /// AppContainers by Stage 2 of `SepAccessCheck`), while ensuring every child AppContainer's
+    /// `TokenDefaultDacl` grants both `CurrentUser` (Stage 1) and that task's own
+    /// `<AppContainerSid>` (Stage 2).
+    fn ensure_process_token_default_dacl_grants_current_user() {
+        static DONE: OnceLock<()> = OnceLock::new();
+        DONE.get_or_init(|| unsafe {
+            let Ok(user_sid) = OwnedSid::current_user() else {
+                return;
+            };
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
+                &mut token,
+            ) == 0
+                || token.is_null()
+            {
+                return;
             }
-        }
-        if let Ok(users_sid) = OwnedSid::from_well_known(WinBuiltinUsersSid) {
-            if !dacl_already_grants_sid(&root, users_sid.as_psid(), traverse_mask) {
-                entries.push(explicit_access(
-                    users_sid.as_psid(),
-                    traverse_mask,
-                    GRANT_ACCESS,
-                    NO_INHERITANCE,
-                ));
+            let owner = TOKEN_OWNER {
+                Owner: user_sid.as_psid(),
+            };
+            let _ = SetTokenInformation(
+                token,
+                TokenOwner,
+                &owner as *const TOKEN_OWNER as *const core::ffi::c_void,
+                std::mem::size_of::<TOKEN_OWNER>() as u32,
+            );
+
+            let mut needed: u32 = 0;
+            let _ = GetTokenInformation(
+                token,
+                TokenDefaultDacl,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+            if needed > 0 {
+                let mut buf = vec![0u8; needed as usize];
+                if GetTokenInformation(
+                    token,
+                    TokenDefaultDacl,
+                    buf.as_mut_ptr() as *mut core::ffi::c_void,
+                    needed,
+                    &mut needed,
+                ) != 0
+                {
+                    let tdd = &*(buf.as_ptr() as *const TOKEN_DEFAULT_DACL);
+                    if !tdd.DefaultDacl.is_null() {
+                        const GENERIC_ALL_MASK: u32 = 0x1000_0000;
+                        let ea = explicit_access(
+                            user_sid.as_psid(),
+                            GENERIC_ALL_MASK,
+                            GRANT_ACCESS,
+                            NO_INHERITANCE,
+                        );
+                        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+                        if SetEntriesInAclW(1, &ea, tdd.DefaultDacl, &mut new_dacl) == ERROR_SUCCESS
+                            && !new_dacl.is_null()
+                        {
+                            let new_tdd = TOKEN_DEFAULT_DACL {
+                                DefaultDacl: new_dacl,
+                            };
+                            let _ = SetTokenInformation(
+                                token,
+                                TokenDefaultDacl,
+                                &new_tdd as *const TOKEN_DEFAULT_DACL as *const core::ffi::c_void,
+                                std::mem::size_of::<TOKEN_DEFAULT_DACL>() as u32,
+                            );
+                            LocalFree(new_dacl as HLOCAL);
+                        }
+                    }
+                }
             }
-        }
-        if !entries.is_empty() {
-            let _ = merge_non_inherited_entries_on_path(&root, &entries);
-        }
+            CloseHandle(token);
+        });
     }
 
     fn grant_rx_non_inherited(
@@ -2140,7 +2094,7 @@ pub mod windows {
                 NO_INHERITANCE,
             ));
         }
-        merge_non_inherited_entries_on_path(path, &entries)
+        merge_entries_on_path(path, &entries)
     }
 
     /// Sets a single inheritable read+execute ACE (`OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`)
@@ -2466,7 +2420,6 @@ pub mod windows {
         if !sandbox_base.exists() || is_reparse_point(sandbox_base) {
             return Ok(());
         }
-        ensure_volume_root_traverse(sandbox_base, toolchain_sid);
         let traverse_mask = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
         if dacl_already_grants_sid(sandbox_base, toolchain_sid, traverse_mask)
             && !dacl_already_grants_sid(sandbox_base, toolchain_sid, FILE_LIST_DIRECTORY)
@@ -2511,6 +2464,7 @@ pub mod windows {
         protected_files: &[PathBuf],
         sandbox_base: Option<&Path>,
     ) -> Result<(), String> {
+        ensure_process_token_default_dacl_grants_current_user();
         validate_protected_files_outside_toolchains(host, protected_files)?;
         if let Some(base) = sandbox_base {
             validate_sandbox_base_safe(base, host)?;
@@ -2522,10 +2476,6 @@ pub mod windows {
         let toolchain_sid = OwnedSid::oxideswarm_toolchain().map_err(|e| {
             format!("DeriveCapabilitySidsFromName(oxideswarm.toolchain) failed: {e}")
         })?;
-        let sys_root = std::env::var_os("SystemRoot")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-        ensure_volume_root_traverse(&sys_root, toolchain_sid.as_psid());
 
         let manifest = acl_grant_manifest_path(host);
         let manifest_opt = if host.user_home.as_os_str().is_empty()
@@ -2570,7 +2520,6 @@ pub mod windows {
                 || !path_starts_with_ci(&host.user_home, &host.rustup_home))
         {
             let rustup = &host.rustup_home;
-            ensure_volume_root_traverse(rustup, toolchain_sid.as_psid());
             grant_rx_non_inherited(rustup, toolchain_sid.as_psid(), manifest_opt)
                 .map_err(|e| format!("failed to prepare RUSTUP_HOME {}: {e}", rustup.display()))?;
             let settings = rustup.join("settings.toml");
@@ -2582,7 +2531,30 @@ pub mod windows {
             // inherit read+execute automatically without walking (N6).
             let tc_root = rustup.join("toolchains");
             if tc_root.exists() {
-                let _ = grant_rx_recursive(&tc_root, toolchain_sid.as_psid(), manifest_opt);
+                grant_rx_recursive(&tc_root, toolchain_sid.as_psid(), manifest_opt).map_err(
+                    |e| {
+                        format!(
+                            "failed to prepare RUSTUP_HOME toolchains {}: {e}",
+                            tc_root.display()
+                        )
+                    },
+                )?;
+                if let Ok(entries) = std::fs::read_dir(&tc_root) {
+                    for entry in entries.flatten() {
+                        let tc = entry.path();
+                        if tc.is_dir() && !is_reparse_point(&tc) {
+                            let _ = grant_rx_recursive(&tc, toolchain_sid.as_psid(), manifest_opt);
+                            let tc_bin = tc.join("bin");
+                            if tc_bin.is_dir() && !is_reparse_point(&tc_bin) {
+                                let _ = grant_rx_recursive(
+                                    &tc_bin,
+                                    toolchain_sid.as_psid(),
+                                    manifest_opt,
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -2591,7 +2563,6 @@ pub mod windows {
             && (host.user_home.as_os_str().is_empty()
                 || !path_starts_with_ci(&host.user_home, &host.cargo_home))
         {
-            ensure_volume_root_traverse(&host.cargo_home, toolchain_sid.as_psid());
             prepare_one_cargo_dir(&host.cargo_home, toolchain_sid.as_psid(), manifest_opt)
                 .map_err(|e| {
                     format!(
@@ -2812,6 +2783,7 @@ pub mod windows {
             cmd_cargo_home: Option<&Path>,
             cmd_rustup_home: Option<&Path>,
         ) -> io::Result<Self> {
+            ensure_process_token_default_dacl_grants_current_user();
             validate_protected_files_outside_toolchains(jail.host, jail.protected_files)
                 .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
             validate_sandbox_base_safe(jail.sandbox_base, jail.host)
@@ -3705,6 +3677,7 @@ pub mod windows {
         desktop_name_wide: &[u16],
         creation_flags: u32,
     ) -> io::Result<AppContainerChild> {
+        ensure_process_token_default_dacl_grants_current_user();
         if desktop_name_wide.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,

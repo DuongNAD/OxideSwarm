@@ -59,12 +59,12 @@ impl Rig {
         std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
         std::fs::write(home.path().join(".ssh/test_key"), KEY).unwrap();
         let base = if base_in_home {
-            home.path().join(".oxideswarm/sandboxes")
+            home.path().join(".oxideswarm").join("sandboxes")
         } else {
             outside.path().join("sandboxes")
         };
         std::fs::create_dir_all(base.join("other_task")).unwrap();
-        std::fs::write(base.join("other_task/secret.txt"), SIBLING).unwrap();
+        std::fs::write(base.join("other_task").join("secret.txt"), SIBLING).unwrap();
 
         // On Windows, never touch the developer's real `.rustup` or `.cargo` in `Rig::new`;
         // use temporary directories under `home` by default. Tests that run `cargo build`
@@ -123,12 +123,15 @@ impl Rig {
         HashMap::from([
             (
                 "T_SECRET".into(),
-                p(&self.home.path().join(".oxideswarm/cluster.secret")),
+                p(&self.home.path().join(".oxideswarm").join("cluster.secret")),
             ),
-            ("T_KEY".into(), p(&self.home.path().join(".ssh/test_key"))),
+            (
+                "T_KEY".into(),
+                p(&self.home.path().join(".ssh").join("test_key")),
+            ),
             (
                 "T_SIBLING".into(),
-                p(&self.base.join("other_task/secret.txt")),
+                p(&self.base.join("other_task").join("secret.txt")),
             ),
             ("T_BASE".into(), p(&self.base)),
             ("T_HOME".into(), p(self.home.path())),
@@ -163,7 +166,11 @@ impl Rig {
 }
 
 fn lines(result: &TaskResult) -> Vec<String> {
-    result.stdout_str().lines().map(str::to_string).collect()
+    result
+        .stdout_str()
+        .lines()
+        .map(|l| l.trim_end().to_string())
+        .collect()
 }
 
 #[cfg(target_os = "macos")]
@@ -2132,28 +2139,28 @@ mod windows {
         )
     }
 
-    const WIN_FS_SCRIPT: &str = r#"
-Write-Output 'TASK_STARTED'
-Set-Content -LiteralPath "$env:RUSTY_GRID_SANDBOX_DIR\allowed.txt" -Value 'hello' -NoNewline
-Write-Output 'WRITE_OK'
-if ((Get-Content -LiteralPath "$env:RUSTY_GRID_SANDBOX_DIR\allowed.txt" -Raw) -eq 'hello') { Write-Output 'READ_OK' }
-New-Item -ItemType Directory -Path "$env:RUSTY_GRID_SANDBOX_DIR\sub" -Force | Out-Null
-Write-Output 'MKDIR_OK'
-'x' > $null
-Write-Output 'DEVNULL_OK'
-try { Get-Content -LiteralPath $env:T_SECRET -ErrorAction Stop | Out-Null; Write-Output 'LEAK_SECRET' } catch { Write-Output 'DENY_SECRET' }
-try { Get-Content -LiteralPath $env:T_KEY -ErrorAction Stop | Out-Null; Write-Output 'LEAK_KEY' } catch { Write-Output 'DENY_KEY' }
-try { Get-Content -LiteralPath $env:T_SIBLING -ErrorAction Stop | Out-Null; Write-Output 'LEAK_SIBLING' } catch { Write-Output 'DENY_SIBLING' }
-try { Get-ChildItem -LiteralPath $env:T_BASE -ErrorAction Stop | Out-Null; Write-Output 'LEAK_LISTING' } catch { Write-Output 'DENY_LISTING' }
-try { Get-ChildItem -LiteralPath $env:T_HOME -ErrorAction Stop | Out-Null; Write-Output 'LEAK_HOME_LISTING' } catch { Write-Output 'DENY_HOME_LISTING' }
-try { Set-Content -LiteralPath "$env:T_HOME\planted.txt" -Value 'x' -ErrorAction Stop; Write-Output 'LEAK_WRITE_HOME' } catch { Write-Output 'DENY_WRITE_HOME' }
-try { Set-Content -LiteralPath "$env:T_BASE\other_task\planted.txt" -Value 'x' -ErrorAction Stop; Write-Output 'LEAK_WRITE_SIBLING' } catch { Write-Output 'DENY_WRITE_SIBLING' }
-try { Set-Content -LiteralPath "$env:T_OUTSIDE\feat3_outside_marker" -Value 'x' -ErrorAction Stop; Write-Output 'LEAK_WRITE_TMP' } catch { Write-Output 'DENY_WRITE_TMP' }
+    const WIN_CSHARP_HELPER: &str = r#"
+function Compile-CSharp([string]$code) {
+    $prov = [Microsoft.CSharp.CSharpCodeProvider]::new()
+    $cp = [System.CodeDom.Compiler.CompilerParameters]::new()
+    $cp.GenerateInMemory = $true
+    $cp.TempFiles = [System.CodeDom.Compiler.TempFileCollection]::new($env:RUSTY_GRID_SANDBOX_DIR, $false)
+    $null = $cp.ReferencedAssemblies.Add('System.dll')
+    $null = $cp.ReferencedAssemblies.Add('System.Core.dll')
+    $cr = $prov.CompileAssemblyFromSource($cp, [string[]]@($code))
+    if ($cr.Errors.HasErrors) {
+        $msgs = [System.Collections.Generic.List[string]]::new()
+        foreach ($e in $cr.Errors) { $null = $msgs.Add($e.ToString()) }
+        throw [string]::Join('; ', $msgs)
+    }
+}
 "#;
+
+    const WIN_FS_SCRIPT: &str = r#"echo TASK_STARTED&(echo hello)>%RUSTY_GRID_SANDBOX_DIR%\allowed.txt&&echo WRITE_OK&findstr hello %RUSTY_GRID_SANDBOX_DIR%\allowed.txt >nul 2>nul&&echo READ_OK&mkdir %RUSTY_GRID_SANDBOX_DIR%\sub >nul 2>nul&&echo MKDIR_OK&echo x>nul&&echo DEVNULL_OK&(type %T_SECRET% >nul 2>nul&&echo LEAK_SECRET||echo DENY_SECRET)&(type %T_KEY% >nul 2>nul&&echo LEAK_KEY||echo DENY_KEY)&(type %T_SIBLING% >nul 2>nul&&echo LEAK_SIBLING||echo DENY_SIBLING)&(dir /b %T_BASE% >nul 2>nul&&echo LEAK_LISTING||echo DENY_LISTING)&(dir /b %T_HOME% >nul 2>nul&&echo LEAK_HOME_LISTING||echo DENY_HOME_LISTING)&((echo x>%T_HOME%\planted.txt) >nul 2>nul&if exist %T_HOME%\planted.txt (echo LEAK_WRITE_HOME) else (echo DENY_WRITE_HOME))&((echo x>%T_BASE%\other_task\planted.txt) >nul 2>nul&if exist %T_BASE%\other_task\planted.txt (echo LEAK_WRITE_SIBLING) else (echo DENY_WRITE_SIBLING))&((echo x>%T_OUTSIDE%\feat3_outside_marker) >nul 2>nul&if exist %T_OUTSIDE%\feat3_outside_marker (echo LEAK_WRITE_TMP) else (echo DENY_WRITE_TMP))"#;
 
     fn run_win_fs(rig: &Rig) -> Task {
         let outside = rig._outside.path().to_string_lossy().into_owned();
-        win_task(rig, WIN_FS_SCRIPT, &[("T_OUTSIDE", &outside)], 60)
+        win_cmd_task(rig, WIN_FS_SCRIPT, &[("T_OUTSIDE", &outside)], 60)
     }
 
     #[tokio::test]
@@ -2212,13 +2219,13 @@ try { Set-Content -LiteralPath "$env:T_OUTSIDE\feat3_outside_marker" -Value 'x' 
     async fn test_concurrent_tasks_under_fs_cannot_read_or_list_each_others_sandboxes() {
         let rig = Arc::new(Rig::new(IsolationLevel::Fs, false));
         let script = r#"
-Write-Output 'TASK_STARTED'
-Set-Content -LiteralPath "$env:RUSTY_GRID_SANDBOX_DIR\secret.txt" -Value 'secret-from-t1'
-Start-Sleep -Milliseconds 400
-try { Get-Content -LiteralPath "$env:T_SIB_SANDBOX\secret.txt" -ErrorAction Stop | Out-Null; Write-Output 'LEAK_SIBLING_READ' } catch { Write-Output 'DENY_SIBLING_READ' }
-try { Get-ChildItem -LiteralPath $env:T_SIB_SANDBOX -ErrorAction Stop | Out-Null; Write-Output 'LEAK_SIBLING_LIST' } catch { Write-Output 'DENY_SIBLING_LIST' }
-try { Set-Content -LiteralPath "$env:T_SIB_SANDBOX\planted.txt" -Value 'x' -ErrorAction Stop; Write-Output 'LEAK_SIBLING_WRITE' } catch { Write-Output 'DENY_SIBLING_WRITE' }
-Start-Sleep -Milliseconds 400
+[Console]::Out.WriteLine('TASK_STARTED')
+[System.IO.File]::WriteAllText("$env:RUSTY_GRID_SANDBOX_DIR\secret.txt", 'secret-from-t1')
+[System.Threading.Thread]::Sleep(400)
+try { $null = [System.IO.File]::ReadAllText("$env:T_SIB_SANDBOX\secret.txt"); [Console]::Out.WriteLine('LEAK_SIBLING_READ') } catch { [Console]::Out.WriteLine('DENY_SIBLING_READ') }
+try { $null = [System.IO.Directory]::GetFileSystemEntries($env:T_SIB_SANDBOX); [Console]::Out.WriteLine('LEAK_SIBLING_LIST') } catch { [Console]::Out.WriteLine('DENY_SIBLING_LIST') }
+try { [System.IO.File]::WriteAllText("$env:T_SIB_SANDBOX\planted.txt", 'x'); [Console]::Out.WriteLine('LEAK_SIBLING_WRITE') } catch { [Console]::Out.WriteLine('DENY_SIBLING_WRITE') }
+[System.Threading.Thread]::Sleep(300)
 "#;
         let task1 = win_task(&rig, script, &[], 60);
         let mut task2 = task1.clone();
@@ -2272,26 +2279,9 @@ Start-Sleep -Milliseconds 400
     #[tokio::test]
     async fn test_environment_is_moved_into_the_sandbox_and_ipc_sockets_are_removed() {
         let rig = Rig::new(IsolationLevel::Fs, false);
-        let task = win_task(
+        let task = win_cmd_task(
             &rig,
-            r#"
-Write-Output 'TASK_STARTED=1'
-Write-Output "HOME=$env:HOME"
-Write-Output "USERPROFILE=$env:USERPROFILE"
-Write-Output "TMPDIR=$env:TMPDIR"
-Write-Output "TEMP=$env:TEMP"
-Write-Output "TMP=$env:TMP"
-Write-Output "SANDBOX=$env:RUSTY_GRID_SANDBOX_DIR"
-Write-Output "RUSTUP_HOME=$env:RUSTUP_HOME"
-Write-Output "CARGO_HOME=$env:CARGO_HOME"
-Write-Output ("SSH=" + $(if ($null -ne $env:SSH_AUTH_SOCK) { $env:SSH_AUTH_SOCK } else { 'unset' }))
-Write-Output ("GPG=" + $(if ($null -ne $env:GPG_AGENT_INFO) { $env:GPG_AGENT_INFO } else { 'unset' }))
-Write-Output ("DBUS=" + $(if ($null -ne $env:DBUS_SESSION_BUS_ADDRESS) { $env:DBUS_SESSION_BUS_ADDRESS } else { 'unset' }))
-Write-Output ("DOCKER=" + $(if ($null -ne $env:DOCKER_HOST) { $env:DOCKER_HOST } else { 'unset' }))
-Write-Output ("SECRET=" + $(if ($null -ne $env:OXIDESWARM_SECRET) { $env:OXIDESWARM_SECRET } else { 'unset' }))
-Write-Output ("TASK_ID=" + $(if ($null -ne $env:RUSTY_GRID_TASK_ID) { $env:RUSTY_GRID_TASK_ID } else { 'unset' }))
-Write-Output ("RUN_TOKEN=" + $(if ($null -ne $env:RUSTY_GRID_RUN_TOKEN) { $env:RUSTY_GRID_RUN_TOKEN } else { 'unset' }))
-"#,
+            r#"echo TASK_STARTED=1& echo HOME=%HOME%& echo USERPROFILE=%USERPROFILE%& echo TMPDIR=%TMPDIR%& echo TEMP=%TEMP%& echo TMP=%TMP%& echo SANDBOX=%RUSTY_GRID_SANDBOX_DIR%& echo RUSTUP_HOME=%RUSTUP_HOME%& echo CARGO_HOME=%CARGO_HOME%& (if defined SSH_AUTH_SOCK (echo SSH=%SSH_AUTH_SOCK%) else (echo SSH=unset))& (if defined GPG_AGENT_INFO (echo GPG=%GPG_AGENT_INFO%) else (echo GPG=unset))& (if defined DBUS_SESSION_BUS_ADDRESS (echo DBUS=%DBUS_SESSION_BUS_ADDRESS%) else (echo DBUS=unset))& (if defined DOCKER_HOST (echo DOCKER=%DOCKER_HOST%) else (echo DOCKER=unset))& (if defined OXIDESWARM_SECRET (echo SECRET=%OXIDESWARM_SECRET%) else (echo SECRET=unset))& (if defined RUSTY_GRID_TASK_ID (echo TASK_ID=%RUSTY_GRID_TASK_ID%) else (echo TASK_ID=unset))& (if defined RUSTY_GRID_RUN_TOKEN (echo RUN_TOKEN=%RUSTY_GRID_RUN_TOKEN%) else (echo RUN_TOKEN=unset))"#,
             &[
                 ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
                 ("GPG_AGENT_INFO", "x"),
@@ -2364,19 +2354,19 @@ Write-Output ("RUN_TOKEN=" + $(if ($null -ne $env:RUSTY_GRID_RUN_TOKEN) { $env:R
             .unwrap_or_else(|| "0".to_string());
 
         let tcp_script = r#"
-Write-Output 'TASK_STARTED'
+[Console]::Out.WriteLine('TASK_STARTED')
 try {
-    $c = New-Object System.Net.Sockets.TcpClient
+    $c = [System.Net.Sockets.TcpClient]::new()
     $c.Connect('127.0.0.1', [int]$env:T_PORT)
     $c.Close()
-    Write-Output 'CONNECTED'
+    [Console]::Out.WriteLine('CONNECTED')
 } catch {
-    Write-Output 'REFUSED'
+    [Console]::Out.WriteLine('REFUSED')
 }
 try {
-    $u = New-Object System.Net.Sockets.UdpClient
+    $u = [System.Net.Sockets.UdpClient]::new()
     $b = [System.Text.Encoding]::ASCII.GetBytes('FEAT3_UDP')
-    $u.Send($b, $b.Length, '127.0.0.1', [int]$env:T_UDP_PORT) | Out-Null
+    $null = $u.Send($b, $b.Length, '127.0.0.1', [int]$env:T_UDP_PORT)
     $u.Close()
 } catch {}
 "#;
@@ -2384,83 +2374,83 @@ try {
         // (`192.0.2.1:53`), real DNS resolution (`example.com`), IPv6 loopback (`[::1]`) and IPv6
         // outbound (`[2001:db8::1]:80`), and UNC share access (`\\127.0.0.1\C$\Windows\win.ini`).
         let net_matrix_script = r#"
-Write-Output 'TASK_STARTED'
+[Console]::Out.WriteLine('TASK_STARTED')
 try {
-    $c = New-Object System.Net.Sockets.TcpClient
+    $c = [System.Net.Sockets.TcpClient]::new()
     $ar = $c.BeginConnect('192.0.2.1', 80, $null, $null)
     if ($ar.AsyncWaitHandle.WaitOne(150, $false)) {
         $c.EndConnect($ar)
     }
     $c.Close()
-    Write-Output 'TCP_V4_ALLOWED'
+    [Console]::Out.WriteLine('TCP_V4_ALLOWED')
 } catch [System.Net.Sockets.SocketException] {
-    if ($_.Exception.NativeErrorCode -eq 10013) { Write-Output 'TCP_V4_REFUSED' } else { Write-Output 'TCP_V4_ALLOWED' }
+    if ($_.Exception.NativeErrorCode -eq 10013) { [Console]::Out.WriteLine('TCP_V4_REFUSED') } else { [Console]::Out.WriteLine('TCP_V4_ALLOWED') }
 } catch {
     if ($_.Exception.InnerException -is [System.Net.Sockets.SocketException] -and $_.Exception.InnerException.NativeErrorCode -eq 10013) {
-        Write-Output 'TCP_V4_REFUSED'
+        [Console]::Out.WriteLine('TCP_V4_REFUSED')
     } else {
-        Write-Output 'TCP_V4_ALLOWED'
+        [Console]::Out.WriteLine('TCP_V4_ALLOWED')
     }
 }
 
 try {
-    $u = New-Object System.Net.Sockets.UdpClient
+    $u = [System.Net.Sockets.UdpClient]::new()
     $u.Connect('192.0.2.1', 53)
     $bytes = [System.Text.Encoding]::ASCII.GetBytes('FEAT3_MATRIX_UDP')
-    $u.Send($bytes, $bytes.Length) | Out-Null
+    $null = $u.Send($bytes, $bytes.Length)
     $u.Close()
-    Write-Output 'UDP_SEND_OK'
+    [Console]::Out.WriteLine('UDP_SEND_OK')
 } catch [System.Net.Sockets.SocketException] {
-    if ($_.Exception.NativeErrorCode -eq 10013) { Write-Output 'UDP_SEND_REFUSED' } else { Write-Output "UDP_SEND_OTHER=$($_.Exception.NativeErrorCode)" }
+    if ($_.Exception.NativeErrorCode -eq 10013) { [Console]::Out.WriteLine('UDP_SEND_REFUSED') } else { [Console]::Out.WriteLine("UDP_SEND_OTHER=$($_.Exception.NativeErrorCode)") }
 } catch {
     if ($_.Exception.InnerException -is [System.Net.Sockets.SocketException] -and $_.Exception.InnerException.NativeErrorCode -eq 10013) {
-        Write-Output 'UDP_SEND_REFUSED'
+        [Console]::Out.WriteLine('UDP_SEND_REFUSED')
     } else {
-        Write-Output "UDP_SEND_OTHER=$($_.Exception.Message)"
+        [Console]::Out.WriteLine("UDP_SEND_OTHER=$($_.Exception.Message)")
     }
 }
 
 try {
     $ips = [System.Net.Dns]::GetHostAddresses('example.com')
-    if ($ips.Count -gt 0) { Write-Output 'DNS_ALLOWED' } else { Write-Output 'DNS_EMPTY' }
+    if ($ips.Count -gt 0) { [Console]::Out.WriteLine('DNS_ALLOWED') } else { [Console]::Out.WriteLine('DNS_EMPTY') }
 } catch {
-    Write-Output 'DNS_REFUSED'
+    [Console]::Out.WriteLine('DNS_REFUSED')
 }
 
 if ([int]$env:T_PORT6 -gt 0) {
     try {
-        $c6 = New-Object System.Net.Sockets.TcpClient([System.Net.Sockets.AddressFamily]::InterNetworkV6)
+        $c6 = [System.Net.Sockets.TcpClient]::new([System.Net.Sockets.AddressFamily]::InterNetworkV6)
         $c6.Connect('::1', [int]$env:T_PORT6)
         $c6.Close()
-        Write-Output 'IPV6_LOOPBACK_CONNECTED'
+        [Console]::Out.WriteLine('IPV6_LOOPBACK_CONNECTED')
     } catch {
-        Write-Output 'IPV6_LOOPBACK_REFUSED'
+        [Console]::Out.WriteLine('IPV6_LOOPBACK_REFUSED')
     }
 }
 
 try {
-    $c6o = New-Object System.Net.Sockets.TcpClient([System.Net.Sockets.AddressFamily]::InterNetworkV6)
+    $c6o = [System.Net.Sockets.TcpClient]::new([System.Net.Sockets.AddressFamily]::InterNetworkV6)
     $ar6 = $c6o.BeginConnect('2001:db8::1', 80, $null, $null)
     if ($ar6.AsyncWaitHandle.WaitOne(150, $false)) {
         $c6o.EndConnect($ar6)
     }
     $c6o.Close()
-    Write-Output 'IPV6_OUTBOUND_ALLOWED'
+    [Console]::Out.WriteLine('IPV6_OUTBOUND_ALLOWED')
 } catch [System.Net.Sockets.SocketException] {
-    if ($_.Exception.NativeErrorCode -eq 10013) { Write-Output 'IPV6_OUTBOUND_REFUSED' } else { Write-Output "IPV6_OUTBOUND_OTHER=$($_.Exception.NativeErrorCode)" }
+    if ($_.Exception.NativeErrorCode -eq 10013) { [Console]::Out.WriteLine('IPV6_OUTBOUND_REFUSED') } else { [Console]::Out.WriteLine("IPV6_OUTBOUND_OTHER=$($_.Exception.NativeErrorCode)") }
 } catch {
     if ($_.Exception.InnerException -is [System.Net.Sockets.SocketException] -and $_.Exception.InnerException.NativeErrorCode -eq 10013) {
-        Write-Output 'IPV6_OUTBOUND_REFUSED'
+        [Console]::Out.WriteLine('IPV6_OUTBOUND_REFUSED')
     } else {
-        Write-Output "IPV6_OUTBOUND_OTHER=$($_.Exception.Message)"
+        [Console]::Out.WriteLine("IPV6_OUTBOUND_OTHER=$($_.Exception.Message)")
     }
 }
 
 try {
-    Get-Content -LiteralPath '\\127.0.0.1\C$\Windows\win.ini' -ErrorAction Stop | Out-Null
-    Write-Output 'UNC_ALLOWED'
+    $null = [System.IO.File]::ReadAllText('\\127.0.0.1\C$\Windows\win.ini')
+    [Console]::Out.WriteLine('UNC_ALLOWED')
 } catch {
-    Write-Output 'UNC_REFUSED'
+    [Console]::Out.WriteLine('UNC_REFUSED')
 }
 "#;
 
@@ -2991,7 +2981,7 @@ try {
         let handle = {
             let (rig, pid) = (Arc::clone(&rig), Arc::clone(&pid));
             tokio::spawn(async move {
-                let task = win_task(&rig, "Start-Sleep -Seconds 120", &[], 120);
+                let task = win_task(&rig, "[System.Threading.Thread]::Sleep(120000)", &[], 120);
                 rig.runner
                     .execute_task(&task, Some(pid), Some(cancel_rx))
                     .await
@@ -3008,7 +2998,7 @@ try {
 
         // Timeout.
         let pid = Arc::new(AtomicU32::new(0));
-        let task = win_task(&rig, "Start-Sleep -Seconds 120", &[], 2);
+        let task = win_task(&rig, "[System.Threading.Thread]::Sleep(120000)", &[], 2);
         let started = std::time::Instant::now();
         let result = rig
             .runner
@@ -3065,21 +3055,11 @@ try {
     #[tokio::test]
     async fn test_worker_only_environment_variables_do_not_reach_a_confined_task() {
         assert!(std::env::var_os("CARGO_PKG_NAME").is_some());
-        let script = r#"
-Write-Output 'TASK_STARTED'
-$w = if ($env:CARGO_PKG_NAME) { $env:CARGO_PKG_NAME } else { "unset" }
-$p = if ($env:PATH) { "yes" } else { "no" }
-$t = if ($env:T_BASE) { "yes" } else { "no" }
-$i = if ($env:RUSTY_GRID_TASK_ID) { "yes" } else { "no" }
-Write-Output "WORKER_VAR=$w"
-Write-Output "PATH_SET=$p"
-Write-Output "TASK_VAR=$t"
-Write-Output "ID=$i"
-"#;
+        let script = r#"echo TASK_STARTED& (if defined CARGO_PKG_NAME (echo WORKER_VAR=%CARGO_PKG_NAME%) else (echo WORKER_VAR=unset))& (if defined PATH (echo PATH_SET=yes) else (echo PATH_SET=no))& (if defined T_BASE (echo TASK_VAR=yes) else (echo TASK_VAR=no))& (if defined RUSTY_GRID_TASK_ID (echo ID=yes) else (echo ID=no))"#;
         let control_rig = Rig::new(IsolationLevel::Off, false);
         let control = control_rig
             .runner
-            .execute_task(&win_task(&control_rig, script, &[], 60), None, None)
+            .execute_task(&win_cmd_task(&control_rig, script, &[], 60), None, None)
             .await;
         assert!(
             lines(&control).contains(&"TASK_STARTED".to_string())
@@ -3091,7 +3071,7 @@ Write-Output "ID=$i"
             let rig = Rig::new(level, false);
             let result = rig
                 .runner
-                .execute_task(&win_task(&rig, script, &[], 60), None, None)
+                .execute_task(&win_cmd_task(&rig, script, &[], 60), None, None)
                 .await;
             let got = lines(&result);
             for expected in [
@@ -3126,15 +3106,15 @@ Write-Output "ID=$i"
             rusty_grid_core::TaskId::new().0
         );
         let script = r#"
-Write-Output 'TASK_STARTED'
-$server = New-Object System.IO.Pipes.NamedPipeServerStream($env:T_PIPE, [System.IO.Pipes.PipeDirection]::InOut, 4)
+[Console]::Out.WriteLine('TASK_STARTED')
+$server = [System.IO.Pipes.NamedPipeServerStream]::new($env:T_PIPE, [System.IO.Pipes.PipeDirection]::InOut, 4)
 try {
-    $client = New-Object System.IO.Pipes.NamedPipeClientStream('.', $env:T_PIPE, [System.IO.Pipes.PipeDirection]::InOut)
+    $client = [System.IO.Pipes.NamedPipeClientStream]::new('.', $env:T_PIPE, [System.IO.Pipes.PipeDirection]::InOut)
     $client.Connect(1500)
     $client.Dispose()
-    Write-Output 'PIPE_CONNECTED'
+    [Console]::Out.WriteLine('PIPE_CONNECTED')
 } catch {
-    Write-Output 'PIPE_REFUSED'
+    [Console]::Out.WriteLine('PIPE_REFUSED')
 } finally {
     $server.Dispose()
 }
@@ -3142,30 +3122,30 @@ try {
         // First verify that a host named pipe and host named event created outside the
         // AppContainer are reachable under `off` and unreachable under `fs` and `fs+net`.
         let host_pipe_script = r#"
-Write-Output 'TASK_STARTED'
+[Console]::Out.WriteLine('TASK_STARTED')
 try {
-    $client = New-Object System.IO.Pipes.NamedPipeClientStream('.', $env:T_PIPE, [System.IO.Pipes.PipeDirection]::InOut)
+    $client = [System.IO.Pipes.NamedPipeClientStream]::new('.', $env:T_PIPE, [System.IO.Pipes.PipeDirection]::InOut)
     $client.Connect(1500)
     $client.Dispose()
-    Write-Output 'HOST_PIPE_CONNECTED'
+    [Console]::Out.WriteLine('HOST_PIPE_CONNECTED')
 } catch {
-    Write-Output 'HOST_PIPE_REFUSED'
+    [Console]::Out.WriteLine('HOST_PIPE_REFUSED')
 }
 try {
     $ev = [System.Threading.EventWaitHandle]::OpenExisting($env:T_EVENT)
     $ev.Dispose()
-    Write-Output 'HOST_EVENT_OPENED'
+    [Console]::Out.WriteLine('HOST_EVENT_OPENED')
 } catch {
-    Write-Output 'HOST_EVENT_REFUSED'
+    [Console]::Out.WriteLine('HOST_EVENT_REFUSED')
 }
 foreach ($wellKnown in @('openssh-ssh-agent', 'docker_engine')) {
     try {
-        $wk = New-Object System.IO.Pipes.NamedPipeClientStream('.', $wellKnown, [System.IO.Pipes.PipeDirection]::InOut)
+        $wk = [System.IO.Pipes.NamedPipeClientStream]::new('.', $wellKnown, [System.IO.Pipes.PipeDirection]::InOut)
         $wk.Connect(200)
         $wk.Dispose()
-        Write-Output "WK_CONNECTED=$wellKnown"
+        [Console]::Out.WriteLine("WK_CONNECTED=$wellKnown")
     } catch {
-        Write-Output "WK_REFUSED=$wellKnown"
+        [Console]::Out.WriteLine("WK_REFUSED=$wellKnown")
     }
 }
 "#;
@@ -3177,11 +3157,11 @@ foreach ($wellKnown in @('openssh-ssh-agent', 'docker_engine')) {
             "-NonInteractive",
             "-Command",
             &format!(
-                "$s1 = New-Object System.IO.Pipes.NamedPipeServerStream('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
-                 $s2 = New-Object System.IO.Pipes.NamedPipeServerStream('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
-                 $s3 = New-Object System.IO.Pipes.NamedPipeServerStream('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
-                 $ev = New-Object System.Threading.EventWaitHandle($true, [System.Threading.EventResetMode]::ManualReset, '{event_name}'); \
-                 Write-Output 'READY'; Start-Sleep -Seconds 30"
+                "$s1 = [System.IO.Pipes.NamedPipeServerStream]::new('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
+                 $s2 = [System.IO.Pipes.NamedPipeServerStream]::new('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
+                 $s3 = [System.IO.Pipes.NamedPipeServerStream]::new('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
+                 $ev = [System.Threading.EventWaitHandle]::new($true, [System.Threading.EventResetMode]::ManualReset, '{event_name}'); \
+                 [Console]::Out.WriteLine('READY'); [System.Threading.Thread]::Sleep(30000)"
             ),
         ])
         .stdout(std::process::Stdio::piped())
@@ -3285,13 +3265,14 @@ foreach ($wellKnown in @('openssh-ssh-agent', 'docker_engine')) {
         let secret_addr = (secret_bytes.as_ptr() as usize).to_string();
         let secret_len = secret_bytes.len().to_string();
 
-        let script = r#"
-Write-Output 'TASK_STARTED'
-Add-Type -TypeDefinition @"
+        let script = format!(
+            r#"{WIN_CSHARP_HELPER}
+[Console]::Out.WriteLine('TASK_STARTED')
+Compile-CSharp @"
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
-public static class WinProcProbe {
+public static class WinProcProbe {{
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -3301,33 +3282,33 @@ public static class WinProcProbe {
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr hObject);
 
-    public static string TryReadWorkerMemory(int pid, ulong addr, int len) {
+    public static string TryReadWorkerMemory(int pid, ulong addr, int len) {{
         const uint PROCESS_VM_READ = 0x0010;
         const uint PROCESS_QUERY_INFORMATION = 0x0400;
         IntPtr h = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid);
         if (h == IntPtr.Zero) return "RPM_OPEN_DENIED";
-        try {
+        try {{
             byte[] buf = new byte[len];
             IntPtr read;
             if (!ReadProcessMemory(h, (IntPtr)addr, buf, len, out read)) return "RPM_READ_DENIED";
             return "RPM_LEAK=" + Encoding.UTF8.GetString(buf, 0, (int)read);
-        } finally {
+        }} finally {{
             CloseHandle(h);
-        }
-    }
+        }}
+    }}
 
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     public static extern IntPtr GetModuleHandle(string lpModuleName);
     [DllImport("kernel32.dll", CharSet = CharSet.Ansi, ExactSpelling = true, SetLastError = true)]
     public static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
 
-    public static string TryCreateRemoteThread(int pid) {
+    public static string TryCreateRemoteThread(int pid) {{
         const uint PROCESS_CREATE_THREAD = 0x0002;
         const uint PROCESS_VM_OPERATION = 0x0008;
         const uint PROCESS_VM_WRITE = 0x0020;
         IntPtr h = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE, false, pid);
         if (h == IntPtr.Zero) return "CRT_OPEN_DENIED";
-        try {
+        try {{
             IntPtr k32 = GetModuleHandle("kernel32.dll");
             IntPtr fnAddr = GetProcAddress(k32, "GetCurrentProcessId");
             uint tid;
@@ -3335,40 +3316,41 @@ public static class WinProcProbe {
             if (th == IntPtr.Zero) return "CRT_CALL_DENIED";
             CloseHandle(th);
             return "CRT_CREATED";
-        } finally {
+        }} finally {{
             CloseHandle(h);
-        }
-    }
-}
+        }}
+    }}
+}}
 "@
-Write-Output ([WinProcProbe]::TryReadWorkerMemory([int]$env:WORKER_PID, [uint64]$env:SECRET_ADDR, [int]$env:SECRET_LEN))
-Write-Output ("WORKER_" + [WinProcProbe]::TryCreateRemoteThread([int]$env:WORKER_PID))
-Write-Output ("VICTIM_" + [WinProcProbe]::TryCreateRemoteThread([int]$env:VICTIM_PID))
-try {
+[Console]::Out.WriteLine(([WinProcProbe]::TryReadWorkerMemory([int]$env:WORKER_PID, [uint64]$env:SECRET_ADDR, [int]$env:SECRET_LEN)))
+[Console]::Out.WriteLine(("WORKER_" + [WinProcProbe]::TryCreateRemoteThread([int]$env:WORKER_PID)))
+[Console]::Out.WriteLine(("VICTIM_" + [WinProcProbe]::TryCreateRemoteThread([int]$env:VICTIM_PID)))
+try {{
     $w = [System.Diagnostics.Process]::GetProcessById([int]$env:WORKER_PID)
     $h = $w.Handle
-    Write-Output 'WORKER_HANDLE_OPENED'
-} catch {
-    Write-Output 'WORKER_HANDLE_DENIED'
-}
-try {
-    Stop-Process -Id ([int]$env:VICTIM_PID) -Force -ErrorAction Stop
-    Write-Output 'SIGNALLED'
-} catch {
-    Write-Output 'DENIED'
-}
-try {
-    $psi = New-Object System.Diagnostics.ProcessStartInfo("$env:SystemRoot\System32\cmd.exe", '/C ping -n 60 127.0.0.1 >nul')
+    [Console]::Out.WriteLine('WORKER_HANDLE_OPENED')
+}} catch {{
+    [Console]::Out.WriteLine('WORKER_HANDLE_DENIED')
+}}
+try {{
+    [System.Diagnostics.Process]::GetProcessById([int]$env:VICTIM_PID).Kill()
+    [Console]::Out.WriteLine('SIGNALLED')
+}} catch {{
+    [Console]::Out.WriteLine('DENIED')
+}}
+try {{
+    $psi = [System.Diagnostics.ProcessStartInfo]::new("$env:SystemRoot\System32\cmd.exe", '/C ping -n 60 127.0.0.1 >nul')
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $own = [System.Diagnostics.Process]::Start($psi)
     $own.Kill()
-    $own.WaitForExit(5000) | Out-Null
-    Write-Output 'OWN_CHILD_OK'
-} catch {
-    Write-Output 'OWN_CHILD_FAIL'
-}
-"#;
+    $null = $own.WaitForExit(5000)
+    [Console]::Out.WriteLine('OWN_CHILD_OK')
+}} catch {{
+    [Console]::Out.WriteLine('OWN_CHILD_FAIL')
+}}
+"#
+        );
         let envs = [
             ("VICTIM_PID", victim_pid.as_str()),
             ("WORKER_PID", worker_pid.as_str()),
@@ -3379,7 +3361,7 @@ try {
             let rig = Rig::new(level, false);
             let result = rig
                 .runner
-                .execute_task(&win_task(&rig, script, &envs, 60), None, None)
+                .execute_task(&win_task(&rig, &script, &envs, 60), None, None)
                 .await;
             let got = lines(&result);
             assert!(
@@ -3415,7 +3397,7 @@ try {
         let control_rig = Rig::new(IsolationLevel::Off, false);
         let control = control_rig
             .runner
-            .execute_task(&win_task(&control_rig, script, &envs, 60), None, None)
+            .execute_task(&win_task(&control_rig, &script, &envs, 60), None, None)
             .await;
         let _ = victim.kill();
         let _ = victim.wait();
@@ -3448,37 +3430,39 @@ try {
         let helper_pid = console_helper.id().to_string();
         let worker_pid = std::process::id().to_string();
 
-        let script = r#"
-Write-Output 'TASK_STARTED'
-Add-Type -TypeDefinition @"
+        let script = format!(
+            r#"{WIN_CSHARP_HELPER}
+[Console]::Out.WriteLine('TASK_STARTED')
+Compile-CSharp @"
 using System;
 using System.Runtime.InteropServices;
-public static class WinConsoleProbe {
+public static class WinConsoleProbe {{
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool FreeConsole();
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool AttachConsole(uint dwProcessId);
 
-    public static string TryAttach(uint helperPid, uint workerPid) {
+    public static string TryAttach(uint helperPid, uint workerPid) {{
         FreeConsole();
-        if (AttachConsole(helperPid)) {
+        if (AttachConsole(helperPid)) {{
             FreeConsole();
             return "ATTACH_HELPER_OK";
-        }
-        if (AttachConsole(workerPid)) {
+        }}
+        if (AttachConsole(workerPid)) {{
             FreeConsole();
             return "ATTACH_WORKER_OK";
-        }
-        if (AttachConsole(0xFFFFFFFFu)) {
+        }}
+        if (AttachConsole(0xFFFFFFFFu)) {{
             FreeConsole();
             return "ATTACH_PARENT_OK";
-        }
+        }}
         return "ATTACH_DENIED";
-    }
-}
+    }}
+}}
 "@
-Write-Output ([WinConsoleProbe]::TryAttach([uint32]$env:HELPER_PID, [uint32]$env:WORKER_PID))
-"#;
+[Console]::Out.WriteLine(([WinConsoleProbe]::TryAttach([uint32]$env:HELPER_PID, [uint32]$env:WORKER_PID)))
+"#
+        );
         let envs = [
             ("HELPER_PID", helper_pid.as_str()),
             ("WORKER_PID", worker_pid.as_str()),
@@ -3489,7 +3473,7 @@ Write-Output ([WinConsoleProbe]::TryAttach([uint32]$env:HELPER_PID, [uint32]$env
         let control_rig = Rig::new(IsolationLevel::Off, false);
         let control = control_rig
             .runner
-            .execute_task(&win_task(&control_rig, script, &envs, 60), None, None)
+            .execute_task(&win_task(&control_rig, &script, &envs, 60), None, None)
             .await;
         let control_got = lines(&control);
 
@@ -3497,7 +3481,7 @@ Write-Output ([WinConsoleProbe]::TryAttach([uint32]$env:HELPER_PID, [uint32]$env
             let rig = Rig::new(level, false);
             let result = rig
                 .runner
-                .execute_task(&win_task(&rig, script, &envs, 60), None, None)
+                .execute_task(&win_task(&rig, &script, &envs, 60), None, None)
                 .await;
             let got = lines(&result);
             assert!(
@@ -3553,34 +3537,13 @@ Write-Output ([WinConsoleProbe]::TryAttach([uint32]$env:HELPER_PID, [uint32]$env
         );
 
         let script = format!(
-            r#"
-Write-Output 'TASK_STARTED'
-function Invoke-Reg([string]$arguments) {{
-    $psi = New-Object System.Diagnostics.ProcessStartInfo("$env:SystemRoot\System32\reg.exe", $arguments)
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.CreateNoWindow = $true
-    $p = [System.Diagnostics.Process]::Start($psi)
-    $out = $p.StandardOutput.ReadToEnd()
-    $p.WaitForExit()
-    return @($p.ExitCode, $out.Trim())
-}}
-$hklm = Invoke-Reg 'query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion" /v ProductName'
-if ($hklm[0] -eq 0 -and $hklm[1] -match 'Windows') {{
-    Write-Output 'HKLM_READ_OK'
-}}
-$r = Invoke-Reg 'query "{read_key}" /v secret'
-Write-Output "READ=$($r[1] -replace '\r?\n', ' ')"
-$w = Invoke-Reg 'add "{write_key}" /v planted /t REG_SZ /d yes /f'
-Write-Output "WRITE_RC=$($w[0])"
-"#
+            r#"echo TASK_STARTED&(reg.exe query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion /v ProgramFilesDir >nul 2>nul&&echo HKLM_READ_OK)&(reg.exe query {read_key} /v secret 2>nul||echo READ_DENIED)&(reg.exe add {write_key} /v planted /t REG_SZ /d yes /f >nul 2>nul&&echo WRITE_RC=0||echo WRITE_RC=1)"#
         );
 
         let control_rig = Rig::new(IsolationLevel::Off, false);
         let control = control_rig
             .runner
-            .execute_task(&win_task(&control_rig, &script, &[], 60), None, None)
+            .execute_task(&win_cmd_task(&control_rig, &script, &[], 60), None, None)
             .await;
         let control_lines = lines(&control);
         let control_reads = control_lines.contains(&"TASK_STARTED".to_string())
@@ -3600,7 +3563,7 @@ Write-Output "WRITE_RC=$($w[0])"
             let rig = Rig::new(level, false);
             let result = rig
                 .runner
-                .execute_task(&win_task(&rig, &script, &[], 60), None, None)
+                .execute_task(&win_cmd_task(&rig, &script, &[], 60), None, None)
                 .await;
             let got = lines(&result);
             assert!(
@@ -3633,12 +3596,13 @@ Write-Output "WRITE_RC=$($w[0])"
     #[tokio::test]
     async fn test_clipboard_is_not_readable() {
         let marker = format!("feat3c-clip-marker-{}", rusty_grid_core::TaskId::new().0);
-        let clip_helper = r#"
-Add-Type -TypeDefinition @"
+        let clip_helper = format!(
+            r#"{WIN_CSHARP_HELPER}
+Compile-CSharp @"
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
-public static class WinClipProbe {
+public static class WinClipProbe {{
     const uint CF_UNICODETEXT = 13;
     const uint GMEM_MOVEABLE = 0x0002;
     const int UOI_NAME = 2;
@@ -3659,44 +3623,44 @@ public static class WinClipProbe {
     [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr GlobalLock(IntPtr hMem);
     [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GlobalUnlock(IntPtr hMem);
 
-    public static string CurrentDesktopName() {
+    public static string CurrentDesktopName() {{
         IntPtr hDesk = GetThreadDesktop(GetCurrentThreadId());
         if (hDesk == IntPtr.Zero) return "NONE";
         byte[] buf = new byte[512];
         uint needed;
         if (!GetUserObjectInformationW(hDesk, UOI_NAME, buf, (uint)buf.Length, out needed) || needed < 2) return "UNKNOWN";
         return Encoding.Unicode.GetString(buf, 0, (int)needed).TrimEnd('\0');
-    }
+    }}
 
-    public static bool CanOpenOrSwitchDefaultDesktop() {
+    public static bool CanOpenOrSwitchDefaultDesktop() {{
         IntPtr h = OpenDesktopW("Default", 0, false, DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP);
         if (h == IntPtr.Zero) return false;
         bool switched = SwitchDesktop(h);
         CloseDesktop(h);
         return true;
-    }
+    }}
 
-    public static string ReadText() {
-        for (int i = 0; i < 10; i++) {
-            if (OpenClipboard(IntPtr.Zero)) {
-                try {
+    public static string ReadText() {{
+        for (int i = 0; i < 10; i++) {{
+            if (OpenClipboard(IntPtr.Zero)) {{
+                try {{
                     IntPtr h = GetClipboardData(CF_UNICODETEXT);
                     if (h == IntPtr.Zero) return "";
                     IntPtr p = GlobalLock(h);
                     if (p == IntPtr.Zero) return "";
-                    try { return Marshal.PtrToStringUni(p) ?? ""; }
-                    finally { GlobalUnlock(h); }
-                } finally { CloseClipboard(); }
-            }
+                    try {{ return Marshal.PtrToStringUni(p) ?? ""; }}
+                    finally {{ GlobalUnlock(h); }}
+                }} finally {{ CloseClipboard(); }}
+            }}
             System.Threading.Thread.Sleep(20);
-        }
+        }}
         return "OPEN_DENIED";
-    }
+    }}
 
-    public static bool WriteText(string s) {
-        for (int i = 0; i < 10; i++) {
-            if (OpenClipboard(IntPtr.Zero)) {
-                try {
+    public static bool WriteText(string s) {{
+        for (int i = 0; i < 10; i++) {{
+            if (OpenClipboard(IntPtr.Zero)) {{
+                try {{
                     EmptyClipboard();
                     if (string.IsNullOrEmpty(s)) return true;
                     int bytes = (s.Length + 1) * 2;
@@ -3707,38 +3671,39 @@ public static class WinClipProbe {
                     Marshal.WriteInt16(p, s.Length * 2, 0);
                     GlobalUnlock(h);
                     return SetClipboardData(CF_UNICODETEXT, h) != IntPtr.Zero;
-                } finally { CloseClipboard(); }
-            }
+                }} finally {{ CloseClipboard(); }}
+            }}
             System.Threading.Thread.Sleep(20);
-        }
+        }}
         return false;
-    }
-}
+    }}
+}}
 "@
-"#;
+"#
+        );
         let read_script = format!(
             r#"{clip_helper}
-Write-Output 'TASK_STARTED'
+[Console]::Out.WriteLine('TASK_STARTED')
 $desk = [WinClipProbe]::CurrentDesktopName()
-if ($desk.StartsWith('ox_desk_')) {{ Write-Output 'DESK_ISOLATED=yes' }} else {{ Write-Output "DESK_ISOLATED=$desk" }}
-if (-not [WinClipProbe]::CanOpenOrSwitchDefaultDesktop()) {{ Write-Output 'DEFAULT_DESK_DENIED=yes' }} else {{ Write-Output 'DEFAULT_DESK_DENIED=no' }}
+if ($desk.StartsWith('ox_desk_')) {{ [Console]::Out.WriteLine('DESK_ISOLATED=yes') }} else {{ [Console]::Out.WriteLine("DESK_ISOLATED=$desk") }}
+if (-not [WinClipProbe]::CanOpenOrSwitchDefaultDesktop()) {{ [Console]::Out.WriteLine('DEFAULT_DESK_DENIED=yes') }} else {{ [Console]::Out.WriteLine('DEFAULT_DESK_DENIED=no') }}
 $v = [WinClipProbe]::ReadText()
 if ($v -eq 'OPEN_DENIED' -or $v -eq '') {{
-    Write-Output "CLIP_NONE=$v"
+    [Console]::Out.WriteLine("CLIP_NONE=$v")
 }} else {{
-    Write-Output "CLIP_LEAK=$v"
+    [Console]::Out.WriteLine("CLIP_LEAK=$v")
 }}
 "#
         );
         let seed_and_read_script = format!(
             r#"{clip_helper}
-Write-Output 'TASK_STARTED'
+[Console]::Out.WriteLine('TASK_STARTED')
 $prev = [WinClipProbe]::ReadText()
 if ($prev -eq 'OPEN_DENIED') {{ $prev = '' }}
-Set-Content -LiteralPath "$env:RUSTY_GRID_SANDBOX_DIR\prev_clip.txt" -Value $prev -NoNewline
-[WinClipProbe]::WriteText($env:T_MARKER) | Out-Null
+[System.IO.File]::WriteAllText("$env:RUSTY_GRID_SANDBOX_DIR\prev_clip.txt", $prev)
+$null = [WinClipProbe]::WriteText($env:T_MARKER)
 $v = [WinClipProbe]::ReadText()
-Write-Output "CLIP_LEAK=$v"
+[Console]::Out.WriteLine("CLIP_LEAK=$v")
 "#
         );
 
@@ -3782,7 +3747,7 @@ Write-Output "CLIP_LEAK=$v"
         // Restore previous clipboard contents.
         let restore_script = format!(
             r#"{clip_helper}
-[WinClipProbe]::WriteText($env:T_PREV) | Out-Null
+$null = [WinClipProbe]::WriteText($env:T_PREV)
 "#
         );
         let _ = control_rig
@@ -3811,9 +3776,9 @@ Write-Output "CLIP_LEAK=$v"
     #[tokio::test]
     async fn test_appcontainer_profile_is_deleted_on_cleanup() {
         let rig = Rig::new(IsolationLevel::Fs, false);
-        let task = win_task(
+        let task = win_cmd_task(
             &rig,
-            r#"Write-Output 'TASK_STARTED'; Write-Output "RUN_TOKEN=$env:RUSTY_GRID_RUN_TOKEN""#,
+            r#"echo TASK_STARTED& echo RUN_TOKEN=%RUSTY_GRID_RUN_TOKEN%"#,
             &[],
             60,
         );
@@ -3922,12 +3887,8 @@ Write-Output "CLIP_LEAK=$v"
                 WorkerCapabilities::new("feat3", 4, 8192, false, false, None),
                 config,
             );
-            let script = r#"
-Write-Output 'TASK_STARTED'
-try { Write-Output (Get-Content -LiteralPath $env:T_A -Raw -ErrorAction Stop) } catch { Write-Output 'DENY_A' }
-try { Write-Output (Get-Content -LiteralPath $env:T_B -Raw -ErrorAction Stop) } catch { Write-Output 'DENY_B' }
-"#;
-            let task = win_task(
+            let script = r#"echo TASK_STARTED&(type %T_A% 2>nul||echo DENY_A)&echo.&(type %T_B% 2>nul||echo DENY_B)"#;
+            let task = win_cmd_task(
                 &rig,
                 script,
                 &[
@@ -4086,12 +4047,8 @@ try { Write-Output (Get-Content -LiteralPath $env:T_B -Raw -ErrorAction Stop) } 
             assert!(!ssh_acl_before.contains(&tc_sid));
             assert!(!other_acl_before.contains(&tc_sid));
 
-            let script = r#"
-Write-Output 'TASK_STARTED'
-try { Get-Content -LiteralPath "$env:CARGO_HOME\test_key" -ErrorAction Stop | Out-Null; Write-Output 'LEAK_SSH' } catch { Write-Output 'DENY_SSH' }
-try { Get-Content -LiteralPath "$env:RUSTUP_HOME\secret.txt" -ErrorAction Stop | Out-Null; Write-Output 'LEAK_OTHER' } catch { Write-Output 'DENY_OTHER' }
-"#;
-            let task = win_task(
+            let script = r#"echo TASK_STARTED& (type "%CARGO_HOME%\test_key" >nul 2>nul && echo LEAK_SSH || echo DENY_SSH)& (type "%RUSTUP_HOME%\secret.txt" >nul 2>nul && echo LEAK_OTHER || echo DENY_OTHER)"#;
+            let task = win_cmd_task(
                 &rig,
                 script,
                 &[
@@ -4127,9 +4084,9 @@ try { Get-Content -LiteralPath "$env:RUSTUP_HOME\secret.txt" -ErrorAction Stop |
             );
 
             // Conversely, a task-chosen CARGO_HOME inside its own sandbox IS permitted.
-            let mut allow_task = win_task(
+            let mut allow_task = win_cmd_task(
                 &rig,
-                r#"Write-Output 'TASK_STARTED'; Write-Output "ALLOWED_CARGO=$env:CARGO_HOME""#,
+                r#"echo TASK_STARTED& echo ALLOWED_CARGO=%CARGO_HOME%"#,
                 &[],
                 60,
             );
@@ -4211,12 +4168,9 @@ try { Get-Content -LiteralPath "$env:RUSTUP_HOME\secret.txt" -ErrorAction Stop |
 
             // Also run a positive confined task on the same rig to prove confined execution works
             // (`TASK_STARTED`) and `sibling_secret` remains unreadable (`DENY_SIBLING_SECRET`).
-            let probe = win_task(
+            let probe = win_cmd_task(
                 &rig,
-                r#"
-Write-Output 'TASK_STARTED'
-try { Get-Content -LiteralPath $env:T_SIBLING_SECRET -ErrorAction Stop | Out-Null; Write-Output 'LEAK_SIBLING_SECRET' } catch { Write-Output 'DENY_SIBLING_SECRET' }
-"#,
+                r#"echo TASK_STARTED& (type "%T_SIBLING_SECRET%" >nul 2>nul && echo LEAK_SIBLING_SECRET || echo DENY_SIBLING_SECRET)"#,
                 &[("T_SIBLING_SECRET", sibling_secret.to_str().unwrap())],
                 60,
             );
@@ -4246,14 +4200,15 @@ try { Get-Content -LiteralPath $env:T_SIBLING_SECRET -ErrorAction Stop | Out-Nul
     ///    neither `.ssh`'s nor `cluster.secret`'s DACL is modified.
     #[tokio::test]
     async fn test_attack_junctions_and_hardlinks_inside_sandbox_cannot_expose_denied_secret() {
-        let script = r#"
-Write-Output 'TASK_STARTED'
-Add-Type -TypeDefinition @"
+        let script = format!(
+            r#"{WIN_CSHARP_HELPER}
+[Console]::Out.WriteLine('TASK_STARTED')
+Compile-CSharp @"
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
-public static class WinLinkProbe {
+public static class WinLinkProbe {{
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern bool CreateHardLinkW(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
 
@@ -4270,7 +4225,7 @@ public static class WinLinkProbe {
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);
 
-    public static string CreateJunction(string junctionPath, string targetDir) {
+    public static string CreateJunction(string junctionPath, string targetDir) {{
         Directory.CreateDirectory(junctionPath);
         const uint GENERIC_WRITE = 0x40000000;
         const uint OPEN_EXISTING = 3;
@@ -4282,10 +4237,10 @@ public static class WinLinkProbe {
         IntPtr h = CreateFileW(
             junctionPath, GENERIC_WRITE, 0, IntPtr.Zero, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
-        if (h == new IntPtr(-1)) {
+        if (h == new IntPtr(-1)) {{
             return "OPEN_ERR=" + Marshal.GetLastWin32Error();
-        }
-        try {
+        }}
+        try {{
             string subName = @"\??\" + targetDir;
             string printName = targetDir;
             byte[] subBytes = Encoding.Unicode.GetBytes(subName);
@@ -4303,54 +4258,55 @@ public static class WinLinkProbe {
             Array.Copy(subBytes, 0, buf, 16, subBytes.Length);
             Array.Copy(printBytes, 0, buf, 16 + subBytes.Length + 2, printBytes.Length);
             int returned;
-            if (!DeviceIoControl(h, FSCTL_SET_REPARSE_POINT, buf, buf.Length, IntPtr.Zero, 0, out returned, IntPtr.Zero)) {
+            if (!DeviceIoControl(h, FSCTL_SET_REPARSE_POINT, buf, buf.Length, IntPtr.Zero, 0, out returned, IntPtr.Zero)) {{
                 int err = Marshal.GetLastWin32Error();
                 CloseHandle(h);
                 h = new IntPtr(-1);
-                try { Directory.Delete(junctionPath); } catch {}
+                try {{ Directory.Delete(junctionPath); }} catch {{}}
                 return "IOCTL_ERR=" + err;
-            }
+            }}
             return "OK";
-        } finally {
+        }} finally {{
             if (h != new IntPtr(-1)) CloseHandle(h);
-        }
-    }
-}
+        }}
+    }}
+}}
 "@
 $sb = $env:RUSTY_GRID_SANDBOX_DIR
-if (-not [System.IO.Directory]::Exists("$sb\j_ssh")) {
+if (-not [System.IO.Directory]::Exists("$sb\j_ssh")) {{
     $jRes = [WinLinkProbe]::CreateJunction("$sb\j_ssh", $env:T_SSH_DIR)
-    Write-Output "JUNCTION_CREATE=$jRes"
-}
-if (-not [System.IO.File]::Exists("$sb\hl_secret.txt")) {
-    if ([WinLinkProbe]::CreateHardLinkW("$sb\hl_secret.txt", $env:T_SECRET, [IntPtr]::Zero)) {
-        Write-Output 'HARDLINK_CREATED'
-    } else {
+    [Console]::Out.WriteLine("JUNCTION_CREATE=$jRes")
+}}
+if (-not [System.IO.File]::Exists("$sb\hl_secret.txt")) {{
+    if ([WinLinkProbe]::CreateHardLinkW("$sb\hl_secret.txt", $env:T_SECRET, [IntPtr]::Zero)) {{
+        [Console]::Out.WriteLine('HARDLINK_CREATED')
+    }} else {{
         $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        Write-Output "HARDLINK_CREATE_DENIED=$err"
-    }
-}
-if ($env:T_WAIT_HOST_JUNCTION -eq '1') {
+        [Console]::Out.WriteLine("HARDLINK_CREATE_DENIED=$err")
+    }}
+}}
+if ($env:T_WAIT_HOST_JUNCTION -eq '1') {{
     [System.IO.File]::WriteAllText("$sb\ready.txt", "1")
-    for ($i = 0; $i -lt 200; $i++) {
-        if ([System.IO.File]::Exists("$sb\go.txt")) { break }
-        Start-Sleep -Milliseconds 25
-    }
-}
-if ([System.IO.Directory]::Exists("$sb\j_ssh")) {
+    for ($i = 0; $i -lt 200; $i++) {{
+        if ([System.IO.File]::Exists("$sb\go.txt")) {{ break }}
+        [System.Threading.Thread]::Sleep(25)
+    }}
+}}
+if ([System.IO.Directory]::Exists("$sb\j_ssh")) {{
     $attrs = [System.IO.File]::GetAttributes("$sb\j_ssh")
-    if (($attrs -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        Write-Output 'JUNCTION_EXISTS'
-    }
-}
-if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {
-    Write-Output 'HARDLINK_CREATED'
-}
-try { [System.IO.File]::ReadAllText("$sb\j_ssh\test_key") | Out-Null; Write-Output 'LEAK_JUNCTION' } catch { Write-Output 'DENY_JUNCTION' }
-if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {
-    try { [System.IO.File]::ReadAllText("$sb\hl_secret.txt") | Out-Null; Write-Output 'LEAK_HARDLINK' } catch { Write-Output 'DENY_HARDLINK' }
-}
-"#;
+    if (($attrs -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {{
+        [Console]::Out.WriteLine('JUNCTION_EXISTS')
+    }}
+}}
+if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
+    [Console]::Out.WriteLine('HARDLINK_CREATED')
+}}
+try {{ $null = [System.IO.File]::ReadAllText("$sb\j_ssh\test_key"); [Console]::Out.WriteLine('LEAK_JUNCTION') }} catch {{ [Console]::Out.WriteLine('DENY_JUNCTION') }}
+if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
+    try {{ $null = [System.IO.File]::ReadAllText("$sb\hl_secret.txt"); [Console]::Out.WriteLine('LEAK_HARDLINK') }} catch {{ [Console]::Out.WriteLine('DENY_HARDLINK') }}
+}}
+"#
+        );
 
         // Positive control (`IsolationLevel::Off`): both the junction and the hard link are
         // created and both secrets can be read through them.
@@ -4361,7 +4317,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {
             .execute_task(
                 &win_task(
                     &control_rig,
-                    script,
+                    &script,
                     &[("T_SSH_DIR", control_ssh.to_str().unwrap())],
                     60,
                 ),
@@ -4392,7 +4348,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {
 
         let task = win_task(
             &rig,
-            script,
+            &script,
             &[("T_SSH_DIR", ssh_dir.to_str().unwrap())],
             60,
         );
@@ -4429,7 +4385,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {
         // `DENY_HARDLINK`), and neither `.ssh`'s nor `cluster.secret`'s DACL is modified.
         let task2 = win_task(
             &rig,
-            script,
+            &script,
             &[
                 ("T_SSH_DIR", ssh_dir.to_str().unwrap()),
                 ("T_WAIT_HOST_JUNCTION", "1"),
@@ -4543,17 +4499,13 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {
         let registry_dir = rig.host.cargo_home.join("registry");
         std::fs::create_dir_all(&registry_dir).unwrap();
 
-        let probe_script = r#"
-Write-Output 'TASK_STARTED'
-try { Get-Content -LiteralPath $env:T_SECRET -ErrorAction Stop | Out-Null; Write-Output 'LEAK_CLUSTER_SECRET' } catch { Write-Output 'DENY_CLUSTER_SECRET' }
-try { Get-Content -LiteralPath $env:T_CARGO_CRED -ErrorAction Stop | Out-Null; Write-Output 'LEAK_CARGO_CRED' } catch { Write-Output 'DENY_CARGO_CRED' }
-"#;
+        let probe_script = r#"echo TASK_STARTED&(type %T_SECRET% >nul 2>nul&&echo LEAK_CLUSTER_SECRET||echo DENY_CLUSTER_SECRET)&(type %T_CARGO_CRED% >nul 2>nul&&echo LEAK_CARGO_CRED||echo DENY_CARGO_CRED)"#;
         let envs = [("T_CARGO_CRED", cargo_cred.to_str().unwrap())];
 
         // First task triggers `prepare_worker_toolchains`, placing a DENY_ACCESS ACE on `credentials.toml`.
         let res1 = rig
             .runner
-            .execute_task(&win_task(&rig, probe_script, &envs, 60), None, None)
+            .execute_task(&win_cmd_task(&rig, probe_script, &envs, 60), None, None)
             .await;
         assert!(res1.is_success());
         assert_eq!(
@@ -4609,21 +4561,11 @@ try { Get-Content -LiteralPath $env:T_CARGO_CRED -ErrorAction Stop | Out-Null; W
         std::fs::write(&secret_tmp, "rotated-cluster-secret-value").unwrap();
         std::fs::write(&cred_tmp, "token = \"rotated-cargo-cred-value\"").unwrap();
 
-        let pre_rename_script = r#"
-Write-Output 'TASK_STARTED'
-try {
-    $s = Get-Content -LiteralPath $env:T_SECRET_TMP -Raw -ErrorAction Stop
-    if ($s -match 'rotated-cluster-secret-value') { Write-Output 'READABLE_SECRET_TMP' }
-} catch { Write-Output 'UNREADABLE_SECRET_TMP' }
-try {
-    $c = Get-Content -LiteralPath $env:T_CRED_TMP -Raw -ErrorAction Stop
-    if ($c -match 'rotated-cargo-cred-value') { Write-Output 'READABLE_CRED_TMP' }
-} catch { Write-Output 'UNREADABLE_CRED_TMP' }
-"#;
+        let pre_rename_script = r#"echo TASK_STARTED&(findstr rotated-cluster-secret-value %T_SECRET_TMP% >nul 2>nul&&echo READABLE_SECRET_TMP||echo UNREADABLE_SECRET_TMP)&(findstr rotated-cargo-cred-value %T_CRED_TMP% >nul 2>nul&&echo READABLE_CRED_TMP||echo UNREADABLE_CRED_TMP)"#;
         let pre_res = rig
             .runner
             .execute_task(
-                &win_task(
+                &win_cmd_task(
                     &rig,
                     pre_rename_script,
                     &[
@@ -4653,7 +4595,7 @@ try {
         // Subsequent task on the SAME running `TaskRunner` must still be denied both secrets.
         let res2 = rig
             .runner
-            .execute_task(&win_task(&rig, probe_script, &envs, 60), None, None)
+            .execute_task(&win_cmd_task(&rig, probe_script, &envs, 60), None, None)
             .await;
         assert!(res2.is_success());
         assert_eq!(
@@ -4677,6 +4619,61 @@ try {
                 !sddl.contains(&tc_sid),
                 "revoked path {} still contains toolchain SID {tc_sid}: {sddl}",
                 p.display()
+            );
+        }
+    }
+
+    /// Dedicated PowerShell diagnostic test under `IsolationLevel::Off` and `IsolationLevel::Fs`
+    /// printing `$PSVersionTable`, `$env:PSModulePath`, `Get-Module -ListAvailable | Select -First 5`,
+    /// `Test-Path C:\Windows\System32\WindowsPowerShell\v1.0\Modules\Microsoft.PowerShell.Utility`,
+    /// and `[Environment]::GetEnvironmentVariables()` (names only).
+    #[tokio::test]
+    async fn test_powershell_diagnostics_under_appcontainer() {
+        let diag_script = r#"
+[Console]::Out.WriteLine('PS_DIAG_START')
+[Console]::Out.WriteLine("PS_VERSION=$($PSVersionTable.PSVersion)")
+[Console]::Out.WriteLine("PS_MODULE_PATH=$env:PSModulePath")
+$utilDir = 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\Microsoft.PowerShell.Utility'
+[Console]::Out.WriteLine("UTIL_DIR_EXISTS=$([System.IO.Directory]::Exists($utilDir))")
+try {
+    $tp = Test-Path $utilDir
+    [Console]::Out.WriteLine("TEST_PATH_CMDLET=$tp")
+} catch {
+    [Console]::Out.WriteLine("TEST_PATH_ERR=$($_.Exception.Message)")
+}
+try {
+    $mods = @(Get-Module -ListAvailable | Select-Object -First 5 | ForEach-Object { $_.Name })
+    [Console]::Out.WriteLine("MODULES=$($mods -join ',')")
+} catch {
+    [Console]::Out.WriteLine("MODULES_ERR=$($_.Exception.Message)")
+}
+$names = [System.Collections.Generic.List[string]]::new()
+foreach ($k in [Environment]::GetEnvironmentVariables().Keys) { $null = $names.Add([string]$k) }
+$names.Sort()
+[Console]::Out.WriteLine("ENV_NAMES=$([string]::Join(',', $names))")
+[Console]::Out.WriteLine('PS_DIAG_END')
+"#;
+        for level in [IsolationLevel::Off, IsolationLevel::Fs] {
+            let rig = Rig::new(level, false);
+            let res = rig
+                .runner
+                .execute_task(&win_task(&rig, diag_script, &[], 60), None, None)
+                .await;
+            eprintln!(
+                "=== PowerShell diagnostics ({level}) exit={} ===\nstdout:\n{}\nstderr:\n{}",
+                res.exit_code,
+                res.stdout_str(),
+                res.stderr_str()
+            );
+            assert!(
+                res.is_success()
+                    && lines(&res).contains(&"PS_DIAG_START".to_string())
+                    && lines(&res).contains(&"PS_DIAG_END".to_string())
+                    && lines(&res).contains(&"UTIL_DIR_EXISTS=True".to_string()),
+                "{level}: PowerShell diagnostic failed (exit={}): stdout={}\nstderr={}",
+                res.exit_code,
+                res.stdout_str(),
+                res.stderr_str()
             );
         }
     }
