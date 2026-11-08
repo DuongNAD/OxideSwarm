@@ -5,12 +5,13 @@ Created: 2026-11-08    Updated: 2026-11-08
 
 ## Summary
 
-Adds an append-only task journal and snapshot store (`crates/master/src/store.rs`, enabled by
-`master --state-dir <DIR>` / `RUSTY_GRID_STATE_DIR` / `[master].state_dir`) that persists task
-submissions, state transitions, checkpoints, terminal results, and evictions, replays them on
-startup (`Scheduled` and `Running` tasks return to `Queued` without retry or failover charge), and
-lets reconnecting workers resume still-running tasks via `WorkerMessage::ResumeSession { worker_id,
-running }` during a bounded grace period.
+Adds an append-only task journal and self-describing snapshot store (`crates/master/src/store.rs`,
+enabled by `master --state-dir <DIR>` / `RUSTY_GRID_STATE_DIR` / `[master].state_dir`) that persists
+task submissions (with `5 ms` group commit), state transitions, checkpoints, terminal results, and
+evictions, replays them on startup (`Scheduled` and `Running` tasks return to `Queued` without retry
+or failover charge, or `Failed` if `Running` with `max_retries == 0` and not resumed), and lets
+reconnecting workers resume still-running tasks via `WorkerMessage::ResumeSession { worker_id,
+running }` within a master-advertised hold window (`--session-resume-hold-secs`).
 
 ## Context
 
@@ -35,19 +36,23 @@ running }` during a bounded grace period.
 
 ## Goals
 
-- **G1.** Add `crates/master/src/store.rs` with an append-only binary journal (`journal.bin`) and
-  atomic snapshot compaction (`snapshot.bin`), wired to `master --state-dir <DIR>`
-  (`RUSTY_GRID_STATE_DIR`, `[master].state_dir`), recording task submission, state transitions,
-  mid-task checkpoints, terminal results, and terminal evictions (`docs/BACKLOG.md:1103-1104`).
+- **G1.** Add `crates/master/src/store.rs` with an append-only binary journal (`journal.bin`),
+  `5 ms` group commit for submissions, and atomic self-describing JSON snapshot compaction
+  (`snapshot.bin`), wired to `master --state-dir <DIR>` (`RUSTY_GRID_STATE_DIR`,
+  `[master].state_dir`), recording task submission, state transitions, mid-task checkpoints,
+  terminal results, and terminal evictions (`docs/BACKLOG.md:1103-1104`).
 - **G2.** Replay `snapshot.bin` and `journal.bin` when the master starts so that retained terminal
   results (`Completed`, `Failed`, `Cancelled`) are readable immediately, `Queued` and `Retrying`
   tasks resume their queue order, and `Scheduled` or `Running` tasks become `TaskState::Queued`
-  without incrementing `retry_count` or `failover_count` (`docs/BACKLOG.md:1105`).
-- **G3.** Add a worker session-resume grace period (`worker --session-resume-grace-secs`, default
-  `30 s`) and a capability-gated `WorkerMessage::ResumeSession { worker_id, running }` message so a
-  worker keeps active tasks running across a transient disconnect or master restart and the master
-  adopts those tasks back into `TaskState::Running` without dispatching a duplicate copy
-  (`docs/BACKLOG.md:1106-1107`).
+  without incrementing `retry_count` or `failover_count` (while failing any `Running` task with
+  effective `max_retries == 0` that is not resumed during the hold window)
+  (`docs/BACKLOG.md:1105`).
+- **G3.** Make the master the single source of truth for the session-resume hold window
+  (`master --session-resume-hold-secs`, default `30 s`), advertised in `RegisterAck` as
+  `session-resume=<secs>`, and bound the worker's grace period by
+  `hold - dead_peer_timeout - margin` so a reconnecting worker resumes still-running tasks via
+  `WorkerMessage::ResumeSession { worker_id, running }` and no task ever runs concurrently on two
+  workers (`docs/BACKLOG.md:1106-1107`).
 - **G4.** Prove end-to-end recovery in `tests/master_restart_recovery.rs`: killing a master that
   holds one running, two queued, and one finished task and restarting it on the same `--state-dir`
   allows reading the finished result back, completes both queued tasks, and finishes the running
@@ -74,6 +79,10 @@ running }` during a bounded grace period.
    - Add `pub state_dir: Option<PathBuf>` and `pub fn with_state_dir(mut self, dir: impl Into<PathBuf>) -> Self`
      to `ServerConfig` (`crates/master/src/server.rs:148`), defaulting to `None` so existing unit
      and integration tests remain purely in-memory unless they opt in.
+   - Add `--session-resume-hold-secs <SECS>` to `MasterArgs` (`crates/cli/src/cli_app.rs:312`),
+     backed by `RUSTY_GRID_SESSION_RESUME_HOLD_SECS`, `MasterFileConfig::session_resume_hold_secs: Option<u64>`,
+     and `ServerConfig::session_resume_hold: Duration` (default `Duration::from_secs(30)`; `0`
+     disables session resume).
    - When `state_dir` is `Some(dir)` and `--blob-dir` / `RUSTY_GRID_BLOB_DIR` / `[master].blob_dir`
      was not explicitly provided, default the master's blob store directory
      (`crates/cli/src/cli_app.rs:1404-1415` and `MasterServer::bind_full` in
@@ -85,25 +94,41 @@ running }` during a bounded grace period.
      concurrently. If `try_lock()` fails with `TryLockError::WouldBlock`, `TaskStore::open` returns
      `GridError::Config` naming `<state_dir>/store.lock`.
    - `<state_dir>/journal.bin`: append-only framed event log.
-   - `<state_dir>/snapshot.bin`: latest compacted point-in-time checkpoint of `TaskQueue` entries
-     (written to `<state_dir>/snapshot.bin.tmp`, `sync_all()`, and atomically renamed over
-     `snapshot.bin`).
-3. **Directory permissions and ownership check:**
+   - `<state_dir>/snapshot.bin`: latest compacted point-in-time checkpoint of `TaskQueue` entries in
+     self-describing JSON (written to `<state_dir>/snapshot.bin.tmp`, `sync_all()`, and atomically
+     renamed over `snapshot.bin`).
+3. **Directory permissions and ownership check (Unix and Windows):**
    - On Unix, `<state_dir>` is created with mode `0o700` (`DirBuilderExt::mode(0o700)`), verified
      via `std::fs::symlink_metadata` not to be a symlink and to be owned by `current_euid()`, and
      its files (`store.lock`, `journal.bin`, `snapshot.bin`) are opened with mode `0o600`.
+   - On Windows, `<state_dir>` is verified via `std::fs::symlink_metadata` not to be a symlink or
+     reparse point (`FileType::is_symlink`), and its DACL is restricted to the current user (owner)
+     and `SYSTEM` / `Administrators` with inheritance stripped (`icacls <state_dir> /inheritance:r
+     /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "<current_user_sid>:(OI)(CI)F"`),
+     matching the owner-only ACL pattern used in `packaging/windows/install_windows_service.ps1:805`
+     for the directory holding `cluster.secret`.
 
-### D2: Append-only journal and snapshot compaction (`crates/master/src/store.rs`)
+### D2: Append-only journal, group commit, and self-describing snapshot compaction (`crates/master/src/store.rs`)
 
-1. **File header and frame envelope:**
-   - Both `journal.bin` and `snapshot.bin` begin with a 12-byte header: magic `b"OXSWJRN1"` (or
-     `b"OXSWSNP1"` for `snapshot.bin`) followed by version `1u32` (little-endian).
-   - Every journal frame after the header has the fixed layout:
+1. **File header (including `PROTOCOL_VERSION_CURRENT`) and frame envelope:**
+   - Both `journal.bin` and `snapshot.bin` begin with a 16-byte header:
+     ```text
+     [magic: 8B][store_format_version: u32 LE][protocol_version: u32 LE]
+     ```
+     where `magic` is `b"OXSWJRN1"` for `journal.bin` and `b"OXSWSNP1"` for `snapshot.bin`,
+     `store_format_version` is `1u32`, and `protocol_version` records
+     `rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT` (`crates/core/src/protocol.rs:31`) at the
+     time the file was written.
+   - Every journal frame after the 16-byte header has the fixed layout:
      ```text
      [payload_len: u32 LE][blake3_hash: [u8; 32]][payload: [u8; payload_len]]
      ```
      `payload_len` is bounded by `rusty_grid_core::protocol::MAX_FRAME_SIZE` (`64 MiB`,
-     `crates/core/src/protocol.rs:16`). `payload` is a `bincode`-serialized `JournalRecord`.
+     `crates/core/src/protocol.rs:16`). In `journal.bin`, `payload` is a `bincode`-serialized
+     `JournalRecord`. In `snapshot.bin`, a single frame follows the 16-byte header whose `payload`
+     is UTF-8 JSON (`serde_json`) of `SnapshotImage` using the `is_human_readable() == true` serde
+     representations (`HumanTaskSpec`, etc. in `crates/core/src/task.rs:1442-1460`), so snapshots
+     remain self-describing across `PROTOCOL_VERSION_CURRENT` bumps via `#[serde(default)]`.
 2. **Journal record types:**
    ```rust
    #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +158,7 @@ running }` during a bounded grace period.
            state: TaskState, // Queued or Retrying
            retry_count: u32,
            failover_count: u32,
+           evacuation_count: u32,
            rejection_count: u32,
            avoid_workers: Vec<Uuid>,
            retry_attempt: Option<RetryAttempt>,
@@ -149,6 +175,7 @@ running }` during a bounded grace period.
            assigned_worker_id: Option<Uuid>,
            retry_count: u32,
            failover_count: u32,
+           evacuation_count: u32,
            rejection_count: u32,
            retry_attempt: Option<RetryAttempt>,
            result: Option<TaskResult>,
@@ -160,32 +187,47 @@ running }` during a bounded grace period.
        },
    }
    ```
-3. **Durability (`sync_data`) boundary:**
-   - `TaskSubmitted`, `CheckpointRecorded`, and `TaskTerminal` flush and call `File::sync_data()`
-     before the master sends `ClientResponse::TaskSubmitted`, `ClientResponse::TaskCancelled`, or
-     wakes completion waiters, guaranteeing that any acknowledged submission, checkpoint, or
-     terminal outcome is on disk before the caller observes it.
-   - High-frequency intermediate transitions (`TaskDispatched`, `TaskRunning`, `TaskRequeued`,
-     `TaskAdopted`, `TaskEvicted`) write and flush to the OS file buffer; if the master crashes
-     mid-flight, replay restores active tasks to `Queued` anyway (see D3).
-4. **Torn-tail tolerance vs. mid-file corruption:**
+3. **Durability (`sync_data`) boundary and `5 ms` group commit:**
+   - **Sync set:** `TaskSubmitted`, `TaskRequeued`, `CheckpointRecorded`, `TaskTerminal`, and
+     `TaskRunning` (when the task's effective `max_retries == 0`, so the "already started once"
+     fact cannot be lost in a crash) are durable records that call `File::sync_data()` before the
+     caller acknowledges the operation. Syncing `TaskRequeued` guarantees that `retry_count`,
+     `failover_count`, `evacuation_count`, and `rejection_count` never roll backward across a crash
+     and grant a task more retries than its budget.
+   - **`5 ms` group commit for `TaskSubmitted` (and concurrent durable records):**
+     - A MapReduce job or an MCP burst of 1,000 task submissions must not execute 1,000 sequential
+       `sync_data()` syscalls.
+     - `TaskStore` runs a dedicated writer loop fed by an `mpsc` channel of `(JournalRecord,
+       Option<oneshot::Sender<GridResult<()>>>)`.
+     - When the first record requiring `sync_data()` arrives, the writer appends it to the OS buffer
+       and waits up to `GROUP_COMMIT_WINDOW = Duration::from_millis(5)` (or until `MAX_GROUP_BATCH = 256`
+       records have accumulated) to coalesce any concurrent submissions/transitions arriving in the
+       same window, calls `File::sync_data()` **once** for the entire batch, and then signals all
+       waiting `oneshot::Sender` handles together.
+   - Non-synced transitions (`TaskDispatched`, `TaskRunning` when `max_retries > 0`, `TaskAdopted`,
+     `TaskEvicted`) are written to `journal.bin` without blocking on `sync_data()`.
+4. **Torn-tail tolerance, mid-file corruption, and `GridError::Storage`:**
+   - Add `GridError::Storage(String)` (`#[error("Storage error: {0}")]`) in
+     `crates/core/src/error.rs:14`.
    - If the final record at the end of `journal.bin` has a truncated header, fewer than
      `payload_len` bytes remaining before EOF, or a BLAKE3 mismatch on the final frame (as happens
      when the process dies mid-write), `TaskStore::open` logs a `warn!`, truncates `journal.bin`
      back to the offset of that final frame, and succeeds.
-   - A bad magic header, unsupported version, `payload_len > MAX_FRAME_SIZE`, or a BLAKE3 / decode
-     failure on any frame **before** the final frame is treated as storage corruption and returns
-     `GridError::Storage` (`io::ErrorKind::InvalidData`), refusing startup rather than silently
-     dropping history.
-5. **Snapshot compaction (`snapshot.bin`):**
+   - A bad magic header, unsupported `store_format_version`, `payload_len > MAX_FRAME_SIZE`, or a
+     BLAKE3 / decode failure on any frame **before** the final frame is treated as storage
+     corruption and returns `GridError::Storage`, refusing startup rather than silently dropping
+     history.
+5. **Snapshot compaction (`snapshot.bin`) and clean-shutdown compaction:**
    - When `journal.bin` exceeds `DEFAULT_COMPACT_MAX_BYTES` (`64 MiB`) or
-     `DEFAULT_COMPACT_MAX_RECORDS` (`10,000` records), or on clean master shutdown, `TaskStore`
-     writes a `SnapshotImage` (`next_sequence: u64` plus all non-evicted `PersistedTaskEntry`
-     records in `tasks` and `terminal_order`) to `<state_dir>/snapshot.bin.tmp` with a whole-payload
-     BLAKE3 digest, calls `sync_all()`, atomically renames `snapshot.bin.tmp` to `snapshot.bin`,
-     and truncates `journal.bin` back to its 12-byte header.
+     `DEFAULT_COMPACT_MAX_RECORDS` (`10,000` records), or on **clean master shutdown** (`shutdown_tx`
+     / `SIGINT` / `SIGTERM`), `TaskStore` writes a self-describing JSON `SnapshotImage`
+     (`next_sequence: u64` plus all non-evicted `PersistedTaskEntry` records in `tasks` and
+     `terminal_order`) to `<state_dir>/snapshot.bin.tmp` with the 16-byte header (`b"OXSWSNP1"`,
+     `1u32`, `PROTOCOL_VERSION_CURRENT`) and frame envelope (`[payload_len][blake3][json_bytes]`),
+     calls `sync_all()`, atomically renames `snapshot.bin.tmp` to `snapshot.bin`, and resets
+     `journal.bin` to its 16-byte header with `PROTOCOL_VERSION_CURRENT` and 0 records.
 
-### D3: Startup replay and adoption hold window
+### D3: Startup replay, `max_retries == 0` enforcement, and adoption hold window
 
 1. **Replay into `TaskQueue` (`crates/master/src/queue.rs`):**
    - During `MasterServer::bind_full` (`crates/master/src/server.rs:509`), if `config.state_dir` is
@@ -198,147 +240,246 @@ running }` during a bounded grace period.
      or `--max-retained-mb` is smaller than when the snapshot was written).
    - Tasks whose replayed state is `Submitted`, `Queued`, or `Retrying` are placed in
      `TaskState::Queued` in `ready_queue` with their preserved `priority`, `sequence`,
-     `retry_count`, `failover_count`, `rejection_count`, `avoid_workers`, `retry_history`, and
-     `task.latest_checkpoint`.
+     `retry_count`, `failover_count`, `evacuation_count`, `rejection_count`, `avoid_workers`,
+     `retry_history`, and `task.latest_checkpoint`.
    - Tasks whose replayed state was `Scheduled` or `Running` on `worker_id` transition to
-     `TaskState::Queued` **without** incrementing `retry_count`, `failover_count`, or
-     `rejection_count` and without appending a `RetryAttempt` (`docs/BACKLOG.md:1105`).
-2. **Adoption hold window (`adoptable_by`) so running tasks finish exactly once:**
-   - When a task that was `Scheduled` or `Running` on `worker_id` is replayed into `TaskState::Queued`,
-     `TaskEntry` records `adoptable_by: Option<(Uuid, Instant)> = Some((worker_id, now + adoption_hold))`
-     where `ServerConfig::session_resume_hold_Window` defaults to `Duration::from_secs(15)` (more
-     than `4 ×` the worker's initial reconnect backoff).
+     `TaskState::Queued` **without** incrementing `retry_count`, `failover_count`,
+     `evacuation_count`, or `rejection_count` and without appending a `RetryAttempt`
+     (`docs/BACKLOG.md:1105`), subject to the adoption hold and `max_retries == 0` rule below.
+2. **Adoption hold window (`adoptable_by`) and `max_retries == 0` ("run at most once") rule:**
+   - When a task that was `Scheduled` or `Running` on `worker_id` is replayed:
+     - If `config.session_resume_hold > Duration::ZERO`, `TaskEntry` records
+       `adoptable_by: Option<(Uuid, Instant)> = Some((worker_id, now + config.session_resume_hold))`
+       (default `30 s`).
+     - If the task's replayed state was `Running` (or `Scheduled`) and its effective retry limit is
+       zero (`task.requirements.max_retries == Some(0)` or `retry_policy.max_retries == 0`),
+       `TaskEntry` also sets `fail_if_not_adopted: bool = true`. (If `config.session_resume_hold.is_zero()`,
+       such a task transitions immediately on replay to `TaskState::Failed` with reason
+       `"master restarted while the task ran; not re-run because max_retries is 0"`.)
    - While `Instant::now() < hold_until`:
      - `TaskQueue::queued_task_views` (`crates/master/src/queue.rs`) skips any task whose
        `adoptable_by` deadline has not yet expired, so `WorkloadScheduler::schedule_pass` will not
        hand a second copy of the task to another worker while the original worker is reconnecting.
      - If the original `worker_id` reconnects and sends `WorkerMessage::ResumeSession { worker_id, running }`
-       listing `task_id`, `TaskQueue::adopt_resumed_tasks` transitions the task directly from
+       listing `task_id`, `TaskQueue::adopt_session_tasks` transitions the task directly from
        `TaskState::Queued` to `TaskState::Running` on `(worker_id, new_session_id)`, clears
-       `adoptable_by`, increments the worker's `active_tasks` in `WorkerRegistry`, and writes
-       `JournalRecord::TaskAdopted`.
+       `adoptable_by` and `fail_if_not_adopted`, increments the worker's `active_tasks` in
+       `WorkerRegistry`, and writes `JournalRecord::TaskAdopted`.
      - If `worker_id` reconnects and sends `ResumeSession` **without** `task_id` (or registers
-       without `SESSION_RESUME`), `adoptable_by` is cleared immediately for all tasks that were
-       waiting on `worker_id`, and `scheduler_notify.notify_one()` wakes the scheduler to dispatch
-       them right away.
-     - When `hold_until` expires without `worker_id` reconnecting, the scheduler's periodic pass
-       (`crates/master/src/server.rs:845`) sees the task as eligible and dispatches it normally.
+       without `SESSION_RESUME`), or when `hold_until` expires without `worker_id` reconnecting:
+       - If `fail_if_not_adopted` is `true` (effective `max_retries == 0`), the task never enters
+         `ready_queue` for a second run; instead it transitions to `TaskState::Failed` with
+         `error_message = Some("master restarted while the task ran; not re-run because max_retries is 0".into())`,
+         syncs `JournalRecord::TaskTerminal`, and wakes any completion waiters.
+       - Otherwise, `adoptable_by` is cleared and the task becomes eligible in `ready_queue` for
+         the scheduler to dispatch.
 3. **Re-pinning blobs on replay:**
    - When `blob_store` is enabled alongside `state_dir`, startup replay re-pins `task.inputs` for
      every recovered non-terminal task and re-pins `result.outputs` for every recovered terminal
      task so the blob store sweeper (`crates/master/src/server.rs:942-944`) does not evict their
      blobs before workers or clients read them.
 
-### D4: Worker session-resume grace period and `WorkerMessage::ResumeSession`
+### D4: Master-advertised hold, worker grace inequality, and `WorkerMessage::ResumeSession`
 
-1. **Capability and feature negotiation (`crates/core/src/protocol.rs`):**
+1. **Capability and feature negotiation with master-sourced hold (`crates/core/src/protocol.rs`):**
    - Add `pub const SESSION_RESUME: Self = Self(1 << 12);` to `ProtocolCapabilities` and include it
      in `ProtocolCapabilities::all_supported()` (`crates/core/src/protocol.rs:95-108`).
-   - Note: bit `1 << 10` is reserved for `WORKSPACE_SYNC` (`docs/design/0039-agent-workspaces.md`)
+   - Note: bit `1 << 10` is reserved for `WORKSPACES` (`docs/design/0039-agent-workspaces.md`)
      and bit `1 << 11` is reserved for `THREE_D` (`docs/design/0044-dead-code-and-connection-loop-unification.md`).
-   - Add `pub const SESSION_RESUME: &str = "session-resume";` to `master_features` and include it in
-     `master_features::SUPPORTED` (`crates/core/src/protocol.rs:1406-1417`) so the master announces
-     `features=mobile-telemetry,session-resume[,blobs]` in `RegisterAck.message`.
-2. **Wire message (`WorkerMessage::ResumeSession`):**
+   - In `master_features` (`crates/core/src/protocol.rs:1406-1417`), add:
+     - `pub const SESSION_RESUME_PREFIX: &str = "session-resume=";`
+     - `pub fn session_resume_feature(hold_secs: u64) -> String` (formats `"session-resume={hold_secs}"`)
+     - `pub fn parse_session_resume_hold_secs(message: Option<&str>) -> Option<u64>`
+     When `ServerConfig::session_resume_hold` is non-zero (`--session-resume-hold-secs`, default
+     `30`), the master includes `session-resume=<secs>` in the `RegisterAck` feature announcement
+     (e.g., `features=mobile-telemetry,session-resume=30,blobs`). When `--session-resume-hold-secs 0`
+     is configured, the token is omitted.
+2. **Wire message (`WorkerMessage::ResumeSession`) and removing `compute_intensity` on the bump:**
    - Append `ResumeSession` at the end of `WorkerMessage` (`crates/core/src/protocol.rs:520`),
-     `HumanWorkerMessage` (`crates/core/src/protocol.rs:608`), `BinaryWorkerMessage`
-     (`crates/core/src/protocol.rs:683`), and `crates/core/src/binary_wire.rs`:
+     `HumanWorkerMessage` (`crates/core/src/protocol.rs:608`), and `BinaryWorkerMessage`
+     (`crates/core/src/protocol.rs:683`):
      ```rust
      /// Sent immediately after `RegisterAck` when both worker and master support
-     /// `SESSION_RESUME` and the worker still has tasks running from its previous session.
+     /// `SESSION_RESUME` and the worker still has tasks running or buffered from its previous session.
      ResumeSession {
          worker_id: Uuid,
          running: Vec<TaskId>,
      },
      ```
-   - Per `docs/design/0040-protocol-versioning.md` (D1/D2), adding a wire variant to `WorkerMessage`
-     bumps `PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE` by 1 and updates
-     `crates/core/tests/data/wire_layout.txt` via `UPDATE_WIRE_LAYOUT=1`.
+   - Per `docs/design/0040-protocol-versioning.md` (D1/D2), adding `WorkerMessage::ResumeSession`
+     bumps `PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE` from `3` to `4` and
+     updates `crates/core/tests/data/wire_layout.txt` via `UPDATE_WIRE_LAYOUT=1`.
+   - Because `F1-b` performs the next required protocol version bump (`3 -> 4`), `F1-b` also removes
+     the deprecated `compute_intensity: u32` field from `TaskSpec::GpuCompute`,
+     `HumanTaskSpec::GpuCompute`, and `BinaryTaskSpec::GpuCompute` (`crates/core/src/task.rs:1046`,
+     `:1100`, `:1157`, see `docs/design/0044-dead-code-and-connection-loop-unification.md` D1.5).
    - A worker sends `WorkerMessage::ResumeSession` **only** when the master's `RegisterAck`
-     announces `master_features::SESSION_RESUME` (`crates/core/src/protocol.rs:1406`).
-3. **Worker grace period and outbox buffering (`crates/worker/src/client.rs`):**
-   - Add `pub session_resume_grace: Duration` (default `Duration::from_secs(30)`) to `WorkerConfig`
-     (`crates/worker/src/client.rs:211`), configurable via `worker --session-resume-grace-secs <SECS>`,
-     `RUSTY_GRID_SESSION_RESUME_GRACE_SECS`, and `[worker].session_resume_grace_secs` (`0` disables
-     grace and cancels immediately on disconnect as before).
-   - In `WorkerClient::run` (`crates/worker/src/client.rs:1447-1460`), when `connect_and_run` exits:
-     - If `*shutdown_rx.borrow()` is true, or `current_evacuation_reason().is_some()`, or
-       `self.session_resume_grace.is_zero()`, or the worker has no active tasks and no buffered
-       results, call `self.cancel_all_active_tasks(&cancel_reason).await` immediately as today.
-     - Otherwise (connection drop, EOF, heartbeat timeout, or master restart while tasks are
-       running), keep active tasks running and start/retain a `resume_deadline = Instant::now() + self.session_resume_grace`.
-     - While disconnected, any `WorkerMessage::Checkpoint` or `WorkerMessage::TaskResult` emitted by
-       a still-running task onto the old session's `outbound_tx` is captured into a bounded per-worker
-       `pending_resume_outbox: Mutex<VecDeque<WorkerMessage>>` (capped at `max_concurrent_tasks * 2`
-       messages, retaining only the latest `Checkpoint` per `task_id` plus its final `TaskResult`).
-     - During the reconnect backoff sleep (`crates/worker/src/client.rs:1515`), also `tokio::select!`
-       on `tokio::time::sleep_until(resume_deadline)`: if `resume_deadline` expires before a new
-       session completes `RegisterAck`, call `self.cancel_all_active_tasks("session resume grace period expired").await`
-       and clear `pending_resume_outbox`.
-   - Upon completing `RegisterAck` in `connect_and_run`:
-     - If the master announced `master_features::SESSION_RESUME`:
-       1. Collect `running: Vec<TaskId>` consisting of all currently running task IDs in
-          `active_tasks` plus any task IDs that have a buffered `TaskResult` in
-          `pending_resume_outbox`.
-       2. If `!running.is_empty()`, send `WorkerMessage::ResumeSession { worker_id: self.worker_id, running }`
-          as the first post-handshake frame before heartbeats or new dispatches.
-       3. Drain `pending_resume_outbox` onto the new session's `outbound_tx` so any `Checkpoint` or
-          `TaskResult` that finished while the master was restarting is delivered on the adopted
-          session.
-     - If the master did **not** announce `master_features::SESSION_RESUME`, cancel any carried-over
-       active tasks and clear `pending_resume_outbox` before entering the session loop.
+     announces a non-zero `session-resume=<secs>`.
+3. **Worker grace inequality, outbox buffering, and output blob upload (`crates/worker/src/client.rs`):**
+   - **Why the worker's grace must be strictly shorter than the master's hold:**
+     - When a silent network drop or master crash occurs at wall-clock time $t_0$, the master's
+       `adoptable_by` timer starts either at master restart or when the master detects the drop,
+       whereas the worker only exits `connect_and_run` after its own dead-peer liveness timeout
+       $W_{\text{dead\_worker}} = \max(2\text{ s}, 4 \times \tau_{\text{worker}})$
+       (`12 s` at the default $\tau_{\text{worker}} = 3\text{ s}$).
+     - To guarantee that the worker kills its local task **before** the master's hold $T_{\text{hold}}$
+       can expire and dispatch a second copy to another worker, the worker's post-disconnect grace
+       budget $T_{\text{worker\_grace}}$ must satisfy:
+       $$T_{\text{worker\_grace}} \le \max\bigl(0,\; T_{\text{hold}} - W_{\text{dead\_worker}} - T_{\text{margin}}\bigr)$$
+       where $T_{\text{margin}} = 3\text{ s}$ covers clock drift and reconnect handshake latency.
+     - With the defaults ($T_{\text{hold}} = 30\text{ s}$, $\tau_{\text{worker}} = 3\text{ s} \Rightarrow W_{\text{dead\_worker}} = 12\text{ s}$, $T_{\text{margin}} = 3\text{ s}$), the worker's grace after detecting the disconnect is $30 - 12 - 3 = 15\text{ s}$.
+     - The worker retains `last_negotiated_hold: Option<Duration>` from the most recent `RegisterAck`.
+       An optional worker flag `worker --session-resume-grace-secs <SECS>`
+       (`RUSTY_GRID_SESSION_RESUME_GRACE_SECS`, `[worker].session_resume_grace_secs`,
+       `WorkerConfig::session_resume_grace_cap: Option<Duration>`) **may only shorten** (clamp
+       downward) the computed grace budget:
+       ```rust
+       let max_safe_grace = hold.saturating_sub(dead_peer_timeout).saturating_sub(RESUME_SAFETY_MARGIN);
+       let effective_grace = match self.config.session_resume_grace_cap {
+           Some(cap) => cap.min(max_safe_grace),
+           None => max_safe_grace,
+       };
+       ```
+       If `effective_grace.is_zero()` (for example, `session-resume` was not advertised, `--session-resume-grace-secs 0`
+       was set, or `hold <= dead_peer_timeout + margin`), the worker cancels all active tasks
+       immediately on disconnect.
+   - **Disconnected outbox and output blobs (`pending_resume_outbox`):**
+     - When `connect_and_run` exits due to a connection drop, EOF, heartbeat timeout, or master
+       restart while `effective_grace > Duration::ZERO` and the worker has active tasks (and neither
+       `*shutdown_rx.borrow()` nor `current_evacuation_reason()` is set), the worker keeps its
+       active tasks running until `resume_deadline = Instant::now() + effective_grace`.
+     - While disconnected, any `WorkerMessage::Checkpoint` or `WorkerMessage::TaskResult` produced
+       by a running task is buffered in `pending_resume_outbox: Mutex<VecDeque<BufferedTaskEvent>>`
+       (retaining at most the latest `Checkpoint` and the final `TaskResult` per `task_id`).
+     - If a task that finished while disconnected produced output files (`output_globs`), the task
+       runner stores the collected output blobs in the worker's local `BlobCache` (pinned by
+       `task_id`) and attaches their `Vec<BlobFile>` metadata and local cache paths to the
+       `BufferedTaskEvent::Result`.
+     - During the reconnect backoff sleep (`crates/worker/src/client.rs:1515`), `WorkerClient::run`
+       selects on `tokio::time::sleep_until(resume_deadline)`: if `resume_deadline` expires before
+        a new session completes `RegisterAck` (or if a reconnect attempt starts before
+       `resume_deadline` and only finishes `RegisterAck` after the master's `hold` has expired),
+       the worker calls `self.cancel_all_active_tasks("session resume grace period expired").await`,
+       unpins and clears `pending_resume_outbox`, and therefore never runs a duplicate copy alongside
+       a newly scheduled worker.
+   - **Post-`RegisterAck` resume sequence on the new session:**
+     - If the new master session announces `session-resume=<secs>` and `Instant::now() < resume_deadline`:
+       1. Collect `running: Vec<TaskId>` containing all currently running task IDs in `active_tasks`
+          plus any task IDs with a buffered `TaskResult` in `pending_resume_outbox`.
+       2. Send `WorkerMessage::ResumeSession { worker_id: self.worker_id, running }` as the first
+          post-handshake message and read/process any immediate `MasterMessage::CancelTask` frames.
+       3. For each buffered `TaskResult` whose `task_id` was not cancelled by the master and has
+          non-empty `outputs: Vec<BlobFile>`, use the new session's `BlobClient` to upload any
+          missing output blobs from the worker's `BlobCache` to the master's `BlobStore` **before**
+          sending the `WorkerMessage::TaskResult` frame on the new session's `outbound_tx`.
+       4. Flush all remaining non-cancelled buffered `Checkpoint` and `TaskResult` frames to
+          `outbound_tx`.
+     - Otherwise, cancel any carried-over active tasks and clear `pending_resume_outbox`.
 4. **Master handling of `WorkerMessage::ResumeSession` (`crates/master/src/server.rs`):**
    - When the master receives `WorkerMessage::ResumeSession { worker_id, running }` on `session_id`:
      - Verify `worker_id == registered_worker_id` (rejecting mismatched IDs as a protocol violation).
      - Call `queue.adopt_session_tasks(worker_id, session_id, &running, store.as_ref()).await`:
        - For each `task_id` in `running`:
-         - If the task is in `TaskState::Queued` (or `TaskState::Scheduled` / `TaskState::Running`
-           from a prior session of the same `worker_id`) and is not owned by a different live worker:
-           transition it to `TaskState::Running` with `assigned_worker_id = Some(worker_id)` and
-           `assigned_session = Some(session_id)`, clear `adoptable_by`, add `task_id` to
+         - If the task is in `TaskState::Queued` with `adoptable_by == Some((worker_id, hold_until))`
+           where `Instant::now() < hold_until` (or still in `Scheduled`/`Running` from a superseded
+           session of the same `worker_id`): transition it to `TaskState::Running` with
+           `assigned_worker_id = Some(worker_id)` and `assigned_session = Some(session_id)`, clear
+           `adoptable_by`, `fail_if_not_adopted`, and `pending_failover_charge`, add `task_id` to
            `worker_assignments[worker_id]`, remove it from `ready_queue` / `delayed_retries`, and
            append `JournalRecord::TaskAdopted`.
-         - Otherwise (the task is unknown, `Cancelled`, `Completed`, `Failed`, or already running on
-           a different worker): include `task_id` in `stale_to_cancel: Vec<TaskId>`.
+         - Otherwise (the task's `adoptable_by` hold already expired, or the task is unknown,
+           `Cancelled`, `Completed`, `Failed`, or owned by a different worker): include `task_id`
+           in `stale_to_cancel: Vec<TaskId>`.
        - For any task in `queue` that had `adoptable_by == Some((worker_id, _))` but was **not** in
-         `running`: clear `adoptable_by` so the scheduler can dispatch it immediately.
+         `running`: release its hold immediately via the deferred failover/failure rule in D3.2 and
+         D4.5.
      - Update `WorkerRegistry` active task count for `(worker_id, session_id)` to match the number
        of adopted tasks, send `MasterMessage::CancelTask { task_id }` for each task in
        `stale_to_cancel`, and notify `scheduler_notify`.
-5. **Handling short network drops without a master restart:**
-   - When a worker's TCP/QUIC connection drops while the master stays up, `handle_worker_disconnect`
-     (`crates/master/src/server.rs:2557`) unregisters the old session and `failover_session_tasks`
-     re-queues its tasks. For a worker that had negotiated `ProtocolCapabilities::SESSION_RESUME`,
-     `handle_session_disconnected` sets `adoptable_by = Some((worker_id, now + adoption_hold))` on
-     those re-queued tasks and does not charge `failover_count` unless the hold expires without
-     `worker_id` resuming them. If `worker_id` reconnects within `adoption_hold` and sends
-     `ResumeSession`, the master re-adopts the tasks seamlessly and subtracts the temporary
-     disconnect from failover accounting.
+5. **Handling short network drops on a master that stays up, and the cost of the hold:**
+   - **Trade-off / cost:** When a `SESSION_RESUME`-capable worker disconnects while the master stays
+     up, holding its in-flight tasks in `adoptable_by` for `--session-resume-hold-secs` (default
+     `30 s`) means that if the worker genuinely crashed or lost power, failover redispatch of those
+     tasks to another worker is delayed by `session_resume_hold` (`30 s`). Operators who want
+     immediate failover on disconnect can set `--session-resume-hold-secs 0`.
+   - **Exact failover-accounting state machine (`pending_failover_charge`):**
+     - When a worker that negotiated `ProtocolCapabilities::SESSION_RESUME` disconnects while the
+       master is running and `session_resume_hold > Duration::ZERO`,
+       `TaskQueue::handle_session_disconnected` transitions the session's `Scheduled`/`Running`
+       tasks to `TaskState::Queued` with `adoptable_by = Some((worker_id, now + session_resume_hold))`
+       and `pending_failover_charge: bool = true` (plus `fail_if_not_adopted = true` if the task was
+       `Running` with effective `max_retries == 0`), **without** incrementing `retry_count` or
+       `failover_count` or appending a `RetryAttempt` yet.
+     - If `worker_id` reconnects before `hold_until` and adopts `task_id` via `ResumeSession`,
+       `pending_failover_charge` and `adoptable_by` are cleared; `retry_count` and `failover_count`
+       stay untouched.
+     - If `hold_until` expires without `worker_id` adopting `task_id` (checked by the scheduler/reaper
+       via `TaskQueue::release_expired_adoption_holds(now)`) or if `worker_id` reconnects without
+       listing `task_id` in `ResumeSession`:
+       1. `adoptable_by` and `pending_failover_charge` are cleared.
+       2. If `fail_if_not_adopted` is `true` (`Running` with `max_retries == 0`) or
+          `!retry_policy.failover_budget(&entry).0`, the task transitions to `TaskState::Failed`,
+          syncs `JournalRecord::TaskTerminal`, and wakes any completion waiters.
+       3. Otherwise, `retry_count` and `failover_count` are incremented by `1`, a `RetryAttempt`
+          audit entry is pushed to `retry_history`, `JournalRecord::TaskRequeued` is synced to disk,
+          and the task becomes eligible in `ready_queue` for any worker.
 
 ## Compatibility
 
-- **Wire protocol version:** Adding `WorkerMessage::ResumeSession` bumps `PROTOCOL_VERSION_CURRENT`
-  and `PROTOCOL_VERSION_MIN_COMPATIBLE` in `crates/core/src/protocol.rs:31-33` and updates
-  `crates/core/tests/data/wire_layout.txt` (enforced by `crates/core/src/wire_layout_tests.rs`).
-- **Feature gating:** Even within a compatible protocol version range, a worker sends
-  `WorkerMessage::ResumeSession` only when `RegisterAck.message` contains
-  `master_features::SESSION_RESUME` (`"session-resume"`), and a master only sets the disconnect
-  adoption hold for workers that advertised `ProtocolCapabilities::SESSION_RESUME`.
+- **Wire protocol version:** Adding `WorkerMessage::ResumeSession` (and removing the deprecated
+  `compute_intensity` field from `TaskSpec::GpuCompute`) in `F1-b` bumps `PROTOCOL_VERSION_CURRENT`
+  and `PROTOCOL_VERSION_MIN_COMPATIBLE` from `3` to `4` in `crates/core/src/protocol.rs:31-33` and
+  updates `crates/core/tests/data/wire_layout.txt` (enforced by `crates/core/src/wire_layout_tests.rs`).
+- **On-disk state across protocol version upgrades (path (a) — self-describing JSON snapshot on clean shutdown):**
+  - Both `journal.bin` and `snapshot.bin` record `protocol_version: u32` (`PROTOCOL_VERSION_CURRENT`)
+    in bytes `12..16` of their 16-byte file header (D2.1).
+  - `snapshot.bin` is stored as UTF-8 JSON using the `Human*` serde representations (`#[serde(default)]`
+    for added fields, unknown fields ignored on removal), and a clean master shutdown (`SIGTERM`,
+    `SIGINT`, or `MasterHandle::shutdown`) always compacts all live and retained terminal tasks into
+    `snapshot.bin` and truncates `journal.bin` to 0 records (D2.5).
+  - On startup after a binary upgrade where `PROTOCOL_VERSION_CURRENT` changed:
+    1. `TaskStore::open` reads `snapshot.bin` via `serde_json` even when the snapshot header's
+       `protocol_version != PROTOCOL_VERSION_CURRENT`.
+    2. If `journal.bin` has 0 records after its 16-byte header (the normal state after a clean stop),
+       `TaskStore::open` rewrites the `snapshot.bin` and `journal.bin` headers with the new
+       `PROTOCOL_VERSION_CURRENT` and startup succeeds with all tasks preserved.
+    3. If `journal.bin` contains uncompacted bincode records **and** its header
+       `protocol_version != PROTOCOL_VERSION_CURRENT` (meaning the old master crashed without
+       compacting right before the binary was upgraded), `TaskStore::open` refuses to decode the
+       incompatible bincode frames and returns a clear `GridError::Storage` message naming
+       `<state_dir>/journal.bin`, the recorded `protocol_version`, and `PROTOCOL_VERSION_CURRENT`
+       (and `DEPLOYMENT.md` 3.5 documents stopping the master cleanly before upgrading the binary).
+- **Feature gating:** A worker sends `WorkerMessage::ResumeSession` only when `RegisterAck.message`
+  contains `session-resume=<secs>` with `<secs> > 0`, and a master only sets the disconnect adoption
+  hold for workers that advertised `ProtocolCapabilities::SESSION_RESUME`.
 - **CLI and config defaults:** `--state-dir` is optional (`None` by default in `ServerConfig`), so
   all existing CLI invocations and test harnesses continue to work unchanged.
 
 ## Security
 
-- **Filesystem permissions and symlink defense:** `<state_dir>` is created with mode `0o700` on
-  Unix, checked with `symlink_metadata` to reject symlinks and foreign UIDs, and locked with an
-  exclusive advisory lock (`store.lock`) so a second process cannot corrupt or race the journal.
+- **Sensitive data on disk in `<state_dir>`:**
+  - `journal.bin` and `snapshot.bin` persist complete `Task` and `TaskResult` payloads in plaintext
+    on disk, including task `env` variables, `stdin`, inline `staged_files`, `stdout`, and `stderr`.
+    Any secret passed inside a task's environment variables, standard input, or staged files is
+    written to `<state_dir>`. Users should not pass long-lived credentials in task `env` or `stdin`
+    on unencrypted disks, and `<state_dir>` must be protected with the same access controls as
+    `cluster.secret` (`README.md` and `docs/SECURITY.md`).
+- **Filesystem permissions and symlink defense (Unix and Windows):**
+  - On Unix, `<state_dir>` is created with mode `0o700`, checked with `symlink_metadata` to reject
+    symlinks and foreign UIDs, and its files (`store.lock`, `journal.bin`, `snapshot.bin`) are
+    created with mode `0o600`.
+  - On Windows, `<state_dir>` is checked with `symlink_metadata` to reject symlinks/reparse points
+    and restricted via `icacls` (`icacls <state_dir> /inheritance:r /grant:r ...`) to the current
+    user SID, `SYSTEM`, and `Administrators`, matching the protection of `cluster.secret`.
+  - `<state_dir>/store.lock` is held via `File::try_lock()` so a second process cannot corrupt or
+    race the journal.
 - **Bounded deserialization and integrity:** Every journal and snapshot frame is length-checked
-  against `MAX_FRAME_SIZE` (`64 MiB`) and verified with BLAKE3 before `bincode` deserialization.
+  against `MAX_FRAME_SIZE` (`64 MiB`) and verified with BLAKE3 before deserialization.
 - **Session ownership enforcement:** `ResumeSession` is only accepted after the connection has
   completed the `OXS-AUTH` cluster secret handshake (`crates/master/src/server.rs`) and `Register`
-  for `worker_id`. A worker cannot adopt a task that is currently assigned to a different connected
-  worker; attempting to do so causes the master to reply with `MasterMessage::CancelTask` for that
-  `task_id`.
+  for `worker_id`. A worker cannot adopt a task whose hold has expired or that is assigned to a
+  different worker; attempting to do so causes the master to reply with `MasterMessage::CancelTask`
+  for that `task_id`.
 
 ## Test plan
 
@@ -349,34 +490,43 @@ running }` during a bounded grace period.
      byte in the final frame's payload), reopen `TaskStore`, and verify the first 4 records replay
      cleanly and `journal.bin` is truncated to the 4th frame boundary.
    - Mid-file corruption rejection: flip a byte in the 2nd of 4 frames and verify `TaskStore::open`
-     returns an error rather than silently skipping the frame.
-   - Compaction (`snapshot.bin`): write records past the compaction threshold, trigger compaction,
-     verify `snapshot.bin` is written and `journal.bin` is truncated to 12 bytes, append more
-     records, reopen, and verify full state matches.
+     returns `Err(GridError::Storage(_))` rather than silently skipping the frame.
+   - Compaction (`snapshot.bin`) and cross-protocol-version upgrade test:
+     1. Write records, compact to JSON `snapshot.bin` with header `protocol_version = 3` and empty
+        `journal.bin`, reopen under `PROTOCOL_VERSION_CURRENT` (`4`), and verify the snapshot loads
+        cleanly and updates the header version.
+     2. Write non-empty `journal.bin` with header `protocol_version = 2` (simulating an uncompacted
+        crash across a protocol bump), reopen, and verify `TaskStore::open` returns
+        `Err(GridError::Storage(_))` naming the recorded version and `PROTOCOL_VERSION_CURRENT`.
+   - Group-commit benchmark/unit test: submit 1,000 tasks concurrently to a master with
+     `--state-dir`, verify all 1,000 submissions succeed and are persisted in `journal.bin`, and
+     record the elapsed wall-clock time.
    - Concurrent lock rejection: opening a second `TaskStore` on the same `<state_dir>` fails while
      the first lock is held.
 2. **Unit tests (`crates/master/src/queue.rs` and `crates/core/src/protocol.rs`):**
    - `WorkerMessage::ResumeSession` round-trip in both Bincode and JSON codecs, plus
-     `crates/core/src/wire_layout_tests.rs` golden layout verification.
+     `crates/core/src/wire_layout_tests.rs` golden layout verification (with `compute_intensity`
+     removed in `F1-b`).
    - Replay of `Scheduled` and `Running` tasks transitions them to `Queued` with `retry_count == 0`
      and `failover_count == 0`, sets `adoptable_by`, holds them out of `queued_task_views` until
      `hold_until`, and adopts them back into `Running` when `adopt_session_tasks` is called.
-3. **End-to-end integration test (`tests/master_restart_recovery.rs`, registered in `crates/master/Cargo.toml`):**
-   - Start a master with `--state-dir <tmp>` and one connected worker.
-   - Submit 4 tasks:
-     1. `t_done`: fast task that completes before the master is killed.
-     2. `t_run`: shell/command task that writes a marker counter to a file and sleeps ~2 s so it is
-        actively `Running` on the worker when the master goes down.
-     3. `t_q1`, `t_q2`: two tasks queued behind `t_run` (worker `max_concurrency = 1`).
-   - Wait until `t_done` is `Completed`, `t_run` is `Running`, and `t_q1`, `t_q2` are `Queued`.
-   - Kill/abort the first master instance while the worker stays alive inside its session-resume
-     grace window.
-   - Start a second master bound to the same port and `--state-dir <tmp>`.
-   - Verify:
-     - `get_task_result(t_done)` immediately returns the completed result from before the restart.
-     - The worker reconnects, sends `ResumeSession { running: [t_run] }`, and finishes `t_run`
-       with execution marker count `== 1` (ran **exactly once**, `retry_count == 0`).
-     - Both `t_q1` and `t_q2` are scheduled after `t_run` finishes and complete with `exit_code == 0`.
+   - Replay of a `Running` task with `max_retries == 0` that nobody resumes within the hold ends in
+     `TaskState::Failed` with reason `"master restarted while the task ran; not re-run because max_retries is 0"`.
+3. **End-to-end integration tests (`tests/master_restart_recovery.rs`, registered in `crates/master/Cargo.toml`):**
+   - **Test 1 (`test_master_restart_recovers_finished_queued_and_adopts_running_task_once`):**
+     - Start a master with `--state-dir <tmp>` and one connected worker.
+     - Submit 4 tasks: `t_done` (completes before kill), `t_run` (writes an execution counter to a
+       marker file and runs across the restart), and `t_q1`, `t_q2` (queued behind `t_run`).
+     - Kill the first master and restart a second master on the same port and `--state-dir <tmp>`.
+     - Verify `get_task_result(t_done)` reads back immediately, `t_run` is adopted via
+       `ResumeSession` and finishes with marker count `== 1` (ran **exactly once**), and `t_q1`,
+       `t_q2` both complete.
+   - **Test 2 (`test_worker_reconnecting_after_master_hold_expires_runs_task_only_once`):**
+     - Configure a short master hold (`--session-resume-hold-secs 6`) with worker heartbeat `1 s`
+       ($W_{\text{dead\_worker}} = 2\text{ s}$, $T_{\text{margin}} = 3\text{ s} \Rightarrow T_{\text{worker\_grace}} = 1\text{ s}$),
+       delay the first worker's reconnect until after the master's `6 s` hold has expired, and
+       verify via the marker file that the first worker stopped its local task before `hold` expired
+       and the task ran **exactly once** on the second worker (or after reconnect).
 4. **Gates:**
    - `cargo fmt --all -- --check`
    - `cargo clippy --workspace --all-targets --locked -- -D warnings`
@@ -393,11 +543,20 @@ lands as a self-contained, reviewable unit.
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| F1-design | Design record `0046` for master durability and worker session resume | `docs/design/0046-master-durability.md`, `docs/README.md` | Design record reviewed and accepted by the owner | Draft |
-| F1-a | Append-only task journal, snapshot compaction, `--state-dir`, and startup replay (`Scheduled`/`Running` -> `Queued` uncharged, terminal results & queued tasks restored, blob re-pinning) | `crates/master/src/store.rs`, `crates/master/src/lib.rs`, `crates/master/src/queue.rs`, `crates/master/src/server.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `README.md` | Unit tests in `crates/master/src/store.rs` and `queue.rs` pass (round-trip, torn-tail recovery, mid-file corruption error, compaction, lock exclusion, and uncharged replay) | Planned |
-| F1-b | `ProtocolCapabilities::SESSION_RESUME`, `master_features::SESSION_RESUME`, `WorkerMessage::ResumeSession`, and master task adoption + `adoptable_by` hold window | `crates/core/src/protocol.rs`, `crates/core/src/binary_wire.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/master/src/queue.rs`, `crates/master/src/server.rs`, `crates/master/src/registry.rs` | Wire round-trip and golden-bytes tests pass; master unit tests prove `adoptable_by` holds replayed running tasks from duplicate dispatch, `ResumeSession` adopts them into `Running`, and unknown/cancelled tasks receive `CancelTask` | Planned |
-| F1-c | Worker session-resume grace period (`--session-resume-grace-secs`), disconnected outbox buffering, and `tests/master_restart_recovery.rs` | `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `crates/master/Cargo.toml`, `tests/master_restart_recovery.rs`, `README.md`, `docs/design/0046-master-durability.md` | `cargo test -p rusty_grid_master --test master_restart_recovery --locked` kills a master holding 1 running, 2 queued, and 1 finished task, restarts it, reads the finished result back, finishes both queued tasks, and finishes the running task exactly once | Planned |
+| F1-design | Design record `0046` for master durability and worker session resume | `docs/design/0046-master-durability.md`, `docs/design/0044-dead-code-and-connection-loop-unification.md`, `docs/README.md` | Design record reviewed and accepted by the owner | Draft |
+| F1-a | Append-only task journal, `5 ms` group commit, self-describing JSON snapshot compaction, `GridError::Storage`, `--state-dir`, and startup replay (`Scheduled`/`Running` -> `Queued` uncharged, `Running` with `max_retries == 0` -> `Failed` when unresumed, terminal results & queued tasks restored, blob re-pinning) | `crates/core/src/error.rs`, `crates/master/src/store.rs`, `crates/master/src/lib.rs`, `crates/master/src/queue.rs`, `crates/master/src/server.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `README.md`, `docs/SECURITY.md`, `DEPLOYMENT.md` | Unit tests in `crates/master/src/store.rs` and `queue.rs` pass (round-trip, torn-tail recovery, mid-file corruption error, JSON snapshot across protocol versions, uncompacted version-mismatch error, 1,000-task group-commit timing test, lock exclusion, uncharged replay, and `Running` + `max_retries == 0` unresumed failure test) | Planned |
+| F1-b | `ProtocolCapabilities::SESSION_RESUME`, `master_features` `session-resume=<secs>`, `WorkerMessage::ResumeSession`, wire removal of deprecated `compute_intensity` (protocol bump `3 -> 4`), `--session-resume-hold-secs`, and master task adoption + `adoptable_by` / `pending_failover_charge` | `crates/core/src/protocol.rs`, `crates/core/src/task.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/master/src/queue.rs`, `crates/master/src/server.rs`, `crates/master/src/registry.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs` | Wire round-trip and golden-bytes tests pass at protocol version 4; master unit tests prove `adoptable_by` holds replayed/disconnected running tasks from duplicate dispatch, `ResumeSession` adopts them into `Running`, expired holds charge deferred failovers or fail `max_retries == 0` tasks, and unknown/cancelled/expired tasks receive `CancelTask` | Planned |
+| F1-c | Worker session-resume grace inequality (`hold - dead_peer_timeout - margin`, `--session-resume-grace-secs` clamp), disconnected outbox buffering with `BlobClient` output blob upload before `TaskResult`, and `tests/master_restart_recovery.rs` | `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `crates/master/Cargo.toml`, `tests/master_restart_recovery.rs`, `README.md`, `docs/design/0046-master-durability.md` | `cargo test -p rusty_grid_master --test master_restart_recovery --locked` passes both the 4-task master restart recovery test and the expired-hold reconnect test, proving every task runs **exactly once** | Planned |
 
 ## Status log
 
 - **2026-11-08:** Draft created (`0046-master-durability.md`) for `FEAT-1` per Working Rule 7.
+- **2026-11-08:** Updated per owner review (`122-fix`): made `--session-resume-hold-secs` on the
+  master the source of truth (`session-resume=<secs>` in `RegisterAck`) with worker grace bounded by
+  `hold - dead_peer_timeout - margin`; recorded `PROTOCOL_VERSION_CURRENT` in file headers and made
+  `snapshot.bin` self-describing JSON compacted on clean shutdown; failed unresumed `Running` tasks
+  that have `max_retries == 0` and synced `TaskRequeued`; added `BlobClient` output-blob upload
+  before flushing a buffered `TaskResult`; added `5 ms` group commit for submissions; documented
+  plaintext task data on disk and Windows `icacls` owner-only ACLs in Security; defined deferred
+  `pending_failover_charge` accounting and hold trade-off in D4.5; and scheduled the wire removal of
+  deprecated `compute_intensity` in `F1-b` alongside the protocol version `3 -> 4` bump.
