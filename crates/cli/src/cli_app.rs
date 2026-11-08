@@ -922,8 +922,10 @@ pub struct DoctorArgs {
 }
 
 pub async fn run_cli() -> ExitCode {
-    let cli = Cli::parse();
+    run_cli_with(Cli::parse()).await
+}
 
+pub async fn run_cli_with(cli: Cli) -> ExitCode {
     // Initialize tracing subscriber if not already set
     let log_level = if cli.verbose {
         "debug"
@@ -963,6 +965,7 @@ pub async fn run_cli() -> ExitCode {
     };
 
     let secret_opts = cli.secret_opts();
+    rusty_grid_core::mode::set_mode_runner_hook(crate::mode_cli::execute_mode_action);
     match cli.command {
         Commands::Master(args) => run_master(args, config_file, secret_opts).await,
         Commands::Worker(args) => run_worker(args, config_file, secret_opts).await,
@@ -5635,6 +5638,35 @@ fail_unfulfillable_tasks = false
         ));
 
         rr_master_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_run_cli_registers_mode_runner_hook() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cfg_path = temp.path().join("rusty-grid.toml");
+        std::fs::write(&cfg_path, "").expect("write empty config");
+        let cli = Cli::try_parse_from([
+            "oxideswarm",
+            "--config",
+            cfg_path.to_str().expect("cfg_path utf8"),
+            "--secret",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+            "secret",
+            "show",
+        ])
+        .unwrap();
+        let code = run_cli_with(cli).await;
+        assert_eq!(code, ExitCode::SUCCESS);
+        let res = rusty_grid_core::mode::dispatch_mode_action(
+            rusty_grid_core::mode::WorkflowMode::Research,
+            "profile",
+            std::path::Path::new("."),
+        );
+        assert!(
+            res.success,
+            "run_cli must register the mode runner hook before dispatching subcommands: {}",
+            res.stderr
+        );
     }
 
     #[test]
