@@ -70,6 +70,11 @@ impl BlobClient {
         self.in_flight.close();
         self.pending().clear();
     }
+
+    /// True once [`BlobClient::close`] was called or the underlying outbound channel closed.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire) || self.outbound.is_closed()
+    }
 }
 
 impl BlobChannel for BlobClient {
