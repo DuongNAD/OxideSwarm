@@ -127,6 +127,7 @@ impl WebUiState {
             }
         }
 
+        let store_error = stats.store_error.clone();
         let status_dto = ClusterStatusDto {
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_secs: self.started_at.elapsed().as_secs(),
@@ -140,6 +141,7 @@ impl WebUiState {
             },
             tasks: stats,
             p2p_ticket: self.p2p_ticket.clone(),
+            store_error,
         };
 
         ClusterSnapshotDto {
@@ -451,6 +453,8 @@ pub struct DashboardStatus {
     pub tasks: DashboardTasks,
     #[serde(default)]
     pub p2p_ticket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -493,6 +497,8 @@ pub struct DashboardTasks {
     pub active_bytes: usize,
     #[serde(default)]
     pub max_active_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_error: Option<String>,
     /// The newest non-finished tasks, at most [`STATUS_ACTIVE_LIST_LIMIT`]. `state` is spelled
     /// like everywhere else in the API (`TaskState::as_str`, snake_case).
     #[serde(default)]
@@ -649,6 +655,7 @@ async fn api_status(
         .collect();
     let (pending, running, _, _) = stats.cluster_buckets();
 
+    let store_error = stats.store_error.clone();
     let tasks = DashboardTasks {
         total: stats.total,
         queued: stats.queued,
@@ -660,6 +667,7 @@ async fn api_status(
         cancelled: stats.cancelled,
         active_bytes: stats.active_bytes,
         max_active_bytes: stats.max_active_bytes,
+        store_error: store_error.clone(),
         active_list,
         active_total: pending + running,
     };
@@ -673,6 +681,7 @@ async fn api_status(
         "workers": workers,
         "tasks": tasks,
         "p2p_ticket": state.p2p_ticket.clone(),
+        "store_error": store_error,
     });
     if let (Some(hosts), Some(obj)) = (discovery_hosts, resp.as_object_mut()) {
         obj.insert("discovery_hosts".into(), serde_json::json!(hosts));

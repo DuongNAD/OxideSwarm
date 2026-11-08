@@ -1058,22 +1058,53 @@ impl Drop for Session {
 
 /// Task runner tasks are spawned and hold a clone of `active_task_table`, so they would outlive a
 /// dropped `WorkerClient` (for example when a caller aborts the task running `WorkerClient::run`)
-/// and keep child processes alive in the background. Dropping `WorkerClient` stops and aborts any
-/// remaining active runs.
+/// and keep child processes alive in the background. Dropping `WorkerClient` signals any remaining
+/// active runs to stop via their cancellation channel and drains them asynchronously so their
+/// process trees and sandboxes clean up off the runtime thread before falling back to `abort()`.
 impl Drop for WorkerClient {
     fn drop(&mut self) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            if let Ok(mut lock) = self.active_task_table.try_write() {
+                for (_, handle) in lock.drain() {
+                    if let Some(join) = Self::begin_stop(handle, "WorkerClient dropped") {
+                        join.abort();
+                    }
+                }
+            }
+            return;
+        };
+        let mut joins = Vec::new();
         if let Ok(mut lock) = self.active_task_table.try_write() {
             for (_, handle) in lock.drain() {
                 if let Some(join) = Self::begin_stop(handle, "WorkerClient dropped") {
-                    join.abort();
+                    joins.push(join);
                 }
             }
-        } else if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        } else {
             let table = Arc::clone(&self.active_task_table);
             rt.spawn(async move {
-                let mut lock = table.write().await;
-                for (_, handle) in lock.drain() {
-                    if let Some(join) = Self::begin_stop(handle, "WorkerClient dropped") {
+                let handles: Vec<TaskExecutionHandle> = {
+                    let mut lock = table.write().await;
+                    lock.drain().map(|(_, h)| h).collect()
+                };
+                let joins: Vec<JoinHandle<()>> = handles
+                    .into_iter()
+                    .filter_map(|h| Self::begin_stop(h, "WorkerClient dropped"))
+                    .collect();
+                let deadline = tokio::time::Instant::now() + TASK_DRAIN_TIMEOUT;
+                for mut join in joins {
+                    if tokio::time::timeout_at(deadline, &mut join).await.is_err() {
+                        join.abort();
+                    }
+                }
+            });
+            return;
+        }
+        if !joins.is_empty() {
+            rt.spawn(async move {
+                let deadline = tokio::time::Instant::now() + TASK_DRAIN_TIMEOUT;
+                for mut join in joins {
+                    if tokio::time::timeout_at(deadline, &mut join).await.is_err() {
                         join.abort();
                     }
                 }
@@ -5651,7 +5682,7 @@ mod tests {
         assert!(rusty_grid_core::placement::validate_user_tag("iso:fs+net").is_err());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[tokio::test]
     async fn test_run_refuses_isolation_this_platform_cannot_enforce() {
         let dir = tempfile::tempdir().unwrap();

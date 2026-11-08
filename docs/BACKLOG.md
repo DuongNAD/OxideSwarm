@@ -483,8 +483,8 @@ These items remove ways to lose data or to run code without authorisation.
 - **Problem:** On Unix the cluster secret and `master_key.bin` are created with mode 0600 and
   `ClusterSecret::load_file` warns about a wider mode. On Windows the files inherit the DACL of their
   directory, so every local account can read the secret and the master identity, and nothing warns.
-- **Do:** Create each private file (cluster secret, master key, ticket file) and the
-  `~\.oxideswarm` directory with a protected DACL for the current user, `SYSTEM` and
+- **Do:** Create each private file (cluster secret, master key, ticket file), the task store
+  directory (`--state-dir`) and the `~\.oxideswarm` directory with a protected DACL for the current user, `SYSTEM` and
   `Administrators`, applied by `CreateFileW` at creation. Warn at load, with the `icacls` fix, when
   the DACL grants anyone else. Design 0047.
 - **Done when:** A Windows test creates a private file under a parent that grants `Everyone` read

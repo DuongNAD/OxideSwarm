@@ -37,6 +37,7 @@ default = ["p2p", "dashboard"]
 p2p = ["dep:iroh", "rusty_grid_core/p2p"]
 dashboard = ["dep:axum", "dep:tower-http"]
 3d = ["rusty_grid_worker/3d"]
+test-hooks = []
 
 [dev-dependencies]
 rusty_grid_worker = { path = "../worker" }
@@ -166,5 +167,10 @@ path = "../../tests/m3_challenger_1_wire_encryption_stress.rs"
 [[test]]
 name = "test_challenger_m4_scheduler_runner"
 path = "../../tests/test_challenger_m4_scheduler_runner.rs"
+
+[[test]]
+name = "master_restart_recovery"
+path = "../../tests/master_restart_recovery.rs"
+
 
 

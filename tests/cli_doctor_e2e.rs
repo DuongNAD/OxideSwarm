@@ -302,3 +302,50 @@ async fn test_doctor_fails_when_workers_are_missing_or_the_master_is_unreachable
     assert_eq!(report.checks[0].id, "C1");
     assert_eq!(report.checks[0].outcome, Outcome::Fail);
 }
+
+#[tokio::test]
+async fn test_doctor_fails_when_master_task_store_has_failed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state_dir = dir.path().join("state");
+    let master = MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_state_dir(&state_dir),
+        SchedulerConfig::default(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("master starts with state_dir");
+    let addr = master.server_addr().to_string();
+
+    master
+        .queue()
+        .fail_store_for_test("cannot sync journal.bin: Input/output error")
+        .await;
+
+    let options = DoctorOptions {
+        expect_workers: 0,
+        skip_gpu: true,
+        skip_spread: true,
+        ..DoctorOptions::default()
+    };
+    let report = run_doctor(&addr, None, &options).await;
+    let rendered = report.render();
+    assert!(
+        report.failed(),
+        "doctor must fail when task store has failed:\n{rendered}"
+    );
+    let store_check = report
+        .checks
+        .iter()
+        .find(|c| c.name == "Task store")
+        .expect("expected Task store check in doctor report");
+    assert_eq!(store_check.outcome, Outcome::Fail);
+    assert!(
+        store_check
+            .detail
+            .contains("durability is gone until a restart")
+            && store_check.detail.contains("cannot sync journal.bin"),
+        "unexpected Task store check detail: {}",
+        store_check.detail
+    );
+    master.shutdown().unwrap();
+}

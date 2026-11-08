@@ -313,7 +313,7 @@ pub struct MasterArgs {
     #[arg(
         long,
         value_name = "DIR",
-        help = "Directory of the blob store that keeps task input and output files (default ~/.oxideswarm/blobs; env RUSTY_GRID_BLOB_DIR)"
+        help = "Directory of the blob store that keeps task input and output files (default ~/.oxideswarm/blobs, or <STATE_DIR>/blobs when --state-dir is set; env RUSTY_GRID_BLOB_DIR)"
     )]
     pub blob_dir: Option<PathBuf>,
 
@@ -323,6 +323,13 @@ pub struct MasterArgs {
         help = "Megabytes the blob store may hold before it evicts the least recently used files no queued or running task needs (default 4096; env RUSTY_GRID_BLOB_STORE_MB)"
     )]
     pub blob_store_mb: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory for durable task queue persistence (store.lock, snapshot.bin, journal.bin; env RUSTY_GRID_STATE_DIR)"
+    )]
+    pub state_dir: Option<PathBuf>,
 
     #[arg(
         long,
@@ -1409,6 +1416,15 @@ async fn run_master(
         .with_max_connections(max_connections)
         .with_max_pending_handshakes(max_pending_handshakes);
 
+    let state_dir = resolve_state_dir_value(
+        args.state_dir,
+        std::env::var("RUSTY_GRID_STATE_DIR").ok().as_deref(),
+        master_cfg.as_ref().and_then(|m| m.state_dir.as_deref()),
+    );
+    if let Some(ref dir) = state_dir {
+        server_config = server_config.with_state_dir(dir);
+    }
+
     // Task input and output files live in a bounded, content-addressed store on disk.
     let blob_store_mb = resolve_u64(
         args.blob_store_mb,
@@ -1422,6 +1438,7 @@ async fn run_master(
         master_cfg.as_ref().and_then(|m| m.blob_dir.clone()),
     )
     .map(PathBuf::from)
+    .or_else(|| state_dir.as_ref().map(|dir| dir.join("blobs")))
     .or_else(|| crate::config::default_oxideswarm_dir().map(|dir| dir.join("blobs")));
     match &blob_dir {
         Some(dir) => {
@@ -1556,11 +1573,33 @@ async fn run_master(
         }
     }
 
-    // Await termination signal
-    let _ = tokio::signal::ctrl_c().await;
+    // Await termination signal (SIGINT or SIGTERM on Unix)
+    wait_for_worker_shutdown_signal().await;
     println!("\nRustyGrid Master shutting down...");
     let _ = handle.shutdown();
     ExitCode::SUCCESS
+}
+
+/// Resolves `--state-dir` / `RUSTY_GRID_STATE_DIR` / `master.state_dir` without mutating the
+/// process environment.
+fn resolve_state_dir_value(
+    cli_val: Option<PathBuf>,
+    env_val: Option<&str>,
+    cfg_val: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(path) = cli_val {
+        let trimmed = path.display().to_string();
+        if !trimmed.trim().is_empty() {
+            return Some(path);
+        }
+    }
+    if let Some(env_s) = env_val.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(env_s));
+    }
+    if let Some(cfg_s) = cfg_val.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(cfg_s));
+    }
+    None
 }
 
 /// Applies `--web-ui-addr` to the master's configuration.
@@ -3193,6 +3232,7 @@ async fn run_status(
                 failed_tasks,
                 active_bytes,
                 max_active_bytes,
+                store_error,
                 workers,
             } => {
                 if args.json {
@@ -3209,20 +3249,21 @@ async fn run_status(
                             val
                         })
                         .collect();
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "total_tasks": total_tasks,
-                            "pending_tasks": pending_tasks,
-                            "running_tasks": running_tasks,
-                            "completed_tasks": completed_tasks,
-                            "failed_tasks": failed_tasks,
-                            "active_bytes": active_bytes,
-                            "max_active_bytes": max_active_bytes,
-                            "worker_count": workers.len(),
-                            "workers": enriched_workers
-                        })
-                    );
+                    let mut out = serde_json::json!({
+                        "total_tasks": total_tasks,
+                        "pending_tasks": pending_tasks,
+                        "running_tasks": running_tasks,
+                        "completed_tasks": completed_tasks,
+                        "failed_tasks": failed_tasks,
+                        "active_bytes": active_bytes,
+                        "max_active_bytes": max_active_bytes,
+                        "worker_count": workers.len(),
+                        "workers": enriched_workers
+                    });
+                    if let Some(ref err) = store_error {
+                        out["store_error"] = serde_json::Value::String(err.clone());
+                    }
+                    println!("{}", out);
                 } else {
                     println!("=== RustyGrid Cluster Status ===");
                     println!("Connected Workers: {}", workers.len());
@@ -3238,6 +3279,12 @@ async fn run_status(
                         active_bytes as f64 / (1024.0 * 1024.0),
                         max_active_bytes as f64 / (1024.0 * 1024.0),
                     );
+                    if let Some(ref err) = store_error {
+                        println!(
+                            "Task Store Error: {} (durability is gone until restart)",
+                            err
+                        );
+                    }
                     if !workers.is_empty() {
                         println!("\nWorkers:");
                         for w in &workers {
@@ -5337,6 +5384,7 @@ max_active_mb = 768
                                 failed_tasks: 0,
                                 active_bytes: 0,
                                 max_active_bytes: 0,
+                                store_error: None,
                                 workers: vec![],
                             })
                             .await
@@ -6032,5 +6080,42 @@ fail_unfulfillable_tasks = false
             1,
             "only the pre-flight ClusterStatus probe should be sent before refusing the v2 master"
         );
+    }
+
+    #[test]
+    fn test_master_state_dir_flag_and_env_precedence() {
+        let cli = Cli::try_parse_from(["oxideswarm", "master", "--state-dir", "/tmp/cli-state"])
+            .expect("parse master --state-dir");
+        let Commands::Master(m_args) = cli.command else {
+            panic!("expected Master");
+        };
+        assert_eq!(
+            m_args.state_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/cli-state"))
+        );
+
+        let resolved_cli = resolve_state_dir_value(
+            Some(PathBuf::from("/tmp/cli-state")),
+            Some("/tmp/env-state"),
+            Some("/tmp/cfg-state"),
+        );
+        let resolved_env =
+            resolve_state_dir_value(None, Some("/tmp/env-state"), Some("/tmp/cfg-state"));
+        let resolved_cfg = resolve_state_dir_value(None, Some("   "), Some("/tmp/cfg-state"));
+        let resolved_none = resolve_state_dir_value(None, None, None);
+
+        assert_eq!(
+            resolved_cli.as_deref(),
+            Some(std::path::Path::new("/tmp/cli-state"))
+        );
+        assert_eq!(
+            resolved_env.as_deref(),
+            Some(std::path::Path::new("/tmp/env-state"))
+        );
+        assert_eq!(
+            resolved_cfg.as_deref(),
+            Some(std::path::Path::new("/tmp/cfg-state"))
+        );
+        assert_eq!(resolved_none, None);
     }
 }

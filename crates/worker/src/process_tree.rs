@@ -30,7 +30,7 @@
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tracing::warn;
 
@@ -1191,17 +1191,75 @@ pub fn terminate_all_task_process_trees() -> usize {
     snapshot.len()
 }
 
+struct TreeInner {
+    id: imp::RawId,
+    done: AtomicBool,
+    kill_lock: Mutex<()>,
+    #[cfg(windows)]
+    spawned_at: std::time::Instant,
+    #[cfg(unix)]
+    lifeline_write: Mutex<Option<std::os::unix::io::OwnedFd>>,
+    #[cfg(target_os = "linux")]
+    cgroup_leaf: Mutex<Option<imp::CgroupLeaf>>,
+}
+
+impl TreeInner {
+    fn kill_and_release_once(&self, child_already_exited: bool) {
+        if self.done.load(Ordering::Acquire) {
+            return;
+        }
+        let _guard = self
+            .kill_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.done.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        #[cfg(windows)]
+        if !child_already_exited {
+            // Avoid terminating a freshly resumed MSYS2/Cygwin child while it is still inside
+            // `msys-2.0.dll` `dll_crt0_1` shared-memory initialization, which can stall
+            // concurrent MSYS2 processes on Windows for 15s waiting on the global init lock.
+            const MIN_LIVE_KILL_AGE: std::time::Duration = std::time::Duration::from_millis(80);
+            if let Some(remaining) = MIN_LIVE_KILL_AGE.checked_sub(self.spawned_at.elapsed()) {
+                std::thread::sleep(remaining);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = child_already_exited;
+
+        live().retain(|registered| *registered != self.id);
+        imp::kill(self.id);
+        imp::release(self.id);
+        #[cfg(target_os = "linux")]
+        if let Ok(mut leaf) = self.cgroup_leaf.lock() {
+            drop(leaf.take());
+        }
+        #[cfg(unix)]
+        if let Ok(mut lifeline) = self.lifeline_write.lock() {
+            if let Some(w) = lifeline.take() {
+                use std::os::unix::io::AsRawFd;
+                unsafe {
+                    let _ = libc::write(w.as_raw_fd(), b"0".as_ptr().cast::<libc::c_void>(), 1);
+                }
+                drop(w);
+            }
+        }
+    }
+}
+
+impl Drop for TreeInner {
+    fn drop(&mut self) {
+        self.kill_and_release_once(true);
+    }
+}
+
 /// The process tree of one task: a supervised process group (Unix) or a Job Object (Windows).
 ///
 /// Create it with [`ConfiguredCommand::attach`] right after the child is spawned. Dropping it
 /// kills whatever is still running in the tree and closes the lifeline pipe write end.
 pub(crate) struct ProcessTree {
-    id: Option<imp::RawId>,
-    killed: AtomicBool,
-    #[cfg(unix)]
-    lifeline_write: Option<std::os::unix::io::OwnedFd>,
-    #[cfg(target_os = "linux")]
-    cgroup_leaf: Option<imp::CgroupLeaf>,
+    inner: Option<Arc<TreeInner>>,
 }
 
 impl ProcessTree {
@@ -1219,93 +1277,73 @@ impl ProcessTree {
         #[cfg(not(unix))]
         let id = imp::attach(child);
 
-        if let Some(id) = id {
+        let inner = id.map(|id| {
             live().push(id);
-        }
-        Self {
-            id,
-            killed: AtomicBool::new(false),
-            #[cfg(unix)]
-            lifeline_write: unix.lifeline_write.take(),
-            #[cfg(target_os = "linux")]
-            cgroup_leaf: unix.cgroup_leaf.take(),
-        }
+            Arc::new(TreeInner {
+                id,
+                done: AtomicBool::new(false),
+                kill_lock: Mutex::new(()),
+                #[cfg(windows)]
+                spawned_at: std::time::Instant::now(),
+                #[cfg(unix)]
+                lifeline_write: Mutex::new(unix.lifeline_write.take()),
+                #[cfg(target_os = "linux")]
+                cgroup_leaf: Mutex::new(unix.cgroup_leaf.take()),
+            })
+        });
+        Self { inner }
     }
 
     /// Whether the whole tree (not only the leader) can be reached.
     pub(crate) fn is_tracked(&self) -> bool {
-        self.id.is_some()
+        self.inner.is_some()
     }
 
     /// Asks the tree to stop (`SIGTERM` to the group). Returns whether a request could be made;
     /// on Windows there is no such request and this is `false`.
     pub(crate) fn request_stop(&self) -> bool {
-        self.id.is_some_and(imp::request_stop)
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| !inner.done.load(Ordering::Acquire) && imp::request_stop(inner.id))
     }
 
-    /// Kills every process of the tree on a blocking thread so the process-table sweep on Unix
-    /// never blocks a Tokio runtime worker thread. Safe to repeat.
+    /// Kills every process of the tree on a blocking thread so neither the process-table sweep on
+    /// Unix nor Job Object termination/close on Windows ever blocks a Tokio runtime worker thread,
+    /// while serialising `imp::kill` and `imp::release` through `TreeInner` so a Windows Job
+    /// Object handle is never closed before `TerminateJobObject` completes. Safe to repeat.
     ///
     /// `live_leader` is the leader's PID, to be passed only while it has not been reaped: when the
     /// platform gave us no container (a Windows process that could not be put into a job) it is
     /// all there is to go on, and `taskkill /F /T` takes the leader and its children.
     pub(crate) async fn kill_async(&self, live_leader: Option<u32>) {
-        match self.id {
-            Some(id) => {
-                #[cfg(windows)]
-                {
-                    if !self.killed.swap(true, Ordering::AcqRel) {
-                        imp::kill(id);
-                    }
-                }
-                #[cfg(not(windows))]
-                {
-                    let _ = tokio::task::spawn_blocking(move || imp::kill(id)).await;
-                    self.killed.store(true, Ordering::Release);
+        match self.inner.as_ref() {
+            Some(inner) => {
+                if !inner.done.load(Ordering::Acquire) {
+                    let inner = Arc::clone(inner);
+                    let child_already_exited = live_leader.is_none();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        inner.kill_and_release_once(child_already_exited);
+                    })
+                    .await;
                 }
             }
-            None => {
-                self.killed.store(true, Ordering::Release);
-                kill_by_leader(live_leader);
-            }
+            None => kill_by_leader(live_leader),
         }
     }
 }
 
 impl Drop for ProcessTree {
     fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
-        let cgroup_leaf = self.cgroup_leaf.take();
-        #[cfg(unix)]
-        let lifeline_write = self.lifeline_write.take();
-
-        if let Some(id) = self.id {
-            let already_killed = self.killed.swap(true, Ordering::AcqRel);
-            live().retain(|registered| *registered != id);
-            let finish = move || {
-                if !already_killed {
-                    imp::kill(id);
-                }
-                imp::release(id);
-                #[cfg(target_os = "linux")]
-                drop(cgroup_leaf);
-                #[cfg(unix)]
-                if let Some(w) = lifeline_write {
-                    use std::os::unix::io::AsRawFd;
-                    unsafe {
-                        let _ = libc::write(w.as_raw_fd(), b"0".as_ptr().cast::<libc::c_void>(), 1);
-                    }
-                    drop(w);
-                }
-            };
-            #[cfg(not(windows))]
-            if !already_killed {
+        if let Some(inner) = self.inner.take() {
+            if !inner.done.load(Ordering::Acquire) {
                 if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    runtime.spawn_blocking(finish);
+                    runtime.spawn_blocking(move || {
+                        inner.kill_and_release_once(false);
+                    });
                     return;
                 }
+                inner.kill_and_release_once(false);
             }
-            finish();
         }
     }
 }

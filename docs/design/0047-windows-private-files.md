@@ -5,7 +5,7 @@ Created: 2026-11-08    Updated: 2026-11-08
 
 ## Summary
 
-On Windows, the files OxideSwarm creates as private (the cluster secret and the master P2P key, plus the P2P ticket file and the directories that hold them) are created with a protected DACL that grants full control only to the current user, `SYSTEM` and `BUILTIN\Administrators`, applied by `CreateFileW` itself so no moment exists at which another account can read them. Loading the cluster secret or the master key logs a warning, with the exact `icacls` fix, when the file grants access to anyone else. Unix behaviour is unchanged (`SEC-9`).
+On Windows, the files OxideSwarm creates as private (the cluster secret and the master P2P key, plus the P2P ticket file, the task store directory (`--state-dir`) and the directories that hold them) are created with a protected DACL that grants full control only to the current user, `SYSTEM` and `BUILTIN\Administrators`, applied by `CreateFileW` itself so no moment exists at which another account can read them. Loading the cluster secret or the master key logs a warning, with the exact `icacls` fix, when the file grants access to anyone else. Unix behaviour is unchanged (`SEC-9`).
 
 ## Context
 
@@ -23,7 +23,6 @@ On Unix `write_private_new` (`crates/core/src/cluster_auth.rs`) and `write_new_p
 
 - Rewriting the DACL of an existing file or directory (Unix tightens an exposed key; on Windows the warning gives the command and the owner decides, because rewriting an ACL can lock out a service account the owner set up on purpose).
 - The Windows service installer files under `C:\ProgramData\OxideSwarm` (the installer sets their ACL) and the worker id file (an identity, not a credential).
-- The task store directory of `FEAT-1` (design 0046, D1.3): it can call `create_private_dir_all` and `warn_if_readable_by_others` from this module.
 
 ## Design
 
@@ -52,6 +51,7 @@ Every system allocation (the security descriptor, the string SID) is released th
 | `cluster.secret` (`oxideswarm secret generate`, the master's generated secret) | `write_private_new`, `ClusterSecret::save_file` (new parent directory), `ClusterSecret::load_file` | protected DACL at creation; private parent directory; warning at load |
 | `master_key.bin` | `write_new_private_key`, `resolve_p2p_secret_key` in `crates/master/src/server.rs` | protected DACL at creation; private parent directory; warning at load |
 | P2P ticket file (`--p2p-ticket-file`) | the master's ticket publication in `server.rs` | written with `write_private_replace` |
+| task store directory (`--state-dir`, design 0046) with `store.lock`, `journal.bin`, `snapshot.bin` | `prepare_dir` in `crates/master/src/store.rs` | a new directory gets `create_private_dir_all` (the files inherit its `OICI` entries); an existing one is only checked, with a warning when open. It resolves the `TODO(FEAT-1)` of design 0046 D1.3. Unix keeps mode 0700 and 0600 |
 
 ## Compatibility
 
@@ -60,4 +60,4 @@ No wire or CLI change. An existing file keeps its DACL; only new files are priva
 ## Testing
 
 - Pure tests (all platforms): `private_sddl`, `open_grants` (private DACL, `Everyone`, `Users`, `Authenticated Users`, case-insensitive user SID, ignored attribute-only entries) and `open_acl_warning`.
-- Windows tests (`private_file::windows_tests`, run on `windows-latest`): in a temp directory whose DACL grants `Everyone` and `BUILTIN\Users` read with inheritance, a file created with `std::fs::write` is flagged, while a file from `create_private_new` has a protected DACL with exactly the three allowed SIDs and no `Everyone` or `Users`, refuses an existing file, a directory from `create_private_dir_all` is protected and the files in it inherit only the three entries, and `write_private_replace` replaces and stays private. The tests use temp directories only and never touch the real `~\.oxideswarm`.
+- Windows tests (`private_file::windows_tests`, run on `windows-latest`): in a temp directory whose DACL grants `Everyone` and `BUILTIN\Users` read with inheritance, a file created with `std::fs::write` is flagged, while a file from `create_private_new` has a protected DACL with exactly the three allowed SIDs and no `Everyone` or `Users`, refuses an existing file, a directory from `create_private_dir_all` is protected and the files in it inherit only the three entries, and `write_private_replace` replaces and stays private. `store::tests::state_dir_gets_a_protected_dacl_and_its_files_inherit_it` opens a task store under such a parent and checks the directory, `store.lock`, `journal.bin` and `snapshot.bin`. The tests use temp directories only and never touch the real `~\.oxideswarm`.
