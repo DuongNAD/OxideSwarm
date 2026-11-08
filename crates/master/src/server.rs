@@ -1959,8 +1959,9 @@ impl Drop for UploadOwner {
 /// The `BlobRequest`s of one client connection that are being handled. Up to
 /// [`MAX_IN_FLIGHT_REQUESTS`] run at the same time (different blobs overlap their disk work),
 /// and their replies leave in the order the requests arrived. A client that sends more than that
-/// is held back: the connection stops reading until a reply went out, so what a client can make
-/// the Master hold is bounded by the limit times one chunk.
+/// is held back: the connection stops reading until a reply went out, so the number of requests
+/// held is bounded. Their size is not bounded by the chunk size: a frame may be up to the 64 MiB
+/// frame limit until `append` rejects it, so the worst case is the limit times that.
 #[derive(Default)]
 struct BlobPipeline {
     running: std::collections::VecDeque<tokio::task::JoinHandle<BlobReply>>,
