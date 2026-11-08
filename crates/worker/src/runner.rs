@@ -33,9 +33,9 @@
 //!
 //! A [`TaskSpec::GpuCompute`] is a seeded `matrix_dim x matrix_dim` single-precision matrix
 //! multiplication (`simulated_matrix_dim`, tiled with `work_group_size` x `work_group_size`
-//! threads). `kernel_name` is only a label echoed in the report and `compute_intensity` is not
-//! read: it is a benchmark workload, not a general kernel launcher, and the input matrices are
-//! generated from `input_data` rather than supplied by the caller.
+//! threads). `kernel_name` is only a label echoed in the report: it is a benchmark workload, not a
+//! general kernel launcher, and the input matrices are generated from `input_data` rather than
+//! supplied by the caller.
 //!
 //! * A worker with a **real** GPU (`has_gpu`, which a worker advertises only if its binary
 //!   contains the wgpu engine, feature `gpu-wgpu`, and an adapter started) multiplies on the GPU
@@ -63,9 +63,11 @@ use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::WorkerMessage;
+#[cfg(feature = "3d")]
+use rusty_grid_core::task::Engine3D;
 use rusty_grid_core::task::{
-    sha256_digest, Bytes, BytesMut, CheckpointData, Engine3D, OutputArtifact, Task, TaskId,
-    TaskResult, TaskSpec, MAX_AGGREGATE_ARTIFACT_BYTES, MAX_OUTPUT_ARTIFACT_BYTES,
+    sha256_digest, Bytes, BytesMut, CheckpointData, OutputArtifact, Task, TaskId, TaskResult,
+    TaskSpec, MAX_AGGREGATE_ARTIFACT_BYTES, MAX_OUTPUT_ARTIFACT_BYTES,
 };
 
 use crate::blob_cache::{BlobCache, DEFAULT_BLOB_CACHE_MAX_BYTES};
@@ -1998,7 +2000,60 @@ impl TaskRunner {
         res
     }
 
+    /// Fallback when `rusty_grid_worker` is compiled without the `3d` Cargo feature.
+    #[cfg(not(feature = "3d"))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_generative_3d_workload(
+        &self,
+        task: &Task,
+        _spec: &rusty_grid_core::task::Generative3DSpec,
+        _checkpoint: Option<&CheckpointData>,
+        _checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
+        _timeout: Duration,
+        _child_pid: Option<Arc<AtomicU32>>,
+        _cancel_rx: Option<oneshot::Receiver<String>>,
+        start_time: Instant,
+    ) -> TaskResult {
+        let msg = "worker was built without the '3d' feature; rebuild with --features 3d to run Generative3D tasks";
+        TaskResult::failure(
+            self.worker_id,
+            task.id,
+            EXIT_CODE_GENERAL_ERROR,
+            Bytes::new(),
+            Bytes::from_static(b"worker was built without the '3d' feature; rebuild with --features 3d to run Generative3D tasks\n"),
+            start_time.elapsed().as_millis() as u64,
+            Some(msg.to_string()),
+        )
+    }
+
+    /// Fallback when `rusty_grid_worker` is compiled without the `3d` Cargo feature.
+    #[cfg(not(feature = "3d"))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_auto_rig_workload(
+        &self,
+        task: &Task,
+        _spec: &rusty_grid_core::task::AutoRigSpec,
+        _checkpoint: Option<&CheckpointData>,
+        _checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
+        _timeout: Duration,
+        _child_pid: Option<Arc<AtomicU32>>,
+        _cancel_rx: Option<oneshot::Receiver<String>>,
+        start_time: Instant,
+    ) -> TaskResult {
+        let msg = "worker was built without the '3d' feature; rebuild with --features 3d to run AutoRig tasks";
+        TaskResult::failure(
+            self.worker_id,
+            task.id,
+            EXIT_CODE_GENERAL_ERROR,
+            Bytes::new(),
+            Bytes::from_static(b"worker was built without the '3d' feature; rebuild with --features 3d to run AutoRig tasks\n"),
+            start_time.elapsed().as_millis() as u64,
+            Some(msg.to_string()),
+        )
+    }
+
     /// Executes a `TaskSpec::Generative3D` workload via Tier 0 (SDF) or Tier 1 (Subprocess).
+    #[cfg(feature = "3d")]
     #[allow(clippy::too_many_arguments)]
     pub async fn execute_generative_3d_workload(
         &self,
@@ -2277,6 +2332,7 @@ impl TaskRunner {
 
     /// Direct Tier 0 Procedural Signed Distance Function mesh generator (< 50 ms)
     /// with incremental milestone progress checkpoints (25%, 50%, 75%, 100%).
+    #[cfg(feature = "3d")]
     async fn execute_tier0_sdf(
         &self,
         task: &Task,
@@ -2376,6 +2432,7 @@ impl TaskRunner {
 
     /// Executes an automated skeleton rigging and animation synthesis workload (`TaskSpec::AutoRig`)
     /// with incremental milestone progress checkpoints (25%, 50%, 75%, 100%).
+    #[cfg(feature = "3d")]
     #[allow(clippy::too_many_arguments)]
     pub async fn execute_auto_rig_workload(
         &self,
@@ -2580,9 +2637,9 @@ impl TaskRunner {
         // Last line of defence for the direct child if this future is dropped; the process tree
         // below takes care of everything else.
         cmd.kill_on_drop(true);
-        configure_command(&mut cmd, self.config.process_priority);
+        let mut configured = configure_command(&mut cmd, self.config.process_priority, task_id);
 
-        let mut child = match cmd.spawn() {
+        let mut child = match configured.spawn(&mut cmd) {
             Ok(c) => c,
             Err(e) => {
                 return TaskResult::failure(
@@ -2602,7 +2659,7 @@ impl TaskRunner {
         };
 
         // Declared before the readers so it is dropped after them: dropping it kills what is left.
-        let tree = ProcessTree::attach(&child);
+        let tree = configured.attach(&child);
         if !tree.is_tracked() {
             warn!(task_id = %task_id, "Could not place the task process in its own process group or job; only the direct child can be terminated reliably");
         }
@@ -2648,7 +2705,7 @@ impl TaskRunner {
                 // lives, so wait a bounded time, then take the tree down and keep what arrived.
                 let drained = readers.wait(self.config.pipe_drain_grace).await;
                 // Nothing the task started may outlive it: its sandbox is deleted next.
-                tree.kill(None);
+                tree.kill_async(None).await;
                 if !drained {
                     readers.wait(POST_KILL_DRAIN).await;
                 }
@@ -2741,7 +2798,7 @@ impl TaskRunner {
         if tree.request_stop() {
             let _ = tokio::time::timeout(self.config.stop_grace, child.wait()).await;
         }
-        tree.kill(child.id());
+        tree.kill_async(child.id()).await;
         // The leader at least, even where no tree could be tracked.
         let _ = child.start_kill();
         let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
@@ -2783,6 +2840,7 @@ pub(crate) fn append_note(bytes: Bytes, note: &str) -> Bytes {
 /// Returns `Ok(None)` only if the file was not found (`ErrorKind::NotFound`).
 /// Returns `Err(io::Error)` if reading failed for any other reason (e.g. symbolic link,
 /// not a regular file, exceeds `MAX_FRAME_SIZE`, or permission denied).
+#[cfg(any(feature = "3d", test))]
 pub(crate) async fn read_output_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     let mut opts = tokio::fs::OpenOptions::new();
     opts.read(true);
@@ -3158,6 +3216,54 @@ mod tests {
         assert!(res.stdout_str().contains("compilation artifacts generated"));
     }
 
+    #[cfg(not(feature = "3d"))]
+    #[tokio::test]
+    async fn test_runner_3d_stubs_fail_cleanly_when_built_without_3d_feature() {
+        let runner = test_runner(false);
+
+        let gen_task = Task::new(
+            TaskSpec::Generative3D(
+                rusty_grid_core::task::Generative3DSpec::new_prompt("drone".to_string())
+                    .with_engine("sdf")
+                    .with_quality("fast"),
+            ),
+            TaskRequirements::generic(1, 30),
+        );
+        let gen_res = runner.execute_task(&gen_task, None, None).await;
+        assert!(!gen_res.is_success());
+        assert_eq!(gen_res.exit_code, EXIT_CODE_GENERAL_ERROR);
+        assert!(
+            gen_res
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("--features 3d"),
+            "unexpected Generative3D stub error: {:?}",
+            gen_res.error
+        );
+
+        let rig_task = Task::new(
+            TaskSpec::AutoRig(rusty_grid_core::task::AutoRigSpec::new(
+                vec![1, 2, 3, 4],
+                "biped",
+            )),
+            TaskRequirements::generic(1, 30),
+        );
+        let rig_res = runner.execute_task(&rig_task, None, None).await;
+        assert!(!rig_res.is_success());
+        assert_eq!(rig_res.exit_code, EXIT_CODE_GENERAL_ERROR);
+        assert!(
+            rig_res
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("--features 3d"),
+            "unexpected AutoRig stub error: {:?}",
+            rig_res.error
+        );
+    }
+
+    #[cfg(feature = "3d")]
     #[tokio::test]
     async fn test_runner_generative_3d_tier0_checkpoints() {
         let spec =
@@ -3220,6 +3326,7 @@ mod tests {
         assert_eq!(&asset.as_slice()[0..4], b"glTF");
     }
 
+    #[cfg(feature = "3d")]
     #[tokio::test]
     async fn test_runner_autorig_checkpoints() {
         // Generate a small mesh first

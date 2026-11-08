@@ -437,7 +437,6 @@ fn test_m8_large_binary_payload_wire_comparison() {
             input_data: input_data.clone(),
             work_group_size: 16,
             simulated_matrix_dim: 64,
-            compute_intensity: 1,
         };
 
         // Serialize via Bincode
@@ -506,7 +505,6 @@ async fn test_m8_large_binary_payload_gpu_compute_5mb_e2e() {
             input_data: large_buffer,
             work_group_size: 16,
             simulated_matrix_dim: 64,
-            compute_intensity: 1,
         },
         TaskRequirements::gpu(60),
     );

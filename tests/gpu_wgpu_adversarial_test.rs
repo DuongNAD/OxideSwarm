@@ -454,7 +454,6 @@ async fn test_runner_hostile_parameter_clamping() {
             input_data: b"clamp_payload".to_vec(),
             work_group_size: 0,
             simulated_matrix_dim: 0,
-            compute_intensity: 1,
         },
         TaskRequirements::gpu(30),
     );
@@ -480,7 +479,6 @@ async fn test_runner_hostile_parameter_clamping() {
             input_data: b"clamp_payload".to_vec(),
             work_group_size: 999,
             simulated_matrix_dim: 100000,
-            compute_intensity: 1,
         },
         TaskRequirements::gpu(30),
     );
@@ -502,7 +500,6 @@ async fn test_runner_hostile_parameter_clamping() {
             input_data: huge_input,
             work_group_size: 16,
             simulated_matrix_dim: 32,
-            compute_intensity: 1,
         },
         TaskRequirements::gpu(30),
     );

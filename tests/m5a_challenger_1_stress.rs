@@ -310,7 +310,6 @@ fn test_task_eligibility_under_tier_oscillation() {
         input_data: vec![1, 2, 3],
         work_group_size: 128,
         simulated_matrix_dim: 512,
-        compute_intensity: 3,
     };
     let light_command = TaskSpec::command("uptime", vec![]);
     let light_builtin = TaskSpec::BuiltinTest {

@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07
+Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07 and Q6 on 2026-11-08
 Created: 2026-11-07    Updated: 2026-11-08
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
@@ -15,8 +15,9 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
 - Purpose: **a coding agent runs builds and tests on the machines its owner already has.**
   Work that serves this purpose goes first.
 - Order: close the open foundations, make the master durable and tasks isolated, build persistent
-  agent workspaces, then ship a release. Android, master failover, 3D and language model inference
-  wait.
+  agent workspaces, then ship a release. These four phases, A to D, are the core.
+- Later work starts after the core: Phase E and the table of what waits. Android, master failover,
+  3D, language model inference and distributed training are later work.
 
 ## Where the project stands
 
@@ -100,8 +101,14 @@ other tools lack.
 4. **Small core.** Subsystems outside the user story move behind opt-in Cargo features.
 5. **Each phase ends with a check that runs.** A phase is finished when a test passes or a live run is
    recorded.
+6. **Core before later work.** Phases A to D are the core. Work in Phase E or in the table of what
+   waits starts after the Phase D exit check, unless its row names an earlier gate. Security fixes
+   may land at any time. A design record may be written at any time, because it builds nothing.
 
 ## Phases
+
+Phases A to D are the core: at their end the user story works and ships as a release. Phase E and
+the table of what waits are later work (principle 6).
 
 ### Phase A: close the foundations
 
@@ -192,10 +199,11 @@ After the first release, in order of value to the user story:
 | GPU kernels | FEAT-9 | Decision D6 keeps GPU compute a benchmark | State "benchmark only" in `README.md` and `PROJECT.md`, as FEAT-9 asks |
 | Agent Mesh grid features | MESH-3 | MCP already lets agents submit work. Two agent interfaces split the effort | Not built (decision Q3). The removal of the hub-local file fallback is a security fix and may land at any time |
 | Agent Mesh relay data | MESH-2 | It does not serve the user story | Phase E |
+| Distributed training | TRAIN-1 to TRAIN-5 ([design 0045](design/0045-distributed-training.md)) | It does not serve the user story. Until FEAT-3 a training task can read the worker's `cluster.secret`, and long rounds need FEAT-1 and FEAT-5 | After the Phase D exit check (decision Q6). TRAIN-1, independent runs, comes first |
 
 ## Decisions for the owner
 
-The owner accepted each proposal on 2026-11-07.
+The owner accepted Q1 to Q5 on 2026-11-07 and Q6 on 2026-11-08.
 
 | ID | Question | Decision |
 |---|---|---|
@@ -204,6 +212,7 @@ The owner accepted each proposal on 2026-11-07.
 | Q3 | Keep the Agent Mesh as a second way for agents to submit grid work? | No. MCP is the agent interface. The mesh keeps its relay role and gets no new grid features |
 | Q4 | When does language model work start? | LLM-1 at any time. LLM-2 to LLM-5 after Phase C |
 | Q5 | Make every CI job a required check on `master` (TEST-6)? | Yes |
+| Q6 | When does distributed training start? | After the Phase D exit check. Design 0045 records the direction, and nothing is built before then |
 
 ## Risks
 
@@ -222,3 +231,6 @@ The owner accepted each proposal on 2026-11-07.
 - 2026-11-08: Phase A states updated at `master` `5df82df`. WS-2 follows design 0039, a tree
   sync instead of a commit checkout. Decision Q3 applied to MESH-2 and MESH-3. The protocol version
   row corrected: the master does check a worker's version.
+- 2026-11-08: Phases A to D named the core, and principle 6 added: later work starts after the
+  Phase D exit check. The owner accepted Q6. Distributed training (design 0045) added to the table
+  of what waits.

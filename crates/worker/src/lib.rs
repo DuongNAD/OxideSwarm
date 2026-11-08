@@ -3,12 +3,14 @@
 //! Provides TCP client networking, hardware capability detection,
 //! registration handshake, periodic heartbeat telemetry, and resilient backoff.
 
+#[cfg(feature = "3d")]
 pub mod autorig;
 pub mod backoff;
 pub mod blob_cache;
 pub mod blob_client;
 pub mod client;
 pub mod cpu_simd;
+#[cfg(feature = "3d")]
 pub mod gen3d;
 pub mod gpu;
 pub mod heartbeat;

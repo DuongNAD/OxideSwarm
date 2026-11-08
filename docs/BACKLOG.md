@@ -126,7 +126,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-08, at `master` `5df82df`: 47 items Implemented, 3 Partial and 20 Planned. "Pull
+On 2026-11-08, at `master` `b03172a`: 53 items Implemented, 0 Partial and 17 Planned. "Pull
 requests" lists them by number, "(open)" marks one that is not merged yet, and "(design)" marks a
 design record that builds nothing.
 
@@ -153,9 +153,9 @@ design record that builds nothing.
 | TEST-1 | Gate host-bound tests | P1 | M | INT-4 |  | Implemented | 51 |
 | TEST-2 | Isolate tests from the host battery | P1 | M | INT-4 |  | Implemented | 76 |
 | TEST-3 | Repair stale, starved and flaky tests | P1 | M | TEST-1 |  | Implemented | 39 |
-| TEST-4 | Stop tests from reading the real home directory | P1 | S | INT-4 |  | Partial | 29 |
+| TEST-4 | Stop tests from reading the real home directory | P1 | S | INT-4 |  | Implemented | 29, 112 |
 | TEST-5 | Register or delete the orphan Rust test | P1 | S | INT-4 |  | Implemented | 19 |
-| TEST-6 | Extend CI to the full suite | P1 | M | TEST-1, TEST-2, TEST-3, TEST-4 |  | Partial | 67 |
+| TEST-6 | Extend CI to the full suite | P1 | M | TEST-1, TEST-2, TEST-3, TEST-4 |  | Implemented | 67, 124 |
 | TEST-7 | Run or delete the orphan Python tests | P2 | M | INT-4 |  | Implemented | 55, 66 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
@@ -176,14 +176,14 @@ design record that builds nothing.
 | SCHED-3 | Give impossible tasks an outcome | P2 | S | INT-4 |  | Implemented | 96, 107 |
 | MOB-1 | Fix the adaptive keepalive | P1 | S | INT-4 |  | Implemented | 98 |
 | MOB-2 | Keep thermal state on the master | P1 | M | INT-4 |  | Implemented | 99 |
-| MOB-3 | Do not charge evacuation to retry budgets | P2 | S | INT-4 |  | Planned | 108 (open) |
+| MOB-3 | Do not charge evacuation to retry budgets | P2 | S | INT-4 |  | Implemented | 108 |
 | 3D-2 | Wire VRAM and Blender routing | P2 | M | BUG-3 |  | Planned |  |
 | 3D-3 | Make AutoRig options real or refuse them | P2 | M | SEC-5 |  | Planned |  |
 | MR-1 | Let a CLI user ship a mapper and reducer | P2 | S | INT-4 |  | Implemented | 33 |
 | MESH-1 | Make `wss://` work in the Rust mesh client | P2 | S | INT-4 |  | Implemented | 94 |
 | MESH-2 | Deliver mesh data to a consumer | P2 | M | INT-4 |  | Planned |  |
 | MESH-3 | Attach the bridge to a running master | P2 | M | INT-4 |  | Planned |  |
-| MODE-1 | Make `ox-mode` report only what happened | P2 | M | INT-4 |  | Planned | 92 (open) |
+| MODE-1 | Make `ox-mode` report only what happened | P2 | M | INT-4 |  | Implemented | 92 |
 | BRIDGE-1 | Repair `agent_bridge.py diagnose` | P2 | S | SEC-4 |  | Implemented | 77 |
 | AND-1 | Make the Android app build | P1 | M | SEC-3 | Yes | Planned |  |
 | AND-2 | Keep the master across restarts | P2 | M | AND-1 | Yes | Planned |  |
@@ -196,10 +196,10 @@ design record that builds nothing.
 | FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 |  | Planned |  |
 | FEAT-6 | Master failover | P3 | L | FEAT-1 | D1 | Implemented | 81 |
 | FEAT-7 | Usable rendezvous discovery | P3 | M | INT-4 |  | Planned |  |
-| FEAT-8 | Real protocol versioning | P2 | M | INT-4 |  | Partial | 40, 110 (open) |
+| FEAT-8 | Real protocol versioning | P2 | M | INT-4 |  | Implemented | 40, 110, 120 |
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Planned |  |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Planned |  |
-| FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Planned |  |
+| FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented | 118 (design), 125, 126, 127, 131 |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Planned |  |
 | REL-5 | Contributor and security files | P3 | S | REL-1 |  | Implemented | 75 |
 
@@ -1339,3 +1339,33 @@ Add one dated line per finished item, newest last.
 - 2026-11-08: The roadmap (`ROADMAP.md`) sets the order after this backlog. Its decision Q2 freezes
   3D-2 and 3D-3. Its decision Q3 drops the grid features of MESH-3, and keeps only the removal of
   the hub-local file fallback in `parse_binary_data`. These items stay Planned.
+- 2026-11-08: TEST-4 is Implemented: pull requests 29, 112. At `master` `9ed146e` on macOS,
+  `cargo test --workspace --locked --no-fail-fast` gave the same result with an empty temporary
+  `HOME` and with a dummy `cluster.secret` in it: 1700 passed, 0 failed and 4 ignored in 124 test
+  binaries. Neither run wrote anything else under `HOME/.oxideswarm`. Pull request 112 records the
+  same check at `5b16f55` in `README.md`.
+- 2026-11-08: Four items are Implemented. Each "Done when" was checked at `master` `553b53e`.
+  - MODE-1 (pull request 92): `crates/core` has no `Command::new("cargo")`, no source in `crates/`
+    prints `OPTIMAL`, and the engine is in `crates/cli/src/mode_cli.rs`.
+  - MOB-3 (pull request 108): `tests/mobile_coordination_test.rs` and the queue unit tests assert
+    `failover_count` 0 after repeated evacuations.
+  - FEAT-8 (pull requests 40, 110, 120): the CI step "verify wire_layout.txt version bump against
+    baseline" fails a layout change without a version bump. Design 0040 records the version refusal
+    and, in D4, the plan to leave `bincode` 1.x.
+  - TEST-6 (pull requests 67, 124): `ci.yml` has no `continue-on-error`. The 21 required checks on
+    `master` are every check of the `553b53e` run, and all passed. The one exception is
+    "p2p wan relay (ignored)", which runs only on a schedule or by hand and so cannot be required.
+- 2026-11-08: FEAT-11 is Implemented: design 0044 (pull request 118) and its four parts, pull
+  requests 125, 126, 127 and 131. Checked at `master` `b03172a`:
+  - `dashboard/index.html`, `shaders/hash.wgsl`, `DashboardState`, `prepare_spec`,
+    `probe_physical_adapter` and the `service` JNI exports are gone from `crates/`.
+  - `auto_rig_mesh_async` has a production caller in `crates/worker/src/runner.rs`.
+    `crates/core/src/arbitrage.rs` keeps 181 lines, and `MasterLeaseTicket` is used by
+    `protocol.rs` and by `reject_master_role_claim` in `crates/master/src/server.rs`.
+  - `handle_connection` and `handle_multiplexed_connection` in `server.rs` both call
+    `WorkerSession::run_connection` (`crates/master/src/session.rs`).
+  - Leftover sandboxes are swept at start-up (pull request 126).
+  - `compute_intensity` (design 0044 D1.5): marked `#[deprecated]` without a wire break in `F11-a`
+    (pull request 125) and removed from `TaskSpec::GpuCompute`, `HumanTaskSpec::GpuCompute`, and
+    `BinaryTaskSpec::GpuCompute` at the protocol version `3 -> 4` bump in `FEAT-1` (`F1-b` wire,
+    pull request 141, design 0046).

@@ -2047,7 +2047,7 @@ mod tests {
     fn store_layout_is_frozen() {
         let mut lines = vec![format!(
             "header {}",
-            hex(&header_bytes(JOURNAL_MAGIC, 0)[..16])
+            hex(&header_bytes(JOURNAL_MAGIC, 0)[..12])
         )];
         let states = [
             TaskState::Submitted,

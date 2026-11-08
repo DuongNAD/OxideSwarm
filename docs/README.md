@@ -28,7 +28,7 @@ before adding or changing a document.
 | [design/0028-host-battery-probe-override.md](design/0028-host-battery-probe-override.md) | Host battery probe override (`WorkerConfig::with_no_battery` and `RUSTY_GRID_NO_BATTERY`) and start-up warning | Contributors |
 | [design/0029-mesh-client-wss-tls.md](design/0029-mesh-client-wss-tls.md) | Enable `wss://` TLS in the Rust `agent-mesh` client and add `--tls-ca` (`OXIDE_MESH_TLS_CA`) for private TLS proxies (`MESH-1`) | Contributors |
 | [design/0030-mcp-post-reply-cancel-and-p2p-endpoint-lifecycle.md](design/0030-mcp-post-reply-cancel-and-p2p-endpoint-lifecycle.md) | MCP post-reply `notifications/cancelled` (`completed_submits`), `4 s` stdio EOF grace window, and P2P master relay readiness (`5 s`) and endpoint shutdown | Contributors |
-| [design/0031-containment-after-worker-crash.md](design/0031-containment-after-worker-crash.md) | Draft: per-task lifeline pipe and supervisor so a task tree dies within 5 s after a worker `SIGKILL` on Linux, macOS, and Android (`FEAT-2`) | Contributors |
+| [design/0031-containment-after-worker-crash.md](design/0031-containment-after-worker-crash.md) | Per-task lifeline pipe and supervisor so a task tree dies within 5 s after a worker `SIGKILL` on Linux, macOS, and Android (`FEAT-2`) | Contributors |
 | [design/0032-p2p-handshake-refusal-delivery.md](design/0032-p2p-handshake-refusal-delivery.md) | P2P QUIC handshake and cluster-auth refusal delivery via stream finish and bounded `conn.closed()` drain (`BUG-17`) | Contributors |
 | [design/0033-os-level-task-isolation.md](design/0033-os-level-task-isolation.md) | Draft: OS-level task isolation (`--isolation off\|fs\|fs+net`) via Landlock/namespaces on Linux, `sandbox-exec` on macOS, and AppContainer/Restricted Token on Windows, plus `iso:` tag and `doctor` reporting (`FEAT-3`) | Contributors |
 | [design/0034-fail-unfulfillable-tasks.md](design/0034-fail-unfulfillable-tasks.md) | Fail unfulfillable tasks (`--fail-unfulfillable-tasks`, `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, `[master].fail_unfulfillable_tasks`) when no registered worker can satisfy capabilities or placement constraints (`SCHED-3`) | Contributors |
@@ -37,9 +37,10 @@ before adding or changing a document.
 | [design/0039-agent-workspaces.md](design/0039-agent-workspaces.md) | Accepted, not built: persistent workspaces for coding agents on workers, synced from a local directory, with affinity and one task per workspace, plus P2P for clients and `cargo` builds (`FEAT-4`, `FEAT-10`) | Contributors |
 | [design/0040-protocol-versioning.md](design/0040-protocol-versioning.md) | Protocol version 3, golden-bytes version-bump enforcement, `RegisterAck` feature-bit gating, and client-path protocol versioning (`FEAT-8`) | Contributors |
 | [design/0044-dead-code-and-connection-loop-unification.md](design/0044-dead-code-and-connection-loop-unification.md) | Planned: remove dead code, merge TCP and 2-lane QUIC worker connection loops into `WorkerSession`, sweep leftover sandboxes at start-up, and gate `gen3d`/`autorig` behind Cargo feature `3d` (`FEAT-11`, decision Q2) | Contributors |
+| [design/0045-distributed-training.md](design/0045-distributed-training.md) | Planned, after the core of the roadmap: training on several workers with a framework the owner installs, by independent runs, low-communication rounds and adapter rounds (`TRAIN-1` to `TRAIN-5`) | Contributors |
 | [design/0046-master-durability.md](design/0046-master-durability.md) | Draft: append-only task journal and snapshot store (`--state-dir`), startup replay, and worker session resume (`WorkerMessage::ResumeSession`) (`FEAT-1`) | Contributors |
 | [BACKLOG.md](BACKLOG.md) | Open work in execution order, each item with files and a check | Coding agents, contributors |
-| [ROADMAP.md](ROADMAP.md) | Direction after the backlog: the purpose, phases A to E, what waits, and the owner's decisions | Owner, contributors |
+| [ROADMAP.md](ROADMAP.md) | Direction after the backlog: the purpose, the core (phases A to D) and the later work, what waits, and the owner's decisions | Owner, contributors |
 
 ## Document types
 

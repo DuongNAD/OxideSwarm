@@ -21,9 +21,8 @@ use rusty_grid_core::cluster_auth::{
 };
 use rusty_grid_core::mapreduce::{MapReduceJobSpec, MapReduceResult};
 use rusty_grid_core::protocol::{
-    format_incompatible_version_error, is_protocol_version_compatible, ClientMessage,
-    ClientResponse, EndpointRole, InboundMessage, ProtocolCapabilities, ProtocolError,
-    PROTOCOL_VERSION_CURRENT,
+    format_incompatible_version_error, ClientMessage, ClientResponse, EndpointRole, InboundMessage,
+    ProtocolError,
 };
 use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus};
 #[cfg(feature = "p2p")]
@@ -35,7 +34,6 @@ use rusty_grid_core::{
 
 use crate::auth::DevBypass;
 use crate::blob_store::{BlobStore, BlobStoreConfig};
-use crate::liveness::{RxClock, StampedStream};
 use crate::mapreduce::{MapReduceEngine, DEFAULT_MAPREDUCE_PARALLELISM};
 use crate::queue::{
     QueueStats, ResultDisposition, TaskInfo, TaskQueue, TaskState, DEFAULT_MAX_ACTIVE_BYTES,
@@ -44,7 +42,7 @@ use crate::queue::{
 #[allow(unused_imports)]
 use crate::reaper::spawn_reaper_with_queue;
 use crate::reaper::ReaperConfig;
-use crate::registry::{HeartbeatOutcome, WorkerInfo, WorkerRegistry};
+use crate::registry::{WorkerInfo, WorkerRegistry};
 use crate::scheduler::{SchedulerConfig, WorkloadScheduler};
 
 /// Type alias for client waiters awaiting task completion via oneshot channels.
@@ -1672,7 +1670,8 @@ impl MasterServer {
 
 /// Dashboard broadcast channel type, so signatures stay readable.
 #[cfg(feature = "dashboard")]
-type DashboardTx = tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>;
+pub(crate) type DashboardTx =
+    tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>;
 
 /// Removes waiters of `task_id` whose receiving side has gone away (timed-out or abandoned
 /// waits), so they do not accumulate until the task finishes. Live waiters are kept.
@@ -1888,13 +1887,13 @@ impl Drop for UploadOwner {
 /// worker caps its requests in flight per session at [`MAX_IN_FLIGHT_REQUESTS`], smaller than
 /// this queue, so a cooperative worker never fills the queue and blocks its own heartbeats or
 /// results; the bounded channel still caps buffered requests if a peer ignores that limit.
-struct BlobService {
+pub(crate) struct BlobService {
     requests: mpsc::Sender<(u64, BlobRequest)>,
     _task: AbortOnDrop,
 }
 
 impl BlobService {
-    fn spawn(store: Arc<BlobStore>, replies: mpsc::Sender<MasterMessage>) -> Self {
+    pub(crate) fn spawn(store: Arc<BlobStore>, replies: mpsc::Sender<MasterMessage>) -> Self {
         let (requests, mut incoming) =
             mpsc::channel::<(u64, BlobRequest)>(MAX_IN_FLIGHT_REQUESTS * 2);
         let task = tokio::spawn(async move {
@@ -1919,7 +1918,7 @@ impl BlobService {
 
 /// Hands a worker's `BlobRequest` to its connection's [`BlobService`], or answers it with a
 /// refusal on a master without a blob store.
-async fn serve_worker_blob_request(
+pub(crate) async fn serve_worker_blob_request(
     service: Option<&BlobService>,
     replies: &mpsc::Sender<MasterMessage>,
     request_id: u64,
@@ -1941,7 +1940,7 @@ async fn serve_worker_blob_request(
 }
 
 /// The `RegisterAck` message announcing the optional features of this master.
-fn feature_announcement(blob_store: Option<&Arc<BlobStore>>) -> String {
+pub(crate) fn feature_announcement(blob_store: Option<&Arc<BlobStore>>) -> String {
     use rusty_grid_core::protocol::master_features;
     let mut features = master_features::SUPPORTED.to_vec();
     if blob_store.is_some() {
@@ -2163,7 +2162,7 @@ async fn apply_task_result(
 /// `AssignTaskWithCheckpoint` exceeds `MAX_FRAME_SIZE`, keeping the worker session alive so
 /// unrelated tasks on the worker can continue.
 #[allow(clippy::too_many_arguments)]
-async fn handle_oversized_master_message(
+pub(crate) async fn handle_oversized_master_message(
     msg: MasterMessage,
     size: usize,
     max: usize,
@@ -2358,7 +2357,7 @@ async fn apply_task_progress(
 /// As with every other message, the identity comes from the connection: a report naming another
 /// worker is logged and applied to the sender only. A change wakes the scheduler, because a phone
 /// that just recovered (plugged in, cooled down) may now take queued heavy work.
-async fn apply_mobile_telemetry(
+pub(crate) async fn apply_mobile_telemetry(
     registry: &WorkerRegistry,
     scheduler_notify: &Arc<tokio::sync::Notify>,
     worker_id: Uuid,
@@ -2399,7 +2398,7 @@ async fn apply_mobile_telemetry(
 /// The identity comes from the connection. A `worker_id` inside the message body is never trusted:
 /// otherwise any registered worker could complete, fail or poison a task it does not own.
 #[allow(clippy::too_many_arguments)]
-async fn handle_session_task_message(
+pub(crate) async fn handle_session_task_message(
     msg: WorkerMessage,
     registry: &WorkerRegistry,
     queue: &TaskQueue,
@@ -2756,7 +2755,7 @@ async fn failover_session_tasks(
 /// so it finishes even when the handler is cancelled meanwhile. If it were cancelled before it
 /// ran, the next sweep of this worker still recovers the tasks, because a sweep of session `s`
 /// takes every older session along (see `TaskQueue::handle_session_disconnected`).
-async fn failover_superseded_session(
+pub(crate) async fn failover_superseded_session(
     queue: &TaskQueue,
     scheduler_notify: &Arc<tokio::sync::Notify>,
     waiters: &WaiterMap,
@@ -2894,7 +2893,7 @@ async fn listed_worker(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
+pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     first_msg: ClientMessage,
     mut transport: MessageTransport<S>,
     registry: WorkerRegistry,
@@ -3173,7 +3172,7 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
 /// silently dropped, so a misconfigured worker gets an actionable error.
 ///
 /// `lane` only labels the log lines ("connection" for TCP, "control stream" for QUIC).
-async fn authenticate_and_read_first_message<S>(
+pub(crate) async fn authenticate_and_read_first_message<S>(
     transport: &mut MessageTransport<S>,
     peer: &str,
     cluster_secret: Option<&ClusterSecret>,
@@ -3262,7 +3261,7 @@ where
 
 /// Aborts a spawned helper task when the connection handler that owns it ends, including when the
 /// handler itself is aborted by the reaper or by the worker re-registering.
-struct AbortOnDrop(tokio::task::AbortHandle);
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::AbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -3277,7 +3276,7 @@ impl Drop for AbortOnDrop {
 /// clone of the connection; the map holds another, so without an explicit close the worker would
 /// stay connected to a master that has long written it off and never get the chance to reconnect.
 #[cfg(feature = "p2p")]
-struct P2pConnGuard {
+pub(crate) struct P2pConnGuard {
     conn: iroh::endpoint::Connection,
     conns: Arc<tokio::sync::RwLock<HashMap<Uuid, iroh::endpoint::Connection>>>,
     worker_id: Uuid,
@@ -3285,7 +3284,7 @@ struct P2pConnGuard {
 
 #[cfg(feature = "p2p")]
 impl P2pConnGuard {
-    fn new(
+    pub(crate) fn new(
         conn: iroh::endpoint::Connection,
         conns: Arc<tokio::sync::RwLock<HashMap<Uuid, iroh::endpoint::Connection>>>,
         worker_id: Uuid,
@@ -3299,7 +3298,7 @@ impl P2pConnGuard {
 
     /// Removes this guard's connection from the map, unless the same worker has since
     /// re-registered over a newer connection that took the slot.
-    async fn unlist(&self) {
+    pub(crate) async fn unlist(&self) {
         let mut guard = self.conns.write().await;
         if guard
             .get(&self.worker_id)
@@ -3331,7 +3330,7 @@ impl Drop for P2pConnGuard {
     }
 }
 
-fn reject_master_role_claim(
+pub(crate) fn reject_master_role_claim(
     ticket: &rusty_grid_core::arbitrage::MasterLeaseTicket,
 ) -> MasterMessage {
     warn!(
@@ -3366,7 +3365,7 @@ async fn finish_and_wait_for_peer_close<T: AsyncRead + AsyncWrite + Unpin>(
 
 /// Finishes the control send stream after an authentication `REJECT` frame has been written and
 /// waits up to [`REFUSAL_DRAIN_TIMEOUT`] for the peer to close the QUIC connection (`BUG-17`).
-async fn drain_refusal_stream<T: AsyncRead + AsyncWrite + Unpin>(
+pub(crate) async fn drain_refusal_stream<T: AsyncRead + AsyncWrite + Unpin>(
     transport: &mut MessageTransport<T>,
     #[cfg(feature = "p2p")] p2p_conn: Option<&iroh::endpoint::Connection>,
 ) {
@@ -3385,7 +3384,7 @@ async fn drain_refusal_stream<T: AsyncRead + AsyncWrite + Unpin>(
 /// `RoleHandoverAck { accepted: false, .. }`), finishes the control send stream, and waits up to
 /// [`REFUSAL_DRAIN_TIMEOUT`] (`1 s`) in total for the peer to close before dropping the QUIC
 /// connection handle (`BUG-17`).
-async fn send_refusal_and_drain<T: AsyncRead + AsyncWrite + Unpin>(
+pub(crate) async fn send_refusal_and_drain<T: AsyncRead + AsyncWrite + Unpin>(
     transport: &mut MessageTransport<T>,
     msg: &MasterMessage,
     #[cfg(feature = "p2p")] p2p_conn: Option<&iroh::endpoint::Connection>,
@@ -3413,7 +3412,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     waiters: WaiterMap,
     heartbeat_interval_secs: u64,
     handshake_timeout: Duration,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
     abort_handle: Option<AbortHandle>,
     wire_codec: WireCodec,
     cluster_secret: Option<ClusterSecret>,
@@ -3428,455 +3427,34 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         Arc<tokio::sync::RwLock<HashMap<Uuid, iroh::endpoint::Connection>>>,
     >,
 ) -> GridResult<()> {
-    // Every inbound byte stamps `rx_clock`: the reaper counts a connection that is mid-way through
-    // a large upload as alive even though its heartbeats are stuck behind that frame.
-    let rx_clock = RxClock::new();
-    let mut transport =
-        MessageTransport::with_codec(StampedStream::new(stream, rx_clock.clone()), wire_codec);
-
-    // 1. Cluster authentication + handshake watchdog (Slowloris defense). Nothing is read as an
-    //    `InboundMessage`, so nothing is registered or queued, until the peer has authenticated.
-    let (first_msg, detected_codec) = authenticate_and_read_first_message(
-        &mut transport,
-        &remote_addr.to_string(),
-        cluster_secret.as_ref(),
-        handshake_timeout,
-        "connection",
-    )
-    .await?;
-    // Authenticated and speaking: this peer no longer counts against the pre-auth budget.
-    drop(handshake_permit);
-
-    if wire_codec == WireCodec::Bincode {
-        transport.set_outbound_codec(detected_codec);
-    }
-
-    let worker_msg = match first_msg {
-        InboundMessage::Client(client_msg) => {
-            return handle_client_connection(
-                client_msg,
-                transport,
-                registry,
-                queue,
-                scheduler_notify,
-                waiters,
-                mapreduce_parallelism,
-                blob_store,
-                #[cfg(feature = "dashboard")]
-                broadcast_tx,
-                #[cfg(feature = "p2p")]
-                p2p_conns,
-            )
-            .await;
-        }
-        InboundMessage::Worker(wm) => wm,
-    };
-
-    // 2. Validate Register message
-    let (worker_id, capabilities, _worker_protocol_version, worker_features) = match worker_msg {
-        WorkerMessage::Register {
-            worker_id,
-            capabilities,
-            protocol_version,
-            features,
-        } => {
-            if !is_protocol_version_compatible(protocol_version) {
-                let reason = format_incompatible_version_error("worker", protocol_version);
-                let reject_ack = MasterMessage::RegisterAck {
-                    accepted: false,
-                    worker_id,
-                    heartbeat_interval_secs: 0,
-                    protocol_version: PROTOCOL_VERSION_CURRENT,
-                    features: ProtocolCapabilities::empty(),
-                    message: Some(reason.clone()),
-                };
-                let _ = transport.send_msg(&reject_ack).await;
-                return Err(GridError::RegistrationRejected(reason));
-            }
-            if capabilities.cpu_cores == 0 {
-                let reject_ack = MasterMessage::RegisterAck {
-                    accepted: false,
-                    worker_id,
-                    heartbeat_interval_secs: 0,
-                    protocol_version: PROTOCOL_VERSION_CURRENT,
-                    features: ProtocolCapabilities::empty(),
-                    message: Some("Invalid capability: cpu_cores must be > 0".into()),
-                };
-                let _ = transport.send_msg(&reject_ack).await;
-                return Err(GridError::RegistrationRejected(
-                    "cpu_cores must be > 0".into(),
-                ));
-            }
-            (worker_id, capabilities, protocol_version, features)
-        }
-        WorkerMessage::ClaimMasterRole { ticket } => {
-            let ack = reject_master_role_claim(&ticket);
-            let _ = transport.send_msg(&ack).await;
-            return Ok(());
-        }
-        other => {
-            let reject_ack = MasterMessage::RegisterAck {
-                accepted: false,
-                worker_id: Uuid::nil(),
-                heartbeat_interval_secs: 0,
-                protocol_version: PROTOCOL_VERSION_CURRENT,
-                features: ProtocolCapabilities::empty(),
-                message: Some(format!(
-                    "Expected Register message, received {}",
-                    other.variant_name()
-                )),
-            };
-            let _ = transport.send_msg(&reject_ack).await;
-            return Err(GridError::HandshakeFailed(format!(
-                "Expected Register message, received {}",
-                other.variant_name()
-            )));
-        }
-    };
-
-    // 3. Register in WorkerRegistry
-    let negotiated_features = worker_features & ProtocolCapabilities::all_supported();
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<MasterMessage>(128);
-    let registration = registry
-        .register_session(
-            worker_id,
-            capabilities,
-            negotiated_features,
-            remote_addr,
-            outbound_tx.clone(),
-            abort_handle,
-        )
-        .await?;
-    let session_id = registration.session_id;
-    registry
-        .set_rx_clock(&worker_id, session_id, rx_clock.clone())
-        .await;
-
-    // The previous session of this worker id was still live (no EOF seen yet) and has just been
-    // aborted; its in-flight tasks lost their connection, so fail them over now, exactly once.
-    if let Some(old_session) = registration.superseded_session {
-        failover_superseded_session(
-            &queue,
-            &scheduler_notify,
-            &waiters,
-            worker_id,
-            old_session,
-            session_id,
-            #[cfg(feature = "dashboard")]
-            broadcast_tx.as_ref(),
-        )
-        .await;
-    }
-
-    #[cfg(feature = "p2p")]
-    let _p2p_guard = match (&p2p_conn, &p2p_conns) {
-        (Some(conn), Some(conns)) => {
-            conns.write().await.insert(worker_id, conn.clone());
-            let path_info = rusty_grid_core::transport::inspect_connection_paths(conn);
-            info!(
-                worker_id = %worker_id,
-                path_info = ?path_info,
-                "Tracked P2P connection path for registered worker"
-            );
-            Some(P2pConnGuard::new(
-                conn.clone(),
-                Arc::clone(conns),
-                worker_id,
-            ))
-        }
-        _ => None,
-    };
-
-    // 4. Send RegisterAck
-    let negotiated_features = worker_features & ProtocolCapabilities::all_supported();
-    let ack = MasterMessage::RegisterAck {
-        accepted: true,
-        worker_id,
-        heartbeat_interval_secs,
-        protocol_version: PROTOCOL_VERSION_CURRENT,
-        features: negotiated_features,
-        message: Some(feature_announcement(blob_store.as_ref())),
-    };
-    if let Err(e) = transport.send_msg(&ack).await {
-        // Tasks may already have been assigned to this session; sweep them, not just unregister.
-        handle_worker_disconnect_with_broadcast(
-            &registry,
-            &queue,
-            &scheduler_notify,
-            Some(&waiters),
-            &worker_id,
-            Some(session_id),
-            "RegisterAck delivery failed",
-            true,
-            #[cfg(feature = "dashboard")]
-            broadcast_tx.as_ref(),
-        )
-        .await;
-        return Err(e.into());
-    }
-
-    #[cfg(feature = "dashboard")]
-    if let Some(ref b_tx) = broadcast_tx {
-        if let Some(info) = registry.get_worker(worker_id).await {
-            let _ =
-                b_tx.send(crate::dashboard::dto::DashboardStreamMessage::WorkerRegistered(info));
-        }
-    }
-
-    info!(
-        worker_id = %worker_id,
-        session_id = session_id,
-        remote = %remote_addr,
-        "Worker successfully registered with master"
+    let pre_auth = crate::session::PreAuthSession::new_single(
+        stream,
+        remote_addr,
+        wire_codec,
+        mapreduce_parallelism,
+        #[cfg(feature = "p2p")]
+        p2p_conn,
+        #[cfg(feature = "p2p")]
+        p2p_conns,
     );
-
-    // 5. Split transport into independent writer and reader
-    let (mut writer, mut reader) = transport.split();
-
-    // 6. Spawn outbound message writer task
-    let writer_registry = registry.clone();
-    let writer_queue = queue.clone();
-    let writer_sched_notify = Arc::clone(&scheduler_notify);
-    let writer_waiters = Arc::clone(&waiters);
-    let writer_blob_store = blob_store.clone();
-    #[cfg(feature = "dashboard")]
-    let writer_broadcast_tx = broadcast_tx.clone();
-    let writer_task = tokio::spawn(async move {
-        while let Some(msg) = outbound_rx.recv().await {
-            match writer.send_msg(&msg).await {
-                Ok(()) => {}
-                Err(rusty_grid_core::protocol::ProtocolError::FrameTooLarge { size, max }) => {
-                    handle_oversized_master_message(
-                        msg,
-                        size,
-                        max,
-                        &writer_registry,
-                        &writer_queue,
-                        &writer_sched_notify,
-                        &writer_waiters,
-                        worker_id,
-                        session_id,
-                        writer_blob_store.as_ref(),
-                        #[cfg(feature = "dashboard")]
-                        writer_broadcast_tx.as_ref(),
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    debug!(error = %e, "Outbound message write failed; terminating writer task");
-                    break;
-                }
-            }
-        }
-    });
-
-    let _writer_guard = AbortOnDrop(writer_task.abort_handle());
-    let blob_service = blob_store
-        .clone()
-        .map(|store| BlobService::spawn(store, outbound_tx.clone()));
-
-    // Allow newly connected worker to complete handshake acknowledgement, split its transport,
-    // and enter its inbound message loop before tasks are dispatched to it.
-    let sched_notify = scheduler_notify.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        sched_notify.notify_one();
-    });
-
-    // 7. Inbound reader loop
-    loop {
-        tokio::select! {
-            inbound_res = reader.recv_msg::<WorkerMessage>() => {
-                match inbound_res {
-                    Ok(Some(msg)) => {
-                        match msg {
-                            WorkerMessage::Heartbeat {
-                                worker_id: id,
-                                timestamp,
-                                active_tasks,
-                                cpu_usage_pct,
-                                ram_available_mb,
-                            } => {
-                                if id == worker_id {
-                                    let heartbeat = registry
-                                        .record_heartbeat_session(
-                                            &worker_id,
-                                            active_tasks,
-                                            timestamp,
-                                            cpu_usage_pct,
-                                            ram_available_mb,
-                                            Some(session_id),
-                                        )
-                                        .await;
-                                    if let Ok(HeartbeatOutcome::Revived) = heartbeat {
-                                        scheduler_notify.notify_one();
-                                        #[cfg(feature = "dashboard")]
-                                        if let Some(ref b_tx) = broadcast_tx {
-                                            if let Some(info) = registry.get_worker(worker_id).await {
-                                                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::WorkerRegistered(info));
-                                            }
-                                        }
-                                    }
-                                    let _ = outbound_tx
-                                        .send(MasterMessage::HeartbeatAck { timestamp })
-                                        .await;
-                                    #[cfg(feature = "dashboard")]
-                                    if let Some(ref b_tx) = broadcast_tx {
-                                        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::WorkerHeartbeat {
-                                            worker_id: id,
-                                            cpu_usage_pct,
-                                            ram_available_mb,
-                                            active_tasks,
-                                            timestamp,
-                                        });
-                                    }
-                                } else {
-                                    warn!(expected = %worker_id, got = %id, "Heartbeat worker_id mismatch");
-                                }
-                            }
-                            WorkerMessage::Disconnecting { worker_id: id, reason } => {
-                                info!(worker_id = %id, reason = %reason, "Worker announced graceful disconnection");
-                                handle_worker_evacuate_with_broadcast(
-                                    &registry,
-                                    &queue,
-                                    &scheduler_notify,
-                                    Some(&waiters),
-                                    &worker_id,
-                                    Some(session_id),
-                                    &format!("Worker graceful disconnect: {reason}"),
-                                    #[cfg(feature = "dashboard")]
-                                    broadcast_tx.as_ref(),
-                                ).await;
-                                break;
-                            }
-                            msg @ (WorkerMessage::TaskProgress { .. }
-                                | WorkerMessage::TaskResult { .. }
-                                | WorkerMessage::Checkpoint { .. }) => {
-                                handle_session_task_message(
-                                    msg,
-                                    &registry,
-                                    &queue,
-                                    &scheduler_notify,
-                                    &waiters,
-                                    worker_id,
-                                    session_id,
-                                    blob_store.as_ref(),
-                                    #[cfg(feature = "dashboard")]
-                                    broadcast_tx.as_ref(),
-                                ).await;
-                            }
-                            WorkerMessage::BlobRequest { request_id, request } => {
-                                serve_worker_blob_request(blob_service.as_ref(), &outbound_tx, request_id, request).await;
-                            }
-                            WorkerMessage::MobileTelemetry {
-                                worker_id: claimed,
-                                battery_pct,
-                                is_charging,
-                                thermal_throttled,
-                                battery_temperature,
-                                network_type,
-                                battery_tier,
-                                thermal_tier,
-                            } => {
-                                apply_mobile_telemetry(
-                                    &registry,
-                                    &scheduler_notify,
-                                    worker_id,
-                                    session_id,
-                                    claimed,
-                                    MobileLiveStatus {
-                                        battery_pct,
-                                        is_charging,
-                                        thermal_throttled,
-                                        battery_temperature,
-                                        network_type,
-                                        battery_tier,
-                                        thermal_tier,
-                                    },
-                                ).await;
-                            }
-                            WorkerMessage::ClaimMasterRole { ticket } => {
-                                let ack = reject_master_role_claim(&ticket);
-                                let _ = outbound_tx.send(ack).await;
-                            }
-                            WorkerMessage::Register { .. } => {
-                                warn!(worker_id = %worker_id, "Ignoring unexpected Register message on active connection");
-                            }
-                            WorkerMessage::UnknownVariant { tag, ref raw_bytes } => {
-                                warn!(worker_id = %worker_id, tag, raw_bytes_len = raw_bytes.len(), "Ignoring unrecognized WorkerMessage variant from future protocol version");
-                            }
-
-                        }
-                    }
-                    Ok(None) => {
-                        info!(worker_id = %worker_id, "Worker connection closed by peer (EOF)");
-                        handle_worker_disconnect_with_broadcast(
-                            &registry,
-                            &queue,
-                            &scheduler_notify,
-                            Some(&waiters),
-                            &worker_id,
-                            Some(session_id),
-                            "TCP connection EOF",
-                            false,
-                            #[cfg(feature = "dashboard")]
-                            broadcast_tx.as_ref(),
-                        ).await;
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(worker_id = %worker_id, error = %e, "Inbound message read error");
-                        handle_worker_disconnect_with_broadcast(
-                            &registry,
-                            &queue,
-                            &scheduler_notify,
-                            Some(&waiters),
-                            &worker_id,
-                            Some(session_id),
-                            &format!("Inbound socket error: {e}"),
-                            false,
-                            #[cfg(feature = "dashboard")]
-                            broadcast_tx.as_ref(),
-                        ).await;
-                        break;
-                    }
-                }
-            }
-            res = shutdown_rx.changed() => {
-                if res.is_ok() && *shutdown_rx.borrow() {
-                    info!(worker_id = %worker_id, "Master shutting down; notifying worker");
-                    let _ = outbound_tx.send(MasterMessage::Shutdown {
-                        reason: "Master server shutting down".into(),
-                        grace_period_secs: Some(5),
-                    }).await;
-                    break;
-                } else if res.is_err() {
-                    break;
-                }
-            }
-        }
-    }
-
-    // 8. Cleanup upon disconnect
-    handle_worker_disconnect_with_broadcast(
-        &registry,
-        &queue,
-        &scheduler_notify,
-        Some(&waiters),
-        &worker_id,
-        Some(session_id),
-        "Connection terminated",
-        false,
+    crate::session::WorkerSession::run_connection(
+        pre_auth,
+        registry,
+        queue,
+        scheduler_notify,
+        waiters,
+        heartbeat_interval_secs,
+        handshake_timeout,
+        shutdown_rx,
+        abort_handle,
+        wire_codec,
+        cluster_secret,
+        handshake_permit,
+        blob_store,
         #[cfg(feature = "dashboard")]
-        broadcast_tx.as_ref(),
+        broadcast_tx,
     )
-    .await;
-    #[cfg(feature = "p2p")]
-    if let Some(ref guard) = _p2p_guard {
-        guard.unlist().await;
-    }
-    writer_task.abort();
-    Ok(())
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3894,7 +3472,7 @@ async fn handle_multiplexed_connection<
     waiters: WaiterMap,
     heartbeat_interval_secs: u64,
     handshake_timeout: Duration,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
     abort_handle: Option<AbortHandle>,
     wire_codec: WireCodec,
     cluster_secret: Option<ClusterSecret>,
@@ -3908,645 +3486,34 @@ async fn handle_multiplexed_connection<
         Arc<tokio::sync::RwLock<HashMap<Uuid, iroh::endpoint::Connection>>>,
     >,
 ) -> GridResult<()> {
-    // Bytes on either lane count as proof of life for the reaper (see `handle_connection`).
-    let rx_clock = RxClock::new();
-    let mut ctrl_transport = MessageTransport::with_codec(
-        StampedStream::new(ctrl_stream, rx_clock.clone()),
+    let pre_auth = crate::session::PreAuthSession::new_multiplexed(
+        ctrl_stream,
+        data_stream,
+        remote_addr,
         wire_codec,
+        #[cfg(feature = "p2p")]
+        p2p_conn,
+        #[cfg(feature = "p2p")]
+        p2p_conns,
     );
-    let mut data_transport = MessageTransport::with_codec(
-        StampedStream::new(data_stream, rx_clock.clone()),
-        wire_codec,
-    );
-
-    // An iroh ticket only addresses a node, it is not a credential, so QUIC peers authenticate
-    // with the cluster secret exactly like TCP peers. The handshake runs on the control stream
-    // (the lane that carries `Register`); the data lane is never read before registration.
-    #[cfg(feature = "p2p")]
-    let peer_label = match p2p_conn {
-        Some(ref conn) => format!("{remote_addr} (iroh node {})", conn.remote_id()),
-        None => remote_addr.to_string(),
-    };
-    #[cfg(not(feature = "p2p"))]
-    let peer_label = remote_addr.to_string();
-
-    // 1. Cluster authentication + handshake on the control stream (Slowloris defense)
-    let first_res = authenticate_and_read_first_message(
-        &mut ctrl_transport,
-        &peer_label,
-        cluster_secret.as_ref(),
-        handshake_timeout,
-        "control stream",
-    )
-    .await;
-    drop(handshake_permit);
-    let (first_msg, detected_codec) = match first_res {
-        Ok(pair) => pair,
-        Err(e) => {
-            if matches!(e, GridError::AuthFailed(_) | GridError::AuthRequired(_)) {
-                drain_refusal_stream(
-                    &mut ctrl_transport,
-                    #[cfg(feature = "p2p")]
-                    p2p_conn.as_ref(),
-                )
-                .await;
-            }
-            return Err(e);
-        }
-    };
-
-    if wire_codec == WireCodec::Bincode {
-        ctrl_transport.set_outbound_codec(detected_codec);
-        data_transport.set_outbound_codec(detected_codec);
-    }
-
-    let worker_msg = match first_msg {
-        InboundMessage::Worker(wm) => wm,
-        InboundMessage::Client(_) => {
-            return Err(GridError::HandshakeFailed(
-                "Client connection not supported over multiplexed P2P worker transport".into(),
-            ));
-        }
-    };
-
-    // 2. Validate Register message
-    let (worker_id, capabilities, _worker_protocol_version, worker_features) = match worker_msg {
-        WorkerMessage::Register {
-            worker_id,
-            capabilities,
-            protocol_version,
-            features,
-        } => {
-            if !is_protocol_version_compatible(protocol_version) {
-                let reason = format_incompatible_version_error("worker", protocol_version);
-                let reject_ack = MasterMessage::RegisterAck {
-                    accepted: false,
-                    worker_id,
-                    heartbeat_interval_secs: 0,
-                    protocol_version: PROTOCOL_VERSION_CURRENT,
-                    features: ProtocolCapabilities::empty(),
-                    message: Some(reason.clone()),
-                };
-                send_refusal_and_drain(
-                    &mut ctrl_transport,
-                    &reject_ack,
-                    #[cfg(feature = "p2p")]
-                    p2p_conn.as_ref(),
-                )
-                .await;
-                return Err(GridError::RegistrationRejected(reason));
-            }
-            if capabilities.cpu_cores == 0 {
-                let reject_ack = MasterMessage::RegisterAck {
-                    accepted: false,
-                    worker_id,
-                    heartbeat_interval_secs: 0,
-                    protocol_version: PROTOCOL_VERSION_CURRENT,
-                    features: ProtocolCapabilities::empty(),
-                    message: Some("Invalid capability: cpu_cores must be > 0".into()),
-                };
-                send_refusal_and_drain(
-                    &mut ctrl_transport,
-                    &reject_ack,
-                    #[cfg(feature = "p2p")]
-                    p2p_conn.as_ref(),
-                )
-                .await;
-                return Err(GridError::RegistrationRejected(
-                    "cpu_cores must be > 0".into(),
-                ));
-            }
-            (worker_id, capabilities, protocol_version, features)
-        }
-        WorkerMessage::ClaimMasterRole { ticket } => {
-            let ack = reject_master_role_claim(&ticket);
-            send_refusal_and_drain(
-                &mut ctrl_transport,
-                &ack,
-                #[cfg(feature = "p2p")]
-                p2p_conn.as_ref(),
-            )
-            .await;
-            return Ok(());
-        }
-        other => {
-            let reject_ack = MasterMessage::RegisterAck {
-                accepted: false,
-                worker_id: Uuid::nil(),
-                heartbeat_interval_secs: 0,
-                protocol_version: PROTOCOL_VERSION_CURRENT,
-                features: ProtocolCapabilities::empty(),
-                message: Some(format!(
-                    "Expected Register message, received {}",
-                    other.variant_name()
-                )),
-            };
-            send_refusal_and_drain(
-                &mut ctrl_transport,
-                &reject_ack,
-                #[cfg(feature = "p2p")]
-                p2p_conn.as_ref(),
-            )
-            .await;
-            return Err(GridError::HandshakeFailed(format!(
-                "Expected Register message, received {}",
-                other.variant_name()
-            )));
-        }
-    };
-
-    // 3. Register in WorkerRegistry
-    let negotiated_features = worker_features & ProtocolCapabilities::all_supported();
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<MasterMessage>(128);
-    let registration = registry
-        .register_session(
-            worker_id,
-            capabilities,
-            negotiated_features,
-            remote_addr,
-            outbound_tx.clone(),
-            abort_handle,
-        )
-        .await?;
-    let session_id = registration.session_id;
-    registry
-        .set_rx_clock(&worker_id, session_id, rx_clock.clone())
-        .await;
-
-    // See `handle_connection`: fail over the superseded session's tasks exactly once.
-    if let Some(old_session) = registration.superseded_session {
-        failover_superseded_session(
-            &queue,
-            &scheduler_notify,
-            &waiters,
-            worker_id,
-            old_session,
-            session_id,
-            #[cfg(feature = "dashboard")]
-            broadcast_tx.as_ref(),
-        )
-        .await;
-    }
-
-    #[cfg(feature = "p2p")]
-    let _p2p_guard = match (&p2p_conn, &p2p_conns) {
-        (Some(conn), Some(conns)) => {
-            conns.write().await.insert(worker_id, conn.clone());
-            let path_info = rusty_grid_core::transport::inspect_connection_paths(conn);
-            info!(
-                worker_id = %worker_id,
-                path_info = ?path_info,
-                "Tracked P2P connection path for registered worker"
-            );
-            Some(P2pConnGuard::new(
-                conn.clone(),
-                Arc::clone(conns),
-                worker_id,
-            ))
-        }
-        _ => None,
-    };
-
-    // 4. Send RegisterAck over control stream
-    let negotiated_features = worker_features & ProtocolCapabilities::all_supported();
-    let ack = MasterMessage::RegisterAck {
-        accepted: true,
-        worker_id,
+    crate::session::WorkerSession::run_connection(
+        pre_auth,
+        registry,
+        queue,
+        scheduler_notify,
+        waiters,
         heartbeat_interval_secs,
-        protocol_version: PROTOCOL_VERSION_CURRENT,
-        features: negotiated_features,
-        message: Some(feature_announcement(blob_store.as_ref())),
-    };
-    if let Err(e) = ctrl_transport.send_msg(&ack).await {
-        handle_worker_disconnect_with_broadcast(
-            &registry,
-            &queue,
-            &scheduler_notify,
-            Some(&waiters),
-            &worker_id,
-            Some(session_id),
-            "RegisterAck delivery failed",
-            true,
-            #[cfg(feature = "dashboard")]
-            broadcast_tx.as_ref(),
-        )
-        .await;
-        return Err(e.into());
-    }
-
-    #[cfg(feature = "dashboard")]
-    if let Some(ref b_tx) = broadcast_tx {
-        if let Some(info) = registry.get_worker(worker_id).await {
-            let _ =
-                b_tx.send(crate::dashboard::dto::DashboardStreamMessage::WorkerRegistered(info));
-        }
-    }
-
-    info!(
-        worker_id = %worker_id,
-        session_id = session_id,
-        remote = %remote_addr,
-        "Worker successfully registered with master (QUIC 2-lane multiplexed)"
-    );
-
-    // 5. Split transports into independent writers and readers
-    let (mut ctrl_writer, mut ctrl_reader) = ctrl_transport.split();
-    let (mut data_writer, mut data_reader) = data_transport.split();
-
-    // 6. Spawn 2-lane outbound writers: Control Lane and Data Lane
-    let (ctrl_out_tx, mut ctrl_out_rx) = mpsc::channel::<MasterMessage>(64);
-    let (data_out_tx, mut data_out_rx) = mpsc::channel::<MasterMessage>(64);
-    let ctrl_sender = ctrl_out_tx.clone();
-
-    // router_task decouples data and control lane routing from outbound_rx.
-    // When data_out_tx experiences backpressure, pending data frames are queued
-    // locally in pending_data, while outbound_rx continues to be drained so that
-    // control messages are dispatched immediately to ctrl_out_tx without head-of-line blocking.
-    let router_task = tokio::spawn(async move {
-        let mut pending_data: std::collections::VecDeque<MasterMessage> =
-            std::collections::VecDeque::new();
-
-        loop {
-            if pending_data.is_empty() {
-                match outbound_rx.recv().await {
-                    Some(msg) => match msg {
-                        MasterMessage::AssignTask { .. }
-                        | MasterMessage::AssignTaskWithCheckpoint { .. }
-                        | MasterMessage::CancelTask { .. }
-                        | MasterMessage::BlobReply { .. } => match data_out_tx.try_send(msg) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(data_msg)) => {
-                                pending_data.push_back(data_msg);
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
-                        },
-                        ctrl_msg => {
-                            if ctrl_out_tx.send(ctrl_msg).await.is_err() {
-                                break;
-                            }
-                        }
-                    },
-                    None => break,
-                }
-            } else {
-                tokio::select! {
-                    send_permit = data_out_tx.reserve() => {
-                        match send_permit {
-                            Ok(permit) => {
-                                if let Some(msg) = pending_data.pop_front() {
-                                    permit.send(msg);
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    msg_opt = outbound_rx.recv() => {
-                        match msg_opt {
-                            Some(msg) => match msg {
-                                MasterMessage::AssignTask { .. }
-                                | MasterMessage::AssignTaskWithCheckpoint { .. }
-                                | MasterMessage::CancelTask { .. }
-                                | MasterMessage::BlobReply { .. } => {
-                                    pending_data.push_back(msg);
-                                }
-
-                                ctrl_msg => {
-                                    // Control frames bypass pending data frames immediately
-                                    if ctrl_out_tx.send(ctrl_msg).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            },
-                            None => {
-                                // outbound_rx closed; drain remaining pending data then exit
-                                while let Some(msg) = pending_data.pop_front() {
-                                    if data_out_tx.send(msg).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    let ctrl_writer_task = tokio::spawn(async move {
-        while let Some(msg) = ctrl_out_rx.recv().await {
-            match ctrl_writer.send_msg(&msg).await {
-                Ok(()) => {}
-                Err(rusty_grid_core::protocol::ProtocolError::FrameTooLarge { size, max }) => {
-                    warn!(
-                        worker_id = %worker_id,
-                        session_id = session_id,
-                        variant = %msg.variant_name(),
-                        size = size,
-                        max = max,
-                        "Control frame exceeds frame limit; dropping frame without closing session"
-                    );
-                }
-                Err(e) => {
-                    debug!(error = %e, "Control writer send error; terminating");
-                    break;
-                }
-            }
-        }
-    });
-
-    let data_registry = registry.clone();
-    let data_queue = queue.clone();
-    let data_sched_notify = Arc::clone(&scheduler_notify);
-    let data_waiters = Arc::clone(&waiters);
-    let data_blob_store = blob_store.clone();
-    #[cfg(feature = "dashboard")]
-    let data_broadcast_tx = broadcast_tx.clone();
-    let data_writer_task = tokio::spawn(async move {
-        while let Some(msg) = data_out_rx.recv().await {
-            match data_writer.send_msg(&msg).await {
-                Ok(()) => {}
-                Err(rusty_grid_core::protocol::ProtocolError::FrameTooLarge { size, max }) => {
-                    handle_oversized_master_message(
-                        msg,
-                        size,
-                        max,
-                        &data_registry,
-                        &data_queue,
-                        &data_sched_notify,
-                        &data_waiters,
-                        worker_id,
-                        session_id,
-                        data_blob_store.as_ref(),
-                        #[cfg(feature = "dashboard")]
-                        data_broadcast_tx.as_ref(),
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    debug!(error = %e, "Data writer send error; terminating");
-                    break;
-                }
-            }
-        }
-    });
-
-    // These helpers must not outlive the handler: if it is aborted (reaper, re-registration) the
-    // explicit aborts at the end of this function never run.
-    let _router_guard = AbortOnDrop(router_task.abort_handle());
-    let _ctrl_writer_guard = AbortOnDrop(ctrl_writer_task.abort_handle());
-    let _data_writer_guard = AbortOnDrop(data_writer_task.abort_handle());
-    // Blob replies go out through the router, which puts them on the data stream.
-    let blob_service = blob_store
-        .clone()
-        .map(|store| BlobService::spawn(store, outbound_tx.clone()));
-
-    let sched_notify = scheduler_notify.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        sched_notify.notify_one();
-    });
-
-    // 7. Multiplexed inbound reader loop
-    loop {
-        tokio::select! {
-            ctrl_res = ctrl_reader.recv_msg::<WorkerMessage>() => {
-                match ctrl_res {
-                    Ok(Some(msg)) => {
-                        match msg {
-                            WorkerMessage::Heartbeat {
-                                worker_id: id,
-                                timestamp,
-                                active_tasks,
-                                cpu_usage_pct,
-                                ram_available_mb,
-                            } => {
-                                if id == worker_id {
-                                    let heartbeat = registry
-                                        .record_heartbeat_session(
-                                            &worker_id,
-                                            active_tasks,
-                                            timestamp,
-                                            cpu_usage_pct,
-                                            ram_available_mb,
-                                            Some(session_id),
-                                        )
-                                        .await;
-                                    if let Ok(HeartbeatOutcome::Revived) = heartbeat {
-                                        scheduler_notify.notify_one();
-                                        #[cfg(feature = "dashboard")]
-                                        if let Some(ref b_tx) = broadcast_tx {
-                                            if let Some(info) = registry.get_worker(worker_id).await {
-                                                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::WorkerRegistered(info));
-                                            }
-                                        }
-                                    }
-                                    let _ = ctrl_sender
-                                        .send(MasterMessage::HeartbeatAck { timestamp })
-                                        .await;
-                                    #[cfg(feature = "dashboard")]
-                                    if let Some(ref b_tx) = broadcast_tx {
-                                        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::WorkerHeartbeat {
-                                            worker_id: id,
-                                            cpu_usage_pct,
-                                            ram_available_mb,
-                                            active_tasks,
-                                            timestamp,
-                                        });
-                                    }
-                                } else {
-                                    warn!(expected = %worker_id, got = %id, "Heartbeat worker_id mismatch on control stream");
-                                }
-                            }
-                            WorkerMessage::Disconnecting { worker_id: id, reason } => {
-                                info!(worker_id = %id, reason = %reason, "Worker announced graceful disconnection on control stream");
-                                handle_worker_evacuate_with_broadcast(
-                                    &registry,
-                                    &queue,
-                                    &scheduler_notify,
-                                    Some(&waiters),
-                                    &worker_id,
-                                    Some(session_id),
-                                    &format!("Worker graceful disconnect: {reason}"),
-                                    #[cfg(feature = "dashboard")]
-                                    broadcast_tx.as_ref(),
-                                ).await;
-                                break;
-                            }
-                            WorkerMessage::MobileTelemetry {
-                                worker_id: claimed,
-                                battery_pct,
-                                is_charging,
-                                thermal_throttled,
-                                battery_temperature,
-                                network_type,
-                                battery_tier,
-                                thermal_tier,
-                            } => {
-                                apply_mobile_telemetry(
-                                    &registry,
-                                    &scheduler_notify,
-                                    worker_id,
-                                    session_id,
-                                    claimed,
-                                    MobileLiveStatus {
-                                        battery_pct,
-                                        is_charging,
-                                        thermal_throttled,
-                                        battery_temperature,
-                                        network_type,
-                                        battery_tier,
-                                        thermal_tier,
-                                    },
-                                ).await;
-                            }
-                            WorkerMessage::ClaimMasterRole { ticket } => {
-                                let ack = reject_master_role_claim(&ticket);
-                                let _ = ctrl_sender.send(ack).await;
-                            }
-                            WorkerMessage::BlobRequest { request_id, request } => {
-                                serve_worker_blob_request(blob_service.as_ref(), &outbound_tx, request_id, request).await;
-                            }
-                            other => {
-                                warn!(worker_id = %worker_id, message = %other.variant_name(), "Unexpected message on control stream");
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        info!(worker_id = %worker_id, "Worker control stream closed by peer (EOF)");
-                        handle_worker_disconnect_with_broadcast(
-                            &registry,
-                            &queue,
-                            &scheduler_notify,
-                            Some(&waiters),
-                            &worker_id,
-                            Some(session_id),
-                            "Control stream EOF",
-                            false,
-                            #[cfg(feature = "dashboard")]
-                            broadcast_tx.as_ref(),
-                        ).await;
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(worker_id = %worker_id, error = %e, "Control stream read error");
-                        handle_worker_disconnect_with_broadcast(
-                            &registry,
-                            &queue,
-                            &scheduler_notify,
-                            Some(&waiters),
-                            &worker_id,
-                            Some(session_id),
-                            &format!("Control stream socket error: {e}"),
-                            false,
-                            #[cfg(feature = "dashboard")]
-                            broadcast_tx.as_ref(),
-                        ).await;
-                        break;
-                    }
-                }
-            }
-            data_res = data_reader.recv_msg::<WorkerMessage>() => {
-                match data_res {
-                    Ok(Some(msg)) => {
-                        match msg {
-                            msg @ (WorkerMessage::TaskProgress { .. }
-                                | WorkerMessage::TaskResult { .. }
-                                | WorkerMessage::Checkpoint { .. }) => {
-                                handle_session_task_message(
-                                    msg,
-                                    &registry,
-                                    &queue,
-                                    &scheduler_notify,
-                                    &waiters,
-                                    worker_id,
-                                    session_id,
-                                    blob_store.as_ref(),
-                                    #[cfg(feature = "dashboard")]
-                                    broadcast_tx.as_ref(),
-                                ).await;
-                            }
-                            WorkerMessage::BlobRequest { request_id, request } => {
-                                serve_worker_blob_request(blob_service.as_ref(), &outbound_tx, request_id, request).await;
-                            }
-                            other => {
-                                warn!(worker_id = %worker_id, message = %other.variant_name(), "Unexpected message on data stream");
-                            }
-
-                        }
-                    }
-                    Ok(None) => {
-                        info!(worker_id = %worker_id, "Worker data stream closed by peer (EOF)");
-                        handle_worker_disconnect_with_broadcast(
-                            &registry,
-                            &queue,
-                            &scheduler_notify,
-                            Some(&waiters),
-                            &worker_id,
-                            Some(session_id),
-                            "Data stream EOF",
-                            false,
-                            #[cfg(feature = "dashboard")]
-                            broadcast_tx.as_ref(),
-                        ).await;
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(worker_id = %worker_id, error = %e, "Data stream read error");
-                        handle_worker_disconnect_with_broadcast(
-                            &registry,
-                            &queue,
-                            &scheduler_notify,
-                            Some(&waiters),
-                            &worker_id,
-                            Some(session_id),
-                            &format!("Data stream socket error: {e}"),
-                            false,
-                            #[cfg(feature = "dashboard")]
-                            broadcast_tx.as_ref(),
-                        ).await;
-                        break;
-                    }
-                }
-            }
-            res = shutdown_rx.changed() => {
-                if res.is_ok() && *shutdown_rx.borrow() {
-                    info!(worker_id = %worker_id, "Master shutting down; notifying worker on control stream");
-                    let _ = ctrl_sender.send(MasterMessage::Shutdown {
-                        reason: "Master server shutting down".into(),
-                        grace_period_secs: Some(5),
-                    }).await;
-                    break;
-                } else if res.is_err() {
-                    break;
-                }
-            }
-        }
-    }
-
-    // 8. Cleanup upon disconnect
-    handle_worker_disconnect_with_broadcast(
-        &registry,
-        &queue,
-        &scheduler_notify,
-        Some(&waiters),
-        &worker_id,
-        Some(session_id),
-        "Multiplexed connection terminated",
-        false,
+        handshake_timeout,
+        shutdown_rx,
+        abort_handle,
+        wire_codec,
+        cluster_secret,
+        handshake_permit,
+        blob_store,
         #[cfg(feature = "dashboard")]
-        broadcast_tx.as_ref(),
+        broadcast_tx,
     )
-    .await;
-
-    #[cfg(feature = "p2p")]
-    if let Some(ref guard) = _p2p_guard {
-        guard.unlist().await;
-    }
-    ctrl_writer_task.abort();
-    data_writer_task.abort();
-    router_task.abort();
-    Ok(())
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5059,6 +4026,7 @@ async fn spawn_master_discovery_service(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusty_grid_core::protocol::{ProtocolCapabilities, PROTOCOL_VERSION_CURRENT};
     use rusty_grid_core::task::Task;
     use rusty_grid_core::WorkerCapabilities;
     use tokio::net::TcpStream;
@@ -7406,57 +6374,69 @@ mod tests {
             .expect("spawn master");
         let addr = server.server_addr;
 
-        // 1. Worker with lower (2) or higher (current + 1) protocol_version is refused by Master
-        // with a clear RegisterAck message.
-        for bad_worker_ver in [2u32, PROTOCOL_VERSION_CURRENT + 1] {
-            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-            let mut transport = MessageTransport::new(stream);
-            transport
-                .send_msg(&WorkerMessage::Register {
-                    worker_id: Uuid::new_v4(),
-                    capabilities: WorkerCapabilities::new(
-                        "skew-worker",
-                        4,
-                        4096,
-                        false,
-                        false,
-                        None,
-                    ),
-                    protocol_version: bad_worker_ver,
-                    features: ProtocolCapabilities::all_supported(),
-                })
-                .await
-                .unwrap();
-            let ack = transport
-                .recv_msg::<MasterMessage>()
-                .await
-                .unwrap()
-                .expect("RegisterAck");
-            match ack {
-                MasterMessage::RegisterAck {
-                    accepted,
-                    protocol_version,
-                    message,
-                    ..
-                } => {
-                    assert!(!accepted);
-                    assert_eq!(protocol_version, PROTOCOL_VERSION_CURRENT);
-                    let msg = message.unwrap_or_default();
-                    assert!(
-                        msg.contains(&format!("Incompatible protocol version {bad_worker_ver}"))
-                            && msg.contains(&PROTOCOL_VERSION_CURRENT.to_string()),
-                        "expected version mismatch message, got: {msg}"
-                    );
+        // 1. Worker with lower (2, current - 1) or higher (current + 1) protocol_version in both
+        // Bincode and JSON is refused by Master with a clear RegisterAck message.
+        for codec in [WireCodec::Bincode, WireCodec::Json] {
+            for bad_worker_ver in [
+                2u32,
+                PROTOCOL_VERSION_CURRENT - 1,
+                PROTOCOL_VERSION_CURRENT + 1,
+            ] {
+                let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let mut transport = MessageTransport::with_codec(stream, codec);
+                transport
+                    .send_msg(&WorkerMessage::Register {
+                        worker_id: Uuid::new_v4(),
+                        capabilities: WorkerCapabilities::new(
+                            "skew-worker",
+                            4,
+                            4096,
+                            false,
+                            false,
+                            None,
+                        ),
+                        protocol_version: bad_worker_ver,
+                        features: ProtocolCapabilities::all_supported(),
+                    })
+                    .await
+                    .unwrap();
+                let ack = transport
+                    .recv_msg::<MasterMessage>()
+                    .await
+                    .unwrap()
+                    .expect("RegisterAck");
+                match ack {
+                    MasterMessage::RegisterAck {
+                        accepted,
+                        protocol_version,
+                        message,
+                        ..
+                    } => {
+                        assert!(!accepted);
+                        assert_eq!(protocol_version, PROTOCOL_VERSION_CURRENT);
+                        let msg = message.unwrap_or_default();
+                        assert!(
+                            msg.contains(&format!(
+                                "Incompatible protocol version {bad_worker_ver}"
+                            )) && msg.contains(&PROTOCOL_VERSION_CURRENT.to_string()),
+                            "expected version mismatch message for {codec:?}, got: {msg}"
+                        );
+                    }
+                    other => panic!("expected RegisterAck, got {other:?}"),
                 }
-                other => panic!("expected RegisterAck, got {other:?}"),
             }
         }
 
-        // 2. Client with lower (2) or higher (current + 1) protocol_version in both Bincode and
-        // JSON receives a clear ClientResponse::Error from the Master, and a client reading a
-        // mismatched ClientResponse from a fake Master also refuses with GridError::IncompatibleVersion.
+        // 2. Client with lower (2, current - 1) or higher (current + 1) protocol_version in both
+        // Bincode and JSON receives a clear ClientResponse::Error from the Master, and a client
+        // reading a mismatched ClientResponse from a fake Master also refuses with
+        // GridError::IncompatibleVersion.
         for codec in [WireCodec::Bincode, WireCodec::Json] {
-            for bad_client_ver in [2u32, PROTOCOL_VERSION_CURRENT + 1] {
+            for bad_client_ver in [
+                2u32,
+                PROTOCOL_VERSION_CURRENT - 1,
+                PROTOCOL_VERSION_CURRENT + 1,
+            ] {
                 let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
                 let mut transport = MessageTransport::with_codec(stream, codec);
                 let raw_frame =
@@ -7484,47 +6464,49 @@ mod tests {
             // Client side: receiving a non-Error ClientResponse with an incompatible protocol_version
             // fails with GridError::IncompatibleVersion naming both versions (without a
             // "Registration handshake failed:" prefix).
-            let (client_io, master_io) = tokio::io::duplex(4096);
-            let bad_master_ver = PROTOCOL_VERSION_CURRENT + 2;
-            tokio::spawn(async move {
-                let mut fake_master = MessageTransport::with_codec(master_io, codec);
-                let _ = fake_master
-                    .recv_msg::<InboundMessage>()
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let bad_resp = stamp_frame_version(
-                    &ClientResponse::WorkerList {
-                        workers: Vec::new(),
-                    },
-                    bad_master_ver,
-                    codec,
-                );
-                fake_master.send_raw_frame(bad_resp.into()).await.unwrap();
-            });
-            let mut client_transport = MessageTransport::with_codec(client_io, codec);
-            client_transport
-                .send_msg(&ClientMessage::ListWorkers)
-                .await
-                .unwrap();
-            let err: GridError = client_transport
-                .recv_msg::<ClientResponse>()
-                .await
-                .expect_err("client must refuse incompatible Master ClientResponse")
-                .into();
-            assert!(
-                !err.to_string().contains("Registration handshake failed:"),
-                "client refusal must not carry worker handshake prefix: {err}"
-            );
-            match &err {
-                GridError::IncompatibleVersion(msg) => {
-                    assert!(
-                        msg.contains(&format!("Incompatible protocol version {bad_master_ver}"))
-                            && msg.contains(&PROTOCOL_VERSION_CURRENT.to_string()),
-                        "expected clear client-side version refusal, got: {msg}"
+            for bad_master_ver in [PROTOCOL_VERSION_CURRENT - 1, PROTOCOL_VERSION_CURRENT + 2] {
+                let (client_io, master_io) = tokio::io::duplex(4096);
+                tokio::spawn(async move {
+                    let mut fake_master = MessageTransport::with_codec(master_io, codec);
+                    let _ = fake_master
+                        .recv_msg::<InboundMessage>()
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let bad_resp = stamp_frame_version(
+                        &ClientResponse::WorkerList {
+                            workers: Vec::new(),
+                        },
+                        bad_master_ver,
+                        codec,
                     );
+                    fake_master.send_raw_frame(bad_resp.into()).await.unwrap();
+                });
+                let mut client_transport = MessageTransport::with_codec(client_io, codec);
+                client_transport
+                    .send_msg(&ClientMessage::ListWorkers)
+                    .await
+                    .unwrap();
+                let err: GridError = client_transport
+                    .recv_msg::<ClientResponse>()
+                    .await
+                    .expect_err("client must refuse incompatible Master ClientResponse")
+                    .into();
+                assert!(
+                    !err.to_string().contains("Registration handshake failed:"),
+                    "client refusal must not carry worker handshake prefix: {err}"
+                );
+                match &err {
+                    GridError::IncompatibleVersion(msg) => {
+                        assert!(
+                            msg.contains(&format!(
+                                "Incompatible protocol version {bad_master_ver}"
+                            )) && msg.contains(&PROTOCOL_VERSION_CURRENT.to_string()),
+                            "expected clear client-side version refusal, got: {msg}"
+                        );
+                    }
+                    other => panic!("expected GridError::IncompatibleVersion, got {other:?}"),
                 }
-                other => panic!("expected GridError::IncompatibleVersion, got {other:?}"),
             }
         }
 

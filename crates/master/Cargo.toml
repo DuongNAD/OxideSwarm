@@ -36,6 +36,7 @@ libc = "0.2"
 default = ["p2p", "dashboard"]
 p2p = ["dep:iroh", "rusty_grid_core/p2p"]
 dashboard = ["dep:axum", "dep:tower-http"]
+3d = ["rusty_grid_worker/3d"]
 
 [dev-dependencies]
 rusty_grid_worker = { path = "../worker" }

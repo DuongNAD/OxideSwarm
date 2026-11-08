@@ -18,6 +18,8 @@
 //! 3. Output path boundary conditions:
 //!    - Deeply nested non-existent directory tree (auto-creation validation)
 
+#![cfg_attr(not(feature = "3d"), allow(unused_imports, dead_code))]
+
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -520,6 +522,7 @@ fn cli_command(home: &Path) -> Command {
     cmd
 }
 
+#[cfg(feature = "3d")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cli_deeply_nested_output_directory_creation() {
     let temp_home = TempDir::new().expect("create test temp dir");

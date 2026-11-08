@@ -544,11 +544,15 @@ impl AgentGridBridge {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let image_bytes = parse_binary_data(
+        let image_bytes = match parse_binary_data(
             args.get("image")
                 .or_else(|| args.get("image_data"))
                 .or_else(|| args.get("image_bytes")),
-        );
+            "image",
+        ) {
+            Ok(bytes) => bytes,
+            Err(msg) => return make_error_response(from, correlation_id, command, 1, &msg),
+        };
 
         if prompt.is_none() && image_bytes.is_empty() {
             return make_error_response(
@@ -724,11 +728,15 @@ impl AgentGridBridge {
         correlation_id: &str,
         timeout: Duration,
     ) -> AgentMeshEnvelope {
-        let input_mesh_bytes = parse_binary_data(
+        let input_mesh_bytes = match parse_binary_data(
             args.get("input_mesh")
                 .or_else(|| args.get("input_mesh_bytes"))
                 .or_else(|| args.get("mesh")),
-        );
+            "input_mesh",
+        ) {
+            Ok(bytes) => bytes,
+            Err(msg) => return make_error_response(from, correlation_id, command, 1, &msg),
+        };
 
         if input_mesh_bytes.is_empty() {
             return make_error_response(
@@ -869,37 +877,58 @@ fn parse_input_bytes(val: Option<&Value>) -> Vec<u8> {
     }
 }
 
-fn parse_binary_data(val: Option<&Value>) -> Vec<u8> {
+/// Decode a binary payload (image or mesh) sent by a peer.
+///
+/// Order of attempts for a string value (after trimming):
+/// 1. empty: `Ok(vec![])` (the caller reports its own "missing input" error);
+/// 2. `0x` / `0X` prefix: strict hex (even length, hex digits only). Bare hex
+///    without the prefix is not recognised, because it is also valid base64;
+/// 3. path-like: a leading `/` other than the JPEG base64 magic `/9j/` is
+///    refused, since strings such as `/tmp/abcd` are valid base64 characters.
+///    Strings with `.`, `\`, `:` (`/tmp/x.glb`, `C:\x.glb`) are not base64
+///    and are refused by step 4;
+/// 4. base64 (`STANDARD` alphabet, padded);
+/// 5. anything else is refused. The string's own bytes are never used as the
+///    payload and the hub never reads files a peer names.
+///
+/// A JSON array of numbers is taken as raw bytes; other JSON types give an
+/// empty result.
+fn parse_binary_data(val: Option<&Value>, field: &str) -> Result<Vec<u8>, String> {
+    let refusal =
+        || format!("{field} must be base64, hex or a byte array; file paths are not accepted");
     match val {
-        Some(Value::Array(arr)) => arr
+        Some(Value::Array(arr)) => Ok(arr
             .iter()
             .filter_map(|v| v.as_u64().map(|n| n as u8))
-            .collect(),
+            .collect()),
         Some(Value::String(s)) => {
             let s_trim = s.trim();
-            if s_trim.starts_with("0x") || s_trim.starts_with("0X") {
-                (2..s_trim.len())
-                    .step_by(2)
-                    .filter_map(|i| {
-                        if i + 2 <= s_trim.len() {
-                            u8::from_str_radix(&s_trim[i..i + 2], 16).ok()
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            } else {
-                use base64::engine::general_purpose::STANDARD;
-                use base64::Engine;
-                if let Ok(bytes) = STANDARD.decode(s_trim) {
-                    if !bytes.is_empty() {
-                        return bytes;
-                    }
+            if s_trim.is_empty() {
+                return Ok(Vec::new());
+            }
+            if let Some(hex) = s_trim
+                .strip_prefix("0x")
+                .or_else(|| s_trim.strip_prefix("0X"))
+            {
+                if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(refusal());
                 }
-                s_trim.as_bytes().to_vec()
+                return Ok((0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap_or(0))
+                    .collect());
+            }
+            if s_trim.starts_with('/') && !s_trim.starts_with("/9j/") {
+                return Err(refusal());
+            }
+            use base64::engine::general_purpose::STANDARD;
+            use base64::Engine;
+            match STANDARD.decode(s_trim) {
+                Ok(bytes) if !bytes.is_empty() => Ok(bytes),
+                _ => Err(refusal()),
             }
         }
-        _ => Vec::new(),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -1217,7 +1246,7 @@ mod tests {
             (&secret_txt_path, secret_txt_bytes.as_slice()),
         ] {
             let path_val = serde_json::Value::String(path.to_string_lossy().to_string());
-            let parsed = parse_binary_data(Some(&path_val));
+            let parsed = parse_binary_data(Some(&path_val), "input_mesh").unwrap_or_default();
             assert_ne!(
                 parsed.as_slice(),
                 secret,
@@ -1323,6 +1352,116 @@ mod tests {
             after_txt.saturating_sub(before_txt)
         );
 
+        let _ = master.shutdown();
+    }
+
+    #[test]
+    fn parse_binary_data_accepts_array_base64_and_hex() {
+        let arr = serde_json::json!([1, 2, 255]);
+        assert_eq!(parse_binary_data(Some(&arr), "x").unwrap(), vec![1, 2, 255]);
+
+        let b64 = serde_json::json!("Z2xURg==");
+        assert_eq!(parse_binary_data(Some(&b64), "x").unwrap(), b"glTF");
+        let b64_ws = serde_json::json!("  Z2xURg==\n");
+        assert_eq!(parse_binary_data(Some(&b64_ws), "x").unwrap(), b"glTF");
+        // JPEG base64 starts with '/', which must stay accepted.
+        let jpeg = serde_json::json!("/9j/4AAQ");
+        assert_eq!(
+            parse_binary_data(Some(&jpeg), "x").unwrap(),
+            vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]
+        );
+
+        let hex = serde_json::json!("0x676c5446");
+        assert_eq!(parse_binary_data(Some(&hex), "x").unwrap(), b"glTF");
+        let hex_up = serde_json::json!("0X676C5446");
+        assert_eq!(parse_binary_data(Some(&hex_up), "x").unwrap(), b"glTF");
+    }
+
+    #[test]
+    fn parse_binary_data_empty_values_stay_empty() {
+        assert!(parse_binary_data(None, "x").unwrap().is_empty());
+        assert!(parse_binary_data(Some(&serde_json::json!("")), "x")
+            .unwrap()
+            .is_empty());
+        assert!(parse_binary_data(Some(&serde_json::json!("  ")), "x")
+            .unwrap()
+            .is_empty());
+        assert!(parse_binary_data(Some(&serde_json::json!([])), "x")
+            .unwrap()
+            .is_empty());
+        assert!(parse_binary_data(Some(&serde_json::json!(5)), "x")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn parse_binary_data_refuses_paths_and_garbage() {
+        for bad in [
+            "/tmp/x.glb",
+            "/tmp/abc",
+            "/tmp/abcd",
+            "/Users/me/mesh",
+            "C:\\x.glb",
+            "C:\\Users\\me\\mesh.obj",
+            "relative/mesh.glb",
+            "mesh.glb",
+            "~/mesh.glb",
+            "not base64 at all",
+            "0xzz",
+            "0x123",
+        ] {
+            let err =
+                parse_binary_data(Some(&serde_json::json!(bad)), "input_mesh").expect_err(bad);
+            assert_eq!(
+                err, "input_mesh must be base64, hex or a byte array; file paths are not accepted",
+                "{bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_refuses_path_valued_inputs_without_submitting() {
+        let master = rusty_grid_master::server::MasterServer::spawn(
+            rusty_grid_master::server::ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        )
+        .await
+        .expect("spawn master");
+        let bridge = AgentGridBridge::new(master.clone());
+        let before = master.queue_stats().await.expect("queue stats").total;
+
+        for (command, key) in [
+            ("grid_auto_rig", "input_mesh"),
+            ("grid_3d_generate", "image"),
+        ] {
+            for path in ["/tmp/x.glb", "C:\\x.glb"] {
+                let req = AgentMeshEnvelope::new_command_request(
+                    "peer-agent",
+                    "grid",
+                    command,
+                    serde_json::json!({ key: path, "wait": false }),
+                    Some(5000),
+                );
+                match bridge.handle_command(&req).await {
+                    AgentMeshEnvelope::CommandResponse {
+                        exit_code,
+                        stderr,
+                        status,
+                        ..
+                    } => {
+                        assert_eq!(status, "failed");
+                        assert_ne!(exit_code, 0);
+                        assert!(
+                            stderr.contains("file paths are not accepted"),
+                            "{command} {path}: {stderr}"
+                        );
+                    }
+                    other => panic!("expected CommandResponse, got {other:?}"),
+                }
+            }
+        }
+
+        let after = master.queue_stats().await.expect("queue stats").total;
+        assert_eq!(before, after, "a refused input must not submit a task");
         let _ = master.shutdown();
     }
 }

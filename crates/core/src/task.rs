@@ -1043,10 +1043,6 @@ pub enum TaskSpec {
         input_data: Vec<u8>,
         work_group_size: u32,
         simulated_matrix_dim: u32,
-        #[deprecated(
-            note = "unused by the worker; kept on the wire until the next protocol version bump (design 0044 D1.5)"
-        )]
-        compute_intensity: u32,
     },
     /// In-memory built-in test task for rapid verification.
     BuiltinTest {
@@ -1099,8 +1095,6 @@ enum HumanTaskSpec {
         work_group_size: u32,
         #[serde(default = "default_matrix_dim")]
         simulated_matrix_dim: u32,
-        #[serde(default)]
-        compute_intensity: u32,
     },
     BuiltinTest {
         #[serde(default = "default_test_name")]
@@ -1157,7 +1151,6 @@ enum BinaryTaskSpec {
         input_data: Vec<u8>,
         work_group_size: u32,
         simulated_matrix_dim: u32,
-        compute_intensity: u32,
     },
     BuiltinTest {
         test_name: String,
@@ -1171,7 +1164,6 @@ enum BinaryTaskSpec {
 }
 
 impl From<TaskSpec> for HumanTaskSpec {
-    #[allow(deprecated)]
     fn from(spec: TaskSpec) -> Self {
         match spec {
             TaskSpec::Command {
@@ -1212,13 +1204,11 @@ impl From<TaskSpec> for HumanTaskSpec {
                 input_data,
                 work_group_size,
                 simulated_matrix_dim,
-                compute_intensity,
             } => HumanTaskSpec::GpuCompute {
                 kernel_name,
                 input_data,
                 work_group_size,
                 simulated_matrix_dim,
-                compute_intensity,
             },
             TaskSpec::BuiltinTest {
                 test_name,
@@ -1240,7 +1230,6 @@ impl From<TaskSpec> for HumanTaskSpec {
 }
 
 impl From<HumanTaskSpec> for TaskSpec {
-    #[allow(deprecated)]
     fn from(spec: HumanTaskSpec) -> Self {
         match spec {
             HumanTaskSpec::Command {
@@ -1281,13 +1270,11 @@ impl From<HumanTaskSpec> for TaskSpec {
                 input_data,
                 work_group_size,
                 simulated_matrix_dim,
-                compute_intensity,
             } => TaskSpec::GpuCompute {
                 kernel_name,
                 input_data,
                 work_group_size,
                 simulated_matrix_dim,
-                compute_intensity,
             },
             HumanTaskSpec::BuiltinTest {
                 test_name,
@@ -1309,7 +1296,6 @@ impl From<HumanTaskSpec> for TaskSpec {
 }
 
 impl From<TaskSpec> for BinaryTaskSpec {
-    #[allow(deprecated)]
     fn from(spec: TaskSpec) -> Self {
         match spec {
             TaskSpec::Command {
@@ -1350,13 +1336,11 @@ impl From<TaskSpec> for BinaryTaskSpec {
                 input_data,
                 work_group_size,
                 simulated_matrix_dim,
-                compute_intensity,
             } => BinaryTaskSpec::GpuCompute {
                 kernel_name,
                 input_data,
                 work_group_size,
                 simulated_matrix_dim,
-                compute_intensity,
             },
             TaskSpec::BuiltinTest {
                 test_name,
@@ -1378,7 +1362,6 @@ impl From<TaskSpec> for BinaryTaskSpec {
 }
 
 impl From<BinaryTaskSpec> for TaskSpec {
-    #[allow(deprecated)]
     fn from(spec: BinaryTaskSpec) -> Self {
         match spec {
             BinaryTaskSpec::Command {
@@ -1419,13 +1402,11 @@ impl From<BinaryTaskSpec> for TaskSpec {
                 input_data,
                 work_group_size,
                 simulated_matrix_dim,
-                compute_intensity,
             } => TaskSpec::GpuCompute {
                 kernel_name,
                 input_data,
                 work_group_size,
                 simulated_matrix_dim,
-                compute_intensity,
             },
             BinaryTaskSpec::BuiltinTest {
                 test_name,
@@ -1514,14 +1495,12 @@ impl TaskSpec {
         Self::new_rust_compilation(crate_name, source_files, compiler_flags)
     }
 
-    #[allow(deprecated)]
     pub fn new_gpu_compute(kernel_name: impl Into<String>, simulated_matrix_dim: u32) -> Self {
         Self::GpuCompute {
             kernel_name: kernel_name.into(),
             input_data: Vec::new(),
             work_group_size: default_work_group_size(),
             simulated_matrix_dim,
-            compute_intensity: 0,
         }
     }
 
@@ -1529,7 +1508,6 @@ impl TaskSpec {
         Self::new_gpu_compute(kernel_name, simulated_matrix_dim)
     }
 
-    #[allow(deprecated)]
     pub fn gpu_compute_with_params(
         kernel_name: impl Into<String>,
         input_data: Vec<u8>,
@@ -1541,7 +1519,6 @@ impl TaskSpec {
             input_data,
             work_group_size,
             simulated_matrix_dim,
-            compute_intensity: 0,
         }
     }
 
@@ -2711,7 +2688,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_task_gpu_mismatch_validation() {
         // Spec requires GPU, but requirements state gpu_required = false
         let gpu_spec = TaskSpec::GpuCompute {
@@ -2719,7 +2695,6 @@ mod tests {
             input_data: vec![1, 2, 3],
             work_group_size: 16,
             simulated_matrix_dim: 64,
-            compute_intensity: 10,
         };
         let bad_requirements = TaskRequirements::generic(1, 60);
 
@@ -2735,7 +2710,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_task_spec_serde_aliases_and_defaults() {
         // Test "command" alias deserializes into `program`
         let json_cmd = r#"{"type":"Command","command":"echo","args":["hi"]}"#;
@@ -2782,13 +2756,11 @@ mod tests {
                 kernel_name,
                 work_group_size,
                 simulated_matrix_dim,
-                compute_intensity,
                 ..
             } => {
                 assert_eq!(kernel_name, "test");
                 assert_eq!(work_group_size, 16);
                 assert_eq!(simulated_matrix_dim, 64);
-                assert_eq!(compute_intensity, 0);
             }
             _ => panic!("Expected GpuCompute variant"),
         }
@@ -2880,7 +2852,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_task_bincode_serialization_roundtrip() {
         let specs = vec![
             TaskSpec::new_command("cargo", vec!["build".into(), "--release".into()]),
@@ -2898,7 +2869,6 @@ mod tests {
                 input_data: vec![1, 2, 3, 4, 5],
                 work_group_size: 32,
                 simulated_matrix_dim: 128,
-                compute_intensity: 50,
             },
             TaskSpec::BuiltinTest {
                 test_name: "quick_test".into(),

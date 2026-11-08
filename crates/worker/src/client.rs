@@ -87,6 +87,18 @@ pub struct TaskExecutionHandle {
 /// Thread-safe registry of active tasks executing on the worker.
 pub type ActiveTaskTable = Arc<RwLock<HashMap<TaskId, TaskExecutionHandle>>>;
 
+/// Protocol capabilities advertised by this worker build.
+///
+/// [`ProtocolCapabilities::THREE_D`] is advertised only when `rusty_grid_worker` is compiled with
+/// the `3d` Cargo feature.
+pub fn advertised_protocol_capabilities() -> ProtocolCapabilities {
+    #[allow(unused_mut)]
+    let mut caps = ProtocolCapabilities::all_supported();
+    #[cfg(not(feature = "3d"))]
+    caps.remove(ProtocolCapabilities::THREE_D);
+    caps
+}
+
 /// Default upper bound for establishing the transport to the Master (TCP connect or P2P dial).
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1207,7 +1219,7 @@ impl WorkerClient {
             master_shutdown_announced: false,
             master_takes_mobile_telemetry: AtomicBool::new(false),
             master_has_blobs: AtomicBool::new(false),
-            negotiated_features: AtomicU64::new(ProtocolCapabilities::all_supported().bits()),
+            negotiated_features: AtomicU64::new(advertised_protocol_capabilities().bits()),
             blob_client: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(feature = "p2p")]
             p2p_endpoint: Arc::new(tokio::sync::Mutex::new(None)),
@@ -2704,7 +2716,7 @@ impl WorkerClient {
             worker_id: self.worker_id,
             capabilities,
             protocol_version: PROTOCOL_VERSION_CURRENT,
-            features: ProtocolCapabilities::all_supported(),
+            features: advertised_protocol_capabilities(),
         };
 
         transport.send_msg(&register_msg).await.map_err(|e| {
@@ -2765,7 +2777,7 @@ impl WorkerClient {
                     self.config.default_heartbeat_interval
                 };
 
-                let negotiated = features & ProtocolCapabilities::all_supported();
+                let negotiated = features & advertised_protocol_capabilities();
                 self.negotiated_features
                     .store(negotiated.bits(), Ordering::Release);
 
@@ -6322,34 +6334,39 @@ mod tests {
             "WorkerClient::new must forward WorkerConfig::blender_path to RunnerConfig"
         );
 
-        let (glb_bytes, _) = crate::gen3d::generate_procedural_3d(
-            &rusty_grid_core::task::Generative3DSpec::new_prompt("test biped")
-                .with_quality("fast")
-                .with_engine("sdf"),
-        )
-        .expect("procedural 3d mesh");
-        let spec = rusty_grid_core::task::AutoRigSpec::new(
-            rusty_grid_core::task::Bytes::from(glb_bytes),
-            "biped",
-        )
-        .with_provider("blender");
-        let task = Task::new(
-            rusty_grid_core::task::TaskSpec::AutoRig(spec),
-            rusty_grid_core::task::TaskRequirements::generic(1, 30),
-        );
-        let result = client
-            .runner
-            .execute_task_with_checkpoint(&task, None, None, None, None)
-            .await;
-        assert!(
-            marker_file.exists(),
-            "TaskRunner constructed by WorkerClient must invoke the configured blender_path override"
-        );
-        assert!(
-            result.is_success(),
-            "AutoRig should fall back cleanly after fake Blender exits 42: {:?}",
-            result.error
-        );
+        #[cfg(feature = "3d")]
+        {
+            let (glb_bytes, _) = crate::gen3d::generate_procedural_3d(
+                &rusty_grid_core::task::Generative3DSpec::new_prompt("test biped")
+                    .with_quality("fast")
+                    .with_engine("sdf"),
+            )
+            .expect("procedural 3d mesh");
+            let spec = rusty_grid_core::task::AutoRigSpec::new(
+                rusty_grid_core::task::Bytes::from(glb_bytes),
+                "biped",
+            )
+            .with_provider("blender");
+            let task = Task::new(
+                rusty_grid_core::task::TaskSpec::AutoRig(spec),
+                rusty_grid_core::task::TaskRequirements::generic(1, 30),
+            );
+            let result = client
+                .runner
+                .execute_task_with_checkpoint(&task, None, None, None, None)
+                .await;
+            assert!(
+                marker_file.exists(),
+                "TaskRunner constructed by WorkerClient must invoke the configured blender_path override"
+            );
+            assert!(
+                result.is_success(),
+                "AutoRig should fall back cleanly after fake Blender exits 42: {:?}",
+                result.error
+            );
+        }
+        #[cfg(not(feature = "3d"))]
+        let _ = &marker_file;
 
         let _ = std::fs::remove_dir_all(&dir);
     }
