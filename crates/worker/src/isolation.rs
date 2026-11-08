@@ -11,7 +11,10 @@
 //!   program in place, so the PID the worker tracks is the task itself and the process-group
 //!   kill, the timeout and the cancellation work as without isolation.
 //! * **Linux** (Landlock, `seccomp`, namespaces): FEAT-3b, not implemented yet.
-//! * **Windows** (per-task AppContainer): FEAT-3c, not implemented yet.
+//! * **Windows** (`windows`, FEAT-3c): each task runs inside a per-task AppContainer profile
+//!   (`oxideswarm.task.<task_id>`) spawned with `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`,
+//!   explicit NTFS DACLs on its sandbox and read-only toolchains, zero network capabilities under
+//!   `fs+net`, and `DeleteAppContainerProfile` on teardown.
 //!
 //! A worker that was asked for isolation and cannot enforce it never runs tasks unsandboxed: it
 //! refuses to start ([`verify_isolation_support`]), and [`wrap_program`] fails a task rather than
@@ -118,7 +121,7 @@ pub fn prepare_environment(
 /// What the runner knows about one task when it asks for it to be confined. Only the
 /// platforms that have an implementation read every field.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 pub(crate) struct Jail<'a> {
     pub level: IsolationLevel,
     pub host: &'a HostDirs,
@@ -146,7 +149,14 @@ pub(crate) fn wrap_program(
             .ok_or_else(|| format!("program '{program}' was not found in PATH"))?;
         macos::wrap(jail, &resolved, args)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        let _ = jail;
+        let resolved = windows::resolve_program(program, search_path)
+            .ok_or_else(|| format!("program '{program}' was not found in PATH"))?;
+        Ok((resolved, args.to_vec()))
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (jail, program, args, search_path);
         Err(unsupported_message(jail.level))
@@ -169,14 +179,20 @@ pub async fn verify_isolation_support(
             .await
             .map_err(GridError::Config)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        windows::probe(level, sandbox_base)
+            .await
+            .map_err(GridError::Config)
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = sandbox_base;
         Err(GridError::Config(unsupported_message(level)))
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn unsupported_message(level: IsolationLevel) -> String {
     let which = if cfg!(target_os = "linux") {
         "FEAT-3b"
@@ -428,6 +444,1605 @@ mod macos {
     }
 }
 
+/// The Windows implementation (design 0033 D4, FEAT-3c): per-task AppContainer profile
+/// (`oxideswarm.task.<task_id>`), explicit NTFS DACLs on the sandbox and host toolchains,
+/// zero network capabilities under `fs+net`, and `DeleteAppContainerProfile` on cleanup.
+#[cfg(windows)]
+pub(crate) mod windows {
+    use super::{HostDirs, IsolationLevel, Jail};
+    use std::collections::{BTreeMap, HashSet, VecDeque};
+    use std::ffi::{OsStr, OsString};
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use std::os::windows::process::ExitStatusExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, LocalFree, SetHandleInformation, ERROR_ALREADY_EXISTS, ERROR_SUCCESS,
+        GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, HLOCAL,
+        WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW, SetNamedSecurityInfoW,
+        SetSecurityInfo, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, SET_ACCESS, SE_FILE_OBJECT,
+        SE_WINDOW_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::Isolation::{
+        CreateAppContainerProfile, DeleteAppContainerProfile,
+        DeriveAppContainerSidFromAppContainerName,
+    };
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, CreateWellKnownSid, EqualSid, FreeSid, GetAce, GetAclInformation,
+        GetTokenInformation, TokenUser, WinBuiltinAdministratorsSid, WinBuiltinAnyPackageSid,
+        WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid,
+        WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_FLAGS, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
+        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, NO_INHERITANCE, OBJECT_INHERIT_ACE,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+        SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+        WELL_KNOWN_SID_TYPE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS, FILE_DELETE_CHILD,
+        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_TRAVERSE, FILE_WRITE_EA, SYNCHRONIZE,
+        WRITE_DAC, WRITE_OWNER,
+    };
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::SystemServices::{
+        ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, SE_GROUP_ENABLED,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetCurrentThreadId,
+        GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken, TerminateProcess,
+        UpdateProcThreadAttribute, WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT,
+        EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    };
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetProcessWindowStation() -> HANDLE;
+        fn GetThreadDesktop(dwThreadId: u32) -> HANDLE;
+    }
+
+    static WINSTA_PREPARED: OnceLock<()> = OnceLock::new();
+    static PREPARE_LOCK: Mutex<()> = Mutex::new(());
+    static PREPARED_TOOLCHAIN_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    static MSVC_ENV_CACHE: OnceLock<Option<(PathBuf, String)>> = OnceLock::new();
+
+    const HRESULT_ALREADY_EXISTS: i32 =
+        ((1u32 << 31) | (7u32 << 16) | (ERROR_ALREADY_EXISTS & 0xffff)) as i32;
+
+    /// Directory permissions that allow listing or modifying a directory (denied on `user_home`
+    /// and `.oxideswarm` while leaving `FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE`
+    /// permitted for path canonicalization).
+    const DIR_LIST_AND_WRITE_MASK: u32 = FILE_LIST_DIRECTORY
+        | FILE_ADD_FILE
+        | FILE_ADD_SUBDIRECTORY
+        | FILE_WRITE_EA
+        | FILE_DELETE_CHILD
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER;
+
+    const WINDOWS_EXEC_EXTS: &[&str] = &[".com", ".exe", ".bat", ".cmd"];
+
+    fn prepared_cache() -> &'static Mutex<HashSet<PathBuf>> {
+        PREPARED_TOOLCHAIN_PATHS.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    fn ensure_window_station_and_desktop_access(any_pkg_sid: PSID) {
+        WINSTA_PREPARED.get_or_init(|| unsafe {
+            // WINSTA_ALL_ACCESS (0x37F) | STANDARD_RIGHTS_REQUIRED (0x000F0000)
+            let winsta = GetProcessWindowStation();
+            grant_window_object_access(winsta, any_pkg_sid, 0x000F_037F);
+            // DESKTOP_ALL_ACCESS (0x1FF) | STANDARD_RIGHTS_REQUIRED (0x000F0000)
+            let desktop = GetThreadDesktop(GetCurrentThreadId());
+            grant_window_object_access(desktop, any_pkg_sid, 0x000F_01FF);
+        });
+    }
+
+    fn grant_window_object_access(handle: HANDLE, any_pkg_sid: PSID, access_mask: u32) {
+        if handle.is_null() {
+            return;
+        }
+        let mut old_dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let rc = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_WINDOW_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut old_dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            if !sd.is_null() {
+                unsafe {
+                    LocalFree(sd as HLOCAL);
+                }
+            }
+            return;
+        }
+        let entry = explicit_access(any_pkg_sid, access_mask, GRANT_ACCESS, NO_INHERITANCE);
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        let rc = unsafe { SetEntriesInAclW(1, &entry, old_dacl, &mut new_dacl) };
+        if rc == ERROR_SUCCESS && !new_dacl.is_null() {
+            unsafe {
+                let _ = SetSecurityInfo(
+                    handle,
+                    SE_WINDOW_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    new_dacl,
+                    std::ptr::null(),
+                );
+                LocalFree(new_dacl as HLOCAL);
+            }
+        }
+        if !sd.is_null() {
+            unsafe {
+                LocalFree(sd as HLOCAL);
+            }
+        }
+    }
+
+    /// Resolves the host MSVC `bin\Hostx64\x64` directory and `LIB` search path once on Windows so
+    /// `rustc` inside an AppContainer (where COM `CLSID_SetupConfiguration` is blocked) can locate
+    /// `link.exe` and the Windows SDK `.lib` files directly via `PATH` and `LIB`.
+    pub fn resolve_windows_msvc_env() -> Option<(PathBuf, String)> {
+        MSVC_ENV_CACHE
+            .get_or_init(|| {
+                let mut vs_roots = vec![PathBuf::from(r"C:\BuildTools")];
+                for pf_var in ["ProgramFiles", "ProgramFiles(x86)"] {
+                    if let Some(pf) = std::env::var_os(pf_var).map(PathBuf::from) {
+                        for year in ["2022", "2019"] {
+                            for ed in ["Enterprise", "Professional", "Community", "BuildTools"] {
+                                vs_roots
+                                    .push(pf.join("Microsoft Visual Studio").join(year).join(ed));
+                            }
+                        }
+                    }
+                }
+                let mut msvc_ver_dir: Option<PathBuf> = None;
+                for root in vs_roots {
+                    let msvc_base = root.join("VC").join("Tools").join("MSVC");
+                    if let Ok(entries) = std::fs::read_dir(&msvc_base) {
+                        let mut vers: Vec<PathBuf> = entries
+                            .flatten()
+                            .map(|e| e.path())
+                            .filter(|p| p.is_dir())
+                            .collect();
+                        vers.sort();
+                        if let Some(best) = vers.into_iter().rev().find(|v| {
+                            v.join("bin")
+                                .join("Hostx64")
+                                .join("x64")
+                                .join("link.exe")
+                                .is_file()
+                        }) {
+                            msvc_ver_dir = Some(best);
+                            break;
+                        }
+                    }
+                }
+                let msvc_ver_dir = msvc_ver_dir?;
+                let msvc_bin = msvc_ver_dir.join("bin").join("Hostx64").join("x64");
+                let msvc_lib = msvc_ver_dir.join("lib").join("x64");
+
+                let kits_base = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\Lib");
+                let mut sdk_ver_dir: Option<PathBuf> = None;
+                if let Ok(entries) = std::fs::read_dir(&kits_base) {
+                    let mut vers: Vec<PathBuf> = entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.is_dir())
+                        .collect();
+                    vers.sort();
+                    sdk_ver_dir = vers.into_iter().rev().find(|v| {
+                        v.join("um").join("x64").join("kernel32.lib").is_file()
+                            && v.join("ucrt").join("x64").join("ucrt.lib").is_file()
+                    });
+                }
+                let sdk_ver_dir = sdk_ver_dir?;
+                let ucrt_lib = sdk_ver_dir.join("ucrt").join("x64");
+                let um_lib = sdk_ver_dir.join("um").join("x64");
+                let lib_str = format!(
+                    "{};{};{}",
+                    msvc_lib.display(),
+                    ucrt_lib.display(),
+                    um_lib.display()
+                );
+                Some((msvc_bin, lib_str))
+            })
+            .clone()
+    }
+
+    /// Resolves `program` against `search_path` on Windows. Returns `None` if the executable
+    /// does not exist.
+    pub(super) fn resolve_program(program: &str, search_path: &str) -> Option<String> {
+        let p = Path::new(program);
+        let has_sep = program.contains('/') || program.contains('\\') || program.contains(':');
+        if has_sep {
+            if p.is_file() {
+                return Some(program.to_string());
+            }
+            for ext in WINDOWS_EXEC_EXTS {
+                let candidate = PathBuf::from(format!("{program}{ext}"));
+                if candidate.is_file() {
+                    return Some(candidate.to_string_lossy().into_owned());
+                }
+            }
+            if !program.starts_with("/bin/") && !program.starts_with("/usr/bin/") {
+                return None;
+            }
+        }
+        let bare = p.file_name().and_then(|n| n.to_str()).unwrap_or(program);
+        for dir in std::env::split_paths(search_path) {
+            let base = if dir.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                dir
+            };
+            let direct = base.join(bare);
+            if direct.is_file() {
+                return Some(direct.to_string_lossy().into_owned());
+            }
+            for ext in WINDOWS_EXEC_EXTS {
+                let with_ext = base.join(format!("{bare}{ext}"));
+                if with_ext.is_file() {
+                    return Some(with_ext.to_string_lossy().into_owned());
+                }
+            }
+        }
+        None
+    }
+
+    fn to_wide(s: &OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    struct OwnedSid(Vec<u8>);
+
+    impl OwnedSid {
+        fn from_well_known(sid_type: WELL_KNOWN_SID_TYPE) -> io::Result<Self> {
+            let mut buf = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
+            let mut size = buf.len() as u32;
+            let ok = unsafe {
+                CreateWellKnownSid(
+                    sid_type,
+                    std::ptr::null_mut(),
+                    buf.as_mut_ptr() as PSID,
+                    &mut size,
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            buf.truncate(size as usize);
+            Ok(Self(buf))
+        }
+
+        fn current_user() -> io::Result<Self> {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut needed = 0u32;
+            unsafe {
+                let _ = GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+            }
+            let mut buf = vec![0u8; needed as usize];
+            let ok = unsafe {
+                GetTokenInformation(
+                    token,
+                    TokenUser,
+                    buf.as_mut_ptr() as *mut _,
+                    needed,
+                    &mut needed,
+                )
+            };
+            unsafe {
+                CloseHandle(token);
+            }
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let token_user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+            let sid_ptr = token_user.User.Sid;
+            let len = unsafe { windows_sys::Win32::Security::GetLengthSid(sid_ptr) } as usize;
+            let slice = unsafe { std::slice::from_raw_parts(sid_ptr as *const u8, len) };
+            Ok(Self(slice.to_vec()))
+        }
+
+        fn as_psid(&self) -> PSID {
+            self.0.as_ptr() as PSID
+        }
+    }
+
+    fn explicit_access(
+        sid: PSID,
+        access_mask: u32,
+        access_mode: i32,
+        inheritance: ACE_FLAGS,
+    ) -> EXPLICIT_ACCESS_W {
+        EXPLICIT_ACCESS_W {
+            grfAccessPermissions: access_mask,
+            grfAccessMode: access_mode,
+            grfInheritance: inheritance,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: 0,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: sid as *mut u16,
+            },
+        }
+    }
+
+    fn dacl_has_ace(
+        path: &Path,
+        target_sid: PSID,
+        ace_type: u32,
+        required_mask: u32,
+        required_flags: u32,
+    ) -> bool {
+        let wide_path = to_wide(path.as_os_str());
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if rc != ERROR_SUCCESS || dacl.is_null() {
+            if !sd.is_null() {
+                unsafe {
+                    LocalFree(sd as HLOCAL);
+                }
+            }
+            return false;
+        }
+
+        let mut acl_info = ACL_SIZE_INFORMATION::default();
+        let ok = unsafe {
+            GetAclInformation(
+                dacl,
+                &mut acl_info as *mut _ as *mut _,
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        };
+        let mut found = false;
+        if ok != 0 {
+            for idx in 0..acl_info.AceCount {
+                let mut ace_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+                if unsafe { GetAce(dacl, idx, &mut ace_ptr) } != 0 && !ace_ptr.is_null() {
+                    let header = unsafe { &*(ace_ptr as *const ACE_HEADER) };
+                    if header.AceType as u32 == ace_type
+                        && (header.AceFlags as u32 & required_flags) == required_flags
+                    {
+                        let ace = unsafe { &*(ace_ptr as *const ACCESS_ALLOWED_ACE) };
+                        let ace_sid = (&ace.SidStart as *const u32) as PSID;
+                        if unsafe { EqualSid(ace_sid, target_sid) } != 0
+                            && (ace.Mask & required_mask) == required_mask
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !sd.is_null() {
+            unsafe {
+                LocalFree(sd as HLOCAL);
+            }
+        }
+        found
+    }
+
+    fn dacl_already_grants_sid_with_flags(
+        path: &Path,
+        target_sid: PSID,
+        required_mask: u32,
+        required_flags: u32,
+    ) -> bool {
+        dacl_has_ace(
+            path,
+            target_sid,
+            ACCESS_ALLOWED_ACE_TYPE,
+            required_mask,
+            required_flags,
+        )
+    }
+
+    fn dacl_already_grants_sid(path: &Path, target_sid: PSID, required_mask: u32) -> bool {
+        dacl_already_grants_sid_with_flags(path, target_sid, required_mask, 0)
+    }
+
+    fn dacl_already_denies_sid(path: &Path, target_sid: PSID, required_mask: u32) -> bool {
+        dacl_has_ace(path, target_sid, ACCESS_DENIED_ACE_TYPE, required_mask, 0)
+    }
+
+    fn merge_entries_on_path(path: &Path, entries: &[EXPLICIT_ACCESS_W]) -> io::Result<()> {
+        if !path.exists() || entries.is_empty() {
+            return Ok(());
+        }
+        let wide_path = to_wide(path.as_os_str());
+        let mut old_dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut old_dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            if !sd.is_null() {
+                unsafe {
+                    LocalFree(sd as HLOCAL);
+                }
+            }
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        let rc = unsafe {
+            SetEntriesInAclW(
+                entries.len() as u32,
+                entries.as_ptr(),
+                old_dacl,
+                &mut new_dacl,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            if !sd.is_null() {
+                unsafe {
+                    LocalFree(sd as HLOCAL);
+                }
+            }
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+
+        let set_rc = unsafe {
+            SetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                new_dacl,
+                std::ptr::null(),
+            )
+        };
+        unsafe {
+            if !new_dacl.is_null() {
+                LocalFree(new_dacl as HLOCAL);
+            }
+            if !sd.is_null() {
+                LocalFree(sd as HLOCAL);
+            }
+        }
+        if set_rc != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(set_rc as i32));
+        }
+        Ok(())
+    }
+
+    fn set_protected_dacl_on_path(path: &Path, entries: &[EXPLICIT_ACCESS_W]) -> io::Result<()> {
+        let wide_path = to_wide(path.as_os_str());
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        let rc = unsafe {
+            SetEntriesInAclW(
+                entries.len() as u32,
+                entries.as_ptr(),
+                std::ptr::null(),
+                &mut new_dacl,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        let set_rc = unsafe {
+            SetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                new_dacl,
+                std::ptr::null(),
+            )
+        };
+        unsafe {
+            if !new_dacl.is_null() {
+                LocalFree(new_dacl as HLOCAL);
+            }
+        }
+        if set_rc != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(set_rc as i32));
+        }
+        Ok(())
+    }
+
+    fn grant_ancestor_traverse(path: &Path, any_pkg_sid: PSID) {
+        let traverse_mask = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+        let mut cur = path.parent();
+        while let Some(dir) = cur {
+            if dir.parent().is_none() {
+                break;
+            }
+            if !dacl_already_grants_sid(dir, any_pkg_sid, traverse_mask) {
+                let entry =
+                    explicit_access(any_pkg_sid, traverse_mask, GRANT_ACCESS, NO_INHERITANCE);
+                let _ = merge_entries_on_path(dir, &[entry]);
+            }
+            cur = dir.parent();
+        }
+    }
+
+    fn deny_list_and_write_non_inherited(dir: &Path, any_pkg_sid: PSID) {
+        if !dir.exists() {
+            return;
+        }
+        let traverse_mask = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+        if !dacl_already_grants_sid(dir, any_pkg_sid, traverse_mask) {
+            let allow = explicit_access(any_pkg_sid, traverse_mask, GRANT_ACCESS, NO_INHERITANCE);
+            let _ = merge_entries_on_path(dir, &[allow]);
+        }
+        if dacl_already_grants_sid(dir, any_pkg_sid, FILE_LIST_DIRECTORY)
+            && !dacl_already_denies_sid(dir, any_pkg_sid, DIR_LIST_AND_WRITE_MASK)
+        {
+            let deny = explicit_access(
+                any_pkg_sid,
+                DIR_LIST_AND_WRITE_MASK,
+                DENY_ACCESS,
+                NO_INHERITANCE,
+            );
+            let _ = merge_entries_on_path(dir, &[deny]);
+        }
+    }
+
+    fn grant_rx_non_inherited(path: &Path, any_pkg_sid: PSID) {
+        if !path.exists() {
+            return;
+        }
+        let rx_mask = GENERIC_READ | GENERIC_EXECUTE;
+        if dacl_already_grants_sid(path, any_pkg_sid, FILE_READ_ATTRIBUTES) {
+            return;
+        }
+        let entry = explicit_access(any_pkg_sid, rx_mask, GRANT_ACCESS, NO_INHERITANCE);
+        let _ = merge_entries_on_path(path, &[entry]);
+    }
+
+    fn grant_rx_recursive_cached(path: &Path, any_pkg_sid: PSID) {
+        if !path.exists() {
+            return;
+        }
+        if let Ok(mut guard) = prepared_cache().lock() {
+            if guard.contains(path) {
+                return;
+            }
+            let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+            if dacl_already_grants_sid_with_flags(
+                path,
+                any_pkg_sid,
+                FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+                inherit,
+            ) {
+                guard.insert(path.to_path_buf());
+                return;
+            }
+            let rx_mask = GENERIC_READ | GENERIC_EXECUTE;
+            let entry = explicit_access(any_pkg_sid, rx_mask, GRANT_ACCESS, inherit);
+            if merge_entries_on_path(path, &[entry]).is_ok() {
+                guard.insert(path.to_path_buf());
+            }
+        }
+    }
+
+    fn deny_any_package_on_path(path: &Path, any_pkg_sid: PSID) {
+        if !path.exists() {
+            return;
+        }
+        if !dacl_already_denies_sid(path, any_pkg_sid, GENERIC_ALL) {
+            let entry = explicit_access(any_pkg_sid, GENERIC_ALL, DENY_ACCESS, NO_INHERITANCE);
+            let _ = merge_entries_on_path(path, &[entry]);
+        }
+        if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for e in entries.take(64).flatten() {
+                    let child = e.path();
+                    if child.is_file() && !dacl_already_denies_sid(&child, any_pkg_sid, GENERIC_ALL)
+                    {
+                        let entry =
+                            explicit_access(any_pkg_sid, GENERIC_ALL, DENY_ACCESS, NO_INHERITANCE);
+                        let _ = merge_entries_on_path(&child, &[entry]);
+                    }
+                }
+            }
+        }
+    }
+
+    fn parse_cargo_lock_packages(sandbox_path: &Path) -> Vec<String> {
+        let lock_path = sandbox_path.join("Cargo.lock");
+        let Ok(content) = std::fs::read_to_string(&lock_path) else {
+            return Vec::new();
+        };
+        let mut pkgs = Vec::new();
+        let mut cur_name: Option<String> = None;
+        let mut cur_ver: Option<String> = None;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed == "[[package]]" {
+                if let (Some(n), Some(v)) = (cur_name.take(), cur_ver.take()) {
+                    pkgs.push(format!("{n}-{v}"));
+                }
+            } else if let Some(rest) = trimmed.strip_prefix("name = ") {
+                cur_name = Some(rest.trim_matches('"').to_string());
+            } else if let Some(rest) = trimmed.strip_prefix("version = ") {
+                cur_ver = Some(rest.trim_matches('"').to_string());
+            }
+        }
+        if let (Some(n), Some(v)) = (cur_name, cur_ver) {
+            pkgs.push(format!("{n}-{v}"));
+        }
+        pkgs
+    }
+
+    fn index_prefix_relpath(crate_name: &str) -> PathBuf {
+        let lower = crate_name.to_ascii_lowercase();
+        match lower.len() {
+            1 => PathBuf::from("1").join(&lower),
+            2 => PathBuf::from("2").join(&lower),
+            3 => PathBuf::from("3").join(&lower[..1]).join(&lower),
+            _ => PathBuf::from(&lower[..2]).join(&lower[2..4]).join(&lower),
+        }
+    }
+
+    fn prepare_one_cargo_dir(sandbox_path: &Path, cargo: &Path, any_pkg_sid: PSID) {
+        if !cargo.exists() {
+            return;
+        }
+        grant_ancestor_traverse(cargo, any_pkg_sid);
+        grant_rx_non_inherited(cargo, any_pkg_sid);
+        for file in [
+            "config.toml",
+            "config",
+            ".package-cache",
+            ".package-cache-lock",
+        ] {
+            grant_rx_non_inherited(&cargo.join(file), any_pkg_sid);
+        }
+        grant_rx_recursive_cached(&cargo.join("bin"), any_pkg_sid);
+        grant_rx_recursive_cached(&cargo.join("git"), any_pkg_sid);
+        grant_rx_recursive_cached(&cargo.join("vendor"), any_pkg_sid);
+
+        let registry = cargo.join("registry");
+        if registry.exists() {
+            grant_rx_non_inherited(&registry, any_pkg_sid);
+            let src_dir = registry.join("src");
+            let cache_dir = registry.join("cache");
+            let index_dir = registry.join("index");
+            grant_rx_non_inherited(&src_dir, any_pkg_sid);
+            grant_rx_non_inherited(&cache_dir, any_pkg_sid);
+            grant_rx_non_inherited(&index_dir, any_pkg_sid);
+
+            let mut pkgs = parse_cargo_lock_packages(sandbox_path);
+            // Also include cached leaf crates used by offline build tests when no Cargo.lock
+            // exists yet in the sandbox.
+            if let Ok(remotes) = std::fs::read_dir(&cache_dir) {
+                for remote in remotes.flatten() {
+                    if let Ok(files) = std::fs::read_dir(remote.path()) {
+                        for f in files.flatten() {
+                            if let Some(stem) = f
+                                .file_name()
+                                .to_str()
+                                .and_then(|s| s.strip_suffix(".crate"))
+                            {
+                                if let Some((name, _)) = stem.rsplit_once('-') {
+                                    if [
+                                        "cfg-if",
+                                        "itoa",
+                                        "bytes",
+                                        "memchr",
+                                        "smallvec",
+                                        "once_cell",
+                                    ]
+                                    .contains(&name)
+                                        && !pkgs.iter().any(|p| p == stem)
+                                    {
+                                        pkgs.push(stem.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Ok(remotes) = std::fs::read_dir(&src_dir) {
+                for remote in remotes.flatten() {
+                    let remote_path = remote.path();
+                    grant_rx_non_inherited(&remote_path, any_pkg_sid);
+                    for pkg in &pkgs {
+                        grant_rx_recursive_cached(&remote_path.join(pkg), any_pkg_sid);
+                    }
+                }
+            }
+            if let Ok(remotes) = std::fs::read_dir(&cache_dir) {
+                for remote in remotes.flatten() {
+                    let remote_path = remote.path();
+                    grant_rx_non_inherited(&remote_path, any_pkg_sid);
+                    for pkg in &pkgs {
+                        grant_rx_non_inherited(
+                            &remote_path.join(format!("{pkg}.crate")),
+                            any_pkg_sid,
+                        );
+                    }
+                }
+            }
+            if let Ok(remotes) = std::fs::read_dir(&index_dir) {
+                for remote in remotes.flatten() {
+                    let remote_path = remote.path();
+                    grant_rx_non_inherited(&remote_path, any_pkg_sid);
+                    grant_rx_non_inherited(&remote_path.join("config.json"), any_pkg_sid);
+                    let dot_cache = remote_path.join(".cache");
+                    grant_rx_non_inherited(&dot_cache, any_pkg_sid);
+                    for pkg in &pkgs {
+                        if let Some((name, _)) = pkg.rsplit_once('-') {
+                            let rel = index_prefix_relpath(name);
+                            for root in [&remote_path, &dot_cache] {
+                                let target = root.join(&rel);
+                                if target.exists() {
+                                    let mut cur = target.parent();
+                                    while let Some(p) = cur {
+                                        if p == root {
+                                            break;
+                                        }
+                                        grant_rx_non_inherited(p, any_pkg_sid);
+                                        cur = p.parent();
+                                    }
+                                    grant_rx_non_inherited(&target, any_pkg_sid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Explicitly deny access to Cargo registry credentials if they would otherwise be
+        // readable by `ALL APPLICATION PACKAGES` (design 0033 D4.4).
+        for cred in ["credentials.toml", "credentials"] {
+            let p = cargo.join(cred);
+            if p.exists() && dacl_already_grants_sid(&p, any_pkg_sid, FILE_READ_ATTRIBUTES) {
+                deny_any_package_on_path(&p, any_pkg_sid);
+            }
+        }
+    }
+
+    fn prepare_home_and_toolchains(
+        jail: &Jail<'_>,
+        cmd_cargo_home: Option<&Path>,
+        cmd_rustup_home: Option<&Path>,
+        any_pkg_sid: PSID,
+    ) {
+        let home = &jail.host.user_home;
+        if !home.as_os_str().is_empty() && home.exists() {
+            deny_list_and_write_non_inherited(home, any_pkg_sid);
+            let ox_dir = home.join(".oxideswarm");
+            if ox_dir.exists() {
+                if jail.sandbox_dir.starts_with(&ox_dir) {
+                    deny_list_and_write_non_inherited(&ox_dir, any_pkg_sid);
+                    if let Ok(entries) = std::fs::read_dir(&ox_dir) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if !jail.sandbox_dir.starts_with(&p)
+                                && dacl_already_grants_sid(&p, any_pkg_sid, FILE_READ_ATTRIBUTES)
+                            {
+                                deny_any_package_on_path(&p, any_pkg_sid);
+                            }
+                        }
+                    }
+                } else if dacl_already_grants_sid(&ox_dir, any_pkg_sid, FILE_READ_ATTRIBUTES) {
+                    deny_any_package_on_path(&ox_dir, any_pkg_sid);
+                }
+            }
+            for dir_name in [".ssh", ".aws", ".gnupg", ".config"] {
+                let sub = home.join(dir_name);
+                if sub.exists() && dacl_already_grants_sid(&sub, any_pkg_sid, FILE_READ_ATTRIBUTES)
+                {
+                    deny_any_package_on_path(&sub, any_pkg_sid);
+                }
+            }
+        }
+
+        for rustup in [Some(jail.host.rustup_home.as_path()), cmd_rustup_home]
+            .into_iter()
+            .flatten()
+        {
+            if rustup.exists() {
+                grant_ancestor_traverse(rustup, any_pkg_sid);
+                grant_rx_non_inherited(rustup, any_pkg_sid);
+                grant_rx_non_inherited(&rustup.join("settings.toml"), any_pkg_sid);
+                let tc_root = rustup.join("toolchains");
+                grant_rx_non_inherited(&tc_root, any_pkg_sid);
+                if let Ok(entries) = std::fs::read_dir(&tc_root) {
+                    for entry in entries.flatten() {
+                        let tc_dir = entry.path();
+                        grant_rx_non_inherited(&tc_dir, any_pkg_sid);
+                        grant_rx_recursive_cached(&tc_dir.join("bin"), any_pkg_sid);
+                        grant_rx_recursive_cached(&tc_dir.join("lib"), any_pkg_sid);
+                        grant_rx_recursive_cached(&tc_dir.join("libexec"), any_pkg_sid);
+                    }
+                }
+            }
+        }
+
+        prepare_one_cargo_dir(jail.sandbox_dir, &jail.host.cargo_home, any_pkg_sid);
+        if let Some(custom_cargo) = cmd_cargo_home {
+            if custom_cargo != jail.host.cargo_home {
+                prepare_one_cargo_dir(jail.sandbox_dir, custom_cargo, any_pkg_sid);
+            }
+        }
+
+        let program_data = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        let vs_root = program_data.join("Microsoft").join("VisualStudio");
+        for sub in [
+            vs_root.join("Setup"),
+            vs_root.join("Packages").join("_Instances"),
+        ] {
+            if sub.exists() {
+                grant_ancestor_traverse(&sub, any_pkg_sid);
+                grant_rx_recursive_cached(&sub, any_pkg_sid);
+            }
+        }
+    }
+
+    fn apply_dacl_to_existing_tree(root: &Path, entries: &[EXPLICIT_ACCESS_W]) -> io::Result<()> {
+        set_protected_dacl_on_path(root, entries)?;
+        let mut queue = VecDeque::new();
+        queue.push_back(root.to_path_buf());
+        while let Some(dir) = queue.pop_front() {
+            let Ok(read_dir) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                let _ = set_protected_dacl_on_path(&path, entries);
+                if path.is_dir() {
+                    queue.push_back(path);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Per-task Windows AppContainer state that must outlive `CreateProcessW` and deletes the
+    /// AppContainer profile when the task's `ProcessTree` is dropped.
+    pub struct WindowsAppContainerGuard {
+        wide_profile_name: Vec<u16>,
+        app_container_sid: PSID,
+        _capability_sids: Vec<OwnedSid>,
+        _capability_attrs: Vec<SID_AND_ATTRIBUTES>,
+        security_capabilities: Box<SECURITY_CAPABILITIES>,
+        cleaned_up: bool,
+    }
+
+    // SAFETY: WindowsAppContainerGuard owns its heap allocations and raw pointers are only read
+    // synchronously during `CreateProcessW` before `spawn()` returns.
+    unsafe impl Send for WindowsAppContainerGuard {}
+    unsafe impl Sync for WindowsAppContainerGuard {}
+
+    impl WindowsAppContainerGuard {
+        pub(crate) fn create(
+            task_id: rusty_grid_core::TaskId,
+            jail: &Jail<'_>,
+            cmd: &tokio::process::Command,
+        ) -> io::Result<Self> {
+            let std_cmd = cmd.as_std();
+            let program = std_cmd.get_program().to_string_lossy().to_string();
+            let mut cmd_cargo_home: Option<PathBuf> = None;
+            let mut cmd_rustup_home: Option<PathBuf> = None;
+            for (k, v) in std_cmd.get_envs() {
+                if k.eq_ignore_ascii_case("CARGO_HOME") {
+                    cmd_cargo_home = v.map(PathBuf::from);
+                } else if k.eq_ignore_ascii_case("RUSTUP_HOME") {
+                    cmd_rustup_home = v.map(PathBuf::from);
+                }
+            }
+
+            let profile_name = format!("oxideswarm.task.{}", task_id.0);
+            let wide_profile_name = to_wide(OsStr::new(&profile_name));
+            let wide_display = to_wide(OsStr::new("OxideSwarm Task Sandbox"));
+
+            let mut app_container_sid: PSID = std::ptr::null_mut();
+            let hr = unsafe {
+                CreateAppContainerProfile(
+                    wide_profile_name.as_ptr(),
+                    wide_display.as_ptr(),
+                    wide_display.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    &mut app_container_sid,
+                )
+            };
+            let hr = if hr == HRESULT_ALREADY_EXISTS {
+                unsafe {
+                    DeriveAppContainerSidFromAppContainerName(
+                        wide_profile_name.as_ptr(),
+                        &mut app_container_sid,
+                    )
+                }
+            } else {
+                hr
+            };
+            if hr < 0 || app_container_sid.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("CreateAppContainerProfile({profile_name}) failed: HRESULT 0x{hr:08x}"),
+                ));
+            }
+
+            let user_sid = OwnedSid::current_user()?;
+            let system_sid = OwnedSid::from_well_known(WinLocalSystemSid)?;
+            let admins_sid = OwnedSid::from_well_known(WinBuiltinAdministratorsSid)?;
+            let any_pkg_sid = OwnedSid::from_well_known(WinBuiltinAnyPackageSid)?;
+
+            ensure_window_station_and_desktop_access(any_pkg_sid.as_psid());
+
+            let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+            let owner_only_entries = [
+                explicit_access(user_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
+                explicit_access(system_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
+                explicit_access(admins_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
+            ];
+
+            {
+                let _guard = PREPARE_LOCK
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+                // 1. Protect `<sandbox_base>` so sibling sandboxes cannot be listed or read.
+                let sandbox_base = jail.sandbox_base;
+                if sandbox_base.exists() {
+                    grant_ancestor_traverse(sandbox_base, any_pkg_sid.as_psid());
+                    let traverse_mask = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+                    if !dacl_already_grants_sid(sandbox_base, any_pkg_sid.as_psid(), traverse_mask)
+                        || dacl_already_grants_sid(
+                            sandbox_base,
+                            any_pkg_sid.as_psid(),
+                            FILE_LIST_DIRECTORY,
+                        )
+                    {
+                        let base_entries = [
+                            owner_only_entries[0],
+                            owner_only_entries[1],
+                            owner_only_entries[2],
+                            explicit_access(
+                                any_pkg_sid.as_psid(),
+                                traverse_mask,
+                                SET_ACCESS,
+                                NO_INHERITANCE,
+                            ),
+                        ];
+                        let _ = set_protected_dacl_on_path(sandbox_base, &base_entries);
+                    }
+
+                    if let Ok(entries) = std::fs::read_dir(sandbox_base) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p == jail.sandbox_dir {
+                                continue;
+                            }
+                            if dacl_already_grants_sid(
+                                &p,
+                                any_pkg_sid.as_psid(),
+                                FILE_READ_ATTRIBUTES,
+                            ) {
+                                let _ = apply_dacl_to_existing_tree(&p, &owner_only_entries);
+                            }
+                        }
+                    }
+                }
+
+                // 2. Grant read+execute on host Rust/Cargo toolchains and deny access to secrets.
+                prepare_home_and_toolchains(
+                    jail,
+                    cmd_cargo_home.as_deref(),
+                    cmd_rustup_home.as_deref(),
+                    any_pkg_sid.as_psid(),
+                );
+
+                // 3. If `program` is an explicit path outside C:\Windows (e.g. Python in
+                //    %LOCALAPPDATA%), ensure the executable and its stdlib/DLLs are RX.
+                let prog_path = Path::new(&program);
+                if prog_path.is_absolute() && prog_path.exists() {
+                    grant_ancestor_traverse(prog_path, any_pkg_sid.as_psid());
+                    grant_rx_non_inherited(prog_path, any_pkg_sid.as_psid());
+                    if let Some(prog_dir) = prog_path.parent() {
+                        let is_home = prog_dir == jail.host.user_home;
+                        let in_sandbox_base = prog_dir.starts_with(jail.sandbox_base);
+                        if !is_home && !in_sandbox_base {
+                            grant_rx_non_inherited(prog_dir, any_pkg_sid.as_psid());
+                            if let Ok(entries) = std::fs::read_dir(prog_dir) {
+                                for entry in entries.flatten() {
+                                    let p = entry.path();
+                                    if p.is_file() {
+                                        grant_rx_non_inherited(&p, any_pkg_sid.as_psid());
+                                    } else if p.is_dir() {
+                                        let name = entry.file_name();
+                                        if name.eq_ignore_ascii_case("Lib") {
+                                            grant_rx_non_inherited(&p, any_pkg_sid.as_psid());
+                                            if let Ok(lib_entries) = std::fs::read_dir(&p) {
+                                                for le in lib_entries.flatten() {
+                                                    let lp = le.path();
+                                                    let lname = le.file_name();
+                                                    if lname.eq_ignore_ascii_case("site-packages")
+                                                        || lname.eq_ignore_ascii_case("test")
+                                                    {
+                                                        continue;
+                                                    }
+                                                    if lp.is_file() {
+                                                        grant_rx_non_inherited(
+                                                            &lp,
+                                                            any_pkg_sid.as_psid(),
+                                                        );
+                                                    } else if lp.is_dir() {
+                                                        grant_rx_recursive_cached(
+                                                            &lp,
+                                                            any_pkg_sid.as_psid(),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        } else if name.eq_ignore_ascii_case("DLLs")
+                                            || name.eq_ignore_ascii_case("libs")
+                                            || name.eq_ignore_ascii_case("bin")
+                                        {
+                                            grant_rx_recursive_cached(&p, any_pkg_sid.as_psid());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4. Set a protected DACL on `<sandbox_dir>` granting full control only to
+            //    CurrentUser, SYSTEM, Administrators, and this task's specific AppContainer SID.
+            grant_ancestor_traverse(jail.sandbox_dir, any_pkg_sid.as_psid());
+            let sandbox_entries = [
+                owner_only_entries[0],
+                owner_only_entries[1],
+                owner_only_entries[2],
+                explicit_access(app_container_sid, FILE_ALL_ACCESS, SET_ACCESS, inherit),
+            ];
+            apply_dacl_to_existing_tree(jail.sandbox_dir, &sandbox_entries)?;
+
+            // 5. Build SECURITY_CAPABILITIES for `Fs` (outbound + LAN client/server) or `FsNet` (0 caps).
+            let mut capability_sids = Vec::new();
+            let mut capability_attrs = Vec::new();
+            if jail.level == IsolationLevel::Fs {
+                let net_client = OwnedSid::from_well_known(WinCapabilityInternetClientSid)?;
+                let net_private =
+                    OwnedSid::from_well_known(WinCapabilityPrivateNetworkClientServerSid)?;
+                capability_attrs.push(SID_AND_ATTRIBUTES {
+                    Sid: net_client.as_psid(),
+                    Attributes: SE_GROUP_ENABLED as u32,
+                });
+                capability_attrs.push(SID_AND_ATTRIBUTES {
+                    Sid: net_private.as_psid(),
+                    Attributes: SE_GROUP_ENABLED as u32,
+                });
+                capability_sids.push(net_client);
+                capability_sids.push(net_private);
+            }
+
+            let security_capabilities = Box::new(SECURITY_CAPABILITIES {
+                AppContainerSid: app_container_sid,
+                Capabilities: if capability_attrs.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    capability_attrs.as_mut_ptr()
+                },
+                CapabilityCount: capability_attrs.len() as u32,
+                Reserved: 0,
+            });
+
+            Ok(Self {
+                wide_profile_name,
+                app_container_sid,
+                _capability_sids: capability_sids,
+                _capability_attrs: capability_attrs,
+                security_capabilities,
+                cleaned_up: false,
+            })
+        }
+
+        pub fn spawn_in_appcontainer(
+            &self,
+            cmd: &mut tokio::process::Command,
+            creation_flags: u32,
+        ) -> io::Result<AppContainerChild> {
+            spawn_with_security_capabilities(
+                cmd.as_std(),
+                &self.security_capabilities,
+                creation_flags,
+            )
+        }
+
+        pub fn cleanup(&mut self) {
+            if self.cleaned_up {
+                return;
+            }
+            self.cleaned_up = true;
+            unsafe {
+                if !self.app_container_sid.is_null() {
+                    FreeSid(self.app_container_sid);
+                    self.app_container_sid = std::ptr::null_mut();
+                }
+                let _ = DeleteAppContainerProfile(self.wide_profile_name.as_ptr());
+            }
+        }
+    }
+
+    impl Drop for WindowsAppContainerGuard {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
+    }
+
+    /// Start-up self-check on Windows: creates a probe AppContainer profile and runs a probe
+    /// command inside `sandbox_base/.isolation-probe-<pid>` verifying that the task can write
+    /// inside its sandbox and cannot write into `sandbox_base`.
+    pub(super) async fn probe(level: IsolationLevel, sandbox_base: &Path) -> Result<(), String> {
+        let fail =
+            |what: String| format!("--isolation {level} cannot be enforced on this host: {what}");
+        let probe_dir = sandbox_base.join(format!(".isolation-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&probe_dir).map_err(|e| {
+            format!(
+                "--isolation {level}: cannot create the probe directory {}: {e}",
+                probe_dir.display()
+            )
+        })?;
+        let outside_name = format!(".isolation-outside-{}", std::process::id());
+        let outside_file = sandbox_base.join(&outside_name);
+        let outcome = async {
+            let host =
+                HostDirs::from_home(PathBuf::new(), Some(PathBuf::new()), Some(PathBuf::new()));
+            let jail = Jail {
+                level,
+                host: &host,
+                sandbox_base,
+                sandbox_dir: &probe_dir,
+            };
+            let comspec = std::env::var("COMSPEC")
+                .unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+            let cmd_line = format!(
+                "echo ok > inside && (echo no > ..\\{outside_name} 2>nul && exit /b 3 || exit /b 0)"
+            );
+            let mut cmd = tokio::process::Command::new(&comspec);
+            cmd.args(["/C", &cmd_line]);
+            cmd.current_dir(&probe_dir);
+            let probe_id = rusty_grid_core::TaskId::new();
+            let guard = WindowsAppContainerGuard::create(probe_id, &jail, &cmd)
+                .map_err(|e| fail(format!("AppContainer setup failed: {e}")))?;
+            let mut child = guard
+                .spawn_in_appcontainer(&mut cmd, 0)
+                .map_err(|e| fail(format!("could not spawn AppContainer probe: {e}")))?;
+            let status = child
+                .wait()
+                .await
+                .map_err(|e| fail(format!("waiting for AppContainer probe failed: {e}")))?;
+            drop(guard);
+            match status.code() {
+                Some(0) if probe_dir.join("inside").exists() && !outside_file.exists() => Ok(()),
+                Some(3) => Err(fail(
+                    "the probe wrote outside its sandbox, so the AppContainer DACL was not enforced"
+                        .to_string(),
+                )),
+                _ => Err(fail(format!("the probe failed ({status})"))),
+            }
+        }
+        .await;
+        let _ = std::fs::remove_file(&outside_file);
+        let _ = std::fs::remove_dir_all(&probe_dir);
+        outcome
+    }
+
+    struct WinProcessHandle(HANDLE);
+    unsafe impl Send for WinProcessHandle {}
+    unsafe impl Sync for WinProcessHandle {}
+
+    impl Drop for WinProcessHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    /// A child process spawned inside a Windows AppContainer via `CreateProcessW` +
+    /// `STARTUPINFOEXW` (`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`).
+    pub struct AppContainerChild {
+        process: Arc<WinProcessHandle>,
+        pid: u32,
+        pub stdin: Option<tokio::fs::File>,
+        pub stdout: Option<tokio::fs::File>,
+        pub stderr: Option<tokio::fs::File>,
+        exited: bool,
+    }
+
+    impl AppContainerChild {
+        pub fn id(&self) -> Option<u32> {
+            if self.exited {
+                None
+            } else {
+                Some(self.pid)
+            }
+        }
+
+        pub fn raw_handle(&self) -> Option<*mut core::ffi::c_void> {
+            if self.exited {
+                None
+            } else {
+                Some(self.process.0)
+            }
+        }
+
+        pub fn start_kill(&mut self) -> io::Result<()> {
+            if !self.exited {
+                unsafe {
+                    let _ = TerminateProcess(self.process.0, 1);
+                }
+            }
+            Ok(())
+        }
+
+        pub async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+            drop(self.stdin.take());
+            let proc_handle = Arc::clone(&self.process);
+            let status = tokio::task::spawn_blocking(move || unsafe {
+                let wait_rc = WaitForSingleObject(proc_handle.0, INFINITE);
+                if wait_rc != WAIT_OBJECT_0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let mut code: u32 = 1;
+                if GetExitCodeProcess(proc_handle.0, &mut code) == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(std::process::ExitStatus::from_raw(code))
+            })
+            .await
+            .map_err(|e| io::Error::other(format!("AppContainer wait join error: {e}")))??;
+            self.exited = true;
+            Ok(status)
+        }
+    }
+
+    impl Drop for AppContainerChild {
+        fn drop(&mut self) {
+            if !self.exited {
+                unsafe {
+                    let _ = TerminateProcess(self.process.0, 1);
+                }
+            }
+        }
+    }
+
+    fn append_windows_quoted_arg(cmd: &mut Vec<u16>, arg: &OsStr, force_quotes: bool) {
+        let wide: Vec<u16> = arg.encode_wide().collect();
+        let needs_quotes = force_quotes
+            || wide.is_empty()
+            || wide.iter().any(|&c| {
+                c == b' ' as u16
+                    || c == b'\t' as u16
+                    || c == b'\n' as u16
+                    || c == 0x0b
+                    || c == b'"' as u16
+            });
+        if !needs_quotes {
+            cmd.extend_from_slice(&wide);
+            return;
+        }
+        cmd.push(b'"' as u16);
+        let mut backslashes = 0usize;
+        for &ch in &wide {
+            if ch == b'\\' as u16 {
+                backslashes += 1;
+            } else if ch == b'"' as u16 {
+                for _ in 0..(backslashes * 2 + 1) {
+                    cmd.push(b'\\' as u16);
+                }
+                cmd.push(b'"' as u16);
+                backslashes = 0;
+            } else {
+                for _ in 0..backslashes {
+                    cmd.push(b'\\' as u16);
+                }
+                backslashes = 0;
+                cmd.push(ch);
+            }
+        }
+        for _ in 0..(backslashes * 2) {
+            cmd.push(b'\\' as u16);
+        }
+        cmd.push(b'"' as u16);
+    }
+
+    fn build_windows_command_line(std_cmd: &std::process::Command) -> Vec<u16> {
+        let mut cmdline = Vec::new();
+        let prog = std_cmd.get_program();
+        let is_cmd_exe = Path::new(prog)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("cmd"));
+        append_windows_quoted_arg(&mut cmdline, prog, true);
+        let args: Vec<&OsStr> = std_cmd.get_args().collect();
+        if is_cmd_exe && args.len() == 2 && args[0].eq_ignore_ascii_case("/C") {
+            cmdline.extend_from_slice(&[
+                b' ' as u16,
+                b'/' as u16,
+                b'C' as u16,
+                b' ' as u16,
+                b'"' as u16,
+            ]);
+            cmdline.extend(args[1].encode_wide());
+            cmdline.push(b'"' as u16);
+        } else {
+            for arg in args {
+                cmdline.push(b' ' as u16);
+                append_windows_quoted_arg(&mut cmdline, arg, false);
+            }
+        }
+        cmdline.push(0);
+        cmdline
+    }
+
+    fn build_windows_env_block(std_cmd: &std::process::Command) -> Vec<u16> {
+        let mut env_map: BTreeMap<String, (OsString, OsString)> = BTreeMap::new();
+        for (k, v) in std::env::vars_os() {
+            env_map.insert(k.to_string_lossy().to_uppercase(), (k, v));
+        }
+        for (k, v_opt) in std_cmd.get_envs() {
+            let upper = k.to_string_lossy().to_uppercase();
+            match v_opt {
+                Some(v) => {
+                    env_map.insert(upper, (k.to_os_string(), v.to_os_string()));
+                }
+                None => {
+                    env_map.remove(&upper);
+                }
+            }
+        }
+        let mut block = Vec::new();
+        for (_, (k, v)) in env_map {
+            block.extend(k.encode_wide());
+            block.push(b'=' as u16);
+            block.extend(v.encode_wide());
+            block.push(0);
+        }
+        if block.is_empty() {
+            block.push(0);
+        }
+        block.push(0);
+        block
+    }
+
+    fn create_pipe_pair(child_is_read: bool) -> io::Result<(HANDLE, HANDLE)> {
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        let mut read_pipe: HANDLE = std::ptr::null_mut();
+        let mut write_pipe: HANDLE = std::ptr::null_mut();
+        let ok = unsafe { CreatePipe(&mut read_pipe, &mut write_pipe, &sa, 0) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let parent_handle = if child_is_read { write_pipe } else { read_pipe };
+        if unsafe { SetHandleInformation(parent_handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            let err = io::Error::last_os_error();
+            unsafe {
+                CloseHandle(read_pipe);
+                CloseHandle(write_pipe);
+            }
+            return Err(err);
+        }
+        Ok((read_pipe, write_pipe))
+    }
+
+    fn spawn_with_security_capabilities(
+        std_cmd: &std::process::Command,
+        sc: &SECURITY_CAPABILITIES,
+        creation_flags: u32,
+    ) -> io::Result<AppContainerChild> {
+        let (stdin_read, stdin_write) = create_pipe_pair(true)?;
+        let (stdout_read, stdout_write) = match create_pipe_pair(false) {
+            Ok(p) => p,
+            Err(e) => {
+                unsafe {
+                    CloseHandle(stdin_read);
+                    CloseHandle(stdin_write);
+                }
+                return Err(e);
+            }
+        };
+        let (stderr_read, stderr_write) = match create_pipe_pair(false) {
+            Ok(p) => p,
+            Err(e) => {
+                unsafe {
+                    CloseHandle(stdin_read);
+                    CloseHandle(stdin_write);
+                    CloseHandle(stdout_read);
+                    CloseHandle(stdout_write);
+                }
+                return Err(e);
+            }
+        };
+
+        let mut inherited_handles: [HANDLE; 3] = [stdin_read, stdout_write, stderr_write];
+        let mut attr_size: usize = 0;
+        unsafe {
+            let _ = InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut attr_size);
+        }
+        let mut attr_buf = vec![0u8; attr_size.max(64)];
+        let attr_list = attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+        if unsafe { InitializeProcThreadAttributeList(attr_list, 2, 0, &mut attr_size) } == 0 {
+            let err = io::Error::last_os_error();
+            unsafe {
+                CloseHandle(stdin_read);
+                CloseHandle(stdin_write);
+                CloseHandle(stdout_read);
+                CloseHandle(stdout_write);
+                CloseHandle(stderr_read);
+                CloseHandle(stderr_write);
+            }
+            return Err(err);
+        }
+
+        let sc_ok = unsafe {
+            UpdateProcThreadAttribute(
+                attr_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                sc as *const SECURITY_CAPABILITIES as *const core::ffi::c_void,
+                std::mem::size_of::<SECURITY_CAPABILITIES>(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        let hl_ok = if sc_ok != 0 {
+            unsafe {
+                UpdateProcThreadAttribute(
+                    attr_list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    inherited_handles.as_mut_ptr() as *const core::ffi::c_void,
+                    inherited_handles.len() * std::mem::size_of::<HANDLE>(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            }
+        } else {
+            0
+        };
+        if sc_ok == 0 || hl_ok == 0 {
+            let err = io::Error::last_os_error();
+            unsafe {
+                DeleteProcThreadAttributeList(attr_list);
+                CloseHandle(stdin_read);
+                CloseHandle(stdin_write);
+                CloseHandle(stdout_read);
+                CloseHandle(stdout_write);
+                CloseHandle(stderr_read);
+                CloseHandle(stderr_write);
+            }
+            return Err(err);
+        }
+
+        let mut cmdline = build_windows_command_line(std_cmd);
+        let env_block = build_windows_env_block(std_cmd);
+        let cwd_wide = std_cmd.get_current_dir().map(|p| to_wide(p.as_os_str()));
+        let cwd_ptr = cwd_wide.as_ref().map_or(std::ptr::null(), |w| w.as_ptr());
+
+        let mut si_ex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        si_ex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si_ex.StartupInfo.hStdInput = stdin_read;
+        si_ex.StartupInfo.hStdOutput = stdout_write;
+        si_ex.StartupInfo.hStdError = stderr_write;
+        si_ex.lpAttributeList = attr_list;
+
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        let flags = creation_flags | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
+        let spawned = unsafe {
+            CreateProcessW(
+                std::ptr::null(),
+                cmdline.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                flags,
+                env_block.as_ptr() as *const core::ffi::c_void,
+                cwd_ptr,
+                &si_ex.StartupInfo,
+                &mut pi,
+            )
+        };
+        let spawn_err = if spawned == 0 {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        };
+
+        unsafe {
+            DeleteProcThreadAttributeList(attr_list);
+            CloseHandle(stdin_read);
+            CloseHandle(stdout_write);
+            CloseHandle(stderr_write);
+        }
+
+        if let Some(err) = spawn_err {
+            unsafe {
+                CloseHandle(stdin_write);
+                CloseHandle(stdout_read);
+                CloseHandle(stderr_read);
+            }
+            return Err(err);
+        }
+
+        unsafe {
+            CloseHandle(pi.hThread);
+        }
+
+        let stdin_file =
+            unsafe { tokio::fs::File::from_std(std::fs::File::from_raw_handle(stdin_write as _)) };
+        let stdout_file =
+            unsafe { tokio::fs::File::from_std(std::fs::File::from_raw_handle(stdout_read as _)) };
+        let stderr_file =
+            unsafe { tokio::fs::File::from_std(std::fs::File::from_raw_handle(stderr_read as _)) };
+
+        Ok(AppContainerChild {
+            process: Arc::new(WinProcessHandle(pi.hProcess)),
+            pid: pi.dwProcessId,
+            stdin: Some(stdin_file),
+            stdout: Some(stdout_file),
+            stderr: Some(stderr_file),
+            exited: false,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,7 +2195,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     #[tokio::test]
     async fn test_self_check_refuses_isolation_without_an_implementation() {
         let dir = tempfile::tempdir().unwrap();
@@ -602,7 +2217,7 @@ mod tests {
             .expect("off needs nothing");
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     #[test]
     fn test_wrap_program_never_returns_the_plain_command() {
         let h = host();
@@ -616,7 +2231,7 @@ mod tests {
         assert!(err.contains("not implemented yet"), "{err}");
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     #[tokio::test]
     async fn test_self_check_passes_on_macos() {
         let dir = tempfile::tempdir().unwrap();
@@ -627,5 +2242,32 @@ mod tests {
         }
         let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert!(leftovers.is_empty(), "the probe cleans up after itself");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_wrap_program_resolves_or_rejects_missing_executable_on_windows() {
+        let h = host();
+        let jail = Jail {
+            level: IsolationLevel::Fs,
+            host: &h,
+            sandbox_base: Path::new(r"C:\sb"),
+            sandbox_dir: Path::new(r"C:\sb\t"),
+        };
+        let err =
+            wrap_program(&jail, "no-such-program-feat3", &[], r"C:\Windows\System32").unwrap_err();
+        assert!(err.contains("not found in PATH"), "{err}");
+        let (resolved, args) = wrap_program(
+            &jail,
+            "cmd",
+            &["/C".into(), "echo".into()],
+            r"C:\Windows\System32",
+        )
+        .expect("cmd.exe resolves in System32");
+        assert!(
+            resolved.to_ascii_lowercase().ends_with("cmd.exe"),
+            "{resolved}"
+        );
+        assert_eq!(args, vec!["/C".to_string(), "echo".to_string()]);
     }
 }

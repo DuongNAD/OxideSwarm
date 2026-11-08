@@ -238,13 +238,17 @@ pub enum TaskRunnerError {
 
 #[cfg(windows)]
 fn augment_windows_path(existing_path: &str) -> String {
-    let paths_to_check = [
+    let mut paths_to_check = Vec::new();
+    if let Some((msvc_bin, _)) = crate::isolation::windows::resolve_windows_msvc_env() {
+        paths_to_check.push(msvc_bin);
+    }
+    paths_to_check.extend([
         std::path::PathBuf::from(r"C:\Program Files\Git\usr\bin"),
         std::path::PathBuf::from(r"C:\Program Files\Git\bin"),
         std::path::PathBuf::from(r"C:\Program Files (x86)\Git\usr\bin"),
         std::path::PathBuf::from(r"C:\Program Files (x86)\Git\bin"),
         std::path::PathBuf::from(r"C:\msys64\usr\bin"),
-    ];
+    ]);
 
     let mut prefix = String::new();
     for p in &paths_to_check {
@@ -344,7 +348,9 @@ fn resolve_windows_executable(program: &str, effective_path: &str) -> String {
                 return with_ext;
             }
         }
-        return program.to_string();
+        if !program.starts_with("/bin/") && !program.starts_with("/usr/bin/") {
+            return program.to_string();
+        }
     }
 
     let bare_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(program);
@@ -483,11 +489,11 @@ struct OutputReaders {
 }
 
 impl OutputReaders {
-    fn spawn(
-        stdout: Option<tokio::process::ChildStdout>,
-        stderr: Option<tokio::process::ChildStderr>,
-        max_bytes: usize,
-    ) -> Self {
+    fn spawn<Out, Err>(stdout: Option<Out>, stderr: Option<Err>, max_bytes: usize) -> Self
+    where
+        Out: tokio::io::AsyncRead + Unpin + Send + 'static,
+        Err: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
         let stdout_capture = SharedCapture::default();
         let stderr_capture = SharedCapture::default();
         Self {
@@ -2688,6 +2694,12 @@ impl TaskRunner {
             for name in &plan.remove {
                 cmd.env_remove(name);
             }
+            #[cfg(windows)]
+            if !env.contains_key("LIB") {
+                if let Some((_, msvc_lib)) = crate::isolation::windows::resolve_windows_msvc_env() {
+                    cmd.env("LIB", msvc_lib);
+                }
+            }
         }
 
         cmd.stdout(std::process::Stdio::piped());
@@ -2703,6 +2715,37 @@ impl TaskRunner {
         // below takes care of everything else.
         cmd.kill_on_drop(true);
         let mut configured = configure_command(&mut cmd, self.config.process_priority, task_id);
+
+        #[cfg(windows)]
+        if self.config.isolation != IsolationLevel::Off {
+            let jail = crate::isolation::Jail {
+                level: self.config.isolation,
+                host: &self.config.host_dirs,
+                sandbox_base: &self.config.sandbox_config.base_dir,
+                sandbox_dir: sandbox_path,
+            };
+            match crate::isolation::windows::WindowsAppContainerGuard::create(task_id, &jail, &cmd)
+            {
+                Ok(guard) => configured.set_app_container(guard),
+                Err(e) => {
+                    return TaskResult::failure(
+                        self.worker_id,
+                        task_id,
+                        EXIT_CODE_GENERAL_ERROR,
+                        "",
+                        format!(
+                            "Cannot run '{program}' with --isolation {}: {e}",
+                            jail.level
+                        ),
+                        start_time.elapsed().as_millis() as u64,
+                        Some(format!(
+                            "Isolation error for '{program}' ({}): {e}",
+                            jail.level
+                        )),
+                    );
+                }
+            }
+        }
 
         let mut child = match configured.spawn(&mut cmd) {
             Ok(c) => c,
@@ -2733,8 +2776,15 @@ impl TaskRunner {
             holder.store(pid, Ordering::Release);
         }
 
+        #[cfg(windows)]
+        let (child_stdin, child_stdout, child_stderr) =
+            (child.take_stdin(), child.take_stdout(), child.take_stderr());
+        #[cfg(not(windows))]
+        let (child_stdin, child_stdout, child_stderr) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take());
+
         // Concurrent asynchronous stdin writer
-        let _stdin_writer = match (child.stdin.take(), stdin_data) {
+        let _stdin_writer = match (child_stdin, stdin_data) {
             (Some(mut writer), Some(bytes)) => Some(AbortOnDrop(tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
                 let _ = writer.write_all(&bytes).await;
@@ -2745,11 +2795,8 @@ impl TaskRunner {
         };
 
         // Concurrent asynchronous bounded stdout / stderr readers
-        let mut readers = OutputReaders::spawn(
-            child.stdout.take(),
-            child.stderr.take(),
-            self.config.max_output_bytes,
-        );
+        let mut readers =
+            OutputReaders::spawn(child_stdout, child_stderr, self.config.max_output_bytes);
 
         enum Ended {
             Exited(std::io::Result<std::process::ExitStatus>),
@@ -2859,7 +2906,7 @@ impl TaskRunner {
     /// Ends a task's process tree: a polite stop (`SIGTERM`; Windows has none), a short grace
     /// period for the leader to wind down, then a kill of everything that is left, and the leader
     /// is reaped so that no zombie remains. Never blocks a runtime thread.
-    async fn stop_tree(&self, child: &mut tokio::process::Child, tree: &ProcessTree) {
+    async fn stop_tree(&self, child: &mut crate::process_tree::SpawnedChild, tree: &ProcessTree) {
         if tree.request_stop() {
             let _ = tokio::time::timeout(self.config.stop_grace, child.wait()).await;
         }

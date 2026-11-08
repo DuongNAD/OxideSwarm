@@ -9,7 +9,10 @@
 //! `.ssh/test_key`), its own sandbox base and loopback ports; nothing touches the developer's
 //! real `~/.oxideswarm`. The real Rust toolchain is only read.
 
-#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+#![cfg_attr(
+    not(any(target_os = "macos", windows)),
+    allow(dead_code, unused_imports)
+)]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -109,6 +112,7 @@ impl Rig {
         ])
     }
 
+    #[cfg(not(windows))]
     fn task(&self, script: &str, extra_env: &[(&str, &str)], timeout_secs: u64) -> Task {
         let mut env = self.env();
         for (k, v) in extra_env {
@@ -126,6 +130,7 @@ impl Rig {
         )
     }
 
+    #[cfg(not(windows))]
     async fn run(&self, script: &str) -> TaskResult {
         self.runner
             .execute_task(&self.task(script, &[], 60), None, None)
@@ -137,6 +142,7 @@ fn lines(result: &TaskResult) -> Vec<String> {
     result.stdout_str().lines().map(str::to_string).collect()
 }
 
+#[cfg(not(windows))]
 const FS_SCRIPT: &str = r#"
 echo hello > "$RUSTY_GRID_SANDBOX_DIR/allowed.txt" && echo WRITE_OK
 [ "$(cat "$RUSTY_GRID_SANDBOX_DIR/allowed.txt")" = hello ] && echo READ_OK
@@ -152,7 +158,7 @@ ls "$T_HOME" > /dev/null 2>&1 && echo LEAK_HOME_LISTING || echo DENY_HOME_LISTIN
 ( echo x > /private/tmp/feat3_outside_marker ) 2>/dev/null && echo LEAK_WRITE_TMP || echo DENY_WRITE_TMP
 "#;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn assert_fs_policy_holds(result: &TaskResult, what: &str) {
     assert!(
         result.is_success(),
@@ -565,9 +571,539 @@ cargo build --offline 2>&1
     }
 }
 
-/// Where there is no implementation yet (FEAT-3b: Linux, FEAT-3c: Windows) isolation is refused
+#[cfg(windows)]
+mod windows {
+    use super::*;
+
+    fn win_task(rig: &Rig, script: &str, extra_env: &[(&str, &str)], timeout_secs: u64) -> Task {
+        let mut env = rig.env();
+        for (k, v) in extra_env {
+            env.insert((*k).into(), (*v).into());
+        }
+        Task::new(
+            TaskSpec::Command {
+                program: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".into(),
+                args: vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    script.into(),
+                ],
+                env,
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, timeout_secs),
+        )
+    }
+
+    fn win_cmd_task(
+        rig: &Rig,
+        script: &str,
+        extra_env: &[(&str, &str)],
+        timeout_secs: u64,
+    ) -> Task {
+        let mut env = rig.env();
+        for (k, v) in extra_env {
+            env.insert((*k).into(), (*v).into());
+        }
+        Task::new(
+            TaskSpec::Command {
+                program: r"C:\Windows\System32\cmd.exe".into(),
+                args: vec!["/C".into(), script.into()],
+                env,
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, timeout_secs),
+        )
+    }
+
+    const WIN_FS_SCRIPT: &str = r#"
+Set-Content -LiteralPath "$env:RUSTY_GRID_SANDBOX_DIR\allowed.txt" -Value 'hello' -NoNewline
+Write-Output 'WRITE_OK'
+if ((Get-Content -LiteralPath "$env:RUSTY_GRID_SANDBOX_DIR\allowed.txt" -Raw) -eq 'hello') { Write-Output 'READ_OK' }
+New-Item -ItemType Directory -Path "$env:RUSTY_GRID_SANDBOX_DIR\sub" -Force | Out-Null
+Write-Output 'MKDIR_OK'
+'x' > $null
+Write-Output 'DEVNULL_OK'
+try { Get-Content -LiteralPath $env:T_SECRET -ErrorAction Stop | Out-Null; Write-Output 'LEAK_SECRET' } catch { Write-Output 'DENY_SECRET' }
+try { Get-Content -LiteralPath $env:T_KEY -ErrorAction Stop | Out-Null; Write-Output 'LEAK_KEY' } catch { Write-Output 'DENY_KEY' }
+try { Get-Content -LiteralPath $env:T_SIBLING -ErrorAction Stop | Out-Null; Write-Output 'LEAK_SIBLING' } catch { Write-Output 'DENY_SIBLING' }
+try { Get-ChildItem -LiteralPath $env:T_BASE -ErrorAction Stop | Out-Null; Write-Output 'LEAK_LISTING' } catch { Write-Output 'DENY_LISTING' }
+try { Get-ChildItem -LiteralPath $env:T_HOME -ErrorAction Stop | Out-Null; Write-Output 'LEAK_HOME_LISTING' } catch { Write-Output 'DENY_HOME_LISTING' }
+try { Set-Content -LiteralPath "$env:T_HOME\planted.txt" -Value 'x' -ErrorAction Stop; Write-Output 'LEAK_WRITE_HOME' } catch { Write-Output 'DENY_WRITE_HOME' }
+try { Set-Content -LiteralPath "$env:T_BASE\other_task\planted.txt" -Value 'x' -ErrorAction Stop; Write-Output 'LEAK_WRITE_SIBLING' } catch { Write-Output 'DENY_WRITE_SIBLING' }
+try { Set-Content -LiteralPath "$env:T_OUTSIDE\feat3_outside_marker" -Value 'x' -ErrorAction Stop; Write-Output 'LEAK_WRITE_TMP' } catch { Write-Output 'DENY_WRITE_TMP' }
+"#;
+
+    fn run_win_fs(rig: &Rig) -> Task {
+        let outside = rig._outside.path().to_string_lossy().into_owned();
+        win_task(rig, WIN_FS_SCRIPT, &[("T_OUTSIDE", &outside)], 60)
+    }
+
+    #[tokio::test]
+    async fn test_off_leaves_the_owners_files_readable_as_a_control() {
+        let rig = Rig::new(IsolationLevel::Off, false);
+        let result = rig.runner.execute_task(&run_win_fs(&rig), None, None).await;
+        let got = lines(&result);
+        for leak in ["LEAK_SECRET", "LEAK_KEY", "LEAK_SIBLING", "LEAK_WRITE_HOME"] {
+            assert!(
+                got.iter().any(|l| l == leak),
+                "without isolation {leak} must succeed (otherwise the tests below prove nothing): {got:?} / stderr={}",
+                result.stderr_str()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fs_confines_a_task_to_its_sandbox() {
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let rig = Rig::new(level, false);
+            let result = rig.runner.execute_task(&run_win_fs(&rig), None, None).await;
+            assert_fs_policy_holds(&result, &level.to_string());
+            assert!(
+                !rig.home.path().join("planted.txt").exists()
+                    && !rig.base.join("other_task/planted.txt").exists()
+                    && !rig._outside.path().join("feat3_outside_marker").exists(),
+                "nothing was planted outside the sandbox"
+            );
+            assert_eq!(
+                std::fs::read_to_string(rig.base.join("other_task/secret.txt")).unwrap(),
+                SIBLING
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fs_holds_when_the_sandbox_base_lives_inside_the_denied_home() {
+        let rig = Rig::new(IsolationLevel::Fs, true);
+        let result = rig.runner.execute_task(&run_win_fs(&rig), None, None).await;
+        assert_fs_policy_holds(&result, "base inside home");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_tasks_under_fs_cannot_read_or_list_each_others_sandboxes() {
+        let rig = Arc::new(Rig::new(IsolationLevel::Fs, false));
+        let script = r#"
+Set-Content -LiteralPath "$env:RUSTY_GRID_SANDBOX_DIR\secret.txt" -Value 'secret-from-t1'
+Start-Sleep -Milliseconds 400
+try { Get-Content -LiteralPath "$env:T_SIB_SANDBOX\secret.txt" -ErrorAction Stop | Out-Null; Write-Output 'LEAK_SIBLING_READ' } catch { Write-Output 'DENY_SIBLING_READ' }
+try { Get-ChildItem -LiteralPath $env:T_SIB_SANDBOX -ErrorAction Stop | Out-Null; Write-Output 'LEAK_SIBLING_LIST' } catch { Write-Output 'DENY_SIBLING_LIST' }
+try { Set-Content -LiteralPath "$env:T_SIB_SANDBOX\planted.txt" -Value 'x' -ErrorAction Stop; Write-Output 'LEAK_SIBLING_WRITE' } catch { Write-Output 'DENY_SIBLING_WRITE' }
+Start-Sleep -Milliseconds 400
+"#;
+        let task1 = win_task(&rig, script, &[], 60);
+        let mut task2 = task1.clone();
+        task2.id = rusty_grid_core::TaskId::new();
+
+        let sb1 = rig.base.join(task1.id.0.to_string());
+        let sb2 = rig.base.join(task2.id.0.to_string());
+
+        let mut t1 = task1;
+        let mut t2 = task2;
+        if let TaskSpec::Command { ref mut env, .. } = t1.spec {
+            env.insert("T_SIB_SANDBOX".into(), sb2.to_string_lossy().into_owned());
+        }
+        if let TaskSpec::Command { ref mut env, .. } = t2.spec {
+            env.insert("T_SIB_SANDBOX".into(), sb1.to_string_lossy().into_owned());
+        }
+
+        let r1 = Arc::clone(&rig);
+        let r2 = Arc::clone(&rig);
+        let (res1, res2) = tokio::join!(
+            async move { r1.runner.execute_task(&t1, None, None).await },
+            async move { r2.runner.execute_task(&t2, None, None).await },
+        );
+
+        for (label, res) in [("task1", &res1), ("task2", &res2)] {
+            assert!(
+                res.is_success(),
+                "{label} failed: {:?} / {}",
+                res.error,
+                res.stderr_str()
+            );
+            let got = lines(res);
+            for expected in [
+                "DENY_SIBLING_READ",
+                "DENY_SIBLING_LIST",
+                "DENY_SIBLING_WRITE",
+            ] {
+                assert!(
+                    got.iter().any(|l| l == expected),
+                    "{label}: missing {expected}; got {got:?}"
+                );
+            }
+            assert!(
+                !got.iter().any(|l| l.starts_with("LEAK_")),
+                "{label}: sibling sandbox access leaked: {got:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_environment_is_moved_into_the_sandbox_and_ipc_sockets_are_removed() {
+        let rig = Rig::new(IsolationLevel::Fs, false);
+        let task = win_task(
+            &rig,
+            r#"
+Write-Output "HOME=$env:HOME"
+Write-Output "USERPROFILE=$env:USERPROFILE"
+Write-Output "TMPDIR=$env:TMPDIR"
+Write-Output "TEMP=$env:TEMP"
+Write-Output "TMP=$env:TMP"
+Write-Output "SANDBOX=$env:RUSTY_GRID_SANDBOX_DIR"
+Write-Output "RUSTUP_HOME=$env:RUSTUP_HOME"
+Write-Output "CARGO_HOME=$env:CARGO_HOME"
+Write-Output ("SSH=" + $(if ($null -ne $env:SSH_AUTH_SOCK) { $env:SSH_AUTH_SOCK } else { 'unset' }))
+Write-Output ("GPG=" + $(if ($null -ne $env:GPG_AGENT_INFO) { $env:GPG_AGENT_INFO } else { 'unset' }))
+Write-Output ("DBUS=" + $(if ($null -ne $env:DBUS_SESSION_BUS_ADDRESS) { $env:DBUS_SESSION_BUS_ADDRESS } else { 'unset' }))
+Write-Output ("DOCKER=" + $(if ($null -ne $env:DOCKER_HOST) { $env:DOCKER_HOST } else { 'unset' }))
+Write-Output ("SECRET=" + $(if ($null -ne $env:OXIDESWARM_SECRET) { $env:OXIDESWARM_SECRET } else { 'unset' }))
+Write-Output ("TASK_ID=" + $(if ($null -ne $env:RUSTY_GRID_TASK_ID) { $env:RUSTY_GRID_TASK_ID } else { 'unset' }))
+"#,
+            &[
+                ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+                ("GPG_AGENT_INFO", "x"),
+                ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/bus"),
+                ("DOCKER_HOST", "unix:///var/run/docker.sock"),
+            ],
+            60,
+        );
+        let result = rig.runner.execute_task(&task, None, None).await;
+        assert!(
+            result.is_success(),
+            "{:?} {}",
+            result.error,
+            result.stderr_str()
+        );
+        let got: HashMap<String, String> = lines(&result)
+            .iter()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let sandbox = got["SANDBOX"].clone();
+        assert!(sandbox.contains(&rig.base.file_name().unwrap().to_string_lossy().to_string()));
+        for name in ["HOME", "USERPROFILE", "TMPDIR"] {
+            assert_eq!(got[name], sandbox, "{name}");
+        }
+        // On Windows, `CreateProcessW` (`KernelBase!BasepAppContainerEnvironmentExtension`)
+        // rewrites `TEMP` and `TMP` into the per-task AppContainer folder
+        // `...\Packages\oxideswarm.task.<task_id>\AC\Temp`.
+        let task_moniker = format!("oxideswarm.task.{}", task.id.0);
+        for name in ["TEMP", "TMP"] {
+            let val = &got[name];
+            assert!(
+                val == &sandbox || val.contains(&task_moniker),
+                "{name} must be sandbox or per-task AppContainer temp dir, got {val}"
+            );
+        }
+        assert_eq!(got["RUSTUP_HOME"], rig.host.rustup_home.to_string_lossy());
+        assert_eq!(got["CARGO_HOME"], rig.host.cargo_home.to_string_lossy());
+        assert_eq!(
+            got["TASK_ID"],
+            task.id.to_string(),
+            "worker task diagnostic vars must survive environment preparation"
+        );
+        for name in ["SSH", "GPG", "DBUS", "DOCKER", "SECRET"] {
+            assert_eq!(got[name], "unset", "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fs_net_refuses_tcp_connections_and_fs_allows_them() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        let tcp_script = r#"
+try {
+    $c = New-Object System.Net.Sockets.TcpClient
+    $c.Connect('127.0.0.1', [int]$env:T_PORT)
+    $c.Close()
+    Write-Output 'CONNECTED'
+} catch {
+    Write-Output 'REFUSED'
+}
+"#;
+        // Probes outbound TCP via WFP: under `fs` (`WinCapabilityInternetClientSid` +
+        // `WinCapabilityPrivateNetworkClientServerSid`), WFP permits the outbound SYN to
+        // RFC 5737 TEST-NET-1 (`192.0.2.1:80`), whereas under `fs+net` (zero capabilities),
+        // WFP immediately rejects `Connect` with `WSAEACCES` (`10013` = `AccessDenied`).
+        let wfp_tcp_script = r#"
+try {
+    $c = New-Object System.Net.Sockets.TcpClient
+    $ar = $c.BeginConnect('192.0.2.1', 80, $null, $null)
+    if ($ar.AsyncWaitHandle.WaitOne(150, $false)) {
+        $c.EndConnect($ar)
+    }
+    $c.Close()
+    Write-Output 'NET_ALLOWED'
+} catch [System.Net.Sockets.SocketException] {
+    if ($_.Exception.NativeErrorCode -eq 10013) {
+        Write-Output 'NET_REFUSED'
+    } else {
+        Write-Output 'NET_ALLOWED'
+    }
+} catch {
+    if ($_.Exception.InnerException -is [System.Net.Sockets.SocketException] -and $_.Exception.InnerException.NativeErrorCode -eq 10013) {
+        Write-Output 'NET_REFUSED'
+    } else {
+        Write-Output 'NET_ALLOWED'
+    }
+}
+"#;
+
+        // Control 1 (`off`): loopback TCP connect reaches the listener.
+        let rig = Rig::new(IsolationLevel::Off, false);
+        let result = rig
+            .runner
+            .execute_task(
+                &win_task(&rig, tcp_script, &[("T_PORT", &port)], 60),
+                None,
+                None,
+            )
+            .await;
+        let accepted_in_off = listener.accept().is_ok();
+        assert!(
+            accepted_in_off && lines(&result).contains(&"CONNECTED".to_string()),
+            "control under off must reach listener: {:?} / {}",
+            lines(&result),
+            result.stderr_str()
+        );
+        while listener.accept().is_ok() {}
+
+        // Control 2 (`fs`): `WinCapabilityInternetClientSid` and
+        // `WinCapabilityPrivateNetworkClientServerSid` allow outbound TCP in WFP.
+        let rig = Rig::new(IsolationLevel::Fs, false);
+        let result = rig
+            .runner
+            .execute_task(&win_task(&rig, wfp_tcp_script, &[], 60), None, None)
+            .await;
+        assert!(
+            lines(&result).contains(&"NET_ALLOWED".to_string()),
+            "control under fs must allow outbound TCP in WFP: {:?} / {}",
+            lines(&result),
+            result.stderr_str()
+        );
+
+        // Under `fs+net` (zero capabilities): both outbound TCP and loopback TCP are refused
+        // by WFP (`WSAEACCES` = 10013), and the listener accepts no connection.
+        let rig = Rig::new(IsolationLevel::FsNet, false);
+        let wfp_res = rig
+            .runner
+            .execute_task(&win_task(&rig, wfp_tcp_script, &[], 60), None, None)
+            .await;
+        assert!(
+            lines(&wfp_res).contains(&"NET_REFUSED".to_string()),
+            "{:?} {}",
+            lines(&wfp_res),
+            wfp_res.stderr_str()
+        );
+        let result = rig
+            .runner
+            .execute_task(
+                &win_task(&rig, tcp_script, &[("T_PORT", &port)], 60),
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            lines(&result).contains(&"REFUSED".to_string()),
+            "{:?} {}",
+            lines(&result),
+            result.stderr_str()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("the listener must see no connection from an fs+net task: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cargo_build_offline_works_under_fs() {
+        let cargo = HostDirs::detect().cargo_home.join("bin/cargo.exe");
+        if !cargo.exists() {
+            eprintln!("skipped: no rustup cargo proxy at {}", cargo.display());
+            return;
+        }
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let rig = Rig::new(level, false);
+            let sys_path = std::env::var("PATH").unwrap_or_default();
+            let path = format!(
+                "{};{sys_path}",
+                rig.host.cargo_home.join("bin").to_string_lossy()
+            );
+            let task = win_cmd_task(
+                &rig,
+                r#"set "CARGO_TARGET_DIR=" & set "CARGO_BUILD_TARGET_DIR=" & mkdir tiny\src & (echo [package]& echo name = "tiny"& echo version = "0.1.0"& echo edition = "2021") > tiny\Cargo.toml & (echo fn main^(^) { println!^("tiny-ran"^); }) > tiny\src\main.rs & cd tiny & cargo.exe build --offline 2>&1 & target\debug\tiny.exe"#,
+                &[("PATH", &path)],
+                300,
+            );
+            let result = rig.runner.execute_task(&task, None, None).await;
+            assert!(
+                result.is_success(),
+                "{level}: {:?}\n{}\n{}",
+                result.error,
+                result.stdout_str(),
+                result.stderr_str()
+            );
+            assert!(
+                result.stdout_str().contains("tiny-ran"),
+                "{}",
+                result.stdout_str()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cargo_build_offline_with_a_cached_dependency_under_a_denied_home() {
+        let real = HostDirs::detect();
+        let cargo = real.cargo_home.join("bin/cargo.exe");
+        let Some(home) = real.cargo_home.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let cached = std::fs::read_dir(real.cargo_home.join("registry/cache"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|index| {
+                std::fs::read_dir(index.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+            })
+            .filter_map(|f| f.file_name().to_str().map(str::to_string))
+            .filter_map(|f| f.strip_suffix(".crate").map(str::to_string))
+            .find_map(|stem| {
+                let (name, version) = stem.rsplit_once('-')?;
+                ["cfg-if", "itoa", "bytes", "memchr", "smallvec", "once_cell"]
+                    .contains(&name)
+                    .then(|| (name.to_string(), version.to_string()))
+            });
+        let Some((name, version)) = cached else {
+            eprintln!(
+                "skipped: no cached leaf crate in {}",
+                real.cargo_home.display()
+            );
+            return;
+        };
+        if !cargo.exists() {
+            eprintln!("skipped: no rustup cargo proxy at {}", cargo.display());
+            return;
+        };
+        let rig = Rig::new(IsolationLevel::Fs, false).with_policy_home(IsolationLevel::Fs, home);
+        let sys_path = std::env::var("PATH").unwrap_or_default();
+        let path = format!(
+            "{};{sys_path}",
+            rig.host.cargo_home.join("bin").to_string_lossy()
+        );
+        let script = format!(
+            r#"set "CARGO_TARGET_DIR=" & set "CARGO_BUILD_TARGET_DIR=" & mkdir dep\src & (echo [package]& echo name = "dep"& echo version = "0.1.0"& echo edition = "2021"& echo [dependencies]& echo {name} = "={version}") > dep\Cargo.toml & (echo fn main^(^) {{ println!^("dep-ran"^); }}) > dep\src\main.rs & cd dep & cargo.exe build --offline 2>&1 & target\debug\dep.exe"#
+        );
+        let result = rig
+            .runner
+            .execute_task(
+                &win_cmd_task(&rig, &script, &[("PATH", &path)], 300),
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_success(),
+            "{name} {version}: {:?}\n{}\n{}",
+            result.error,
+            result.stdout_str(),
+            result.stderr_str()
+        );
+        assert!(result.stdout_str().contains("dep-ran"));
+    }
+
+    #[tokio::test]
+    async fn test_tracked_pid_is_the_task_and_cancel_and_timeout_still_kill_it() {
+        let rig = Arc::new(Rig::new(IsolationLevel::Fs, false));
+
+        // Cancellation.
+        let pid = Arc::new(AtomicU32::new(0));
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<String>();
+        let handle = {
+            let (rig, pid) = (Arc::clone(&rig), Arc::clone(&pid));
+            tokio::spawn(async move {
+                let task = win_task(&rig, "Start-Sleep -Seconds 120", &[], 120);
+                rig.runner
+                    .execute_task(&task, Some(pid), Some(cancel_rx))
+                    .await
+            })
+        };
+        let tracked = wait_for_pid(&pid).await;
+        assert!(tracked > 1);
+        cancel_tx.send("test".into()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(20), handle)
+            .await
+            .expect("cancellation finishes the task")
+            .unwrap();
+        assert_eq!(result.exit_code, EXIT_CODE_CANCELLED, "{:?}", result.error);
+
+        // Timeout.
+        let pid = Arc::new(AtomicU32::new(0));
+        let task = win_task(&rig, "Start-Sleep -Seconds 120", &[], 2);
+        let started = std::time::Instant::now();
+        let result = rig
+            .runner
+            .execute_task(&task, Some(Arc::clone(&pid)), None)
+            .await;
+        assert_eq!(result.exit_code, EXIT_CODE_TIMEOUT, "{:?}", result.error);
+        assert!(started.elapsed() < Duration::from_secs(30));
+        let tracked = pid.load(Ordering::Acquire);
+        assert!(tracked > 1);
+    }
+
+    async fn wait_for_pid(pid: &AtomicU32) -> u32 {
+        for _ in 0..200 {
+            let v = pid.load(Ordering::Acquire);
+            if v > 1 {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the runner never reported a child PID");
+    }
+
+    #[tokio::test]
+    async fn test_self_check_accepts_both_levels_on_windows() {
+        let base = tempfile::tempdir().unwrap();
+        for level in [
+            IsolationLevel::Off,
+            IsolationLevel::Fs,
+            IsolationLevel::FsNet,
+        ] {
+            verify_isolation_support(level, base.path())
+                .await
+                .unwrap_or_else(|e| panic!("{level}: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_missing_program_fails_the_task_with_a_clear_message() {
+        let rig = Rig::new(IsolationLevel::Fs, false);
+        let task = Task::new(
+            TaskSpec::command("no-such-program-feat3", vec![]),
+            TaskRequirements::generic(1, 30),
+        );
+        let result = rig.runner.execute_task(&task, None, None).await;
+        assert!(!result.is_success());
+        assert!(
+            result.stderr_str().contains("no-such-program-feat3")
+                && result.stderr_str().contains("not found"),
+            "{}",
+            result.stderr_str()
+        );
+    }
+}
+
+/// Where there is no implementation yet (FEAT-3b: Linux) isolation is refused
 /// at start-up, and a task is refused instead of running unsandboxed.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 mod unimplemented_platform {
     use super::*;
 

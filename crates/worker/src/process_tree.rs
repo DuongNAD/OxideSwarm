@@ -195,31 +195,144 @@ impl FromStr for ProcessPriority {
     }
 }
 
+/// A spawned task child process: on Windows, either a standard [`tokio::process::Child`] or an
+/// AppContainer child process spawned via `CreateProcessW` + `STARTUPINFOEXW`.
+#[cfg(not(windows))]
+pub(crate) type SpawnedChild = tokio::process::Child;
+
+/// A spawned task child process: either a standard [`tokio::process::Child`] or a Windows
+/// AppContainer child process spawned via `CreateProcessW` + `STARTUPINFOEXW`.
+#[cfg(windows)]
+pub(crate) enum SpawnedChild {
+    Tokio(tokio::process::Child),
+    AppContainer(crate::isolation::windows::AppContainerChild),
+}
+
+#[cfg(windows)]
+impl SpawnedChild {
+    pub(crate) fn id(&self) -> Option<u32> {
+        match self {
+            Self::Tokio(c) => c.id(),
+            Self::AppContainer(c) => c.id(),
+        }
+    }
+
+    pub(crate) fn raw_handle(&self) -> Option<*mut core::ffi::c_void> {
+        match self {
+            Self::Tokio(c) => c.raw_handle(),
+            Self::AppContainer(c) => c.raw_handle(),
+        }
+    }
+
+    pub(crate) fn take_stdin(
+        &mut self,
+    ) -> Option<std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>> {
+        match self {
+            Self::Tokio(c) => c
+                .stdin
+                .take()
+                .map(|s| Box::pin(s) as std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>),
+            Self::AppContainer(c) => c
+                .stdin
+                .take()
+                .map(|s| Box::pin(s) as std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>),
+        }
+    }
+
+    pub(crate) fn take_stdout(
+        &mut self,
+    ) -> Option<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>> {
+        match self {
+            Self::Tokio(c) => c
+                .stdout
+                .take()
+                .map(|s| Box::pin(s) as std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>),
+            Self::AppContainer(c) => c
+                .stdout
+                .take()
+                .map(|s| Box::pin(s) as std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>),
+        }
+    }
+
+    pub(crate) fn take_stderr(
+        &mut self,
+    ) -> Option<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>> {
+        match self {
+            Self::Tokio(c) => c
+                .stderr
+                .take()
+                .map(|s| Box::pin(s) as std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>),
+            Self::AppContainer(c) => c
+                .stderr
+                .take()
+                .map(|s| Box::pin(s) as std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>),
+        }
+    }
+
+    pub(crate) async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self {
+            Self::Tokio(c) => c.wait().await,
+            Self::AppContainer(c) => c.wait().await,
+        }
+    }
+
+    pub(crate) fn start_kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Tokio(c) => c.start_kill(),
+            Self::AppContainer(c) => c.start_kill(),
+        }
+    }
+}
+
 /// State prepared by [`configure_command`] before spawning the task process.
 pub(crate) struct ConfiguredCommand {
     #[cfg(unix)]
     unix: imp::PreparedUnix,
+    #[cfg(windows)]
+    windows_creation_flags: u32,
+    #[cfg(windows)]
+    app_container: Option<crate::isolation::windows::WindowsAppContainerGuard>,
 }
 
 impl ConfiguredCommand {
+    /// Attaches a per-task Windows AppContainer guard to be used during [`Self::spawn`] and
+    /// cleaned up when the [`ProcessTree`] is dropped.
+    #[cfg(windows)]
+    pub(crate) fn set_app_container(
+        &mut self,
+        guard: crate::isolation::windows::WindowsAppContainerGuard,
+    ) {
+        self.app_container = Some(guard);
+    }
+
     /// Spawns `cmd` (holding `SPAWN_LOCK` on macOS so no concurrent `fork` observes an
     /// un-`CLOEXEC`ed lifeline descriptor) and closes the parent's copy of the lifeline read end.
     pub(crate) fn spawn(
         &mut self,
         cmd: &mut tokio::process::Command,
-    ) -> std::io::Result<tokio::process::Child> {
+    ) -> std::io::Result<SpawnedChild> {
         #[cfg(unix)]
         {
             imp::spawn_command(&mut self.unix, cmd)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            if let Some(ref guard) = self.app_container {
+                guard
+                    .spawn_in_appcontainer(cmd, self.windows_creation_flags)
+                    .map(SpawnedChild::AppContainer)
+            } else {
+                cmd.spawn().map(SpawnedChild::Tokio)
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             cmd.spawn()
         }
     }
 
     /// Attaches the freshly spawned `child` to its [`ProcessTree`].
-    pub(crate) fn attach(self, child: &tokio::process::Child) -> ProcessTree {
+    pub(crate) fn attach(self, child: &SpawnedChild) -> ProcessTree {
         ProcessTree::attach(child, self)
     }
 }
@@ -246,7 +359,10 @@ pub(crate) fn configure_command(
         let flag =
             priority.windows_class_flag() | rusty_grid_core::capabilities::WINDOWS_CREATE_SUSPENDED;
         cmd.creation_flags(flag);
-        ConfiguredCommand {}
+        ConfiguredCommand {
+            windows_creation_flags: flag,
+            app_container: None,
+        }
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -1128,12 +1244,11 @@ mod imp {
     use rusty_grid_core::capabilities::{
         attach_suspended_process_to_kill_on_close_job, close_job_object, terminate_job_object,
     };
-    use tokio::process::Child;
 
     /// A Job Object handle, as an integer so it can sit in a `static`.
     pub(super) type RawId = isize;
 
-    pub(super) fn attach(child: &Child) -> Option<RawId> {
+    pub(super) fn attach(child: &super::SpawnedChild) -> Option<RawId> {
         let process = child.raw_handle()?;
         attach_suspended_process_to_kill_on_close_job(process)
     }
@@ -1202,16 +1317,20 @@ pub(crate) struct ProcessTree {
     lifeline_write: Option<std::os::unix::io::OwnedFd>,
     #[cfg(target_os = "linux")]
     cgroup_leaf: Option<imp::CgroupLeaf>,
+    #[cfg(windows)]
+    app_container: Option<crate::isolation::windows::WindowsAppContainerGuard>,
 }
 
 impl ProcessTree {
     /// Starts tracking the tree of the freshly spawned `child`. If the platform cannot provide a
     /// container (see [`Self::is_tracked`]) the tree is empty and the caller must fall back to
     /// signalling the leader.
-    pub(crate) fn attach(child: &tokio::process::Child, configured: ConfiguredCommand) -> Self {
+    pub(crate) fn attach(child: &SpawnedChild, configured: ConfiguredCommand) -> Self {
         #[cfg(unix)]
         let mut unix = configured.unix;
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let mut app_container = configured.app_container;
+        #[cfg(not(any(unix, windows)))]
         let _ = configured;
 
         #[cfg(unix)]
@@ -1229,6 +1348,8 @@ impl ProcessTree {
             lifeline_write: unix.lifeline_write.take(),
             #[cfg(target_os = "linux")]
             cgroup_leaf: unix.cgroup_leaf.take(),
+            #[cfg(windows)]
+            app_container: app_container.take(),
         }
     }
 
@@ -1266,6 +1387,8 @@ impl Drop for ProcessTree {
         let cgroup_leaf = self.cgroup_leaf.take();
         #[cfg(unix)]
         let lifeline_write = self.lifeline_write.take();
+        #[cfg(windows)]
+        let app_container = self.app_container.take();
 
         if let Some(id) = self.id {
             let already_killed = self.killed.swap(true, Ordering::AcqRel);
@@ -1285,6 +1408,8 @@ impl Drop for ProcessTree {
                     }
                     drop(w);
                 }
+                #[cfg(windows)]
+                drop(app_container);
             };
             if !already_killed {
                 if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -1293,6 +1418,9 @@ impl Drop for ProcessTree {
                 }
             }
             finish();
+        } else {
+            #[cfg(windows)]
+            drop(app_container);
         }
     }
 }
