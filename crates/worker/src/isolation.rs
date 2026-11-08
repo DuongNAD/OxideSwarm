@@ -464,8 +464,14 @@ mod tests {
                 .find(|(k, _)| k == name)
                 .map(|(_, v)| v.as_str())
         };
-        assert_eq!(get("RUSTUP_HOME"), Some("/home/u/.rustup"));
-        assert_eq!(get("CARGO_HOME"), Some("/home/u/.cargo"));
+        let joined = |leaf: &str| {
+            Path::new("/home/u")
+                .join(leaf)
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(get("RUSTUP_HOME"), Some(joined(".rustup").as_str()));
+        assert_eq!(get("CARGO_HOME"), Some(joined(".cargo").as_str()));
         for name in ["HOME", "USERPROFILE", "TMPDIR", "TEMP", "TMP"] {
             assert_eq!(get(name), Some("/sb/task1"), "{name}");
         }
