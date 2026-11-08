@@ -334,7 +334,7 @@ pub struct MasterArgs {
     #[arg(
         long,
         value_name = "SECS",
-        help = "Seconds the master holds a disconnected session-resume worker's tasks before requeuing or failing them (default 30; 0 disables session resume; max 3600; env RUSTY_GRID_SESSION_RESUME_HOLD_SECS)"
+        help = "Seconds the master holds a disconnected session-resume worker's tasks before requeuing or failing them (CLI default 30 on every master, even without --state-dir; 0 disables the hold for immediate failover; max 3600; env RUSTY_GRID_SESSION_RESUME_HOLD_SECS)"
     )]
     pub session_resume_hold_secs: Option<u64>,
 

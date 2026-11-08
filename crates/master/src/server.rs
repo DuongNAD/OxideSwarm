@@ -2279,12 +2279,15 @@ async fn apply_task_result_inner(
     }
 
     // 2. Release the worker's slot immediately and keep its circuit breaker current
-    let _ = registry.decrement_active_tasks(&worker_id).await;
+    if !outcome.adopted_from_hold {
+        let _ = registry.decrement_active_tasks(&worker_id).await;
+    }
     if outcome.rejected {
         let _ = registry.record_rejection(&worker_id, session_id).await;
     } else if outcome.disposition != ResultDisposition::Late {
         registry.clear_rejections(&worker_id).await;
     }
+    let send_ack = queue.session_resume_hold_secs() > 0;
 
     // 3. Notify awaiting clients, but only once the task is really finished: a requeued
     //    task (rejection, execution retry) will still produce its real result and keeps its
@@ -2300,13 +2303,23 @@ async fn apply_task_result_inner(
         if spawn_waiter_ack {
             if let Some(ack) = durable_ack {
                 let waiters = Arc::clone(waiters);
+                let ack_registry = registry.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = ack.await {
-                        warn!(
-                            task_id = %task_id.0,
-                            error = %err,
-                            "Failed to sync TaskTerminal journal record for task result"
-                        );
+                    let sync_ok = match ack.await {
+                        Ok(()) => true,
+                        Err(err) => {
+                            warn!(
+                                task_id = %task_id.0,
+                                error = %err,
+                                "Failed to sync TaskTerminal journal record for task result"
+                            );
+                            false
+                        }
+                    };
+                    if send_ack && sync_ok {
+                        ack_registry
+                            .send_result_ack(&worker_id, session_id, task_id)
+                            .await;
                     }
                     let mut lock = waiters.write().await;
                     if let Some(senders) = lock.remove(&task_id) {
@@ -2316,6 +2329,11 @@ async fn apply_task_result_inner(
                     }
                 });
             } else {
+                if send_ack {
+                    registry
+                        .send_result_ack(&worker_id, session_id, task_id)
+                        .await;
+                }
                 let mut lock = waiters.write().await;
                 if let Some(senders) = lock.remove(&task_id) {
                     for tx in senders {
@@ -2324,14 +2342,25 @@ async fn apply_task_result_inner(
                 }
             }
         } else {
-            if let Some(ack) = durable_ack {
-                if let Err(err) = ack.await {
-                    warn!(
-                        task_id = %task_id.0,
-                        error = %err,
-                        "Failed to sync TaskTerminal journal record for task result"
-                    );
+            let sync_ok = if let Some(ack) = durable_ack {
+                match ack.await {
+                    Ok(()) => true,
+                    Err(err) => {
+                        warn!(
+                            task_id = %task_id.0,
+                            error = %err,
+                            "Failed to sync TaskTerminal journal record for task result"
+                        );
+                        false
+                    }
                 }
+            } else {
+                true
+            };
+            if send_ack && sync_ok {
+                registry
+                    .send_result_ack(&worker_id, session_id, task_id)
+                    .await;
             }
             let mut lock = waiters.write().await;
             if let Some(senders) = lock.remove(&task_id) {
@@ -2339,6 +2368,21 @@ async fn apply_task_result_inner(
                     let _ = tx.send(result.clone());
                 }
             }
+        }
+    } else if send_ack {
+        if let Some(ack) = durable_ack {
+            let ack_registry = registry.clone();
+            tokio::spawn(async move {
+                if ack.await.is_ok() {
+                    ack_registry
+                        .send_result_ack(&worker_id, session_id, task_id)
+                        .await;
+                }
+            });
+        } else {
+            registry
+                .send_result_ack(&worker_id, session_id, task_id)
+                .await;
         }
     }
 

@@ -1460,6 +1460,14 @@ pub mod master_features {
     /// [`parse_session_resume_hold_secs`], preventing `Instant + Duration` overflow on bogus input.
     pub const MAX_SESSION_RESUME_HOLD_SECS: u64 = 3_600;
 
+    /// `MasterMessage::CancelTask { task_id, reason: Some(RESULT_ACK_REASON.into()) }` sentinel
+    /// sent by the Master on the control lane after it has accepted and durably recorded a
+    /// `WorkerMessage::TaskResult` from a `SESSION_RESUME`-capable Worker. The Worker retains
+    /// the completed result (and its pinned output files) in `pending_resume_outbox` until it
+    /// receives this acknowledgment (or a regular `CancelTask` for `task_id`), preventing result
+    /// loss if the Master shuts down gracefully or the session drops mid-flush.
+    pub const RESULT_ACK_REASON: &str = "oxs:result-ack";
+
     /// Every feature this build of the Master supports unconditionally.
     pub const SUPPORTED: &[&str] = &[MOBILE_TELEMETRY];
 

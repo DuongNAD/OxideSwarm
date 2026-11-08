@@ -158,41 +158,109 @@ pub fn compute_effective_resume_grace(
     let max_safe_grace = hold
         .saturating_sub(dead_peer_timeout)
         .saturating_sub(RESUME_SAFETY_MARGIN);
-    match grace_cap {
+    let effective = match grace_cap {
         Some(cap) => cap.min(max_safe_grace),
         None => max_safe_grace,
+    };
+    if effective < Duration::from_secs(1) {
+        Duration::ZERO
+    } else {
+        effective
     }
 }
 
-/// Completed task result buffered while the worker is disconnected within its session-resume
-/// grace window. Holds `output_pin` so output blobs stay pinned in `BlobCache` until uploaded.
+/// Completed task result buffered in the worker's session-resume outbox until acknowledged by the
+/// Master (`MasterMessage::CancelTask { reason: Some(RESULT_ACK_REASON) }`) or until the resume
+/// window expires. Holds `output_pin` (`Arc<CachePin>`) so output blobs stay pinned in
+/// `BlobCache` across transient session drops.
+#[derive(Clone)]
 struct BufferedTaskResult {
     task: Task,
     result: TaskResult,
-    output_pin: Option<crate::blob_cache::CachePin>,
+    _output_pin: Option<Arc<crate::blob_cache::CachePin>>,
     used_blobs: bool,
 }
 
-/// Bounded per-worker outbox for checkpoints and task results produced while disconnected within
-/// the session-resume grace window (design 0046 D2.5).
-#[derive(Default)]
+/// Bounded per-worker outbox for checkpoints and task results retained across transient session
+/// drops (design 0046 D2.5 / D4).
 struct PendingResumeOutbox {
     checkpoints: HashMap<TaskId, WorkerMessage>,
     results: Vec<BufferedTaskResult>,
     cancelled: std::collections::HashSet<TaskId>,
+    max_results: usize,
+}
+
+impl Default for PendingResumeOutbox {
+    fn default() -> Self {
+        Self::with_capacity(8)
+    }
 }
 
 impl PendingResumeOutbox {
+    fn with_capacity(max_results: usize) -> Self {
+        Self {
+            checkpoints: HashMap::new(),
+            results: Vec::new(),
+            cancelled: std::collections::HashSet::new(),
+            max_results: max_results.max(2),
+        }
+    }
+
     fn clear(&mut self) {
         self.checkpoints.clear();
         self.results.clear();
         self.cancelled.clear();
     }
 
-    fn cancel_task(&mut self, task_id: TaskId) {
+    fn push_result(&mut self, item: BufferedTaskResult) -> bool {
+        let task_id = item.result.task_id;
+        if self.cancelled.contains(&task_id) {
+            return false;
+        }
+        let mut evicted_used_blobs = false;
+        self.results.retain(|r| {
+            if r.result.task_id == task_id {
+                evicted_used_blobs |= r.used_blobs;
+                false
+            } else {
+                true
+            }
+        });
+        while self.results.len() >= self.max_results {
+            let evicted = self.results.remove(0);
+            evicted_used_blobs |= evicted.used_blobs;
+        }
+        self.results.push(item);
+        evicted_used_blobs
+    }
+
+    fn ack_result(&mut self, task_id: TaskId) -> bool {
         self.checkpoints.remove(&task_id);
-        self.results.retain(|item| item.result.task_id != task_id);
+        let mut used_blobs = false;
+        self.results.retain(|item| {
+            if item.result.task_id == task_id {
+                used_blobs |= item.used_blobs;
+                false
+            } else {
+                true
+            }
+        });
+        used_blobs
+    }
+
+    fn cancel_task(&mut self, task_id: TaskId) -> bool {
+        self.checkpoints.remove(&task_id);
+        let mut used_blobs = false;
+        self.results.retain(|item| {
+            if item.result.task_id == task_id {
+                used_blobs |= item.used_blobs;
+                false
+            } else {
+                true
+            }
+        });
         self.cancelled.insert(task_id);
+        used_blobs
     }
 }
 
@@ -746,7 +814,7 @@ pub struct WorkerClient {
     /// Current session's outbound data channel (`Some` while `run_session` is active).
     session_data_tx: Arc<std::sync::RwLock<Option<mpsc::Sender<WorkerMessage>>>>,
     /// `session-resume=<secs>` negotiated in the current session's `RegisterAck` (`0` if disabled).
-    current_session_hold_secs: AtomicU64,
+    current_session_hold_secs: Arc<AtomicU64>,
     /// `session-resume=<secs>` negotiated in the most recent connected session.
     last_negotiated_hold_secs: AtomicU64,
     /// Heartbeat interval (in milliseconds) from the most recent `RegisterAck`.
@@ -1392,12 +1460,14 @@ impl WorkerClient {
             negotiated_features: AtomicU64::new(advertised_protocol_capabilities().bits()),
             blob_client: Arc::new(std::sync::RwLock::new(None)),
             session_data_tx: Arc::new(std::sync::RwLock::new(None)),
-            current_session_hold_secs: AtomicU64::new(0),
+            current_session_hold_secs: Arc::new(AtomicU64::new(0)),
             last_negotiated_hold_secs: AtomicU64::new(0),
             last_heartbeat_interval_ms: AtomicU64::new(0),
             resume_window_active: Arc::new(AtomicBool::new(false)),
             resume_deadline: None,
-            pending_resume_outbox: Arc::new(std::sync::Mutex::new(PendingResumeOutbox::default())),
+            pending_resume_outbox: Arc::new(std::sync::Mutex::new(
+                PendingResumeOutbox::with_capacity(2 * concurrency_permits.max(1)),
+            )),
             #[cfg(feature = "p2p")]
             p2p_endpoint: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "p2p")]
@@ -1575,17 +1645,39 @@ impl WorkerClient {
         caps
     }
 
+    /// Effective keepalive interval for the current connection, accounting for negotiated
+    /// `ADAPTIVE_KEEPALIVE` and mobile live status (matching `run_session`'s dead-peer watchdog).
+    fn current_keepalive_interval(&self, base_interval: Duration) -> Duration {
+        let adaptive_keepalive = self
+            .negotiated_features()
+            .contains(ProtocolCapabilities::ADAPTIVE_KEEPALIVE);
+        if !adaptive_keepalive {
+            return base_interval;
+        }
+        let active = self.heartbeat_tracker.active_tasks.load(Ordering::Relaxed);
+        self.mobile
+            .live_status()
+            .map(|status| {
+                status
+                    .recommended_keepalive_interval_or(0, base_interval)
+                    .max(status.recommended_keepalive_interval_or(active, base_interval))
+            })
+            .unwrap_or(base_interval)
+            .max(base_interval)
+    }
+
     /// Computes this worker's effective session-resume grace window from the most recent
     /// `RegisterAck`'s `session-resume=<secs>` and heartbeat interval (`design 0046 D2.4`).
     pub fn effective_resume_grace(&self) -> Duration {
         let hold_secs = self.last_negotiated_hold_secs.load(Ordering::Acquire);
         let hold = (hold_secs > 0).then(|| Duration::from_secs(hold_secs));
         let hb_ms = self.last_heartbeat_interval_ms.load(Ordering::Acquire);
-        let hb = if hb_ms > 0 {
+        let base_hb = if hb_ms > 0 {
             Duration::from_millis(hb_ms)
         } else {
             self.config.default_heartbeat_interval
         };
+        let hb = self.current_keepalive_interval(base_hb);
         let dead_peer = self.dead_peer_timeout(hb);
         compute_effective_resume_grace(hold, dead_peer, self.config.session_resume_grace_cap)
     }
@@ -2033,8 +2125,10 @@ impl WorkerClient {
         let suppress = Arc::clone(&suppress_result);
         let blob_client_slot = Arc::clone(&self.blob_client);
         let session_data_tx = Arc::clone(&self.session_data_tx);
+        let current_session_hold_secs = Arc::clone(&self.current_session_hold_secs);
         let resume_window_active = Arc::clone(&self.resume_window_active);
         let pending_resume_outbox = Arc::clone(&self.pending_resume_outbox);
+        let grace_enabled = self.config.session_resume_grace_cap != Some(Duration::ZERO);
 
         // The table lock is held from before the spawn until the handle is inserted, so the run's
         // own cleanup (which needs the lock) can never overtake the insertion and leave a stale
@@ -2226,34 +2320,48 @@ impl WorkerClient {
             let output_pin = runner
                 .blob_cache()
                 .ok()
-                .and_then(|cache| cache.take_task_outputs(task.id));
+                .and_then(|cache| cache.take_task_outputs(task.id))
+                .map(Arc::new);
+            let resume_enabled = grace_enabled
+                && (current_session_hold_secs.load(Ordering::Acquire) > 0
+                    || resume_window_active.load(Ordering::Acquire));
 
             if cancelled_reason.is_none() && !suppress.load(Ordering::Acquire) {
-                let live_tx = current_tx(&session_data_tx, &outbound_tx);
-                if live_tx.is_none() && resume_window_active.load(Ordering::Acquire) {
-                    drop(_inputs);
+                let (live_tx, evicted_used_blobs) = {
                     let mut outbox = pending_resume_outbox
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    if !outbox.cancelled.contains(&task.id) {
-                        outbox.results.push(BufferedTaskResult {
-                            task,
-                            result,
-                            output_pin,
+                    let tx = current_tx(&session_data_tx, &outbound_tx);
+                    let evicted = if resume_enabled {
+                        outbox.push_result(BufferedTaskResult {
+                            task: task.clone(),
+                            result: result.clone(),
+                            _output_pin: output_pin.clone(),
                             used_blobs,
-                        });
+                        })
+                    } else {
+                        false
+                    };
+                    (tx, evicted)
+                };
+                if evicted_used_blobs {
+                    if let Ok(cache) = runner.blob_cache() {
+                        let _ = tokio::task::spawn_blocking(move || cache.evict_to_fit()).await;
                     }
-                    drop(outbox);
+                }
+                if live_tx.is_none() && resume_enabled {
+                    drop(output_pin);
+                    drop(_inputs);
                     drop(cancel_slot);
                     return;
                 }
 
-                let saved_result = result.clone();
-                if !result.outputs.is_empty() {
-                    let current_blob_client = blob_client_slot
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
+                let current_blob_client = blob_client_slot
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let had_outputs = !result.outputs.is_empty();
+                if had_outputs {
                     match runner.blob_cache() {
                         Ok(cache) => {
                             tokio::select! {
@@ -2270,27 +2378,27 @@ impl WorkerClient {
                     }
                 }
 
+                let blob_client_closed = had_outputs
+                    && current_blob_client
+                        .as_ref()
+                        .is_some_and(|client| client.is_closed());
                 if cancelled_reason.is_none()
                     && !suppress.load(Ordering::Acquire)
-                    && current_tx(&session_data_tx, &outbound_tx).is_none()
-                    && resume_window_active.load(Ordering::Acquire)
+                    && resume_enabled
+                    && (blob_client_closed || current_tx(&session_data_tx, &outbound_tx).is_none())
                 {
+                    drop(output_pin);
                     drop(_inputs);
-                    let mut outbox = pending_resume_outbox
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if !outbox.cancelled.contains(&task.id) {
-                        outbox.results.push(BufferedTaskResult {
-                            task,
-                            result: saved_result,
-                            output_pin,
-                            used_blobs,
-                        });
-                    }
-                    drop(outbox);
                     drop(cancel_slot);
                     return;
                 }
+            }
+
+            if (cancelled_reason.is_some() || suppress.load(Ordering::Acquire)) && resume_enabled {
+                pending_resume_outbox
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .ack_result(task.id);
             }
 
             drop(output_pin);
@@ -2337,20 +2445,44 @@ impl WorkerClient {
 
     /// Cancels an active task by signaling the cancellation channel and triggering abort if necessary.
     pub async fn handle_cancel_task(&self, task_id: TaskId, reason: Option<String>) {
-        let had_buffered = {
+        if reason.as_deref() == Some(rusty_grid_core::protocol::master_features::RESULT_ACK_REASON)
+        {
+            let used_blobs = self
+                .pending_resume_outbox
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .ack_result(task_id);
+            self.runner.release_task_outputs(task_id);
+            if used_blobs {
+                if let Ok(cache) = self.runner.blob_cache() {
+                    let _ = tokio::task::spawn_blocking(move || cache.evict_to_fit()).await;
+                }
+            }
+            return;
+        }
+
+        let (had_buffered, used_blobs) = {
             let mut outbox = self
                 .pending_resume_outbox
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let had = outbox.checkpoints.contains_key(&task_id)
                 || outbox.results.iter().any(|r| r.result.task_id == task_id);
-            outbox.cancel_task(task_id);
-            had
+            let used_blobs = outbox.cancel_task(task_id);
+            (had, used_blobs)
         };
+        if used_blobs {
+            self.runner.release_task_outputs(task_id);
+            if let Ok(cache) = self.runner.blob_cache() {
+                let _ = tokio::task::spawn_blocking(move || cache.evict_to_fit()).await;
+            }
+        }
         let mut lock = self.active_task_table.write().await;
         if let Some(mut handle) = lock.remove(&task_id) {
             let r = reason.unwrap_or_else(|| "Cancelled by master directive".into());
-            if r.contains("Session resume hold expired") {
+            if r.contains("no longer assigned to this worker")
+                || r.contains("Session resume hold expired")
+            {
                 handle.suppress_result.store(true, Ordering::Release);
             }
             info!(task_id = %task_id, reason = %r, "Cancelling active task");
@@ -2935,8 +3067,31 @@ impl WorkerClient {
             self.expire_resume_window("reconnected to a Master with session-resume disabled")
                 .await;
         }
+        // Blob requests ride the data queue: the QUIC data stream, never the control stream.
+        // Snapshot the outbox and publish `blob_client` + `session_data_tx` while holding the
+        // outbox lock before clearing `resume_window_active` so a task finishing right as the
+        // session starts never sees both `session_data_tx == None` and `resume_window_active == false`.
+        let blob_client = self
+            .master_has_blobs
+            .load(Ordering::Acquire)
+            .then(|| BlobClient::new(session.data_tx.clone()));
+        let (buffered_checkpoints, buffered_results) = {
+            let mut outbox = self
+                .pending_resume_outbox
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            outbox.cancelled.clear();
+            let cps: Vec<(TaskId, WorkerMessage)> = outbox.checkpoints.drain().collect();
+            let res: Vec<BufferedTaskResult> = outbox.results.clone();
+            *self.blob_client.write().unwrap_or_else(|e| e.into_inner()) = blob_client.clone();
+            *self
+                .session_data_tx
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = Some(session.data_tx.clone());
+            self.resume_window_active.store(false, Ordering::Release);
+            (cps, res)
+        };
         self.resume_deadline = None;
-        self.resume_window_active.store(false, Ordering::Release);
 
         let adaptive_keepalive = self
             .negotiated_features()
@@ -2949,26 +3104,8 @@ impl WorkerClient {
             adaptive_keepalive.then(|| self.mobile.clone()),
         );
 
-        let mut dead_after = {
-            let active = self.heartbeat_tracker.active_tasks.load(Ordering::Relaxed);
-            let iv = if adaptive_keepalive {
-                self.mobile
-                    .live_status()
-                    .map(|status| {
-                        status
-                            .recommended_keepalive_interval_or(0, heartbeat_interval)
-                            .max(
-                                status
-                                    .recommended_keepalive_interval_or(active, heartbeat_interval),
-                            )
-                    })
-                    .unwrap_or(heartbeat_interval)
-                    .max(heartbeat_interval)
-            } else {
-                heartbeat_interval
-            };
-            self.dead_peer_timeout(iv)
-        };
+        let mut dead_after =
+            self.dead_peer_timeout(self.current_keepalive_interval(heartbeat_interval));
         let mut watchdog = tokio::time::interval(
             (dead_after / 8).clamp(Duration::from_millis(25), Duration::from_secs(1)),
         );
@@ -3006,137 +3143,81 @@ impl WorkerClient {
             }
         }
         let mut farewell: Option<WorkerMessage> = None;
-        // Blob requests ride the data queue: the QUIC data stream, never the control stream.
-        let blob_client = self
-            .master_has_blobs
-            .load(Ordering::Acquire)
-            .then(|| BlobClient::new(session.data_tx.clone()));
-        *self.blob_client.write().unwrap_or_else(|e| e.into_inner()) = blob_client.clone();
-        *self
-            .session_data_tx
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = Some(session.data_tx.clone());
-
-        let (buffered_checkpoints, buffered_results) = {
-            let mut outbox = self
-                .pending_resume_outbox
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            outbox.cancelled.clear();
-            let cps: Vec<(TaskId, WorkerMessage)> = outbox.checkpoints.drain().collect();
-            let res: Vec<BufferedTaskResult> = std::mem::take(&mut outbox.results);
-            (cps, res)
-        };
-        let _outbox_flush_guard = (!buffered_checkpoints.is_empty()
-            || !buffered_results.is_empty())
-        .then(|| {
-            let data_tx = session.data_tx.clone();
-            let flush_blob_client = blob_client.clone();
-            let flush_runner = Arc::clone(&self.runner);
-            let flush_outbox = Arc::clone(&self.pending_resume_outbox);
-            let flush_resume_active = Arc::clone(&self.resume_window_active);
-            AbortOnDrop(tokio::spawn(async move {
-                for (tid, cp_msg) in buffered_checkpoints {
-                    let cancelled = flush_outbox
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .cancelled
-                        .contains(&tid);
-                    if !cancelled && data_tx.send(cp_msg).await.is_err() {
-                        return;
+        let _outbox_flush_guard =
+            (!buffered_checkpoints.is_empty() || !buffered_results.is_empty()).then(|| {
+                let data_tx = session.data_tx.clone();
+                let flush_blob_client = blob_client.clone();
+                let flush_runner = Arc::clone(&self.runner);
+                let flush_outbox = Arc::clone(&self.pending_resume_outbox);
+                AbortOnDrop(tokio::spawn(async move {
+                    for (tid, cp_msg) in buffered_checkpoints {
+                        let cancelled = flush_outbox
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .cancelled
+                            .contains(&tid);
+                        if !cancelled && data_tx.send(cp_msg).await.is_err() {
+                            return;
+                        }
                     }
-                }
-                let mut iter = buffered_results.into_iter();
-                while let Some(item) = iter.next() {
-                    let BufferedTaskResult {
-                        task,
-                        mut result,
-                        output_pin,
-                        used_blobs,
-                    } = item;
-                    let is_cancelled = flush_outbox
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .cancelled
-                        .contains(&task.id);
-                    if is_cancelled {
-                        drop(output_pin);
-                        flush_runner.release_task_outputs(task.id);
-                        if used_blobs {
-                            if let Ok(cache) = flush_runner.blob_cache() {
-                                let _ =
-                                    tokio::task::spawn_blocking(move || cache.evict_to_fit()).await;
+                    for item in buffered_results {
+                        let still_pending = {
+                            let outbox = flush_outbox.lock().unwrap_or_else(|e| e.into_inner());
+                            !outbox.cancelled.contains(&item.task.id)
+                                && outbox
+                                    .results
+                                    .iter()
+                                    .any(|r| r.result.task_id == item.task.id)
+                        };
+                        if !still_pending {
+                            continue;
+                        }
+
+                        let mut result = item.result.clone();
+                        if !result.outputs.is_empty() {
+                            match flush_runner.blob_cache() {
+                                Ok(cache) => {
+                                    upload_task_outputs(
+                                        &item.task,
+                                        &mut result,
+                                        flush_blob_client.as_deref(),
+                                        &cache,
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    result.outputs.clear();
+                                    result.error = Some(e);
+                                }
                             }
                         }
-                        continue;
-                    }
 
-                    let saved_result = result.clone();
-                    if !result.outputs.is_empty() {
-                        match flush_runner.blob_cache() {
-                            Ok(cache) => {
-                                upload_task_outputs(
-                                    &task,
-                                    &mut result,
-                                    flush_blob_client.as_deref(),
-                                    &cache,
-                                )
-                                .await;
-                            }
-                            Err(e) => {
-                                result.outputs.clear();
-                                result.error = Some(e);
-                            }
+                        if !item.result.outputs.is_empty()
+                            && flush_blob_client
+                                .as_ref()
+                                .is_some_and(|client| client.is_closed())
+                        {
+                            return;
+                        }
+
+                        let still_pending = {
+                            let outbox = flush_outbox.lock().unwrap_or_else(|e| e.into_inner());
+                            !outbox.cancelled.contains(&item.task.id)
+                                && outbox
+                                    .results
+                                    .iter()
+                                    .any(|r| r.result.task_id == item.task.id)
+                        };
+                        if !still_pending {
+                            continue;
+                        }
+
+                        if data_tx.send(WorkerMessage::from(result)).await.is_err() {
+                            return;
                         }
                     }
-
-                    let cancelled_after_upload = flush_outbox
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .cancelled
-                        .contains(&task.id);
-                    if cancelled_after_upload {
-                        drop(output_pin);
-                        flush_runner.release_task_outputs(task.id);
-                        if used_blobs {
-                            if let Ok(cache) = flush_runner.blob_cache() {
-                                let _ =
-                                    tokio::task::spawn_blocking(move || cache.evict_to_fit()).await;
-                            }
-                        }
-                        continue;
-                    }
-
-                    if data_tx.is_closed() && flush_resume_active.load(Ordering::Acquire) {
-                        let mut outbox = flush_outbox.lock().unwrap_or_else(|e| e.into_inner());
-                        outbox.results.push(BufferedTaskResult {
-                            task,
-                            result: saved_result,
-                            output_pin,
-                            used_blobs,
-                        });
-                        outbox.results.extend(iter);
-                        return;
-                    }
-
-                    drop(output_pin);
-                    flush_runner.release_task_outputs(task.id);
-                    if used_blobs {
-                        if let Ok(cache) = flush_runner.blob_cache() {
-                            let _ = tokio::task::spawn_blocking(move || cache.evict_to_fit()).await;
-                        }
-                    }
-
-                    if data_tx.send(WorkerMessage::from(result)).await.is_err() {
-                        if flush_resume_active.load(Ordering::Acquire) {
-                            let mut outbox = flush_outbox.lock().unwrap_or_else(|e| e.into_inner());
-                            outbox.results.extend(iter);
-                        }
-                        return;
-                    }
-                }
-            }))
-        });
+                }))
+            });
 
         let outcome: GridResult<()> = loop {
             tokio::select! {
@@ -3204,26 +3285,8 @@ impl WorkerClient {
                 // Dead-peer watchdog: nothing received for `dead_after` (and no frame upload making
                 // progress) means the Master is gone even though the socket still accepts writes.
                 _ = watchdog.tick() => {
-                    let active = self.heartbeat_tracker.active_tasks.load(Ordering::Relaxed);
-                    let current_iv = if adaptive_keepalive {
-                        self.mobile
-                            .live_status()
-                            .map(|status| {
-                                status
-                                    .recommended_keepalive_interval_or(0, heartbeat_interval)
-                                    .max(
-                                        status.recommended_keepalive_interval_or(
-                                            active,
-                                            heartbeat_interval,
-                                        ),
-                                    )
-                            })
-                            .unwrap_or(heartbeat_interval)
-                            .max(heartbeat_interval)
-                    } else {
-                        heartbeat_interval
-                    };
-                    dead_after = dead_after.max(self.dead_peer_timeout(current_iv));
+                    dead_after = dead_after
+                        .max(self.dead_peer_timeout(self.current_keepalive_interval(heartbeat_interval)));
                     let silence = session.clock.silence();
                     if silence > dead_after {
                         warn!(
@@ -7136,11 +7199,40 @@ mod tests {
             ),
             Duration::ZERO
         );
+        // Sub-second computed grace (< 1s) is treated as zero.
+        assert_eq!(
+            compute_effective_resume_grace(Some(Duration::from_millis(15_500)), dead_peer, None,),
+            Duration::ZERO
+        );
 
         let default_client = WorkerClient::for_testing("127.0.0.1:9999", None, Some(1), false);
         assert!(default_client
             .advertised_features()
             .contains(ProtocolCapabilities::SESSION_RESUME));
+
+        // L2: when ADAPTIVE_KEEPALIVE is negotiated on a mobile worker whose live keepalive is
+        // 30s (dead_peer = 120s), a 30s master hold yields 0s grace instead of 15s.
+        default_client
+            .last_negotiated_hold_secs
+            .store(30, Ordering::Release);
+        default_client
+            .last_heartbeat_interval_ms
+            .store(3_000, Ordering::Release);
+        default_client.negotiated_features.store(
+            ProtocolCapabilities::all_supported().bits(),
+            Ordering::Release,
+        );
+        assert_eq!(
+            default_client.effective_resume_grace(),
+            Duration::from_secs(15)
+        );
+        default_client.mobile_telemetry().update(MobileLiveStatus {
+            battery_pct: Some(80),
+            is_charging: Some(true),
+            thermal_throttled: false,
+            ..Default::default()
+        });
+        assert_eq!(default_client.effective_resume_grace(), Duration::ZERO);
 
         let disabled_client = WorkerClient::new(
             WorkerConfig::new("127.0.0.1:9999")
@@ -7154,5 +7246,45 @@ mod tests {
         assert!(!disabled_client
             .advertised_features()
             .contains(ProtocolCapabilities::SESSION_RESUME));
+    }
+
+    #[tokio::test]
+    async fn test_outbox_retains_result_across_aborted_flush_until_result_ack() {
+        let client = WorkerClient::for_testing("127.0.0.1:9999", None, Some(1), false);
+        let task = Task::new(
+            rusty_grid_core::task::TaskSpec::builtin_test("sleep", 0),
+            TaskRequirements::generic(1, 32),
+        );
+        let task_id = task.id;
+        let res = TaskResult::success(client.worker_id(), task_id, "ok", 5, false);
+        {
+            let mut outbox = client.pending_resume_outbox.lock().unwrap();
+            outbox.push_result(BufferedTaskResult {
+                task,
+                result: res,
+                _output_pin: None,
+                used_blobs: false,
+            });
+        }
+        assert_eq!(client.resumable_task_ids().await, vec![task_id]);
+
+        // Simulating `run_session`'s non-destructive clone of `outbox.results` followed by an
+        // aborted `_outbox_flush_guard`: the buffered result remains in the outbox for the next
+        // reconnect until `RESULT_ACK_REASON` arrives.
+        let cloned = client.pending_resume_outbox.lock().unwrap().results.clone();
+        assert_eq!(cloned.len(), 1);
+        assert_eq!(client.resumable_task_ids().await, vec![task_id]);
+
+        client
+            .handle_cancel_task(
+                task_id,
+                Some(rusty_grid_core::protocol::master_features::RESULT_ACK_REASON.to_string()),
+            )
+            .await;
+        assert!(client.resumable_task_ids().await.is_empty());
+        assert!(
+            !client.cancelled_unseen.lock().unwrap().contains(&task_id),
+            "RESULT_ACK_REASON must not record task_id in cancelled_unseen"
+        );
     }
 }

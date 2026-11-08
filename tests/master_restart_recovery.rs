@@ -881,3 +881,546 @@ async fn test_worker_reconnecting_after_master_hold_expires_runs_task_only_once(
     w2_handle.abort();
     master2.shutdown().expect("shutdown master2");
 }
+
+/// Reviewer Probe P3b (`158-fix` H2): a task that finishes right as the master shuts down (after
+/// `close_and_compact_store_sync`, or while its `TaskResult` is in flight on the dying socket)
+/// retains its result in `pending_resume_outbox` until the master acknowledges it, so the
+/// restarted master adopts and records the result and the task runs **exactly once**.
+#[tokio::test]
+async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
+    let mut twice = 0usize;
+    let rounds = 12u64;
+    for round in 0..rounds {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("master-state");
+        let marker_path = dir.path().join("p3.marker");
+        let gate_path = dir.path().join("p3.gate");
+        let done_path = dir.path().join("p3.done");
+        let config1 = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(false)
+            .with_discovery(false)
+            .with_state_dir(&state_dir);
+        let master1 = MasterServer::spawn(config1).await.expect("spawn master1");
+        let master_addr = master1.server_addr();
+        let (w_tx, w_rx) = watch::channel(false);
+        let mut w1 = WorkerClient::for_testing(
+            master_addr.to_string(),
+            Some(format!("p3-{round}")),
+            Some(1),
+            false,
+        );
+        w1.set_backoff_config(rusty_grid_worker::backoff::BackoffConfig {
+            initial: Duration::from_millis(80),
+            max: Duration::from_millis(200),
+            factor: 1.5,
+            jitter_ratio: 0.0,
+        });
+        let wh = tokio::spawn(async move {
+            let _ = w1.run(w_rx).await;
+        });
+        assert!(
+            wait_for(
+                Duration::from_secs(5),
+                Duration::from_millis(25),
+                || async {
+                    master1
+                        .list_workers()
+                        .await
+                        .map(|w| w.len() == 1)
+                        .unwrap_or(false)
+                }
+            )
+            .await
+        );
+        let t = gated_marker_task(&marker_path, &gate_path, Some(&done_path), None, Some(2));
+        let tid = master1.submit_task(t).await.expect("submit");
+        assert!(
+            wait_for(
+                Duration::from_secs(5),
+                Duration::from_millis(10),
+                || async {
+                    let running = master1
+                        .get_task_info(tid)
+                        .await
+                        .map(|i| i.state == TaskState::Running)
+                        .unwrap_or(false);
+                    running
+                        && std::fs::read_to_string(&marker_path)
+                            .map(|s| s.lines().count() == 1)
+                            .unwrap_or(false)
+                }
+            )
+            .await
+        );
+        std::fs::write(&gate_path, b"go").unwrap();
+        while !done_path.exists() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(round % 6)).await;
+        master1.shutdown().expect("shutdown master1");
+        drop(master1);
+        assert!(
+            wait_for(
+                Duration::from_secs(5),
+                Duration::from_millis(10),
+                || async { done_path.exists() }
+            )
+            .await
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let config2 = ServerConfig::new(master_addr)
+            .with_web_ui(false)
+            .with_discovery(false)
+            .with_state_dir(&state_dir);
+        let master2 = spawn_rebound_master(config2, Duration::from_secs(5)).await;
+        let res = master2
+            .wait_task(tid, Some(Duration::from_secs(10)))
+            .await
+            .expect("task completion on master2");
+        assert!(res.is_success(), "round {round} task failed: {res:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let runs = std::fs::read_to_string(&marker_path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        let info = master2.get_task_info(tid).await.expect("task info");
+        eprintln!(
+            "RV158 P3 round={round} delay_ms={} runs={runs} state={:?} retry={} failover={}",
+            round % 6,
+            info.state,
+            info.retry_count,
+            info.failover_count
+        );
+        if runs > 1 {
+            twice += 1;
+        }
+        let _ = w_tx.send(true);
+        wh.abort();
+        master2.shutdown().expect("shutdown master2");
+    }
+    eprintln!("RV158 P3: rounds={rounds} ran_twice={twice}");
+    assert_eq!(twice, 0, "task ran twice in {twice}/{rounds} rounds");
+}
+
+/// `158-fix` M3 (live connection drop while master stays up):
+/// A worker connected through a TCP relay has its connection severed while the master stays up
+/// and two tasks (one normal, one `max_retries = 0`) are `Running`. The master places both tasks
+/// in `adoptable_by` hold, the worker reconnects within the hold and sends `ResumeSession`, and
+/// both tasks finish with 1 execution and 0 retries/failovers.
+#[tokio::test]
+async fn test_worker_connection_drop_adopts_running_task_while_master_stays_up() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker_normal = dir.path().join("drop_normal.marker");
+    let marker_zero = dir.path().join("drop_zero.marker");
+    let gate_path = dir.path().join("drop.gate");
+
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_web_ui(false)
+        .with_discovery(false)
+        .with_session_resume_hold(Duration::from_secs(30));
+    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master_addr = master.server_addr();
+
+    // TCP relay that can sever the active connection on demand while accepting subsequent reconnects.
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
+    let (sever_tx, sever_rx) = watch::channel(0u64);
+    let proxy_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut client_sock, _)) = proxy_listener.accept().await else {
+                break;
+            };
+            let Ok(mut upstream_sock) = tokio::net::TcpStream::connect(master_addr).await else {
+                continue;
+            };
+            let mut conn_sever_rx = sever_rx.clone();
+            let gen_at_start = *conn_sever_rx.borrow_and_update();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::io::copy_bidirectional(&mut client_sock, &mut upstream_sock) => {}
+                    _ = conn_sever_rx.changed() => {
+                        if *conn_sever_rx.borrow() != gen_at_start {
+                            // Sever both TCP legs immediately.
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let (w_shutdown_tx, w_shutdown_rx) = watch::channel(false);
+    let mut w1 = WorkerClient::for_testing(
+        proxy_addr.to_string(),
+        Some("drop-live-w1".into()),
+        Some(2),
+        false,
+    );
+    w1.set_backoff_config(rusty_grid_worker::backoff::BackoffConfig {
+        initial: Duration::from_millis(80),
+        max: Duration::from_millis(200),
+        factor: 1.5,
+        jitter_ratio: 0.0,
+    });
+    let w1_id = w1.worker_id();
+    let w1_handle = tokio::spawn(async move {
+        let _ = w1.run(w_shutdown_rx).await;
+    });
+
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(25),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|w| w.len() == 1)
+                    .unwrap_or(false)
+            }
+        )
+        .await,
+        "worker must register through proxy"
+    );
+
+    let t_normal = gated_marker_task(&marker_normal, &gate_path, None, None, Some(2));
+    let t_zero = gated_marker_task(&marker_zero, &gate_path, None, None, Some(0));
+    let t_normal_id = master.submit_task(t_normal).await.expect("submit normal");
+    let t_zero_id = master.submit_task(t_zero).await.expect("submit zero");
+
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(25),
+            || async {
+                let n_ok = master
+                    .get_task_info(t_normal_id)
+                    .await
+                    .map(|i| i.state == TaskState::Running)
+                    .unwrap_or(false)
+                    && std::fs::read_to_string(&marker_normal)
+                        .map(|s| s.lines().count() == 1)
+                        .unwrap_or(false);
+                let z_ok = master
+                    .get_task_info(t_zero_id)
+                    .await
+                    .map(|i| i.state == TaskState::Running)
+                    .unwrap_or(false)
+                    && std::fs::read_to_string(&marker_zero)
+                        .map(|s| s.lines().count() == 1)
+                        .unwrap_or(false);
+                n_ok && z_ok
+            }
+        )
+        .await,
+        "both normal and max_retries=0 tasks must be Running before connection drop"
+    );
+    let session_before = master.list_workers().await.unwrap()[0].session_id;
+
+    // Sever the TCP connection while the master stays up.
+    let _ = sever_tx.send(1);
+
+    // Wait for the worker to reconnect on a new session_id and re-adopt both tasks into Running.
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(25),
+            || async {
+                let reconnected = master
+                    .list_workers()
+                    .await
+                    .map(|ws| {
+                        ws.iter().any(|w| {
+                            w.worker_id == w1_id
+                                && w.session_id > session_before
+                                && w.active_tasks == 2
+                        })
+                    })
+                    .unwrap_or(false);
+                let both_running = master
+                    .get_task_info(t_normal_id)
+                    .await
+                    .map(|i| i.state == TaskState::Running)
+                    .unwrap_or(false)
+                    && master
+                        .get_task_info(t_zero_id)
+                        .await
+                        .map(|i| i.state == TaskState::Running)
+                        .unwrap_or(false);
+                reconnected && both_running
+            }
+        )
+        .await,
+        "worker must reconnect on a new session and re-adopt both tasks"
+    );
+
+    std::fs::write(&gate_path, b"go").expect("write gate");
+
+    for tid in [t_normal_id, t_zero_id] {
+        let res = master
+            .wait_task(tid, Some(Duration::from_secs(10)))
+            .await
+            .expect("task completion after live reconnect");
+        assert!(res.is_success(), "task {tid} failed: {res:?}");
+        let info = master.get_task_info(tid).await.expect("task info");
+        assert_eq!(info.retry_count, 0);
+        assert_eq!(info.failover_count, 0);
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(&marker_normal)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker_zero)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+
+    let _ = w_shutdown_tx.send(true);
+    w1_handle.abort();
+    proxy_task.abort();
+    master.shutdown().expect("shutdown master");
+}
+
+/// Helper entrypoint invoked as a child process by
+/// `test_master_sigkill_restart_adopts_running_normal_and_zero_retry_tasks_once` so the parent test
+/// can `SIGKILL` (`Child::kill()`) a real master process while tasks are `Running`, ensuring
+/// `close_and_compact_store_sync` never runs and the restarted master replays from `journal.bin`.
+#[tokio::test]
+async fn sigkill_child_master_entrypoint() {
+    let Ok(state_dir) = std::env::var("OXIDESWARM_TEST_SIGKILL_MASTER_STATE_DIR") else {
+        return;
+    };
+    let port_file =
+        std::env::var("OXIDESWARM_TEST_SIGKILL_MASTER_PORT_FILE").expect("PORT_FILE env");
+    let ready_file =
+        std::env::var("OXIDESWARM_TEST_SIGKILL_MASTER_READY_FILE").expect("READY_FILE env");
+    let marker_normal = std::path::PathBuf::from(
+        std::env::var("OXIDESWARM_TEST_SIGKILL_MARKER_NORMAL").expect("MARKER_NORMAL env"),
+    );
+    let marker_zero = std::path::PathBuf::from(
+        std::env::var("OXIDESWARM_TEST_SIGKILL_MARKER_ZERO").expect("MARKER_ZERO env"),
+    );
+    let gate_path =
+        std::path::PathBuf::from(std::env::var("OXIDESWARM_TEST_SIGKILL_GATE").expect("GATE env"));
+
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_web_ui(false)
+        .with_discovery(false)
+        .with_state_dir(&state_dir);
+    let master = MasterServer::spawn(config)
+        .await
+        .expect("spawn child master");
+    std::fs::write(&port_file, master.server_addr().to_string()).expect("write port_file");
+
+    let t_normal_id = master
+        .submit_task(gated_marker_task(
+            &marker_normal,
+            &gate_path,
+            None,
+            None,
+            Some(2),
+        ))
+        .await
+        .expect("submit normal task");
+    let t_zero_id = master
+        .submit_task(gated_marker_task(
+            &marker_zero,
+            &gate_path,
+            None,
+            None,
+            Some(0),
+        ))
+        .await
+        .expect("submit zero-retry task");
+
+    while master
+        .get_task_info(t_normal_id)
+        .await
+        .map(|i| i.state != TaskState::Running)
+        .unwrap_or(true)
+        || master
+            .get_task_info(t_zero_id)
+            .await
+            .map(|i| i.state != TaskState::Running)
+            .unwrap_or(true)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Ensure `TaskRunning` journal records are flushed before signalling parent.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    std::fs::write(&ready_file, format!("{t_normal_id}\n{t_zero_id}\n")).expect("write ready_file");
+    std::future::pending::<()>().await;
+}
+
+/// `158-fix` M3 (unclean `SIGKILL` master crash with uncompacted journal replay):
+/// Spawns a child master process on `--state-dir`, runs both a normal task and a `max_retries = 0`
+/// task on a 2-slot worker, kills the child master with `Child::kill()` (`SIGKILL`) so
+/// `close_and_compact_store_sync` does not run, starts `master2` on the same `--state-dir`
+/// (replaying `journal.bin` directly), and verifies both tasks are adopted and finish with 1 run
+/// and 0 retries/failovers.
+#[tokio::test]
+async fn test_master_sigkill_restart_adopts_running_normal_and_zero_retry_tasks_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state_dir = dir.path().join("master-state");
+    let port_file = dir.path().join("master.addr");
+    let ready_file = dir.path().join("master.ready");
+    let marker_normal = dir.path().join("sigkill_normal.marker");
+    let marker_zero = dir.path().join("sigkill_zero.marker");
+    let gate_path = dir.path().join("sigkill.gate");
+
+    let mut child = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .arg("--exact")
+        .arg("sigkill_child_master_entrypoint")
+        .arg("--nocapture")
+        .env("OXIDESWARM_TEST_SIGKILL_MASTER_STATE_DIR", &state_dir)
+        .env("OXIDESWARM_TEST_SIGKILL_MASTER_PORT_FILE", &port_file)
+        .env("OXIDESWARM_TEST_SIGKILL_MASTER_READY_FILE", &ready_file)
+        .env("OXIDESWARM_TEST_SIGKILL_MARKER_NORMAL", &marker_normal)
+        .env("OXIDESWARM_TEST_SIGKILL_MARKER_ZERO", &marker_zero)
+        .env("OXIDESWARM_TEST_SIGKILL_GATE", &gate_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn child master process");
+
+    assert!(
+        wait_for(
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || async {
+                std::fs::read_to_string(&port_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<std::net::SocketAddr>().ok())
+                    .is_some()
+            }
+        )
+        .await,
+        "child master process must write its bound address"
+    );
+    let master_addr: std::net::SocketAddr = std::fs::read_to_string(&port_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    let (w_shutdown_tx, w_shutdown_rx) = watch::channel(false);
+    let mut w1 = WorkerClient::for_testing(
+        master_addr.to_string(),
+        Some("sigkill-w1".into()),
+        Some(2),
+        false,
+    );
+    w1.set_backoff_config(rusty_grid_worker::backoff::BackoffConfig {
+        initial: Duration::from_millis(80),
+        max: Duration::from_millis(200),
+        factor: 1.5,
+        jitter_ratio: 0.0,
+    });
+    let w1_id = w1.worker_id();
+    let w1_handle = tokio::spawn(async move {
+        let _ = w1.run(w_shutdown_rx).await;
+    });
+
+    assert!(
+        wait_for(
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || async {
+                ready_file.exists()
+                    && std::fs::read_to_string(&marker_normal)
+                        .map(|s| s.lines().count() == 1)
+                        .unwrap_or(false)
+                    && std::fs::read_to_string(&marker_zero)
+                        .map(|s| s.lines().count() == 1)
+                        .unwrap_or(false)
+            }
+        )
+        .await,
+        "both normal and max_retries=0 tasks must start running before SIGKILL"
+    );
+    let ready_text = std::fs::read_to_string(&ready_file).expect("read ready_file");
+    let mut lines = ready_text.lines();
+    let t_normal_id: rusty_grid_core::task::TaskId =
+        lines.next().unwrap().parse().expect("parse t_normal_id");
+    let t_zero_id: rusty_grid_core::task::TaskId =
+        lines.next().unwrap().parse().expect("parse t_zero_id");
+
+    // Uncleanly kill (`SIGKILL`) the child master process so `close_and_compact_store_sync` never runs.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let journal_len = std::fs::metadata(state_dir.join("journal.bin"))
+        .expect("journal.bin metadata")
+        .len();
+    assert!(
+        journal_len > 24,
+        "journal.bin must hold uncompacted records after SIGKILL (len={journal_len})"
+    );
+
+    let config2 = ServerConfig::new(master_addr)
+        .with_web_ui(false)
+        .with_discovery(false)
+        .with_state_dir(&state_dir);
+    let master2 = spawn_rebound_master(config2, Duration::from_secs(5)).await;
+
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(25),
+            || async {
+                let n_adopted = master2
+                    .get_task_info(t_normal_id)
+                    .await
+                    .map(|i| i.state == TaskState::Running && i.assigned_worker_id == Some(w1_id))
+                    .unwrap_or(false);
+                let z_adopted = master2
+                    .get_task_info(t_zero_id)
+                    .await
+                    .map(|i| i.state == TaskState::Running && i.assigned_worker_id == Some(w1_id))
+                    .unwrap_or(false);
+                n_adopted && z_adopted
+            }
+        )
+        .await,
+        "w1 must reconnect to master2 after SIGKILL and adopt both normal and max_retries=0 tasks"
+    );
+
+    std::fs::write(&gate_path, b"go").expect("write gate");
+
+    for tid in [t_normal_id, t_zero_id] {
+        let res = master2
+            .wait_task(tid, Some(Duration::from_secs(10)))
+            .await
+            .expect("task completion after SIGKILL restart");
+        assert!(res.is_success(), "task {tid} failed: {res:?}");
+        let info = master2.get_task_info(tid).await.expect("task info");
+        assert_eq!(info.retry_count, 0);
+        assert_eq!(info.failover_count, 0);
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(&marker_normal)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker_zero)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+
+    let _ = w_shutdown_tx.send(true);
+    w1_handle.abort();
+    master2.shutdown().expect("shutdown master2");
+}

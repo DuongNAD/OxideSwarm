@@ -1081,6 +1081,38 @@ impl WorkerRegistry {
         Ok(())
     }
 
+    /// Sends a `MasterMessage::CancelTask` carrying [`master_features::RESULT_ACK_REASON`] to
+    /// `(worker_id, session_id)` if the session is still connected and negotiated
+    /// [`ProtocolCapabilities::SESSION_RESUME`].
+    pub async fn send_result_ack(
+        &self,
+        worker_id: &Uuid,
+        session_id: Option<u64>,
+        task_id: rusty_grid_core::task::TaskId,
+    ) {
+        let sender = {
+            let inner = self.inner.read().await;
+            let Some(entry) = inner.workers.get(worker_id) else {
+                return;
+            };
+            if entry.status == WorkerStatus::Disconnected
+                || !entry
+                    .features
+                    .contains(ProtocolCapabilities::SESSION_RESUME)
+                || session_id.is_some_and(|s| entry.session_id != s)
+            {
+                return;
+            }
+            entry.sender.clone()
+        };
+        let _ = sender
+            .send(MasterMessage::CancelTask {
+                task_id,
+                reason: Some(rusty_grid_core::protocol::master_features::RESULT_ACK_REASON.into()),
+            })
+            .await;
+    }
+
     /// Broadcasts a MasterMessage to all active workers. Returns the count of successful transmissions.
     pub async fn broadcast(&self, msg: MasterMessage) -> GridResult<usize> {
         let senders: Vec<(Uuid, mpsc::Sender<MasterMessage>)> = {

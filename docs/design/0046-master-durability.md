@@ -79,10 +79,13 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
    - Add `pub state_dir: Option<PathBuf>` and `pub fn with_state_dir(mut self, dir: impl Into<PathBuf>) -> Self`
      to `ServerConfig` (`crates/master/src/server.rs:148`), defaulting to `None` so existing unit
      and integration tests remain purely in-memory unless they opt in.
-   - Add `--session-resume-hold-secs <SECS>` to `MasterArgs` (`crates/cli/src/cli_app.rs:312`),
+   - Add `--session-resume-hold-secs <SECS>` to `MasterArgs` (`crates/cli/src/cli_app.rs:338`),
      backed by `RUSTY_GRID_SESSION_RESUME_HOLD_SECS`, `MasterFileConfig::session_resume_hold_secs: Option<u64>`,
-     and `ServerConfig::session_resume_hold: Duration` (default `Duration::from_secs(30)`; `0`
-     disables session resume).
+     and `ServerConfig::session_resume_hold: Duration` (CLI default `30 s` on every master, even
+     without `--state-dir`, whereas library `ServerConfig` defaults to `Duration::ZERO` unless
+     `with_state_dir` or `with_session_resume_hold` is called; `0` disables the hold for immediate
+     failover; maximum `MAX_SESSION_RESUME_HOLD_SECS = 3_600`, clamping higher programmatic values
+     with a `warn!`).
    - When `state_dir` is `Some(dir)` and `--blob-dir` / `RUSTY_GRID_BLOB_DIR` / `[master].blob_dir`
      was not explicitly provided, default the master's blob store directory
      (`crates/cli/src/cli_app.rs:1404-1415` and `MasterServer::bind_full` in
@@ -652,3 +655,14 @@ lands as a self-contained, reviewable unit.
   `[worker].session_resume_grace_secs`), disconnected outbox buffering (`pending_resume_outbox`) with
   `upload_task_outputs` before flushing `TaskResult`, and end-to-end session-resume tests in
   `tests/master_restart_recovery.rs`.
+- **2026-11-09:** Review fixes (`158-fix`): accepted `TaskResult` and `Checkpoint` directly from an
+  active `adoptable_by` hold for the same `worker_id` so QUIC 2-lane data frames racing ahead of
+  `ResumeSession` adopt and complete the task; retained completed task results (with `Arc<CachePin>`)
+  in `pending_resume_outbox` until the master acknowledges recording them via
+  `CancelTask { reason: Some("oxs:result-ack") }` and skipped `handle_worker_disconnect` on local
+  master shutdown so results in flight during shutdown are re-sent and adopted on restart; charged
+  `pending_failover_charge` before dispatching an expired hold; bounded `session_resume_workers` at
+  `4,096` and refused `ResumeSession` when `SESSION_RESUME` was not negotiated; accounted for
+  `ADAPTIVE_KEEPALIVE` in `effective_resume_grace`; and added QUIC race, expired-hold dispatch,
+  shutdown-in-flight result, cross-worker adoption rejection, live connection-drop, and `SIGKILL`
+  master restart tests.
