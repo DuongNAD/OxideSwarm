@@ -852,7 +852,8 @@ pub mod windows {
         ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
         GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW, SetNamedSecurityInfoW,
         SetSecurityInfo, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, SDDL_REVISION_1, SET_ACCESS,
-        SE_FILE_OBJECT, SE_WINDOW_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+        SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_WINDOW_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+        TRUSTEE_W,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -861,17 +862,49 @@ pub mod windows {
     use windows_sys::Win32::Security::{
         AclSizeInformation, CreateWellKnownSid, DeleteAce, DeriveCapabilitySidsFromName, EqualSid,
         FreeSid, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
-        GetSecurityDescriptorDacl, GetTokenInformation, IsValidSid, SetTokenInformation,
-        TokenDefaultDacl, TokenOwner, TokenUser, WinBuiltinAdministratorsSid,
+        GetSecurityDescriptorDacl, GetTokenInformation, IsValidSid, SetFileSecurityW,
+        SetTokenInformation, TokenDefaultDacl, TokenOwner, TokenUser, WinBuiltinAdministratorsSid,
         WinBuiltinAnyPackageSid, WinBuiltinUsersSid, WinCapabilityInternetClientSid,
-        WinCapabilityPrivateNetworkClientServerSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE,
-        ACE_FLAGS, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
-        DACL_SECURITY_INFORMATION, INHERITED_ACE, INHERIT_ONLY_ACE, NO_INHERITANCE,
-        OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-        SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
-        TOKEN_ADJUST_DEFAULT, TOKEN_DEFAULT_DACL, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
-        UNPROTECTED_DACL_SECURITY_INFORMATION, WELL_KNOWN_SID_TYPE,
+        WinCapabilityPrivateNetworkClientServerSid, WinLocalSystemSid, WinWorldSid,
+        ACCESS_ALLOWED_ACE, ACE_FLAGS, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
+        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERITED_ACE, INHERIT_ONLY_ACE,
+        NO_INHERITANCE, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
+        SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_DEFAULT_DACL,
+        TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, UNPROTECTED_DACL_SECURITY_INFORMATION,
+        WELL_KNOWN_SID_TYPE,
     };
+
+    #[repr(C)]
+    struct NtUnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    struct NtObjectAttributes {
+        length: u32,
+        root_directory: HANDLE,
+        object_name: *mut NtUnicodeString,
+        attributes: u32,
+        security_descriptor: *mut core::ffi::c_void,
+        security_quality_of_service: *mut core::ffi::c_void,
+    }
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtOpenDirectoryObject(
+            directory_handle: *mut HANDLE,
+            desired_access: u32,
+            object_attributes: *const NtObjectAttributes,
+        ) -> i32;
+        fn NtOpenSymbolicLinkObject(
+            link_handle: *mut HANDLE,
+            desired_access: u32,
+            object_attributes: *const NtObjectAttributes,
+        ) -> i32;
+    }
 
     #[link(name = "user32")]
     extern "system" {
@@ -901,9 +934,10 @@ pub mod windows {
         ) -> i32;
     }
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
-        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_TRAVERSE, SYNCHRONIZE,
-        WRITE_DAC, WRITE_OWNER,
+        CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE,
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+        FILE_READ_DATA, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING,
+        SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::SystemServices::{
@@ -1795,6 +1829,28 @@ pub mod windows {
         if set_rc != ERROR_SUCCESS {
             return Err(io::Error::from_raw_os_error(set_rc as i32));
         }
+        // `SetNamedSecurityInfoW` always sets `SE_DACL_AUTO_INHERITED` (`AI`). If the original
+        // SDDL did not have `AI` (e.g. `D:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;LA)`
+        // on `windows-latest`), apply the exact parsed security descriptor via `SetFileSecurityW`
+        // so `get_path_dacl_sddl` matches `sddl` byte-for-byte.
+        if get_path_dacl_sddl(path).ok().as_deref() != Some(sddl) {
+            let mut raw_sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let mut raw_size: u32 = 0;
+            let raw_ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide_sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut raw_sd,
+                    &mut raw_size,
+                )
+            };
+            if raw_ok != 0 && !raw_sd.is_null() {
+                unsafe {
+                    let _ = SetFileSecurityW(wide_path.as_ptr(), sec_info, raw_sd);
+                    LocalFree(raw_sd as HLOCAL);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1959,99 +2015,263 @@ pub mod windows {
         record_manifest_line(manifest_path, &line)
     }
 
-    /// Ensures the current process token's `TokenOwner` is `CurrentUser` (`TokenUser`) and its
-    /// `TokenDefaultDacl` includes an explicit `GENERIC_ALL` (`0x1000_0000`) allow ACE for
-    /// `CurrentUser`.
+    unsafe fn merge_entries_on_kernel_handle(handle: HANDLE, entries: &[EXPLICIT_ACCESS_W]) {
+        if handle.is_null() || handle == (-1isize as HANDLE) || entries.is_empty() {
+            return;
+        }
+        let mut old_dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        if GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut old_dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        ) == ERROR_SUCCESS
+        {
+            let mut new_dacl: *mut ACL = std::ptr::null_mut();
+            if SetEntriesInAclW(
+                entries.len() as u32,
+                entries.as_ptr(),
+                old_dacl,
+                &mut new_dacl,
+            ) == ERROR_SUCCESS
+                && !new_dacl.is_null()
+            {
+                let _ = SetSecurityInfo(
+                    handle,
+                    SE_KERNEL_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    new_dacl,
+                    std::ptr::null(),
+                );
+                LocalFree(new_dacl as HLOCAL);
+            }
+            if !sd.is_null() {
+                LocalFree(sd as HLOCAL);
+            }
+        }
+    }
+
+    /// Ensures that when the worker runs under an elevated Administrator token (such as
+    /// `runneradmin` on GitHub Actions `windows-latest`):
+    /// 1. The worker process token's `TokenOwner` is `CurrentUser` (`TokenUser`) and its
+    ///    `TokenDefaultDacl` includes explicit `GENERIC_ALL | FILE_ALL_ACCESS` allow ACEs for
+    ///    `CurrentUser` and `BUILTIN\Users`.
+    /// 2. The per-logon-session Object Manager `DosDevices` directory `\??`
+    ///    (`\Sessions\<SessionId>\DosDevices\<LogonId>`) and `\GLOBAL??`, together with the
+    ///    `NUL` / `PIPE` symbolic links and `\Device\Null`, grant `DIRECTORY_QUERY |
+    ///    DIRECTORY_TRAVERSE` / `SYMBOLIC_LINK_QUERY` / `RWX` to `CurrentUser`, `BUILTIN\Users`,
+    ///    `Everyone`, `S-1-15-2-1` (`ALL APPLICATION PACKAGES`), and `oxideswarm.toolchain`.
     ///
-    /// Why: when the worker runs under an elevated Administrator token (such as `runneradmin` on
-    /// GitHub Actions `windows-latest`), Windows sets `TokenOwner = BUILTIN\Administrators` (`BA`)
-    /// and `TokenDefaultDacl = D:(A;;GA;;;BA)(A;;GA;;;SY)` — with NO ACE for `TokenUser` itself.
-    /// When `CreateProcessW` creates an AppContainer token via `SepCreateLowBoxToken`, the kernel
-    /// copies the parent's `TokenDefaultDacl` and appends `(A;;GA;;;<AppContainerSid>)`, while
-    /// marking `BUILTIN\Administrators` (`BA`) as `SE_GROUP_USE_FOR_DENY_ONLY`. Consequently, when
-    /// any process inside the AppContainer (`cargo.exe` spawning `rustc -vV`, `CreatePipe(NULL, 0)`,
-    /// or `powershell.exe` / CLR initializing internal anonymous pipes/events) creates an object
-    /// with a `NULL` security descriptor and reopens it via `NtOpenFile`, Stage 1 of
-    /// `SepAccessCheck` (normal user/group SIDs) fails with `STATUS_ACCESS_DENIED` (`os error 5`)
-    /// because `BA` is deny-only and `TokenUser` is absent from `TokenDefaultDacl`.
-    ///
-    /// Adding `CurrentUser:(GA)` to the worker's `TokenDefaultDacl` does NOT add any AppContainer
-    /// or capability SID to host-created objects (so host pipes/events remain 100% blocked to
-    /// AppContainers by Stage 2 of `SepAccessCheck`), while ensuring every child AppContainer's
-    /// `TokenDefaultDacl` grants both `CurrentUser` (Stage 1) and that task's own
-    /// `<AppContainerSid>` (Stage 2).
+    /// Why: under an elevated Administrator session on `windows-latest`:
+    /// - Windows sets `TokenOwner = BUILTIN\Administrators` (`BA`) and `TokenDefaultDacl =
+    ///   D:(A;;GA;;;BA)(A;;GA;;;SY)` — with NO ACE for `TokenUser` (`runneradmin`) or `WD`
+    ///   (`Everyone`).
+    /// - At logon time, `lsass.exe` creates `\??` (`\Sessions\<SessionId>\DosDevices\<LogonId>`)
+    ///   using that elevated token's `TokenOwner` (`BA`), resulting in a DACL on `\??` that
+    ///   grants ONLY `SY` and `BA` (unlike non-elevated sessions where `TokenOwner == CurrentUser`
+    ///   so `\??` grants `CurrentUser`).
+    /// - Inside an AppContainer, `BA` is marked `SE_GROUP_USE_FOR_DENY_ONLY`. When any process in
+    ///   the AppContainer (`cmd.exe` redirecting `>nul` or `2>nul`, or `cargo.exe` spawning
+    ///   `rustc -vV` with `Stdio::null()`) opens `NUL` (`\??\NUL`), `NUL` is a leaf entry inside
+    ///   `\??`, which requires `DIRECTORY_QUERY` (`0x0001`, NOT bypassed by
+    ///   `SeChangeNotifyPrivilege`) on `\??`. Without an allow ACE on `\??` for `CurrentUser`
+    ///   (Stage 1 of `SepAccessCheck`) and the AppContainer (Stage 2), opening `NUL` inside the
+    ///   AppContainer fails with `STATUS_ACCESS_DENIED` (`os error 5`, `Access is denied.`).
     fn ensure_process_token_default_dacl_grants_current_user() {
         static DONE: OnceLock<()> = OnceLock::new();
         DONE.get_or_init(|| unsafe {
             let Ok(user_sid) = OwnedSid::current_user() else {
                 return;
             };
+            let users_sid = OwnedSid::from_well_known(WinBuiltinUsersSid).ok();
+            let everyone_sid = OwnedSid::from_well_known(WinWorldSid).ok();
+            let any_pkg_sid = OwnedSid::from_well_known(WinBuiltinAnyPackageSid).ok();
+            let toolchain_sid = OwnedSid::oxideswarm_toolchain().ok();
+
             let mut token: HANDLE = std::ptr::null_mut();
             if OpenProcessToken(
                 GetCurrentProcess(),
                 TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
                 &mut token,
-            ) == 0
-                || token.is_null()
+            ) != 0
+                && !token.is_null()
             {
-                return;
-            }
-            let owner = TOKEN_OWNER {
-                Owner: user_sid.as_psid(),
-            };
-            let _ = SetTokenInformation(
-                token,
-                TokenOwner,
-                &owner as *const TOKEN_OWNER as *const core::ffi::c_void,
-                std::mem::size_of::<TOKEN_OWNER>() as u32,
-            );
+                let owner = TOKEN_OWNER {
+                    Owner: user_sid.as_psid(),
+                };
+                let _ = SetTokenInformation(
+                    token,
+                    TokenOwner,
+                    &owner as *const TOKEN_OWNER as *const core::ffi::c_void,
+                    std::mem::size_of::<TOKEN_OWNER>() as u32,
+                );
 
-            let mut needed: u32 = 0;
-            let _ = GetTokenInformation(
-                token,
-                TokenDefaultDacl,
-                std::ptr::null_mut(),
-                0,
-                &mut needed,
-            );
-            if needed > 0 {
-                let mut buf = vec![0u8; needed as usize];
-                if GetTokenInformation(
+                let mut needed: u32 = 0;
+                let _ = GetTokenInformation(
                     token,
                     TokenDefaultDacl,
-                    buf.as_mut_ptr() as *mut core::ffi::c_void,
-                    needed,
+                    std::ptr::null_mut(),
+                    0,
                     &mut needed,
-                ) != 0
-                {
-                    let tdd = &*(buf.as_ptr() as *const TOKEN_DEFAULT_DACL);
-                    if !tdd.DefaultDacl.is_null() {
-                        const GENERIC_ALL_MASK: u32 = 0x1000_0000;
-                        let ea = explicit_access(
-                            user_sid.as_psid(),
-                            GENERIC_ALL_MASK,
-                            GRANT_ACCESS,
-                            NO_INHERITANCE,
-                        );
-                        let mut new_dacl: *mut ACL = std::ptr::null_mut();
-                        if SetEntriesInAclW(1, &ea, tdd.DefaultDacl, &mut new_dacl) == ERROR_SUCCESS
-                            && !new_dacl.is_null()
-                        {
-                            let new_tdd = TOKEN_DEFAULT_DACL {
-                                DefaultDacl: new_dacl,
-                            };
-                            let _ = SetTokenInformation(
-                                token,
-                                TokenDefaultDacl,
-                                &new_tdd as *const TOKEN_DEFAULT_DACL as *const core::ffi::c_void,
-                                std::mem::size_of::<TOKEN_DEFAULT_DACL>() as u32,
-                            );
-                            LocalFree(new_dacl as HLOCAL);
+                );
+                if needed > 0 {
+                    let mut buf = vec![0u8; needed as usize];
+                    if GetTokenInformation(
+                        token,
+                        TokenDefaultDacl,
+                        buf.as_mut_ptr() as *mut core::ffi::c_void,
+                        needed,
+                        &mut needed,
+                    ) != 0
+                    {
+                        let tdd = &*(buf.as_ptr() as *const TOKEN_DEFAULT_DACL);
+                        if !tdd.DefaultDacl.is_null() {
+                            const FULL_DEFAULT_MASK: u32 = 0x101F_01FF;
+                            let mut entries = vec![explicit_access(
+                                user_sid.as_psid(),
+                                FULL_DEFAULT_MASK,
+                                GRANT_ACCESS,
+                                NO_INHERITANCE,
+                            )];
+                            if let Some(ref us) = users_sid {
+                                entries.push(explicit_access(
+                                    us.as_psid(),
+                                    FULL_DEFAULT_MASK,
+                                    GRANT_ACCESS,
+                                    NO_INHERITANCE,
+                                ));
+                            }
+                            let mut new_dacl: *mut ACL = std::ptr::null_mut();
+                            if SetEntriesInAclW(
+                                entries.len() as u32,
+                                entries.as_ptr(),
+                                tdd.DefaultDacl,
+                                &mut new_dacl,
+                            ) == ERROR_SUCCESS
+                                && !new_dacl.is_null()
+                            {
+                                let new_tdd = TOKEN_DEFAULT_DACL {
+                                    DefaultDacl: new_dacl,
+                                };
+                                let _ = SetTokenInformation(
+                                    token,
+                                    TokenDefaultDacl,
+                                    &new_tdd as *const TOKEN_DEFAULT_DACL
+                                        as *const core::ffi::c_void,
+                                    std::mem::size_of::<TOKEN_DEFAULT_DACL>() as u32,
+                                );
+                                LocalFree(new_dacl as HLOCAL);
+                            }
                         }
                     }
                 }
+                CloseHandle(token);
             }
-            CloseHandle(token);
+
+            let mut target_sids: Vec<PSID> = vec![user_sid.as_psid()];
+            if let Some(ref s) = users_sid {
+                target_sids.push(s.as_psid());
+            }
+            if let Some(ref s) = everyone_sid {
+                target_sids.push(s.as_psid());
+            }
+            if let Some(ref s) = any_pkg_sid {
+                target_sids.push(s.as_psid());
+            }
+            if let Some(ref s) = toolchain_sid {
+                target_sids.push(s.as_psid());
+            }
+
+            const READ_CONTROL_WRITE_DAC: u32 = 0x0006_0000;
+            const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+            // DIRECTORY_QUERY (0x0001) | DIRECTORY_TRAVERSE (0x0002) | READ_CONTROL (0x00020000)
+            const DIR_QUERY_TRAVERSE: u32 = 0x0002_0003;
+            // SYMBOLIC_LINK_QUERY (0x0001) | READ_CONTROL (0x00020000)
+            const SYMLINK_QUERY: u32 = 0x0002_0001;
+
+            let dir_entries: Vec<EXPLICIT_ACCESS_W> = target_sids
+                .iter()
+                .map(|&sid| explicit_access(sid, DIR_QUERY_TRAVERSE, GRANT_ACCESS, NO_INHERITANCE))
+                .collect();
+            for obj_path in [r"\??", r"\GLOBAL??"] {
+                let mut wide: Vec<u16> = OsStr::new(obj_path).encode_wide().collect();
+                let byte_len = (wide.len() * 2) as u16;
+                let mut us = NtUnicodeString {
+                    length: byte_len,
+                    maximum_length: byte_len,
+                    buffer: wide.as_mut_ptr(),
+                };
+                let oa = NtObjectAttributes {
+                    length: std::mem::size_of::<NtObjectAttributes>() as u32,
+                    root_directory: std::ptr::null_mut(),
+                    object_name: &mut us,
+                    attributes: OBJ_CASE_INSENSITIVE,
+                    security_descriptor: std::ptr::null_mut(),
+                    security_quality_of_service: std::ptr::null_mut(),
+                };
+                let mut h: HANDLE = std::ptr::null_mut();
+                if NtOpenDirectoryObject(&mut h, READ_CONTROL_WRITE_DAC, &oa) == 0 && !h.is_null() {
+                    merge_entries_on_kernel_handle(h, &dir_entries);
+                    CloseHandle(h);
+                }
+            }
+
+            let link_entries: Vec<EXPLICIT_ACCESS_W> = target_sids
+                .iter()
+                .map(|&sid| explicit_access(sid, SYMLINK_QUERY, GRANT_ACCESS, NO_INHERITANCE))
+                .collect();
+            for link_path in [r"\??\NUL", r"\??\PIPE", r"\GLOBAL??\NUL", r"\GLOBAL??\PIPE"] {
+                let mut wide: Vec<u16> = OsStr::new(link_path).encode_wide().collect();
+                let byte_len = (wide.len() * 2) as u16;
+                let mut us = NtUnicodeString {
+                    length: byte_len,
+                    maximum_length: byte_len,
+                    buffer: wide.as_mut_ptr(),
+                };
+                let oa = NtObjectAttributes {
+                    length: std::mem::size_of::<NtObjectAttributes>() as u32,
+                    root_directory: std::ptr::null_mut(),
+                    object_name: &mut us,
+                    attributes: OBJ_CASE_INSENSITIVE,
+                    security_descriptor: std::ptr::null_mut(),
+                    security_quality_of_service: std::ptr::null_mut(),
+                };
+                let mut h: HANDLE = std::ptr::null_mut();
+                if NtOpenSymbolicLinkObject(&mut h, READ_CONTROL_WRITE_DAC, &oa) == 0
+                    && !h.is_null()
+                {
+                    merge_entries_on_kernel_handle(h, &link_entries);
+                    CloseHandle(h);
+                }
+            }
+
+            let null_mask =
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | SYNCHRONIZE;
+            let null_entries: Vec<EXPLICIT_ACCESS_W> = target_sids
+                .iter()
+                .map(|&sid| explicit_access(sid, null_mask, GRANT_ACCESS, NO_INHERITANCE))
+                .collect();
+            let wide_null = to_wide(OsStr::new(r"\\.\GLOBALROOT\Device\Null"));
+            let h_null = CreateFileW(
+                wide_null.as_ptr(),
+                READ_CONTROL_WRITE_DAC,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            if !h_null.is_null() && h_null != (-1isize as HANDLE) {
+                merge_entries_on_kernel_handle(h_null, &null_entries);
+                CloseHandle(h_null);
+            }
         });
     }
 
@@ -2912,6 +3132,7 @@ pub mod windows {
 
             let setup_res = (|| -> io::Result<(HANDLE, Vec<u16>, Vec<OwnedSid>)> {
                 let user_sid = OwnedSid::current_user()?;
+                let users_sid = OwnedSid::from_well_known(WinBuiltinUsersSid)?;
                 let system_sid = OwnedSid::from_well_known(WinLocalSystemSid)?;
                 let admins_sid = OwnedSid::from_well_known(WinBuiltinAdministratorsSid)?;
 
@@ -2921,6 +3142,39 @@ pub mod windows {
                     explicit_access(system_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
                     explicit_access(admins_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
                 ];
+
+                // On `windows-latest`, `<LOCALAPPDATA>\Packages` has DACL
+                // `D:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;LA)` without `user_sid` or
+                // `BUILTIN\Users`. Ensure `<LOCALAPPDATA>\Packages\<profile_name>` (which
+                // `BasepAppContainerEnvironmentExtension` uses as `%TEMP%`/`%TMP%` inside the
+                // AppContainer) grants `user_sid`, `users_sid`, and `app_container_sid` so Stage 1
+                // and Stage 2 of `SepAccessCheck` both succeed for `%TEMP%` and `%TMP%`.
+                if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+                    let pkg_dir = local_app_data.join("Packages").join(&profile_name);
+                    if pkg_dir.exists() {
+                        let pkg_entries = [
+                            explicit_access(
+                                user_sid.as_psid(),
+                                FILE_ALL_ACCESS,
+                                GRANT_ACCESS,
+                                inherit,
+                            ),
+                            explicit_access(
+                                users_sid.as_psid(),
+                                FILE_ALL_ACCESS,
+                                GRANT_ACCESS,
+                                inherit,
+                            ),
+                            explicit_access(
+                                app_container_sid,
+                                FILE_ALL_ACCESS,
+                                GRANT_ACCESS,
+                                inherit,
+                            ),
+                        ];
+                        let _ = merge_entries_on_path(&pkg_dir, &pkg_entries);
+                    }
+                }
 
                 {
                     let _guard = PREPARE_LOCK

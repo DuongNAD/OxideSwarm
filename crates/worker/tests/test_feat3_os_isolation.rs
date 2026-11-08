@@ -216,7 +216,8 @@ fn assert_fs_policy_holds(result: &TaskResult, what: &str) {
     ] {
         assert!(
             got.iter().any(|l| l == expected),
-            "{what}: missing {expected}; output was {got:?}"
+            "{what}: missing {expected}; output was {got:?} (stderr: {})",
+            result.stderr_str()
         );
     }
     assert!(
@@ -2156,7 +2157,7 @@ function Compile-CSharp([string]$code) {
 }
 "#;
 
-    const WIN_FS_SCRIPT: &str = r#"echo TASK_STARTED&(echo hello)>%RUSTY_GRID_SANDBOX_DIR%\allowed.txt&&echo WRITE_OK&findstr hello %RUSTY_GRID_SANDBOX_DIR%\allowed.txt >nul 2>nul&&echo READ_OK&mkdir %RUSTY_GRID_SANDBOX_DIR%\sub >nul 2>nul&&echo MKDIR_OK&echo x>nul&&echo DEVNULL_OK&(type %T_SECRET% >nul 2>nul&&echo LEAK_SECRET||echo DENY_SECRET)&(type %T_KEY% >nul 2>nul&&echo LEAK_KEY||echo DENY_KEY)&(type %T_SIBLING% >nul 2>nul&&echo LEAK_SIBLING||echo DENY_SIBLING)&(dir /b %T_BASE% >nul 2>nul&&echo LEAK_LISTING||echo DENY_LISTING)&(dir /b %T_HOME% >nul 2>nul&&echo LEAK_HOME_LISTING||echo DENY_HOME_LISTING)&((echo x>%T_HOME%\planted.txt) >nul 2>nul&if exist %T_HOME%\planted.txt (echo LEAK_WRITE_HOME) else (echo DENY_WRITE_HOME))&((echo x>%T_BASE%\other_task\planted.txt) >nul 2>nul&if exist %T_BASE%\other_task\planted.txt (echo LEAK_WRITE_SIBLING) else (echo DENY_WRITE_SIBLING))&((echo x>%T_OUTSIDE%\feat3_outside_marker) >nul 2>nul&if exist %T_OUTSIDE%\feat3_outside_marker (echo LEAK_WRITE_TMP) else (echo DENY_WRITE_TMP))"#;
+    const WIN_FS_SCRIPT: &str = r#"echo TASK_STARTED&((echo hello)>%RUSTY_GRID_SANDBOX_DIR%\allowed.txt&&echo WRITE_OK)&(findstr hello %RUSTY_GRID_SANDBOX_DIR%\allowed.txt >nul 2>nul&&echo READ_OK)&(mkdir %RUSTY_GRID_SANDBOX_DIR%\sub >nul 2>nul&&echo MKDIR_OK)&((echo x>nul)&&echo DEVNULL_OK)&(type %T_SECRET% >nul 2>nul&&echo LEAK_SECRET||echo DENY_SECRET)&(type %T_KEY% >nul 2>nul&&echo LEAK_KEY||echo DENY_KEY)&(type %T_SIBLING% >nul 2>nul&&echo LEAK_SIBLING||echo DENY_SIBLING)&(dir /b %T_BASE% >nul 2>nul&&echo LEAK_LISTING||echo DENY_LISTING)&(dir /b %T_HOME% >nul 2>nul&&echo LEAK_HOME_LISTING||echo DENY_HOME_LISTING)&((echo x>%T_HOME%\planted.txt) >nul 2>nul&if exist %T_HOME%\planted.txt (echo LEAK_WRITE_HOME) else (echo DENY_WRITE_HOME))&((echo x>%T_BASE%\other_task\planted.txt) >nul 2>nul&if exist %T_BASE%\other_task\planted.txt (echo LEAK_WRITE_SIBLING) else (echo DENY_WRITE_SIBLING))&((echo x>%T_OUTSIDE%\feat3_outside_marker) >nul 2>nul&if exist %T_OUTSIDE%\feat3_outside_marker (echo LEAK_WRITE_TMP) else (echo DENY_WRITE_TMP))"#;
 
     fn run_win_fs(rig: &Rig) -> Task {
         let outside = rig._outside.path().to_string_lossy().into_owned();
@@ -2879,7 +2880,7 @@ try {
                 .into_owned();
             let task = win_cmd_task(
                 &rig,
-                r#"echo TASK_STARTED & set "CARGO_TARGET_DIR=" & set "CARGO_BUILD_TARGET_DIR=" & mkdir tiny\src & (echo [package]& echo name = "tiny"& echo version = "0.1.0"& echo edition = "2021") > tiny\Cargo.toml & (echo fn main^(^) { println!^("tiny-ran"^); }) > tiny\src\main.rs & cd tiny & cargo.exe build --offline 2>&1 & target\debug\tiny.exe"#,
+                r#"echo TASK_STARTED & rustc.exe -vV 2>&1 & set "CARGO_TARGET_DIR=" & set "CARGO_BUILD_TARGET_DIR=" & mkdir tiny\src & (echo [package]& echo name = "tiny"& echo version = "0.1.0"& echo edition = "2021") > tiny\Cargo.toml & (echo fn main^(^) { println!^("tiny-ran"^); }) > tiny\src\main.rs & cd tiny & cargo.exe build --offline 2>&1 & target\debug\tiny.exe"#,
                 &[("PATH", &path), ("RUSTC", &rustc)],
                 300,
             );
@@ -2894,8 +2895,9 @@ try {
             assert!(
                 result.stdout_str().contains("TASK_STARTED")
                     && result.stdout_str().contains("tiny-ran"),
-                "{}",
-                result.stdout_str()
+                "stdout:\n{}\nstderr:\n{}",
+                result.stdout_str(),
+                result.stderr_str()
             );
         }
     }
@@ -2932,7 +2934,7 @@ try {
             .join("cluster.secret")
             .to_string_lossy()
             .into_owned();
-        let script = r#"echo TASK_STARTED & set "CARGO_TARGET_DIR=" & set "CARGO_BUILD_TARGET_DIR=" & mkdir dep\src & (echo [package]& echo name = "dep"& echo version = "0.1.0"& echo edition = "2021"& echo [dependencies]& echo cfg-if = "=1.0.0") > dep\Cargo.toml & (echo [workspace]) >> dep\Cargo.toml & (echo version = 3& echo.& echo [[package]]& echo name = "cfg-if"& echo version = "1.0.0"& echo source = "registry+https://github.com/rust-lang/crates.io-index"& echo checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"& echo.& echo [[package]]& echo name = "dep"& echo version = "0.1.0"& echo dependencies = ["cfg-if"]) > dep\Cargo.lock & (echo use cfg_if::cfg_if; fn main^(^) { cfg_if! { if #[cfg^(windows^)] {} } println!^("dep-ran"^); }) > dep\src\main.rs & cd dep & cargo.exe build --offline 2>&1 & target\debug\dep.exe & (type "%T_DENIED_SECRET%" >nul 2>nul && echo LEAK_DENIED_SECRET || echo DENY_DENIED_SECRET)"#;
+        let script = r#"echo TASK_STARTED & rustc.exe -vV 2>&1 & set "CARGO_TARGET_DIR=" & set "CARGO_BUILD_TARGET_DIR=" & mkdir dep\src & (echo [package]& echo name = "dep"& echo version = "0.1.0"& echo edition = "2021"& echo [dependencies]& echo cfg-if = "=1.0.0") > dep\Cargo.toml & (echo [workspace]) >> dep\Cargo.toml & (echo version = 3& echo.& echo [[package]]& echo name = "cfg-if"& echo version = "1.0.0"& echo source = "registry+https://github.com/rust-lang/crates.io-index"& echo checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"& echo.& echo [[package]]& echo name = "dep"& echo version = "0.1.0"& echo dependencies = ["cfg-if"]) > dep\Cargo.lock & (echo use cfg_if::cfg_if; fn main^(^) { cfg_if! { if #[cfg^(windows^)] {} } println!^("dep-ran"^); }) > dep\src\main.rs & cd dep & cargo.exe build --offline 2>&1 & target\debug\dep.exe & (type %T_DENIED_SECRET% >nul 2>nul && echo LEAK_DENIED_SECRET || echo DENY_DENIED_SECRET)"#;
         let result = rig
             .runner
             .execute_task(
@@ -4552,6 +4554,18 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
             restored_base_sddl, orig_base_sddl,
             "revoke must restore sandbox_base's original DACL SDDL"
         );
+        // Also verify `restore_path_dacl_sddl` preserves a non-`AI` (`D:(...)` without
+        // `SE_DACL_AUTO_INHERITED`) SDDL byte-for-byte, matching `windows-latest`.
+        let non_ai_sddl = orig_base_sddl.replacen("D:AI(", "D:(", 1);
+        rusty_grid_worker::isolation::windows::restore_path_dacl_sddl(&rig.base, &non_ai_sddl)
+            .expect("restore non-AI SDDL");
+        assert_eq!(
+            rusty_grid_worker::isolation::windows::get_path_dacl_sddl(&rig.base).unwrap(),
+            non_ai_sddl,
+            "restore_path_dacl_sddl must preserve non-AI SDDL byte-for-byte"
+        );
+        rusty_grid_worker::isolation::windows::restore_path_dacl_sddl(&rig.base, &orig_base_sddl)
+            .expect("restore orig_base_sddl");
 
         // Stage `.tmp` files inside `<cargo_home>/registry` (which receives inheritable `(OI)(CI)(RX)`
         // for `oxideswarm.toolchain`) and prove in a task BEFORE the rename that both `.tmp`
