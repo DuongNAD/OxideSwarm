@@ -61,7 +61,11 @@ iroh = { version = "1.2", default-features = false, features = ["tls-ring", "por
 
 [profile.dev]
 opt-level = 0
-debug = true
+# Line tables keep file:line in panics and backtraces. Full debug info (`debug = true`) is the
+# largest part of `target/` that a setting can remove, because each integration test is its own
+# binary. CI uses the same value. Set `CARGO_PROFILE_DEV_DEBUG=true` for a session that needs
+# variables in a debugger.
+debug = "line-tables-only"
 
 [profile.release]
 opt-level = 3

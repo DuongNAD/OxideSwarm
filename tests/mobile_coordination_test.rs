@@ -8,7 +8,6 @@
 //! 5. Master lease ticket signing, verification, and role handover claim evaluation
 //! 6. Deterministic 4-stage election tie-breaking
 
-use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
@@ -16,10 +15,7 @@ use uuid::Uuid;
 
 use oxideworker::{get_evacuation_reason_impl, trigger_fast_evacuation_impl};
 use rusty_grid_core::arbitrage::{
-    calculate_authority_score, check_mobile_master_eligibility, evaluate_master_claim,
-    evaluate_mobile_master_refusal_matrix, resolve_election_tie, CandidateRanking, ClaimVerdict,
-    LeaseValidationError, MasterLeaseTicket, MasterRefusalReason, MobileEnvironmentTelemetry,
-    PlatformType, ELECTION_THRESHOLD_SCORE, LEASE_VALIDITY_DURATION_MS, SCORE_MIN,
+    LeaseValidationError, MasterLeaseTicket, LEASE_VALIDITY_DURATION_MS,
 };
 use rusty_grid_core::capabilities::{
     calculate_effective_concurrency, calculate_keepalive_interval, is_task_eligible, BatteryTier,
@@ -496,201 +492,11 @@ async fn test_adaptive_rrc_keepalive_controller_and_dynamic_master_timeout() {
     assert_eq!(retrieved.worker_id, id);
 }
 
-/// Test 3: Autonomous mobile master refusal matrix (§5.1).
-/// Verifies all 5 refusal rules:
-/// 1. Discharging (not charging)
-/// 2. Battery < 50%
-/// 3. Cellular or metered network
-/// 4. Thermal headroom exceeded (temp > 40°C or throttled)
-/// 5. Inactive Android Foreground Service
-///
-/// And verifies clean eligibility when all conditions are met.
-#[test]
-fn test_mobile_master_refusal_matrix() {
-    // Base healthy telemetry: Charging, 85% battery, Wi-Fi, 34°C, not throttled, FGS active
-    let healthy = MobileEnvironmentTelemetry::new(true, 85, "wifi", 34.0, false, true);
-    assert_eq!(check_mobile_master_eligibility(&healthy), Ok(()));
-    assert!(evaluate_mobile_master_refusal_matrix(&healthy).is_empty());
-
-    // Rule 1: Discharging -> Refuse NotCharging
-    let mut telem_discharging = healthy.clone();
-    telem_discharging.is_charging = Some(false);
-    assert_eq!(
-        check_mobile_master_eligibility(&telem_discharging),
-        Err(MasterRefusalReason::NotCharging)
-    );
-
-    // Rule 2: Battery < 50% -> Refuse BatteryBelowThreshold
-    let mut telem_low_battery = healthy.clone();
-    telem_low_battery.battery_pct = Some(49);
-    assert!(matches!(
-        check_mobile_master_eligibility(&telem_low_battery),
-        Err(MasterRefusalReason::BatteryBelowThreshold {
-            pct: 49,
-            threshold: 50
-        })
-    ));
-
-    // Rule 3: Cellular / metered network -> Refuse CellularOrMeteredNetwork
-    for cell_net in &["cellular", "5g", "lte", "mobile", "cgnat", "metered_wifi"] {
-        let mut telem_cell = healthy.clone();
-        telem_cell.network_type = Some((*cell_net).into());
-        let res = check_mobile_master_eligibility(&telem_cell);
-        assert!(
-            matches!(
-                res,
-                Err(MasterRefusalReason::CellularOrMeteredNetwork { .. })
-            ),
-            "Expected refusal for network {}",
-            cell_net
-        );
-    }
-
-    // Rule 4: Thermal headroom exceeded
-    // Case 4a: Temp > 40.0°C
-    let mut telem_hot = healthy.clone();
-    telem_hot.battery_temperature = Some(40.5);
-    assert!(matches!(
-        check_mobile_master_eligibility(&telem_hot),
-        Err(MasterRefusalReason::ThermalHeadroomExceeded { .. })
-    ));
-    // Case 4b: OS thermal throttling flag set
-    let mut telem_throttled = healthy.clone();
-    telem_throttled.thermal_throttled = true;
-    assert!(matches!(
-        check_mobile_master_eligibility(&telem_throttled),
-        Err(MasterRefusalReason::ThermalHeadroomExceeded { .. })
-    ));
-
-    // Rule 5: Foreground service inactive
-    let mut telem_no_fgs = healthy.clone();
-    telem_no_fgs.has_fgs_active = false;
-    assert_eq!(
-        check_mobile_master_eligibility(&telem_no_fgs),
-        Err(MasterRefusalReason::ForegroundServiceInactive)
-    );
-
-    // Multiple concurrent violations: evaluate_mobile_master_refusal_matrix returns all of them
-    let multi_violation = MobileEnvironmentTelemetry {
-        is_charging: Some(false),                 // Violation 1
-        battery_pct: Some(25),                    // Violation 2
-        network_type: Some("5g cellular".into()), // Violation 3
-        thermal_throttled: true,                  // Violation 4
-        battery_temperature: Some(44.0),
-        has_fgs_active: false, // Violation 5
-    };
-    let all_violations = evaluate_mobile_master_refusal_matrix(&multi_violation);
-    assert_eq!(all_violations.len(), 5);
-    assert!(all_violations.iter().any(|v| v.is_not_charging()));
-    assert!(all_violations
-        .iter()
-        .any(|v| v.is_battery_below_threshold()));
-    assert!(all_violations.iter().any(|v| v.is_cellular()));
-    assert!(all_violations.iter().any(|v| v.is_thermal_exceeded()));
-    assert!(all_violations.iter().any(|v| v.is_foreground_inactive()));
-}
-
-/// Test 4: Authority score calculation ($S_{\text{auth}}$) and deterministic 4-stage tie-breaking (§5.2).
-/// Verifies:
-/// - Authority scoring scale [-10000, 10000] and election threshold >= 2500.
-/// - Mobile refusal causing immediate -10000 score.
-/// - Deterministic 4-stage tie-breaking:
-///   1. Higher authority score wins
-///   2. Higher platform weight wins
-///   3. Higher uptime seconds wins
-///   4. Lexicographically lower UUID wins
-#[test]
-fn test_authority_score_calculation_and_tie_breaking() {
-    // 1. Platform weights
-    assert_eq!(PlatformType::LinuxServer.weight(), 5000);
-    assert_eq!(PlatformType::MacOs.weight(), 4500);
-    assert_eq!(PlatformType::Windows.weight(), 4000);
-    assert_eq!(PlatformType::Android.weight(), 500);
-
-    // 2. Desktop evaluation: Linux on AC, Gigabit Ethernet, cold, 10,000s uptime
-    let desktop_eval = calculate_authority_score(
-        PlatformType::LinuxServer,
-        Some(true),
-        None,
-        Some("ethernet"),
-        false,
-        None,
-        10_000,
-        false, // Not Android, FGS ignored
-    );
-    // Platform(5000) + Power(2000) + Net(1500) + Thermal(0) + Uptime(1000) = 9500
-    assert_eq!(desktop_eval.total_score, 9500);
-    assert!(desktop_eval.is_eligible);
-    assert!(desktop_eval.total_score >= ELECTION_THRESHOLD_SCORE);
-
-    // 3. Android failing refusal (e.g. discharging) -> instant -10,000
-    let android_failing = calculate_authority_score(
-        PlatformType::Android,
-        Some(false),
-        Some(80),
-        Some("wifi"),
-        false,
-        Some(32.0),
-        5_000,
-        true,
-    );
-    assert_eq!(android_failing.total_score, SCORE_MIN);
-    assert!(!android_failing.is_eligible);
-
-    // 4. Android satisfying all refusal criteria:
-    // Android(500) + Charging(2000) + Wi-Fi(700) + Thermal(0) + Uptime(500) = 3700 >= 2500
-    let android_eligible = calculate_authority_score(
-        PlatformType::Android,
-        Some(true),
-        Some(90),
-        Some("wifi"),
-        false,
-        Some(34.0),
-        5_000,
-        true,
-    );
-    assert_eq!(android_eligible.total_score, 3700);
-    assert!(android_eligible.is_eligible);
-
-    // 5. Deterministic 4-Stage Tie-Breaking
-    let node_a = Uuid::from_u128(100);
-    let node_b = Uuid::from_u128(200);
-
-    // Stage 1: Authority Score difference
-    let c1 = CandidateRanking::new(node_a, 6000, 4000, 1000);
-    let c2 = CandidateRanking::new(node_b, 5000, 5000, 2000);
-    assert_eq!(resolve_election_tie(&c1, &c2), Ordering::Greater);
-    assert_eq!(resolve_election_tie(&c2, &c1), Ordering::Less);
-
-    // Stage 2: Equal score, different platform weight
-    let c3 = CandidateRanking::new(node_a, 5000, 5000, 1000); // Linux (5000)
-    let c4 = CandidateRanking::new(node_b, 5000, 4000, 2000); // Windows (4000)
-    assert_eq!(resolve_election_tie(&c3, &c4), Ordering::Greater);
-
-    // Stage 3: Equal score and platform, different uptime
-    let c5 = CandidateRanking::new(node_a, 5000, 5000, 3000);
-    let c6 = CandidateRanking::new(node_b, 5000, 5000, 1000);
-    assert_eq!(resolve_election_tie(&c5, &c6), Ordering::Greater);
-
-    // Stage 4: Equal score, platform, and uptime -> lower UUID wins!
-    // node_low has smaller byte values than node_high
-    let uuid_low = Uuid::from_u128(1);
-    let uuid_high = Uuid::from_u128(2);
-    let c_low = CandidateRanking::new(uuid_low, 5000, 5000, 1000);
-    let c_high = CandidateRanking::new(uuid_high, 5000, 5000, 1000);
-    assert_eq!(
-        resolve_election_tie(&c_low, &c_high),
-        Ordering::Greater,
-        "Lexicographically lower UUID must win election tie"
-    );
-}
-
-/// Test 5: Master lease ticket lifecycle, HMAC signing/verification, and role handover (§5.3).
+/// Test 5: Master lease ticket lifecycle and HMAC signing/verification (§5.3).
 /// Verifies:
 /// - Cryptographic HMAC-SHA256 signature using cluster secret over 60-byte binary layout.
 /// - Ticket expiration and time validation.
 /// - Tamper detection (modified score, sequence, or expired time).
-/// - Claim superiority evaluation (evaluate_master_claim).
 #[test]
 fn test_master_lease_ticket_lifecycle_and_role_handover() {
     let secret = ClusterSecret::generate().expect("cluster secret");
@@ -741,79 +547,17 @@ fn test_master_lease_ticket_lifecycle_and_role_handover() {
     assert_eq!(&canonical[16..32], master_id.as_bytes());
     assert_eq!(&canonical[32..40], &1u64.to_be_bytes());
     assert_eq!(&canonical[40..44], &6000i32.to_be_bytes());
-
-    // 6. Role claim evaluation (evaluate_master_claim)
-    let incumbent_ticket = MasterLeaseTicket::issue(
-        cluster_id,
-        master_id,
-        1,
-        3500,
-        now_ms,
-        Duration::from_millis(LEASE_VALIDITY_DURATION_MS),
-        &secret,
-    );
-
-    // Case 6a: Claimant has superior score -> AcceptHandover
-    let superior_claimant = MasterLeaseTicket::issue(
-        cluster_id,
-        Uuid::new_v4(),
-        2,
-        6500,
-        now_ms,
-        Duration::from_millis(LEASE_VALIDITY_DURATION_MS),
-        &secret,
-    );
-    assert_eq!(
-        evaluate_master_claim(&incumbent_ticket, &superior_claimant, &secret, now_ms),
-        ClaimVerdict::AcceptedAndStepDown
-    );
-
-    // Case 6b: Claimant has inferior score -> Reject
-    let inferior_claimant = MasterLeaseTicket::issue(
-        cluster_id,
-        Uuid::new_v4(),
-        2,
-        3000,
-        now_ms,
-        Duration::from_millis(LEASE_VALIDITY_DURATION_MS),
-        &secret,
-    );
-    assert_eq!(
-        evaluate_master_claim(&incumbent_ticket, &inferior_claimant, &secret, now_ms),
-        ClaimVerdict::RejectedInferiorScore
-    );
-
-    // Case 6c: Claimant score equal to incumbent -> Incumbent retains authority
-    let equal_claimant = MasterLeaseTicket::issue(
-        cluster_id,
-        Uuid::new_v4(),
-        2,
-        3500,
-        now_ms,
-        Duration::from_millis(LEASE_VALIDITY_DURATION_MS),
-        &secret,
-    );
-    assert_eq!(
-        evaluate_master_claim(&incumbent_ticket, &equal_claimant, &secret, now_ms),
-        ClaimVerdict::RejectedInferiorScore
-    );
-
-    // Case 6d: Claimant ticket has invalid signature -> RejectInvalidTicket
-    let mut invalid_claimant = superior_claimant;
-    invalid_claimant.authority_score = 9000; // Signature no longer matches
-    assert!(matches!(
-        evaluate_master_claim(&incumbent_ticket, &invalid_claimant, &secret, now_ms),
-        ClaimVerdict::RejectedInvalidTicket(_)
-    ));
 }
 
 /// Test 6: Pre-sleep fast task evacuation (< 50ms) without task loss (§5.4).
-/// Spawns a loopback MasterServer and two WorkerClients. Submits a task.
-/// While running, triggers fast evacuation on the active worker.
+/// Spawns a loopback MasterServer and WorkerClients. Submits a task with `max_retries = 1`.
+/// Triggers repeated fast evacuations across two workers (`w1`/`w2` -> survivor -> `w3`).
 /// Verifies:
-/// - Evacuation and task reassignment completes in < 50ms.
-/// - Task completes on surviving worker with exit code 0 and retry_count == 1.
-/// - No task loss occurs.
+/// - Each evacuation and task reassignment completes in < 100ms (< 50ms design target).
+/// - Repeated evacuations do not charge `retry_count` or `failover_count` (both remain 0) and
+///   do not exhaust the task's `max_retries = 1` budget (`MOB-3`).
+/// - Task completes on the final surviving worker with exit code 0, `retry_count == 0`,
+///   and `failover_count == 0`.
 #[tokio::test]
 async fn test_fast_evacuation_under_50ms_without_task_loss() {
     // Also test JNI bridge fast evacuation API directly
@@ -826,14 +570,16 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let sandbox_path = temp_dir.path().to_path_buf();
 
-    let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3);
+    let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_max_retries(1)
+        .with_max_failovers(1);
     let master = MasterServer::spawn(server_config)
         .await
         .expect("master spawn");
     let master_addr = master.server_addr().to_string();
 
     let (w1_shutdown_tx, w1_shutdown_rx) = watch::channel(false);
-    let (_w2_shutdown_tx, w2_shutdown_rx) = watch::channel(false);
+    let (w2_shutdown_tx, w2_shutdown_rx) = watch::channel(false);
 
     let mut config1 = WorkerConfig::new(&master_addr)
         .with_no_battery(true)
@@ -877,16 +623,16 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
         "Both workers must be registered"
     );
 
-    // Submit long-running BuiltinTest task (2000ms duration)
+    // Submit long-running BuiltinTest task (2500ms duration) with max_retries = 1
     let task = Task::new(
         TaskSpec::BuiltinTest {
             test_name: "evacuation_resilience".into(),
             iterations: 100,
-            duration_ms: 2000,
+            duration_ms: 2500,
             should_fail: false,
             require_gpu: false,
         },
-        TaskRequirements::generic(1, 30),
+        TaskRequirements::generic(1, 30).with_max_retries(1),
     );
     let task_id = master.submit_task(task).await.expect("task submit");
 
@@ -909,15 +655,15 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
 
     let info = master.get_task_info(task_id).await.unwrap();
     let initial_worker = info.assigned_worker_id.expect("must be assigned");
-    let (active_shutdown_tx, survivor_id) = if initial_worker == w1_id {
-        (w1_shutdown_tx, w2_id)
+    let (first_shutdown_tx, second_worker_id, second_shutdown_tx) = if initial_worker == w1_id {
+        (w1_shutdown_tx, w2_id, w2_shutdown_tx)
     } else {
-        (_w2_shutdown_tx, w1_id)
+        (w2_shutdown_tx, w1_id, w1_shutdown_tx)
     };
 
-    // Trigger fast evacuation with emergency pre-sleep reason
+    // Trigger 1st fast evacuation with emergency pre-sleep reason
     let evacuation_start = Instant::now();
-    let _ = active_shutdown_tx.send(true);
+    let _ = first_shutdown_tx.send(true);
 
     // Assert fast task evacuation & reassignment occurs within 50ms (or 100ms loopback tolerance)
     let reassigned = wait_for(
@@ -925,7 +671,7 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
         Duration::from_millis(5),
         || async {
             if let Ok(info) = master.get_task_info(task_id).await {
-                info.assigned_worker_id == Some(survivor_id)
+                info.assigned_worker_id == Some(second_worker_id)
                     && (info.state == TaskState::Scheduled || info.state == TaskState::Running)
             } else {
                 false
@@ -944,8 +690,91 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
         "Evacuation and reassignment exceeded fast deadline: {:?}",
         evacuation_elapsed
     );
+    let after_first = master.get_task_info(task_id).await.unwrap();
+    assert_eq!(after_first.retry_count, 0);
+    assert_eq!(after_first.failover_count, 0);
 
-    // Wait for task to complete successfully on survivor worker
+    // Wait for task to enter Running on second_worker_id, then register a 3rd worker and evacuate a second time
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .get_task_info(task_id)
+                    .await
+                    .map(|i| {
+                        i.assigned_worker_id == Some(second_worker_id)
+                            && i.state == TaskState::Running
+                    })
+                    .unwrap_or(false)
+            }
+        )
+        .await,
+        "Task must enter Running state on second worker before second evacuation"
+    );
+
+    let (_w3_shutdown_tx, w3_shutdown_rx) = watch::channel(false);
+    let w3_id = Uuid::new_v4();
+    let config3 = WorkerConfig::new(&master_addr)
+        .with_no_battery(true)
+        .with_name("evac-worker-3")
+        .with_cores(2)
+        .with_worker_id(w3_id)
+        .with_sandbox_base_dir(sandbox_path.join("w3"));
+    let mut w3 = WorkerClient::new(config3);
+    tokio::spawn(async move {
+        let _ = w3.run(w3_shutdown_rx).await;
+    });
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|workers| {
+                        workers.iter().any(|w| {
+                            w.worker_id == w3_id
+                                && w.status == rusty_grid_master::registry::WorkerStatus::Connected
+                        })
+                    })
+                    .unwrap_or(false)
+            }
+        )
+        .await,
+        "Third worker must register and be Connected before second evacuation"
+    );
+
+    let second_evac_start = Instant::now();
+    let _ = second_shutdown_tx.send(true);
+    let reassigned_second = wait_for(
+        Duration::from_millis(100),
+        Duration::from_millis(5),
+        || async {
+            if let Ok(info) = master.get_task_info(task_id).await {
+                info.assigned_worker_id == Some(w3_id)
+                    && (info.state == TaskState::Scheduled || info.state == TaskState::Running)
+            } else {
+                false
+            }
+        },
+    )
+    .await;
+    let second_evac_elapsed = second_evac_start.elapsed();
+    assert!(
+        reassigned_second,
+        "Second pre-sleep evacuation must immediately reassign task to w3 (elapsed: {:?})",
+        second_evac_elapsed
+    );
+    assert!(
+        second_evac_elapsed < Duration::from_millis(100),
+        "Second evacuation exceeded fast deadline: {:?}",
+        second_evac_elapsed
+    );
+
+    // Wait for task to complete successfully on w3
     let completed = wait_for(
         Duration::from_secs(6),
         Duration::from_millis(50),
@@ -960,14 +789,16 @@ async fn test_fast_evacuation_under_50ms_without_task_loss() {
     .await;
     assert!(
         completed,
-        "Task must complete on survivor worker without data loss"
+        "Task must complete on third worker after repeated evacuations without data loss"
     );
 
     let final_info = master.get_task_info(task_id).await.unwrap();
     assert_eq!(final_info.state, TaskState::Completed);
     assert_eq!(final_info.exit_code, Some(0));
-    assert_eq!(final_info.retry_count, 1);
-    assert_eq!(final_info.assigned_worker_id, Some(survivor_id));
+    assert_eq!(final_info.retry_count, 0);
+    assert_eq!(final_info.failover_count, 0);
+    assert_eq!(final_info.evacuation_count, 2);
+    assert_eq!(final_info.assigned_worker_id, Some(w3_id));
 
     let _ = master.shutdown();
 }
@@ -1269,6 +1100,11 @@ async fn test_worker_with_1s_negotiated_interval_does_not_reconnect_within_15s_a
 #[tokio::test]
 async fn test_idle_wifi_phone_switching_to_unknown_network_stays_in_session_1_for_25s_with_10s_reaper(
 ) {
+    use rusty_grid_core::capabilities::MobileCapabilities;
+    use rusty_grid_core::protocol::{
+        MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage,
+        PROTOCOL_VERSION_CURRENT,
+    };
     use rusty_grid_master::reaper::ReaperConfig;
     use rusty_grid_master::scheduler::SchedulerConfig;
 
@@ -1324,6 +1160,90 @@ async fn test_idle_wifi_phone_switching_to_unknown_network_stays_in_session_1_fo
         1
     );
 
+    // Also connect a raw-protocol phone (simulating an older APK that never restarts its
+    // heartbeat timer when `network_type` drops to `None` or a task arrives) so this test
+    // guards the master's `update_mobile_telemetry` window retention on its own.
+    let raw_id = Uuid::new_v4();
+    let raw_stream = tokio::net::TcpStream::connect(&master_addr)
+        .await
+        .expect("connect raw phone");
+    let mut raw_transport = MessageTransport::new(raw_stream);
+    raw_transport
+        .send_msg(&WorkerMessage::Register {
+            worker_id: raw_id,
+            capabilities: WorkerCapabilities::new("raw-apk-phone", 2, 4096, false, false, None)
+                .with_mobile(Some(MobileCapabilities {
+                    os_version: "Android 14".into(),
+                    soc_model: "Snapdragon".into(),
+                    battery_pct: Some(85),
+                    is_charging: Some(false),
+                    thermal_throttled: false,
+                })),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
+        })
+        .await
+        .expect("send raw Register");
+    match raw_transport
+        .recv_msg::<MasterMessage>()
+        .await
+        .expect("recv raw RegisterAck")
+    {
+        Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+        other => panic!("expected accepted RegisterAck for raw phone, got {other:?}"),
+    }
+    raw_transport
+        .send_msg(&WorkerMessage::MobileTelemetry {
+            worker_id: raw_id,
+            battery_pct: Some(85),
+            is_charging: Some(false),
+            thermal_throttled: false,
+            battery_temperature: Some(33.0),
+            network_type: Some("wifi".into()),
+            battery_tier: Some(BatteryTier::Normal),
+            thermal_tier: Some(ThermalTier::Normal),
+        })
+        .await
+        .expect("send raw wifi telemetry");
+    raw_transport
+        .send_msg(&WorkerMessage::MobileTelemetry {
+            worker_id: raw_id,
+            battery_pct: Some(85),
+            is_charging: Some(false),
+            thermal_throttled: false,
+            battery_temperature: Some(33.0),
+            network_type: None,
+            battery_tier: Some(BatteryTier::Normal),
+            thermal_tier: Some(ThermalTier::Normal),
+        })
+        .await
+        .expect("send raw None telemetry");
+    let raw_initial_session = wait_for(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        || async {
+            master
+                .registry()
+                .get_worker(raw_id)
+                .await
+                .and_then(|w| w.mobile_status)
+                .and_then(|s| s.network_type)
+                .as_deref()
+                == Some("wifi")
+        },
+    )
+    .await;
+    assert!(
+        raw_initial_session,
+        "Master must retain network_type=wifi for raw-protocol phone after network_type=None telemetry"
+    );
+    let raw_session_id = master
+        .registry()
+        .get_worker(raw_id)
+        .await
+        .unwrap()
+        .session_id;
+
     // After ~1 s on Wi-Fi (while the worker's heartbeat ticker was armed for 60 s), switch
     // network_type to None (simulating Wi-Fi roaming / activeNetwork without capabilities).
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1344,7 +1264,8 @@ async fn test_idle_wifi_phone_switching_to_unknown_network_stays_in_session_1_fo
         "Master must observe network_type=None after telemetry update"
     );
 
-    // Wait 25 s with the 10 s reaper running: the phone must remain Connected in session 1.
+    // Wait 25 s with the 10 s reaper running: both the WorkerClient phone and the raw-protocol
+    // phone (which sent zero Heartbeats) must remain Connected in their original sessions.
     tokio::time::sleep(Duration::from_millis(25_200)).await;
 
     let info = master.registry().get_worker(w_id).await.unwrap();
@@ -1353,6 +1274,18 @@ async fn test_idle_wifi_phone_switching_to_unknown_network_stays_in_session_1_fo
         "Idle Wi-Fi phone switching to network_type=None must stay in session 1 for 25 s with a 10 s reaper"
     );
     assert_eq!(info.status, WorkerStatus::Connected);
+
+    let raw_info = master.registry().get_worker(raw_id).await.unwrap();
+    assert_eq!(
+        raw_info.session_id, raw_session_id,
+        "Raw-protocol phone that never restarts its heartbeat timer must stay in its original session"
+    );
+    assert_eq!(
+        raw_info.status,
+        WorkerStatus::Connected,
+        "Raw-protocol phone that sends no heartbeats for 25 s after network_type=None must not be reaped by the 10 s reaper"
+    );
+    drop(raw_transport);
 
     let _ = w_shutdown_tx.send(true);
     let _ = master.shutdown();

@@ -21,8 +21,9 @@ use rusty_grid_core::cluster_auth::{
 };
 use rusty_grid_core::mapreduce::{MapReduceJobSpec, MapReduceResult};
 use rusty_grid_core::protocol::{
-    ClientMessage, ClientResponse, EndpointRole, InboundMessage, ProtocolCapabilities,
-    ProtocolError, PROTOCOL_VERSION_CURRENT, PROTOCOL_VERSION_MIN_COMPATIBLE,
+    format_incompatible_version_error, is_protocol_version_compatible, ClientMessage,
+    ClientResponse, EndpointRole, InboundMessage, ProtocolCapabilities, ProtocolError,
+    PROTOCOL_VERSION_CURRENT,
 };
 use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus};
 #[cfg(feature = "p2p")]
@@ -97,6 +98,10 @@ pub struct ServerConfig {
     /// timed out, re-registered or refused the task, counted apart from `max_retries`
     /// (default: [`crate::queue::DEFAULT_MAX_FAILOVERS`]). `max_retries = 0` still disables re-runs entirely.
     pub max_failovers: u32,
+    /// Maximum uncharged voluntary worker drains (`WorkerMessage::Disconnecting`) per task
+    /// (default: [`crate::queue::DEFAULT_MAX_EVACUATIONS`]). Past this cap, drains take the charged
+    /// failover path.
+    pub max_evacuations: u32,
     /// Optional TCP port for the embedded web observability dashboard (0 for ephemeral).
     pub dashboard_port: Option<u16>,
     /// Optional bind IP for the dashboard HTTP listener.
@@ -175,6 +180,7 @@ impl Default for ServerConfig {
             wire_codec: WireCodec::default(),
             max_retries: 3,
             max_failovers: crate::queue::DEFAULT_MAX_FAILOVERS,
+            max_evacuations: crate::queue::DEFAULT_MAX_EVACUATIONS,
             dashboard_port: None,
             dashboard_bind_ip: None,
             dashboard_port_file: None,
@@ -315,6 +321,12 @@ impl ServerConfig {
     /// Sets the per-task cap on infrastructure failovers (see `ServerConfig::max_failovers`).
     pub fn with_max_failovers(mut self, failovers: u32) -> Self {
         self.max_failovers = failovers;
+        self
+    }
+
+    /// Sets the per-task cap on uncharged voluntary worker drains (`WorkerMessage::Disconnecting`).
+    pub fn with_max_evacuations(mut self, evacuations: u32) -> Self {
+        self.max_evacuations = evacuations;
         self
     }
 
@@ -687,6 +699,7 @@ impl MasterServer {
         let retry_policy = crate::queue::RetryPolicy {
             max_retries: config.max_retries,
             max_failovers: config.max_failovers,
+            max_evacuations: config.max_evacuations,
             ..Default::default()
         };
         let queue = TaskQueue::with_retention_limits(
@@ -2606,6 +2619,84 @@ pub async fn handle_worker_disconnect_with_broadcast(
     .await;
 }
 
+/// Unregisters a worker session that announced a graceful drain (`WorkerMessage::Disconnecting`),
+/// returns its in-flight tasks to `Queued` without charging `retry_count` or `failover_count`
+/// while under `max_evacuations` (or takes the charged failover path past that cap), resolves
+/// terminal waiters if any task reached `Failed`, notifies dashboard subscribers, and pokes the
+/// scheduler (`MOB-3`).
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_worker_evacuate_with_broadcast(
+    registry: &WorkerRegistry,
+    queue: &TaskQueue,
+    scheduler_notify: &tokio::sync::Notify,
+    waiters: Option<&WaiterMap>,
+    worker_id: &Uuid,
+    session_id: Option<u64>,
+    reason: &str,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<
+        &tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
+) {
+    let unregistered = registry
+        .unregister(worker_id, session_id)
+        .await
+        .unwrap_or(false);
+    if !unregistered {
+        debug!(worker_id = %worker_id, "Worker drain unregister skipped (stale session or already handled)");
+        return;
+    }
+
+    info!(
+        worker_id = %worker_id,
+        reason = %reason,
+        "Worker announced drain; evacuating in-flight tasks"
+    );
+
+    #[cfg(feature = "dashboard")]
+    if let Some(b_tx) = broadcast_tx {
+        let _ = b_tx.send(
+            crate::dashboard::dto::DashboardStreamMessage::WorkerDisconnected {
+                worker_id: *worker_id,
+                reason: reason.to_string(),
+            },
+        );
+    }
+
+    let affected_tasks = queue
+        .handle_session_evacuated(worker_id, session_id, reason)
+        .await;
+    if affected_tasks.is_empty() {
+        return;
+    }
+
+    info!(
+        worker_id = %worker_id,
+        count = affected_tasks.len(),
+        tasks = ?affected_tasks,
+        "Processed evacuated tasks from draining worker"
+    );
+
+    #[cfg(feature = "dashboard")]
+    if let Some(b_tx) = broadcast_tx {
+        for task_id in &affected_tasks {
+            if let Some(info) = queue.get_task(task_id).await {
+                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
+                    info,
+                ));
+            }
+        }
+        let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
+            queue.stats().await,
+        ));
+    }
+
+    if let Some(waiters) = waiters {
+        resolve_terminal_waiters(queue, waiters, &affected_tasks, Some(*worker_id)).await;
+    }
+
+    scheduler_notify.notify_one();
+}
+
 /// Fails over the in-flight tasks of one worker session: re-enqueues those with budget left,
 /// fails the rest, wakes the clients of tasks that became terminal and pokes the scheduler.
 /// With `session_id = Some(s)` only tasks dispatched on that session are touched.
@@ -2831,9 +2922,22 @@ async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     loop {
         let msg = match next_msg.take() {
             Some(m) => m,
-            None => match transport.recv_msg::<ClientMessage>().await? {
-                Some(m) => m,
-                None => break,
+            None => match transport.recv_msg::<ClientMessage>().await {
+                Ok(Some(m)) => m,
+                Ok(None) => break,
+                Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                    let message = format_incompatible_version_error("client", peer_version);
+                    warn!(peer_version, error = %message, "Refusing client message with incompatible protocol version");
+                    let _ = send_client_response(
+                        &mut transport,
+                        &ClientResponse::Error {
+                            message: message.clone(),
+                        },
+                    )
+                    .await;
+                    return Err(GridError::IncompatibleVersion(message));
+                }
+                Err(e) => return Err(e.into()),
             },
         };
 
@@ -3126,6 +3230,25 @@ where
                     .into(),
             ))
         }
+        Ok(Err(ProtocolError::IncompatibleVersion { peer_version, .. })) => {
+            let message = format_incompatible_version_error("client", peer_version);
+            warn!(
+                remote = %peer,
+                lane,
+                peer_version,
+                error = %message,
+                "Refusing client connection with incompatible protocol version"
+            );
+            if let Some(detected) = transport.last_detected_codec() {
+                transport.set_outbound_codec(detected);
+            }
+            let err_resp = ClientResponse::Error {
+                message: message.clone(),
+            };
+            let _ =
+                tokio::time::timeout(REFUSAL_DRAIN_TIMEOUT, transport.send_msg(&err_resp)).await;
+            Err(GridError::IncompatibleVersion(message))
+        }
         Ok(Err(e)) => {
             warn!(remote = %peer, lane, error = %e, "Protocol error during handshake");
             Err(e.into())
@@ -3357,21 +3480,18 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             protocol_version,
             features,
         } => {
-            if protocol_version < PROTOCOL_VERSION_MIN_COMPATIBLE {
+            if !is_protocol_version_compatible(protocol_version) {
+                let reason = format_incompatible_version_error("worker", protocol_version);
                 let reject_ack = MasterMessage::RegisterAck {
                     accepted: false,
                     worker_id,
                     heartbeat_interval_secs: 0,
                     protocol_version: PROTOCOL_VERSION_CURRENT,
                     features: ProtocolCapabilities::empty(),
-                    message: Some(format!(
-                        "Incompatible protocol version {protocol_version} (minimum required: {PROTOCOL_VERSION_MIN_COMPATIBLE})"
-                    )),
+                    message: Some(reason.clone()),
                 };
                 let _ = transport.send_msg(&reject_ack).await;
-                return Err(GridError::RegistrationRejected(format!(
-                    "Incompatible protocol version {protocol_version}"
-                )));
+                return Err(GridError::RegistrationRejected(reason));
             }
             if capabilities.cpu_cores == 0 {
                 let reject_ack = MasterMessage::RegisterAck {
@@ -3616,7 +3736,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             }
                             WorkerMessage::Disconnecting { worker_id: id, reason } => {
                                 info!(worker_id = %id, reason = %reason, "Worker announced graceful disconnection");
-                                handle_worker_disconnect_with_broadcast(
+                                handle_worker_evacuate_with_broadcast(
                                     &registry,
                                     &queue,
                                     &scheduler_notify,
@@ -3624,7 +3744,6 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                     &worker_id,
                                     Some(session_id),
                                     &format!("Worker graceful disconnect: {reason}"),
-                                    true,
                                     #[cfg(feature = "dashboard")]
                                     broadcast_tx.as_ref(),
                                 ).await;
@@ -3858,16 +3977,15 @@ async fn handle_multiplexed_connection<
             protocol_version,
             features,
         } => {
-            if protocol_version < PROTOCOL_VERSION_MIN_COMPATIBLE {
+            if !is_protocol_version_compatible(protocol_version) {
+                let reason = format_incompatible_version_error("worker", protocol_version);
                 let reject_ack = MasterMessage::RegisterAck {
                     accepted: false,
                     worker_id,
                     heartbeat_interval_secs: 0,
                     protocol_version: PROTOCOL_VERSION_CURRENT,
                     features: ProtocolCapabilities::empty(),
-                    message: Some(format!(
-                        "Incompatible protocol version {protocol_version} (minimum required: {PROTOCOL_VERSION_MIN_COMPATIBLE})"
-                    )),
+                    message: Some(reason.clone()),
                 };
                 send_refusal_and_drain(
                     &mut ctrl_transport,
@@ -3876,9 +3994,7 @@ async fn handle_multiplexed_connection<
                     p2p_conn.as_ref(),
                 )
                 .await;
-                return Err(GridError::RegistrationRejected(format!(
-                    "Incompatible protocol version {protocol_version}"
-                )));
+                return Err(GridError::RegistrationRejected(reason));
             }
             if capabilities.cpu_cores == 0 {
                 let reject_ack = MasterMessage::RegisterAck {
@@ -4244,7 +4360,7 @@ async fn handle_multiplexed_connection<
                             }
                             WorkerMessage::Disconnecting { worker_id: id, reason } => {
                                 info!(worker_id = %id, reason = %reason, "Worker announced graceful disconnection on control stream");
-                                handle_worker_disconnect_with_broadcast(
+                                handle_worker_evacuate_with_broadcast(
                                     &registry,
                                     &queue,
                                     &scheduler_notify,
@@ -4252,7 +4368,6 @@ async fn handle_multiplexed_connection<
                                     &worker_id,
                                     Some(session_id),
                                     &format!("Worker graceful disconnect: {reason}"),
-                                    true,
                                     #[cfg(feature = "dashboard")]
                                     broadcast_tx.as_ref(),
                                 ).await;
@@ -7259,5 +7374,160 @@ mod tests {
                 .any(|l| l.contains("RUSTY_GRID_P2P_MINIMAL")),
             "crates/master/src/server.rs library code must not read RUSTY_GRID_P2P_MINIMAL from the environment"
         );
+    }
+
+    #[tokio::test]
+    async fn test_client_and_worker_protocol_version_mismatch_refused_on_both_sides() {
+        fn stamp_frame_version<M: serde::Serialize>(
+            msg: &M,
+            version: u32,
+            codec: WireCodec,
+        ) -> Vec<u8> {
+            let mut raw = rusty_grid_core::protocol::serialize_message(msg, codec)
+                .unwrap()
+                .to_vec();
+            match codec {
+                WireCodec::Bincode => {
+                    let len = raw.len();
+                    raw[len - 4..].copy_from_slice(&version.to_le_bytes());
+                }
+                WireCodec::Json => {
+                    let mut val: serde_json::Value = serde_json::from_slice(&raw[1..]).unwrap();
+                    val["protocol_version"] = serde_json::Value::from(version);
+                    raw.truncate(1);
+                    serde_json::to_writer(&mut raw, &val).unwrap();
+                }
+            }
+            raw
+        }
+
+        let server = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
+            .await
+            .expect("spawn master");
+        let addr = server.server_addr;
+
+        // 1. Worker with lower (2) or higher (current + 1) protocol_version is refused by Master
+        // with a clear RegisterAck message.
+        for bad_worker_ver in [2u32, PROTOCOL_VERSION_CURRENT + 1] {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut transport = MessageTransport::new(stream);
+            transport
+                .send_msg(&WorkerMessage::Register {
+                    worker_id: Uuid::new_v4(),
+                    capabilities: WorkerCapabilities::new(
+                        "skew-worker",
+                        4,
+                        4096,
+                        false,
+                        false,
+                        None,
+                    ),
+                    protocol_version: bad_worker_ver,
+                    features: ProtocolCapabilities::all_supported(),
+                })
+                .await
+                .unwrap();
+            let ack = transport
+                .recv_msg::<MasterMessage>()
+                .await
+                .unwrap()
+                .expect("RegisterAck");
+            match ack {
+                MasterMessage::RegisterAck {
+                    accepted,
+                    protocol_version,
+                    message,
+                    ..
+                } => {
+                    assert!(!accepted);
+                    assert_eq!(protocol_version, PROTOCOL_VERSION_CURRENT);
+                    let msg = message.unwrap_or_default();
+                    assert!(
+                        msg.contains(&format!("Incompatible protocol version {bad_worker_ver}"))
+                            && msg.contains(&PROTOCOL_VERSION_CURRENT.to_string()),
+                        "expected version mismatch message, got: {msg}"
+                    );
+                }
+                other => panic!("expected RegisterAck, got {other:?}"),
+            }
+        }
+
+        // 2. Client with lower (2) or higher (current + 1) protocol_version in both Bincode and
+        // JSON receives a clear ClientResponse::Error from the Master, and a client reading a
+        // mismatched ClientResponse from a fake Master also refuses with GridError::IncompatibleVersion.
+        for codec in [WireCodec::Bincode, WireCodec::Json] {
+            for bad_client_ver in [2u32, PROTOCOL_VERSION_CURRENT + 1] {
+                let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let mut transport = MessageTransport::with_codec(stream, codec);
+                let raw_frame =
+                    stamp_frame_version(&ClientMessage::ClusterStatus, bad_client_ver, codec);
+                transport.send_raw_frame(raw_frame.into()).await.unwrap();
+
+                let reply = transport
+                    .recv_msg::<ClientResponse>()
+                    .await
+                    .expect("client must decode Master's Error response cleanly")
+                    .expect("ClientResponse::Error frame");
+                match reply {
+                    ClientResponse::Error { message } => {
+                        assert!(
+                            message.contains(&format!(
+                                "Incompatible protocol version {bad_client_ver}"
+                            )) && message.contains(&PROTOCOL_VERSION_CURRENT.to_string()),
+                            "expected clear version error from Master, got: {message}"
+                        );
+                    }
+                    other => panic!("expected ClientResponse::Error, got {other:?}"),
+                }
+            }
+
+            // Client side: receiving a non-Error ClientResponse with an incompatible protocol_version
+            // fails with GridError::IncompatibleVersion naming both versions (without a
+            // "Registration handshake failed:" prefix).
+            let (client_io, master_io) = tokio::io::duplex(4096);
+            let bad_master_ver = PROTOCOL_VERSION_CURRENT + 2;
+            tokio::spawn(async move {
+                let mut fake_master = MessageTransport::with_codec(master_io, codec);
+                let _ = fake_master
+                    .recv_msg::<InboundMessage>()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let bad_resp = stamp_frame_version(
+                    &ClientResponse::WorkerList {
+                        workers: Vec::new(),
+                    },
+                    bad_master_ver,
+                    codec,
+                );
+                fake_master.send_raw_frame(bad_resp.into()).await.unwrap();
+            });
+            let mut client_transport = MessageTransport::with_codec(client_io, codec);
+            client_transport
+                .send_msg(&ClientMessage::ListWorkers)
+                .await
+                .unwrap();
+            let err: GridError = client_transport
+                .recv_msg::<ClientResponse>()
+                .await
+                .expect_err("client must refuse incompatible Master ClientResponse")
+                .into();
+            assert!(
+                !err.to_string().contains("Registration handshake failed:"),
+                "client refusal must not carry worker handshake prefix: {err}"
+            );
+            match &err {
+                GridError::IncompatibleVersion(msg) => {
+                    assert!(
+                        msg.contains(&format!("Incompatible protocol version {bad_master_ver}"))
+                            && msg.contains(&PROTOCOL_VERSION_CURRENT.to_string()),
+                        "expected clear client-side version refusal, got: {msg}"
+                    );
+                }
+                other => panic!("expected GridError::IncompatibleVersion, got {other:?}"),
+            }
+        }
+
+        let _ = server.shutdown();
     }
 }

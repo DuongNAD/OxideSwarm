@@ -434,11 +434,16 @@ async fn test_boundary_max_retries_1_single_retry_then_failure() {
 
 #[tokio::test]
 async fn test_boundary_max_retries_5_overrides_lower_server_default() {
-    // Master server configured with default_retry_max = 1 (very restrictive!)
-    let master =
-        MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(1))
-            .await
-            .expect("master spawn");
+    // Master server configured with default_retry_max = 1 (very restrictive!) and
+    // max_evacuations = 2 so the first 2 graceful drains are uncharged and the next 5
+    // take the charged path (with_max_retries(5) overriding server default 1).
+    let master = MasterServer::spawn(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_max_retries(1)
+            .with_max_evacuations(2),
+    )
+    .await
+    .expect("master spawn");
     let master_addr = master.server_addr().to_string();
 
     // Submit task requesting max_retries = Some(5)
@@ -454,8 +459,57 @@ async fn test_boundary_max_retries_5_overrides_lower_server_default() {
     );
     let task_id = master.submit_task(task).await.expect("submit");
 
-    // Execute 5 consecutive graceful disconnect cycles (immediate 0ms failover)
-    // to rapidly and deterministically test all 5 retry boundary steps
+    // 1. First 2 graceful disconnect cycles are under max_evacuations (2): evacuation_count
+    //    increments to 1..=2 while retry_count remains 0.
+    for drain in 1..=2u32 {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut worker = WorkerClient::for_testing(
+            master_addr.clone(),
+            Some(format!("w-drain-{drain}")),
+            Some(1),
+            false,
+        );
+        let _h = tokio::spawn(async move {
+            let _ = worker.run(shutdown_rx).await;
+        });
+
+        assert!(
+            wait_for(
+                Duration::from_secs(5),
+                Duration::from_millis(20),
+                || async {
+                    master
+                        .get_task_info(task_id)
+                        .await
+                        .map(|i| i.state == TaskState::Running)
+                        .unwrap_or(false)
+                }
+            )
+            .await,
+            "Task must become Running in uncharged drain {drain}"
+        );
+
+        let _ = shutdown_tx.send(true);
+
+        assert!(
+            wait_for(
+                Duration::from_secs(3),
+                Duration::from_millis(15),
+                || async {
+                    master
+                        .get_task_info(task_id)
+                        .await
+                        .map(|i| i.evacuation_count == drain && i.retry_count == 0)
+                        .unwrap_or(false)
+                }
+            )
+            .await,
+            "evacuation_count must increment to {drain} with retry_count == 0"
+        );
+    }
+
+    // 2. Next 5 consecutive graceful disconnect cycles exceed max_evacuations (2) and take the
+    //    charged path (0 ms reschedule delay), testing all 5 retry boundary steps.
     for cycle in 1..=5 {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut worker = WorkerClient::for_testing(
@@ -485,7 +539,7 @@ async fn test_boundary_max_retries_5_overrides_lower_server_default() {
             "Task must become Running in cycle {cycle}"
         );
 
-        // Gracefully disconnect the worker
+        // Gracefully disconnect the worker (past max_evacuations -> charged retry)
         let _ = shutdown_tx.send(true);
 
         // Wait for retry_count to increment to cycle
@@ -506,6 +560,7 @@ async fn test_boundary_max_retries_5_overrides_lower_server_default() {
         );
 
         let info = master.get_task_info(task_id).await.unwrap();
+        assert_eq!(info.evacuation_count, 2);
         if cycle < 5 {
             // Task must be Queued or Retrying, NOT Failed (even though cycle >= 1 which exceeds server default of 1!)
             assert_ne!(
@@ -516,7 +571,7 @@ async fn test_boundary_max_retries_5_overrides_lower_server_default() {
         }
     }
 
-    // Now spawn the 6th worker: accepts task, then disconnects -> exhausts max_retries (5)
+    // Now spawn the next worker: accepts task, then disconnects -> exhausts max_retries (5)
     let (shutdown_tx6, shutdown_rx6) = watch::channel(false);
     let mut w6 = WorkerClient::for_testing(
         master_addr.clone(),
@@ -563,6 +618,7 @@ async fn test_boundary_max_retries_5_overrides_lower_server_default() {
 
     let final_info = master.get_task_info(task_id).await.unwrap();
     assert_eq!(final_info.state, TaskState::Failed);
+    assert_eq!(final_info.evacuation_count, 2);
     assert_eq!(final_info.retry_count, 5, "Must have exactly 5 retries");
     assert_eq!(final_info.exit_code, Some(1));
 
@@ -597,6 +653,7 @@ async fn test_direct_queue_boundary_crash_cycles_and_audit() {
         backoff_multiplier: 1.5,
         retry_on_execution_failure: false,
         retry_on_worker_disconnect: true,
+        ..Default::default()
     };
     let queue = TaskQueue::with_config(policy, None);
 

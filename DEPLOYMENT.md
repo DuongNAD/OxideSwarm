@@ -259,12 +259,18 @@ This app runs the **compute-grid worker** (not the agent-mesh node) in-process v
 - Supports cluster secret authentication via native JNI configuration (`nativeSetClusterSecret`; note: the Gradle APK project in `packaging/android/app/` does not compile yet, see `AND-1` in [docs/BACKLOG.md](docs/BACKLOG.md)).
 
 ### 3.5 Upgrading a running grid (master and workers)
-All nodes in a cluster (`master`, `worker`, and CLI commands) must run one build: `Task`, `TaskResult`, and message
-frames are encoded positionally with bincode. Workers and the master exchange `PROTOCOL_VERSION_CURRENT` during
-registration, and each side refuses a peer below `PROTOCOL_VERSION_MIN_COMPATIBLE` (currently version 2); client
-commands (`submit`, `status`, `doctor`, ...) send no version, and a message type or layout from another build is
-treated as a corrupt frame and disconnects the peer (failing over any running tasks). Always **restart the master
-first**, then the workers and CLIs, so every node runs the same build.
+All nodes in a cluster (`master`, `worker`, and CLI/MCP clients) must run one build: `Task`, `TaskResult`, and message
+frames are encoded positionally with bincode. Workers, clients, and the master exchange `PROTOCOL_VERSION_CURRENT`
+(currently version 3, `PROTOCOL_VERSION_MIN_COMPATIBLE = 3`; see `docs/design/0040-protocol-versioning.md`). Every
+protocol version bump breaks older peers (`PROTOCOL_VERSION_MIN_COMPATIBLE == PROTOCOL_VERSION_CURRENT`), and each side
+refuses any peer outside `PROTOCOL_VERSION_MIN_COMPATIBLE..=PROTOCOL_VERSION_CURRENT`. Client commands (`submit`,
+`cancel`, `status`, `doctor`, `mcp`, ...) stamp `protocol_version` on every `ClientMessage` and `ClientResponse`
+(unversioned JSON frames default to `LEGACY_UNVERSIONED_PROTOCOL_VERSION = 2` and are refused), and `connect_master`
+runs a side-effect-free `ClusterStatus` version check before sending any state-changing request so a newer CLI never
+executes a task on an older master. Always **upgrade and restart the master first**, then the workers and CLIs: an
+upgraded v3 master immediately refuses v2 workers and clients before registration or task submission, whereas a v3
+worker pointed at an un-upgraded v2 master registers before inspecting the v2 `RegisterAck`, drops the connection on
+the version mismatch, and retries with backoff (briefly appearing in the v2 master's `workers` list).
 With a cluster secret, nodes must also speak the same cluster authentication version: a release with version 2
 (encrypted record layer, `docs/design/0005-cluster-auth-v2-record-layer.md`) and an older one refuse each other
 during the handshake (the newer side reports that the master speaks another cluster authentication version, the

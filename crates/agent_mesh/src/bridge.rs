@@ -193,11 +193,6 @@ impl AgentGridBridge {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(16) as u32;
 
-            let compute_intensity = args
-                .get("compute_intensity")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as u32;
-
             let input_data = parse_input_bytes(args.get("input_data"));
 
             let gpu_required = args
@@ -207,13 +202,12 @@ impl AgentGridBridge {
                 .unwrap_or(true);
 
             (
-                TaskSpec::GpuCompute {
+                TaskSpec::gpu_compute_with_params(
                     kernel_name,
                     input_data,
                     work_group_size,
                     simulated_matrix_dim,
-                    compute_intensity,
-                },
+                ),
                 TaskRequirements {
                     cpu_cores: 1,
                     ram_mb: 1024,
@@ -742,7 +736,7 @@ impl AgentGridBridge {
                 correlation_id,
                 command,
                 1,
-                "AutoRig requires non-empty 'input_mesh' (base64, byte array, or file path)",
+                "AutoRig requires non-empty 'input_mesh' (base64, hex string, or byte array)",
             );
         }
 
@@ -897,28 +891,12 @@ fn parse_binary_data(val: Option<&Value>) -> Vec<u8> {
             } else {
                 use base64::engine::general_purpose::STANDARD;
                 use base64::Engine;
-                let p = std::path::Path::new(s_trim);
-                if p.exists()
-                    && (s_trim.ends_with(".glb")
-                        || s_trim.ends_with(".gltf")
-                        || s_trim.ends_with(".obj")
-                        || s_trim.ends_with(".png")
-                        || s_trim.ends_with(".jpg"))
-                {
-                    if let Ok(bytes) = std::fs::read(p) {
-                        return bytes;
-                    }
-                }
                 if let Ok(bytes) = STANDARD.decode(s_trim) {
                     if !bytes.is_empty() {
                         return bytes;
                     }
                 }
-                if let Ok(bytes) = std::fs::read(s_trim) {
-                    bytes
-                } else {
-                    s_trim.as_bytes().to_vec()
-                }
+                s_trim.as_bytes().to_vec()
             }
         }
         _ => Vec::new(),
@@ -1212,5 +1190,139 @@ mod tests {
             }
             other => panic!("expected CommandResponse, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_parse_binary_data_and_bridge_never_read_hub_local_files() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let secret_glb_path = temp_dir.path().join("secret_mesh.glb");
+        let secret_png_path = temp_dir.path().join("secret_image.png");
+        let secret_txt_path = temp_dir.path().join("secret_notes.txt");
+
+        let mut secret_glb_bytes =
+            b"glTF\x02\x00\x00\x00\x28\x00\x00\x00HUB_LOCAL_SECRET_GLB_DO_NOT_READ".to_vec();
+        secret_glb_bytes.resize(65_536, b'G');
+        let mut secret_png_bytes = b"\x89PNG\r\n\x1a\nHUB_LOCAL_SECRET_PNG_DO_NOT_READ".to_vec();
+        secret_png_bytes.resize(65_536, b'P');
+        let mut secret_txt_bytes = b"HUB_LOCAL_SECRET_TXT_DO_NOT_READ".to_vec();
+        secret_txt_bytes.resize(65_536, b'T');
+
+        std::fs::write(&secret_glb_path, &secret_glb_bytes).expect("write secret glb");
+        std::fs::write(&secret_png_path, &secret_png_bytes).expect("write secret png");
+        std::fs::write(&secret_txt_path, &secret_txt_bytes).expect("write secret txt");
+
+        for (path, secret) in [
+            (&secret_glb_path, secret_glb_bytes.as_slice()),
+            (&secret_png_path, secret_png_bytes.as_slice()),
+            (&secret_txt_path, secret_txt_bytes.as_slice()),
+        ] {
+            let path_val = serde_json::Value::String(path.to_string_lossy().to_string());
+            let parsed = parse_binary_data(Some(&path_val));
+            assert_ne!(
+                parsed.as_slice(),
+                secret,
+                "parse_binary_data must never read hub-local file {}",
+                path.display()
+            );
+            assert!(
+                !String::from_utf8_lossy(&parsed).contains("HUB_LOCAL_SECRET_"),
+                "parse_binary_data leaked hub-local file content from {}",
+                path.display()
+            );
+        }
+
+        let master = rusty_grid_master::server::MasterServer::spawn(
+            rusty_grid_master::server::ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        )
+        .await
+        .expect("spawn master");
+        let bridge = AgentGridBridge::new(master.clone());
+
+        // 1. Peer passes a hub-local .png path to grid_3d_generate
+        let before_3d = master
+            .queue_stats()
+            .await
+            .expect("queue stats")
+            .active_bytes;
+        let req_3d = AgentMeshEnvelope::new_command_request(
+            "peer-agent",
+            "grid",
+            "grid_3d_generate",
+            serde_json::json!({
+                "image": secret_png_path.to_string_lossy().to_string(),
+                "engine": "triposr",
+                "wait": false,
+            }),
+            Some(5000),
+        );
+        let _resp_3d = bridge.handle_command(&req_3d).await;
+        let after_3d = master
+            .queue_stats()
+            .await
+            .expect("queue stats")
+            .active_bytes;
+        assert!(
+            after_3d.saturating_sub(before_3d) < 8_192,
+            "grid_3d_generate read the 64 KiB hub-local .png file into the queue (active_bytes delta = {})",
+            after_3d.saturating_sub(before_3d)
+        );
+
+        // 2. Peer passes a hub-local .glb path to grid_auto_rig
+        let before_rig = master
+            .queue_stats()
+            .await
+            .expect("queue stats")
+            .active_bytes;
+        let req_rig = AgentMeshEnvelope::new_command_request(
+            "peer-agent",
+            "grid",
+            "grid_auto_rig",
+            serde_json::json!({
+                "input_mesh": secret_glb_path.to_string_lossy().to_string(),
+                "wait": false,
+            }),
+            Some(5000),
+        );
+        let _resp_rig = bridge.handle_command(&req_rig).await;
+        let after_rig = master
+            .queue_stats()
+            .await
+            .expect("queue stats")
+            .active_bytes;
+        assert!(
+            after_rig.saturating_sub(before_rig) < 8_192,
+            "grid_auto_rig read the 64 KiB hub-local .glb file into the queue (active_bytes delta = {})",
+            after_rig.saturating_sub(before_rig)
+        );
+
+        // 3. Peer passes a hub-local .txt path to grid_auto_rig
+        let before_txt = master
+            .queue_stats()
+            .await
+            .expect("queue stats")
+            .active_bytes;
+        let req_txt = AgentMeshEnvelope::new_command_request(
+            "peer-agent",
+            "grid",
+            "grid_auto_rig",
+            serde_json::json!({
+                "input_mesh": secret_txt_path.to_string_lossy().to_string(),
+                "wait": false,
+            }),
+            Some(5000),
+        );
+        let _resp_txt = bridge.handle_command(&req_txt).await;
+        let after_txt = master
+            .queue_stats()
+            .await
+            .expect("queue stats")
+            .active_bytes;
+        assert!(
+            after_txt.saturating_sub(before_txt) < 8_192,
+            "grid_auto_rig read the 64 KiB hub-local .txt file into the queue (active_bytes delta = {})",
+            after_txt.saturating_sub(before_txt)
+        );
+
+        let _ = master.shutdown();
     }
 }

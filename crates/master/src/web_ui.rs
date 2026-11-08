@@ -34,7 +34,7 @@ use crate::dashboard::dto::{
 use crate::queue::{TaskInfo, TaskQueue};
 use crate::registry::{WorkerInfo, WorkerRegistry, WorkerStatus};
 use rusty_grid_core::mode::{
-    execute_mode_action, find_workspace_root, get_mode_descriptors, ModeDescriptor,
+    dispatch_mode_action, find_workspace_root, get_mode_descriptors, ModeDescriptor,
     ModeExecutionResult, WorkflowMode,
 };
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
@@ -1496,7 +1496,7 @@ async fn api_run_mode(
     tokio::spawn(async move {
         let workspace_root = find_workspace_root();
         let res = tokio::task::spawn_blocking(move || {
-            execute_mode_action(mode_parsed, &action_clone, &workspace_root)
+            dispatch_mode_action(mode_parsed, &action_clone, &workspace_root)
         })
         .await
         .unwrap_or_else(|e| {

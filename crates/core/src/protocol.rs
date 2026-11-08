@@ -28,13 +28,36 @@ pub const WIRE_FORMAT_AUTH: u8 = 0x03;
 pub const WIRE_FORMAT_ENCRYPTED: u8 = 0x04;
 
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION_CURRENT: u32 = 2;
+pub const PROTOCOL_VERSION_CURRENT: u32 = 3;
 /// Minimum wire protocol version compatible with this build.
-pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 2;
+pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 3;
+/// Protocol version assumed when a JSON peer omits `protocol_version`.
+pub const LEGACY_UNVERSIONED_PROTOCOL_VERSION: u32 = 2;
 
-/// Default protocol version used in deserialization fallbacks.
+/// Default protocol version used in deserialization fallbacks when `protocol_version` is omitted.
 pub const fn default_protocol_version() -> u32 {
-    PROTOCOL_VERSION_CURRENT
+    LEGACY_UNVERSIONED_PROTOCOL_VERSION
+}
+
+/// Returns `true` when `peer_version` is within the supported inclusive range
+/// [`PROTOCOL_VERSION_MIN_COMPATIBLE`]`..=`[`PROTOCOL_VERSION_CURRENT`].
+pub const fn is_protocol_version_compatible(peer_version: u32) -> bool {
+    peer_version >= PROTOCOL_VERSION_MIN_COMPATIBLE && peer_version <= PROTOCOL_VERSION_CURRENT
+}
+
+/// Formats a human-readable refusal message when a peer speaks an incompatible wire protocol
+/// version.
+pub fn format_incompatible_version_error(peer_role: &str, peer_version: u32) -> String {
+    let upgrade_targets = if peer_role.eq_ignore_ascii_case("master") {
+        "master and worker/client".to_string()
+    } else {
+        format!("master and {peer_role}")
+    };
+    format!(
+        "Incompatible protocol version {peer_version} from {peer_role} \
+         (supported: {PROTOCOL_VERSION_MIN_COMPATIBLE}..={PROTOCOL_VERSION_CURRENT}; \
+         upgrade both {upgrade_targets} to matching builds)"
+    )
 }
 
 /// Negotiable protocol capabilities and feature flags.
@@ -409,6 +432,16 @@ pub enum ProtocolError {
     /// Connection closed gracefully by remote peer.
     #[error("Connection closed gracefully by peer")]
     ConnectionClosed,
+
+    /// Peer sent a message with an incompatible wire protocol version.
+    #[error(
+        "Incompatible protocol version {peer_version} (supported: {min_compatible_version}..={current_version}; upgrade both master and client/worker to matching builds)"
+    )]
+    IncompatibleVersion {
+        peer_version: u32,
+        current_version: u32,
+        min_compatible_version: u32,
+    },
 
     /// General protocol violation.
     #[error("Protocol violation: {0}")]
@@ -1903,29 +1936,86 @@ enum HumanClientMessage {
         task: Task,
         #[serde(default)]
         wait: bool,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
     },
     GetTaskStatus {
         task_id: TaskId,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
     },
     CancelTask {
         task_id: TaskId,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
     },
-    ClusterStatus,
-    ListWorkers,
+    ClusterStatus {
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    ListWorkers {
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
     SubmitMapReduce {
         job: crate::mapreduce::MapReduceJobSpec,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
     },
     GetTaskResult {
         task_id: TaskId,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
     },
     BlobRequest {
         request: crate::blob_transfer::BlobRequest,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
     },
 }
 
 #[derive(Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
 enum BinaryClientMessage {
+    SubmitTask {
+        task: Task,
+        wait: bool,
+        protocol_version: u32,
+    },
+    GetTaskStatus {
+        task_id: TaskId,
+        protocol_version: u32,
+    },
+    CancelTask {
+        task_id: TaskId,
+        protocol_version: u32,
+    },
+    ClusterStatus {
+        protocol_version: u32,
+    },
+    ListWorkers {
+        protocol_version: u32,
+    },
+    SubmitMapReduce {
+        job: crate::mapreduce::MapReduceJobSpec,
+        protocol_version: u32,
+    },
+    GetTaskResult {
+        task_id: TaskId,
+        protocol_version: u32,
+    },
+    BlobRequest {
+        request: crate::blob_transfer::BlobRequest,
+        protocol_version: u32,
+    },
+}
+
+/// Pre-v3 (protocol version 2) positional bincode layout of [`ClientMessage`], which carried no
+/// `protocol_version` trailer. Used only so a v3 Master can recognize an older v2 client frame and
+/// refuse it with [`ProtocolError::IncompatibleVersion`] instead of an opaque bincode EOF error.
+#[derive(Deserialize)]
+#[allow(clippy::large_enum_variant, dead_code)]
+enum LegacyV2BinaryClientMessage {
     SubmitTask {
         task: Task,
         wait: bool,
@@ -1949,86 +2039,184 @@ enum BinaryClientMessage {
     },
 }
 
+impl HumanClientMessage {
+    fn from_client_message(msg: ClientMessage, protocol_version: u32) -> Self {
+        match msg {
+            ClientMessage::SubmitTask { task, wait } => HumanClientMessage::SubmitTask {
+                task,
+                wait,
+                protocol_version,
+            },
+            ClientMessage::GetTaskStatus { task_id } => HumanClientMessage::GetTaskStatus {
+                task_id,
+                protocol_version,
+            },
+            ClientMessage::CancelTask { task_id } => HumanClientMessage::CancelTask {
+                task_id,
+                protocol_version,
+            },
+            ClientMessage::ClusterStatus => HumanClientMessage::ClusterStatus { protocol_version },
+            ClientMessage::ListWorkers => HumanClientMessage::ListWorkers { protocol_version },
+            ClientMessage::SubmitMapReduce { job } => HumanClientMessage::SubmitMapReduce {
+                job,
+                protocol_version,
+            },
+            ClientMessage::GetTaskResult { task_id } => HumanClientMessage::GetTaskResult {
+                task_id,
+                protocol_version,
+            },
+            ClientMessage::BlobRequest { request } => HumanClientMessage::BlobRequest {
+                request,
+                protocol_version,
+            },
+        }
+    }
+
+    const fn protocol_version(&self) -> u32 {
+        match self {
+            Self::SubmitTask {
+                protocol_version, ..
+            }
+            | Self::GetTaskStatus {
+                protocol_version, ..
+            }
+            | Self::CancelTask {
+                protocol_version, ..
+            }
+            | Self::ClusterStatus { protocol_version }
+            | Self::ListWorkers { protocol_version }
+            | Self::SubmitMapReduce {
+                protocol_version, ..
+            }
+            | Self::GetTaskResult {
+                protocol_version, ..
+            }
+            | Self::BlobRequest {
+                protocol_version, ..
+            } => *protocol_version,
+        }
+    }
+}
+
+impl BinaryClientMessage {
+    fn from_client_message(msg: ClientMessage, protocol_version: u32) -> Self {
+        match msg {
+            ClientMessage::SubmitTask { task, wait } => BinaryClientMessage::SubmitTask {
+                task,
+                wait,
+                protocol_version,
+            },
+            ClientMessage::GetTaskStatus { task_id } => BinaryClientMessage::GetTaskStatus {
+                task_id,
+                protocol_version,
+            },
+            ClientMessage::CancelTask { task_id } => BinaryClientMessage::CancelTask {
+                task_id,
+                protocol_version,
+            },
+            ClientMessage::ClusterStatus => BinaryClientMessage::ClusterStatus { protocol_version },
+            ClientMessage::ListWorkers => BinaryClientMessage::ListWorkers { protocol_version },
+            ClientMessage::SubmitMapReduce { job } => BinaryClientMessage::SubmitMapReduce {
+                job,
+                protocol_version,
+            },
+            ClientMessage::GetTaskResult { task_id } => BinaryClientMessage::GetTaskResult {
+                task_id,
+                protocol_version,
+            },
+            ClientMessage::BlobRequest { request } => BinaryClientMessage::BlobRequest {
+                request,
+                protocol_version,
+            },
+        }
+    }
+
+    const fn protocol_version(&self) -> u32 {
+        match self {
+            Self::SubmitTask {
+                protocol_version, ..
+            }
+            | Self::GetTaskStatus {
+                protocol_version, ..
+            }
+            | Self::CancelTask {
+                protocol_version, ..
+            }
+            | Self::ClusterStatus { protocol_version }
+            | Self::ListWorkers { protocol_version }
+            | Self::SubmitMapReduce {
+                protocol_version, ..
+            }
+            | Self::GetTaskResult {
+                protocol_version, ..
+            }
+            | Self::BlobRequest {
+                protocol_version, ..
+            } => *protocol_version,
+        }
+    }
+}
+
 impl From<ClientMessage> for HumanClientMessage {
     fn from(msg: ClientMessage) -> Self {
-        match msg {
-            ClientMessage::SubmitTask { task, wait } => {
-                HumanClientMessage::SubmitTask { task, wait }
-            }
-            ClientMessage::GetTaskStatus { task_id } => {
-                HumanClientMessage::GetTaskStatus { task_id }
-            }
-            ClientMessage::CancelTask { task_id } => HumanClientMessage::CancelTask { task_id },
-            ClientMessage::ClusterStatus => HumanClientMessage::ClusterStatus,
-            ClientMessage::ListWorkers => HumanClientMessage::ListWorkers,
-            ClientMessage::SubmitMapReduce { job } => HumanClientMessage::SubmitMapReduce { job },
-            ClientMessage::GetTaskResult { task_id } => {
-                HumanClientMessage::GetTaskResult { task_id }
-            }
-            ClientMessage::BlobRequest { request } => HumanClientMessage::BlobRequest { request },
-        }
+        Self::from_client_message(msg, PROTOCOL_VERSION_CURRENT)
     }
 }
 
 impl From<HumanClientMessage> for ClientMessage {
     fn from(msg: HumanClientMessage) -> Self {
         match msg {
-            HumanClientMessage::SubmitTask { task, wait } => {
+            HumanClientMessage::SubmitTask { task, wait, .. } => {
                 ClientMessage::SubmitTask { task, wait }
             }
-            HumanClientMessage::GetTaskStatus { task_id } => {
+            HumanClientMessage::GetTaskStatus { task_id, .. } => {
                 ClientMessage::GetTaskStatus { task_id }
             }
-            HumanClientMessage::CancelTask { task_id } => ClientMessage::CancelTask { task_id },
-            HumanClientMessage::ClusterStatus => ClientMessage::ClusterStatus,
-            HumanClientMessage::ListWorkers => ClientMessage::ListWorkers,
-            HumanClientMessage::SubmitMapReduce { job } => ClientMessage::SubmitMapReduce { job },
-            HumanClientMessage::GetTaskResult { task_id } => {
+            HumanClientMessage::CancelTask { task_id, .. } => ClientMessage::CancelTask { task_id },
+            HumanClientMessage::ClusterStatus { .. } => ClientMessage::ClusterStatus,
+            HumanClientMessage::ListWorkers { .. } => ClientMessage::ListWorkers,
+            HumanClientMessage::SubmitMapReduce { job, .. } => {
+                ClientMessage::SubmitMapReduce { job }
+            }
+            HumanClientMessage::GetTaskResult { task_id, .. } => {
                 ClientMessage::GetTaskResult { task_id }
             }
-            HumanClientMessage::BlobRequest { request } => ClientMessage::BlobRequest { request },
+            HumanClientMessage::BlobRequest { request, .. } => {
+                ClientMessage::BlobRequest { request }
+            }
         }
     }
 }
 
 impl From<ClientMessage> for BinaryClientMessage {
     fn from(msg: ClientMessage) -> Self {
-        match msg {
-            ClientMessage::SubmitTask { task, wait } => {
-                BinaryClientMessage::SubmitTask { task, wait }
-            }
-            ClientMessage::GetTaskStatus { task_id } => {
-                BinaryClientMessage::GetTaskStatus { task_id }
-            }
-            ClientMessage::CancelTask { task_id } => BinaryClientMessage::CancelTask { task_id },
-            ClientMessage::ClusterStatus => BinaryClientMessage::ClusterStatus,
-            ClientMessage::ListWorkers => BinaryClientMessage::ListWorkers,
-            ClientMessage::SubmitMapReduce { job } => BinaryClientMessage::SubmitMapReduce { job },
-            ClientMessage::GetTaskResult { task_id } => {
-                BinaryClientMessage::GetTaskResult { task_id }
-            }
-            ClientMessage::BlobRequest { request } => BinaryClientMessage::BlobRequest { request },
-        }
+        Self::from_client_message(msg, PROTOCOL_VERSION_CURRENT)
     }
 }
 
 impl From<BinaryClientMessage> for ClientMessage {
     fn from(msg: BinaryClientMessage) -> Self {
         match msg {
-            BinaryClientMessage::SubmitTask { task, wait } => {
+            BinaryClientMessage::SubmitTask { task, wait, .. } => {
                 ClientMessage::SubmitTask { task, wait }
             }
-            BinaryClientMessage::GetTaskStatus { task_id } => {
+            BinaryClientMessage::GetTaskStatus { task_id, .. } => {
                 ClientMessage::GetTaskStatus { task_id }
             }
-            BinaryClientMessage::CancelTask { task_id } => ClientMessage::CancelTask { task_id },
-            BinaryClientMessage::ClusterStatus => ClientMessage::ClusterStatus,
-            BinaryClientMessage::ListWorkers => ClientMessage::ListWorkers,
-            BinaryClientMessage::SubmitMapReduce { job } => ClientMessage::SubmitMapReduce { job },
-            BinaryClientMessage::GetTaskResult { task_id } => {
+            BinaryClientMessage::CancelTask { task_id, .. } => {
+                ClientMessage::CancelTask { task_id }
+            }
+            BinaryClientMessage::ClusterStatus { .. } => ClientMessage::ClusterStatus,
+            BinaryClientMessage::ListWorkers { .. } => ClientMessage::ListWorkers,
+            BinaryClientMessage::SubmitMapReduce { job, .. } => {
+                ClientMessage::SubmitMapReduce { job }
+            }
+            BinaryClientMessage::GetTaskResult { task_id, .. } => {
                 ClientMessage::GetTaskResult { task_id }
             }
-            BinaryClientMessage::BlobRequest { request } => ClientMessage::BlobRequest { request },
+            BinaryClientMessage::BlobRequest { request, .. } => {
+                ClientMessage::BlobRequest { request }
+            }
         }
     }
 }
@@ -2108,10 +2296,14 @@ pub enum ClientResponse {
 enum HumanClientResponse {
     TaskSubmitted {
         task_id: TaskId,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
     },
     TaskCompleted {
         task_id: TaskId,
         result: TaskResult,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
     },
     TaskStatusInfo {
         task_id: TaskId,
@@ -2119,10 +2311,14 @@ enum HumanClientResponse {
         state_name: String,
         assigned_worker: Option<Uuid>,
         error: Option<String>,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
     },
     TaskCancelled {
         task_id: TaskId,
         success: bool,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
     },
     ClusterStatus {
         total_tasks: usize,
@@ -2135,28 +2331,103 @@ enum HumanClientResponse {
         active_bytes: usize,
         #[serde(default)]
         max_active_bytes: usize,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
     },
     WorkerList {
         workers: Vec<WorkerCapabilities>,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
     },
     MapReduceSubmitted {
         job_id: Uuid,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
     },
     MapReduceCompleted {
         result: crate::mapreduce::MapReduceResult,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
     },
     Error {
         message: String,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
     },
     /// The answer to `ClientMessage::BlobRequest`. Appended last so existing variant indices do
     /// not move.
     BlobReply {
         reply: crate::blob_transfer::BlobReply,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
     },
 }
 
 #[derive(Serialize, Deserialize)]
 enum BinaryClientResponse {
+    TaskSubmitted {
+        task_id: TaskId,
+        protocol_version: u32,
+    },
+    TaskCompleted {
+        task_id: TaskId,
+        result: TaskResult,
+        protocol_version: u32,
+    },
+    TaskStatusInfo {
+        task_id: TaskId,
+        status: TaskStatus,
+        state_name: String,
+        assigned_worker: Option<Uuid>,
+        error: Option<String>,
+        protocol_version: u32,
+    },
+    TaskCancelled {
+        task_id: TaskId,
+        success: bool,
+        protocol_version: u32,
+    },
+    ClusterStatus {
+        total_tasks: usize,
+        pending_tasks: usize,
+        running_tasks: usize,
+        completed_tasks: usize,
+        failed_tasks: usize,
+        workers: Vec<WorkerCapabilities>,
+        active_bytes: usize,
+        max_active_bytes: usize,
+        protocol_version: u32,
+    },
+    WorkerList {
+        workers: Vec<WorkerCapabilities>,
+        protocol_version: u32,
+    },
+    MapReduceSubmitted {
+        job_id: Uuid,
+        protocol_version: u32,
+    },
+    MapReduceCompleted {
+        result: crate::mapreduce::MapReduceResult,
+        protocol_version: u32,
+    },
+    Error {
+        message: String,
+        protocol_version: u32,
+    },
+    /// The answer to `ClientMessage::BlobRequest`. Appended last so existing variant indices do
+    /// not move.
+    BlobReply {
+        reply: crate::blob_transfer::BlobReply,
+        protocol_version: u32,
+    },
+}
+
+/// Pre-v3 (protocol version 2) positional bincode layout of [`ClientResponse`], which carried no
+/// `protocol_version` trailer. Used so a v3 client can recognize an older v2 Master reply and
+/// report [`ProtocolError::IncompatibleVersion`] instead of an opaque bincode EOF error.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+enum LegacyV2BinaryClientResponse {
     TaskSubmitted {
         task_id: TaskId,
     },
@@ -2197,21 +2468,24 @@ enum BinaryClientResponse {
     Error {
         message: String,
     },
-    /// The answer to `ClientMessage::BlobRequest`. Appended last so existing variant indices do
-    /// not move.
     BlobReply {
         reply: crate::blob_transfer::BlobReply,
     },
 }
 
-impl From<ClientResponse> for HumanClientResponse {
-    fn from(msg: ClientResponse) -> Self {
+impl HumanClientResponse {
+    fn from_client_response(msg: ClientResponse, protocol_version: u32) -> Self {
         match msg {
-            ClientResponse::TaskSubmitted { task_id } => {
-                HumanClientResponse::TaskSubmitted { task_id }
-            }
+            ClientResponse::TaskSubmitted { task_id } => HumanClientResponse::TaskSubmitted {
+                task_id,
+                protocol_version,
+            },
             ClientResponse::TaskCompleted { task_id, result } => {
-                HumanClientResponse::TaskCompleted { task_id, result }
+                HumanClientResponse::TaskCompleted {
+                    task_id,
+                    result,
+                    protocol_version,
+                }
             }
             ClientResponse::TaskStatusInfo {
                 task_id,
@@ -2225,9 +2499,14 @@ impl From<ClientResponse> for HumanClientResponse {
                 state_name,
                 assigned_worker,
                 error,
+                protocol_version,
             },
             ClientResponse::TaskCancelled { task_id, success } => {
-                HumanClientResponse::TaskCancelled { task_id, success }
+                HumanClientResponse::TaskCancelled {
+                    task_id,
+                    success,
+                    protocol_version,
+                }
             }
             ClientResponse::ClusterStatus {
                 total_tasks,
@@ -2247,85 +2526,88 @@ impl From<ClientResponse> for HumanClientResponse {
                 workers,
                 active_bytes,
                 max_active_bytes,
+                protocol_version,
             },
-            ClientResponse::WorkerList { workers } => HumanClientResponse::WorkerList { workers },
+            ClientResponse::WorkerList { workers } => HumanClientResponse::WorkerList {
+                workers,
+                protocol_version,
+            },
             ClientResponse::MapReduceSubmitted { job_id } => {
-                HumanClientResponse::MapReduceSubmitted { job_id }
+                HumanClientResponse::MapReduceSubmitted {
+                    job_id,
+                    protocol_version,
+                }
             }
             ClientResponse::MapReduceCompleted { result } => {
-                HumanClientResponse::MapReduceCompleted { result }
+                HumanClientResponse::MapReduceCompleted {
+                    result,
+                    protocol_version,
+                }
             }
-            ClientResponse::Error { message } => HumanClientResponse::Error { message },
-            ClientResponse::BlobReply { reply } => HumanClientResponse::BlobReply { reply },
+            ClientResponse::Error { message } => HumanClientResponse::Error {
+                message,
+                protocol_version,
+            },
+            ClientResponse::BlobReply { reply } => HumanClientResponse::BlobReply {
+                reply,
+                protocol_version,
+            },
         }
+    }
+
+    const fn protocol_version(&self) -> u32 {
+        match self {
+            Self::TaskSubmitted {
+                protocol_version, ..
+            }
+            | Self::TaskCompleted {
+                protocol_version, ..
+            }
+            | Self::TaskStatusInfo {
+                protocol_version, ..
+            }
+            | Self::TaskCancelled {
+                protocol_version, ..
+            }
+            | Self::ClusterStatus {
+                protocol_version, ..
+            }
+            | Self::WorkerList {
+                protocol_version, ..
+            }
+            | Self::MapReduceSubmitted {
+                protocol_version, ..
+            }
+            | Self::MapReduceCompleted {
+                protocol_version, ..
+            }
+            | Self::Error {
+                protocol_version, ..
+            }
+            | Self::BlobReply {
+                protocol_version, ..
+            } => *protocol_version,
+        }
+    }
+
+    const fn is_error(&self) -> bool {
+        matches!(self, Self::Error { .. })
     }
 }
 
-impl From<HumanClientResponse> for ClientResponse {
-    fn from(msg: HumanClientResponse) -> Self {
+impl BinaryClientResponse {
+    fn from_client_response(msg: ClientResponse, protocol_version: u32) -> Self {
         match msg {
-            HumanClientResponse::TaskSubmitted { task_id } => {
-                ClientResponse::TaskSubmitted { task_id }
-            }
-            HumanClientResponse::TaskCompleted { task_id, result } => {
-                ClientResponse::TaskCompleted { task_id, result }
-            }
-            HumanClientResponse::TaskStatusInfo {
+            ClientResponse::TaskSubmitted { task_id } => BinaryClientResponse::TaskSubmitted {
                 task_id,
-                status,
-                state_name,
-                assigned_worker,
-                error,
-            } => ClientResponse::TaskStatusInfo {
-                task_id,
-                status,
-                state_name,
-                assigned_worker,
-                error,
+                protocol_version,
             },
-            HumanClientResponse::TaskCancelled { task_id, success } => {
-                ClientResponse::TaskCancelled { task_id, success }
-            }
-            HumanClientResponse::ClusterStatus {
-                total_tasks,
-                pending_tasks,
-                running_tasks,
-                completed_tasks,
-                failed_tasks,
-                workers,
-                active_bytes,
-                max_active_bytes,
-            } => ClientResponse::ClusterStatus {
-                total_tasks,
-                pending_tasks,
-                running_tasks,
-                completed_tasks,
-                failed_tasks,
-                workers,
-                active_bytes,
-                max_active_bytes,
-            },
-            HumanClientResponse::WorkerList { workers } => ClientResponse::WorkerList { workers },
-            HumanClientResponse::MapReduceSubmitted { job_id } => {
-                ClientResponse::MapReduceSubmitted { job_id }
-            }
-            HumanClientResponse::MapReduceCompleted { result } => {
-                ClientResponse::MapReduceCompleted { result }
-            }
-            HumanClientResponse::Error { message } => ClientResponse::Error { message },
-            HumanClientResponse::BlobReply { reply } => ClientResponse::BlobReply { reply },
-        }
-    }
-}
-
-impl From<ClientResponse> for BinaryClientResponse {
-    fn from(msg: ClientResponse) -> Self {
-        match msg {
-            ClientResponse::TaskSubmitted { task_id } => {
-                BinaryClientResponse::TaskSubmitted { task_id }
-            }
             ClientResponse::TaskCompleted { task_id, result } => {
-                BinaryClientResponse::TaskCompleted { task_id, result }
+                BinaryClientResponse::TaskCompleted {
+                    task_id,
+                    result,
+                    protocol_version,
+                }
             }
             ClientResponse::TaskStatusInfo {
                 task_id,
@@ -2339,9 +2621,14 @@ impl From<ClientResponse> for BinaryClientResponse {
                 state_name,
                 assigned_worker,
                 error,
+                protocol_version,
             },
             ClientResponse::TaskCancelled { task_id, success } => {
-                BinaryClientResponse::TaskCancelled { task_id, success }
+                BinaryClientResponse::TaskCancelled {
+                    task_id,
+                    success,
+                    protocol_version,
+                }
             }
             ClientResponse::ClusterStatus {
                 total_tasks,
@@ -2361,35 +2648,97 @@ impl From<ClientResponse> for BinaryClientResponse {
                 workers,
                 active_bytes,
                 max_active_bytes,
+                protocol_version,
             },
-            ClientResponse::WorkerList { workers } => BinaryClientResponse::WorkerList { workers },
+            ClientResponse::WorkerList { workers } => BinaryClientResponse::WorkerList {
+                workers,
+                protocol_version,
+            },
             ClientResponse::MapReduceSubmitted { job_id } => {
-                BinaryClientResponse::MapReduceSubmitted { job_id }
+                BinaryClientResponse::MapReduceSubmitted {
+                    job_id,
+                    protocol_version,
+                }
             }
             ClientResponse::MapReduceCompleted { result } => {
-                BinaryClientResponse::MapReduceCompleted { result }
+                BinaryClientResponse::MapReduceCompleted {
+                    result,
+                    protocol_version,
+                }
             }
-            ClientResponse::Error { message } => BinaryClientResponse::Error { message },
-            ClientResponse::BlobReply { reply } => BinaryClientResponse::BlobReply { reply },
+            ClientResponse::Error { message } => BinaryClientResponse::Error {
+                message,
+                protocol_version,
+            },
+            ClientResponse::BlobReply { reply } => BinaryClientResponse::BlobReply {
+                reply,
+                protocol_version,
+            },
         }
+    }
+
+    const fn protocol_version(&self) -> u32 {
+        match self {
+            Self::TaskSubmitted {
+                protocol_version, ..
+            }
+            | Self::TaskCompleted {
+                protocol_version, ..
+            }
+            | Self::TaskStatusInfo {
+                protocol_version, ..
+            }
+            | Self::TaskCancelled {
+                protocol_version, ..
+            }
+            | Self::ClusterStatus {
+                protocol_version, ..
+            }
+            | Self::WorkerList {
+                protocol_version, ..
+            }
+            | Self::MapReduceSubmitted {
+                protocol_version, ..
+            }
+            | Self::MapReduceCompleted {
+                protocol_version, ..
+            }
+            | Self::Error {
+                protocol_version, ..
+            }
+            | Self::BlobReply {
+                protocol_version, ..
+            } => *protocol_version,
+        }
+    }
+
+    const fn is_error(&self) -> bool {
+        matches!(self, Self::Error { .. })
     }
 }
 
-impl From<BinaryClientResponse> for ClientResponse {
-    fn from(msg: BinaryClientResponse) -> Self {
+impl From<ClientResponse> for HumanClientResponse {
+    fn from(msg: ClientResponse) -> Self {
+        Self::from_client_response(msg, PROTOCOL_VERSION_CURRENT)
+    }
+}
+
+impl From<HumanClientResponse> for ClientResponse {
+    fn from(msg: HumanClientResponse) -> Self {
         match msg {
-            BinaryClientResponse::TaskSubmitted { task_id } => {
+            HumanClientResponse::TaskSubmitted { task_id, .. } => {
                 ClientResponse::TaskSubmitted { task_id }
             }
-            BinaryClientResponse::TaskCompleted { task_id, result } => {
-                ClientResponse::TaskCompleted { task_id, result }
-            }
-            BinaryClientResponse::TaskStatusInfo {
+            HumanClientResponse::TaskCompleted {
+                task_id, result, ..
+            } => ClientResponse::TaskCompleted { task_id, result },
+            HumanClientResponse::TaskStatusInfo {
                 task_id,
                 status,
                 state_name,
                 assigned_worker,
                 error,
+                ..
             } => ClientResponse::TaskStatusInfo {
                 task_id,
                 status,
@@ -2397,10 +2746,10 @@ impl From<BinaryClientResponse> for ClientResponse {
                 assigned_worker,
                 error,
             },
-            BinaryClientResponse::TaskCancelled { task_id, success } => {
-                ClientResponse::TaskCancelled { task_id, success }
-            }
-            BinaryClientResponse::ClusterStatus {
+            HumanClientResponse::TaskCancelled {
+                task_id, success, ..
+            } => ClientResponse::TaskCancelled { task_id, success },
+            HumanClientResponse::ClusterStatus {
                 total_tasks,
                 pending_tasks,
                 running_tasks,
@@ -2409,6 +2758,7 @@ impl From<BinaryClientResponse> for ClientResponse {
                 workers,
                 active_bytes,
                 max_active_bytes,
+                ..
             } => ClientResponse::ClusterStatus {
                 total_tasks,
                 pending_tasks,
@@ -2419,15 +2769,84 @@ impl From<BinaryClientResponse> for ClientResponse {
                 active_bytes,
                 max_active_bytes,
             },
-            BinaryClientResponse::WorkerList { workers } => ClientResponse::WorkerList { workers },
-            BinaryClientResponse::MapReduceSubmitted { job_id } => {
+            HumanClientResponse::WorkerList { workers, .. } => {
+                ClientResponse::WorkerList { workers }
+            }
+            HumanClientResponse::MapReduceSubmitted { job_id, .. } => {
                 ClientResponse::MapReduceSubmitted { job_id }
             }
-            BinaryClientResponse::MapReduceCompleted { result } => {
+            HumanClientResponse::MapReduceCompleted { result, .. } => {
                 ClientResponse::MapReduceCompleted { result }
             }
-            BinaryClientResponse::Error { message } => ClientResponse::Error { message },
-            BinaryClientResponse::BlobReply { reply } => ClientResponse::BlobReply { reply },
+            HumanClientResponse::Error { message, .. } => ClientResponse::Error { message },
+            HumanClientResponse::BlobReply { reply, .. } => ClientResponse::BlobReply { reply },
+        }
+    }
+}
+
+impl From<ClientResponse> for BinaryClientResponse {
+    fn from(msg: ClientResponse) -> Self {
+        Self::from_client_response(msg, PROTOCOL_VERSION_CURRENT)
+    }
+}
+
+impl From<BinaryClientResponse> for ClientResponse {
+    fn from(msg: BinaryClientResponse) -> Self {
+        match msg {
+            BinaryClientResponse::TaskSubmitted { task_id, .. } => {
+                ClientResponse::TaskSubmitted { task_id }
+            }
+            BinaryClientResponse::TaskCompleted {
+                task_id, result, ..
+            } => ClientResponse::TaskCompleted { task_id, result },
+            BinaryClientResponse::TaskStatusInfo {
+                task_id,
+                status,
+                state_name,
+                assigned_worker,
+                error,
+                ..
+            } => ClientResponse::TaskStatusInfo {
+                task_id,
+                status,
+                state_name,
+                assigned_worker,
+                error,
+            },
+            BinaryClientResponse::TaskCancelled {
+                task_id, success, ..
+            } => ClientResponse::TaskCancelled { task_id, success },
+            BinaryClientResponse::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+                active_bytes,
+                max_active_bytes,
+                ..
+            } => ClientResponse::ClusterStatus {
+                total_tasks,
+                pending_tasks,
+                running_tasks,
+                completed_tasks,
+                failed_tasks,
+                workers,
+                active_bytes,
+                max_active_bytes,
+            },
+            BinaryClientResponse::WorkerList { workers, .. } => {
+                ClientResponse::WorkerList { workers }
+            }
+            BinaryClientResponse::MapReduceSubmitted { job_id, .. } => {
+                ClientResponse::MapReduceSubmitted { job_id }
+            }
+            BinaryClientResponse::MapReduceCompleted { result, .. } => {
+                ClientResponse::MapReduceCompleted { result }
+            }
+            BinaryClientResponse::Error { message, .. } => ClientResponse::Error { message },
+            BinaryClientResponse::BlobReply { reply, .. } => ClientResponse::BlobReply { reply },
         }
     }
 }
@@ -2448,6 +2867,46 @@ impl<'de> Deserialize<'de> for ClientResponse {
             HumanClientResponse::deserialize(deserializer).map(Into::into)
         } else {
             BinaryClientResponse::deserialize(deserializer).map(Into::into)
+        }
+    }
+}
+
+/// Serializes a [`ClientMessage`] stamped with an explicit `protocol_version` (for version-skew
+/// tests). Normal callers use [`serialize_message`], which stamps [`PROTOCOL_VERSION_CURRENT`].
+#[cfg(test)]
+fn serialize_client_message_with_version(
+    msg: &ClientMessage,
+    protocol_version: u32,
+    codec: WireCodec,
+) -> Result<Bytes, ProtocolError> {
+    match codec {
+        WireCodec::Bincode => {
+            let wire = BinaryClientMessage::from_client_message(msg.clone(), protocol_version);
+            serialize_message(&wire, WireCodec::Bincode)
+        }
+        WireCodec::Json => {
+            let wire = HumanClientMessage::from_client_message(msg.clone(), protocol_version);
+            serialize_message(&wire, WireCodec::Json)
+        }
+    }
+}
+
+/// Serializes a [`ClientResponse`] stamped with an explicit `protocol_version` (for version-skew
+/// tests). Normal callers use [`serialize_message`], which stamps [`PROTOCOL_VERSION_CURRENT`].
+#[cfg(test)]
+fn serialize_client_response_with_version(
+    msg: &ClientResponse,
+    protocol_version: u32,
+    codec: WireCodec,
+) -> Result<Bytes, ProtocolError> {
+    match codec {
+        WireCodec::Bincode => {
+            let wire = BinaryClientResponse::from_client_response(msg.clone(), protocol_version);
+            serialize_message(&wire, WireCodec::Bincode)
+        }
+        WireCodec::Json => {
+            let wire = HumanClientResponse::from_client_response(msg.clone(), protocol_version);
+            serialize_message(&wire, WireCodec::Json)
         }
     }
 }
@@ -2576,6 +3035,164 @@ pub fn serialize_message<M: Serialize>(msg: &M, codec: WireCodec) -> Result<Byte
     }
 }
 
+fn bincode_exact_deserialize<T: DeserializeOwned>(
+    slice: &[u8],
+) -> Result<T, Box<bincode::ErrorKind>> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(slice.len() as u64)
+        .deserialize(slice)
+}
+
+fn downcast_msg<T: 'static, M: 'static>(val: T) -> M {
+    let boxed: Box<dyn std::any::Any> = Box::new(val);
+    *boxed
+        .downcast::<M>()
+        .expect("caller checked TypeId::of::<M>() == TypeId::of::<T>()")
+}
+
+fn incompatible_version_error(peer_version: u32) -> ProtocolError {
+    ProtocolError::IncompatibleVersion {
+        peer_version,
+        current_version: PROTOCOL_VERSION_CURRENT,
+        min_compatible_version: PROTOCOL_VERSION_MIN_COMPATIBLE,
+    }
+}
+
+fn decode_bincode_client_message(slice: &[u8]) -> Result<ClientMessage, ProtocolError> {
+    match bincode_exact_deserialize::<BinaryClientMessage>(slice) {
+        Ok(bin_msg) => {
+            let ver = bin_msg.protocol_version();
+            if !is_protocol_version_compatible(ver) {
+                return Err(incompatible_version_error(ver));
+            }
+            Ok(bin_msg.into())
+        }
+        Err(err) => {
+            if bincode_exact_deserialize::<LegacyV2BinaryClientMessage>(slice).is_ok() {
+                return Err(incompatible_version_error(2));
+            }
+            Err(ProtocolError::Bincode(err))
+        }
+    }
+}
+
+fn decode_bincode_client_response(slice: &[u8]) -> Result<ClientResponse, ProtocolError> {
+    match bincode_exact_deserialize::<BinaryClientResponse>(slice) {
+        Ok(bin_resp) => {
+            let ver = bin_resp.protocol_version();
+            if !bin_resp.is_error() && !is_protocol_version_compatible(ver) {
+                return Err(incompatible_version_error(ver));
+            }
+            Ok(bin_resp.into())
+        }
+        Err(err) => {
+            if let Ok(legacy_resp) =
+                bincode_exact_deserialize::<LegacyV2BinaryClientResponse>(slice)
+            {
+                if let LegacyV2BinaryClientResponse::Error { message } = legacy_resp {
+                    return Ok(ClientResponse::Error { message });
+                }
+                return Err(incompatible_version_error(2));
+            }
+            Err(ProtocolError::Bincode(err))
+        }
+    }
+}
+
+fn decode_bincode_inbound_message(slice: &[u8]) -> Result<InboundMessage, ProtocolError> {
+    // 1. Bare modern WorkerMessage opening with Register.
+    if let Ok(w) = bincode_exact_deserialize::<WorkerMessage>(slice) {
+        if matches!(w, WorkerMessage::Register { .. }) {
+            return Ok(InboundMessage::Worker(w));
+        }
+    }
+
+    // 2. Bare ClientMessage (checks protocol_version and legacy v2 client layout).
+    let client_res = decode_bincode_client_message(slice);
+    if let Ok(c) = client_res {
+        return Ok(InboundMessage::Client(c));
+    }
+
+    // 3. Bare non-Register WorkerMessage.
+    if let Ok(w) = bincode_exact_deserialize::<WorkerMessage>(slice) {
+        return Ok(InboundMessage::Worker(w));
+    }
+
+    // 4. Bare legacy WorkerMessage.
+    if let Ok(legacy) = bincode_exact_deserialize::<LegacyBinaryWorkerMessage>(slice) {
+        return Ok(InboundMessage::Worker(legacy.into()));
+    }
+
+    // 5. Wrapped BinaryInboundMessage.
+    if let Ok(wrapped) = bincode_exact_deserialize::<BinaryInboundMessage>(slice) {
+        return Ok(wrapped.into());
+    }
+
+    // 6. Surface version mismatch when the frame matched a ClientMessage layout with an
+    // incompatible protocol version.
+    if let Err(err @ ProtocolError::IncompatibleVersion { .. }) = client_res {
+        return Err(err);
+    }
+
+    // 7. Unknown future WorkerMessage variant.
+    if slice.len() >= 4 {
+        let tag = u32::from_le_bytes(slice[0..4].try_into().unwrap());
+        if (8..10_000).contains(&tag) {
+            return Ok(InboundMessage::Worker(WorkerMessage::UnknownVariant {
+                tag,
+                raw_bytes: slice[4..].to_vec(),
+            }));
+        }
+    }
+
+    Err(client_res.unwrap_err())
+}
+
+fn decode_json_client_message(raw: &[u8]) -> Result<ClientMessage, ProtocolError> {
+    let human: HumanClientMessage = serde_json::from_slice(raw)?;
+    let ver = human.protocol_version();
+    if !is_protocol_version_compatible(ver) {
+        return Err(incompatible_version_error(ver));
+    }
+    Ok(human.into())
+}
+
+fn decode_json_client_response(raw: &[u8]) -> Result<ClientResponse, ProtocolError> {
+    let human: HumanClientResponse = serde_json::from_slice(raw)?;
+    let ver = human.protocol_version();
+    if !human.is_error() && !is_protocol_version_compatible(ver) {
+        return Err(incompatible_version_error(ver));
+    }
+    Ok(human.into())
+}
+
+fn decode_json_typed<M: DeserializeOwned + 'static>(raw: &[u8]) -> Result<M, ProtocolError> {
+    if std::any::TypeId::of::<M>() == std::any::TypeId::of::<ClientMessage>() {
+        return decode_json_client_message(raw).map(downcast_msg);
+    }
+    if std::any::TypeId::of::<M>() == std::any::TypeId::of::<ClientResponse>() {
+        return decode_json_client_response(raw).map(downcast_msg);
+    }
+    if std::any::TypeId::of::<M>() == std::any::TypeId::of::<InboundMessage>() {
+        if let Ok(w) = serde_json::from_slice::<WorkerMessage>(raw) {
+            return Ok(downcast_msg(InboundMessage::Worker(w)));
+        }
+        return decode_json_client_message(raw).map(|c| downcast_msg(InboundMessage::Client(c)));
+    }
+    serde_json::from_slice::<M>(raw).map_err(ProtocolError::Json)
+}
+
+fn peek_wire_codec(bytes: &[u8]) -> Option<WireCodec> {
+    match bytes.first().copied() {
+        Some(WIRE_FORMAT_BINCODE) => Some(WireCodec::Bincode),
+        Some(WIRE_FORMAT_JSON | b'{' | b' ' | b'\t' | b'\r' | b'\n') => Some(WireCodec::Json),
+        _ => None,
+    }
+}
+
 /// Deserializes a message from a byte frame, automatically identifying the wire format
 /// from the 1-byte discriminator tag or legacy raw JSON format.
 pub fn deserialize_message<M: DeserializeOwned + 'static>(
@@ -2589,19 +3206,30 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
 
     match bytes[0] {
         WIRE_FORMAT_BINCODE => {
-            match bincode::deserialize::<M>(&bytes[1..]) {
+            let slice = &bytes[1..];
+            if std::any::TypeId::of::<M>() == std::any::TypeId::of::<ClientMessage>() {
+                return decode_bincode_client_message(slice)
+                    .map(|msg| (downcast_msg(msg), WireCodec::Bincode));
+            }
+            if std::any::TypeId::of::<M>() == std::any::TypeId::of::<ClientResponse>() {
+                return decode_bincode_client_response(slice)
+                    .map(|msg| (downcast_msg(msg), WireCodec::Bincode));
+            }
+            if std::any::TypeId::of::<M>() == std::any::TypeId::of::<InboundMessage>() {
+                return decode_bincode_inbound_message(slice)
+                    .map(|msg| (downcast_msg(msg), WireCodec::Bincode));
+            }
+
+            match bincode_exact_deserialize::<M>(slice) {
                 Ok(msg) => Ok((msg, WireCodec::Bincode)),
                 Err(e) => {
-                    let slice = &bytes[1..];
                     // Fallback for WorkerMessage (legacy or unknown variant)
                     if std::any::TypeId::of::<M>() == std::any::TypeId::of::<WorkerMessage>() {
-                        if let Ok(legacy) = bincode::deserialize::<LegacyBinaryWorkerMessage>(slice)
+                        if let Ok(legacy) =
+                            bincode_exact_deserialize::<LegacyBinaryWorkerMessage>(slice)
                         {
                             let msg: WorkerMessage = legacy.into();
-                            let boxed: Box<dyn std::any::Any> = Box::new(msg);
-                            if let Ok(m) = boxed.downcast::<M>() {
-                                return Ok((*m, WireCodec::Bincode));
-                            }
+                            return Ok((downcast_msg(msg), WireCodec::Bincode));
                         }
                         if slice.len() >= 4 {
                             let tag = u32::from_le_bytes(slice[0..4].try_into().unwrap());
@@ -2610,23 +3238,18 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
                                     tag,
                                     raw_bytes: slice[4..].to_vec(),
                                 };
-                                let boxed: Box<dyn std::any::Any> = Box::new(unknown);
-                                if let Ok(m) = boxed.downcast::<M>() {
-                                    return Ok((*m, WireCodec::Bincode));
-                                }
+                                return Ok((downcast_msg(unknown), WireCodec::Bincode));
                             }
                         }
                     }
 
                     // Fallback for MasterMessage (legacy or unknown variant)
                     if std::any::TypeId::of::<M>() == std::any::TypeId::of::<MasterMessage>() {
-                        if let Ok(legacy) = bincode::deserialize::<LegacyBinaryMasterMessage>(slice)
+                        if let Ok(legacy) =
+                            bincode_exact_deserialize::<LegacyBinaryMasterMessage>(slice)
                         {
                             let msg: MasterMessage = legacy.into();
-                            let boxed: Box<dyn std::any::Any> = Box::new(msg);
-                            if let Ok(m) = boxed.downcast::<M>() {
-                                return Ok((*m, WireCodec::Bincode));
-                            }
+                            return Ok((downcast_msg(msg), WireCodec::Bincode));
                         }
                         if slice.len() >= 4 {
                             let tag = u32::from_le_bytes(slice[0..4].try_into().unwrap());
@@ -2635,112 +3258,18 @@ pub fn deserialize_message<M: DeserializeOwned + 'static>(
                                     tag,
                                     raw_bytes: slice[4..].to_vec(),
                                 };
-                                let boxed: Box<dyn std::any::Any> = Box::new(unknown);
-                                if let Ok(m) = boxed.downcast::<M>() {
-                                    return Ok((*m, WireCodec::Bincode));
-                                }
+                                return Ok((downcast_msg(unknown), WireCodec::Bincode));
                             }
                         }
                     }
 
-                    // Fallback for InboundMessage when peer sent raw WorkerMessage or ClientMessage
-                    if std::any::TypeId::of::<M>() == std::any::TypeId::of::<InboundMessage>() {
-                        use bincode::Options;
-                        let slice_opts = bincode::DefaultOptions::new()
-                            .with_fixint_encoding()
-                            .allow_trailing_bytes()
-                            .with_limit(slice.len() as u64);
-
-                        // 1. Try modern WorkerMessage: verify exact byte consumption AND worker registration invariant
-                        let mut cursor_w = std::io::Cursor::new(slice);
-                        if let Ok(w) =
-                            slice_opts.deserialize_from::<_, WorkerMessage>(&mut cursor_w)
-                        {
-                            let matches_size = cursor_w.position() as usize == slice.len();
-                            let is_initial_worker_msg = matches!(w, WorkerMessage::Register { .. });
-                            if matches_size && is_initial_worker_msg {
-                                let inbound = InboundMessage::Worker(w);
-                                let boxed: Box<dyn std::any::Any> = Box::new(inbound);
-                                if let Ok(m) = boxed.downcast::<M>() {
-                                    return Ok((*m, WireCodec::Bincode));
-                                }
-                            }
-                        }
-                        // 2. Try ClientMessage: verify exact byte consumption
-                        let mut cursor_c = std::io::Cursor::new(slice);
-                        if let Ok(c) =
-                            slice_opts.deserialize_from::<_, ClientMessage>(&mut cursor_c)
-                        {
-                            if cursor_c.position() as usize == slice.len() {
-                                let inbound = InboundMessage::Client(c);
-                                let boxed: Box<dyn std::any::Any> = Box::new(inbound);
-                                if let Ok(m) = boxed.downcast::<M>() {
-                                    return Ok((*m, WireCodec::Bincode));
-                                }
-                            }
-                        }
-                        // 3. Fallback: if WorkerMessage consumed all bytes without Register requirement
-                        let mut cursor_w2 = std::io::Cursor::new(slice);
-                        if let Ok(w) =
-                            slice_opts.deserialize_from::<_, WorkerMessage>(&mut cursor_w2)
-                        {
-                            if cursor_w2.position() as usize == slice.len() {
-                                let inbound = InboundMessage::Worker(w);
-                                let boxed: Box<dyn std::any::Any> = Box::new(inbound);
-                                if let Ok(m) = boxed.downcast::<M>() {
-                                    return Ok((*m, WireCodec::Bincode));
-                                }
-                            }
-                        }
-
-                        // 4. Try legacy WorkerMessage (must consume all bytes of legacy frame)
-                        let mut cursor_leg = std::io::Cursor::new(slice);
-                        if let Ok(legacy) = slice_opts
-                            .deserialize_from::<_, LegacyBinaryWorkerMessage>(&mut cursor_leg)
-                        {
-                            if cursor_leg.position() as usize == slice.len() {
-                                let inbound = InboundMessage::Worker(legacy.into());
-                                let boxed: Box<dyn std::any::Any> = Box::new(inbound);
-                                if let Ok(m) = boxed.downcast::<M>() {
-                                    return Ok((*m, WireCodec::Bincode));
-                                }
-                            }
-                        }
-                        // 4. Fallback: if ClientMessage was sent without exact size check
-                        if let Ok(c) = slice_opts.deserialize::<ClientMessage>(slice) {
-                            let inbound = InboundMessage::Client(c);
-                            let boxed: Box<dyn std::any::Any> = Box::new(inbound);
-                            if let Ok(m) = boxed.downcast::<M>() {
-                                return Ok((*m, WireCodec::Bincode));
-                            }
-                        }
-                        // 5. Fallback: Unknown variant WorkerMessage
-                        if slice.len() >= 4 {
-                            let tag = u32::from_le_bytes(slice[0..4].try_into().unwrap());
-                            if (8..10_000).contains(&tag) {
-                                let unknown = WorkerMessage::UnknownVariant {
-                                    tag,
-                                    raw_bytes: slice[4..].to_vec(),
-                                };
-                                let inbound = InboundMessage::Worker(unknown);
-                                let boxed: Box<dyn std::any::Any> = Box::new(inbound);
-                                if let Ok(m) = boxed.downcast::<M>() {
-                                    return Ok((*m, WireCodec::Bincode));
-                                }
-                            }
-                        }
-                    }
                     Err(ProtocolError::Bincode(e))
                 }
             }
         }
-        WIRE_FORMAT_JSON => {
-            let msg: M = serde_json::from_slice(&bytes[1..])?;
-            Ok((msg, WireCodec::Json))
-        }
+        WIRE_FORMAT_JSON => decode_json_typed::<M>(&bytes[1..]).map(|msg| (msg, WireCodec::Json)),
         b'{' | b' ' | b'\t' | b'\r' | b'\n' => {
-            let msg: M = serde_json::from_slice(bytes)?;
-            Ok((msg, WireCodec::Json))
+            decode_json_typed::<M>(bytes).map(|msg| (msg, WireCodec::Json))
         }
         tag => Err(ProtocolError::InvalidFormatTag(tag)),
     }
@@ -2972,6 +3501,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MessageTransport<T> {
                     Some(r) => r.decrypt_frame(&bytes)?,
                     None => bytes.freeze(),
                 };
+                if let Some(detected) = peek_wire_codec(&plaintext) {
+                    self.last_detected_codec = Some(detected);
+                }
                 let (msg, codec) = deserialize_message::<M>(&plaintext)?;
                 self.last_detected_codec = Some(codec);
                 Ok(Some((msg, codec)))
@@ -3121,6 +3653,9 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
                     Some(r) => r.decrypt_frame(&bytes)?,
                     None => bytes.freeze(),
                 };
+                if let Some(detected) = peek_wire_codec(&plaintext) {
+                    self.last_detected_codec = Some(detected);
+                }
                 let (msg, codec) = deserialize_message::<M>(&plaintext)?;
                 self.last_detected_codec = Some(codec);
                 Ok(Some((msg, codec)))
@@ -4594,5 +5129,158 @@ mod tests {
             !ProtocolCapabilities::all_supported().contains(ProtocolCapabilities::ROLE_ARBITRAGE),
             "ROLE_ARBITRAGE is design-only and must not be advertised in all_supported()"
         );
+    }
+
+    #[test]
+    fn test_client_message_and_response_version_skew_refused_in_both_codecs() {
+        let req = ClientMessage::ClusterStatus;
+        let resp = ClientResponse::TaskSubmitted {
+            task_id: TaskId::new(),
+        };
+
+        for codec in [WireCodec::Bincode, WireCodec::Json] {
+            for bad_ver in [1u32, 2, PROTOCOL_VERSION_CURRENT + 1, 99] {
+                let raw_req = serialize_client_message_with_version(&req, bad_ver, codec).unwrap();
+                match deserialize_message::<ClientMessage>(&raw_req) {
+                    Err(ProtocolError::IncompatibleVersion {
+                        peer_version,
+                        current_version,
+                        min_compatible_version,
+                    }) => {
+                        assert_eq!(peer_version, bad_ver);
+                        assert_eq!(current_version, PROTOCOL_VERSION_CURRENT);
+                        assert_eq!(min_compatible_version, PROTOCOL_VERSION_MIN_COMPATIBLE);
+                    }
+                    other => panic!(
+                        "expected IncompatibleVersion({bad_ver}) for {codec:?}, got {other:?}"
+                    ),
+                }
+
+                match deserialize_message::<InboundMessage>(&raw_req) {
+                    Err(ProtocolError::IncompatibleVersion {
+                        peer_version,
+                        current_version,
+                        min_compatible_version,
+                    }) => {
+                        assert_eq!(peer_version, bad_ver);
+                        assert_eq!(current_version, PROTOCOL_VERSION_CURRENT);
+                        assert_eq!(min_compatible_version, PROTOCOL_VERSION_MIN_COMPATIBLE);
+                    }
+                    other => panic!(
+                        "expected InboundMessage IncompatibleVersion({bad_ver}) for {codec:?}, got {other:?}"
+                    ),
+                }
+
+                let raw_resp =
+                    serialize_client_response_with_version(&resp, bad_ver, codec).unwrap();
+                match deserialize_message::<ClientResponse>(&raw_resp) {
+                    Err(ProtocolError::IncompatibleVersion {
+                        peer_version,
+                        current_version,
+                        min_compatible_version,
+                    }) => {
+                        assert_eq!(peer_version, bad_ver);
+                        assert_eq!(current_version, PROTOCOL_VERSION_CURRENT);
+                        assert_eq!(min_compatible_version, PROTOCOL_VERSION_MIN_COMPATIBLE);
+                    }
+                    other => panic!(
+                        "expected ClientResponse IncompatibleVersion({bad_ver}) for {codec:?}, got {other:?}"
+                    ),
+                }
+
+                // ClientResponse::Error is always decoded regardless of protocol_version so a
+                // rejected client can display the Master's refusal message.
+                let err_resp = ClientResponse::Error {
+                    message: format_incompatible_version_error("client", bad_ver),
+                };
+                let raw_err =
+                    serialize_client_response_with_version(&err_resp, bad_ver, codec).unwrap();
+                let (decoded_err, detected) =
+                    deserialize_message::<ClientResponse>(&raw_err).unwrap();
+                assert_eq!(detected, codec);
+                assert_eq!(decoded_err, err_resp);
+            }
+        }
+
+        // Also verify that an unversioned legacy v2 bincode ClientMessage (4-byte ClusterStatus
+        // tag only) is recognized as peer_version = 2 rather than failing with an opaque EOF error.
+        let mut legacy_v2_cluster_status = vec![WIRE_FORMAT_BINCODE];
+        legacy_v2_cluster_status.extend_from_slice(&3u32.to_le_bytes());
+        match deserialize_message::<InboundMessage>(&legacy_v2_cluster_status) {
+            Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                assert_eq!(peer_version, 2);
+            }
+            other => panic!("expected IncompatibleVersion(2) for legacy v2 frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unversioned_json_client_message_and_response_refused_with_version_2() {
+        let raw_json_req = br#"{"type":"ClusterStatus"}"#;
+        let mut framed_json_req = vec![WIRE_FORMAT_JSON];
+        framed_json_req.extend_from_slice(raw_json_req);
+
+        for frame in [raw_json_req.as_slice(), framed_json_req.as_slice()] {
+            match deserialize_message::<ClientMessage>(frame) {
+                Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                    assert_eq!(peer_version, LEGACY_UNVERSIONED_PROTOCOL_VERSION);
+                    assert_eq!(peer_version, 2);
+                }
+                other => {
+                    panic!("expected IncompatibleVersion(2) for unversioned JSON ClientMessage, got {other:?}")
+                }
+            }
+            match deserialize_message::<InboundMessage>(frame) {
+                Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                    assert_eq!(peer_version, LEGACY_UNVERSIONED_PROTOCOL_VERSION);
+                    assert_eq!(peer_version, 2);
+                }
+                other => {
+                    panic!("expected IncompatibleVersion(2) for unversioned JSON InboundMessage, got {other:?}")
+                }
+            }
+        }
+
+        let raw_json_resp = br#"{"type":"ClusterStatus","total_tasks":0,"pending_tasks":0,"running_tasks":0,"completed_tasks":0,"failed_tasks":0,"workers":[]}"#;
+        let mut framed_json_resp = vec![WIRE_FORMAT_JSON];
+        framed_json_resp.extend_from_slice(raw_json_resp);
+
+        for frame in [raw_json_resp.as_slice(), framed_json_resp.as_slice()] {
+            match deserialize_message::<ClientResponse>(frame) {
+                Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                    assert_eq!(peer_version, LEGACY_UNVERSIONED_PROTOCOL_VERSION);
+                    assert_eq!(peer_version, 2);
+                }
+                other => {
+                    panic!("expected IncompatibleVersion(2) for unversioned JSON ClientResponse, got {other:?}")
+                }
+            }
+        }
+
+        // Unversioned JSON Register and RegisterAck also default to protocol_version = 2 and fail
+        // `is_protocol_version_compatible`.
+        let raw_json_register = br#"{"type":"Register","worker_id":"00000000-0000-0000-0000-000000000001","capabilities":{"name":"w","cpu_cores":2,"ram_mb":1024,"has_gpu":false,"is_simulated_gpu":false,"tags":[]}}"#;
+        let (decoded_reg, _) = deserialize_message::<WorkerMessage>(raw_json_register).unwrap();
+        match decoded_reg {
+            WorkerMessage::Register {
+                protocol_version, ..
+            } => {
+                assert_eq!(protocol_version, LEGACY_UNVERSIONED_PROTOCOL_VERSION);
+                assert!(!is_protocol_version_compatible(protocol_version));
+            }
+            other => panic!("expected WorkerMessage::Register, got {other:?}"),
+        }
+
+        let raw_json_ack = br#"{"type":"RegisterAck","accepted":true,"worker_id":"00000000-0000-0000-0000-000000000001","heartbeat_interval_secs":5}"#;
+        let (decoded_ack, _) = deserialize_message::<MasterMessage>(raw_json_ack).unwrap();
+        match decoded_ack {
+            MasterMessage::RegisterAck {
+                protocol_version, ..
+            } => {
+                assert_eq!(protocol_version, LEGACY_UNVERSIONED_PROTOCOL_VERSION);
+                assert!(!is_protocol_version_compatible(protocol_version));
+            }
+            other => panic!("expected MasterMessage::RegisterAck, got {other:?}"),
+        }
     }
 }

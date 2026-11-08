@@ -2389,15 +2389,8 @@ impl TaskRunner {
         start_time: Instant,
     ) -> TaskResult {
         let task_id = task.id;
-        let pref = spec
-            .preferred_provider
-            .as_deref()
-            .unwrap_or("builtin")
-            .to_lowercase();
         let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel();
-        let spec_clone = spec.clone();
-        let tx_clone = checkpoint_tx.clone();
-        let tx_forward = tx_clone.clone();
+        let tx_forward = checkpoint_tx.clone();
 
         // Background forwarder for progress checkpoints
         let forward_handle = tokio::spawn(async move {
@@ -2421,60 +2414,10 @@ impl TaskRunner {
             }
         });
 
-        let compute_fut = async {
-            if pref == "blender" {
-                if let Some(blender_bin) = crate::autorig::blender_provider::resolve_blender_binary(
-                    self.config.blender_path.as_deref(),
-                ) {
-                    if let Some(ref tx) = tx_clone {
-                        let _ = tx
-                            .send(WorkerMessage::Checkpoint {
-                                task_id,
-                                sequence: 1,
-                                delta_state: Bytes::from_static(b"analyzing_mesh"),
-                            })
-                            .await;
-                    }
-                    match crate::autorig::BlenderRigProvider::execute_rigging(
-                        self,
-                        task_id,
-                        &blender_bin,
-                        spec_clone.input_mesh.as_bytes(),
-                        &spec_clone.rig_preset,
-                        &spec_clone.embed_animations,
-                        60,
-                    )
-                    .await
-                    {
-                        Ok(glb) => {
-                            if let Some(ref tx) = tx_clone {
-                                let _ = tx
-                                    .send(WorkerMessage::Checkpoint {
-                                        task_id,
-                                        sequence: 2,
-                                        delta_state: Bytes::from_static(b"completed"),
-                                    })
-                                    .await;
-                            }
-                            return Ok(glb);
-                        }
-                        Err(e) => {
-                            warn!("Blender auto-rigging failed ({e}); falling back to pure-Rust engine");
-                        }
-                    }
-                } else {
-                    warn!("Blender executable not found; falling back to pure-Rust engine");
-                }
-            }
-
-            tokio::task::spawn_blocking(move || {
-                crate::autorig::auto_rig_mesh_with_progress(&spec_clone, |frac, stage, msg| {
-                    let _ = prog_tx.send((frac, stage, msg));
-                })
-            })
-            .await
-            .map_err(|e| crate::autorig::WorkerError::AutoRig(format!("Join error: {e}")))?
-        };
+        let compute_fut =
+            crate::autorig::auto_rig_mesh_async(self, task_id, spec, move |frac, stage, msg| {
+                let _ = prog_tx.send((frac, stage, msg.to_string()));
+            });
 
         tokio::select! {
             result = tokio::time::timeout(timeout, compute_fut) => {

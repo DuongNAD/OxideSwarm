@@ -498,13 +498,7 @@ fn probe_task(
             (spec, TaskRequirements::generic(1, timeout_secs))
         }
         ProbeKind::Gpu { dim, .. } => (
-            TaskSpec::GpuCompute {
-                kernel_name: "matrix_multiply".into(),
-                input_data: vec![1, 2, 3, 4],
-                work_group_size: 16,
-                simulated_matrix_dim: dim,
-                compute_intensity: 10,
-            },
+            TaskSpec::gpu_compute_with_params("matrix_multiply", vec![1, 2, 3, 4], 16, dim),
             TaskRequirements::gpu(timeout_secs),
         ),
     };

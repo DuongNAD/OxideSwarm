@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use tracing::{debug, warn};
 
 use rusty_grid_core::task::{
-    StagedFile, TaskId, TaskSpec, MAX_AGGREGATE_STAGED_BYTES, MAX_STAGED_FILE_BYTES,
+    StagedFile, TaskId, MAX_AGGREGATE_STAGED_BYTES, MAX_STAGED_FILE_BYTES,
 };
 
 /// Windows reserved DOS device names that cannot be created or accessed as files.
@@ -291,6 +291,9 @@ impl SandboxConfig {
         tokio::fs::write(&probe, b"probe").await.map_err(unusable)?;
         let _ = tokio::fs::remove_file(&probe).await;
         self.remove_legacy_staging_cache().await;
+        if !self.keep_sandboxes {
+            self.sweep_leftover_sandboxes().await;
+        }
         Ok(())
     }
 
@@ -429,6 +432,177 @@ impl SandboxConfig {
                     );
                 }
             }
+        }
+    }
+
+    /// Sweeps unlocked leftover `<base_dir>/<uuid>` task sandbox directories and orphan
+    /// `<base_dir>/.locks/<uuid>.lock` files left behind by crashed worker processes or earlier
+    /// `--keep-sandboxes` runs (design 0044 D5).
+    ///
+    /// Lock files live in `<base_dir>/.locks/<task_id>.lock` outside the task-writable directory
+    /// `<base_dir>/<task_id>/`, so a running task that deletes everything inside its own sandbox
+    /// still holds its advisory lock and is never swept by a second worker sharing `base_dir`.
+    pub async fn sweep_leftover_sandboxes(&self) {
+        match tokio::fs::symlink_metadata(&self.base_dir).await {
+            Ok(meta) if is_real_owned_dir(&meta) => {}
+            Ok(meta) => {
+                warn!(
+                    path = %self.base_dir.display(),
+                    is_symlink = meta.file_type().is_symlink(),
+                    is_dir = meta.file_type().is_dir(),
+                    "Skipping leftover sandbox sweep: sandbox base is not a real directory owned by the current user"
+                );
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                warn!(
+                    path = %self.base_dir.display(),
+                    error = %e,
+                    "Failed to inspect sandbox base directory for leftover sandbox sweep"
+                );
+                return;
+            }
+        }
+
+        let mut swept_sandboxes: usize = 0;
+
+        let mut dir_entries = match tokio::fs::read_dir(&self.base_dir).await {
+            Ok(rd) => rd,
+            Err(e) => {
+                warn!(
+                    path = %self.base_dir.display(),
+                    error = %e,
+                    "Failed to read sandbox base directory during leftover sandbox sweep"
+                );
+                return;
+            }
+        };
+
+        while let Ok(Some(entry)) = dir_entries.next_entry().await {
+            let file_name = entry.file_name();
+            let Some(name_str) = file_name.to_str() else {
+                continue;
+            };
+            let Ok(uuid) = uuid::Uuid::parse_str(name_str) else {
+                continue;
+            };
+
+            let entry_path = entry.path();
+            match tokio::fs::symlink_metadata(&entry_path).await {
+                Ok(meta) if is_real_owned_dir(&meta) => {}
+                _ => continue,
+            }
+
+            let task_id = TaskId::from_uuid(uuid);
+            match open_and_try_lock_task(&self.base_dir, task_id) {
+                Ok(Some((lock_path, lock_file))) => {
+                    if let Err(e) = tokio::fs::remove_dir_all(&entry_path).await {
+                        warn!(
+                            task_id = %task_id,
+                            path = %entry_path.display(),
+                            error = %e,
+                            "Failed to remove leftover task sandbox directory"
+                        );
+                    } else {
+                        swept_sandboxes += 1;
+                    }
+                    let _ = tokio::fs::remove_file(&lock_path).await;
+                    drop(lock_file);
+                }
+                Ok(None) => {
+                    // Held by a live worker / Sandbox; leave the sandbox directory untouched.
+                }
+                Err(e) => {
+                    warn!(
+                        task_id = %task_id,
+                        path = %entry_path.display(),
+                        error = %e,
+                        "Skipping leftover sandbox directory: failed to inspect or lock .locks entry"
+                    );
+                }
+            }
+        }
+
+        let locks_dir = self.base_dir.join(".locks");
+        match tokio::fs::symlink_metadata(&locks_dir).await {
+            Ok(meta) if is_real_owned_dir(&meta) => {}
+            Ok(meta) => {
+                warn!(
+                    path = %locks_dir.display(),
+                    is_symlink = meta.file_type().is_symlink(),
+                    is_dir = meta.file_type().is_dir(),
+                    "Skipping orphan lock sweep: .locks path is not a real directory owned by the current user"
+                );
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if swept_sandboxes > 0 {
+                    tracing::info!(
+                        swept_sandboxes,
+                        base_dir = %self.base_dir.display(),
+                        "Swept leftover task sandboxes at worker startup"
+                    );
+                }
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    path = %locks_dir.display(),
+                    error = %e,
+                    "Failed to inspect .locks directory during leftover sandbox sweep"
+                );
+                return;
+            }
+        }
+
+        if let Ok(mut lock_entries) = tokio::fs::read_dir(&locks_dir).await {
+            while let Ok(Some(entry)) = lock_entries.next_entry().await {
+                let file_name = entry.file_name();
+                let Some(name_str) = file_name.to_str() else {
+                    continue;
+                };
+                let Some(stem) = name_str.strip_suffix(".lock") else {
+                    continue;
+                };
+                let Ok(uuid) = uuid::Uuid::parse_str(stem) else {
+                    continue;
+                };
+
+                let sandbox_dir = self.base_dir.join(uuid.to_string());
+                match tokio::fs::symlink_metadata(&sandbox_dir).await {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => continue,
+                }
+
+                let lock_path = entry.path();
+                match tokio::fs::symlink_metadata(&lock_path).await {
+                    Ok(meta) if is_real_owned_file(&meta) => {}
+                    _ => continue,
+                }
+
+                if let Ok(Some((locked_path, lock_file))) =
+                    open_and_try_lock_task(&self.base_dir, TaskId::from_uuid(uuid))
+                {
+                    // Re-check that the sandbox directory was not created concurrently before
+                    // unlinking the orphan lock file.
+                    if matches!(
+                        tokio::fs::symlink_metadata(&sandbox_dir).await,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+                    ) {
+                        let _ = tokio::fs::remove_file(&locked_path).await;
+                    }
+                    drop(lock_file);
+                }
+            }
+        }
+
+        if swept_sandboxes > 0 {
+            tracing::info!(
+                swept_sandboxes,
+                base_dir = %self.base_dir.display(),
+                "Swept leftover task sandboxes at worker startup"
+            );
         }
     }
 }
@@ -608,16 +782,128 @@ pub fn set_permissions(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+fn is_real_owned_dir(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != current_euid() {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_real_owned_file(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != current_euid() {
+            return false;
+        }
+    }
+    true
+}
+
+fn ensure_locks_dir(base_dir: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(base_dir)?;
+    let base_meta = std::fs::symlink_metadata(base_dir)?;
+    if !is_real_owned_dir(&base_meta) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sandbox base directory is a symbolic link or not owned by the current user",
+        ));
+    }
+
+    let locks_dir = base_dir.join(".locks");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        match std::fs::DirBuilder::new().mode(0o700).create(&locks_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match std::fs::create_dir(&locks_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    let locks_meta = std::fs::symlink_metadata(&locks_dir)?;
+    if !is_real_owned_dir(&locks_meta) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sandbox .locks directory is a symbolic link or not owned by the current user",
+        ));
+    }
+    let _ = set_permissions(&locks_dir, 0o700);
+    Ok(locks_dir)
+}
+
+fn open_and_try_lock_task(
+    base_dir: &Path,
+    task_id: TaskId,
+) -> std::io::Result<Option<(PathBuf, std::fs::File)>> {
+    let locks_dir = ensure_locks_dir(base_dir)?;
+    let lock_path = locks_dir.join(format!("{task_id}.lock"));
+
+    if let Ok(meta) = std::fs::symlink_metadata(&lock_path) {
+        if !is_real_owned_file(&meta) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sandbox lock path is a symbolic link or not a regular file owned by the current user",
+            ));
+        }
+    }
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+
+    let file = opts.open(&lock_path)?;
+    let file_meta = file.metadata()?;
+    if !is_real_owned_file(&file_meta) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "opened sandbox lock descriptor is not a regular file owned by the current user",
+        ));
+    }
+
+    match file.try_lock() {
+        Ok(()) => Ok(Some((lock_path, file))),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 /// An isolated sandbox environment for executing a single task.
 pub struct Sandbox {
     task_id: TaskId,
     path: PathBuf,
+    lock_path: PathBuf,
+    lock_file: Option<std::fs::File>,
     keep_sandboxes: bool,
     destroyed: bool,
 }
 
 impl Sandbox {
-    /// Creates and initializes a private directory `<base_dir>/<task_id>` with 0o700 permissions.
+    /// Creates and initializes a private directory `<base_dir>/<task_id>` with 0o700 permissions,
+    /// acquiring `<base_dir>/.locks/<task_id>.lock` before creating `<base_dir>/<task_id>`
+    /// (design 0044 D5).
     ///
     /// For the default base on Unix the private root is checked again first, because a temp
     /// cleaner may have removed it since start-up and another user may have created one
@@ -632,9 +918,23 @@ impl Sandbox {
             });
         }
 
-        tokio::fs::create_dir_all(&path)
-            .await
-            .map_err(|e| SandboxError::Io { task_id, source: e })?;
+        let (lock_path, lock_file) = match open_and_try_lock_task(&config.base_dir, task_id)
+            .map_err(|e| SandboxError::Io { task_id, source: e })?
+        {
+            Some(pair) => pair,
+            None => {
+                return Err(SandboxError::AlreadyExists {
+                    task_id,
+                    path: path.clone(),
+                });
+            }
+        };
+
+        if let Err(e) = tokio::fs::create_dir_all(&path).await {
+            let _ = tokio::fs::remove_file(&lock_path).await;
+            drop(lock_file);
+            return Err(SandboxError::Io { task_id, source: e });
+        }
 
         if let Err(e) = set_permissions(&path, 0o700) {
             warn!(task_id = %task_id, error = %e, "Failed to set 0o700 permissions on sandbox directory");
@@ -645,6 +945,8 @@ impl Sandbox {
         Ok(Self {
             task_id,
             path,
+            lock_path,
+            lock_file: Some(lock_file),
             keep_sandboxes: config.keep_sandboxes,
             destroyed: false,
         })
@@ -708,22 +1010,6 @@ impl Sandbox {
             warn!(task_id = %self.task_id, path = %target.display(), error = %e, "Failed to set 0o700 permissions on script");
         }
         Ok(target)
-    }
-
-    /// Materializes files necessary for a given TaskSpec variant.
-    pub async fn prepare_spec(&self, spec: &TaskSpec) -> Result<(), SandboxError> {
-        match spec {
-            TaskSpec::ShellScript { script, .. } => {
-                self.write_script("task_script.sh", script).await?;
-            }
-            TaskSpec::RustCompilation { source_files, .. } => {
-                for (rel_path, content) in source_files {
-                    self.write_file(rel_path, content.as_bytes()).await?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
     }
 
     /// Materializes staged files directly into the sandbox directory.
@@ -803,6 +1089,7 @@ impl Sandbox {
         self.destroyed = true;
 
         if self.keep_sandboxes {
+            self.lock_file = None;
             debug!(task_id = %self.task_id, path = %self.path.display(), "Sandbox retained per keep_sandboxes config");
             return Ok(());
         }
@@ -815,6 +1102,8 @@ impl Sandbox {
                     source: e,
                 })?;
         }
+        let _ = tokio::fs::remove_file(&self.lock_path).await;
+        self.lock_file = None;
         debug!(task_id = %self.task_id, "Sandbox destroyed");
         Ok(())
     }
@@ -822,8 +1111,14 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        if !self.destroyed && !self.keep_sandboxes && self.path.exists() {
-            let _ = std::fs::remove_dir_all(&self.path);
+        if !self.destroyed {
+            if !self.keep_sandboxes {
+                if self.path.exists() {
+                    let _ = std::fs::remove_dir_all(&self.path);
+                }
+                let _ = std::fs::remove_file(&self.lock_path);
+            }
+            self.lock_file = None;
         }
     }
 }
@@ -1501,5 +1796,215 @@ mod tests {
         sb2.destroy().await.unwrap();
         sb3.destroy().await.unwrap();
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Design 0044 D5 (1): `ensure_usable` removes unlocked leftover `<base_dir>/<uuid>`
+    /// directories and their `<base_dir>/.locks/<uuid>.lock` files (plus orphan lock files) when
+    /// `keep_sandboxes == false`.
+    #[tokio::test]
+    async fn test_ensure_usable_sweeps_unlocked_leftover_uuid_sandboxes_and_locks() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_dir = temp.path().join("sandboxes");
+        let config = SandboxConfig::new(&base_dir);
+
+        // Simulate two crashed task sandboxes whose lock files are no longer held by any process,
+        // plus one orphan .lock file whose directory was already removed.
+        let crashed_a = TaskId::new();
+        let crashed_b = TaskId::new();
+        let orphan_lock_id = TaskId::new();
+
+        let dir_a = base_dir.join(crashed_a.to_string());
+        let dir_b = base_dir.join(crashed_b.to_string());
+        let locks_dir = base_dir.join(".locks");
+        tokio::fs::create_dir_all(&dir_a).await.unwrap();
+        tokio::fs::write(dir_a.join("partial.out"), b"leftover")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(&dir_b).await.unwrap();
+        tokio::fs::create_dir_all(&locks_dir).await.unwrap();
+
+        let lock_a = locks_dir.join(format!("{crashed_a}.lock"));
+        let orphan_lock = locks_dir.join(format!("{orphan_lock_id}.lock"));
+        tokio::fs::write(&lock_a, b"").await.unwrap();
+        tokio::fs::write(&orphan_lock, b"").await.unwrap();
+
+        config.ensure_usable().await.unwrap();
+
+        assert!(!dir_a.exists(), "unlocked leftover sandbox A must be swept");
+        assert!(!dir_b.exists(), "unlocked leftover sandbox B must be swept");
+        assert!(
+            !lock_a.exists(),
+            "lock file for swept sandbox A must be removed"
+        );
+        assert!(!orphan_lock.exists(), "orphan lock file must be removed");
+        assert!(locks_dir.is_dir(), ".locks directory itself must remain");
+    }
+
+    /// Design 0044 D5 (2): `ensure_usable` leaves a live `Sandbox` untouched even when a task
+    /// deletes **everything** inside `<base_dir>/<task_id>` and a second `SandboxConfig` sharing
+    /// the same `base_dir` runs `ensure_usable`.
+    #[tokio::test]
+    async fn test_ensure_usable_spares_live_sandbox_even_when_emptied() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_dir = temp.path().join("sandboxes");
+        let config_worker_1 = SandboxConfig::new(&base_dir);
+        config_worker_1.ensure_usable().await.unwrap();
+
+        let live_id = TaskId::new();
+        let mut live_sb = Sandbox::create(&config_worker_1, live_id).await.unwrap();
+        live_sb.write_file("work.txt", b"in-flight").await.unwrap();
+
+        // Simulate a task deleting everything inside its own `<base_dir>/<task_id>` directory
+        // (e.g. `rm -rf * .*`). Because the advisory lock lives in `<base_dir>/.locks/<task_id>.lock`,
+        // the lock remains held.
+        let mut entries = tokio::fs::read_dir(live_sb.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let p = entry.path();
+            if p.is_dir() {
+                tokio::fs::remove_dir_all(&p).await.unwrap();
+            } else {
+                tokio::fs::remove_file(&p).await.unwrap();
+            }
+        }
+        assert!(
+            std::fs::read_dir(live_sb.path()).unwrap().next().is_none(),
+            "live sandbox directory is completely empty"
+        );
+
+        // Also place an unlocked crashed UUID sandbox alongside the live one to prove the sweep
+        // actually ran.
+        let crashed_id = TaskId::new();
+        let crashed_dir = base_dir.join(crashed_id.to_string());
+        tokio::fs::create_dir_all(&crashed_dir).await.unwrap();
+
+        // A second worker sharing the same `base_dir` starts up and runs `ensure_usable`.
+        let config_worker_2 = SandboxConfig::new(&base_dir);
+        config_worker_2.ensure_usable().await.unwrap();
+
+        assert!(
+            !crashed_dir.exists(),
+            "unlocked crashed sandbox must be swept"
+        );
+        assert!(
+            live_sb.path().is_dir(),
+            "live sandbox directory must survive even when completely emptied"
+        );
+        assert!(
+            base_dir
+                .join(".locks")
+                .join(format!("{live_id}.lock"))
+                .is_file(),
+            "live sandbox external lock file must survive"
+        );
+
+        // The live task can still write outputs and clean up normally.
+        live_sb.write_file("result.txt", b"done").await.unwrap();
+        live_sb.destroy().await.unwrap();
+        assert!(!base_dir.join(live_id.to_string()).exists());
+    }
+
+    /// Design 0044 D5 (3): `ensure_usable` leaves `<base_dir>/.locks`, `<base_dir>/cache/blobs`,
+    /// `worker.id`, non-UUID directories, regular files with UUID names, and symbolic links
+    /// untouched.
+    #[tokio::test]
+    async fn test_ensure_usable_leaves_locks_cache_blobs_worker_id_non_uuid_and_symlinks_untouched()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let base_dir = temp.path().join("sandboxes");
+        let outside_dir = temp.path().join("outside_target");
+        tokio::fs::create_dir_all(&outside_dir).await.unwrap();
+        tokio::fs::write(outside_dir.join(" precious.txt"), b"keep")
+            .await
+            .unwrap();
+
+        let locks_dir = base_dir.join(".locks");
+        tokio::fs::create_dir_all(&locks_dir).await.unwrap();
+        let blobs_dir = base_dir.join("cache").join("blobs");
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+        let blob_file = blobs_dir.join("deadbeef");
+        tokio::fs::write(&blob_file, b"cached-blob").await.unwrap();
+
+        let worker_id_file = base_dir.join("worker.id");
+        tokio::fs::write(&worker_id_file, b"11111111-1111-1111-1111-111111111111")
+            .await
+            .unwrap();
+
+        let custom_dir = base_dir.join("not-a-uuid-dir");
+        tokio::fs::create_dir_all(&custom_dir).await.unwrap();
+
+        let uuid_file = base_dir.join(TaskId::new().to_string());
+        tokio::fs::write(&uuid_file, b"regular-file-with-uuid-name")
+            .await
+            .unwrap();
+
+        #[cfg(unix)]
+        let symlink_uuid = {
+            let link_path = base_dir.join(TaskId::new().to_string());
+            std::os::unix::fs::symlink(&outside_dir, &link_path).unwrap();
+            link_path
+        };
+
+        let config = SandboxConfig::new(&base_dir);
+        config.ensure_usable().await.unwrap();
+
+        assert!(base_dir.join(".locks").is_dir());
+        assert!(blob_file.is_file());
+        assert!(worker_id_file.is_file());
+        assert!(custom_dir.is_dir());
+        assert!(uuid_file.is_file());
+        assert!(outside_dir.join(" precious.txt").is_file());
+        #[cfg(unix)]
+        assert!(
+            std::fs::symlink_metadata(&symlink_uuid)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "UUID-named symlink must not be followed or removed"
+        );
+    }
+
+    /// Design 0044 D5 (4): `ensure_usable` removes nothing when `keep_sandboxes == true`, and a
+    /// subsequent `ensure_usable` with `keep_sandboxes == false` sweeps those retained unlocked
+    /// sandboxes.
+    #[tokio::test]
+    async fn test_ensure_usable_keep_sandboxes_retains_and_subsequent_default_sweeps() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_dir = temp.path().join("sandboxes");
+
+        let keep_config = SandboxConfig::new(&base_dir).with_keep_sandboxes(true);
+        keep_config.ensure_usable().await.unwrap();
+
+        let task_id = TaskId::new();
+        let mut sb = Sandbox::create(&keep_config, task_id).await.unwrap();
+        let sb_path = sb.path().to_path_buf();
+        sb.write_file("debug.log", b"trace").await.unwrap();
+        sb.destroy().await.unwrap();
+        assert!(
+            sb_path.is_dir(),
+            "destroy() with keep_sandboxes == true must retain the sandbox directory"
+        );
+
+        // Restarting with keep_sandboxes == true must also leave retained sandboxes intact.
+        keep_config.ensure_usable().await.unwrap();
+        assert!(
+            sb_path.is_dir(),
+            "ensure_usable() with keep_sandboxes == true must not sweep retained sandboxes"
+        );
+
+        // Restarting without --keep-sandboxes (keep_sandboxes == false) sweeps the retained
+        // unlocked sandbox directory and its lock file.
+        let default_config = SandboxConfig::new(&base_dir).with_keep_sandboxes(false);
+        default_config.ensure_usable().await.unwrap();
+        assert!(
+            !sb_path.exists(),
+            "subsequent ensure_usable() with keep_sandboxes == false must sweep retained unlocked sandboxes"
+        );
+        assert!(
+            !base_dir
+                .join(".locks")
+                .join(format!("{task_id}.lock"))
+                .exists(),
+            "lock file of swept retained sandbox must be removed"
+        );
     }
 }

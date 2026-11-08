@@ -17,13 +17,7 @@ pub mod transport;
 #[cfg(test)]
 mod wire_layout_tests;
 
-pub use arbitrage::{
-    calculate_authority_score, check_mobile_master_eligibility, evaluate_master_claim,
-    evaluate_mobile_master_refusal, evaluate_mobile_master_refusal_matrix, resolve_election_tie,
-    AuthorityEvaluation, CandidateRanking, ClaimVerdict, LeaseValidationError, MasterLeaseTicket,
-    MasterRefusalReason, MobileEnvironmentTelemetry, PlatformType, ELECTION_THRESHOLD_SCORE,
-    LEASE_RENEWAL_INTERVAL_MS, LEASE_VALIDITY_DURATION_MS, SCORE_MAX, SCORE_MIN,
-};
+pub use arbitrage::{LeaseValidationError, MasterLeaseTicket, LEASE_VALIDITY_DURATION_MS};
 pub use capabilities::{
     calculate_effective_concurrency, calculate_keepalive_interval, is_task_eligible, BatteryTier,
     MobileCapabilities, MobileLiveStatus, ThermalTier, WorkerCapabilities,

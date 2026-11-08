@@ -42,9 +42,9 @@ use rusty_grid_core::cluster_auth::{client_handshake, ClusterSecret, WIRE_FORMAT
 use rusty_grid_core::discovery::{is_valid_host, sanitize_host_port, sanitize_http_origin};
 use rusty_grid_core::error::{GridError, GridResult};
 use rusty_grid_core::protocol::{
-    master_features, EndpointRole, MasterMessage, MessageReader, MessageTransport, MessageWriter,
+    format_incompatible_version_error, is_protocol_version_compatible, master_features,
+    EndpointRole, MasterMessage, MessageReader, MessageTransport, MessageWriter,
     ProtocolCapabilities, ProtocolError, WireCodec, WorkerMessage, PROTOCOL_VERSION_CURRENT,
-    PROTOCOL_VERSION_MIN_COMPATIBLE,
 };
 use rusty_grid_core::task::{CheckpointData, Task, TaskId, TaskResult, TaskStatus};
 
@@ -637,6 +637,9 @@ pub struct WorkerClient {
     /// Whether the Master of the current connection announced a blob store
     /// (`master_features::BLOBS`): only then are task inputs fetched and outputs uploaded.
     master_has_blobs: AtomicBool,
+    /// Intersection of `ProtocolCapabilities` advertised by this worker and acknowledged by the
+    /// Master in the current connection's `RegisterAck` (`features & all_supported()`).
+    negotiated_features: AtomicU64,
     /// The blob requester of the current session, if its Master has a blob store.
     blob_client: Arc<std::sync::RwLock<Option<Arc<BlobClient>>>>,
     #[cfg(feature = "p2p")]
@@ -1204,6 +1207,7 @@ impl WorkerClient {
             master_shutdown_announced: false,
             master_takes_mobile_telemetry: AtomicBool::new(false),
             master_has_blobs: AtomicBool::new(false),
+            negotiated_features: AtomicU64::new(ProtocolCapabilities::all_supported().bits()),
             blob_client: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(feature = "p2p")]
             p2p_endpoint: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1590,6 +1594,52 @@ impl WorkerClient {
             return;
         }
 
+        let negotiated = self.negotiated_features();
+        if (!task.staged_files.is_empty() || !task.expected_outputs.is_empty())
+            && !negotiated.contains(ProtocolCapabilities::FILE_STAGING)
+        {
+            warn!(
+                task_id = %task_id,
+                "Refusing task with staged_files/expected_outputs: FILE_STAGING was not acknowledged in RegisterAck"
+            );
+            let result = TaskResult::failure(
+                worker_id,
+                task_id,
+                EXIT_CODE_GENERAL_ERROR,
+                "",
+                "Task requires FILE_STAGING capability, which was not negotiated in RegisterAck",
+                0,
+                Some(
+                    "FILE_STAGING capability not negotiated with master in RegisterAck".to_string(),
+                ),
+            );
+            let _ = outbound_tx.send(WorkerMessage::from(result)).await;
+            return;
+        }
+
+        if (!task.inputs.is_empty() || !task.output_globs.is_empty())
+            && !negotiated.contains(ProtocolCapabilities::BLOB_TRANSFER)
+        {
+            warn!(
+                task_id = %task_id,
+                "Refusing task with blob inputs/output_globs: BLOB_TRANSFER was not acknowledged in RegisterAck"
+            );
+            let result = TaskResult::failure(
+                worker_id,
+                task_id,
+                EXIT_CODE_GENERAL_ERROR,
+                "",
+                "Task requires BLOB_TRANSFER capability, which was not negotiated in RegisterAck",
+                0,
+                Some(
+                    "BLOB_TRANSFER capability not negotiated with master in RegisterAck"
+                        .to_string(),
+                ),
+            );
+            let _ = outbound_tx.send(WorkerMessage::from(result)).await;
+            return;
+        }
+
         // Mobile constraints: reject task if battery < 15% and discharging. The reading is the
         // live one (platform callbacks / periodic poll), not the snapshot taken at startup.
         if let Some(mobile) = self.mobile.snapshot() {
@@ -1763,6 +1813,9 @@ impl WorkerClient {
             };
 
             let effective_checkpoint = checkpoint.or_else(|| task.latest_checkpoint.clone());
+            let checkpoint_tx = negotiated
+                .contains(ProtocolCapabilities::CHECKPOINT_DELTA)
+                .then(|| outbound_tx.clone());
             let (exec_cancel_tx, exec_cancel_rx) = oneshot::channel::<String>();
             let mut exec_cancel_tx = Some(exec_cancel_tx);
             let mut cancelled_reason: Option<String> = None;
@@ -1770,7 +1823,7 @@ impl WorkerClient {
                 let exec_fut = runner.execute_task_with_checkpoint(
                     &task,
                     effective_checkpoint.as_ref(),
-                    Some(outbound_tx.clone()),
+                    checkpoint_tx,
                     Some(child_pid_clone),
                     Some(exec_cancel_rx),
                 );
@@ -2358,6 +2411,12 @@ impl WorkerClient {
         }
     }
 
+    /// Returns the intersection of `ProtocolCapabilities` supported by this worker and
+    /// acknowledged by the Master in the most recent `RegisterAck`.
+    pub fn negotiated_features(&self) -> ProtocolCapabilities {
+        ProtocolCapabilities::from_bits_truncate(self.negotiated_features.load(Ordering::Acquire))
+    }
+
     /// The event loop of one registered connection: reacts to the Master's frames, watches for a
     /// silently dead peer, reports live mobile telemetry, and obeys the local shutdown signal.
     /// Returns `Ok(())` only for the local shutdown; every other way out is an error the
@@ -2369,26 +2428,35 @@ impl WorkerClient {
         shutdown_rx: &mut watch::Receiver<bool>,
     ) -> GridResult<()> {
         let worker_id = self.worker_id;
+        let adaptive_keepalive = self
+            .negotiated_features()
+            .contains(ProtocolCapabilities::ADAPTIVE_KEEPALIVE);
         let heartbeat_handle = spawn_adaptive_heartbeat_task(
             worker_id,
             heartbeat_interval,
             session.control_tx.clone(),
             Arc::clone(&self.heartbeat_tracker),
-            Some(self.mobile.clone()),
+            adaptive_keepalive.then(|| self.mobile.clone()),
         );
 
         let mut dead_after = {
             let active = self.heartbeat_tracker.active_tasks.load(Ordering::Relaxed);
-            let iv = self
-                .mobile
-                .live_status()
-                .map(|status| {
-                    status
-                        .recommended_keepalive_interval_or(0, heartbeat_interval)
-                        .max(status.recommended_keepalive_interval_or(active, heartbeat_interval))
-                })
-                .unwrap_or(heartbeat_interval)
-                .max(heartbeat_interval);
+            let iv = if adaptive_keepalive {
+                self.mobile
+                    .live_status()
+                    .map(|status| {
+                        status
+                            .recommended_keepalive_interval_or(0, heartbeat_interval)
+                            .max(
+                                status
+                                    .recommended_keepalive_interval_or(active, heartbeat_interval),
+                            )
+                    })
+                    .unwrap_or(heartbeat_interval)
+                    .max(heartbeat_interval)
+            } else {
+                heartbeat_interval
+            };
             self.dead_peer_timeout(iv)
         };
         let mut watchdog = tokio::time::interval(
@@ -2502,21 +2570,24 @@ impl WorkerClient {
                 // progress) means the Master is gone even though the socket still accepts writes.
                 _ = watchdog.tick() => {
                     let active = self.heartbeat_tracker.active_tasks.load(Ordering::Relaxed);
-                    let current_iv = self
-                        .mobile
-                        .live_status()
-                        .map(|status| {
-                            status
-                                .recommended_keepalive_interval_or(0, heartbeat_interval)
-                                .max(
-                                    status.recommended_keepalive_interval_or(
-                                        active,
-                                        heartbeat_interval,
-                                    ),
-                                )
-                        })
-                        .unwrap_or(heartbeat_interval)
-                        .max(heartbeat_interval);
+                    let current_iv = if adaptive_keepalive {
+                        self.mobile
+                            .live_status()
+                            .map(|status| {
+                                status
+                                    .recommended_keepalive_interval_or(0, heartbeat_interval)
+                                    .max(
+                                        status.recommended_keepalive_interval_or(
+                                            active,
+                                            heartbeat_interval,
+                                        ),
+                                    )
+                            })
+                            .unwrap_or(heartbeat_interval)
+                            .max(heartbeat_interval)
+                    } else {
+                        heartbeat_interval
+                    };
                     dead_after = dead_after.max(self.dead_peer_timeout(current_iv));
                     let silence = session.clock.silence();
                     if silence > dead_after {
@@ -2626,6 +2697,7 @@ impl WorkerClient {
         self.master_takes_mobile_telemetry
             .store(false, Ordering::Release);
         self.master_has_blobs.store(false, Ordering::Release);
+        self.negotiated_features.store(0, Ordering::Release);
         let mut capabilities = self.capabilities.clone();
         capabilities.mobile = self.mobile.snapshot();
         let register_msg = WorkerMessage::Register {
@@ -2665,7 +2737,7 @@ impl WorkerClient {
                 heartbeat_interval_secs,
                 message,
                 protocol_version,
-                features: _features,
+                features,
             } => {
                 if !accepted {
                     let reason =
@@ -2674,10 +2746,10 @@ impl WorkerClient {
                     return Err(GridError::RegistrationRejected(reason));
                 }
 
-                if protocol_version < PROTOCOL_VERSION_MIN_COMPATIBLE {
-                    return Err(GridError::HandshakeFailed(format!(
-                        "Incompatible Master protocol version: {protocol_version} (minimum required: {PROTOCOL_VERSION_MIN_COMPATIBLE})"
-                    )));
+                if !is_protocol_version_compatible(protocol_version) {
+                    return Err(GridError::HandshakeFailed(
+                        format_incompatible_version_error("Master", protocol_version),
+                    ));
                 }
 
                 if ack_wid != self.worker_id {
@@ -2693,16 +2765,20 @@ impl WorkerClient {
                     self.config.default_heartbeat_interval
                 };
 
-                let takes_telemetry = master_features::announced(
-                    message.as_deref(),
-                    master_features::MOBILE_TELEMETRY,
-                );
+                let negotiated = features & ProtocolCapabilities::all_supported();
+                self.negotiated_features
+                    .store(negotiated.bits(), Ordering::Release);
+
+                let takes_telemetry = negotiated.contains(ProtocolCapabilities::MOBILE_TELEMETRY)
+                    && master_features::announced(
+                        message.as_deref(),
+                        master_features::MOBILE_TELEMETRY,
+                    );
                 self.master_takes_mobile_telemetry
                     .store(takes_telemetry, Ordering::Release);
-                self.master_has_blobs.store(
-                    master_features::announced(message.as_deref(), master_features::BLOBS),
-                    Ordering::Release,
-                );
+                let has_blobs = negotiated.contains(ProtocolCapabilities::BLOB_TRANSFER)
+                    && master_features::announced(message.as_deref(), master_features::BLOBS);
+                self.master_has_blobs.store(has_blobs, Ordering::Release);
                 if !takes_telemetry && self.mobile.live_status().is_some() {
                     info!(
                         worker_id = %self.worker_id,
@@ -3188,6 +3264,7 @@ async fn run_portal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE;
     use rusty_grid_core::task::TaskRequirements;
 
     #[test]
@@ -3900,7 +3977,167 @@ mod tests {
             .await
             .expect_err("worker must refuse a version 1 RegisterAck");
         let msg = err.to_string();
-        assert!(msg.contains("1") && msg.contains("2"), "{msg}");
+        assert!(
+            msg.contains("1") && msg.contains(&PROTOCOL_VERSION_MIN_COMPATIBLE.to_string()),
+            "{msg}"
+        );
+
+        // Also verify that a future Master protocol version (> PROTOCOL_VERSION_CURRENT) is refused.
+        let (client_io2, server_io2) = tokio::io::duplex(4096);
+        let future_ver = PROTOCOL_VERSION_CURRENT + 5;
+        tokio::spawn(async move {
+            let mut server_transport = MessageTransport::new(server_io2);
+            let _ = server_transport
+                .recv_msg::<WorkerMessage>()
+                .await
+                .unwrap()
+                .unwrap();
+            server_transport
+                .send_msg(&MasterMessage::RegisterAck {
+                    accepted: true,
+                    worker_id,
+                    heartbeat_interval_secs: 3,
+                    message: None,
+                    protocol_version: future_ver,
+                    features: ProtocolCapabilities::all_supported(),
+                })
+                .await
+                .unwrap();
+        });
+        let mut client_transport2 = MessageTransport::new(client_io2);
+        let err2 = client
+            .perform_handshake(&mut client_transport2)
+            .await
+            .expect_err("worker must refuse a higher incompatible RegisterAck version");
+        let msg2 = err2.to_string();
+        assert!(
+            msg2.contains(&future_ver.to_string())
+                && msg2.contains(&PROTOCOL_VERSION_CURRENT.to_string()),
+            "{msg2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_ack_feature_bits_gate_worker_capabilities() {
+        use rusty_grid_core::blob::{BlobId, InputSource, TaskInput};
+        use rusty_grid_core::task::{StagedFile, TaskRequirements, TaskSpec};
+
+        let config = WorkerConfig::new("127.0.0.1:9999").with_no_battery(true);
+        let client = WorkerClient::new(config);
+        let worker_id = client.worker_id();
+
+        // Master accepts registration and announces mobile-telemetry and blobs in `message`,
+        // but clears FILE_STAGING, BLOB_TRANSFER, MOBILE_TELEMETRY, and CHECKPOINT_DELTA in `features`.
+        let ack_features = ProtocolCapabilities::AEAD_ENCRYPTION;
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let mut server_transport = MessageTransport::new(server_io);
+            let _ = server_transport
+                .recv_msg::<WorkerMessage>()
+                .await
+                .unwrap()
+                .unwrap();
+            server_transport
+                .send_msg(&MasterMessage::RegisterAck {
+                    accepted: true,
+                    worker_id,
+                    heartbeat_interval_secs: 3,
+                    message: Some("features=mobile-telemetry,blobs".into()),
+                    protocol_version: PROTOCOL_VERSION_CURRENT,
+                    features: ack_features,
+                })
+                .await
+                .unwrap();
+        });
+
+        let mut client_transport = MessageTransport::new(client_io);
+        client
+            .perform_handshake(&mut client_transport)
+            .await
+            .expect("handshake should succeed");
+
+        assert_eq!(client.negotiated_features(), ack_features);
+        assert!(
+            !client.master_takes_mobile_telemetry.load(Ordering::Acquire),
+            "MOBILE_TELEMETRY must stay disabled when RegisterAck.features omits it"
+        );
+        assert!(
+            !client.master_has_blobs.load(Ordering::Acquire),
+            "BLOB_TRANSFER must stay disabled when RegisterAck.features omits it"
+        );
+
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(16);
+
+        // 1. A task with staged_files must be refused when FILE_STAGING is not in negotiated_features.
+        let mut staged_task = Task::new(
+            TaskSpec::command("echo", vec!["hi".into()]),
+            TaskRequirements::generic(1, 10),
+        );
+        staged_task.staged_files.push(StagedFile {
+            path: "input.txt".into(),
+            size: 2,
+            sha256: [0u8; 32],
+            executable: false,
+            data: rusty_grid_core::task::Bytes::from_static(b"hi"),
+        });
+        client
+            .handle_assign_task(staged_task.clone(), outbound_tx.clone())
+            .await;
+        match outbound_rx
+            .recv()
+            .await
+            .expect("TaskResult for staged_task")
+        {
+            WorkerMessage::TaskResult {
+                task_id,
+                exit_code,
+                stderr,
+                ..
+            } => {
+                assert_eq!(task_id, staged_task.id);
+                assert_ne!(exit_code, 0);
+                let stderr_str = String::from_utf8_lossy(stderr.as_ref());
+                assert!(
+                    stderr_str.contains("FILE_STAGING"),
+                    "expected FILE_STAGING refusal, got: {stderr_str}"
+                );
+            }
+            other => panic!("expected TaskResult, got {other:?}"),
+        }
+
+        // 2. A task with blob inputs must be refused when BLOB_TRANSFER is not in negotiated_features.
+        let mut blob_task = Task::new(
+            TaskSpec::command("echo", vec!["hi".into()]),
+            TaskRequirements::generic(1, 10),
+        );
+        blob_task.inputs.push(TaskInput {
+            path: "blob.bin".into(),
+            source: InputSource::File {
+                id: BlobId([1u8; 32]),
+                size: 4,
+                executable: false,
+            },
+        });
+        client
+            .handle_assign_task(blob_task.clone(), outbound_tx)
+            .await;
+        match outbound_rx.recv().await.expect("TaskResult for blob_task") {
+            WorkerMessage::TaskResult {
+                task_id,
+                exit_code,
+                stderr,
+                ..
+            } => {
+                assert_eq!(task_id, blob_task.id);
+                assert_ne!(exit_code, 0);
+                let stderr_str = String::from_utf8_lossy(stderr.as_ref());
+                assert!(
+                    stderr_str.contains("BLOB_TRANSFER"),
+                    "expected BLOB_TRANSFER refusal, got: {stderr_str}"
+                );
+            }
+            other => panic!("expected TaskResult, got {other:?}"),
+        }
     }
 
     #[tokio::test]

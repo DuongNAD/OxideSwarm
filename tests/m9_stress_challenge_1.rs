@@ -519,8 +519,10 @@ async fn test_stress_tcp_rst_vs_graceful_disconnect() {
     let final_b = master.get_task_info(id_b).await.unwrap();
     assert_eq!(final_a.state, TaskState::Completed);
     assert_eq!(final_b.state, TaskState::Completed);
-    assert_eq!(final_a.retry_count, 1);
+    assert_eq!(final_a.retry_count, 0);
+    assert_eq!(final_a.failover_count, 0);
     assert_eq!(final_b.retry_count, 1);
+    assert_eq!(final_b.failover_count, 1);
     assert_eq!(final_a.exit_code, Some(0));
     assert_eq!(final_b.exit_code, Some(0));
 
