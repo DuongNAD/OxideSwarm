@@ -126,13 +126,8 @@ jobs:
     # Full Cargo workspace test suite (`tests/` and `crates/*/tests/` included).
     # Tests bind 127.0.0.1:0 and give child processes a temporary HOME, so they need no fixed ports
     # and never touch the runner's ~/.oxideswarm.
-    # Until TEST-14 lands (fixing the timing flakes under runner load in the handshake timeout test,
-    # the rapid detection test, and `test_adversarial_quic_stream_multiplexing_heavy_saturation_anti_hol`)
-    # and TEST-12 (PR #63) merges on Windows, keep `continue-on-error: true` so full-suite results are
-    # recorded without turning pull requests red on slow runners.
     name: workspace tests (${{ matrix.os }})
     if: github.event_name != 'schedule'
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
