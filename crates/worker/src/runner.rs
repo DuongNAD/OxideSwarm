@@ -2744,8 +2744,11 @@ impl TaskRunner {
                 sandbox_base: &self.config.sandbox_config.base_dir,
                 sandbox_dir: sandbox_path,
             };
-            match crate::isolation::windows::WindowsAppContainerGuard::create(task_id, &jail, &cmd)
-            {
+            match crate::isolation::windows::WindowsAppContainerGuard::create(
+                configured.run_token(),
+                &jail,
+                &cmd,
+            ) {
                 Ok(guard) => configured.set_app_container(guard),
                 Err(e) => {
                     return TaskResult::failure(

@@ -11,10 +11,11 @@
 //!   program in place, so the PID the worker tracks is the task itself and the process-group
 //!   kill, the timeout and the cancellation work as without isolation.
 //! * **Linux** (Landlock, `seccomp`, namespaces): FEAT-3b, not implemented yet.
-//! * **Windows** (`windows`, FEAT-3c): each task runs inside a per-task AppContainer profile
-//!   (`oxideswarm.task.<task_id>`) spawned with `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`,
-//!   explicit NTFS DACLs on its sandbox and read-only toolchains, zero network capabilities under
-//!   `fs+net`, and `DeleteAppContainerProfile` on teardown.
+//! * **Windows** (`windows`, FEAT-3c): each task attempt runs inside a per-attempt AppContainer
+//!   profile (`oxideswarm.task.<run_token>`) spawned with
+//!   `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`, explicit NTFS DACLs on its sandbox and
+//!   read-only toolchains, zero network capabilities under `fs+net`, and
+//!   `DeleteAppContainerProfile` on teardown.
 //!
 //! A worker that was asked for isolation and cannot enforce it never runs tasks unsandboxed: it
 //! refuses to start ([`verify_isolation_support`]), and [`wrap_program`] fails a task rather than
@@ -664,7 +665,7 @@ mod macos {
 }
 
 /// The Windows implementation (design 0033 D4, FEAT-3c): per-task AppContainer profile
-/// (`oxideswarm.task.<task_id>`), explicit NTFS DACLs on the sandbox and host toolchains,
+/// (`oxideswarm.task.<run_token>`), explicit NTFS DACLs on the sandbox and host toolchains,
 /// zero network capabilities under `fs+net`, and `DeleteAppContainerProfile` on cleanup.
 #[cfg(windows)]
 pub(crate) mod windows {
@@ -713,10 +714,10 @@ pub(crate) mod windows {
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetCurrentThreadId,
         GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken, TerminateProcess,
-        UpdateProcThreadAttribute, WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT,
-        EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-        STARTF_USESTDHANDLES, STARTUPINFOEXW,
+        UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW,
+        CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
+        LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
     };
 
     #[link(name = "user32")]
@@ -1288,27 +1289,37 @@ pub(crate) mod windows {
         if !path.exists() {
             return;
         }
-        if !dacl_already_denies_sid(path, any_pkg_sid, FILE_ALL_ACCESS)
-            || dacl_already_grants_sid(path, any_pkg_sid, FILE_READ_ATTRIBUTES)
+        if dacl_already_denies_sid(path, any_pkg_sid, FILE_ALL_ACCESS)
+            && !dacl_already_grants_sid(path, any_pkg_sid, FILE_READ_ATTRIBUTES)
         {
-            let entry = explicit_access(any_pkg_sid, FILE_ALL_ACCESS, DENY_ACCESS, NO_INHERITANCE);
-            let _ = merge_entries_on_path(path, &[entry]);
+            return;
         }
+        let Ok(user_sid) = OwnedSid::current_user() else {
+            return;
+        };
+        let Ok(system_sid) = OwnedSid::from_well_known(WinLocalSystemSid) else {
+            return;
+        };
+        let Ok(admins_sid) = OwnedSid::from_well_known(WinBuiltinAdministratorsSid) else {
+            return;
+        };
+        let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+        let entries = [
+            explicit_access(user_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
+            explicit_access(system_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
+            explicit_access(admins_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
+            explicit_access(any_pkg_sid, FILE_ALL_ACCESS, DENY_ACCESS, inherit),
+        ];
+        let _ = set_protected_dacl_on_path(path, &entries);
         if path.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(path) {
-                for e in entries.take(64).flatten() {
+            if let Ok(dir_entries) = std::fs::read_dir(path) {
+                for e in dir_entries.take(64).flatten() {
                     let child = e.path();
                     if child.is_file()
                         && (!dacl_already_denies_sid(&child, any_pkg_sid, FILE_ALL_ACCESS)
                             || dacl_already_grants_sid(&child, any_pkg_sid, FILE_READ_ATTRIBUTES))
                     {
-                        let entry = explicit_access(
-                            any_pkg_sid,
-                            FILE_ALL_ACCESS,
-                            DENY_ACCESS,
-                            NO_INHERITANCE,
-                        );
-                        let _ = merge_entries_on_path(&child, &[entry]);
+                        let _ = set_protected_dacl_on_path(&child, &entries);
                     }
                 }
             }
@@ -1637,7 +1648,7 @@ pub(crate) mod windows {
 
     impl WindowsAppContainerGuard {
         pub(crate) fn create(
-            task_id: rusty_grid_core::TaskId,
+            run_token: uuid::Uuid,
             jail: &Jail<'_>,
             cmd: &tokio::process::Command,
         ) -> io::Result<Self> {
@@ -1653,7 +1664,7 @@ pub(crate) mod windows {
                 }
             }
 
-            let profile_name = format!("oxideswarm.task.{}", task_id.0);
+            let profile_name = format!("oxideswarm.task.{run_token}");
             let wide_profile_name = to_wide(OsStr::new(&profile_name));
             let wide_display = to_wide(OsStr::new("OxideSwarm Task Sandbox"));
 
@@ -1943,8 +1954,8 @@ pub(crate) mod windows {
             for (name, value) in super::inherited_environment(std::env::vars_os()) {
                 cmd.env(name, value);
             }
-            let probe_id = rusty_grid_core::TaskId::new();
-            let guard = WindowsAppContainerGuard::create(probe_id, &jail, &cmd)
+            let probe_token = uuid::Uuid::new_v4();
+            let guard = WindowsAppContainerGuard::create(probe_token, &jail, &cmd)
                 .map_err(|e| fail(format!("AppContainer setup failed: {e}")))?;
             let mut child = guard
                 .spawn_in_appcontainer(&mut cmd, 0)
@@ -2286,7 +2297,10 @@ pub(crate) mod windows {
         si_ex.lpAttributeList = attr_list;
 
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-        let flags = creation_flags | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
+        let flags = creation_flags
+            | EXTENDED_STARTUPINFO_PRESENT
+            | CREATE_UNICODE_ENVIRONMENT
+            | CREATE_NO_WINDOW;
         let spawned = unsafe {
             CreateProcessW(
                 std::ptr::null(),

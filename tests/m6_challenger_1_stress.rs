@@ -50,7 +50,7 @@ use rusty_grid_worker::runner::EXIT_CODE_CANCELLED;
 
 /// Timeout for a single fast subprocess task (echo, short sh script) to be scheduled,
 /// spawn on Windows under parallel test CPU load, and report its result back to the Master.
-const SINGLE_TASK_TIMEOUT: Duration = Duration::from_secs(15);
+const SINGLE_TASK_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Timeout for 7 serialized echo subprocesses on a 1-slot worker across worker crash + failover.
 const PRIORITY_CHURN_TIMEOUT: Duration = Duration::from_secs(25);

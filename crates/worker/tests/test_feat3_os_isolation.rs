@@ -1160,6 +1160,7 @@ Write-Output ("DBUS=" + $(if ($null -ne $env:DBUS_SESSION_BUS_ADDRESS) { $env:DB
 Write-Output ("DOCKER=" + $(if ($null -ne $env:DOCKER_HOST) { $env:DOCKER_HOST } else { 'unset' }))
 Write-Output ("SECRET=" + $(if ($null -ne $env:OXIDESWARM_SECRET) { $env:OXIDESWARM_SECRET } else { 'unset' }))
 Write-Output ("TASK_ID=" + $(if ($null -ne $env:RUSTY_GRID_TASK_ID) { $env:RUSTY_GRID_TASK_ID } else { 'unset' }))
+Write-Output ("RUN_TOKEN=" + $(if ($null -ne $env:RUSTY_GRID_RUN_TOKEN) { $env:RUSTY_GRID_RUN_TOKEN } else { 'unset' }))
 "#,
             &[
                 ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
@@ -1187,9 +1188,10 @@ Write-Output ("TASK_ID=" + $(if ($null -ne $env:RUSTY_GRID_TASK_ID) { $env:RUSTY
             assert_eq!(got[name], sandbox, "{name}");
         }
         // On Windows, `CreateProcessW` (`KernelBase!BasepAppContainerEnvironmentExtension`)
-        // rewrites `TEMP` and `TMP` into the per-task AppContainer folder
-        // `...\Packages\oxideswarm.task.<task_id>\AC\Temp`.
-        let task_moniker = format!("oxideswarm.task.{}", task.id.0);
+        // rewrites `TEMP` and `TMP` into the per-attempt AppContainer folder
+        // `...\Packages\oxideswarm.task.<run_token>\AC\Temp`.
+        assert_ne!(got["RUN_TOKEN"], "unset");
+        let task_moniker = format!("oxideswarm.task.{}", got["RUN_TOKEN"]);
         for name in ["TEMP", "TMP"] {
             let val = &got[name];
             assert!(
@@ -1572,6 +1574,16 @@ try {
 } catch {
     Write-Output 'HOST_PIPE_REFUSED'
 }
+foreach ($wellKnown in @('openssh-ssh-agent', 'docker_engine')) {
+    try {
+        $wk = New-Object System.IO.Pipes.NamedPipeClientStream('.', $wellKnown, [System.IO.Pipes.PipeDirection]::InOut)
+        $wk.Connect(200)
+        $wk.Dispose()
+        Write-Output "WK_CONNECTED=$wellKnown"
+    } catch {
+        Write-Output "WK_REFUSED=$wellKnown"
+    }
+}
 "#;
         let mut host_server = std::process::Command::new(
             r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
@@ -1621,8 +1633,10 @@ try {
                 )
                 .await;
             assert!(
-                lines(&result).contains(&"HOST_PIPE_REFUSED".to_string()),
-                "{level}: host named pipe should be unreachable from AppContainer: {:?}",
+                lines(&result).contains(&"HOST_PIPE_REFUSED".to_string())
+                    && lines(&result).contains(&"WK_REFUSED=openssh-ssh-agent".to_string())
+                    && lines(&result).contains(&"WK_REFUSED=docker_engine".to_string()),
+                "{level}: host named pipes should be unreachable from AppContainer: {:?}",
                 lines(&result)
             );
             // Also verify `\\.\pipe\...` creation/connect inside AppContainer is blocked by
@@ -1656,10 +1670,12 @@ try {
         );
     }
 
-    /// M5 + worker process environment protection on Windows: an AppContainer task runs at Low
-    /// Mandatory Integrity Level and cannot terminate, suspend, or open `PROCESS_VM_READ` /
-    /// `PROCESS_QUERY_INFORMATION` handles to Medium-IL host processes (the worker or foreign
-    /// processes), while still being able to terminate its own child processes.
+    /// M5 + worker process environment and memory protection on Windows: an AppContainer task
+    /// runs at Low Mandatory Integrity Level and cannot terminate, suspend, open
+    /// `PROCESS_VM_READ` / `PROCESS_QUERY_INFORMATION` handles, call `ReadProcessMemory` on the
+    /// worker's memory, or inject threads via `CreateRemoteThread` into Medium-IL host processes
+    /// (the worker or foreign processes), while still being able to terminate its own child
+    /// processes.
     #[tokio::test]
     async fn test_a_task_cannot_signal_or_inspect_foreign_processes() {
         let mut victim = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
@@ -1668,8 +1684,68 @@ try {
             .expect("spawn victim");
         let victim_pid = victim.id().to_string();
         let worker_pid = std::process::id().to_string();
+        let secret_bytes: Vec<u8> = b"WORKER-MEM-SECRET-feat3c".to_vec();
+        let secret_addr = (secret_bytes.as_ptr() as usize).to_string();
+        let secret_len = secret_bytes.len().to_string();
 
         let script = r#"
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class WinProcProbe {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out IntPtr lpNumberOfBytesRead);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr CreateRemoteThread(IntPtr hProcess, IntPtr lpThreadAttributes, uint dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, out uint lpThreadId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    public static string TryReadWorkerMemory(int pid, ulong addr, int len) {
+        const uint PROCESS_VM_READ = 0x0010;
+        const uint PROCESS_QUERY_INFORMATION = 0x0400;
+        IntPtr h = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid);
+        if (h == IntPtr.Zero) return "RPM_OPEN_DENIED";
+        try {
+            byte[] buf = new byte[len];
+            IntPtr read;
+            if (!ReadProcessMemory(h, (IntPtr)addr, buf, len, out read)) return "RPM_READ_DENIED";
+            return "RPM_LEAK=" + Encoding.UTF8.GetString(buf, 0, (int)read);
+        } finally {
+            CloseHandle(h);
+        }
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    public static extern IntPtr GetModuleHandle(string lpModuleName);
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, ExactSpelling = true, SetLastError = true)]
+    public static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+
+    public static string TryCreateRemoteThread(int pid) {
+        const uint PROCESS_CREATE_THREAD = 0x0002;
+        const uint PROCESS_VM_OPERATION = 0x0008;
+        const uint PROCESS_VM_WRITE = 0x0020;
+        IntPtr h = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE, false, pid);
+        if (h == IntPtr.Zero) return "CRT_OPEN_DENIED";
+        try {
+            IntPtr k32 = GetModuleHandle("kernel32.dll");
+            IntPtr fnAddr = GetProcAddress(k32, "GetCurrentProcessId");
+            uint tid;
+            IntPtr th = CreateRemoteThread(h, IntPtr.Zero, 0, fnAddr, IntPtr.Zero, 0, out tid);
+            if (th == IntPtr.Zero) return "CRT_CALL_DENIED";
+            CloseHandle(th);
+            return "CRT_CREATED";
+        } finally {
+            CloseHandle(h);
+        }
+    }
+}
+"@
+Write-Output ([WinProcProbe]::TryReadWorkerMemory([int]$env:WORKER_PID, [uint64]$env:SECRET_ADDR, [int]$env:SECRET_LEN))
+Write-Output ("WORKER_" + [WinProcProbe]::TryCreateRemoteThread([int]$env:WORKER_PID))
+Write-Output ("VICTIM_" + [WinProcProbe]::TryCreateRemoteThread([int]$env:VICTIM_PID))
 try {
     $w = [System.Diagnostics.Process]::GetProcessById([int]$env:WORKER_PID)
     $h = $w.Handle
@@ -1695,22 +1771,29 @@ try {
     Write-Output 'OWN_CHILD_FAIL'
 }
 "#;
+        let envs = [
+            ("VICTIM_PID", victim_pid.as_str()),
+            ("WORKER_PID", worker_pid.as_str()),
+            ("SECRET_ADDR", secret_addr.as_str()),
+            ("SECRET_LEN", secret_len.as_str()),
+        ];
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             let rig = Rig::new(level, false);
             let result = rig
                 .runner
-                .execute_task(
-                    &win_task(
-                        &rig,
-                        script,
-                        &[("VICTIM_PID", &victim_pid), ("WORKER_PID", &worker_pid)],
-                        60,
-                    ),
-                    None,
-                    None,
-                )
+                .execute_task(&win_task(&rig, script, &envs, 60), None, None)
                 .await;
             let got = lines(&result);
+            assert!(
+                got.contains(&"RPM_OPEN_DENIED".to_string())
+                    && !result.stdout_str().contains("WORKER-MEM-SECRET-feat3c"),
+                "{level}: AppContainer must not ReadProcessMemory on worker: {got:?}"
+            );
+            assert!(
+                got.contains(&"WORKER_CRT_OPEN_DENIED".to_string())
+                    && got.contains(&"VICTIM_CRT_OPEN_DENIED".to_string()),
+                "{level}: AppContainer must not open PROCESS_CREATE_THREAD / CreateRemoteThread: {got:?}"
+            );
             assert!(
                 got.contains(&"WORKER_HANDLE_DENIED".to_string()),
                 "{level}: AppContainer must not open worker process handle: {got:?}"
@@ -1725,29 +1808,71 @@ try {
             );
         }
 
-        // Control (`off`): can open worker handle and terminate the victim process.
+        // Control (`off`): can ReadProcessMemory on worker, open worker handle, and terminate victim.
         let control_rig = Rig::new(IsolationLevel::Off, false);
         let control = control_rig
             .runner
-            .execute_task(
-                &win_task(
-                    &control_rig,
-                    script,
-                    &[("VICTIM_PID", &victim_pid), ("WORKER_PID", &worker_pid)],
-                    60,
-                ),
-                None,
-                None,
-            )
+            .execute_task(&win_task(&control_rig, script, &envs, 60), None, None)
             .await;
         let _ = victim.kill();
         let _ = victim.wait();
+        std::hint::black_box(&secret_bytes);
         let control_got = lines(&control);
         assert!(
-            control_got.contains(&"WORKER_HANDLE_OPENED".to_string())
+            control_got.contains(&"RPM_LEAK=WORKER-MEM-SECRET-feat3c".to_string())
+                && control_got.contains(&"WORKER_HANDLE_OPENED".to_string())
                 && control_got.contains(&"SIGNALLED".to_string()),
-            "unconfined control must open handle and terminate victim: {control_got:?}"
+            "unconfined control must ReadProcessMemory on worker and terminate victim: {control_got:?}"
         );
+    }
+
+    /// M4 on Windows: console / Windows Terminal keystroke injection (`TIOCSTI` equivalent via
+    /// `AttachConsole(worker_pid)` + `WriteConsoleInputW` or inherited `CONIN$`) is blocked
+    /// because AppContainer tasks are spawned with `CREATE_NO_WINDOW` and run at Low Mandatory
+    /// Integrity Level.
+    #[tokio::test]
+    async fn test_console_and_terminal_injection_is_blocked() {
+        let worker_pid = std::process::id().to_string();
+        let script = r#"
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class WinConsoleProbe {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool FreeConsole();
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool AttachConsole(uint dwProcessId);
+
+    public static string TryAttachWorkerConsole(uint workerPid) {
+        FreeConsole();
+        if (AttachConsole(workerPid)) {
+            return "ATTACH_WORKER_OK";
+        }
+        if (AttachConsole(0xFFFFFFFFu)) {
+            return "ATTACH_PARENT_OK";
+        }
+        return "ATTACH_DENIED";
+    }
+}
+"@
+Write-Output ([WinConsoleProbe]::TryAttachWorkerConsole([uint32]$env:WORKER_PID))
+"#;
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let rig = Rig::new(level, false);
+            let result = rig
+                .runner
+                .execute_task(
+                    &win_task(&rig, script, &[("WORKER_PID", &worker_pid)], 60),
+                    None,
+                    None,
+                )
+                .await;
+            let got = lines(&result);
+            assert!(
+                got.contains(&"ATTACH_DENIED".to_string()),
+                "{level}: AppContainer must not attach to worker/parent console: {got:?}"
+            );
+        }
     }
 
     /// H2 on Windows: the owner's `HKCU\Software\...` registry keys cannot be read or written
@@ -1857,35 +1982,64 @@ try {
         }
     }
 
-    /// Design 0033 D4.6: `DeleteAppContainerProfile` deletes the per-task AppContainer profile
-    /// (`oxideswarm.task.<task_id>`) and its `%LOCALAPPDATA%\Packages\oxideswarm.task.<task_id>`
-    /// storage folder when the task finishes.
+    /// Design 0033 D4.1 + D4.6: the per-attempt AppContainer profile is named by the FEAT-2
+    /// per-attempt run token (`oxideswarm.task.<run_token>`) so a retried task with the same
+    /// `TaskId` gets a fresh profile that cannot collide, and `DeleteAppContainerProfile` deletes
+    /// `%LOCALAPPDATA%\Packages\oxideswarm.task.<run_token>` when each attempt finishes.
     #[tokio::test]
     async fn test_appcontainer_profile_is_deleted_on_cleanup() {
         let rig = Rig::new(IsolationLevel::Fs, false);
-        let task = win_task(&rig, r#"Write-Output "TEMP_DIR=$env:TEMP""#, &[], 60);
-        let moniker = format!("oxideswarm.task.{}", task.id.0);
-        let result = rig.runner.execute_task(&task, None, None).await;
+        let task = win_task(
+            &rig,
+            r#"Write-Output "RUN_TOKEN=$env:RUSTY_GRID_RUN_TOKEN""#,
+            &[],
+            60,
+        );
+        let result1 = rig.runner.execute_task(&task, None, None).await;
         assert!(
-            result.is_success(),
+            result1.is_success(),
             "{:?} {}",
-            result.error,
-            result.stderr_str()
+            result1.error,
+            result1.stderr_str()
+        );
+        // Retry the exact same `Task` (same `TaskId`): must get a distinct per-attempt run token.
+        let result2 = rig.runner.execute_task(&task, None, None).await;
+        assert!(
+            result2.is_success(),
+            "{:?} {}",
+            result2.error,
+            result2.stderr_str()
+        );
+
+        let extract_token = |res: &rusty_grid_core::TaskResult| -> String {
+            lines(res)
+                .iter()
+                .find_map(|l| l.strip_prefix("RUN_TOKEN=").map(str::to_string))
+                .expect("RUN_TOKEN line")
+        };
+        let token1 = extract_token(&result1);
+        let token2 = extract_token(&result2);
+        assert_ne!(
+            token1, token2,
+            "retried task with the same TaskId must get a fresh per-attempt run token"
         );
 
         if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
-            let pkg_dir = local_app_data.join("Packages").join(&moniker);
-            for _ in 0..20 {
-                if !pkg_dir.exists() {
-                    break;
+            for token in [&token1, &token2] {
+                let moniker = format!("oxideswarm.task.{token}");
+                let pkg_dir = local_app_data.join("Packages").join(&moniker);
+                for _ in 0..20 {
+                    if !pkg_dir.exists() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                assert!(
+                    !pkg_dir.exists(),
+                    "DeleteAppContainerProfile must remove {} on task cleanup",
+                    pkg_dir.display()
+                );
             }
-            assert!(
-                !pkg_dir.exists(),
-                "DeleteAppContainerProfile must remove {} on task cleanup",
-                pkg_dir.display()
-            );
         }
     }
 
