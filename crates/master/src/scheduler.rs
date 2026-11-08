@@ -284,7 +284,7 @@ impl Shape {
     }
 }
 
-/// The names of the file-moving features in `features`, for "cluster lacks ..." messages.
+/// The names of the protocol features in `features`, for "cluster lacks ..." messages.
 fn feature_names(features: ProtocolCapabilities) -> String {
     let mut names = Vec::new();
     if features.contains(ProtocolCapabilities::FILE_STAGING) {
@@ -292,6 +292,9 @@ fn feature_names(features: ProtocolCapabilities) -> String {
     }
     if features.contains(ProtocolCapabilities::BLOB_TRANSFER) {
         names.push("BLOB_TRANSFER");
+    }
+    if features.contains(ProtocolCapabilities::THREE_D) {
+        names.push("THREE_D");
     }
     names.join(" and ")
 }
@@ -527,7 +530,7 @@ impl<'a> Engine<'a> {
     }
 
     fn skip_reason(&self, view: &TaskView, placement: &Placement) -> ScheduleSkipReason {
-        if view.requires_gpu {
+        if view.requires_gpu && !self.any_gpu_worker {
             ScheduleSkipReason::NoGpuWorkersAvailable
         } else if !view.required_features.is_empty()
             && !self
@@ -539,6 +542,8 @@ impl<'a> Engine<'a> {
                 "cluster lacks workers with {} capability",
                 feature_names(view.required_features)
             ))
+        } else if view.requires_gpu {
+            ScheduleSkipReason::NoGpuWorkersAvailable
         } else if !placement.is_empty()
             && !self
                 .seats

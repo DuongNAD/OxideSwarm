@@ -60,6 +60,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
           cache-on-failure: true
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features 3d --locked -- -D warnings
       - name: master compiles without default features (dashboard, p2p)
         if: matrix.os == 'ubuntu-latest'
         run: cargo check -p rusty_grid_master --no-default-features --locked
@@ -114,6 +115,12 @@ jobs:
           git fetch --no-tags --depth=1 origin "+${{ (github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || github.base_ref || 'master' }}:refs/remotes/ci/wire-layout-base"
           cargo test -p rusty_grid_core --lib wire_layout_tests::wire_layout_file_bumps_version_when_body_differs_from_origin_master --locked -- --exact
       - run: cargo test --workspace --lib --locked
+      - name: run 3d feature unit and integration tests
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo test --workspace --lib --features 3d --locked
+          cargo test -p rusty_grid_worker --features 3d --locked --test test_3d1_honest_sdf --test test_autorig_adversarial_stress --test test_autorig_pipeline --test test_challenger_m3_blender_job_object --test test_gen3d_adversarial_stress --test test_gen3d_pipeline
+          cargo test -p rusty_grid_cli --features 3d --locked --test test_cli_3d_submission --test test_3d_autorig_pipeline --test test_challenger_m5_3d_pipeline
       - name: run agent mesh integration tests
         run: cargo test -p agent_mesh --test test_sec6_mesh_sandbox --locked
       - name: build agent mesh hub binary for Python interop suites
@@ -166,6 +173,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
           cache-on-failure: true
       - run: cargo test -p rusty_grid_worker --test test_sec5_hardened_runner --locked
+      - run: cargo test -p rusty_grid_worker --test test_sec5_hardened_runner --features 3d --locked
 
   launcher-scripts:
     name: launcher scripts (${{ matrix.os }})

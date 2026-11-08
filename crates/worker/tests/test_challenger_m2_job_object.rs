@@ -10,6 +10,7 @@
 //! 4. Verify aborting a running task future triggers RAII cleanup of all subprocesses without zombies.
 
 #![allow(clippy::field_reassign_with_default)]
+#![cfg_attr(not(feature = "3d"), allow(unused_imports, dead_code))]
 
 use std::fs::File;
 use std::io::Write;
@@ -171,6 +172,7 @@ else:
 // Challenge 5: TaskRunner Generative3D Cancellation During Active Workload
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_adversarial_task_runner_generative3d_cancellation_tree_cleanup() {
     let (runner, _dir) = create_test_runner();
@@ -260,6 +262,7 @@ time.sleep(30.0)
 // Challenge 6: TaskRunner Generative3D Watchdog Timeout Cleans Subprocesses
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_adversarial_task_runner_generative3d_timeout_watchdog_cleanup() {
     let (runner, _dir) = create_test_runner();
@@ -332,6 +335,7 @@ time.sleep(30.0)
 // Challenge 7: TaskRunner Future Abort/Drop Mid-Execution (RAII Cleanup)
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_adversarial_task_runner_future_drop_mid_execution_raii_cleanup() {
     let (runner, _dir) = create_test_runner();
