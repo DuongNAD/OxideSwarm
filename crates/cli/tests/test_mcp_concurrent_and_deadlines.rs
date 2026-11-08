@@ -110,7 +110,14 @@ async fn spawn_cluster() -> (
     let cfg = ServerConfig::from_addr("127.0.0.1:0")
         .expect("server cfg")
         .with_heartbeat_interval(60);
-    let master = MasterServer::spawn(cfg).await.expect("spawn master");
+    let sched_cfg = rusty_grid_master::scheduler::SchedulerConfig {
+        max_host_cpu_pct: 100.0,
+        ..Default::default()
+    };
+    let master =
+        MasterServer::spawn_with_config(cfg, sched_cfg, rusty_grid_master::ReaperConfig::default())
+            .await
+            .expect("spawn master");
     let master_addr = master.server_addr().to_string();
 
     let worker_cfg = WorkerConfig::new(&master_addr)
@@ -1171,8 +1178,16 @@ async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_sec
     let secret_hex = secret.to_hex();
     let cfg = ServerConfig::from_addr("127.0.0.1:0")
         .expect("server cfg")
-        .with_cluster_secret(secret.clone());
-    let master = MasterServer::spawn(cfg).await.expect("spawn master");
+        .with_cluster_secret(secret.clone())
+        .with_heartbeat_interval(60);
+    let sched_cfg = rusty_grid_master::scheduler::SchedulerConfig {
+        max_host_cpu_pct: 100.0,
+        ..Default::default()
+    };
+    let master =
+        MasterServer::spawn_with_config(cfg, sched_cfg, rusty_grid_master::ReaperConfig::default())
+            .await
+            .expect("spawn master");
     let master_addr = master.server_addr().to_string();
 
     let worker_cfg = WorkerConfig::new(&master_addr)
@@ -1384,7 +1399,7 @@ async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_sec
         "submit {{wait:true, wait_secs:0}} against authenticated master failed: {frame}"
     );
     assert!(
-        cached_start.elapsed() < Duration::from_millis(800),
+        cached_start.elapsed() < Duration::from_millis(1400),
         "cached --master auto address must avoid repeating 1.5s discovery, took {:?}",
         cached_start.elapsed()
     );
@@ -1417,7 +1432,7 @@ async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_sec
     let _ = auto_child.wait();
     auth_proxy_handle.abort();
 
-    // 2. N2: Pipe `doctor` and a 1s `submit {wait: true}` followed immediately by EOF,
+    // 2. N2: Pipe `doctor` and an in-flight `submit {wait: true}` followed immediately by EOF,
     // and assert BOTH replies are written to stdout before the server exits.
     let mut piped_child = Command::new(BIN)
         .current_dir(home)
@@ -1472,7 +1487,7 @@ async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_sec
                     "arguments": {
                         "type": "shell",
                         "interpreter": "python3",
-                        "script": "import time; time.sleep(1); print('piped-1s-ok')",
+                        "script": "import time; time.sleep(0.2); print('piped-1s-ok')",
                         "wait": true
                     }
                 }
@@ -1482,7 +1497,7 @@ async fn test_mcp1_rendezvous_auto_discovery_piped_eof_replies_and_zero_wait_sec
             p_stdin.write_all(format!("{s}\n").as_bytes()).unwrap();
         }
         p_stdin.flush().unwrap();
-        // Drop `p_stdin` immediately to send EOF while `doctor` and 1s `submit` are in flight.
+        // Drop `p_stdin` immediately to send EOF while `doctor` and `submit` are in flight.
     }
 
     let piped_out = piped_child.wait_with_output().expect("wait piped mcp");

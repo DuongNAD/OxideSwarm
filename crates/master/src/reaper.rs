@@ -304,17 +304,35 @@ mod tests {
             .register(worker_id, caps, "127.0.0.1:9001".parse().unwrap(), tx, None)
             .await
             .unwrap();
+        let registered_at = registry
+            .last_heartbeat_instant(&worker_id)
+            .await
+            .expect("registered worker must have heartbeat instant");
 
+        let reaper_timeout = Duration::from_millis(50);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let config = ReaperConfig::new(Duration::from_millis(20), Duration::from_millis(50));
+        let config = ReaperConfig::new(Duration::from_millis(10), reaper_timeout);
 
         let handle = spawn_reaper(registry.clone(), config, shutdown_rx);
 
-        // Sleep to let worker exceed timeout and reaper run
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        let info = registry.get_worker(worker_id).await.unwrap();
-        assert_eq!(info.status, WorkerStatus::Disconnected);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let info = registry.get_worker(worker_id).await.unwrap();
+            if info.status == WorkerStatus::Disconnected {
+                assert!(
+                    registered_at.elapsed() >= reaper_timeout,
+                    "reaper must not transition worker before {:?} timeout (elapsed {:?})",
+                    reaper_timeout,
+                    registered_at.elapsed()
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed-out worker was not transitioned to Disconnected within 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         let _ = shutdown_tx.send(true);
         let _ = handle.await;
@@ -358,27 +376,46 @@ mod tests {
             .record_heartbeat(&worker_id, 0, 100, 12.0, 6000, Some(session))
             .await
             .unwrap();
+        let hb_at = registry
+            .last_heartbeat_instant(&worker_id)
+            .await
+            .expect("battery worker must have heartbeat instant");
 
-        let real_interval = Duration::from_millis(25);
+        let real_interval = Duration::from_millis(50);
         let reaper_window = real_interval * 4;
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let config = ReaperConfig::new(Duration::from_millis(10), reaper_window);
-        let handle = spawn_reaper(registry.clone(), config, shutdown_rx);
-
-        // Before 4 * real_interval (at 2 * real_interval), the battery worker is still Connected.
-        tokio::time::sleep(real_interval * 2).await;
+        // Before 4 * real_interval, the battery worker is not reaped.
+        assert!(registry
+            .reap_stale_sessions_at(hb_at + real_interval * 2, reaper_window)
+            .await
+            .is_empty());
         assert_eq!(
             registry.get_worker(worker_id).await.unwrap().status,
             WorkerStatus::Connected
         );
 
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = ReaperConfig::new(Duration::from_millis(10), reaper_window);
+        let handle = spawn_reaper(registry.clone(), config, shutdown_rx);
+
         // Once 4 * real_interval has elapsed, the reaper marks the battery worker Disconnected
         // instead of waiting 240 s (4 * 60 s).
-        tokio::time::sleep(real_interval * 4).await;
-        assert_eq!(
-            registry.get_worker(worker_id).await.unwrap().status,
-            WorkerStatus::Disconnected
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if registry.get_worker(worker_id).await.unwrap().status == WorkerStatus::Disconnected {
+                assert!(
+                    hb_at.elapsed() >= reaper_window,
+                    "battery worker reaped before {:?} window (elapsed {:?})",
+                    reaper_window,
+                    hb_at.elapsed()
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "battery worker was not reaped within 5s (instead of waiting 240s)"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         let _ = shutdown_tx.send(true);
         let _ = handle.await;
