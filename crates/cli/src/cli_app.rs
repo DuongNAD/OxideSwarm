@@ -936,6 +936,12 @@ pub struct DoctorArgs {
     #[arg(long, help = "Leave out the spread check (C6)")]
     pub skip_spread: bool,
 
+    #[arg(
+        long,
+        help = "Leave out the blob throughput probe (C8), which moves an 8 MiB blob to every worker"
+    )]
+    pub skip_throughput: bool,
+
     #[arg(long, help = "Print the report as JSON")]
     pub json: bool,
 
@@ -2685,6 +2691,7 @@ async fn run_doctor_command(
         spread_tasks: args.spread_tasks,
         skip_gpu: args.skip_gpu,
         skip_spread: args.skip_spread,
+        skip_throughput: args.skip_throughput,
     };
     let report = run_doctor(&master_addr, secret.as_ref(), &options).await;
     if args.json {
@@ -4389,7 +4396,7 @@ mod tests {
                 assert_eq!(a.probe_timeout_secs, 60);
                 assert_eq!(a.gpu_dim, 512);
                 assert_eq!(a.spread_tasks, None);
-                assert!(!a.skip_gpu && !a.skip_spread && !a.json);
+                assert!(!a.skip_gpu && !a.skip_spread && !a.skip_throughput && !a.json);
             }
             other => panic!("expected doctor, got {other:?}"),
         }
@@ -4402,6 +4409,7 @@ mod tests {
             "--spread-tasks",
             "16",
             "--skip-gpu",
+            "--skip-throughput",
             "--json",
         ])
         .command
@@ -4410,7 +4418,7 @@ mod tests {
                 assert_eq!(a.master.as_deref(), Some("10.0.0.7"));
                 assert_eq!(a.expect_workers, 2);
                 assert_eq!(a.spread_tasks, Some(16));
-                assert!(a.skip_gpu && a.json);
+                assert!(a.skip_gpu && a.skip_throughput && a.json);
             }
             other => panic!("expected doctor, got {other:?}"),
         }
