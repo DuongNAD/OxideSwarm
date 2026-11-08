@@ -10,7 +10,10 @@
 //!   -- <program> <args>`. `sandbox-exec` applies the Seatbelt profile and then `exec`s the
 //!   program in place, so the PID the worker tracks is the task itself and the process-group
 //!   kill, the timeout and the cancellation work as without isolation.
-//! * **Linux** (Landlock, `seccomp`, namespaces): FEAT-3b, not implemented yet.
+//! * **Linux** (`linux`, FEAT-3b): Landlock for files, `seccomp` for sockets and a few dangerous
+//!   calls, a private user and network namespace under `fs+net`. There is no wrapper program:
+//!   [`confine_command`] registers a `pre_exec` hook that runs in the task leader after FEAT-2's
+//!   hook (so the lifeline supervisor stays unrestricted) and right before `execve`.
 //! * **Windows** (per-task AppContainer): FEAT-3c, not implemented yet.
 //!
 //! A worker that was asked for isolation and cannot enforce it never runs tasks unsandboxed: it
@@ -151,7 +154,7 @@ pub fn prepare_environment(
 /// What the runner knows about one task when it asks for it to be confined. Only the
 /// platforms that have an implementation read every field.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(crate) struct Jail<'a> {
     pub level: IsolationLevel,
     pub host: &'a HostDirs,
@@ -166,8 +169,10 @@ pub(crate) struct Jail<'a> {
 /// The program and arguments to spawn so that the task runs confined at `jail.level`.
 ///
 /// `program` is resolved against `search_path` first (a bare name is looked up like `execvp`
-/// does), so a program that does not exist fails here with a clear message. Never returns the
-/// unconfined command: a platform without an implementation yields an error.
+/// does), so a program that does not exist fails here with a clear message. On macOS the result
+/// is the `sandbox-exec` wrapper; on Linux it is the program itself and the confinement is
+/// applied by the `pre_exec` hook that [`confine_command`] registers. A platform without an
+/// implementation yields an error: a confined task is never silently started plain.
 pub(crate) fn wrap_program(
     jail: &Jail<'_>,
     program: &str,
@@ -181,11 +186,49 @@ pub(crate) fn wrap_program(
             .ok_or_else(|| format!("program '{program}' was not found in PATH"))?;
         macos::wrap(jail, &resolved, args)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let resolved = resolve_program(program, search_path)
+            .ok_or_else(|| format!("program '{program}' was not found in PATH"))?;
+        Ok((resolved, args.to_vec()))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (jail, program, args, search_path);
         Err(unsupported_message(jail.level))
     }
+}
+
+/// Registers the part of the confinement that is not a wrapper program (Linux: Landlock, `seccomp`
+/// and the namespaces, as a `pre_exec` hook). Call it right after `configure_command` so the hook
+/// runs after FEAT-2's: the lifeline supervisor is forked and the leader is in its cgroup before
+/// the leader restricts itself. A no-op on macOS, where `sandbox-exec` does it. The hook holds
+/// the policy's descriptors until `cmd` is dropped, so drop `cmd` after `spawn`.
+pub(crate) fn confine_command(
+    jail: &Jail<'_>,
+    cmd: &mut tokio::process::Command,
+) -> Result<(), String> {
+    debug_assert!(jail.level != IsolationLevel::Off);
+    #[cfg(target_os = "linux")]
+    {
+        let confinement = linux::Confinement::build(jail)?;
+        // SAFETY: the hook makes raw system calls only (see `linux::Confinement::apply`).
+        unsafe {
+            cmd.pre_exec(confinement.into_hook());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (jail, cmd);
+        Ok(())
+    }
+}
+
+/// The Landlock ABI version of the running kernel (`1` is Linux 5.13), or why there is none.
+#[cfg(target_os = "linux")]
+pub fn landlock_abi() -> std::io::Result<u32> {
+    linux::landlock_abi()
 }
 
 /// Start-up self-check: proves this host can enforce `level`, or says why not. Runs a probe task
@@ -204,18 +247,22 @@ pub async fn verify_isolation_support(
             .await
             .map_err(GridError::Config)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::probe(level, sandbox_base)
+            .await
+            .map_err(GridError::Config)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = sandbox_base;
         Err(GridError::Config(unsupported_message(level)))
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn unsupported_message(level: IsolationLevel) -> String {
-    let which = if cfg!(target_os = "linux") {
-        "FEAT-3b"
-    } else if cfg!(windows) {
+    let which = if cfg!(windows) {
         "FEAT-3c"
     } else {
         "no FEAT-3 item covers this platform"
@@ -228,7 +275,7 @@ fn unsupported_message(level: IsolationLevel) -> String {
 
 /// Looks `program` up the way `execvp` does: a name with a `/` is used as given, a bare name is
 /// searched in the `PATH`-style list (`:`-separated; an empty entry is the current directory).
-#[cfg(any(target_os = "macos", all(test, unix)))]
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
 fn resolve_program(program: &str, search_path: &str) -> Option<String> {
     use std::os::unix::fs::PermissionsExt;
     if program.contains('/') {
@@ -251,6 +298,25 @@ fn resolve_program(program: &str, search_path: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// The canonical form of `p`; a path that does not exist (yet) is returned as given, with its
+/// longest existing prefix canonicalized.
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+fn canonical(p: &Path) -> PathBuf {
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+            canonical(parent).join(name)
+        }
+        _ => p.to_path_buf(),
+    }
+}
+
+/// The Linux implementation: Landlock, `seccomp` and namespaces, applied by a `pre_exec` hook.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+mod linux;
+
 /// The macOS implementation: a Seatbelt profile handed to `/usr/bin/sandbox-exec`.
 ///
 /// Facts about Seatbelt that the profile relies on, each checked by experiment on macOS (design
@@ -268,7 +334,7 @@ fn resolve_program(program: &str, search_path: &str) -> Option<String> {
 /// * `(deny network*)` stops a TCP connect to a loopback listener and Unix-socket connects.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod macos {
-    use super::{IsolationLevel, Jail};
+    use super::{canonical, IsolationLevel, Jail};
     use std::path::{Path, PathBuf};
 
     #[cfg(target_os = "macos")]
@@ -424,20 +490,6 @@ mod macos {
     #[cfg(not(target_os = "macos"))]
     fn user_cache_dir() -> Option<PathBuf> {
         None
-    }
-
-    /// The canonical form of `p`; a path that does not exist (yet) is returned as given, with
-    /// its longest existing prefix canonicalized.
-    fn canonical(p: &Path) -> PathBuf {
-        if let Ok(c) = p.canonicalize() {
-            return c;
-        }
-        match (p.parent(), p.file_name()) {
-            (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
-                canonical(parent).join(name)
-            }
-            _ => p.to_path_buf(),
-        }
     }
 
     /// Everything `sandbox-exec` is told: `-p <profile> -D name=value ...`.
@@ -811,7 +863,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[tokio::test]
     async fn test_self_check_refuses_isolation_without_an_implementation() {
         let dir = tempfile::tempdir().unwrap();
@@ -833,7 +885,7 @@ mod tests {
             .expect("off needs nothing");
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn test_wrap_program_never_returns_the_plain_command() {
         let h = host();

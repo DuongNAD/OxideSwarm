@@ -1,0 +1,26 @@
+name: iso-linux-dev
+# Temporary: fast feedback for FEAT-3b. Removed before the PR is merged.
+on:
+  push:
+    branches: [claude/feat-3b-isolation-linux]
+jobs:
+  iso:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTY_GRID_REQUIRE_LANDLOCK: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: "false"
+      - name: kernel facts
+        run: |
+          uname -a
+          cat /sys/kernel/security/lsm || true
+          cat /proc/sys/kernel/unprivileged_userns_clone || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.io_uring_disabled || true
+          python3 -c "import ctypes; l=ctypes.CDLL(None,use_errno=True); print('landlock abi', l.syscall(444,None,0,1), ctypes.get_errno())"
+      - run: cargo test -p rusty_grid_worker --lib isolation --locked
+      - run: cargo test -p rusty_grid_worker --test test_feat3_os_isolation --locked -- --nocapture --test-threads=4

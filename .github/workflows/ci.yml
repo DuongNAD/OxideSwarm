@@ -141,6 +141,10 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    env:
+      # Design 0033 (FEAT-3b): on Linux the isolation tests fail, instead of skipping, when the
+      # runner kernel has no Landlock.
+      RUSTY_GRID_REQUIRE_LANDLOCK: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
