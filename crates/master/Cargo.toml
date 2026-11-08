@@ -24,6 +24,13 @@ axum = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
 # Constant-time dashboard token comparison (already in Cargo.lock via rusty_grid_core).
 ring = "0.17"
+# Task store (design 0046 D2): bincode journal records, BLAKE3 frame checksums.
+bincode = { workspace = true }
+blake3 = "1.8"
+
+[target.'cfg(unix)'.dependencies]
+# `geteuid` for the state-directory owner check (design 0046 D1.3).
+libc = "0.2"
 
 [features]
 default = ["p2p", "dashboard"]
@@ -35,7 +42,6 @@ rusty_grid_worker = { path = "../worker" }
 futures = { workspace = true }
 reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }
-bincode = { workspace = true }
 
 [[test]]
 name = "m2_lifecycle"

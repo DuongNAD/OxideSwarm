@@ -560,3 +560,6 @@ lands as a self-contained, reviewable unit.
   plaintext task data on disk and Windows `icacls` owner-only ACLs in Security; defined deferred
   `pending_failover_charge` accounting and hold trade-off in D4.5; and scheduled the wire removal of
   deprecated `compute_intensity` in `F1-b` alongside the protocol version `3 -> 4` bump.
+- **2026-11-08:** `F1-a` module landed: `crates/master/src/store.rs` (`TaskStore` journal, 5 ms group
+  commit, JSON snapshot compaction, torn-tail recovery, `store.lock`) and `GridError::Storage`, not
+  yet wired into `TaskQueue`, `MasterServer` or the CLI. Windows owner-only ACL is still a TODO.
