@@ -49,7 +49,7 @@ tempfile = "3"
 futures = { workspace = true }
 agent_mesh = { workspace = true }
 bytes = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 
 [[test]]
 name = "test_3d_autorig_pipeline"
@@ -123,6 +123,10 @@ path = "../../tests/cli_worker_signals_e2e.rs"
 [[test]]
 name = "cli_dashboard_policy_e2e"
 path = "../../tests/cli_dashboard_policy_e2e.rs"
+
+[[test]]
+name = "cli_isolation_e2e"
+path = "../../tests/cli_isolation_e2e.rs"
 
 [[test]]
 name = "cli_worker_identity_e2e"

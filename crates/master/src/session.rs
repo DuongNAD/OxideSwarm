@@ -601,7 +601,8 @@ impl<
             .set_rx_clock(&worker_id, session_id, rx_clock)
             .await;
 
-        // Fail over the superseded session's tasks in a detached task (`BUG-18`).
+        // Fail over the superseded session's tasks; `failover_superseded_session` spawns a task
+        // and awaits it so the sweep finishes even if this handler is aborted (`BUG-18`).
         if let Some(old_session) = registration.superseded_session {
             failover_superseded_session(
                 &queue,
@@ -1194,5 +1195,639 @@ impl<
                 true
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::sync::RwLock;
+
+    use rusty_grid_core::arbitrage::{MasterLeaseTicket, LEASE_VALIDITY_DURATION_MS};
+    use rusty_grid_core::blob::BlobId;
+    use rusty_grid_core::blob_transfer::{BlobReply, BlobRequest};
+    use rusty_grid_core::capabilities::{
+        BatteryTier, MobileCapabilities, ThermalTier, WorkerCapabilities,
+    };
+    use rusty_grid_core::task::{Bytes, Task, TaskRequirements, TaskSpec, TaskStatus};
+
+    use crate::blob_store::{BlobStore, BlobStoreConfig, DEFAULT_BLOB_STORE_MAX_BYTES};
+    use crate::queue::TaskState;
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_test_multiplexed_session(
+        ctrl_master: tokio::io::DuplexStream,
+        data_master: tokio::io::DuplexStream,
+        registry: WorkerRegistry,
+        queue: TaskQueue,
+        scheduler_notify: Arc<tokio::sync::Notify>,
+        waiters: WaiterMap,
+        stop_rx: watch::Receiver<bool>,
+        blob_store: Option<Arc<BlobStore>>,
+    ) -> tokio::task::JoinHandle<GridResult<()>> {
+        tokio::spawn(async move {
+            let pre_auth = PreAuthSession::new_multiplexed(
+                ctrl_master,
+                data_master,
+                SocketAddr::from(([127, 0, 0, 1], 55_000)),
+                WireCodec::Bincode,
+                #[cfg(feature = "p2p")]
+                None,
+                #[cfg(feature = "p2p")]
+                None,
+            );
+            WorkerSession::run_connection(
+                pre_auth,
+                registry,
+                queue,
+                scheduler_notify,
+                waiters,
+                10,
+                Duration::from_secs(5),
+                stop_rx,
+                None,
+                WireCodec::Bincode,
+                None,
+                None,
+                blob_store,
+                #[cfg(feature = "dashboard")]
+                None,
+            )
+            .await
+        })
+    }
+
+    #[tokio::test]
+    async fn test_multiplexed_blob_reply_is_routed_to_data_lane() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(&BlobStoreConfig::new(
+            temp_dir.path().join("blobs"),
+            DEFAULT_BLOB_STORE_MAX_BYTES,
+        ))
+        .unwrap();
+        let registry = WorkerRegistry::new();
+        let queue = TaskQueue::new();
+        let scheduler_notify = Arc::new(tokio::sync::Notify::new());
+        let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = watch::channel(false);
+
+        // Use a small 64-byte duplex buffer on the data lane so Phase 2 can deterministically
+        // backpressure `data_out_tx` and exercise the `!pending_data.is_empty()` branch too.
+        let (c_master, c_worker) = tokio::io::duplex(64 * 1024);
+        let (d_master, d_worker) = tokio::io::duplex(64);
+        let session_task = spawn_test_multiplexed_session(
+            c_master,
+            d_master,
+            registry.clone(),
+            queue.clone(),
+            Arc::clone(&scheduler_notify),
+            Arc::clone(&waiters),
+            stop_rx,
+            Some(Arc::clone(&store)),
+        );
+
+        let mut mux_ctrl = MessageTransport::new(c_worker);
+        let mut mux_data = MessageTransport::new(d_worker);
+        let worker_id = Uuid::new_v4();
+        mux_ctrl
+            .send_msg(&WorkerMessage::Register {
+                worker_id,
+                capabilities: WorkerCapabilities::new(
+                    "mux-blob-worker",
+                    2,
+                    4096,
+                    false,
+                    false,
+                    None,
+                ),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        match mux_ctrl.recv_msg::<MasterMessage>().await.unwrap() {
+            Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+            other => panic!("expected RegisterAck, got {other:?}"),
+        }
+
+        // Phase 1 (`pending_data.is_empty()` branch in `router_task`):
+        // Send a `BlobRequest` followed by a control-lane `Heartbeat`. `BlobReply` must arrive on
+        // the data lane (`mux_data`) while `HeartbeatAck` arrives on the control lane (`mux_ctrl`).
+        let probe_id_1 = BlobId::of(b"blob-on-data-lane-1");
+        mux_data
+            .send_msg(&WorkerMessage::BlobRequest {
+                request_id: 101,
+                request: BlobRequest::Missing {
+                    ids: vec![probe_id_1],
+                },
+            })
+            .await
+            .unwrap();
+
+        let data_reply =
+            tokio::time::timeout(Duration::from_secs(2), mux_data.recv_msg::<MasterMessage>())
+                .await
+                .expect(
+                    "BlobReply (request_id=101) must arrive on the data lane without timing out",
+                )
+                .expect("data lane decode must succeed")
+                .expect("data lane must stay open");
+        assert_eq!(
+            data_reply,
+            MasterMessage::BlobReply {
+                request_id: 101,
+                reply: BlobReply::Missing {
+                    ids: vec![probe_id_1],
+                },
+            }
+        );
+
+        mux_ctrl
+            .send_msg(&WorkerMessage::Heartbeat {
+                worker_id,
+                timestamp: 1_001,
+                active_tasks: 0,
+                cpu_usage_pct: 10.0,
+                ram_available_mb: 4096,
+            })
+            .await
+            .unwrap();
+        let ctrl_reply =
+            tokio::time::timeout(Duration::from_secs(2), mux_ctrl.recv_msg::<MasterMessage>())
+                .await
+                .expect("HeartbeatAck must arrive on the control lane")
+                .expect("control lane decode must succeed")
+                .expect("control lane must stay open");
+        assert_eq!(ctrl_reply, MasterMessage::HeartbeatAck { timestamp: 1_001 });
+
+        // Phase 2 (`!pending_data.is_empty()` branch in `router_task`):
+        // Stop reading `mux_data` and flood 80 `AssignTask` frames so the 64-byte duplex buffer
+        // and 64-slot `data_out_tx` channel fill up and overflow into `pending_data`.
+        let flood_count = 80usize;
+        let mut expected_task_ids = Vec::with_capacity(flood_count);
+        for i in 0..flood_count {
+            let task = Task::new(
+                TaskSpec::Command {
+                    program: "echo".into(),
+                    args: vec![format!("blob-flood-{i}"), "p".repeat(1024)],
+                    env: HashMap::new(),
+                    working_dir: None,
+                    stdin: None,
+                },
+                TaskRequirements::generic(1, 64),
+            );
+            expected_task_ids.push(task.id);
+            registry
+                .send_to_worker(&worker_id, MasterMessage::AssignTask { task })
+                .await
+                .unwrap();
+        }
+        // Give `router_task` a brief turn to drain `outbound_rx` into `pending_data`.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let probe_id_2 = BlobId::of(b"blob-on-data-lane-2");
+        mux_data
+            .send_msg(&WorkerMessage::BlobRequest {
+                request_id: 202,
+                request: BlobRequest::Missing {
+                    ids: vec![probe_id_2],
+                },
+            })
+            .await
+            .unwrap();
+        // Wait briefly so `BlobService` enqueues `BlobReply(202)` onto `outbound_rx` while
+        // `pending_data` is still non-empty.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        // A control-lane heartbeat sent now must still receive `HeartbeatAck` on `mux_ctrl`
+        // (and never `BlobReply(202)`).
+        mux_ctrl
+            .send_msg(&WorkerMessage::Heartbeat {
+                worker_id,
+                timestamp: 2_002,
+                active_tasks: 0,
+                cpu_usage_pct: 15.0,
+                ram_available_mb: 4096,
+            })
+            .await
+            .unwrap();
+        let ctrl_reply_2 =
+            tokio::time::timeout(Duration::from_secs(2), mux_ctrl.recv_msg::<MasterMessage>())
+                .await
+                .expect(
+                    "HeartbeatAck must arrive on the control lane while data lane is backpressured",
+                )
+                .expect("control lane decode must succeed")
+                .expect("control lane must stay open");
+        assert_eq!(
+            ctrl_reply_2,
+            MasterMessage::HeartbeatAck { timestamp: 2_002 },
+            "control lane must receive HeartbeatAck, never a misrouted BlobReply"
+        );
+
+        // Now drain the 80 `AssignTask` messages and the trailing `BlobReply(202)` from `mux_data`.
+        for expected_id in expected_task_ids {
+            let msg =
+                tokio::time::timeout(Duration::from_secs(2), mux_data.recv_msg::<MasterMessage>())
+                    .await
+                    .expect("queued AssignTask must drain from data lane")
+                    .expect("data lane decode must succeed")
+                    .expect("data lane must stay open");
+            match msg {
+                MasterMessage::AssignTask { task } => assert_eq!(task.id, expected_id),
+                other => panic!("expected AssignTask({expected_id}), got {other:?}"),
+            }
+        }
+        let data_reply_2 = tokio::time::timeout(
+            Duration::from_secs(2),
+            mux_data.recv_msg::<MasterMessage>(),
+        )
+        .await
+        .expect("BlobReply (request_id=202) queued while pending_data was non-empty must arrive on data lane")
+        .expect("data lane decode must succeed")
+        .expect("data lane must stay open");
+        assert_eq!(
+            data_reply_2,
+            MasterMessage::BlobReply {
+                request_id: 202,
+                reply: BlobReply::Missing {
+                    ids: vec![probe_id_2],
+                },
+            }
+        );
+
+        let _ = stop_tx.send(true);
+        session_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_multiplexed_inbound_lane_separation_ignores_wrong_lane_messages() {
+        let registry = WorkerRegistry::new();
+        let queue = TaskQueue::new();
+        let scheduler_notify = Arc::new(tokio::sync::Notify::new());
+        let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = watch::channel(false);
+
+        let (c_master, c_worker) = tokio::io::duplex(64 * 1024);
+        let (d_master, d_worker) = tokio::io::duplex(64 * 1024);
+        let session_task = spawn_test_multiplexed_session(
+            c_master,
+            d_master,
+            registry.clone(),
+            queue.clone(),
+            Arc::clone(&scheduler_notify),
+            Arc::clone(&waiters),
+            stop_rx,
+            None,
+        );
+
+        let mut mux_ctrl = MessageTransport::new(c_worker);
+        let mut mux_data = MessageTransport::new(d_worker);
+        let worker_id = Uuid::new_v4();
+        let mut caps = WorkerCapabilities::new("mux-lane-sep-worker", 2, 4096, false, false, None);
+        caps.mobile = Some(MobileCapabilities {
+            soc_model: "Pixel-Test".into(),
+            os_version: "15".into(),
+            battery_pct: Some(90),
+            is_charging: Some(true),
+            thermal_throttled: false,
+        });
+        mux_ctrl
+            .send_msg(&WorkerMessage::Register {
+                worker_id,
+                capabilities: caps,
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        match mux_ctrl.recv_msg::<MasterMessage>().await.unwrap() {
+            Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+            other => panic!("expected RegisterAck, got {other:?}"),
+        }
+
+        let before = registry.get_worker(worker_id).await.unwrap();
+        assert_eq!(before.active_tasks, 0);
+        assert_eq!(before.cpu_usage_pct, 0.0);
+        assert_ne!(before.last_heartbeat_timestamp, 999_999);
+        assert_eq!(
+            before
+                .capabilities
+                .mobile
+                .as_ref()
+                .and_then(|m| m.battery_pct),
+            Some(90)
+        );
+
+        // 1. Send control-only messages (`Heartbeat`, `MobileTelemetry`, `ClaimMasterRole`,
+        //    `Disconnecting`) on the DATA lane, followed by a `BlobRequest` barrier on the data
+        //    lane so we know the session loop has already read and processed all four messages.
+        let secret = ClusterSecret::generate().unwrap();
+        let ticket = MasterLeaseTicket::issue(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            1,
+            5_000,
+            1_000,
+            Duration::from_millis(LEASE_VALIDITY_DURATION_MS),
+            &secret,
+        );
+        mux_data
+            .send_msg(&WorkerMessage::Heartbeat {
+                worker_id,
+                timestamp: 999_999,
+                active_tasks: 7,
+                cpu_usage_pct: 88.0,
+                ram_available_mb: 512,
+            })
+            .await
+            .unwrap();
+        mux_data
+            .send_msg(&WorkerMessage::MobileTelemetry {
+                worker_id,
+                battery_pct: Some(15),
+                is_charging: Some(false),
+                thermal_throttled: true,
+                battery_temperature: Some(46.0),
+                network_type: Some("cellular".into()),
+                battery_tier: Some(BatteryTier::Critical),
+                thermal_tier: Some(ThermalTier::Critical),
+            })
+            .await
+            .unwrap();
+        mux_data
+            .send_msg(&WorkerMessage::ClaimMasterRole { ticket })
+            .await
+            .unwrap();
+        mux_data
+            .send_msg(&WorkerMessage::Disconnecting {
+                worker_id,
+                reason: "wrong-lane disconnect".into(),
+            })
+            .await
+            .unwrap();
+        mux_data
+            .send_msg(&WorkerMessage::BlobRequest {
+                request_id: 1,
+                request: BlobRequest::Missing { ids: vec![] },
+            })
+            .await
+            .unwrap();
+
+        let barrier_reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            mux_data.recv_msg::<MasterMessage>(),
+        )
+        .await
+        .expect("data-lane BlobRequest barrier must be answered; Disconnecting on data lane must not close session")
+        .expect("data lane decode must succeed")
+        .expect("data lane must stay open");
+        assert!(matches!(
+            barrier_reply,
+            MasterMessage::BlobReply { request_id: 1, .. }
+        ));
+
+        let after_wrong_data = registry
+            .get_worker(worker_id)
+            .await
+            .expect("worker must remain registered after wrong-lane Disconnecting on data stream");
+        assert_eq!(
+            after_wrong_data.active_tasks, 0,
+            "Heartbeat on data lane must not update active_tasks"
+        );
+        assert_eq!(
+            after_wrong_data.cpu_usage_pct, 0.0,
+            "Heartbeat on data lane must not update cpu_usage_pct"
+        );
+        assert_eq!(
+            after_wrong_data.last_heartbeat_timestamp, before.last_heartbeat_timestamp,
+            "Heartbeat on data lane must not update last_heartbeat_timestamp"
+        );
+        assert_eq!(
+            after_wrong_data
+                .capabilities
+                .mobile
+                .as_ref()
+                .and_then(|m| m.battery_pct),
+            Some(90),
+            "MobileTelemetry on data lane must not update mobile capabilities"
+        );
+
+        // No `HeartbeatAck` (for timestamp 999_999) or `RoleHandoverAck` may have been sent on `mux_ctrl`.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                mux_ctrl.recv_msg::<MasterMessage>(),
+            )
+            .await
+            .is_err(),
+            "Heartbeat and ClaimMasterRole on data lane must not produce any reply on the control lane"
+        );
+
+        // 2. Send data-only messages (`TaskProgress`, `Checkpoint`, `TaskResult`) on the CONTROL
+        //    lane, followed by a valid `Heartbeat` barrier on the control lane.
+        let session_id = after_wrong_data.session_id;
+        let task = Task::new(
+            TaskSpec::command("echo", vec!["lane-check".into()]),
+            TaskRequirements::generic(1, 64),
+        );
+        let task_id = queue.submit(task).await.unwrap();
+        queue
+            .schedule_tasks_batch_in_sessions(&[(task_id, worker_id, session_id)])
+            .await;
+
+        mux_ctrl
+            .send_msg(&WorkerMessage::TaskProgress {
+                worker_id,
+                task_id,
+                status: TaskStatus::Running,
+            })
+            .await
+            .unwrap();
+        mux_ctrl
+            .send_msg(&WorkerMessage::Checkpoint {
+                task_id,
+                sequence: 1,
+                delta_state: Bytes::from_static(b"wrong-lane-cp"),
+            })
+            .await
+            .unwrap();
+        mux_ctrl
+            .send_msg(&WorkerMessage::TaskResult {
+                worker_id,
+                task_id,
+                exit_code: 0,
+                stdout: Bytes::from_static(b"wrong-lane-result"),
+                stderr: Bytes::new(),
+                execution_time_ms: 5,
+                is_gpu_executed: false,
+                device_name: None,
+                error: None,
+                asset_bytes: None,
+                artifacts: vec![],
+                outputs: vec![],
+            })
+            .await
+            .unwrap();
+        mux_ctrl
+            .send_msg(&WorkerMessage::Heartbeat {
+                worker_id,
+                timestamp: 123_456,
+                active_tasks: 1,
+                cpu_usage_pct: 42.0,
+                ram_available_mb: 2048,
+            })
+            .await
+            .unwrap();
+
+        let ctrl_ack =
+            tokio::time::timeout(Duration::from_secs(2), mux_ctrl.recv_msg::<MasterMessage>())
+                .await
+                .expect("valid control-lane Heartbeat must receive HeartbeatAck")
+                .expect("control lane decode must succeed")
+                .expect("control lane must stay open");
+        assert_eq!(ctrl_ack, MasterMessage::HeartbeatAck { timestamp: 123_456 });
+
+        let task_info = queue.get_task(&task_id).await.unwrap();
+        assert_eq!(
+            task_info.state,
+            TaskState::Scheduled,
+            "TaskProgress/TaskResult on control lane must be ignored and leave task in Scheduled state"
+        );
+        assert!(
+            queue.get_result(&task_id).await.is_none(),
+            "TaskResult on control lane must not record a result"
+        );
+
+        let _ = stop_tx.send(true);
+        session_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_register_call_site_supersede_sweep_survives_session_abort() {
+        let registry = WorkerRegistry::new();
+        let queue = TaskQueue::new();
+        let scheduler_notify = Arc::new(tokio::sync::Notify::new());
+        let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let worker_id = Uuid::new_v4();
+
+        // 1. Register session 1 via `WorkerSession::run_connection` and put a running task on it.
+        let (c1_master, c1_worker) = tokio::io::duplex(64 * 1024);
+        let (d1_master, _d1_worker) = tokio::io::duplex(64 * 1024);
+        let session1_task = spawn_test_multiplexed_session(
+            c1_master,
+            d1_master,
+            registry.clone(),
+            queue.clone(),
+            Arc::clone(&scheduler_notify),
+            Arc::clone(&waiters),
+            stop_rx.clone(),
+            None,
+        );
+        let mut ctrl1 = MessageTransport::new(c1_worker);
+        ctrl1
+            .send_msg(&WorkerMessage::Register {
+                worker_id,
+                capabilities: WorkerCapabilities::new(
+                    "supersede-worker",
+                    2,
+                    4096,
+                    false,
+                    false,
+                    None,
+                ),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        match ctrl1.recv_msg::<MasterMessage>().await.unwrap() {
+            Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+            other => panic!("expected session 1 RegisterAck, got {other:?}"),
+        }
+        assert_eq!(
+            registry.get_worker(worker_id).await.map(|w| w.session_id),
+            Some(1)
+        );
+
+        let task = Task::new(
+            TaskSpec::command("echo", vec!["supersede-call-site".into()]),
+            TaskRequirements::generic(1, 30),
+        );
+        let task_id = queue.submit(task).await.unwrap();
+        queue
+            .schedule_tasks_batch_in_sessions(&[(task_id, worker_id, 1)])
+            .await;
+        queue
+            .mark_running_from(worker_id, Some(1), &task_id)
+            .await
+            .unwrap();
+
+        // 2. Hold the queue write lock, then start session 2's `WorkerSession::run_connection`
+        //    so it registers session 2 in `WorkerRegistry` and parks at the `session.rs`
+        //    `failover_superseded_session` call site waiting for the queue write lock.
+        let lock = queue.hold_write_lock_for_test().await;
+        let (c2_master, c2_worker) = tokio::io::duplex(64 * 1024);
+        let (d2_master, _d2_worker) = tokio::io::duplex(64 * 1024);
+        let session2_task = spawn_test_multiplexed_session(
+            c2_master,
+            d2_master,
+            registry.clone(),
+            queue.clone(),
+            Arc::clone(&scheduler_notify),
+            Arc::clone(&waiters),
+            stop_rx,
+            None,
+        );
+        let mut ctrl2 = MessageTransport::new(c2_worker);
+        ctrl2
+            .send_msg(&WorkerMessage::Register {
+                worker_id,
+                capabilities: WorkerCapabilities::new(
+                    "supersede-worker",
+                    2,
+                    4096,
+                    false,
+                    false,
+                    None,
+                ),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while registry.get_worker(worker_id).await.map(|w| w.session_id) != Some(2) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "session 2 did not reach WorkerRegistry::register_session"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Let session 2 enter `failover_superseded_session` and spawn its inner sweep task.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Abort session 2's connection handler while it is parked in `failover_superseded_session`,
+        // then release the queue write lock. Session 1's task must still fail over to `Queued`.
+        session2_task.abort();
+        assert!(session2_task.await.unwrap_err().is_cancelled());
+        drop(lock);
+
+        let failover_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while queue.get_state(&task_id).await != Some(TaskState::Queued) {
+            assert!(
+                tokio::time::Instant::now() < failover_deadline,
+                "session 1's task stayed in {:?} after session 2 was aborted mid-sweep",
+                queue.get_state(&task_id).await
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(queue.get_task(&task_id).await.unwrap().retry_count, 1);
+
+        let _ = stop_tx.send(true);
+        session1_task.abort();
     }
 }

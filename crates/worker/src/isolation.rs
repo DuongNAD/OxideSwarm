@@ -37,6 +37,68 @@ pub const STRIPPED_IPC_ENV_VARS: [&str; 4] = [
     "DOCKER_HOST",
 ];
 
+/// Variables of the worker's own environment that a confined task still inherits. Everything
+/// else (tokens such as `GITHUB_TOKEN`, cloud credentials, proxy passwords, `OXIDESWARM_*`) stays
+/// with the worker; the task's own `env`, the moved `HOME`/temp variables, `RUSTUP_HOME`,
+/// `CARGO_HOME` and the `RUSTY_GRID_*` variables the runner sets are added on top.
+pub const INHERITED_ENV_VARS: [&str; 12] = [
+    "PATH",
+    "LANG",
+    "TERM",
+    "TZ",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "COLORTERM",
+    "NO_COLOR",
+    "DEVELOPER_DIR",
+    "SDKROOT",
+    "RUSTUP_TOOLCHAIN",
+];
+
+/// Windows system environment variables that native Win32 tools (`cmd.exe`, `powershell.exe`,
+/// `cargo.exe`, `rustc.exe`, `link.exe`, Winsock `ws2_32.dll`, and `CreateProcessW`'s
+/// `BasepAppContainerEnvironmentExtension`) require to initialize when the child starts from an
+/// empty environment (`cmd.env_clear()`). Matched case-insensitively on Windows.
+pub const WINDOWS_INHERITED_ENV_VARS: [&str; 16] = [
+    "SystemRoot",
+    "SystemDrive",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "OS",
+    "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "CommonProgramFiles",
+    "CommonProgramFiles(x86)",
+    "ProgramData",
+    "PUBLIC",
+    "LOCALAPPDATA",
+    "APPDATA",
+];
+
+/// The part of `vars` (the worker's environment) that a confined task inherits: the names in
+/// [`INHERITED_ENV_VARS`] and every `LC_*` (plus [`WINDOWS_INHERITED_ENV_VARS`] on Windows).
+pub fn inherited_environment(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    vars.into_iter()
+        .filter(|(name, _)| {
+            name.to_str().is_some_and(|n| {
+                INHERITED_ENV_VARS.contains(&n)
+                    || (n.starts_with("LC_") && n.len() > 3)
+                    || (cfg!(windows)
+                        && (INHERITED_ENV_VARS.iter().any(|w| w.eq_ignore_ascii_case(n))
+                            || WINDOWS_INHERITED_ENV_VARS
+                                .iter()
+                                .any(|w| w.eq_ignore_ascii_case(n))))
+            })
+        })
+        .collect()
+}
+
 /// The directories of the host that the policy names: the owner's home (denied), and the Rust
 /// toolchain and Cargo cache (readable, so `cargo build --offline` works, design 0033 D1.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,15 +333,19 @@ mod macos {
     /// `USER_HOME`, `SANDBOX_BASE`, `CACHE_DIR`, `RUSTUP_HOME`, `CARGO_HOME`, `CARGO_CRED`,
     /// `CARGO_CRED_TOML`, `ANCESTOR_<n>` for `ancestors` entries), so no path is ever spliced into
     /// the profile text.
-    pub(super) fn profile(level: IsolationLevel, ancestors: usize) -> String {
+    pub(super) fn profile(level: IsolationLevel, ancestors: usize, extra_denied: usize) -> String {
         let mut p = String::from("(version 1)\n(allow default)\n(deny file-write* (subpath \"/\"))\n(allow file-write*\n    (subpath (param \"SANDBOX_DIR\"))\n");
         for dev in WRITABLE_DEVICES {
             p.push_str(&format!("    (literal \"{dev}\")\n"));
         }
         p.push_str("    (subpath \"/dev/fd\"))\n");
         p.push_str(
-            "(deny file-read*\n    (subpath (param \"USER_HOME\"))\n    (subpath (param \"SANDBOX_BASE\"))\n    (subpath (param \"CACHE_DIR\")))\n",
+            "(deny file-read*\n    (subpath (param \"USER_HOME\"))\n    (subpath (param \"SANDBOX_BASE\"))\n    (subpath (param \"CACHE_DIR\"))",
         );
+        for i in 0..extra_denied {
+            p.push_str(&format!("\n    (subpath (param \"DENIED_{i}\"))"));
+        }
+        p.push_str(")\n");
         p.push_str(
             "(allow file-read*\n    (subpath (param \"SANDBOX_DIR\"))\n    (subpath (param \"RUSTUP_HOME\"))\n    (subpath (param \"CARGO_HOME\")))\n",
         );
@@ -293,10 +359,79 @@ mod macos {
             }
             p.push_str(")\n");
         }
+        // Ways out of the file policy that are not file accesses (design 0033, security review):
+        // - LaunchServices and Apple events start an unconfined process on the task's behalf.
+        p.push_str("(deny lsopen)\n(deny appleevent-send)\n");
+        // - cfprefsd reads and writes the owner's preference files for the task. Reading the
+        //   global domain stays possible.
+        p.push_str("(deny user-preference-read user-preference-write)\n(allow user-preference-read (preference-domain \"kCFPreferencesAnyApplication\"))\n");
+        // - Unix sockets of the desktop session (ssh-agent, gpg-agent, docker); DNS stays.
+        p.push_str("(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n");
+        // - The clipboard.
+        p.push_str("(deny mach-lookup (global-name-prefix \"com.apple.pasteboard\"))\n");
+        // - Keystroke injection into the controlling terminal (TIOCSTI).
+        p.push_str("(deny file-ioctl (literal \"/dev/tty\") (regex #\"^/dev/ttys[0-9]+$\"))\n");
+        // - Signals to anything but the task's own processes (the worker, other tasks).
+        p.push_str("(deny signal)\n(allow signal (target same-sandbox))\n");
         if level == IsolationLevel::FsNet {
             p.push_str("(deny network*)\n");
         }
         p
+    }
+
+    /// The home directory the account database names for this user (`getpwuid_r`), which can
+    /// differ from `$HOME` when the worker was started with another one.
+    #[cfg(target_os = "macos")]
+    fn account_home() -> Option<PathBuf> {
+        use std::ffi::CStr;
+        let mut buf = vec![0u8; 4096];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut out: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: the buffer outlives the call and `pwd`/`out` are valid for writes.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                &mut pwd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut out,
+            )
+        };
+        if rc != 0 || out.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: `pw_dir` points into `buf`, NUL-terminated by getpwuid_r.
+        let dir = unsafe { CStr::from_ptr(pwd.pw_dir) }
+            .to_string_lossy()
+            .into_owned();
+        (!dir.is_empty()).then(|| PathBuf::from(dir))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn account_home() -> Option<PathBuf> {
+        None
+    }
+
+    /// The per-user temporary directory (`DARWIN_USER_TEMP_DIR`, `/var/folders/../T`).
+    #[cfg(target_os = "macos")]
+    fn user_temp_dir() -> Option<PathBuf> {
+        let mut buf = vec![0 as libc::c_char; 1024];
+        // SAFETY: the buffer is valid for `len` bytes.
+        let n =
+            unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr(), buf.len()) };
+        if n == 0 || n > buf.len() {
+            return None;
+        }
+        // SAFETY: confstr NUL-terminates within the buffer when `n <= len`.
+        let text = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        (!text.is_empty()).then(|| PathBuf::from(text))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn user_temp_dir() -> Option<PathBuf> {
+        None
     }
 
     /// The canonical form of `p`; a path that does not exist (yet) is returned as given, with
@@ -322,9 +457,32 @@ mod macos {
         let cargo = canonical(&jail.host.cargo_home);
         let cache = base.join("cache");
 
+        // Further places whose reads are denied: the account's real home (it differs from
+        // `$HOME` when the worker runs with another one), the user temp directory (other tasks'
+        // and tools' scratch files, Blender's temp dirs), and the shared areas a task has no
+        // business in. The task's own sandbox is re-allowed after them.
+        let mut extra: Vec<PathBuf> = Vec::new();
+        let candidates = [
+            account_home(),
+            user_temp_dir(),
+            Some(PathBuf::from("/Users/Shared")),
+            Some(PathBuf::from("/private/tmp")),
+            Some(PathBuf::from("/private/var/tmp")),
+            Some(PathBuf::from("/Volumes")),
+        ];
+        for dir in candidates.into_iter().flatten() {
+            let dir = canonical(&dir);
+            if dir != home && dir != base && !extra.contains(&dir) {
+                extra.push(dir);
+            }
+        }
+
         // Directories on the way to an allowed path that the deny rules cover: their metadata
         // must stay readable for `realpath()`.
-        let denied = [&home, &base, &cache];
+        let denied: Vec<&PathBuf> = [&home, &base, &cache]
+            .into_iter()
+            .chain(extra.iter())
+            .collect();
         let mut ancestors: Vec<PathBuf> = Vec::new();
         for target in [&sandbox_dir, &rustup, &cargo] {
             for dir in target.ancestors().skip(1) {
@@ -342,7 +500,10 @@ mod macos {
             ancestors.push(base.clone());
         }
 
-        let mut args = vec!["-p".to_string(), profile(jail.level, ancestors.len())];
+        let mut args = vec![
+            "-p".to_string(),
+            profile(jail.level, ancestors.len(), extra.len()),
+        ];
         let mut define = |name: &str, value: &Path| {
             args.push("-D".to_string());
             args.push(format!("{name}={}", value.to_string_lossy()));
@@ -355,6 +516,9 @@ mod macos {
         define("CARGO_HOME", &cargo);
         define("CARGO_CRED", &cargo.join("credentials"));
         define("CARGO_CRED_TOML", &cargo.join("credentials.toml"));
+        for (i, dir) in extra.iter().enumerate() {
+            define(&format!("DENIED_{i}"), dir);
+        }
         for (i, dir) in ancestors.iter().enumerate() {
             define(&format!("ANCESTOR_{i}"), dir);
         }
@@ -1650,6 +1814,10 @@ pub(crate) mod windows {
             let mut cmd = tokio::process::Command::new(&comspec);
             cmd.args(["/C", &cmd_line]);
             cmd.current_dir(&probe_dir);
+            cmd.env_clear();
+            for (name, value) in super::inherited_environment(std::env::vars_os()) {
+                cmd.env(name, value);
+            }
             let probe_id = rusty_grid_core::TaskId::new();
             let guard = WindowsAppContainerGuard::create(probe_id, &jail, &cmd)
                 .map_err(|e| fail(format!("AppContainer setup failed: {e}")))?;
@@ -1829,9 +1997,6 @@ pub(crate) mod windows {
 
     fn build_windows_env_block(std_cmd: &std::process::Command) -> Vec<u16> {
         let mut env_map: BTreeMap<String, (OsString, OsString)> = BTreeMap::new();
-        for (k, v) in std::env::vars_os() {
-            env_map.insert(k.to_string_lossy().to_uppercase(), (k, v));
-        }
         for (k, v_opt) in std_cmd.get_envs() {
             let upper = k.to_string_lossy().to_uppercase();
             match v_opt {
@@ -1840,6 +2005,18 @@ pub(crate) mod windows {
                 }
                 None => {
                     env_map.remove(&upper);
+                }
+            }
+        }
+        // `CreateProcessW` with `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` calls
+        // `KernelBase!BasepAppContainerEnvironmentExtension`, which fails with
+        // `ERROR_ENVVAR_NOT_FOUND` (203) if `LOCALAPPDATA` or `SystemRoot` is absent from the
+        // child's environment block.
+        for req in ["SystemRoot", "LOCALAPPDATA"] {
+            let upper = req.to_uppercase();
+            if let std::collections::btree_map::Entry::Vacant(e) = env_map.entry(upper) {
+                if let Some(val) = std::env::var_os(req) {
+                    e.insert((OsString::from(req), val));
                 }
             }
         }
@@ -2104,6 +2281,30 @@ mod tests {
     }
 
     #[test]
+    fn test_inherited_environment_is_an_allowlist() {
+        let os = |s: &str| std::ffi::OsString::from(s);
+        let vars = [
+            ("PATH", "/bin"),
+            ("LANG", "C"),
+            ("LC_ALL", "C"),
+            ("LC_", "x"),
+            ("GITHUB_TOKEN", "t"),
+            ("AWS_SECRET_ACCESS_KEY", "k"),
+            ("OXIDESWARM_SECRET", "s"),
+            ("OXIDESWARM_SECRET_FILE", "/f"),
+            ("HOME", "/Users/u"),
+            ("RUSTY_GRID_RUN_TOKEN", "t"),
+            ("TERM", "xterm"),
+        ]
+        .map(|(k, v)| (os(k), os(v)));
+        let kept: Vec<String> = inherited_environment(vars)
+            .into_iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(kept, ["PATH", "LANG", "LC_ALL", "TERM"]);
+    }
+
+    #[test]
     fn test_prepare_environment_keeps_a_task_chosen_toolchain_location() {
         let mut env = HashMap::new();
         env.insert("CARGO_HOME".to_string(), "/sb/task1/.cargo".to_string());
@@ -2140,7 +2341,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_seatbelt_profile_orders_deny_allow_deny_and_adds_network_rule_for_fs_net() {
-        let fs = macos::profile(IsolationLevel::Fs, 2);
+        let fs = macos::profile(IsolationLevel::Fs, 2, 1);
         let at = |needle: &str| {
             fs.find(needle)
                 .unwrap_or_else(|| panic!("{needle} missing in\n{fs}"))
@@ -2153,8 +2354,23 @@ mod tests {
         assert!(fs.contains("(deny file-write* (subpath \"/\"))"));
         assert!(fs.contains("(literal (param \"ANCESTOR_1\"))"));
         assert!(!fs.contains("ANCESTOR_2"));
-        assert!(!fs.contains("network"), "fs does not touch the network");
-        let net = macos::profile(IsolationLevel::FsNet, 0);
+        assert!(
+            !fs.contains("(deny network*)"),
+            "fs does not close the network, only the Unix sockets"
+        );
+        for rule in [
+            "(deny lsopen)",
+            "(deny appleevent-send)",
+            "(deny user-preference-read user-preference-write)",
+            "(deny network-outbound (remote unix-socket))",
+            "(deny mach-lookup (global-name-prefix \"com.apple.pasteboard\"))",
+            "(deny file-ioctl",
+            "(deny signal)\n(allow signal (target same-sandbox))",
+            "(param \"DENIED_0\")",
+        ] {
+            assert!(fs.contains(rule), "{rule} missing in\n{fs}");
+        }
+        let net = macos::profile(IsolationLevel::FsNet, 0, 0);
         assert!(net.ends_with("(deny network*)\n"));
         assert!(!net.contains("ANCESTOR"));
     }
