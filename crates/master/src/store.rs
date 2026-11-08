@@ -552,6 +552,15 @@ struct Writer {
     shared: Arc<Shared>,
 }
 
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // Unlock `store.lock` explicitly on the kernel open file description so a concurrent
+        // `fork()` in another thread of the same process (before `execve` closes `O_CLOEXEC`
+        // descriptors) or an unwinding writer thread cannot keep `flock` held past `join()`.
+        let _ = self._lock.unlock();
+    }
+}
+
 impl Writer {
     fn run(mut self, rx: mpsc::Receiver<Cmd>) {
         let mut next = rx.recv().ok();

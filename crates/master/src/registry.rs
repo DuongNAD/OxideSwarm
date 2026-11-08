@@ -801,6 +801,23 @@ impl WorkerRegistry {
         }
     }
 
+    /// Credits `count` adopted tasks (`WorkerMessage::ResumeSession`) to `session_id`'s active task
+    /// count and marks the worker `Busy` if it was `Connected`.
+    pub async fn add_adopted_tasks(&self, worker_id: &Uuid, session_id: u64, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut inner = self.inner.write().await;
+        if let Some(entry) = inner.workers.get_mut(worker_id) {
+            if entry.session_id == session_id && entry.status != WorkerStatus::Disconnected {
+                entry.active_tasks = entry.active_tasks.saturating_add(count);
+                if entry.status == WorkerStatus::Connected {
+                    entry.status = WorkerStatus::Busy;
+                }
+            }
+        }
+    }
+
     /// Records that `worker_id` handed a task back without running it (battery, capability or
     /// sandbox rejection) and excludes it from scheduling for an exponentially growing cooldown.
     ///
@@ -1062,6 +1079,41 @@ impl WorkerRegistry {
             .await
             .map_err(|_| GridError::ConnectionClosed)?;
         Ok(())
+    }
+
+    /// Sends a `MasterMessage::CancelTask` carrying [`master_features::format_result_ack_reason`]
+    /// to `(worker_id, session_id)` if the session is still connected and negotiated
+    /// [`ProtocolCapabilities::SESSION_RESUME`].
+    pub async fn send_result_ack(
+        &self,
+        worker_id: &Uuid,
+        session_id: Option<u64>,
+        task_id: rusty_grid_core::task::TaskId,
+        ack_token: u64,
+    ) {
+        let sender = {
+            let inner = self.inner.read().await;
+            let Some(entry) = inner.workers.get(worker_id) else {
+                return;
+            };
+            if entry.status == WorkerStatus::Disconnected
+                || !entry
+                    .features
+                    .contains(ProtocolCapabilities::SESSION_RESUME)
+                || session_id.is_some_and(|s| entry.session_id != s)
+            {
+                return;
+            }
+            entry.sender.clone()
+        };
+        let _ = sender
+            .send(MasterMessage::CancelTask {
+                task_id,
+                reason: Some(
+                    rusty_grid_core::protocol::master_features::format_result_ack_reason(ack_token),
+                ),
+            })
+            .await;
     }
 
     /// Broadcasts a MasterMessage to all active workers. Returns the count of successful transmissions.
