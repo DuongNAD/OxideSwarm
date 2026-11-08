@@ -577,6 +577,21 @@ fn write_private_new(path: &Path, data: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
+/// Unix: gives `tmp` the mode of the file `path` it will replace (nothing if there is none).
+#[cfg(unix)]
+fn inherit_mode(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    match std::fs::metadata(path) {
+        Ok(meta) => std::fs::set_permissions(tmp, meta.permissions()),
+        Err(_) => Ok(()),
+    }
+}
+
+/// Windows: the private temporary file keeps its protected owner-only DACL through the rename.
+#[cfg(not(unix))]
+fn inherit_mode(_tmp: &Path, _path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Writes the planned config file: a private backup `<name>.bak-<unix seconds>` of the old file
 /// first (when there is one), then the new text through a temporary file and a rename. Returns the
 /// backup path.
@@ -618,13 +633,7 @@ pub fn apply_plan(
     // given the old file, so no moment exists at which the content is readable more widely than
     // the old file was.
     let result = write_private_new(&tmp, plan.text.as_bytes())
-        .and_then(|()| {
-            #[cfg(unix)]
-            if let Ok(meta) = std::fs::metadata(path) {
-                return std::fs::set_permissions(&tmp, meta.permissions());
-            }
-            Ok(())
-        })
+        .and_then(|()| inherit_mode(&tmp, path))
         .and_then(|()| std::fs::rename(&tmp, path));
     result.map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
