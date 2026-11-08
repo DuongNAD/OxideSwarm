@@ -25,3 +25,8 @@ jobs:
       - run: cargo test -p rusty_grid_worker --lib isolation --locked
       - if: always()
         run: cargo test -p rusty_grid_worker --test test_feat3_os_isolation --locked -- --nocapture --test-threads=4
+      - name: user namespaces allowed (AppArmor restriction off)
+        if: always()
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          RUSTY_GRID_REQUIRE_USERNS=1 cargo test -p rusty_grid_worker --test test_feat3_os_isolation --locked -- --nocapture --test-threads=4

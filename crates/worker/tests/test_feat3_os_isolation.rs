@@ -1182,6 +1182,7 @@ ls "$T_BASE/$T_PEER" > /dev/null 2>&1 && echo LEAK_LIST || echo DENY_LIST
 ( echo x > "$T_BASE/$T_PEER/planted.txt" ) 2>/dev/null && echo LEAK_WRITE || echo DENY_WRITE
 echo done > done.txt
 i=0; while [ ! -e "$T_BASE/$T_PEER/done.txt" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
+sleep 1   # the peer must see this task's done.txt before the sandbox goes away
 "#;
         for (level, must_leak) in [
             (IsolationLevel::Off, true),
@@ -1420,6 +1421,66 @@ except OSError as e:
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 other => panic!("{level}: the listener must see nothing: {other:?}"),
             }
+        }
+    }
+
+    /// `fs+net` enters a private user and network namespace when the host allows unprivileged
+    /// user namespaces, with the task's ids mapped to themselves; where it does not (sysctl,
+    /// AppArmor), seccomp alone enforces the level and every other test still holds.
+    /// `RUSTY_GRID_REQUIRE_USERNS=1` (CI) turns "not entered" into a failure.
+    #[tokio::test]
+    async fn test_fs_net_enters_a_private_namespace_when_the_host_allows_it() {
+        require_landlock!();
+        if !python3() {
+            eprintln!("skipped: no python3");
+            return;
+        }
+        let py = r#"
+import os, socket
+print("NETNS=" + os.readlink("/proc/self/ns/net"))
+print("UID=%d" % os.getuid())
+print("GID=%d" % os.getgid())
+try:
+    socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0).close()
+    print("NETLINK=OK")
+except OSError as e:
+    print("NETLINK=ERR%d" % e.errno)
+"#;
+        // `exec` keeps the interpreter the task leader, the one process whose `/proc/self` the
+        // policy allows.
+        let script = r#"exec python3 -c "$T_PY""#;
+        let value = |result: &TaskResult, key: &str| {
+            lines(result)
+                .iter()
+                .find_map(|l| l.strip_prefix(&format!("{key}=")).map(str::to_string))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{key} missing in {:?} {}",
+                        lines(result),
+                        result.stderr_str()
+                    )
+                })
+        };
+        let worker_netns = std::fs::read_link("/proc/self/ns/net").unwrap();
+        let worker_ids = unsafe { (libc::getuid(), libc::getgid()) };
+        let fs = run_at(IsolationLevel::Fs, script, &[("T_PY", py)]).await;
+        assert_eq!(value(&fs, "NETNS"), worker_netns.to_string_lossy());
+        let net = run_at(IsolationLevel::FsNet, script, &[("T_PY", py)]).await;
+        let netns = value(&net, "NETNS");
+        if netns == worker_netns.to_string_lossy() {
+            assert!(
+                std::env::var_os("RUSTY_GRID_REQUIRE_USERNS").is_none(),
+                "the task did not enter a private network namespace"
+            );
+            eprintln!("note: unprivileged user namespaces are unavailable here, seccomp only");
+        } else {
+            assert_eq!(
+                value(&net, "UID"),
+                worker_ids.0.to_string(),
+                "ids are mapped to themselves"
+            );
+            assert_eq!(value(&net, "GID"), worker_ids.1.to_string());
+            assert!(has(&net, "NETLINK=OK"), "{:?}", lines(&net));
         }
     }
 
