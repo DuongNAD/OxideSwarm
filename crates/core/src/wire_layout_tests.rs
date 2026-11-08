@@ -658,6 +658,7 @@ fn client_responses() -> Vec<(&'static str, ClientResponse)> {
                 workers: vec![worker_capabilities(2)],
                 active_bytes: 601_029,
                 max_active_bytes: 268_435_456,
+                store_error: Some("cannot sync journal.bin: Input/output error".into()),
             },
         ),
         (

@@ -1002,13 +1002,16 @@ async fn tool_status(state: &McpState, args: &Value) -> ToolCallResult {
                 workers,
                 active_bytes,
                 max_active_bytes,
+                store_error,
             }) => {
                 let connected_count = workers
                     .iter()
                     .filter(|w| tag_value(&w.tags, STATE_TAG_PREFIX) != Some("disconnected"))
                     .count();
 
-                let cluster_status = if connected_count > 0 {
+                let cluster_status = if store_error.is_some() {
+                    "degraded"
+                } else if connected_count > 0 {
                     "ok"
                 } else {
                     "no_workers"
@@ -1032,6 +1035,9 @@ async fn tool_status(state: &McpState, args: &Value) -> ToolCallResult {
                     "active_bytes": active_bytes,
                     "max_active_bytes": max_active_bytes,
                 });
+                if let Some(err) = store_error {
+                    summary["store_error"] = Value::String(err);
+                }
 
                 if include_workers {
                     let worker_list: Vec<Value> = workers

@@ -190,14 +190,35 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
    ```
 3. **Durability (`sync_data`) boundary and `5 ms` group commit:**
    - **Sync set:** `TaskSubmitted`, `TaskRequeued`, `CheckpointRecorded`, `TaskTerminal`, and
-     `TaskRunning` (when the task's effective `max_retries == 0`, so the "already started once"
-     fact cannot be lost in a crash) are durable records that call `File::sync_data()` before the
-     caller acknowledges the operation. Syncing `TaskRequeued` guarantees that `retry_count`,
+     `TaskDispatched` / `TaskRunning` (when the task's effective `max_retries == 0`, so the
+     "already dispatched or started once" fact cannot be lost in a crash) are durable records that
+     call `File::sync_data()`. Syncing `TaskRequeued` guarantees that `retry_count`,
      `failover_count`, `evacuation_count`, and `rejection_count` never roll backward across a crash
      and grant a task more retries than its budget.
-   - **`5 ms` group commit for `TaskSubmitted` (and concurrent durable records):**
-     - A MapReduce job or an MCP burst of 1,000 task submissions must not execute 1,000 sequential
-       `sync_data()` syscalls.
+   - **Submission gate vs. in-flight transition behaviour on storage failure:**
+     - On `submit` / `try_submit_slot` / `submit_with_priority`, `TaskQueue` checks store health
+       and enqueues `TaskSubmitted` before mutating `inner.tasks` or advancing `next_sequence`,
+       and holds off inserting the task into `ready_queue` until the `DurableAck` resolves inside a
+       spawned task (`tokio::spawn`) that the caller awaits. Because the `DurableAck` resolution and
+       `ready_queue` insertion (or rollback on `Err(GridError::Storage)`) run in that spawned task,
+       a concurrent scheduler pass cannot dispatch an un-synced task during the `5 ms` group-commit
+       window, and dropping or aborting the caller's `submit` future mid-ack still completes the
+       `ready_queue` insertion (or rollback) consistently with `journal.bin` rather than leaving a
+       zombie `Queued` task outside `ready_queue`.
+     - Once a task has been admitted, subsequent transitions (`record_result_from`,
+       `cancel_task_detailed`, `fail_unsendable_assignment`, `requeue_task`, `mark_running_from`,
+       `record_checkpoint`) commit in memory first and log a `tracing::warn!` if `append_durable`
+       or `DurableAck` fails, so a degraded disk never leaks worker capacity slots, leaves task
+       blobs pinned forever, or strands awaiting clients. Once the store fails, durability is gone
+       until a restart; the failure reason is surfaced via `TaskStore::failure_reason()`,
+       `QueueStats::store_error`, `ClientResponse::ClusterStatus.store_error` (bumping
+       `PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE` to `5`),
+       `ClusterStatusDto::store_error`, and `oxideswarm doctor` (which records a failed `Task store`
+       check).
+   - **`5 ms` group commit for `TaskSubmitted` and `TaskTerminal` (and concurrent durable records):**
+     - A MapReduce job, an MCP burst of 1,000 task submissions, or a worker returning a burst of
+       task results on a single connection must not execute one sequential `sync_data()` syscall per
+       message.
      - `TaskStore` runs a dedicated writer loop fed by an `mpsc` channel of `(JournalRecord,
        Option<oneshot::Sender<GridResult<()>>>)`.
      - When the first record requiring `sync_data()` arrives, the writer appends it to the OS buffer
@@ -205,7 +226,12 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
        records have accumulated) to coalesce any concurrent submissions/transitions arriving in the
        same window, calls `File::sync_data()` **once** for the entire batch, and then signals all
        waiting `oneshot::Sender` handles together.
-   - Non-synced transitions (`TaskDispatched`, `TaskRunning` when `max_retries > 0`, `TaskAdopted`,
+     - On the worker session inbound path (`handle_session_task_message`), `apply_task_result_inner`
+       enqueues `TaskTerminal` via `record_result_from_enqueued`, releases the worker slot and unpins
+       blobs immediately, and awaits the `DurableAck` + wakes completion `waiters` in a spawned task
+       so sequential `WorkerMessage::TaskResult` frames on one connection coalesce inside the same
+       `5 ms` group-commit window.
+   - Non-synced transitions (`TaskDispatched` and `TaskRunning` when `max_retries > 0`, `TaskAdopted`,
      `TaskEvicted`) are written to `journal.bin` without blocking on `sync_data()`.
 4. **Torn-tail tolerance, mid-file corruption, and `GridError::Storage`:**
    - Add `GridError::Storage(String)` (`#[error("Storage error: {0}")]`) in
@@ -274,7 +300,11 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
          syncs `JournalRecord::TaskTerminal`, and wakes any completion waiters.
        - Otherwise, `adoptable_by` is cleared and the task becomes eligible in `ready_queue` for
          the scheduler to dispatch.
-3. **Re-pinning blobs on replay:**
+3. **Store-health reporting, visibility before `fsync`, and clean-shutdown fencing (`D3.3`):**
+   - **Store-health reporting:** Once the store fails, durability is gone until a restart. `TaskStore::failure_reason(&self) -> Option<String>` exposes the writer's failure reason; `TaskQueue::stats()` populates `QueueStats::store_error`, which flows into `ClientResponse::ClusterStatus.store_error` (`crates/core/src/protocol.rs`, protocol version `5`), `ClusterStatusDto::store_error` (`crates/master/src/dashboard/dto.rs`), `oxideswarm status`, MCP `cluster_status`, and `oxideswarm doctor` (`crates/cli/src/doctor.rs`, which records `Outcome::Fail` on `C1 Task store` whenever `store_error` is `Some`).
+   - **Visibility and schedulability relative to `fsync`:** A task is schedulable only after its `TaskSubmitted` `DurableAck` resolves (an acknowledged `submit`), and a `Completed` result is readable in `get_task` / `get_result` immediately when `record_result_from_enqueued` commits in memory, before that result's own `fsync` (which gates `--wait` completion waiters) or a subsequent result's `fsync` completes.
+   - **Clean-shutdown boundary (`store_closed`):** When `MasterServer::run` (or `MasterHandle::shutdown`) calls `close_and_compact_store` / `close_and_compact_store_sync`, `TaskQueueInner::store_closed` is set to `true` atomically under the queue write lock before writing the final `snapshot.bin`. Once `store_closed` is `true`, new submissions (`submit_with_priority`, `try_submit_slot`) and post-shutdown results (`record_result_from_enqueued`) return `Err(GridError::Storage("task store is closed (master shutting down)"))`, and post-shutdown worker session teardown (`handle_session_disconnected`, `handle_session_evacuated`) leaves in-flight task states untouched so workers still transition to `Disconnected` in `WorkerRegistry` without charging `failover_count` after the final snapshot is written.
+4. **Re-pinning blobs on replay:**
    - When `blob_store` is enabled alongside `state_dir`, startup replay re-pins `task.inputs` for
      every recovered non-terminal task and re-pins `result.outputs` for every recovered terminal
      task so the blob store sweeper (`crates/master/src/server.rs:942-944`) does not evict their
@@ -438,8 +468,12 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
 
 - **Wire protocol version:** Adding `WorkerMessage::ResumeSession` (and removing the deprecated
   `compute_intensity` field from `TaskSpec::GpuCompute`) in `F1-b` bumps `PROTOCOL_VERSION_CURRENT`
-  and `PROTOCOL_VERSION_MIN_COMPATIBLE` from `3` to `4` in `crates/core/src/protocol.rs:31-33` and
-  updates `crates/core/tests/data/wire_layout.txt` (enforced by `crates/core/src/wire_layout_tests.rs`).
+  and `PROTOCOL_VERSION_MIN_COMPATIBLE` from `3` to `4` in `crates/core/src/protocol.rs:31-33`, and
+  adding `store_error: Option<String>` to `ClientResponse::ClusterStatus` in `F1-a` wiring (pull
+  request #147, D3.3) bumps `PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE` from `4`
+  to `5` (with `LegacyV3V4BinaryClientResponse` so a v5 client reports a clear
+  `Incompatible protocol version 4` error from a v4 master) and updates
+  `crates/core/tests/data/wire_layout.txt` (enforced by `crates/core/src/wire_layout_tests.rs`).
 - **On-disk state across protocol version upgrades (path (a) — self-describing JSON snapshot on clean shutdown):**
   - Both `journal.bin` and `snapshot.bin` record `protocol_version: u32` (`PROTOCOL_VERSION_CURRENT`)
     in bytes `12..16` of their 24-byte file header (D2.1).
@@ -554,7 +588,7 @@ lands as a self-contained, reviewable unit.
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
 | F1-design | Design record `0046` for master durability and worker session resume | `docs/design/0046-master-durability.md`, `docs/design/0044-dead-code-and-connection-loop-unification.md`, `docs/README.md` | Design record reviewed and accepted by the owner | Implemented |
-| F1-a | Append-only task journal, `5 ms` group commit, self-describing JSON snapshot compaction, `GridError::Storage`, `--state-dir`, and startup replay (`Scheduled`/`Running` -> `Queued` uncharged, `Running` with `max_retries == 0` -> `Failed` when unresumed, terminal results & queued tasks restored, blob re-pinning) | `crates/core/src/error.rs`, `crates/master/src/store.rs`, `crates/master/src/lib.rs`, `crates/master/src/queue.rs`, `crates/master/src/server.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `README.md`, `docs/SECURITY.md`, `DEPLOYMENT.md` | Unit tests in `crates/master/src/store.rs` and `queue.rs` pass (round-trip, torn-tail recovery, mid-file corruption error, JSON snapshot across protocol versions, uncompacted version-mismatch error, 1,000-task group-commit timing test, lock exclusion, uncharged replay, and `Running` + `max_retries == 0` unresumed failure test) | Planned |
+| F1-a | Append-only task journal, `5 ms` group commit, self-describing JSON snapshot compaction, `GridError::Storage`, `--state-dir`, and startup replay (`Scheduled`/`Running` -> `Queued` uncharged, `Running` with `max_retries == 0` -> `Failed` when unresumed, terminal results & queued tasks restored, blob re-pinning) | `crates/core/src/error.rs`, `crates/master/src/store.rs`, `crates/master/src/lib.rs`, `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/master/src/server.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `tests/master_restart_recovery.rs`, `README.md`, `docs/SECURITY.md`, `DEPLOYMENT.md` | Unit tests in `crates/master/src/store.rs`, `queue.rs`, and `server.rs` plus `tests/master_restart_recovery.rs` pass (round-trip, torn-tail recovery, mid-file corruption error, JSON snapshot across protocol versions, uncompacted version-mismatch error, 1,000-task group-commit timing test, lock exclusion, uncharged replay, `Running` + `max_retries == 0` unresumed failure, blob re-pinning, and end-to-end master restart recovery) | Implemented |
 | F1-b wire | `ProtocolCapabilities::SESSION_RESUME` (defined, not yet advertised in `all_supported()`), `master_features` `session-resume=<secs>` with `MAX_SESSION_RESUME_HOLD_SECS = 3_600`, `WorkerMessage::ResumeSession` (accepted on `LaneKind::Unified \| LaneKind::Control`), and wire removal of deprecated `compute_intensity` (protocol bump `3 -> 4`) | `crates/core/src/protocol.rs`, `crates/core/src/task.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/master/src/session.rs`, `crates/master/src/server.rs`, `crates/worker/src/runner.rs`, `DEPLOYMENT.md`, `README.md`, `CLAUDE.md`, `docs/BACKLOG.md`, `docs/design/0044-dead-code-and-connection-loop-unification.md`, `docs/design/0046-master-durability.md` | Wire round-trip, hold-bound, and golden-bytes tests pass at protocol version 4; `SESSION_RESUME` is not advertised in `all_supported()` yet; `compute_intensity` is removed from `TaskSpec::GpuCompute` | Implemented |
 | F1-b master adoption | `--session-resume-hold-secs`, advertising `SESSION_RESUME` / `session-resume=<secs>`, and master task adoption + `adoptable_by` / `pending_failover_charge` | `crates/core/src/protocol.rs`, `crates/master/src/queue.rs`, `crates/master/src/session.rs`, `crates/master/src/server.rs`, `crates/master/src/registry.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs` | Master unit tests prove `adoptable_by` holds replayed/disconnected running tasks from duplicate dispatch, `ResumeSession` adopts them into `Running`, expired holds charge deferred failovers or fail `max_retries == 0` tasks, and unknown/cancelled/expired tasks receive `CancelTask` | Planned |
 | F1-c | Worker session-resume grace inequality (`hold - dead_peer_timeout - margin`, `--session-resume-grace-secs` clamp), disconnected outbox buffering with `BlobClient` output blob upload before `TaskResult`, and `tests/master_restart_recovery.rs` | `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `crates/master/Cargo.toml`, `tests/master_restart_recovery.rs`, `README.md`, `docs/design/0046-master-durability.md` | `cargo test -p rusty_grid_master --test master_restart_recovery --locked` passes both the 4-task master restart recovery test and the expired-hold reconnect test, proving every task runs **exactly once** | Planned |
@@ -593,3 +627,13 @@ lands as a self-contained, reviewable unit.
   `master_features` `session-resume=<secs>` helpers bounded by `MAX_SESSION_RESUME_HOLD_SECS = 3_600`,
   appended `WorkerMessage::ResumeSession` (routed on `LaneKind::Unified | LaneKind::Control`),
   removed `TaskSpec::GpuCompute::compute_intensity` from the wire, and regenerated `wire_layout.txt`.
+- **2026-11-08:** Implemented `F1-a` wiring (PR #147): wired `TaskStore` into `TaskQueue` (journal
+  emission with durable `DurableAck` awaited in a spawned task outside the queue write lock, startup
+  replay of all D2.5 task states, `adoptable_by` / `fail_if_not_adopted` hold handling, input/output
+  blob re-pinning, and threshold/shutdown snapshot compaction), `MasterServer`
+  (`ServerConfig::with_state_dir`, default `<state_dir>/blobs` blob store, `TaskStore::open` before
+  binding listeners, shutdown compaction), `oxideswarm master --state-dir` (`RUSTY_GRID_STATE_DIR`,
+  `[master].state_dir`), store-health visibility (`TaskStore::failure_reason`, `QueueStats::store_error`,
+  `ClientResponse::ClusterStatus.store_error` in protocol version 5 with `LegacyV3V4BinaryClientResponse`
+  fallback, `ClusterStatusDto::store_error`, `#storeErrorBanner` in `dashboard.html`, and `C1 Task store`
+  failure check in `oxideswarm doctor`), and `tests/master_restart_recovery.rs`.

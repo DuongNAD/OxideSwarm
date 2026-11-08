@@ -210,3 +210,10 @@ Because `WireCodec` and the 1-byte frame discriminator (`0x01` JSON, `0x02` Binc
   baseline check after regeneration under `UPDATE_WIRE_LAYOUT=1` and name the baseline ref in
   failure messages, document JSON `Register` / `RegisterAck` refusal when `"protocol_version"` is
   omitted, and schedule the lightweight `Hello` version probe variant for `0039` W1.
+- 2026-11-08: Protocol version 4 (pull request #141, `FEAT-1` `F1-b wire`): added
+  `WorkerMessage::ResumeSession`, `ProtocolCapabilities::SESSION_RESUME`, and `master_features`
+  `session-resume=<secs>`, and removed deprecated `TaskSpec::GpuCompute::compute_intensity`.
+- 2026-11-08: Protocol version 5 (pull request #147, `FEAT-1` `F1-a` wiring): added
+  `store_error: Option<String>` to `ClientResponse::ClusterStatus` (plus `LegacyV3V4BinaryClientResponse`
+  fallback so a v5 client reports a clear `Incompatible protocol version 4` error from a v4 master)
+  and regenerated `crates/core/tests/data/wire_layout.txt`.

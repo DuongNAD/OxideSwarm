@@ -86,6 +86,8 @@ pub struct MasterFileConfig {
     pub blob_dir: Option<String>,
     /// Megabytes the blob store may hold (`master --blob-store-mb`).
     pub blob_store_mb: Option<u64>,
+    /// Directory of the durable task queue state (`master --state-dir`).
+    pub state_dir: Option<String>,
     /// Allow a master that is reachable beyond this machine to run without a cluster secret.
     pub insecure: Option<bool>,
     pub secret_file: Option<String>,
@@ -562,6 +564,7 @@ mod tests {
 listen = "127.0.0.1:9090"
 port_file = "/tmp/port.txt"
 heartbeat_interval_secs = 5
+state_dir = "/var/lib/oxideswarm/master-state"
 
 [worker]
 master = "127.0.0.1:9090"
@@ -576,6 +579,10 @@ gpu_name = "Mock RTX"
         let master = parsed_toml.master.unwrap();
         assert_eq!(master.listen.as_deref(), Some("127.0.0.1:9090"));
         assert_eq!(master.heartbeat_interval_secs, Some(5));
+        assert_eq!(
+            master.state_dir.as_deref(),
+            Some("/var/lib/oxideswarm/master-state")
+        );
 
         let worker = parsed_toml.worker.unwrap();
         assert_eq!(worker.simulate_gpu, Some(true));
