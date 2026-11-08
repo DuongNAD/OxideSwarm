@@ -699,12 +699,16 @@ pub(crate) mod windows {
 
     fn ensure_window_station_and_desktop_access(any_pkg_sid: PSID) {
         WINSTA_PREPARED.get_or_init(|| unsafe {
-            // WINSTA_ALL_ACCESS (0x37F) | STANDARD_RIGHTS_REQUIRED (0x000F0000)
+            // Grant only read/enumerate/atom attributes on the Window Station (`0x0002_0363`),
+            // explicitly omitting `WINSTA_READCLIPBOARD` (0x0004), `WINSTA_ACCESSCLIPBOARD`
+            // (0x0008), `WINSTA_WRITEATTRIBUTES` (0x0010), `DELETE`, `WRITE_DAC`, and `WRITE_OWNER`.
             let winsta = GetProcessWindowStation();
-            grant_window_object_access(winsta, any_pkg_sid, 0x000F_037F);
-            // DESKTOP_ALL_ACCESS (0x1FF) | STANDARD_RIGHTS_REQUIRED (0x000F0000)
+            grant_window_object_access(winsta, any_pkg_sid, 0x0002_0363);
+            // Grant only standard desktop connection rights (`0x0002_01C3`), explicitly omitting
+            // `DESKTOP_HOOKCONTROL` (0x0008), `DESKTOP_JOURNALRECORD` (0x0010),
+            // `DESKTOP_JOURNALPLAYBACK` (0x0020), `DELETE`, `WRITE_DAC`, and `WRITE_OWNER`.
             let desktop = GetThreadDesktop(GetCurrentThreadId());
-            grant_window_object_access(desktop, any_pkg_sid, 0x000F_01FF);
+            grant_window_object_access(desktop, any_pkg_sid, 0x0002_01C3);
         });
     }
 
@@ -734,7 +738,7 @@ pub(crate) mod windows {
             }
             return;
         }
-        let entry = explicit_access(any_pkg_sid, access_mask, GRANT_ACCESS, NO_INHERITANCE);
+        let entry = explicit_access(any_pkg_sid, access_mask, SET_ACCESS, NO_INHERITANCE);
         let mut new_dacl: *mut ACL = std::ptr::null_mut();
         let rc = unsafe { SetEntriesInAclW(1, &entry, old_dacl, &mut new_dacl) };
         if rc == ERROR_SUCCESS && !new_dacl.is_null() {
@@ -1441,6 +1445,31 @@ pub(crate) mod windows {
                     deny_any_package_on_path(&sub, any_pkg_sid);
                 }
             }
+            if let Ok(entries) = std::fs::read_dir(home) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    let is_allowed_ancestor = jail.sandbox_dir.starts_with(&p)
+                        || jail.sandbox_base.starts_with(&p)
+                        || jail.host.rustup_home.starts_with(&p)
+                        || jail.host.cargo_home.starts_with(&p)
+                        || cmd_rustup_home.is_some_and(|r| r.starts_with(&p))
+                        || cmd_cargo_home.is_some_and(|c| c.starts_with(&p))
+                        || entry.file_name().eq_ignore_ascii_case("AppData");
+                    if !is_allowed_ancestor
+                        && dacl_already_grants_sid(&p, any_pkg_sid, FILE_READ_ATTRIBUTES)
+                    {
+                        deny_any_package_on_path(&p, any_pkg_sid);
+                    }
+                }
+            }
+        }
+        if let Some(account_home) = std::env::var_os("USERPROFILE")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+        {
+            if account_home != *home && account_home.exists() {
+                deny_list_and_write_non_inherited(&account_home, any_pkg_sid);
+            }
         }
 
         for rustup in [Some(jail.host.rustup_home.as_path()), cmd_rustup_home]
@@ -1771,7 +1800,18 @@ pub(crate) mod windows {
                     FreeSid(self.app_container_sid);
                     self.app_container_sid = std::ptr::null_mut();
                 }
-                let _ = DeleteAppContainerProfile(self.wide_profile_name.as_ptr());
+                let hr = DeleteAppContainerProfile(self.wide_profile_name.as_ptr());
+                if hr < 0 {
+                    let wide_name = std::mem::take(&mut self.wide_profile_name);
+                    std::thread::spawn(move || {
+                        for _ in 0..10 {
+                            std::thread::sleep(std::time::Duration::from_millis(25));
+                            if DeleteAppContainerProfile(wide_name.as_ptr()) >= 0 {
+                                break;
+                            }
+                        }
+                    });
+                }
             }
         }
     }

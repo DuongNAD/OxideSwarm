@@ -1432,6 +1432,357 @@ Write-Output "ID=$i"
             }
         }
     }
+
+    /// M2 on Windows: host named pipes (such as `\\.\pipe\openssh-ssh-agent` or
+    /// `\\.\pipe\docker_engine`) are isolated by the per-task AppContainer named-object directory
+    /// (`\Sessions\<id>\AppContainerNamedObjects\<TaskAppContainerSid>`).
+    #[tokio::test]
+    async fn test_host_named_pipes_cannot_be_connected_to_under_fs() {
+        let pipe_name = format!(
+            "oxideswarm-feat3-pipe-{}-{}",
+            std::process::id(),
+            rusty_grid_core::TaskId::new().0
+        );
+        let script = r#"
+$server = New-Object System.IO.Pipes.NamedPipeServerStream($env:T_PIPE, [System.IO.Pipes.PipeDirection]::InOut, 4)
+try {
+    $client = New-Object System.IO.Pipes.NamedPipeClientStream('.', $env:T_PIPE, [System.IO.Pipes.PipeDirection]::InOut)
+    $client.Connect(1500)
+    $client.Dispose()
+    Write-Output 'PIPE_CONNECTED'
+} catch {
+    Write-Output 'PIPE_REFUSED'
+} finally {
+    $server.Dispose()
+}
+"#;
+        // First verify that a host named pipe created outside the AppContainer is reachable
+        // under `off` and unreachable under `fs` and `fs+net`.
+        let host_pipe_script = r#"
+try {
+    $client = New-Object System.IO.Pipes.NamedPipeClientStream('.', $env:T_PIPE, [System.IO.Pipes.PipeDirection]::InOut)
+    $client.Connect(1500)
+    $client.Dispose()
+    Write-Output 'HOST_PIPE_CONNECTED'
+} catch {
+    Write-Output 'HOST_PIPE_REFUSED'
+}
+"#;
+        let mut host_server = std::process::Command::new(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        )
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "$s1 = New-Object System.IO.Pipes.NamedPipeServerStream('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
+                 $s2 = New-Object System.IO.Pipes.NamedPipeServerStream('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
+                 $s3 = New-Object System.IO.Pipes.NamedPipeServerStream('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
+                 Write-Output 'READY'; Start-Sleep -Seconds 30"
+            ),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn host pipe server");
+
+        // Wait for the host pipe instances to be created.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let control_rig = Rig::new(IsolationLevel::Off, false);
+        let control = control_rig
+            .runner
+            .execute_task(
+                &win_task(
+                    &control_rig,
+                    host_pipe_script,
+                    &[("T_PIPE", &pipe_name)],
+                    60,
+                ),
+                None,
+                None,
+            )
+            .await;
+        let control_ok = lines(&control).contains(&"HOST_PIPE_CONNECTED".to_string());
+
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let rig = Rig::new(level, false);
+            let result = rig
+                .runner
+                .execute_task(
+                    &win_task(&rig, host_pipe_script, &[("T_PIPE", &pipe_name)], 60),
+                    None,
+                    None,
+                )
+                .await;
+            assert!(
+                lines(&result).contains(&"HOST_PIPE_REFUSED".to_string()),
+                "{level}: host named pipe should be unreachable from AppContainer: {:?}",
+                lines(&result)
+            );
+            // Also verify `\\.\pipe\...` creation/connect inside AppContainer is blocked by
+            // default named-pipe ACLs.
+            let self_res = rig
+                .runner
+                .execute_task(
+                    &win_task(
+                        &rig,
+                        script,
+                        &[("T_PIPE", &format!("{pipe_name}-inner"))],
+                        60,
+                    ),
+                    None,
+                    None,
+                )
+                .await;
+            assert!(
+                !lines(&self_res).contains(&"HOST_PIPE_CONNECTED".to_string()),
+                "{level}: {:?}",
+                lines(&self_res)
+            );
+        }
+
+        let _ = host_server.kill();
+        let _ = host_server.wait();
+        assert!(
+            control_ok,
+            "unconfined control must connect to host named pipe: {:?}",
+            lines(&control)
+        );
+    }
+
+    /// M5 + worker process environment protection on Windows: an AppContainer task runs at Low
+    /// Mandatory Integrity Level and cannot terminate, suspend, or open `PROCESS_VM_READ` /
+    /// `PROCESS_QUERY_INFORMATION` handles to Medium-IL host processes (the worker or foreign
+    /// processes), while still being able to terminate its own child processes.
+    #[tokio::test]
+    async fn test_a_task_cannot_signal_or_inspect_foreign_processes() {
+        let mut victim = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+            .args(["/C", "ping -n 120 127.0.0.1 >nul"])
+            .spawn()
+            .expect("spawn victim");
+        let victim_pid = victim.id().to_string();
+        let worker_pid = std::process::id().to_string();
+
+        let script = r#"
+try {
+    $w = [System.Diagnostics.Process]::GetProcessById([int]$env:WORKER_PID)
+    $h = $w.Handle
+    Write-Output 'WORKER_HANDLE_OPENED'
+} catch {
+    Write-Output 'WORKER_HANDLE_DENIED'
+}
+try {
+    Stop-Process -Id ([int]$env:VICTIM_PID) -Force -ErrorAction Stop
+    Write-Output 'SIGNALLED'
+} catch {
+    Write-Output 'DENIED'
+}
+try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo("$env:SystemRoot\System32\cmd.exe", '/C ping -n 60 127.0.0.1 >nul')
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $own = [System.Diagnostics.Process]::Start($psi)
+    $own.Kill()
+    $own.WaitForExit(5000) | Out-Null
+    Write-Output 'OWN_CHILD_OK'
+} catch {
+    Write-Output 'OWN_CHILD_FAIL'
+}
+"#;
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let rig = Rig::new(level, false);
+            let result = rig
+                .runner
+                .execute_task(
+                    &win_task(
+                        &rig,
+                        script,
+                        &[("VICTIM_PID", &victim_pid), ("WORKER_PID", &worker_pid)],
+                        60,
+                    ),
+                    None,
+                    None,
+                )
+                .await;
+            let got = lines(&result);
+            assert!(
+                got.contains(&"WORKER_HANDLE_DENIED".to_string()),
+                "{level}: AppContainer must not open worker process handle: {got:?}"
+            );
+            assert!(
+                got.contains(&"DENIED".to_string()),
+                "{level}: AppContainer must not terminate foreign process: {got:?}"
+            );
+            assert!(
+                got.contains(&"OWN_CHILD_OK".to_string()),
+                "{level}: AppContainer must still be able to terminate its own child: {got:?}"
+            );
+        }
+
+        // Control (`off`): can open worker handle and terminate the victim process.
+        let control_rig = Rig::new(IsolationLevel::Off, false);
+        let control = control_rig
+            .runner
+            .execute_task(
+                &win_task(
+                    &control_rig,
+                    script,
+                    &[("VICTIM_PID", &victim_pid), ("WORKER_PID", &worker_pid)],
+                    60,
+                ),
+                None,
+                None,
+            )
+            .await;
+        let _ = victim.kill();
+        let _ = victim.wait();
+        let control_got = lines(&control);
+        assert!(
+            control_got.contains(&"WORKER_HANDLE_OPENED".to_string())
+                && control_got.contains(&"SIGNALLED".to_string()),
+            "unconfined control must open handle and terminate victim: {control_got:?}"
+        );
+    }
+
+    /// H2 on Windows: the owner's `HKCU\Software\...` registry keys cannot be read or written
+    /// by a confined AppContainer task.
+    #[tokio::test]
+    async fn test_registry_of_the_owner_is_neither_read_nor_written() {
+        let pid = std::process::id();
+        let read_key = format!(r"HKCU\Software\OxideSwarmFeat3Read_{pid}");
+        let write_key = format!(r"HKCU\Software\OxideSwarmFeat3Write_{pid}");
+        let reg = |args: &[&str]| {
+            std::process::Command::new(r"C:\Windows\System32\reg.exe")
+                .args(args)
+                .output()
+        };
+        let cleanup = || {
+            let _ = reg(&["delete", &read_key, "/f"]);
+            let _ = reg(&["delete", &write_key, "/f"]);
+        };
+        if !reg(&[
+            "add",
+            &read_key,
+            "/v",
+            "secret",
+            "/t",
+            "REG_SZ",
+            "/d",
+            "owner-registry-value",
+            "/f",
+        ])
+        .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skipped: cannot write test registry key");
+            return;
+        }
+
+        let script = format!(
+            r#"
+$r = & "$env:SystemRoot\System32\reg.exe" query "{read_key}" /v secret 2>$null
+Write-Output "READ=$($r -join ' ')"
+& "$env:SystemRoot\System32\reg.exe" add "{write_key}" /v planted /t REG_SZ /d yes /f >$null 2>$null
+Write-Output "WRITE_RC=$LASTEXITCODE"
+"#
+        );
+
+        let control_rig = Rig::new(IsolationLevel::Off, false);
+        let control = control_rig
+            .runner
+            .execute_task(&win_task(&control_rig, &script, &[], 60), None, None)
+            .await;
+        let control_reads = control.stdout_str().contains("owner-registry-value");
+        let _ = reg(&["delete", &write_key, "/f"]);
+        if !control_reads {
+            cleanup();
+            eprintln!("skipped: registry key not readable even unconfined");
+            return;
+        }
+
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let rig = Rig::new(level, false);
+            let result = rig
+                .runner
+                .execute_task(&win_task(&rig, &script, &[], 60), None, None)
+                .await;
+            assert!(
+                !result.stdout_str().contains("owner-registry-value"),
+                "{level}: AppContainer read owner's HKCU registry secret: {}",
+                result.stdout_str()
+            );
+            let planted =
+                reg(&["query", &write_key, "/v", "planted"]).is_ok_and(|o| o.status.success());
+            assert!(
+                !planted,
+                "{level}: AppContainer wrote into owner's HKCU registry"
+            );
+        }
+        cleanup();
+    }
+
+    /// M3 on Windows: Window Station DACL for `ALL APPLICATION PACKAGES` omits
+    /// `WINSTA_READCLIPBOARD` and `WINSTA_ACCESSCLIPBOARD`, and AppContainer isolation prevents
+    /// reading the user's clipboard (`Get-Clipboard`).
+    #[tokio::test]
+    async fn test_clipboard_is_not_readable() {
+        let script = r#"
+try {
+    $c = Get-Clipboard -ErrorAction Stop
+    if ($null -ne $c -and "$c".Length -gt 0) {
+        Write-Output "CLIP_LEAK=$c"
+    } else {
+        Write-Output 'CLIP_EMPTY'
+    }
+} catch {
+    Write-Output 'CLIP_DENIED'
+}
+"#;
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let rig = Rig::new(level, false);
+            let result = rig
+                .runner
+                .execute_task(&win_task(&rig, script, &[], 60), None, None)
+                .await;
+            assert!(
+                !result.stdout_str().contains("CLIP_LEAK="),
+                "{level}: task read the clipboard: {}",
+                result.stdout_str()
+            );
+        }
+    }
+
+    /// Design 0033 D4.6: `DeleteAppContainerProfile` deletes the per-task AppContainer profile
+    /// (`oxideswarm.task.<task_id>`) and its `%LOCALAPPDATA%\Packages\oxideswarm.task.<task_id>`
+    /// storage folder when the task finishes.
+    #[tokio::test]
+    async fn test_appcontainer_profile_is_deleted_on_cleanup() {
+        let rig = Rig::new(IsolationLevel::Fs, false);
+        let task = win_task(&rig, r#"Write-Output "TEMP_DIR=$env:TEMP""#, &[], 60);
+        let moniker = format!("oxideswarm.task.{}", task.id.0);
+        let result = rig.runner.execute_task(&task, None, None).await;
+        assert!(
+            result.is_success(),
+            "{:?} {}",
+            result.error,
+            result.stderr_str()
+        );
+
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            let pkg_dir = local_app_data.join("Packages").join(&moniker);
+            for _ in 0..20 {
+                if !pkg_dir.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(
+                !pkg_dir.exists(),
+                "DeleteAppContainerProfile must remove {} on task cleanup",
+                pkg_dir.display()
+            );
+        }
+    }
 }
 
 /// Where there is no implementation yet (FEAT-3b: Linux) isolation is refused
