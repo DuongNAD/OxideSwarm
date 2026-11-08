@@ -5,6 +5,7 @@ coding agent without other context.
 
 Snapshot: 2026-11-01, commit `3a1c120` (`master` at `c427f8b` plus pull request 3).
 Line numbers refer to that commit. If a line has moved, search for the named symbol.
+The Index and the status log are kept current. The rest of the file describes the snapshot.
 
 ## Is the project finished?
 
@@ -125,80 +126,82 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-| ID | Item | Priority | Size | Needs | Owner | Status |
-|---|---|---|---|---|---|---|
-| INT-1 | Merge pull request 3 | P0 | S | | Yes | Implemented |
-| INT-2 | Close superseded pull requests and branches | P0 | S | INT-1 | Yes | Implemented |
-| INT-3 | Land the AEAD hardening branch | P0 | S | INT-1 | Yes | Implemented |
-| INT-4 | Land the content-addressed file branch | P0 | M | INT-3, INT-5 | Yes | Partial |
-| INT-5 | Fix the review findings of pull request 6 | P0 | M | INT-3 | | Implemented |
-| SEC-1 | Remove `mcp --sse` | P0 | S | INT-4 | | Planned |
-| SEC-2 | Make MCP refuse a remote master without a secret | P0 | S | INT-4 | | Planned |
-| SEC-3 | Delete the Android stub master | P0 | M | INT-4 | D2 | Planned |
-| SEC-4 | Delete the plain-HTTP secret transfer | P0 | S | INT-4 | D7 | Planned |
-| SEC-5 | Run Python and Blender through the hardened runner | P0 | M | INT-4 | | Planned |
-| SEC-6 | Restrict Agent Mesh node commands | P0 | M | INT-4 | | Planned |
-| SEC-7 | Correct public route claims and redact the lease | P1 | S | INT-4 | | Planned |
-| BUG-1 | Stop hard-linking the staging cache | P0 | S | INT-4 | | Planned |
-| BUG-2 | Fail a task when a declared output is missing | P0 | S | INT-4 | | Planned |
-| BUG-3 | Fix the default 3D submit | P0 | S | INT-4 | | Planned |
-| BUG-4 | Fail only the task when a result is too large | P1 | S | INT-4 | | Planned |
-| BUG-5 | Close the remaining gaps in the blob store and cache | P1 | M | INT-4 | | Planned |
-| 3D-1 | Stop reporting the stub as TripoSR | P0 | S | INT-4 | D3 | Planned |
-| TEST-1 | Gate host-bound tests | P1 | M | INT-4 | | Planned |
-| TEST-2 | Isolate tests from the host battery | P1 | M | INT-4 | | Planned |
-| TEST-3 | Repair stale, starved and flaky tests | P1 | M | TEST-1 | | Planned |
-| TEST-4 | Stop tests from reading the real home directory | P1 | S | INT-4 | | Planned |
-| TEST-5 | Register or delete the orphan Rust test | P1 | S | INT-4 | | Planned |
-| TEST-6 | Extend CI to the full suite | P1 | M | TEST-1, TEST-2, TEST-3, TEST-4 | | Planned |
-| TEST-7 | Run or delete the orphan Python tests | P2 | M | INT-4 | | Planned |
-| DOC-1 | Correct false status claims | P1 | M | INT-4 | | Planned |
-| DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 | | Implemented |
-| DOC-1 | Correct false status claims | P1 | M | INT-4 | | Implemented |
-| DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 | | Planned |
-| DOC-3 | Align design records with the code | P1 | M | INT-4 | | Planned |
-| DOC-4 | Complete the CLI and environment reference | P2 | M | INT-4 | | Planned |
-| DOC-5 | Document the 3D subsystem | P2 | S | 3D-1 | | Implemented |
-| DOC-6 | Correct the minimum Rust version | P1 | S | INT-4 | | Planned |
-| DOC-7 | Add an MCP client setup guide | P2 | S | SEC-2 | | Planned |
-| REL-1 | Restore the Apache licence text | P0 | S | | | Planned |
-| REL-2 | Remove owner data from tracked files | P1 | M | INT-4 | D5 | Planned |
-| REL-3 | Small repository hygiene | P2 | S | INT-4 | | Implemented |
-| CLI-1 | Add `cancel` and `result` commands | P1 | M | INT-4 | | Planned |
-| MCP-1 | Make the MCP server concurrent, with deadlines | P1 | M | SEC-2 | | Planned |
-| MCP-2 | Return outputs safely to an LLM | P1 | M | MCP-1 | | Planned |
-| MCP-3 | Correct JSON-RPC and argument handling | P2 | S | MCP-1 | | Planned |
-| SCHED-1 | Respect `--max-concurrency` on the master | P1 | S | INT-4 | | Planned |
-| SCHED-2 | Wire or delete dead flags | P1 | M | INT-4 | | Planned |
-| SCHED-3 | Give impossible tasks an outcome | P2 | S | INT-4 | | Planned |
-| MOB-1 | Fix the adaptive keepalive | P1 | S | INT-4 | | Planned |
-| MOB-2 | Keep thermal state on the master | P1 | M | INT-4 | | Planned |
-| MOB-3 | Do not charge evacuation to retry budgets | P2 | S | INT-4 | | Planned |
-| 3D-2 | Wire VRAM and Blender routing | P2 | M | BUG-3 | | Planned |
-| 3D-3 | Make AutoRig options real or refuse them | P2 | M | SEC-5 | | Planned |
-| MR-1 | Let a CLI user ship a mapper and reducer | P2 | S | INT-4 | | Planned |
-| MESH-1 | Make `wss://` work in the Rust mesh client | P2 | S | INT-4 | | Planned |
-| MESH-2 | Deliver mesh data to a consumer | P2 | M | INT-4 | | Planned |
-| MESH-3 | Attach the bridge to a running master | P2 | M | INT-4 | | Planned |
-| MODE-1 | Make `ox-mode` report only what happened | P2 | M | INT-4 | | Planned |
-| BRIDGE-1 | Repair `agent_bridge.py diagnose` | P2 | S | SEC-4 | | Planned |
-| AND-1 | Make the Android app build | P1 | M | SEC-3 | Yes | Planned |
-| AND-2 | Keep the master across restarts | P2 | M | AND-1 | Yes | Planned |
-| AND-3 | Wire pre-sleep evacuation | P2 | M | AND-1 | Yes | Planned |
-| AND-4 | Report real worker status | P2 | M | AND-1 | Yes | Planned |
-| FEAT-1 | Master durability | P1 | L | TEST-6 | | Planned |
-| FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 | | Planned |
-| FEAT-3 | OS-level task isolation | P2 | L | SEC-5 | | Planned |
-| FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 | | Planned |
-| FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 | | Planned |
-| FEAT-6 | Master failover | P3 | L | FEAT-1 | D1 | Planned |
-| FEAT-7 | Usable rendezvous discovery | P3 | M | INT-4 | | Planned |
-| FEAT-8 | Real protocol versioning | P2 | M | INT-4 | | Planned |
-| FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Planned |
-| FEAT-10 | Compile crates with cargo | P3 | M | INT-4 | | Planned |
-| FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 | | Planned |
-| REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Planned |
-| REL-5 | Contributor and security files | P3 | S | REL-1 | | Planned |
+On 2026-11-08, at `master` `5df82df`: 47 items Implemented, 3 Partial and 20 Planned. "Pull
+requests" lists them by number, "(open)" marks one that is not merged yet, and "(design)" marks a
+design record that builds nothing.
+
+| ID | Item | Priority | Size | Needs | Owner | Status | Pull requests |
+|---|---|---|---|---|---|---|---|
+| INT-1 | Merge pull request 3 | P0 | S |  | Yes | Implemented | 3, 4 |
+| INT-2 | Close superseded pull requests and branches | P0 | S | INT-1 | Yes | Implemented |  |
+| INT-3 | Land the AEAD hardening branch | P0 | S | INT-1 | Yes | Implemented | 5 |
+| INT-4 | Land the content-addressed file branch | P0 | M | INT-3, INT-5 | Yes | Implemented | 6 |
+| INT-5 | Fix the review findings of pull request 6 | P0 | M | INT-3 |  | Implemented | 6 |
+| SEC-1 | Remove `mcp --sse` | P0 | S | INT-4 |  | Implemented | 11 |
+| SEC-2 | Make MCP refuse a remote master without a secret | P0 | S | INT-4 |  | Implemented | 15 |
+| SEC-3 | Delete the Android stub master | P0 | M | INT-4 | D2 | Implemented | 13 |
+| SEC-4 | Delete the plain-HTTP secret transfer | P0 | S | INT-4 | D7 | Implemented | 14 |
+| SEC-5 | Run Python and Blender through the hardened runner | P0 | M | INT-4 |  | Implemented | 17 |
+| SEC-6 | Restrict Agent Mesh node commands | P0 | M | INT-4 |  | Implemented | 25 |
+| SEC-7 | Correct public route claims and redact the lease | P1 | S | INT-4 |  | Implemented | 12 |
+| BUG-1 | Stop hard-linking the staging cache | P0 | S | INT-4 |  | Implemented | 16 |
+| BUG-2 | Fail a task when a declared output is missing | P0 | S | INT-4 |  | Implemented | 20 |
+| BUG-3 | Fix the default 3D submit | P0 | S | INT-4 |  | Implemented | 21, 44 |
+| BUG-4 | Fail only the task when a result is too large | P1 | S | INT-4 |  | Implemented | 18 |
+| BUG-5 | Close the remaining gaps in the blob store and cache | P1 | M | INT-4 |  | Implemented | 26 |
+| 3D-1 | Stop reporting the stub as TripoSR | P0 | S | INT-4 | D3 | Implemented | 22, 46 |
+| TEST-1 | Gate host-bound tests | P1 | M | INT-4 |  | Implemented | 51 |
+| TEST-2 | Isolate tests from the host battery | P1 | M | INT-4 |  | Implemented | 76 |
+| TEST-3 | Repair stale, starved and flaky tests | P1 | M | TEST-1 |  | Implemented | 39 |
+| TEST-4 | Stop tests from reading the real home directory | P1 | S | INT-4 |  | Partial | 29 |
+| TEST-5 | Register or delete the orphan Rust test | P1 | S | INT-4 |  | Implemented | 19 |
+| TEST-6 | Extend CI to the full suite | P1 | M | TEST-1, TEST-2, TEST-3, TEST-4 |  | Partial | 67 |
+| TEST-7 | Run or delete the orphan Python tests | P2 | M | INT-4 |  | Implemented | 55, 66 |
+| DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
+| DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
+| DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
+| DOC-4 | Complete the CLI and environment reference | P2 | M | INT-4 |  | Implemented | 69 |
+| DOC-5 | Document the 3D subsystem | P2 | S | 3D-1 |  | Implemented | 70 |
+| DOC-6 | Correct the minimum Rust version | P1 | S | INT-4 |  | Implemented | 56 |
+| DOC-7 | Add an MCP client setup guide | P2 | S | SEC-2 |  | Implemented | 32 |
+| REL-1 | Restore the Apache licence text | P0 | S |  |  | Implemented | 8, 82 |
+| REL-2 | Remove owner data from tracked files | P1 | M | INT-4 | D5 | Implemented | 74 |
+| REL-3 | Small repository hygiene | P2 | S | INT-4 |  | Implemented | 71 |
+| CLI-1 | Add `cancel` and `result` commands | P1 | M | INT-4 |  | Implemented | 30, 47 |
+| MCP-1 | Make the MCP server concurrent, with deadlines | P1 | M | SEC-2 |  | Implemented | 31, 41 |
+| MCP-2 | Return outputs safely to an LLM | P1 | M | MCP-1 |  | Implemented | 62 |
+| MCP-3 | Correct JSON-RPC and argument handling | P2 | S | MCP-1 |  | Implemented | 97 |
+| SCHED-1 | Respect `--max-concurrency` on the master | P1 | S | INT-4 |  | Implemented | 34, 38 |
+| SCHED-2 | Wire or delete dead flags | P1 | M | INT-4 |  | Implemented | 78 |
+| SCHED-3 | Give impossible tasks an outcome | P2 | S | INT-4 |  | Implemented | 96, 107 |
+| MOB-1 | Fix the adaptive keepalive | P1 | S | INT-4 |  | Implemented | 98 |
+| MOB-2 | Keep thermal state on the master | P1 | M | INT-4 |  | Implemented | 99 |
+| MOB-3 | Do not charge evacuation to retry budgets | P2 | S | INT-4 |  | Planned | 108 (open) |
+| 3D-2 | Wire VRAM and Blender routing | P2 | M | BUG-3 |  | Planned |  |
+| 3D-3 | Make AutoRig options real or refuse them | P2 | M | SEC-5 |  | Planned |  |
+| MR-1 | Let a CLI user ship a mapper and reducer | P2 | S | INT-4 |  | Implemented | 33 |
+| MESH-1 | Make `wss://` work in the Rust mesh client | P2 | S | INT-4 |  | Implemented | 94 |
+| MESH-2 | Deliver mesh data to a consumer | P2 | M | INT-4 |  | Planned |  |
+| MESH-3 | Attach the bridge to a running master | P2 | M | INT-4 |  | Planned |  |
+| MODE-1 | Make `ox-mode` report only what happened | P2 | M | INT-4 |  | Planned | 92 (open) |
+| BRIDGE-1 | Repair `agent_bridge.py diagnose` | P2 | S | SEC-4 |  | Implemented | 77 |
+| AND-1 | Make the Android app build | P1 | M | SEC-3 | Yes | Planned |  |
+| AND-2 | Keep the master across restarts | P2 | M | AND-1 | Yes | Planned |  |
+| AND-3 | Wire pre-sleep evacuation | P2 | M | AND-1 | Yes | Planned |  |
+| AND-4 | Report real worker status | P2 | M | AND-1 | Yes | Planned |  |
+| FEAT-1 | Master durability | P1 | L | TEST-6 |  | Planned |  |
+| FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 |  | Planned |  |
+| FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Planned |  |
+| FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Planned | 105 (design) |
+| FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 |  | Planned |  |
+| FEAT-6 | Master failover | P3 | L | FEAT-1 | D1 | Implemented | 81 |
+| FEAT-7 | Usable rendezvous discovery | P3 | M | INT-4 |  | Planned |  |
+| FEAT-8 | Real protocol versioning | P2 | M | INT-4 |  | Partial | 40, 110 (open) |
+| FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Planned |  |
+| FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Planned |  |
+| FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Planned |  |
+| REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Planned |  |
+| REL-5 | Contributor and security files | P3 | S | REL-1 |  | Implemented | 75 |
 
 ## Phase 0: integrate open work
 
@@ -1274,3 +1277,65 @@ Add one dated line per finished item, newest last.
   a `rusty_grid-<euid>` that another local user could change (work item SEC-8 of design 0021).
 - 2026-11-04: REL-3 completed on branch `win/rel-3-repo-hygiene`; added `test_reports/` and `**/jniLibs/**/*.so` to `.gitignore` with a regression check in `tests/test_launcher_scripts.py`.
 - 2026-11-04: DOC-5 completed on branch `win/doc-5-3d-subsystem`; added `docs/design/0023-generative-3d-and-autorig-subsystem.md`, documented `gen3d`, `autorig`, and `engines/` (including `3D-2` and `3D-3` limits) in `README.md` and `CLAUDE.md`, and updated the macOS, Windows, and Android Termux worker installers to deploy `engines/` and set `OXIDESWARM_GEN3D_SCRIPT`.
+- 2026-11-07: Index synced with the pull requests merged up to `5c518b5`.
+  These items are now Implemented (date of the first merge, pull requests):
+  - INT-4: 2026-11-01, pull request 6.
+  - REL-1: 2026-11-01, pull requests 8, 82.
+  - SEC-1: 2026-11-01, pull request 11.
+  - SEC-7: 2026-11-01, pull request 12.
+  - SEC-3: 2026-11-01, pull request 13.
+  - SEC-4: 2026-11-01, pull request 14.
+  - SEC-2: 2026-11-01, pull request 15.
+  - BUG-1: 2026-11-01, pull request 16.
+  - SEC-5: 2026-11-02, pull request 17.
+  - BUG-4: 2026-11-02, pull request 18.
+  - BUG-2: 2026-11-02, pull request 20.
+  - BUG-5: 2026-11-02, pull request 26.
+  - DOC-7: 2026-11-02, pull request 32.
+  - MR-1: 2026-11-02, pull request 33.
+  - TEST-5: 2026-11-03, pull request 19.
+  - BUG-3: 2026-11-03, pull requests 21, 44.
+  - 3D-1: 2026-11-03, pull requests 22, 46.
+  - SEC-6: 2026-11-03, pull request 25.
+  - CLI-1: 2026-11-03, pull requests 30, 47.
+  - MCP-1: 2026-11-03, pull requests 31, 41.
+  - SCHED-1: 2026-11-03, pull requests 34, 38.
+  - TEST-3: 2026-11-03, pull request 39.
+  - TEST-1: 2026-11-03, pull request 51.
+  - TEST-7: 2026-11-03, pull requests 55, 66.
+  - DOC-6: 2026-11-03, pull request 56.
+  - MCP-2: 2026-11-04, pull request 62.
+  - DOC-3: 2026-11-04, pull request 68.
+  - DOC-4: 2026-11-04, pull request 69.
+  - REL-2: 2026-11-04, pull request 74.
+  - REL-5: 2026-11-04, pull request 75.
+  - TEST-2: 2026-11-04, pull request 76.
+  - BRIDGE-1: 2026-11-04, pull request 77.
+  - SCHED-2: 2026-11-04, pull request 78.
+  - FEAT-6: 2026-11-04, pull request 81.
+  - MESH-1: 2026-11-07, pull request 94.
+  - MCP-3: 2026-11-07, pull request 97.
+  - MOB-1: 2026-11-07, pull request 98.
+  - MOB-2: 2026-11-07, pull request 99.
+- 2026-11-07: These items are Partial:
+  - TEST-4: pull request 29 fixed the six named tests. No run of the full suite with a dummy
+    `cluster.secret` in `HOME` has been recorded.
+  - TEST-6: every job exists and passed on `master` in run 41798333188 (`d021094`). The
+    `workspace-test` job still has `continue-on-error: true`, and `master` has no required checks.
+  - FEAT-8: pull request 40 pins the bincode layout of every message in
+    `crates/core/src/wire_layout_tests.rs`. Nothing forces a protocol version bump yet, and
+    `ClientMessage` has no version.
+- 2026-11-07: Planned items with an open pull request: SCHED-3 (96) and MODE-1 (92).
+- 2026-11-07: Items found after the audit have no section in this file: BUG-6 to BUG-17, TEST-8
+  to TEST-16, SEC-8, BRIDGE-2 and BRIDGE-3. Each has a merged pull request except TEST-16
+  (pull request 95, open).
+- 2026-11-08: Index synced with `master` `5df82df`.
+  - SCHED-3 is Implemented: 2026-11-07, pull requests 96, 107.
+  - TEST-16 merged on 2026-11-07 in pull request 95. Its follow-up TEST-16b is pull request 109,
+    open.
+  - Open pull requests: MODE-1 (92), MOB-3 (108), FEAT-8 (110).
+  - FEAT-4: design 0039 (pull request 105) is Accepted and builds nothing yet. The draft design
+    0042 (pull request 111) was not taken.
+- 2026-11-08: The roadmap (`ROADMAP.md`) sets the order after this backlog. Its decision Q2 freezes
+  3D-2 and 3D-3. Its decision Q3 drops the grid features of MESH-3, and keeps only the removal of
+  the hub-local file fallback in `parse_binary_data`. These items stay Planned.

@@ -34,6 +34,7 @@ fn cli(home: &Path) -> Command {
         .env_remove("RUSTY_GRID_MASTER_LISTEN")
         .env_remove("RUSTY_GRID_INSECURE")
         .env_remove("RUSTY_GRID_P2P")
+        .env("RUSTY_GRID_P2P_MINIMAL", "1")
         .env("RUSTY_GRID_DISABLE_DISCOVERY", "1")
         .env("RUSTY_GRID_DISABLE_WEB_UI", "1")
         .env("RUSTY_GRID_NO_BATTERY", "1")

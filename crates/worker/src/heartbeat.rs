@@ -296,13 +296,23 @@ impl<S: AsyncRead + Unpin> AsyncRead for StampedStream<S> {
     }
 }
 
+/// Maximum slice handed to a single `poll_write` on a bulk frame so Windows `AFD.sys` cannot
+/// lock an entire multi-MB frame in one `WSASend` call (which would prevent `StampedStream` from
+/// observing write progress as the peer drains the socket).
+pub const MAX_BULK_WRITE_CHUNK_BYTES: usize = 64 * 1024;
+
 impl<S: AsyncWrite + Unpin> AsyncWrite for StampedStream<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        let slice = if buf.len() > MAX_BULK_WRITE_CHUNK_BYTES {
+            &buf[..MAX_BULK_WRITE_CHUNK_BYTES]
+        } else {
+            buf
+        };
+        let poll = Pin::new(&mut self.inner).poll_write(cx, slice);
         if let Poll::Ready(Ok(n)) = &poll {
             if *n > 0 && buf.len() >= BULK_WRITE_BYTES {
                 self.clock.touch_bulk_tx();
