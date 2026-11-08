@@ -1250,12 +1250,24 @@ impl ProcessTree {
     /// platform gave us no container (a Windows process that could not be put into a job) it is
     /// all there is to go on, and `taskkill /F /T` takes the leader and its children.
     pub(crate) async fn kill_async(&self, live_leader: Option<u32>) {
-        self.killed.store(true, Ordering::Release);
         match self.id {
             Some(id) => {
-                let _ = tokio::task::spawn_blocking(move || imp::kill(id)).await;
+                #[cfg(windows)]
+                {
+                    if !self.killed.swap(true, Ordering::AcqRel) {
+                        imp::kill(id);
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = tokio::task::spawn_blocking(move || imp::kill(id)).await;
+                    self.killed.store(true, Ordering::Release);
+                }
             }
-            None => kill_by_leader(live_leader),
+            None => {
+                self.killed.store(true, Ordering::Release);
+                kill_by_leader(live_leader);
+            }
         }
     }
 }
@@ -1286,6 +1298,7 @@ impl Drop for ProcessTree {
                     drop(w);
                 }
             };
+            #[cfg(not(windows))]
             if !already_killed {
                 if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                     runtime.spawn_blocking(finish);
