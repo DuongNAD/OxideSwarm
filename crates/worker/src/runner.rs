@@ -73,6 +73,7 @@ use rusty_grid_core::task::{
 use crate::blob_cache::{BlobCache, DEFAULT_BLOB_CACHE_MAX_BYTES};
 use crate::cpu_simd;
 use crate::gpu::{check_gemm_request, DeviceLimits, GpuError};
+use crate::isolation::{HostDirs, IsolationLevel};
 use crate::process_tree::{configure_command, ProcessPriority, ProcessTree};
 use crate::sandbox::{sanitize_relative_path, Sandbox, SandboxConfig, SandboxError};
 use crate::staging::{collect_outputs_pinned, materialize_inputs, OutputLimits};
@@ -131,6 +132,14 @@ pub struct RunnerConfig {
     pub output_limits: OutputLimits,
     /// Optional explicit path to the host Blender executable (`--blender-path`).
     pub blender_path: Option<String>,
+    /// How strongly task processes are confined (`--isolation`, design 0033). Process tasks
+    /// only: in-process workloads are not affected.
+    pub isolation: IsolationLevel,
+    /// The host directories the isolation policy names (the owner's home, the Rust toolchain).
+    pub host_dirs: HostDirs,
+    /// Files denied to confined tasks wherever they are (the cluster secret file, the config
+    /// file in use).
+    pub protected_files: Vec<PathBuf>,
 }
 
 impl Default for RunnerConfig {
@@ -150,7 +159,28 @@ impl RunnerConfig {
             blob_cache_bytes: DEFAULT_BLOB_CACHE_MAX_BYTES,
             output_limits: OutputLimits::default(),
             blender_path: None,
+            isolation: IsolationLevel::Off,
+            host_dirs: HostDirs::detect(),
+            protected_files: Vec::new(),
         }
+    }
+
+    /// Confines task processes at `level`. The host directories come from this process's
+    /// environment (see [`HostDirs::detect`]); use [`with_host_dirs`](Self::with_host_dirs) to
+    /// name them.
+    pub fn with_isolation(mut self, level: IsolationLevel) -> Self {
+        self.isolation = level;
+        self
+    }
+
+    pub fn with_protected_files(mut self, files: Vec<PathBuf>) -> Self {
+        self.protected_files = files;
+        self
+    }
+
+    pub fn with_host_dirs(mut self, host_dirs: HostDirs) -> Self {
+        self.host_dirs = host_dirs;
+        self
     }
 
     pub fn with_blender_path(mut self, blender_path: Option<String>) -> Self {
@@ -2598,9 +2628,52 @@ impl TaskRunner {
         #[cfg(not(windows))]
         let resolved_program = program.to_string();
 
-        let mut cmd = tokio::process::Command::new(&resolved_program);
-        cmd.args(args);
+        // Under `--isolation fs|fs+net` the task is started through the platform's confinement
+        // (macOS: `sandbox-exec`); when that is impossible the task fails, it never runs plain.
+        let (spawn_program, spawn_args) = if self.config.isolation == IsolationLevel::Off {
+            (resolved_program.clone(), args.to_vec())
+        } else {
+            let jail = crate::isolation::Jail {
+                level: self.config.isolation,
+                host: &self.config.host_dirs,
+                protected_files: &self.config.protected_files,
+                sandbox_base: &self.config.sandbox_config.base_dir,
+                sandbox_dir: sandbox_path,
+            };
+            match crate::isolation::wrap_program(&jail, &resolved_program, args, &effective_path) {
+                Ok(wrapped) => wrapped,
+                Err(e) => {
+                    return TaskResult::failure(
+                        self.worker_id,
+                        task_id,
+                        EXIT_CODE_GENERAL_ERROR,
+                        "",
+                        format!(
+                            "Cannot run '{program}' with --isolation {}: {e}",
+                            jail.level
+                        ),
+                        start_time.elapsed().as_millis() as u64,
+                        Some(format!(
+                            "Isolation error for '{program}' ({}): {e}",
+                            jail.level
+                        )),
+                    );
+                }
+            }
+        };
+
+        let mut cmd = tokio::process::Command::new(&spawn_program);
+        cmd.args(&spawn_args);
         cmd.current_dir(cwd);
+
+        // A confined task gets an allowlisted environment, not a copy of the worker's: tokens and
+        // credentials in the worker's environment are none of its business (design 0033 D1.4).
+        if self.config.isolation != IsolationLevel::Off {
+            cmd.env_clear();
+            for (name, value) in crate::isolation::inherited_environment(std::env::vars_os()) {
+                cmd.env(name, value);
+            }
+        }
 
         // The worker's own secrets are none of the task's business. Removed before the task's own
         // environment is applied, so a task that is handed one explicitly still gets it.
@@ -2624,6 +2697,17 @@ impl TaskRunner {
             "RUSTY_GRID_SANDBOX_DIR",
             sandbox_path.to_string_lossy().to_string(),
         );
+
+        if self.config.isolation != IsolationLevel::Off {
+            let plan =
+                crate::isolation::prepare_environment(&self.config.host_dirs, env, sandbox_path);
+            for (name, value) in &plan.set {
+                cmd.env(name, value);
+            }
+            for name in &plan.remove {
+                cmd.env_remove(name);
+            }
+        }
 
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());

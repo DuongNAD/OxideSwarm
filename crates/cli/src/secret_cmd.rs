@@ -103,6 +103,64 @@ fn config_key_error(key: &str, err: &GridError) -> GridError {
     GridError::Config(format!("config file key '{key}': {detail}"))
 }
 
+/// Where the cluster secret would be visible to a confined task, or `None` when it is not.
+///
+/// On macOS no sandbox rule stops a task from reading the environment and the command line of
+/// the other processes of its user (`sysctl KERN_PROCARGS2`). A secret handed to the worker in
+/// `OXIDESWARM_SECRET` or `--secret` is therefore readable by every task, whatever its isolation
+/// level (design 0033, Security). A secret file path is not exposed that way, but the file itself
+/// must be unreadable to tasks: see [`secret_files_to_protect`]. Returns the description of the
+/// exposed channel.
+pub fn secret_exposed_to_tasks(
+    opts: &SecretOpts,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<&'static str> {
+    if opts.value.is_some() {
+        return Some("--secret, which is visible in the process list");
+    }
+    if env(ENV_SECRET).is_some_and(|v| !v.trim().is_empty()) {
+        return Some("the OXIDESWARM_SECRET environment variable, which other processes of this user can read");
+    }
+    None
+}
+
+/// Every file that holds or may hold the cluster secret for a worker: the file named by
+/// `--secret-file`, `OXIDESWARM_SECRET_FILE` or a config key, the default file, and the config file
+/// in use (it can hold `secret =`). A worker with isolation passes these to the sandbox policy so
+/// that a task cannot read them even when they live outside the denied home (design 0033).
+pub fn secret_files_to_protect(
+    opts: &SecretOpts,
+    config: Option<&ConfigFile>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    files.extend(opts.file.clone());
+    files.extend(
+        env(ENV_SECRET_FILE)
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from),
+    );
+    if let Some(config) = config {
+        for section in [SecretSection::Worker, SecretSection::Master] {
+            if let (_, Some(file)) = config.secret_keys(section) {
+                files.push(PathBuf::from(file.trim()));
+            }
+        }
+        files.extend(config.source_path.0.clone());
+    }
+    files.extend(ClusterSecret::default_path());
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// The refusal a worker with `--isolation fs|fs+net` prints for an exposed secret.
+pub fn exposed_secret_error(channel: &str) -> String {
+    format!(
+        "--isolation is on but the cluster secret is given through {channel}, and a task running as this user could read it. Put the secret in a file and pass --secret-file PATH or {ENV_SECRET_FILE}=PATH (or use the default file ~/.oxideswarm/cluster.secret), and unset {ENV_SECRET}"
+    )
+}
+
 /// Adds the "how do I create it" hint when an explicitly named secret file does not exist.
 fn explain_missing_file(err: GridError, file: Option<&Path>) -> GridError {
     match (&err, file) {
@@ -495,6 +553,66 @@ pub fn announce_master_secret(outcome: &MasterSecretOutcome, listen: &str, insec
             tracing::warn!("{banner}");
             eprintln!("!!! {banner}");
         }
+    }
+}
+
+#[cfg(test)]
+mod exposure_tests {
+    use super::*;
+
+    #[test]
+    fn test_secret_files_to_protect_lists_every_place_the_secret_may_be() {
+        let opts = SecretOpts {
+            file: Some(PathBuf::from("/x/flag.secret")),
+            ..SecretOpts::default()
+        };
+        let config = ConfigFile {
+            source_path: crate::config::SourcePath(Some(PathBuf::from("/x/rusty-grid.toml"))),
+            secret_file: Some("/x/config.secret".into()),
+            ..ConfigFile::default()
+        };
+        let env = |n: &str| (n == ENV_SECRET_FILE).then(|| "/x/env.secret".to_string());
+        let files = secret_files_to_protect(&opts, Some(&config), env);
+        for expected in [
+            "/x/flag.secret",
+            "/x/env.secret",
+            "/x/config.secret",
+            "/x/rusty-grid.toml",
+        ] {
+            assert!(
+                files.contains(&PathBuf::from(expected)),
+                "{expected} in {files:?}"
+            );
+        }
+        assert!(
+            secret_files_to_protect(&SecretOpts::default(), None, |_| None)
+                .iter()
+                .all(|p| p.ends_with("cluster.secret"))
+        );
+    }
+
+    #[test]
+    fn test_secret_exposure_is_flag_or_env_value_but_not_a_file() {
+        let none = |_: &str| None;
+        let mut opts = SecretOpts::default();
+        assert_eq!(secret_exposed_to_tasks(&opts, none), None);
+        let env = |n: &str| (n == ENV_SECRET).then(|| "ab".repeat(32));
+        assert!(secret_exposed_to_tasks(&opts, env)
+            .unwrap()
+            .contains("OXIDESWARM_SECRET"));
+        let blank = |n: &str| (n == ENV_SECRET).then(|| "  ".to_string());
+        assert_eq!(secret_exposed_to_tasks(&opts, blank), None);
+        let file_env = |n: &str| (n == ENV_SECRET_FILE).then(|| "/x/secret".to_string());
+        assert_eq!(secret_exposed_to_tasks(&opts, file_env), None);
+        opts.value = Some(SecretText("ab".repeat(32)));
+        assert!(secret_exposed_to_tasks(&opts, none)
+            .unwrap()
+            .contains("--secret"));
+        let msg = exposed_secret_error("--secret");
+        assert!(
+            msg.contains("--secret-file") && msg.contains("OXIDESWARM_SECRET_FILE"),
+            "{msg}"
+        );
     }
 }
 

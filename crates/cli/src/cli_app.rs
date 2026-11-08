@@ -30,7 +30,8 @@ use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::error::GridError;
 use rusty_grid_core::mapreduce::{MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec};
 use rusty_grid_core::placement::{
-    listed_worker_id, tag_value, validate_user_tag, Placement, REQUIRE_PREFIX, STATE_TAG_PREFIX,
+    listed_worker_id, tag_value, validate_user_tag, IsolationLevel, Placement, REQUIRE_PREFIX,
+    STATE_TAG_PREFIX,
 };
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport, WireCodec};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
@@ -372,9 +373,16 @@ pub struct WorkerArgs {
     #[arg(
         long = "tag",
         value_name = "TAG",
-        help = "User tag advertised to the master, matched by `submit --require-tag` (repeatable; env RUSTY_GRID_WORKER_TAGS, comma-separated). The prefixes os:, arch:, link:, id: and state: are reserved"
+        help = "User tag advertised to the master, matched by `submit --require-tag` (repeatable; env RUSTY_GRID_WORKER_TAGS, comma-separated). The prefixes os:, arch:, slots:, link:, id:, state: and iso: are reserved"
     )]
     pub tags: Vec<String>,
+
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        help = "Confine task processes at the OS level: off (default), fs (a task writes only its own sandbox and cannot read the owner's home, other sandboxes or the blob cache) or fs+net (fs plus no network sockets). The worker refuses to start where the level cannot be enforced (macOS only for now); advertised as the iso:<level> tag; env RUSTY_GRID_ISOLATION, config [worker].isolation"
+    )]
+    pub isolation: Option<String>,
 
     #[arg(long, alias = "cpu-cores", help = "Override advertised CPU core count")]
     pub cores: Option<usize>,
@@ -642,6 +650,13 @@ pub struct SubmitArgs {
         help = "Run only on this worker: its name (ignoring case) or its id, as `workers --json` lists them"
     )]
     pub worker: Option<String>,
+
+    #[arg(
+        long = "require-isolation",
+        value_name = "LEVEL",
+        help = "Run only on a worker confined at least at this level: fs or fs+net (`worker --isolation`)"
+    )]
+    pub require_isolation: Option<String>,
 
     #[arg(
         long = "require-tag",
@@ -1839,6 +1854,30 @@ async fn run_worker(
             None => None,
         };
 
+    // A misspelt level must not silently run tasks unconfined on the owner's machine.
+    let isolation = match resolve_isolation(
+        args.isolation,
+        &[ISOLATION_ENV],
+        worker_cfg.as_ref().and_then(|w| w.isolation.clone()),
+    ) {
+        Ok(level) => level,
+        Err(e) => {
+            eprintln!("--isolation: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // A task can read the environment and argv of this user's other processes on macOS, so a
+    // secret passed that way would defeat the isolation it is meant to enforce.
+    if isolation != IsolationLevel::Off {
+        let exposed = crate::secret_cmd::secret_exposed_to_tasks(&secret_opts, |name| {
+            std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
+        });
+        if let Some(channel) = exposed {
+            eprintln!("{}", crate::secret_cmd::exposed_secret_error(channel));
+            return ExitCode::from(AUTH_EXIT_CODE);
+        }
+    }
+
     let keep_sandboxes = resolve_bool(
         if args.keep_sandboxes {
             Some(true)
@@ -1929,6 +1968,14 @@ async fn run_worker(
     }
     if let Some(priority) = task_priority {
         config = config.with_process_priority(priority);
+    }
+    config = config.with_isolation(isolation);
+    if isolation != IsolationLevel::Off {
+        config = config.with_protected_files(crate::secret_cmd::secret_files_to_protect(
+            &secret_opts,
+            config_file.as_ref(),
+            |name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned()),
+        ));
     }
     config = config.with_keep_sandboxes(keep_sandboxes);
     let blob_cache_mb = resolve_u64(
@@ -2488,7 +2535,22 @@ fn parse_env_pairs(pairs: &[String]) -> Result<HashMap<String, String>, String> 
     Ok(env)
 }
 
-/// The placement constraints of `submit --os / --arch / --worker / --require-tag`, checked and
+/// Environment variable that selects the worker's isolation level (`--isolation`).
+const ISOLATION_ENV: &str = "RUSTY_GRID_ISOLATION";
+
+/// `--isolation` > environment > config file `[worker].isolation` > `off`.
+fn resolve_isolation(
+    cli: Option<String>,
+    env_names: &[&str],
+    file: Option<String>,
+) -> Result<IsolationLevel, String> {
+    match resolve_opt_string(cli, env_names, file) {
+        Some(text) => text.parse(),
+        None => Ok(IsolationLevel::Off),
+    }
+}
+
+/// The placement constraints of `submit --os / --arch / --worker / --require-isolation / --require-tag`, checked and
 /// normalised exactly as the master will read them.
 fn build_placement(args: &SubmitArgs) -> Result<Placement, String> {
     let mut tags = Vec::new();
@@ -2500,6 +2562,11 @@ fn build_placement(args: &SubmitArgs) -> Result<Placement, String> {
     }
     if let Some(worker) = &args.worker {
         tags.push(format!("{REQUIRE_PREFIX}worker={worker}"));
+    }
+    if let Some(level) = &args.require_isolation {
+        let level = IsolationLevel::parse_required(level)
+            .map_err(|e| format!("--require-isolation: {e}"))?;
+        tags.push(format!("{REQUIRE_PREFIX}iso={level}"));
     }
     for tag in &args.require_tags {
         tags.push(format!("{REQUIRE_PREFIX}tag={tag}"));
@@ -4036,6 +4103,57 @@ mod tests {
         let err = build_placement(&submit_args(&["--require-tag", "os:macos", "--", "true"]))
             .unwrap_err();
         assert!(err.contains("only the worker or the master"), "{err}");
+    }
+
+    #[test]
+    fn test_submit_require_isolation_becomes_a_placement_constraint() {
+        for (flag, level) in [
+            ("fs", IsolationLevel::Fs),
+            ("fs+net", IsolationLevel::FsNet),
+        ] {
+            let placement =
+                build_placement(&submit_args(&["--require-isolation", flag, "--", "true"]))
+                    .unwrap();
+            assert_eq!(placement.isolation, Some(level));
+            assert_eq!(placement.to_task_tags(), [format!("require:iso={flag}")]);
+        }
+        for bad in ["off", "strict", ""] {
+            let err = build_placement(&submit_args(&["--require-isolation", bad, "--", "true"]))
+                .unwrap_err();
+            assert!(err.contains("--require-isolation"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_isolation_precedence_is_cli_then_env_then_config_then_off() {
+        let key = "RUSTY_GRID_TEST_ISOLATION_PRECEDENCE";
+        std::env::remove_var(key);
+        let resolve = |cli: Option<&str>, file: Option<&str>| {
+            resolve_isolation(cli.map(str::to_string), &[key], file.map(str::to_string))
+        };
+        assert_eq!(resolve(None, None), Ok(IsolationLevel::Off));
+        assert_eq!(resolve(None, Some("fs")), Ok(IsolationLevel::Fs));
+        std::env::set_var(key, "fs+net");
+        assert_eq!(resolve(None, Some("fs")), Ok(IsolationLevel::FsNet));
+        assert_eq!(resolve(Some("off"), Some("fs")), Ok(IsolationLevel::Off));
+        std::env::set_var(key, "bogus");
+        let err = resolve(None, Some("fs")).unwrap_err();
+        std::env::remove_var(key);
+        assert!(err.contains("unknown isolation level 'bogus'"), "{err}");
+        assert_eq!(ISOLATION_ENV, "RUSTY_GRID_ISOLATION");
+    }
+
+    #[test]
+    fn test_worker_isolation_flag_is_kept_as_text_for_run_worker_to_validate() {
+        let isolation_of = |args: &[&str]| match parse(args).command {
+            Commands::Worker(a) => a.isolation,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(isolation_of(&["worker"]), None);
+        assert_eq!(
+            isolation_of(&["worker", "--isolation", "fs+net"]).as_deref(),
+            Some("fs+net")
+        );
     }
 
     #[test]

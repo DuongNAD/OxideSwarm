@@ -20,8 +20,8 @@ use uuid::Uuid;
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::error::GridError;
 use rusty_grid_core::placement::{
-    listed_worker_id, tag_value, Placement, ARCH_TAG_PREFIX, LINK_TAG_PREFIX, OS_TAG_PREFIX,
-    RESERVED_TAG_PREFIXES, STATE_TAG_PREFIX,
+    listed_worker_id, tag_value, IsolationLevel, Placement, ARCH_TAG_PREFIX, ISO_TAG_PREFIX,
+    LINK_TAG_PREFIX, OS_TAG_PREFIX, RESERVED_TAG_PREFIXES, STATE_TAG_PREFIX,
 };
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskResult, TaskSpec};
@@ -115,6 +115,9 @@ pub struct WorkerSummary {
     pub ram_mb: u64,
     /// `none`, the GPU's name, or `<name> (simulated)`.
     pub gpu: String,
+    /// Task isolation level from the `iso:` tag: `off`, `fs` or `fs+net`. A worker without the
+    /// tag (older, or one that reports none) counts as `off`.
+    pub isolation: String,
     pub link: Option<String>,
     pub state: Option<String>,
     /// The worker's user tags (everything without a reserved prefix).
@@ -143,6 +146,7 @@ impl WorkerSummary {
             cores: caps.cpu_cores,
             ram_mb: caps.ram_mb,
             gpu,
+            isolation: IsolationLevel::from_tags(&caps.tags).to_string(),
             link: value(LINK_TAG_PREFIX),
             state: value(STATE_TAG_PREFIX),
             tags: caps
@@ -207,8 +211,8 @@ impl DoctorReport {
                 self.workers.len()
             ));
             out.push_str(&format!(
-                "  {:<20} {:<9} {:<16} {:>5} {:>9}  {:<28} {:<10} {}\n",
-                "NAME", "ID", "OS/ARCH", "CORES", "RAM MB", "GPU", "STATE", "TAGS"
+                "  {:<20} {:<9} {:<16} {:>5} {:>9}  {:<28} {:<7} {:<10} {}\n",
+                "NAME", "ID", "OS/ARCH", "CORES", "RAM MB", "GPU", "ISO", "STATE", "TAGS"
             ));
             for w in &self.workers {
                 let os_arch = format!(
@@ -217,13 +221,14 @@ impl DoctorReport {
                     w.arch.as_deref().unwrap_or("?")
                 );
                 out.push_str(&format!(
-                    "  {:<20} {:<9} {:<16} {:>5} {:>9}  {:<28} {:<10} {}\n",
+                    "  {:<20} {:<9} {:<16} {:>5} {:>9}  {:<28} {:<7} {:<10} {}\n",
                     w.name,
                     w.id.map(|id| short_id(&id)).unwrap_or_else(|| "?".into()),
                     os_arch,
                     w.cores,
                     w.ram_mb,
                     w.gpu,
+                    w.isolation,
                     w.state.as_deref().unwrap_or("?"),
                     w.tags.join(","),
                 ));
@@ -289,6 +294,8 @@ struct Probe {
     kind: ProbeKind,
     worker_name: String,
     worker_id: Uuid,
+    /// The worker's isolation level (`iso:` tag), shown with the process probe.
+    isolation: String,
     task: Result<TaskId, String>,
 }
 
@@ -659,6 +666,7 @@ async fn run_checks(
                 kind,
                 worker_name: w.name.clone(),
                 worker_id,
+                isolation: w.isolation.clone(),
                 task,
             });
         }
@@ -676,6 +684,11 @@ async fn run_checks(
                 Outcome::Fail,
                 format!("the master refused the probe: {message}"),
             ),
+        };
+        // The process probe is the one that runs under the worker's isolation.
+        let detail = match probe.kind {
+            ProbeKind::Process => format!("{detail} [{ISO_TAG_PREFIX}{}]", probe.isolation),
+            _ => detail,
         };
         report.push(id, name, Some(probe.worker_name.as_str()), outcome, detail);
     }
@@ -880,6 +893,7 @@ mod tests {
             kind,
             worker_name: "w".into(),
             worker_id,
+            isolation: "off".into(),
             task: Ok(TaskId::new()),
         };
         let timeout = Duration::from_secs(5);
@@ -954,6 +968,29 @@ mod tests {
     }
 
     #[test]
+    fn test_report_shows_each_workers_isolation_level() {
+        let summary = |tags: &[&str]| WorkerSummary::of(&caps("W", tags));
+        assert_eq!(summary(&["os:macos", "iso:fs+net"]).isolation, "fs+net");
+        assert_eq!(summary(&["iso:fs", "laptop"]).isolation, "fs");
+        assert_eq!(summary(&["os:linux"]).isolation, "off");
+        assert!(
+            summary(&["iso:fs", "laptop"]).tags == ["laptop"],
+            "the iso: tag is reserved, not a user tag"
+        );
+        let report = DoctorReport {
+            master: "m".into(),
+            workers: vec![summary(&["os:macos", "iso:fs+net"])],
+            checks: Vec::new(),
+            auth_failed: false,
+        };
+        assert!(report.render().contains("fs+net"));
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["workers"][0]["isolation"],
+            "fs+net"
+        );
+    }
+
+    #[test]
     fn test_report_rendering_and_outcome() {
         let mut report = DoctorReport {
             master: "127.0.0.1:8088".into(),
@@ -973,6 +1010,13 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("PASS  C1"), "{text}");
+        let header = text.lines().find(|l| l.contains("NAME")).unwrap();
+        assert!(header.contains("ISO"), "{header}");
+        let row = text.lines().find(|l| l.contains("macos/aarch64")).unwrap();
+        assert!(
+            row.contains(" off "),
+            "a worker without iso: counts as off: {row}"
+        );
         assert!(
             text.contains("1 passed, 1 warnings, 0 failed, 0 skipped"),
             "{text}"
@@ -981,6 +1025,7 @@ mod tests {
         assert!(report.failed());
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["checks"][2]["outcome"], "fail");
+        assert_eq!(json["workers"][0]["isolation"], "off");
         assert!(json.get("auth_failed").is_none());
     }
 }

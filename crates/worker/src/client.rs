@@ -57,6 +57,7 @@ use crate::heartbeat::{
     IoClock, MobileTelemetryHandle, StampedStream,
 };
 use crate::identity::{default_worker_id_path, load_or_create_worker_id};
+use crate::isolation::IsolationLevel;
 use crate::process_tree::ProcessPriority;
 use crate::runner::{
     cancellation, RunnerConfig, TaskRunner, DEFAULT_MAX_OUTPUT_BYTES, EXIT_CODE_CANCELLED,
@@ -268,6 +269,12 @@ pub struct WorkerConfig {
     pub max_concurrency: Option<usize>,
     /// CPU priority of task processes. `None`: `RUSTY_GRID_TASK_PRIORITY`, else below normal.
     pub process_priority: Option<ProcessPriority>,
+    /// How strongly task processes are confined (CLI `--isolation`, default `off`; design 0033).
+    /// A level this host cannot enforce makes [`WorkerClient::run`] fail at start-up.
+    pub isolation: IsolationLevel,
+    /// Files a confined task must not read even though they are outside the denied home: the
+    /// cluster secret file and the config file in use (CLI, with `--isolation`).
+    pub protected_files: Vec<std::path::PathBuf>,
     /// Fallback heartbeat interval if not specified by Master in `RegisterAck` (default: 3s).
     pub default_heartbeat_interval: Duration,
     /// Maximum duration to await Master response during registration handshake (default: 5s).
@@ -355,6 +362,8 @@ impl WorkerConfig {
             no_battery: false,
             max_concurrency: None,
             process_priority: None,
+            isolation: IsolationLevel::Off,
+            protected_files: Vec::new(),
             default_heartbeat_interval: Duration::from_secs(3),
             handshake_timeout: Duration::from_secs(5),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -505,6 +514,16 @@ impl WorkerConfig {
 
     pub fn with_process_priority(mut self, priority: ProcessPriority) -> Self {
         self.process_priority = Some(priority);
+        self
+    }
+
+    pub fn with_isolation(mut self, level: IsolationLevel) -> Self {
+        self.isolation = level;
+        self
+    }
+
+    pub fn with_protected_files(mut self, files: Vec<std::path::PathBuf>) -> Self {
+        self.protected_files = files;
         self
     }
 
@@ -1064,15 +1083,17 @@ impl Drop for WorkerClient {
 }
 
 /// What the worker advertises in `WorkerCapabilities::tags`: its system tags (`os:`, `arch:`, see
-/// `rusty_grid_core::placement`), its effective task concurrency (`slots:<n>`), then the
+/// `rusty_grid_core::placement`), its effective task concurrency (`slots:<n>`), its isolation
+/// level (`iso:<level>`), then the
 /// configured user tags that are not among them.
-fn advertised_tags(user_tags: &[String], slots: usize) -> Vec<String> {
+fn advertised_tags(user_tags: &[String], slots: usize, isolation: IsolationLevel) -> Vec<String> {
     let mut tags = rusty_grid_core::placement::system_tags();
     tags.push(format!(
         "{}{}",
         rusty_grid_core::placement::SLOTS_TAG_PREFIX,
         slots.max(1)
     ));
+    tags.push(isolation.tag());
     for tag in user_tags {
         if !tags.contains(tag) && !tag.starts_with(rusty_grid_core::placement::SLOTS_TAG_PREFIX) {
             tags.push(tag.clone());
@@ -1121,7 +1142,11 @@ impl WorkerClient {
                 }
             })
             .max(1);
-        capabilities = capabilities.with_tags(advertised_tags(&config.tags, concurrency_permits));
+        capabilities = capabilities.with_tags(advertised_tags(
+            &config.tags,
+            concurrency_permits,
+            config.isolation,
+        ));
         // A real GPU is advertised only if this binary can compute on one (see `gpu`).
         let gpu_request = GpuRequest {
             no_gpu: config.no_gpu,
@@ -1177,6 +1202,9 @@ impl WorkerClient {
         if let Some(priority) = config.process_priority {
             runner_cfg = runner_cfg.with_process_priority(priority);
         }
+        runner_cfg = runner_cfg
+            .with_isolation(config.isolation)
+            .with_protected_files(config.protected_files.clone());
         let runner = Arc::new(TaskRunner::new(worker_id, capabilities.clone(), runner_cfg));
         let active_task_table = Arc::new(RwLock::new(HashMap::new()));
         let concurrency_semaphore = Arc::new(Semaphore::new(concurrency_permits));
@@ -1434,6 +1462,20 @@ impl WorkerClient {
             let err = GridError::Config(e.to_string());
             error!(worker_id = %self.worker_id, error = %err, "Task sandboxes cannot be created");
             return Err(err);
+        }
+
+        // Isolation that was asked for and cannot be enforced must stop the worker here, not let
+        // it run tasks with the owner's file access.
+        if self.config.isolation != IsolationLevel::Off {
+            if let Err(err) = crate::isolation::verify_isolation_support(
+                self.config.isolation,
+                &self.runner.config().sandbox_config.base_dir,
+            )
+            .await
+            {
+                error!(worker_id = %self.worker_id, error = %err, "Task isolation cannot be enforced");
+                return Err(err);
+            }
         }
 
         // A user tag that looks like a system one (`os:`, `link:`, ...) would mislead placement.
@@ -5589,6 +5631,53 @@ mod tests {
     }
 
     #[test]
+    fn test_worker_advertises_its_isolation_level_and_refuses_a_spoofed_tag() {
+        for level in [
+            IsolationLevel::Off,
+            IsolationLevel::Fs,
+            IsolationLevel::FsNet,
+        ] {
+            let client = WorkerClient::new(
+                WorkerConfig::new("127.0.0.1:9")
+                    .with_isolation(level)
+                    .with_redirection_portal(false)
+                    .with_no_battery(true),
+            );
+            let tags = client.capabilities().tags.clone();
+            assert!(tags.contains(&format!("iso:{level}")), "{tags:?}");
+            assert_eq!(tags.iter().filter(|t| t.starts_with("iso:")).count(), 1);
+            assert_eq!(client.runner().config().isolation, level);
+        }
+        assert!(rusty_grid_core::placement::validate_user_tag("iso:fs+net").is_err());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn test_run_refuses_isolation_this_platform_cannot_enforce() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = WorkerClient::new(
+            WorkerConfig::new("127.0.0.1:9")
+                .with_sandbox_base_dir(dir.path().join("sandboxes"))
+                .with_isolation(IsolationLevel::Fs)
+                .with_redirection_portal(false)
+                .with_no_battery(true),
+        );
+        let (_tx, rx) = watch::channel(false);
+        let result = tokio::time::timeout(Duration::from_secs(5), client.run(rx))
+            .await
+            .expect("an impossible isolation level must end run() at once");
+        match result {
+            Err(GridError::Config(msg)) => {
+                assert!(
+                    msg.contains("not implemented yet on this platform"),
+                    "{msg}"
+                )
+            }
+            other => panic!("expected a Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_worker_advertises_system_tags_then_user_tags() {
         let client = WorkerClient::new(
             WorkerConfig::new("127.0.0.1:9")
@@ -5607,9 +5696,10 @@ mod tests {
                 format!("os:{}", std::env::consts::OS),
                 format!("arch:{}", std::env::consts::ARCH),
                 "slots:3".to_string(),
+                "iso:off".to_string(),
                 "laptop".to_string(),
             ],
-            "system tags and slots:<n> first, a user tag equal to one of them or starting with slots: is not repeated"
+            "system tags, slots:<n> and iso:<level> first, a user tag equal to one of them or starting with slots: is not repeated"
         );
     }
 
