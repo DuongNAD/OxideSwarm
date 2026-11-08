@@ -36,7 +36,6 @@ fn bench_gpu_compute(size: usize, iters: usize) -> BenchmarkResult {
         input_data,
         work_group_size: 64,
         simulated_matrix_dim: 128,
-        compute_intensity: 100,
     };
 
     // Serialize once for sizing and roundtrip verification
@@ -310,7 +309,6 @@ fn test_multi_payload_size_benchmark_matrix() {
             input_data,
             work_group_size: 32,
             simulated_matrix_dim: 64,
-            compute_intensity: 10,
         };
         let task = Task::new(
             spec,

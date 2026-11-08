@@ -236,7 +236,6 @@ fn rust_spec() -> TaskSpec {
     }
 }
 
-#[allow(deprecated)]
 fn gpu_spec() -> TaskSpec {
     TaskSpec::GpuCompute {
         kernel_name: "gemm".into(),
@@ -244,7 +243,6 @@ fn gpu_spec() -> TaskSpec {
         // The JSON defaults are 16 and 64.
         work_group_size: 32,
         simulated_matrix_dim: 256,
-        compute_intensity: 5,
     }
 }
 
@@ -444,6 +442,13 @@ fn worker_messages() -> Vec<(&'static str, WorkerMessage)> {
                 },
             },
         ),
+        (
+            "ResumeSession",
+            WorkerMessage::ResumeSession {
+                worker_id: worker_id(),
+                running: vec![task_id(), TaskId(fixed_uuid(0x06))],
+            },
+        ),
     ];
     check_instances("WorkerMessage", &all, |msg| match msg {
         WorkerMessage::Register { .. } => "Register",
@@ -456,6 +461,7 @@ fn worker_messages() -> Vec<(&'static str, WorkerMessage)> {
         WorkerMessage::ClaimMasterRole { .. } => "ClaimMasterRole",
         WorkerMessage::UnknownVariant { .. } => "UnknownVariant",
         WorkerMessage::BlobRequest { .. } => "BlobRequest",
+        WorkerMessage::ResumeSession { .. } => "ResumeSession",
     });
     all
 }

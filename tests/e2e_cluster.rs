@@ -703,7 +703,6 @@ async fn test_tier1_f4_gpu_task_routes_exclusively_to_simulated_gpu_worker() {
             input_data: vec![1, 2, 3],
             work_group_size: 16,
             simulated_matrix_dim: 32,
-            compute_intensity: 1,
         },
         TaskRequirements::gpu(10),
     );
@@ -735,7 +734,6 @@ async fn test_tier1_f4_gpu_task_blocked_when_no_gpu_workers_connected() {
             input_data: vec![1, 2, 3],
             work_group_size: 16,
             simulated_matrix_dim: 32,
-            compute_intensity: 1,
         },
         TaskRequirements::gpu(10),
     );
@@ -767,7 +765,6 @@ async fn test_tier1_f4_gpu_task_dispatches_immediately_when_gpu_worker_joins() {
             input_data: vec![1, 2, 3],
             work_group_size: 16,
             simulated_matrix_dim: 32,
-            compute_intensity: 1,
         },
         TaskRequirements::gpu(10),
     );
@@ -808,7 +805,6 @@ async fn test_tier1_f4_gpu_compute_matrix_multiplication_correctness() {
             input_data: vec![1, 2, 3, 4, 5, 6, 7, 8],
             work_group_size: 16,
             simulated_matrix_dim: 32,
-            compute_intensity: 1,
         },
         TaskRequirements::gpu(15),
     );
@@ -1694,7 +1690,6 @@ async fn test_tier3_pairwise_interleaved_gpu_and_cpu_batches() {
                     input_data: vec![i as u8],
                     work_group_size: 16,
                     simulated_matrix_dim: 32,
-                    compute_intensity: 1,
                 },
                 TaskRequirements::gpu(10),
             )
@@ -2143,7 +2138,6 @@ async fn test_tier3_pairwise_worker_disconnect_during_heterogeneous_batch() {
             input_data: vec![7, 8],
             work_group_size: 16,
             simulated_matrix_dim: 32,
-            compute_intensity: 1,
         },
         TaskRequirements::gpu(10),
     );
@@ -2359,7 +2353,6 @@ async fn test_tier4_scenario_full_acceptance_criteria_ac1_to_ac5() {
             input_data: vec![42, 43, 44],
             work_group_size: 16,
             simulated_matrix_dim: 32,
-            compute_intensity: 1,
         },
         TaskRequirements::gpu(15),
     );
@@ -2476,7 +2469,6 @@ async fn test_tier4_scenario_heterogeneous_gpu_matrix_and_cpu_data_pipeline() {
             input_data: vec![1, 2, 3, 4],
             work_group_size: 16,
             simulated_matrix_dim: 32,
-            compute_intensity: 1,
         },
         TaskRequirements::gpu(15),
     );

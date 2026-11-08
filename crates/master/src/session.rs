@@ -1169,6 +1169,14 @@ impl<
                 warn!(worker_id = %worker_id, "Ignoring unexpected Register message on active connection");
                 true
             }
+            (LaneKind::Unified, WorkerMessage::ResumeSession { ref running, .. }) => {
+                debug!(
+                    worker_id = %worker_id,
+                    running_count = running.len(),
+                    "Ignoring ResumeSession message (session resumption not active)"
+                );
+                true
+            }
             (LaneKind::Unified, WorkerMessage::UnknownVariant { tag, ref raw_bytes }) => {
                 warn!(
                     worker_id = %worker_id,

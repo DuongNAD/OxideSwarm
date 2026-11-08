@@ -73,7 +73,6 @@ fn gpu_task(dim: u32, tile: u32, timeout_secs: u64) -> Task {
             input_data: b"param_test_payload".to_vec(),
             work_group_size: tile,
             simulated_matrix_dim: dim,
-            compute_intensity: 1,
         },
         TaskRequirements::gpu(timeout_secs),
     )
@@ -251,7 +250,6 @@ async fn test_simulated_gpu_backward_compatibility() {
             input_data: b"legacy_compat_payload".to_vec(),
             work_group_size: 16,
             simulated_matrix_dim: 48,
-            compute_intensity: 1,
         },
         TaskRequirements::gpu(30),
     );
