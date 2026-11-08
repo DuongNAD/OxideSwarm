@@ -167,7 +167,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          RUSTY_GRID_REQUIRE_USERNS=1 cargo test -p rusty_grid_worker --test test_feat3_os_isolation --locked
+          RUSTY_GRID_REQUIRE_USERNS=1 cargo test -p rusty_grid_worker --test test_feat3_os_isolation --locked -- --nocapture
 
   sec5-hardened-runner:
     name: sec5 hardened runner (${{ matrix.os }})

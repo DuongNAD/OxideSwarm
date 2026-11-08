@@ -1004,6 +1004,16 @@ mod linux {
         };
     }
 
+    /// An early return of a test whose precondition is missing: a failure when CI demands the
+    /// Linux tests (`RUSTY_GRID_REQUIRE_LANDLOCK`), a notice otherwise.
+    fn cannot_run(why: &str) {
+        assert!(
+            std::env::var_os("RUSTY_GRID_REQUIRE_LANDLOCK").is_none(),
+            "required here (RUSTY_GRID_REQUIRE_LANDLOCK) but cannot run: {why}"
+        );
+        eprintln!("skipped: {why}");
+    }
+
     fn python3() -> bool {
         std::process::Command::new("python3")
             .arg("--version")
@@ -1316,7 +1326,7 @@ echo "TOKEN=${RUSTY_GRID_RUN_TOKEN-unset}"
     async fn test_socket_domains_are_refused_by_level() {
         require_landlock!();
         if !python3() {
-            eprintln!("skipped: no python3");
+            cannot_run("no python3");
             return;
         }
         let py = r#"
@@ -1380,7 +1390,7 @@ except OSError as e:
     async fn test_a_listening_unix_socket_outside_the_sandbox_cannot_be_reached() {
         require_landlock!();
         if !python3() {
-            eprintln!("skipped: no python3");
+            cannot_run("no python3");
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1434,7 +1444,7 @@ except OSError as e:
         require_landlock!();
         let _serial = NETNS_ENV.lock().await;
         if !python3() {
-            eprintln!("skipped: no python3");
+            cannot_run("no python3");
             return;
         }
         let py = r#"
@@ -1502,7 +1512,7 @@ except OSError as e:
         require_landlock!();
         let _serial = NETNS_ENV.lock().await;
         if !python3() {
-            eprintln!("skipped: no python3");
+            cannot_run("no python3");
             return;
         }
         let py = r#"
@@ -1529,12 +1539,13 @@ except OSError as e:
         };
         let control = run_at(IsolationLevel::Off, script, &[("T_PY", py)]).await;
         if !(has(&control, "DIAG=OK") && has(&control, "ROUTE=OK") && has(&control, "PROCNET=OK")) {
-            eprintln!(
-                "skipped: netlink or /proc/self/net unusable even unconfined: {:?}",
+            cannot_run(&format!(
+                "netlink or /proc/self/net unusable even unconfined: {:?}",
                 lines(&control)
-            );
+            ));
             return;
         }
+        eprintln!("NETLINK_CONTROL_OK");
         let worker_netns = std::fs::read_link("/proc/self/ns/net").unwrap();
         // SAFETY: only this and the other NETNS_ENV tests read it, and they hold the lock.
         unsafe { std::env::set_var("RUSTY_GRID_ISOLATION_NO_USERNS", "1") };
@@ -1560,7 +1571,7 @@ except OSError as e:
     async fn test_the_kernel_keyring_is_refused() {
         require_landlock!();
         if !python3() {
-            eprintln!("skipped: no python3");
+            cannot_run("no python3");
             return;
         }
         let py = r#"
@@ -1592,7 +1603,7 @@ print("KEYCTL_OK" if r >= 0 else "KEYCTL_ERR%d" % ctypes.get_errno())
     async fn test_io_uring_setup_is_refused() {
         require_landlock!();
         if !python3() {
-            eprintln!("skipped: no python3");
+            cannot_run("no python3");
             return;
         }
         let py = r#"
@@ -1628,7 +1639,7 @@ print("IOURING_OK" if fd >= 0 else "IOURING_ERR%d" % ctypes.get_errno())
     async fn test_tiocsti_is_refused() {
         require_landlock!();
         if !python3() {
-            eprintln!("skipped: no python3");
+            cannot_run("no python3");
             return;
         }
         let py = r#"
