@@ -104,6 +104,8 @@ pub struct WorkerFileConfig {
     pub heartbeat_interval_secs: Option<u64>,
     pub max_concurrency: Option<usize>,
     pub sandbox_base_dir: Option<String>,
+    /// Task isolation level: `off`, `fs` or `fs+net` (`worker --isolation`).
+    pub isolation: Option<String>,
     pub keep_sandboxes: Option<bool>,
     /// Megabytes of task input and output files the worker caches (`worker --blob-cache-mb`).
     pub blob_cache_mb: Option<u64>,
@@ -656,6 +658,15 @@ master = "10.0.0.5:8088"
             ..Default::default()
         };
         assert_eq!(config.secret_keys(SecretSection::Worker), (None, None));
+    }
+
+    #[test]
+    fn test_worker_section_reads_isolation() {
+        let config: ConfigFile = toml::from_str("[worker]\nisolation = \"fs+net\"\n").unwrap();
+        assert_eq!(
+            config.worker.and_then(|w| w.isolation).as_deref(),
+            Some("fs+net")
+        );
     }
 
     #[test]

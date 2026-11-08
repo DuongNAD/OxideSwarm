@@ -191,7 +191,7 @@ design record that builds nothing.
 | AND-4 | Report real worker status | P2 | M | AND-1 | Yes | Planned |  |
 | FEAT-1 | Master durability | P1 | L | TEST-6 |  | Planned |  |
 | FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 |  | Planned |  |
-| FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Planned |  |
+| FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Partial | FEAT-3a (core and macOS) in review; FEAT-3b Linux, FEAT-3c Windows |
 | FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Planned | 105 (design) |
 | FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 |  | Planned |  |
 | FEAT-6 | Master failover | P3 | L | FEAT-1 | D1 | Implemented | 81 |

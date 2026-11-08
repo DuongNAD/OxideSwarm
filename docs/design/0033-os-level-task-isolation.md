@@ -1,6 +1,6 @@
 # 0033: OS-level task isolation
 
-Status: Draft
+Status: Accepted
 Created: 2026-11-08    Updated: 2026-11-08
 
 ## Summary
@@ -44,7 +44,7 @@ This matters before Phase C ([design 0039](0039-agent-workspaces.md)) enables pe
 
 ### D1 Isolation levels, environment scrubbing, toolchain preservation, and start-up self-check (`crates/worker/src/isolation.rs`)
 
-1. New type `IsolationLevel` in `crates/worker/src/isolation.rs` (re-exported in `rusty_grid_core::placement`):
+1. New type `IsolationLevel`, defined in `crates/core/src/placement.rs` because placement needs it and `core` cannot depend on `worker`, and re-exported from `crates/worker/src/isolation.rs` (FEAT-3a implementation note; the design first put it in the worker):
    - `IsolationLevel::Off` (`"off"`, default)
    - `IsolationLevel::Fs` (`"fs"`)
    - `IsolationLevel::FsNet` (`"fs+net"`)
@@ -99,11 +99,10 @@ On macOS (`#[cfg(target_os = "macos")]`), when `isolation` is `Fs` or `FsNet`, `
    (deny file-write* (subpath "/"))
    (allow file-write*
        (subpath (param "SANDBOX_DIR"))
-       (literal "/dev/null")
-       (literal "/dev/zero")
-       (literal "/dev/random")
-       (literal "/dev/urandom")
-       (literal "/dev/dtracehelper"))
+       (literal "/dev/null") (literal "/dev/zero") (literal "/dev/random")
+       (literal "/dev/urandom") (literal "/dev/dtracehelper")
+       (literal "/dev/stdout") (literal "/dev/stderr") (literal "/dev/tty")
+       (subpath "/dev/fd"))
    (deny file-read*
        (subpath (param "USER_HOME"))
        (subpath (param "SANDBOX_BASE"))
@@ -115,12 +114,23 @@ On macOS (`#[cfg(target_os = "macos")]`), when `isolation` is `Fs` or `FsNet`, `
    (deny file-read*
        (literal (param "CARGO_CRED"))
        (literal (param "CARGO_CRED_TOML")))
+   (allow file-read-metadata
+       (literal (param "ANCESTOR_0")) (literal (param "ANCESTOR_1")) ...)
    ```
-   Seatbelt evaluates later matching rules with higher precedence:
-   - `(deny file-read* (subpath (param "USER_HOME")) ...)` denies reading everything under the user's home directory (`~/.oxideswarm/cluster.secret`, `~/.ssh/test_key`, `~/.aws`, `~/.config`, and other repositories), sibling sandboxes under `SANDBOX_BASE`, and `CACHE_DIR`.
-   - The subsequent `(allow file-read* ...)` re-allows reading only `SANDBOX_DIR`, `RUSTUP_HOME`, and `CARGO_HOME`, and the final `(deny file-read* ...)` re-blocks `$CARGO_HOME/credentials` and `$CARGO_HOME/credentials.toml`.
-2. **`fs+net` Seatbelt profile:**
-   Appends `(deny network*)` to the `fs` profile, blocking all outbound and inbound IPv4, IPv6, and pathname `AF_UNIX` network connections.
+   The `ANCESTOR_<n>` parameters are generated per task (see the second correction below). `RUSTUP_HOME` and `CARGO_HOME` in the profile are always the host's own directories, never a value from the task's environment.
+2. **`fs+net` Seatbelt profile:** appends `(deny network*)` to the `fs` profile.
+3. **Invocation:** `/usr/bin/sandbox-exec -p <profile> -D NAME=VALUE ... -- <program> <args>`, with the program resolved against the task's `PATH` first (a missing program fails the task with a clear message). `sandbox-exec` applies the profile and `exec`s the program in place, so the PID the worker tracks is the task itself.
+4. **Start-up probe:** `verify_isolation_support` runs `/bin/sh` under the profile in a temporary directory below the sandbox base. It must write inside the sandbox and must fail to write next to it, so a host where `sandbox-exec` is missing, refuses to nest (the worker itself runs inside a sandbox) or does not enforce the profile stops at start-up.
+
+**What was verified on macOS (FEAT-3a, 2026-11-08, Darwin 27.2, Apple silicon), and what it changed in this section:**
+
+- *Rule precedence is last-match-wins, as the design assumed.* With the profile order above, `cat` of `$USER_HOME/.ssh/key`, of a sibling sandbox file and of `$CARGO_HOME/credentials` fails with `Operation not permitted`, while `$SANDBOX_DIR` and `$CARGO_HOME/registry` read fine. With the `allow` placed *before* the `deny` the sandbox's own file becomes unreadable. The order deny, allow, deny is therefore required, not stylistic.
+- *Correction 1: `/dev/stdout`, `/dev/stderr`, `/dev/tty` and `/dev/fd/*` need their own write rules.* With only the five device nodes of the first draft, `echo x > /dev/stderr` (common in build scripts) fails, because the check is on the `/dev/stderr` path, not on the descriptor it resolves to.
+- *Correction 2: the directories on the way to an allowed path need `file-read-metadata`.* A `subpath` rule also matches the directory itself, so `(deny file-read* (subpath SANDBOX_BASE))` made `stat(SANDBOX_BASE)` fail, and then `realpath()` of anything below it failed too: `cargo build --offline` printed `could not canonicalize path` and died with `could not parse/generate dep info`. `stat` of `USER_HOME` fails likewise, which broke compiling a dependency from `$CARGO_HOME/registry/src` when the toolchain lives under the home (the normal case). The profile therefore re-allows `file-read-metadata` for the literal ancestors of `SANDBOX_DIR`, `RUSTUP_HOME` and `CARGO_HOME` that the deny rules cover, plus `SANDBOX_BASE`. Their contents stay unreadable (`ls` of the base or of the home fails; `stat` of `~/.ssh` fails; only `stat` of the ancestors themselves succeeds). Without this change both cargo tests in `test_feat3_os_isolation.rs` fail.
+- *The parameters must be canonical.* Rules match the real path, so a path given through a symlink (`/tmp/...` for `/private/tmp/...`) is denied like the real one, and a `-D` value through a symlink would never match. `/var/folders/...` temp bases are `/private/var/folders/...`; every parameter is canonicalized (its longest existing prefix, when the path does not exist yet).
+- *`(deny network*)` blocks a loopback TCP connect:* `nc -z 127.0.0.1 <port>` succeeds under `fs` and the listener accepts it; under `fs+net` it fails and the listener sees nothing.
+- *`--` ends the `sandbox-exec` options,* and `-p` takes the profile text, so no profile file is written.
+- *Not covered:* `~/Library` and `DARWIN_USER_TEMP_DIR` (`/var/folders/...`) are outside `USER_HOME` when the home is elsewhere, and a tool that writes there (a compiler cache) is refused by the write rule. Reads of system paths stay open (`(allow default)`), as on Linux.
 
 ### D4 Windows implementation: per-task AppContainer SID (`crates/worker/src/isolation.rs`)
 
@@ -144,7 +154,7 @@ On Windows (`#[cfg(windows)]`), when `isolation` is `Fs` or `FsNet`:
    - Every worker advertises `iso:off`, `iso:fs`, or `iso:fs+net` in `WorkerCapabilities::tags`.
    - `Placement` gains `pub isolation: Option<IsolationLevel>`, parsed from `require:iso=off`, `require:iso=fs`, or `require:iso=fs+net`.
    - In `Placement::matches` (`crates/core/src/placement.rs`), a worker with `iso:<w_level>` satisfies `require:iso=<req_level>` when `w_level >= req_level` (`Off < Fs < FsNet`). A worker without an `iso:` tag is treated as `IsolationLevel::Off`.
-2. `crates/cli/src/cli_app.rs` (`SubmitArgs`) gains `--require-isolation <fs|fs+net>` (emitting `require:iso=<level>`), and MCP `submit` (`crates/cli/src/mcp.rs`) gains optional `isolation: "fs" | "fs+net"`.
+2. `crates/cli/src/cli_app.rs` (`SubmitArgs`) gains `--require-isolation <fs|fs+net>` (emitting `require:iso=<level>`), and MCP `submit` (`crates/cli/src/mcp.rs`) gains optional `isolation: "fs" | "fs+net"`. Both refuse `off` (`IsolationLevel::parse_required`): every worker is at least `off`, so the constraint would match everything; the placement parser itself accepts `require:iso=off`.
 
 ### D6 `oxideswarm doctor` reporting (`crates/cli/src/doctor.rs`)
 
@@ -194,9 +204,13 @@ On Windows (`#[cfg(windows)]`), when `isolation` is `Fs` or `FsNet`:
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| `FEAT-3` | Add `--isolation off\|fs\|fs+net`, Linux Landlock/`seccomp`/namespaces, macOS `sandbox-exec`, Windows per-task AppContainer, `RUSTUP_HOME`/`CARGO_HOME` preservation, `iso:` tag, and `doctor` reporting | `crates/core/src/placement.rs`, `crates/worker/src/isolation.rs`, `crates/worker/src/process_tree.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/sandbox.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `crates/cli/src/doctor.rs`, `crates/cli/src/mcp.rs`, `crates/worker/tests/test_feat3_os_isolation.rs`, `README.md`, `docs/README.md` | Under `fs`, reading `cluster.secret`, `$HOME/.ssh/test_key`, a concurrent task's sandbox, or `/proc/<worker_pid>/environ` fails and `cargo build --offline` of a crate with a cached dependency succeeds on each OS; under `fs+net`, outbound TCP and Linux `io_uring` socket attempts fail; `doctor` reports the level | Planned |
+| `FEAT-3` | Add `--isolation off\|fs\|fs+net`, Linux Landlock/`seccomp`/namespaces, macOS `sandbox-exec`, Windows per-task AppContainer, `RUSTUP_HOME`/`CARGO_HOME` preservation, `iso:` tag, and `doctor` reporting. Split into the three rows below | `crates/core/src/placement.rs`, `crates/worker/src/isolation.rs`, `crates/worker/src/process_tree.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/sandbox.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `crates/cli/src/doctor.rs`, `crates/cli/src/mcp.rs`, `crates/worker/tests/test_feat3_os_isolation.rs`, `README.md`, `docs/README.md` | Under `fs`, reading `cluster.secret`, `$HOME/.ssh/test_key`, a concurrent task's sandbox, or `/proc/<worker_pid>/environ` fails and `cargo build --offline` of a crate with a cached dependency succeeds on each OS; under `fs+net`, outbound TCP and Linux `io_uring` socket attempts fail; `doctor` reports the level | Partial |
+| `FEAT-3a` | The platform-independent core and macOS: `IsolationLevel`, `--isolation` / `RUSTY_GRID_ISOLATION` / `[worker].isolation`, start-up self-check, environment preparation, `iso:` tag, `require:iso=`, `submit --require-isolation`, MCP `isolation`, `doctor` ISO column, macOS `sandbox-exec` profile | `crates/core/src/placement.rs`, `crates/worker/src/isolation.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/src/{cli_app,config,doctor,mcp}.rs`, `crates/worker/tests/test_feat3_os_isolation.rs` | On macOS the `fs` and `fs+net` tests in `test_feat3_os_isolation.rs` pass (secrets, sibling sandbox and outside writes denied, TCP refused, `cargo build --offline` works, PID, cancel and timeout still work); on Linux and Windows an `fs` worker refuses to start with "not implemented yet" | Implemented |
+| `FEAT-3b` | Linux: Landlock, `seccomp`, namespaces, `/proc` narrowing; adds the concurrent-task and `io_uring` tests | `crates/worker/src/isolation.rs`, `crates/worker/src/process_tree.rs` | The Linux rows of the Test plan pass; the self-check refuses a kernel without Landlock | Planned |
+| `FEAT-3c` | Windows: per-task AppContainer profile and ACLs | `crates/worker/src/isolation.rs`, `crates/worker/src/sandbox.rs` | The Windows rows of the Test plan pass | Planned |
 
 ## Status log
 
 - 2026-11-08: Initial draft written for `FEAT-3` (Phase B of `docs/ROADMAP.md`).
 - 2026-11-08: Addressed review `117-fix`: preserved `RUSTUP_HOME` and read-only `CARGO_HOME` (with `credentials*` denied) so `cargo build --offline` works under `fs`; unified the `fs` read policy across Linux, macOS (`(deny file-read* (subpath (param "USER_HOME")))` before toolchain/sandbox allows), and Windows; switched Windows to a per-task AppContainer profile (`oxideswarm.task.<task_id>`) so concurrent tasks cannot read each other's sandboxes; added `AUDIT_ARCH` validation and `io_uring_*` blocking to the Linux `seccomp` filter and stripped `SSH_AUTH_SOCK` / `DBUS_SESSION_BUS_ADDRESS` / `DOCKER_HOST`; narrowed Linux `/proc` rules to `/proc/self` and system info files; specified `pre_exec` ordering after design 0031's supervisor fork; and documented the effects of moving `HOME` in Compatibility.
+- 2026-11-08: `FEAT-3a` implemented (core and macOS). Set Status to Accepted. `IsolationLevel` lives in `rusty_grid_core::placement` (re-exported by the worker). Corrected D3 after checking Seatbelt on macOS: last-match-wins precedence confirmed; `/dev/stdout`, `/dev/stderr`, `/dev/tty`, `/dev/fd/*` added to the writable devices; `file-read-metadata` re-allowed for the ancestors of the allowed paths (needed for `realpath()` and so for cargo); parameters must be canonical; added the start-up probe. Linux (`FEAT-3b`) and Windows (`FEAT-3c`) still make an `fs` worker refuse to start.

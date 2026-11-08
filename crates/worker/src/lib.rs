@@ -15,6 +15,7 @@ pub mod gen3d;
 pub mod gpu;
 pub mod heartbeat;
 pub mod identity;
+pub mod isolation;
 pub mod process_tree;
 pub mod runner;
 pub mod sandbox;
@@ -27,6 +28,7 @@ pub use blob_cache::{BlobCache, CachePin, DEFAULT_BLOB_CACHE_MAX_BYTES};
 pub use client::{WorkerClient, WorkerConfig};
 pub use gpu::{GpuError, GpuNotice, NoticeLevel, WGPU_COMPILED};
 pub use heartbeat::{HeartbeatHandle, HeartbeatTracker, MobileTelemetryHandle};
+pub use isolation::{verify_isolation_support, HostDirs, IsolationLevel};
 pub use process_tree::{terminate_all_task_process_trees, ProcessPriority};
 pub use runner::{
     read_bounded_stream, RunnerConfig, TaskRunner, TaskRunnerError, DEFAULT_MAX_OUTPUT_BYTES,

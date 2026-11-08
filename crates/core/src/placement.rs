@@ -7,13 +7,16 @@
 //! * **Worker tags.** A worker adds [`system_tags`] (`os:<os>`, `arch:<arch>`) and `slots:<n>`
 //!   itself, and its operator may add user tags ([`validate_user_tag`]). In `ListWorkers` /
 //!   `ClusterStatus` answers the master adds `link:<path>`, `id:<worker uuid>` and
-//!   `state:<state>`. Those six prefixes are [`RESERVED_TAG_PREFIXES`]: no user tag may start
+//!   `state:<state>`, and the worker adds its task isolation level as `iso:<level>`
+//!   ([`IsolationLevel`], design 0033). Those seven prefixes are [`RESERVED_TAG_PREFIXES`]: no user tag may start
 //!   with one.
 //! * **Task constraints.** `require:<key>=<value>` entries of `Task::tags`, parsed into a
-//!   [`Placement`]. Keys: `os`, `arch`, `worker` (UUID or name) and `tag` (repeatable). Every
+//!   [`Placement`]. Keys: `os`, `arch`, `worker` (UUID or name), `iso` (a minimum
+//!   [`IsolationLevel`]) and `tag` (repeatable). Every
 //!   constraint must hold; other task tags are ignored.
 
 use std::fmt;
+use std::str::FromStr;
 
 use uuid::Uuid;
 
@@ -33,17 +36,92 @@ pub const LINK_TAG_PREFIX: &str = "link:";
 pub const ID_TAG_PREFIX: &str = "id:";
 /// Prefix of the connection-state tag the master adds to worker listings (`state:busy`).
 pub const STATE_TAG_PREFIX: &str = "state:";
+/// Prefix of the task isolation tag a worker adds itself (`iso:fs+net`).
+pub const ISO_TAG_PREFIX: &str = "iso:";
 /// Tag prefixes only the worker or the master may set.
-pub const RESERVED_TAG_PREFIXES: [&str; 6] = [
+pub const RESERVED_TAG_PREFIXES: [&str; 7] = [
     OS_TAG_PREFIX,
     ARCH_TAG_PREFIX,
     SLOTS_TAG_PREFIX,
     LINK_TAG_PREFIX,
     ID_TAG_PREFIX,
     STATE_TAG_PREFIX,
+    ISO_TAG_PREFIX,
 ];
 /// Longest user tag, in bytes.
 pub const MAX_USER_TAG_LEN: usize = 64;
+
+/// How strongly a worker confines the processes of its tasks (design 0033).
+///
+/// Ordered by strength: `Off < Fs < FsNet`. A task that requires a level runs on every worker at
+/// that level or above.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IsolationLevel {
+    /// No OS-level confinement (the default): a task runs with the worker's own file access.
+    #[default]
+    Off,
+    /// Files: a task may write only its own sandbox and read only it, the system and the Rust
+    /// toolchain.
+    Fs,
+    /// `Fs` plus no network sockets.
+    FsNet,
+}
+
+impl IsolationLevel {
+    /// The spelling used by the flag, the environment variable, the config file and the tags.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IsolationLevel::Off => "off",
+            IsolationLevel::Fs => "fs",
+            IsolationLevel::FsNet => "fs+net",
+        }
+    }
+
+    /// The tag a worker at this level advertises (`iso:fs`).
+    pub fn tag(self) -> String {
+        format!("{ISO_TAG_PREFIX}{}", self.as_str())
+    }
+
+    /// Parses the level a task may ask for (`submit --require-isolation`, MCP `isolation`): `fs`
+    /// or `fs+net`. `off` is refused because every worker is at least `off`, so it would
+    /// constrain nothing.
+    pub fn parse_required(text: &str) -> Result<Self, String> {
+        match text.parse::<Self>()? {
+            IsolationLevel::Off => {
+                Err("a required isolation is fs or fs+net (every worker is at least off)".into())
+            }
+            level => Ok(level),
+        }
+    }
+
+    /// The level a worker's tags advertise; no (or an unreadable) `iso:` tag counts as `Off`.
+    pub fn from_tags(tags: &[String]) -> Self {
+        tag_value(tags, ISO_TAG_PREFIX)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_default()
+    }
+}
+
+impl fmt::Display for IsolationLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for IsolationLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(IsolationLevel::Off),
+            "fs" => Ok(IsolationLevel::Fs),
+            "fs+net" => Ok(IsolationLevel::FsNet),
+            other => Err(format!(
+                "unknown isolation level '{other}' (expected off, fs or fs+net)"
+            )),
+        }
+    }
+}
 
 /// The tags every worker advertises about itself: `os:<std::env::consts::OS>` and
 /// `arch:<std::env::consts::ARCH>`, for example `os:macos` and `arch:aarch64`.
@@ -131,6 +209,9 @@ pub struct Placement {
     pub arch: Option<String>,
     /// Worker UUID, or worker name (compared ignoring ASCII case).
     pub worker: Option<String>,
+    /// Minimum isolation level ([`IsolationLevel`]); a worker without an `iso:` tag counts as
+    /// `off`.
+    pub isolation: Option<IsolationLevel>,
     /// User tags the worker must all carry, sorted and without duplicates.
     pub tags: Vec<String>,
 }
@@ -138,13 +219,17 @@ pub struct Placement {
 impl Placement {
     /// True when the task has no constraint.
     pub fn is_empty(&self) -> bool {
-        self.os.is_none() && self.arch.is_none() && self.worker.is_none() && self.tags.is_empty()
+        self.os.is_none()
+            && self.arch.is_none()
+            && self.worker.is_none()
+            && self.isolation.is_none()
+            && self.tags.is_empty()
     }
 
     /// Parses the `require:` entries of a task's tags; tags without that prefix are ignored.
     ///
     /// Rejects an entry that is not `require:<key>=<value>`, an unknown key, an empty value, a
-    /// second `os`, `arch` or `worker`, and a `tag` that is not a valid user tag.
+    /// second `os`, `arch`, `worker` or `iso`, an unknown isolation level, and a `tag` that is not a valid user tag.
     pub fn from_task_tags(task_tags: &[String]) -> Result<Self, String> {
         let mut placement = Self::default();
         for tag in task_tags {
@@ -159,6 +244,17 @@ impl Placement {
             if value.is_empty() {
                 return Err(format!("placement constraint `{tag}` has an empty value"));
             }
+            if key == "iso" {
+                let level = value
+                    .parse::<IsolationLevel>()
+                    .map_err(|e| format!("placement constraint `{tag}`: {e}"))?;
+                if placement.isolation.replace(level).is_some() {
+                    return Err(format!(
+                        "placement constraint `{key}` is given more than once"
+                    ));
+                }
+                continue;
+            }
             let slot = match key {
                 "os" => &mut placement.os,
                 "arch" => &mut placement.arch,
@@ -171,7 +267,7 @@ impl Placement {
                 }
                 other => {
                     return Err(format!(
-                        "unknown placement constraint `{other}` in `{tag}` (known: os, arch, worker, tag)"
+                        "unknown placement constraint `{other}` in `{tag}` (known: os, arch, worker, iso, tag)"
                     ))
                 }
             };
@@ -206,6 +302,9 @@ impl Placement {
         if let Some(worker) = &self.worker {
             tags.push(format!("{REQUIRE_PREFIX}worker={worker}"));
         }
+        if let Some(level) = self.isolation {
+            tags.push(format!("{REQUIRE_PREFIX}iso={level}"));
+        }
         for tag in &self.tags {
             tags.push(format!("{REQUIRE_PREFIX}tag={tag}"));
         }
@@ -236,6 +335,11 @@ impl Placement {
                 return false;
             }
         }
+        if let Some(required) = self.isolation {
+            if IsolationLevel::from_tags(worker_tags) < required {
+                return false;
+            }
+        }
         self.tags.iter().all(|wanted| worker_tags.contains(wanted))
     }
 
@@ -261,6 +365,9 @@ impl fmt::Display for Placement {
         }
         if let Some(worker) = &self.worker {
             parts.push(format!("worker={worker}"));
+        }
+        if let Some(level) = self.isolation {
+            parts.push(format!("iso>={level}"));
         }
         for tag in &self.tags {
             parts.push(format!("tag={tag}"));
@@ -314,6 +421,8 @@ mod tests {
             "link:TCP/LAN",
             "id:123",
             "state:busy",
+            "iso:fs",
+            "iso:off",
         ] {
             assert!(validate_user_tag(bad).is_err(), "{bad:?} must be refused");
         }
@@ -411,14 +520,82 @@ mod tests {
             let err = Placement::from_task_tags(&tags(&[bad])).unwrap_err();
             assert!(err.contains(needle), "{bad}: {err}");
         }
-        for key in ["os", "arch", "worker"] {
+        for key in ["os", "arch", "worker", "iso"] {
             let err = Placement::from_task_tags(&tags(&[
-                &format!("require:{key}=a"),
-                &format!("require:{key}=b"),
+                &format!("require:{key}={}", if key == "iso" { "fs" } else { "a" }),
+                &format!("require:{key}={}", if key == "iso" { "off" } else { "b" }),
             ]))
             .unwrap_err();
             assert!(err.contains("more than once"), "{key}: {err}");
         }
+    }
+
+    #[test]
+    fn test_isolation_level_parses_orders_and_displays() {
+        for (text, level) in [
+            ("off", IsolationLevel::Off),
+            ("fs", IsolationLevel::Fs),
+            ("fs+net", IsolationLevel::FsNet),
+            (" FS+Net ", IsolationLevel::FsNet),
+        ] {
+            assert_eq!(text.parse::<IsolationLevel>(), Ok(level), "{text}");
+        }
+        for bad in ["", "net", "fs+", "strict", "fsnet"] {
+            assert!(bad.parse::<IsolationLevel>().is_err(), "{bad:?}");
+        }
+        for level in [
+            IsolationLevel::Off,
+            IsolationLevel::Fs,
+            IsolationLevel::FsNet,
+        ] {
+            assert_eq!(level.to_string().parse(), Ok(level));
+            assert_eq!(level.tag(), format!("iso:{level}"));
+            assert_eq!(IsolationLevel::from_tags(&[level.tag()]), level);
+        }
+        assert!(IsolationLevel::Off < IsolationLevel::Fs);
+        assert!(IsolationLevel::Fs < IsolationLevel::FsNet);
+        assert_eq!(IsolationLevel::default(), IsolationLevel::Off);
+        assert_eq!(
+            IsolationLevel::from_tags(&tags(&["os:macos"])),
+            IsolationLevel::Off
+        );
+        assert_eq!(
+            IsolationLevel::from_tags(&tags(&["iso:bogus"])),
+            IsolationLevel::Off
+        );
+    }
+
+    #[test]
+    fn test_require_isolation_matches_at_least_the_level() {
+        let id = Uuid::new_v4();
+        let worker = |level: Option<&str>| {
+            let mut t = tags(&["os:macos"]);
+            if let Some(l) = level {
+                t.push(format!("iso:{l}"));
+            }
+            t
+        };
+        let need =
+            |l: &str| Placement::from_task_tags(&tags(&[&format!("require:iso={l}")])).unwrap();
+        let fs = need("fs");
+        let fsnet = need("fs+net");
+        let off = need("off");
+        assert_eq!(fs.isolation, Some(IsolationLevel::Fs));
+        assert_eq!(fs.to_string(), "iso>=fs");
+        assert!(!fs.is_empty());
+        for (w, ok_off, ok_fs, ok_fsnet) in [
+            (None, true, false, false),
+            (Some("off"), true, false, false),
+            (Some("fs"), true, true, false),
+            (Some("fs+net"), true, true, true),
+        ] {
+            let tags = worker(w);
+            assert_eq!(off.matches(id, "w", &tags), ok_off, "off on {w:?}");
+            assert_eq!(fs.matches(id, "w", &tags), ok_fs, "fs on {w:?}");
+            assert_eq!(fsnet.matches(id, "w", &tags), ok_fsnet, "fs+net on {w:?}");
+        }
+        let err = Placement::from_task_tags(&tags(&["require:iso=strict"])).unwrap_err();
+        assert!(err.contains("unknown isolation level"), "{err}");
     }
 
     #[test]
@@ -427,6 +604,7 @@ mod tests {
             os: Some("windows".into()),
             arch: Some("x86_64".into()),
             worker: Some("DELL-VOSTRO".into()),
+            isolation: Some(IsolationLevel::FsNet),
             tags: tags(&["cpu", "office"]),
         };
         assert_eq!(Placement::from_task_tags(&p.to_task_tags()).unwrap(), p);

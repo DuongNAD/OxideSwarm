@@ -42,8 +42,8 @@ use uuid::Uuid;
 
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::placement::{
-    listed_worker_id, tag_value, Placement, ARCH_TAG_PREFIX, OS_TAG_PREFIX, REQUIRE_PREFIX,
-    STATE_TAG_PREFIX,
+    listed_worker_id, tag_value, IsolationLevel, Placement, ARCH_TAG_PREFIX, OS_TAG_PREFIX,
+    REQUIRE_PREFIX, STATE_TAG_PREFIX,
 };
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
@@ -522,6 +522,11 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Target worker name or UUID"
                     },
+                    "isolation": {
+                        "type": "string",
+                        "enum": ["fs", "fs+net"],
+                        "description": "Run only on a worker confined at least at this OS-level isolation (worker --isolation): fs or fs+net"
+                    },
                     "require_tags": {
                         "type": "array",
                         "items": { "type": "string" },
@@ -851,8 +856,14 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             let arch_opt = check_opt_str(obj, "arch")?;
             let worker_opt = check_opt_str(obj, "worker")?;
             let req_tags = check_opt_str_array(obj, "require_tags")?;
+            let isolation_opt = check_opt_str(obj, "isolation")?;
 
             let mut placement_tags = Vec::new();
+            if let Some(level) = isolation_opt {
+                let level = IsolationLevel::parse_required(level)
+                    .map_err(|e| format!("Invalid placement constraints: {e}"))?;
+                placement_tags.push(format!("{REQUIRE_PREFIX}iso={level}"));
+            }
             if let Some(os) = os_opt {
                 placement_tags.push(format!("{REQUIRE_PREFIX}os={os}"));
             }
@@ -1835,6 +1846,12 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
     }
     if let Some(worker) = args.get("worker").and_then(Value::as_str) {
         placement_tags.push(format!("{REQUIRE_PREFIX}worker={worker}"));
+    }
+    if let Some(level) = args.get("isolation").and_then(Value::as_str) {
+        match IsolationLevel::parse_required(level) {
+            Ok(level) => placement_tags.push(format!("{REQUIRE_PREFIX}iso={level}")),
+            Err(e) => return ToolCallResult::error(format!("Invalid placement constraints: {e}")),
+        }
     }
     if let Some(tags_arr) = args.get("require_tags").and_then(Value::as_array) {
         for t in tags_arr.iter().filter_map(Value::as_str) {
@@ -3070,6 +3087,37 @@ pub async fn run_mcp(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn test_submit_isolation_argument_is_a_minimum_level_placement() {
+        for level in ["fs", "fs+net"] {
+            assert_eq!(
+                validate_tool_arguments("submit", &json!({"command": "echo", "isolation": level})),
+                Ok(()),
+                "{level}"
+            );
+        }
+        for bad in ["off", "strict"] {
+            let err =
+                validate_tool_arguments("submit", &json!({"command": "echo", "isolation": bad}))
+                    .unwrap_err();
+            assert!(
+                err.contains("Invalid placement constraints"),
+                "{bad}: {err}"
+            );
+        }
+        assert!(
+            validate_tool_arguments("submit", &json!({"command": "echo", "isolation": 3})).is_err()
+        );
+        let submit = available_tools()
+            .into_iter()
+            .find(|t| t.name == "submit")
+            .unwrap();
+        assert_eq!(
+            submit.input_schema["properties"]["isolation"]["enum"],
+            json!(["fs", "fs+net"])
+        );
+    }
 
     #[test]
     fn test_mcp_args_rejects_sse_flags() {
