@@ -44,7 +44,7 @@ Each row is a limit a user meets today, and the item that removes it.
 | The master keeps all state in memory | A master restart loses queued, running and finished tasks | FEAT-1 |
 | There is one master and no failover | The master is a single point of failure | FEAT-6 (Design only, decision D1) |
 | Delivery is at least once | A task can run twice after a worker is lost | FEAT-1, FEAT-2 |
-| A task runs as the worker's user without OS isolation | A task can read `cluster.secret` and other sandboxes | FEAT-3 |
+| On Linux and Windows a task runs as the worker's user without OS isolation. macOS has `--isolation fs` and `fs+net` (FEAT-3a) | A task on Linux or Windows can read `cluster.secret` and other sandboxes | FEAT-3 (`FEAT-3b`, `FEAT-3c`) |
 | Each task gets a fresh sandbox | An agent's `cargo test` builds from zero every time | FEAT-4 |
 | Clients connect over TCP only (`connect_master` in `crates/cli/src/connect.rs`) | A client on another network cannot reach a master that is reachable only over P2P | FEAT-4 |
 | `RustCompilation` runs bare `rustc` on one file | A crate with dependencies does not build | FEAT-10 |
@@ -138,7 +138,7 @@ Goal: a master restart loses nothing, and a task cannot reach the worker's secre
 |---|---|---|
 | FEAT-1 | Journal in `--state-dir`, replay at start, and `ResumeSession` so a master adopts running tasks | Partial. Design 0046 (Draft). Merged: the wire layer (pull request 141: protocol version 4, `ResumeSession`) and the journal and snapshot module (pull request 129), which the master does not use yet |
 | FEAT-2 | A supervisor per task group that kills the group when the worker dies, on Linux and macOS | Implemented (pull request 123, design 0031) |
-| FEAT-3 | An `--isolation` flag with the levels `off`, `fs` and `fs+net`, using Landlock and namespaces on Linux, `sandbox-exec` on macOS, and AppContainer or a restricted token on Windows | Design 0033 (Draft). Pull request 133, the core and macOS, open |
+| FEAT-3 | An `--isolation` flag with the levels `off`, `fs` and `fs+net`, using Landlock and namespaces on Linux, `sandbox-exec` on macOS, and AppContainer or a restricted token on Windows | Partial. Design 0033 (Accepted). The core and macOS (`FEAT-3a`) are merged (pull request 133). Linux (`FEAT-3b`) and Windows (`FEAT-3c`) are Planned |
 
 This phase comes before workspaces. A workspace keeps the owner's source code on another machine
 and runs commands an agent chose. Without FEAT-3 such a command can read `cluster.secret`. Without
@@ -241,3 +241,5 @@ The owner accepted Q1 to Q5 on 2026-11-07 and Q6 on 2026-11-08.
   and FEAT-3 has an open pull request. "Where the project stands" moved to the
   same commit: containment and the wire layout check now work, and their rows left "What is
   missing". The 3D and Agent Mesh rows of "What waits" record what FEAT-11 and MESH-3 landed.
+- 2026-11-08: FEAT-3 is Partial at `master` `4e1aeb3`: the core and macOS (`FEAT-3a`, pull request
+  133) are merged. The "What is missing" row now names Linux and Windows only.
