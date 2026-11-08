@@ -404,3 +404,87 @@ fn test_bad_tokens_and_a_different_existing_secret_are_refused() {
         );
     }
 }
+
+#[test]
+fn test_an_existing_config_is_kept_backed_up_and_not_repointed_without_the_flag() {
+    let master_home = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let mut seen = Seen::default();
+    let out = seen.run(with(master_home.path(), &["secret", "generate"]), None);
+    assert!(out.status.success());
+    let secret = read_secret(master_home.path());
+    let out = seen.run_token(with(
+        master_home.path(),
+        &["secret", "join-token", "--master", "127.0.0.1:9"],
+    ));
+    let token = text(&out.stdout).trim().to_string();
+
+    let config_path = home.path().join(".oxideswarm/rusty-grid.toml");
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    let old = "# my own notes\n[worker]\nname = \"box\" # keep\nmaster = \"10.9.9.9:8088\"\n";
+    fs::write(&config_path, old).unwrap();
+
+    // A different master is already configured: refused, nothing written, not even the secret.
+    let out = seen.run(with(home.path(), &["join", "--no-doctor"]), Some(&token));
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("--replace-master"));
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), old);
+    assert!(!secret_file(home.path()).exists());
+
+    // With the flag: comments and other keys survive, the keys are listed, a private backup exists.
+    let out = seen.run(
+        with(home.path(), &["join", "--no-doctor", "--replace-master"]),
+        Some(&token),
+    );
+    seen.keep_stdout(&out);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let new = fs::read_to_string(&config_path).unwrap();
+    assert!(new.contains("# my own notes") && new.contains("name = \"box\" # keep"));
+    assert!(new.contains("127.0.0.1:9") && !new.contains("10.9.9.9"));
+    let err = text(&out.stderr);
+    assert!(err.contains("[worker].master") && err.contains("[submit].master"));
+    assert!(
+        !err.contains("127.0.0.1:9"),
+        "values are not listed, only keys"
+    );
+    let backups: Vec<PathBuf> = fs::read_dir(config_path.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().contains("rusty-grid.toml.bak-"))
+        .collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(fs::read_to_string(&backups[0]).unwrap(), old);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&backups[0]).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    // A config file that is a symbolic link is never edited.
+    #[cfg(unix)]
+    {
+        let other = TempDir::new().unwrap();
+        let real = other.path().join("real.toml");
+        fs::write(&real, "# real\n").unwrap();
+        let link_home = TempDir::new().unwrap();
+        fs::create_dir_all(link_home.path().join(".oxideswarm")).unwrap();
+        std::os::unix::fs::symlink(&real, link_home.path().join(".oxideswarm/rusty-grid.toml"))
+            .unwrap();
+        let out = seen.run(
+            with(link_home.path(), &["join", "--no-doctor"]),
+            Some(&token),
+        );
+        assert!(!out.status.success());
+        assert!(text(&out.stderr).contains("symbolic link"));
+        assert_eq!(fs::read_to_string(&real).unwrap(), "# real\n");
+        assert!(!secret_file(link_home.path()).exists());
+    }
+
+    for output in &seen.0 {
+        assert!(
+            !output.contains(&secret),
+            "the secret was printed:\n{output}"
+        );
+    }
+}

@@ -159,7 +159,24 @@ impl JoinToken {
     }
 }
 
-/// Reads at most [`MAX_TOKEN_BYTES`] from `reader` and returns the trimmed text. Never echoes it.
+fn clean_token(text: &str) -> GridResult<String> {
+    if text.len() as u64 > MAX_TOKEN_BYTES {
+        return Err(GridError::Config(
+            "the input is too long to be a join token".into(),
+        ));
+    }
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err(GridError::Config(
+            "the input is empty: pipe the join token into this command or paste it at the prompt"
+                .into(),
+        ));
+    }
+    Ok(text)
+}
+
+/// Reads at most [`MAX_TOKEN_BYTES`] from `reader` (piped standard input) and returns the trimmed
+/// text. Never echoes it.
 pub fn read_token(reader: impl Read) -> GridResult<String> {
     let mut text = String::new();
     reader
@@ -170,98 +187,313 @@ pub fn read_token(reader: impl Read) -> GridResult<String> {
                 "cannot read the join token from standard input: {e}"
             ))
         })?;
-    if text.len() as u64 > MAX_TOKEN_BYTES {
-        return Err(GridError::Config(
-            "standard input is too long to be a join token".into(),
-        ));
-    }
-    let text = text.trim().to_string();
-    if text.is_empty() {
-        return Err(GridError::Config(
-            "standard input is empty: pipe the join token into this command".into(),
-        ));
-    }
-    Ok(text)
+    clean_token(&text)
 }
 
-/// Saves the master address and ticket in the TOML config file `path`, keeping its other keys
-/// (comments are not kept). Returns whether the file changed. A file that is not valid TOML is
-/// refused and left alone.
-///
-/// * `[worker] master`, `[submit] master` and `[status] master` get the address.
-/// * `[worker] p2p_ticket` gets the ticket; without one the key is removed, because a stale ticket
-///   from an earlier master would otherwise win over the new address.
-pub fn save_target(path: &Path, master: Option<&str>, ticket: Option<&str>) -> GridResult<bool> {
-    let cfg_err = |what: &str, e: &dyn std::fmt::Display| {
-        GridError::Config(format!("{what} '{}': {e}", path.display()))
-    };
-    let existing = match std::fs::read_to_string(path) {
-        Ok(text) => Some(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(cfg_err("cannot read config file", &e)),
-    };
-    let mut table: toml::Table = match &existing {
-        Some(text) => toml::from_str(text).map_err(|e| {
-            GridError::Config(format!(
-                "config file '{}' is not valid TOML ({e}); fix or move it, then join again",
-                path.display()
-            ))
-        })?,
-        None => toml::Table::new(),
-    };
-    let before = table.clone();
-    for name in ["worker", "submit", "status"] {
-        section_of(&mut table, name, path)?;
-    }
-    if let Some(master) = master {
-        for name in ["worker", "submit", "status"] {
-            section_of(&mut table, name, path)?
-                .insert("master".into(), toml::Value::String(master.to_string()));
-        }
-    }
-    let worker = section_of(&mut table, "worker", path)?;
-    match ticket {
-        Some(t) => {
-            worker.insert("p2p_ticket".into(), toml::Value::String(t.to_string()));
-        }
-        None => {
-            worker.remove("p2p_ticket");
-        }
-    }
-    if table == before && existing.is_some() {
-        return Ok(false);
-    }
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| cfg_err("cannot create the directory of", &e))?;
-    }
-    let text =
-        toml::to_string_pretty(&table).map_err(|e| cfg_err("cannot render config file", &e))?;
-    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, text)
-        .and_then(|()| std::fs::rename(&tmp, path))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            cfg_err("cannot write config file", &e)
-        })?;
-    Ok(true)
+/// Switches the terminal behind a file descriptor (Unix) or console handle (Windows) to no-echo
+/// and restores the previous mode when dropped.
+pub struct EchoOff {
+    #[cfg(unix)]
+    fd: std::os::fd::RawFd,
+    #[cfg(unix)]
+    saved: libc::termios,
+    #[cfg(windows)]
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    #[cfg(windows)]
+    saved: u32,
 }
 
-fn section_of<'a>(
-    table: &'a mut toml::Table,
+#[cfg(unix)]
+impl EchoOff {
+    /// Turns echo off on the terminal `fd` (the line stays canonical, so Enter still ends it).
+    pub fn on_fd(fd: std::os::fd::RawFd) -> std::io::Result<Self> {
+        // SAFETY: `termios` is plain data; `tcgetattr` fills it or fails.
+        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut quiet = saved;
+        quiet.c_lflag &= !libc::ECHO;
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { fd, saved })
+    }
+
+    /// Standard input.
+    pub fn stdin() -> std::io::Result<Self> {
+        Self::on_fd(0)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        // SAFETY: restores the attributes read in `on_fd`.
+        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) };
+    }
+}
+
+#[cfg(windows)]
+impl EchoOff {
+    /// Standard input: clears `ENABLE_ECHO_INPUT` of the console mode.
+    pub fn stdin() -> std::io::Result<Self> {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, STD_INPUT_HANDLE,
+        };
+        // SAFETY: plain Win32 calls on the process's own standard input handle.
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            let mut saved = 0u32;
+            if GetConsoleMode(handle, &mut saved) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if SetConsoleMode(handle, saved & !ENABLE_ECHO_INPUT) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self { handle, saved })
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        // SAFETY: restores the mode read in `stdin`.
+        unsafe { windows_sys::Win32::System::Console::SetConsoleMode(self.handle, self.saved) };
+    }
+}
+
+/// Prompts on stderr and reads one line from the terminal on standard input with echo off, so a
+/// pasted token is not shown on screen. Fails (rather than reading with echo) when echo cannot be
+/// turned off.
+#[cfg(any(unix, windows))]
+pub fn read_token_hidden() -> GridResult<String> {
+    use std::io::{BufRead, Write};
+    let guard = EchoOff::stdin().map_err(|e| {
+        GridError::Config(format!(
+            "cannot turn off terminal echo ({e}); pipe the token in instead, for example `pbpaste | oxideswarm join`"
+        ))
+    })?;
+    eprint!("Paste the join token (it will not be shown): ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    let read = std::io::stdin()
+        .lock()
+        .take(MAX_TOKEN_BYTES + 1)
+        .read_line(&mut line);
+    drop(guard);
+    eprintln!();
+    read.map_err(|e| GridError::Config(format!("cannot read the join token: {e}")))?;
+    clean_token(&line)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn read_token_hidden() -> GridResult<String> {
+    Err(GridError::Config(
+        "reading from a terminal is not supported here; pipe the token in".into(),
+    ))
+}
+
+/// The result of planning the edit of the config file.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ConfigPlan {
+    /// The new text of the file (equal to the old text when nothing changes).
+    pub text: String,
+    /// The keys that are set or removed, as `[section].key` (never values).
+    pub changes: Vec<String>,
+    /// Keys that already hold a different master or ticket, as `[section].key`.
+    pub conflicts: Vec<String>,
+}
+
+fn table_of<'a>(
+    doc: &'a mut toml_edit::DocumentMut,
     name: &str,
     path: &Path,
-) -> GridResult<&'a mut toml::Table> {
-    table
-        .entry(name)
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| {
-            GridError::Config(format!(
-                "config file '{}' has a `{name}` key that is not a table",
-                path.display()
-            ))
+) -> GridResult<&'a mut toml_edit::Table> {
+    if !doc.contains_key(name) {
+        doc[name] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc[name].as_table_mut().ok_or_else(|| {
+        GridError::Config(format!(
+            "config file '{}' has a `{name}` key that is not a table; fix it by hand, then join again",
+            path.display()
+        ))
+    })
+}
+
+/// Plans the edit of the config file text `existing` (`None`: no file yet) that saves the master
+/// address and ticket. Only the keys below are touched; comments, order and formatting of
+/// everything else are kept (`toml_edit`).
+///
+/// * `[worker] master`, `[submit] master` and `[status] master` get the address (when the token has
+///   one).
+/// * `[worker] p2p_ticket` gets the ticket. A token without a ticket removes an existing one,
+///   because the worker prefers a ticket from the config file and an old one would win over the
+///   new address.
+///
+/// A key that already holds a *different* value is a conflict, reported in `conflicts`; the caller
+/// decides whether to go on (`--replace-master`).
+pub fn plan_target(
+    existing: Option<&str>,
+    master: Option<&str>,
+    ticket: Option<&str>,
+    path: &Path,
+) -> GridResult<ConfigPlan> {
+    let mut doc: toml_edit::DocumentMut = existing.unwrap_or("").parse().map_err(|e| {
+        GridError::Config(format!(
+            "config file '{}' is not valid TOML ({e}); fix or move it, then join again",
+            path.display()
+        ))
+    })?;
+    let mut plan = ConfigPlan::default();
+    if let Some(master) = master {
+        for name in ["worker", "submit", "status"] {
+            let table = table_of(&mut doc, name, path)?;
+            let current = table.get("master").and_then(|v| v.as_str());
+            let current_normalized = current.map(normalize_master_addr);
+            if current_normalized.as_deref() == Some(master) {
+                continue;
+            }
+            if table.contains_key("master") {
+                plan.conflicts.push(format!("[{name}].master"));
+            }
+            table["master"] = toml_edit::value(master);
+            plan.changes.push(format!("[{name}].master"));
+        }
+    }
+    let worker = table_of(&mut doc, "worker", path)?;
+    let current_ticket = worker
+        .get("p2p_ticket")
+        .map(|v| v.as_str().map(str::to_string));
+    match (ticket, current_ticket) {
+        (Some(t), Some(Some(cur))) if cur == t => {}
+        (Some(t), current) => {
+            if current.is_some() {
+                plan.conflicts.push("[worker].p2p_ticket".into());
+            }
+            worker["p2p_ticket"] = toml_edit::value(t);
+            plan.changes.push("[worker].p2p_ticket".into());
+        }
+        // Only a token that names an address replaces a ticket: a ticket-less, address-less token
+        // cannot exist, but keep the rule explicit.
+        (None, Some(_)) if master.is_some() => {
+            plan.conflicts.push("[worker].p2p_ticket".into());
+            worker.remove("p2p_ticket");
+            plan.changes.push("[worker].p2p_ticket (removed)".into());
+        }
+        (None, _) => {}
+    }
+    // An empty table that only this function created is not worth writing.
+    for name in ["worker", "submit", "status"] {
+        if doc
+            .get(name)
+            .and_then(|i| i.as_table())
+            .is_some_and(|t| t.is_empty())
+        {
+            doc.remove(name);
+        }
+    }
+    plan.text = if plan.changes.is_empty() {
+        existing.unwrap_or("").to_string()
+    } else {
+        doc.to_string()
+    };
+    Ok(plan)
+}
+
+/// Reads the config file at `path` for planning: `None` when it does not exist. A symbolic link is
+/// refused (writing through it would change a file somewhere else, and a rename would replace the
+/// link).
+pub fn read_config_for_plan(path: &Path) -> GridResult<Option<String>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(GridError::Config(format!(
+            "config file '{}' is a symbolic link; join does not edit through links. Replace it with a regular file or edit it by hand",
+            path.display()
+        ))),
+        Ok(_) => std::fs::read_to_string(path).map(Some).map_err(|e| {
+            GridError::Config(format!("cannot read config file '{}': {e}", path.display()))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(GridError::Config(format!(
+            "cannot read config file '{}': {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// Creates a file that only the owner can read (mode 600 on Unix, the protected DACL of design
+/// 0047 on Windows) and fills it.
+fn write_private_new(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?
+    };
+    #[cfg(windows)]
+    let mut file = rusty_grid_core::private_file::create_private_new(path)?;
+    #[cfg(not(any(unix, windows)))]
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(data)?;
+    file.sync_all()
+}
+
+/// Writes the planned config file: a private backup `<name>.bak-<unix seconds>` of the old file
+/// first (when there is one), then the new text through a temporary file and a rename. Returns the
+/// backup path.
+pub fn apply_plan(
+    path: &Path,
+    existing: Option<&str>,
+    plan: &ConfigPlan,
+) -> GridResult<Option<PathBuf>> {
+    let err = |what: &str, e: &dyn std::fmt::Display| {
+        GridError::Config(format!("{what} '{}': {e}", path.display()))
+    };
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| err("cannot create the directory of", &e))?;
+    }
+    let mut backup = None;
+    if let Some(old) = existing {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| CONFIG_FILE_NAME.to_string());
+        let mut candidate = path.with_file_name(format!("{name}.bak-{stamp}"));
+        let mut n = 1;
+        while candidate.exists() {
+            candidate = path.with_file_name(format!("{name}.bak-{stamp}-{n}"));
+            n += 1;
+        }
+        write_private_new(&candidate, old.as_bytes())
+            .map_err(|e| err("cannot write a backup of", &e))?;
+        backup = Some(candidate);
+    }
+    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let result = std::fs::write(&tmp, &plan.text)
+        .and_then(|()| match std::fs::metadata(path) {
+            // Keep the permissions the owner gave the file.
+            Ok(meta) => std::fs::set_permissions(&tmp, meta.permissions()),
+            Err(_) => Ok(()),
         })
+        .and_then(|()| std::fs::rename(&tmp, path));
+    result.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        err("cannot write config file", &e)
+    })?;
+    Ok(backup)
 }
 
 /// What [`store_secret`] did.
@@ -307,6 +539,12 @@ pub struct JoinArgs {
 
     #[arg(
         long,
+        help = "Replace a different master address or P2P ticket that the config file already names"
+    )]
+    pub replace_master: bool,
+
+    #[arg(
+        long,
         value_name = "N",
         default_value = "0",
         help = "The doctor check fails unless at least N workers are connected (default 0: this machine's worker usually starts after joining)"
@@ -332,11 +570,12 @@ pub async fn run_join(args: JoinArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let stdin = std::io::stdin();
-    if stdin.is_terminal() {
-        eprintln!("Standard input is a terminal, where a pasted token would be shown on screen. Pipe the token in instead, for example `pbpaste | oxideswarm join`.");
-        return ExitCode::FAILURE;
-    }
-    let text = match read_token(stdin.lock()) {
+    let read = if stdin.is_terminal() {
+        read_token_hidden()
+    } else {
+        read_token(stdin.lock())
+    };
+    let text = match read {
         Ok(text) => text,
         Err(e) => {
             eprintln!("{e}");
@@ -361,7 +600,34 @@ pub async fn run_join(args: JoinArgs) -> ExitCode {
         .unwrap_or_else(|| PathBuf::from(CONFIG_FILE_NAME));
     let master = token.master.as_deref().map(normalize_master_addr);
 
-    // Settle the secret first: a refusal must leave the machine untouched.
+    // Plan the config edit before anything is written: a refusal must leave the machine untouched.
+    let existing = match read_config_for_plan(&config_path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let plan = match plan_target(
+        existing.as_deref(),
+        master.as_deref(),
+        token.ticket.as_deref(),
+        &config_path,
+    ) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !plan.conflicts.is_empty() && !args.replace_master {
+        eprintln!(
+            "{} already names a different master or P2P ticket (keys: {}). Joining would point this machine at another cluster. If that is what you want, run `oxideswarm join --replace-master`; a backup of the file is kept.",
+            config_path.display(),
+            plan.conflicts.join(", ")
+        );
+        return ExitCode::FAILURE;
+    }
     match store_secret(&secret_path, &token.secret, args.replace_secret) {
         Ok(SecretStored::Created) => println!("Cluster secret saved to {}", secret_path.display()),
         Ok(SecretStored::AlreadyPresent) => println!(
@@ -377,12 +643,24 @@ pub async fn run_join(args: JoinArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    match save_target(&config_path, master.as_deref(), token.ticket.as_deref()) {
-        Ok(true) => println!("Master address saved to {}", config_path.display()),
-        Ok(false) => println!("{} already names this master", config_path.display()),
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
+    if plan.changes.is_empty() {
+        println!("{} already names this master", config_path.display());
+    } else {
+        match apply_plan(&config_path, existing.as_deref(), &plan) {
+            Ok(backup) => {
+                eprintln!(
+                    "Changed in {}: {}",
+                    config_path.display(),
+                    plan.changes.join(", ")
+                );
+                if let Some(backup) = backup {
+                    eprintln!("Previous file kept as {} (owner-only)", backup.display());
+                }
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
         }
     }
     if let Some(master) = &master {
@@ -545,44 +823,155 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_save_target_merges_and_drops_a_stale_ticket() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rusty-grid.toml");
-        std::fs::write(
-            &path,
-            "[worker]\nname = \"box\"\np2p_ticket = \"old\"\n\n[master]\nlisten = \"0.0.0.0:8088\"\n",
-        )
-        .unwrap();
-        assert!(save_target(&path, Some("10.0.0.2:8088"), None).unwrap());
-        let cfg: crate::config::ConfigFile =
-            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let worker = cfg.worker.unwrap();
-        assert_eq!(worker.master.as_deref(), Some("10.0.0.2:8088"));
-        assert_eq!(worker.name.as_deref(), Some("box"));
-        assert_eq!(
-            worker.p2p_ticket, None,
-            "a stale ticket would win over the new address"
-        );
-        assert_eq!(cfg.submit.unwrap().master.as_deref(), Some("10.0.0.2:8088"));
-        assert_eq!(cfg.status.unwrap().master.as_deref(), Some("10.0.0.2:8088"));
-        assert_eq!(cfg.master.unwrap().listen.as_deref(), Some("0.0.0.0:8088"));
-        assert!(
-            !save_target(&path, Some("10.0.0.2:8088"), None).unwrap(),
-            "unchanged"
-        );
-        assert!(save_target(&path, Some("10.0.0.2:8088"), Some("tk")).unwrap());
+    fn plan(existing: Option<&str>, master: Option<&str>, ticket: Option<&str>) -> ConfigPlan {
+        plan_target(existing, master, ticket, Path::new("rusty-grid.toml")).unwrap()
     }
 
     #[test]
-    fn test_save_target_refuses_a_file_that_is_not_toml() {
+    fn test_plan_keeps_comments_and_order_and_touches_only_its_keys() {
+        let old = "# my cluster\n[worker]\nname = \"box\"  # keep me\n\n[master]\nlisten = \"0.0.0.0:8088\"\n";
+        let p = plan(Some(old), Some("10.0.0.2:8088"), None);
+        assert!(p.conflicts.is_empty());
+        assert_eq!(
+            p.changes,
+            ["[worker].master", "[submit].master", "[status].master"]
+        );
+        assert!(p.text.contains("# my cluster"));
+        assert!(p.text.contains("name = \"box\"  # keep me"));
+        assert!(p.text.contains("listen = \"0.0.0.0:8088\""));
+        let cfg: crate::config::ConfigFile = toml::from_str(&p.text).unwrap();
+        assert_eq!(cfg.worker.unwrap().master.as_deref(), Some("10.0.0.2:8088"));
+        assert_eq!(cfg.submit.unwrap().master.as_deref(), Some("10.0.0.2:8088"));
+        assert_eq!(cfg.status.unwrap().master.as_deref(), Some("10.0.0.2:8088"));
+        // Planning again on the result changes nothing and leaves the text as it is.
+        let again = plan(Some(&p.text), Some("10.0.0.2:8088"), None);
+        assert!(again.changes.is_empty() && again.conflicts.is_empty());
+        assert_eq!(again.text, p.text);
+    }
+
+    #[test]
+    fn test_plan_reports_a_different_master_or_ticket_as_a_conflict() {
+        let old = "[worker]\nmaster = \"10.0.0.9:8088\"\np2p_ticket = \"old\"\n";
+        let p = plan(Some(old), Some("10.0.0.2:8088"), None);
+        assert!(p.conflicts.contains(&"[worker].master".to_string()));
+        assert!(p.conflicts.contains(&"[worker].p2p_ticket".to_string()));
+        assert!(!p.text.contains("p2p_ticket"), "removed in the plan");
+        assert!(p
+            .changes
+            .contains(&"[worker].p2p_ticket (removed)".to_string()));
+        // A bare host in the file equals the normalised address of the token.
+        let same = plan(
+            Some("[worker]\nmaster = \"10.0.0.2\"\n"),
+            Some("10.0.0.2:8088"),
+            None,
+        );
+        assert!(same.conflicts.iter().all(|c| !c.starts_with("[worker]")));
+        // A different ticket is a conflict, the same ticket is not.
+        let t = plan(Some("[worker]\np2p_ticket = \"a\"\n"), None, Some("b"));
+        assert_eq!(t.conflicts, ["[worker].p2p_ticket"]);
+        let t = plan(Some("[worker]\np2p_ticket = \"a\"\n"), None, Some("a"));
+        assert!(t.changes.is_empty());
+    }
+
+    #[test]
+    fn test_plan_refuses_a_file_that_is_not_toml_or_has_a_non_table_section() {
+        assert!(plan_target(
+            Some("this is = = not toml"),
+            Some("h:1"),
+            None,
+            Path::new("c")
+        )
+        .is_err());
+        assert!(plan_target(Some("worker = 3\n"), Some("h:1"), None, Path::new("c")).is_err());
+    }
+
+    #[test]
+    fn test_apply_plan_backs_up_privately_and_writes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rusty-grid.toml");
-        std::fs::write(&path, "this is = = not toml").unwrap();
-        assert!(save_target(&path, Some("h:1"), None).is_err());
+        let old = "# keep\n[worker]\nname = \"x\"\n";
+        std::fs::write(&path, old).unwrap();
+        let p = plan(Some(old), Some("10.0.0.2:8088"), None);
+        let backup = apply_plan(&path, Some(old), &p).unwrap().expect("a backup");
+        assert!(backup
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("rusty-grid.toml.bak-"));
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), old);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), p.text);
+        // A second backup never overwrites the first.
+        let again = apply_plan(&path, Some(old), &p).unwrap().unwrap();
+        assert_ne!(again, backup);
+        // A new file has nothing to back up.
+        let fresh = dir.path().join("sub").join("rusty-grid.toml");
+        assert!(apply_plan(&fresh, None, &plan(None, Some("h:8088"), None))
+            .unwrap()
+            .is_none());
+        assert!(fresh.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_symbolic_link_config_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, "").unwrap();
+        let link = dir.path().join("rusty-grid.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(read_config_for_plan(&link)
+            .unwrap_err()
+            .to_string()
+            .contains("symbolic link"));
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "this is = = not toml"
+            read_config_for_plan(&dir.path().join("none.toml")).unwrap(),
+            None
         );
+        assert_eq!(read_config_for_plan(&real).unwrap().as_deref(), Some(""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_echo_off_clears_echo_and_restores_it_on_a_terminal() {
+        let (mut master, mut slave) = (0, 0);
+        // SAFETY: openpty fills both descriptors on success; they are closed below.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty");
+        let echo = |fd| {
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0);
+            t.c_lflag & libc::ECHO != 0
+        };
+        assert!(echo(slave), "a new terminal echoes");
+        {
+            let _guard = EchoOff::on_fd(slave).unwrap();
+            assert!(!echo(slave), "echo is off while the guard lives");
+        }
+        assert!(echo(slave), "echo is back after the guard");
+        // A descriptor that is not a terminal is an error, not a silent echo.
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(dir.path().join("f")).unwrap();
+        use std::os::fd::AsRawFd;
+        assert!(EchoOff::on_fd(file.as_raw_fd()).is_err());
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
     }
 }
