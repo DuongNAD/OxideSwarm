@@ -28,9 +28,9 @@ pub const WIRE_FORMAT_AUTH: u8 = 0x03;
 pub const WIRE_FORMAT_ENCRYPTED: u8 = 0x04;
 
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION_CURRENT: u32 = 3;
+pub const PROTOCOL_VERSION_CURRENT: u32 = 4;
 /// Minimum wire protocol version compatible with this build.
-pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 3;
+pub const PROTOCOL_VERSION_MIN_COMPATIBLE: u32 = 4;
 /// Protocol version assumed when a JSON peer omits `protocol_version`.
 pub const LEGACY_UNVERSIONED_PROTOCOL_VERSION: u32 = 2;
 
@@ -95,6 +95,11 @@ impl ProtocolCapabilities {
     /// Generative 3D (`TaskSpec::Generative3D`) and skeletal auto-rigging (`TaskSpec::AutoRig`)
     /// execution support (advertised by workers compiled with the `3d` Cargo feature).
     pub const THREE_D: Self = Self(1 << 11);
+    /// Worker session resumption across transient master restarts or network drops
+    /// (`WorkerMessage::ResumeSession`, `master_features::SESSION_RESUME_PREFIX`).
+    /// Not advertised in [`ProtocolCapabilities::all_supported`] until master task adoption and
+    /// worker session resume are wired (`docs/design/0046-master-durability.md` D4.1).
+    pub const SESSION_RESUME: Self = Self(1 << 12);
 
     pub const fn all_supported() -> Self {
         Self(
@@ -525,6 +530,12 @@ pub enum WorkerMessage {
         request_id: u64,
         request: crate::blob_transfer::BlobRequest,
     },
+    /// Sent immediately after `RegisterAck` when both worker and master support
+    /// `SESSION_RESUME` and the worker still has tasks running or buffered from its previous session.
+    ResumeSession {
+        worker_id: Uuid,
+        running: Vec<TaskId>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -613,6 +624,10 @@ enum HumanWorkerMessage {
         request_id: u64,
         request: crate::blob_transfer::BlobRequest,
     },
+    ResumeSession {
+        worker_id: Uuid,
+        running: Vec<TaskId>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -687,6 +702,10 @@ enum BinaryWorkerMessage {
     BlobRequest {
         request_id: u64,
         request: crate::blob_transfer::BlobRequest,
+    },
+    ResumeSession {
+        worker_id: Uuid,
+        running: Vec<TaskId>,
     },
 }
 
@@ -932,6 +951,9 @@ impl From<WorkerMessage> for HumanWorkerMessage {
                 request_id,
                 request,
             },
+            WorkerMessage::ResumeSession { worker_id, running } => {
+                HumanWorkerMessage::ResumeSession { worker_id, running }
+            }
         }
     }
 }
@@ -1043,6 +1065,9 @@ impl From<HumanWorkerMessage> for WorkerMessage {
                 request_id,
                 request,
             },
+            HumanWorkerMessage::ResumeSession { worker_id, running } => {
+                WorkerMessage::ResumeSession { worker_id, running }
+            }
         }
     }
 }
@@ -1154,6 +1179,9 @@ impl From<WorkerMessage> for BinaryWorkerMessage {
                 request_id,
                 request,
             },
+            WorkerMessage::ResumeSession { worker_id, running } => {
+                BinaryWorkerMessage::ResumeSession { worker_id, running }
+            }
         }
     }
 }
@@ -1265,6 +1293,9 @@ impl From<BinaryWorkerMessage> for WorkerMessage {
                 request_id,
                 request,
             },
+            BinaryWorkerMessage::ResumeSession { worker_id, running } => {
+                WorkerMessage::ResumeSession { worker_id, running }
+            }
         }
     }
 }
@@ -1313,6 +1344,7 @@ impl WorkerMessage {
             Self::ClaimMasterRole { .. } => "ClaimMasterRole",
             Self::UnknownVariant { .. } => "UnknownVariant",
             Self::BlobRequest { .. } => "BlobRequest",
+            Self::ResumeSession { .. } => "ResumeSession",
         }
     }
 
@@ -1329,6 +1361,7 @@ impl WorkerMessage {
             Self::ClaimMasterRole { ticket } => ticket.master_id,
             Self::UnknownVariant { .. } => Uuid::nil(),
             Self::BlobRequest { .. } => Uuid::nil(),
+            Self::ResumeSession { worker_id, .. } => *worker_id,
         }
     }
 }
@@ -1416,10 +1449,37 @@ pub mod master_features {
     /// part of [`SUPPORTED`].
     pub const BLOBS: &str = "blobs";
 
+    /// Prefix for the parameterized session-resume hold feature token (`session-resume=<secs>`).
+    /// Announced only when the Master has a non-zero session-resume hold configured.
+    pub const SESSION_RESUME_PREFIX: &str = "session-resume=";
+
+    /// Upper bound (`1 hour`) on the session-resume hold seconds accepted by
+    /// [`parse_session_resume_hold_secs`], preventing `Instant + Duration` overflow on bogus input.
+    pub const MAX_SESSION_RESUME_HOLD_SECS: u64 = 3_600;
+
     /// Every feature this build of the Master supports unconditionally.
     pub const SUPPORTED: &[&str] = &[MOBILE_TELEMETRY];
 
     const PREFIX: &str = "features=";
+
+    /// Formats the `session-resume=<hold_secs>` feature token.
+    pub fn session_resume_feature(hold_secs: u64) -> String {
+        format!("{SESSION_RESUME_PREFIX}{hold_secs}")
+    }
+
+    /// Extracts the Master's advertised session-resume hold in seconds from a `RegisterAck`'s
+    /// `message`, or `None` if `session-resume=<secs>` is not announced, cannot be parsed, or
+    /// exceeds [`MAX_SESSION_RESUME_HOLD_SECS`].
+    pub fn parse_session_resume_hold_secs(message: Option<&str>) -> Option<u64> {
+        message
+            .and_then(|m| m.trim().strip_prefix(PREFIX))
+            .and_then(|list| {
+                list.split(',')
+                    .find_map(|f| f.trim().strip_prefix(SESSION_RESUME_PREFIX))
+            })
+            .and_then(|secs| secs.parse::<u64>().ok())
+            .filter(|&secs| secs <= MAX_SESSION_RESUME_HOLD_SECS)
+    }
 
     /// The `RegisterAck` message announcing `features`.
     pub fn announcement(features: &[&str]) -> String {
@@ -4663,6 +4723,92 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_session_resume_feature_and_message_round_trip() {
+        use super::master_features::{
+            announced, announcement, parse_session_resume_hold_secs, session_resume_feature, BLOBS,
+            MAX_SESSION_RESUME_HOLD_SECS, MOBILE_TELEMETRY, SESSION_RESUME_PREFIX,
+        };
+
+        assert_eq!(ProtocolCapabilities::SESSION_RESUME.bits(), 1 << 12);
+        assert!(
+            !ProtocolCapabilities::all_supported().contains(ProtocolCapabilities::SESSION_RESUME),
+            "SESSION_RESUME must not be advertised in all_supported() until adoption and worker resume are wired"
+        );
+        assert_eq!(SESSION_RESUME_PREFIX, "session-resume=");
+        assert_eq!(MAX_SESSION_RESUME_HOLD_SECS, 3_600);
+
+        let token = session_resume_feature(30);
+        assert_eq!(token, "session-resume=30");
+        let msg = announcement(&[MOBILE_TELEMETRY, &token, BLOBS]);
+        assert_eq!(msg, "features=mobile-telemetry,session-resume=30,blobs");
+        assert!(announced(Some(&msg), MOBILE_TELEMETRY));
+        assert!(announced(Some(&msg), BLOBS));
+        assert_eq!(parse_session_resume_hold_secs(Some(&msg)), Some(30));
+        assert_eq!(
+            parse_session_resume_hold_secs(Some("features=session-resume=0")),
+            Some(0)
+        );
+        assert_eq!(
+            parse_session_resume_hold_secs(Some("features=mobile-telemetry, session-resume=45")),
+            Some(45)
+        );
+        assert_eq!(
+            parse_session_resume_hold_secs(Some("features=session-resume=3600")),
+            Some(3_600)
+        );
+        assert_eq!(
+            parse_session_resume_hold_secs(Some("features=session-resume=3601")),
+            None
+        );
+        assert_eq!(
+            parse_session_resume_hold_secs(Some(&format!("features=session-resume={}", u64::MAX))),
+            None
+        );
+        assert_eq!(parse_session_resume_hold_secs(None), None);
+        assert_eq!(parse_session_resume_hold_secs(Some("")), None);
+        assert_eq!(
+            parse_session_resume_hold_secs(Some("features=mobile-telemetry,blobs")),
+            None
+        );
+        assert_eq!(
+            parse_session_resume_hold_secs(Some("session-resume=30")),
+            None
+        );
+        assert_eq!(
+            parse_session_resume_hold_secs(Some("features=session-resume=")),
+            None
+        );
+        assert_eq!(
+            parse_session_resume_hold_secs(Some("features=session-resume=abc")),
+            None
+        );
+        assert_eq!(
+            parse_session_resume_hold_secs(Some("features=session-resume=-5")),
+            None
+        );
+
+        let worker_id = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888);
+        let t1 = TaskId(Uuid::from_u128(0xaaaa));
+        let t2 = TaskId(Uuid::from_u128(0xbbbb));
+        let resume = WorkerMessage::ResumeSession {
+            worker_id,
+            running: vec![t1, t2],
+        };
+        assert_eq!(resume.variant_name(), "ResumeSession");
+        assert_eq!(resume.worker_id(), worker_id);
+
+        for codec in [WireCodec::Bincode, WireCodec::Json] {
+            let bytes = serialize_message(&resume, codec).unwrap();
+            let (decoded, detected): (WorkerMessage, _) = deserialize_message(&bytes).unwrap();
+            assert_eq!(detected, codec);
+            assert_eq!(decoded, resume);
+
+            let (inbound, _): (InboundMessage, _) = deserialize_message(&bytes).unwrap();
+            assert_eq!(inbound, InboundMessage::Worker(resume.clone()));
+        }
+    }
+
     /// The text of a `ProtocolError::Violation`; the record layer reports nothing else.
     fn violation_text(err: ProtocolError) -> String {
         match err {
@@ -5143,7 +5289,13 @@ mod tests {
         };
 
         for codec in [WireCodec::Bincode, WireCodec::Json] {
-            for bad_ver in [1u32, 2, PROTOCOL_VERSION_CURRENT + 1, 99] {
+            for bad_ver in [
+                1u32,
+                2,
+                PROTOCOL_VERSION_CURRENT - 1,
+                PROTOCOL_VERSION_CURRENT + 1,
+                99,
+            ] {
                 let raw_req = serialize_client_message_with_version(&req, bad_ver, codec).unwrap();
                 match deserialize_message::<ClientMessage>(&raw_req) {
                     Err(ProtocolError::IncompatibleVersion {

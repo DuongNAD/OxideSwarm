@@ -244,7 +244,6 @@ async fn test_structured_message_large_gpu_payload() {
             input_data: input_data.clone(),
             work_group_size: 16,
             simulated_matrix_dim: 64,
-            compute_intensity: 100,
         },
         TaskRequirements::gpu(300),
     );
