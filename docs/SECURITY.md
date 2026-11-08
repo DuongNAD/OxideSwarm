@@ -184,6 +184,7 @@ What the worker does limit, so that tasks stay out of the owner's way:
 | :--- | :--- | :--- |
 | `~/.oxideswarm/cluster.secret` | the cluster secret | 600; on Windows a protected ACL for the current user, SYSTEM and Administrators, set at creation, with a warning at load when the ACL is wider ([design 0047](design/0047-windows-private-files.md)) |
 | `~/.oxideswarm/master_key.bin` | the P2P node identity of a master | 600 (enforced on creation and tightened at startup by `server.rs`); on Windows the same protected ACL as the secret, with a warning at load (design 0047) |
+| a join token (`oxideswarm secret join-token`, `oxs1-join:...`) | the cluster secret and the master address, wrapped in base64 and an integrity tag; **as sensitive as the secret itself** | never written to a file by OxideSwarm and never logged. `oxideswarm join` reads it from standard input only and refuses it as an argument; do not paste it into chat, e-mail, tickets or logs ([design 0048](design/0048-join-token.md)) |
 | `~/.oxideswarm/remote-worker.toml` (`connect_remote.sh`) | a P2P ticket and the path of the secret file | 600 |
 | `/etc/oxideswarm/worker.toml`, `/etc/oxideswarm/cluster.secret` (macOS daemon) | ticket / master address, secret copy | 600, owned by the service account |
 | `C:\ProgramData\OxideSwarm\rusty-grid.toml`, `cluster.secret` (Windows service) | ticket / master address, secret copy | ACL: SYSTEM, Administrators, the service account |

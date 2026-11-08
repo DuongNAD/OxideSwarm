@@ -65,9 +65,34 @@ connect the Windows machine with `connect_remote.cmd` and the ticket from
 `~/.oxideswarm/master_ticket.txt` ([README, section D](../../README.md#d-remote-wan-connection-cross-network--internet--requires-ticket-and-secret));
 then continue with step 6.
 
-### 4. Copy the cluster secret to Windows
+### 4. Join Windows with one token (or copy the cluster secret)
 
-Copy `~/.oxideswarm/cluster.secret` from the Mac to `%USERPROFILE%\.oxideswarm\cluster.secret` on
+Fastest: create a join token on the Mac and pipe it into `oxideswarm join` on Windows. The token
+carries the cluster secret and the Mac's address, so it replaces this step and the address in step 5.
+It is as sensitive as the secret: move it by USB stick or `scp`, never through chat, e-mail or a
+cloud-synced folder, and never as a command line argument (`join` refuses that).
+
+On the Mac:
+
+```bash
+./target/release/oxideswarm secret join-token --master <MAC_IP>:8088 > ~/join.token
+```
+
+On Windows (PowerShell; the token goes in on standard input):
+
+```powershell
+scp <USER>@<MAC_IP>:join.token "$env:TEMP\join.token"
+Get-Content "$env:TEMP\join.token" | .\target\release\oxideswarm.exe join
+Remove-Item "$env:TEMP\join.token"
+```
+
+`join` saves the secret in `%USERPROFILE%\.oxideswarm\cluster.secret` (owner-only), the address in
+`%USERPROFILE%\.oxideswarm\rusty-grid.toml`, and runs the doctor checks against the Mac (no worker
+is expected yet). Delete `~/join.token` on the Mac too. Then go to step 5; the worker needs no
+`--master` (the saved address is used) but the `switch_role` launcher still takes one. If this machine
+already has a different secret, `join` refuses until you add `--replace-secret`.
+
+By hand instead, copy the secret file. Copy `~/.oxideswarm/cluster.secret` from the Mac to `%USERPROFILE%\.oxideswarm\cluster.secret` on
 Windows, by USB stick or, on Windows (PowerShell):
 
 ```powershell

@@ -206,7 +206,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | REAPI-1 | Serve the blob store as a Remote Execution API cache | P3 | L | CACHE-1 | Yes | Planned |  |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | 155 |
 | REL-5 | Contributor and security files | P3 | S | REL-1 |  | Implemented | 75 |
-| JOIN-1 | Join a machine with one token | P2 | M |  |  | Planned |  |
+| JOIN-1 | Join a machine with one token | P2 | M |  |  | Partial | 162 (open) |
 | LINK-1 | Show whether each link is direct or relayed | P2 | M |  |  | Partial | 159 (open) |
 | BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Planned |  |
 
