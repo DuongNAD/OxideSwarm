@@ -3269,7 +3269,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 name = "rusty_grid_android_bridge"
 version = "0.1.0"
 dependencies = [
- "jni 0.21.1",
+ "jni 0.22.4",
  "rusty_grid_core",
  "rusty_grid_master",
  "rusty_grid_worker",
