@@ -863,6 +863,8 @@ python3 tests/test_launcher_scripts.py
 The scripts exit non-zero and say FAIL when a check fails; their reports are computed from what was observed in
 that run.
 
+**Benchmarks.** [benchmarks/grid](benchmarks/grid/README.md) measures no-op task overhead with 1 to 4 workers and a first versus a repeated upload of the same input tree on loopback, with the script that produced each dated record in [benchmarks/grid/results](benchmarks/grid/results). The records state their machine, load and limits.
+
 ---
 
 ## 9. License
