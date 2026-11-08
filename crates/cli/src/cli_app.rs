@@ -152,8 +152,11 @@ pub enum Commands {
     /// Check a running cluster end to end: connection, workers, pinned probes, GPUs, spreading
     Doctor(DoctorArgs),
 
-    /// Generate or show the shared cluster secret
+    /// Generate or show the shared cluster secret, or create a join token for another machine
     Secret(SecretCliArgs),
+
+    /// Join this machine to a cluster with a join token read from standard input
+    Join(crate::join::JoinArgs),
 
     /// Workflow modes and presets (test, dev, doc, research)
     Mode(mode_cli::ModeCliArgs),
@@ -333,6 +336,13 @@ pub struct MasterArgs {
 
     #[arg(
         long,
+        value_name = "SECS",
+        help = "Seconds the master holds a disconnected session-resume worker's tasks before requeuing or failing them (CLI default 30 on every master, even without --state-dir; 0 disables the hold for immediate failover; max 3600; env RUSTY_GRID_SESSION_RESUME_HOLD_SECS)"
+    )]
+    pub session_resume_hold_secs: Option<u64>,
+
+    #[arg(
+        long,
         value_name = "N",
         help = "Tasks of one mapreduce job in flight at once; keep it above the cluster's total slots (default 256)"
     )]
@@ -454,6 +464,13 @@ pub struct WorkerArgs {
         help = "Heartbeat interval in seconds"
     )]
     pub heartbeat_interval_secs: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "Optional cap in seconds on how long the worker keeps running tasks alive across a disconnect (0 disables session resume; default uses the master's advertised window bounded by the dead-peer inequality; env RUSTY_GRID_SESSION_RESUME_GRACE_SECS)"
+    )]
+    pub session_resume_grace_secs: Option<u64>,
 
     #[arg(
         long,
@@ -1020,6 +1037,9 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
         Commands::Mapreduce(args) => run_mapreduce(args, config_file, secret_opts).await,
         Commands::Doctor(args) => run_doctor_command(args, config_file, secret_opts).await,
         Commands::Secret(args) => run_secret(args, &secret_opts, config_file.as_ref()),
+        Commands::Join(args) => {
+            crate::join::run_join(args, &secret_opts, config_file.as_ref()).await
+        }
         Commands::Mode(args) => {
             let code = mode_cli::run_mode_cli(args).await;
             if code == 0 {
@@ -1445,6 +1465,23 @@ async fn run_master(
     if let Some(ref dir) = state_dir {
         server_config = server_config.with_state_dir(dir);
     }
+    let requested_hold_secs = resolve_u64(
+        args.session_resume_hold_secs,
+        &["RUSTY_GRID_SESSION_RESUME_HOLD_SECS"],
+        master_cfg.as_ref().and_then(|m| m.session_resume_hold_secs),
+        rusty_grid_master::DEFAULT_SESSION_RESUME_HOLD_SECS,
+    );
+    let max_hold_secs = rusty_grid_core::protocol::master_features::MAX_SESSION_RESUME_HOLD_SECS;
+    if requested_hold_secs > max_hold_secs {
+        tracing::warn!(
+            requested_secs = requested_hold_secs,
+            max_secs = max_hold_secs,
+            "Requested --session-resume-hold-secs exceeds maximum; clamping to {max_hold_secs}s"
+        );
+    }
+    let session_resume_hold_secs = requested_hold_secs.min(max_hold_secs);
+    server_config =
+        server_config.with_session_resume_hold(Duration::from_secs(session_resume_hold_secs));
 
     // Task input and output files live in a bounded, content-addressed store on disk.
     let blob_store_mb = resolve_u64(
@@ -1895,6 +1932,14 @@ async fn run_worker(
         3,
     );
 
+    let session_resume_grace_secs = resolve_opt_u64(
+        args.session_resume_grace_secs,
+        &["RUSTY_GRID_SESSION_RESUME_GRACE_SECS"],
+        worker_cfg
+            .as_ref()
+            .and_then(|w| w.session_resume_grace_secs),
+    );
+
     let sandbox_base_dir = resolve_opt_string(
         args.sandbox_base_dir.map(|p| p.display().to_string()),
         &["RUSTY_GRID_SANDBOX_BASE_DIR"],
@@ -2061,6 +2106,9 @@ async fn run_worker(
         config = config.with_persistent_worker_id();
     }
     config.default_heartbeat_interval = Duration::from_secs(heartbeat_interval);
+    if let Some(secs) = session_resume_grace_secs {
+        config = config.with_session_resume_grace_cap(Some(Duration::from_secs(secs)));
+    }
 
     let wire_codec = match resolve_wire_codec(
         args.wire_codec,
@@ -6431,6 +6479,22 @@ fail_unfulfillable_tasks = false
             Some(std::path::Path::new("/tmp/cfg-state"))
         );
         assert_eq!(resolved_none, None);
+
+        let cli_hold =
+            Cli::try_parse_from(["oxideswarm", "master", "--session-resume-hold-secs", "45"])
+                .expect("parse master --session-resume-hold-secs");
+        let Commands::Master(m_hold_args) = cli_hold.command else {
+            panic!("expected Master");
+        };
+        assert_eq!(m_hold_args.session_resume_hold_secs, Some(45));
+
+        let cli_grace =
+            Cli::try_parse_from(["oxideswarm", "worker", "--session-resume-grace-secs", "15"])
+                .expect("parse worker --session-resume-grace-secs");
+        let Commands::Worker(w_grace_args) = cli_grace.command else {
+            panic!("expected Worker");
+        };
+        assert_eq!(w_grace_args.session_resume_grace_secs, Some(15));
     }
 
     #[test]

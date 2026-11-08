@@ -199,6 +199,17 @@ scp user@master:~/.oxideswarm/cluster.secret ~/.oxideswarm/cluster.secret && chm
 ```
 
 (Windows: `%USERPROFILE%\.oxideswarm\cluster.secret`; a USB stick works too. Never chat, e-mail or cloud-synced folders.)
+**Quick path: join with one token.** Instead of copying the file and typing the address, create a token on the
+master and pipe it into `oxideswarm join` on the new machine (the token is as sensitive as the secret: send it over a
+channel you trust, never through chat or e-mail, and never as a command line argument):
+
+```bash
+# on the master
+./target/release/oxideswarm secret join-token --master 192.168.1.100:8088 > join.token
+# on the new machine (token on standard input; saves the secret at mode 600 and the address, then runs the doctor checks)
+./target/release/oxideswarm join < join.token && ./target/release/oxideswarm worker
+```
+
 A master bound to loopback only (plain `oxideswarm master`) needs no secret. The dashboard token is
 `oxideswarm secret show --dashboard-token`. More: [docs/SECURITY.md](docs/SECURITY.md).
 
@@ -319,6 +330,10 @@ or `~/.oxideswarm/cluster.secret`.
 # Register with Tier 3 HTTP rendezvous registry:
 ./target/release/oxideswarm master --listen 0.0.0.0:8088 --rendezvous http://rendezvous.example.com:8080
 
+# Join a machine with one token (design 0048): print on the master, read from standard input on the new machine
+./target/release/oxideswarm secret join-token --master 192.168.1.100:8088 [--p2p-ticket-file ~/.oxideswarm/master_ticket.txt]
+./target/release/oxideswarm join [--replace-secret] [--expect-workers N] [--no-doctor] < join.token
+
 # Worker: --master takes the CLUSTER port (default 127.0.0.1:8088; a bare host gets :8088; 'auto' = LAN discovery)
 ./target/release/oxideswarm worker --master 192.168.1.100:8088
 ./target/release/oxideswarm worker --master 192.168.1.100:8088                  # a --features gpu-wgpu build finds and uses the GPU itself
@@ -428,6 +443,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--max-retained-mb <MB>` | `256` (`RUSTY_GRID_MAX_RETAINED_MB`, `[master].max_retained_mb`) | Megabytes of finished-task payload and output retained in memory |
 | `--max-active-mb <MB>` | `256` (`RUSTY_GRID_MAX_ACTIVE_MB`, `[master].max_active_mb`) | Megabytes of active (queued, scheduled, running, retrying) task payloads held at once (minimum `1`) |
 | `--state-dir <DIR>` | In-memory only (`RUSTY_GRID_STATE_DIR`, `[master].state_dir`) | Directory of the durable task queue store (`store.lock`, `snapshot.bin`, `journal.bin`, mode `0700`/`0600` on Unix; persists task specs, `env`, `stdin`, and results in plaintext and defaults `--blob-dir` to `<DIR>/blobs` when `--blob-dir` is not set) |
+| `--session-resume-hold-secs <SECS>` | `30` (`RUSTY_GRID_SESSION_RESUME_HOLD_SECS`, `[master].session_resume_hold_secs`) | Seconds a disconnected worker's running tasks are held for session resumption on every CLI master, even without `--state-dir` (`0` disables the hold for immediate failover; library `ServerConfig` defaults to `0` without `with_state_dir`; maximum `3600`, [design 0046](docs/design/0046-master-durability.md)) |
 | `--blob-dir <DIR>` | `<state_dir>/blobs` when `--state-dir` is set, else `~/.oxideswarm/blobs` (`RUSTY_GRID_BLOB_DIR`, `[master].blob_dir`) | Directory of the content-addressed blob store for task input and output files |
 | `--blob-store-mb <MB>` | `4096` (`RUSTY_GRID_BLOB_STORE_MB`, `[master].blob_store_mb`) | Megabytes the master blob store holds before LRU eviction of unreferenced blobs |
 | `--mapreduce-parallelism <N>` | `256` (`RUSTY_GRID_MAPREDUCE_PARALLELISM`, `[master].mapreduce_parallelism`) | Maximum map or reduce chunk tasks of one `mapreduce` job in flight at once |
@@ -457,6 +473,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--blender-version <VER>` | Auto-detected (`RUSTY_GRID_BLENDER_VERSION`, `[worker].blender_version`) | Override advertised Blender version string |
 | `--max-concurrency <N>` (alias `--max-concurrent-tasks`) | `max(1, cores - 1)` (`cores` when `--cores <N>` is given; `RUSTY_GRID_MAX_CONCURRENCY`, `RUSTY_GRID_MAX_CONCURRENT_TASKS`, `[worker].max_concurrency`) | Maximum concurrent tasks executed simultaneously on this worker |
 | `--heartbeat-interval-secs <SECS>` (alias `--heartbeat-interval`) | `3` (`RUSTY_GRID_HEARTBEAT_INTERVAL_SECS`, `[worker].heartbeat_interval_secs`) | Fallback heartbeat interval in seconds |
+| `--session-resume-grace-secs <SECS>` | Master hold window (`RUSTY_GRID_SESSION_RESUME_GRACE_SECS`, `[worker].session_resume_grace_secs`) | Upper bound in seconds on how long running tasks keep executing across a master disconnect (`0` disables session resumption on this worker, [design 0046](docs/design/0046-master-durability.md)) |
 | `--sandbox-base-dir <DIR>` | `<TMPDIR or temp dir>/rusty_grid-<euid>/sandboxes` on Unix (private mode `0700`, [design 0021](docs/design/0021-private-default-sandbox-base.md)) and `%TEMP%\rusty_grid\sandboxes` on Windows (`RUSTY_GRID_SANDBOX_BASE_DIR`, `[worker].sandbox_base_dir`) | Base directory for isolated task execution sandboxes (used as given when set explicitly) |
 | `--task-priority <PRIORITY>` | `below-normal` (`RUSTY_GRID_TASK_PRIORITY`) | OS scheduling priority for task child processes: `normal`, `below-normal`, or `idle` |
 | `--isolation <LEVEL>` | `off` (`RUSTY_GRID_ISOLATION`, `[worker].isolation`) | OS-level confinement of task processes ([design 0033](docs/design/0033-os-level-task-isolation.md)): `off`; `fs` (a task writes only its own sandbox and cannot read the owner's home, other sandboxes, the blob cache or the shared temp areas; the Rust toolchain is read-only); `fs+net` (`fs` plus no network sockets). A confined task gets an allowlisted environment (`PATH`, `LANG`, `LC_*`, `TERM`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `COLORTERM`, `NO_COLOR`, `DEVELOPER_DIR`, `SDKROOT`, `RUSTUP_TOOLCHAIN`, its own `env`, the `RUSTY_GRID_*` task variables), `RUSTUP_HOME` and `CARGO_HOME` pinned to the host's, and `HOME` and the temp variables inside its sandbox. macOS (`sandbox-exec`) and Linux (Landlock for files, `seccomp` for sockets, `io_uring` and `TIOCSTI`, a private network namespace under `fs+net` when the host allows user namespaces; needs Linux 5.13+ with Landlock enabled, `x86_64` or `aarch64`, and the worker refuses to start otherwise; signals to the worker are only blocked from Linux 6.12) so far; on Windows `fs` and `fs+net` make the worker refuse to start (FEAT-3c). A confined Linux task cannot create `AF_UNIX` sockets (ssh-agent, `docker.sock` and the D-Bus bus are out of reach; `socketpair` works) or use the kernel keyring and, under `fs+net`, no socket at all (the start-up log says whether a private network namespace is also available). `$CARGO_HOME/config.toml` is readable to tasks: keep registry tokens in `credentials.toml`. The worker also refuses to start when the cluster secret comes from `OXIDESWARM_SECRET` or `--secret`: on macOS a task running as the worker's user can read the environment and command line of every process of that user, so use `--secret-file`, `OXIDESWARM_SECRET_FILE` or the default file. Advertised as the reserved `iso:<level>` tag |
@@ -522,6 +539,8 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `oxideswarm doctor` | `--master <ADDR\|auto>`, `--expect-workers <N>` (default `1`), `--probe-timeout-secs <SECS>` (default `60`), `--gpu-dim <N>` (default `512`), `--spread-tasks <N>`, `--skip-gpu`, `--skip-spread`, `--skip-throughput`, `--json`, `--insecure` | End-to-end cluster verification across C1 (master reachable), C2 (worker count), C3 (pinned echo per worker), C4 (shell script per worker), C5 (GPU GEMM probe), C6 (multi-worker spread), C7 (link kind: warns for a relayed worker) and C8 (an 8 MiB blob moved to each worker, MB/s). The worker table has a `LINK` column (`direct`, `relay`, `tcp` plus the round-trip time) |
 | `oxideswarm secret generate` | `--out <PATH>`, `--force`, `--print` | Generate a 256-bit random cluster secret file (`0600` permissions; default `~/.oxideswarm/cluster.secret`) |
 | `oxideswarm secret show` | `--raw`, `--dashboard-token` | Show the resolved secret source + fingerprint, raw 64-char hex (`--raw`), or derived dashboard admin bearer token (`--dashboard-token`) |
+| `oxideswarm secret join-token` | `--master <HOST:PORT>`, `--p2p-ticket <TICKET>`, `--p2p-ticket-file <PATH>` | Print a join token (`oxs1-join:...`: the master address, an optional P2P ticket and the cluster secret, with an integrity tag) to stdout, with a warning on stderr. The token is as sensitive as the secret. Without `--master`, the `[master] listen` of the config file is used unless it is a wildcard |
+| `oxideswarm join` | `--replace-secret`, `--replace-master`, `--expect-workers <N>` (default `0`), `--no-doctor` | Read a join token from **standard input** (piped, or pasted at a no-echo prompt on a terminal; an argument is refused), save the secret at mode `0600` (Windows: owner-only ACL) and the master address in `~/.oxideswarm/rusty-grid.toml` (edited in place, comments kept, a private `.bak-<time>` backup first, never through a symlink), refuse a different secret configured via `OXIDESWARM_SECRET*`, `--secret*` or the config file, refuse to replace a different secret without `--replace-secret` or a different master or ticket without `--replace-master`, then run the doctor checks and exit with their status. Design: [docs/design/0048-join-token.md](docs/design/0048-join-token.md) |
 | `oxideswarm mode [MODE] [ACTION]` | `[MODE]` (`test`, `dev`, `doc`, `research`), `[ACTION]`, `-a` / `--action-opt <ACTION>`, `--iterations <N>` (default `5`), `--port <PORT>` (`RUSTY_GRID_DASHBOARD_PORT`; without `--port`, `dev status` probes `.dev_cluster.json` then `8080`), `-i` / `--interactive`, `--json` | Run or inspect workflow modes (`test`, `dev`, `doc`, `research`) or open the interactive menu (`--interactive`) |
 | `oxideswarm mcp` | `--master <ADDR\|auto>`, `--insecure` | Run the Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio |
 
@@ -584,7 +603,8 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_MAX_RETAINED_TASKS` | Master | Maximum count of finished tasks retained in memory (`--max-retained-tasks`; default `10000`) |
 | `RUSTY_GRID_MAX_RETAINED_MB` | Master | Maximum megabytes of finished task payloads and output retained (`--max-retained-mb`; default `256`) |
 | `RUSTY_GRID_MAX_ACTIVE_MB` | Master & Agent Mesh | Maximum megabytes of active (non-terminal) task payloads held in the queue (`--max-active-mb` on `oxideswarm master` and `agent-mesh hub`; default `256`, minimum `1`) |
-| `RUSTY_GRID_STATE_DIR` | Master | Directory of the durable task queue store (`--state-dir`, `[master].state_dir`; persists `store.lock`, `snapshot.bin`, and `journal.bin` in plaintext with mode `0700`/`0600` on Unix and defaults `--blob-dir` to `<state_dir>/blobs`) |
+| `RUSTY_GRID_STATE_DIR` | Master | Directory of the durable task queue store (`--state-dir`, `[master].state_dir`; persists `store.lock`, `snapshot.bin`, and `journal.bin` in plaintext with mode `0700`/`0600` on Unix and defaults `--blob-dir` to `<state_dir>/blobs`, [design 0046](docs/design/0046-master-durability.md)) |
+| `RUSTY_GRID_SESSION_RESUME_HOLD_SECS` | Master | Seconds the master holds in-flight tasks for a reconnecting worker to adopt via `ResumeSession` (`--session-resume-hold-secs`, `[master].session_resume_hold_secs`; default `30`, `0` disables session resume, [design 0046](docs/design/0046-master-durability.md)) |
 | `RUSTY_GRID_BLOB_DIR` | Master | Directory of the blob store of task input and output files (`--blob-dir`; default `<state_dir>/blobs` when `--state-dir` is set, else `~/.oxideswarm/blobs`) |
 | `RUSTY_GRID_BLOB_STORE_MB` | Master | Megabytes the blob store holds before evicting least recently used files (`--blob-store-mb`; default `4096`) |
 | `RUSTY_GRID_MAPREDUCE_PARALLELISM` | Master | Maximum concurrent in-flight map/reduce chunk tasks (`--mapreduce-parallelism`; default `256`) |
@@ -656,6 +676,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (ru
 | `RUSTY_GRID_OUTPUT_LIMIT_MB` | Worker | Megabytes of output files one task may bring back; more fails the task (`--output-limit-mb`; default `1024`) |
 | `RUSTY_GRID_NO_PORTAL` | Worker | Leaves out the standby portal on `0.0.0.0:8080` (`--no-portal`), e.g. for a second worker on one machine |
 | `RUSTY_GRID_NO_BATTERY` | Worker | Disables host battery and thermal probing in `oxideswarm worker` (`1`, `true`, `yes`, or `on`), logging a startup warning ([design 0028](docs/design/0028-host-battery-probe-override.md)) |
+| `RUSTY_GRID_SESSION_RESUME_GRACE_SECS` | Worker | Optional upper bound in seconds on how long the worker keeps running tasks alive across a disconnect (`--session-resume-grace-secs`, `[worker].session_resume_grace_secs`; clamped to `hold - dead_peer_timeout - 3 s`, `0` disables worker session resume, [design 0046](docs/design/0046-master-durability.md)) |
 
 #### Tier D: Task Child Process Injection Environment
 | Variable | Component | Purpose |

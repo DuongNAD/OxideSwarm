@@ -3363,6 +3363,7 @@ dependencies = [
  "clap",
  "futures",
  "ignore",
+ "libc",
  "rusty_grid_core",
  "rusty_grid_master",
  "rusty_grid_worker",
@@ -3372,9 +3373,11 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4188,6 +4191,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

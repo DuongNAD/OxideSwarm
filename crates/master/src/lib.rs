@@ -44,6 +44,7 @@ pub use scheduler::{
 pub use server::{
     handle_task_progress, handle_task_result, handle_worker_disconnect, remove_port_file,
     write_port_file, MasterHandle, MasterServer, ServerConfig, WaiterMap,
+    DEFAULT_SESSION_RESUME_HOLD, DEFAULT_SESSION_RESUME_HOLD_SECS,
 };
 
 pub fn version() -> &'static str {

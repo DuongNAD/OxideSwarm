@@ -38,6 +38,14 @@ toml = { workspace = true }
 chrono = { workspace = true }
 sysinfo = { workspace = true }
 ignore = "0.4"
+base64 = "0.23"
+toml_edit = "0.25"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
 
 [features]
 # Workers of this binary can compute on the GPU (Metal, Vulkan, DirectX 12) and advertise it:
@@ -53,7 +61,6 @@ tempfile = "3"
 futures = { workspace = true }
 agent_mesh = { workspace = true }
 bytes = { workspace = true }
-base64 = "0.23"
 
 [[test]]
 name = "test_3d_autorig_pipeline"
@@ -177,3 +184,7 @@ name = "m5c_challenger_2_stress"
 path = "../../tests/m5c_challenger_2_stress.rs"
 
 
+
+[[test]]
+name = "cli_join_e2e"
+path = "../../tests/cli_join_e2e.rs"
