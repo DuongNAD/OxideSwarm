@@ -1919,11 +1919,26 @@ const NO_BLOB_STORE: &str = "this master has no blob store, so it cannot move ta
 const BLOB_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Admits a task that moves files through the blob store: every input blob (and every file of
-/// every input tree) must already be in the store, and they are pinned there until the task
-/// finishes, so the bound cannot evict them before a worker fetched them. Tasks without inputs
-/// or output patterns pass untouched.
+/// every input tree or workspace source tree) must already be in the store, and they are pinned
+/// there until the task finishes, so the bound cannot evict them before a worker fetched them.
+/// Tasks without inputs, output patterns, or a workspace source tree pass untouched.
 async fn admit_blob_task(blob_store: Option<&Arc<BlobStore>>, task: &Task) -> Result<(), String> {
-    if !task.uses_blobs() {
+    let workspace_tree = task
+        .workspace
+        .as_ref()
+        .and_then(|ws| match ws.source.as_ref()? {
+            rusty_grid_core::task::WorkspaceSource::Tree {
+                manifest,
+                manifest_size,
+            } => Some(rusty_grid_core::blob::TaskInput {
+                path: format!("workspace:{}", ws.name),
+                source: rusty_grid_core::blob::InputSource::Tree {
+                    manifest: *manifest,
+                    manifest_size: *manifest_size,
+                },
+            }),
+        });
+    if !task.uses_blobs() && workspace_tree.is_none() {
         return Ok(());
     }
     let Some(store) = blob_store else {
@@ -1933,7 +1948,11 @@ async fn admit_blob_task(blob_store: Option<&Arc<BlobStore>>, task: &Task) -> Re
         ));
     };
     task.validate()?;
-    let ids = store.resolve_inputs(&task.inputs).await?;
+    let mut inputs = task.inputs.clone();
+    if let Some(ws_input) = workspace_tree {
+        inputs.push(ws_input);
+    }
+    let ids = store.resolve_inputs(&inputs).await?;
     if ids.is_empty() {
         return Ok(());
     }
@@ -7701,5 +7720,53 @@ mod tests {
         );
 
         h.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_admit_blob_task_pins_workspace_tree_manifest_and_files() {
+        use rusty_grid_core::blob::{BlobFile, BlobId, TreeManifest};
+        use rusty_grid_core::task::WorkspaceRef;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(&crate::blob_store::BlobStoreConfig::new(
+            dir.path(),
+            64 * 1024 * 1024,
+        ))
+        .unwrap();
+
+        let file_bytes = b"fn main() {}\n";
+        let file_id = store.put(file_bytes).await.unwrap();
+        let manifest = TreeManifest::new(vec![BlobFile {
+            path: "src/main.rs".into(),
+            id: file_id,
+            size: file_bytes.len() as u64,
+            executable: false,
+        }])
+        .unwrap();
+        let manifest_bytes = manifest.encode();
+        let manifest_id = store.put(&manifest_bytes).await.unwrap();
+
+        let task = Task::new(
+            rusty_grid_core::TaskSpec::new_command("cargo", vec!["check".into()]),
+            rusty_grid_core::TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(
+            WorkspaceRef::new("oxide-ws").with_tree(manifest_id, manifest_bytes.len() as u64),
+        );
+
+        admit_blob_task(Some(&store), &task).await.unwrap();
+        assert_eq!(store.pinned_tasks().len(), 1);
+        store.unpin_task(&task.id).await;
+        assert_eq!(store.pinned_tasks().len(), 0);
+
+        // Missing workspace manifest blob is rejected.
+        let missing_manifest_id = BlobId::of(b"not-uploaded");
+        let bad_task = Task::new(
+            rusty_grid_core::TaskSpec::new_command("cargo", vec!["check".into()]),
+            rusty_grid_core::TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("oxide-ws").with_tree(missing_manifest_id, 12));
+        let err = admit_blob_task(Some(&store), &bad_task).await.unwrap_err();
+        assert!(err.contains("is not on the master"), "got: {err}");
     }
 }
