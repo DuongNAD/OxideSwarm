@@ -21,7 +21,7 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
 
 ## Where the project stands
 
-The state at `master` `5c518b5` on 2026-11-07.
+The state at `master` `6723945` on 2026-11-08.
 
 ### What works
 
@@ -30,9 +30,10 @@ The state at `master` `5c518b5` on 2026-11-07.
 | Scheduling | Task state machine with retries, placement by OS, architecture, worker and tag, GPU gating, host CPU backpressure, requeue when a worker is lost | `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/core/src/placement.rs` |
 | Trust and transport | Cluster-secret handshake on TCP and iroh QUIC. ChaCha20-Poly1305 records on authenticated TCP | `crates/core/src/cluster_auth.rs`, `crates/core/src/transport.rs` |
 | Files | Files and directories in, glob patterns out, as BLAKE3 blobs. A blob the other side has is not sent again | `crates/core/src/blob.rs`, `crates/master/src/blob_store.rs`, `crates/worker/src/blob_cache.rs` |
+| Containment | After `kill -9` of a worker, a supervisor per task group kills the task's processes within 5 s on Linux and macOS. Windows uses a Job Object | `crates/worker/src/process_tree.rs`, `tests/cli_worker_signals_e2e.rs` |
 | Agents | `oxideswarm mcp` with the tools `status`, `workers`, `submit`, `task_result`, `cancel` and `doctor`, wait deadlines, cancellation and head-and-tail output | `crates/cli/src/mcp.rs` |
 | Operations | `oxideswarm doctor`, the dashboard, launchers and service installers | `crates/cli/src/doctor.rs`, `crates/master/src/web_ui.rs`, `switch_role.sh`, `windows/oxctl.ps1`, `packaging/` |
-| Checks | CI runs rustfmt, clippy, unit tests, the full workspace suite, the launcher tests and the Python suites on Linux, macOS and Windows | `.github/workflows/ci.yml` |
+| Checks | CI runs rustfmt, clippy, unit tests, the full workspace suite, the launcher tests and the Python suites on Linux, macOS and Windows. Every job is a required check on `master`. A changed wire layout fails CI without a protocol version bump | `.github/workflows/ci.yml`, `crates/core/src/wire_layout_tests.rs` |
 
 ### What is missing
 
@@ -44,12 +45,10 @@ Each row is a limit a user meets today, and the item that removes it.
 | There is one master and no failover | The master is a single point of failure | FEAT-6 (Design only, decision D1) |
 | Delivery is at least once | A task can run twice after a worker is lost | FEAT-1, FEAT-2 |
 | A task runs as the worker's user without OS isolation | A task can read `cluster.secret` and other sandboxes | FEAT-3 |
-| No cleanup after `kill -9` of a worker on macOS and Android. On Linux only the direct child dies | A task keeps running while the master runs it elsewhere | FEAT-2 |
 | Each task gets a fresh sandbox | An agent's `cargo test` builds from zero every time | FEAT-4 |
 | Clients connect over TCP only (`connect_master` in `crates/cli/src/connect.rs`) | A client on another network cannot reach a master that is reachable only over P2P | FEAT-4 |
 | `RustCompilation` runs bare `rustc` on one file | A crate with dependencies does not build | FEAT-10 |
 | Input trees carry no symbolic links or empty directories, and do not read `.gitignore` | The client picks paths by hand, or sends a whole project with its `target/` | FEAT-4 |
-| The master checks a worker's protocol version at registration, but nothing forces a version bump when the wire layout changes, and clients send no version | Mixed versions can fail without a clear message | FEAT-8 |
 | There is no release | A user must build from source | REL-4 |
 | The Android app does not compile | There is no Android worker app to install | AND-1 |
 | GPU compute is a seeded matrix benchmark | No user workload runs on the GPU | FEAT-9 (decision D6) |
@@ -114,29 +113,32 @@ the table of what waits are later work (principle 6).
 
 Goal: finish the short open items, and make CI block on the full suite.
 
-| Item | Work | State on 2026-11-08 (`master` `5df82df`) |
+| Item | Work | State on 2026-11-08 (`master` `6723945`) |
 |---|---|---|
 | SCHED-3 | Give impossible tasks an outcome | Implemented (pull requests 96, 107) |
-| MODE-1 | Make `ox-mode` report only what happened | Pull request 92 open |
-| TEST-16 | Keep the iroh tests off the network | Implemented (pull request 95). The follow-up TEST-16b is pull request 109. Neither has a section in BACKLOG |
-| TEST-4 | Record a full-suite run with a dummy `cluster.secret` in `HOME` | Partial |
-| TEST-6 | Remove `continue-on-error` from `workspace-test` and make every job required on `master` | Partial. The owner sets the required checks |
-| FEAT-8 | Make the layout tests force a version bump, version the client path, and plan the move off `bincode` 1.x | Partial. Pull request 110 open. Dependabot pull request 86 proposes `bincode` 3 |
-| MOB-3 | Do not charge evacuation to retry budgets | Pull request 108 open |
-| FEAT-11 | Remove dead code and merge the two connection loops in `server.rs` | Planned. Do it before Phase B changes `server.rs` |
+| MODE-1 | Make `ox-mode` report only what happened | Implemented (pull request 92) |
+| TEST-16 | Keep the iroh tests off the network | Implemented (pull requests 95, 109). Neither has a section in BACKLOG |
+| TEST-4 | Record a full-suite run with a dummy `cluster.secret` in `HOME` | Implemented (pull requests 29, 112, 115) |
+| TEST-6 | Remove `continue-on-error` from `workspace-test` and make every job required on `master` | Implemented (pull requests 67, 124). 21 required checks |
+| FEAT-8 | Make the layout tests force a version bump, version the client path, and plan the move off `bincode` 1.x | Implemented (pull requests 40, 110, 120). Dependabot pull request 86 proposes `bincode` 3 |
+| MOB-3 | Do not charge evacuation to retry budgets | Implemented (pull request 108) |
+| FEAT-11 | Remove dead code and merge the two connection loops in `server.rs` | Implemented (pull requests 125, 126, 127, 131). `compute_intensity` leaves the wire with FEAT-1 |
 
 **Exit check:** no CI job has `continue-on-error`, every job is required on `master`, and the items
 above are Implemented.
+
+Passed on 2026-11-08 at `master` `6723945`. The one CI job that is not required is
+"p2p wan relay (ignored)", which runs only on a schedule or by hand.
 
 ### Phase B: durable and contained
 
 Goal: a master restart loses nothing, and a task cannot reach the worker's secrets.
 
-| Item | Work |
-|---|---|
-| FEAT-1 | Journal in `--state-dir`, replay at start, and `ResumeSession` so a master adopts running tasks |
-| FEAT-2 | A supervisor per task group that kills the group when the worker dies, on Linux and macOS |
-| FEAT-3 | An `--isolation` flag with the levels `off`, `fs` and `fs+net`, using Landlock and namespaces on Linux, `sandbox-exec` on macOS, and AppContainer or a restricted token on Windows |
+| Item | Work | State on 2026-11-08 (`master` `6723945`) |
+|---|---|---|
+| FEAT-1 | Journal in `--state-dir`, replay at start, and `ResumeSession` so a master adopts running tasks | Design 0046 (Draft). Pull request 129, the journal and snapshot module, open |
+| FEAT-2 | A supervisor per task group that kills the group when the worker dies, on Linux and macOS | Implemented (pull request 123, design 0031) |
+| FEAT-3 | An `--isolation` flag with the levels `off`, `fs` and `fs+net`, using Landlock and namespaces on Linux, `sandbox-exec` on macOS, and AppContainer or a restricted token on Windows | Design 0033 (Draft). Pull request 133, the core and macOS, open |
 
 This phase comes before workspaces. A workspace keeps the owner's source code on another machine
 and runs commands an agent chose. Without FEAT-3 such a command can read `cluster.secret`. Without
@@ -194,10 +196,10 @@ After the first release, in order of value to the user story:
 
 | Area | Items | Why it waits | Plan |
 |---|---|---|---|
-| 3D generation and rigging | 3D-2, 3D-3 | It does not serve the user story. `gen3d` and `autorig` are compiled into every worker, because the worker crate has no Cargo feature for them | Freeze. Move them behind an opt-in feature when FEAT-11 splits the modules |
+| 3D generation and rigging | 3D-2, 3D-3 | It does not serve the user story | Frozen. Since FEAT-11 (pull request 127), `gen3d` and `autorig` build only with the opt-in Cargo feature `3d` |
 | Language model inference | LLM-1 to LLM-5 ([design 0038](design/0038-large-language-model-inference.md)) | LLM-2 needs FEAT-1 and FEAT-8. LLM-4 is a new transport | LLM-1 (a guide and a script, size S) can start at any time. LLM-2 to LLM-5 start after Phase C |
 | GPU kernels | FEAT-9 | Decision D6 keeps GPU compute a benchmark | State "benchmark only" in `README.md` and `PROJECT.md`, as FEAT-9 asks |
-| Agent Mesh grid features | MESH-3 | MCP already lets agents submit work. Two agent interfaces split the effort | Not built (decision Q3). The removal of the hub-local file fallback is a security fix and may land at any time |
+| Agent Mesh grid features | MESH-3 | MCP already lets agents submit work. Two agent interfaces split the effort | Not built (decision Q3). The removal of the hub-local file fallback, a security fix, landed in pull requests 114 and 132 |
 | Agent Mesh relay data | MESH-2 | It does not serve the user story | Phase E |
 | Distributed training | TRAIN-1 to TRAIN-5 ([design 0045](design/0045-distributed-training.md)) | It does not serve the user story. Until FEAT-3 a training task can read the worker's `cluster.secret`, and long rounds need FEAT-1 and FEAT-5 | After the Phase D exit check (decision Q6). TRAIN-1, independent runs, comes first |
 
@@ -234,3 +236,7 @@ The owner accepted Q1 to Q5 on 2026-11-07 and Q6 on 2026-11-08.
 - 2026-11-08: Phases A to D named the core, and principle 6 added: later work starts after the
   Phase D exit check. The owner accepted Q6. Distributed training (design 0045) added to the table
   of what waits.
+- 2026-11-08: Phase A passed its exit check at `master` `6723945`. Phase B states added: FEAT-2 is
+  Implemented, FEAT-1 and FEAT-3 have open pull requests. "Where the project stands" moved to the
+  same commit: containment and the wire layout check now work, and their rows left "What is
+  missing". The 3D and Agent Mesh rows of "What waits" record what FEAT-11 and MESH-3 landed.
