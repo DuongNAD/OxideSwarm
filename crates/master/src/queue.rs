@@ -478,6 +478,8 @@ pub struct TaskView {
     /// validates them, so an error only reaches here for a task that bypassed it; such a task is
     /// placed nowhere.
     pub placement: Result<Placement, String>,
+    /// Named persistent workspace (`Task::workspace`), if any (design 0039 D4).
+    pub workspace: Option<String>,
 }
 
 impl TaskView {
@@ -494,6 +496,7 @@ impl TaskView {
             required_features: required_features(task),
             avoid: Vec::new(),
             placement: task.placement(),
+            workspace: task.workspace.as_ref().map(|w| w.name.clone()),
         }
     }
 }
@@ -510,11 +513,26 @@ fn required_features(task: &Task) -> ProtocolCapabilities {
     if matches!(task.spec, TaskSpec::Generative3D(_) | TaskSpec::AutoRig(_)) {
         features.insert(ProtocolCapabilities::THREE_D);
     }
-    if task.workspace.is_some() {
+    if let Some(workspace) = &task.workspace {
         features.insert(ProtocolCapabilities::WORKSPACES);
+        if workspace.source.is_some() {
+            features.insert(ProtocolCapabilities::BLOB_TRANSFER);
+        }
     }
     features
 }
+
+/// Last worker that finished a task in a named workspace, and when (design 0039 D4, D6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceAffinity {
+    pub name: String,
+    pub worker_id: Uuid,
+    pub last_used_utc: u64,
+}
+
+/// Upper bound on in-memory workspace affinity entries so ephemeral workspace names cannot grow
+/// the map without bound.
+const MAX_WORKSPACE_AFFINITIES: usize = 4_096;
 
 /// What the master's own books say a worker is carrying: the tasks assigned to it that have not
 /// reported a result (`Scheduled` or `Running`), whatever its last heartbeat claimed.
@@ -693,6 +711,11 @@ struct TaskQueueInner {
     session_resume_workers: Arc<std::sync::Mutex<HashSet<Uuid>>>,
     /// Tracks FIFO order and liveness/assignment protection for `session_resume_workers`.
     session_resume_tracker: Arc<std::sync::Mutex<SessionResumeTracker>>,
+    /// Per-workspace affinity recorded when a worker finishes a task in that workspace (design 0039 D4).
+    workspace_affinity: HashMap<String, WorkspaceAffinity>,
+    /// Index of tasks currently occupying each workspace (`Scheduled`, `Running`, or held in
+    /// `held_tasks` via `adoptable_by` / `fail_if_not_adopted`).
+    workspace_active_tasks: HashMap<String, HashSet<TaskId>>,
 }
 
 /// Bytes one blob reference (id, size, flags) is charged in addition to its path.
@@ -773,11 +796,20 @@ pub(crate) fn task_active_bytes(task: &Task) -> usize {
         .map(|i| i.path.len() + BLOB_REF_BYTES)
         .chain(task.output_globs.iter().map(String::len))
         .sum();
+    let workspace_bytes = task.workspace.as_ref().map_or(0, |w| {
+        w.name.len()
+            + if w.source.is_some() {
+                BLOB_REF_BYTES
+            } else {
+                0
+            }
+    });
     RETAINED_ENTRY_OVERHEAD_BYTES
         + spec
         + staged_files_bytes
         + expected_outputs_bytes
         + blob_refs_bytes
+        + workspace_bytes
         + checkpoint
         + task.tags.iter().map(String::len).sum::<usize>()
 }
@@ -829,13 +861,27 @@ impl TaskQueueInner {
 
     /// Drops a retained terminal task and its byte charge.
     fn remove_retained(&mut self, task_id: &TaskId) {
-        let prev_hold_worker = self
+        let (prev_hold_worker, ws_name) = self
             .tasks
             .get(task_id)
-            .and_then(|e| e.adoptable_by.map(|(w, _)| w));
+            .map(|e| {
+                (
+                    e.adoptable_by.map(|(w, _)| w),
+                    e.task.workspace.as_ref().map(|ws| ws.name.clone()),
+                )
+            })
+            .unwrap_or((None, None));
         self.tasks.remove(task_id);
         self.untrack_active_task(task_id);
         self.track_adoption_hold(*task_id, false);
+        if let Some(ws) = ws_name {
+            if let Some(set) = self.workspace_active_tasks.get_mut(&ws) {
+                set.remove(task_id);
+                if set.is_empty() {
+                    self.workspace_active_tasks.remove(&ws);
+                }
+            }
+        }
         if let Some(wid) = prev_hold_worker {
             self.refresh_worker_resume_protection(wid);
         }
@@ -858,6 +904,7 @@ impl TaskQueueInner {
         if changed {
             self.sync_adoption_holds();
         }
+        self.sync_workspace_active(task_id);
     }
 
     /// Evicts the oldest retained terminal task. Returns false when none is left.
@@ -1005,6 +1052,67 @@ impl TaskQueueInner {
         }
     }
 
+    fn record_workspace_affinity(&mut self, name: &str, worker_id: Uuid, last_used_utc: u64) {
+        if !self.workspace_affinity.contains_key(name)
+            && self.workspace_affinity.len() >= MAX_WORKSPACE_AFFINITIES
+        {
+            if let Some(oldest_key) = self
+                .workspace_affinity
+                .iter()
+                .min_by_key(|(k, v)| (v.last_used_utc, *k))
+                .map(|(k, _)| k.clone())
+            {
+                self.workspace_affinity.remove(&oldest_key);
+            }
+        }
+        self.workspace_affinity.insert(
+            name.to_string(),
+            WorkspaceAffinity {
+                name: name.to_string(),
+                worker_id,
+                last_used_utc,
+            },
+        );
+    }
+
+    fn sync_workspace_active(&mut self, task_id: TaskId) {
+        let Some(entry) = self.tasks.get(&task_id) else {
+            return;
+        };
+        let Some(ws) = entry.task.workspace.as_ref() else {
+            return;
+        };
+        let occupies =
+            entry.state.is_active() || entry.fail_if_not_adopted || entry.adoptable_by.is_some();
+        if occupies {
+            if let Some(set) = self.workspace_active_tasks.get_mut(&ws.name) {
+                set.insert(task_id);
+            } else {
+                let mut set = HashSet::new();
+                set.insert(task_id);
+                self.workspace_active_tasks.insert(ws.name.clone(), set);
+            }
+        } else if let Some(set) = self.workspace_active_tasks.get_mut(&ws.name) {
+            set.remove(&task_id);
+            if set.is_empty() {
+                let name = ws.name.clone();
+                self.workspace_active_tasks.remove(&name);
+            }
+        }
+    }
+
+    fn is_workspace_active(&self, name: &str, now: Instant) -> bool {
+        self.workspace_active_tasks.get(name).is_some_and(|ids| {
+            ids.iter().any(|tid| {
+                self.tasks.get(tid).is_some_and(|entry| {
+                    entry.state.is_active()
+                        || entry.fail_if_not_adopted
+                        || entry.adoptable_by.is_some_and(|(_, until)| now < until)
+                })
+            })
+        })
+    }
+
     fn refresh_worker_resume_protection(&self, worker_id: Uuid) {
         let has_active = self
             .worker_assignments
@@ -1139,6 +1247,8 @@ impl TaskQueue {
                 session_resume_hold: Duration::ZERO,
                 session_resume_workers: Arc::clone(&session_resume_workers),
                 session_resume_tracker: Arc::clone(&session_resume_tracker),
+                workspace_affinity: HashMap::new(),
+                workspace_active_tasks: HashMap::new(),
             })),
             adoption_holds,
             session_resume_hold_secs,
@@ -1471,6 +1581,7 @@ impl TaskQueue {
     ) -> GridResult<()> {
         let mut persisted: HashMap<TaskId, PersistedTaskEntry> = HashMap::new();
         let mut terminal_order_vec: Vec<TaskId> = Vec::new();
+        let mut terminal_timestamps: HashMap<TaskId, u64> = HashMap::new();
         let mut max_seq: u64 = 1;
 
         if let Some(snapshot) = recovered.snapshot {
@@ -1609,8 +1720,9 @@ impl TaskQueue {
                     retry_attempt,
                     result,
                     error_message,
-                    ..
+                    timestamp_utc,
                 } => {
+                    terminal_timestamps.insert(task_id, timestamp_utc);
                     if let Some(entry) = persisted.get_mut(&task_id) {
                         entry.state = state;
                         entry.assigned_worker_id = assigned_worker_id;
@@ -1632,6 +1744,7 @@ impl TaskQueue {
                 }
                 JournalRecord::TaskEvicted { task_id } => {
                     persisted.remove(&task_id);
+                    terminal_timestamps.remove(&task_id);
                     terminal_order_vec.retain(|id| *id != task_id);
                 }
             }
@@ -1676,6 +1789,8 @@ impl TaskQueue {
             inner.active_sizes.clear();
             inner.active_bytes = 0;
             inner.held_tasks.clear();
+            inner.workspace_affinity.clear();
+            inner.workspace_active_tasks.clear();
             inner.sync_adoption_holds();
             inner.store_closed = false;
             inner.next_sequence = max_seq.max(1);
@@ -1683,6 +1798,18 @@ impl TaskQueue {
 
             for p in sorted_entries {
                 let task_id = p.task.id;
+                if matches!(p.state, TaskState::Completed | TaskState::Failed) {
+                    if let (Some(ws), Some(wid)) = (&p.task.workspace, p.assigned_worker_id) {
+                        let rejected = p.result.as_ref().is_some_and(is_worker_rejection);
+                        if !rejected {
+                            let finished_utc = terminal_timestamps
+                                .get(&task_id)
+                                .copied()
+                                .unwrap_or(p.submitted_at_utc);
+                            inner.record_workspace_affinity(&ws.name, wid, finished_utc);
+                        }
+                    }
+                }
                 let zero_retries = p
                     .task
                     .requirements
@@ -1752,6 +1879,7 @@ impl TaskQueue {
                 if has_hold {
                     inner.held_tasks.insert(task_id);
                 }
+                inner.sync_workspace_active(task_id);
 
                 if !is_terminal {
                     inner.active_sizes.insert(task_id, size);
@@ -1833,8 +1961,26 @@ impl TaskQueue {
                             terminal.push((entry.task.id, ids));
                         }
                     }
-                } else if !entry.task.inputs.is_empty() {
-                    active.push((entry.task.id, entry.task.inputs.clone()));
+                } else {
+                    let mut inputs = entry.task.inputs.clone();
+                    if let Some(ref ws) = entry.task.workspace {
+                        if let Some(rusty_grid_core::task::WorkspaceSource::Tree {
+                            manifest,
+                            manifest_size,
+                        }) = ws.source
+                        {
+                            inputs.push(rusty_grid_core::blob::TaskInput {
+                                path: format!("workspace:{}", ws.name),
+                                source: rusty_grid_core::blob::InputSource::Tree {
+                                    manifest,
+                                    manifest_size,
+                                },
+                            });
+                        }
+                    }
+                    if !inputs.is_empty() {
+                        active.push((entry.task.id, inputs));
+                    }
                 }
             }
             (active, terminal)
@@ -2703,6 +2849,46 @@ impl TaskQueue {
             .collect()
     }
 
+    /// Returns a snapshot of `(workspace_affinity_map, active_workspace_names)` for a scheduling pass:
+    /// - `workspace_affinity_map` maps each known workspace name to the worker UUID that last
+    ///   finished (`Completed` or `Failed`) a task in that workspace.
+    /// - `active_workspace_names` contains every workspace name that currently has a `Scheduled`
+    ///   or `Running` task, or a task held for adoption (`adoptable_by` / `fail_if_not_adopted`),
+    ///   in the queue.
+    pub async fn workspace_scheduling_state(&self) -> (HashMap<String, Uuid>, HashSet<String>) {
+        let inner = self.inner.read().await;
+        let now = Instant::now();
+        let affinities = inner
+            .workspace_affinity
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.worker_id))
+            .collect();
+        let active = inner
+            .workspace_active_tasks
+            .keys()
+            .filter(|name| inner.is_workspace_active(name, now))
+            .cloned()
+            .collect();
+        (affinities, active)
+    }
+
+    /// Returns the worker UUID that last finished a task in `workspace_name`, if known.
+    pub async fn workspace_affinity(&self, workspace_name: &str) -> Option<Uuid> {
+        let inner = self.inner.read().await;
+        inner
+            .workspace_affinity
+            .get(workspace_name)
+            .map(|e| e.worker_id)
+    }
+
+    /// Returns all known workspace affinity entries sorted by workspace name.
+    pub async fn list_workspaces(&self) -> Vec<WorkspaceAffinity> {
+        let inner = self.inner.read().await;
+        let mut list: Vec<WorkspaceAffinity> = inner.workspace_affinity.values().cloned().collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        list
+    }
+
     /// Applies a deferred failover charge (`entry.pending_failover_charge`) when an expired hold
     /// is dispatched before `release_expired_adoption_holds` ran.
     fn apply_pending_failover_charge_before_dispatch(
@@ -2777,7 +2963,13 @@ impl TaskQueue {
                 .iter()
                 .find(|k| {
                     if let Some(entry) = inner.tasks.get(&k.task_id) {
+                        let ws_busy = entry
+                            .task
+                            .workspace
+                            .as_ref()
+                            .is_some_and(|ws| inner.is_workspace_active(&ws.name, now));
                         is_schedulable_queued(entry, &policy, now)
+                            && !ws_busy
                             && predicate(&entry.task.requirements)
                     } else {
                         false
@@ -2853,6 +3045,14 @@ impl TaskQueue {
             let priority_info = {
                 let entry = inner.tasks.get(task_id)?;
                 if !is_schedulable_queued(entry, &policy, now) {
+                    return None;
+                }
+                if entry
+                    .task
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|ws| inner.is_workspace_active(&ws.name, now))
+                {
                     return None;
                 }
                 (entry.priority, entry.sequence)
@@ -2956,6 +3156,14 @@ impl TaskQueue {
             for &(task_id, worker_id, session_id) in assignments {
                 let (priority, sequence) = match inner.tasks.get(&task_id) {
                     Some(entry) if is_schedulable_queued(entry, &policy, now) => {
+                        if entry
+                            .task
+                            .workspace
+                            .as_ref()
+                            .is_some_and(|ws| inner.is_workspace_active(&ws.name, now))
+                        {
+                            continue;
+                        }
                         (entry.priority, entry.sequence)
                     }
                     Some(entry) if entry.state == TaskState::Queued => continue,
@@ -3079,6 +3287,7 @@ impl TaskQueue {
                 (entry.priority, entry.sequence, record)
             };
 
+            inner.sync_workspace_active(*task_id);
             inner.insert_ready(QueueOrderKey {
                 priority_rev: Reverse(priority),
                 sequence,
@@ -3162,6 +3371,7 @@ impl TaskQueue {
         if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
             tasks.remove(task_id);
         }
+        inner.sync_workspace_active(*task_id);
         inner.refresh_worker_resume_protection(*worker_id);
         inner.insert_ready(QueueOrderKey {
             priority_rev: Reverse(priority),
@@ -3222,6 +3432,7 @@ impl TaskQueue {
                 entry.state = TaskState::Running;
                 entry.started_instant = Some(Instant::now());
             }
+            inner.sync_workspace_active(*task_id);
 
             let record = JournalRecord::TaskRunning {
                 task_id: *task_id,
@@ -3743,8 +3954,18 @@ impl TaskQueue {
         if let Some(key) = ready_key_to_insert {
             inner.insert_ready(key);
         }
+        inner.sync_workspace_active(task_id);
 
         if res_state.is_terminal() {
+            if !rejected && matches!(res_state, TaskState::Completed | TaskState::Failed) {
+                if let Some(ws_name) = inner
+                    .tasks
+                    .get(&task_id)
+                    .and_then(|e| e.task.workspace.as_ref().map(|ws| ws.name.clone()))
+                {
+                    inner.record_workspace_affinity(&ws_name, worker_id, now_epoch);
+                }
+            }
             inner.track_terminal_task(task_id);
         } else {
             inner.update_active_task(task_id);
@@ -3829,6 +4050,7 @@ impl TaskQueue {
                 }
             };
 
+            inner.sync_workspace_active(task_id);
             inner.track_terminal_task(task_id);
             let ack = inner.append_durable_warn(&record);
             inner.maybe_trigger_compaction();
@@ -4131,8 +4353,10 @@ impl TaskQueue {
                 let tid = key.task_id;
                 inner.insert_ready(key);
                 inner.update_active_task(tid);
+                inner.sync_workspace_active(tid);
             }
             for tid in terminal_to_track {
+                inner.sync_workspace_active(tid);
                 inner.track_terminal_task(tid);
             }
             if !inner.worker_assignments.contains_key(worker_id) {
@@ -4399,16 +4623,19 @@ impl TaskQueue {
                 let tid = key.task_id;
                 inner.delayed_retries.insert(key);
                 inner.update_active_task(tid);
+                inner.sync_workspace_active(tid);
             }
             for key in ready_to_insert {
                 let tid = key.task_id;
                 inner.insert_ready(key);
                 inner.update_active_task(tid);
+                inner.sync_workspace_active(tid);
             }
             for tid in holds_to_track {
                 inner.track_adoption_hold(tid, true);
             }
             for tid in terminal_to_track {
+                inner.sync_workspace_active(tid);
                 inner.track_terminal_task(tid);
             }
             if !inner.worker_assignments.contains_key(worker_id) {
@@ -7834,6 +8061,19 @@ mod tests {
         let report = WorkloadScheduler::matchmake(&cfg, &tasks, std::slice::from_ref(&w));
         assert!(report.skipped.is_empty());
         assert!(report.assignments.iter().any(|a| a.task_id == ws_task.id));
+
+        // A workspace task with a tree source requires both WORKSPACES and BLOB_TRANSFER.
+        let ws_tree_task = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(
+            WorkspaceRef::new("agent-1")
+                .with_tree(rusty_grid_core::blob::BlobId::of(b"manifest"), 16),
+        );
+        let tree_features = TaskView::of(&ws_tree_task).required_features;
+        assert!(tree_features.contains(ProtocolCapabilities::WORKSPACES));
+        assert!(tree_features.contains(ProtocolCapabilities::BLOB_TRANSFER));
     }
 
     #[tokio::test]
@@ -8169,5 +8409,237 @@ mod tests {
                 .contains(&live_worker),
             "disconnected idle worker must be evictable once its latest session disconnects"
         );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_one_at_a_time_across_master_restart_and_disconnect_holds() {
+        use rusty_grid_core::task::WorkspaceRef;
+
+        let dir = tempfile::tempdir().unwrap();
+        let worker_a = Uuid::new_v4();
+        let worker_b = Uuid::new_v4();
+
+        // 1. Reviewer's exact scenario: task A in `ws-a` is Running; store is reopened with a
+        //    30 s hold; task B in `ws-a` is submitted.
+        let task_a_id = {
+            let (store, rec) = TaskStore::open(dir.path()).unwrap();
+            let q = TaskQueue::with_config(replay_policy(), None);
+            q.attach_store_and_replay(store, rec, Duration::ZERO)
+                .await
+                .unwrap();
+
+            let task_a = echo_task("ws-a-task-a").with_workspace(WorkspaceRef::new("ws-a"));
+            let a_id = q.submit(task_a).await.unwrap();
+            q.schedule_tasks_batch_in_sessions(&[(a_id, worker_a, 1)])
+                .await;
+            q.mark_running_from(worker_a, Some(1), &a_id).await.unwrap();
+            drop(q);
+            a_id
+        };
+
+        let (store2, rec2) = TaskStore::open(dir.path()).unwrap();
+        let q2 = TaskQueue::with_config(replay_policy(), None);
+        q2.attach_store_and_replay(store2, rec2, Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        let task_b = echo_task("ws-a-task-b").with_workspace(WorkspaceRef::new("ws-a"));
+        let task_b_id = q2.submit(task_b).await.unwrap();
+
+        let (_aff, active_ws) = q2.workspace_scheduling_state().await;
+        assert!(
+            active_ws.contains("ws-a"),
+            "held task A after master restart must keep workspace ws-a active"
+        );
+
+        // Neither pop_and_schedule, schedule_task, nor schedule_tasks_batch_in_sessions may
+        // dispatch task B while task A is held for adoption.
+        assert!(
+            q2.pop_and_schedule(worker_b, |_| true).await.is_none(),
+            "pop_and_schedule must not return task B while task A holds ws-a"
+        );
+        assert!(
+            q2.schedule_task(&task_b_id, worker_b).await.is_none(),
+            "schedule_task must not schedule task B while task A holds ws-a"
+        );
+        assert!(
+            q2.schedule_tasks_batch_in_sessions(&[(task_b_id, worker_b, 1)])
+                .await
+                .is_empty(),
+            "schedule_tasks_batch_in_sessions must not schedule task B while task A holds ws-a"
+        );
+
+        // After `adopt_session_tasks`, only A is Running and B stays Queued.
+        let adopted = q2.adopt_session_tasks(worker_a, 2, &[task_a_id]).await;
+        assert_eq!(adopted.adopted, vec![task_a_id]);
+        assert_eq!(q2.get_state(&task_a_id).await, Some(TaskState::Running));
+        assert_eq!(q2.get_state(&task_b_id).await, Some(TaskState::Queued));
+        assert!(q2.pop_and_schedule(worker_b, |_| true).await.is_none());
+
+        // 2. F1-c disconnect hold: `worker_a` (with SESSION_RESUME) disconnects; task A enters an
+        //    adoption hold again, and task B must still be refused until A finishes.
+        q2.set_worker_session_resume(worker_a, true);
+        q2.handle_session_disconnected(&worker_a, Some(2), "brief drop", true)
+            .await;
+        assert_eq!(q2.get_state(&task_a_id).await, Some(TaskState::Queued));
+        let (_aff, active_after_disc) = q2.workspace_scheduling_state().await;
+        assert!(
+            active_after_disc.contains("ws-a"),
+            "F1-c disconnect hold on task A must keep workspace ws-a active"
+        );
+        assert!(q2.pop_and_schedule(worker_b, |_| true).await.is_none());
+        assert!(q2.schedule_task(&task_b_id, worker_b).await.is_none());
+
+        // Re-adopt and complete task A; now task B can be scheduled.
+        let adopted2 = q2.adopt_session_tasks(worker_a, 3, &[task_a_id]).await;
+        assert_eq!(adopted2.adopted, vec![task_a_id]);
+        q2.record_result_from(
+            worker_a,
+            Some(3),
+            TaskResult::success(worker_a, task_a_id, "ok", 5, false),
+        )
+        .await
+        .unwrap();
+
+        let (_aff, active_after_done) = q2.workspace_scheduling_state().await;
+        assert!(!active_after_done.contains("ws-a"));
+        let popped_b = q2.pop_and_schedule(worker_b, |_| true).await.unwrap();
+        assert_eq!(popped_b.id, task_b_id);
+        q2.close_and_compact_store().await;
+    }
+
+    #[tokio::test]
+    async fn test_workspace_queue_level_guards_refuse_second_task_when_engine_pass_is_stale() {
+        use rusty_grid_core::task::WorkspaceRef;
+
+        let q = TaskQueue::new();
+        let w1 = Uuid::new_v4();
+        let w2 = Uuid::new_v4();
+
+        let t1 = q
+            .submit(echo_task("ws-1").with_workspace(WorkspaceRef::new("ws-guard")))
+            .await
+            .unwrap();
+        let t2 = q
+            .submit(echo_task("ws-2").with_workspace(WorkspaceRef::new("ws-guard")))
+            .await
+            .unwrap();
+        let _t3 = q
+            .submit(echo_task("ws-3").with_workspace(WorkspaceRef::new("ws-guard")))
+            .await
+            .unwrap();
+        let t_other = q
+            .submit(echo_task("other").with_workspace(WorkspaceRef::new("ws-other")))
+            .await
+            .unwrap();
+
+        // Simulate a stale engine pass (or direct batch call) attempting to schedule two tasks of
+        // the same workspace (`t1` and `t2`) in one batch alongside `t_other`.
+        let placed = q
+            .schedule_tasks_batch_in_sessions(&[(t1, w1, 1), (t2, w2, 1), (t_other, w2, 1)])
+            .await;
+        let placed_ids: Vec<TaskId> = placed.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(
+            placed_ids,
+            vec![t1, t_other],
+            "schedule_batch_inner guard must refuse the second task of ws-guard"
+        );
+        assert_eq!(q.get_state(&t2).await, Some(TaskState::Queued));
+
+        // While `t1` is Scheduled in `ws-guard`, both `schedule_task` and `pop_and_schedule` must
+        // refuse `t2` and `t3`.
+        assert!(
+            q.schedule_task(&t2, w2).await.is_none(),
+            "schedule_task guard must refuse t2 while t1 is Scheduled in ws-guard"
+        );
+        assert!(
+            q.pop_and_schedule(w2, |_| true).await.is_none(),
+            "pop_and_schedule guard must refuse t2/t3 while t1 is Scheduled in ws-guard"
+        );
+
+        // Complete `t1`; now `schedule_task` accepts `t2`, and while `t2` is Scheduled,
+        // `pop_and_schedule` still refuses `t3`.
+        q.record_result_from(w1, Some(1), TaskResult::success(w1, t1, "done", 1, false))
+            .await
+            .unwrap();
+        let scheduled_t2 = q.schedule_task(&t2, w2).await.unwrap();
+        assert_eq!(scheduled_t2.id, t2);
+        assert!(
+            q.pop_and_schedule(w1, |_| true).await.is_none(),
+            "pop_and_schedule guard must refuse t3 while t2 is Scheduled in ws-guard"
+        );
+
+        // Requeue `t2` (e.g. dispatch failure); `ws-guard` is now free and `pop_and_schedule`
+        // dispatches `t2`.
+        q.requeue_task(&t2).await.unwrap();
+        let popped = q.pop_and_schedule(w1, |_| true).await.unwrap();
+        assert_eq!(popped.id, t2);
+    }
+
+    #[tokio::test]
+    async fn test_workspace_affinity_replay_uses_terminal_finish_timestamp() {
+        use rusty_grid_core::task::WorkspaceRef;
+
+        let dir = tempfile::tempdir().unwrap();
+        let w1 = Uuid::new_v4();
+        let tid = TaskId::new();
+        let mut task = echo_task("ws-replay-ts").with_workspace(WorkspaceRef::new("ws-ts"));
+        task.id = tid;
+
+        {
+            let (store, _rec) = TaskStore::open(dir.path()).unwrap();
+            store
+                .append_durable(&JournalRecord::TaskSubmitted {
+                    task: Box::new(task),
+                    priority: 0,
+                    sequence: 1,
+                    submitted_at_utc: 1_000,
+                })
+                .unwrap()
+                .await
+                .unwrap();
+            store
+                .append_durable(&JournalRecord::TaskDispatched {
+                    task_id: tid,
+                    worker_id: w1,
+                    timestamp_utc: 1_010,
+                })
+                .unwrap()
+                .await
+                .unwrap();
+            store
+                .append_durable(&JournalRecord::TaskTerminal {
+                    task_id: tid,
+                    state: TaskState::Completed,
+                    assigned_worker_id: Some(w1),
+                    retry_count: 0,
+                    failover_count: 0,
+                    evacuation_count: 0,
+                    rejection_count: 0,
+                    retry_attempt: None,
+                    result: Some(TaskResult::success(w1, tid, "ok", 5, false)),
+                    error_message: None,
+                    timestamp_utc: 2_500,
+                })
+                .unwrap()
+                .await
+                .unwrap();
+        }
+
+        let (store2, rec2) = TaskStore::open(dir.path()).unwrap();
+        let q = TaskQueue::new();
+        q.attach_store_and_replay(store2, rec2, Duration::ZERO)
+            .await
+            .unwrap();
+
+        let workspaces = q.list_workspaces().await;
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].name, "ws-ts");
+        assert_eq!(workspaces[0].worker_id, w1);
+        assert_eq!(
+            workspaces[0].last_used_utc, 2_500,
+            "replay must record workspace affinity with the TaskTerminal finish timestamp"
+        );
+        q.close_and_compact_store().await;
     }
 }
