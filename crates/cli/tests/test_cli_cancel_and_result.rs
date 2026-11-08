@@ -617,6 +617,14 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
                             })
                             .await;
                     }
+                    rusty_grid_core::protocol::ClientMessage::Hello => {
+                        let _ = tx
+                            .send_msg(&rusty_grid_core::protocol::ClientResponse::Hello {
+                                min_compatible_version:
+                                    rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE,
+                            })
+                            .await;
+                    }
                     rusty_grid_core::protocol::ClientMessage::ClusterStatus => {
                         let _ = tx
                             .send_msg(&rusty_grid_core::protocol::ClientResponse::ClusterStatus {

@@ -12,8 +12,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["RustyGrid Contributors"]
+authors = ["The OxideSwarm Authors"]
 license = "MIT OR Apache-2.0"
+publish = false
 rust-version = "1.91"
 
 [workspace.dependencies]

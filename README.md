@@ -121,7 +121,7 @@ Status values use the fixed vocabulary: `Implemented`, `Partial`, `Planned`, or 
 | **7** | UDP discovery on isolated subnets | Partial | 3-tier discovery hierarchy: Tier 1 LAN UDP beacon (`:8089`), Tier 2 authenticated HTTP probe (`GET /api/discovery/probe?nonce=<hex>`, served on the dashboard listener, which is loopback by default), and Tier 3 rendezvous registry (`--rendezvous <URL>` / `OXIDESWARM_RENDEZVOUS`). Tier 2 and Tier 3 have remaining limitations (see `FEAT-7` in [docs/BACKLOG.md](docs/BACKLOG.md)). Documented in [docs/design/0004-mcp-and-discovery.md](docs/design/0004-mcp-and-discovery.md). |
 | **8** | Mid-task checkpointing | Partial | `WorkerClient` passes the checkpoint sender to every task (`client.rs:1670`), and `BuiltinTest`, `Generative3D`, and `AutoRig` send `WorkerMessage::Checkpoint` (`runner.rs:2087`, `:2225`, `:2315`), but `Generative3D` and `AutoRig` ignore the checkpoint on resume (`_checkpoint`, `runner.rs:1909`, `:2286`) and only the hash branch of `BuiltinTest` resumes from `CheckpointData` (`runner.rs:903-908`); all other task types and branches restart from the beginning when reassigned (see `FEAT-5` in [docs/BACKLOG.md](docs/BACKLOG.md)). |
 | **9** | OS child process containment | Implemented | On Windows, task child processes are bound to a Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` with `CREATE_SUSPENDED`) to kill the process tree on worker termination, falling back to `taskkill /F /T` if job assignment fails. On Unix (`Linux`, `macOS`, `Android`), each task process group is watched by a double-forked lifeline-pipe supervisor (`process_tree.rs`) that kills the process group (`SIGTERM` then `SIGKILL`), any delegated Linux cgroup v2 leaf, and `setsid()` survivors matching the per-attempt `RUSTY_GRID_RUN_TOKEN` when the worker crashes or is killed with `SIGKILL` ([docs/design/0031-containment-after-worker-crash.md](docs/design/0031-containment-after-worker-crash.md)). Start-up host capability probes (`blender --version`, `sysctl`, `nvidia-smi`, `pmset`, `dumpsys`, `getprop`, `sw_vers`, `nvcc`) are bounded to `3 s` (`HOST_PROBE_TIMEOUT`). On Windows, `resolve_windows_executable` (`runner.rs`) resolves task executables across the fixed extension list `[".com", ".exe", ".bat", ".cmd"]` (in `PATHEXT`'s default order) with a 2-byte `MZ` PE header check on `.com`/`.exe` and keeps Git for Windows `usr\bin` and `bin` ahead of `PATH` for bare names so extensionless files or 0-byte stubs cannot fail `CreateProcessW` with `os error 193`. Documented in [docs/design/0009-blender-and-3d-process-supervision.md](docs/design/0009-blender-and-3d-process-supervision.md), [docs/design/0020-bounded-host-capability-probes.md](docs/design/0020-bounded-host-capability-probes.md), [docs/design/0025-windows-executable-resolution.md](docs/design/0025-windows-executable-resolution.md), and [docs/design/0031-containment-after-worker-crash.md](docs/design/0031-containment-after-worker-crash.md). |
-| **10** | Protocol version & capability negotiation | Implemented | Workers, the master, and clients (`ClientMessage` and `ClientResponse`, protocol version 5) exchange and enforce `protocol_version` (`PROTOCOL_VERSION_MIN_COMPATIBLE..=PROTOCOL_VERSION_CURRENT`, with `LEGACY_UNVERSIONED_PROTOCOL_VERSION = 2` for unversioned JSON frames and a pre-flight `ClusterStatus` check in `connect_master` before any state-changing command), `WorkerClient` gates runtime capabilities on the `ProtocolCapabilities` bits acknowledged in `RegisterAck`, and `crates/core/src/wire_layout_tests.rs` (plus CI against `origin/master`) requires bumping `PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE` whenever recorded bincode bytes change. Documented in [docs/design/0040-protocol-versioning.md](docs/design/0040-protocol-versioning.md). |
+| **10** | Protocol version & capability negotiation | Implemented | Workers, the master, and clients (`ClientMessage` and `ClientResponse`, protocol version 6) exchange and enforce `protocol_version` (`PROTOCOL_VERSION_MIN_COMPATIBLE..=PROTOCOL_VERSION_CURRENT`, with `LEGACY_UNVERSIONED_PROTOCOL_VERSION = 2` for unversioned JSON frames and a pre-flight `Hello` check in `connect_master` before any state-changing command), `WorkerClient` gates runtime capabilities on the `ProtocolCapabilities` bits acknowledged in `RegisterAck`, and `crates/core/src/wire_layout_tests.rs` (plus CI against `origin/master`) requires bumping `PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE` whenever recorded bincode bytes change. Documented in [docs/design/0040-protocol-versioning.md](docs/design/0040-protocol-versioning.md). |
 | **11** | 3D generative engine names and CPU fallback | Implemented | Default 3D generation executes on CPU worker nodes via procedural SDF without GPU hardware. Strict validation refuses unknown engine names across CLI, core builder, Agent Mesh bridge, and wire codecs (JSON and bincode). Documented in [docs/design/0015-engine-names-and-cpu-fallback.md](docs/design/0015-engine-names-and-cpu-fallback.md). |
 | **12** | Honest 3D procedural SDF fallback | Implemented | Default (`auto`) and procedural (`sdf`) 3D generation routes to pure Rust Tier 0 Signed Distance Functions (`Procedural-SDF-PureRust`). Uninstalled neural checkpoints fail non-zero with explicit diagnostic reasons, `--image` inputs reject fast client-side, and subprocess failures propagate terminal stderr in `result.error`. Documented in [docs/design/0017-honest-3d-sdf-fallback.md](docs/design/0017-honest-3d-sdf-fallback.md). |
 | **13** | Exactly-once execution | Planned | Task delivery is at-least-once: if a worker disconnects, times out on heartbeats, or fails over after starting a task (or before the master processes its `WorkerMessage::TaskResult`, `protocol.rs:443`), the master requeues and dispatches the task to another worker, and the process tree of a killed worker can also keep running (`run_chaos_test.sh:309`), so a task can run twice. Tasks with external side effects must be idempotent. |
@@ -133,7 +133,39 @@ Status values use the fixed vocabulary: `Implemented`, `Partial`, `Planned`, or 
 Ports: **8088** is the cluster port (workers and `submit` / `status` talk to it), **8080** is the dashboard
 (never a valid `--master` target), **8089/udp** is discovery. Details: [docs/SECURITY.md](docs/SECURITY.md#4-what-each-port-exposes).
 
-### Step 0: Build
+### Install
+
+> No release exists yet: the first archives appear on the [Releases page](https://github.com/DuongNAD/OxideSwarm/releases)
+> when the owner pushes a `v*` tag. Until then, build from source (Step 0 below).
+
+Each release carries one archive per system, `oxideswarm-<version>-<target>.tar.gz` (Linux, macOS) or
+`.zip` (Windows), and a `-gpu` variant built with `--features gpu-wgpu` for a worker whose GPU should
+do work. Targets: `x86_64-unknown-linux-gnu` (built on Ubuntu 22.04, needs glibc 2.35 or newer), `aarch64-apple-darwin`, `x86_64-apple-darwin`,
+`x86_64-pc-windows-msvc`. An archive holds `oxideswarm`, `rusty-grid`, `ox-mode`, the licences and the
+installer scripts for that system under `scripts/`. `SHA256SUMS` lists every archive.
+
+```bash
+# macOS / Linux: verify, unpack, put the binaries on PATH (the file names below are an example)
+shasum -a 256 -c SHA256SUMS --ignore-missing      # Linux: sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf oxideswarm-0.1.0-aarch64-apple-darwin.tar.gz
+# The binaries are not signed or notarized: a browser download is quarantined and Gatekeeper refuses to run it.
+xattr -dr com.apple.quarantine oxideswarm-0.1.0-aarch64-apple-darwin      # macOS only
+sudo install -m 755 oxideswarm-0.1.0-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
+oxideswarm --help
+```
+
+```powershell
+# Windows: compare the hash with the SHA256SUMS line, unpack, add the folder to PATH
+(Get-FileHash .\oxideswarm-0.1.0-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+Expand-Archive .\oxideswarm-0.1.0-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
+$user = [Environment]::GetEnvironmentVariable('Path', 'User')
+[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.1.0-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
+```
+
+Then continue with Step 1 (master, worker, `submit`). The background-service installers in
+`scripts/` (`install_mac_daemon.sh --bin <PATH>`, `install_windows_service.ps1`) take the unpacked `rusty-grid` binary.
+
+### Step 0: Build (from source)
 
 ```bash
 cargo build --release --bin oxideswarm --bin rusty-grid     # the two names are the same program

@@ -1560,6 +1560,14 @@ async fn test_mcp1_slow_6mb_response_succeeds_and_post_submit_cancel_check_fires
                 let mut transport = MessageTransport::new(stream);
                 while let Ok(Some(msg)) = transport.recv_msg::<ClientMessage>().await {
                     match msg {
+                        ClientMessage::Hello => {
+                            let _ = transport
+                                .send_msg(&ClientResponse::Hello {
+                                    min_compatible_version:
+                                        rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE,
+                                })
+                                .await;
+                        }
                         ClientMessage::ClusterStatus => {
                             let _ = transport
                                 .send_msg(&ClientResponse::ClusterStatus {

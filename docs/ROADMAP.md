@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07 and Q6 on 2026-11-08
+Status: Accepted. The owner accepted decisions Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08
 Created: 2026-11-07    Updated: 2026-11-08
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
@@ -14,10 +14,14 @@ and to the design records. The status of each item lives in the BACKLOG Index, n
   MCP server lets coding agents submit work.
 - Purpose: **a coding agent runs builds and tests on the machines its owner already has.**
   Work that serves this purpose goes first.
+- Position: one binary per machine turns the macOS, Windows, Linux and Android machines that one
+  owner already has into a backend for coding agents, over encrypted P2P links. The research of
+  2026-11-08 (below) supports this position. It adds a one-command join, link reporting, published
+  benchmarks and a result cache.
 - Order: close the open foundations, make the master durable and tasks isolated, build persistent
   agent workspaces, then ship a release. These four phases, A to D, are the core.
-- Later work starts after the core: Phase E and the table of what waits. Android, master failover,
-  3D, language model inference and distributed training are later work.
+- Later work starts after the core: the launch, Phase E and the table of what waits. Android, master
+  failover, 3D, language model inference and distributed training are later work.
 
 ## Where the project stands
 
@@ -88,6 +92,30 @@ other tools lack.
 | HTCondor | High-throughput batch jobs on pools of machines | Targets a few machines that one person owns, with one binary |
 | Ray | Distributed Python applications | Runs any executable, with no API to adopt |
 | Nomad, Kubernetes | Services and batch jobs in data centres | Runs from one binary per machine |
+| HyperQueue | Task graphs on HPC clusters, from one binary with prebuilt archives for Linux | Also runs workers on macOS, Windows and Android, over authenticated P2P links |
+| BOINC | Volunteer computing for research projects | Serves the machines of one owner and the coding agents that owner runs |
+| prima.cpp, exo, distributed-llama | Running one language model over several home devices | Runs no model itself. Design 0038 supervises llama.cpp and carries its traffic |
+
+### What the research of 2026-11-08 found
+
+A web research run on 2026-11-08 checked each claim below against its source, with three
+independent votes per claim. Each row gives the finding, its source and what this roadmap does
+with it.
+
+| Finding | Source | Consequence |
+|---|---|---|
+| Ray supports multi-node clusters officially on Linux only. macOS and Windows nodes need an opt-in environment variable and run at the user's own risk. Ray on Golem is an MVP tested on Ubuntu and WSL only | [Ray cluster guide](https://github.com/ray-project/ray/blob/ray-2.11.0/doc/source/cluster/getting-started.rst), [Golem limits](https://docs.golem.network/docs/creators/ray/supported-versions-and-other-limitations) | Mixed-OS clusters are a real opening for OxideSwarm |
+| Nomad runs clients on Windows, and BOINC has Android clients | [Nomad Windows clients](https://developer.hashicorp.com/validated-designs/nomad/installation-guide/windows-clients) | OxideSwarm is not the only cross-platform grid, and its documents do not claim it |
+| HyperQueue ships one statically linked binary. Its README states a per-task overhead below 0.1 ms without a method | [HyperQueue](https://github.com/It4innovations/hyperqueue) | BENCH-1 publishes a method with every number. REL-4 and JOIN-1 match the one-binary install on three systems |
+| Joining a Tailscale network takes installing the client and logging in on each device | [What is Tailscale](https://tailscale.com/docs/concepts/what-is-tailscale.md) | JOIN-1 |
+| iroh dials by public key, tries a direct path and falls back to a relay. The n0 public relays are rate-limited and meant for development | [iroh hole punching](https://docs.iroh.computer/concepts/holepunching) | LINK-1 shows the path of each link and lets the owner name a relay of their own |
+| REAPI v2 names BLAKE3 as a digest function and allows a cache-only server | [remote_execution.proto](https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto) | CACHE-1 borrows the ActionCache model. REAPI-1 serves the blob store to REAPI clients without rehashing |
+| Over Wi-Fi, splitting a model by layers beats splitting each layer, because a split layer costs a network round trip per layer per token. A published run split a 70B model over a Mac, two PCs with RTX GPUs and a phone. Nobody has reproduced it, and its authors build a competing system | [prima.cpp](https://arxiv.org/abs/2504.08791) | Supports design 0038: a layer split through llama.cpp RPC (D2 to D5). Whether a phone helps as a stage stays open |
+| A Hacker News launch adds stars on average, but most of the gain goes to a few repositories. The research could not confirm an effect of the hour of posting | [Study of AI repositories on Hacker News](https://arxiv.org/abs/2511.04453) | Launch only after the release, a demo and the benchmark page (see "Launch") |
+
+Open questions: how often iroh reaches a direct path between the owner's own machines, how often
+CACHE-1 hits in the user story, and which features of hosted agent sandboxes coding agents depend
+on. The research found no checked measurements of compile farms such as sccache-dist or distcc.
 
 ## Principles
 
@@ -160,6 +188,10 @@ Goal: the user story works between two real machines. The design record is
 | WS-5 | MCP tools for workspaces, with timeouts suited to builds rather than the 60 s default | FEAT-4: default timeout |
 | WS-6 | Pipelined and compressed uploads from the client | The input-file limits listed in `README.md` |
 | WS-7 | A guide in `docs/guides/` for offloading `cargo test` from a coding agent, with a recorded two-machine run | |
+| CACHE-1 | Reuse the result of an identical task, keyed by the command, the environment and the input digests (decision Q7) | Exact repeats of a run |
+
+CACHE-1 is not part of the exit check. It starts with a design record, and MCP turns it on by
+default only after its hit rate on the WS-7 story is recorded.
 
 **Exit check:** the FEAT-4 "Done when" passes between two machines, the second run reuses `target/`,
 and the run is recorded with its date.
@@ -173,9 +205,26 @@ Goal: someone without Rust installed follows the README and reaches the user sto
 | REL-4 | Release workflow on `v*` tags with Linux, macOS and Windows archives, with and without `gpu-wgpu`, and `SHA256SUMS`. An install section in `README.md` |
 | Quick start | From install to the first offloaded `cargo test`, linking [guides/mcp-client-setup.md](guides/mcp-client-setup.md) and the WS-7 guide |
 | Release notes | A `CHANGELOG.md` entry for the release, with the upgrade order for mixed versions |
+| JOIN-1 | One join token that carries the master's address or ticket and the cluster secret, read from standard input (decision Q7) |
+| LINK-1 | `doctor` shows whether each worker is direct or relayed, and the owner can name a relay of their own (decision Q7) |
+| BENCH-1 | A benchmark page for task overhead, repeated uploads and the WS-7 offload, each number with its script and date (decision Q7) |
 
 **Exit check:** a tagged release exists with archives and checksums, and a machine without Rust runs
-the WS-7 guide from the README alone.
+the WS-7 guide from the README alone, joining with one token (JOIN-1). The benchmark page holds a
+dated run of the WS-7 offload (BENCH-1).
+
+### Launch
+
+After the Phase D exit check, and not before it:
+
+1. Record a short demo of the user story: an agent on one operating system runs `cargo test` on a
+   machine with another, and the second run is faster.
+2. Link the demo, the release and the BENCH-1 page from the top of `README.md`. Every number on the
+   page links to its run record (writing standard rule 6).
+3. Announce the release, for example on Hacker News.
+4. A second demo, one language model larger than any single machine split over several of them,
+   waits for LLM-2 and LLM-4 of design 0038 (decision Q4). LLM-1, which routes a prompt to the
+   worker that holds a model, can be shown earlier.
 
 ### Phase E: reach
 
@@ -197,7 +246,8 @@ After the first release, in order of value to the user story:
 | Area | Items | Why it waits | Plan |
 |---|---|---|---|
 | 3D generation and rigging | 3D-2, 3D-3 | It does not serve the user story | Frozen. Since FEAT-11 (pull request 127), `gen3d` and `autorig` build only with the opt-in Cargo feature `3d` |
-| Language model inference | LLM-1 to LLM-5 ([design 0038](design/0038-large-language-model-inference.md)) | LLM-2 needs FEAT-1 and FEAT-8. LLM-4 is a new transport | LLM-1 (a guide and a script, size S) can start at any time. LLM-2 to LLM-5 start after Phase C |
+| Language model inference | LLM-1 to LLM-5 ([design 0038](design/0038-large-language-model-inference.md)) | LLM-2 needs FEAT-1 and FEAT-8. LLM-4 is a new transport | LLM-1 (a guide and a script, size S) can start at any time. LLM-2 to LLM-5 start after Phase C. The research of 2026-11-08 supports the layer split of D2 to D5 for home networks |
+| Remote Execution API cache | REAPI-1 | It serves Bazel and Buck2 users rather than the user story, and adds a gRPC listener | After CACHE-1, cache-only. The `Execution` service is not planned |
 | GPU kernels | FEAT-9 | Decision D6 keeps GPU compute a benchmark | State "benchmark only" in `README.md` and `PROJECT.md`, as FEAT-9 asks |
 | Agent Mesh grid features | MESH-3 | MCP already lets agents submit work. Two agent interfaces split the effort | Not built (decision Q3). The removal of the hub-local file fallback, a security fix, landed in pull requests 114 and 132 |
 | Agent Mesh relay data | MESH-2 | It does not serve the user story | Phase E |
@@ -205,7 +255,7 @@ After the first release, in order of value to the user story:
 
 ## Decisions for the owner
 
-The owner accepted Q1 to Q5 on 2026-11-07 and Q6 on 2026-11-08.
+The owner accepted Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08.
 
 | ID | Question | Decision |
 |---|---|---|
@@ -215,6 +265,7 @@ The owner accepted Q1 to Q5 on 2026-11-07 and Q6 on 2026-11-08.
 | Q4 | When does language model work start? | LLM-1 at any time. LLM-2 to LLM-5 after Phase C |
 | Q5 | Make every CI job a required check on `master` (TEST-6)? | Yes |
 | Q6 | When does distributed training start? | After the Phase D exit check. Design 0045 records the direction, and nothing is built before then |
+| Q7 | Add the items from the research of 2026-11-08? | Yes. JOIN-1, LINK-1 and BENCH-1 join Phase D. CACHE-1 joins Phase C outside its exit check. REAPI-1 waits |
 
 ## Risks
 
@@ -225,6 +276,8 @@ The owner accepted Q1 to Q5 on 2026-11-07 and Q6 on 2026-11-08.
 | A wire layout change breaks mixed versions | FEAT-8 in Phase A |
 | `bincode` 1.x is unmaintained (RUSTSEC-2025-0141) | The FEAT-8 plan. Review pull request 86 against the layout tests in `crates/core/src/wire_layout_tests.rs` |
 | Documents drift from the code | The writing standard in [README.md](README.md), and a BACKLOG Index kept current |
+| A launch claims more than the evidence shows | BENCH-1, writing standard rule 6, and the order in "Launch" |
+| Links that fall back to the n0 public relays are rate-limited | LINK-1 |
 
 ## Status log
 
@@ -243,3 +296,6 @@ The owner accepted Q1 to Q5 on 2026-11-07 and Q6 on 2026-11-08.
   missing". The 3D and Agent Mesh rows of "What waits" record what FEAT-11 and MESH-3 landed.
 - 2026-11-08: FEAT-3 is Partial at `master` `4e1aeb3`: the core and macOS (`FEAT-3a`, pull request
   133) are merged. The "What is missing" row now names Linux and Windows only.
+- 2026-11-08: A web research run added "What the research of 2026-11-08 found", three rows of
+  neighbouring tools and the Launch section. The owner accepted Q7: JOIN-1, LINK-1 and BENCH-1 in
+  Phase D, CACHE-1 in Phase C outside its exit check, and REAPI-1 in the table of what waits.

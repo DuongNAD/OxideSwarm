@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+publish.workspace = true
+description = "OxideSwarm master: task queue, scheduler, worker registry and dashboard"
 
 [dependencies]
 rusty_grid_core = { workspace = true }

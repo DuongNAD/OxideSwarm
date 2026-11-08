@@ -67,6 +67,8 @@ scp user@master:~/.oxideswarm/cluster.secret ~/.oxideswarm/cluster.secret   # Ma
 chmod 600 ~/.oxideswarm/cluster.secret
 ```
 
+On Windows a secret or key file that OxideSwarm creates is private from the first byte (a protected ACL for you, SYSTEM and Administrators). A file you copy in yourself inherits the folder's ACL, which on a default home folder lets every local account read it. OxideSwarm warns at load; fix it with `icacls "%USERPROFILE%\.oxideswarm\cluster.secret" /inheritance:r /grant:r "%USERNAME%:F" SYSTEM:F Administrators:F`.
+
 On Windows use `scp` from the built-in OpenSSH client or carry the file on a USB stick to
 `%USERPROFILE%\.oxideswarm\cluster.secret`. Do not paste it into chat, e-mail or a cloud-synced folder
 (`scripts/sync_network` writes into one, so never put the secret there). Showing it as a QR code is not
@@ -180,8 +182,8 @@ What the worker does limit, so that tasks stay out of the owner's way:
 
 | File | Contains | Mode |
 | :--- | :--- | :--- |
-| `~/.oxideswarm/cluster.secret` | the cluster secret | 600 |
-| `~/.oxideswarm/master_key.bin` | the P2P node identity of a master | 600 (enforced on creation and tightened at startup by `server.rs`) |
+| `~/.oxideswarm/cluster.secret` | the cluster secret | 600; on Windows a protected ACL for the current user, SYSTEM and Administrators, set at creation, with a warning at load when the ACL is wider ([design 0047](design/0047-windows-private-files.md)) |
+| `~/.oxideswarm/master_key.bin` | the P2P node identity of a master | 600 (enforced on creation and tightened at startup by `server.rs`); on Windows the same protected ACL as the secret, with a warning at load (design 0047) |
 | `~/.oxideswarm/remote-worker.toml` (`connect_remote.sh`) | a P2P ticket and the path of the secret file | 600 |
 | `/etc/oxideswarm/worker.toml`, `/etc/oxideswarm/cluster.secret` (macOS daemon) | ticket / master address, secret copy | 600, owned by the service account |
 | `C:\ProgramData\OxideSwarm\rusty-grid.toml`, `cluster.secret` (Windows service) | ticket / master address, secret copy | ACL: SYSTEM, Administrators, the service account |

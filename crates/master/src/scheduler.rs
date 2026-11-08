@@ -296,6 +296,9 @@ fn feature_names(features: ProtocolCapabilities) -> String {
     if features.contains(ProtocolCapabilities::THREE_D) {
         names.push("THREE_D");
     }
+    if features.contains(ProtocolCapabilities::WORKSPACES) {
+        names.push("WORKSPACES");
+    }
     names.join(" and ")
 }
 

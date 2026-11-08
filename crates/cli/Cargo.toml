@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+publish.workspace = true
+description = "OxideSwarm command line: master, worker, submit, doctor and MCP server"
 
 [lib]
 path = "src/lib.rs"
@@ -35,6 +37,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 toml = { workspace = true }
 chrono = { workspace = true }
 sysinfo = { workspace = true }
+ignore = "0.4"
 
 [features]
 # Workers of this binary can compute on the GPU (Metal, Vulkan, DirectX 12) and advertise it:
