@@ -231,6 +231,7 @@ fn rust_spec() -> TaskSpec {
     }
 }
 
+#[allow(deprecated)]
 fn gpu_spec() -> TaskSpec {
     TaskSpec::GpuCompute {
         kernel_name: "gemm".into(),

@@ -263,7 +263,7 @@ async fn test_verify_autorig_async_with_preferred_provider_blender() {
 
     let (runner, _dir) = create_test_runner();
     let t0 = Instant::now();
-    let result = auto_rig_mesh_async(&runner, TaskId::new(), &spec).await;
+    let result = auto_rig_mesh_async(&runner, TaskId::new(), &spec, |_, _, _| {}).await;
     let elapsed = t0.elapsed();
     println!(
         "auto_rig_mesh_async with preferred_provider=blender took {:?}",
@@ -465,7 +465,7 @@ async fn test_graceful_fallback_when_blender_path_is_invalid_or_missing() {
     let (runner, _dir) = create_test_runner();
     let t0 = Instant::now();
     // Must NOT panic or fail, but cleanly fallback to built-in pure-Rust rigging pipeline
-    let result = auto_rig_mesh_async(&runner, TaskId::new(), &spec).await;
+    let result = auto_rig_mesh_async(&runner, TaskId::new(), &spec, |_, _, _| {}).await;
     let elapsed = t0.elapsed();
     println!("Fallback execution completed in {:?}", elapsed);
 
@@ -546,7 +546,7 @@ async fn test_runner_and_capabilities_honor_stale_and_valid_blender_path_flag() 
         "stale RunnerConfig.blender_path must resolve to None"
     );
 
-    let direct_res = auto_rig_mesh_async(&stale_runner, TaskId::new(), &spec).await;
+    let direct_res = auto_rig_mesh_async(&stale_runner, TaskId::new(), &spec, |_, _, _| {}).await;
     assert!(direct_res.is_ok(), "stale flag must fallback cleanly");
     assert!(
         !env_marker.exists(),
@@ -586,7 +586,7 @@ async fn test_runner_and_capabilities_honor_stale_and_valid_blender_path_flag() 
         "valid RunnerConfig.blender_path must resolve to the flag path"
     );
 
-    let _ = auto_rig_mesh_async(&valid_runner, TaskId::new(), &spec).await;
+    let _ = auto_rig_mesh_async(&valid_runner, TaskId::new(), &spec, |_, _, _| {}).await;
     assert!(
         flag_marker.exists(),
         "valid --blender-path in auto_rig_mesh_async must invoke the flag binary"
@@ -669,7 +669,7 @@ async fn test_graceful_fallback_when_blender_binary_crashes() {
     let (runner, _dir) = create_test_runner();
     let t0 = Instant::now();
     // Must gracefully catch failure and fallback to built-in pure-Rust engine
-    let result = auto_rig_mesh_async(&runner, TaskId::new(), &spec).await;
+    let result = auto_rig_mesh_async(&runner, TaskId::new(), &spec, |_, _, _| {}).await;
     let elapsed = t0.elapsed();
     println!("Crash fallback completed in {:?}", elapsed);
 

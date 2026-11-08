@@ -2391,16 +2391,14 @@ pub fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
             if dim == 0 || tile == 0 {
                 return Err("--matrix-dim and --work-group-size must be at least 1".to_string());
             }
-            Ok(TaskSpec::GpuCompute {
-                kernel_name: args
-                    .command
+            Ok(TaskSpec::gpu_compute_with_params(
+                args.command
                     .clone()
                     .unwrap_or_else(|| "matrix_multiply".into()),
-                input_data: vec![1, 2, 3, 4],
-                work_group_size: tile,
-                simulated_matrix_dim: dim,
-                compute_intensity: 10,
-            })
+                vec![1, 2, 3, 4],
+                tile,
+                dim,
+            ))
         }
         "compile" => Err(
             "compile tasks need the crate's source files, which `submit` cannot send; they are \

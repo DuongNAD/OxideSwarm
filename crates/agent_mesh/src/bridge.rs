@@ -193,11 +193,6 @@ impl AgentGridBridge {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(16) as u32;
 
-            let compute_intensity = args
-                .get("compute_intensity")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as u32;
-
             let input_data = parse_input_bytes(args.get("input_data"));
 
             let gpu_required = args
@@ -207,13 +202,12 @@ impl AgentGridBridge {
                 .unwrap_or(true);
 
             (
-                TaskSpec::GpuCompute {
+                TaskSpec::gpu_compute_with_params(
                     kernel_name,
                     input_data,
                     work_group_size,
                     simulated_matrix_dim,
-                    compute_intensity,
-                },
+                ),
                 TaskRequirements {
                     cpu_cores: 1,
                     ram_mb: 1024,

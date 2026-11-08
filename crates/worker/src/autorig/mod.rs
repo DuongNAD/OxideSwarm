@@ -110,11 +110,15 @@ pub fn auto_rig_mesh(spec: &AutoRigSpec) -> Result<Vec<u8>, WorkerError> {
 /// Asynchronous entry point with provider routing:
 /// Supports headless Blender 4.5.4 LTS fallback (F16) when requested,
 /// with automatic deterministic fallback to the built-in pure-Rust rigging engine.
-pub async fn auto_rig_mesh_async(
+pub async fn auto_rig_mesh_async<F>(
     runner: &crate::runner::TaskRunner,
     task_id: rusty_grid_core::task::TaskId,
     spec: &AutoRigSpec,
-) -> Result<Vec<u8>, WorkerError> {
+    mut on_progress: F,
+) -> Result<Vec<u8>, WorkerError>
+where
+    F: FnMut(f32, &'static str, &str) + Send + 'static,
+{
     let pref = spec
         .preferred_provider
         .as_deref()
@@ -126,6 +130,11 @@ pub async fn auto_rig_mesh_async(
             blender_provider::resolve_blender_binary(runner.config().blender_path.as_deref())
         {
             info!(bin = ?blender_bin, "Attempting Blender headless auto-rigging provider");
+            on_progress(
+                0.10,
+                "analyzing_mesh",
+                "Executing Blender headless auto-rigging provider",
+            );
             match BlenderRigProvider::execute_rigging(
                 runner,
                 task_id,
@@ -139,6 +148,11 @@ pub async fn auto_rig_mesh_async(
             {
                 Ok(glb) => {
                     info!("Blender auto-rigging completed successfully");
+                    on_progress(
+                        1.00,
+                        "completed",
+                        "Blender auto-rigging completed successfully",
+                    );
                     return Ok(glb);
                 }
                 Err(e) => {
@@ -151,5 +165,8 @@ pub async fn auto_rig_mesh_async(
     }
 
     // Default or fallback: Built-in pure-Rust rigging engine
-    auto_rig_mesh(spec)
+    let spec_clone = spec.clone();
+    tokio::task::spawn_blocking(move || auto_rig_mesh_with_progress(&spec_clone, on_progress))
+        .await
+        .map_err(|e| WorkerError::AutoRig(format!("Join error: {e}")))?
 }

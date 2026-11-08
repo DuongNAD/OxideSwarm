@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use tracing::{debug, warn};
 
 use rusty_grid_core::task::{
-    StagedFile, TaskId, TaskSpec, MAX_AGGREGATE_STAGED_BYTES, MAX_STAGED_FILE_BYTES,
+    StagedFile, TaskId, MAX_AGGREGATE_STAGED_BYTES, MAX_STAGED_FILE_BYTES,
 };
 
 /// Windows reserved DOS device names that cannot be created or accessed as files.
@@ -708,22 +708,6 @@ impl Sandbox {
             warn!(task_id = %self.task_id, path = %target.display(), error = %e, "Failed to set 0o700 permissions on script");
         }
         Ok(target)
-    }
-
-    /// Materializes files necessary for a given TaskSpec variant.
-    pub async fn prepare_spec(&self, spec: &TaskSpec) -> Result<(), SandboxError> {
-        match spec {
-            TaskSpec::ShellScript { script, .. } => {
-                self.write_script("task_script.sh", script).await?;
-            }
-            TaskSpec::RustCompilation { source_files, .. } => {
-                for (rel_path, content) in source_files {
-                    self.write_file(rel_path, content.as_bytes()).await?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
     }
 
     /// Materializes staged files directly into the sandbox directory.
