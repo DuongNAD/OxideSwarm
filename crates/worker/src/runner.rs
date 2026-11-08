@@ -2637,9 +2637,9 @@ impl TaskRunner {
         // Last line of defence for the direct child if this future is dropped; the process tree
         // below takes care of everything else.
         cmd.kill_on_drop(true);
-        configure_command(&mut cmd, self.config.process_priority);
+        let mut configured = configure_command(&mut cmd, self.config.process_priority, task_id);
 
-        let mut child = match cmd.spawn() {
+        let mut child = match configured.spawn(&mut cmd) {
             Ok(c) => c,
             Err(e) => {
                 return TaskResult::failure(
@@ -2659,7 +2659,7 @@ impl TaskRunner {
         };
 
         // Declared before the readers so it is dropped after them: dropping it kills what is left.
-        let tree = ProcessTree::attach(&child);
+        let tree = configured.attach(&child);
         if !tree.is_tracked() {
             warn!(task_id = %task_id, "Could not place the task process in its own process group or job; only the direct child can be terminated reliably");
         }
@@ -2705,7 +2705,7 @@ impl TaskRunner {
                 // lives, so wait a bounded time, then take the tree down and keep what arrived.
                 let drained = readers.wait(self.config.pipe_drain_grace).await;
                 // Nothing the task started may outlive it: its sandbox is deleted next.
-                tree.kill(None);
+                tree.kill_async(None).await;
                 if !drained {
                     readers.wait(POST_KILL_DRAIN).await;
                 }
@@ -2798,7 +2798,7 @@ impl TaskRunner {
         if tree.request_stop() {
             let _ = tokio::time::timeout(self.config.stop_grace, child.wait()).await;
         }
-        tree.kill(child.id());
+        tree.kill_async(child.id()).await;
         // The leader at least, even where no tree could be tracked.
         let _ = child.start_kill();
         let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
