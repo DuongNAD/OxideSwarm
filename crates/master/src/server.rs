@@ -527,7 +527,21 @@ impl MasterServer {
         scheduler_notify: Arc<tokio::sync::Notify>,
         waiters: WaiterMap,
     ) -> GridResult<Self> {
-        // Opened first: a store that cannot be used must not leave a ticket or port file behind.
+        // Opened first: a store that cannot be used (e.g. `store.lock` held by another master)
+        // must fail before `BlobStore::open` scans `blobs/` or purges `blobs/tmp/`, and before
+        // any ticket or port file is written.
+        let opened_task_store = if let Some(ref state_dir) = config.state_dir {
+            let state_dir_clone = state_dir.clone();
+            let (store, recovered) = tokio::task::spawn_blocking(move || {
+                crate::store::TaskStore::open(&state_dir_clone)
+            })
+            .await
+            .map_err(|e| GridError::Config(format!("Task store start-up failed: {e}")))??;
+            Some((store, recovered))
+        } else {
+            None
+        };
+
         let effective_blob_store = config.blob_store.clone().or_else(|| {
             config.state_dir.as_ref().map(|dir| {
                 BlobStoreConfig::new(
@@ -553,13 +567,7 @@ impl MasterServer {
             None => None,
         };
 
-        if let Some(ref state_dir) = config.state_dir {
-            let state_dir_clone = state_dir.clone();
-            let (store, recovered) = tokio::task::spawn_blocking(move || {
-                crate::store::TaskStore::open(&state_dir_clone)
-            })
-            .await
-            .map_err(|e| GridError::Config(format!("Task store start-up failed: {e}")))??;
+        if let Some((store, recovered)) = opened_task_store {
             queue
                 .attach_store_and_replay(store, recovered, Duration::ZERO)
                 .await?;
@@ -2097,8 +2105,37 @@ async fn apply_task_result(
     waiters: &WaiterMap,
     worker_id: Uuid,
     session_id: Option<u64>,
+    result: TaskResult,
+    blob_store: Option<&Arc<BlobStore>>,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<&DashboardTx>,
+) {
+    apply_task_result_inner(
+        registry,
+        queue,
+        scheduler_notify,
+        waiters,
+        worker_id,
+        session_id,
+        result,
+        blob_store,
+        false,
+        #[cfg(feature = "dashboard")]
+        broadcast_tx,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_task_result_inner(
+    registry: &WorkerRegistry,
+    queue: &TaskQueue,
+    scheduler_notify: &tokio::sync::Notify,
+    waiters: &WaiterMap,
+    worker_id: Uuid,
+    session_id: Option<u64>,
     mut result: TaskResult,
     blob_store: Option<&Arc<BlobStore>>,
+    spawn_waiter_ack: bool,
     #[cfg(feature = "dashboard")] broadcast_tx: Option<&DashboardTx>,
 ) {
     let task_id = result.task_id;
@@ -2133,12 +2170,13 @@ async fn apply_task_result(
         }
     };
 
-    // 1. Record outcome in TaskQueue FSM
-    let outcome = match queue
-        .record_result_from(worker_id, session_id, result.clone())
+    // 1. Record outcome in TaskQueue FSM and enqueue its journal record without blocking the
+    //    worker session loop on the 5 ms group-commit window.
+    let (outcome, durable_ack) = match queue
+        .record_result_from_enqueued(worker_id, session_id, result.clone())
         .await
     {
-        Ok(outcome) => outcome,
+        Ok(pair) => pair,
         Err(e) => {
             warn!(task_id = %task_id, error = %e, "Failed to record task result in queue");
             return;
@@ -2186,10 +2224,47 @@ async fn apply_task_result(
         if let Some(pin) = output_pin {
             pin.commit_terminal(task_id).await;
         }
-        let mut lock = waiters.write().await;
-        if let Some(senders) = lock.remove(&task_id) {
-            for tx in senders {
-                let _ = tx.send(result.clone());
+        if spawn_waiter_ack {
+            if let Some(ack) = durable_ack {
+                let waiters = Arc::clone(waiters);
+                tokio::spawn(async move {
+                    if let Err(err) = ack.await {
+                        warn!(
+                            task_id = %task_id.0,
+                            error = %err,
+                            "Failed to sync TaskTerminal journal record for task result"
+                        );
+                    }
+                    let mut lock = waiters.write().await;
+                    if let Some(senders) = lock.remove(&task_id) {
+                        for tx in senders {
+                            let _ = tx.send(result.clone());
+                        }
+                    }
+                });
+            } else {
+                let mut lock = waiters.write().await;
+                if let Some(senders) = lock.remove(&task_id) {
+                    for tx in senders {
+                        let _ = tx.send(result.clone());
+                    }
+                }
+            }
+        } else {
+            if let Some(ack) = durable_ack {
+                if let Err(err) = ack.await {
+                    warn!(
+                        task_id = %task_id.0,
+                        error = %err,
+                        "Failed to sync TaskTerminal journal record for task result"
+                    );
+                }
+            }
+            let mut lock = waiters.write().await;
+            if let Some(senders) = lock.remove(&task_id) {
+                for tx in senders {
+                    let _ = tx.send(result.clone());
+                }
             }
         }
     }
@@ -2512,7 +2587,7 @@ pub(crate) async fn handle_session_task_message(
             #[cfg(feature = "dashboard")]
             let broadcast_tx = broadcast_tx.cloned();
             let _ = tokio::spawn(async move {
-                apply_task_result(
+                apply_task_result_inner(
                     &registry,
                     &queue,
                     &scheduler_notify,
@@ -2521,6 +2596,7 @@ pub(crate) async fn handle_session_task_message(
                     Some(session_id),
                     result,
                     blob_store.as_ref(),
+                    true,
                     #[cfg(feature = "dashboard")]
                     broadcast_tx.as_ref(),
                 )
@@ -3906,12 +3982,10 @@ impl MasterHandle {
 
     /// Signals all Master subsystems to shut down.
     pub fn shutdown(&self) -> GridResult<()> {
-        let res = self
-            .shutdown_tx
-            .send(true)
-            .map_err(|_| GridError::ConnectionClosed);
         self.queue.close_and_compact_store_sync();
-        res
+        self.shutdown_tx
+            .send(true)
+            .map_err(|_| GridError::ConnectionClosed)
     }
 
     /// Executes an in-memory Map/Reduce job across cluster workers.
@@ -6771,5 +6845,387 @@ mod tests {
             Some(TaskState::Completed)
         );
         handle2.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_storage_failure_on_result_releases_worker_slot_unpins_blobs_and_wakes_waiters() {
+        use rusty_grid_core::blob::{BlobId, TaskInput};
+        use rusty_grid_core::blob_transfer::{upload_blob, BlobChannel, BlobError};
+
+        struct StoreConn {
+            store: Arc<BlobStore>,
+            owner: u64,
+        }
+        impl BlobChannel for StoreConn {
+            async fn call(&self, request: BlobRequest) -> Result<BlobReply, BlobError> {
+                Ok(self.store.handle(self.owner, request).await)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let blob_dir = state_dir.join("blobs");
+        let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(false)
+            .with_discovery(false)
+            .with_state_dir(&state_dir)
+            .with_blob_store(&blob_dir, 64 * 1024);
+        let handle = MasterServer::spawn(config).await.unwrap();
+        let bstore = handle.blob_store.as_ref().unwrap();
+        let conn = StoreConn {
+            store: Arc::clone(bstore),
+            owner: bstore.new_owner(),
+        };
+
+        let input_bytes = vec![b'X'; 512];
+        let input_id = BlobId::of(&input_bytes);
+        upload_blob(&conn, input_id, input_bytes.len() as u64, &input_bytes[..])
+            .await
+            .unwrap();
+
+        let worker_id = Uuid::new_v4();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let session_id = handle
+            .registry()
+            .register(
+                worker_id,
+                WorkerCapabilities::new("slot-worker", 4, 4096, false, false, None),
+                "127.0.0.1:9999".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut task = Task::new(
+            rusty_grid_core::TaskSpec::command("echo", vec!["hi".into()]),
+            rusty_grid_core::TaskRequirements::generic(1, 10),
+        );
+        task.inputs.push(TaskInput::file(
+            "input.bin",
+            input_id,
+            input_bytes.len() as u64,
+            false,
+        ));
+        let task_id = handle.submit_task(task).await.unwrap();
+        assert_eq!(bstore.stats().pinned_blobs, 1);
+
+        let (waiter_tx, waiter_rx) = tokio::sync::oneshot::channel();
+        handle
+            .waiters
+            .write()
+            .await
+            .entry(task_id)
+            .or_default()
+            .push(waiter_tx);
+
+        handle
+            .queue()
+            .schedule_tasks_batch_in_sessions(&[(task_id, worker_id, session_id)])
+            .await;
+        handle
+            .registry()
+            .increment_active_tasks(&worker_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle
+                .registry()
+                .get_worker(worker_id)
+                .await
+                .unwrap()
+                .active_tasks,
+            1
+        );
+
+        // Inject storage sync failure before the result arrives.
+        handle.queue().inject_store_sync_failure(1).await;
+
+        apply_task_result(
+            handle.registry(),
+            handle.queue(),
+            handle.scheduler_notify(),
+            &handle.waiters,
+            worker_id,
+            Some(session_id),
+            TaskResult::success(worker_id, task_id, "done", 3, false),
+            handle.blob_store.as_ref(),
+            #[cfg(feature = "dashboard")]
+            None,
+        )
+        .await;
+
+        let waited = tokio::time::timeout(Duration::from_secs(1), waiter_rx)
+            .await
+            .expect("waiter must be woken even when TaskStore sync fails")
+            .expect("waiter channel must receive result");
+        assert_eq!(waited.exit_code, 0);
+        assert_eq!(
+            handle
+                .registry()
+                .get_worker(worker_id)
+                .await
+                .unwrap()
+                .active_tasks,
+            0,
+            "worker slot must be released even when TaskStore sync fails"
+        );
+        assert_eq!(
+            bstore.stats().pinned_blobs,
+            0,
+            "task input blobs must be unpinned even when TaskStore sync fails"
+        );
+        handle.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_second_master_refused_on_locked_state_dir_leaves_blobs_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let config1 = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(false)
+            .with_discovery(false)
+            .with_state_dir(&state_dir);
+        let handle1 = MasterServer::spawn(config1).await.unwrap();
+
+        // Simulate an in-flight upload file inside `<state_dir>/blobs/tmp/` on the running master.
+        let staged_tmp = state_dir.join("blobs").join("tmp").join("upload-1.part");
+        std::fs::create_dir_all(staged_tmp.parent().unwrap()).unwrap();
+        std::fs::write(&staged_tmp, b"in-flight-upload-bytes").unwrap();
+        assert!(staged_tmp.exists());
+
+        // Starting a second master on the same `--state-dir` must fail on `store.lock` BEFORE
+        // `BlobStore::open` runs and purges `blobs/tmp/`.
+        let config2 = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(false)
+            .with_discovery(false)
+            .with_state_dir(&state_dir);
+        let Err(err) = MasterServer::spawn(config2).await else {
+            panic!("expected second MasterServer::spawn on locked state_dir to fail");
+        };
+        assert!(
+            err.to_string().contains("store.lock"),
+            "expected store.lock refusal on locked state_dir, got {err:?}"
+        );
+        assert!(
+            staged_tmp.exists(),
+            "second master refused on locked state_dir must not purge running master's blobs/tmp/ files"
+        );
+        assert_eq!(
+            std::fs::read(&staged_tmp).unwrap(),
+            b"in-flight-upload-bytes"
+        );
+
+        handle1.shutdown().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_worker_session_50_results_batch_in_group_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(false)
+            .with_discovery(false)
+            .with_state_dir(&state_dir);
+        let handle = MasterServer::spawn(config).await.unwrap();
+
+        let worker_id = Uuid::new_v4();
+        let (tx, _rx) = tokio::sync::mpsc::channel(128);
+        let session_id = handle
+            .registry()
+            .register(
+                worker_id,
+                WorkerCapabilities::new("batch-worker", 64, 65536, false, false, None),
+                "127.0.0.1:9998".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let count = 50usize;
+        let mut task_ids = Vec::with_capacity(count);
+        let mut waiter_rxs = Vec::with_capacity(count);
+        for i in 0..count {
+            let t = Task::new(
+                rusty_grid_core::TaskSpec::command("echo", vec![format!("r-{i}")]),
+                rusty_grid_core::TaskRequirements::generic(1, 10),
+            );
+            let tid = handle.submit_task(t).await.unwrap();
+            let (wtx, wrx) = tokio::sync::oneshot::channel();
+            handle
+                .waiters
+                .write()
+                .await
+                .entry(tid)
+                .or_default()
+                .push(wtx);
+            task_ids.push(tid);
+            waiter_rxs.push(wrx);
+        }
+
+        let assign: Vec<_> = task_ids
+            .iter()
+            .map(|tid| (*tid, worker_id, session_id))
+            .collect();
+        handle
+            .queue()
+            .schedule_tasks_batch_in_sessions(&assign)
+            .await;
+
+        let syncs_before = handle.queue().store_sync_count().await.unwrap();
+        let start = std::time::Instant::now();
+        for tid in &task_ids {
+            handle_session_task_message(
+                WorkerMessage::TaskResult {
+                    worker_id,
+                    task_id: *tid,
+                    exit_code: 0,
+                    stdout: "ok".into(),
+                    stderr: String::new().into(),
+                    execution_time_ms: 1,
+                    is_gpu_executed: false,
+                    device_name: None,
+                    error: None,
+                    asset_bytes: None,
+                    artifacts: Vec::new(),
+                    outputs: Vec::new(),
+                },
+                handle.registry(),
+                handle.queue(),
+                handle.scheduler_notify(),
+                &handle.waiters,
+                worker_id,
+                session_id,
+                handle.blob_store.as_ref(),
+                #[cfg(feature = "dashboard")]
+                None,
+            )
+            .await;
+        }
+
+        for wrx in waiter_rxs {
+            let res = tokio::time::timeout(Duration::from_secs(2), wrx)
+                .await
+                .expect("waiter timed out")
+                .expect("waiter dropped");
+            assert_eq!(res.exit_code, 0);
+        }
+        let elapsed = start.elapsed();
+        let syncs_after = handle.queue().store_sync_count().await.unwrap();
+        let sync_delta = syncs_after.saturating_sub(syncs_before);
+
+        assert!(
+            sync_delta > 0 && sync_delta < 20,
+            "expected >=50 sequential session results to coalesce into < 20 syncs, got {sync_delta} (elapsed {elapsed:?})"
+        );
+
+        handle.shutdown().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_submit_after_shutdown_returns_err_and_clean_shutdown_does_not_charge_running_tasks(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state_part_a");
+        let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(false)
+            .with_discovery(false)
+            .with_state_dir(&state_dir);
+        let handle = MasterServer::spawn(config).await.unwrap();
+        handle.shutdown().unwrap();
+
+        let late_task = Task::new(
+            rusty_grid_core::TaskSpec::command("echo", vec!["late".into()]),
+            rusty_grid_core::TaskRequirements::generic(1, 10),
+        );
+        let late_id = late_task.id;
+        let res = handle.submit_task(late_task).await;
+        assert!(
+            matches!(res, Err(GridError::Storage(_))),
+            "submit_task after shutdown() must return Err(GridError::Storage), got {res:?}"
+        );
+
+        let config2 = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(false)
+            .with_discovery(false)
+            .with_state_dir(&state_dir);
+        let handle2 = MasterServer::spawn(config2).await.unwrap();
+        assert_eq!(handle2.queue().get_state(&late_id).await, None);
+        handle2.shutdown().unwrap();
+
+        // Part B: clean shutdown while a worker is executing a task must never charge failover_count.
+        for round in 0..4 {
+            let round_dir = dir.path().join(format!("state_round_{round}"));
+            let cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+                .with_web_ui(false)
+                .with_discovery(false)
+                .with_state_dir(&round_dir);
+            let h = MasterServer::spawn(cfg).await.unwrap();
+            let addr = h.server_addr().to_string();
+            let (wtx, wrx) = tokio::sync::watch::channel(false);
+            let mut w = rusty_grid_worker::client::WorkerClient::for_testing(
+                addr,
+                Some(format!("clean-shutdown-{round}")),
+                Some(1),
+                false,
+            );
+            let wh = tokio::spawn(async move {
+                let _ = w.run(wrx).await;
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while h.list_workers().await.map(|v| v.len()).unwrap_or(0) < 1
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let mut req = rusty_grid_core::TaskRequirements::generic(1, 16);
+            req.max_retries = Some(2);
+            let running_task = Task::new(
+                rusty_grid_core::TaskSpec::BuiltinTest {
+                    test_name: "long".into(),
+                    iterations: 4,
+                    duration_ms: 5_000,
+                    should_fail: false,
+                    require_gpu: false,
+                },
+                req,
+            );
+            let id = h.submit_task(running_task).await.unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while h.queue().get_state(&id).await != Some(TaskState::Running)
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            h.shutdown().unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = wtx.send(true);
+            wh.abort();
+
+            let cfg_reopen = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+                .with_web_ui(false)
+                .with_discovery(false)
+                .with_state_dir(&round_dir);
+            let h2 = MasterServer::spawn(cfg_reopen).await.unwrap();
+            let info = h2.queue().get_task(&id).await.unwrap();
+            assert_eq!(
+                info.failover_count, 0,
+                "round {round}: clean master shutdown must not charge failover_count"
+            );
+            assert_eq!(
+                info.retry_count, 0,
+                "round {round}: clean master shutdown must not charge retry_count"
+            );
+            assert!(
+                h2.queue()
+                    .get_retry_history(&id)
+                    .await
+                    .unwrap_or_default()
+                    .is_empty(),
+                "round {round}: clean master shutdown must not append a RetryAttempt"
+            );
+            h2.shutdown().unwrap();
+        }
     }
 }

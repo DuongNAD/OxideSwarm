@@ -198,6 +198,10 @@ pub struct PersistedTaskEntry {
     #[serde(default)]
     pub avoid_workers: Vec<Uuid>,
     #[serde(default)]
+    pub adoptable_by_worker: Option<Uuid>,
+    #[serde(default)]
+    pub fail_if_not_adopted: bool,
+    #[serde(default)]
     pub retry_history: Vec<RetryAttempt>,
     #[serde(default)]
     pub result: Option<TaskResult>,
@@ -290,6 +294,7 @@ struct Shared {
     sync_calls: AtomicU64,
     journal_bytes: AtomicU64,
     journal_records: AtomicU64,
+    pending_compactions: AtomicU64,
     compaction_due: AtomicBool,
     failed: Mutex<Option<String>>,
     /// Test-only fault injection: 1 = `sync_data` fails, 2 = the writer panics at the sync.
@@ -447,7 +452,16 @@ impl TaskStore {
     /// on the writer thread.
     pub fn compact(&self, image: SnapshotImage) -> GridResult<DurableAck> {
         let (ack, rx) = oneshot::channel();
-        self.send(Cmd::Compact { image, ack })?;
+        self.shared
+            .pending_compactions
+            .fetch_add(1, Ordering::AcqRel);
+        self.shared.compaction_due.store(false, Ordering::Release);
+        if let Err(err) = self.send(Cmd::Compact { image, ack }) {
+            self.shared
+                .pending_compactions
+                .fetch_sub(1, Ordering::AcqRel);
+            return Err(err);
+        }
         Ok(DurableAck(rx))
     }
 
@@ -474,6 +488,12 @@ impl TaskStore {
     /// Current journal size in bytes.
     pub fn journal_bytes(&self) -> u64 {
         self.shared.journal_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Injects a sync failure (`1`) or writer panic (`2`) for fault-injection tests.
+    #[cfg(test)]
+    pub(crate) fn set_inject(&self, mode: u8) {
+        self.shared.inject.store(mode, Ordering::SeqCst);
     }
 
     fn send(&self, cmd: Cmd) -> GridResult<()> {
@@ -520,6 +540,10 @@ impl Writer {
                 Cmd::Append { frame, ack } => self.handle_append(frame, ack, &rx),
                 Cmd::Compact { image, ack } => {
                     let res = self.check_failed().and_then(|()| self.compact(&image));
+                    self.shared
+                        .pending_compactions
+                        .fetch_sub(1, Ordering::AcqRel);
+                    self.update_due();
                     self.finish(res, std::iter::once(ack));
                     rx.recv().ok()
                 }
@@ -624,9 +648,10 @@ impl Writer {
     }
 
     fn update_due(&self) {
-        let due = self.bytes > self.options.compact_max_bytes
-            || self.records > self.options.compact_max_records;
-        self.shared.compaction_due.store(due, Ordering::Relaxed);
+        let due = self.shared.pending_compactions.load(Ordering::Acquire) == 0
+            && (self.bytes > self.options.compact_max_bytes
+                || self.records > self.options.compact_max_records);
+        self.shared.compaction_due.store(due, Ordering::Release);
     }
 
     fn check_failed(&self) -> GridResult<()> {
@@ -1413,6 +1438,8 @@ mod tests {
                 evacuation_count: 0,
                 rejection_count: 0,
                 avoid_workers: vec![],
+                adoptable_by_worker: None,
+                fail_if_not_adopted: false,
                 retry_history: vec![attempt()],
                 result: None,
                 error_message: None,
@@ -1851,6 +1878,8 @@ mod tests {
                 evacuation_count: 0,
                 rejection_count: 0,
                 avoid_workers: vec![],
+                adoptable_by_worker: None,
+                fail_if_not_adopted: false,
                 retry_history: vec![],
                 result: Some(result),
                 error_message: None,

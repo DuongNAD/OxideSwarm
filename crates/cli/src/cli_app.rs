@@ -1401,14 +1401,11 @@ async fn run_master(
         .with_max_connections(max_connections)
         .with_max_pending_handshakes(max_pending_handshakes);
 
-    let state_dir = resolve_opt_string(
-        args.state_dir.map(|p| p.display().to_string()),
-        &["RUSTY_GRID_STATE_DIR"],
-        master_cfg.as_ref().and_then(|m| m.state_dir.clone()),
-    )
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty())
-    .map(PathBuf::from);
+    let state_dir = resolve_state_dir_value(
+        args.state_dir,
+        std::env::var("RUSTY_GRID_STATE_DIR").ok().as_deref(),
+        master_cfg.as_ref().and_then(|m| m.state_dir.as_deref()),
+    );
     if let Some(ref dir) = state_dir {
         server_config = server_config.with_state_dir(dir);
     }
@@ -1566,6 +1563,28 @@ async fn run_master(
     println!("\nRustyGrid Master shutting down...");
     let _ = handle.shutdown();
     ExitCode::SUCCESS
+}
+
+/// Resolves `--state-dir` / `RUSTY_GRID_STATE_DIR` / `master.state_dir` without mutating the
+/// process environment.
+fn resolve_state_dir_value(
+    cli_val: Option<PathBuf>,
+    env_val: Option<&str>,
+    cfg_val: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(path) = cli_val {
+        let trimmed = path.display().to_string();
+        if !trimmed.trim().is_empty() {
+            return Some(path);
+        }
+    }
+    if let Some(env_s) = env_val.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(env_s));
+    }
+    if let Some(cfg_s) = cfg_val.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(cfg_s));
+    }
+    None
 }
 
 /// Applies `--web-ui-addr` to the master's configuration.
@@ -5948,19 +5967,28 @@ fail_unfulfillable_tasks = false
             Some(std::path::Path::new("/tmp/cli-state"))
         );
 
-        let env_key = "RUSTY_GRID_STATE_DIR";
-        std::env::set_var(env_key, "/tmp/env-state");
-        let resolved_env = resolve_opt_string(None, &[env_key], Some("/tmp/cfg-state".to_string()));
-        let resolved_cli = resolve_opt_string(
-            Some("/tmp/cli-state".to_string()),
-            &[env_key],
-            Some("/tmp/cfg-state".to_string()),
+        let resolved_cli = resolve_state_dir_value(
+            Some(PathBuf::from("/tmp/cli-state")),
+            Some("/tmp/env-state"),
+            Some("/tmp/cfg-state"),
         );
-        std::env::remove_var(env_key);
-        let resolved_cfg = resolve_opt_string(None, &[env_key], Some("/tmp/cfg-state".to_string()));
+        let resolved_env =
+            resolve_state_dir_value(None, Some("/tmp/env-state"), Some("/tmp/cfg-state"));
+        let resolved_cfg = resolve_state_dir_value(None, Some("   "), Some("/tmp/cfg-state"));
+        let resolved_none = resolve_state_dir_value(None, None, None);
 
-        assert_eq!(resolved_cli.as_deref(), Some("/tmp/cli-state"));
-        assert_eq!(resolved_env.as_deref(), Some("/tmp/env-state"));
-        assert_eq!(resolved_cfg.as_deref(), Some("/tmp/cfg-state"));
+        assert_eq!(
+            resolved_cli.as_deref(),
+            Some(std::path::Path::new("/tmp/cli-state"))
+        );
+        assert_eq!(
+            resolved_env.as_deref(),
+            Some(std::path::Path::new("/tmp/env-state"))
+        );
+        assert_eq!(
+            resolved_cfg.as_deref(),
+            Some(std::path::Path::new("/tmp/cfg-state"))
+        );
+        assert_eq!(resolved_none, None);
     }
 }

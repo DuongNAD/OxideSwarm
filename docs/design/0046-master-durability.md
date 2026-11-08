@@ -190,14 +190,27 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
    ```
 3. **Durability (`sync_data`) boundary and `5 ms` group commit:**
    - **Sync set:** `TaskSubmitted`, `TaskRequeued`, `CheckpointRecorded`, `TaskTerminal`, and
-     `TaskRunning` (when the task's effective `max_retries == 0`, so the "already started once"
-     fact cannot be lost in a crash) are durable records that call `File::sync_data()` before the
-     caller acknowledges the operation. Syncing `TaskRequeued` guarantees that `retry_count`,
+     `TaskDispatched` / `TaskRunning` (when the task's effective `max_retries == 0`, so the
+     "already dispatched or started once" fact cannot be lost in a crash) are durable records that
+     call `File::sync_data()`. Syncing `TaskRequeued` guarantees that `retry_count`,
      `failover_count`, `evacuation_count`, and `rejection_count` never roll backward across a crash
      and grant a task more retries than its budget.
-   - **`5 ms` group commit for `TaskSubmitted` (and concurrent durable records):**
-     - A MapReduce job or an MCP burst of 1,000 task submissions must not execute 1,000 sequential
-       `sync_data()` syscalls.
+   - **Submission gate vs. in-flight transition behaviour on storage failure:**
+     - On `submit` / `try_submit_slot` / `submit_with_priority`, `TaskQueue` checks store health
+       and enqueues `TaskSubmitted` before mutating `inner.tasks` or advancing `next_sequence`,
+       and holds off inserting the task into `ready_queue` until the `DurableAck` resolves so a
+       concurrent scheduler pass cannot dispatch an un-synced task during the `5 ms` group-commit
+       window. If the `DurableAck` fails (`Err(GridError::Storage)`), the entry is rolled back from
+       `inner.tasks`, `inner.ready_queue`, and `inner.active_sizes` before returning `Err(Storage)`.
+     - Once a task has been admitted, subsequent transitions (`record_result_from`,
+       `cancel_task_detailed`, `fail_unsendable_assignment`, `requeue_task`, `mark_running_from`,
+       `record_checkpoint`) commit in memory first and log a `tracing::warn!` if `append_durable`
+       or `DurableAck` fails, so a degraded disk never leaks worker capacity slots, leaves task
+       blobs pinned forever, or strands awaiting clients.
+   - **`5 ms` group commit for `TaskSubmitted` and `TaskTerminal` (and concurrent durable records):**
+     - A MapReduce job, an MCP burst of 1,000 task submissions, or a worker returning a burst of
+       task results on a single connection must not execute one sequential `sync_data()` syscall per
+       message.
      - `TaskStore` runs a dedicated writer loop fed by an `mpsc` channel of `(JournalRecord,
        Option<oneshot::Sender<GridResult<()>>>)`.
      - When the first record requiring `sync_data()` arrives, the writer appends it to the OS buffer
@@ -205,7 +218,12 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
        records have accumulated) to coalesce any concurrent submissions/transitions arriving in the
        same window, calls `File::sync_data()` **once** for the entire batch, and then signals all
        waiting `oneshot::Sender` handles together.
-   - Non-synced transitions (`TaskDispatched`, `TaskRunning` when `max_retries > 0`, `TaskAdopted`,
+     - On the worker session inbound path (`handle_session_task_message`), `apply_task_result_inner`
+       enqueues `TaskTerminal` via `record_result_from_enqueued`, releases the worker slot and unpins
+       blobs immediately, and awaits the `DurableAck` + wakes completion `waiters` in a spawned task
+       so sequential `WorkerMessage::TaskResult` frames on one connection coalesce inside the same
+       `5 ms` group-commit window.
+   - Non-synced transitions (`TaskDispatched` and `TaskRunning` when `max_retries > 0`, `TaskAdopted`,
      `TaskEvicted`) are written to `journal.bin` without blocking on `sync_data()`.
 4. **Torn-tail tolerance, mid-file corruption, and `GridError::Storage`:**
    - Add `GridError::Storage(String)` (`#[error("Storage error: {0}")]`) in
