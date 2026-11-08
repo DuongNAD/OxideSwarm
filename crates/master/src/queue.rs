@@ -183,11 +183,18 @@ impl PartialOrd for DelayedRetryKey {
 /// Default cap on infrastructure failovers (worker lost, reaped or superseded) per task.
 pub const DEFAULT_MAX_FAILOVERS: u32 = 10;
 
+/// Default cap on uncharged voluntary worker drains (`WorkerMessage::Disconnecting`) per task.
+pub const DEFAULT_MAX_EVACUATIONS: u32 = 10;
+
 /// A task that workers keep handing back without running it is failed after this many rejections.
 pub const MAX_WORKER_REJECTIONS_PER_TASK: u32 = 3;
 
 fn default_max_failovers() -> u32 {
     DEFAULT_MAX_FAILOVERS
+}
+
+fn default_max_evacuations() -> u32 {
+    DEFAULT_MAX_EVACUATIONS
 }
 
 /// Configurable retry policy and exponential backoff strategy.
@@ -196,19 +203,31 @@ pub struct RetryPolicy {
     /// Maximum number of retries permitted per task (default: 3).
     ///
     /// Bounds *execution* retries (`retry_on_execution_failure`). Infrastructure failovers have their
-    /// own budget, `max_failovers`; the only effect `max_retries` has on them is that `0` means
-    /// "never run this task twice" and so disables failover re-runs as well.
+    /// own budget, `max_failovers`, and announced voluntary drains have `max_evacuations`; the only
+    /// effect `max_retries` has on them is that `0` means "never run this task twice" and so disables
+    /// failover re-runs (and drain re-runs once the task is `Running`) as well.
     pub max_retries: u32,
     /// Maximum infrastructure failovers per task (default: 10).
     ///
-    /// A failover is a re-dispatch caused by the worker, not the task: its connection dropped, its
-    /// heartbeat timed out, it re-registered, or it refused the task unrun. A 2-hour job on a phone
+    /// A failover is an unannounced or involuntary re-dispatch caused by the worker, not the task: its
+    /// connection dropped without `WorkerMessage::Disconnecting`, its heartbeat timed out, it
+    /// re-registered over an existing session, or it refused the task unrun. A 2-hour job on a phone
     /// that roams networks must not be failed for the network's sake after three handoffs, but a
     /// task that kills every worker it touches still has to stop eventually. The effective cap is
     /// `max(max_failovers, max_retries)`, so raising `max_retries` never reduces it. An explicit
-    /// per-task `requirements.max_retries` overrides this and bounds all re-runs of that task.
+    /// per-task `requirements.max_retries` overrides this and bounds all charged re-runs (execution
+    /// retries, infrastructure failovers, and drains beyond `max_evacuations`) of that task.
     #[serde(default = "default_max_failovers")]
     pub max_failovers: u32,
+    /// Maximum uncharged voluntary worker drains (`WorkerMessage::Disconnecting`) per task (default: 10).
+    ///
+    /// Each announced drain below this cap returns the task to `Queued` immediately and increments
+    /// `evacuation_count` (recording an audit entry in `retry_history`) without charging `retry_count`
+    /// or `failover_count`. Once `evacuation_count >= max_evacuations`, further drains take the
+    /// charged failover path, and when `max_retries` is `0` (either on `RetryPolicy` or on
+    /// `requirements.max_retries`), a `Running` task is never re-queued by a drain.
+    #[serde(default = "default_max_evacuations")]
+    pub max_evacuations: u32,
     /// Base delay for the first retry attempt in ms (default: 500 ms).
     pub initial_backoff_ms: u64,
     /// Ceiling limit for backoff delay in ms (default: 30,000 ms).
@@ -226,6 +245,7 @@ impl Default for RetryPolicy {
         Self {
             max_retries: 3,
             max_failovers: DEFAULT_MAX_FAILOVERS,
+            max_evacuations: DEFAULT_MAX_EVACUATIONS,
             initial_backoff_ms: 500,
             max_backoff_ms: 30_000,
             backoff_multiplier: 2.0,
@@ -236,10 +256,14 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
-    /// Whether `entry` may be re-run once more after an infrastructure failure, and the cap that applied.
+    /// Whether `entry` may be re-run once more on the charged failover path (unannounced disconnect,
+    /// heartbeat timeout, superseded session, or announced drain past `max_evacuations`), and the cap
+    /// that applied.
     fn failover_budget(&self, entry: &TaskEntry) -> (bool, u32) {
         match entry.task.requirements.max_retries {
-            // An explicit per-task limit bounds every re-run of that task, whatever caused it.
+            // An explicit per-task limit bounds every charged re-run (execution retries,
+            // infrastructure failovers, and drains past `max_evacuations`), with `0` also forbidding
+            // any drain re-run once the task is `Running`.
             Some(limit) => (entry.retry_count < limit, limit),
             None => {
                 let cap = if self.max_retries == 0 {
@@ -249,6 +273,14 @@ impl RetryPolicy {
                 };
                 (entry.failover_count < cap, cap)
             }
+        }
+    }
+
+    /// True when "run at most once" (`max_retries == 0`) is in effect for `entry`.
+    fn zero_retries_for(&self, entry: &TaskEntry) -> bool {
+        match entry.task.requirements.max_retries {
+            Some(limit) => limit == 0,
+            None => self.max_retries == 0,
         }
     }
 
@@ -291,8 +323,13 @@ pub struct TaskEntry {
     /// Total re-dispatches of this task: execution retries plus `failover_count`.
     pub retry_count: u32,
     /// Re-dispatches caused by infrastructure (worker lost, reaped, superseded, or refused the task
-    /// unrun), tracked apart from execution retries so network churn cannot exhaust `max_retries`.
+    /// unrun, or an announced drain past `max_evacuations`), tracked apart from execution retries
+    /// so network churn cannot exhaust `max_retries`.
     pub failover_count: u32,
+    /// Voluntary worker drains (`WorkerMessage::Disconnecting`, handled by
+    /// [`TaskQueue::handle_session_evacuated`]) that returned this task to `Queued` without
+    /// charging `retry_count` or `failover_count` (bounded by [`RetryPolicy::max_evacuations`]).
+    pub evacuation_count: u32,
     /// Times a worker handed this task back without running it.
     pub rejection_count: u32,
     /// Workers that rejected this task; the scheduler places it elsewhere while it can.
@@ -315,6 +352,8 @@ impl TaskEntry {
             gpu_required: self.task.requirements.gpu_required || self.task.spec.requires_gpu(),
             assigned_worker_id: self.assigned_worker_id,
             retry_count: self.retry_count,
+            failover_count: self.failover_count,
+            evacuation_count: self.evacuation_count,
             submitted_at_utc: self.submitted_at_utc,
             execution_time_ms: self.result.as_ref().map(|r| r.execution_time_ms),
             exit_code: self.result.as_ref().map(|r| r.exit_code),
@@ -332,6 +371,10 @@ pub struct TaskInfo {
     pub gpu_required: bool,
     pub assigned_worker_id: Option<Uuid>,
     pub retry_count: u32,
+    #[serde(default)]
+    pub failover_count: u32,
+    #[serde(default)]
+    pub evacuation_count: u32,
     pub submitted_at_utc: u64,
     pub execution_time_ms: Option<u64>,
     pub exit_code: Option<i32>,
@@ -945,6 +988,7 @@ impl TaskQueue {
             retry_after_instant: None,
             retry_count: 0,
             failover_count: 0,
+            evacuation_count: 0,
             rejection_count: 0,
             avoid_workers: Vec::new(),
             assigned_session: None,
@@ -1013,6 +1057,7 @@ impl TaskQueue {
             retry_after_instant: None,
             retry_count: 0,
             failover_count: 0,
+            evacuation_count: 0,
             rejection_count: 0,
             avoid_workers: Vec::new(),
             assigned_session: None,
@@ -1927,6 +1972,176 @@ impl TaskQueue {
 
     // --- Worker Disconnect & Failover ---
 
+    /// Returns all active tasks assigned to a draining worker (`WorkerMessage::Disconnecting`) to
+    /// `Queued` immediately (without charging `retry_count` or `failover_count` while under
+    /// [`RetryPolicy::max_evacuations`], or via the charged failover path past that cap).
+    /// See [`handle_session_evacuated`](Self::handle_session_evacuated).
+    pub async fn handle_worker_evacuated(&self, worker_id: &Uuid, reason: &str) -> Vec<TaskId> {
+        self.handle_session_evacuated(worker_id, None, reason).await
+    }
+
+    /// Handles the in-flight tasks of one draining worker session (`WorkerMessage::Disconnecting`).
+    ///
+    /// While `entry.evacuation_count < policy.max_evacuations`, `policy.retry_on_worker_disconnect`
+    /// is enabled, and the task is not `Running` under `max_retries == 0`, the drain increments
+    /// `evacuation_count`, records an audit entry in `retry_history`, and returns the task to
+    /// `Queued` (`ready_queue`, 0 ms delay) without charging `retry_count` or `failover_count`.
+    /// Once `evacuation_count >= max_evacuations` (or when `max_retries == 0` on a `Running` task,
+    /// or `retry_on_worker_disconnect == false`), the drain takes the charged failover path so a
+    /// task cannot be re-dispatched without limit.
+    pub async fn handle_session_evacuated(
+        &self,
+        worker_id: &Uuid,
+        session_id: Option<u64>,
+        reason: &str,
+    ) -> Vec<TaskId> {
+        let mut guard = self.inner.write().await;
+        let inner = &mut *guard;
+
+        let mut assigned: HashSet<TaskId> = inner
+            .worker_assignments
+            .get(worker_id)
+            .cloned()
+            .unwrap_or_default();
+
+        for (id, entry) in &inner.tasks {
+            if entry.assigned_worker_id == Some(*worker_id) && entry.state.is_active() {
+                assigned.insert(*id);
+            }
+        }
+
+        let now_epoch = Utc::now().timestamp() as u64;
+        let policy = inner.retry_policy.clone();
+
+        let mut affected = Vec::with_capacity(assigned.len());
+        let mut ready_to_insert = Vec::new();
+        let mut terminal_to_track = Vec::new();
+
+        for task_id in assigned {
+            let Some(entry) = inner.tasks.get_mut(&task_id) else {
+                continue;
+            };
+            let session_matches = match (session_id, entry.assigned_session) {
+                (Some(swept), Some(assigned)) => assigned <= swept,
+                _ => true,
+            };
+            if !entry.state.is_active()
+                || entry.assigned_worker_id != Some(*worker_id)
+                || !session_matches
+            {
+                continue;
+            }
+
+            affected.push(task_id);
+            if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
+                tasks.remove(&task_id);
+            }
+
+            let running_with_zero_retries =
+                entry.state == TaskState::Running && policy.zero_retries_for(entry);
+            if policy.retry_on_worker_disconnect
+                && !running_with_zero_retries
+                && entry.evacuation_count < policy.max_evacuations
+            {
+                entry.evacuation_count += 1;
+                tracing::debug!(
+                    task_id = %task_id,
+                    worker_id = %worker_id,
+                    session_id = ?session_id,
+                    evacuation_count = entry.evacuation_count,
+                    max_evacuations = policy.max_evacuations,
+                    reason = %reason,
+                    "Returning task from announced worker drain to ready_queue without charging retry budget"
+                );
+                entry.retry_history.push(RetryAttempt {
+                    attempt: entry.retry_count,
+                    timestamp_utc: now_epoch,
+                    failed_worker_id: Some(*worker_id),
+                    reason: reason.to_string(),
+                    exit_code: None,
+                    error: Some(format!(
+                        "Worker draining ({reason}); uncharged evacuation {}/{}",
+                        entry.evacuation_count, policy.max_evacuations
+                    )),
+                });
+                entry.state = TaskState::Queued;
+                entry.assigned_worker_id = None;
+                entry.assigned_session = None;
+                entry.scheduled_instant = None;
+                entry.started_instant = None;
+                entry.retry_after_instant = None;
+                ready_to_insert.push(QueueOrderKey {
+                    priority_rev: Reverse(entry.priority),
+                    sequence: entry.sequence,
+                    task_id,
+                });
+            } else {
+                // Past `max_evacuations` (or `Running` with `max_retries == 0`, or
+                // `!retry_on_worker_disconnect`): take the charged path with 0 ms reschedule delay.
+                let (budget_left, cap) = policy.failover_budget(entry);
+                if policy.retry_on_worker_disconnect && !running_with_zero_retries && budget_left {
+                    entry.retry_count += 1;
+                    entry.failover_count += 1;
+                    entry.assigned_worker_id = None;
+                    entry.assigned_session = None;
+                    entry.retry_history.push(RetryAttempt {
+                        attempt: entry.retry_count,
+                        timestamp_utc: now_epoch,
+                        failed_worker_id: Some(*worker_id),
+                        reason: reason.to_string(),
+                        exit_code: None,
+                        error: Some(format!("Worker evicted ({reason})")),
+                    });
+                    entry.state = TaskState::Queued;
+                    entry.scheduled_instant = None;
+                    entry.started_instant = None;
+                    entry.retry_after_instant = None;
+                    ready_to_insert.push(QueueOrderKey {
+                        priority_rev: Reverse(entry.priority),
+                        sequence: entry.sequence,
+                        task_id,
+                    });
+                } else {
+                    let used = if entry.task.requirements.max_retries.is_some() {
+                        entry.retry_count
+                    } else {
+                        entry.failover_count
+                    };
+                    entry.state = TaskState::Failed;
+                    entry.assigned_worker_id = None;
+                    entry.assigned_session = None;
+                    let err_msg = format!(
+                        "Task execution failed: maximum retry limit ({cap}) reached after worker eviction (Worker disconnected and retries exhausted ({used}/{cap}), last failure on worker {worker_id}: {reason})"
+                    );
+                    entry.error_message = Some(err_msg.clone());
+                    let fail_result =
+                        TaskResult::failure(*worker_id, task_id, 1, "", "", 0, Some(err_msg));
+                    entry.result = Some(fail_result);
+                    terminal_to_track.push(task_id);
+                }
+            }
+        }
+
+        if inner
+            .worker_assignments
+            .get(worker_id)
+            .is_some_and(|tasks| tasks.is_empty())
+        {
+            inner.worker_assignments.remove(worker_id);
+        }
+
+        for key in ready_to_insert {
+            let tid = key.task_id;
+            inner.insert_ready(key);
+            inner.update_active_task(tid);
+        }
+        for tid in terminal_to_track {
+            inner.track_terminal_task(tid);
+        }
+
+        affected
+    }
+
     /// Reaps all tasks assigned to a disconnected or timed-out worker, whatever session they were
     /// dispatched on. See [`handle_session_disconnected`](Self::handle_session_disconnected).
     pub async fn handle_worker_disconnected(
@@ -1949,11 +2164,12 @@ impl TaskQueue {
     /// each other: when a connection is aborted before its own sweep ran (the worker id
     /// re-registered a third time, the reaper fired), the next sweep of that worker still recovers
     /// the tasks it left on a session that no longer exists.
-    /// If `immediate_reschedule` is true (e.g. graceful worker disconnect), tasks are
+    /// If `immediate_reschedule` is true (e.g. superseded session), tasks are
     /// re-enqueued directly to `ready_queue` with 0ms delay.
     /// Otherwise, exponential backoff is scheduled via `delayed_retries`.
     /// Infrastructure failovers are counted in `failover_count` against `max_failovers`,
-    /// not against the task's execution retry budget.
+    /// not against the task's execution retry budget; announced drains use
+    /// [`handle_session_evacuated`](Self::handle_session_evacuated) instead so neither counter is charged.
     /// Returns the list of affected TaskIds.
     pub async fn handle_session_disconnected(
         &self,
@@ -2271,6 +2487,12 @@ impl TaskQueue {
     pub async fn get_result(&self, task_id: &TaskId) -> Option<TaskResult> {
         let inner = self.inner.read().await;
         inner.tasks.get(task_id).and_then(|e| e.result.clone())
+    }
+
+    /// Retrieves the recorded retry and evacuation history for a task.
+    pub async fn get_retry_history(&self, task_id: &TaskId) -> Option<Vec<RetryAttempt>> {
+        let inner = self.inner.read().await;
+        inner.tasks.get(task_id).map(|e| e.retry_history.clone())
     }
 
     /// Returns a snapshot of all managed tasks.
@@ -3074,6 +3296,197 @@ mod tests {
         queue.schedule_task(&id, w).await.unwrap();
         queue.handle_worker_disconnected(&w, "crash", true).await;
         assert_eq!(queue.get_state(&id).await, Some(TaskState::Failed));
+    }
+
+    #[tokio::test]
+    async fn test_repeated_evacuations_leave_failover_and_retry_counts_at_zero_and_preserve_budgets(
+    ) {
+        // 1. Drains 1..=max_evacuations (3) leave retry_count == 0 and failover_count == 0,
+        //    increment evacuation_count, and record each drain in retry_history.
+        //    Past max_evacuations, drain 4 takes the charged path (retry_count = 1,
+        //    failover_count = 1), and drain 5 (N + 1 after both uncharged and charged caps)
+        //    transitions the task to Failed.
+        let policy = RetryPolicy {
+            max_retries: 1,
+            max_failovers: 1,
+            max_evacuations: 3,
+            ..Default::default()
+        };
+        let queue = TaskQueue::with_config(policy, None);
+        let id = queue
+            .submit(Task::new(
+                TaskSpec::command("echo", vec!["evac".into()]),
+                TaskRequirements::generic(1, 10).with_max_retries(1),
+            ))
+            .await
+            .unwrap();
+
+        for round in 1..=3u64 {
+            let w = Uuid::new_v4();
+            let scheduled = queue
+                .schedule_tasks_batch_in_sessions(&[(id, w, round)])
+                .await;
+            assert_eq!(scheduled.len(), 1, "round {round} must schedule");
+            queue.mark_running_from(w, Some(round), &id).await.unwrap();
+
+            let affected = if round % 2 == 1 {
+                queue
+                    .handle_session_evacuated(&w, Some(round), "FAST_PRE_SLEEP_BATTERY_LOW")
+                    .await
+            } else {
+                queue
+                    .handle_worker_evacuated(&w, "Graceful worker shutdown")
+                    .await
+            };
+            assert_eq!(affected, vec![id]);
+
+            let info = queue.get_task(&id).await.unwrap();
+            assert_eq!(info.state, TaskState::Queued, "round {round}");
+            assert_eq!(info.retry_count, 0, "round {round}");
+            assert_eq!(info.failover_count, 0, "round {round}");
+            assert_eq!(info.evacuation_count, round as u32, "round {round}");
+            assert_eq!(info.assigned_worker_id, None, "round {round}");
+            let history = queue.get_retry_history(&id).await.unwrap();
+            assert_eq!(history.len(), round as usize, "round {round}");
+            assert!(
+                history
+                    .last()
+                    .unwrap()
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains(&format!("uncharged evacuation {round}/3")),
+                "history entry must record uncharged evacuation: {history:?}"
+            );
+        }
+
+        // Drain 4: past max_evacuations (3), so it takes the charged path (retry_count = 1, failover_count = 1).
+        let w4 = Uuid::new_v4();
+        assert_eq!(
+            queue
+                .schedule_tasks_batch_in_sessions(&[(id, w4, 4)])
+                .await
+                .len(),
+            1
+        );
+        queue.mark_running_from(w4, Some(4), &id).await.unwrap();
+        queue
+            .handle_session_evacuated(&w4, Some(4), "FAST_PRE_SLEEP_BATTERY_LOW")
+            .await;
+        let info4 = queue.get_task(&id).await.unwrap();
+        assert_eq!(info4.state, TaskState::Queued);
+        assert_eq!(info4.evacuation_count, 3);
+        assert_eq!(info4.retry_count, 1);
+        assert_eq!(info4.failover_count, 1);
+        assert_eq!(queue.get_retry_history(&id).await.unwrap().len(), 4);
+
+        // Drain 5 (N + 1): both max_evacuations (3) and charged budget (1) are exhausted -> Failed.
+        let w5 = Uuid::new_v4();
+        assert_eq!(
+            queue
+                .schedule_tasks_batch_in_sessions(&[(id, w5, 5)])
+                .await
+                .len(),
+            1
+        );
+        queue.mark_running_from(w5, Some(5), &id).await.unwrap();
+        queue
+            .handle_session_evacuated(&w5, Some(5), "FAST_PRE_SLEEP_BATTERY_LOW")
+            .await;
+        let info5 = queue.get_task(&id).await.unwrap();
+        assert_eq!(info5.state, TaskState::Failed);
+        assert_eq!(info5.evacuation_count, 3);
+        assert_eq!(info5.retry_count, 1);
+
+        // 2. When a task's charged budget is already spent (or N = max_evacuations = 3 while
+        //    Scheduled with 0 charged budget), N drains succeed and the (N + 1)-th drain fails.
+        let sched_id = queue
+            .submit(Task::new(
+                TaskSpec::command("echo", vec!["sched-zero".into()]),
+                TaskRequirements::generic(1, 10).with_max_retries(0),
+            ))
+            .await
+            .unwrap();
+        for round in 1..=3u64 {
+            let w = Uuid::new_v4();
+            queue
+                .schedule_tasks_batch_in_sessions(&[(sched_id, w, round)])
+                .await;
+            queue
+                .handle_session_evacuated(&w, Some(round), "drain before start")
+                .await;
+            assert_eq!(queue.get_state(&sched_id).await, Some(TaskState::Queued));
+        }
+        let w_n_plus_1 = Uuid::new_v4();
+        queue
+            .schedule_tasks_batch_in_sessions(&[(sched_id, w_n_plus_1, 4)])
+            .await;
+        queue
+            .handle_session_evacuated(&w_n_plus_1, Some(4), "drain 4")
+            .await;
+        assert_eq!(
+            queue.get_state(&sched_id).await,
+            Some(TaskState::Failed),
+            "N + 1 (4th) drain with 0 charged budget must end in Failed"
+        );
+
+        // 3. A Running task with max_retries(0) (per-task or policy-level) is never run again:
+        //    the very first drain transitions it to Failed.
+        let run_once_id = queue
+            .submit(Task::new(
+                TaskSpec::command("echo", vec!["run-once".into()]),
+                TaskRequirements::generic(1, 10).with_max_retries(0),
+            ))
+            .await
+            .unwrap();
+        let w_once = Uuid::new_v4();
+        queue
+            .schedule_tasks_batch_in_sessions(&[(run_once_id, w_once, 1)])
+            .await;
+        queue
+            .mark_running_from(w_once, Some(1), &run_once_id)
+            .await
+            .unwrap();
+        queue
+            .handle_session_evacuated(&w_once, Some(1), "FAST_PRE_SLEEP_BATTERY_LOW")
+            .await;
+        let once_info = queue.get_task(&run_once_id).await.unwrap();
+        assert_eq!(
+            once_info.state,
+            TaskState::Failed,
+            "Running task with max_retries(0) must not be run again on drain"
+        );
+        assert_eq!(once_info.evacuation_count, 0);
+        assert_eq!(once_info.retry_count, 0);
+
+        let policy_zero_queue = TaskQueue::with_config(
+            RetryPolicy {
+                max_retries: 0,
+                max_evacuations: 10,
+                ..Default::default()
+            },
+            None,
+        );
+        let policy_zero_id = policy_zero_queue
+            .submit(echo_task("policy-zero-once"))
+            .await
+            .unwrap();
+        let w_pz = Uuid::new_v4();
+        policy_zero_queue
+            .schedule_tasks_batch_in_sessions(&[(policy_zero_id, w_pz, 1)])
+            .await;
+        policy_zero_queue
+            .mark_running_from(w_pz, Some(1), &policy_zero_id)
+            .await
+            .unwrap();
+        policy_zero_queue
+            .handle_session_evacuated(&w_pz, Some(1), "Graceful worker shutdown")
+            .await;
+        assert_eq!(
+            policy_zero_queue.get_state(&policy_zero_id).await,
+            Some(TaskState::Failed),
+            "Running task under policy max_retries = 0 must fail on first drain"
+        );
     }
 
     /// The exact texts `WorkerClient` and the task runner emit when they refuse to run a task.
