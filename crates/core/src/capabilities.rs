@@ -650,6 +650,8 @@ impl WorkerCapabilities {
             }
         };
 
+        let probe_physical_gpu = has_gpu && !is_simulated_gpu;
+
         // --- VRAM Detection & Overrides ---
         let vram_mb = if overrides.no_gpu {
             None
@@ -659,7 +661,7 @@ impl WorkerCapabilities {
             std::env::var("RUSTY_GRID_VRAM_MB").or_else(|_| std::env::var("OXIDE_SWARM_VRAM_MB"))
         {
             vram_str.trim().parse::<u64>().ok()
-        } else if has_gpu {
+        } else if probe_physical_gpu {
             detect_gpu_vram_mb()
         } else {
             None
@@ -680,10 +682,10 @@ impl WorkerCapabilities {
             if val == "1" || val.eq_ignore_ascii_case("true") {
                 false
             } else {
-                detect_cuda_support(has_gpu)
+                detect_cuda_support(probe_physical_gpu)
             }
-        } else if has_gpu {
-            detect_cuda_support(has_gpu)
+        } else if probe_physical_gpu {
+            detect_cuda_support(probe_physical_gpu)
         } else {
             false
         };

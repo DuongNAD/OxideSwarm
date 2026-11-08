@@ -45,7 +45,18 @@ use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::scheduler::SchedulerConfig;
 use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
+use rusty_grid_worker::process_tree::ProcessPriority;
 use rusty_grid_worker::runner::EXIT_CODE_CANCELLED;
+
+/// Timeout for a single fast subprocess task (echo, short sh script) to be scheduled,
+/// spawn on Windows under parallel test CPU load, and report its result back to the Master.
+const SINGLE_TASK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Timeout for 7 serialized echo subprocesses on a 1-slot worker across worker crash + failover.
+const PRIORITY_CHURN_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Timeout for 100 echo subprocesses (+ failover re-runs across 3 worker crashes) on Windows.
+const FLOOD_100_TASKS_TIMEOUT: Duration = Duration::from_secs(45);
 
 // ============================================================================
 // TEST HARNESS & FIXTURES
@@ -100,8 +111,18 @@ impl ChallengerTestCluster {
         simulate_gpu: bool,
     ) -> Uuid {
         let temp_dir = tempfile::tempdir().expect("tempdir");
+        // Disable host CLI probes (`blender --version`, `nvidia-smi`, `nvcc`) and the standby
+        // HTTP redirection portal on port 8080 so `WorkerClient::new` does not block the
+        // single-threaded `#[tokio::test]` runtime, and run task child processes at
+        // `ProcessPriority::Normal` so `BELOW_NORMAL_PRIORITY_CLASS` children on Windows are not
+        // starved for 3-4s per quantum when all cores are saturated by parallel test threads.
         let cfg = WorkerConfig::new(self.master_addr.to_string())
             .with_no_battery(true)
+            .with_no_gpu(!simulate_gpu)
+            .with_no_blender(true)
+            .with_no_cuda(true)
+            .with_redirection_portal(false)
+            .with_process_priority(ProcessPriority::Normal)
             .with_name(name)
             .with_cores(cores)
             .with_ram_mb(ram_mb)
@@ -376,7 +397,7 @@ async fn test_adversarial_task_flood_100_tasks_rolling_worker_churn() {
     // Await all 100 tasks
     let wait_futures: Vec<_> = task_ids
         .into_iter()
-        .map(|id| cluster.master.wait_task(id, Some(Duration::from_secs(25))))
+        .map(|id| cluster.master.wait_task(id, Some(FLOOD_100_TASKS_TIMEOUT)))
         .collect();
 
     let results = join_all(wait_futures).await;
@@ -447,7 +468,7 @@ async fn test_adversarial_priority_flood_preemption_under_churn() {
     for id in high_prio_ids {
         let res = cluster
             .master
-            .wait_task(id, Some(Duration::from_secs(10)))
+            .wait_task(id, Some(PRIORITY_CHURN_TIMEOUT))
             .await
             .expect("high prio resolution");
         assert_eq!(res.exit_code, 0);
@@ -457,7 +478,7 @@ async fn test_adversarial_priority_flood_preemption_under_churn() {
     for id in low_prio_ids {
         let res = cluster
             .master
-            .wait_task(id, Some(Duration::from_secs(15)))
+            .wait_task(id, Some(PRIORITY_CHURN_TIMEOUT))
             .await
             .expect("low prio resolution");
         assert_eq!(res.exit_code, 0);
@@ -508,7 +529,7 @@ async fn test_adversarial_garbage_wire_frame_exceeding_max_length() {
 
     let task = make_echo_task("post_oversized_frame_verification");
     let result = cluster
-        .submit_and_wait(task, Duration::from_secs(5))
+        .submit_and_wait(task, SINGLE_TASK_TIMEOUT)
         .await
         .expect("task run");
     assert_eq!(result.exit_code, 0);
@@ -553,7 +574,7 @@ async fn test_adversarial_garbage_wire_non_json_payload() {
 
     let task = make_echo_task("post_garbage_test");
     let res = cluster
-        .submit_and_wait(task, Duration::from_secs(5))
+        .submit_and_wait(task, SINGLE_TASK_TIMEOUT)
         .await
         .unwrap();
     assert_eq!(res.exit_code, 0);
@@ -577,7 +598,7 @@ async fn test_adversarial_truncated_length_header_unexpected_eof() {
     assert!(cluster.wait_for_workers(1, Duration::from_secs(5)).await);
 
     let res = cluster
-        .submit_and_wait(make_echo_task("header_eof_ok"), Duration::from_secs(5))
+        .submit_and_wait(make_echo_task("header_eof_ok"), SINGLE_TASK_TIMEOUT)
         .await
         .unwrap();
     assert_eq!(res.exit_code, 0);
@@ -599,7 +620,7 @@ async fn test_adversarial_unexpected_tcp_eof_during_active_task_execution() {
     // Wait until task is actively Running
     let start = Instant::now();
     let mut is_running = false;
-    while start.elapsed() < Duration::from_secs(5) {
+    while start.elapsed() < SINGLE_TASK_TIMEOUT {
         if let Ok(TaskStatus::Running) = cluster.master.get_task_status(task_id).await {
             is_running = true;
             break;
@@ -644,7 +665,7 @@ async fn test_adversarial_client_abrupt_disconnect_with_pending_waiter() {
     // Master finishes task, attempts to notify dead client, handles error gracefully
     let start = Instant::now();
     let mut state = TaskState::Submitted;
-    while start.elapsed() < Duration::from_secs(3) {
+    while start.elapsed() < SINGLE_TASK_TIMEOUT {
         if let Ok(info) = cluster.master.get_task_info(task_id).await {
             state = info.state;
             if state == TaskState::Completed {
@@ -926,8 +947,15 @@ async fn test_adversarial_rapid_concurrent_cancel_storm_30_tasks() {
     // Wait for all cancellation directives to complete
     join_all(cancel_handles).await;
 
-    // Allow any non-cancelled tasks to complete
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // Poll until all non-cancelled tasks finish (up to SINGLE_TASK_TIMEOUT under Windows CPU load)
+    let storm_deadline = Instant::now() + SINGLE_TASK_TIMEOUT;
+    while Instant::now() < storm_deadline {
+        let stats = cluster.master.queue_stats().await.unwrap();
+        if stats.queued == 0 && stats.running == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     // Validate state invariants for every task
     for (i, task_id) in task_ids.iter().enumerate() {
@@ -1035,7 +1063,7 @@ async fn test_adversarial_cancel_running_process_aborts_child() {
     // Poll until Running
     let start = Instant::now();
     let mut is_running = false;
-    while start.elapsed() < Duration::from_secs(5) {
+    while start.elapsed() < SINGLE_TASK_TIMEOUT {
         if let Ok(TaskStatus::Running) = cluster.master.get_task_status(task_id).await {
             is_running = true;
             break;
@@ -1049,7 +1077,7 @@ async fn test_adversarial_cancel_running_process_aborts_child() {
 
     let res = cluster
         .master
-        .wait_task(task_id, Some(Duration::from_secs(5)))
+        .wait_task(task_id, Some(SINGLE_TASK_TIMEOUT))
         .await
         .unwrap();
 
@@ -1061,7 +1089,7 @@ async fn test_adversarial_cancel_running_process_aborts_child() {
 
     // Verify worker is immediately freed and capable of running new tasks
     let quick_res = cluster
-        .submit_and_wait(make_echo_task("worker_freed_check"), Duration::from_secs(5))
+        .submit_and_wait(make_echo_task("worker_freed_check"), SINGLE_TASK_TIMEOUT)
         .await
         .unwrap();
     assert_eq!(quick_res.exit_code, 0);
@@ -1096,7 +1124,7 @@ async fn test_adversarial_concurrent_cancel_same_task_idempotence() {
 
     let res = cluster
         .master
-        .wait_task(task_id, Some(Duration::from_secs(5)))
+        .wait_task(task_id, Some(SINGLE_TASK_TIMEOUT))
         .await
         .unwrap();
     assert_eq!(res.exit_code, EXIT_CODE_CANCELLED);
@@ -1125,7 +1153,7 @@ async fn test_adversarial_cancel_nonexistent_and_terminal_tasks() {
     let task_id = cluster.master.submit_task(task).await.unwrap();
     let res = cluster
         .master
-        .wait_task(task_id, Some(Duration::from_secs(5)))
+        .wait_task(task_id, Some(SINGLE_TASK_TIMEOUT))
         .await
         .unwrap();
     assert_eq!(res.exit_code, 0);
