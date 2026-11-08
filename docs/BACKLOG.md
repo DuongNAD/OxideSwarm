@@ -126,7 +126,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-08, at `master` `6723945`: 54 items Implemented, 1 Partial and 15 Planned. "Pull
+On 2026-11-08, at `master` `9aa4d23`: 54 items Implemented, 2 Partial and 14 Planned. "Pull
 requests" lists them by number, "(open)" marks one that is not merged yet, and "(design)" marks a
 design record that builds nothing.
 
@@ -189,7 +189,7 @@ design record that builds nothing.
 | AND-2 | Keep the master across restarts | P2 | M | AND-1 | Yes | Planned |  |
 | AND-3 | Wire pre-sleep evacuation | P2 | M | AND-1 | Yes | Planned |  |
 | AND-4 | Report real worker status | P2 | M | AND-1 | Yes | Planned |  |
-| FEAT-1 | Master durability | P1 | L | TEST-6 |  | Planned |  |
+| FEAT-1 | Master durability | P1 | L | TEST-6 |  | Partial | 122 (design), 141, 129 (open) |
 | FEAT-2 | Containment after a worker crash | P1 | L | SEC-5 |  | Implemented | 123 |
 | FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Planned |  |
 | FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Planned | 105 (design) |
@@ -1365,9 +1365,10 @@ Add one dated line per finished item, newest last.
   - `handle_connection` and `handle_multiplexed_connection` in `server.rs` both call
     `WorkerSession::run_connection` (`crates/master/src/session.rs`).
   - Leftover sandboxes are swept at start-up (pull request 126).
-  - One symbol neither has a caller nor is gone: `compute_intensity`. Design 0044 D1.5 keeps it on
-    the wire as `#[deprecated]`, and nothing in the CLI or MCP sets it. It leaves the wire at the
-    next protocol version bump, in FEAT-1 (design 0046, `F1-b`).
+  - `compute_intensity` (design 0044 D1.5): marked `#[deprecated]` without a wire break in `F11-a`
+    (pull request 125) and removed from `TaskSpec::GpuCompute`, `HumanTaskSpec::GpuCompute`, and
+    `BinaryTaskSpec::GpuCompute` at the protocol version `3 -> 4` bump in `FEAT-1` (`F1-b` wire,
+    pull request 141, design 0046).
 - 2026-11-08: FEAT-2 is Implemented: pull request 123, design 0031. Checked at `master` `6723945`:
   `test_sigkill_of_the_worker_kills_its_child_grandchild_and_setsid_descendants_within_five_seconds`
   in `tests/cli_worker_signals_e2e.rs` starts the real worker, sends `kill -9`, and asserts that a
@@ -1378,3 +1379,7 @@ Add one dated line per finished item, newest last.
   `parse_binary_data`, and pull request 132 refuses a string that is neither base64 nor hex.
   Decision Q3 of `ROADMAP.md` drops the rest of the item (a bridge to a running master, placement,
   files, outputs, result and cancel), so no further work is planned on it.
+- 2026-11-08: FEAT-1 is Partial. Of the work items in design 0046, the wire layer (`F1-b wire`,
+  pull request 141) is merged: protocol version 4, `WorkerMessage::ResumeSession`, and the
+  `SESSION_RESUME` bit, which is not advertised yet. The task store (pull request 129) is open.
+  `F1-a` (replay at start), the master's adoption of resumed tasks and `F1-c` are Planned.

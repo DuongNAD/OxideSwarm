@@ -17,8 +17,9 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use jni::objects::{JClass, JString};
+use jni::refs::Reference;
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
-use jni::JNIEnv;
+use jni::{Env, EnvUnowned};
 use rusty_grid_core::capabilities::MobileLiveStatus;
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_worker::{
@@ -522,6 +523,40 @@ pub fn discover_master_impl(timeout_ms: i64) -> String {
 }
 
 // ==============================================================================
+// JNI helpers (jni 0.22: native methods receive an `EnvUnowned`, JNI calls need an `Env`)
+// ==============================================================================
+
+/// Runs `f` with the thread's `Env`. A JNI error is returned to the caller, who picks the
+/// fallback; a Rust panic is not caught here, so it still stops at the `extern "system"`
+/// boundary exactly as it did with `jni` 0.21.
+fn with_jni_env<'local, T>(
+    env: &mut EnvUnowned<'local>,
+    f: impl FnOnce(&mut Env<'local>) -> jni::errors::Result<T>,
+) -> jni::errors::Result<T> {
+    match env.with_env_no_catch(f).into_outcome() {
+        jni::Outcome::Ok(value) => Ok(value),
+        jni::Outcome::Err(err) => Err(err),
+        jni::Outcome::Panic(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Copies a Java string into a Rust `String`.
+fn jstring_to_string<'local>(
+    env: &mut EnvUnowned<'local>,
+    value: &JString<'local>,
+) -> jni::errors::Result<String> {
+    with_jni_env(env, |env| value.try_to_string(env))
+}
+
+/// Builds a Java string and hands its raw reference to the JVM, or null when that fails.
+fn string_to_jstring<'local>(env: &mut EnvUnowned<'local>, value: &str) -> jstring {
+    match with_jni_env(env, |env| JString::from_str(env, value)) {
+        Ok(s) => s.as_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+// ==============================================================================
 // JNI Exported Functions: com.oxideswarm.worker.runner.OxideWorkerBridge
 // ==============================================================================
 
@@ -529,7 +564,7 @@ pub fn discover_master_impl(timeout_ms: i64) -> String {
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeStartWorker<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     master_addr: JString<'local>,
     p2p_ticket: JString<'local>,
@@ -539,13 +574,13 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
     simulate_gpu: jboolean,
     heartbeat_interval_secs: jlong,
 ) -> jboolean {
-    let master: String = match env.get_string(&master_addr) {
-        Ok(s) => s.into(),
+    let master: String = match jstring_to_string(&mut env, &master_addr) {
+        Ok(s) => s,
         Err(_) => return JNI_FALSE,
     };
-    let ticket_str: Option<String> = match env.get_string(&p2p_ticket) {
+    let ticket_str: Option<String> = match jstring_to_string(&mut env, &p2p_ticket) {
         Ok(s) => {
-            let val: String = s.into();
+            let val: String = s;
             if val.trim().is_empty() {
                 None
             } else {
@@ -554,17 +589,14 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
         }
         Err(_) => None,
     };
-    let name: String = match env.get_string(&worker_name) {
-        Ok(s) => s.into(),
-        Err(_) => String::new(),
-    };
+    let name: String = jstring_to_string(&mut env, &worker_name).unwrap_or_default();
     if start_worker_impl(
         master,
         ticket_str,
         name,
         cores,
         ram_mb,
-        simulate_gpu != 0,
+        simulate_gpu,
         heartbeat_interval_secs,
     ) {
         JNI_TRUE
@@ -578,12 +610,12 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeSetSandboxDir<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     sandbox_dir: JString<'local>,
 ) -> jboolean {
-    let dir: String = match env.get_string(&sandbox_dir) {
-        Ok(s) => s.into(),
+    let dir: String = match jstring_to_string(&mut env, &sandbox_dir) {
+        Ok(s) => s,
         Err(_) => return JNI_FALSE,
     };
     if set_sandbox_dir_impl(dir) {
@@ -598,12 +630,12 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeSetClusterSecret<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     cluster_secret: JString<'local>,
 ) -> jboolean {
-    let secret_str: String = match env.get_string(&cluster_secret) {
-        Ok(s) => s.into(),
+    let secret_str: String = match jstring_to_string(&mut env, &cluster_secret) {
+        Ok(s) => s,
         Err(_) => return JNI_FALSE,
     };
     if set_cluster_secret_impl(&secret_str) {
@@ -617,13 +649,13 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeUpdateTelemetry<
     'local,
 >(
-    _env: JNIEnv<'local>,
+    _env: EnvUnowned<'local>,
     _class: JClass<'local>,
     battery_pct: jint,
     is_charging: jboolean,
     thermal_throttled: jboolean,
 ) -> jboolean {
-    if update_telemetry_impl(battery_pct, is_charging != 0, thermal_throttled != 0) {
+    if update_telemetry_impl(battery_pct, is_charging, thermal_throttled) {
         JNI_TRUE
     } else {
         JNI_FALSE
@@ -634,7 +666,7 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeUpdateTelemetryDetailed<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     battery_pct: jint,
     is_charging: jboolean,
@@ -642,9 +674,9 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
     battery_temperature: jfloat,
     network_type: JString<'local>,
 ) -> jboolean {
-    let net_opt: Option<String> = match env.get_string(&network_type) {
+    let net_opt: Option<String> = match jstring_to_string(&mut env, &network_type) {
         Ok(s) => {
-            let val: String = s.into();
+            let val: String = s;
             if val.trim().is_empty() {
                 None
             } else {
@@ -661,8 +693,8 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
 
     if update_telemetry_detailed_impl(
         battery_pct,
-        is_charging != 0,
-        thermal_throttled != 0,
+        is_charging,
+        thermal_throttled,
         temp_opt,
         net_opt,
     ) {
@@ -676,7 +708,7 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeStopWorker<
     'local,
 >(
-    _env: JNIEnv<'local>,
+    _env: EnvUnowned<'local>,
     _class: JClass<'local>,
 ) -> jboolean {
     if stop_worker_impl() {
@@ -690,7 +722,7 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeIsRunning<
     'local,
 >(
-    _env: JNIEnv<'local>,
+    _env: EnvUnowned<'local>,
     _class: JClass<'local>,
 ) -> jboolean {
     if is_running_impl() {
@@ -704,41 +736,35 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeGetWorkerStatus<
     'local,
 >(
-    env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
 ) -> jstring {
     let status = get_worker_status_impl();
-    match env.new_string(status) {
-        Ok(s) => s.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+    string_to_jstring(&mut env, &status)
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeDiscoverMaster<
     'local,
 >(
-    env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     timeout_ms: jlong,
 ) -> jstring {
     let status = discover_master_impl(timeout_ms);
-    match env.new_string(status) {
-        Ok(s) => s.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+    string_to_jstring(&mut env, &status)
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativeTriggerFastEvacuation<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     reason: JString<'local>,
 ) -> jboolean {
-    let reason_str: String = match env.get_string(&reason) {
-        Ok(s) => s.into(),
+    let reason_str: String = match jstring_to_string(&mut env, &reason) {
+        Ok(s) => s,
         Err(_) => "PRE_SLEEP_EVACUATION".to_string(),
     };
     if trigger_fast_evacuation_impl(&reason_str) {

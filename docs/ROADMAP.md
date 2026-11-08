@@ -136,7 +136,7 @@ Goal: a master restart loses nothing, and a task cannot reach the worker's secre
 
 | Item | Work | State on 2026-11-08 (`master` `6723945`) |
 |---|---|---|
-| FEAT-1 | Journal in `--state-dir`, replay at start, and `ResumeSession` so a master adopts running tasks | Design 0046 (Draft). Pull request 129, the journal and snapshot module, open |
+| FEAT-1 | Journal in `--state-dir`, replay at start, and `ResumeSession` so a master adopts running tasks | Partial. Design 0046 (Draft). The wire layer is merged (pull request 141: protocol version 4, `ResumeSession`). Pull request 129, the journal and snapshot module, is open |
 | FEAT-2 | A supervisor per task group that kills the group when the worker dies, on Linux and macOS | Implemented (pull request 123, design 0031) |
 | FEAT-3 | An `--isolation` flag with the levels `off`, `fs` and `fs+net`, using Landlock and namespaces on Linux, `sandbox-exec` on macOS, and AppContainer or a restricted token on Windows | Design 0033 (Draft). Pull request 133, the core and macOS, open |
 
@@ -237,6 +237,7 @@ The owner accepted Q1 to Q5 on 2026-11-07 and Q6 on 2026-11-08.
   Phase D exit check. The owner accepted Q6. Distributed training (design 0045) added to the table
   of what waits.
 - 2026-11-08: Phase A passed its exit check at `master` `6723945`. Phase B states added: FEAT-2 is
-  Implemented, FEAT-1 and FEAT-3 have open pull requests. "Where the project stands" moved to the
+  Implemented, FEAT-1 is Partial (its wire layer, pull request 141, is merged), and FEAT-1 and
+  FEAT-3 have open pull requests. "Where the project stands" moved to the
   same commit: containment and the wire layout check now work, and their rows left "What is
   missing". The 3D and Agent Mesh rows of "What waits" record what FEAT-11 and MESH-3 landed.

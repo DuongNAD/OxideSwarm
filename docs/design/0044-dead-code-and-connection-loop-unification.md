@@ -1,6 +1,6 @@
 # 0044: Remove dead code, unify master connection loops, and sweep leftover sandboxes
 
-Status: Draft
+Status: Implemented
 Created: 2026-11-08    Updated: 2026-11-08
 
 ## Summary
@@ -140,7 +140,8 @@ Create `crates/master/src/session.rs` and replace the duplicated worker bodies o
    - `PreAuthSession::Multiplexed { ctrl_transport, data_transport, remote_addr, p2p_conn }` (QUIC)
    - Both run `authenticate_and_read_first_message` on the primary stream (`transport` or
      `ctrl_transport`), drop `handshake_permit` immediately after authentication, and on
-     authentication failure call `drain_refusal_stream` when `p2p_conn.is_some()`.
+     authentication failure call `drain_refusal_stream(&mut ctrl_transport, p2p_conn.as_ref())` on
+     every `PreAuthSession::Multiplexed` connection (`BUG-17`).
    - If the first message is `InboundMessage::Client(client_msg)`:
      - `Single` delegates to `handle_client_connection`.
      - `Multiplexed` returns `Err(GridError::HandshakeFailed("Client connection not supported over multiplexed P2P worker transport"))`.
@@ -148,10 +149,13 @@ Create `crates/master/src/session.rs` and replace the duplicated worker bodies o
    - Validates `WorkerMessage::Register` (`is_protocol_version_compatible(protocol_version)` and
      `capabilities.cpu_cores > 0`), refuses `WorkerMessage::ClaimMasterRole` via
      `reject_master_role_claim`, and rejects any other initial variant. Refusal frames use
-     `send_refusal_and_drain` when `p2p_conn.is_some()` and `send_msg` otherwise.
-   - Calls `registry.register_session`, attaches `rx_clock`, spawns `failover_superseded_session`
-     in its own detached task if `registration.superseded_session` is `Some`, registers
-     `P2pConnGuard` if `p2p_conn` is present, sends `MasterMessage::RegisterAck`, and broadcasts
+     `send_refusal_and_drain(&mut ctrl_transport, msg, p2p_conn.as_ref())` on every
+     `PreAuthSession::Multiplexed` connection and `send_msg` on `PreAuthSession::Single`.
+   - Calls `registry.register_session`, attaches `rx_clock`, calls and awaits
+     `failover_superseded_session` if `registration.superseded_session` is `Some`
+     (`failover_superseded_session` spawns the sweep in its own Tokio task and awaits it so the
+     sweep finishes even if the connection handler is aborted mid-sweep), registers `P2pConnGuard`
+     if `p2p_conn` is present, sends `MasterMessage::RegisterAck`, and broadcasts
      `DashboardStreamMessage::WorkerRegistered`.
 3. **Active session lanes (`ActiveLanes`):**
    - `ActiveLanes::Single`: splits `transport` into `reader` and `writer`, spawns one outbound
@@ -170,10 +174,11 @@ Create `crates/master/src/session.rs` and replace the duplicated worker bodies o
    - One `tokio::select!` loop over `lanes.recv_next()` and `shutdown_rx.changed()`:
      - On `LaneKind::Data`, accepts `TaskProgress`, `TaskResult`, `Checkpoint`, and `BlobRequest`,
        logging a warning on any control-only variant (`Heartbeat`, `Disconnecting`,
-       `MobileTelemetry`, `ClaimMasterRole`, `Register`), preserving the exact lane separation of
-       `handle_multiplexed_connection`.
+       `MobileTelemetry`, `ClaimMasterRole`, `ResumeSession`, `Register`), preserving the exact
+       lane separation of `handle_multiplexed_connection`.
      - On `LaneKind::Control`, accepts `Heartbeat`, `Disconnecting`, `MobileTelemetry`,
-       `ClaimMasterRole`, and `BlobRequest`, logging a warning on unexpected variants.
+       `ClaimMasterRole`, `ResumeSession`, and `BlobRequest`, logging a warning on unexpected
+       variants.
      - On `LaneKind::Unified`, accepts all `WorkerMessage` variants.
    - On loop exit (graceful `Disconnecting`, EOF, socket error, or master `Shutdown`), runs the
      single cleanup block (`handle_worker_disconnect_with_broadcast`, `P2pConnGuard::unlist`, and
@@ -182,39 +187,50 @@ Create `crates/master/src/session.rs` and replace the duplicated worker bodies o
 #### Preserved invariants
 
 Every invariant of the existing TCP and QUIC session handlers is preserved and verified by its
-existing guard test(s):
+guard tests:
 
 - **A failover sweep of session `s` also takes every older session (`<= s`) of that worker:**
-  guarded by `queue::tests::test_sweep_of_a_later_session_recovers_tasks_stranded_on_an_older_one`
-  (`crates/master/src/queue.rs:2924`) and
+  end-to-end session coverage in
   `test_a_third_registration_of_a_worker_id_leaves_no_task_on_a_dead_session`
-  (`tests/master_failover_cancel_liveness.rs:409`).
+  (`tests/master_failover_cancel_liveness.rs:409`), plus queue unit coverage in
+  `queue::tests::test_sweep_of_a_later_session_recovers_tasks_stranded_on_an_older_one`
+  (`crates/master/src/queue.rs:3149`).
 - **A connection handler that a newer registration aborted never sweeps the new session:**
-  guarded by `registry::tests::test_registry_session_isolation_on_reconnect`
-  (`crates/master/src/registry.rs:1236`),
-  `queue::tests::test_session_scoped_failover_spares_the_newer_session`
-  (`crates/master/src/queue.rs:2891`),
+  end-to-end session coverage in
   `test_reregistering_worker_id_fails_over_the_superseded_session_exactly_once`
-  (`tests/master_failover_cancel_liveness.rs:299`), and
+  (`tests/master_failover_cancel_liveness.rs:299`) and
   `test_a_restarted_worker_keeps_its_identity_at_the_master`
-  (`tests/worker_connection_lifecycle.rs:904`).
-- **The supersede sweep (`failover_superseded_session`) runs in its own spawned task:**
-  guarded by `server::tests::test_superseded_session_sweep_survives_the_abort_of_its_caller`
-  (`crates/master/src/server.rs:5189`).
-- **`BlobService` answers off the inbound loop, on the data stream:**
-  guarded by `test_adversarial_master_multiplexed_heartbeat_under_backpressured_data_lane`
-  (`tests/m2_challenger_2_stress.rs:1015`),
-  `test_adversarial_data_lane_backpressure_and_concurrent_traffic`
-  (`tests/m3_challenger_2_checkpoint_stress.rs:570`), and `tests/blob_transfer_e2e.rs`.
+  (`tests/worker_connection_lifecycle.rs:904`), plus registry/queue unit coverage in
+  `registry::tests::test_registry_session_isolation_on_reconnect`
+  (`crates/master/src/registry.rs:1236`) and
+  `queue::tests::test_session_scoped_failover_spares_the_newer_session`
+  (`crates/master/src/queue.rs:3116`).
+- **The supersede sweep (`failover_superseded_session`) runs in its own spawned task and is awaited
+  by `WorkerSession::register`:**
+  guarded at the `WorkerSession::run_connection` call site by
+  `session::tests::test_register_call_site_supersede_sweep_survives_session_abort`
+  (`crates/master/src/session.rs:1708`) and at the helper by
+  `server::tests::test_superseded_session_sweep_survives_the_abort_of_its_caller`
+  (`crates/master/src/server.rs:4245`).
+- **`BlobService` answers off the inbound loop, on the data stream, and inbound lane separation
+  rejects wrong-lane messages:**
+  guarded on 2-lane multiplexed sessions by
+  `session::tests::test_multiplexed_blob_reply_is_routed_to_data_lane`
+  (`crates/master/src/session.rs:1262`),
+  `session::tests::test_multiplexed_inbound_lane_separation_ignores_wrong_lane_messages`
+  (`crates/master/src/session.rs:1465`), and
+  `test_adversarial_master_multiplexed_heartbeat_under_backpressured_data_lane`
+  (`tests/m2_challenger_2_stress.rs:1015`), and over TCP by `tests/blob_transfer_e2e.rs`.
 - **The handshake permit is held until authentication finishes, then dropped:**
-  guarded by `test_workers_over_quic_release_the_pre_auth_slot_once_registered`
-  (`tests/master_quic_limits.rs:123`) and
-  `server::tests::test_connection_limits_keep_two_separate_budgets_and_do_not_leak_permits`
-  (`crates/master/src/server.rs:5258`).
+  guarded on `session.rs` over QUIC by
+  `test_workers_over_quic_release_the_pre_auth_slot_once_registered`
+  (`tests/master_quic_limits.rs:138`) (with `ConnectionLimits` budget arithmetic unit-tested in
+  `server::tests::test_connection_limits_keep_two_separate_budgets_and_do_not_leak_permits` at
+  `crates/master/src/server.rs:4314`).
 - **P2P refusals go through `send_refusal_and_drain` (and `drain_refusal_stream` on pre-registration
   auth failure):**
   guarded by `server::tests::test_p2p_handshake_refusals_delivered_over_real_iroh`
-  (`crates/master/src/server.rs:6580`).
+  (`crates/master/src/server.rs:5636`).
 
 ### D5 Start-up sweep of leftover task sandboxes (`crates/worker/src/sandbox.rs`)
 
@@ -390,10 +406,11 @@ Implementation is split into four separate pull requests, opened and reviewed in
 
 | ID | Pull Request | Scope | Files | Done when | Status |
 |---|---|---|---|---|---|
-| F11-a | PR (a): Dead-code deletions (`D1.1`–`D1.5`, `D2`, `D3`) | Delete `dashboard/index.html`, `shaders/hash.wgsl`, `DashboardState`, `Sandbox::prepare_spec`, `probe_physical_adapter`, dead `arbitrage.rs` items, and duplicate `service` JNI exports; wire `auto_rig_mesh_async` into `TaskRunner::execute_auto_rig_workload`; mark `compute_intensity` `#[deprecated]` in `task.rs` and stop setting it in CLI/MCP (no wire change; wire removal happens in `0046` `F1-b`) | `crates/core/src/task.rs`, `crates/core/src/arbitrage.rs`, `crates/core/src/lib.rs`, `crates/master/src/dashboard/`, `crates/worker/src/shaders/`, `crates/worker/src/sandbox.rs`, `crates/worker/src/wgpu_engine.rs`, `crates/worker/src/autorig/mod.rs`, `crates/worker/src/runner.rs`, `crates/cli/src/`, `crates/agent_mesh/src/bridge.rs`, `crates/android_bridge/src/lib.rs`, `tests/mobile_coordination_test.rs`, `tests/m5a_challenger_2_stress.rs` | None of the removed files/symbols exist, `auto_rig_mesh_async` is called by `execute_auto_rig_workload`, `compute_intensity` is deprecated with zero wire changes, and workspace tests pass | Planned |
-| F11-b | PR (b): Start-up sandbox sweep (`D5`) | Add `<base_dir>/.locks/<task_id>.lock` advisory locking (acquired before creating `<base_dir>/<task_id>`) and start-up leftover sandbox sweep in `SandboxConfig::ensure_usable`; document `--keep-sandboxes` interaction in `README.md` | `crates/worker/src/sandbox.rs`, `README.md` | A unit test deletes everything inside a live sandbox, runs a second `ensure_usable`, and the sandbox directory survives; unlocked crashed UUID sandboxes are swept | Planned |
-| F11-c | PR (c): Opt-in `3d` feature (`D6`) | Gate `gen3d` and `autorig` behind Cargo feature `3d`, add `ProtocolCapabilities::THREE_D` placement requirement for `Generative3D`/`AutoRig`, gate 3D test targets/functions, and add the `--features 3d` CI step | `crates/core/src/protocol.rs`, `crates/master/src/queue.rs`, `crates/master/Cargo.toml`, `crates/worker/Cargo.toml`, `crates/worker/src/lib.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/Cargo.toml`, `crates/worker/tests/`, `crates/cli/tests/`, `tests/`, `.github/workflows/ci.yml` | `cargo test --workspace` passes without `3d`, the new CI step passes with `--features 3d`, and unit tests verify 3D task placement when only a non-`3d` worker is connected | Planned |
-| F11-d | PR (d): Worker session loop merge (`D4`) | Merge TCP `handle_connection` and QUIC `handle_multiplexed_connection` into `WorkerSession` in `crates/master/src/session.rs` | `crates/master/src/session.rs`, `crates/master/src/server.rs`, `crates/master/src/lib.rs` | All six preserved invariants hold, and every `[[test]]` target of `rusty_grid_master` and `rusty_grid_worker` plus `test_integration.sh` and `run_chaos_test.sh` pass | Planned |
+| F11-a | PR (a): Dead-code deletions (`D1.1`–`D1.5`, `D2`, `D3`) | Delete `dashboard/index.html`, `shaders/hash.wgsl`, `DashboardState`, `Sandbox::prepare_spec`, `probe_physical_adapter`, dead `arbitrage.rs` items, and duplicate `service` JNI exports; wire `auto_rig_mesh_async` into `TaskRunner::execute_auto_rig_workload`; mark `compute_intensity` `#[deprecated]` in `task.rs` and stop setting it in CLI/MCP (no wire change; wire removal happens in `0046` `F1-b`) | `crates/core/src/task.rs`, `crates/core/src/arbitrage.rs`, `crates/core/src/lib.rs`, `crates/master/src/dashboard/`, `crates/worker/src/shaders/`, `crates/worker/src/sandbox.rs`, `crates/worker/src/wgpu_engine.rs`, `crates/worker/src/autorig/mod.rs`, `crates/worker/src/runner.rs`, `crates/cli/src/`, `crates/agent_mesh/src/bridge.rs`, `crates/android_bridge/src/lib.rs`, `tests/mobile_coordination_test.rs`, `tests/m5a_challenger_2_stress.rs` | None of the removed files/symbols exist, `auto_rig_mesh_async` is called by `execute_auto_rig_workload`, `compute_intensity` is deprecated with zero wire changes, and workspace tests pass | Implemented |
+| F11-b | PR (b): Start-up sandbox sweep (`D5`) | Add `<base_dir>/.locks/<task_id>.lock` advisory locking (acquired before creating `<base_dir>/<task_id>`) and start-up leftover sandbox sweep in `SandboxConfig::ensure_usable`; document `--keep-sandboxes` interaction in `README.md` | `crates/worker/src/sandbox.rs`, `README.md` | A unit test deletes everything inside a live sandbox, runs a second `ensure_usable`, and the sandbox directory survives; unlocked crashed UUID sandboxes are swept | Implemented |
+| F11-c | PR (c): Opt-in `3d` feature (`D6`) | Gate `gen3d` and `autorig` behind Cargo feature `3d`, add `ProtocolCapabilities::THREE_D` placement requirement for `Generative3D`/`AutoRig`, gate 3D test targets/functions, and add the `--features 3d` CI step | `crates/core/src/protocol.rs`, `crates/master/src/queue.rs`, `crates/master/Cargo.toml`, `crates/worker/Cargo.toml`, `crates/worker/src/lib.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/Cargo.toml`, `crates/worker/tests/`, `crates/cli/tests/`, `tests/`, `.github/workflows/ci.yml` | `cargo test --workspace` passes without `3d`, the new CI step passes with `--features 3d`, and unit tests verify 3D task placement when only a non-`3d` worker is connected | Implemented |
+| F11-d | PR (d): Worker session loop merge (`D4`) | Merge TCP `handle_connection` and QUIC `handle_multiplexed_connection` into `WorkerSession` in `crates/master/src/session.rs` | `crates/master/src/session.rs`, `crates/master/src/server.rs`, `crates/master/src/lib.rs` | All six preserved invariants hold, and every `[[test]]` target of `rusty_grid_master` and `rusty_grid_worker` plus `test_integration.sh` and `run_chaos_test.sh` pass | Implemented |
+| F11-e | PR (e): `WorkerSession` guard tests and D4 doc fixes (`FEAT-11e`) | Add 2-lane `BlobReply` data-lane routing, inbound lane separation, and registration call-site supersede-sweep guard tests in `crates/master/src/session.rs`; make `mod session` private in `crates/master/src/lib.rs`; update `0044` D4 and `CLAUDE.md` | `crates/master/src/session.rs`, `crates/master/src/lib.rs`, `docs/design/0044-dead-code-and-connection-loop-unification.md`, `CLAUDE.md` | Mutations routing `BlobReply` to the control lane or accepting `Heartbeat` on the data lane fail the new `session::tests` guards | Implemented |
 
 ## Status log
 
@@ -408,3 +425,8 @@ Implementation is split into four separate pull requests, opened and reviewed in
 - 2026-11-08: Updated D1.5, Compatibility, and `F11-a` per `122-fix` so the wire removal of
   deprecated `compute_intensity` lands in `F1-b` of `design/0046-master-durability.md` (the next
   protocol version bump).
+- 2026-11-08: Implemented `F11-a` (`dcd0fe1`), `F11-b` (`6d63092`), `F11-c` (`1fc664b`), `F11-d`
+  (`3327960`), and `F11-e` (`6f0a153`, `session::tests` guard coverage and D4 documentation updates).
+- 2026-11-08: Removed deprecated `compute_intensity` from the wire (`TaskSpec::GpuCompute`,
+  `HumanTaskSpec::GpuCompute`, and `BinaryTaskSpec::GpuCompute`) in the `F1-b` wire pull request
+  (PR #141, protocol version bump `3 -> 4`, `docs/design/0046-master-durability.md` D4.2).

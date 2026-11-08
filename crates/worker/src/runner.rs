@@ -33,9 +33,9 @@
 //!
 //! A [`TaskSpec::GpuCompute`] is a seeded `matrix_dim x matrix_dim` single-precision matrix
 //! multiplication (`simulated_matrix_dim`, tiled with `work_group_size` x `work_group_size`
-//! threads). `kernel_name` is only a label echoed in the report and `compute_intensity` is not
-//! read: it is a benchmark workload, not a general kernel launcher, and the input matrices are
-//! generated from `input_data` rather than supplied by the caller.
+//! threads). `kernel_name` is only a label echoed in the report: it is a benchmark workload, not a
+//! general kernel launcher, and the input matrices are generated from `input_data` rather than
+//! supplied by the caller.
 //!
 //! * A worker with a **real** GPU (`has_gpu`, which a worker advertises only if its binary
 //!   contains the wgpu engine, feature `gpu-wgpu`, and an adapter started) multiplies on the GPU
