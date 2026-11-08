@@ -1008,7 +1008,9 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
         Commands::Mapreduce(args) => run_mapreduce(args, config_file, secret_opts).await,
         Commands::Doctor(args) => run_doctor_command(args, config_file, secret_opts).await,
         Commands::Secret(args) => run_secret(args, &secret_opts, config_file.as_ref()),
-        Commands::Join(args) => crate::join::run_join(args).await,
+        Commands::Join(args) => {
+            crate::join::run_join(args, &secret_opts, config_file.as_ref()).await
+        }
         Commands::Mode(args) => {
             let code = mode_cli::run_mode_cli(args).await;
             if code == 0 {

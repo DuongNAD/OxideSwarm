@@ -19,12 +19,13 @@ use base64::Engine;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
-use rusty_grid_core::cluster_auth::ClusterSecret;
+use rusty_grid_core::cluster_auth::{ClusterSecret, ENV_SECRET, ENV_SECRET_FILE};
 use rusty_grid_core::error::{GridError, GridResult};
 
-use crate::config::default_oxideswarm_dir;
+use crate::config::{default_oxideswarm_dir, ConfigFile, SecretSection};
 use crate::connect::{normalize_master_addr, AUTH_EXIT_CODE};
 use crate::doctor::{run_doctor, DoctorOptions};
+use crate::secret_cmd::SecretOpts;
 
 /// Every join token starts with this prefix (`oxs1` = version 1 of the OxideSwarm secret formats).
 pub const TOKEN_PREFIX: &str = "oxs1-join:";
@@ -191,16 +192,93 @@ pub fn read_token(reader: impl Read) -> GridResult<String> {
 }
 
 /// Switches the terminal behind a file descriptor (Unix) or console handle (Windows) to no-echo
-/// and restores the previous mode when dropped.
+/// and restores the previous mode when dropped. [`EchoOff::stdin`] also restores it when the
+/// process is interrupted (SIGINT, SIGTERM, SIGHUP on Unix; Ctrl-C, Ctrl-Break and closing the
+/// console on Windows) while the guard lives, and then lets the signal take its normal effect, so
+/// the exit status is the conventional one and the terminal is not left without echo.
 pub struct EchoOff {
     #[cfg(unix)]
     fd: std::os::fd::RawFd,
     #[cfg(unix)]
     saved: libc::termios,
+    #[cfg(unix)]
+    signals: Option<unix_signals::Guard>,
     #[cfg(windows)]
     handle: windows_sys::Win32::Foundation::HANDLE,
     #[cfg(windows)]
     saved: u32,
+    #[cfg(windows)]
+    ctrl: Option<windows_ctrl::Guard>,
+}
+
+#[cfg(unix)]
+mod unix_signals {
+    use std::cell::UnsafeCell;
+    use std::mem::MaybeUninit;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+    struct Saved(UnsafeCell<MaybeUninit<libc::termios>>);
+    // SAFETY: written only while `FD` is -1 (before the handlers are installed) and read by the
+    // handler only after `FD` was published with Release ordering.
+    unsafe impl Sync for Saved {}
+
+    static FD: AtomicI32 = AtomicI32::new(-1);
+    static TERMIOS: Saved = Saved(UnsafeCell::new(MaybeUninit::uninit()));
+
+    /// Async-signal-safe: restores the terminal, then re-raises the signal with its default action.
+    extern "C" fn restore_and_die(sig: libc::c_int) {
+        let fd = FD.load(Ordering::Acquire);
+        if fd >= 0 {
+            // SAFETY: `tcsetattr` is async-signal-safe; TERMIOS was initialised before FD was set.
+            unsafe { libc::tcsetattr(fd, libc::TCSANOW, (*TERMIOS.0.get()).as_ptr()) };
+        }
+        // SAFETY: `signal` and `raise` are async-signal-safe. The signal is blocked while this
+        // handler runs, so the re-raised signal is delivered, with the default action (the
+        // process ends with the conventional status of that signal), when the handler returns.
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+
+    /// The handlers installed for the lifetime of the guard; dropping it puts the old ones back.
+    pub struct Guard {
+        old: Vec<(libc::c_int, libc::sigaction)>,
+    }
+
+    impl Guard {
+        pub fn install(fd: std::os::fd::RawFd, saved: &libc::termios) -> Self {
+            // SAFETY: no handler can run yet (FD is -1), so nothing reads TERMIOS concurrently.
+            unsafe { (*TERMIOS.0.get()).write(*saved) };
+            FD.store(fd, Ordering::Release);
+            let mut old = Vec::new();
+            for sig in SIGNALS {
+                // SAFETY: `sigaction` is plain data; the handler has the required signature.
+                unsafe {
+                    let mut action: libc::sigaction = std::mem::zeroed();
+                    action.sa_sigaction = restore_and_die as extern "C" fn(libc::c_int) as usize;
+                    libc::sigemptyset(&mut action.sa_mask);
+                    let mut previous: libc::sigaction = std::mem::zeroed();
+                    if libc::sigaction(sig, &action, &mut previous) == 0 {
+                        old.push((sig, previous));
+                    }
+                }
+            }
+            Self { old }
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            for (sig, previous) in &self.old {
+                // SAFETY: puts back the action that `sigaction` returned for this signal.
+                unsafe { libc::sigaction(*sig, previous, std::ptr::null_mut()) };
+            }
+            FD.store(-1, Ordering::Release);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -217,12 +295,18 @@ impl EchoOff {
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(Self { fd, saved })
+        Ok(Self {
+            fd,
+            saved,
+            signals: None,
+        })
     }
 
-    /// Standard input.
+    /// Standard input, with the restore-on-signal handlers installed until the guard is dropped.
     pub fn stdin() -> std::io::Result<Self> {
-        Self::on_fd(0)
+        let mut guard = Self::on_fd(0)?;
+        guard.signals = Some(unix_signals::Guard::install(0, &guard.saved));
+        Ok(guard)
     }
 }
 
@@ -231,6 +315,48 @@ impl Drop for EchoOff {
     fn drop(&mut self) {
         // SAFETY: restores the attributes read in `on_fd`.
         unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) };
+        self.signals = None; // puts the previous signal handlers back
+    }
+}
+
+#[cfg(windows)]
+mod windows_ctrl {
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, SetConsoleMode};
+
+    static HANDLE_VALUE: AtomicUsize = AtomicUsize::new(0);
+    static MODE: AtomicU32 = AtomicU32::new(0);
+
+    /// Restores the console mode and returns FALSE, so the next handler (by default: end the
+    /// process) still runs.
+    unsafe extern "system" fn restore(_ctrl_type: u32) -> i32 {
+        let handle = HANDLE_VALUE.load(Ordering::Acquire);
+        if handle != 0 {
+            // SAFETY: restores the mode saved in `install` on the same handle.
+            unsafe { SetConsoleMode(handle as HANDLE, MODE.load(Ordering::Acquire)) };
+        }
+        0
+    }
+
+    pub struct Guard;
+
+    impl Guard {
+        pub fn install(handle: HANDLE, mode: u32) -> Self {
+            MODE.store(mode, Ordering::Release);
+            HANDLE_VALUE.store(handle as usize, Ordering::Release);
+            // SAFETY: registers a handler with the required signature.
+            unsafe { SetConsoleCtrlHandler(Some(restore), 1) };
+            Guard
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // SAFETY: removes the handler added in `install`.
+            unsafe { SetConsoleCtrlHandler(Some(restore), 0) };
+            HANDLE_VALUE.store(0, Ordering::Release);
+        }
     }
 }
 
@@ -251,7 +377,11 @@ impl EchoOff {
             if SetConsoleMode(handle, saved & !ENABLE_ECHO_INPUT) == 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            Ok(Self { handle, saved })
+            Ok(Self {
+                handle,
+                saved,
+                ctrl: Some(windows_ctrl::Guard::install(handle, saved)),
+            })
         }
     }
 }
@@ -261,6 +391,7 @@ impl Drop for EchoOff {
     fn drop(&mut self) {
         // SAFETY: restores the mode read in `stdin`.
         unsafe { windows_sys::Win32::System::Console::SetConsoleMode(self.handle, self.saved) };
+        self.ctrl = None; // removes the Ctrl-C handler
     }
 }
 
@@ -482,11 +613,17 @@ pub fn apply_plan(
     }
     let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
-    let result = std::fs::write(&tmp, &plan.text)
-        .and_then(|()| match std::fs::metadata(path) {
-            // Keep the permissions the owner gave the file.
-            Ok(meta) => std::fs::set_permissions(&tmp, meta.permissions()),
-            Err(_) => Ok(()),
+    // The temporary file is private from its creation (mode 600; on Windows the protected owner-only
+    // DACL, which the renamed file keeps). Only then, on Unix, does it take the mode the owner had
+    // given the old file, so no moment exists at which the content is readable more widely than
+    // the old file was.
+    let result = write_private_new(&tmp, plan.text.as_bytes())
+        .and_then(|()| {
+            #[cfg(unix)]
+            if let Ok(meta) = std::fs::metadata(path) {
+                return std::fs::set_permissions(&tmp, meta.permissions());
+            }
+            Ok(())
         })
         .and_then(|()| std::fs::rename(&tmp, path));
     result.map_err(|e| {
@@ -501,6 +638,8 @@ pub fn apply_plan(
 pub enum SecretStored {
     Created,
     AlreadyPresent,
+    /// The file held this secret but was readable by group or others (Unix); it is now mode 600.
+    AlreadyPresentTightened,
     Replaced,
 }
 
@@ -516,6 +655,24 @@ pub fn store_secret(
         return Ok(SecretStored::Created);
     }
     if ClusterSecret::load_file(path).is_ok_and(|existing| existing.to_hex() == secret.to_hex()) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(path) {
+                if meta.permissions().mode() & 0o077 != 0 {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                        .map_err(|e| {
+                            GridError::Config(format!(
+                                "cannot set mode 600 on '{}': {e}; run `chmod 600` on it",
+                                path.display()
+                            ))
+                        })?;
+                    return Ok(SecretStored::AlreadyPresentTightened);
+                }
+            }
+        }
+        // On Windows `ClusterSecret::load_file` above already warned, with the `icacls` command
+        // that fixes it, when the file's ACL grants anyone else access.
         return Ok(SecretStored::AlreadyPresent);
     }
     if !replace {
@@ -526,6 +683,70 @@ pub fn store_secret(
     }
     secret.save_file(path, true)?;
     Ok(SecretStored::Replaced)
+}
+
+/// Looks for a cluster secret configured *outside* `cluster.secret` that outranks the file and
+/// differs from the token's (`--secret`, `--secret-file`, `OXIDESWARM_SECRET`,
+/// `OXIDESWARM_SECRET_FILE`, the `secret` / `secret_file` keys of the config file, resolved in the
+/// order the CLI uses, for every section that `join` configures). Returns a message that names the
+/// source and never a value. A source that cannot be read counts as a conflict too: the machine
+/// would not use the token's secret either.
+pub fn conflicting_secret_source(
+    opts: &SecretOpts,
+    config: Option<&ConfigFile>,
+    env: &impl Fn(&str) -> Option<String>,
+    token_secret: &ClusterSecret,
+) -> Option<String> {
+    let source = |section: SecretSection| -> String {
+        if opts.value.is_some() {
+            "the --secret flag".into()
+        } else if opts.file.is_some() {
+            "the --secret-file flag".into()
+        } else if env(ENV_SECRET).is_some() {
+            format!("the {ENV_SECRET} environment variable")
+        } else if env(ENV_SECRET_FILE).is_some() {
+            format!("the {ENV_SECRET_FILE} environment variable")
+        } else {
+            let name = match section {
+                SecretSection::Master => "[master]",
+                SecretSection::Worker => "[worker]",
+                SecretSection::Submit => "[submit]",
+                SecretSection::Status => "[status]",
+            };
+            let path = config
+                .and_then(|c| c.source_path.0.as_ref())
+                .map(|p| format!(" in {}", p.display()))
+                .unwrap_or_default();
+            format!(
+                "the `secret` or `secret_file` key (top level or {name}) of the config file{path}"
+            )
+        }
+    };
+    for section in [
+        SecretSection::Worker,
+        SecretSection::Submit,
+        SecretSection::Status,
+        SecretSection::Master,
+    ] {
+        // The default file is withheld: it is the file this command writes.
+        match opts.resolve_with(config, section, env, None) {
+            Ok(None) => {}
+            Ok(Some(found)) if found.to_hex() == token_secret.to_hex() => {}
+            Ok(Some(_)) => {
+                return Some(format!(
+                    "{} sets a different cluster secret and outranks ~/.oxideswarm/cluster.secret, so this machine would keep using it and not the one in the token",
+                    source(section)
+                ))
+            }
+            Err(e) => {
+                return Some(format!(
+                    "{} names a cluster secret that cannot be used ({e})",
+                    source(section)
+                ))
+            }
+        }
+    }
+    None
 }
 
 /// `oxideswarm join`: reads a join token from standard input.
@@ -564,7 +785,11 @@ pub struct JoinArgs {
 }
 
 /// Runs `oxideswarm join`.
-pub async fn run_join(args: JoinArgs) -> ExitCode {
+pub async fn run_join(
+    args: JoinArgs,
+    secret_opts: &SecretOpts,
+    config: Option<&ConfigFile>,
+) -> ExitCode {
     if !args.refused_argument.is_empty() {
         eprintln!("A join token must not be given as an argument: it would stay in your shell history and be visible in the process list. Pipe it in instead, for example `pbpaste | oxideswarm join`, or `ssh master oxideswarm secret join-token | oxideswarm join`.");
         return ExitCode::FAILURE;
@@ -590,6 +815,15 @@ pub async fn run_join(args: JoinArgs) -> ExitCode {
         }
     };
     drop(text);
+
+    // A secret configured elsewhere would outrank the file this command writes.
+    let env = |name: &str| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned());
+    if let Some(problem) = conflicting_secret_source(secret_opts, config, &env, &token.secret) {
+        eprintln!(
+            "{problem}. Remove or change it (or run join where it is not set), then join again; nothing was changed."
+        );
+        return ExitCode::FAILURE;
+    }
 
     let Some(secret_path) = ClusterSecret::default_path() else {
         eprintln!("cannot determine the home directory for ~/.oxideswarm/cluster.secret");
@@ -634,6 +868,15 @@ pub async fn run_join(args: JoinArgs) -> ExitCode {
             "{} already holds this cluster's secret; left as it is",
             secret_path.display()
         ),
+        Ok(SecretStored::AlreadyPresentTightened) => {
+            println!(
+                "{} already holds this cluster's secret; left as it is",
+                secret_path.display()
+            );
+            eprintln!(
+                "The file was readable by other users; its mode is now 600 (it held the secret before this join)."
+            );
+        }
         Ok(SecretStored::Replaced) => println!(
             "The cluster secret in {} was replaced",
             secret_path.display()
@@ -973,5 +1216,102 @@ mod tests {
             libc::close(master);
             libc::close(slave);
         }
+    }
+
+    #[test]
+    fn test_a_secret_configured_elsewhere_that_differs_is_a_conflict() {
+        let token_secret = secret();
+        let other_hex = "cd".repeat(32);
+        let none_env = |_: &str| None::<String>;
+        let opts = SecretOpts::default();
+        assert_eq!(
+            conflicting_secret_source(&opts, None, &none_env, &token_secret),
+            None
+        );
+
+        // The environment.
+        let env = |name: &str| (name == ENV_SECRET).then(|| other_hex.clone());
+        let msg = conflicting_secret_source(&opts, None, &env, &token_secret).unwrap();
+        assert!(msg.contains("OXIDESWARM_SECRET") && !msg.contains(&other_hex));
+        // The same secret in the environment is fine.
+        let same = |name: &str| (name == ENV_SECRET).then(|| token_secret.to_hex());
+        assert_eq!(
+            conflicting_secret_source(&opts, None, &same, &token_secret),
+            None
+        );
+
+        // A key of the config file.
+        let cfg: ConfigFile =
+            toml::from_str(&format!("[worker]\nsecret = \"{other_hex}\"\n")).unwrap();
+        let msg = conflicting_secret_source(&opts, Some(&cfg), &none_env, &token_secret).unwrap();
+        assert!(msg.contains("config file") && !msg.contains(&other_hex));
+        let cfg: ConfigFile =
+            toml::from_str(&format!("secret = \"{}\"\n", token_secret.to_hex())).unwrap();
+        assert_eq!(
+            conflicting_secret_source(&opts, Some(&cfg), &none_env, &token_secret),
+            None
+        );
+
+        // A secret file, and an unreadable one.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("other.secret");
+        std::fs::write(&file, format!("{other_hex}\n")).unwrap();
+        let by_flag = SecretOpts {
+            value: None,
+            file: Some(file),
+        };
+        let msg = conflicting_secret_source(&by_flag, None, &none_env, &token_secret).unwrap();
+        assert!(msg.contains("--secret-file") && !msg.contains(&other_hex));
+        let missing = SecretOpts {
+            value: None,
+            file: Some(dir.path().join("missing")),
+        };
+        assert!(conflicting_secret_source(&missing, None, &none_env, &token_secret).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_an_existing_secret_file_with_loose_permissions_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cluster.secret");
+        std::fs::write(&path, format!("{}\n", secret().to_hex())).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            store_secret(&path, &secret(), false).unwrap(),
+            SecretStored::AlreadyPresentTightened
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            store_secret(&path, &secret(), false).unwrap(),
+            SecretStored::AlreadyPresent
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_the_temporary_config_is_private_from_the_start_and_the_old_mode_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rusty-grid.toml");
+        std::fs::write(&path, "[worker]\nname = \"x\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let old = std::fs::read_to_string(&path).unwrap();
+        let p = plan(Some(&old), Some("h:8088"), None);
+        apply_plan(&path, Some(&old), &p).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        // A new file is private.
+        let fresh = dir.path().join("new.toml");
+        apply_plan(&fresh, None, &plan(None, Some("h:8088"), None)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

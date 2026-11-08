@@ -488,3 +488,180 @@ fn test_an_existing_config_is_kept_backed_up_and_not_repointed_without_the_flag(
         );
     }
 }
+
+#[test]
+fn test_a_secret_configured_elsewhere_blocks_the_join_without_naming_its_value() {
+    let master_home = TempDir::new().unwrap();
+    let mut seen = Seen::default();
+    let out = seen.run(with(master_home.path(), &["secret", "generate"]), None);
+    assert!(out.status.success());
+    let secret = read_secret(master_home.path());
+    let out = seen.run_token(with(
+        master_home.path(),
+        &["secret", "join-token", "--master", "127.0.0.1:9"],
+    ));
+    let token = text(&out.stdout).trim().to_string();
+    let stale = "ef".repeat(32);
+
+    // A `[worker] secret` in the config file.
+    let home = TempDir::new().unwrap();
+    fs::create_dir_all(home.path().join(".oxideswarm")).unwrap();
+    let config_path = home.path().join(".oxideswarm/rusty-grid.toml");
+    let config = format!("[worker]\nsecret = \"{stale}\"\n");
+    fs::write(&config_path, &config).unwrap();
+    let out = seen.run(with(home.path(), &["join", "--no-doctor"]), Some(&token));
+    seen.keep_stdout(&out);
+    assert!(!out.status.success());
+    let err = text(&out.stderr);
+    assert!(
+        err.contains("config file") && err.contains("different cluster secret"),
+        "{err}"
+    );
+    assert!(!secret_file(home.path()).exists(), "nothing was written");
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+
+    // The environment variable, and the same secret in it being accepted.
+    let home = TempDir::new().unwrap();
+    let mut cmd = with(home.path(), &["join", "--no-doctor"]);
+    cmd.env("OXIDESWARM_SECRET", &stale);
+    let out = seen.run(cmd, Some(&token));
+    seen.keep_stdout(&out);
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("OXIDESWARM_SECRET"));
+    assert!(!secret_file(home.path()).exists());
+    let mut cmd = with(home.path(), &["join", "--no-doctor"]);
+    cmd.env("OXIDESWARM_SECRET", &secret);
+    let out = seen.run(cmd, Some(&token));
+    seen.keep_stdout(&out);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+
+    // The secret file variable.
+    let home = TempDir::new().unwrap();
+    let other_file = home.path().join("other.secret");
+    fs::write(&other_file, format!("{stale}\n")).unwrap();
+    let mut cmd = with(home.path(), &["join", "--no-doctor"]);
+    cmd.env("OXIDESWARM_SECRET_FILE", &other_file);
+    let out = seen.run(cmd, Some(&token));
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("OXIDESWARM_SECRET_FILE"));
+
+    for output in &seen.0 {
+        assert!(
+            !output.contains(&stale),
+            "the stale secret was printed:\n{output}"
+        );
+        assert!(
+            !output.contains(&secret),
+            "the secret was printed:\n{output}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_an_existing_secret_file_with_loose_permissions_is_tightened_by_join() {
+    use std::os::unix::fs::PermissionsExt;
+    let master_home = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let mut seen = Seen::default();
+    let out = seen.run(with(master_home.path(), &["secret", "generate"]), None);
+    assert!(out.status.success());
+    let out = seen.run_token(with(
+        master_home.path(),
+        &["secret", "join-token", "--master", "127.0.0.1:9"],
+    ));
+    let token = text(&out.stdout).trim().to_string();
+    fs::create_dir_all(home.path().join(".oxideswarm")).unwrap();
+    fs::copy(secret_file(master_home.path()), secret_file(home.path())).unwrap();
+    fs::set_permissions(secret_file(home.path()), fs::Permissions::from_mode(0o644)).unwrap();
+    let out = seen.run(with(home.path(), &["join", "--no-doctor"]), Some(&token));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_private(&secret_file(home.path()));
+    assert!(text(&out.stderr).contains("mode is now 600"));
+}
+
+/// Ctrl-C (SIGINT) and SIGTERM during the hidden prompt must leave the terminal with echo on, and
+/// the process must end by that signal (the conventional status).
+#[cfg(unix)]
+#[test]
+fn test_a_signal_during_the_hidden_prompt_restores_terminal_echo() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::process::ExitStatusExt;
+
+    for (signal, name) in [
+        (libc::SIGINT, "SIGINT"),
+        (libc::SIGTERM, "SIGTERM"),
+        (libc::SIGHUP, "SIGHUP"),
+    ] {
+        let home = TempDir::new().unwrap();
+        let (mut master_fd, mut slave_fd) = (0, 0);
+        // SAFETY: openpty fills both descriptors on success.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty");
+        // SAFETY: both descriptors are valid and owned by the files from here on.
+        let (master, slave) = unsafe {
+            (
+                fs::File::from_raw_fd(master_fd),
+                fs::File::from_raw_fd(slave_fd),
+            )
+        };
+        let echo_on = || {
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut t) }, 0);
+            t.c_lflag & libc::ECHO != 0
+        };
+        assert!(echo_on());
+
+        let mut cmd = with(home.path(), &["join", "--no-doctor"]);
+        cmd.stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave.try_clone().unwrap()));
+        let mut child = cmd.spawn().expect("spawn join");
+
+        // Wait for the prompt (written to the terminal) and for echo to be off.
+        let mut seen_prompt = Vec::new();
+        let ok = wait_for(Duration::from_secs(20), || {
+            let mut fds = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut fds, 1, 50) } > 0 {
+                let mut buf = [0u8; 256];
+                let n =
+                    unsafe { libc::read(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                if n > 0 {
+                    seen_prompt.extend_from_slice(&buf[..n as usize]);
+                }
+            }
+            String::from_utf8_lossy(&seen_prompt).contains("Paste the join token") && !echo_on()
+        });
+        assert!(
+            ok,
+            "{name}: no prompt with echo off; saw {:?}",
+            String::from_utf8_lossy(&seen_prompt)
+        );
+
+        // SAFETY: signals the child that this test started.
+        unsafe { libc::kill(child.id() as i32, signal) };
+        let status = child.wait().unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(signal),
+            "{name}: ended by the signal, got {status:?}"
+        );
+        assert!(
+            echo_on(),
+            "{name}: echo must be back on after the process was interrupted"
+        );
+        assert!(!secret_file(home.path()).exists());
+    }
+}
