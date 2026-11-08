@@ -7455,25 +7455,39 @@ mod tests {
             other => panic!("expected ClusterStatus, got {other:?}"),
         }
 
-        // 3. Dashboard /api/status carries store_error on both ClusterStatusDto and its tasks QueueStats.
-        if let Some(dash_addr) = h.dashboard_addr() {
-            let status_dto: crate::dashboard::dto::ClusterStatusDto =
-                reqwest::get(format!("http://{dash_addr}/api/status"))
-                    .await
-                    .unwrap()
-                    .json()
-                    .await
-                    .unwrap();
-            assert!(
-                status_dto
-                    .store_error
-                    .as_deref()
-                    .is_some_and(|s| s.contains("injected sync failure")),
-                "expected store_error in ClusterStatusDto, got {:?}",
-                status_dto.store_error
-            );
-            assert_eq!(status_dto.tasks.store_error, status_dto.store_error);
-        }
+        // 3. Dashboard /api/status carries store_error on both ClusterStatusDto and its tasks QueueStats,
+        // and GET / serves dashboard.html with the storeErrorBanner alert.
+        let dash_addr = h
+            .dashboard_addr()
+            .expect("dashboard must be enabled in this test");
+        let status_dto: crate::dashboard::dto::ClusterStatusDto =
+            reqwest::get(format!("http://{dash_addr}/api/status"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert!(
+            status_dto
+                .store_error
+                .as_deref()
+                .is_some_and(|s| s.contains("injected sync failure")),
+            "expected store_error in ClusterStatusDto, got {:?}",
+            status_dto.store_error
+        );
+        assert_eq!(status_dto.tasks.store_error, status_dto.store_error);
+
+        let html = reqwest::get(format!("http://{dash_addr}/"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            html.contains("id=\"storeErrorBanner\"")
+                && html.contains("Task store failed: durability is off until restart"),
+            "dashboard.html must contain #storeErrorBanner for store_error visibility"
+        );
 
         h.shutdown().unwrap();
     }

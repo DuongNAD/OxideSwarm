@@ -4110,6 +4110,7 @@ impl TaskQueue {
         inner.store.as_ref().and_then(|s| s.failure_reason())
     }
 
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub async fn fail_store_for_test(&self, reason: impl Into<String>) {
         let inner = self.inner.read().await;

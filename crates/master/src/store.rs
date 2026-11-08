@@ -496,8 +496,8 @@ impl TaskStore {
         self.shared.failed.lock().unwrap().clone()
     }
 
-    #[doc(hidden)]
-    pub fn record_failure_for_test(&self, reason: impl Into<String>) {
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn record_failure_for_test(&self, reason: impl Into<String>) {
         let mut slot = self.shared.failed.lock().unwrap();
         if slot.is_none() {
             *slot = Some(reason.into());

@@ -468,8 +468,12 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
 
 - **Wire protocol version:** Adding `WorkerMessage::ResumeSession` (and removing the deprecated
   `compute_intensity` field from `TaskSpec::GpuCompute`) in `F1-b` bumps `PROTOCOL_VERSION_CURRENT`
-  and `PROTOCOL_VERSION_MIN_COMPATIBLE` from `3` to `4` in `crates/core/src/protocol.rs:31-33` and
-  updates `crates/core/tests/data/wire_layout.txt` (enforced by `crates/core/src/wire_layout_tests.rs`).
+  and `PROTOCOL_VERSION_MIN_COMPATIBLE` from `3` to `4` in `crates/core/src/protocol.rs:31-33`, and
+  adding `store_error: Option<String>` to `ClientResponse::ClusterStatus` in `F1-a` wiring (pull
+  request #147, D3.3) bumps `PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE` from `4`
+  to `5` (with `LegacyV3V4BinaryClientResponse` so a v5 client reports a clear
+  `Incompatible protocol version 4` error from a v4 master) and updates
+  `crates/core/tests/data/wire_layout.txt` (enforced by `crates/core/src/wire_layout_tests.rs`).
 - **On-disk state across protocol version upgrades (path (a) — self-describing JSON snapshot on clean shutdown):**
   - Both `journal.bin` and `snapshot.bin` record `protocol_version: u32` (`PROTOCOL_VERSION_CURRENT`)
     in bytes `12..16` of their 24-byte file header (D2.1).
@@ -623,10 +627,13 @@ lands as a self-contained, reviewable unit.
   `master_features` `session-resume=<secs>` helpers bounded by `MAX_SESSION_RESUME_HOLD_SECS = 3_600`,
   appended `WorkerMessage::ResumeSession` (routed on `LaneKind::Unified | LaneKind::Control`),
   removed `TaskSpec::GpuCompute::compute_intensity` from the wire, and regenerated `wire_layout.txt`.
-- **2026-11-08:** Implemented `F1-a` wiring: wired `TaskStore` into `TaskQueue` (journal emission
-  with durable `DurableAck` awaited outside the queue write lock, startup replay of all D2.5 task
-  states, `adoptable_by` / `fail_if_not_adopted` hold handling, input/output blob re-pinning, and
-  threshold/shutdown snapshot compaction), `MasterServer` (`ServerConfig::with_state_dir`, default
-  `<state_dir>/blobs` blob store, `TaskStore::open` before binding listeners, shutdown compaction),
-  `oxideswarm master --state-dir` (`RUSTY_GRID_STATE_DIR`, `[master].state_dir`), and
-  `tests/master_restart_recovery.rs`.
+- **2026-11-08:** Implemented `F1-a` wiring (PR #147): wired `TaskStore` into `TaskQueue` (journal
+  emission with durable `DurableAck` awaited in a spawned task outside the queue write lock, startup
+  replay of all D2.5 task states, `adoptable_by` / `fail_if_not_adopted` hold handling, input/output
+  blob re-pinning, and threshold/shutdown snapshot compaction), `MasterServer`
+  (`ServerConfig::with_state_dir`, default `<state_dir>/blobs` blob store, `TaskStore::open` before
+  binding listeners, shutdown compaction), `oxideswarm master --state-dir` (`RUSTY_GRID_STATE_DIR`,
+  `[master].state_dir`), store-health visibility (`TaskStore::failure_reason`, `QueueStats::store_error`,
+  `ClientResponse::ClusterStatus.store_error` in protocol version 5 with `LegacyV3V4BinaryClientResponse`
+  fallback, `ClusterStatusDto::store_error`, `#storeErrorBanner` in `dashboard.html`, and `C1 Task store`
+  failure check in `oxideswarm doctor`), and `tests/master_restart_recovery.rs`.

@@ -765,6 +765,29 @@
             flex: 1;
         }
 
+        /* Task Store Failure Alert Banner */
+        .store-error-banner {
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid var(--dot-red);
+            color: var(--dot-red);
+            padding: 8px 14px;
+            margin: 6px 12px 0 12px;
+            border-radius: 6px;
+            font-size: 11.5px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            box-shadow: 0 2px 8px rgba(239, 68, 68, 0.1);
+        }
+        .store-error-banner .alert-icon {
+            font-size: 14px;
+            flex-shrink: 0;
+        }
+        .store-error-banner .alert-text {
+            flex: 1;
+        }
+
         /* ========================================================
            TAB 3: WORKFLOW MODES & AUTOMATION PRESETS
            ======================================================== */
@@ -1057,6 +1080,9 @@
                 <button class="theme-btn" onclick="toggleTheme()" id="btnTheme" title="Toggle Light/Dark Theme">🌓</button>
             </div>
         </header>
+
+        <!-- Task Store Failure Alert Banner -->
+        <div id="storeErrorBanner" class="store-error-banner" style="display:none;"></div>
 
         <!-- Visual Degradation Alert Banner -->
         <div id="degradationAlertBanner" class="degradation-banner" style="display:none;"></div>
@@ -2071,9 +2097,27 @@
             });
 
             const totalNodes = workers.length + (data.master ? 1 : 0);
-            const hasDegraded = workers.some(w => w.status === 'Disconnected');
+            const storeError = (typeof data.store_error === 'string' && data.store_error)
+                ? data.store_error
+                : (data.tasks && typeof data.tasks.store_error === 'string' && data.tasks.store_error ? data.tasks.store_error : null);
+            const hasDegraded = Boolean(storeError) || workers.some(w => w.status === 'Disconnected');
             const clusterHealth = hasDegraded ? 'Degraded' : 'Healthy';
-            const healthColor = hasDegraded ? 'var(--dot-busy)' : 'var(--dot-green)';
+            const healthColor = storeError ? 'var(--dot-red)' : (hasDegraded ? 'var(--dot-busy)' : 'var(--dot-green)');
+
+            // Task Store Failure Alert Banner (shown only when store_error is set)
+            const storeBanner = document.getElementById('storeErrorBanner');
+            if (storeBanner) {
+                if (storeError) {
+                    setHtml(
+                        storeBanner,
+                        html`<span class="alert-icon">⛔</span><span class="alert-text">Task store failed: durability is off until restart (${storeError})</span>`
+                    );
+                    storeBanner.style.display = 'flex';
+                } else {
+                    storeBanner.textContent = '';
+                    storeBanner.style.display = 'none';
+                }
+            }
 
             // Update Topbar and Banner Summaries
             setSummary(html`<span style="color:${healthColor}">●</span> ${totalNodes} devices (${totalCores}c) • ${clusterHealth}`);
@@ -2142,6 +2186,9 @@
                 const budgetPill = maxActiveBytes > 0
                     ? html`<div class="metric-pill" title="${activeBytes} / ${maxActiveBytes} bytes"><span class="m-label">Active Budget:</span><span>${fmtBytes(activeBytes)} / ${fmtBytes(maxActiveBytes)}</span></div>`
                     : '';
+                const storePill = storeError
+                    ? html`<div class="metric-pill" style="color:var(--dot-red);border-color:var(--dot-red);" title="Task store failed: durability is off until restart (${storeError})"><span class="m-label">Task Store:</span><span>Failed (${storeError})</span></div>`
+                    : '';
                 cards.push(html`
                         <div class="device-card">
                             <div class="card-row-1">
@@ -2165,6 +2212,7 @@
                                     <span>${masterQueued} pending</span>
                                 </div>
                                 ${budgetPill}
+                                ${storePill}
                             </div>
                         </div>
                     `);
