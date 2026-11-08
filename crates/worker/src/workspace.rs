@@ -383,7 +383,7 @@ impl WorkspaceStore {
             .flatten()
     }
 
-    /// The workspaces on disk (those with a readable `state.json`), in no particular order.
+    /// The workspaces on disk, in no particular order. One without a readable `state.json` is listed as `Syncing` with its measured size.
     pub fn list(&self) -> Vec<WorkspaceInfo> {
         let mut out = Vec::new();
         let Ok(rd) = fs::read_dir(&self.root) else {
@@ -400,12 +400,33 @@ impl WorkspaceStore {
             if validate_workspace_name(&name).is_err() {
                 continue;
             }
-            if let Some(st) = read_state(&entry.path()) {
+            let path = entry.path();
+            if let Some(st) = read_state(&path) {
                 out.push(WorkspaceInfo {
                     name,
                     state: st.state,
                     size_bytes: st.size_bytes,
                     last_used_ms: st.last_used_ms,
+                });
+            } else if ["tree", "tmp", STATE_FILE]
+                .iter()
+                .any(|n| fs::symlink_metadata(path.join(n)).is_ok())
+            {
+                // No readable state.json but content: measure it, so it is counted and evictable.
+                let (bytes, complete) = measure_dir(&path, self.limits.measure_entry_cap);
+                out.push(WorkspaceInfo {
+                    name,
+                    state: SyncState::Syncing,
+                    size_bytes: if complete {
+                        bytes
+                    } else {
+                        bytes.max(self.limits.limit_bytes().saturating_add(1))
+                    },
+                    last_used_ms: entry
+                        .metadata()
+                        .ok()
+                        .map(|m| mtime_ns(&m) / 1_000_000)
+                        .unwrap_or(0),
                 });
             }
         }
@@ -635,12 +656,26 @@ impl WorkspaceGuard {
         fs::rename(&tmp, self.dir.join(STATE_FILE)).map_err(io_err("replacing state.json"))
     }
 
-    /// Removes everything but the lock file. Used by eviction; errors are ignored.
+    /// Removes everything in the workspace directory but the lock file (a held lock stays). Used by eviction; errors are ignored.
     fn wipe(&self) {
-        let _ = fs::remove_dir_all(self.tree_dir());
-        let _ = fs::remove_dir_all(self.tmp_dir());
-        let _ = fs::remove_file(self.dir.join("state.json.tmp"));
-        let _ = fs::remove_file(self.dir.join(STATE_FILE));
+        let Ok(rd) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            if entry.file_name() == "lock" {
+                continue;
+            }
+            let p = entry.path();
+            match fs::symlink_metadata(&p) {
+                Ok(m) if m.is_dir() && !is_link_like(&m) => {
+                    let _ = fs::remove_dir_all(&p);
+                }
+                Ok(_) => {
+                    let _ = fs::remove_file(&p).or_else(|_| fs::remove_dir(&p));
+                }
+                Err(_) => {}
+            }
+        }
     }
 
     /// Brings `tree/` to `manifest` (D3). On error the workspace stays `Syncing` and the next
@@ -654,6 +689,7 @@ impl WorkspaceGuard {
         let mut st = read_state(&self.dir).unwrap_or_else(WorkspaceState::fresh);
         let force_hash = st.state != SyncState::Ready;
 
+        check_case_collisions(manifest)?;
         // Check every path before any change, so a bad manifest touches nothing.
         let mut targets: Vec<(&BlobFile, PathBuf)> = Vec::with_capacity(manifest.files().len());
         for f in manifest.files() {
@@ -679,12 +715,10 @@ impl WorkspaceGuard {
             }
             Err(_) => fs::create_dir(&tree).map_err(io_err("creating tree"))?,
         }
+        // A task may have replaced tmp/ with a link: recreate it as a real directory (this also
+        // removes the temporary files a crashed sync left behind).
+        self.prepare_tmp()?;
         let tmp_dir = self.tmp_dir();
-        match fs::create_dir(&tmp_dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(io_err("creating tmp")(e)),
-        }
 
         let mut report = SyncReport::default();
 
@@ -729,7 +763,6 @@ impl WorkspaceGuard {
 
         // 2 and 3. add or replace.
         let mut records = BTreeMap::new();
-        let mut counter = 0u64;
         for (file, path) in &targets {
             ensure_parents(&tree, path, &file.path)?;
             let want_exec = file.executable;
@@ -773,8 +806,7 @@ impl WorkspaceGuard {
                 report.unchanged += 1;
                 set_exec(path, want_exec);
             } else {
-                counter += 1;
-                let tmp = tmp_dir.join(format!(".sync-{}-{counter}", std::process::id()));
+                let tmp = tmp_dir.join(format!(".sync-{}", uuid::Uuid::new_v4().simple()));
                 let res = write_blob(source, file, &tmp, want_exec).and_then(|()| {
                     fs::rename(&tmp, path).map_err(io_err(format!("placing {}", file.path)))
                 });
@@ -818,7 +850,10 @@ impl WorkspaceGuard {
             size_bytes: bytes,
             ..Default::default()
         };
-        if let Some(mut st) = read_state(&self.dir) {
+        {
+            // A missing or malformed state.json still gets a record, so the workspace is counted
+            // and can be evicted.
+            let mut st = read_state(&self.dir).unwrap_or_else(WorkspaceState::fresh);
             st.size_bytes = bytes;
             st.last_used_ms = (self.store.clock)();
             if bytes > limit {
@@ -839,6 +874,37 @@ impl WorkspaceGuard {
         report.evicted = self.store.evict_to_fit(Some(&self.name))?;
         Ok(report)
     }
+}
+
+/// Refuses a manifest whose paths differ only by case (`A.rs` and `a.rs`, or a file `A` next to
+/// `a/x`): on the case-insensitive default file systems of macOS and Windows they are one file,
+/// so the sync would leave one of the contents in place and rewrite it every time. Uses Unicode
+/// lowercasing on every host. Residual: names that differ only by NFC/NFD normalisation (macOS
+/// APFS treats them as equal) are not detected.
+fn check_case_collisions(manifest: &TreeManifest) -> Result<(), WorkspaceError> {
+    let mut files: HashSet<String> = HashSet::new();
+    let mut dirs: HashSet<String> = HashSet::new();
+    let clash = |path: &str, other: &str| WorkspaceError::Path {
+        path: path.to_string(),
+        reason: format!(
+            "it differs from '{other}' only by case, which one file system entry cannot hold \
+             on macOS and Windows"
+        ),
+    };
+    for f in manifest.files() {
+        let folded = f.path.to_lowercase();
+        if dirs.contains(&folded) || !files.insert(folded.clone()) {
+            return Err(clash(&f.path, &folded));
+        }
+        for (pos, _) in folded.match_indices('/') {
+            let d = &folded[..pos];
+            if files.contains(d) {
+                return Err(clash(&f.path, d));
+            }
+            dirs.insert(d.to_string());
+        }
+    }
+    Ok(())
 }
 
 /// `tree` joined with the manifest path `rel`, after the checks of design 0021 and the blob path
@@ -978,6 +1044,11 @@ fn set_exec(path: &Path, executable: bool) {
     use std::os::unix::fs::PermissionsExt;
     let mode = if executable { 0o755 } else { 0o644 };
     if let Ok(m) = fs::metadata(path) {
+        use std::os::unix::fs::MetadataExt;
+        // A file with other hard links may be shared with something outside the tree.
+        if m.nlink() > 1 {
+            return;
+        }
         if m.permissions().mode() & 0o777 != mode {
             let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
         }
@@ -1712,5 +1783,171 @@ mod tests {
         assert!(checked_path(Path::new("C:\\t"), "src\\a.rs").is_err());
         assert!(checked_path(Path::new("C:\\t"), "c:/x").is_err());
         assert!(checked_path(Path::new("C:\\t"), "a/b:stream").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rv1_a_tmp_replaced_by_a_link_is_recreated_not_followed() {
+        let td = tempfile::tempdir().unwrap();
+        let (_s, g) = ready(&td);
+        let v1: Files = &[("a.rs", "aaa", false)];
+        g.sync(&manifest(v1), &Mem::new(v1)).unwrap();
+        let outside = td.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::remove_dir_all(g.tmp_dir()).unwrap();
+        std::os::unix::fs::symlink(&outside, g.tmp_dir()).unwrap();
+        let v2: Files = &[("a.rs", "aaa", false), ("b.rs", "bbb", false)];
+        g.sync(&manifest(v2), &Mem::new(v2)).unwrap();
+        assert_eq!(
+            fs::read_dir(&outside).unwrap().count(),
+            0,
+            "nothing written outside"
+        );
+        assert!(fs::symlink_metadata(g.tmp_dir()).unwrap().is_dir());
+        assert_eq!(read(&g, "b.rs"), "bbb");
+    }
+
+    #[test]
+    fn rv2_stale_temp_files_never_break_a_sync() {
+        let td = tempfile::tempdir().unwrap();
+        let (_s, g) = ready(&td);
+        let v1: Files = &[("a.rs", "aaa", false)];
+        g.sync(&manifest(v1), &Mem::new(v1)).unwrap();
+        for n in 0..3 {
+            fs::write(
+                g.tmp_dir()
+                    .join(format!(".sync-{}-{n}", std::process::id())),
+                "stale",
+            )
+            .unwrap();
+        }
+        let v2: Files = &[("a.rs", "aaa", false), ("b.rs", "bbb", false)];
+        g.sync(&manifest(v2), &Mem::new(v2)).unwrap();
+        assert_eq!(fs::read_dir(g.tmp_dir()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn rv3_case_colliding_paths_are_refused_before_any_change() {
+        let td = tempfile::tempdir().unwrap();
+        let (_s, g) = ready(&td);
+        for v in [
+            &[("A.rs", "upper", false), ("a.rs", "lower", false)][..],
+            &[
+                ("Src/x", "1", false),
+                ("src/y", "2", false),
+                ("SRC", "3", false),
+            ][..],
+            &[("\u{c9}.rs", "1", false), ("\u{e9}.rs", "2", false)][..],
+        ] {
+            let err = g.sync(&manifest(v), &Mem::new(v)).unwrap_err();
+            assert!(matches!(err, WorkspaceError::Path { .. }), "{err}");
+        }
+        assert!(!g.tree_dir().exists(), "nothing was created");
+        // Same case, different directories is fine.
+        let ok: Files = &[("a/x", "1", false), ("A2/x", "2", false)];
+        g.sync(&manifest(ok), &Mem::new(ok)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rv4_a_hard_linked_file_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let (_s, g) = ready(&td);
+        let v: Files = &[("f", "same", false)];
+        g.sync(&manifest(v), &Mem::new(v)).unwrap();
+        let outside = td.path().join("o");
+        fs::write(&outside, "same").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_file(g.tree_dir().join("f")).unwrap();
+        fs::hard_link(&outside, g.tree_dir().join("f")).unwrap();
+        g.sync(&manifest(v), &Mem::new(v)).unwrap();
+        assert_eq!(
+            fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Different content replaces the link, it does not write through it.
+        fs::write(&outside, "DIFFERENT").unwrap();
+        g.sync(&manifest(v), &Mem::new(v)).unwrap();
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "DIFFERENT");
+        assert_eq!(read(&g, "f"), "same");
+    }
+
+    #[test]
+    fn rv5_a_workspace_with_a_malformed_state_is_counted_and_evicted() {
+        let td = tempfile::tempdir().unwrap();
+        let s = small(&td, 1);
+        let g = s.acquire("old", Duration::ZERO).unwrap();
+        let v: Files = &[("a.rs", "a", false)];
+        g.sync(&manifest(v), &Mem::new(v)).unwrap();
+        fs::write(g.dir.join(STATE_FILE), "garbage").unwrap();
+        let r = g.finish().unwrap();
+        assert!(r.size_bytes > 0);
+        assert_eq!(g.state().unwrap().state, SyncState::Syncing);
+        drop(g);
+        // Missing state.json altogether, content still there: listed and evictable.
+        let g = s.acquire("lost", Duration::ZERO).unwrap();
+        g.sync(&manifest(v), &Mem::new(v)).unwrap();
+        fs::remove_file(g.dir.join(STATE_FILE)).unwrap();
+        drop(g);
+        assert_eq!(s.list().len(), 2);
+        let r = use_ws(&s, "new");
+        assert_eq!(r.evicted.len(), 2, "{r:?}");
+        let dir_names: Vec<_> = fs::read_dir(s.root())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        for dead in ["old", "lost"] {
+            let d = s.root().join(dead);
+            let left: Vec<_> = fs::read_dir(&d)
+                .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+                .unwrap_or_default();
+            assert!(
+                left.iter().all(|n| n == "lock"),
+                "{dead}: {left:?} {dir_names:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rv6_eviction_never_follows_links_in_tree_or_tmp() {
+        let td = tempfile::tempdir().unwrap();
+        let s = small(&td, 1);
+        let outside = td.path().join("out");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("k"), "keep").unwrap();
+        {
+            let g = s.acquire("a", Duration::ZERO).unwrap();
+            let v: Files = &[("x", "x", false)];
+            g.sync(&manifest(v), &Mem::new(v)).unwrap();
+            std::os::unix::fs::symlink(&outside, g.tree_dir().join("lnk")).unwrap();
+            std::os::unix::fs::symlink(&outside, g.tmp_dir().join("lnk2")).unwrap();
+            g.finish().unwrap();
+        }
+        let r = use_ws(&s, "b");
+        assert_eq!(r.evicted, vec!["a".to_string()]);
+        assert!(outside.join("k").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rv7_a_symlinked_parent_is_neither_deleted_through_nor_written_through() {
+        let td = tempfile::tempdir().unwrap();
+        let (_s, g) = ready(&td);
+        let v1: Files = &[("sub/x", "x", false), ("k", "k", false)];
+        g.sync(&manifest(v1), &Mem::new(v1)).unwrap();
+        let victim = td.path().join("victim");
+        fs::create_dir(&victim).unwrap();
+        fs::write(victim.join("x"), "x").unwrap();
+        fs::remove_dir_all(g.tree_dir().join("sub")).unwrap();
+        std::os::unix::fs::symlink(&victim, g.tree_dir().join("sub")).unwrap();
+        let v2: Files = &[("k", "k", false)];
+        g.sync(&manifest(v2), &Mem::new(v2)).unwrap();
+        assert!(victim.join("x").exists());
+        assert!(g.tree_dir().join("sub").is_symlink());
+        assert!(g.sync(&manifest(v1), &Mem::new(v1)).is_err());
+        assert_eq!(fs::read_dir(&victim).unwrap().count(), 1);
     }
 }

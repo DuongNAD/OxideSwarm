@@ -380,3 +380,13 @@ off by default until FEAT-3 is Implemented.
   1.89, below the MSRV 1.91. W2b is pending: the runner and client wiring, `--workspaces`,
   `--workspace-root`, `--workspace-limit-mb`, `--max-workspaces`, and advertising `WORKSPACES`; it
   waits for the pull requests that rewrite `runner.rs` and `client.rs`.
+- 2026-11-09: W2a review fixes. `sync` recreates `tmp/` through `prepare_tmp`, so a task that
+  replaced it with a link cannot make the sync write outside the workspace, and stale temporary
+  files are removed; temporary names carry a random suffix. A manifest whose paths differ only by
+  case (Unicode lowercasing) is refused by the store on every host, because such a tree cannot exist
+  on the case-insensitive file systems of macOS and Windows; names that differ only by NFC/NFD
+  normalisation are a residual and are not detected. A kept file with more than one hard link keeps
+  its mode. A workspace with a missing or malformed `state.json` is listed as `Syncing` with its
+  measured size, `finish` writes a record for it, and eviction removes the whole `<name>/`
+  directory except a held lock.
+
