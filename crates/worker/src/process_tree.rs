@@ -11,10 +11,10 @@
 //!   lifeline pipe (`FD_CLOEXEC`) from the worker. The group id is the leader's PID, stays
 //!   reserved while *any* member is alive, and `killpg` reaches every member in one call,
 //!   grandchildren included. Stopping is `SIGTERM` to the group, a short grace, then `SIGKILL` to
-//!   the group, followed by a cgroup v2 leaf kill (on Linux when delegated) and a
-//!   `RUSTY_GRID_TASK_ID` environment sweep for `setsid()` survivors. When the worker crashes
-//!   (`SIGKILL`, OOM kill), the kernel closes the worker's write end of the lifeline pipe and the
-//!   supervisor runs the same teardown on EOF.
+//!   the group, followed by a cgroup v2 leaf kill (on Linux when delegated) and a per-attempt
+//!   `RUSTY_GRID_RUN_TOKEN` environment sweep for `setsid()` survivors. When the worker crashes
+//!   (`SIGKILL`, OOM kill), the kernel closes the worker's write end of the lifeline pipe with
+//!   zero bytes written and the supervisor runs the same teardown on EOF.
 //! * **Windows**: the child is assigned to a Job Object created with
 //!   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. `TerminateJobObject` ends every process in the job, and
 //!   closing the last handle to it (worker exit, or a worker crash: the OS closes the handle) does
@@ -34,23 +34,23 @@ use std::sync::{Mutex, MutexGuard};
 
 use tracing::warn;
 
-/// Length of `"RUSTY_GRID_TASK_ID=<36-char hyphenated UUID>\0"`.
+/// Length of `"RUSTY_GRID_RUN_TOKEN=<36-char hyphenated UUID>\0"`.
 #[cfg(any(unix, test))]
-pub(crate) const TASK_ENV_NEEDLE_LEN: usize = 19 + 36 + 1;
+pub(crate) const TASK_ENV_NEEDLE_LEN: usize = 21 + 36 + 1;
 
-/// Fixed-size stack buffer holding `"RUSTY_GRID_TASK_ID=<uuid>\0"`.
+/// Fixed-size stack buffer holding `"RUSTY_GRID_RUN_TOKEN=<uuid>\0"`.
 #[cfg(any(unix, test))]
 pub(crate) type TaskEnvNeedle = [u8; TASK_ENV_NEEDLE_LEN];
 
-/// Formats `"RUSTY_GRID_TASK_ID=<uuid>\0"` into a fixed-size stack array with no heap allocation.
+/// Formats `"RUSTY_GRID_RUN_TOKEN=<uuid>\0"` into a fixed-size stack array with no heap allocation.
 #[cfg(any(unix, test))]
-pub(crate) fn build_task_env_needle(task_id: rusty_grid_core::TaskId) -> TaskEnvNeedle {
+pub(crate) fn build_task_env_needle(run_token: uuid::Uuid) -> TaskEnvNeedle {
     let mut out = [0u8; TASK_ENV_NEEDLE_LEN];
-    out[..19].copy_from_slice(b"RUSTY_GRID_TASK_ID=");
+    out[..21].copy_from_slice(b"RUSTY_GRID_RUN_TOKEN=");
     let mut uuid_buf = [0u8; 36];
-    let hyphenated = task_id.0.hyphenated().encode_lower(&mut uuid_buf);
-    out[19..55].copy_from_slice(hyphenated.as_bytes());
-    out[55] = 0;
+    let hyphenated = run_token.hyphenated().encode_lower(&mut uuid_buf);
+    out[21..57].copy_from_slice(hyphenated.as_bytes());
+    out[57] = 0;
     out
 }
 
@@ -58,7 +58,7 @@ pub(crate) fn build_task_env_needle(task_id: rusty_grid_core::TaskId) -> TaskEnv
 ///
 /// When `allow_at_start` is `true`, a match at byte offset `0` is accepted; otherwise `needle`
 /// must be immediately preceded by a `\0` separator byte.
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", test))]
 pub(crate) fn env_block_contains_needle_chunk(
     buf: &[u8],
     needle: &TaskEnvNeedle,
@@ -81,14 +81,15 @@ pub(crate) fn env_block_contains_needle_chunk(
     false
 }
 
-/// Checks whether a `\0`-delimited environment buffer contains the exact `RUSTY_GRID_TASK_ID=<uuid>\0` entry.
-#[cfg(any(unix, test))]
+/// Checks whether a `\0`-delimited environment buffer contains the exact
+/// `RUSTY_GRID_RUN_TOKEN=<uuid>\0` entry.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn env_block_contains_needle(buf: &[u8], needle: &TaskEnvNeedle) -> bool {
     env_block_contains_needle_chunk(buf, needle, true)
 }
 
 /// Formats `val` as ASCII decimal into `out` and returns the number of bytes written.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 fn format_u32_decimal(mut val: u32, out: &mut [u8; 16]) -> usize {
     if val == 0 {
         out[0] = b'0';
@@ -233,8 +234,9 @@ pub(crate) fn configure_command(
 ) -> ConfiguredCommand {
     #[cfg(unix)]
     {
+        let _ = task_id;
         ConfiguredCommand {
-            unix: imp::configure_command(cmd, priority, task_id),
+            unix: imp::configure_command(cmd, priority),
         }
     }
 
@@ -257,17 +259,22 @@ pub(crate) fn configure_command(
 #[cfg(unix)]
 mod imp {
     use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     use std::sync::Mutex;
     use tokio::process::Child;
 
-    use super::{
-        build_task_env_needle, env_block_contains_needle, env_block_contains_needle_chunk,
-        format_u32_decimal, ProcessPriority, TaskEnvNeedle, TASK_ENV_NEEDLE_LEN,
-    };
+    #[cfg(target_os = "macos")]
+    use super::env_block_contains_needle;
+    #[cfg(any(target_os = "linux", target_os = "android", test))]
+    use super::TASK_ENV_NEEDLE_LEN;
+    use super::{build_task_env_needle, ProcessPriority, TaskEnvNeedle};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use super::{env_block_contains_needle_chunk, format_u32_decimal};
 
     /// Serialises `pipe` + `fcntl(FD_CLOEXEC)` and `cmd.spawn()` on platforms without `pipe2`
-    /// (macOS) so no concurrent `fork` can inherit a lifeline pipe descriptor before `FD_CLOEXEC`
-    /// is set on it.
+    /// (macOS) so no concurrent task `fork` can inherit a lifeline pipe descriptor before
+    /// `FD_CLOEXEC` is set on it.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
     #[cfg(target_os = "linux")]
@@ -285,6 +292,8 @@ mod imp {
         pub(super) lifeline_write: Option<OwnedFd>,
         worker_pid: libc::pid_t,
         needle: TaskEnvNeedle,
+        #[cfg(target_os = "macos")]
+        spawn_tvsec: u64,
         #[cfg(target_os = "linux")]
         pub(super) cgroup_leaf: Option<CgroupLeaf>,
     }
@@ -297,6 +306,8 @@ mod imp {
         pub(super) pgid: libc::pid_t,
         worker_pid: libc::pid_t,
         needle: TaskEnvNeedle,
+        #[cfg(target_os = "macos")]
+        spawn_tvsec: u64,
         #[cfg(target_os = "linux")]
         cgroup_path_cstr: [u8; CGROUP_PATH_CAP],
         #[cfg(target_os = "linux")]
@@ -320,6 +331,8 @@ mod imp {
                 pgid,
                 worker_pid: 0,
                 needle: [0u8; TASK_ENV_NEEDLE_LEN],
+                #[cfg(target_os = "macos")]
+                spawn_tvsec: 0,
                 #[cfg(target_os = "linux")]
                 cgroup_path_cstr: [0u8; CGROUP_PATH_CAP],
                 #[cfg(target_os = "linux")]
@@ -405,12 +418,12 @@ mod imp {
     }
 
     #[cfg(target_os = "linux")]
-    fn prepare_cgroup_leaf(task_id: rusty_grid_core::TaskId) -> Option<CgroupLeaf> {
+    fn prepare_cgroup_leaf(run_token: uuid::Uuid) -> Option<CgroupLeaf> {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::OpenOptionsExt;
 
         let base = delegated_cgroup_base()?;
-        let leaf_dir = base.join(format!("oxideswarm-task-{task_id}"));
+        let leaf_dir = base.join(format!("oxideswarm-run-{run_token}"));
         let raw_bytes = leaf_dir.as_os_str().as_bytes();
         if raw_bytes.is_empty() || raw_bytes.len() + 1 > CGROUP_PATH_CAP || raw_bytes.contains(&0) {
             return None;
@@ -440,6 +453,30 @@ mod imp {
             procs_fd: OwnedFd::from(procs_file),
             kill_fd: kill_file.map(OwnedFd::from),
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe fn rmdir_cgroup_leaf_with_retry(path_cstr: &[u8; CGROUP_PATH_CAP]) {
+        if path_cstr[0] == 0 {
+            return;
+        }
+        let ptr = path_cstr.as_ptr().cast::<libc::c_char>();
+        let mut attempt = 0;
+        while attempt < 6 {
+            if libc::rmdir(ptr) == 0 {
+                return;
+            }
+            let err = std::io::Error::last_os_error().raw_os_error();
+            if err != Some(libc::EBUSY) {
+                return;
+            }
+            let req = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 5_000_000,
+            };
+            let _ = libc::nanosleep(&req, std::ptr::null_mut());
+            attempt += 1;
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -479,10 +516,10 @@ mod imp {
                 }
             }
         }
-        let _ = libc::rmdir(path_cstr.as_ptr().cast::<libc::c_char>());
+        rmdir_cgroup_leaf_with_retry(path_cstr);
     }
 
-    unsafe fn close_fds_except(keep: &[libc::c_int]) {
+    unsafe fn close_fds_except(keep: &[libc::c_int], max_nofile: libc::c_int) {
         let mut max_keep: libc::c_int = -1;
         for &fd in keep {
             if fd > max_keep {
@@ -505,7 +542,10 @@ mod imp {
             fd += 1;
         }
 
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        // Bionic's app seccomp filter only added `close_range` in Android 13 (API 33), while our
+        // `minSdk` is 24. Never call `SYS_close_range` on Android so API 26-32 does not trap with
+        // `SIGSYS`; use the bounded `close` loop below instead.
+        #[cfg(target_os = "linux")]
         {
             let first_after = (max_keep + 1) as libc::c_uint;
             let last_fd = libc::c_uint::MAX;
@@ -515,20 +555,8 @@ mod imp {
             }
         }
 
-        let mut rlim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        #[allow(clippy::unnecessary_cast)]
-        let max_fd: libc::c_int =
-            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 && rlim.rlim_cur > 0 {
-                (rlim.rlim_cur as u64).min(16384) as libc::c_int
-            } else {
-                4096
-            };
-
         let mut fd = max_keep + 1;
-        while fd < max_fd {
+        while fd < max_nofile {
             let _ = libc::close(fd);
             fd += 1;
         }
@@ -544,8 +572,9 @@ mod imp {
             return 0;
         }
         let self_pid = libc::getpid();
+        let my_euid = libc::geteuid();
         let proc_fd = libc::open(
-            b"/proc\0".as_ptr().cast::<libc::c_char>(),
+            c"/proc".as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         );
         if proc_fd < 0 {
@@ -613,6 +642,12 @@ mod imp {
                     continue;
                 }
 
+                let mut st: libc::stat = std::mem::zeroed();
+                if libc::fstat(env_fd, &mut st) == 0 && st.st_uid != my_euid {
+                    let _ = libc::close(env_fd);
+                    continue;
+                }
+
                 let mut matched = false;
                 let mut carry = 0usize;
                 let mut first_chunk = true;
@@ -654,6 +689,7 @@ mod imp {
         task_pgid: libc::pid_t,
         worker_pid: libc::pid_t,
         needle: &TaskEnvNeedle,
+        spawn_tvsec: u64,
     ) -> usize {
         if needle[0] == 0 {
             return 0;
@@ -671,35 +707,8 @@ mod imp {
         }
         let count = (n_pids as usize).min(pids.len());
 
-        let mut arg_max_int: libc::c_int = 0;
-        let mut arg_max_size: libc::size_t = std::mem::size_of::<libc::c_int>();
-        let mut max_mib: [libc::c_int; 2] = [libc::CTL_KERN, libc::KERN_ARGMAX];
-        let buf_cap: libc::size_t = if libc::sysctl(
-            max_mib.as_mut_ptr(),
-            2,
-            (&mut arg_max_int as *mut libc::c_int).cast::<libc::c_void>(),
-            &mut arg_max_size,
-            std::ptr::null_mut(),
-            0,
-        ) == 0
-            && arg_max_int > 4096
-        {
-            (arg_max_int as usize).min(4 * 1024 * 1024)
-        } else {
-            1024 * 1024
-        };
-
-        let buf_ptr = libc::mmap(
-            std::ptr::null_mut(),
-            buf_cap,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
-        );
-        if buf_ptr == libc::MAP_FAILED || buf_ptr.is_null() {
-            return 0;
-        }
+        let mut buf_ptr: *mut libc::c_void = std::ptr::null_mut();
+        let mut buf_cap: libc::size_t = 0;
 
         let mut killed = 0usize;
         for &pid in &pids[..count] {
@@ -714,11 +723,46 @@ mod imp {
                 (&mut bsd_info as *mut libc::proc_bsdinfo).cast::<libc::c_void>(),
                 std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
             );
-            if info_rc == std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int
-                && bsd_info.pbi_uid != my_euid
-                && bsd_info.pbi_ruid != my_euid
-            {
+            if info_rc != std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int {
                 continue;
+            }
+            if bsd_info.pbi_uid != my_euid && bsd_info.pbi_ruid != my_euid {
+                continue;
+            }
+            if bsd_info.pbi_start_tvsec < spawn_tvsec {
+                continue;
+            }
+
+            if buf_ptr.is_null() {
+                let mut arg_max_int: libc::c_int = 0;
+                let mut arg_max_size: libc::size_t = std::mem::size_of::<libc::c_int>();
+                let mut max_mib: [libc::c_int; 2] = [libc::CTL_KERN, libc::KERN_ARGMAX];
+                buf_cap = if libc::sysctl(
+                    max_mib.as_mut_ptr(),
+                    2,
+                    (&mut arg_max_int as *mut libc::c_int).cast::<libc::c_void>(),
+                    &mut arg_max_size,
+                    std::ptr::null_mut(),
+                    0,
+                ) == 0
+                    && arg_max_int > 4096
+                {
+                    (arg_max_int as usize).min(4 * 1024 * 1024)
+                } else {
+                    1024 * 1024
+                };
+                let mapped = libc::mmap(
+                    std::ptr::null_mut(),
+                    buf_cap,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                );
+                if mapped == libc::MAP_FAILED || mapped.is_null() {
+                    return 0;
+                }
+                buf_ptr = mapped;
             }
 
             let mut mib: [libc::c_int; 3] = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
@@ -743,7 +787,9 @@ mod imp {
             }
         }
 
-        let _ = libc::munmap(buf_ptr, buf_cap);
+        if !buf_ptr.is_null() {
+            let _ = libc::munmap(buf_ptr, buf_cap);
+        }
         killed
     }
 
@@ -759,12 +805,44 @@ mod imp {
     pub(super) fn configure_command(
         cmd: &mut tokio::process::Command,
         priority: ProcessPriority,
-        task_id: rusty_grid_core::TaskId,
     ) -> PreparedUnix {
         cmd.process_group(0);
         let nice = priority.unix_nice();
         let worker_pid = unsafe { libc::getpid() };
-        let needle = build_task_env_needle(task_id);
+        let run_token = uuid::Uuid::new_v4();
+        cmd.env("RUSTY_GRID_RUN_TOKEN", run_token.to_string());
+        let needle = build_task_env_needle(run_token);
+
+        #[cfg(target_os = "macos")]
+        let spawn_tvsec: u64 = unsafe {
+            let mut tv = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            };
+            if libc::gettimeofday(&mut tv, std::ptr::null_mut()) == 0 && tv.tv_sec > 2 {
+                (tv.tv_sec as u64).saturating_sub(2)
+            } else {
+                0
+            }
+        };
+
+        let max_nofile: libc::c_int = unsafe {
+            let mut rlim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            #[allow(clippy::unnecessary_cast)]
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 && rlim.rlim_cur > 0 {
+                let cur = rlim.rlim_cur as u64;
+                if cur < (libc::c_int::MAX as u64) {
+                    cur as libc::c_int
+                } else {
+                    65536
+                }
+            } else {
+                65536
+            }
+        };
 
         let (lifeline_read, lifeline_write) = match create_lifeline_pipe() {
             Ok((r, w)) => (Some(r), Some(w)),
@@ -774,7 +852,7 @@ mod imp {
         let write_raw = lifeline_write.as_ref().map_or(-1, AsRawFd::as_raw_fd);
 
         #[cfg(target_os = "linux")]
-        let cgroup_leaf = prepare_cgroup_leaf(task_id);
+        let cgroup_leaf = prepare_cgroup_leaf(run_token);
         #[cfg(target_os = "linux")]
         let cgroup_procs_raw = cgroup_leaf
             .as_ref()
@@ -814,17 +892,25 @@ mod imp {
 
                         let _ = libc::setsid();
                         #[cfg(target_os = "linux")]
-                        close_fds_except(&[read_raw, cgroup_procs_raw, cgroup_kill_raw]);
+                        close_fds_except(
+                            &[read_raw, cgroup_procs_raw, cgroup_kill_raw],
+                            max_nofile,
+                        );
                         #[cfg(not(target_os = "linux"))]
-                        close_fds_except(&[read_raw]);
+                        close_fds_except(&[read_raw], max_nofile);
 
                         let mut byte: u8 = 0;
+                        let mut worker_dismissed = false;
                         loop {
                             let n = libc::read(
                                 read_raw,
                                 (&mut byte as *mut u8).cast::<libc::c_void>(),
                                 1,
                             );
+                            if n > 0 {
+                                worker_dismissed = true;
+                                break;
+                            }
                             if n == 0 {
                                 break;
                             }
@@ -838,31 +924,47 @@ mod imp {
                             }
                         }
 
-                        if task_pgid > 1 {
-                            let _ = libc::killpg(task_pgid, libc::SIGTERM);
-                            let mut step = 0;
-                            while step < 10 {
-                                if libc::killpg(task_pgid, 0) != 0 {
-                                    break;
-                                }
-                                let req = libc::timespec {
-                                    tv_sec: 0,
-                                    tv_nsec: 20_000_000,
-                                };
-                                let _ = libc::nanosleep(&req, std::ptr::null_mut());
-                                step += 1;
-                            }
-                            let _ = libc::killpg(task_pgid, libc::SIGKILL);
-                        }
-
-                        #[cfg(target_os = "linux")]
-                        kill_cgroup_leaf(cgroup_kill_raw, cgroup_procs_raw, &cgroup_path_cstr);
-
-                        if kill_escaped_by_env(task_pgid, worker_pid, &needle) > 0 {
+                        if !worker_dismissed {
                             if task_pgid > 1 {
+                                let _ = libc::killpg(task_pgid, libc::SIGTERM);
+                                let mut step = 0;
+                                while step < 10 {
+                                    if libc::killpg(task_pgid, 0) != 0 {
+                                        break;
+                                    }
+                                    let req = libc::timespec {
+                                        tv_sec: 0,
+                                        tv_nsec: 20_000_000,
+                                    };
+                                    let _ = libc::nanosleep(&req, std::ptr::null_mut());
+                                    step += 1;
+                                }
                                 let _ = libc::killpg(task_pgid, libc::SIGKILL);
                             }
-                            let _ = kill_escaped_by_env(task_pgid, worker_pid, &needle);
+
+                            #[cfg(target_os = "linux")]
+                            kill_cgroup_leaf(cgroup_kill_raw, cgroup_procs_raw, &cgroup_path_cstr);
+
+                            #[cfg(target_os = "macos")]
+                            let swept =
+                                kill_escaped_by_env(task_pgid, worker_pid, &needle, spawn_tvsec);
+                            #[cfg(not(target_os = "macos"))]
+                            let swept = kill_escaped_by_env(task_pgid, worker_pid, &needle);
+
+                            if swept > 0 {
+                                if task_pgid > 1 {
+                                    let _ = libc::killpg(task_pgid, libc::SIGKILL);
+                                }
+                                #[cfg(target_os = "macos")]
+                                let _ = kill_escaped_by_env(
+                                    task_pgid,
+                                    worker_pid,
+                                    &needle,
+                                    spawn_tvsec,
+                                );
+                                #[cfg(not(target_os = "macos"))]
+                                let _ = kill_escaped_by_env(task_pgid, worker_pid, &needle);
+                            }
                         }
 
                         let _ = libc::close(read_raw);
@@ -919,6 +1021,8 @@ mod imp {
             lifeline_write,
             worker_pid,
             needle,
+            #[cfg(target_os = "macos")]
+            spawn_tvsec,
             #[cfg(target_os = "linux")]
             cgroup_leaf,
         }
@@ -951,6 +1055,8 @@ mod imp {
             pgid,
             worker_pid: prepared.worker_pid,
             needle: prepared.needle,
+            #[cfg(target_os = "macos")]
+            spawn_tvsec: prepared.spawn_tvsec,
             #[cfg(target_os = "linux")]
             cgroup_path_cstr: prepared
                 .cgroup_leaf
@@ -983,8 +1089,16 @@ mod imp {
             #[cfg(target_os = "linux")]
             kill_cgroup_leaf(id.cgroup_kill_fd, id.cgroup_procs_fd, &id.cgroup_path_cstr);
 
-            if kill_escaped_by_env(id.pgid, id.worker_pid, &id.needle) > 0 {
+            #[cfg(target_os = "macos")]
+            let swept = kill_escaped_by_env(id.pgid, id.worker_pid, &id.needle, id.spawn_tvsec);
+            #[cfg(not(target_os = "macos"))]
+            let swept = kill_escaped_by_env(id.pgid, id.worker_pid, &id.needle);
+
+            if swept > 0 {
                 signal(id.pgid, libc::SIGKILL);
+                #[cfg(target_os = "macos")]
+                let _ = kill_escaped_by_env(id.pgid, id.worker_pid, &id.needle, id.spawn_tvsec);
+                #[cfg(not(target_os = "macos"))]
                 let _ = kill_escaped_by_env(id.pgid, id.worker_pid, &id.needle);
             }
         }
@@ -992,10 +1106,8 @@ mod imp {
 
     pub(super) fn release(id: RawId) {
         #[cfg(target_os = "linux")]
-        if id.cgroup_path_cstr[0] != 0 {
-            unsafe {
-                let _ = libc::rmdir(id.cgroup_path_cstr.as_ptr().cast::<libc::c_char>());
-            }
+        unsafe {
+            rmdir_cgroup_leaf_with_retry(&id.cgroup_path_cstr);
         }
         #[cfg(not(target_os = "linux"))]
         let _ = id;
@@ -1072,11 +1184,11 @@ fn live() -> MutexGuard<'static, Vec<imp::RawId>> {
 /// task futures kills their trees as well, but a process that is terminated by the default signal
 /// action never gets to drop anything.
 pub fn terminate_all_task_process_trees() -> usize {
-    let live = live();
-    for id in live.iter() {
+    let snapshot: Vec<imp::RawId> = live().clone();
+    for id in &snapshot {
         imp::kill(*id);
     }
-    live.len()
+    snapshot.len()
 }
 
 /// The process tree of one task: a supervised process group (Unix) or a Job Object (Windows).
@@ -1131,15 +1243,18 @@ impl ProcessTree {
         self.id.is_some_and(imp::request_stop)
     }
 
-    /// Kills every process of the tree. Cheap and non-blocking (one system call), safe to repeat.
+    /// Kills every process of the tree on a blocking thread so the process-table sweep on Unix
+    /// never blocks a Tokio runtime worker thread. Safe to repeat.
     ///
     /// `live_leader` is the leader's PID, to be passed only while it has not been reaped: when the
     /// platform gave us no container (a Windows process that could not be put into a job) it is
     /// all there is to go on, and `taskkill /F /T` takes the leader and its children.
-    pub(crate) fn kill(&self, live_leader: Option<u32>) {
+    pub(crate) async fn kill_async(&self, live_leader: Option<u32>) {
         self.killed.store(true, Ordering::Release);
         match self.id {
-            Some(id) => imp::kill(id),
+            Some(id) => {
+                let _ = tokio::task::spawn_blocking(move || imp::kill(id)).await;
+            }
             None => kill_by_leader(live_leader),
         }
     }
@@ -1147,20 +1262,38 @@ impl ProcessTree {
 
 impl Drop for ProcessTree {
     fn drop(&mut self) {
-        if let Some(id) = self.id {
-            // Hold the registry across kill and release: `terminate_all_task_process_trees` must not
-            // find an id whose Windows handle or Linux cgroup descriptors have just been closed.
-            let mut live = live();
-            live.retain(|registered| *registered != id);
-            if !self.killed.load(Ordering::Acquire) {
-                imp::kill(id);
-            }
-            imp::release(id);
-        }
         #[cfg(target_os = "linux")]
-        drop(self.cgroup_leaf.take());
+        let cgroup_leaf = self.cgroup_leaf.take();
         #[cfg(unix)]
-        drop(self.lifeline_write.take());
+        let lifeline_write = self.lifeline_write.take();
+
+        if let Some(id) = self.id {
+            let already_killed = self.killed.swap(true, Ordering::AcqRel);
+            live().retain(|registered| *registered != id);
+            let finish = move || {
+                if !already_killed {
+                    imp::kill(id);
+                }
+                imp::release(id);
+                #[cfg(target_os = "linux")]
+                drop(cgroup_leaf);
+                #[cfg(unix)]
+                if let Some(w) = lifeline_write {
+                    use std::os::unix::io::AsRawFd;
+                    unsafe {
+                        let _ = libc::write(w.as_raw_fd(), b"0".as_ptr().cast::<libc::c_void>(), 1);
+                    }
+                    drop(w);
+                }
+            };
+            if !already_killed {
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn_blocking(finish);
+                    return;
+                }
+            }
+            finish();
+        }
     }
 }
 
@@ -1222,13 +1355,12 @@ mod tests {
 
     #[test]
     fn test_task_env_needle_matches_exact_nul_delimited_entry() {
-        let task_id = rusty_grid_core::TaskId(
-            uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid uuid"),
-        );
-        let needle = build_task_env_needle(task_id);
+        let run_token =
+            uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid uuid");
+        let needle = build_task_env_needle(run_token);
         assert_eq!(
             &needle[..],
-            b"RUSTY_GRID_TASK_ID=550e8400-e29b-41d4-a716-446655440000\0"
+            b"RUSTY_GRID_RUN_TOKEN=550e8400-e29b-41d4-a716-446655440000\0"
         );
 
         // Exact match at start of buffer.
@@ -1245,14 +1377,13 @@ mod tests {
 
         // Substring suffix of another variable name must not match.
         let mut fake = Vec::new();
-        fake.extend_from_slice(b"NOT_RUSTY_GRID_TASK_ID=550e8400-e29b-41d4-a716-446655440000\0");
+        fake.extend_from_slice(b"NOT_RUSTY_GRID_RUN_TOKEN=550e8400-e29b-41d4-a716-446655440000\0");
         assert!(!env_block_contains_needle(&fake, &needle));
 
-        // Different task UUID must not match.
-        let other_id = rusty_grid_core::TaskId(
-            uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001").expect("valid uuid"),
-        );
-        let other_needle = build_task_env_needle(other_id);
+        // Different run token UUID must not match.
+        let other_token =
+            uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001").expect("valid uuid");
+        let other_needle = build_task_env_needle(other_token);
         assert!(!env_block_contains_needle(&block, &other_needle));
     }
 

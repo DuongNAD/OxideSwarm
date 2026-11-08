@@ -2705,7 +2705,7 @@ impl TaskRunner {
                 // lives, so wait a bounded time, then take the tree down and keep what arrived.
                 let drained = readers.wait(self.config.pipe_drain_grace).await;
                 // Nothing the task started may outlive it: its sandbox is deleted next.
-                tree.kill(None);
+                tree.kill_async(None).await;
                 if !drained {
                     readers.wait(POST_KILL_DRAIN).await;
                 }
@@ -2798,7 +2798,7 @@ impl TaskRunner {
         if tree.request_stop() {
             let _ = tokio::time::timeout(self.config.stop_grace, child.wait()).await;
         }
-        tree.kill(child.id());
+        tree.kill_async(child.id()).await;
         // The leader at least, even where no tree could be tracked.
         let _ = child.start_kill();
         let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;

@@ -1412,6 +1412,7 @@ sys.exit(0)
 const FEAT2_HELPER_ENV: &str = "OXIDESWARM_SEC5_CRASH_CONTAINMENT_HELPER";
 const FEAT2_HELPER_PIDS_ENV: &str = "OXIDESWARM_SEC5_CRASH_CONTAINMENT_PIDS_FILE";
 const FEAT2_HELPER_SANDBOX_ENV: &str = "OXIDESWARM_SEC5_CRASH_CONTAINMENT_SANDBOX_DIR";
+const FEAT2_HELPER_COUNT_ENV: &str = "OXIDESWARM_SEC5_CRASH_CONTAINMENT_TASK_COUNT";
 
 #[tokio::test]
 async fn test_feat2_task_waitpid_minus_one_returns_echild_immediately() {
@@ -1561,6 +1562,357 @@ sys.exit(0)
 }
 
 #[tokio::test]
+async fn test_feat2_concurrent_attempts_with_same_task_id_do_not_kill_each_other() {
+    let (runner_1, _sandbox_dir_1) = create_test_runner();
+    let (runner_2, _sandbox_dir_2) = create_test_runner();
+    let work_dir = tempfile::tempdir().expect("work tempdir");
+    let attempt2_ready_file = work_dir.path().join("attempt2_ready.marker");
+    let attempt1_pids_file = work_dir.path().join("attempt1_setsid.pids");
+
+    let script_1_path = work_dir.path().join("attempt1.py");
+    let script_1 = r#"
+import os
+import subprocess
+import sys
+import time
+
+ready_file = sys.argv[1]
+pids_file = sys.argv[2]
+
+# Wait until Attempt 2 (sharing the same TaskId) is actively running.
+deadline = time.time() + 10.0
+while time.time() < deadline:
+    if os.path.exists(ready_file):
+        break
+    time.sleep(0.02)
+
+# Spawn a setsid child so Attempt 1's teardown actively performs the environment sweep.
+setsid_code = """
+import os, sys, time
+if hasattr(os, 'setsid'):
+    os.setsid()
+with open(sys.argv[1], 'a', encoding='utf-8') as f:
+    f.write(f'PID:{os.getpid()}\\n')
+    f.flush()
+    os.fsync(f.fileno())
+time.sleep(60)
+"""
+subprocess.Popen(
+    [sys.executable, "-c", setsid_code, pids_file],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    close_fds=True,
+)
+
+deadline = time.time() + 10.0
+while time.time() < deadline:
+    if os.path.exists(pids_file):
+        with open(pids_file, "r", encoding="utf-8") as f:
+            if "PID:" in f.read():
+                break
+    time.sleep(0.02)
+
+print("ATTEMPT_1_DONE", flush=True)
+sys.exit(0)
+"#;
+    std::fs::write(&script_1_path, script_1).expect("write script_1");
+
+    let script_2_path = work_dir.path().join("attempt2.py");
+    let script_2 = r#"
+import os
+import sys
+import time
+
+ready_file = sys.argv[1]
+with open(ready_file, "w", encoding="utf-8") as f:
+    f.write(f"PID:{os.getpid()}\n")
+    f.flush()
+    os.fsync(f.fileno())
+
+# Stay alive across Attempt 1's completion and sweep.
+time.sleep(0.6)
+print("ATTEMPT_2_DONE", flush=True)
+sys.exit(0)
+"#;
+    std::fs::write(&script_2_path, script_2).expect("write script_2");
+
+    let py_exe = get_python_exe().to_string_lossy().to_string();
+    let shared_task_id = TaskId::new();
+
+    let mut task_1 = Task::new(
+        TaskSpec::Command {
+            program: py_exe.clone(),
+            args: vec![
+                script_1_path.to_string_lossy().to_string(),
+                attempt2_ready_file.to_string_lossy().to_string(),
+                attempt1_pids_file.to_string_lossy().to_string(),
+            ],
+            env: Default::default(),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements {
+            timeout_secs: 20,
+            ..Default::default()
+        },
+    );
+    task_1.id = shared_task_id;
+
+    let mut task_2 = Task::new(
+        TaskSpec::Command {
+            program: py_exe,
+            args: vec![
+                script_2_path.to_string_lossy().to_string(),
+                attempt2_ready_file.to_string_lossy().to_string(),
+            ],
+            env: Default::default(),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements {
+            timeout_secs: 20,
+            ..Default::default()
+        },
+    );
+    task_2.id = shared_task_id;
+
+    let (res_1, res_2) = tokio::join!(
+        runner_1.execute_task(&task_1, None, None),
+        runner_2.execute_task(&task_2, None, None)
+    );
+
+    assert!(
+        res_1.is_success(),
+        "Attempt 1 failed: exit_code={}, error={:?}, stderr={}",
+        res_1.exit_code,
+        res_1.error,
+        res_1.stderr_str()
+    );
+    assert!(
+        res_2.is_success(),
+        "Attempt 2 (same TaskId) must not be killed by Attempt 1's sweep: exit_code={}, error={:?}, stderr={}",
+        res_2.exit_code,
+        res_2.error,
+        res_2.stderr_str()
+    );
+    assert!(
+        res_2.stdout_str().contains("ATTEMPT_2_DONE"),
+        "Attempt 2 stdout missing ATTEMPT_2_DONE: {}",
+        res_2.stdout_str()
+    );
+
+    let attempt1_pids = poll_pids_async(&attempt1_pids_file, 1, Duration::from_secs(2)).await;
+    assert_eq!(attempt1_pids.len(), 1);
+    assert_all_dead_async(&attempt1_pids, Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn test_feat2_short_task_finishes_under_one_second_without_pipe_note() {
+    let (runner, _sandbox_dir) = create_test_runner();
+    let py_exe = get_python_exe().to_string_lossy().to_string();
+    let task = Task::new(
+        TaskSpec::Command {
+            program: py_exe,
+            args: vec!["-c".to_string(), "print('SHORT_TASK_OK')".to_string()],
+            env: Default::default(),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements {
+            timeout_secs: 15,
+            ..Default::default()
+        },
+    );
+
+    let t0 = Instant::now();
+    let res = runner.execute_task(&task, None, None).await;
+    let elapsed = t0.elapsed();
+
+    assert!(
+        res.is_success(),
+        "Short task failed: exit_code={}, error={:?}, stderr={}",
+        res.exit_code,
+        res.error,
+        res.stderr_str()
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "Short task must finish in under 1s (supervisor must not hold stdout/stderr open); took {elapsed:?}"
+    );
+    assert!(
+        !res.stderr_str().contains("kept the output pipes open"),
+        "Short task stderr must not contain the pipe-drain note, got: {}",
+        res.stderr_str()
+    );
+}
+
+#[cfg(unix)]
+fn find_other_processes_with_current_exe() -> Vec<u32> {
+    let current_pid = std::process::id();
+    let current_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(&p).ok().or(Some(p)));
+    let current_name = current_exe
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes();
+    let mut out = Vec::new();
+    for (pid, proc_info) in sys.processes() {
+        let pid_u32 = pid.as_u32();
+        if pid_u32 == current_pid {
+            continue;
+        }
+        let exe_matches = match (proc_info.exe(), current_exe.as_ref()) {
+            (Some(p), Some(cur)) => {
+                p == cur.as_path()
+                    || std::fs::canonicalize(p)
+                        .ok()
+                        .is_some_and(|canon| &canon == cur)
+            }
+            _ => false,
+        };
+        let name_matches = !current_name.is_empty() && proc_info.name() == current_name;
+        if exe_matches || name_matches {
+            out.push(pid_u32);
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn test_feat2_supervisor_processes_exit_within_one_second_after_normal_end() {
+    let (runner, _sandbox_dir) = create_test_runner();
+    #[cfg(unix)]
+    let baseline = find_other_processes_with_current_exe();
+
+    let py_exe = get_python_exe().to_string_lossy().to_string();
+    for _ in 0..3 {
+        let task = Task::new(
+            TaskSpec::Command {
+                program: py_exe.clone(),
+                args: vec![
+                    "-c".to_string(),
+                    "import time; time.sleep(0.05)".to_string(),
+                ],
+                env: Default::default(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements {
+                timeout_secs: 15,
+                ..Default::default()
+            },
+        );
+        let res = runner.execute_task(&task, None, None).await;
+        assert!(res.is_success(), "Task failed: {:?}", res.error);
+    }
+
+    #[cfg(unix)]
+    {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let leftover: Vec<u32> = find_other_processes_with_current_exe()
+                .into_iter()
+                .filter(|pid| !baseline.contains(pid))
+                .collect();
+            if leftover.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Supervisor process(es) {:?} still alive 1s after normal task end",
+                leftover
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn test_feat2_macos_platform_binary_setsid_escape_documented() {
+    if !std::path::Path::new("/usr/bin/perl").is_file() {
+        return;
+    }
+    let (runner, _sandbox_dir) = create_test_runner();
+    let work_dir = tempfile::tempdir().expect("work tempdir");
+    let pids_file = work_dir.path().join("perl_platform_setsid.pids");
+
+    // Spawn Apple platform binary `/usr/bin/perl` that detaches with `POSIX::setsid()`.
+    // On macOS with SIP enabled, `sysctl(KERN_PROCARGS2)` omits `envp` for Apple platform
+    // binaries, so this test documents that `/usr/bin/perl` is an expected escape from the
+    // user-space environment sweep on macOS and cleans up the process before returning.
+    let perl_code = r#"
+use POSIX qw(setsid);
+my $pids_file = $ARGV[0];
+my $pid = fork();
+if (defined $pid && $pid == 0) {
+    setsid();
+    open(my $fh, '>>', $pids_file) or exit(1);
+    print $fh "PID:$$\n";
+    close($fh);
+    sleep(60);
+    exit(0);
+}
+for (1..200) {
+    last if -s $pids_file;
+    select(undef, undef, undef, 0.02);
+}
+exit(0);
+"#;
+
+    let task = Task::new(
+        TaskSpec::Command {
+            program: "/usr/bin/perl".to_string(),
+            args: vec![
+                "-e".to_string(),
+                perl_code.to_string(),
+                pids_file.to_string_lossy().to_string(),
+            ],
+            env: Default::default(),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements {
+            timeout_secs: 15,
+            ..Default::default()
+        },
+    );
+
+    let res = runner.execute_task(&task, None, None).await;
+    assert!(
+        res.is_success(),
+        "/usr/bin/perl task failed: exit_code={}, stderr={}",
+        res.exit_code,
+        res.stderr_str()
+    );
+
+    let pids = poll_pids_async(&pids_file, 1, Duration::from_secs(2)).await;
+    assert_eq!(
+        pids.len(),
+        1,
+        "Expected 1 perl PID in {}",
+        pids_file.display()
+    );
+    let perl_pid = pids[0] as libc::pid_t;
+
+    let escaped = unsafe { libc::kill(perl_pid, 0) == 0 };
+    // Clean up unconditionally so the test never leaves a stray `/usr/bin/perl` on the host.
+    unsafe {
+        let _ = libc::kill(perl_pid, libc::SIGKILL);
+    }
+    assert_all_dead_async(&pids, Duration::from_secs(2)).await;
+    println!(
+        "Documented macOS platform binary (/usr/bin/perl) setsid behaviour (escaped_env_sweep={escaped})"
+    );
+}
+
+#[tokio::test]
 async fn feat2_worker_subprocess_helper() {
     if std::env::var(FEAT2_HELPER_ENV).ok().as_deref() != Some("1") {
         return;
@@ -1572,12 +1924,23 @@ async fn feat2_worker_subprocess_helper() {
     let sandbox_dir = std::path::PathBuf::from(
         std::env::var(FEAT2_HELPER_SANDBOX_ENV).expect("missing FEAT2_HELPER_SANDBOX_ENV"),
     );
+    let task_count: usize = std::env::var(FEAT2_HELPER_COUNT_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
 
     let sandbox_config = SandboxConfig::new(sandbox_dir.clone());
     let runner_config = RunnerConfig::new(sandbox_config);
-    let mut caps = WorkerCapabilities::new("crash_victim_worker", 4, 8192, false, false, None);
+    let mut caps = WorkerCapabilities::new(
+        "crash_victim_worker",
+        task_count.max(4),
+        8192,
+        false,
+        false,
+        None,
+    );
     caps.has_cuda = false;
-    let runner = TaskRunner::new(uuid::Uuid::new_v4(), caps, runner_config);
+    let runner = std::sync::Arc::new(TaskRunner::new(uuid::Uuid::new_v4(), caps, runner_config));
 
     let script_path = sandbox_dir.join("victim_tree.py");
     let script = r#"
@@ -1635,40 +1998,48 @@ time.sleep(300)
     f.write_all(script.as_bytes()).expect("write victim script");
     drop(f);
 
-    let py_exe = get_python_exe();
-    let spec = TaskSpec::Command {
-        program: py_exe.to_string_lossy().to_string(),
-        args: vec![
-            script_path.to_string_lossy().to_string(),
-            pids_file.to_string_lossy().to_string(),
-        ],
-        env: Default::default(),
-        working_dir: None,
-        stdin: None,
-    };
-    let requirements = TaskRequirements {
-        timeout_secs: 300,
-        ..Default::default()
-    };
-    let task = Task::new(spec, requirements);
-
-    let _ = runner.execute_task(&task, None, None).await;
+    let py_exe = get_python_exe().to_string_lossy().to_string();
+    let mut handles = Vec::with_capacity(task_count);
+    for _ in 0..task_count {
+        let runner_clone = std::sync::Arc::clone(&runner);
+        let prog = py_exe.clone();
+        let s_path = script_path.to_string_lossy().to_string();
+        let p_path = pids_file.to_string_lossy().to_string();
+        handles.push(tokio::spawn(async move {
+            let spec = TaskSpec::Command {
+                program: prog,
+                args: vec![s_path, p_path],
+                env: Default::default(),
+                working_dir: None,
+                stdin: None,
+            };
+            let requirements = TaskRequirements {
+                timeout_secs: 300,
+                ..Default::default()
+            };
+            let task = Task::new(spec, requirements);
+            let _ = runner_clone.execute_task(&task, None, None).await;
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
 }
 
-#[tokio::test]
-async fn test_feat2_worker_sigkill_terminates_child_grandchild_and_setsid_descendants_within_five_seconds(
-) {
+async fn run_worker_sigkill_containment_test(task_count: usize) {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let pids_file = temp_dir.path().join("crash_descendants.pids");
     let sandbox_dir = temp_dir.path().join("worker_sandbox");
     std::fs::create_dir_all(&sandbox_dir).expect("create sandbox dir");
 
+    let expected_pids = task_count * 3;
     let current_exe = std::env::current_exe().expect("current_exe");
     let mut worker_proc = tokio::process::Command::new(&current_exe)
         .args(["--exact", "feat2_worker_subprocess_helper", "--nocapture"])
         .env(FEAT2_HELPER_ENV, "1")
         .env(FEAT2_HELPER_PIDS_ENV, &pids_file)
         .env(FEAT2_HELPER_SANDBOX_ENV, &sandbox_dir)
+        .env(FEAT2_HELPER_COUNT_ENV, task_count.to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1678,11 +2049,12 @@ async fn test_feat2_worker_sigkill_terminates_child_grandchild_and_setsid_descen
     #[cfg_attr(not(unix), allow(unused_variables))]
     let worker_pid = worker_proc.id().expect("worker pid");
 
-    let pids = poll_pids_async(&pids_file, 3, Duration::from_secs(20)).await;
-    if pids.len() < 3 {
+    let pids = poll_pids_async(&pids_file, expected_pids, Duration::from_secs(30)).await;
+    if pids.len() < expected_pids {
         let _ = worker_proc.kill().await;
         panic!(
-            "Timed out waiting for 3 descendant PIDs (child, grandchild, setsid); got {:?}",
+            "Timed out waiting for {expected_pids} descendant PIDs across {task_count} task(s); got {} ({:?})",
+            pids.len(),
             pids
         );
     }
@@ -1702,4 +2074,15 @@ async fn test_feat2_worker_sigkill_terminates_child_grandchild_and_setsid_descen
     let _ = worker_proc.wait().await;
 
     assert_all_dead_async(&pids, Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn test_feat2_worker_sigkill_terminates_child_grandchild_and_setsid_descendants_within_five_seconds(
+) {
+    run_worker_sigkill_containment_test(1).await;
+}
+
+#[tokio::test]
+async fn test_feat2_eight_concurrent_tasks_all_contained_after_worker_sigkill() {
+    run_worker_sigkill_containment_test(8).await;
 }

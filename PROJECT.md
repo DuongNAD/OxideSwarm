@@ -20,7 +20,7 @@ The repository is organized into four cleanly decoupled functional layers:
 - **Cluster Secret Authentication**: A 32-byte cryptographic hex secret (`~/.oxideswarm/cluster.secret`) authenticates nodes via mutual HMAC-SHA256 challenge-response before exchanging wire frames on TCP (port 8088), Iroh QUIC streams, and UDP discovery beacons (port 8089).
 - **Transport Security**: Plain TCP connections on trusted LANs are authenticated via HMAC-SHA256; remote WAN connections leverage Iroh QUIC with TLS encryption. Authenticated stream encryption (`0x04`) via ChaCha20-Poly1305 secures non-loopback TCP frames.
 - **Web Dashboard Security**: Axum HTTP dashboard on port 8080 binds to loopback (`127.0.0.1:8080`) by default. LAN access requires explicit `--web-ui-addr 0.0.0.0:8080` and authentication via token (`oxideswarm secret show --dashboard-token`).
-- **Process & Privilege Isolation**: Worker tasks execute under unprivileged user accounts (never root or LocalSystem). On Windows, services run under virtual account `NT SERVICE\OxideSwarmWorker`. Child processes are contained via Windows Job Objects (`kill-on-close`) and Unix process groups with `PR_SET_PDEATHSIG`.
+- **Process & Privilege Isolation**: Worker tasks execute under unprivileged user accounts (never root or LocalSystem). On Windows, services run under virtual account `NT SERVICE\OxideSwarmWorker`. Child processes are contained via Windows Job Objects (`kill-on-close`) and Unix process groups supervised by a double-forked lifeline-pipe supervisor ([design 0031](docs/design/0031-containment-after-worker-crash.md)).
 - **Network Ports**:
   - `8088/tcp`: Master Grid coordinator listener (and default `agent-mesh hub` listener; rebind hub to `8090` when co-located).
   - `8080/tcp`: Master Web Dashboard & REST API (and Worker standby HTTP 307 redirect portal).
@@ -90,7 +90,7 @@ OxideSwarm/
 | **CLI** | Cluster Check | `oxideswarm doctor`: connection, workers, pinned in-process / process / GPU probes, spreading (checks C1-C6) | Implemented |
 | **CLI** | Task Inputs | `submit --stdin-file`, `--script-file`, `--interpreter`, `--env`; `--matrix-dim` / `--work-group-size` for GPU tasks | Implemented |
 | **Worker Engine** | Execution Runner | Bounded head-and-tail stdout/stderr capture ([design 0022](docs/design/0022-head-and-tail-stream-capture.md)), cancellation, configurable process priority | Implemented |
-| **Worker Engine** | Child Containment | Windows Job Objects (`kill-on-close` via `CREATE_SUSPENDED`, with a `taskkill /F /T` fallback if job assignment fails) cover the process tree; Linux `PR_SET_PDEATHSIG` covers the direct child only on worker crash; macOS and Android have no kernel parent-death containment on worker crash | Partial |
+| **Worker Engine** | Child Containment | Windows Job Objects (`kill-on-close` via `CREATE_SUSPENDED`, with a `taskkill /F /T` fallback if job assignment fails) and Unix process groups with a double-forked lifeline-pipe supervisor, optional Linux cgroup v2 leaf, and per-attempt `RUSTY_GRID_RUN_TOKEN` `setsid()` sweep ([design 0031](docs/design/0031-containment-after-worker-crash.md)) | Implemented |
 | **Worker Engine** | GPU Acceleration | Hardware `wgpu` compute engine (Metal, Vulkan, DX12) and simulated CPU SIMD fallback | Implemented |
 | **Android Bridge** | In-Process JNI | `liboxideworker.so` cdylib running the Android worker inside Tokio runtime threads (the Android app is a worker only) | Implemented |
 | **Android Bridge** | Cluster Secret Auth | Native secret injection (`nativeSetClusterSecret`) | Partial |
