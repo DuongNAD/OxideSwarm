@@ -76,8 +76,15 @@ impl Drop for ScopedEnvVar {
 
 /// Resolves a runnable Python interpreter (`OXIDESWARM_PYTHON`, `.venv`, `python`, or `python3`).
 pub fn get_python_exe() -> PathBuf {
+    #[cfg(feature = "3d")]
     if let Some(py) = rusty_grid_worker::gen3d::runner::resolve_python_runtime() {
         return py;
+    }
+    if let Ok(env_py) = std::env::var("OXIDESWARM_PYTHON") {
+        let p = PathBuf::from(env_py.trim());
+        if p.exists() {
+            return p;
+        }
     }
     #[cfg(windows)]
     {
@@ -93,6 +100,7 @@ pub fn get_python_exe() -> PathBuf {
 ///
 /// When `RUSTY_GRID_REQUIRE_BLENDER=1` (or `true`) is set in the environment, a missing
 /// Blender installation panics instead of skipping.
+#[cfg(feature = "3d")]
 pub fn blender_binary_or_skip(test: &str) -> Option<PathBuf> {
     if let Some(bin) = rusty_grid_worker::autorig::blender_provider::resolve_blender_binary(None) {
         Some(bin)

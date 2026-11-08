@@ -264,8 +264,9 @@ existing guard test(s):
 ### D6 Gate `gen3d` and `autorig` behind Cargo feature `3d`
 
 1. **Cargo feature and worker compilation:**
-   - In `crates/worker/Cargo.toml`, add `3d = []` under `[features]`. In `crates/cli/Cargo.toml`
-     and `crates/master/Cargo.toml`, add `3d = ["rusty_grid_worker/3d"]`.
+   - In `crates/worker/Cargo.toml`, add `3d = []` under `[features]`. In `crates/cli/Cargo.toml`,
+     `crates/master/Cargo.toml`, and `crates/agent_mesh/Cargo.toml`, add `3d` forwarding to
+     `rusty_grid_worker/3d`.
    - In `crates/worker/src/lib.rs`, gate `pub mod autorig;` and `pub mod gen3d;` with
      `#[cfg(feature = "3d")]`.
    - In `crates/worker/src/runner.rs`, compile the full `execute_generative_3d_workload` and
@@ -313,6 +314,10 @@ existing guard test(s):
          `TaskSpec::Generative3D`/`AutoRig`; gate the `TaskRunner` 3D execution tests with
          `#[cfg(feature = "3d")]`, and update the scheduler tests to register workers with
          `ProtocolCapabilities::THREE_D` when testing 3D placement)
+       - `crates/agent_mesh/tests/test_challenger_m4_mesh_tampering_and_burst.rs` and
+         `tests/test_ecosystem_convergence.rs` (keep non-3D tests in default builds; gate the five
+         in-process worker 3D tests with `#[cfg(feature = "3d")]` and run them in the `--features 3d`
+         CI step)
      - **Core/CLI-flag-only targets (use only `rusty_grid_core::TaskSpec`, which stays
        unconditional; run in default builds unchanged):**
        - `crates/cli/tests/test_bug2_cli_flags.rs`
