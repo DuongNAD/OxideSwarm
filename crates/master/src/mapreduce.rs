@@ -7,7 +7,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 use tracing::{info, warn};
 
 use futures::stream::{self, StreamExt};
@@ -1415,7 +1416,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_wait_only_times_out_when_the_whole_job_stalls() {
         let (engine, _queue, waiters) = engine_fixture();
         let task = Task::new(
@@ -1424,6 +1425,7 @@ mod tests {
         );
         let task_id = task.id;
         let progress = Arc::new(JobProgress::new());
+        let started = Instant::now();
 
         // Other tasks of the job keep finishing every 50 ms (progress), while this one queues for
         // 600 ms: far longer than its 300 ms timeout.
@@ -1457,6 +1459,32 @@ mod tests {
         assert!(
             outcome.is_ok(),
             "job-level progress keeps a queued task's wait alive: {outcome:?}"
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(600),
+            "task must have waited at least 600 ms across 300 ms timeout window"
+        );
+
+        // Once job-level progress stops, a stalled task times out after the 300 ms window.
+        let stalled_task = Task::new(
+            TaskSpec::command("echo", vec!["stalled".into()]),
+            TaskRequirements::generic(1, 60),
+        );
+        let stall_start = Instant::now();
+        let stall_outcome = engine
+            .submit_and_await(
+                stalled_task,
+                std::time::Duration::from_millis(300),
+                Some(&progress),
+            )
+            .await;
+        assert!(
+            matches!(stall_outcome, Err(GridError::Timeout { .. })),
+            "expected Timeout when whole job stalls, got {stall_outcome:?}"
+        );
+        assert!(
+            stall_start.elapsed() >= std::time::Duration::from_millis(300),
+            "stalled wait must not time out before the 300 ms window"
         );
     }
 
@@ -1756,7 +1784,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_mapreduce_resets_execution_clock_after_queue_wait() {
         // Item 1: `own_start` must be reset after `try_submit_slot` succeeds so that time
         // spent waiting for queue room does not consume the partition's execution timeout.
