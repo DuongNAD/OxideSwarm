@@ -510,6 +510,9 @@ fn required_features(task: &Task) -> ProtocolCapabilities {
     if matches!(task.spec, TaskSpec::Generative3D(_) | TaskSpec::AutoRig(_)) {
         features.insert(ProtocolCapabilities::THREE_D);
     }
+    if task.workspace.is_some() {
+        features.insert(ProtocolCapabilities::WORKSPACES);
+    }
     features
 }
 
@@ -7392,5 +7395,67 @@ mod tests {
         let late = queue.adopt_session_tasks(worker_id, 3, &[t_adopted]).await;
         assert!(late.adopted.is_empty());
         assert_eq!(late.stale_to_cancel, vec![t_adopted]);
+    }
+
+    #[tokio::test]
+    async fn test_workspace_tasks_are_not_placed_on_workers_without_the_workspaces_bit() {
+        use crate::registry::{WorkerInfo, WorkerStatus};
+        use crate::scheduler::{ScheduleSkipReason, SchedulerConfig, WorkloadScheduler};
+        use rusty_grid_core::capabilities::WorkerCapabilities;
+        use rusty_grid_core::task::WorkspaceRef;
+
+        let ws_task = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("agent-1"));
+        let plain_task = Task::new(
+            TaskSpec::new_command("echo", vec![]),
+            TaskRequirements::generic(1, 30),
+        );
+        assert!(TaskView::of(&ws_task)
+            .required_features
+            .contains(ProtocolCapabilities::WORKSPACES));
+        assert!(!TaskView::of(&plain_task)
+            .required_features
+            .contains(ProtocolCapabilities::WORKSPACES));
+
+        let worker = |features| WorkerInfo {
+            worker_id: Uuid::new_v4(),
+            session_id: 1,
+            capabilities: WorkerCapabilities::new("w", 4, 8192, false, false, None),
+            features,
+            status: WorkerStatus::Connected,
+            last_heartbeat_timestamp: 1000,
+            registered_timestamp: 1000,
+            active_tasks: 0,
+            remote_addr: "127.0.0.1:9000".into(),
+            cpu_usage_pct: 0.0,
+            ram_available_mb: 8192,
+            mobile_status: None,
+        };
+        let cfg = SchedulerConfig::default();
+        let tasks = vec![ws_task.clone(), plain_task.clone()];
+
+        // `all_supported()` does not carry the bit: the workspace task waits, the plain one runs.
+        let w = worker(ProtocolCapabilities::all_supported());
+        let report = WorkloadScheduler::matchmake(&cfg, &tasks, std::slice::from_ref(&w));
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].task_id, plain_task.id);
+        assert_eq!(report.skipped.len(), 1);
+        match &report.skipped[0].1 {
+            ScheduleSkipReason::ClusterLacksCapability(msg) => {
+                assert!(msg.contains("WORKSPACES"), "{msg}")
+            }
+            other => panic!("expected ClusterLacksCapability, got {other:?}"),
+        }
+
+        // A worker that advertises the bit gets both.
+        let mut features = ProtocolCapabilities::all_supported();
+        features.insert(ProtocolCapabilities::WORKSPACES);
+        let w = worker(features);
+        let report = WorkloadScheduler::matchmake(&cfg, &tasks, std::slice::from_ref(&w));
+        assert!(report.skipped.is_empty());
+        assert!(report.assignments.iter().any(|a| a.task_id == ws_task.id));
     }
 }

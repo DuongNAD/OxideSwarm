@@ -90,8 +90,14 @@ use crate::queue::{RetryAttempt, TaskState};
 pub const JOURNAL_MAGIC: &[u8; 8] = b"OXSWJRN1";
 /// Magic bytes at the start of `snapshot.bin`.
 pub const SNAPSHOT_MAGIC: &[u8; 8] = b"OXSWSNP1";
-/// On-disk layout version understood by this module.
-pub const STORE_FORMAT_VERSION: u32 = 1;
+/// On-disk layout version written by this module. Version 2 appended `Task::workspace` to the
+/// bincode form of `Task` (protocol version 6).
+pub const STORE_FORMAT_VERSION: u32 = 2;
+/// Oldest layout version this module still opens. A version 1 journal can only hold records of
+/// the old `Task` layout, and the protocol version in its header (below 6) refuses those records
+/// (`read_journal`); a version 1 snapshot is JSON and carries over unchanged, as does a version 1
+/// journal with no records, so the clean-shutdown upgrade of `DEPLOYMENT.md` 3.5 keeps working.
+pub const MIN_STORE_FORMAT_VERSION: u32 = 1;
 /// Size of the file header in bytes.
 pub const HEADER_LEN: usize = 24;
 /// Size of a journal frame header: `payload_len` (4), `len_check` (4) and the BLAKE3 hash (32).
@@ -767,7 +773,12 @@ fn prepare_dir(dir: &Path) -> GridResult<()> {
             .create(dir)
             .map_err(|e| storage_io(dir, "create the state directory", e))?;
     }
-    #[cfg(not(unix))]
+    // Windows: a new directory gets a protected DACL for the current user, SYSTEM and
+    // Administrators (SEC-9, design 0047); the files created in it inherit it.
+    #[cfg(windows)]
+    rusty_grid_core::private_file::create_private_dir_all(dir)
+        .map_err(|e| storage_io(dir, "create the state directory", e))?;
+    #[cfg(not(any(unix, windows)))]
     std::fs::create_dir_all(dir).map_err(|e| storage_io(dir, "create the state directory", e))?;
 
     let meta = std::fs::symlink_metadata(dir)
@@ -815,8 +826,9 @@ fn prepare_dir(dir: &Path) -> GridResult<()> {
                 dir.display()
             )));
         }
-        // TODO(FEAT-1): restrict the DACL to the current user, SYSTEM and Administrators
-        // (design 0046 D1.3); until then the directory inherits its parent's ACL.
+        // An existing directory keeps its DACL; warn (never refuse) when it is open to others,
+        // as Unix tightens a wide mode (design 0046 D1.3, design 0047).
+        rusty_grid_core::private_file::warn_if_readable_by_others(dir, "task store directory");
     }
     Ok(())
 }
@@ -873,9 +885,9 @@ fn parse_header(path: &Path, magic: &[u8; 8], bytes: &[u8]) -> GridResult<Header
         )));
     }
     let format = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-    if format != STORE_FORMAT_VERSION {
+    if !(MIN_STORE_FORMAT_VERSION..=STORE_FORMAT_VERSION).contains(&format) {
         return Err(GridError::Storage(format!(
-            "{} has store format version {format}; this binary reads version {STORE_FORMAT_VERSION}",
+            "{} has store format version {format}; this binary reads versions {MIN_STORE_FORMAT_VERSION} to {STORE_FORMAT_VERSION}",
             path.display()
         )));
     }
@@ -1619,6 +1631,57 @@ mod tests {
         assert_eq!(rec.snapshot.as_ref(), Some(&image));
     }
 
+    fn set_header_format(path: &Path, format: u32) {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[8..12].copy_from_slice(&format.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Store format 2 only changed the bincode layout of `Task` (protocol version 6), so a clean
+    /// shutdown under format 1 still upgrades, and records of the old layout are refused.
+    #[test]
+    fn format_1_files_of_a_clean_shutdown_load_and_format_1_records_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = image_with(2);
+        {
+            let (store, _) = TaskStore::open(dir.path()).unwrap();
+            store.compact_blocking(image.clone()).unwrap();
+        }
+        let old = PROTOCOL_VERSION_CURRENT - 1;
+        for name in [SNAPSHOT_FILE, JOURNAL_FILE] {
+            let path = dir.path().join(name);
+            set_header_format(&path, 1);
+            set_header_version(&path, old);
+        }
+        let (store, rec) = TaskStore::open(dir.path()).unwrap();
+        assert_eq!(rec.snapshot.as_ref(), Some(&image));
+        assert!(rec.records.is_empty());
+        drop(store);
+        for name in [SNAPSHOT_FILE, JOURNAL_FILE] {
+            let bytes = std::fs::read(dir.path().join(name)).unwrap();
+            let format = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+            assert_eq!(format, STORE_FORMAT_VERSION, "{name} was rewritten");
+        }
+
+        // A journal that still holds format 1 records is refused with the protocol message.
+        let dir = tempfile::tempdir().unwrap();
+        write_all(dir.path(), &[marker(1)]);
+        let path = journal_path(dir.path());
+        set_header_format(&path, 1);
+        set_header_version(&path, old);
+        let msg = expect_storage_err(TaskStore::open(dir.path()));
+        assert!(msg.contains("uncompacted records"), "{msg}");
+
+        // Neither a format of the future nor 0 is read.
+        for format in [0, STORE_FORMAT_VERSION + 1] {
+            let dir = tempfile::tempdir().unwrap();
+            write_all(dir.path(), &[marker(1)]);
+            set_header_format(&journal_path(dir.path()), format);
+            let msg = expect_storage_err(TaskStore::open(dir.path()));
+            assert!(msg.contains("store format version"), "{msg}");
+        }
+    }
+
     #[test]
     fn corrupt_snapshot_refuses_to_open() {
         let dir = tempfile::tempdir().unwrap();
@@ -1633,6 +1696,33 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let msg = expect_storage_err(TaskStore::open(dir.path()));
         assert!(msg.contains("snapshot.bin"), "{msg}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn state_dir_gets_a_protected_dacl_and_its_files_inherit_it() {
+        use rusty_grid_core::private_file::{current_user_sid, open_grants, read_dacl};
+        let base = tempfile::tempdir().unwrap();
+        // Like a home folder: Everyone and Users can read, with inheritance.
+        let status = std::process::Command::new("icacls")
+            .arg(base.path())
+            .args(["/grant", "*S-1-1-0:(OI)(CI)R", "*S-1-5-32-545:(OI)(CI)R"])
+            .status()
+            .expect("icacls");
+        assert!(status.success());
+        let dir = base.path().join("state");
+        let (store, _) = TaskStore::open(&dir).unwrap();
+        store.compact_blocking(image_with(1)).unwrap();
+        drop(store);
+
+        let user = current_user_sid().unwrap();
+        let (aces, protected) = read_dacl(&dir).unwrap();
+        assert!(protected, "the state directory must not inherit");
+        assert!(open_grants(&aces, &user).is_empty(), "{aces:?}");
+        for name in [LOCK_FILE, JOURNAL_FILE, SNAPSHOT_FILE] {
+            let (aces, _) = read_dacl(&dir.join(name)).unwrap();
+            assert!(open_grants(&aces, &user).is_empty(), "{name}: {aces:?}");
+        }
     }
 
     #[cfg(unix)]

@@ -693,9 +693,20 @@ impl MasterServer {
             if let Some(ref ticket_path) = config.p2p_ticket_file {
                 if let Some(parent) = ticket_path.parent() {
                     if !parent.as_os_str().is_empty() {
+                        #[cfg(windows)]
+                        let _ = rusty_grid_core::private_file::create_private_dir_all(parent);
+                        #[cfg(not(windows))]
                         let _ = tokio::fs::create_dir_all(parent).await;
                     }
                 }
+                // Windows: the ticket file gets the protected owner-only DACL as well (SEC-9).
+                #[cfg(windows)]
+                rusty_grid_core::private_file::write_private_replace(
+                    ticket_path,
+                    ticket.as_bytes(),
+                )
+                .map_err(GridError::Io)?;
+                #[cfg(not(windows))]
                 tokio::fs::write(ticket_path, &ticket)
                     .await
                     .map_err(GridError::Io)?;
@@ -1260,20 +1271,25 @@ fn tighten_key_permissions(path: &Path) -> std::io::Result<Option<u32>> {
     Ok(Some(mode))
 }
 
-/// Creates the key file exclusively with mode 0600 (best effort on Windows, where it inherits the
-/// ACL of its directory) and writes `data`, so the key is never readable by others, not even
-/// between creation and a later chmod.
+/// Creates the key file exclusively with mode 0600 (Windows: a protected DACL for the current
+/// user, SYSTEM and Administrators, SEC-9) and writes `data`, so the key is never readable by
+/// others, not even between creation and a later chmod.
 #[cfg(feature = "p2p")]
 fn write_new_private_key(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(path)?;
+    #[cfg(windows)]
+    let mut file = rusty_grid_core::private_file::create_private_new(path)?;
+    #[cfg(not(windows))]
+    let mut file = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(path)?
+    };
     file.write_all(data)?;
     file.sync_all()
 }
@@ -1302,6 +1318,11 @@ async fn resolve_p2p_secret_key(key_path_opt: Option<&Path>) -> GridResult<iroh:
                         "P2P master key file may be readable by other users and could not be made private; run `chmod 600` on it"
                     ),
                 }
+                #[cfg(windows)]
+                rusty_grid_core::private_file::warn_if_readable_by_others(
+                    path,
+                    "P2P master key file",
+                );
                 let data = tokio::fs::read(path).await.map_err(GridError::Io)?;
                 // 1. Raw 32-byte binary format (e.g. test_key.bin)
                 if data.len() == 32 {
@@ -1330,6 +1351,10 @@ async fn resolve_p2p_secret_key(key_path_opt: Option<&Path>) -> GridResult<iroh:
                 if let Some(parent) = path.parent() {
                     if !parent.as_os_str().is_empty() {
                         let existed = parent.exists();
+                        #[cfg(windows)]
+                        rusty_grid_core::private_file::create_private_dir_all(parent)
+                            .map_err(GridError::Io)?;
+                        #[cfg(not(windows))]
                         tokio::fs::create_dir_all(parent)
                             .await
                             .map_err(GridError::Io)?;
@@ -3240,6 +3265,13 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                     max_active_bytes: stats.max_active_bytes,
                     store_error: stats.store_error,
                     workers,
+                };
+                send_client_response(&mut transport, &resp).await?;
+            }
+            ClientMessage::Hello => {
+                let resp = ClientResponse::Hello {
+                    min_compatible_version:
+                        rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE,
                 };
                 send_client_response(&mut transport, &resp).await?;
             }

@@ -1931,6 +1931,108 @@ pub struct Task {
     /// blobs in `TaskResult::outputs`.
     #[serde(default)]
     pub output_globs: Vec<String>,
+    /// The named, persistent workspace this task runs in (design 0039). Appended last: protocol
+    /// version 6.
+    #[serde(default)]
+    pub workspace: Option<WorkspaceRef>,
+}
+
+/// Longest workspace name in bytes.
+pub const MAX_WORKSPACE_NAME_BYTES: usize = 64;
+
+/// Names that Windows treats as devices, in any case and with any extension (`nul.txt` is `nul`).
+const WINDOWS_DEVICE_NAMES: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// Reference to a workspace: a directory on a worker that outlives the task (design 0039 D1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRef {
+    /// The workspace name, see [`validate_workspace_name`].
+    pub name: String,
+    /// The tree to sync into the workspace before the run. `None` runs in the workspace as it is.
+    pub source: Option<WorkspaceSource>,
+}
+
+/// What a workspace is synced from before a task runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceSource {
+    /// A [`crate::blob::TreeManifest`] stored as blob `manifest`, `manifest_size` bytes long.
+    Tree {
+        manifest: crate::blob::BlobId,
+        manifest_size: u64,
+    },
+}
+
+impl WorkspaceRef {
+    /// A reference to workspace `name` that runs in it as it is.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            source: None,
+        }
+    }
+
+    /// Builder method to sync the tree `manifest` into the workspace before the run.
+    pub fn with_tree(mut self, manifest: crate::blob::BlobId, manifest_size: u64) -> Self {
+        self.source = Some(WorkspaceSource::Tree {
+            manifest,
+            manifest_size,
+        });
+        self
+    }
+
+    /// Checks the name and the source.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_workspace_name(&self.name)?;
+        if let Some(WorkspaceSource::Tree { manifest_size, .. }) = &self.source {
+            if *manifest_size == 0 || *manifest_size > crate::blob::MAX_MANIFEST_BYTES {
+                return Err(format!(
+                    "Workspace '{}' source manifest size {manifest_size} is outside 1..={} bytes",
+                    self.name,
+                    crate::blob::MAX_MANIFEST_BYTES
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validates a workspace name: 1 to 64 bytes of lowercase ASCII letters, digits, `.`, `_` and `-`;
+/// it starts with a letter or a digit, does not end with `.`, and its part before the first `.` is
+/// not a Windows device name. A valid name can never form a path, a device or two directories on a
+/// case-insensitive file system.
+pub fn validate_workspace_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > MAX_WORKSPACE_NAME_BYTES {
+        return Err(format!(
+            "Workspace name must be 1 to {MAX_WORKSPACE_NAME_BYTES} bytes, got {}",
+            name.len()
+        ));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '-'))
+    {
+        return Err(format!(
+            "Workspace name '{name}' contains {bad:?}; use lowercase ASCII letters, digits, '.', '_' and '-'"
+        ));
+    }
+    if !name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+        return Err(format!(
+            "Workspace name '{name}' must start with a letter or a digit"
+        ));
+    }
+    if name.ends_with('.') {
+        return Err(format!("Workspace name '{name}' must not end with '.'"));
+    }
+    let stem = name.split('.').next().unwrap_or(name);
+    if WINDOWS_DEVICE_NAMES.contains(&stem) {
+        return Err(format!(
+            "Workspace name '{name}' starts with the Windows device name '{stem}'"
+        ));
+    }
+    Ok(())
 }
 
 impl Task {
@@ -1952,7 +2054,14 @@ impl Task {
             expected_outputs: Vec::new(),
             inputs: Vec::new(),
             output_globs: Vec::new(),
+            workspace: None,
         }
+    }
+
+    /// Builder method to run the task in a persistent workspace.
+    pub fn with_workspace(mut self, workspace: WorkspaceRef) -> Self {
+        self.workspace = Some(workspace);
+        self
     }
 
     /// Builder method to attach tags.
@@ -2081,6 +2190,25 @@ impl Task {
             }
             crate::blob::validate_task_inputs(&self.inputs)?;
             crate::blob::validate_output_patterns(&self.output_globs)?;
+        }
+
+        if let Some(workspace) = &self.workspace {
+            workspace.validate()?;
+            if !matches!(
+                self.spec,
+                TaskSpec::Command { .. } | TaskSpec::ShellScript { .. }
+            ) {
+                return Err(format!(
+                    "Workspace tasks support Command and ShellScript tasks, not {}",
+                    self.spec.task_type()
+                ));
+            }
+            if !self.inputs.is_empty() || !self.staged_files.is_empty() {
+                return Err(
+                    "A workspace task cannot also carry inputs or staged files; sync the files into the workspace instead"
+                        .to_string(),
+                );
+            }
         }
 
         Ok(())
@@ -3303,5 +3431,100 @@ mod tests {
                 "Image input is only supported with neural 3D engines (e.g. triposr); the auto engine does not accept images"
             );
         }
+    }
+
+    fn workspace_task(name: &str) -> Task {
+        Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::default(),
+        )
+        .with_workspace(WorkspaceRef::new(name))
+    }
+
+    #[test]
+    fn test_workspace_names_accepted() {
+        for name in [
+            "a",
+            "0",
+            "oxideswarm-claude",
+            "repo_1.agent-2",
+            "x.y",
+            "console",
+            "conx.txt",
+            "com10",
+            &"a".repeat(MAX_WORKSPACE_NAME_BYTES),
+        ] {
+            workspace_task(name)
+                .validate()
+                .unwrap_or_else(|e| panic!("name {name:?} refused: {e}"));
+        }
+    }
+
+    #[test]
+    fn test_workspace_names_refused() {
+        let too_long = "a".repeat(MAX_WORKSPACE_NAME_BYTES + 1);
+        for name in [
+            "",
+            "Foo",
+            "fOo",
+            "foo.",
+            "foo..",
+            ".foo",
+            "_foo",
+            "-foo",
+            "con",
+            "nul.txt",
+            "com1",
+            "lpt9.log",
+            "aux.x.y",
+            "a/b",
+            "a\\b",
+            "..",
+            "a b",
+            "a:b",
+            "caf\u{e9}",
+            "a\0b",
+            too_long.as_str(),
+        ] {
+            assert!(
+                workspace_task(name).validate().is_err(),
+                "name {name:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn test_workspace_task_spec_and_files_rules() {
+        // Only Command and ShellScript.
+        let mut t = workspace_task("ws");
+        t.spec = TaskSpec::new_rust_compilation(
+            "x",
+            HashMap::from([("main.rs".to_string(), "fn main() {}".to_string())]),
+            Vec::new(),
+        );
+        let err = t.validate().expect_err("RustCompilation must be refused");
+        assert!(err.contains("Workspace tasks support"), "{err}");
+
+        // No inputs or staged files.
+        let mut t = workspace_task("ws");
+        t.staged_files
+            .push(StagedFile::new("a.txt", Bytes::from_static(b"x"), false));
+        assert!(t.validate().unwrap_err().contains("cannot also carry"));
+        let mut t = workspace_task("ws");
+        t.inputs.push(crate::blob::TaskInput::tree(
+            "src",
+            crate::blob::BlobId([1; 32]),
+            10,
+        ));
+        assert!(t.validate().unwrap_err().contains("cannot also carry"));
+
+        // A source needs a sane manifest size.
+        let t = workspace_task("ws");
+        let mut ok = t.clone();
+        ok.workspace = Some(WorkspaceRef::new("ws").with_tree(crate::blob::BlobId([2; 32]), 100));
+        ok.validate().unwrap();
+        let mut bad = t;
+        bad.workspace = Some(WorkspaceRef::new("ws").with_tree(crate::blob::BlobId([2; 32]), 0));
+        assert!(bad.validate().is_err());
     }
 }

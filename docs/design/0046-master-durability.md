@@ -637,6 +637,11 @@ lands as a self-contained, reviewable unit.
   `ClientResponse::ClusterStatus.store_error` in protocol version 5 with `LegacyV3V4BinaryClientResponse`
   fallback, `ClusterStatusDto::store_error`, `#storeErrorBanner` in `dashboard.html`, and `C1 Task store`
   failure check in `oxideswarm doctor`), and `tests/master_restart_recovery.rs`.
+- **2026-11-08:** Protocol version 6 (design 0039 `W1`) appended `Task::workspace`, which changes the
+  bincode layout of `Task` inside `JournalRecord`: `STORE_FORMAT_VERSION` is 2 and
+  `journal_layout.txt` was re-blessed. `MIN_STORE_FORMAT_VERSION` keeps 1, so a clean shutdown by a
+  version 5 master (JSON snapshot, journal with no records) still upgrades; a format 1 journal that
+  holds records is refused by the existing protocol-version check.
 - **2026-11-08:** Implemented `F1-b master adoption` and `F1-c` worker session resume: enabled
   `ProtocolCapabilities::SESSION_RESUME` in `all_supported()`, wired `master --session-resume-hold-secs`
   (`RUSTY_GRID_SESSION_RESUME_HOLD_SECS`, `[master].session_resume_hold_secs`, `session-resume=<secs>`
