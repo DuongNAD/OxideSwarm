@@ -124,13 +124,23 @@ Checks a running master, with the same address and secret resolution as `submit`
 | C5 | GPU probe, per GPU worker | a pinned GEMM of `--gpu-dim <N>` (default 512, at most 2048 on a simulated GPU) reports `Status: VERIFIED_OK`; time and GFLOP/s are printed |
 | C6 | Spread | `--spread-tasks <N>` unpinned 500 ms `sleep` tasks (default 4 per worker) complete; with two or more workers, at least two of them ran some (otherwise a warning) |
 
+| C7 | Links | no connected worker is reached through a relay; a relayed worker gives a warning (blob transfers are slower through a relay; a self-hosted relay option is planned, `LINK-1`) |
+| C8 | Blob throughput | an 8 MiB blob (random bytes, new on every run) is uploaded to the master and then fetched by every connected worker, which runs a pinned `cksum` (`certutil -hashfile` on Windows) on it; reports MB/s. A master without a blob store skips it |
+
+- The worker table has a `LINK` column from the master's `link:` tag: `direct <rtt>ms`, `relay <rtt>ms`,
+  `tcp`, or `-` when the tag is missing or unreadable. `--json` carries `link_kind` and `link_rtt_ms`.
+- C8 times the upload to the master on its own. The per-worker figure is the time from submit to
+  result, so it includes scheduling and the task's own run (printed next to it) and is a lower bound
+  on the link speed. Workers are probed one after the other so they do not share the master's
+  bandwidth. It works for TCP and P2P workers alike. `--skip-throughput` leaves it out.
+
 - A probe that completes on another worker than the one it was pinned to fails C3 with "the master
   ignores placement constraints; upgrade the master".
 - Probes are submitted without `wait` and collected with `GetTaskResult`, so one slow worker does
   not serialise the run. Each probe times out after `--probe-timeout-secs` (default 60).
-- `--skip-gpu` and `--skip-spread` leave out C5 and C6. `--json` prints one JSON object.
+- `--skip-gpu`, `--skip-spread` and `--skip-throughput` leave out C5, C6 and C8. `--json` prints one JSON object.
 - Exit code: 0 when no check failed, 1 when one failed, 6 when authentication failed.
-- `doctor` runs only built-in tasks, `echo` and GEMM; nothing is written on workers outside the
+- `doctor` runs only built-in tasks, `echo`, GEMM and the C8 checksum; nothing is written on workers outside the
   per-task sandbox.
 
 ### D5 Several workers on one host
@@ -223,3 +233,5 @@ the network. Default behaviour is unchanged.
 - 2026-10-23: Found in the live run and fixed: the wgpu crates logged every device poll at INFO
   (dozens of lines per GPU task); without `RUST_LOG` they now log at WARN (`default_log_filter`).
 - 2026-10-23: Milestone M5 completed. Closed W7 with verified loopback 2-worker cluster doctor checks. Advanced capabilities specified and implemented in design records 0002 (mobile coordination), 0003 (file staging), and 0004 (MCP and discovery).
+- 2026-11-09: `LINK-1` steps 1 and 2: the `LINK` column and C7 (warning for a relayed worker), and the C8
+  blob throughput probe with `--skip-throughput` (MCP `doctor`: `skip_throughput`).

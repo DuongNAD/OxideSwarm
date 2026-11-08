@@ -3,7 +3,8 @@
 //! Connects like every client command ([`connect_master`]), lists the workers, then runs probes
 //! pinned to each worker with a `require:worker=<id>` constraint (`rusty_grid_core::placement`):
 //! a built-in task in the worker process, a process start-up, a GEMM on every GPU worker, and a
-//! burst of unpinned tasks to see the work spread. These are checks C1 to C6 of the design record
+//! burst of unpinned tasks to see the work spread, then the link kind of each worker (C7) and a
+//! blob transfer to each worker (C8). These are checks C1 to C8 of the design record
 //! `docs/design/0001-two-node-readiness.md`.
 //!
 //! Probes are submitted without `wait` and collected with `GetTaskResult` on one connection, so a
@@ -17,6 +18,7 @@ use serde::Serialize;
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
+use rusty_grid_core::blob::TaskInput;
 use rusty_grid_core::cluster_auth::ClusterSecret;
 use rusty_grid_core::error::GridError;
 use rusty_grid_core::placement::{
@@ -37,8 +39,14 @@ pub const SIMULATED_GPU_MAX_DIM: u32 = 2048;
 pub const SPREAD_TASK_MS: u64 = 500;
 /// Tasks of the spread check per connected worker, unless `spread_tasks` says otherwise.
 pub const SPREAD_TASKS_PER_WORKER: usize = 4;
+/// Size of the blob the throughput probe (C8) moves to every worker.
+pub const THROUGHPUT_PROBE_BYTES: usize = 8 * 1024 * 1024;
+/// Where the throughput probe's blob appears in the worker's task sandbox.
+const THROUGHPUT_PROBE_FILE: &str = "doctor-probe.bin";
 /// How often outstanding probes are polled.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How often the throughput probe polls, so a fast link is not rounded to the default interval.
+const THROUGHPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// What a GPU result says when the product passed the CPU check.
 const GPU_VERIFIED: &str = "Status: VERIFIED_OK";
 
@@ -55,6 +63,8 @@ pub struct DoctorOptions {
     pub spread_tasks: Option<usize>,
     pub skip_gpu: bool,
     pub skip_spread: bool,
+    /// Leave out the blob throughput probe (C8).
+    pub skip_throughput: bool,
 }
 
 impl Default for DoctorOptions {
@@ -66,6 +76,7 @@ impl Default for DoctorOptions {
             spread_tasks: None,
             skip_gpu: false,
             skip_spread: false,
+            skip_throughput: false,
         }
     }
 }
@@ -119,6 +130,10 @@ pub struct WorkerSummary {
     /// tag (older, or one that reports none) counts as `off`.
     pub isolation: String,
     pub link: Option<String>,
+    /// `direct`, `relay`, `tcp`, or `-` when the master sent no usable `link:` tag.
+    pub link_kind: String,
+    /// Round-trip time of a P2P link in milliseconds, when the tag carries it.
+    pub link_rtt_ms: Option<f64>,
     pub state: Option<String>,
     /// The worker's user tags (everything without a reserved prefix).
     pub tags: Vec<String>,
@@ -138,6 +153,8 @@ impl WorkerSummary {
                 .unwrap_or_else(|| "GPU".to_string()),
             (false, false) => "none".to_string(),
         };
+        let link = value(LINK_TAG_PREFIX);
+        let (link_kind, link_rtt_ms) = parse_link(link.as_deref());
         Self {
             name: caps.name.clone(),
             id: listed_worker_id(caps),
@@ -147,7 +164,9 @@ impl WorkerSummary {
             ram_mb: caps.ram_mb,
             gpu,
             isolation: IsolationLevel::from_tags(&caps.tags).to_string(),
-            link: value(LINK_TAG_PREFIX),
+            link,
+            link_kind: link_kind.label().to_string(),
+            link_rtt_ms,
             state: value(STATE_TAG_PREFIX),
             tags: caps
                 .tags
@@ -158,9 +177,74 @@ impl WorkerSummary {
         }
     }
 
+    fn relayed(&self) -> bool {
+        self.link_kind == LinkKind::Relay.label()
+    }
+
+    /// The LINK column: kind and, for a P2P link, the round-trip time.
+    fn link_text(&self) -> String {
+        match self.link_rtt_ms {
+            Some(rtt) => format!("{} {rtt:.1}ms", self.link_kind),
+            None => self.link_kind.clone(),
+        }
+    }
+
     fn connected(&self) -> bool {
         self.state.as_deref() != Some("disconnected")
     }
+}
+
+/// How the master reaches a worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkKind {
+    Direct,
+    Relay,
+    Tcp,
+    /// No tag, or one this version does not understand.
+    Unknown,
+}
+
+impl LinkKind {
+    fn label(self) -> &'static str {
+        match self {
+            LinkKind::Direct => "direct",
+            LinkKind::Relay => "relay",
+            LinkKind::Tcp => "tcp",
+            LinkKind::Unknown => "-",
+        }
+    }
+}
+
+/// Reads the master's `link:` tag value: `Direct P2P (QUIC):<rtt>ms`, `Relay (DERP):<rtt>ms` or
+/// `TCP/LAN`. A missing or unrecognised tag is [`LinkKind::Unknown`]; a round-trip time that does
+/// not parse is left out.
+fn parse_link(tag: Option<&str>) -> (LinkKind, Option<f64>) {
+    let Some(tag) = tag.map(str::trim) else {
+        return (LinkKind::Unknown, None);
+    };
+    let (kind_text, rtt_text) = match tag.rsplit_once(':') {
+        Some((kind, rtt)) if rtt.trim_end().ends_with("ms") => (kind, Some(rtt)),
+        _ => (tag, None),
+    };
+    let kind = if kind_text.starts_with("Direct") {
+        LinkKind::Direct
+    } else if kind_text.starts_with("Relay") {
+        LinkKind::Relay
+    } else if kind_text.starts_with("TCP") {
+        LinkKind::Tcp
+    } else {
+        return (LinkKind::Unknown, None);
+    };
+    let rtt = rtt_text
+        .and_then(|t| {
+            t.trim_end()
+                .trim_end_matches("ms")
+                .trim()
+                .parse::<f64>()
+                .ok()
+        })
+        .filter(|ms| ms.is_finite() && *ms >= 0.0);
+    (kind, rtt)
 }
 
 /// Everything one run found.
@@ -211,8 +295,8 @@ impl DoctorReport {
                 self.workers.len()
             ));
             out.push_str(&format!(
-                "  {:<20} {:<9} {:<16} {:>5} {:>9}  {:<28} {:<7} {:<10} {}\n",
-                "NAME", "ID", "OS/ARCH", "CORES", "RAM MB", "GPU", "ISO", "STATE", "TAGS"
+                "  {:<20} {:<9} {:<16} {:>5} {:>9}  {:<28} {:<7} {:<14} {:<10} {}\n",
+                "NAME", "ID", "OS/ARCH", "CORES", "RAM MB", "GPU", "ISO", "LINK", "STATE", "TAGS"
             ));
             for w in &self.workers {
                 let os_arch = format!(
@@ -221,7 +305,7 @@ impl DoctorReport {
                     w.arch.as_deref().unwrap_or("?")
                 );
                 out.push_str(&format!(
-                    "  {:<20} {:<9} {:<16} {:>5} {:>9}  {:<28} {:<7} {:<10} {}\n",
+                    "  {:<20} {:<9} {:<16} {:>5} {:>9}  {:<28} {:<7} {:<14} {:<10} {}\n",
                     w.name,
                     w.id.map(|id| short_id(&id)).unwrap_or_else(|| "?".into()),
                     os_arch,
@@ -229,6 +313,7 @@ impl DoctorReport {
                     w.ram_mb,
                     w.gpu,
                     w.isolation,
+                    w.link_text(),
                     w.state.as_deref().unwrap_or("?"),
                     w.tags.join(","),
                 ));
@@ -333,6 +418,16 @@ async fn collect(
     tasks: &[TaskId],
     timeout: Duration,
 ) -> Result<HashMap<TaskId, Collected>, GridError> {
+    collect_with(transport, tasks, timeout, POLL_INTERVAL).await
+}
+
+/// [`collect`] with its own polling interval.
+async fn collect_with(
+    transport: &mut MessageTransport<TcpStream>,
+    tasks: &[TaskId],
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<HashMap<TaskId, Collected>, GridError> {
     let deadline = Instant::now() + timeout;
     let mut done: HashMap<TaskId, Collected> = HashMap::new();
     let mut last_state: HashMap<TaskId, String> = HashMap::new();
@@ -368,7 +463,7 @@ async fn collect(
         if done.len() == tasks.len() || Instant::now() >= deadline {
             break;
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        tokio::time::sleep(poll_interval).await;
     }
     for &task_id in tasks {
         if let std::collections::hash_map::Entry::Vacant(slot) = done.entry(task_id) {
@@ -718,7 +813,264 @@ async fn run_checks(
         );
     }
 
-    // C6: unpinned tasks spread over the workers.
+    spread_check(&mut transport, options, &connected, report).await?;
+    link_check(report);
+    if !options.skip_throughput {
+        throughput_check(
+            master_addr,
+            secret,
+            &mut transport,
+            options,
+            &connected,
+            report,
+        )
+        .await?;
+    } else {
+        report.push(
+            "C8",
+            "Blob throughput",
+            None,
+            Outcome::Skip,
+            "--skip-throughput",
+        );
+    }
+    Ok(())
+}
+
+/// C7: warns for every connected worker whose link goes through a relay.
+fn link_check(report: &mut DoctorReport) {
+    let relayed: Vec<String> = report
+        .workers
+        .iter()
+        .filter(|w| w.connected() && w.relayed())
+        .map(|w| format!("{} ({})", w.name, w.link_text()))
+        .collect();
+    let connected = report.workers.iter().filter(|w| w.connected()).count();
+    if relayed.is_empty() {
+        report.push(
+            "C7",
+            "Links",
+            None,
+            Outcome::Pass,
+            format!("no relayed link among {connected} connected worker(s)"),
+        );
+        return;
+    }
+    for w in report.workers.clone() {
+        if w.connected() && w.relayed() {
+            report.push(
+                "C7",
+                "Links",
+                Some(w.name.as_str()),
+                Outcome::Warn,
+                format!(
+                    "relayed link ({}): traffic goes through a relay server, so blob transfers will be slower; \
+                     a self-hosted relay option is planned (LINK-1)",
+                    w.link_text()
+                ),
+            );
+        }
+    }
+}
+
+/// The bytes of the throughput probe: pseudo-random and different on every run, so neither the
+/// master's blob store nor a worker's blob cache can answer from an earlier run.
+fn throughput_payload(seed: Uuid) -> Vec<u8> {
+    let (hi, lo) = seed.as_u64_pair();
+    let mut state = hi ^ lo.rotate_left(32) | 1;
+    let mut out = Vec::with_capacity(THROUGHPUT_PROBE_BYTES);
+    while out.len() < THROUGHPUT_PROBE_BYTES {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(THROUGHPUT_PROBE_BYTES);
+    out
+}
+
+/// The task that makes a worker fetch and read the probe blob.
+fn throughput_task(worker_id: Uuid, os: &str, inputs: &[TaskInput], timeout: Duration) -> Task {
+    let spec = match os {
+        "windows" => TaskSpec::command(
+            "cmd",
+            vec![
+                "/C".into(),
+                "certutil".into(),
+                "-hashfile".into(),
+                THROUGHPUT_PROBE_FILE.into(),
+                "SHA256".into(),
+            ],
+        ),
+        _ => TaskSpec::command("cksum", vec![THROUGHPUT_PROBE_FILE.into()]),
+    };
+    let pin = Placement {
+        worker: Some(worker_id.to_string()),
+        ..Placement::default()
+    };
+    Task::new(
+        spec,
+        TaskRequirements::generic(1, timeout.as_secs().max(1)).with_max_retries(0),
+    )
+    .with_placement(&pin)
+    .with_inputs(inputs.to_vec())
+}
+
+/// C8: moves a fixed-size blob to every connected worker and reports MB/s.
+///
+/// The blob is uploaded to the master once (timed on its own); each worker then runs a pinned
+/// `cksum` (`certutil` on Windows) on it, which makes the worker fetch the blob from the master
+/// over the link it is connected by (TCP or P2P). The worker figure is the time from submit to
+/// result and so includes scheduling and the task's own run; it is a lower bound on the link
+/// speed. Workers are probed one after the other so they do not share the master's bandwidth.
+async fn throughput_check(
+    master_addr: &str,
+    secret: Option<&ClusterSecret>,
+    transport: &mut MessageTransport<TcpStream>,
+    options: &DoctorOptions,
+    connected: &[WorkerSummary],
+    report: &mut DoctorReport,
+) -> Result<(), GridError> {
+    const NAME: &str = "Blob throughput";
+    if connected.is_empty() {
+        report.push("C8", NAME, None, Outcome::Skip, "no connected worker");
+        return Ok(());
+    }
+    let mib = THROUGHPUT_PROBE_BYTES as f64 / (1024.0 * 1024.0);
+    let mbps = |ms: f64| THROUGHPUT_PROBE_BYTES as f64 / 1e6 / (ms.max(0.001) / 1000.0);
+
+    // Stage the payload in a private temp file; the input scanner reads files.
+    let path = std::env::temp_dir().join(format!("oxideswarm-doctor-{}.bin", Uuid::new_v4()));
+    let write = {
+        let payload = throughput_payload(Uuid::new_v4());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, &payload))
+    };
+    let outcome = async {
+        write.map_err(|e| format!("cannot stage the probe file: {e}"))?;
+        let prepared =
+            crate::blobs::scan_input_paths(&[(path.clone(), Some(THROUGHPUT_PROBE_FILE.into()))])?;
+        let connection = crate::blobs::BlobConnection::connect(master_addr, secret)
+            .await
+            .map_err(|e| e.to_string())?;
+        let started = Instant::now();
+        crate::blobs::upload_inputs(&connection, &prepared).await?;
+        Ok::<_, String>((prepared, started.elapsed()))
+    }
+    .await;
+    let _ = std::fs::remove_file(&path);
+    let (prepared, upload) = match outcome {
+        Ok(ok) => ok,
+        Err(message) => {
+            let (outcome, detail) = if message.contains("no blob store") {
+                (
+                    Outcome::Skip,
+                    "the master has no blob store (start it with --blob-dir), so it cannot move files"
+                        .to_string(),
+                )
+            } else {
+                (
+                    Outcome::Warn,
+                    format!("could not upload the probe blob: {message}"),
+                )
+            };
+            report.push("C8", NAME, None, outcome, detail);
+            return Ok(());
+        }
+    };
+    report.push(
+        "C8",
+        NAME,
+        None,
+        Outcome::Pass,
+        format!(
+            "upload to the master: {mib:.0} MiB in {} ms, {:.1} MB/s",
+            upload.as_millis(),
+            mbps(upload.as_secs_f64() * 1000.0)
+        ),
+    );
+
+    for w in connected {
+        let (Some(worker_id), Some(os)) = (w.id, w.os.as_deref()) else {
+            report.push(
+                "C8",
+                NAME,
+                Some(w.name.as_str()),
+                Outcome::Skip,
+                "the worker reports no id: or os: tag (older master or worker)",
+            );
+            continue;
+        };
+        let task = throughput_task(worker_id, os, &prepared.inputs, options.probe_timeout);
+        let started = Instant::now();
+        let task_id = match submit(transport, task).await? {
+            Ok(id) => id,
+            Err(message) => {
+                report.push(
+                    "C8",
+                    NAME,
+                    Some(w.name.as_str()),
+                    Outcome::Warn,
+                    format!("the master refused the probe task: {message}"),
+                );
+                continue;
+            }
+        };
+        let collected = collect_with(
+            transport,
+            &[task_id],
+            options.probe_timeout,
+            THROUGHPUT_POLL_INTERVAL,
+        )
+        .await?;
+        let elapsed = started.elapsed();
+        let (outcome, detail) = match collected.get(&task_id) {
+            Some(Collected::Done(result)) if result.worker_id != worker_id => (
+                Outcome::Fail,
+                "ran on another worker: the master ignores placement constraints".to_string(),
+            ),
+            Some(Collected::Done(result)) if result.exit_code == 0 => (
+                Outcome::Pass,
+                format!(
+                    "fetch to the worker over {}: {mib:.0} MiB in {} ms, {:.1} MB/s (submit to result, includes scheduling and a {} ms task)",
+                    w.link_text(),
+                    elapsed.as_millis(),
+                    mbps(elapsed.as_secs_f64() * 1000.0),
+                    result.execution_time_ms
+                ),
+            ),
+            Some(Collected::Done(result)) => (
+                Outcome::Fail,
+                format!("exit code {}: {}", result.exit_code, failure_text(result)),
+            ),
+            Some(Collected::Refused(message)) => (
+                Outcome::Fail,
+                format!("the master refused the probe: {message}"),
+            ),
+            Some(Collected::TimedOut(state)) => (
+                Outcome::Fail,
+                format!(
+                    "no result within {}s (last state {state}); the worker may not support file transfer or the link is very slow",
+                    options.probe_timeout.as_secs()
+                ),
+            ),
+            None => (Outcome::Fail, "the probe was not collected".to_string()),
+        };
+        report.push("C8", NAME, Some(w.name.as_str()), outcome, detail);
+    }
+    Ok(())
+}
+
+/// C6: unpinned tasks spread over the workers.
+async fn spread_check(
+    transport: &mut MessageTransport<TcpStream>,
+    options: &DoctorOptions,
+    connected: &[WorkerSummary],
+    report: &mut DoctorReport,
+) -> Result<(), GridError> {
     if options.skip_spread {
         report.push("C6", "Spread", None, Outcome::Skip, "--skip-spread");
         return Ok(());
@@ -745,7 +1097,7 @@ async fn run_checks(
             TaskRequirements::generic(1, options.probe_timeout.as_secs().max(1))
                 .with_max_retries(0),
         );
-        match submit(&mut transport, task).await? {
+        match submit(transport, task).await? {
             Ok(task_id) => tasks.push(task_id),
             Err(message) => {
                 report.push(
@@ -759,7 +1111,7 @@ async fn run_checks(
             }
         }
     }
-    let collected = collect(&mut transport, &tasks, options.probe_timeout).await?;
+    let collected = collect(transport, &tasks, options.probe_timeout).await?;
     let elapsed_ms = started.elapsed().as_millis();
     let mut per_worker: HashMap<Uuid, usize> = HashMap::new();
     let mut unfinished = 0usize;
@@ -1041,5 +1393,114 @@ mod tests {
         assert_eq!(json["checks"][2]["outcome"], "fail");
         assert_eq!(json["workers"][0]["isolation"], "off");
         assert!(json.get("auth_failed").is_none());
+    }
+
+    #[test]
+    fn test_parse_link_reads_the_masters_tag() {
+        assert_eq!(
+            parse_link(Some("Direct P2P (QUIC):4.5ms")),
+            (LinkKind::Direct, Some(4.5))
+        );
+        assert_eq!(
+            parse_link(Some("Relay (DERP):120.0ms")),
+            (LinkKind::Relay, Some(120.0))
+        );
+        assert_eq!(
+            parse_link(Some("Direct P2P (QUIC)")),
+            (LinkKind::Direct, None)
+        );
+        assert_eq!(parse_link(Some("TCP/LAN")), (LinkKind::Tcp, None));
+        assert_eq!(parse_link(None), (LinkKind::Unknown, None));
+        assert_eq!(
+            parse_link(Some("carrier pigeon")),
+            (LinkKind::Unknown, None)
+        );
+        assert_eq!(
+            parse_link(Some("Relay (DERP):fastms")),
+            (LinkKind::Relay, None),
+            "an unreadable round-trip time is left out"
+        );
+    }
+
+    #[test]
+    fn test_report_shows_the_link_column_and_warns_about_a_relayed_worker() {
+        let mut report = DoctorReport {
+            master: "m".into(),
+            workers: vec![
+                WorkerSummary::of(&caps("lan", &["os:linux", "link:TCP/LAN"])),
+                WorkerSummary::of(&caps("far", &["os:linux", "link:Relay (DERP):88.0ms"])),
+                WorkerSummary::of(&caps("near", &["os:linux", "link:Direct P2P (QUIC):3.2ms"])),
+                WorkerSummary::of(&caps("old", &["os:linux"])),
+            ],
+            checks: Vec::new(),
+            auth_failed: false,
+        };
+        link_check(&mut report);
+        let text = report.render();
+        assert!(
+            text.lines()
+                .any(|l| l.contains("NAME") && l.contains("LINK")),
+            "{text}"
+        );
+        let row = |name: &str| {
+            text.lines()
+                .find(|l| l.trim_start().starts_with(name))
+                .unwrap()
+        };
+        assert!(row("lan").contains(" tcp "), "{text}");
+        assert!(row("far").contains("relay 88.0ms"), "{text}");
+        assert!(row("near").contains("direct 3.2ms"), "{text}");
+        assert!(row("old").contains(" - "), "{text}");
+        let warns: Vec<&Check> = report
+            .checks
+            .iter()
+            .filter(|c| c.outcome == Outcome::Warn)
+            .collect();
+        assert_eq!(warns.len(), 1, "only the relayed worker: {text}");
+        assert_eq!(warns[0].worker.as_deref(), Some("far"));
+        assert!(
+            warns[0].detail.contains("slower") && warns[0].detail.contains("planned (LINK-1)"),
+            "{text}"
+        );
+        assert!(!report.failed(), "a relayed link warns, it does not fail");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["workers"][1]["link_kind"], "relay");
+        assert_eq!(json["workers"][1]["link_rtt_ms"], 88.0);
+
+        let mut clean = DoctorReport {
+            master: "m".into(),
+            workers: vec![WorkerSummary::of(&caps("lan", &["link:TCP/LAN"]))],
+            checks: Vec::new(),
+            auth_failed: false,
+        };
+        link_check(&mut clean);
+        assert_eq!(clean.checks[0].outcome, Outcome::Pass);
+    }
+
+    #[test]
+    fn test_throughput_probe_task_and_payload() {
+        let id = Uuid::new_v4();
+        let a = throughput_payload(Uuid::new_v4());
+        assert_eq!(a.len(), THROUGHPUT_PROBE_BYTES);
+        assert_ne!(
+            a,
+            throughput_payload(Uuid::new_v4()),
+            "differs on every run"
+        );
+        let file = std::env::temp_dir().join("oxideswarm-doctor-unit.bin");
+        std::fs::write(&file, &a[..1024]).unwrap();
+        let prepared =
+            crate::blobs::scan_input_paths(&[(file.clone(), Some(THROUGHPUT_PROBE_FILE.into()))])
+                .unwrap();
+        let _ = std::fs::remove_file(&file);
+        for os in ["windows", "macos", "linux"] {
+            let task = throughput_task(id, os, &prepared.inputs, Duration::from_secs(30));
+            task.validate().expect("passes the master's validation");
+            assert_eq!(task.inputs.len(), 1);
+            assert_eq!(
+                task.placement().unwrap().worker.as_deref(),
+                Some(id.to_string().as_str())
+            );
+        }
     }
 }

@@ -31,8 +31,10 @@ struct Cluster {
 
 impl Cluster {
     async fn new() -> Self {
+        let blob_dir = tempfile::tempdir().expect("blob dir");
         let master = MasterServer::spawn_with_config(
-            ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+            ServerConfig::new("127.0.0.1:0".parse().unwrap())
+                .with_blob_store(blob_dir.path(), 64 * 1024 * 1024),
             SchedulerConfig::default(),
             ReaperConfig::default(),
         )
@@ -43,7 +45,7 @@ impl Cluster {
             master,
             addr,
             workers: Vec::new(),
-            _dirs: Vec::new(),
+            _dirs: vec![blob_dir],
         }
     }
 
@@ -264,6 +266,72 @@ async fn test_doctor_passes_on_a_healthy_two_worker_cluster() {
         rendered.contains("node-a") && rendered.contains("node-b"),
         "{rendered}"
     );
+
+    // LINK-1: the link column (loopback workers are TCP) and the throughput probe (C8).
+    assert!(
+        rendered
+            .lines()
+            .any(|l| l.contains("NAME") && l.contains("LINK")),
+        "{rendered}"
+    );
+    assert!(
+        rendered.lines().filter(|l| l.contains(" tcp ")).count() >= 2,
+        "both workers are listed as tcp: {rendered}"
+    );
+    assert!(
+        report.workers.iter().all(|w| w.link_kind == "tcp"),
+        "{rendered}"
+    );
+    assert_eq!(passed("C7"), 1, "no relayed worker: {rendered}");
+    let c8: Vec<_> = report.checks.iter().filter(|c| c.id == "C8").collect();
+    assert_eq!(
+        c8.len(),
+        3,
+        "one upload line and one line per worker: {rendered}"
+    );
+    assert!(c8.iter().all(|c| c.outcome == Outcome::Pass), "{rendered}");
+    assert!(
+        c8[0].detail.contains("upload") && c8[0].detail.contains("MB/s"),
+        "{rendered}"
+    );
+    assert!(
+        c8[1].detail.contains("8 MiB") && c8[1].detail.contains("MB/s"),
+        "{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn test_doctor_skips_throughput_when_asked_or_when_the_master_has_no_blob_store() {
+    let mut cluster = Cluster::new().await;
+    cluster.spawn_worker("node-a", &[], false);
+    cluster.wait_for_workers(1).await;
+    let options = DoctorOptions {
+        probe_timeout: Duration::from_secs(30),
+        skip_gpu: true,
+        skip_spread: true,
+        skip_throughput: true,
+        ..DoctorOptions::default()
+    };
+    let report = run_doctor(&cluster.addr, None, &options).await;
+    let c8 = report.checks.iter().find(|c| c.id == "C8").expect("C8");
+    assert_eq!(c8.outcome, Outcome::Skip);
+    assert!(c8.detail.contains("--skip-throughput"));
+
+    // A master without a blob store cannot move files: skipped, not failed.
+    let bare = MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        SchedulerConfig::default(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("master starts");
+    let options = DoctorOptions {
+        skip_throughput: false,
+        expect_workers: 0,
+        ..options
+    };
+    let report = run_doctor(&bare.server_addr().to_string(), None, &options).await;
+    assert!(!report.failed(), "{}", report.render());
 }
 
 #[tokio::test]
