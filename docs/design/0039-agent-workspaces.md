@@ -311,7 +311,7 @@ Roadmap Phase C names these steps WS-1 to WS-7. The column "Roadmap" maps them.
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
 | W1 | `Task::workspace`, `WorkspaceRef`, name rules, the `WORKSPACES` bit, a lightweight `ClientMessage::Hello` / `ClientResponse::Hello` version probe variant appended last (replacing `connect_master`'s `ClusterStatus` probe from `FEAT-8b`), the next protocol version, both mirrors and all four `From` impls. Needs FEAT-8. Roadmap WS-1 | `crates/core/src/task.rs`, `crates/core/src/protocol.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/cli/src/connect.rs`, `crates/master/src/server.rs` | Both codecs round-trip, `connect_master` probes with `Hello`, the layout test records the new version, and `Task::validate` refuses bad names | Implemented |
-| W2 | The workspace store, sync, lock, bounds and worker options. Roadmap WS-1, WS-2 | `crates/worker/src/workspace.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `README.md` | The sync unit tests of the test plan pass | Planned |
+| W2 | The workspace store, sync, lock, bounds and worker options. Roadmap WS-1, WS-2 | `crates/worker/src/workspace.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `README.md` | The sync unit tests of the test plan pass | W2a done (store, sync, locks, bounds and tests in `workspace.rs`); W2b pending (wiring into `runner.rs` and `client.rs`, options, advertising `WORKSPACES`) |
 | W3 | Required feature, affinity, one task per workspace. Roadmap WS-1 | `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/master/src/server.rs` | The scheduler unit tests of the test plan pass | Planned |
 | W4 | Source selection with `.gitignore` and limits. Roadmap WS-2 | `crates/cli/src/blobs.rs`, `crates/cli/Cargo.toml` | The scan unit tests pass, and `cargo audit` passes with the `ignore` crate | Done |
 | W5 | `submit --workspace`, `--sync`, `--no-sync`, `--cwd`, the MCP `workspace` field, the `workspaces` tool and command. Roadmap WS-5 | `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs`, `crates/core/src/protocol.rs`, `README.md` | `tests/mcp_server_e2e.rs` covers a workspace submission and the `workspaces` tool | Planned |
@@ -369,3 +369,14 @@ off by default until FEAT-3 is Implemented.
   Compression is left out: design 0006 and the non-goals above keep it out of scope, and this
   record does not change that. The existence check stays one `Missing` request per 65,536 ids, so
   10,000 files need one.
+- 2026-11-09: W2a done, not wired. `crates/worker/src/workspace.rs` holds `WorkspaceStore` (root and
+  the design 0021 checks, `acquire`, `list`, `evict_to_fit`), `WorkspaceGuard` (`sync`,
+  `prepare_tmp`, `finish`, `task_env`, `tree_dir`, `tmp_dir`), the `BlobSource` trait the sync reads
+  blobs from, `state.json` and the unit tests of the test plan. Two details differ from D3 without
+  changing its outcome: deletions run before the writes (a path that turns from a file into a
+  directory needs no special case), and temporary files live in `<name>/tmp/` (same file system, so
+  the rename stays atomic, and a crash leaves nothing in the tree). On Windows the sandbox path
+  rules apply in full; elsewhere a file such as `aux.rs` is legal. `File::try_lock` is stable since
+  1.89, below the MSRV 1.91. W2b is pending: the runner and client wiring, `--workspaces`,
+  `--workspace-root`, `--workspace-limit-mb`, `--max-workspaces`, and advertising `WORKSPACES`; it
+  waits for the pull requests that rewrite `runner.rs` and `client.rs`.

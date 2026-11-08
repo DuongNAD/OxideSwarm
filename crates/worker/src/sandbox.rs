@@ -674,7 +674,7 @@ fn current_euid() -> u32 {
 /// (design 0021): see `parent_refusal` and `root_refusal`. The mode of an existing `root` is never
 /// changed, because another user may already have put links into one that was open. Does nothing
 /// on systems without Unix modes.
-fn ensure_private_dir(root: &Path) -> Result<(), SandboxError> {
+pub(crate) fn ensure_private_dir(root: &Path) -> Result<(), SandboxError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
