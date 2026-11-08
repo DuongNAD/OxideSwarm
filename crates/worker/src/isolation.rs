@@ -235,24 +235,40 @@ pub async fn verify_isolation_support(
     level: IsolationLevel,
     sandbox_base: &Path,
 ) -> GridResult<()> {
+    let empty_host =
+        HostDirs::from_home(PathBuf::new(), Some(PathBuf::new()), Some(PathBuf::new()));
+    verify_isolation_support_with_config(level, sandbox_base, &empty_host, &[]).await
+}
+
+/// Start-up self-check with explicit worker [`HostDirs`] and `protected_files`: validates that no
+/// protected file lies inside a granted toolchain directory, prepares the worker's own toolchain
+/// ACLs once at start-up (on Windows, using the `oxideswarm.toolchain` capability SID), sweeps
+/// leftover per-task AppContainer profiles, and runs the sandbox probe.
+pub async fn verify_isolation_support_with_config(
+    level: IsolationLevel,
+    sandbox_base: &Path,
+    host: &HostDirs,
+    protected_files: &[PathBuf],
+) -> GridResult<()> {
     if level == IsolationLevel::Off {
         return Ok(());
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = (host, protected_files);
         macos::probe(level, sandbox_base)
             .await
             .map_err(GridError::Config)
     }
     #[cfg(windows)]
     {
-        windows::probe(level, sandbox_base)
+        windows::probe_with_config(level, sandbox_base, host, protected_files)
             .await
             .map_err(GridError::Config)
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
-        let _ = sandbox_base;
+        let _ = (sandbox_base, host, protected_files);
         Err(GridError::Config(unsupported_message(level)))
     }
 }
@@ -664,16 +680,26 @@ mod macos {
     }
 }
 
-/// The Windows implementation (design 0033 D4, FEAT-3c): per-task AppContainer profile
-/// (`oxideswarm.task.<run_token>`), explicit NTFS DACLs on the sandbox and host toolchains,
-/// zero network capabilities under `fs+net`, and `DeleteAppContainerProfile` on cleanup.
+/// The Windows implementation (design 0033 D4, FEAT-3c):
+/// - Dedicated custom capability SID `oxideswarm.toolchain` derived via
+///   `DeriveCapabilitySidsFromName` for read+execute on worker-owned toolchains (`rustup_home`,
+///   `cargo_home`, and read-only MSVC/SDK directories), never `S-1-15-2-1` (`ALL APPLICATION PACKAGES`).
+/// - One-time worker toolchain preparation from the worker's own `HostDirs`, never from task env
+///   or `Cargo.lock`, never touching `<user_home>` or `<user_home>/.cargo`, and refusing to start
+///   if any `protected_files` path lies inside a granted toolchain directory.
+/// - Per-task AppContainer profile (`oxideswarm.task.<run_token>`), explicit protected DACL on
+///   `<sandbox_dir>` granting only `SYSTEM`, `Administrators`, current user, and the per-task SID,
+///   non-inherited traverse ACE on `<sandbox_base>` for `oxideswarm.toolchain`, zero network
+///   capabilities under `fs+net`, and `DeleteAppContainerProfile` with retry backoff + start-up
+///   sweep on cleanup.
 #[cfg(windows)]
-pub(crate) mod windows {
+pub mod windows {
     use super::{HostDirs, IsolationLevel, Jail};
-    use std::collections::{BTreeMap, HashSet, VecDeque};
+    use std::collections::{BTreeMap, VecDeque};
     use std::ffi::{OsStr, OsString};
     use std::io;
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::fs::MetadataExt;
     use std::os::windows::io::FromRawHandle;
     use std::os::windows::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
@@ -684,9 +710,10 @@ pub(crate) mod windows {
         GENERIC_EXECUTE, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, HLOCAL, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::{
-        GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW, SetNamedSecurityInfoW,
-        SetSecurityInfo, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, SET_ACCESS, SE_FILE_OBJECT,
-        SE_WINDOW_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW,
+        SetNamedSecurityInfoW, SetSecurityInfo, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS,
+        REVOKE_ACCESS, SET_ACCESS, SE_FILE_OBJECT, SE_WINDOW_OBJECT, TRUSTEE_IS_SID,
+        TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -694,7 +721,7 @@ pub(crate) mod windows {
     };
     use windows_sys::Win32::Security::{
         AclSizeInformation, CreateWellKnownSid, EqualSid, FreeSid, GetAce, GetAclInformation,
-        GetTokenInformation, TokenUser, WinBuiltinAdministratorsSid, WinBuiltinAnyPackageSid,
+        GetLengthSid, GetTokenInformation, IsValidSid, TokenUser, WinBuiltinAdministratorsSid,
         WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid,
         WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_FLAGS, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
         CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, NO_INHERITANCE, OBJECT_INHERIT_ACE,
@@ -702,139 +729,196 @@ pub(crate) mod windows {
         SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
         WELL_KNOWN_SID_TYPE,
     };
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn DeriveCapabilitySidsFromName(
+            CapName: *const u16,
+            CapabilityGroupSids: *mut *mut PSID,
+            CapabilityGroupSidCount: *mut u32,
+            CapabilitySids: *mut *mut PSID,
+            CapabilitySidCount: *mut u32,
+        ) -> i32;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetProcessWindowStation() -> HANDLE;
+        fn CreateWindowStationW(
+            lpwinsta: *const u16,
+            dwflags: u32,
+            dwdesiredaccess: u32,
+            lpsa: *const SECURITY_ATTRIBUTES,
+        ) -> HANDLE;
+        fn SetProcessWindowStation(hwinsta: HANDLE) -> i32;
+        fn CreateDesktopW(
+            lpszdesktop: *const u16,
+            lpszdevice: *const u16,
+            pdevmode: *const core::ffi::c_void,
+            dwflags: u32,
+            dwdesiredaccess: u32,
+            lpsa: *const SECURITY_ATTRIBUTES,
+        ) -> HANDLE;
+        fn GetUserObjectInformationW(
+            hobj: HANDLE,
+            nindex: i32,
+            pvinfo: *mut core::ffi::c_void,
+            nlength: u32,
+            lpnlengthneeded: *mut u32,
+        ) -> i32;
+    }
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS, FILE_DELETE_CHILD,
-        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_TRAVERSE, FILE_WRITE_EA, SYNCHRONIZE,
-        WRITE_DAC, WRITE_OWNER,
+        FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+        FILE_TRAVERSE, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::SystemServices::{
         ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, SE_GROUP_ENABLED,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetCurrentThreadId,
-        GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken, TerminateProcess,
+        CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, OpenProcessToken, TerminateProcess,
         UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW,
         CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
         LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
         PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
     };
 
-    #[link(name = "user32")]
-    extern "system" {
-        fn GetProcessWindowStation() -> HANDLE;
-        fn GetThreadDesktop(dwThreadId: u32) -> HANDLE;
-    }
-
-    static WINSTA_PREPARED: OnceLock<()> = OnceLock::new();
-    static PREPARE_LOCK: Mutex<()> = Mutex::new(());
-    static PREPARED_TOOLCHAIN_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    static MSVC_ENV_CACHE: OnceLock<Option<(PathBuf, String)>> = OnceLock::new();
-
     const HRESULT_ALREADY_EXISTS: i32 =
         ((1u32 << 31) | (7u32 << 16) | (ERROR_ALREADY_EXISTS & 0xffff)) as i32;
-
-    /// Directory permissions that allow listing or modifying a directory (denied on `user_home`
-    /// and `.oxideswarm` while leaving `FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE`
-    /// permitted for path canonicalization).
-    const DIR_LIST_AND_WRITE_MASK: u32 = FILE_LIST_DIRECTORY
-        | FILE_ADD_FILE
-        | FILE_ADD_SUBDIRECTORY
-        | FILE_WRITE_EA
-        | FILE_DELETE_CHILD
-        | DELETE
-        | WRITE_DAC
-        | WRITE_OWNER;
-
     const WINDOWS_EXEC_EXTS: &[&str] = &[".com", ".exe", ".bat", ".cmd"];
 
-    fn prepared_cache() -> &'static Mutex<HashSet<PathBuf>> {
-        PREPARED_TOOLCHAIN_PATHS.get_or_init(|| Mutex::new(HashSet::new()))
+    /// Custom capability name derived via `DeriveCapabilitySidsFromName` and granted only to
+    /// OxideSwarm task AppContainers and worker-owned toolchain directories.
+    pub const OXIDESWARM_TOOLCHAIN_CAPABILITY_NAME: &str = "oxideswarm.toolchain";
+    /// Default filename under `<user_home>/.oxideswarm/` where every path whose DACL is modified
+    /// by `prepare_worker_toolchains` is recorded before the modification takes place.
+    pub const ACL_GRANT_LOG_FILENAME: &str = "windows_acl_grants.txt";
+
+    /// Serialises toolchain and sandbox_base ACL preparation within the worker process.
+    static PREPARE_LOCK: Mutex<()> = Mutex::new(());
+    /// Serialises the brief window in `spawn_with_security_capabilities` where the child ends of
+    /// the stdio pipes are marked inheritable for `CreateProcessW` (M2).
+    static WINDOWS_SPAWN_LOCK: Mutex<()> = Mutex::new(());
+    static MSVC_ENV_CACHE: OnceLock<Option<(PathBuf, String, Vec<PathBuf>)>> = OnceLock::new();
+
+    fn to_wide(s: &OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
     }
 
-    fn ensure_window_station_and_desktop_access(any_pkg_sid: PSID) {
-        WINSTA_PREPARED.get_or_init(|| unsafe {
-            // Grant only read/enumerate/atom attributes on the Window Station (`0x0002_0363`),
-            // explicitly omitting `WINSTA_READCLIPBOARD` (0x0004), `WINSTA_ACCESSCLIPBOARD`
-            // (0x0008), `WINSTA_WRITEATTRIBUTES` (0x0010), `DELETE`, `WRITE_DAC`, and `WRITE_OWNER`.
-            let winsta = GetProcessWindowStation();
-            grant_window_object_access(winsta, any_pkg_sid, 0x0002_0363);
-            // Grant only standard desktop connection rights (`0x0002_01C3`), explicitly omitting
-            // `DESKTOP_HOOKCONTROL` (0x0008), `DESKTOP_JOURNALRECORD` (0x0010),
-            // `DESKTOP_JOURNALPLAYBACK` (0x0020), `DELETE`, `WRITE_DAC`, and `WRITE_OWNER`.
-            let desktop = GetThreadDesktop(GetCurrentThreadId());
-            grant_window_object_access(desktop, any_pkg_sid, 0x0002_01C3);
-        });
-    }
-
-    fn grant_window_object_access(handle: HANDLE, any_pkg_sid: PSID, access_mask: u32) {
-        if handle.is_null() {
-            return;
+    pub(crate) fn normalize_win_path(p: &Path) -> PathBuf {
+        let raw = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let s = raw.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
+            PathBuf::from(format!(r"\\{stripped}"))
+        } else if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            PathBuf::from(stripped)
+        } else {
+            raw
         }
-        let mut old_dacl: *mut ACL = std::ptr::null_mut();
-        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        let rc = unsafe {
-            GetSecurityInfo(
-                handle,
-                SE_WINDOW_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut old_dacl,
-                std::ptr::null_mut(),
-                &mut sd,
-            )
-        };
-        if rc != ERROR_SUCCESS {
-            if !sd.is_null() {
-                unsafe {
-                    LocalFree(sd as HLOCAL);
-                }
+    }
+
+    /// Returns `true` if `path` itself is a symlink or NTFS junction (`FILE_ATTRIBUTE_REPARSE_POINT`).
+    /// Uses `symlink_metadata` so it never follows the reparse target.
+    pub fn is_reparse_point(path: &Path) -> bool {
+        std::fs::symlink_metadata(path)
+            .map(|m| (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+            .unwrap_or(false)
+    }
+
+    /// Returns `true` if `child` is lexically or canonically inside `parent` (case-insensitive on
+    /// Windows).
+    pub fn path_starts_with_ci(child: &Path, parent: &Path) -> bool {
+        if child.as_os_str().is_empty() || parent.as_os_str().is_empty() {
+            return false;
+        }
+        let c_norm = normalize_win_path(child);
+        let p_norm = normalize_win_path(parent);
+        let mut c_iter = c_norm.components();
+        for p_comp in p_norm.components() {
+            let Some(c_comp) = c_iter.next() else {
+                return false;
+            };
+            let p_str = p_comp.as_os_str().to_string_lossy();
+            let c_str = c_comp.as_os_str().to_string_lossy();
+            if !p_str.eq_ignore_ascii_case(&c_str) {
+                return false;
             }
-            return;
         }
-        let entry = explicit_access(any_pkg_sid, access_mask, SET_ACCESS, NO_INHERITANCE);
-        let mut new_dacl: *mut ACL = std::ptr::null_mut();
-        let rc = unsafe { SetEntriesInAclW(1, &entry, old_dacl, &mut new_dacl) };
-        if rc == ERROR_SUCCESS && !new_dacl.is_null() {
-            unsafe {
-                let _ = SetSecurityInfo(
-                    handle,
-                    SE_WINDOW_OBJECT,
-                    DACL_SECURITY_INFORMATION,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    new_dacl,
-                    std::ptr::null(),
+        true
+    }
+
+    /// Queries `vswhere.exe` (when installed) for Visual Studio installation paths with VC tools.
+    fn query_vswhere_install_paths() -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        for pf_var in ["ProgramFiles(x86)", "ProgramFiles"] {
+            if let Some(pf) = std::env::var_os(pf_var).map(PathBuf::from) {
+                candidates.push(
+                    pf.join("Microsoft Visual Studio")
+                        .join("Installer")
+                        .join("vswhere.exe"),
                 );
-                LocalFree(new_dacl as HLOCAL);
             }
         }
-        if !sd.is_null() {
-            unsafe {
-                LocalFree(sd as HLOCAL);
+        candidates.push(PathBuf::from(
+            r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe",
+        ));
+        for vswhere in candidates {
+            if !vswhere.is_file() {
+                continue;
+            }
+            let Ok(output) = std::process::Command::new(&vswhere)
+                .args([
+                    "-latest",
+                    "-products",
+                    "*",
+                    "-requires",
+                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-property",
+                    "installationPath",
+                ])
+                .output()
+            else {
+                continue;
+            };
+            if !output.status.success() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            let paths: Vec<PathBuf> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+                .collect();
+            if !paths.is_empty() {
+                return paths;
             }
         }
+        Vec::new()
     }
 
-    /// Resolves the host MSVC `bin\Hostx64\x64` directory and `LIB` search path once on Windows so
-    /// `rustc` inside an AppContainer (where COM `CLSID_SetupConfiguration` is blocked) can locate
-    /// `link.exe` and the Windows SDK `.lib` files directly via `PATH` and `LIB`.
-    pub fn resolve_windows_msvc_env() -> Option<(PathBuf, String)> {
+    fn discover_msvc_details() -> Option<(PathBuf, String, Vec<PathBuf>)> {
         MSVC_ENV_CACHE
             .get_or_init(|| {
-                let mut vs_roots = vec![PathBuf::from(r"C:\BuildTools")];
+                let mut vs_roots = query_vswhere_install_paths();
+                vs_roots.push(PathBuf::from(r"C:\BuildTools"));
                 for pf_var in ["ProgramFiles", "ProgramFiles(x86)"] {
                     if let Some(pf) = std::env::var_os(pf_var).map(PathBuf::from) {
                         for year in ["2022", "2019"] {
                             for ed in ["Enterprise", "Professional", "Community", "BuildTools"] {
-                                vs_roots
-                                    .push(pf.join("Microsoft Visual Studio").join(year).join(ed));
+                                let candidate =
+                                    pf.join("Microsoft Visual Studio").join(year).join(ed);
+                                if !vs_roots.contains(&candidate) {
+                                    vs_roots.push(candidate);
+                                }
                             }
                         }
                     }
                 }
                 let mut msvc_ver_dir: Option<PathBuf> = None;
+                let mut matched_vs_root: Option<PathBuf> = None;
                 for root in vs_roots {
                     let msvc_base = root.join("VC").join("Tools").join("MSVC");
                     if let Ok(entries) = std::fs::read_dir(&msvc_base) {
@@ -852,15 +936,18 @@ pub(crate) mod windows {
                                 .is_file()
                         }) {
                             msvc_ver_dir = Some(best);
+                            matched_vs_root = Some(root);
                             break;
                         }
                     }
                 }
                 let msvc_ver_dir = msvc_ver_dir?;
+                let matched_vs_root = matched_vs_root?;
                 let msvc_bin = msvc_ver_dir.join("bin").join("Hostx64").join("x64");
                 let msvc_lib = msvc_ver_dir.join("lib").join("x64");
 
-                let kits_base = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\Lib");
+                let kits_root = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10");
+                let kits_base = kits_root.join("Lib");
                 let mut sdk_ver_dir: Option<PathBuf> = None;
                 if let Ok(entries) = std::fs::read_dir(&kits_base) {
                     let mut vers: Vec<PathBuf> = entries
@@ -883,9 +970,19 @@ pub(crate) mod windows {
                     ucrt_lib.display(),
                     um_lib.display()
                 );
-                Some((msvc_bin, lib_str))
+                let grant_roots = vec![matched_vs_root, kits_root];
+                Some((msvc_bin, lib_str, grant_roots))
             })
             .clone()
+    }
+
+    /// Resolves the host MSVC `bin\Hostx64\x64` directory and `LIB` search path once on Windows
+    /// (querying `vswhere.exe` first, then standard Visual Studio installation roots) so `rustc`
+    /// inside an AppContainer can locate `link.exe` and Windows SDK `.lib` files via `PATH` and
+    /// `LIB`.
+    pub fn resolve_windows_msvc_env() -> Option<(PathBuf, String)> {
+        let (bin, lib, _) = discover_msvc_details()?;
+        Some((bin, lib))
     }
 
     /// Resolves `program` against `search_path` on Windows. Returns `None` if the executable
@@ -928,14 +1025,24 @@ pub(crate) mod windows {
         None
     }
 
-    fn to_wide(s: &OsStr) -> Vec<u16> {
-        s.encode_wide().chain(std::iter::once(0)).collect()
-    }
-
-    struct OwnedSid(Vec<u8>);
+    /// RAII wrapper for a SID allocated from a well-known SID, current process token, or
+    /// `DeriveCapabilitySidsFromName`.
+    pub struct OwnedSid(Vec<u8>);
 
     impl OwnedSid {
-        fn from_well_known(sid_type: WELL_KNOWN_SID_TYPE) -> io::Result<Self> {
+        fn from_raw_psid(raw: PSID) -> io::Result<Self> {
+            if raw.is_null() || unsafe { IsValidSid(raw) } == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid Windows SID pointer",
+                ));
+            }
+            let len = unsafe { GetLengthSid(raw) } as usize;
+            let slice = unsafe { std::slice::from_raw_parts(raw as *const u8, len) };
+            Ok(Self(slice.to_vec()))
+        }
+
+        pub fn from_well_known(sid_type: WELL_KNOWN_SID_TYPE) -> io::Result<Self> {
             let mut buf = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
             let mut size = buf.len() as u32;
             let ok = unsafe {
@@ -953,7 +1060,7 @@ pub(crate) mod windows {
             Ok(Self(buf))
         }
 
-        fn current_user() -> io::Result<Self> {
+        pub fn current_user() -> io::Result<Self> {
             let mut token: HANDLE = std::ptr::null_mut();
             if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
                 return Err(io::Error::last_os_error());
@@ -979,15 +1086,94 @@ pub(crate) mod windows {
                 return Err(io::Error::last_os_error());
             }
             let token_user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
-            let sid_ptr = token_user.User.Sid;
-            let len = unsafe { windows_sys::Win32::Security::GetLengthSid(sid_ptr) } as usize;
-            let slice = unsafe { std::slice::from_raw_parts(sid_ptr as *const u8, len) };
-            Ok(Self(slice.to_vec()))
+            Self::from_raw_psid(token_user.User.Sid)
         }
 
-        fn as_psid(&self) -> PSID {
+        /// Derives the custom capability SID for `oxideswarm.toolchain` using
+        /// `DeriveCapabilitySidsFromName`. Unlike `S-1-15-2-1` (`ALL APPLICATION PACKAGES`), no
+        /// other AppContainer on the host holds this capability unless explicitly spawned with it.
+        pub fn oxideswarm_toolchain() -> io::Result<Self> {
+            Self::capability_from_name(OXIDESWARM_TOOLCHAIN_CAPABILITY_NAME)
+        }
+
+        pub fn capability_from_name(name: &str) -> io::Result<Self> {
+            let wide = to_wide(OsStr::new(name));
+            let mut group_sids: *mut PSID = std::ptr::null_mut();
+            let mut group_count: u32 = 0;
+            let mut cap_sids: *mut PSID = std::ptr::null_mut();
+            let mut cap_count: u32 = 0;
+            let ok = unsafe {
+                DeriveCapabilitySidsFromName(
+                    wide.as_ptr(),
+                    &mut group_sids,
+                    &mut group_count,
+                    &mut cap_sids,
+                    &mut cap_count,
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let result = if cap_count > 0 && !cap_sids.is_null() {
+                let first = unsafe { *cap_sids };
+                Self::from_raw_psid(first)
+            } else {
+                Err(io::Error::other(
+                    "DeriveCapabilitySidsFromName returned zero capability SIDs",
+                ))
+            };
+            unsafe {
+                if !group_sids.is_null() {
+                    for i in 0..group_count as usize {
+                        let s = *group_sids.add(i);
+                        if !s.is_null() {
+                            LocalFree(s as HLOCAL);
+                        }
+                    }
+                    LocalFree(group_sids as HLOCAL);
+                }
+                if !cap_sids.is_null() {
+                    for i in 0..cap_count as usize {
+                        let s = *cap_sids.add(i);
+                        if !s.is_null() {
+                            LocalFree(s as HLOCAL);
+                        }
+                    }
+                    LocalFree(cap_sids as HLOCAL);
+                }
+            }
+            result
+        }
+
+        pub fn to_sid_string(&self) -> io::Result<String> {
+            let mut wide_ptr: *mut u16 = std::ptr::null_mut();
+            let ok = unsafe { ConvertSidToStringSidW(self.as_psid(), &mut wide_ptr) };
+            if ok == 0 || wide_ptr.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let mut len = 0usize;
+            unsafe {
+                while *wide_ptr.add(len) != 0 {
+                    len += 1;
+                }
+            }
+            let slice = unsafe { std::slice::from_raw_parts(wide_ptr, len) };
+            let s = OsString::from_wide(slice).to_string_lossy().into_owned();
+            unsafe {
+                LocalFree(wide_ptr as HLOCAL);
+            }
+            Ok(s)
+        }
+
+        pub fn as_psid(&self) -> PSID {
             self.0.as_ptr() as PSID
         }
+    }
+
+    /// Returns the string representation (`S-1-15-3-...`) of the `oxideswarm.toolchain` capability
+    /// SID on this Windows host.
+    pub fn oxideswarm_toolchain_sid_string() -> io::Result<String> {
+        OwnedSid::oxideswarm_toolchain()?.to_sid_string()
     }
 
     fn explicit_access(
@@ -1079,7 +1265,7 @@ pub(crate) mod windows {
         found
     }
 
-    fn dacl_already_grants_sid_with_flags(
+    pub fn dacl_already_grants_sid_with_flags(
         path: &Path,
         target_sid: PSID,
         required_mask: u32,
@@ -1094,16 +1280,18 @@ pub(crate) mod windows {
         )
     }
 
-    fn dacl_already_grants_sid(path: &Path, target_sid: PSID, required_mask: u32) -> bool {
+    pub fn dacl_already_grants_sid(path: &Path, target_sid: PSID, required_mask: u32) -> bool {
         dacl_already_grants_sid_with_flags(path, target_sid, required_mask, 0)
     }
 
-    fn dacl_already_denies_sid(path: &Path, target_sid: PSID, required_mask: u32) -> bool {
+    pub fn dacl_already_denies_sid(path: &Path, target_sid: PSID, required_mask: u32) -> bool {
         dacl_has_ace(path, target_sid, ACCESS_DENIED_ACE_TYPE, required_mask, 0)
     }
 
+    /// Merges `entries` into `path`'s existing DACL without disturbing existing ACEs or
+    /// inheritance. Refuses to operate on symlinks or NTFS junctions (`is_reparse_point`).
     fn merge_entries_on_path(path: &Path, entries: &[EXPLICIT_ACCESS_W]) -> io::Result<()> {
-        if !path.exists() || entries.is_empty() {
+        if !path.exists() || entries.is_empty() || is_reparse_point(path) {
             return Ok(());
         }
         let wide_path = to_wide(path.as_os_str());
@@ -1173,7 +1361,15 @@ pub(crate) mod windows {
         Ok(())
     }
 
+    /// Replaces `path`'s DACL with a fresh protected DACL (`PROTECTED_DACL_SECURITY_INFORMATION`)
+    /// built purely from `entries`. Refuses to operate on symlinks or NTFS junctions.
     fn set_protected_dacl_on_path(path: &Path, entries: &[EXPLICIT_ACCESS_W]) -> io::Result<()> {
+        if is_reparse_point(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("refusing to set DACL on reparse point {}", path.display()),
+            ));
+        }
         let wide_path = to_wide(path.as_os_str());
         let mut new_dacl: *mut ACL = std::ptr::null_mut();
         let rc = unsafe {
@@ -1209,410 +1405,24 @@ pub(crate) mod windows {
         Ok(())
     }
 
-    fn grant_ancestor_traverse(path: &Path, any_pkg_sid: PSID) {
-        let traverse_mask = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
-        let mut cur = path.parent();
-        while let Some(dir) = cur {
-            if dir.parent().is_none() {
-                break;
-            }
-            if !dacl_already_grants_sid(dir, any_pkg_sid, traverse_mask) {
-                let entry =
-                    explicit_access(any_pkg_sid, traverse_mask, GRANT_ACCESS, NO_INHERITANCE);
-                let _ = merge_entries_on_path(dir, &[entry]);
-            }
-            cur = dir.parent();
+    /// Walks an existing directory tree (`root` and all descendants), skipping any symlink or
+    /// NTFS junction (`is_reparse_point`), and applies `entries`.
+    fn apply_dacl_to_existing_tree(
+        root: &Path,
+        entries: &[EXPLICIT_ACCESS_W],
+        protected_root: bool,
+    ) -> io::Result<()> {
+        if !root.exists() || is_reparse_point(root) {
+            return Ok(());
         }
-    }
-
-    fn deny_list_and_write_non_inherited(dir: &Path, any_pkg_sid: PSID) {
-        if !dir.exists() {
-            return;
+        if protected_root {
+            set_protected_dacl_on_path(root, entries)?;
+        } else {
+            merge_entries_on_path(root, entries)?;
         }
-        let traverse_mask = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
-        if !dacl_already_grants_sid(dir, any_pkg_sid, traverse_mask) {
-            let allow = explicit_access(any_pkg_sid, traverse_mask, GRANT_ACCESS, NO_INHERITANCE);
-            let _ = merge_entries_on_path(dir, &[allow]);
+        if !root.is_dir() {
+            return Ok(());
         }
-        if dacl_already_grants_sid(dir, any_pkg_sid, FILE_LIST_DIRECTORY)
-            && !dacl_already_denies_sid(dir, any_pkg_sid, DIR_LIST_AND_WRITE_MASK)
-        {
-            let deny = explicit_access(
-                any_pkg_sid,
-                DIR_LIST_AND_WRITE_MASK,
-                DENY_ACCESS,
-                NO_INHERITANCE,
-            );
-            let _ = merge_entries_on_path(dir, &[deny]);
-        }
-    }
-
-    fn grant_rx_non_inherited(path: &Path, any_pkg_sid: PSID) {
-        if !path.exists() {
-            return;
-        }
-        let rx_mask = GENERIC_READ | GENERIC_EXECUTE;
-        if dacl_already_grants_sid(path, any_pkg_sid, FILE_READ_ATTRIBUTES) {
-            return;
-        }
-        let entry = explicit_access(any_pkg_sid, rx_mask, GRANT_ACCESS, NO_INHERITANCE);
-        let _ = merge_entries_on_path(path, &[entry]);
-    }
-
-    fn grant_rx_recursive_cached(path: &Path, any_pkg_sid: PSID) {
-        if !path.exists() {
-            return;
-        }
-        if let Ok(mut guard) = prepared_cache().lock() {
-            if guard.contains(path) {
-                return;
-            }
-            let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
-            if dacl_already_grants_sid_with_flags(
-                path,
-                any_pkg_sid,
-                FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
-                inherit,
-            ) {
-                guard.insert(path.to_path_buf());
-                return;
-            }
-            let rx_mask = GENERIC_READ | GENERIC_EXECUTE;
-            let entry = explicit_access(any_pkg_sid, rx_mask, GRANT_ACCESS, inherit);
-            if merge_entries_on_path(path, &[entry]).is_ok() {
-                guard.insert(path.to_path_buf());
-            }
-        }
-    }
-
-    fn deny_any_package_on_path(path: &Path, any_pkg_sid: PSID) {
-        if !path.exists() {
-            return;
-        }
-        if dacl_already_denies_sid(path, any_pkg_sid, FILE_ALL_ACCESS)
-            && !dacl_already_grants_sid(path, any_pkg_sid, FILE_READ_ATTRIBUTES)
-        {
-            return;
-        }
-        let Ok(user_sid) = OwnedSid::current_user() else {
-            return;
-        };
-        let Ok(system_sid) = OwnedSid::from_well_known(WinLocalSystemSid) else {
-            return;
-        };
-        let Ok(admins_sid) = OwnedSid::from_well_known(WinBuiltinAdministratorsSid) else {
-            return;
-        };
-        let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
-        let entries = [
-            explicit_access(user_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
-            explicit_access(system_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
-            explicit_access(admins_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
-            explicit_access(any_pkg_sid, FILE_ALL_ACCESS, DENY_ACCESS, inherit),
-        ];
-        let _ = set_protected_dacl_on_path(path, &entries);
-        if path.is_dir() {
-            if let Ok(dir_entries) = std::fs::read_dir(path) {
-                for e in dir_entries.take(64).flatten() {
-                    let child = e.path();
-                    if child.is_file()
-                        && (!dacl_already_denies_sid(&child, any_pkg_sid, FILE_ALL_ACCESS)
-                            || dacl_already_grants_sid(&child, any_pkg_sid, FILE_READ_ATTRIBUTES))
-                    {
-                        let _ = set_protected_dacl_on_path(&child, &entries);
-                    }
-                }
-            }
-        }
-    }
-
-    fn parse_cargo_lock_packages(sandbox_path: &Path) -> Vec<String> {
-        let lock_path = sandbox_path.join("Cargo.lock");
-        let Ok(content) = std::fs::read_to_string(&lock_path) else {
-            return Vec::new();
-        };
-        let mut pkgs = Vec::new();
-        let mut cur_name: Option<String> = None;
-        let mut cur_ver: Option<String> = None;
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed == "[[package]]" {
-                if let (Some(n), Some(v)) = (cur_name.take(), cur_ver.take()) {
-                    pkgs.push(format!("{n}-{v}"));
-                }
-            } else if let Some(rest) = trimmed.strip_prefix("name = ") {
-                cur_name = Some(rest.trim_matches('"').to_string());
-            } else if let Some(rest) = trimmed.strip_prefix("version = ") {
-                cur_ver = Some(rest.trim_matches('"').to_string());
-            }
-        }
-        if let (Some(n), Some(v)) = (cur_name, cur_ver) {
-            pkgs.push(format!("{n}-{v}"));
-        }
-        pkgs
-    }
-
-    fn index_prefix_relpath(crate_name: &str) -> PathBuf {
-        let lower = crate_name.to_ascii_lowercase();
-        match lower.len() {
-            1 => PathBuf::from("1").join(&lower),
-            2 => PathBuf::from("2").join(&lower),
-            3 => PathBuf::from("3").join(&lower[..1]).join(&lower),
-            _ => PathBuf::from(&lower[..2]).join(&lower[2..4]).join(&lower),
-        }
-    }
-
-    fn prepare_one_cargo_dir(sandbox_path: &Path, cargo: &Path, any_pkg_sid: PSID) {
-        if !cargo.exists() {
-            return;
-        }
-        grant_ancestor_traverse(cargo, any_pkg_sid);
-        grant_rx_non_inherited(cargo, any_pkg_sid);
-        for file in [
-            "config.toml",
-            "config",
-            ".package-cache",
-            ".package-cache-lock",
-        ] {
-            grant_rx_non_inherited(&cargo.join(file), any_pkg_sid);
-        }
-        if let Ok(entries) = std::fs::read_dir(cargo) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_file() {
-                    let name = entry.file_name();
-                    if !name.eq_ignore_ascii_case("credentials")
-                        && !name.eq_ignore_ascii_case("credentials.toml")
-                    {
-                        grant_rx_non_inherited(&p, any_pkg_sid);
-                    }
-                }
-            }
-        }
-        grant_rx_recursive_cached(&cargo.join("bin"), any_pkg_sid);
-        grant_rx_recursive_cached(&cargo.join("git"), any_pkg_sid);
-        grant_rx_recursive_cached(&cargo.join("vendor"), any_pkg_sid);
-
-        let registry = cargo.join("registry");
-        if registry.exists() {
-            grant_rx_non_inherited(&registry, any_pkg_sid);
-            let src_dir = registry.join("src");
-            let cache_dir = registry.join("cache");
-            let index_dir = registry.join("index");
-            grant_rx_non_inherited(&src_dir, any_pkg_sid);
-            grant_rx_non_inherited(&cache_dir, any_pkg_sid);
-            grant_rx_non_inherited(&index_dir, any_pkg_sid);
-
-            let mut pkgs = parse_cargo_lock_packages(sandbox_path);
-            // Also include cached leaf crates used by offline build tests when no Cargo.lock
-            // exists yet in the sandbox.
-            if let Ok(remotes) = std::fs::read_dir(&cache_dir) {
-                for remote in remotes.flatten() {
-                    if let Ok(files) = std::fs::read_dir(remote.path()) {
-                        for f in files.flatten() {
-                            if let Some(stem) = f
-                                .file_name()
-                                .to_str()
-                                .and_then(|s| s.strip_suffix(".crate"))
-                            {
-                                if let Some((name, _)) = stem.rsplit_once('-') {
-                                    if [
-                                        "cfg-if",
-                                        "itoa",
-                                        "bytes",
-                                        "memchr",
-                                        "smallvec",
-                                        "once_cell",
-                                    ]
-                                    .contains(&name)
-                                        && !pkgs.iter().any(|p| p == stem)
-                                    {
-                                        pkgs.push(stem.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let Ok(remotes) = std::fs::read_dir(&src_dir) {
-                for remote in remotes.flatten() {
-                    let remote_path = remote.path();
-                    grant_rx_non_inherited(&remote_path, any_pkg_sid);
-                    for pkg in &pkgs {
-                        grant_rx_recursive_cached(&remote_path.join(pkg), any_pkg_sid);
-                    }
-                }
-            }
-            if let Ok(remotes) = std::fs::read_dir(&cache_dir) {
-                for remote in remotes.flatten() {
-                    let remote_path = remote.path();
-                    grant_rx_non_inherited(&remote_path, any_pkg_sid);
-                    for pkg in &pkgs {
-                        grant_rx_non_inherited(
-                            &remote_path.join(format!("{pkg}.crate")),
-                            any_pkg_sid,
-                        );
-                    }
-                }
-            }
-            if let Ok(remotes) = std::fs::read_dir(&index_dir) {
-                for remote in remotes.flatten() {
-                    let remote_path = remote.path();
-                    grant_rx_non_inherited(&remote_path, any_pkg_sid);
-                    grant_rx_non_inherited(&remote_path.join("config.json"), any_pkg_sid);
-                    let dot_cache = remote_path.join(".cache");
-                    grant_rx_non_inherited(&dot_cache, any_pkg_sid);
-                    for pkg in &pkgs {
-                        if let Some((name, _)) = pkg.rsplit_once('-') {
-                            let rel = index_prefix_relpath(name);
-                            for root in [&remote_path, &dot_cache] {
-                                let target = root.join(&rel);
-                                if target.exists() {
-                                    let mut cur = target.parent();
-                                    while let Some(p) = cur {
-                                        if p == root {
-                                            break;
-                                        }
-                                        grant_rx_non_inherited(p, any_pkg_sid);
-                                        cur = p.parent();
-                                    }
-                                    grant_rx_non_inherited(&target, any_pkg_sid);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Explicitly deny access to Cargo registry credentials if they would otherwise be
-        // readable by `ALL APPLICATION PACKAGES` (design 0033 D4.4).
-        for cred in ["credentials.toml", "credentials"] {
-            let p = cargo.join(cred);
-            if p.exists() && dacl_already_grants_sid(&p, any_pkg_sid, FILE_READ_ATTRIBUTES) {
-                deny_any_package_on_path(&p, any_pkg_sid);
-            }
-        }
-    }
-
-    fn prepare_home_and_toolchains(
-        jail: &Jail<'_>,
-        cmd_cargo_home: Option<&Path>,
-        cmd_rustup_home: Option<&Path>,
-        any_pkg_sid: PSID,
-    ) {
-        let home = &jail.host.user_home;
-        if !home.as_os_str().is_empty() && home.exists() {
-            deny_list_and_write_non_inherited(home, any_pkg_sid);
-            let ox_dir = home.join(".oxideswarm");
-            if ox_dir.exists() {
-                if jail.sandbox_dir.starts_with(&ox_dir) {
-                    deny_list_and_write_non_inherited(&ox_dir, any_pkg_sid);
-                    if let Ok(entries) = std::fs::read_dir(&ox_dir) {
-                        for entry in entries.flatten() {
-                            let p = entry.path();
-                            if !jail.sandbox_dir.starts_with(&p)
-                                && dacl_already_grants_sid(&p, any_pkg_sid, FILE_READ_ATTRIBUTES)
-                            {
-                                deny_any_package_on_path(&p, any_pkg_sid);
-                            }
-                        }
-                    }
-                } else if dacl_already_grants_sid(&ox_dir, any_pkg_sid, FILE_READ_ATTRIBUTES) {
-                    deny_any_package_on_path(&ox_dir, any_pkg_sid);
-                }
-            }
-            for dir_name in [".ssh", ".aws", ".gnupg", ".config"] {
-                let sub = home.join(dir_name);
-                if sub.exists() && dacl_already_grants_sid(&sub, any_pkg_sid, FILE_READ_ATTRIBUTES)
-                {
-                    deny_any_package_on_path(&sub, any_pkg_sid);
-                }
-            }
-            if let Ok(entries) = std::fs::read_dir(home) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    let is_allowed_ancestor = jail.sandbox_dir.starts_with(&p)
-                        || jail.sandbox_base.starts_with(&p)
-                        || jail.host.rustup_home.starts_with(&p)
-                        || jail.host.cargo_home.starts_with(&p)
-                        || cmd_rustup_home.is_some_and(|r| r.starts_with(&p))
-                        || cmd_cargo_home.is_some_and(|c| c.starts_with(&p))
-                        || entry.file_name().eq_ignore_ascii_case("AppData");
-                    if !is_allowed_ancestor
-                        && dacl_already_grants_sid(&p, any_pkg_sid, FILE_READ_ATTRIBUTES)
-                    {
-                        deny_any_package_on_path(&p, any_pkg_sid);
-                    }
-                }
-            }
-        }
-        if let Some(account_home) = std::env::var_os("USERPROFILE")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-        {
-            if account_home != *home && account_home.exists() {
-                deny_list_and_write_non_inherited(&account_home, any_pkg_sid);
-            }
-        }
-
-        for rustup in [Some(jail.host.rustup_home.as_path()), cmd_rustup_home]
-            .into_iter()
-            .flatten()
-        {
-            if rustup.exists() {
-                grant_ancestor_traverse(rustup, any_pkg_sid);
-                grant_rx_non_inherited(rustup, any_pkg_sid);
-                grant_rx_non_inherited(&rustup.join("settings.toml"), any_pkg_sid);
-                let tc_root = rustup.join("toolchains");
-                grant_rx_non_inherited(&tc_root, any_pkg_sid);
-                if let Ok(entries) = std::fs::read_dir(&tc_root) {
-                    for entry in entries.flatten() {
-                        let tc_dir = entry.path();
-                        grant_rx_non_inherited(&tc_dir, any_pkg_sid);
-                        grant_rx_recursive_cached(&tc_dir.join("bin"), any_pkg_sid);
-                        grant_rx_recursive_cached(&tc_dir.join("lib"), any_pkg_sid);
-                        grant_rx_recursive_cached(&tc_dir.join("libexec"), any_pkg_sid);
-                    }
-                }
-            }
-        }
-
-        prepare_one_cargo_dir(jail.sandbox_dir, &jail.host.cargo_home, any_pkg_sid);
-        if let Some(custom_cargo) = cmd_cargo_home {
-            if custom_cargo != jail.host.cargo_home {
-                prepare_one_cargo_dir(jail.sandbox_dir, custom_cargo, any_pkg_sid);
-            }
-        }
-
-        let program_data = std::env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-        let vs_root = program_data.join("Microsoft").join("VisualStudio");
-        for sub in [
-            vs_root.join("Setup"),
-            vs_root.join("Packages").join("_Instances"),
-        ] {
-            if sub.exists() {
-                grant_ancestor_traverse(&sub, any_pkg_sid);
-                grant_rx_recursive_cached(&sub, any_pkg_sid);
-            }
-        }
-
-        // Explicitly deny `ALL APPLICATION PACKAGES` on every protected file (such as a cluster
-        // secret file or config file located outside the denied home, or inside a toolchain
-        // directory).
-        for file in jail.protected_files {
-            if !file.as_os_str().is_empty() && file.exists() {
-                deny_any_package_on_path(file, any_pkg_sid);
-            }
-        }
-    }
-
-    fn apply_dacl_to_existing_tree(root: &Path, entries: &[EXPLICIT_ACCESS_W]) -> io::Result<()> {
-        set_protected_dacl_on_path(root, entries)?;
         let mut queue = VecDeque::new();
         queue.push_back(root.to_path_buf());
         while let Some(dir) = queue.pop_front() {
@@ -1621,13 +1431,387 @@ pub(crate) mod windows {
             };
             for entry in read_dir.flatten() {
                 let path = entry.path();
-                let _ = set_protected_dacl_on_path(&path, entries);
+                if is_reparse_point(&path) {
+                    continue;
+                }
+                if protected_root {
+                    let _ = set_protected_dacl_on_path(&path, entries);
+                } else {
+                    let _ = merge_entries_on_path(&path, entries);
+                }
                 if path.is_dir() {
                     queue.push_back(path);
                 }
             }
         }
         Ok(())
+    }
+
+    /// Returns the path of the reversible ACL grant manifest file.
+    /// Honours `RUSTY_GRID_ACL_GRANT_LOG` if set; otherwise uses
+    /// `<user_home>/.oxideswarm/windows_acl_grants.txt`.
+    pub fn acl_grant_manifest_path(host: &HostDirs) -> PathBuf {
+        if let Some(custom) = std::env::var_os("RUSTY_GRID_ACL_GRANT_LOG") {
+            if !custom.is_empty() {
+                return PathBuf::from(custom);
+            }
+        }
+        if !host.user_home.as_os_str().is_empty() {
+            return host
+                .user_home
+                .join(".oxideswarm")
+                .join(ACL_GRANT_LOG_FILENAME);
+        }
+        std::env::temp_dir().join(ACL_GRANT_LOG_FILENAME)
+    }
+
+    fn record_acl_grant(manifest_path: Option<&Path>, granted_path: &Path) -> io::Result<()> {
+        let Some(manifest) = manifest_path else {
+            return Ok(());
+        };
+        if let Some(parent) = manifest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let norm = normalize_win_path(granted_path);
+        let line = norm.to_string_lossy().into_owned();
+        let existing = std::fs::read_to_string(manifest).unwrap_or_default();
+        if existing
+            .lines()
+            .any(|l| l.trim().eq_ignore_ascii_case(&line))
+        {
+            return Ok(());
+        }
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(manifest)?;
+        writeln!(file, "{line}")?;
+        Ok(())
+    }
+
+    fn grant_rx_non_inherited(
+        path: &Path,
+        sid: PSID,
+        manifest_path: Option<&Path>,
+    ) -> io::Result<()> {
+        if !path.exists() || is_reparse_point(path) {
+            return Ok(());
+        }
+        let rx_mask = GENERIC_READ | GENERIC_EXECUTE | SYNCHRONIZE;
+        if dacl_already_grants_sid(path, sid, FILE_READ_ATTRIBUTES) {
+            return Ok(());
+        }
+        record_acl_grant(manifest_path, path)?;
+        let entry = explicit_access(sid, rx_mask, GRANT_ACCESS, NO_INHERITANCE);
+        merge_entries_on_path(path, &[entry])
+    }
+
+    fn grant_rx_recursive(path: &Path, sid: PSID, manifest_path: Option<&Path>) -> io::Result<()> {
+        if !path.exists() || is_reparse_point(path) {
+            return Ok(());
+        }
+        let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+        if dacl_already_grants_sid_with_flags(
+            path,
+            sid,
+            FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+            inherit,
+        ) {
+            return Ok(());
+        }
+        record_acl_grant(manifest_path, path)?;
+        let rx_mask = GENERIC_READ | GENERIC_EXECUTE | SYNCHRONIZE;
+        let entry = explicit_access(sid, rx_mask, GRANT_ACCESS, inherit);
+        apply_dacl_to_existing_tree(path, &[entry], false)
+    }
+
+    /// Grants `oxideswarm.toolchain` read+execute on the existing subdirectories and config files
+    /// of `cargo_home` (`bin`, `registry`, `git`, `vendor`, `config.toml`, `config`) while NEVER
+    /// placing an inheritable allow ACE on `cargo_home` itself and NEVER granting access to
+    /// `credentials` or `credentials.toml`.
+    ///
+    /// Why: if `cargo_home` had an inheritable allow ACE and `credentials.toml` were later
+    /// replaced by atomic rename (`MoveFileExW`), the new file would inherit the allow ACE and
+    /// lose any per-file deny ACE. With `NO_INHERITANCE` on `cargo_home`, any file created or
+    /// renamed inside `cargo_home` inherits zero `oxideswarm.toolchain` permissions.
+    fn prepare_one_cargo_dir(
+        cargo: &Path,
+        toolchain_sid: PSID,
+        manifest_path: Option<&Path>,
+    ) -> io::Result<()> {
+        if !cargo.exists() || is_reparse_point(cargo) {
+            return Ok(());
+        }
+        grant_rx_non_inherited(cargo, toolchain_sid, manifest_path)?;
+        for file in [
+            "config.toml",
+            "config",
+            ".package-cache",
+            ".package-cache-lock",
+        ] {
+            let p = cargo.join(file);
+            if p.exists() && !is_reparse_point(&p) {
+                grant_rx_non_inherited(&p, toolchain_sid, manifest_path)?;
+            }
+        }
+        for subdir in ["bin", "git", "vendor", "registry"] {
+            let p = cargo.join(subdir);
+            if p.exists() && !is_reparse_point(&p) {
+                grant_rx_recursive(&p, toolchain_sid, manifest_path)?;
+            }
+        }
+        for cred in ["credentials", "credentials.toml"] {
+            let p = cargo.join(cred);
+            if p.exists()
+                && !is_reparse_point(&p)
+                && !dacl_already_denies_sid(&p, toolchain_sid, FILE_ALL_ACCESS)
+            {
+                record_acl_grant(manifest_path, &p)?;
+                let deny =
+                    explicit_access(toolchain_sid, FILE_ALL_ACCESS, DENY_ACCESS, NO_INHERITANCE);
+                let _ = merge_entries_on_path(&p, &[deny]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates that no `protected_files` entry (e.g. `--join-token-file`, `--admin-token-file`,
+    /// TLS key, or worker config file) lies inside any directory that receives a recursive
+    /// `oxideswarm.toolchain` read+execute grant.
+    ///
+    /// Why: per-file `DENY_ACCESS` ACEs do not survive atomic file replacement (`write temp` +
+    /// `rename` over the secret), because the renamed replacement file inherits the parent
+    /// directory's allow ACE. Rather than relying on a fragile per-file deny ACE inside a granted
+    /// toolchain tree, the worker refuses to start if a protected file is placed inside
+    /// `rustup_home`, `cargo_home`, or the MSVC/SDK directories.
+    pub fn validate_protected_files_outside_toolchains(
+        host: &HostDirs,
+        protected_files: &[PathBuf],
+    ) -> Result<(), String> {
+        let mut toolchain_roots: Vec<(&str, PathBuf)> = Vec::new();
+        if !host.rustup_home.as_os_str().is_empty() {
+            toolchain_roots.push(("RUSTUP_HOME", host.rustup_home.clone()));
+        }
+        if !host.cargo_home.as_os_str().is_empty() {
+            toolchain_roots.push(("CARGO_HOME", host.cargo_home.clone()));
+        }
+        if let Some((_, _, grant_roots)) = discover_msvc_details() {
+            for r in grant_roots {
+                toolchain_roots.push(("MSVC/Windows SDK toolchain", r));
+            }
+        }
+        for pf in protected_files {
+            if pf.as_os_str().is_empty() {
+                continue;
+            }
+            for (label, root) in &toolchain_roots {
+                if path_starts_with_ci(pf, root) {
+                    return Err(format!(
+                        "refusing to start isolated worker: protected file '{}' lies inside granted {} directory '{}'; move the secret/config file outside the toolchain tree so atomic file replacement cannot inherit toolchain read permissions",
+                        pf.display(),
+                        label,
+                        root.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Protects `sandbox_base` so tasks holding `oxideswarm.toolchain` can traverse `sandbox_base`
+    /// (`FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE`, `NO_INHERITANCE`) without being able
+    /// to list `sandbox_base` (`FILE_LIST_DIRECTORY` omitted) or read sibling sandboxes.
+    fn protect_sandbox_base(sandbox_base: &Path, toolchain_sid: PSID) -> io::Result<()> {
+        if !sandbox_base.exists() || is_reparse_point(sandbox_base) {
+            return Ok(());
+        }
+        let traverse_mask = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+        if dacl_already_grants_sid(sandbox_base, toolchain_sid, traverse_mask)
+            && !dacl_already_grants_sid(sandbox_base, toolchain_sid, FILE_LIST_DIRECTORY)
+        {
+            return Ok(());
+        }
+        let user_sid = OwnedSid::current_user()?;
+        let system_sid = OwnedSid::from_well_known(WinLocalSystemSid)?;
+        let admins_sid = OwnedSid::from_well_known(WinBuiltinAdministratorsSid)?;
+        let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+        let base_entries = [
+            explicit_access(user_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
+            explicit_access(system_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
+            explicit_access(admins_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
+            explicit_access(toolchain_sid, traverse_mask, SET_ACCESS, NO_INHERITANCE),
+        ];
+        set_protected_dacl_on_path(sandbox_base, &base_entries)
+    }
+
+    /// Prepares the worker's own toolchain directories (`host.rustup_home` and `host.cargo_home`)
+    /// once for the `oxideswarm.toolchain` capability SID, and configures `sandbox_base` with
+    /// non-inherited traverse-only access.
+    ///
+    /// Security invariants enforced here:
+    /// - Grants `oxideswarm.toolchain` (`S-1-15-3-...`), NEVER `S-1-15-2-1` (`ALL APPLICATION PACKAGES`).
+    /// - Never modifies `<user_home>` (`C:\Users\<user>`) or any secret directory under it.
+    /// - Never reads task env (`CARGO_HOME`, `RUSTUP_HOME`) or task `Cargo.lock`.
+    /// - Refuses if any `protected_files` path lies inside a granted toolchain root.
+    /// - Checks the actual on-disk DACL (`dacl_already_grants_sid`) before writing any ACE, with
+    ///   no stale in-memory cache.
+    /// - Logs every toolchain path before modifying its DACL to `acl_grant_manifest_path(host)` so
+    ///   the user or `revoke_oxideswarm_toolchain_acls` / `windows/revoke-isolation-acls.ps1` can
+    ///   inspect and revert every ACL change.
+    pub fn prepare_worker_toolchains(
+        host: &HostDirs,
+        protected_files: &[PathBuf],
+        sandbox_base: Option<&Path>,
+    ) -> Result<(), String> {
+        validate_protected_files_outside_toolchains(host, protected_files)?;
+
+        let _guard = PREPARE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let toolchain_sid = OwnedSid::oxideswarm_toolchain().map_err(|e| {
+            format!("DeriveCapabilitySidsFromName(oxideswarm.toolchain) failed: {e}")
+        })?;
+
+        if let Some(base) = sandbox_base {
+            if base.exists() {
+                protect_sandbox_base(base, toolchain_sid.as_psid()).map_err(|e| {
+                    format!(
+                        "failed to configure sandbox_base DACL on {}: {e}",
+                        base.display()
+                    )
+                })?;
+            }
+        }
+
+        let manifest = acl_grant_manifest_path(host);
+        let manifest_opt = if host.user_home.as_os_str().is_empty()
+            && std::env::var_os("RUSTY_GRID_ACL_GRANT_LOG").is_none()
+        {
+            None
+        } else {
+            Some(manifest.as_path())
+        };
+
+        // Never touch `host.user_home` itself. Windows `SeChangeNotifyPrivilege` (Bypass Traverse
+        // Checking, held by AppContainers) allows opening `<user_home>\.rustup` or
+        // `<user_home>\.cargo` directly by full path without any ACE on `<user_home>`.
+        if !host.rustup_home.as_os_str().is_empty()
+            && host.rustup_home.exists()
+            && (host.user_home.as_os_str().is_empty()
+                || !path_starts_with_ci(&host.user_home, &host.rustup_home))
+        {
+            let rustup = &host.rustup_home;
+            grant_rx_non_inherited(rustup, toolchain_sid.as_psid(), manifest_opt)
+                .map_err(|e| format!("failed to prepare RUSTUP_HOME {}: {e}", rustup.display()))?;
+            let settings = rustup.join("settings.toml");
+            if settings.exists() {
+                let _ = grant_rx_non_inherited(&settings, toolchain_sid.as_psid(), manifest_opt);
+            }
+            let tc_root = rustup.join("toolchains");
+            if tc_root.exists() {
+                let _ = grant_rx_non_inherited(&tc_root, toolchain_sid.as_psid(), manifest_opt);
+                if let Ok(entries) = std::fs::read_dir(&tc_root) {
+                    for entry in entries.flatten() {
+                        let tc_dir = entry.path();
+                        if is_reparse_point(&tc_dir) {
+                            continue;
+                        }
+                        let _ =
+                            grant_rx_non_inherited(&tc_dir, toolchain_sid.as_psid(), manifest_opt);
+                        for sub in ["bin", "lib", "libexec", "etc"] {
+                            let sub_path = tc_dir.join(sub);
+                            if sub_path.exists() {
+                                let _ = grant_rx_recursive(
+                                    &sub_path,
+                                    toolchain_sid.as_psid(),
+                                    manifest_opt,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !host.cargo_home.as_os_str().is_empty()
+            && host.cargo_home.exists()
+            && (host.user_home.as_os_str().is_empty()
+                || !path_starts_with_ci(&host.user_home, &host.cargo_home))
+        {
+            prepare_one_cargo_dir(&host.cargo_home, toolchain_sid.as_psid(), manifest_opt)
+                .map_err(|e| {
+                    format!(
+                        "failed to prepare CARGO_HOME {}: {e}",
+                        host.cargo_home.display()
+                    )
+                })?;
+        }
+
+        Ok(())
+    }
+
+    /// Removes all explicit ACEs for `oxideswarm.toolchain` from `path` (and its descendants if
+    /// `path` is a directory), skipping reparse points.
+    pub fn revoke_toolchain_sid_on_tree(path: &Path, toolchain_sid: PSID) -> io::Result<()> {
+        if !path.exists() || is_reparse_point(path) {
+            return Ok(());
+        }
+        let revoke = explicit_access(toolchain_sid, 0, REVOKE_ACCESS, NO_INHERITANCE);
+        apply_dacl_to_existing_tree(path, &[revoke], false)
+    }
+
+    /// Reads the ACL grant manifest at `manifest_path` and revokes `oxideswarm.toolchain` ACEs
+    /// from every recorded path. Returns the list of paths processed.
+    pub fn revoke_oxideswarm_toolchain_acls(manifest_path: &Path) -> io::Result<Vec<PathBuf>> {
+        if !manifest_path.exists() {
+            return Ok(Vec::new());
+        }
+        let toolchain_sid = OwnedSid::oxideswarm_toolchain()?;
+        let content = std::fs::read_to_string(manifest_path)?;
+        let mut revoked = Vec::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let p = PathBuf::from(trimmed);
+            if p.exists() {
+                revoke_toolchain_sid_on_tree(&p, toolchain_sid.as_psid())?;
+                revoked.push(p);
+            }
+        }
+        Ok(revoked)
+    }
+
+    /// Sweeps any leftover `oxideswarm.task.*` AppContainer profiles from previous crashed worker
+    /// runs by scanning `%LOCALAPPDATA%\Packages` and calling `DeleteAppContainerProfile` (M4).
+    pub fn sweep_leftover_appcontainer_profiles() -> usize {
+        let mut deleted = 0usize;
+        let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+            return 0;
+        };
+        let packages_dir = PathBuf::from(local_app_data).join("Packages");
+        let Ok(entries) = std::fs::read_dir(&packages_dir) else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            let Some(prefix) = name
+                .split('_')
+                .next()
+                .filter(|s| s.starts_with("oxideswarm.task."))
+            else {
+                continue;
+            };
+            let wide = to_wide(OsStr::new(prefix));
+            let hr = unsafe { DeleteAppContainerProfile(wide.as_ptr()) };
+            if hr >= 0 {
+                deleted += 1;
+            }
+        }
+        deleted
     }
 
     /// Per-task Windows AppContainer state that must outlive `CreateProcessW` and deletes the
@@ -1661,6 +1845,123 @@ pub(crate) mod windows {
                     cmd_cargo_home = v.map(PathBuf::from);
                 } else if k.eq_ignore_ascii_case("RUSTUP_HOME") {
                     cmd_rustup_home = v.map(PathBuf::from);
+                }
+            }
+            Self::create_blocking(
+                run_token,
+                jail,
+                &program,
+                cmd_cargo_home.as_deref(),
+                cmd_rustup_home.as_deref(),
+            )
+        }
+
+        /// Blocking per-task AppContainer profile + sandbox DACL setup (invoked inside
+        /// `tokio::task::spawn_blocking` by `TaskRunner::execute_process_supervised`).
+        ///
+        /// Security invariants:
+        /// - Never grants `S-1-15-2-1` (`ALL APPLICATION PACKAGES`) on any path.
+        /// - Never modifies any directory named by the task's `CARGO_HOME`, `RUSTUP_HOME`,
+        ///   `program`, or `Cargo.lock`.
+        /// - Never modifies `<user_home>` or any directory outside `<sandbox_base>` and
+        ///   `<sandbox_dir>`.
+        /// - Refuses if `<sandbox_dir>` or `<sandbox_base>` is a symlink/junction.
+        /// - Attaches `oxideswarm.toolchain` capability SID to every task AppContainer so the
+        ///   task can read the worker's pre-prepared toolchain without exposing it to other
+        ///   AppContainers on the host.
+        pub(crate) fn create_blocking(
+            run_token: uuid::Uuid,
+            jail: &Jail<'_>,
+            program: &str,
+            cmd_cargo_home: Option<&Path>,
+            cmd_rustup_home: Option<&Path>,
+        ) -> io::Result<Self> {
+            validate_protected_files_outside_toolchains(jail.host, jail.protected_files)
+                .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+
+            if is_reparse_point(jail.sandbox_dir) || is_reparse_point(jail.sandbox_base) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "refusing to configure AppContainer on a reparse-point sandbox path",
+                ));
+            }
+
+            // Requirement 2: A task's `CARGO_HOME` or `RUSTUP_HOME` may point only to the worker's
+            // own configured toolchain directory or a directory inside the task's sandbox.
+            if let Some(ch) = cmd_cargo_home {
+                if !ch.as_os_str().is_empty()
+                    && !path_starts_with_ci(ch, jail.sandbox_dir)
+                    && (jail.host.cargo_home.as_os_str().is_empty()
+                        || normalize_win_path(ch) != normalize_win_path(&jail.host.cargo_home))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "task CARGO_HOME '{}' must point inside the task sandbox '{}' or match the worker's CARGO_HOME",
+                            ch.display(),
+                            jail.sandbox_dir.display()
+                        ),
+                    ));
+                }
+            }
+            if let Some(rh) = cmd_rustup_home {
+                if !rh.as_os_str().is_empty()
+                    && !path_starts_with_ci(rh, jail.sandbox_dir)
+                    && (jail.host.rustup_home.as_os_str().is_empty()
+                        || normalize_win_path(rh) != normalize_win_path(&jail.host.rustup_home))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "task RUSTUP_HOME '{}' must point inside the task sandbox '{}' or match the worker's RUSTUP_HOME",
+                            rh.display(),
+                            jail.sandbox_dir.display()
+                        ),
+                    ));
+                }
+            }
+
+            let toolchain_sid = OwnedSid::oxideswarm_toolchain()?;
+
+            // Requirement 4: No grants for program paths. A program must resolve inside the
+            // sandbox, the worker's granted toolchain dirs, or system directories that
+            // AppContainers can already read (`C:\Windows`, `C:\Program Files`, etc.).
+            let prog_path = Path::new(program);
+            if prog_path.is_absolute() {
+                let in_sandbox = path_starts_with_ci(prog_path, jail.sandbox_dir);
+                let in_cargo = !jail.host.cargo_home.as_os_str().is_empty()
+                    && path_starts_with_ci(prog_path, &jail.host.cargo_home);
+                let in_rustup = !jail.host.rustup_home.as_os_str().is_empty()
+                    && path_starts_with_ci(prog_path, &jail.host.rustup_home);
+                let in_msvc = discover_msvc_details().is_some_and(|(_, _, roots)| {
+                    roots.iter().any(|r| path_starts_with_ci(prog_path, r))
+                });
+                let sys_root = std::env::var_os("SystemRoot")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+                let prog_files = std::env::var_os("ProgramFiles")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+                let prog_files_x86 = std::env::var_os("ProgramFiles(x86)")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)"));
+                let in_system = path_starts_with_ci(prog_path, &sys_root)
+                    || path_starts_with_ci(prog_path, &prog_files)
+                    || path_starts_with_ci(prog_path, &prog_files_x86);
+                let already_granted = dacl_already_grants_sid(
+                    prog_path,
+                    toolchain_sid.as_psid(),
+                    FILE_READ_ATTRIBUTES,
+                );
+                if !(in_sandbox || in_cargo || in_rustup || in_msvc || in_system || already_granted)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "program '{}' lies outside the task sandbox, worker toolchain directories, and system directories readable by AppContainers",
+                            prog_path.display()
+                        ),
+                    ));
                 }
             }
 
@@ -1699,9 +2000,6 @@ pub(crate) mod windows {
             let user_sid = OwnedSid::current_user()?;
             let system_sid = OwnedSid::from_well_known(WinLocalSystemSid)?;
             let admins_sid = OwnedSid::from_well_known(WinBuiltinAdministratorsSid)?;
-            let any_pkg_sid = OwnedSid::from_well_known(WinBuiltinAnyPackageSid)?;
-
-            ensure_window_station_and_desktop_access(any_pkg_sid.as_psid());
 
             let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
             let owner_only_entries = [
@@ -1714,143 +2012,42 @@ pub(crate) mod windows {
                 let _guard = PREPARE_LOCK
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-                // 1. Protect `<sandbox_base>` so sibling sandboxes cannot be listed or read.
-                let sandbox_base = jail.sandbox_base;
-                if sandbox_base.exists() {
-                    grant_ancestor_traverse(sandbox_base, any_pkg_sid.as_psid());
-                    let traverse_mask = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
-                    if !dacl_already_grants_sid(sandbox_base, any_pkg_sid.as_psid(), traverse_mask)
-                        || dacl_already_grants_sid(
-                            sandbox_base,
-                            any_pkg_sid.as_psid(),
-                            FILE_LIST_DIRECTORY,
-                        )
-                    {
-                        let base_entries = [
-                            owner_only_entries[0],
-                            owner_only_entries[1],
-                            owner_only_entries[2],
-                            explicit_access(
-                                any_pkg_sid.as_psid(),
-                                traverse_mask,
-                                SET_ACCESS,
-                                NO_INHERITANCE,
-                            ),
-                        ];
-                        let _ = set_protected_dacl_on_path(sandbox_base, &base_entries);
-                    }
-
-                    if let Ok(entries) = std::fs::read_dir(sandbox_base) {
-                        for entry in entries.flatten() {
-                            let p = entry.path();
-                            if p == jail.sandbox_dir {
-                                continue;
-                            }
-                            if dacl_already_grants_sid(
-                                &p,
-                                any_pkg_sid.as_psid(),
-                                FILE_READ_ATTRIBUTES,
-                            ) {
-                                let _ = apply_dacl_to_existing_tree(&p, &owner_only_entries);
-                            }
-                        }
-                    }
-                }
-
-                // 2. Grant read+execute on host Rust/Cargo toolchains and deny access to secrets.
-                prepare_home_and_toolchains(
-                    jail,
-                    cmd_cargo_home.as_deref(),
-                    cmd_rustup_home.as_deref(),
-                    any_pkg_sid.as_psid(),
-                );
-
-                // 3. If `program` is an explicit path outside C:\Windows (e.g. Python in
-                //    %LOCALAPPDATA%), ensure the executable and its stdlib/DLLs are RX.
-                let prog_path = Path::new(&program);
-                if prog_path.is_absolute() && prog_path.exists() {
-                    grant_ancestor_traverse(prog_path, any_pkg_sid.as_psid());
-                    grant_rx_non_inherited(prog_path, any_pkg_sid.as_psid());
-                    if let Some(prog_dir) = prog_path.parent() {
-                        let is_home = prog_dir == jail.host.user_home;
-                        let in_sandbox_base = prog_dir.starts_with(jail.sandbox_base);
-                        if !is_home && !in_sandbox_base {
-                            grant_rx_non_inherited(prog_dir, any_pkg_sid.as_psid());
-                            if let Ok(entries) = std::fs::read_dir(prog_dir) {
-                                for entry in entries.flatten() {
-                                    let p = entry.path();
-                                    if p.is_file() {
-                                        grant_rx_non_inherited(&p, any_pkg_sid.as_psid());
-                                    } else if p.is_dir() {
-                                        let name = entry.file_name();
-                                        if name.eq_ignore_ascii_case("Lib") {
-                                            grant_rx_non_inherited(&p, any_pkg_sid.as_psid());
-                                            if let Ok(lib_entries) = std::fs::read_dir(&p) {
-                                                for le in lib_entries.flatten() {
-                                                    let lp = le.path();
-                                                    let lname = le.file_name();
-                                                    if lname.eq_ignore_ascii_case("site-packages")
-                                                        || lname.eq_ignore_ascii_case("test")
-                                                    {
-                                                        continue;
-                                                    }
-                                                    if lp.is_file() {
-                                                        grant_rx_non_inherited(
-                                                            &lp,
-                                                            any_pkg_sid.as_psid(),
-                                                        );
-                                                    } else if lp.is_dir() {
-                                                        grant_rx_recursive_cached(
-                                                            &lp,
-                                                            any_pkg_sid.as_psid(),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        } else if name.eq_ignore_ascii_case("DLLs")
-                                            || name.eq_ignore_ascii_case("libs")
-                                            || name.eq_ignore_ascii_case("bin")
-                                        {
-                                            grant_rx_recursive_cached(&p, any_pkg_sid.as_psid());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                let _ = protect_sandbox_base(jail.sandbox_base, toolchain_sid.as_psid());
             }
 
-            // 4. Set a protected DACL on `<sandbox_dir>` granting full control only to
-            //    CurrentUser, SYSTEM, Administrators, and this task's specific AppContainer SID.
-            grant_ancestor_traverse(jail.sandbox_dir, any_pkg_sid.as_psid());
+            // Set a protected DACL on `<sandbox_dir>` granting access only to CurrentUser,
+            // SYSTEM, Administrators, and this task's specific `app_container_sid` (omitting
+            // `WRITE_DAC` and `WRITE_OWNER` so the task cannot alter its own sandbox ACL).
+            let task_sandbox_mask = FILE_ALL_ACCESS & !(WRITE_DAC | WRITE_OWNER);
             let sandbox_entries = [
                 owner_only_entries[0],
                 owner_only_entries[1],
                 owner_only_entries[2],
-                explicit_access(app_container_sid, FILE_ALL_ACCESS, SET_ACCESS, inherit),
+                explicit_access(app_container_sid, task_sandbox_mask, SET_ACCESS, inherit),
             ];
-            apply_dacl_to_existing_tree(jail.sandbox_dir, &sandbox_entries)?;
+            apply_dacl_to_existing_tree(jail.sandbox_dir, &sandbox_entries, true)?;
 
-            // 5. Build SECURITY_CAPABILITIES for `Fs` (outbound + LAN client/server) or `FsNet` (0 caps).
-            let mut capability_sids = Vec::new();
-            let mut capability_attrs = Vec::new();
+            // Build SECURITY_CAPABILITIES:
+            // - Always include `oxideswarm.toolchain` so the task can read the worker's
+            //   prepared toolchain.
+            // - Under `Fs`, also include `InternetClient` and `PrivateNetworkClientServer`.
+            // - Under `FsNet`, omit all network capabilities so the Windows WFP kernel filter
+            //   blocks outbound and inbound TCP, UDP, DNS, IPv6, and loopback sockets.
+            let mut capability_sids = vec![toolchain_sid];
             if jail.level == IsolationLevel::Fs {
                 let net_client = OwnedSid::from_well_known(WinCapabilityInternetClientSid)?;
                 let net_private =
                     OwnedSid::from_well_known(WinCapabilityPrivateNetworkClientServerSid)?;
-                capability_attrs.push(SID_AND_ATTRIBUTES {
-                    Sid: net_client.as_psid(),
-                    Attributes: SE_GROUP_ENABLED as u32,
-                });
-                capability_attrs.push(SID_AND_ATTRIBUTES {
-                    Sid: net_private.as_psid(),
-                    Attributes: SE_GROUP_ENABLED as u32,
-                });
                 capability_sids.push(net_client);
                 capability_sids.push(net_private);
             }
+            let mut capability_attrs: Vec<SID_AND_ATTRIBUTES> = capability_sids
+                .iter()
+                .map(|sid| SID_AND_ATTRIBUTES {
+                    Sid: sid.as_psid(),
+                    Attributes: SE_GROUP_ENABLED as u32,
+                })
+                .collect();
 
             let security_capabilities = Box::new(SECURITY_CAPABILITIES {
                 AppContainerSid: app_container_sid,
@@ -1899,8 +2096,8 @@ pub(crate) mod windows {
                 if hr < 0 {
                     let wide_name = std::mem::take(&mut self.wide_profile_name);
                     std::thread::spawn(move || {
-                        for _ in 0..10 {
-                            std::thread::sleep(std::time::Duration::from_millis(25));
+                        for _ in 0..25 {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
                             if DeleteAppContainerProfile(wide_name.as_ptr()) >= 0 {
                                 break;
                             }
@@ -1917,12 +2114,32 @@ pub(crate) mod windows {
         }
     }
 
-    /// Start-up self-check on Windows: creates a probe AppContainer profile and runs a probe
-    /// command inside `sandbox_base/.isolation-probe-<pid>` verifying that the task can write
-    /// inside its sandbox and cannot write into `sandbox_base`.
-    pub(super) async fn probe(level: IsolationLevel, sandbox_base: &Path) -> Result<(), String> {
+    /// Start-up self-check on Windows with explicit worker [`HostDirs`] and `protected_files`:
+    /// 1. Validates that no `protected_files` entry lies inside a granted toolchain root.
+    /// 2. Sweeps any leftover `oxideswarm.task.*` AppContainer profiles from crashed runs.
+    /// 3. Prepares the worker's own toolchain ACLs once (`oxideswarm.toolchain` capability SID).
+    /// 4. Runs a probe command inside a temporary AppContainer under `sandbox_base` verifying
+    ///    that the task can write inside its sandbox and cannot write into `sandbox_base`.
+    pub(super) async fn probe_with_config(
+        level: IsolationLevel,
+        sandbox_base: &Path,
+        host: &HostDirs,
+        protected_files: &[PathBuf],
+    ) -> Result<(), String> {
         let fail =
             |what: String| format!("--isolation {level} cannot be enforced on this host: {what}");
+
+        let host_clone = host.clone();
+        let protected_clone = protected_files.to_vec();
+        let base_clone = sandbox_base.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let _ = sweep_leftover_appcontainer_profiles();
+            prepare_worker_toolchains(&host_clone, &protected_clone, Some(&base_clone))
+        })
+        .await
+        .map_err(|e| fail(format!("toolchain preparation task panicked: {e}")))?
+        .map_err(fail)?;
+
         let probe_dir = sandbox_base.join(format!(".isolation-probe-{}", std::process::id()));
         std::fs::create_dir_all(&probe_dir).map_err(|e| {
             format!(
@@ -1933,11 +2150,11 @@ pub(crate) mod windows {
         let outside_name = format!(".isolation-outside-{}", std::process::id());
         let outside_file = sandbox_base.join(&outside_name);
         let outcome = async {
-            let host =
+            let empty_host =
                 HostDirs::from_home(PathBuf::new(), Some(PathBuf::new()), Some(PathBuf::new()));
             let jail = Jail {
                 level,
-                host: &host,
+                host: &empty_host,
                 protected_files: &[],
                 sandbox_base,
                 sandbox_dir: &probe_dir,
@@ -2170,11 +2387,14 @@ pub(crate) mod windows {
         block
     }
 
-    fn create_pipe_pair(child_is_read: bool) -> io::Result<(HANDLE, HANDLE)> {
+    /// Creates an anonymous pipe pair with `bInheritHandle = 0` so neither end is inheritable by
+    /// concurrent `CreateProcess` calls on other threads before `WINDOWS_SPAWN_LOCK` is acquired
+    /// (M2).
+    fn create_non_inheritable_pipe_pair() -> io::Result<(HANDLE, HANDLE)> {
         let sa = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: std::ptr::null_mut(),
-            bInheritHandle: 1,
+            bInheritHandle: 0,
         };
         let mut read_pipe: HANDLE = std::ptr::null_mut();
         let mut write_pipe: HANDLE = std::ptr::null_mut();
@@ -2182,16 +2402,144 @@ pub(crate) mod windows {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        let parent_handle = if child_is_read { write_pipe } else { read_pipe };
-        if unsafe { SetHandleInformation(parent_handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
-            let err = io::Error::last_os_error();
-            unsafe {
-                CloseHandle(read_pipe);
-                CloseHandle(write_pipe);
-            }
-            return Err(err);
-        }
         Ok((read_pipe, write_pipe))
+    }
+
+    fn grant_sid_on_window_object(handle: HANDLE, sid: PSID, access_mask: u32) {
+        if handle.is_null() {
+            return;
+        }
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let mut old_dacl: *mut ACL = std::ptr::null_mut();
+        let rc = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_WINDOW_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut old_dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return;
+        }
+        let ea = explicit_access(sid, access_mask, GRANT_ACCESS, NO_INHERITANCE);
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        let rc2 = unsafe { SetEntriesInAclW(1, &ea, old_dacl, &mut new_dacl) };
+        if rc2 == ERROR_SUCCESS && !new_dacl.is_null() {
+            unsafe {
+                let _ = SetSecurityInfo(
+                    handle,
+                    SE_WINDOW_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    new_dacl,
+                    std::ptr::null(),
+                );
+                LocalFree(new_dacl as HLOCAL);
+            }
+        }
+        if !sd.is_null() {
+            unsafe {
+                LocalFree(sd as HLOCAL);
+            }
+        }
+    }
+
+    /// Creates a dedicated private Window Station and private Desktop for OxideSwarm tasks (similar
+    /// to Chromium's alternate desktop sandbox) and grants minimal Window Station and Desktop
+    /// access to `oxideswarm.toolchain` (and `CurrentUser`) ONLY on that private Window Station
+    /// and private Desktop.
+    ///
+    /// Security properties (design 0033 D4.7):
+    /// - Never modifies the user's interactive Window Station (`WinSta0`) or `Default` desktop.
+    /// - On the private Window Station, grants `WINSTA_ENUMDESKTOPS (0x0001) | WINSTA_READATTRIBUTES (0x0002) |
+    ///   WINSTA_ACCESSGLOBALATOMS (0x0020) | WINSTA_ENUMERATE (0x0100) | READ_CONTROL (0x00020000)` (`0x00020123`),
+    ///   omitting `WINSTA_ACCESSCLIPBOARD (0x0004)`, `WINSTA_CREATEDESKTOP (0x0008)`,
+    ///   `WINSTA_WRITEATTRIBUTES (0x0010)`, `WINSTA_EXITWINDOWS (0x0040)`, and `WINSTA_READSCREEN (0x0200)`.
+    /// - On the private Desktop, grants `DESKTOP_READOBJECTS (0x0001) | DESKTOP_CREATEWINDOW (0x0002) |
+    ///   DESKTOP_CREATEMENU (0x0004) | DESKTOP_ENUMERATE (0x0040) | DESKTOP_WRITEOBJECTS (0x0080) |
+    ///   READ_CONTROL (0x00020000)` (`0x000200C7`), omitting `DESKTOP_HOOKCONTROL (0x0008)`,
+    ///   `DESKTOP_JOURNALRECORD (0x0010)`, `DESKTOP_JOURNALPLAYBACK (0x0020)`, and `DESKTOP_SWITCHDESKTOP (0x0100)`.
+    fn ensure_private_task_desktop() -> Option<Vec<u16>> {
+        static PRIVATE_DESKTOP: OnceLock<Option<Vec<u16>>> = OnceLock::new();
+        PRIVATE_DESKTOP
+            .get_or_init(|| {
+                let toolchain_sid = OwnedSid::oxideswarm_toolchain().ok()?;
+                let user_sid = OwnedSid::current_user().ok()?;
+                unsafe {
+                    let orig_winsta = GetProcessWindowStation();
+                    if orig_winsta.is_null() {
+                        return None;
+                    }
+                    let alt_winsta =
+                        CreateWindowStationW(std::ptr::null(), 0, 0x000F_037F, std::ptr::null());
+                    if alt_winsta.is_null() {
+                        return None;
+                    }
+                    if SetProcessWindowStation(alt_winsta) == 0 {
+                        return None;
+                    }
+                    let desk_name = "oxideswarm_task_desktop";
+                    let wide_desk_name = to_wide(OsStr::new(desk_name));
+                    let alt_desk = CreateDesktopW(
+                        wide_desk_name.as_ptr(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        0,
+                        0x000F_01FF,
+                        std::ptr::null(),
+                    );
+                    let _ = SetProcessWindowStation(orig_winsta);
+                    if alt_desk.is_null() {
+                        return None;
+                    }
+
+                    // Query the kernel-assigned name of `alt_winsta` (UOI_NAME = 2).
+                    let mut buf = vec![0u16; 256];
+                    let mut needed: u32 = 0;
+                    if GetUserObjectInformationW(
+                        alt_winsta,
+                        2,
+                        buf.as_mut_ptr() as *mut core::ffi::c_void,
+                        (buf.len() * 2) as u32,
+                        &mut needed,
+                    ) == 0
+                    {
+                        return None;
+                    }
+                    let mut len = 0usize;
+                    while len < buf.len() && buf[len] != 0 {
+                        len += 1;
+                    }
+                    let winsta_name = OsString::from_wide(&buf[..len])
+                        .to_string_lossy()
+                        .into_owned();
+
+                    const WINSTA_TASK_MASK: u32 = 0x0002_0123;
+                    const DESKTOP_TASK_MASK: u32 = 0x0002_00C7;
+                    grant_sid_on_window_object(alt_winsta, user_sid.as_psid(), 0x000F_037F);
+                    grant_sid_on_window_object(
+                        alt_winsta,
+                        toolchain_sid.as_psid(),
+                        WINSTA_TASK_MASK,
+                    );
+                    grant_sid_on_window_object(alt_desk, user_sid.as_psid(), 0x000F_01FF);
+                    grant_sid_on_window_object(
+                        alt_desk,
+                        toolchain_sid.as_psid(),
+                        DESKTOP_TASK_MASK,
+                    );
+
+                    let full_desktop = format!("{winsta_name}\\{desk_name}");
+                    Some(to_wide(OsStr::new(&full_desktop)))
+                }
+            })
+            .clone()
     }
 
     fn spawn_with_security_capabilities(
@@ -2199,8 +2547,8 @@ pub(crate) mod windows {
         sc: &SECURITY_CAPABILITIES,
         creation_flags: u32,
     ) -> io::Result<AppContainerChild> {
-        let (stdin_read, stdin_write) = create_pipe_pair(true)?;
-        let (stdout_read, stdout_write) = match create_pipe_pair(false) {
+        let (stdin_read, stdin_write) = create_non_inheritable_pipe_pair()?;
+        let (stdout_read, stdout_write) = match create_non_inheritable_pipe_pair() {
             Ok(p) => p,
             Err(e) => {
                 unsafe {
@@ -2210,7 +2558,7 @@ pub(crate) mod windows {
                 return Err(e);
             }
         };
-        let (stderr_read, stderr_write) = match create_pipe_pair(false) {
+        let (stderr_read, stderr_write) = match create_non_inheritable_pipe_pair() {
             Ok(p) => p,
             Err(e) => {
                 unsafe {
@@ -2223,106 +2571,125 @@ pub(crate) mod windows {
             }
         };
 
-        let mut inherited_handles: [HANDLE; 3] = [stdin_read, stdout_write, stderr_write];
-        let mut attr_size: usize = 0;
-        unsafe {
-            let _ = InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut attr_size);
-        }
-        let mut attr_buf = vec![0u8; attr_size.max(64)];
-        let attr_list = attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
-        if unsafe { InitializeProcThreadAttributeList(attr_list, 2, 0, &mut attr_size) } == 0 {
-            let err = io::Error::last_os_error();
-            unsafe {
-                CloseHandle(stdin_read);
-                CloseHandle(stdin_write);
-                CloseHandle(stdout_read);
-                CloseHandle(stdout_write);
-                CloseHandle(stderr_read);
-                CloseHandle(stderr_write);
-            }
-            return Err(err);
-        }
-
-        let sc_ok = unsafe {
-            UpdateProcThreadAttribute(
-                attr_list,
-                0,
-                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-                sc as *const SECURITY_CAPABILITIES as *const core::ffi::c_void,
-                std::mem::size_of::<SECURITY_CAPABILITIES>(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            )
-        };
-        let hl_ok = if sc_ok != 0 {
-            unsafe {
-                UpdateProcThreadAttribute(
-                    attr_list,
-                    0,
-                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                    inherited_handles.as_mut_ptr() as *const core::ffi::c_void,
-                    inherited_handles.len() * std::mem::size_of::<HANDLE>(),
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                )
-            }
-        } else {
-            0
-        };
-        if sc_ok == 0 || hl_ok == 0 {
-            let err = io::Error::last_os_error();
-            unsafe {
-                DeleteProcThreadAttributeList(attr_list);
-                CloseHandle(stdin_read);
-                CloseHandle(stdin_write);
-                CloseHandle(stdout_read);
-                CloseHandle(stdout_write);
-                CloseHandle(stderr_read);
-                CloseHandle(stderr_write);
-            }
-            return Err(err);
-        }
-
         let mut cmdline = build_windows_command_line(std_cmd);
         let env_block = build_windows_env_block(std_cmd);
         let cwd_wide = std_cmd.get_current_dir().map(|p| to_wide(p.as_os_str()));
         let cwd_ptr = cwd_wide.as_ref().map_or(std::ptr::null(), |w| w.as_ptr());
-
-        let mut si_ex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
-        si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-        si_ex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        si_ex.StartupInfo.hStdInput = stdin_read;
-        si_ex.StartupInfo.hStdOutput = stdout_write;
-        si_ex.StartupInfo.hStdError = stderr_write;
-        si_ex.lpAttributeList = attr_list;
 
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
         let flags = creation_flags
             | EXTENDED_STARTUPINFO_PRESENT
             | CREATE_UNICODE_ENVIRONMENT
             | CREATE_NO_WINDOW;
-        let spawned = unsafe {
-            CreateProcessW(
-                std::ptr::null(),
-                cmdline.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                1,
-                flags,
-                env_block.as_ptr() as *const core::ffi::c_void,
-                cwd_ptr,
-                &si_ex.StartupInfo,
-                &mut pi,
-            )
-        };
-        let spawn_err = if spawned == 0 {
-            Some(io::Error::last_os_error())
-        } else {
-            None
+
+        // Hold `WINDOWS_SPAWN_LOCK` only around marking the 3 child pipe ends inheritable,
+        // calling `CreateProcessW` with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, and closing the 3
+        // child pipe ends in the parent (M2).
+        let spawn_err = {
+            let _spawn_guard = WINDOWS_SPAWN_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            let mut inherited_handles: [HANDLE; 3] = [stdin_read, stdout_write, stderr_write];
+            let mut inherit_ok = true;
+            for &h in &inherited_handles {
+                if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0
+                {
+                    inherit_ok = false;
+                    break;
+                }
+            }
+
+            if !inherit_ok {
+                Some(io::Error::last_os_error())
+            } else {
+                let mut attr_size: usize = 0;
+                unsafe {
+                    let _ = InitializeProcThreadAttributeList(
+                        std::ptr::null_mut(),
+                        2,
+                        0,
+                        &mut attr_size,
+                    );
+                }
+                let mut attr_buf = vec![0u8; attr_size.max(64)];
+                let attr_list = attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+                if unsafe { InitializeProcThreadAttributeList(attr_list, 2, 0, &mut attr_size) }
+                    == 0
+                {
+                    Some(io::Error::last_os_error())
+                } else {
+                    let sc_ok = unsafe {
+                        UpdateProcThreadAttribute(
+                            attr_list,
+                            0,
+                            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                            sc as *const SECURITY_CAPABILITIES as *const core::ffi::c_void,
+                            std::mem::size_of::<SECURITY_CAPABILITIES>(),
+                            std::ptr::null_mut(),
+                            std::ptr::null(),
+                        )
+                    };
+                    let hl_ok = if sc_ok != 0 {
+                        unsafe {
+                            UpdateProcThreadAttribute(
+                                attr_list,
+                                0,
+                                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                                inherited_handles.as_mut_ptr() as *const core::ffi::c_void,
+                                inherited_handles.len() * std::mem::size_of::<HANDLE>(),
+                                std::ptr::null_mut(),
+                                std::ptr::null(),
+                            )
+                        }
+                    } else {
+                        0
+                    };
+
+                    let res = if sc_ok == 0 || hl_ok == 0 {
+                        Some(io::Error::last_os_error())
+                    } else {
+                        let mut desktop_wide = ensure_private_task_desktop();
+                        let mut si_ex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+                        si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+                        if let Some(ref mut desk) = desktop_wide {
+                            si_ex.StartupInfo.lpDesktop = desk.as_mut_ptr();
+                        }
+                        si_ex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+                        si_ex.StartupInfo.hStdInput = stdin_read;
+                        si_ex.StartupInfo.hStdOutput = stdout_write;
+                        si_ex.StartupInfo.hStdError = stderr_write;
+                        si_ex.lpAttributeList = attr_list;
+
+                        let spawned = unsafe {
+                            CreateProcessW(
+                                std::ptr::null(),
+                                cmdline.as_mut_ptr(),
+                                std::ptr::null(),
+                                std::ptr::null(),
+                                1,
+                                flags,
+                                env_block.as_ptr() as *const core::ffi::c_void,
+                                cwd_ptr,
+                                &si_ex.StartupInfo,
+                                &mut pi,
+                            )
+                        };
+                        if spawned == 0 {
+                            Some(io::Error::last_os_error())
+                        } else {
+                            None
+                        }
+                    };
+                    unsafe {
+                        DeleteProcThreadAttributeList(attr_list);
+                    }
+                    res
+                }
+            }
         };
 
         unsafe {
-            DeleteProcThreadAttributeList(attr_list);
             CloseHandle(stdin_read);
             CloseHandle(stdout_write);
             CloseHandle(stderr_write);

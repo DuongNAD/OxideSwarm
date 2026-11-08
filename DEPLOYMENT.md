@@ -117,6 +117,16 @@ sc.exe create OxideAgentMesh binPath= "C:\OxideSwarm\agent-mesh.exe node --hub w
 sc.exe start OxideAgentMesh
 ```
 
+#### Compute-Grid Worker OS Isolation (`--isolation fs|fs+net`) & Revoking Toolchain ACLs:
+When `rusty_grid_worker` runs on Windows with `--isolation fs` or `--isolation fs+net` (design 0033 D4), it derives the dedicated capability SID `oxideswarm.toolchain` via `DeriveCapabilitySidsFromName`, records every toolchain directory it prepares in `%USERPROFILE%\.oxideswarm\windows_acl_grants.txt` (or `$env:RUSTY_GRID_ACL_GRANT_LOG`), and grants read+execute on those toolchain directories to `oxideswarm.toolchain` only (never `ALL APPLICATION PACKAGES` / `S-1-15-2-1`, and never modifying `%USERPROFILE%`). To inspect or revoke all `oxideswarm.toolchain` ACEs and sweep any leftover `oxideswarm.task.*` AppContainer profiles after turning off isolation or before uninstalling:
+```powershell
+# Preview the icacls commands without changing disk state:
+powershell -ExecutionPolicy Bypass -File .\windows\revoke-isolation-acls.ps1 -DryRun
+
+# Revoke all oxideswarm.toolchain ACEs recorded in ~/.oxideswarm/windows_acl_grants.txt and remove the manifest:
+powershell -ExecutionPolicy Bypass -File .\windows\revoke-isolation-acls.ps1 -RemoveManifest
+```
+
 ---
 
 ### 3.2 macOS (Apple Silicon M-Series & Intel)

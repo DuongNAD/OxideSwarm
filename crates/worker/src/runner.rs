@@ -357,9 +357,7 @@ fn resolve_windows_executable(program: &str, effective_path: &str) -> String {
                 return with_ext;
             }
         }
-        if !program.starts_with("/bin/") && !program.starts_with("/usr/bin/") {
-            return program.to_string();
-        }
+        return program.to_string();
     }
 
     let bare_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(program);
@@ -726,6 +724,10 @@ pub struct TaskRunner {
     config: RunnerConfig,
     /// The blob cache, opened on first use (see [`TaskRunner::blob_cache`]).
     blob_cache: std::sync::OnceLock<Result<Arc<BlobCache>, String>>,
+    /// One-time start-up preparation of the worker's own toolchains under Windows AppContainer
+    /// isolation (`oxideswarm.toolchain` capability SID).
+    #[cfg(windows)]
+    windows_toolchain_prepared: Arc<std::sync::OnceLock<Result<(), String>>>,
     /// Where GPU-class tasks get their engine; rebuilds it after a device loss.
     #[cfg(feature = "gpu-wgpu")]
     gpu_engine: Arc<crate::wgpu_engine::EngineProvider>,
@@ -738,6 +740,8 @@ impl TaskRunner {
             capabilities,
             config,
             blob_cache: std::sync::OnceLock::new(),
+            #[cfg(windows)]
+            windows_toolchain_prepared: Arc::new(std::sync::OnceLock::new()),
             #[cfg(feature = "gpu-wgpu")]
             gpu_engine: crate::wgpu_engine::EngineProvider::shared(),
         }
@@ -2737,18 +2741,62 @@ impl TaskRunner {
 
         #[cfg(windows)]
         if self.config.isolation != IsolationLevel::Off {
-            let jail = crate::isolation::Jail {
-                level: self.config.isolation,
-                host: &self.config.host_dirs,
-                protected_files: &self.config.protected_files,
-                sandbox_base: &self.config.sandbox_config.base_dir,
-                sandbox_dir: sandbox_path,
-            };
-            match crate::isolation::windows::WindowsAppContainerGuard::create(
-                configured.run_token(),
-                &jail,
-                &cmd,
-            ) {
+            let level = self.config.isolation;
+            let host_dirs = self.config.host_dirs.clone();
+            let protected_files = self.config.protected_files.clone();
+            let sandbox_base = self.config.sandbox_config.base_dir.clone();
+            let sandbox_dir = sandbox_path.to_path_buf();
+            let run_token = configured.run_token();
+            let std_cmd = cmd.as_std();
+            let prog_for_setup = std_cmd.get_program().to_string_lossy().to_string();
+            let mut cmd_cargo_home: Option<PathBuf> = None;
+            let mut cmd_rustup_home: Option<PathBuf> = None;
+            for (k, v) in std_cmd.get_envs() {
+                if k.eq_ignore_ascii_case("CARGO_HOME") {
+                    cmd_cargo_home = v.map(PathBuf::from);
+                } else if k.eq_ignore_ascii_case("RUSTUP_HOME") {
+                    cmd_rustup_home = v.map(PathBuf::from);
+                }
+            }
+            let tc_once = Arc::clone(&self.windows_toolchain_prepared);
+            let setup_res = tokio::task::spawn_blocking(move || {
+                let tc_init = tc_once.get_or_init(|| {
+                    crate::isolation::windows::prepare_worker_toolchains(
+                        &host_dirs,
+                        &protected_files,
+                        Some(&sandbox_base),
+                    )
+                    .map_err(|e| e.to_string())
+                });
+                if let Err(msg) = tc_init {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        msg.clone(),
+                    ));
+                }
+                let jail = crate::isolation::Jail {
+                    level,
+                    host: &host_dirs,
+                    protected_files: &protected_files,
+                    sandbox_base: &sandbox_base,
+                    sandbox_dir: &sandbox_dir,
+                };
+                crate::isolation::windows::WindowsAppContainerGuard::create_blocking(
+                    run_token,
+                    &jail,
+                    &prog_for_setup,
+                    cmd_cargo_home.as_deref(),
+                    cmd_rustup_home.as_deref(),
+                )
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(std::io::Error::other(format!(
+                    "AppContainer setup task panicked: {e}"
+                )))
+            });
+
+            match setup_res {
                 Ok(guard) => configured.set_app_container(guard),
                 Err(e) => {
                     return TaskResult::failure(
@@ -2756,15 +2804,9 @@ impl TaskRunner {
                         task_id,
                         EXIT_CODE_GENERAL_ERROR,
                         "",
-                        format!(
-                            "Cannot run '{program}' with --isolation {}: {e}",
-                            jail.level
-                        ),
+                        format!("Cannot run '{program}' with --isolation {level}: {e}"),
                         start_time.elapsed().as_millis() as u64,
-                        Some(format!(
-                            "Isolation error for '{program}' ({}): {e}",
-                            jail.level
-                        )),
+                        Some(format!("Isolation error for '{program}' ({level}): {e}")),
                     );
                 }
             }

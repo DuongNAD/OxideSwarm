@@ -1498,9 +1498,11 @@ impl WorkerClient {
         // Isolation that was asked for and cannot be enforced must stop the worker here, not let
         // it run tasks with the owner's file access.
         if self.config.isolation != IsolationLevel::Off {
-            if let Err(err) = crate::isolation::verify_isolation_support(
+            if let Err(err) = crate::isolation::verify_isolation_support_with_config(
                 self.config.isolation,
                 &self.runner.config().sandbox_config.base_dir,
+                &self.runner.config().host_dirs,
+                &self.runner.config().protected_files,
             )
             .await
             {
