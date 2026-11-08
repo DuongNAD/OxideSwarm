@@ -464,10 +464,20 @@ cargo build --offline 2>&1
             })
         };
         let tracked = wait_for_pid(&pid).await;
-        let name = comm_of(tracked);
+        // The PID is recorded at spawn; `sandbox-exec` and then `sh` exec in place, so the name
+        // settles on `sleep` within moments. It must never be another PID (a child of the
+        // wrapper), which the single value below proves.
+        let mut name = comm_of(tracked);
+        for _ in 0..100 {
+            if name.ends_with("sleep") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            name = comm_of(tracked);
+        }
         assert!(
             name.ends_with("sleep"),
-            "the tracked PID must be the task, not sandbox-exec; it is `{name}`"
+            "the tracked PID must become the task itself, not stay sandbox-exec; it is `{name}`"
         );
         cancel_tx.send("test".into()).unwrap();
         let result = tokio::time::timeout(Duration::from_secs(20), handle)
