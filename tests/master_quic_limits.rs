@@ -32,7 +32,11 @@ async fn spawn_p2p_master(config: ServerConfig, handshake_timeout_secs: u64) -> 
     .expect("spawn p2p master")
 }
 
-async fn dial(master: &MasterHandle) -> Result<iroh::endpoint::Connection, String> {
+/// Dials the master and hands back the client endpoint with the connection, so a test can close the
+/// endpoint properly (which makes sure the `CONNECTION_CLOSE` frame really reaches the master).
+async fn dial_with_endpoint(
+    master: &MasterHandle,
+) -> Result<(iroh::Endpoint, iroh::endpoint::Connection), String> {
     let ticket = master.p2p_ticket().expect("p2p ticket");
     let addr = parse_p2p_ticket(ticket).expect("parse ticket");
     let client = iroh::Endpoint::builder(Minimal)
@@ -45,6 +49,11 @@ async fn dial(master: &MasterHandle) -> Result<iroh::endpoint::Connection, Strin
         .connect(addr, GRID_ALPN)
         .await
         .map_err(|e| e.to_string())?;
+    Ok((client, conn))
+}
+
+async fn dial(master: &MasterHandle) -> Result<iroh::endpoint::Connection, String> {
+    let (client, conn) = dial_with_endpoint(master).await?;
     // Keep the client endpoint alive as long as the connection.
     std::mem::forget(client);
     Ok(conn)
@@ -79,7 +88,7 @@ async fn test_quic_peers_count_against_the_connection_budget_and_free_it_when_go
     .await;
 
     // The first peer connects and sits on its slot (it opens a control stream and then says nothing).
-    let first = dial(&master).await.expect("first peer");
+    let (first_endpoint, first) = dial_with_endpoint(&master).await.expect("first peer");
     let (mut send, _recv) = first.open_bi().await.expect("open stream");
     send.write_all(&[STREAM_CONTROL]).await.expect("tag");
 
@@ -98,8 +107,14 @@ async fn test_quic_peers_count_against_the_connection_budget_and_free_it_when_go
         started.elapsed()
     );
 
-    // Once the first peer is gone the slot is free again: a new peer stays connected.
+    // Once the first peer is gone the slot is free again: a new peer stays connected. Closing the
+    // endpoint (not just the connection) waits until the close frame has been sent.
     first.close(0u32.into(), b"bye");
+    first_endpoint.close().await;
+    // A refused or abandoned attempt of the retry loop below may itself hold a slot until the
+    // master's handshake timeout (20 s here) runs out, so the deadline has to outlast that timeout;
+    // on a healthy run the first or second attempt gets in within milliseconds.
+    let deadline = Duration::from_secs(20 + 25);
     let start = Instant::now();
     loop {
         if let Ok(conn) = dial(&master).await {
@@ -111,7 +126,7 @@ async fn test_quic_peers_count_against_the_connection_budget_and_free_it_when_go
             }
         }
         assert!(
-            start.elapsed() < Duration::from_secs(15),
+            start.elapsed() < deadline,
             "a closed QUIC peer must give its slot back"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
