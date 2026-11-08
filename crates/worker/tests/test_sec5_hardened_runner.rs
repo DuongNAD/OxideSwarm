@@ -9,6 +9,8 @@
 //! 4. Process tree cleanup: Child and grandchild processes are cleanly reaped upon cancellation
 //!    or future drop across Linux, macOS, and Windows.
 
+#![cfg_attr(not(feature = "3d"), allow(unused_imports, dead_code))]
+
 use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::AtomicU32;
@@ -20,6 +22,7 @@ use tokio::sync::oneshot;
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::WorkerMessage;
 use rusty_grid_core::task::{Generative3DSpec, Task, TaskId, TaskRequirements, TaskSpec};
+#[cfg(feature = "3d")]
 use rusty_grid_worker::autorig::BlenderRigProvider;
 use rusty_grid_worker::sandbox::SandboxConfig;
 use rusty_grid_worker::{
@@ -48,6 +51,7 @@ fn create_test_runner() -> (TaskRunner, TempDir) {
 // Test 1: 3D Task Secret Stripping and Task Priority
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_sec5_3d_task_secret_stripping_and_nice_value() {
     let (runner, _dir) = create_test_runner();
@@ -162,6 +166,7 @@ sys.exit(0)
 // Test 2: Fake Blender Task Secret Stripping and Task Priority
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_sec5_fake_blender_task_secret_stripping_and_nice_value() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -234,6 +239,7 @@ sys.exit(0)
 // Test 3: Blender Large Stderr Does Not Block (Pipe Deadlock Prevention)
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_sec5_blender_large_stderr_does_not_block() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -295,6 +301,7 @@ sys.exit(0)
 // Test 4: 3D Task Grandchildren Die on Abort or Cancel Cross-Platform (Review Item 4)
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_sec5_3d_task_child_and_grandchild_die_on_abort_or_cancel() {
     let (runner, _dir) = create_test_runner();
@@ -462,6 +469,7 @@ time.sleep(60.0)
 // Test 5: Blender Task Grandchildren Die on Future Drop Cross-Platform
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_sec5_blender_task_grandchildren_die_on_abort_cross_platform() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -533,6 +541,7 @@ time.sleep(60.0)
 // Test 6: Blender Watchdog Timeout Cleans Grandchild Process Tree (Item 8)
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_sec5_blender_watchdog_timeout_cleans_grandchild_tree() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -608,6 +617,7 @@ time.sleep(60.0)
 // Test 7: Blender Runner ProcessPriority::Idle & Task/Worker Identity (Items 2 & 8)
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_sec5_blender_runner_priority_idle_and_task_identity() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -781,14 +791,19 @@ sys.exit(0)
     env.set("OXIDE_MESH_TOKEN", "sentinel-mesh-token-sec5");
 
     // Invoke each probe directly with the full fake binary path (no PATH modification)
-    assert!(
-        rusty_grid_worker::autorig::blender_provider::probe_blender(&fake_blender),
-        "blender_provider::probe_blender must succeed on fake binary"
-    );
-    assert!(
-        rusty_grid_worker::gen3d::runner::probe_python(&fake_python),
-        "gen3d::runner::probe_python must succeed on fake binary"
-    );
+    #[cfg(feature = "3d")]
+    {
+        assert!(
+            rusty_grid_worker::autorig::blender_provider::probe_blender(&fake_blender),
+            "blender_provider::probe_blender must succeed on fake binary"
+        );
+        assert!(
+            rusty_grid_worker::gen3d::runner::probe_python(&fake_python),
+            "gen3d::runner::probe_python must succeed on fake binary"
+        );
+    }
+    #[cfg(not(feature = "3d"))]
+    let _ = &fake_python;
     let (has_blender, _ver) = rusty_grid_core::capabilities::probe_blender_binary(&fake_blender);
     assert!(
         has_blender,
@@ -799,13 +814,17 @@ sys.exit(0)
         "capabilities::query_blender_version must succeed on fake binary"
     );
 
-    // Read log with expect and verify exactly 4 probe executions (1 line per probe)
+    // Read log with expect and verify probe executions (1 line per probe)
     let logged = std::fs::read_to_string(&log_file).expect("probe log file was not created");
     let lines: Vec<&str> = logged.lines().collect();
+    #[cfg(feature = "3d")]
+    let expected_probes = 4;
+    #[cfg(not(feature = "3d"))]
+    let expected_probes = 2;
     assert_eq!(
         lines.len(),
-        4,
-        "Expected exactly 4 probe executions (1 line per probe), got {}: {:?}",
+        expected_probes,
+        "Expected exactly {expected_probes} probe executions (1 line per probe), got {}: {:?}",
         lines.len(),
         lines
     );
@@ -829,6 +848,7 @@ sys.exit(0)
 // Test 9: glTF Header Validation Failure Fails For Every Engine (Items 1 & 8)
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_sec5_gltf_header_validation_failure_for_both_engines() {
     let (runner, _dir) = create_test_runner();
@@ -877,6 +897,7 @@ sys.exit(0)
 // Test 10: Explicit Engine Exit Code Described When Error Empty (Items 3 & 8)
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_sec5_explicit_engine_exit_code_3_named_in_error() {
     let (runner, _dir) = create_test_runner();
@@ -907,6 +928,7 @@ async fn test_sec5_explicit_engine_exit_code_3_named_in_error() {
 // Test 11: Process Exit 124 Distinguished From Watchdog Timeout (Items 4 & 8)
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_sec5_exit_124_distinguished_from_watchdog_timeout() {
     let (runner, _dir) = create_test_runner();
@@ -975,6 +997,7 @@ async fn test_sec5_exit_124_distinguished_from_watchdog_timeout() {
 // Test 12: Cancelled Run Sends Zero Checkpoints (Items 5 & 8)
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_sec5_cancelled_dead_run_sends_zero_checkpoints() {
     let (runner, _dir) = create_test_runner();
@@ -1047,6 +1070,7 @@ time.sleep(30)
 // Test 13: 3D Workload Omits Output Artifact Collection (Items 7 & 8)
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_sec5_3d_workload_omits_output_artifacts() {
     let (runner, _dir) = create_test_runner();
@@ -1088,6 +1112,7 @@ sys.exit(0)
 // Test 14: Unreadable Output Directory Fails For Both Engines (Review Item 1)
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_sec5_unreadable_output_directory_fails_for_both_engines() {
     let (runner, _dir) = create_test_runner();
@@ -1136,6 +1161,7 @@ sys.exit(0)
 // Test 15: Missing Output File Fails Under Explicit Engine
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_sec5_missing_output_file_fails_under_explicit_engine() {
     let (runner, _dir) = create_test_runner();
@@ -1169,6 +1195,7 @@ async fn test_sec5_missing_output_file_fails_under_explicit_engine() {
 // Test 16: FIFO or Non-Regular Output File Fails For Both Engines (Review Item 1)
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_sec5_fifo_or_non_regular_output_fails_for_both_engines() {
     let (runner, _dir) = create_test_runner();
@@ -1232,6 +1259,7 @@ sys.exit(0)
 // Test 17: BUG-10 - 3D and Blender Refuse Symbolic Link Output
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_bug10_3d_and_blender_refuse_symlink_output() {
     let (runner, _dir) = create_test_runner();
@@ -1311,6 +1339,7 @@ sys.exit(0)
 // Test 18: BUG-10 - 3D and Blender Refuse Oversized Sparse File Without Reading
 // ============================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_bug10_3d_and_blender_refuse_oversized_sparse_output_without_reading() {
     let (runner, _dir) = create_test_runner();

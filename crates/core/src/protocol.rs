@@ -92,6 +92,9 @@ impl ProtocolCapabilities {
     /// Content-addressed task inputs and output files moved through the Master's blob store
     /// (`Task::inputs`, `Task::output_globs`, see `crate::blob`).
     pub const BLOB_TRANSFER: Self = Self(1 << 9);
+    /// Generative 3D (`TaskSpec::Generative3D`) and skeletal auto-rigging (`TaskSpec::AutoRig`)
+    /// execution support (advertised by workers compiled with the `3d` Cargo feature).
+    pub const THREE_D: Self = Self(1 << 11);
 
     pub const fn all_supported() -> Self {
         Self(
@@ -103,7 +106,8 @@ impl ProtocolCapabilities {
                 | Self::BATCH_DISPATCH.0
                 | Self::FILE_STAGING.0
                 | Self::ADAPTIVE_KEEPALIVE.0
-                | Self::BLOB_TRANSFER.0,
+                | Self::BLOB_TRANSFER.0
+                | Self::THREE_D.0,
         )
     }
 

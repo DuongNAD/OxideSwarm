@@ -36,6 +36,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 default = ["p2p"]
 p2p = ["dep:iroh", "rusty_grid_core/p2p"]
 gpu-wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+3d = []
 
 [dev-dependencies]
 rusty_grid_master = { path = "../master" }
@@ -77,3 +78,33 @@ path = "../../tests/worker_connection_lifecycle.rs"
 [[test]]
 name = "worker_task_shutdown"
 path = "../../tests/worker_task_shutdown.rs"
+
+[[test]]
+name = "test_3d1_honest_sdf"
+path = "tests/test_3d1_honest_sdf.rs"
+required-features = ["3d"]
+
+[[test]]
+name = "test_autorig_adversarial_stress"
+path = "tests/test_autorig_adversarial_stress.rs"
+required-features = ["3d"]
+
+[[test]]
+name = "test_autorig_pipeline"
+path = "tests/test_autorig_pipeline.rs"
+required-features = ["3d"]
+
+[[test]]
+name = "test_challenger_m3_blender_job_object"
+path = "tests/test_challenger_m3_blender_job_object.rs"
+required-features = ["3d"]
+
+[[test]]
+name = "test_gen3d_adversarial_stress"
+path = "tests/test_gen3d_adversarial_stress.rs"
+required-features = ["3d"]
+
+[[test]]
+name = "test_gen3d_pipeline"
+path = "tests/test_gen3d_pipeline.rs"
+required-features = ["3d"]

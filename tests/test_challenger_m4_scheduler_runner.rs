@@ -12,6 +12,8 @@
 //!    - glTF 2.0 binary asset container compliance (magic, chunk offsets, 4-byte buffer alignment)
 //!    - Malformed and corrupted mesh input handling (graceful WorkerError::AutoRig, no panic/zombies)
 
+#![cfg_attr(not(feature = "3d"), allow(unused_imports, dead_code))]
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -596,6 +598,7 @@ fn test_stress_high_throughput_matchmaking_burst_100_tasks() {
 // 2. TASKRUNNER 3D EXECUTION & CHECKPOINT INTEGRITY TESTS (FEATURE F18)
 // =========================================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_stress_taskrunner_checkpoint_sequence_integrity() {
     println!("\n=== [STRESS 2.1] TaskRunner Checkpoint Sequence Integrity ===");
@@ -737,6 +740,7 @@ async fn test_stress_taskrunner_checkpoint_sequence_integrity() {
     );
 }
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_stress_gltf_binary_payload_and_alignment() {
     println!("\n=== [STRESS 2.2] Asset Binary Payload & glTF 2.0 Alignment ===");
@@ -883,6 +887,7 @@ async fn test_stress_gltf_binary_payload_and_alignment() {
     println!("-> [PASS] glTF 2.0 headers, chunk offsets, and 4-byte buffer alignment verified.");
 }
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_stress_taskrunner_malformed_corrupted_mesh() {
     println!("\n=== [STRESS 2.3] Malformed & Corrupted Mesh Input Handling ===");

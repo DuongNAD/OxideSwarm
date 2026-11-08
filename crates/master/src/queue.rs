@@ -447,7 +447,7 @@ pub struct TaskView {
     pub heavy: bool,
     /// Protocol features a worker must advertise to run the task: `FILE_STAGING` for inline staged
     /// files or expected outputs (Requirement R2), `BLOB_TRANSFER` for blob inputs or output
-    /// patterns.
+    /// patterns, `THREE_D` for `Generative3D` and `AutoRig` tasks.
     pub required_features: ProtocolCapabilities,
     /// Workers that already handed this task back without running it.
     pub avoid: Vec<Uuid>,
@@ -483,6 +483,9 @@ fn required_features(task: &Task) -> ProtocolCapabilities {
     }
     if task.uses_blobs() {
         features.insert(ProtocolCapabilities::BLOB_TRANSFER);
+    }
+    if matches!(task.spec, TaskSpec::Generative3D(_) | TaskSpec::AutoRig(_)) {
+        features.insert(ProtocolCapabilities::THREE_D);
     }
     features
 }
@@ -4321,5 +4324,116 @@ mod tests {
         let stats = queue.stats().await;
         assert_eq!(stats.active_bytes, expected_bytes);
         assert_eq!(stats.max_active_bytes, 2_000);
+    }
+
+    #[tokio::test]
+    async fn test_three_d_tasks_require_three_d_protocol_capability_for_placement() {
+        use crate::registry::{WorkerInfo, WorkerStatus};
+        use crate::scheduler::{ScheduleSkipReason, SchedulerConfig, WorkloadScheduler};
+        use rusty_grid_core::capabilities::WorkerCapabilities;
+        use rusty_grid_core::task::{AutoRigSpec, Generative3DSpec};
+
+        let gen3d_task = Task::new(
+            TaskSpec::Generative3D(
+                Generative3DSpec::new_prompt("obsidian crystal").with_quality("fast"),
+            ),
+            TaskRequirements::generic(1, 30),
+        );
+        let autorig_task = Task::new(
+            TaskSpec::AutoRig(AutoRigSpec::new(vec![1, 2, 3, 4], "biped")),
+            TaskRequirements::generic(1, 30),
+        );
+
+        assert!(
+            TaskView::of(&gen3d_task)
+                .required_features
+                .contains(ProtocolCapabilities::THREE_D),
+            "Generative3D TaskView must require ProtocolCapabilities::THREE_D"
+        );
+        assert!(
+            TaskView::of(&autorig_task)
+                .required_features
+                .contains(ProtocolCapabilities::THREE_D),
+            "AutoRig TaskView must require ProtocolCapabilities::THREE_D"
+        );
+
+        let mut features_without_3d = ProtocolCapabilities::all_supported();
+        features_without_3d.remove(ProtocolCapabilities::THREE_D);
+
+        let worker_no_3d = WorkerInfo {
+            worker_id: Uuid::new_v4(),
+            session_id: 1,
+            capabilities: WorkerCapabilities::new("worker-no-3d", 4, 8192, true, true, None),
+            features: features_without_3d,
+            status: WorkerStatus::Connected,
+            last_heartbeat_timestamp: 1000,
+            registered_timestamp: 1000,
+            active_tasks: 0,
+            remote_addr: "127.0.0.1:9000".into(),
+            cpu_usage_pct: 0.0,
+            ram_available_mb: 8192,
+            mobile_status: None,
+        };
+
+        let tasks = vec![gen3d_task.clone(), autorig_task.clone()];
+        let gen3d_id = gen3d_task.id;
+        let autorig_id = autorig_task.id;
+
+        // 1. Default scheduler: both 3D tasks wait with ClusterLacksCapability("... THREE_D ...").
+        let default_cfg = SchedulerConfig::default();
+        let report =
+            WorkloadScheduler::matchmake(&default_cfg, &tasks, std::slice::from_ref(&worker_no_3d));
+        assert!(
+            report.assignments.is_empty(),
+            "3D tasks must not be placed on a worker without THREE_D"
+        );
+        assert_eq!(report.skipped.len(), 2);
+        for (_, reason) in &report.skipped {
+            match reason {
+                ScheduleSkipReason::ClusterLacksCapability(msg) => {
+                    assert!(
+                        msg.contains("THREE_D"),
+                        "expected THREE_D capability skip reason, got: {msg}"
+                    );
+                }
+                other => panic!("expected ClusterLacksCapability, got {other:?}"),
+            }
+        }
+
+        // 2. With --fail-unfulfillable-tasks: both 3D tasks are reported unfulfillable.
+        let strict_cfg = SchedulerConfig {
+            fail_unfulfillable_tasks: true,
+            ..SchedulerConfig::default()
+        };
+        let strict_report =
+            WorkloadScheduler::matchmake(&strict_cfg, &tasks, std::slice::from_ref(&worker_no_3d));
+        assert!(strict_report.assignments.is_empty());
+        assert_eq!(strict_report.unfulfillable.len(), 2);
+        for (_, msg) in &strict_report.unfulfillable {
+            assert!(
+                msg.contains("THREE_D"),
+                "expected THREE_D in unfulfillable error, got: {msg}"
+            );
+        }
+
+        // 3. Once a worker advertising ProtocolCapabilities::THREE_D registers, both are placed on it.
+        let mut worker_with_3d = worker_no_3d.clone();
+        worker_with_3d.worker_id = Uuid::new_v4();
+        worker_with_3d.capabilities.name = "worker-with-3d".into();
+        worker_with_3d.features = ProtocolCapabilities::all_supported();
+        let workers = vec![worker_no_3d, worker_with_3d.clone()];
+
+        let placed_report = WorkloadScheduler::matchmake(&default_cfg, &tasks, &workers);
+        assert_eq!(placed_report.assignments.len(), 2);
+        assert_eq!(placed_report.assignments[0].task_id, gen3d_id);
+        assert_eq!(
+            placed_report.assignments[0].worker_id,
+            worker_with_3d.worker_id
+        );
+        assert_eq!(placed_report.assignments[1].task_id, autorig_id);
+        assert_eq!(
+            placed_report.assignments[1].worker_id,
+            worker_with_3d.worker_id
+        );
     }
 }

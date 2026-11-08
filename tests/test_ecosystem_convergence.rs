@@ -518,6 +518,7 @@ async fn test_convergence_error_propagation_and_timeout() {
 // TEST SUITE 7: Rust Agent 3D Generative Workload via Bridge (F20)
 // =========================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_convergence_rust_agent_3d_generate() {
     let cluster = ConvergenceCluster::spawn(1).await;
@@ -562,6 +563,7 @@ async fn test_convergence_rust_agent_3d_generate() {
     cluster.shutdown().await;
 }
 
+#[cfg(feature = "3d")]
 fn create_humanoid_obj_bytes() -> Vec<u8> {
     let mut s = String::new();
     s.push_str("# OxideSwarm Test Humanoid OBJ\n");
@@ -608,6 +610,7 @@ fn create_humanoid_obj_bytes() -> Vec<u8> {
     s.into_bytes()
 }
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_convergence_rust_agent_auto_rig() {
     let cluster = ConvergenceCluster::spawn(1).await;
@@ -664,6 +667,7 @@ async fn test_convergence_rust_agent_auto_rig() {
 // TEST SUITE 9: Python Agent Node End-to-End 3D Challenger Suite (F21)
 // =========================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_convergence_python_agent_node_3d() {
     let cluster = ConvergenceCluster::spawn(1).await;
