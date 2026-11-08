@@ -159,7 +159,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-5 | Register or delete the orphan Rust test | P1 | S | INT-4 |  | Implemented | 19 |
 | TEST-6 | Extend CI to the full suite | P1 | M | TEST-1, TEST-2, TEST-3, TEST-4 |  | Implemented | 67, 124 |
 | TEST-7 | Run or delete the orphan Python tests | P2 | M | INT-4 |  | Implemented | 55, 66 |
-| TEST-19 | Fix flaky required tests | P1 | S | TEST-3 |  | Implemented | PRNUM |
+| TEST-19 | Fix flaky required tests | P1 | S | TEST-3 |  | Implemented | 161 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
