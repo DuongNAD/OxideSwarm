@@ -22,9 +22,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # [profile.dev] has `debug = true`. Line tables keep file:line in panics and backtraces while keeping
-  # the ~60 test binaries small enough for the runners' disks and the cache.
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 # The toolchain is pinned (`dtolnay/rust-toolchain@<version>`) so that a new stable release and its
 # new lints cannot turn CI red on an unchanged tree. Bump it in every job at once, deliberately,
