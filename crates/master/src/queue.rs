@@ -633,8 +633,9 @@ const MAX_SESSION_RESUME_WORKERS: usize = 4_096;
 struct SessionResumeTracker {
     /// FIFO insertion order of workers in `session_resume_workers`.
     order: std::collections::VecDeque<Uuid>,
-    /// Workers with a currently connected `WorkerSession`.
-    connected: HashSet<Uuid>,
+    /// Workers with a currently connected `WorkerSession`, mapped to the highest live `session_id`
+    /// so an older session's disconnect sweep never clears `connected` while a newer session lives.
+    connected: HashMap<Uuid, u64>,
     /// Workers that currently have active assignments (`worker_assignments`) or active holds (`held_tasks`).
     with_work_or_hold: HashSet<Uuid>,
 }
@@ -1199,7 +1200,7 @@ impl TaskQueue {
             }
             while set.len() >= MAX_SESSION_RESUME_WORKERS {
                 let evict_pos = tracker.order.iter().position(|candidate| {
-                    !tracker.connected.contains(candidate)
+                    !tracker.connected.contains_key(candidate)
                         && !tracker.with_work_or_hold.contains(candidate)
                 });
                 let Some(pos) = evict_pos else {
@@ -1218,16 +1219,31 @@ impl TaskQueue {
         }
     }
 
-    /// Marks whether a `SESSION_RESUME`-capable worker currently has a live session so the
-    /// [`MAX_SESSION_RESUME_WORKERS`] bound never evicts a connected worker even while idle.
-    pub fn set_worker_session_resume_connected(&self, worker_id: Uuid, connected: bool) {
+    /// Marks whether `session_id` of a `SESSION_RESUME`-capable worker is currently connected so
+    /// the [`MAX_SESSION_RESUME_WORKERS`] bound never evicts a connected worker even while idle,
+    /// and a late disconnect sweep for an older session never clears `connected` while a newer
+    /// session of the same worker is live.
+    pub fn set_worker_session_resume_connected(
+        &self,
+        worker_id: Uuid,
+        session_id: u64,
+        connected: bool,
+    ) {
         let mut tracker = self
             .session_resume_tracker
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if connected {
-            tracker.connected.insert(worker_id);
-        } else {
+            tracker
+                .connected
+                .entry(worker_id)
+                .and_modify(|cur| *cur = (*cur).max(session_id))
+                .or_insert(session_id);
+        } else if tracker
+            .connected
+            .get(&worker_id)
+            .is_some_and(|&cur| cur <= session_id)
+        {
             tracker.connected.remove(&worker_id);
         }
     }
@@ -2084,7 +2100,7 @@ impl TaskQueue {
                         .session_resume_tracker
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    tracker.connected.contains(&wid) || tracker.with_work_or_hold.contains(&wid)
+                    tracker.connected.contains_key(&wid) || tracker.with_work_or_hold.contains(&wid)
                 };
                 if !is_protected {
                     inner
@@ -4120,12 +4136,20 @@ impl TaskQueue {
                 inner.track_terminal_task(tid);
             }
             if !inner.worker_assignments.contains_key(worker_id) {
-                inner
+                let mut tracker = inner
                     .session_resume_tracker
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .connected
-                    .remove(worker_id);
+                    .unwrap_or_else(|e| e.into_inner());
+                let clear = match session_id {
+                    Some(swept) => tracker
+                        .connected
+                        .get(worker_id)
+                        .is_some_and(|&cur| cur <= swept),
+                    None => true,
+                };
+                if clear {
+                    tracker.connected.remove(worker_id);
+                }
             }
             inner.refresh_worker_resume_protection(*worker_id);
 
@@ -4388,12 +4412,20 @@ impl TaskQueue {
                 inner.track_terminal_task(tid);
             }
             if !inner.worker_assignments.contains_key(worker_id) {
-                inner
+                let mut tracker = inner
                     .session_resume_tracker
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .connected
-                    .remove(worker_id);
+                    .unwrap_or_else(|e| e.into_inner());
+                let clear = match session_id {
+                    Some(swept) => tracker
+                        .connected
+                        .get(worker_id)
+                        .is_some_and(|&cur| cur <= swept),
+                    None => true,
+                };
+                if clear {
+                    tracker.connected.remove(worker_id);
+                }
             }
             inner.refresh_worker_resume_protection(*worker_id);
 
@@ -8073,6 +8105,69 @@ mod tests {
                 .unwrap()
                 .contains(&w),
             "expired worker with no active tasks or holds must be pruned from session_resume_workers"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_resume_connected_survives_stale_session_disconnect_and_registration_churn(
+    ) {
+        let queue = TaskQueue::new();
+        queue.set_session_resume_hold(Duration::from_secs(60)).await;
+        let live_worker = Uuid::new_v4();
+
+        // Worker connects on session 1, then quickly reconnects on session 2 (idle).
+        queue.set_worker_session_resume(live_worker, true);
+        queue.set_worker_session_resume_connected(live_worker, 1, true);
+        queue.set_worker_session_resume(live_worker, true);
+        queue.set_worker_session_resume_connected(live_worker, 2, true);
+
+        // Session 1's late disconnect sweep runs after session 2 is already live.
+        queue.set_worker_session_resume_connected(live_worker, 1, false);
+        queue
+            .handle_session_disconnected(&live_worker, Some(1), "superseded session 1", true)
+            .await;
+
+        // Over 4,096 ephemeral workers register and disconnect.
+        for i in 0..(MAX_SESSION_RESUME_WORKERS + 128) {
+            let ephemeral = Uuid::new_v4();
+            let sid = 100 + i as u64;
+            queue.set_worker_session_resume(ephemeral, true);
+            queue.set_worker_session_resume_connected(ephemeral, sid, true);
+            queue.set_worker_session_resume_connected(ephemeral, sid, false);
+        }
+
+        // The live worker on session 2 must still be marked SESSION_RESUME-capable.
+        assert!(
+            queue
+                .inner
+                .read()
+                .await
+                .session_resume_workers
+                .lock()
+                .unwrap()
+                .contains(&live_worker),
+            "live worker on session 2 must not be evicted after session 1 disconnect sweep and >4,096 registrations"
+        );
+
+        // When session 2 later disconnects and another wave of ephemeral workers registers,
+        // the worker is no longer connected and can be evicted.
+        queue.set_worker_session_resume_connected(live_worker, 2, false);
+        queue
+            .handle_session_disconnected(&live_worker, Some(2), "session 2 closed", true)
+            .await;
+        for _ in 0..(MAX_SESSION_RESUME_WORKERS + 10) {
+            queue.set_worker_session_resume(Uuid::new_v4(), true);
+        }
+        assert!(
+            !queue
+                .inner
+                .read()
+                .await
+                .session_resume_workers
+                .lock()
+                .unwrap()
+                .contains(&live_worker),
+            "disconnected idle worker must be evictable once its latest session disconnects"
         );
     }
 }
