@@ -1431,6 +1431,13 @@ impl WorkerClient {
         &self.capabilities
     }
 
+    /// Replaces the advertised [`WorkerCapabilities`] on this client (e.g. in tests that construct
+    /// a worker with specific capability tags).
+    pub fn with_capabilities(mut self, capabilities: WorkerCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
     /// What start-up decided about the GPU and why: the real adapter in use, or, if the owner
     /// asked for a GPU that cannot be used, a warning saying how to get one. The CLI prints these.
     pub fn gpu_notices(&self) -> &[GpuNotice] {

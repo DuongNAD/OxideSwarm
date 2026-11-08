@@ -2872,7 +2872,21 @@ fn build_placement(args: &SubmitArgs) -> Result<Placement, String> {
     Placement::from_task_tags(&tags)
 }
 
-/// The master's worker list, each entry tagged by the master with `id:` / `state:` / `link:`
+/// For `TaskSpec::RustCompilation`, automatically adds `require:tool=cargo` when `source_files`
+/// contains `Cargo.toml` (or `require:tool=rustc` otherwise), unless the caller already specified
+/// a `--require-tool` requirement.
+fn apply_default_spec_placement(spec: &TaskSpec, placement: &mut Placement) {
+    if let TaskSpec::RustCompilation { source_files, .. } = spec {
+        if placement.tools.is_empty() {
+            let tool = if source_files.contains_key("Cargo.toml") {
+                "cargo"
+            } else {
+                "rustc"
+            };
+            placement.tools.push(tool.to_string());
+        }
+    }
+}
 /// (see `rusty_grid_core::placement`). `None` when the master did not answer with a list.
 async fn fetch_workers(
     transport: &mut MessageTransport<TcpStream>,
@@ -2976,7 +2990,8 @@ async fn run_submit_with_secret(
 ) -> ExitCode {
     // Everything wrong with the arguments is reported before connecting.
     let (spec, placement) = match build_task_spec(&args).and_then(|spec| {
-        let placement = build_placement(&args)?;
+        let mut placement = build_placement(&args)?;
+        apply_default_spec_placement(&spec, &mut placement);
         Ok((spec, placement))
     }) {
         Ok(built) => built,
@@ -6445,6 +6460,34 @@ fail_unfulfillable_tasks = false
             tag_err.contains("only the worker or the master"),
             "{tag_err}"
         );
+
+        // `submit --type compile` automatically adds `require:tool=cargo` when `Cargo.toml` is
+        // present and `require:tool=rustc` otherwise, unless `--require-tool` was already set.
+        let mut cargo_sources = HashMap::new();
+        cargo_sources.insert("Cargo.toml".into(), "[package]\nname = \"a\"\n".into());
+        cargo_sources.insert("src/main.rs".into(), "fn main() {}\n".into());
+        let cargo_spec = TaskSpec::rust_compilation("a", cargo_sources.clone(), vec![]);
+        let mut default_cargo_placement = Placement::default();
+        apply_default_spec_placement(&cargo_spec, &mut default_cargo_placement);
+        assert_eq!(
+            default_cargo_placement.to_task_tags(),
+            ["require:tool=cargo"]
+        );
+
+        let mut rustc_sources = HashMap::new();
+        rustc_sources.insert("src/lib.rs".into(), "pub fn f() {}\n".into());
+        let rustc_spec = TaskSpec::rust_compilation("b", rustc_sources, vec![]);
+        let mut default_rustc_placement = Placement::default();
+        apply_default_spec_placement(&rustc_spec, &mut default_rustc_placement);
+        assert_eq!(
+            default_rustc_placement.to_task_tags(),
+            ["require:tool=rustc"]
+        );
+
+        let mut explicit_placement =
+            build_placement(&submit_args(&["--require-tool", "git", "--", "true"])).unwrap();
+        apply_default_spec_placement(&cargo_spec, &mut explicit_placement);
+        assert_eq!(explicit_placement.to_task_tags(), ["require:tool=git"]);
     }
 
     #[tokio::test]
@@ -6499,17 +6542,17 @@ fail_unfulfillable_tasks = false
             .with_sandbox_base_dir(&w1_sandbox)
             .with_mobile_telemetry(plugged_in())
             .with_redirection_portal(false);
-        let mut w1_client = rusty_grid_core::capabilities::with_test_tool_probe(
-            vec!["tool:git".to_string()],
-            || WorkerClient::new(w1_config),
-        );
+        let w1_client = WorkerClient::new(w1_config);
+        let mut w1_caps = w1_client.capabilities().clone();
+        w1_caps.tags.retain(|t| t != "tool:cargo");
+        let mut w1_client = w1_client.with_capabilities(w1_caps);
         let w1_id = w1_client.worker_id();
         let (w1_stop_tx, w1_stop_rx) = watch::channel(false);
         let w1_handle = tokio::spawn(async move {
             let _ = w1_client.run(w1_stop_rx).await;
         });
 
-        // Worker 2: advertises `tool:cargo` and `tool:rustc`.
+        // Worker 2: advertises `tool:cargo` and `tool:rustc` (probed from host at start-up).
         let w2_sandbox = temp.path().join("w2-sandbox");
         let w2_config = WorkerConfig::new(master_addr.clone())
             .with_cluster_secret(secret.clone())
@@ -6520,13 +6563,13 @@ fail_unfulfillable_tasks = false
             .with_sandbox_base_dir(&w2_sandbox)
             .with_mobile_telemetry(plugged_in())
             .with_redirection_portal(false);
-        let mut w2_client = rusty_grid_core::capabilities::with_test_tool_probe(
-            vec![
-                "tool:cargo".to_string(),
-                "tool:rustc".to_string(),
-                "tool:git".to_string(),
-            ],
-            || WorkerClient::new(w2_config),
+        let mut w2_client = WorkerClient::new(w2_config);
+        assert!(
+            w2_client
+                .capabilities()
+                .tags
+                .contains(&"tool:cargo".to_string()),
+            "host worker must advertise tool:cargo"
         );
         let w2_id = w2_client.worker_id();
         let (w2_stop_tx, w2_stop_rx) = watch::channel(false);
@@ -6592,13 +6635,13 @@ edition = "2021"
 
         let client_out_dir = temp.path().join("client-out");
         let input_spec = format!("{}:local_math", dep_dir.display());
+        // Note: no explicit `--require-tool cargo` flag is passed; `submit --type compile`
+        // automatically adds `require:tool=cargo` because `Cargo.toml` is in `source_files`.
         let s_args = submit_args(&[
             "--master",
             &master_addr,
             "--type",
             "compile",
-            "--require-tool",
-            "cargo",
             "--source",
             crate_dir.to_str().unwrap(),
             "--input",

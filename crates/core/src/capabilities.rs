@@ -1292,8 +1292,9 @@ fn detect_os_version(is_android: bool) -> String {
 }
 
 /// Maximum wall-clock time a single host capability probe subprocess (`blender --version`,
-/// `pmset`, `sysctl`, `sw_vers`, `nvidia-smi`, `nvcc`, `dumpsys`, `getprop`) may take before it is
-/// killed and treated as unavailable.
+/// `cargo --version`, `rustc --version`, `git --version`, `pmset`, `sysctl`, `sw_vers`,
+/// `nvidia-smi`, `nvcc`, `dumpsys`, `getprop`) may take before it is killed and treated as
+/// unavailable.
 pub const HOST_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Debug)]
@@ -1563,15 +1564,153 @@ fn run_host_probe(cmd: &mut std::process::Command, label: &str) -> Option<std::p
 /// Host tools probed at worker start-up (`<tool> --version`, bounded by [`HOST_PROBE_TIMEOUT`]).
 pub const HOST_PROBED_TOOLS: [&str; 3] = ["cargo", "rustc", "git"];
 
+/// Prepends standard Git for Windows / MSYS2 binary directories (`C:\Program Files\Git\usr\bin`,
+/// `C:\Program Files\Git\bin`, `C:\Program Files (x86)\Git\usr\bin`,
+/// `C:\Program Files (x86)\Git\bin`, `C:\msys64\usr\bin`) to `existing_path` when present on disk.
+#[cfg(windows)]
+pub fn augment_windows_path(existing_path: &str) -> String {
+    let paths_to_check = [
+        std::path::PathBuf::from(r"C:\Program Files\Git\usr\bin"),
+        std::path::PathBuf::from(r"C:\Program Files\Git\bin"),
+        std::path::PathBuf::from(r"C:\Program Files (x86)\Git\usr\bin"),
+        std::path::PathBuf::from(r"C:\Program Files (x86)\Git\bin"),
+        std::path::PathBuf::from(r"C:\msys64\usr\bin"),
+    ];
+
+    let mut prefix = String::new();
+    for p in &paths_to_check {
+        if p.exists() {
+            let p_str = p.to_string_lossy();
+            if !existing_path.contains(&*p_str) {
+                if !prefix.is_empty() {
+                    prefix.push(';');
+                }
+                prefix.push_str(&p_str);
+            }
+        }
+    }
+    if prefix.is_empty() {
+        existing_path.to_string()
+    } else if existing_path.is_empty() {
+        prefix
+    } else {
+        format!("{prefix};{existing_path}")
+    }
+}
+
+#[cfg(windows)]
+const WINDOWS_EXEC_EXTS: &[&str] = &[".com", ".exe", ".bat", ".cmd"];
+
+#[cfg(windows)]
+fn has_windows_exec_ext(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "com" | "exe" | "bat" | "cmd"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_valid_windows_executable(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    if !has_windows_exec_ext(path) {
+        tracing::debug!(
+            path = %path.display(),
+            "Skipping Windows executable candidate without .com/.exe/.bat/.cmd extension"
+        );
+        return false;
+    }
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if matches!(ext.to_ascii_lowercase().as_str(), "com" | "exe") => {
+            use std::io::Read;
+            let mut magic = [0u8; 2];
+            let valid_mz = std::fs::File::open(path)
+                .and_then(|mut f| f.read_exact(&mut magic))
+                .map(|()| &magic == b"MZ")
+                .unwrap_or(false);
+            if !valid_mz {
+                tracing::debug!(
+                    path = %path.display(),
+                    "Skipping Windows PE candidate without valid MZ header"
+                );
+            }
+            valid_mz
+        }
+        _ => true,
+    }
+}
+
+#[cfg(windows)]
+fn probe_candidate_in_dir(dir: &std::path::Path, bare_name: &str) -> Option<String> {
+    let candidate = dir.join(bare_name);
+    if is_valid_windows_executable(&candidate) {
+        return Some(candidate.to_string_lossy().to_string());
+    }
+    for ext in WINDOWS_EXEC_EXTS {
+        let candidate_ext = dir.join(format!("{bare_name}{ext}"));
+        if is_valid_windows_executable(&candidate_ext) {
+            return Some(candidate_ext.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+/// Resolves `program` on Windows using the same rules as `TaskRunner` (`Git\usr\bin` / `Git\bin`
+/// fast path followed by `effective_path` entries, checking `.com`, `.exe`, `.bat`, `.cmd` and
+/// verifying `MZ` headers on `.com`/`.exe`).
+#[cfg(windows)]
+pub fn resolve_windows_executable(program: &str, effective_path: &str) -> String {
+    let p = std::path::Path::new(program);
+    let has_path_sep = program.contains('/') || program.contains('\\') || program.contains(':');
+    if has_path_sep {
+        if is_valid_windows_executable(p) {
+            return program.to_string();
+        }
+        for ext in WINDOWS_EXEC_EXTS {
+            let with_ext = format!("{program}{ext}");
+            if is_valid_windows_executable(std::path::Path::new(&with_ext)) {
+                return with_ext;
+            }
+        }
+        return program.to_string();
+    }
+
+    let bare_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(program);
+
+    // Fast path: check Git for Windows usr/bin first so bare Unix tool names
+    // (find, sort, timeout, tar, ssh, sh, git) resolve consistently with macOS/Linux
+    // workers even when Git's directories sit after System32 in PATH.
+    for base in &[r"C:\Program Files\Git\usr\bin", r"C:\Program Files\Git\bin"] {
+        if let Some(found) = probe_candidate_in_dir(std::path::Path::new(base), bare_name) {
+            return found;
+        }
+    }
+
+    for dir in std::env::split_paths(effective_path) {
+        if let Some(found) = probe_candidate_in_dir(&dir, bare_name) {
+            return found;
+        }
+    }
+
+    program.to_string()
+}
+
+#[cfg(test)]
 std::thread_local! {
     static TEST_TOOL_PROBE: std::cell::RefCell<Option<Vec<String>>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Overrides the host tool tags returned by [`detect_host_tools`] on the current thread for the
-/// duration of `f`. Used by tests to simulate a worker with or without specific tools (`cargo`,
-/// `rustc`, `git`).
-#[doc(hidden)]
+/// duration of `f`. Used by unit tests to simulate a worker with or without specific tools
+/// (`cargo`, `rustc`, `git`).
+#[cfg(test)]
 pub fn with_test_tool_probe<R>(tools: Vec<String>, f: impl FnOnce() -> R) -> R {
     struct Reset(Option<Vec<String>>);
     impl Drop for Reset {
@@ -1601,6 +1740,20 @@ pub fn probe_tool_with_timeout<P: AsRef<std::ffi::OsStr>>(
     timeout: std::time::Duration,
 ) -> bool {
     let program_ref = program.as_ref();
+    #[cfg(windows)]
+    let (resolved_program, effective_path) = {
+        let base_path = std::env::var("PATH").unwrap_or_default();
+        let effective_path = augment_windows_path(&base_path);
+        let resolved = resolve_windows_executable(&program_ref.to_string_lossy(), &effective_path);
+        (resolved, effective_path)
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = crate::cluster_auth::probe_command(&resolved_program);
+        c.env("PATH", &effective_path);
+        c
+    };
+    #[cfg(not(windows))]
     let mut cmd = crate::cluster_auth::probe_command(program_ref);
     cmd.arg("--version");
     match run_command_bounded(&mut cmd, timeout) {
@@ -1630,6 +1783,7 @@ pub fn detect_host_tools_uncached() -> Vec<String> {
 /// Probes `cargo --version`, `rustc --version` and `git --version` on `PATH` (each bounded by
 /// [`HOST_PROBE_TIMEOUT`]) and returns `tool:<name>` tags for those that succeed.
 pub fn detect_host_tools() -> Vec<String> {
+    #[cfg(test)]
     if let Some(override_tags) = TEST_TOOL_PROBE.with(|c| c.borrow().clone()) {
         return override_tags;
     }

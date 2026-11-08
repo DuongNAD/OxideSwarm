@@ -246,134 +246,186 @@ pub enum TaskRunnerError {
 }
 
 #[cfg(windows)]
-fn augment_windows_path(existing_path: &str) -> String {
-    let paths_to_check = [
-        std::path::PathBuf::from(r"C:\Program Files\Git\usr\bin"),
-        std::path::PathBuf::from(r"C:\Program Files\Git\bin"),
-        std::path::PathBuf::from(r"C:\Program Files (x86)\Git\usr\bin"),
-        std::path::PathBuf::from(r"C:\Program Files (x86)\Git\bin"),
-        std::path::PathBuf::from(r"C:\msys64\usr\bin"),
-    ];
+use rusty_grid_core::capabilities::{augment_windows_path, resolve_windows_executable};
 
-    let mut prefix = String::new();
-    for p in &paths_to_check {
-        if p.exists() {
-            let p_str = p.to_string_lossy();
-            if !existing_path.contains(&*p_str) {
-                if !prefix.is_empty() {
-                    prefix.push(';');
+/// Resolves the worker's active `rustup` toolchain name so `RUSTUP_TOOLCHAIN` can be pinned for
+/// `cargo build --offline` tasks, preventing a task's `rust-toolchain.toml` or `rust-toolchain`
+/// file from triggering network access or toolchain installation.
+fn detect_worker_rustup_toolchain(host_dirs: &crate::isolation::HostDirs) -> Option<String> {
+    if let Ok(tc) = std::env::var("RUSTUP_TOOLCHAIN") {
+        let trimmed = tc.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    let settings_path = host_dirs.rustup_home.join("settings.toml");
+    let contents = std::fs::read_to_string(settings_path).ok()?;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("default_toolchain") {
+            let rest = rest.trim_start();
+            if let Some(val) = rest.strip_prefix('=') {
+                let unquoted = val.trim().trim_matches('"').trim_matches('\'').trim();
+                if !unquoted.is_empty() {
+                    return Some(unquoted.to_string());
                 }
-                prefix.push_str(&p_str);
             }
-        }
-    }
-    if prefix.is_empty() {
-        existing_path.to_string()
-    } else if existing_path.is_empty() {
-        prefix
-    } else {
-        format!("{prefix};{existing_path}")
-    }
-}
-
-#[cfg(windows)]
-const WINDOWS_EXEC_EXTS: &[&str] = &[".com", ".exe", ".bat", ".cmd"];
-
-#[cfg(windows)]
-fn has_windows_exec_ext(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| {
-            matches!(
-                ext.to_ascii_lowercase().as_str(),
-                "com" | "exe" | "bat" | "cmd"
-            )
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(windows)]
-fn is_valid_windows_executable(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    if !has_windows_exec_ext(path) {
-        debug!(
-            path = %path.display(),
-            "Skipping Windows executable candidate without .com/.exe/.bat/.cmd extension"
-        );
-        return false;
-    }
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) if matches!(ext.to_ascii_lowercase().as_str(), "com" | "exe") => {
-            use std::io::Read;
-            let mut magic = [0u8; 2];
-            let valid_mz = std::fs::File::open(path)
-                .and_then(|mut f| f.read_exact(&mut magic))
-                .map(|()| &magic == b"MZ")
-                .unwrap_or(false);
-            if !valid_mz {
-                debug!(
-                    path = %path.display(),
-                    "Skipping Windows PE candidate without valid MZ header"
-                );
-            }
-            valid_mz
-        }
-        _ => true,
-    }
-}
-
-#[cfg(windows)]
-fn probe_candidate_in_dir(dir: &Path, bare_name: &str) -> Option<String> {
-    let candidate = dir.join(bare_name);
-    if is_valid_windows_executable(&candidate) {
-        return Some(candidate.to_string_lossy().to_string());
-    }
-    for ext in WINDOWS_EXEC_EXTS {
-        let candidate_ext = dir.join(format!("{bare_name}{ext}"));
-        if is_valid_windows_executable(&candidate_ext) {
-            return Some(candidate_ext.to_string_lossy().to_string());
         }
     }
     None
 }
 
-#[cfg(windows)]
-fn resolve_windows_executable(program: &str, effective_path: &str) -> String {
-    let p = Path::new(program);
-    let has_path_sep = program.contains('/') || program.contains('\\') || program.contains(':');
-    if has_path_sep {
-        if is_valid_windows_executable(p) {
-            return program.to_string();
+/// Validates and filters `compiler_flags` for the `cargo build --offline` path of
+/// `TaskSpec::RustCompilation`.
+///
+/// Refuses `--config`, `-Z`, `--manifest-path`, `--online`, `--target-dir` outside `sandbox_root`,
+/// and any flag not on the `cargo build` allowlist. Returns the sanitized flags and an optional
+/// in-sandbox `--target-dir` override.
+fn validate_cargo_compiler_flags(
+    compiler_flags: &[String],
+    sandbox_root: &Path,
+) -> Result<(Vec<String>, Option<PathBuf>), String> {
+    const SAFE_ZERO_ARG_FLAGS: &[&str] = &[
+        "--release",
+        "-r",
+        "--all-features",
+        "--no-default-features",
+        "--locked",
+        "--frozen",
+        "--lib",
+        "--bins",
+        "--examples",
+        "--tests",
+        "--benches",
+        "--all-targets",
+        "--workspace",
+        "--all",
+        "--verbose",
+        "-v",
+        "-vv",
+        "--quiet",
+        "-q",
+        "--keep-going",
+        "--timings",
+        "--future-incompat-report",
+        "--ignore-rust-version",
+        "--unit-graph",
+        "--build-plan",
+    ];
+    const SAFE_VALUE_FLAGS: &[&str] = &[
+        "--features",
+        "-F",
+        "--bin",
+        "--example",
+        "--test",
+        "--bench",
+        "--package",
+        "-p",
+        "--profile",
+        "--target",
+        "--jobs",
+        "-j",
+        "--color",
+        "--message-format",
+    ];
+
+    let mut out = Vec::new();
+    let mut override_target_dir = None;
+    let mut idx = 0;
+    while idx < compiler_flags.len() {
+        let flag = compiler_flags[idx].as_str();
+        if flag == "--offline" {
+            // Already passed unconditionally by the runner.
+            idx += 1;
+            continue;
         }
-        for ext in WINDOWS_EXEC_EXTS {
-            let with_ext = format!("{program}{ext}");
-            if is_valid_windows_executable(Path::new(&with_ext)) {
-                return with_ext;
+        if flag == "--config" || flag.starts_with("--config=") {
+            return Err(format!(
+                "flag '{flag}' is disallowed for cargo build --offline (--config is refused)"
+            ));
+        }
+        if flag == "-Z" || flag.starts_with("-Z") {
+            return Err(format!(
+                "flag '{flag}' is disallowed for cargo build --offline (-Z unstable flags are refused)"
+            ));
+        }
+        if flag == "--manifest-path" || flag.starts_with("--manifest-path=") {
+            return Err(format!(
+                "flag '{flag}' is disallowed for cargo build --offline (--manifest-path is refused)"
+            ));
+        }
+        if flag == "--online" || flag.starts_with("--online=") {
+            return Err(format!(
+                "flag '{flag}' is disallowed for cargo build --offline (builds must stay offline)"
+            ));
+        }
+        if flag == "--target-dir" || flag.starts_with("--target-dir=") {
+            let raw_dir = if let Some(rest) = flag.strip_prefix("--target-dir=") {
+                idx += 1;
+                rest
+            } else {
+                let Some(next) = compiler_flags.get(idx + 1) else {
+                    return Err(
+                        "flag '--target-dir' requires a relative path inside the sandbox"
+                            .to_string(),
+                    );
+                };
+                idx += 2;
+                next.as_str()
+            };
+            let resolved =
+                sanitize_relative_path(sandbox_root, Path::new(raw_dir)).map_err(|e| {
+                    format!("--target-dir '{raw_dir}' must stay inside the sandbox: {e}")
+                })?;
+            override_target_dir = Some(resolved);
+            continue;
+        }
+        if SAFE_ZERO_ARG_FLAGS.contains(&flag) {
+            out.push(flag.to_string());
+            idx += 1;
+            continue;
+        }
+        if let Some((prefix, val)) = flag.split_once('=') {
+            if prefix == "--timings" || SAFE_VALUE_FLAGS.contains(&prefix) {
+                if val.is_empty() {
+                    return Err(format!("flag '{flag}' has an empty value"));
+                }
+                if prefix == "--target"
+                    && (val.contains('/') || val.contains('\\') || val.ends_with(".json"))
+                {
+                    return Err(format!(
+                        "flag '{flag}' is disallowed: custom target paths or JSON specs are refused"
+                    ));
+                }
+                out.push(flag.to_string());
+                idx += 1;
+                continue;
             }
         }
-        return program.to_string();
-    }
-
-    let bare_name = p.file_name().and_then(|n| n.to_str()).unwrap_or(program);
-
-    // Fast path: check Git for Windows usr/bin first so bare Unix tool names
-    // (find, sort, timeout, tar, ssh, sh) resolve consistently with macOS/Linux
-    // workers even when Git's directories sit after System32 in PATH.
-    for base in &[r"C:\Program Files\Git\usr\bin", r"C:\Program Files\Git\bin"] {
-        if let Some(found) = probe_candidate_in_dir(Path::new(base), bare_name) {
-            return found;
+        if SAFE_VALUE_FLAGS.contains(&flag) {
+            let Some(val) = compiler_flags.get(idx + 1) else {
+                return Err(format!("flag '{flag}' is missing its value"));
+            };
+            if val.is_empty() || val.starts_with('-') {
+                return Err(format!("flag '{flag}' has an invalid value '{val}'"));
+            }
+            if flag == "--target"
+                && (val.contains('/') || val.contains('\\') || val.ends_with(".json"))
+            {
+                return Err(format!(
+                    "flag '--target {val}' is disallowed: custom target paths or JSON specs are refused"
+                ));
+            }
+            out.push(flag.to_string());
+            out.push(val.clone());
+            idx += 2;
+            continue;
         }
+        return Err(format!(
+            "flag '{flag}' is not on the allowlist for cargo build --offline"
+        ));
     }
-
-    for dir in std::env::split_paths(effective_path) {
-        if let Some(found) = probe_candidate_in_dir(&dir, bare_name) {
-            return found;
-        }
-    }
-
-    program.to_string()
+    Ok((out, override_target_dir))
 }
 
 /// The notice inserted between the preserved head and tail when a capture exceeds its size limit.
@@ -1903,7 +1955,7 @@ impl TaskRunner {
             }
         }
 
-        let out_dir = if let Some(td) = target_dir {
+        let mut out_dir = if let Some(td) = target_dir {
             match sanitize_relative_path(sandbox.path(), td) {
                 Ok(p) => p,
                 Err(e) => {
@@ -1923,26 +1975,77 @@ impl TaskRunner {
             sandbox.path().join("target")
         };
 
-        let _ = tokio::fs::create_dir_all(&out_dir).await;
-
         let use_cargo = sandbox.path().join("Cargo.toml").is_file();
         let (program, args, compile_env) = if use_cargo {
-            let mut cargo_args = vec!["build".to_string()];
-            if !compiler_flags.iter().any(|f| f == "--offline") {
-                cargo_args.push("--offline".to_string());
+            let (filtered_flags, override_target_dir) =
+                match validate_cargo_compiler_flags(compiler_flags, sandbox.path()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = sandbox.destroy().await;
+                        return TaskResult::failure(
+                            self.worker_id,
+                            task.id,
+                            EXIT_CODE_GENERAL_ERROR,
+                            "",
+                            format!("Invalid cargo compiler_flags: {e}"),
+                            start_time.elapsed().as_millis() as u64,
+                            Some(format!("Invalid cargo compiler_flags: {e}")),
+                        );
+                    }
+                };
+            if let Some(td) = override_target_dir {
+                out_dir = td;
             }
-            cargo_args.push("--target-dir".to_string());
-            cargo_args.push(out_dir.to_string_lossy().to_string());
-            for flag in compiler_flags {
-                cargo_args.push(flag.clone());
-            }
+            let _ = tokio::fs::create_dir_all(&out_dir).await;
+
+            // Remove any task-supplied `rust-toolchain` or `rust-toolchain.toml` from the sandbox
+            // root and pin `RUSTUP_TOOLCHAIN` to the worker's active toolchain so `rustup` never
+            // attempts to download or switch to an uncached toolchain over the network.
+            let _ = tokio::fs::remove_file(sandbox.path().join("rust-toolchain")).await;
+            let _ = tokio::fs::remove_file(sandbox.path().join("rust-toolchain.toml")).await;
+
+            let mut cargo_args = vec![
+                "build".to_string(),
+                "--offline".to_string(),
+                "--target-dir".to_string(),
+                out_dir.to_string_lossy().to_string(),
+            ];
+            cargo_args.extend(filtered_flags);
+
+            // Point `CARGO_HOME` and `RUSTUP_HOME` at the worker's host directories so pre-warmed
+            // crate caches in `$CARGO_HOME/registry` and `$CARGO_HOME/git` are readable by
+            // `cargo build --offline`. Under `--isolation fs|fs+net` (Design 0038 / 0039 D8),
+            // `CARGO_HOME` is mounted/ACL'd read-only and `$CARGO_HOME/credentials.toml` is
+            // explicitly denied.
             let mut env = HashMap::new();
             env.insert(
                 "CARGO_TARGET_DIR".to_string(),
                 out_dir.to_string_lossy().to_string(),
             );
+            env.insert("CARGO_NET_OFFLINE".to_string(), "true".to_string());
+            env.insert("RUSTUP_AUTO_INSTALL".to_string(), "0".to_string());
+            env.insert(
+                "CARGO_HOME".to_string(),
+                self.config
+                    .host_dirs
+                    .cargo_home
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            env.insert(
+                "RUSTUP_HOME".to_string(),
+                self.config
+                    .host_dirs
+                    .rustup_home
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            if let Some(toolchain) = detect_worker_rustup_toolchain(&self.config.host_dirs) {
+                env.insert("RUSTUP_TOOLCHAIN".to_string(), toolchain);
+            }
             ("cargo", cargo_args, env)
         } else {
+            let _ = tokio::fs::create_dir_all(&out_dir).await;
             // Determine entry point and default crate type
             let entry_candidates = [
                 ("src/lib.rs", "lib"),
@@ -3460,6 +3563,82 @@ nonexistent_oxideswarm_crate_w8 = "99.99.99"
         assert!(
             !bad_res.is_success(),
             "expected uncached dependency to fail under --offline, got: {bad_res:?}"
+        );
+
+        // 3. Dangerous `compiler_flags` (`--config`, `-Z`, `--manifest-path`, `--target-dir`
+        //    outside the sandbox, `--online`) are refused before spawning `cargo`.
+        for bad_flags in [
+            vec!["--config".to_string(), "net.offline=false".to_string()],
+            vec!["--config=build.rustc-wrapper='sh'".to_string()],
+            vec!["-Z".to_string(), "unstable-options".to_string()],
+            vec!["-Zscript".to_string()],
+            vec![
+                "--manifest-path".to_string(),
+                "../other/Cargo.toml".to_string(),
+            ],
+            vec!["--target-dir".to_string(), "../escape_target".to_string()],
+            vec!["--online".to_string()],
+        ] {
+            let mut flag_sources = HashMap::new();
+            flag_sources.insert(
+                "Cargo.toml".to_string(),
+                "[package]\nname = \"w8_flags\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    .to_string(),
+            );
+            flag_sources.insert("src/main.rs".to_string(), "fn main() {}\n".to_string());
+            let flag_task = Task::new(
+                TaskSpec::RustCompilation {
+                    crate_name: "w8_flags".to_string(),
+                    source_files: flag_sources,
+                    compiler_flags: bad_flags.clone(),
+                    target_dir: None,
+                },
+                TaskRequirements::generic(1, 30),
+            );
+            let flag_res = runner.execute_task(&flag_task, None, None).await;
+            assert!(
+                !flag_res.is_success(),
+                "expected bad compiler_flags {bad_flags:?} to be rejected, got: {flag_res:?}"
+            );
+            assert!(
+                flag_res
+                    .stderr_str()
+                    .contains("Invalid cargo compiler_flags"),
+                "expected 'Invalid cargo compiler_flags' in stderr for {bad_flags:?}, got: {}",
+                flag_res.stderr_str()
+            );
+        }
+
+        // 4. A `rust-toolchain.toml` in `source_files` requesting a bogus toolchain is ignored /
+        //    overridden by the worker's pinned `RUSTUP_TOOLCHAIN` so `rustup` stays offline.
+        let mut tc_sources = HashMap::new();
+        tc_sources.insert(
+            "Cargo.toml".to_string(),
+            "[package]\nname = \"w8_tc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n".to_string(),
+        );
+        tc_sources.insert(
+            "rust-toolchain.toml".to_string(),
+            "[toolchain]\nchannel = \"nonexistent-oxideswarm-toolchain-99.99.99\"\n".to_string(),
+        );
+        tc_sources.insert("src/main.rs".to_string(), "fn main() {}\n".to_string());
+        let tc_task = Task::new(
+            TaskSpec::RustCompilation {
+                crate_name: "w8_tc".to_string(),
+                source_files: tc_sources,
+                compiler_flags: vec!["--release".to_string()],
+                target_dir: None,
+            },
+            TaskRequirements::generic(1, 60),
+        );
+        let tc_res = runner.execute_task(&tc_task, None, None).await;
+        assert!(
+            tc_res.is_success(),
+            "expected rust-toolchain.toml to be neutralized offline and build with worker toolchain, got: {tc_res:?}"
+        );
+        assert!(
+            tc_res.outputs.iter().any(|o| o.path.contains("w8_tc")),
+            "expected w8_tc binary in outputs, got: {:?}",
+            tc_res.outputs
         );
     }
 

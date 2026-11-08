@@ -236,15 +236,34 @@ instead, for four reasons:
 
 ### D8 Tools on workers, and FEAT-10
 
-`crates/core/src/capabilities.rs`, `crates/core/src/placement.rs`, `crates/worker/src/runner.rs`:
+`crates/core/src/capabilities.rs`, `crates/core/src/placement.rs`, `crates/worker/src/runner.rs`,
+`crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs`:
 
 - At start-up the worker probes `cargo --version`, `rustc --version` and `git --version`, each
-  bounded by `HOST_PROBE_TIMEOUT` (design 0020). It advertises `tool:cargo`, `tool:rustc` and
-  `tool:git` for the tools it found.
-- `tool:` becomes the seventh reserved tag prefix. A new placement entry `require:tool=<name>`
-  matches it. The CLI takes `--require-tool NAME`, and MCP `submit` takes `tools: [NAME]`.
+  bounded by `HOST_PROBE_TIMEOUT` (`3 s`, design 0020). On Windows the probe uses
+  `augment_windows_path` and `resolve_windows_executable` (`crates/core/src/capabilities.rs`),
+  shared with `TaskRunner`, so start-up probing and task execution agree on tool paths. The worker
+  advertises `tool:cargo`, `tool:rustc` and `tool:git` for the tools it found.
+- `tool:` becomes the eighth reserved tag prefix (alongside `os:`, `arch:`, `slots:`, `iso:`,
+  `id:`, `state:` and `link:`). A new placement entry `require:tool=<name>` matches it. The CLI
+  takes `--require-tool NAME`, and MCP `submit` takes `tools: [NAME]`. When a `RustCompilation`
+  task (`submit --type compile` or MCP `submit` with `type: "compile"`) has no explicit tool
+  requirement, the client automatically adds `require:tool=cargo` when `Cargo.toml` is present in
+  the task's sources/inputs and `require:tool=rustc` otherwise.
 - `RustCompilation` runs `cargo build --offline` when its sources contain `Cargo.toml`, as FEAT-10
   asks. Workspace tasks do not need this: they run `cargo` as a `Command`.
+- **Hardening for `cargo build --offline` in `RustCompilation`:**
+  - `compiler_flags` are validated against an allowlist of safe `cargo build` flags before spawning
+    `cargo`; `--config`, `-Z`, `--manifest-path`, `--online`, and any `--target-dir` that resolves
+    outside the task sandbox are refused.
+  - `CARGO_HOME` and `RUSTUP_HOME` are set to the worker's `HostDirs` (`CARGO_NET_OFFLINE=true`) so
+    `cargo build --offline` can read pre-warmed crate caches in `$CARGO_HOME/registry` and
+    `$CARGO_HOME/git`. Under `--isolation fs|fs+net` (design 0038), `CARGO_HOME` and `RUSTUP_HOME`
+    are mounted/ACL'd read-only while `$CARGO_HOME/credentials.toml` is denied.
+  - Any `rust-toolchain` or `rust-toolchain.toml` file materialized in the sandbox root is removed
+    before invoking `cargo`, `RUSTUP_TOOLCHAIN` is pinned to the worker's active toolchain (from
+    `RUSTUP_TOOLCHAIN` or `default_toolchain` in `<rustup_home>/settings.toml`), and
+    `RUSTUP_AUTO_INSTALL=0` is set so `rustup` never attempts network access.
 
 ## Compatibility
 
@@ -260,7 +279,7 @@ instead, for four reasons:
   then waits as `ClusterLacksCapability`, or fails when the master is configured to fail
   unplaceable tasks (SCHED-3).
 - `tool:` becomes a reserved tag prefix (D8). A user tag that starts with `tool:` is then refused,
-  as tags with the other six prefixes are. Such a tag must be renamed before the upgrade.
+  as tags with the other seven prefixes are. Such a tag must be renamed before the upgrade.
 - A P2P client sends `STREAM_CLIENT` (D7). An older master reads it as an invalid first tag and
   closes the connection, so the client says the master may be older.
 - Upgrade order as in `DEPLOYMENT.md` 3.5: the master first, then workers and clients.
@@ -273,6 +292,10 @@ instead, for four reasons:
   that user reads, including `cluster.secret` and other workspaces. This is no wider than any task
   today. With FEAT-3, a workspace task runs at least at level `fs`, with write access to
   `<root>/<name>/` only and no access to other workspaces.
+- **Cargo `build.rs` and procedural macros.** During `cargo build`, build scripts (`build.rs`) and
+  procedural macros execute arbitrary code on the worker host. A Cargo `RustCompilation` task is
+  therefore security-equivalent to a `Command` task and relies on `--isolation fs|fs+net` (FEAT-3 /
+  design 0038) for filesystem and network confinement.
 - **Paths.** Names cannot form paths (D1). Sync never follows a symbolic link, and deletes only
   files an earlier manifest listed. The root is private to the worker's user (D2).
 - **Bounds.** Workspace size and count (D2), files and bytes per source (D5), and the manifest
