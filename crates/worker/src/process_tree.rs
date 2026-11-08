@@ -1490,12 +1490,22 @@ fn kill_by_leader(live_leader: Option<u32>) {
         return;
     };
     let taskkill = move || {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        // Acquire `WINDOWS_SPAWN_LOCK` so `taskkill` cannot race with the brief pipe-inheritance
+        // or `SetProcessWindowStation` window in `spawn_with_security_capabilities` (M5, N7).
+        let mut child = {
+            let _spawn_guard = crate::isolation::windows::WINDOWS_SPAWN_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        };
+        if let Ok(ref mut c) = child {
+            let _ = c.wait();
+        }
     };
     // Starting and waiting for a process must not happen on a runtime thread.
     match tokio::runtime::Handle::try_current() {

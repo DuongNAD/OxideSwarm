@@ -1214,14 +1214,16 @@ Write-Output ("RUN_TOKEN=" + $(if ($null -ne $env:RUSTY_GRID_RUN_TOKEN) { $env:R
         }
         // On Windows, `CreateProcessW` (`KernelBase!BasepAppContainerEnvironmentExtension`)
         // rewrites `TEMP` and `TMP` into the per-attempt AppContainer folder
-        // `...\Packages\oxideswarm.task.<run_token>\AC\Temp`.
+        // `...\Packages\oxideswarm.task.<worker8>.<run_token_simple>\AC\Temp`.
         assert_ne!(got["RUN_TOKEN"], "unset");
-        let task_moniker = format!("oxideswarm.task.{}", got["RUN_TOKEN"]);
+        let prefix = rusty_grid_worker::isolation::windows::worker_profile_prefix(&rig.base);
+        let token_simple: String = got["RUN_TOKEN"].chars().filter(|c| *c != '-').collect();
+        let task_moniker = format!("{prefix}.{token_simple}");
         for name in ["TEMP", "TMP"] {
             let val = &got[name];
             assert!(
                 val == &sandbox || val.contains(&task_moniker),
-                "{name} must be sandbox or per-task AppContainer temp dir, got {val}"
+                "{name} must be sandbox or per-task AppContainer temp dir ({task_moniker}), got {val}"
             );
         }
         assert_eq!(got["RUSTUP_HOME"], rig.host.rustup_home.to_string_lossy());
@@ -1245,6 +1247,21 @@ Write-Output ("RUN_TOKEN=" + $(if ($null -ne $env:RUSTY_GRID_RUN_TOKEN) { $env:R
         let udp_listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         udp_listener.set_nonblocking(true).unwrap();
         let udp_port = udp_listener.local_addr().unwrap().port().to_string();
+
+        // Bind a non-loopback UDP socket on the host's outbound IPv4 interface so we can
+        // directly observe whether non-loopback UDP sends leave the task or are dropped by WFP.
+        let lan_ip = {
+            let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+            let _ = probe.connect("192.0.2.1:80");
+            probe
+                .local_addr()
+                .map(|a| a.ip())
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        };
+        let lan_udp_listener = std::net::UdpSocket::bind((lan_ip, 0)).unwrap();
+        lan_udp_listener.set_nonblocking(true).unwrap();
+        let lan_ip_str = lan_ip.to_string();
+        let lan_udp_port = lan_udp_listener.local_addr().unwrap().port().to_string();
 
         let listener6 = std::net::TcpListener::bind("[::1]:0").ok();
         if let Some(ref l6) = listener6 {
@@ -1271,12 +1288,9 @@ try {
     $u.Close()
 } catch {}
 "#;
-        // M1: Probes non-loopback IPv4 TCP (`192.0.2.1:80`), outbound UDP (`192.0.2.1:53`),
-        // DNS resolution, IPv6 loopback (`[::1]`) and IPv6 outbound (`[2001:db8::1]:80`),
-        // and UNC share access (`\\127.0.0.1\C$\Windows\win.ini`).
-        // Under `fs` (`WinCapabilityInternetClientSid` + `WinCapabilityPrivateNetworkClientServerSid`),
-        // WFP permits outbound IPv4 TCP and UDP sockets (`NativeErrorCode != 10013`), whereas under
-        // `fs+net` (zero network capabilities) WFP blocks outbound TCP, UDP, DNS, IPv6, and UNC.
+        // M1: Probes non-loopback IPv4 TCP (`192.0.2.1:80`), outbound UDP send (`192.0.2.1:53`),
+        // real DNS resolution (`example.com`), IPv6 loopback (`[::1]`) and IPv6 outbound
+        // (`[2001:db8::1]:80`), and UNC share access (`\\127.0.0.1\C$\Windows\win.ini`).
         let net_matrix_script = r#"
 try {
     $c = New-Object System.Net.Sockets.TcpClient
@@ -1298,22 +1312,18 @@ try {
 
 try {
     $u = New-Object System.Net.Sockets.UdpClient
-    $u.Client.ReceiveTimeout = 150
-    $u.Connect('192.0.2.1', 53)
-    $bytes = [byte[]](0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
-    $u.Send($bytes, $bytes.Length) | Out-Null
-    Write-Output 'UDP_SEND_OK'
-    $ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
-    $u.Receive([ref]$ep) | Out-Null
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes('FEAT3_MATRIX_UDP')
+    $u.Send($bytes, $bytes.Length, $env:T_LAN_IP, [int]$env:T_LAN_UDP_PORT) | Out-Null
+    $u.Send($bytes, $bytes.Length, 'example.com', 53) | Out-Null
     $u.Close()
-    Write-Output 'UDP_RECV_OK'
+    Write-Output 'UDP_SEND_OK'
 } catch {
-    Write-Output 'UDP_REFUSED'
+    Write-Output 'UDP_SEND_REFUSED'
 }
 
 try {
-    [System.Net.Dns]::GetHostAddresses('feat3-dns-probe.example.com') | Out-Null
-    Write-Output 'DNS_ALLOWED'
+    $ips = [System.Net.Dns]::GetHostAddresses('example.com')
+    if ($ips.Count -gt 0) { Write-Output 'DNS_ALLOWED' } else { Write-Output 'DNS_EMPTY' }
 } catch {
     Write-Output 'DNS_REFUSED'
 }
@@ -1338,12 +1348,12 @@ try {
     $c6o.Close()
     Write-Output 'IPV6_OUTBOUND_ALLOWED'
 } catch [System.Net.Sockets.SocketException] {
-    if ($_.Exception.NativeErrorCode -eq 10013) { Write-Output 'IPV6_OUTBOUND_REFUSED' } else { Write-Output 'IPV6_OUTBOUND_OTHER' }
+    if ($_.Exception.NativeErrorCode -eq 10013) { Write-Output 'IPV6_OUTBOUND_REFUSED' } else { Write-Output "IPV6_OUTBOUND_OTHER=$($_.Exception.NativeErrorCode)" }
 } catch {
     if ($_.Exception.InnerException -is [System.Net.Sockets.SocketException] -and $_.Exception.InnerException.NativeErrorCode -eq 10013) {
         Write-Output 'IPV6_OUTBOUND_REFUSED'
     } else {
-        Write-Output 'IPV6_OUTBOUND_OTHER'
+        Write-Output "IPV6_OUTBOUND_OTHER=$($_.Exception.Message)"
     }
 }
 
@@ -1355,7 +1365,9 @@ try {
 }
 "#;
 
-        // Control 1 (`off`): loopback IPv4 TCP and UDP reach their listeners.
+        // Control 1 (`off`): loopback IPv4 TCP and UDP reach their listeners, and all matrix
+        // probes (`TCP_V4_ALLOWED`, `UDP_SEND_OK`, `DNS_ALLOWED`, `IPV6_OUTBOUND_ALLOWED`,
+        // `UNC_ALLOWED`) succeed.
         let rig = Rig::new(IsolationLevel::Off, false);
         let result = rig
             .runner
@@ -1384,33 +1396,91 @@ try {
         while listener.accept().is_ok() {}
         while udp_listener.recv_from(&mut udp_buf).is_ok() {}
 
+        let matrix_envs = [
+            ("T_PORT6", port6.as_str()),
+            ("T_LAN_IP", lan_ip_str.as_str()),
+            ("T_LAN_UDP_PORT", lan_udp_port.as_str()),
+        ];
+
+        let off_matrix = rig
+            .runner
+            .execute_task(
+                &win_task(&rig, net_matrix_script, &matrix_envs, 60),
+                None,
+                None,
+            )
+            .await;
+        let off_lines = lines(&off_matrix);
+        for expected in [
+            "TCP_V4_ALLOWED",
+            "UDP_SEND_OK",
+            "DNS_ALLOWED",
+            "IPV6_OUTBOUND_ALLOWED",
+            "UNC_ALLOWED",
+        ] {
+            assert!(
+                off_lines.contains(&expected.to_string()),
+                "control under off must allow {expected}: {:?} / {}",
+                off_lines,
+                off_matrix.stderr_str()
+            );
+        }
+        let lan_udp_in_off = lan_udp_listener.recv_from(&mut udp_buf).is_ok();
+        assert!(
+            lan_udp_in_off,
+            "control under off must deliver non-loopback UDP datagram to lan_udp_listener"
+        );
+        while lan_udp_listener.recv_from(&mut udp_buf).is_ok() {}
+        if let Some(ref l6) = listener6 {
+            assert!(
+                off_lines.contains(&"IPV6_LOOPBACK_CONNECTED".to_string()),
+                "control under off must connect to IPv6 loopback: {:?}",
+                off_lines
+            );
+            while l6.accept().is_ok() {}
+        }
+
         // Control 2 (`fs`): `WinCapabilityInternetClientSid` and
-        // `WinCapabilityPrivateNetworkClientServerSid` allow outbound IPv4 TCP and UDP in WFP.
+        // `WinCapabilityPrivateNetworkClientServerSid` allow outbound IPv4/IPv6 TCP, UDP send,
+        // and DNS resolution (`example.com`), while UNC (`\\127.0.0.1\C$\Windows\win.ini`) is
+        // refused because AppContainer tokens omit user credentials / `enterpriseAuthentication`.
         let rig = Rig::new(IsolationLevel::Fs, false);
         let result = rig
             .runner
             .execute_task(
-                &win_task(&rig, net_matrix_script, &[("T_PORT6", &port6)], 60),
+                &win_task(&rig, net_matrix_script, &matrix_envs, 60),
                 None,
                 None,
             )
             .await;
         let fs_lines = lines(&result);
-        assert!(
-            fs_lines.contains(&"TCP_V4_ALLOWED".to_string())
-                && fs_lines.contains(&"UDP_SEND_OK".to_string()),
-            "control under fs must allow outbound IPv4 TCP and UDP in WFP: {:?} / {}",
-            fs_lines,
-            result.stderr_str()
-        );
+        for expected in [
+            "TCP_V4_ALLOWED",
+            "UDP_SEND_OK",
+            "DNS_ALLOWED",
+            "IPV6_OUTBOUND_ALLOWED",
+            "UNC_REFUSED",
+        ] {
+            assert!(
+                fs_lines.contains(&expected.to_string()),
+                "control under fs expected {expected}: {:?} / {}",
+                fs_lines,
+                result.stderr_str()
+            );
+        }
+        while lan_udp_listener.recv_from(&mut udp_buf).is_ok() {}
+        if let Some(ref l6) = listener6 {
+            while l6.accept().is_ok() {}
+        }
 
         // Under `fs+net` (zero network capabilities): non-loopback IPv4 TCP, loopback IPv4 TCP,
-        // outbound UDP, DNS, IPv6 loopback, IPv6 outbound, and UNC are all refused.
+        // outbound UDP send, DNS (`example.com`), IPv6 loopback, IPv6 outbound, and UNC are all
+        // refused (`IPV6_OUTBOUND_OTHER` and `UDP_SEND_OTHER` do NOT count as a pass).
         let rig = Rig::new(IsolationLevel::FsNet, false);
         let matrix_res = rig
             .runner
             .execute_task(
-                &win_task(&rig, net_matrix_script, &[("T_PORT6", &port6)], 60),
+                &win_task(&rig, net_matrix_script, &matrix_envs, 60),
                 None,
                 None,
             )
@@ -1418,8 +1488,9 @@ try {
         let fsnet_lines = lines(&matrix_res);
         for expected in [
             "TCP_V4_REFUSED",
-            "UDP_REFUSED",
+            "UDP_SEND_REFUSED",
             "DNS_REFUSED",
+            "IPV6_OUTBOUND_REFUSED",
             "UNC_REFUSED",
         ] {
             assert!(
@@ -1429,14 +1500,26 @@ try {
                 matrix_res.stderr_str()
             );
         }
+        match lan_udp_listener.recv_from(&mut udp_buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => {
+                panic!("non-loopback UDP listener must see no datagram from an fs+net task: {other:?}")
+            }
+        }
         assert!(
-            !fsnet_lines.contains(&"UDP_RECV_OK".to_string()),
-            "fs+net must not receive UDP response: {:?}",
+            !fsnet_lines.contains(&"UDP_SEND_OK".to_string()),
+            "fs+net must fail UDP on send: {:?}",
             fsnet_lines
         );
         assert!(
-            !fsnet_lines.contains(&"IPV6_OUTBOUND_ALLOWED".to_string()),
-            "fs+net must not allow IPv6 outbound: {:?}",
+            !fsnet_lines.contains(&"DNS_ALLOWED".to_string()),
+            "fs+net must not resolve DNS: {:?}",
+            fsnet_lines
+        );
+        assert!(
+            !fsnet_lines.contains(&"IPV6_OUTBOUND_ALLOWED".to_string())
+                && !fsnet_lines.iter().any(|l| l.starts_with("IPV6_OUTBOUND_OTHER")),
+            "fs+net must refuse IPv6 outbound with WSAEACCES (10013), not OTHER: {:?}",
             fsnet_lines
         );
         if let Some(ref l6) = listener6 {
@@ -2236,8 +2319,10 @@ Write-Output ([WinConsoleProbe]::TryAttach([uint32]$env:HELPER_PID, [uint32]$env
         let _ = console_helper.kill();
         let _ = console_helper.wait();
         assert!(
-            control_got.contains(&"ATTACH_HELPER_OK".to_string()),
-            "positive control under off must attach to CREATE_NEW_CONSOLE helper: {control_got:?} / {}",
+            control_got.contains(&"ATTACH_HELPER_OK".to_string())
+                || control_got.contains(&"ATTACH_WORKER_OK".to_string())
+                || control_got.contains(&"ATTACH_PARENT_OK".to_string()),
+            "positive control under off must attach to host console: {control_got:?} / {}",
             control.stderr_str()
         );
     }
@@ -2258,22 +2343,21 @@ Write-Output ([WinConsoleProbe]::TryAttach([uint32]$env:HELPER_PID, [uint32]$env
             let _ = reg(&["delete", &read_key, "/f"]);
             let _ = reg(&["delete", &write_key, "/f"]);
         };
-        if !reg(&[
-            "add",
-            &read_key,
-            "/v",
-            "secret",
-            "/t",
-            "REG_SZ",
-            "/d",
-            "owner-registry-value",
-            "/f",
-        ])
-        .is_ok_and(|o| o.status.success())
-        {
-            eprintln!("skipped: cannot write test registry key");
-            return;
-        }
+        assert!(
+            reg(&[
+                "add",
+                &read_key,
+                "/v",
+                "secret",
+                "/t",
+                "REG_SZ",
+                "/d",
+                "owner-registry-value",
+                "/f",
+            ])
+            .is_ok_and(|o| o.status.success()),
+            "failed to write test registry key {read_key}"
+        );
 
         let script = format!(
             r#"
@@ -2293,8 +2377,10 @@ Write-Output "WRITE_RC=$LASTEXITCODE"
         let _ = reg(&["delete", &write_key, "/f"]);
         if !control_reads {
             cleanup();
-            eprintln!("skipped: registry key not readable even unconfined");
-            return;
+            panic!(
+                "unconfined control must read test registry key {read_key}: {}",
+                control.stdout_str()
+            );
         }
 
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
@@ -2497,9 +2583,11 @@ Write-Output "CLIP_LEAK=$v"
             "retried task with the same TaskId must get a fresh per-attempt run token"
         );
 
+        let prefix = rusty_grid_worker::isolation::windows::worker_profile_prefix(&rig.base);
         if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
             for token in [&token1, &token2] {
-                let moniker = format!("oxideswarm.task.{token}");
+                let token_simple: String = token.chars().filter(|c| *c != '-').collect();
+                let moniker = format!("{prefix}.{token_simple}");
                 let pkg_dir = local_app_data.join("Packages").join(&moniker);
                 for _ in 0..20 {
                     if !pkg_dir.exists() {
@@ -2513,15 +2601,42 @@ Write-Output "CLIP_LEAK=$v"
                     pkg_dir.display()
                 );
             }
+
+            // N3: Verify `sweep_leftover_appcontainer_profiles_for_base` sweeps ONLY profiles
+            // belonging to `rig.base`'s prefix (`oxideswarm.task.<worker8>.*`) and leaves
+            // another worker's profile prefix untouched.
+            let other_rig = Rig::new(IsolationLevel::Fs, false);
+            let other_prefix =
+                rusty_grid_worker::isolation::windows::worker_profile_prefix(&other_rig.base);
+            assert_ne!(
+                prefix, other_prefix,
+                "distinct sandbox_base dirs must have distinct worker profile prefixes"
+            );
+            let other_dummy = local_app_data
+                .join("Packages")
+                .join(format!("{other_prefix}.deadbeef0000_dummy"));
+            std::fs::create_dir_all(&other_dummy).unwrap();
+            let swept =
+                rusty_grid_worker::isolation::windows::sweep_leftover_appcontainer_profiles_for_base(
+                    &rig.base,
+                );
+            assert!(
+                other_dummy.exists(),
+                "sweep for {} must NOT touch another worker's profile {} (swept={swept})",
+                rig.base.display(),
+                other_dummy.display()
+            );
+            let _ = std::fs::remove_dir_all(&other_dummy);
         }
     }
 
-    /// Design 0033 D4.5 + Requirement 5:
+    /// Design 0033 D4.5 + Requirement 5 + N5:
     /// 1. Secret and config files located outside `%USERPROFILE%` (in a non-toolchain directory)
     ///    are readable under `IsolationLevel::Off` and unreadable under `Fs` and `FsNet`.
     /// 2. If a user configures `protected_files` (`--join-token-file`, `--admin-token-file`, or
-    ///    `--config`) inside a granted toolchain directory (`CARGO_HOME` or `RUSTUP_HOME`), the
-    ///    worker refuses to start or run tasks rather than relying on fragile per-file deny ACEs.
+    ///    `--config`) inside a granted toolchain directory (`CARGO_HOME` or `RUSTUP_HOME`), or
+    ///    with an on-disk DACL granting read access to `S-1-15-2-1` (`ALL APPLICATION PACKAGES`),
+    ///    the worker refuses to start at `verify_isolation_support_with_config`.
     #[tokio::test]
     async fn test_a_secret_file_outside_the_home_is_unreadable_to_a_task() {
         let outside = tempfile::tempdir().unwrap();
@@ -2602,6 +2717,30 @@ try { Write-Output (Get-Content -LiteralPath $env:T_B -Raw -ErrorAction Stop) } 
         assert!(
             err.to_string().contains("CARGO_HOME"),
             "unexpected error: {err}"
+        );
+
+        // N5: A protected file outside the home that carries an `S-1-15-2-1:(R)` ACE is refused
+        // at start-up by `verify_isolation_support_with_config`.
+        let world_ac_secret = etc_dir.join("leaked_by_s_1_15_2_1.secret");
+        std::fs::write(&world_ac_secret, "LEAKED-BY-LEFTOVER-ACE").unwrap();
+        let grant_status = std::process::Command::new(r"C:\Windows\System32\icacls.exe")
+            .arg(&world_ac_secret)
+            .args(["/grant", "*S-1-15-2-1:(R)", "/q"])
+            .status()
+            .expect("icacls grant S-1-15-2-1 on temp file");
+        assert!(grant_status.success());
+        let err_leaked = rusty_grid_worker::verify_isolation_support_with_config(
+            IsolationLevel::Fs,
+            &rig.base,
+            &rig.host,
+            std::slice::from_ref(&world_ac_secret),
+        )
+        .await
+        .expect_err("must refuse protected file readable by S-1-15-2-1");
+        assert!(
+            err_leaked.to_string().contains("leaked_by_s_1_15_2_1.secret")
+                && err_leaked.to_string().contains("S-1-15-2-1"),
+            "unexpected error for S-1-15-2-1 secret: {err_leaked}"
         );
     }
 
@@ -2745,72 +2884,311 @@ try { Get-Content -LiteralPath "$env:RUSTUP_HOME\secret.txt" -ErrorAction Stop |
         }
     }
 
-    /// Attack Test 3 (H1): A task creates a directory junction (`cmd /c mklink /J ...`) and a
-    /// hard link (`fsutil hardlink create ...`) inside its sandbox pointing to `<temp_home>/.ssh`
-    /// or `<temp_home>/.oxideswarm/cluster.secret`, including across a retry. Verify the target
-    /// DACL outside the sandbox is never modified and the secret remains unreadable.
+    /// Attack Test 3 (H1): A task creates a directory junction (`cmd /c mklink /J ...`) and
+    /// attempts to create a hard link (`CreateHardLinkW`) inside its sandbox pointing to
+    /// `<temp_home>/.ssh` and `<temp_home>/.oxideswarm/cluster.secret`, including across a retry.
+    /// Verifies that:
+    /// 1. Under `IsolationLevel::Off` (control), both the junction and the hard link are created
+    ///    (`JUNCTION_EXISTS`, `HARDLINK_CREATED`) and read the secrets (`LEAK_JUNCTION`, `LEAK_HARDLINK`).
+    /// 2. Under `IsolationLevel::Fs` (across 2 attempts of the same `TaskId`), the junction IS
+    ///    created as a reparse point inside the sandbox (`JUNCTION_EXISTS` + host verification),
+    ///    reading through the junction is denied (`DENY_JUNCTION`), `CreateHardLinkW` to the
+    ///    denied secret fails with `ERROR_ACCESS_DENIED` (`HARDLINK_CREATE_DENIED=5`), and
+    ///    neither `.ssh`'s nor `cluster.secret`'s DACL is modified.
     #[tokio::test]
     async fn test_attack_junctions_and_hardlinks_inside_sandbox_cannot_expose_denied_secret() {
+        let script = r#"
+Add-Type -TypeDefinition @"
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class WinLinkProbe {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool CreateHardLinkW(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateFileW(
+        string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DeviceIoControl(
+        IntPtr hDevice, uint dwIoControlCode, byte[] lpInBuffer, int nInBufferSize,
+        IntPtr lpOutBuffer, int nOutBufferSize, out int lpBytesReturned, IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    public static string CreateJunction(string junctionPath, string targetDir) {
+        Directory.CreateDirectory(junctionPath);
+        const uint GENERIC_WRITE = 0x40000000;
+        const uint OPEN_EXISTING = 3;
+        const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+        const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+        const uint FSCTL_SET_REPARSE_POINT = 0x000900A4;
+        const uint IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003;
+
+        IntPtr h = CreateFileW(
+            junctionPath, GENERIC_WRITE, 0, IntPtr.Zero, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+        if (h == new IntPtr(-1)) {
+            return "OPEN_ERR=" + Marshal.GetLastWin32Error();
+        }
+        try {
+            string subName = @"\??\" + targetDir;
+            string printName = targetDir;
+            byte[] subBytes = Encoding.Unicode.GetBytes(subName);
+            byte[] printBytes = Encoding.Unicode.GetBytes(printName);
+            int pathBufferLen = subBytes.Length + 2 + printBytes.Length + 2;
+            int dataLen = 8 + pathBufferLen;
+            byte[] buf = new byte[8 + dataLen];
+            BitConverter.GetBytes(IO_REPARSE_TAG_MOUNT_POINT).CopyTo(buf, 0);
+            BitConverter.GetBytes((ushort)dataLen).CopyTo(buf, 4);
+            BitConverter.GetBytes((ushort)0).CopyTo(buf, 6);
+            BitConverter.GetBytes((ushort)0).CopyTo(buf, 8);
+            BitConverter.GetBytes((ushort)subBytes.Length).CopyTo(buf, 10);
+            BitConverter.GetBytes((ushort)(subBytes.Length + 2)).CopyTo(buf, 12);
+            BitConverter.GetBytes((ushort)printBytes.Length).CopyTo(buf, 14);
+            Array.Copy(subBytes, 0, buf, 16, subBytes.Length);
+            Array.Copy(printBytes, 0, buf, 16 + subBytes.Length + 2, printBytes.Length);
+            int returned;
+            if (!DeviceIoControl(h, FSCTL_SET_REPARSE_POINT, buf, buf.Length, IntPtr.Zero, 0, out returned, IntPtr.Zero)) {
+                int err = Marshal.GetLastWin32Error();
+                CloseHandle(h);
+                h = new IntPtr(-1);
+                try { Directory.Delete(junctionPath); } catch {}
+                return "IOCTL_ERR=" + err;
+            }
+            return "OK";
+        } finally {
+            if (h != new IntPtr(-1)) CloseHandle(h);
+        }
+    }
+}
+"@
+$sb = $env:RUSTY_GRID_SANDBOX_DIR
+if (-not [System.IO.Directory]::Exists("$sb\j_ssh")) {
+    $jRes = [WinLinkProbe]::CreateJunction("$sb\j_ssh", $env:T_SSH_DIR)
+    Write-Output "JUNCTION_CREATE=$jRes"
+}
+if (-not [System.IO.File]::Exists("$sb\hl_secret.txt")) {
+    if ([WinLinkProbe]::CreateHardLinkW("$sb\hl_secret.txt", $env:T_SECRET, [IntPtr]::Zero)) {
+        Write-Output 'HARDLINK_CREATED'
+    } else {
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        Write-Output "HARDLINK_CREATE_DENIED=$err"
+    }
+}
+if ($env:T_WAIT_HOST_JUNCTION -eq '1') {
+    [System.IO.File]::WriteAllText("$sb\ready.txt", "1")
+    for ($i = 0; $i -lt 200; $i++) {
+        if ([System.IO.File]::Exists("$sb\go.txt")) { break }
+        Start-Sleep -Milliseconds 25
+    }
+}
+if ([System.IO.Directory]::Exists("$sb\j_ssh")) {
+    $attrs = [System.IO.File]::GetAttributes("$sb\j_ssh")
+    if (($attrs -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Write-Output 'JUNCTION_EXISTS'
+    }
+}
+if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {
+    Write-Output 'HARDLINK_CREATED'
+}
+try { [System.IO.File]::ReadAllText("$sb\j_ssh\test_key") | Out-Null; Write-Output 'LEAK_JUNCTION' } catch { Write-Output 'DENY_JUNCTION' }
+if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {
+    try { [System.IO.File]::ReadAllText("$sb\hl_secret.txt") | Out-Null; Write-Output 'LEAK_HARDLINK' } catch { Write-Output 'DENY_HARDLINK' }
+}
+"#;
+
+        // Positive control (`IsolationLevel::Off`): both the junction and the hard link are
+        // created and both secrets can be read through them.
+        let control_rig = Rig::new(IsolationLevel::Off, false);
+        let control_ssh = control_rig.home.path().join(".ssh");
+        let control_res = control_rig
+            .runner
+            .execute_task(
+                &win_task(
+                    &control_rig,
+                    script,
+                    &[("T_SSH_DIR", control_ssh.to_str().unwrap())],
+                    60,
+                ),
+                None,
+                None,
+            )
+            .await;
+        let control_got = lines(&control_res);
+        for expected in [
+            "JUNCTION_EXISTS",
+            "HARDLINK_CREATED",
+            "LEAK_JUNCTION",
+            "LEAK_HARDLINK",
+        ] {
+            assert!(
+                control_got.contains(&expected.to_string()),
+                "control under off must produce {expected}: {control_got:?} / {}",
+                control_res.stderr_str()
+            );
+        }
+
         let rig = Rig::new(IsolationLevel::Fs, false);
         let ssh_dir = rig.home.path().join(".ssh");
         let secret_file = rig.home.path().join(".oxideswarm/cluster.secret");
         let ssh_dacl_before = sddl_of(&ssh_dir);
         let secret_dacl_before = sddl_of(&secret_file);
 
-        let script = r#"
-$sb = $env:RUSTY_GRID_SANDBOX_DIR
-& "$env:SystemRoot\System32\cmd.exe" /c "mklink /J `"$sb\j_ssh`" `"$env:T_SSH_DIR`"" >$null 2>$null
-& "$env:SystemRoot\System32\fsutil.exe" hardlink create "$sb\hl_secret.txt" "$env:T_SECRET" >$null 2>$null
-try { Get-Content -LiteralPath "$sb\j_ssh\test_key" -ErrorAction Stop | Out-Null; Write-Output 'LEAK_JUNCTION' } catch { Write-Output 'DENY_JUNCTION' }
-try { Get-Content -LiteralPath "$sb\hl_secret.txt" -ErrorAction Stop | Out-Null; Write-Output 'LEAK_HARDLINK' } catch { Write-Output 'DENY_HARDLINK' }
-"#;
         let task = win_task(
             &rig,
             script,
             &[("T_SSH_DIR", ssh_dir.to_str().unwrap())],
             60,
         );
-        // Run twice with the exact same `TaskId` (simulating a retry when a junction already
-        // exists inside the sandbox directory).
-        for attempt in 1..=2 {
-            let result = rig.runner.execute_task(&task, None, None).await;
+
+        // Attempt 1: inside the AppContainer (`IsolationLevel::Fs`), the Windows NTFS kernel
+        // (`NtfsSetReparsePoint` / `NtSetInformationFile`) refuses both `FSCTL_SET_REPARSE_POINT`
+        // (`JUNCTION_CREATE=IOCTL_ERR=5`) and `CreateHardLinkW` (`HARDLINK_CREATE_DENIED=5`) with
+        // `ERROR_ACCESS_DENIED` (5), whereas under `IsolationLevel::Off` above both succeeded.
+        let result1 = rig.runner.execute_task(&task, None, None).await;
+        assert!(
+            result1.is_success(),
+            "attempt 1: {:?} {}",
+            result1.error,
+            result1.stderr_str()
+        );
+        let got1 = lines(&result1);
+        assert!(
+            got1.contains(&"JUNCTION_CREATE=IOCTL_ERR=5".to_string())
+                && got1.contains(&"HARDLINK_CREATE_DENIED=5".to_string())
+                && got1.contains(&"DENY_JUNCTION".to_string())
+                && !got1.iter().any(|l| l.starts_with("LEAK_")),
+            "attempt 1: expected IOCTL_ERR=5 and HARDLINK_CREATE_DENIED=5 inside AppContainer: {got1:?}"
+        );
+        assert_eq!(sddl_of(&ssh_dir), ssh_dacl_before);
+        assert_eq!(sddl_of(&secret_file), secret_dacl_before);
+
+        // Attempt 2: run the task while the host plants BOTH a real NTFS junction
+        // `<sandbox_dir>\j_ssh -> <temp_home>\.ssh` AND a real NTFS hard link
+        // `<sandbox_dir>\hl_secret.txt -> <temp_home>\.oxideswarm\cluster.secret` inside the
+        // active sandbox directory and re-runs `prepare_worker_toolchains`, verifying that
+        // `JUNCTION_EXISTS` and `HARDLINK_CREATED` are both confirmed on the host and inside the
+        // task, reading both `j_ssh\test_key` and `hl_secret.txt` is denied (`DENY_JUNCTION`,
+        // `DENY_HARDLINK`), and neither `.ssh`'s nor `cluster.secret`'s DACL is modified.
+        let task2 = win_task(
+            &rig,
+            script,
+            &[
+                ("T_SSH_DIR", ssh_dir.to_str().unwrap()),
+                ("T_WAIT_HOST_JUNCTION", "1"),
+            ],
+            60,
+        );
+        let sb_dir2 = rig.base.join(task2.id.0.to_string());
+        let ssh_dir_clone = ssh_dir.clone();
+        let secret_file_clone = secret_file.clone();
+        let host_clone = rig.host.clone();
+        let base_clone = rig.base.clone();
+        let plant_handle = tokio::spawn(async move {
+            let ready = sb_dir2.join("ready.txt");
+            for _ in 0..200 {
+                if ready.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(ready.exists(), "task2 must signal ready.txt");
+            let j_path = sb_dir2.join("j_ssh");
+            let hl_path = sb_dir2.join("hl_secret.txt");
+            let ps_mklink = std::process::Command::new(
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            )
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "New-Item -ItemType Junction -Path $env:J_LINK -Value $env:J_TARGET | Out-Null; New-Item -ItemType HardLink -Path $env:HL_LINK -Value $env:HL_TARGET | Out-Null",
+            ])
+            .env("J_LINK", &j_path)
+            .env("J_TARGET", &ssh_dir_clone)
+            .env("HL_LINK", &hl_path)
+            .env("HL_TARGET", &secret_file_clone)
+            .output()
+            .expect("create host junction and hardlink inside active sandbox");
             assert!(
-                result.is_success(),
-                "attempt {attempt}: {:?} {}",
-                result.error,
-                result.stderr_str()
+                ps_mklink.status.success(),
+                "host New-Item Junction/HardLink failed: {}",
+                String::from_utf8_lossy(&ps_mklink.stderr)
             );
-            let got = lines(&result);
+            let j_meta = std::fs::symlink_metadata(&j_path)
+                .expect("junction j_ssh must exist inside sandbox on host");
+            {
+                use std::os::windows::fs::MetadataExt;
+                assert!(
+                    (j_meta.file_attributes() & 0x0400) != 0,
+                    "j_ssh must have FILE_ATTRIBUTE_REPARSE_POINT"
+                );
+            }
             assert!(
-                got.contains(&"DENY_JUNCTION".to_string())
-                    && got.contains(&"DENY_HARDLINK".to_string())
-                    && !got.iter().any(|l| l.starts_with("LEAK_")),
-                "attempt {attempt}: junction or hardlink leaked secret: {got:?}"
+                hl_path.is_file(),
+                "hardlink hl_secret.txt must exist inside sandbox on host"
             );
-            assert_eq!(
-                sddl_of(&ssh_dir),
-                ssh_dacl_before,
-                "attempt {attempt}: target .ssh DACL was modified via junction"
-            );
-            assert_eq!(
-                sddl_of(&secret_file),
-                secret_dacl_before,
-                "attempt {attempt}: target cluster.secret DACL was modified"
-            );
-        }
+            rusty_grid_worker::isolation::windows::prepare_worker_toolchains(
+                &host_clone,
+                &[],
+                Some(&base_clone),
+            )
+            .expect("prepare_worker_toolchains with active junction and hardlink");
+            std::fs::write(sb_dir2.join("go.txt"), "1").unwrap();
+        });
+        let result2 = rig.runner.execute_task(&task2, None, None).await;
+        plant_handle.await.expect("plant_handle");
+        assert!(
+            result2.is_success(),
+            "attempt 2: {:?} {}",
+            result2.error,
+            result2.stderr_str()
+        );
+        let got2 = lines(&result2);
+        assert!(
+            got2.contains(&"JUNCTION_EXISTS".to_string())
+                && got2.contains(&"HARDLINK_CREATED".to_string())
+                && got2.contains(&"DENY_JUNCTION".to_string())
+                && got2.contains(&"DENY_HARDLINK".to_string())
+                && !got2.iter().any(|l| l.starts_with("LEAK_")),
+            "attempt 2: both junction and hardlink must exist and both reads must be denied: {got2:?}"
+        );
+        assert_eq!(
+            sddl_of(&ssh_dir),
+            ssh_dacl_before,
+            "attempt 2: target .ssh DACL was modified via junction"
+        );
+        assert_eq!(
+            sddl_of(&secret_file),
+            secret_dacl_before,
+            "attempt 2: target cluster.secret DACL was modified"
+        );
     }
 
-    /// Attack Test 4 (H2 + H3 + Requirement 6): A secret file (`<temp_home>/.oxideswarm/cluster.secret`
-    /// and `<temp_cargo_home>/credentials.toml`) is deleted and recreated via atomic rename
-    /// (`std::fs::rename` from `.tmp`) while the worker is running. Verify that a subsequent task
-    /// still cannot read either secret without restarting the worker, and verify that
-    /// `revoke_oxideswarm_toolchain_acls` cleanly removes `oxideswarm.toolchain` ACEs from all
-    /// recorded toolchain paths.
+    /// Attack Test 4 (H2 + H3 + N4 + Requirement 6):
+    /// 1. Verifies that `revoke_oxideswarm_toolchain_acls` removes the `DENY_ACCESS` ACE on
+    ///    `<cargo_home>/credentials.toml` even when `credentials.toml` is NOT replaced first, and
+    ///    restores the original SDDL on `sandbox_base`.
+    /// 2. Creates temporary staging files inside `<cargo_home>/registry` (which inherits
+    ///    `oxideswarm.toolchain:(RX)`), proves in a task that those files ARE readable before the
+    ///    rename (`READABLE_SECRET_TMP`, `READABLE_CRED_TMP`), then atomically renames them via
+    ///    `std::fs::rename` over `<temp_home>/.oxideswarm/cluster.secret` and
+    ///    `<temp_cargo_home>/credentials.toml` while the worker is running, and verifies that the
+    ///    subsequent task on the same `TaskRunner` cannot read either secret.
     #[tokio::test]
     async fn test_attack_secret_replaced_by_rename_stays_unreadable_and_revoke_cleans_up() {
         let rig = Rig::new(IsolationLevel::Fs, false);
+        let orig_base_sddl = rusty_grid_worker::isolation::windows::get_path_dacl_sddl(&rig.base)
+            .expect("orig_base_sddl");
         let cargo_cred = rig.host.cargo_home.join("credentials.toml");
         std::fs::write(&cargo_cred, "token = \"initial-cargo-cred\"").unwrap();
+        let registry_dir = rig.host.cargo_home.join("registry");
+        std::fs::create_dir_all(&registry_dir).unwrap();
 
         let probe_script = r#"
 try { Get-Content -LiteralPath $env:T_SECRET -ErrorAction Stop | Out-Null; Write-Output 'LEAK_CLUSTER_SECRET' } catch { Write-Output 'DENY_CLUSTER_SECRET' }
@@ -2818,7 +3196,7 @@ try { Get-Content -LiteralPath $env:T_CARGO_CRED -ErrorAction Stop | Out-Null; W
 "#;
         let envs = [("T_CARGO_CRED", cargo_cred.to_str().unwrap())];
 
-        // First task triggers one-time `prepare_worker_toolchains`.
+        // First task triggers `prepare_worker_toolchains`, placing a DENY_ACCESS ACE on `credentials.toml`.
         let res1 = rig
             .runner
             .execute_task(&win_task(&rig, probe_script, &envs, 60), None, None)
@@ -2826,16 +3204,92 @@ try { Get-Content -LiteralPath $env:T_CARGO_CRED -ErrorAction Stop | Out-Null; W
         assert!(res1.is_success());
         assert_eq!(lines(&res1), vec!["DENY_CLUSTER_SECRET", "DENY_CARGO_CRED"]);
 
-        // Atomically replace both `<temp_home>/.oxideswarm/cluster.secret` and
-        // `<temp_cargo_home>/credentials.toml` via write-to-.tmp + `std::fs::rename` without
-        // restarting the worker (`TaskRunner`).
-        let secret_path = rig.home.path().join(".oxideswarm/cluster.secret");
-        let secret_tmp = rig.home.path().join(".oxideswarm/cluster.secret.tmp");
-        std::fs::write(&secret_tmp, "rotated-cluster-secret-value").unwrap();
-        std::fs::rename(&secret_tmp, &secret_path).unwrap();
+        let tc_sid = rusty_grid_worker::isolation::windows::oxideswarm_toolchain_sid_string()
+            .expect("toolchain SID string");
+        let cred_sddl_after_prepare = sddl_of(&cargo_cred);
+        assert!(
+            cred_sddl_after_prepare.contains(&tc_sid),
+            "credentials.toml must have explicit deny ACE for {tc_sid}: {cred_sddl_after_prepare}"
+        );
 
-        let cred_tmp = rig.host.cargo_home.join("credentials.toml.tmp");
+        // N4: Test `revoke_oxideswarm_toolchain_acls` on `credentials.toml` BEFORE any rename
+        // replaces it, proving that `DeleteAce` removes `ACCESS_DENIED_ACE_TYPE` entries too, and
+        // that `sandbox_base`'s original SDDL is restored.
+        let manifest = rusty_grid_worker::isolation::windows::acl_grant_manifest_path(&rig.host);
+        assert!(
+            manifest.is_file(),
+            "expected ACL grant manifest at {}",
+            manifest.display()
+        );
+        let revoked_first =
+            rusty_grid_worker::isolation::windows::revoke_oxideswarm_toolchain_acls(&manifest)
+                .expect("revoke_oxideswarm_toolchain_acls before rename");
+        assert!(
+            revoked_first.contains(&cargo_cred),
+            "revoked list must include credentials.toml: {revoked_first:?}"
+        );
+        for p in &revoked_first {
+            let sddl = sddl_of(p);
+            assert!(
+                !sddl.contains(&tc_sid),
+                "revoked path {} (without prior rename) still contains toolchain SID {tc_sid}: {sddl}",
+                p.display()
+            );
+        }
+        let restored_base_sddl =
+            rusty_grid_worker::isolation::windows::get_path_dacl_sddl(&rig.base)
+                .expect("restored_base_sddl");
+        assert_eq!(
+            restored_base_sddl, orig_base_sddl,
+            "revoke must restore sandbox_base's original DACL SDDL"
+        );
+
+        // Stage `.tmp` files inside `<cargo_home>/registry` (which receives inheritable `(OI)(CI)(RX)`
+        // for `oxideswarm.toolchain`) and prove in a task BEFORE the rename that both `.tmp`
+        // files ARE readable by the AppContainer task.
+        let secret_tmp = registry_dir.join("cluster.secret.tmp");
+        let cred_tmp = registry_dir.join("credentials.toml.tmp");
+        std::fs::write(&secret_tmp, "rotated-cluster-secret-value").unwrap();
         std::fs::write(&cred_tmp, "token = \"rotated-cargo-cred-value\"").unwrap();
+
+        let pre_rename_script = r#"
+try {
+    $s = Get-Content -LiteralPath $env:T_SECRET_TMP -Raw -ErrorAction Stop
+    if ($s -match 'rotated-cluster-secret-value') { Write-Output 'READABLE_SECRET_TMP' }
+} catch { Write-Output 'UNREADABLE_SECRET_TMP' }
+try {
+    $c = Get-Content -LiteralPath $env:T_CRED_TMP -Raw -ErrorAction Stop
+    if ($c -match 'rotated-cargo-cred-value') { Write-Output 'READABLE_CRED_TMP' }
+} catch { Write-Output 'UNREADABLE_CRED_TMP' }
+"#;
+        let pre_res = rig
+            .runner
+            .execute_task(
+                &win_task(
+                    &rig,
+                    pre_rename_script,
+                    &[
+                        ("T_SECRET_TMP", secret_tmp.to_str().unwrap()),
+                        ("T_CRED_TMP", cred_tmp.to_str().unwrap()),
+                    ],
+                    60,
+                ),
+                None,
+                None,
+            )
+            .await;
+        assert!(pre_res.is_success());
+        assert_eq!(
+            lines(&pre_res),
+            vec!["READABLE_SECRET_TMP", "READABLE_CRED_TMP"],
+            "staging files inside <cargo_home>/registry must be readable BEFORE the rename: {:?}",
+            lines(&pre_res)
+        );
+
+        // Now atomically rename those readable `.tmp` files over `<temp_home>/.oxideswarm/cluster.secret`
+        // and `<temp_cargo_home>/credentials.toml` without restarting `TaskRunner`.
+        let secret_path = rig.home.path().join(".oxideswarm/cluster.secret");
+        std::fs::rename(&secret_tmp, &secret_path).unwrap();
         std::fs::rename(&cred_tmp, &cargo_cred).unwrap();
 
         // Subsequent task on the SAME running `TaskRunner` must still be denied both secrets.
@@ -2847,7 +3301,7 @@ try { Get-Content -LiteralPath $env:T_CARGO_CRED -ErrorAction Stop | Out-Null; W
         assert_eq!(
             lines(&res2),
             vec!["DENY_CLUSTER_SECRET", "DENY_CARGO_CRED"],
-            "rotated secrets after atomic rename must remain unreadable: {:?}",
+            "rotated secrets after atomic rename from readable .tmp files must be unreadable: {:?}",
             lines(&res2)
         );
         assert!(
@@ -2855,30 +3309,111 @@ try { Get-Content -LiteralPath $env:T_CARGO_CRED -ErrorAction Stop | Out-Null; W
                 && !res2.stdout_str().contains("rotated-cargo-cred-value")
         );
 
-        // Verify the ACL grant manifest was written inside `<temp_home>/.oxideswarm/windows_acl_grants.txt`
-        // and that `revoke_oxideswarm_toolchain_acls` removes the `oxideswarm.toolchain` SID from
-        // the recorded paths.
-        let manifest = rusty_grid_worker::isolation::windows::acl_grant_manifest_path(&rig.host);
-        assert!(
-            manifest.is_file(),
-            "expected ACL grant manifest at {}",
-            manifest.display()
-        );
-        let tc_sid = rusty_grid_worker::isolation::windows::oxideswarm_toolchain_sid_string()
-            .expect("toolchain SID string");
-        let revoked =
+        let revoked_after =
             rusty_grid_worker::isolation::windows::revoke_oxideswarm_toolchain_acls(&manifest)
-                .expect("revoke_oxideswarm_toolchain_acls");
-        assert!(
-            !revoked.is_empty(),
-            "manifest must record granted toolchain paths"
-        );
-        for p in &revoked {
+                .expect("revoke_oxideswarm_toolchain_acls after rename");
+        assert!(!revoked_after.is_empty());
+        for p in &revoked_after {
             let sddl = sddl_of(p);
             assert!(
                 !sddl.contains(&tc_sid),
                 "revoked path {} still contains toolchain SID {tc_sid}: {sddl}",
                 p.display()
+            );
+        }
+    }
+
+    /// N2 + N4: Runs `windows/revoke-isolation-acls.ps1 -DryRun` with a temporary manifest and
+    /// asserts that `DeriveCapabilitySidsFromName` succeeds (`kernelbase.dll`) and that `-DryRun`
+    /// lists every recorded ACL grant and `SDDL|` restore entry without modifying DACLs on disk.
+    #[tokio::test]
+    async fn test_revoke_isolation_acls_script_dry_run_lists_recorded_grants() {
+        let rig = Rig::new(IsolationLevel::Fs, false);
+        let cargo_cred = rig.host.cargo_home.join("credentials.toml");
+        std::fs::write(&cargo_cred, "token = \"dryrun-test\"").unwrap();
+        std::fs::create_dir_all(rig.host.cargo_home.join("bin")).unwrap();
+        std::fs::create_dir_all(rig.host.rustup_home.join("toolchains")).unwrap();
+
+        rusty_grid_worker::isolation::windows::prepare_worker_toolchains(
+            &rig.host,
+            &[],
+            Some(&rig.base),
+        )
+        .expect("prepare_worker_toolchains");
+
+        let manifest = rusty_grid_worker::isolation::windows::acl_grant_manifest_path(&rig.host);
+        assert!(manifest.is_file(), "manifest must exist at {}", manifest.display());
+        let manifest_text = std::fs::read_to_string(&manifest).expect("read manifest");
+        let mut expected_paths = Vec::new();
+        let mut expected_sddl_paths = Vec::new();
+        for line in manifest_text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix("SDDL|") {
+                if let Some((p, _sddl)) = rest.split_once('|') {
+                    expected_sddl_paths.push(p.to_string());
+                }
+            } else {
+                expected_paths.push(trimmed.to_string());
+            }
+        }
+        assert!(
+            !expected_paths.is_empty() && !expected_sddl_paths.is_empty(),
+            "manifest must contain both grant paths and SDDL| restore lines: {manifest_text}"
+        );
+
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+        let script_path = repo_root.join("windows/revoke-isolation-acls.ps1");
+        assert!(script_path.is_file(), "missing {}", script_path.display());
+
+        let out = std::process::Command::new(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        )
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script_path)
+        .arg("-DryRun")
+        .arg("-ManifestPath")
+        .arg(&manifest)
+        .output()
+        .expect("run revoke-isolation-acls.ps1 -DryRun");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "revoke-isolation-acls.ps1 -DryRun failed (status={}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            out.status
+        );
+
+        let tc_sid = rusty_grid_worker::isolation::windows::oxideswarm_toolchain_sid_string()
+            .expect("toolchain SID string");
+        assert!(
+            stdout.contains(&format!("oxideswarm.toolchain capability SID: {tc_sid}")),
+            "DryRun output must include derived capability SID {tc_sid}:\n{stdout}"
+        );
+        for p in &expected_paths {
+            let expected_line = format!("[DryRun] icacls \"{p}\" /remove \"*{tc_sid}\" /c /q");
+            assert!(
+                stdout.contains(&expected_line),
+                "DryRun output missing `{expected_line}`:\n{stdout}"
+            );
+        }
+        for sp in &expected_sddl_paths {
+            let expected_prefix = format!("[DryRun] Restore-AclSddl \"{sp}\" ");
+            assert!(
+                stdout.contains(&expected_prefix),
+                "DryRun output missing `{expected_prefix}`:\n{stdout}"
             );
         }
     }

@@ -724,10 +724,6 @@ pub struct TaskRunner {
     config: RunnerConfig,
     /// The blob cache, opened on first use (see [`TaskRunner::blob_cache`]).
     blob_cache: std::sync::OnceLock<Result<Arc<BlobCache>, String>>,
-    /// One-time start-up preparation of the worker's own toolchains under Windows AppContainer
-    /// isolation (`oxideswarm.toolchain` capability SID).
-    #[cfg(windows)]
-    windows_toolchain_prepared: Arc<std::sync::OnceLock<Result<(), String>>>,
     /// Where GPU-class tasks get their engine; rebuilds it after a device loss.
     #[cfg(feature = "gpu-wgpu")]
     gpu_engine: Arc<crate::wgpu_engine::EngineProvider>,
@@ -740,8 +736,6 @@ impl TaskRunner {
             capabilities,
             config,
             blob_cache: std::sync::OnceLock::new(),
-            #[cfg(windows)]
-            windows_toolchain_prepared: Arc::new(std::sync::OnceLock::new()),
             #[cfg(feature = "gpu-wgpu")]
             gpu_engine: crate::wgpu_engine::EngineProvider::shared(),
         }
@@ -2758,22 +2752,13 @@ impl TaskRunner {
                     cmd_rustup_home = v.map(PathBuf::from);
                 }
             }
-            let tc_once = Arc::clone(&self.windows_toolchain_prepared);
             let setup_res = tokio::task::spawn_blocking(move || {
-                let tc_init = tc_once.get_or_init(|| {
-                    crate::isolation::windows::prepare_worker_toolchains(
-                        &host_dirs,
-                        &protected_files,
-                        Some(&sandbox_base),
-                    )
-                    .map_err(|e| e.to_string())
-                });
-                if let Err(msg) = tc_init {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        msg.clone(),
-                    ));
-                }
+                crate::isolation::windows::prepare_worker_toolchains(
+                    &host_dirs,
+                    &protected_files,
+                    Some(&sandbox_base),
+                )
+                .map_err(|msg| std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg))?;
                 let jail = crate::isolation::Jail {
                     level,
                     host: &host_dirs,
