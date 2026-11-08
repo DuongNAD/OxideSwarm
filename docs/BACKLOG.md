@@ -201,7 +201,7 @@ design record that builds nothing.
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Planned |  |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Planned |  |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented | 118 (design), 125, 126, 127, 131 |
-| REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Planned |  |
+| REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | PRNUM |
 | REL-5 | Contributor and security files | P3 | S | REL-1 |  | Implemented | 75 |
 
 ## Phase 0: integrate open work
@@ -1410,3 +1410,4 @@ Add one dated line per finished item, newest last.
   cache directories, the cluster secret file or the config file in use, and under `fs+net` it has
   no network. `FEAT-3b` (Linux) and `FEAT-3c` (Windows) are Planned, so on those systems a task can
   still read `cluster.secret`.
+- 2026-11-08: REL-4 implemented in pull request PRNUM: `.github/workflows/release.yml` builds archives for Linux, macOS (arm64, x86_64) and Windows, with and without `gpu-wgpu`, and `SHA256SUMS`; a `v*` tag creates the release, a pull request only uploads artifacts. No tag exists yet: the owner cuts the first one. Crates have `publish = false`, `authors` match the licence and `README.md` has an Install section.

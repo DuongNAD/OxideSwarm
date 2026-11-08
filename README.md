@@ -133,7 +133,36 @@ Status values use the fixed vocabulary: `Implemented`, `Partial`, `Planned`, or 
 Ports: **8088** is the cluster port (workers and `submit` / `status` talk to it), **8080** is the dashboard
 (never a valid `--master` target), **8089/udp** is discovery. Details: [docs/SECURITY.md](docs/SECURITY.md#4-what-each-port-exposes).
 
-### Step 0: Build
+### Install
+
+> No release exists yet: the first archives appear on the [Releases page](https://github.com/DuongNAD/OxideSwarm/releases)
+> when the owner pushes a `v*` tag. Until then, build from source (Step 0 below).
+
+Each release carries one archive per system, `oxideswarm-<version>-<target>.tar.gz` (Linux, macOS) or
+`.zip` (Windows), and a `-gpu` variant built with `--features gpu-wgpu` for a worker whose GPU should
+do work. Targets: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`,
+`x86_64-pc-windows-msvc`. An archive holds `oxideswarm`, `rusty-grid`, `ox-mode`, the licences and the
+installer scripts for that system under `scripts/`. `SHA256SUMS` lists every archive.
+
+```bash
+# macOS / Linux: verify, unpack, put the binaries on PATH (the file names below are an example)
+shasum -a 256 -c SHA256SUMS --ignore-missing      # Linux: sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf oxideswarm-0.1.0-aarch64-apple-darwin.tar.gz
+sudo install -m 755 oxideswarm-0.1.0-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
+oxideswarm --help
+```
+
+```powershell
+# Windows: compare the hash with the SHA256SUMS line, unpack, add the folder to PATH
+(Get-FileHash .\oxideswarm-0.1.0-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+Expand-Archive .\oxideswarm-0.1.0-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
+[Environment]::SetEnvironmentVariable('Path', $env:Path + ';C:\oxideswarm\oxideswarm-0.1.0-x86_64-pc-windows-msvc', 'User')
+```
+
+Then continue with Step 1 (master, worker, `submit`). The background-service installers in
+`scripts/` (`install_mac_daemon.sh --bin <PATH>`, `install_windows_service.ps1`) take the unpacked `rusty-grid` binary.
+
+### Step 0: Build (from source)
 
 ```bash
 cargo build --release --bin oxideswarm --bin rusty-grid     # the two names are the same program
