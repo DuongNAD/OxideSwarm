@@ -587,7 +587,6 @@ mod sys {
 
     /// Everything the `pre_exec` hook needs, prepared before `spawn`.
     pub(in crate::isolation) struct Confinement {
-        level: IsolationLevel,
         handled_fs: u64,
         handled_net: u64,
         scoped: u64,
@@ -647,7 +646,6 @@ mod sys {
             // SAFETY: plain getters.
             let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
             Ok(Self {
-                level,
                 handled_fs: handled,
                 handled_net: handled_net(abi, level),
                 scoped: scoped(abi),
