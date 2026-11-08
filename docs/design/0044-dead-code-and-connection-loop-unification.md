@@ -174,10 +174,11 @@ Create `crates/master/src/session.rs` and replace the duplicated worker bodies o
    - One `tokio::select!` loop over `lanes.recv_next()` and `shutdown_rx.changed()`:
      - On `LaneKind::Data`, accepts `TaskProgress`, `TaskResult`, `Checkpoint`, and `BlobRequest`,
        logging a warning on any control-only variant (`Heartbeat`, `Disconnecting`,
-       `MobileTelemetry`, `ClaimMasterRole`, `Register`), preserving the exact lane separation of
-       `handle_multiplexed_connection`.
+       `MobileTelemetry`, `ClaimMasterRole`, `ResumeSession`, `Register`), preserving the exact
+       lane separation of `handle_multiplexed_connection`.
      - On `LaneKind::Control`, accepts `Heartbeat`, `Disconnecting`, `MobileTelemetry`,
-       `ClaimMasterRole`, and `BlobRequest`, logging a warning on unexpected variants.
+       `ClaimMasterRole`, `ResumeSession`, and `BlobRequest`, logging a warning on unexpected
+       variants.
      - On `LaneKind::Unified`, accepts all `WorkerMessage` variants.
    - On loop exit (graceful `Disconnecting`, EOF, socket error, or master `Shutdown`), runs the
      single cleanup block (`handle_worker_disconnect_with_broadcast`, `P2pConnGuard::unlist`, and
@@ -425,4 +426,7 @@ Implementation is split into four separate pull requests, opened and reviewed in
   deprecated `compute_intensity` lands in `F1-b` of `design/0046-master-durability.md` (the next
   protocol version bump).
 - 2026-11-08: Implemented `F11-a` (`dcd0fe1`), `F11-b` (`6d63092`), `F11-c` (`1fc664b`), `F11-d`
-  (`3327960`), and `F11-e` (`session::tests` guard coverage and D4 documentation updates).
+  (`3327960`), and `F11-e` (`6f0a153`, `session::tests` guard coverage and D4 documentation updates).
+- 2026-11-08: Removed deprecated `compute_intensity` from the wire (`TaskSpec::GpuCompute`,
+  `HumanTaskSpec::GpuCompute`, and `BinaryTaskSpec::GpuCompute`) in the `F1-b` wire pull request
+  (PR #141, protocol version bump `3 -> 4`, `docs/design/0046-master-durability.md` D4.2).

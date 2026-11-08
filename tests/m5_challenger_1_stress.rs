@@ -993,7 +993,6 @@ preserve_gpu = true
             input_data: vec![10, 20, 30],
             work_group_size: 16,
             simulated_matrix_dim: 32,
-            compute_intensity: 5,
         },
         TaskRequirements::gpu(30),
     );

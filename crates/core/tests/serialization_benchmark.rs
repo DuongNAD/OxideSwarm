@@ -24,7 +24,6 @@ fn test_task_spec_and_result_benchmark() {
         input_data: (0..16384).map(|i| ((i * 31 + 128) % 256) as u8).collect(),
         work_group_size: 64,
         simulated_matrix_dim: 128,
-        compute_intensity: 100,
     };
 
     // 2. TaskResult with 32 KB stdout logs

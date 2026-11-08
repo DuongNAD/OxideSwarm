@@ -198,6 +198,11 @@ pub enum GridError {
         /// Error details.
         reason: String,
     },
+
+    /// Durable task store (journal or snapshot under `--state-dir`) is corrupt, unreadable from
+    /// this binary version, or could not be written.
+    #[error("Storage error: {0}")]
+    Storage(String),
 }
 
 impl GridError {
@@ -231,6 +236,7 @@ impl GridError {
             GridError::AuthFailed(_) => "AUTH_FAILED",
             GridError::Config(_) => "CONFIG_ERROR",
             GridError::PortFile { .. } => "PORT_FILE_ERROR",
+            GridError::Storage(_) => "STORAGE_ERROR",
         }
     }
 

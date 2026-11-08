@@ -1047,6 +1047,32 @@ impl Drop for Session {
     }
 }
 
+/// Task runner tasks are spawned and hold a clone of `active_task_table`, so they would outlive a
+/// dropped `WorkerClient` (for example when a caller aborts the task running `WorkerClient::run`)
+/// and keep child processes alive in the background. Dropping `WorkerClient` stops and aborts any
+/// remaining active runs.
+impl Drop for WorkerClient {
+    fn drop(&mut self) {
+        if let Ok(mut lock) = self.active_task_table.try_write() {
+            for (_, handle) in lock.drain() {
+                if let Some(join) = Self::begin_stop(handle, "WorkerClient dropped") {
+                    join.abort();
+                }
+            }
+        } else if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let table = Arc::clone(&self.active_task_table);
+            rt.spawn(async move {
+                let mut lock = table.write().await;
+                for (_, handle) in lock.drain() {
+                    if let Some(join) = Self::begin_stop(handle, "WorkerClient dropped") {
+                        join.abort();
+                    }
+                }
+            });
+        }
+    }
+}
+
 /// What the worker advertises in `WorkerCapabilities::tags`: its system tags (`os:`, `arch:`, see
 /// `rusty_grid_core::placement`), its effective task concurrency (`slots:<n>`), its isolation
 /// level (`iso:<level>`), then the
@@ -1303,15 +1329,20 @@ impl WorkerClient {
         Self::new(config)
     }
 
-    /// Test-only constructor initializing `WorkerClient` with host battery probing and the
-    /// redirection portal disabled so tests do not depend on the test runner's battery state.
+    /// Test-only constructor initializing `WorkerClient` with host battery probing, CLI hardware
+    /// probes, and the redirection portal disabled so tests do not depend on the test runner's
+    /// battery state or installed host tools.
     pub fn for_testing(
         master_addr: impl Into<String>,
         name: Option<String>,
         cores: Option<usize>,
         simulate_gpu: bool,
     ) -> Self {
-        let mut config = WorkerConfig::new(master_addr).with_no_battery(true);
+        let mut config = WorkerConfig::new(master_addr)
+            .with_no_battery(true)
+            .with_no_gpu(!simulate_gpu)
+            .with_no_blender(true)
+            .with_no_cuda(true);
         config.enable_redirection_portal = false;
         if let Some(n) = name {
             config = config.with_name(n);
@@ -1450,12 +1481,12 @@ impl WorkerClient {
 
         let mut backoff = ExponentialBackoff::new(self.backoff_config.clone());
 
-        if self.config.enable_redirection_portal {
+        let _portal_guard = self.config.enable_redirection_portal.then(|| {
             let portal_port = self.config.redirection_portal_port;
             let portal_shutdown_rx = shutdown_rx.clone();
             let beacon_ref = Arc::clone(&self.master_beacon);
             let secret = self.config.cluster_secret.clone();
-            tokio::spawn(async move {
+            AbortOnDrop(tokio::spawn(async move {
                 spawn_worker_redirection_portal_with_secret(
                     portal_port,
                     beacon_ref,
@@ -1463,8 +1494,8 @@ impl WorkerClient {
                     portal_shutdown_rx,
                 )
                 .await;
-            });
-        }
+            }))
+        });
 
         // A worker that reads its own battery (a laptop, Termux) keeps the shared reading fresh;
         // one fed by a platform app is updated by that app instead.
