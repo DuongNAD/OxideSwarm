@@ -346,6 +346,28 @@ def power_state():
     return "unknown (not recorded on this platform)"
 
 
+def os_info():
+    """Generic OS facts only. Never the host name, the user name or a path."""
+    return {"system": platform.system(), "release": platform.release(), "version": platform.version(),
+            "machine": platform.machine()}
+
+
+def _slug(text):
+    return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-") or "unknown"
+
+
+def result_path(directory, when, os_facts, hw):
+    """<UTC date>-<os>-<arch>-<cpu short>.json, with a numeric suffix if it exists. No host name."""
+    system = {"darwin": "macos"}.get(os_facts["system"].lower(), os_facts["system"].lower())
+    cpu = _slug(re.sub(r"\(R\)|\(TM\)|CPU|Processor|@.*$", " ", hw.get("cpu_model") or ""))[:30].strip("-")
+    base = "%s-%s-%s-%s" % (when.strftime("%Y-%m-%d"), _slug(system), _slug(os_facts["machine"]), cpu or "cpu")
+    path, n = os.path.join(directory, base + ".json"), 1
+    while os.path.exists(path):
+        n += 1
+        path = os.path.join(directory, "%s-%d.json" % (base, n))
+    return path
+
+
 def git_info():
     commit = sh(["git", "-C", REPO, "rev-parse", "HEAD"])
     dirty = sh(["git", "-C", REPO, "status", "--porcelain", "--", ":!benchmarks/grid/results"])
@@ -379,7 +401,7 @@ def main():
     ap.add_argument("--max-file-bytes", type=int, default=65536)
     ap.add_argument("--seed", type=int, default=20261109)
     ap.add_argument("--quick", action="store_true", help="small smoke run: 1 run, 1 and 2 workers, tiny sizes")
-    ap.add_argument("--out", help="results file (default benchmarks/grid/results/<date>-<host>.json)")
+    ap.add_argument("--out", help="results file (default benchmarks/grid/results/<date>-<os>-<arch>-<cpu>.json)")
     ap.add_argument("--no-write", action="store_true", help="print the record instead of writing it")
     ap.add_argument("--label", default="", help="free-text note stored in the record")
     args = ap.parse_args()
@@ -434,8 +456,7 @@ def main():
         "git": git_info(),
         "binary": {"version": version, "build_profile": build_profile(binary)},
         "hardware": hardware(),
-        "os": {"system": platform.system(), "release": platform.release(), "version": platform.version(),
-               "machine": platform.machine()},
+        "os": os_info(),
         "network": "loopback (127.0.0.1), master and workers on this machine",
         "power": power_state(),
         "load_average_before": load_before,
@@ -455,8 +476,7 @@ def main():
         return
     out = args.out
     if not out:
-        host = re.sub(r"[^A-Za-z0-9]+", "-", platform.node()).strip("-").lower() or "host"
-        out = os.path.join(HERE, "results", "%s-%s.json" % (started.strftime("%Y-%m-%d"), host))
+        out = result_path(os.path.join(HERE, "results"), started, record["os"], record["hardware"])
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     with open(out, "w") as f:
         f.write(text + "\n")

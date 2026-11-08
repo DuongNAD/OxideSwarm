@@ -15,7 +15,7 @@ Every run starts its own master and workers on `127.0.0.1` with ephemeral ports,
 private `HOME` and `USERPROFILE`, stops them through the process handles it holds (never by name) and
 deletes its temporary directory. It never reads or writes the real `~/.oxideswarm`. It fails with the
 reason when the master does not publish a port or a worker does not register. It writes one JSON record
-to `results/<UTC date>-<host>.json` with the date, git commit (and whether the tree had other changes),
+to `results/<UTC date>-<os>-<arch>-<cpu>.json (no host or user name is recorded)` with the date, git commit (and whether the tree had other changes),
 binary version and profile, CPU, cores, RAM, OS and kernel, network, power state, load averages before
 and after, parameters, the median, minimum and maximum over the runs, and every raw run.
 
@@ -48,7 +48,7 @@ process: hashing, upload, the worker's fetch from the master, and the task.
 
 ## Recorded run
 
-Record: [`results/2026-11-08-macbook-air-cua-nguyen-local.json`](results/2026-11-08-macbook-air-cua-nguyen-local.json). 2026-11-08 (UTC), Apple M5, 10 cores, 32 GiB, macOS
+Record: [`results/2026-11-08-macos-arm64-apple-m5.json`](results/2026-11-08-macos-arm64-apple-m5.json). 2026-11-08 (UTC), Apple M5, 10 cores, 32 GiB, macOS
 (Darwin 27.2.0), AC power, release build of `433ba81` plus this script. Loopback.
 
 **The machine was not idle.** Other build and test agents were running: the load averages were 103, 52

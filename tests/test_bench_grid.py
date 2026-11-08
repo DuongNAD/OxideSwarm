@@ -10,8 +10,12 @@ Run:   python3 tests/test_bench_grid.py
 
 import importlib.util
 import os
+import json
+import socket
 import tempfile
 import unittest
+from unittest import mock
+import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "benchmarks", "grid", "bench_grid.py")
@@ -58,6 +62,29 @@ class Tree(unittest.TestCase):
             fa = open(os.path.join(a, "t", "d01", "f0001.bin"), "rb").read()
             fb = open(os.path.join(b, "t", "d01", "f0001.bin"), "rb").read()
             self.assertEqual(fa, fb)
+
+
+class NoHostname(unittest.TestCase):
+    SENTINEL = "SENTINEL-HOST-zq9"
+
+    def test_environment_record_and_file_name_carry_no_host(self):
+        with mock.patch.object(socket, "gethostname", return_value=self.SENTINEL), \
+             mock.patch.object(bench.platform, "node", return_value=self.SENTINEL):
+            hw, osf = bench.hardware(), bench.os_info()
+            with tempfile.TemporaryDirectory() as d:
+                path = bench.result_path(d, datetime.datetime(2026, 11, 8), osf, hw)
+        blob = json.dumps({"hardware": hw, "os": osf, "git": bench.git_info(), "power": bench.power_state()})
+        self.assertNotIn(self.SENTINEL, blob)
+        self.assertNotIn(self.SENTINEL, path)
+
+    def test_file_name_shape_and_suffix(self):
+        hw, osf = {"cpu_model": "Apple M5"}, {"system": "Darwin", "machine": "arm64"}
+        with tempfile.TemporaryDirectory() as d:
+            p1 = bench.result_path(d, datetime.datetime(2026, 11, 8), osf, hw)
+            self.assertEqual(os.path.basename(p1), "2026-11-08-macos-arm64-apple-m5.json")
+            open(p1, "w").close()
+            p2 = bench.result_path(d, datetime.datetime(2026, 11, 8), osf, hw)
+            self.assertEqual(os.path.basename(p2), "2026-11-08-macos-arm64-apple-m5-2.json")
 
 
 if __name__ == "__main__":
