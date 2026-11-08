@@ -35,6 +35,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 toml = { workspace = true }
 chrono = { workspace = true }
 sysinfo = { workspace = true }
+ignore = "0.4"
 
 [features]
 # Workers of this binary can compute on the GPU (Metal, Vulkan, DirectX 12) and advertise it:

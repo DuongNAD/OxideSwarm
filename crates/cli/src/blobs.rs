@@ -459,6 +459,176 @@ impl PreparedInputs {
     }
 }
 
+/// Default maximum number of files in a workspace source (design 0039 D5), below
+/// `MAX_TREE_FILES`.
+pub const DEFAULT_WORKSPACE_MAX_FILES: usize = 100_000;
+/// Default maximum total size of a workspace source: 2 GiB (design 0039 D5).
+pub const DEFAULT_WORKSPACE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Caps on a workspace source scanned by [`scan_workspace_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceLimits {
+    pub max_files: usize,
+    pub max_bytes: u64,
+}
+
+impl Default for WorkspaceLimits {
+    fn default() -> Self {
+        Self {
+            max_files: DEFAULT_WORKSPACE_MAX_FILES,
+            max_bytes: DEFAULT_WORKSPACE_MAX_BYTES,
+        }
+    }
+}
+
+/// A workspace source: one tree manifest plus the blobs it names, ready for [`upload_inputs`].
+pub struct WorkspaceScan {
+    /// The files chosen, with paths relative to the root, sorted by path.
+    pub manifest: TreeManifest,
+    /// Blob id of the encoded manifest.
+    pub manifest_id: BlobId,
+    /// Size in bytes of the encoded manifest.
+    pub manifest_len: u64,
+    /// The blobs to upload (`inputs` stays empty); `skipped` lists links and special files.
+    pub prepared: PreparedInputs,
+}
+
+/// Walks `root` and hashes the files a workspace sync should send. It honours `.gitignore`,
+/// `.ignore` and `.git/info/exclude` (also outside a git repository, and only those found inside
+/// `root`: no parent directory and no global excludes, so the result does not depend on the
+/// machine), includes hidden files and always leaves out `.git`. Symbolic links and special files
+/// are never followed or sent; they are listed in `prepared.skipped`. Fails when a limit of
+/// `limits` is exceeded.
+pub fn scan_workspace_source(
+    root: &Path,
+    limits: WorkspaceLimits,
+) -> Result<WorkspaceScan, String> {
+    let meta = std::fs::symlink_metadata(root)
+        .map_err(|e| format!("workspace source {}: {e}", root.display()))?;
+    if !meta.is_dir() {
+        return Err(format!(
+            "workspace source {}: not a directory",
+            root.display()
+        ));
+    }
+    let mut prepared = PreparedInputs::default();
+    let mut files = Vec::new();
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .parents(false)
+        .git_global(false)
+        .require_git(false)
+        .follow_links(false)
+        .sort_by_file_path(|a, b| a.cmp(b))
+        .filter_entry(|e| e.file_name() != ".git")
+        .build();
+    for entry in walker {
+        let entry = entry.map_err(|e| format!("workspace source {}: {e}", root.display()))?;
+        if entry.depth() == 0 {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .ok_or_else(|| format!("workspace source {}: unreadable entry", path.display()))?;
+        if file_type.is_dir() {
+            continue;
+        }
+        if file_type.is_symlink() {
+            prepared
+                .skipped
+                .push(format!("{} (symbolic links are not sent)", path.display()));
+            continue;
+        }
+        if !file_type.is_file() {
+            prepared
+                .skipped
+                .push(format!("{} (not a regular file)", path.display()));
+            continue;
+        }
+        let rel_path = path
+            .strip_prefix(root)
+            .map_err(|e| format!("workspace source {}: {e}", path.display()))?;
+        let mut parts = Vec::new();
+        let mut valid = true;
+        for c in rel_path.components() {
+            match c {
+                Component::Normal(s) => match s.to_str() {
+                    Some(s) => parts.push(s),
+                    None => valid = false,
+                },
+                _ => valid = false,
+            }
+        }
+        if !valid {
+            prepared
+                .skipped
+                .push(format!("{} (name is not UTF-8)", path.display()));
+            continue;
+        }
+        let rel = parts.join("/");
+        if let Err(e) = validate_blob_path(&rel) {
+            prepared.skipped.push(format!("{} ({e})", path.display()));
+            continue;
+        }
+        if prepared.files >= limits.max_files {
+            return Err(format!(
+                "workspace source {}: more than {} files; raise --workspace-max-files or add the \
+                 build output to .gitignore",
+                root.display(),
+                limits.max_files
+            ));
+        }
+        let len = entry
+            .metadata()
+            .map_err(|e| format!("workspace source {}: {e}", path.display()))?
+            .len();
+        if prepared.bytes.saturating_add(len) > limits.max_bytes {
+            return Err(format!(
+                "workspace source {}: more than {} bytes in total (at {}); raise \
+                 --workspace-max-mb or add large files to .gitignore",
+                root.display(),
+                limits.max_bytes,
+                path.display()
+            ));
+        }
+        let remaining = limits.max_bytes - prepared.bytes;
+        let (id, size, executable) = prepared.add_file_from_path_with_mode(
+            path,
+            Some(InputLimits {
+                max_files: limits.max_files,
+                max_bytes: limits.max_bytes,
+            }),
+            true,
+        )?;
+        debug_assert!(size <= remaining);
+        files.push(BlobFile {
+            path: rel,
+            id,
+            size,
+            executable,
+        });
+    }
+    let manifest = TreeManifest::new(files)
+        .map_err(|e| format!("workspace source {}: {e}", root.display()))?;
+    let encoded = manifest.encode();
+    let manifest_id = BlobId::of(&encoded);
+    let manifest_len = encoded.len() as u64;
+    prepared.blobs.insert(
+        manifest_id,
+        LocalBlob {
+            size: manifest_len,
+            source: LocalSource::Bytes(encoded),
+        },
+    );
+    Ok(WorkspaceScan {
+        manifest,
+        manifest_id,
+        manifest_len,
+        prepared,
+    })
+}
+
 /// A connection to the Master used only for blob requests. Requests are answered in order, one
 /// at a time.
 pub struct BlobConnection {
@@ -991,5 +1161,132 @@ mod tests {
         let ok = prepare_destination(&out, "a/b/c.txt").unwrap();
         assert_eq!(ok, out.join("a").join("b").join("c.txt"));
         assert!(out.join("a/b").is_dir());
+    }
+
+    #[cfg(test)]
+    mod workspace_scan {
+        use super::super::*;
+        use std::fs;
+
+        fn write(root: &Path, rel: &str, body: &str) {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, body).unwrap();
+        }
+
+        fn paths(scan: &WorkspaceScan) -> Vec<String> {
+            scan.manifest
+                .files()
+                .iter()
+                .map(|f| f.path.clone())
+                .collect()
+        }
+
+        #[test]
+        fn gitignore_nested_negation_and_git_dir() {
+            let dir = tempfile::tempdir().unwrap();
+            let r = dir.path();
+            write(r, ".gitignore", "target/\n*.log\n!keep.log\n");
+            write(r, "src/main.rs", "fn main() {}");
+            write(r, "target/debug/x", "bin");
+            write(r, "a.log", "x");
+            write(r, "keep.log", "x");
+            write(r, "sub/.gitignore", "secret.txt\n!/target/\n");
+            write(r, "sub/secret.txt", "s");
+            write(r, "sub/ok.txt", "o");
+            write(r, "sub/target/inner", "i");
+            write(r, ".git/config", "[core]");
+            write(r, ".git/info/exclude", "excluded.txt\n");
+            write(r, "excluded.txt", "e");
+            write(r, ".ignore", "tool.tmp\n");
+            write(r, "tool.tmp", "t");
+            write(r, ".hidden", "h");
+            let scan = scan_workspace_source(r, WorkspaceLimits::default()).unwrap();
+            assert_eq!(
+                paths(&scan),
+                vec![
+                    ".gitignore",
+                    ".hidden",
+                    ".ignore",
+                    "keep.log",
+                    "src/main.rs",
+                    "sub/.gitignore",
+                    "sub/ok.txt",
+                    "sub/target/inner",
+                ]
+            );
+            assert_eq!(scan.prepared.files, 8);
+            assert!(scan.prepared.has_blob(&scan.manifest_id));
+        }
+
+        #[test]
+        fn git_file_and_dir_are_left_out_and_order_is_deterministic() {
+            let dir = tempfile::tempdir().unwrap();
+            let r = dir.path();
+            write(r, ".git", "gitdir: elsewhere");
+            for n in ["z.txt", "a.txt", "m/b.txt", "m/a.txt"] {
+                write(r, n, n);
+            }
+            let a = scan_workspace_source(r, WorkspaceLimits::default()).unwrap();
+            let b = scan_workspace_source(r, WorkspaceLimits::default()).unwrap();
+            assert_eq!(paths(&a), vec!["a.txt", "m/a.txt", "m/b.txt", "z.txt"]);
+            assert_eq!(a.manifest_id, b.manifest_id);
+            assert!(paths(&a).iter().all(|p| !p.contains('\\')));
+        }
+
+        #[test]
+        fn limits_are_refused_with_a_clear_error() {
+            let dir = tempfile::tempdir().unwrap();
+            let r = dir.path();
+            write(r, "a", "12345");
+            write(r, "b", "12345");
+            let e = scan_workspace_source(
+                r,
+                WorkspaceLimits {
+                    max_files: 1,
+                    max_bytes: 100,
+                },
+            )
+            .err()
+            .unwrap();
+            assert!(
+                e.contains("more than 1 files") && e.contains("--workspace-max-files"),
+                "{e}"
+            );
+            let e = scan_workspace_source(
+                r,
+                WorkspaceLimits {
+                    max_files: 10,
+                    max_bytes: 8,
+                },
+            )
+            .err()
+            .unwrap();
+            assert!(
+                e.contains("more than 8 bytes") && e.contains("--workspace-max-mb"),
+                "{e}"
+            );
+            assert!(scan_workspace_source(&r.join("a"), WorkspaceLimits::default()).is_err());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn links_are_skipped_and_listed_and_executable_bit_is_kept() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let r = dir.path();
+            write(r, "run.sh", "#!/bin/sh");
+            fs::set_permissions(r.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+            write(r, "plain", "p");
+            let outside = tempfile::tempdir().unwrap();
+            write(outside.path(), "secret", "s");
+            std::os::unix::fs::symlink(outside.path().join("secret"), r.join("link")).unwrap();
+            std::os::unix::fs::symlink(outside.path(), r.join("dirlink")).unwrap();
+            let scan = scan_workspace_source(r, WorkspaceLimits::default()).unwrap();
+            assert_eq!(paths(&scan), vec!["plain", "run.sh"]);
+            assert!(scan.manifest.files()[1].executable);
+            assert!(!scan.manifest.files()[0].executable);
+            assert_eq!(scan.prepared.skipped.len(), 2);
+        }
     }
 }
