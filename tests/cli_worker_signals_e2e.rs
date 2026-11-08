@@ -314,3 +314,64 @@ fn test_misspelt_task_priority_is_refused_instead_of_running_tasks_at_full_prior
         "{stderr}"
     );
 }
+
+#[test]
+fn test_sigkill_of_the_worker_kills_its_child_grandchild_and_setsid_descendants_within_five_seconds(
+) {
+    let home = tempdir();
+    let master = start_master(home.path());
+    let mut worker = start_worker(home.path(), &master.addr, "sigkill-worker", &[]);
+    wait_for_worker(home.path(), &master, &worker);
+
+    let child_file = home.path().join("sigkill_child.pid");
+    let grandchild_file = home.path().join("sigkill_grandchild.pid");
+    let setsid_file = home.path().join("sigkill_setsid.pid");
+    let script = format!(
+        "sleep 300 & echo $! > '{}'; \
+         sh -c 'sleep 300 & echo $! > \"$0\"; wait' '{}' & \
+         python3 -c 'import os, sys, time; os.setsid(); f = open(sys.argv[1], \"w\"); f.write(str(os.getpid()) + \"\\n\"); f.flush(); os.fsync(f.fileno()); f.close(); time.sleep(300)' '{}' & \
+         wait",
+        child_file.display(),
+        grandchild_file.display(),
+        setsid_file.display()
+    );
+    let out: Output = cli(home.path())
+        .args([
+            "submit",
+            "--master",
+            &master.addr,
+            "--timeout-secs",
+            "600",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "submit failed: {}", text(&out.stderr));
+
+    let child = recorded_pid(&child_file);
+    let grandchild = recorded_pid(&grandchild_file);
+    let setsid_child = recorded_pid(&setsid_file);
+    let _cleanup = KillOnDrop(vec![child, grandchild, setsid_child]);
+    assert!(alive(child) && alive(grandchild) && alive(setsid_child));
+
+    let status = Command::new("kill")
+        .args(["-9", &worker.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let _ = worker.child.wait();
+
+    for (what, pid) in [
+        ("background child", child),
+        ("nested grandchild", grandchild),
+        ("setsid descendant", setsid_child),
+    ] {
+        assert!(
+            wait_for(Duration::from_secs(5), || !alive(pid)),
+            "the {what} (pid {pid}) survived more than 5 s after kill -9 of the worker"
+        );
+    }
+}

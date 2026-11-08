@@ -11,6 +11,7 @@ pub mod reaper;
 pub mod registry;
 pub mod scheduler;
 pub mod server;
+pub mod session;
 #[cfg(feature = "dashboard")]
 pub mod web_ui;
 
