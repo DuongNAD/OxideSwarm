@@ -199,6 +199,17 @@ scp user@master:~/.oxideswarm/cluster.secret ~/.oxideswarm/cluster.secret && chm
 ```
 
 (Windows: `%USERPROFILE%\.oxideswarm\cluster.secret`; a USB stick works too. Never chat, e-mail or cloud-synced folders.)
+**Quick path: join with one token.** Instead of copying the file and typing the address, create a token on the
+master and pipe it into `oxideswarm join` on the new machine (the token is as sensitive as the secret: send it over a
+channel you trust, never through chat or e-mail, and never as a command line argument):
+
+```bash
+# on the master
+./target/release/oxideswarm secret join-token --master 192.168.1.100:8088 > join.token
+# on the new machine (token on standard input; saves the secret at mode 600 and the address, then runs the doctor checks)
+./target/release/oxideswarm join < join.token && ./target/release/oxideswarm worker
+```
+
 A master bound to loopback only (plain `oxideswarm master`) needs no secret. The dashboard token is
 `oxideswarm secret show --dashboard-token`. More: [docs/SECURITY.md](docs/SECURITY.md).
 
@@ -318,6 +329,10 @@ or `~/.oxideswarm/cluster.secret`.
 ./target/release/oxideswarm master --listen 0.0.0.0:8088 --web-ui-addr 0.0.0.0:8080
 # Register with Tier 3 HTTP rendezvous registry:
 ./target/release/oxideswarm master --listen 0.0.0.0:8088 --rendezvous http://rendezvous.example.com:8080
+
+# Join a machine with one token (design 0048): print on the master, read from standard input on the new machine
+./target/release/oxideswarm secret join-token --master 192.168.1.100:8088 [--p2p-ticket-file ~/.oxideswarm/master_ticket.txt]
+./target/release/oxideswarm join [--replace-secret] [--expect-workers N] [--no-doctor] < join.token
 
 # Worker: --master takes the CLUSTER port (default 127.0.0.1:8088; a bare host gets :8088; 'auto' = LAN discovery)
 ./target/release/oxideswarm worker --master 192.168.1.100:8088
@@ -519,9 +534,11 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `oxideswarm result <ID>` | `<ID>`, `--master <ADDR\|auto>`, `-w` / `--wait`, `--json`, `--output-dir <DIR>`, `--insecure` | Fetch stdout/stderr, exit code, and output blobs for task `<ID>` |
 | `oxideswarm cancel <ID>` | `<ID>`, `--master <ADDR\|auto>`, `--json`, `--insecure` | Cancel a queued or running task `<ID>` and terminate its worker process tree |
 | `oxideswarm mapreduce` | `--master <ADDR\|auto>`, `--input <FILE_OR_TEXT>` (required, repeatable), `--mapper <NAME_OR_SCRIPT>` (default `word_count`), `--map-cmd <CMD>`, `--reducer <NAME_OR_SCRIPT>` (default `sum`), `--reduce-cmd <CMD>`, `--chunks <N>` (default `4`), `--timeout-secs <SECS>` (default `60`, `[submit].timeout_secs`), `--json`, `--insecure` | Partition inputs across workers, run built-in (`word_count`, `line_count`, `identity` / `sum`, `count`, `max`, `min`, `concat`), local script (`--mapper` / `--reducer`), or worker command (`--map-cmd` / `--reduce-cmd`) stages |
-| `oxideswarm doctor` | `--master <ADDR\|auto>`, `--expect-workers <N>` (default `1`), `--probe-timeout-secs <SECS>` (default `60`), `--gpu-dim <N>` (default `512`), `--spread-tasks <N>`, `--skip-gpu`, `--skip-spread`, `--json`, `--insecure` | End-to-end cluster verification across C1 (master reachable), C2 (worker count), C3 (pinned echo per worker), C4 (shell script per worker), C5 (GPU GEMM probe), and C6 (multi-worker spread) |
+| `oxideswarm doctor` | `--master <ADDR\|auto>`, `--expect-workers <N>` (default `1`), `--probe-timeout-secs <SECS>` (default `60`), `--gpu-dim <N>` (default `512`), `--spread-tasks <N>`, `--skip-gpu`, `--skip-spread`, `--skip-throughput`, `--json`, `--insecure` | End-to-end cluster verification across C1 (master reachable), C2 (worker count), C3 (pinned echo per worker), C4 (shell script per worker), C5 (GPU GEMM probe), C6 (multi-worker spread), C7 (link kind: warns for a relayed worker) and C8 (an 8 MiB blob moved to each worker, MB/s). The worker table has a `LINK` column (`direct`, `relay`, `tcp` plus the round-trip time) |
 | `oxideswarm secret generate` | `--out <PATH>`, `--force`, `--print` | Generate a 256-bit random cluster secret file (`0600` permissions; default `~/.oxideswarm/cluster.secret`) |
 | `oxideswarm secret show` | `--raw`, `--dashboard-token` | Show the resolved secret source + fingerprint, raw 64-char hex (`--raw`), or derived dashboard admin bearer token (`--dashboard-token`) |
+| `oxideswarm secret join-token` | `--master <HOST:PORT>`, `--p2p-ticket <TICKET>`, `--p2p-ticket-file <PATH>` | Print a join token (`oxs1-join:...`: the master address, an optional P2P ticket and the cluster secret, with an integrity tag) to stdout, with a warning on stderr. The token is as sensitive as the secret. Without `--master`, the `[master] listen` of the config file is used unless it is a wildcard |
+| `oxideswarm join` | `--replace-secret`, `--replace-master`, `--expect-workers <N>` (default `0`), `--no-doctor` | Read a join token from **standard input** (piped, or pasted at a no-echo prompt on a terminal; an argument is refused), save the secret at mode `0600` (Windows: owner-only ACL) and the master address in `~/.oxideswarm/rusty-grid.toml` (edited in place, comments kept, a private `.bak-<time>` backup first, never through a symlink), refuse a different secret configured via `OXIDESWARM_SECRET*`, `--secret*` or the config file, refuse to replace a different secret without `--replace-secret` or a different master or ticket without `--replace-master`, then run the doctor checks and exit with their status. Design: [docs/design/0048-join-token.md](docs/design/0048-join-token.md) |
 | `oxideswarm mode [MODE] [ACTION]` | `[MODE]` (`test`, `dev`, `doc`, `research`), `[ACTION]`, `-a` / `--action-opt <ACTION>`, `--iterations <N>` (default `5`), `--port <PORT>` (`RUSTY_GRID_DASHBOARD_PORT`; without `--port`, `dev status` probes `.dev_cluster.json` then `8080`), `-i` / `--interactive`, `--json` | Run or inspect workflow modes (`test`, `dev`, `doc`, `research`) or open the interactive menu (`--interactive`) |
 | `oxideswarm mcp` | `--master <ADDR\|auto>`, `--insecure` | Run the Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio |
 
@@ -866,6 +883,8 @@ python3 tests/test_launcher_scripts.py
 
 The scripts exit non-zero and say FAIL when a check fails; their reports are computed from what was observed in
 that run.
+
+**Benchmarks.** [benchmarks/grid](benchmarks/grid/README.md) measures no-op task overhead with 1 to 4 workers and a first versus a repeated upload of the same input tree on loopback, with the script that produced each dated record in [benchmarks/grid/results](benchmarks/grid/results). The records state their machine, load and limits.
 
 ---
 

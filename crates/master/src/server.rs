@@ -2002,6 +2002,61 @@ impl Drop for UploadOwner {
     }
 }
 
+/// The `BlobRequest`s of one client connection that are being handled. Up to
+/// [`MAX_IN_FLIGHT_REQUESTS`] run at the same time (different blobs overlap their disk work),
+/// and their replies leave in the order the requests arrived. A client that sends more than that
+/// is held back: the connection stops reading until a reply went out, so the number of requests
+/// held is bounded. Their size is not bounded by the chunk size: a frame may be up to the 64 MiB
+/// frame limit until `append` rejects it, so the worst case is the limit times that.
+#[derive(Default)]
+struct BlobPipeline {
+    running: std::collections::VecDeque<tokio::task::JoinHandle<BlobReply>>,
+}
+
+impl BlobPipeline {
+    fn len(&self) -> usize {
+        self.running.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.running.is_empty()
+    }
+
+    fn is_full(&self) -> bool {
+        self.len() >= MAX_IN_FLIGHT_REQUESTS
+    }
+
+    fn push(&mut self, store: Arc<BlobStore>, owner: u64, request: BlobRequest) {
+        self.running.push_back(tokio::spawn(
+            async move { store.handle(owner, request).await },
+        ));
+    }
+
+    fn push_ready(&mut self, reply: BlobReply) {
+        self.running.push_back(tokio::spawn(async move { reply }));
+    }
+
+    /// Waits for the oldest request's reply. Must not be called when the pipeline is empty.
+    async fn next_reply(&mut self) -> BlobReply {
+        let Some(front) = self.running.front_mut() else {
+            return std::future::pending().await;
+        };
+        let outcome = front.await;
+        self.running.pop_front();
+        outcome.unwrap_or_else(|e| BlobReply::Failed {
+            message: format!("handling the blob request failed: {e}"),
+        })
+    }
+}
+
+impl Drop for BlobPipeline {
+    fn drop(&mut self) {
+        for handle in &self.running {
+            handle.abort();
+        }
+    }
+}
+
 /// Answers one worker connection's `BlobRequest`s in arrival order, off its inbound loop. A
 /// worker caps its requests in flight per session at [`MAX_IN_FLIGHT_REQUESTS`], smaller than
 /// this queue, so a cooperative worker never fills the queue and blocks its own heartbeats or
@@ -3146,27 +3201,60 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
         .with_registry(registry.clone())
         .with_parallelism(mapreduce_parallelism);
 
+    // Blob requests of this connection that are being handled, oldest first. Their replies are
+    // sent in that order (the client matches them by position), and no other answer is sent
+    // while one is pending.
+    let mut blob_pipeline = BlobPipeline::default();
+
     loop {
-        let msg = match next_msg.take() {
-            Some(m) => m,
-            None => match transport.recv_msg::<ClientMessage>().await {
-                Ok(Some(m)) => m,
-                Ok(None) => break,
-                Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
-                    let message = format_incompatible_version_error("client", peer_version);
-                    warn!(peer_version, error = %message, "Refusing client message with incompatible protocol version");
-                    let _ = send_client_response(
-                        &mut transport,
-                        &ClientResponse::Error {
-                            message: message.clone(),
-                        },
-                    )
-                    .await;
-                    return Err(GridError::IncompatibleVersion(message));
+        let received = match next_msg.take() {
+            Some(m) => Ok(Some(m)),
+            None => loop {
+                // A full pipeline stops reading: further requests wait in the socket buffers.
+                if blob_pipeline.is_full() {
+                    let reply = blob_pipeline.next_reply().await;
+                    send_client_response(&mut transport, &ClientResponse::BlobReply { reply })
+                        .await?;
+                    continue;
                 }
-                Err(e) => return Err(e.into()),
+                if blob_pipeline.is_empty() {
+                    break transport.recv_msg::<ClientMessage>().await;
+                }
+                tokio::select! {
+                    biased;
+                    reply = blob_pipeline.next_reply() => {
+                        send_client_response(&mut transport, &ClientResponse::BlobReply { reply })
+                            .await?;
+                    }
+                    received = transport.recv_msg::<ClientMessage>() => break received,
+                }
             },
         };
+        let msg = match received {
+            Ok(Some(m)) => m,
+            Ok(None) => break,
+            Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                let message = format_incompatible_version_error("client", peer_version);
+                warn!(peer_version, error = %message, "Refusing client message with incompatible protocol version");
+                let _ = send_client_response(
+                    &mut transport,
+                    &ClientResponse::Error {
+                        message: message.clone(),
+                    },
+                )
+                .await;
+                return Err(GridError::IncompatibleVersion(message));
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        // Every other message is answered after the blob replies that precede it.
+        if !matches!(msg, ClientMessage::BlobRequest { .. }) {
+            while !blob_pipeline.is_empty() {
+                let reply = blob_pipeline.next_reply().await;
+                send_client_response(&mut transport, &ClientResponse::BlobReply { reply }).await?;
+            }
+        }
 
         match msg {
             ClientMessage::SubmitTask { task, wait } => {
@@ -3380,15 +3468,18 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                 };
                 send_client_response(&mut transport, &resp).await?;
             }
-            ClientMessage::BlobRequest { request } => {
-                let reply = match (&blob_store, &uploads) {
-                    (Some(store), Some(uploads)) => store.handle(uploads.owner, request).await,
-                    _ => BlobReply::Failed {
+            ClientMessage::BlobRequest { request } => match (&blob_store, &uploads) {
+                (Some(store), Some(uploads)) => {
+                    blob_pipeline.push(Arc::clone(store), uploads.owner, request);
+                }
+                _ => {
+                    let reply = BlobReply::Failed {
                         message: NO_BLOB_STORE.to_string(),
-                    },
-                };
-                send_client_response(&mut transport, &ClientResponse::BlobReply { reply }).await?;
-            }
+                    };
+                    // Keep the answers in request order.
+                    blob_pipeline.push_ready(reply);
+                }
+            },
         }
     }
 

@@ -1029,10 +1029,23 @@ enum Scan {
 /// passes. Used to tell a torn tail (nothing valid follows) from damage in the middle of the
 /// history. Hashing work is capped at a few times the file size.
 fn valid_frame_follows(bytes: &[u8], from: usize) -> Scan {
+    valid_frame_follows_counted(bytes, from, &mut ScanWork::default())
+}
+
+/// Work done by one [`valid_frame_follows`] call (offsets probed, bytes hashed); a test reads it
+/// to check the scan is linear without depending on wall-clock time.
+#[derive(Default, Debug, Clone, Copy)]
+struct ScanWork {
+    probes: usize,
+    hashed_bytes: usize,
+}
+
+fn valid_frame_follows_counted(bytes: &[u8], from: usize, work: &mut ScanWork) -> Scan {
     let total = bytes.len();
     let mut budget = 4 * total + (1 << 20);
     let mut o = from;
     while o + FRAME_HEADER_LEN <= total {
+        work.probes += 1;
         let len = u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
         let chk = u32::from_le_bytes(bytes[o + 4..o + 8].try_into().unwrap());
         if chk == len_check(len) && len as usize <= MAX_FRAME_SIZE {
@@ -1042,6 +1055,7 @@ fn valid_frame_follows(bytes: &[u8], from: usize) -> Scan {
                     return Scan::TooCostly;
                 }
                 budget -= len as usize;
+                work.hashed_bytes += len as usize;
                 if blake3::hash(&bytes[o + FRAME_HEADER_LEN..end]).as_bytes()
                     == &bytes[o + 8..o + FRAME_HEADER_LEN]
                 {
@@ -2252,25 +2266,33 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), good);
     }
 
-    fn torn_tail_open_time(tail: &[u8]) -> Duration {
+    /// Builds the journal of `torn_tail_open_time`'s kind (one good record, then a damaged frame
+    /// header and `tail`), opens it, and returns what the classification of the tail cost.
+    fn torn_tail_scan_work(tail: &[u8]) -> (ScanWork, usize) {
         let dir = tempfile::tempdir().unwrap();
         write_all(dir.path(), &[marker(1)]);
+        let mut damaged = Vec::new();
+        // A damaged frame header (no valid check), then garbage.
+        damaged.extend_from_slice(&((tail.len() + 1024) as u32).to_le_bytes());
+        damaged.extend_from_slice(&[0xAB; 36]);
+        damaged.extend_from_slice(tail);
         let mut f = OpenOptions::new()
             .append(true)
             .open(journal_path(dir.path()))
             .unwrap();
-        // A damaged frame header (no valid check), then garbage.
-        f.write_all(&((tail.len() + 1024) as u32).to_le_bytes())
-            .unwrap();
-        f.write_all(&[0xAB; 36]).unwrap();
-        f.write_all(tail).unwrap();
+        f.write_all(&damaged).unwrap();
         drop(f);
-        let t0 = Instant::now();
+        // The real open must still classify it as a torn tail.
         let (_s, rec) = TaskStore::open(dir.path()).unwrap();
         assert!(rec.truncated_tail);
-        t0.elapsed()
+        let mut work = ScanWork::default();
+        let scan = valid_frame_follows_counted(&damaged, 0, &mut work);
+        assert!(matches!(scan, Scan::Nothing), "no valid frame may follow");
+        (work, damaged.len())
     }
 
+    // Asserts the algorithm's cost (probes and hashed bytes), not wall-clock time: a timing
+    // bound is flaky on a loaded CI host and says nothing about the complexity.
     #[test]
     fn classifying_a_damaged_tail_is_linear() {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -2284,19 +2306,43 @@ mod tests {
                 })
                 .collect::<Vec<u8>>()
         };
-        let random = rnd(8 << 20);
-        let t = torn_tail_open_time(&random);
-        assert!(t < Duration::from_secs(1), "8 MiB random tail took {t:?}");
-        let patterned: Vec<u8> = [0u8, 0, 1, 0]
-            .iter()
-            .copied()
-            .cycle()
-            .take(8 << 20)
-            .collect();
-        let t = torn_tail_open_time(&patterned);
-        assert!(
-            t < Duration::from_secs(1),
-            "8 MiB patterned tail took {t:?}"
-        );
+        let patterned =
+            |n: usize| -> Vec<u8> { [0u8, 0, 1, 0].iter().copied().cycle().take(n).collect() };
+        let small = 2usize << 20;
+        let cases: [(&str, Vec<u8>, Vec<u8>); 2] = [
+            ("random", rnd(small), rnd(small * 4)),
+            ("patterned", patterned(small), patterned(small * 4)),
+        ];
+        for (name, n_tail, n4_tail) in &cases {
+            let (w1, len1) = torn_tail_scan_work(n_tail);
+            let (w4, len4) = torn_tail_scan_work(n4_tail);
+            for (w, len) in [(w1, len1), (w4, len4)] {
+                // One probe per offset at most; hashing is capped at 4x the file plus 1 MiB.
+                assert!(
+                    w.probes <= len,
+                    "{name}: {} probes over {len} bytes",
+                    w.probes
+                );
+                assert!(
+                    w.hashed_bytes <= 4 * len + (1 << 20),
+                    "{name}: hashed {} bytes over {len} bytes",
+                    w.hashed_bytes
+                );
+            }
+            // Work on 4N bytes stays within a generous multiple of the work on N bytes
+            // (4x expected; 8x allows for the constant 1 MiB budget term).
+            assert!(
+                w4.probes <= 8 * w1.probes.max(1),
+                "{name}: probes grew {} -> {}",
+                w1.probes,
+                w4.probes
+            );
+            assert!(
+                w4.hashed_bytes <= 8 * w1.hashed_bytes.max(1 << 20),
+                "{name}: hashed bytes grew {} -> {}",
+                w1.hashed_bytes,
+                w4.hashed_bytes
+            );
+        }
     }
 }
