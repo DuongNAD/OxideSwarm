@@ -314,7 +314,7 @@ Roadmap Phase C names these steps WS-1 to WS-7. The column "Roadmap" maps them.
 | W2 | The workspace store, sync, lock, bounds and worker options. Roadmap WS-1, WS-2 | `crates/worker/src/workspace.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `README.md` | The sync unit tests of the test plan pass | W2a done (store, sync, locks, bounds and tests in `workspace.rs`); W2b pending (wiring into `runner.rs` and `client.rs`, options, advertising `WORKSPACES`) |
 | W3 | Required feature, affinity, one task per workspace. Roadmap WS-1 | `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/master/src/server.rs` | The scheduler unit tests of the test plan pass | Done |
 | W4 | Source selection with `.gitignore` and limits. Roadmap WS-2 | `crates/cli/src/blobs.rs`, `crates/cli/Cargo.toml` | The scan unit tests pass, and `cargo audit` passes with the `ignore` crate | Done |
-| W5 | `submit --workspace`, `--sync`, `--no-sync`, `--cwd`, the MCP `workspace` field, the `workspaces` tool and command. Roadmap WS-5 | `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs`, `crates/core/src/protocol.rs`, `README.md` | `tests/mcp_server_e2e.rs` covers a workspace submission and the `workspaces` tool | Planned |
+| W5 | `submit --workspace`, `--sync`, `--no-sync`, `--cwd`, the MCP `workspace` field, the `workspaces` tool and command. Roadmap WS-5 | `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs`, `crates/core/src/protocol.rs`, `README.md` | `tests/mcp_server_e2e.rs` covers a workspace submission and the `workspaces` tool | Done |
 | W6 | End-to-end test | `tests/agent_workspace_e2e.rs`, `crates/cli/Cargo.toml` | The integration test of the test plan passes on Linux, macOS and Windows in CI | Planned |
 | W7 | P2P for clients, the MCP server and blob connections. Roadmap WS-3 | `crates/core/src/transport.rs`, `crates/cli/src/connect.rs`, `crates/cli/src/mcp.rs`, `crates/cli/src/blobs.rs`, `crates/master/src/server.rs` | A test submits a task and downloads its output through a ticket, and a client without a secret is refused | Planned |
 | W8 | Tool probes, `require:tool=`, and `cargo build --offline` in `RustCompilation`. Roadmap WS-4, FEAT-10 | `crates/core/src/capabilities.rs`, `crates/core/src/placement.rs`, `crates/worker/src/runner.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs` | The FEAT-10 "Done when" passes, and a `require:tool=cargo` task avoids a worker without cargo | Planned |
@@ -400,3 +400,16 @@ off by default until FEAT-3 is Implemented.
   in `candidates` wins over affinity). `admit_blob_task` (`crates/master/src/server.rs`) and
   `repin_recovered_blobs` (`crates/master/src/queue.rs`) resolve and pin `WorkspaceSource::Tree`
   manifests and their listed file blobs.
+- 2026-11-09: W5 done in protocol version 7. `ClientMessage::ListWorkspaces` and
+  `ClientResponse::Workspaces { workspaces: Vec<WorkspaceAffinity> }` (`WorkspaceAffinity { name,
+  worker, last_used_utc }` in `crates/core/src/task.rs`) are appended last to `ClientMessage` and
+  `ClientResponse` (and their `Human*` / `Binary*` mirrors), answered from `TaskQueue::list_workspaces`
+  in `crates/master/src/server.rs`, and recorded in `crates/core/tests/data/wire_layout.txt`.
+  `oxideswarm submit` (`crates/cli/src/cli_app.rs`) adds `--workspace`, `--sync`, `--no-sync`,
+  `--cwd`, `--workspace-max-files` and `--workspace-max-mb` (with `1,800` s default timeout when
+  `--workspace` is set and `--timeout-secs` is omitted), plus the `oxideswarm workspaces [--json]`
+  subcommand. `oxideswarm mcp` (`crates/cli/src/mcp.rs`) adds `--workspace-max-files` and
+  `--workspace-max-mb`, the `workspace: { name, sync_dir, cwd }` property on `submit` (refusing
+  `workspace` together with `files` with JSON-RPC `-32602`, confining `sync_dir` to the MCP working
+  directory without symbolic links, and returning `workspace: { name, worker, files, uploaded_bytes,
+  skipped }` in the `submit` reply), and the `workspaces` MCP tool.

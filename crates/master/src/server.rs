@@ -3350,6 +3350,20 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                 let resp = ClientResponse::WorkerList { workers };
                 send_client_response(&mut transport, &resp).await?;
             }
+            ClientMessage::ListWorkspaces => {
+                let workspaces = queue
+                    .list_workspaces()
+                    .await
+                    .into_iter()
+                    .map(|ws| rusty_grid_core::task::WorkspaceAffinity {
+                        name: ws.name,
+                        worker: ws.worker_id,
+                        last_used_utc: ws.last_used_utc,
+                    })
+                    .collect();
+                let resp = ClientResponse::Workspaces { workspaces };
+                send_client_response(&mut transport, &resp).await?;
+            }
             ClientMessage::SubmitMapReduce { job } => {
                 let job_id = job.job_id;
                 let mut exec = std::pin::pin!(mapreduce.execute(job));

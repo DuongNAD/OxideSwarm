@@ -146,6 +146,9 @@ pub enum Commands {
     /// List active worker nodes in the grid
     Workers(WorkersArgs),
 
+    /// List persistent workspaces and their worker affinities
+    Workspaces(WorkspacesArgs),
+
     /// Execute a distributed Map/Reduce job
     Mapreduce(MapReduceArgs),
 
@@ -740,6 +743,47 @@ pub struct SubmitArgs {
     )]
     pub output_dir: Option<PathBuf>,
 
+    #[arg(
+        long = "workspace",
+        value_name = "NAME",
+        help = "Command and shell tasks: run in the named persistent workspace on a worker; syncs the current directory before the run unless --sync or --no-sync is given"
+    )]
+    pub workspace: Option<String>,
+
+    #[arg(
+        long = "sync",
+        value_name = "DIR",
+        help = "Workspace tasks: sync DIR into the workspace before the run instead of the current directory"
+    )]
+    pub sync: Option<PathBuf>,
+
+    #[arg(
+        long = "no-sync",
+        help = "Workspace tasks: run in the workspace as it is, without syncing a local directory"
+    )]
+    pub no_sync: bool,
+
+    #[arg(
+        long = "cwd",
+        value_name = "REL",
+        help = "Workspace command tasks: working directory inside the workspace for --command"
+    )]
+    pub cwd: Option<String>,
+
+    #[arg(
+        long = "workspace-max-files",
+        value_name = "N",
+        help = "Workspace tasks: maximum files one workspace sync may scan (default: 100000)"
+    )]
+    pub workspace_max_files: Option<usize>,
+
+    #[arg(
+        long = "workspace-max-mb",
+        value_name = "MB",
+        help = "Workspace tasks: maximum megabytes one workspace sync may scan (default: 2048)"
+    )]
+    pub workspace_max_mb: Option<u64>,
+
     #[arg(last = true, help = "Command arguments (trailing args after --)")]
     pub args: Vec<String>,
 
@@ -820,6 +864,21 @@ pub struct ResultArgs {
 
 #[derive(Parser, Debug, Clone)]
 pub struct WorkersArgs {
+    #[arg(
+        long,
+        help = "Address of the Master's grid port (default 127.0.0.1:8088); a bare host gets :8088; 'auto' discovers it on the LAN"
+    )]
+    pub master: Option<String>,
+
+    #[arg(long, help = "Format output as JSON")]
+    pub json: bool,
+
+    #[arg(long, help = INSECURE_PEER_HELP)]
+    pub insecure: bool,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct WorkspacesArgs {
     #[arg(
         long,
         help = "Address of the Master's grid port (default 127.0.0.1:8088); a bare host gets :8088; 'auto' discovers it on the LAN"
@@ -1005,6 +1064,7 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
         Commands::Cancel(args) => run_cancel(args, config_file, secret_opts).await,
         Commands::Result(args) => run_result(args, config_file, secret_opts).await,
         Commands::Workers(args) => run_workers(args, config_file, secret_opts).await,
+        Commands::Workspaces(args) => run_workspaces(args, config_file, secret_opts).await,
         Commands::Mapreduce(args) => run_mapreduce(args, config_file, secret_opts).await,
         Commands::Doctor(args) => run_doctor_command(args, config_file, secret_opts).await,
         Commands::Secret(args) => run_secret(args, &secret_opts, config_file.as_ref()),
@@ -2301,6 +2361,21 @@ pub fn validate_glb_header(raw: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Validates and normalizes `--cwd` / `workspace.cwd` relative to the workspace root.
+/// `"."` (or `"./"`, `".\\"`) resolves to `None` (the workspace root itself).
+pub(crate) fn normalize_workspace_cwd(raw: &str) -> Result<Option<PathBuf>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Working directory inside workspace cannot be empty".to_string());
+    }
+    let slash_norm = trimmed.replace('\\', "/");
+    if slash_norm == "." || slash_norm.trim_matches('/') == "." {
+        return Ok(None);
+    }
+    let validated = rusty_grid_core::task::validate_relative_sandbox_path(trimmed)?;
+    Ok(Some(PathBuf::from(validated)))
+}
+
 /// Builds the task spec `submit` sends from its flags, reading `--stdin-file` / `--script-file`;
 /// an error names the flag at fault. Nothing is sent before this succeeds.
 ///
@@ -2389,6 +2464,43 @@ pub fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
     if args.output_dir.is_some() && args.outputs.is_empty() {
         return Err("--output-dir requires at least one --output pattern".to_string());
     }
+    if args.sync.is_some() && args.workspace.is_none() {
+        return Err("--sync requires --workspace <NAME>".to_string());
+    }
+    if args.no_sync && args.workspace.is_none() {
+        return Err("--no-sync requires --workspace <NAME>".to_string());
+    }
+    if args.sync.is_some() && args.no_sync {
+        return Err("--sync cannot be combined with --no-sync".to_string());
+    }
+    if args.cwd.is_some() && args.workspace.is_none() {
+        return Err("--cwd requires --workspace <NAME>".to_string());
+    }
+    if args.cwd.is_some() && !is_command {
+        return only_for("--cwd", "command");
+    }
+    if args.workspace_max_files == Some(0) {
+        return Err("--workspace-max-files must be at least 1 (got 0)".to_string());
+    }
+    if args.workspace_max_mb == Some(0) {
+        return Err("--workspace-max-mb must be at least 1 MiB (got 0)".to_string());
+    }
+    if let Some(ref ws_name) = args.workspace {
+        if !is_command && kind != "shell" {
+            return only_for("--workspace", "command and shell");
+        }
+        rusty_grid_core::task::validate_workspace_name(ws_name)?;
+        if !args.inputs.is_empty() {
+            return Err(
+                "--workspace cannot be combined with --input (or --file); sync the files into the workspace instead"
+                    .to_string(),
+            );
+        }
+    }
+    let working_dir = match &args.cwd {
+        Some(raw_cwd) => normalize_workspace_cwd(raw_cwd).map_err(|e| format!("--cwd: {e}"))?,
+        None => None,
+    };
     let env = parse_env_pairs(&args.env)?;
 
     match kind.as_str() {
@@ -2550,7 +2662,7 @@ pub fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
                 program,
                 args: cmd_args,
                 env,
-                working_dir: None,
+                working_dir,
                 stdin,
             })
         }
@@ -2752,6 +2864,42 @@ async fn run_submit_with_secret(
         eprintln!("Warning: --input skips {skipped}");
     }
 
+    let (workspace_ref, workspace_scan) = match &args.workspace {
+        Some(ws_name) => {
+            if args.no_sync {
+                (
+                    Some(rusty_grid_core::task::WorkspaceRef::new(ws_name.clone())),
+                    None,
+                )
+            } else {
+                let limits = crate::blobs::WorkspaceLimits {
+                    max_files: args
+                        .workspace_max_files
+                        .unwrap_or(crate::blobs::DEFAULT_WORKSPACE_MAX_FILES),
+                    max_bytes: args
+                        .workspace_max_mb
+                        .map(|mb| mb.saturating_mul(MIB))
+                        .unwrap_or(crate::blobs::DEFAULT_WORKSPACE_MAX_BYTES),
+                };
+                let sync_dir = args.sync.as_deref().unwrap_or(Path::new("."));
+                let scan = match crate::blobs::scan_workspace_source(sync_dir, limits) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                for skipped in &scan.prepared.skipped {
+                    eprintln!("Warning: --workspace skips {skipped}");
+                }
+                let ws_ref = rusty_grid_core::task::WorkspaceRef::new(ws_name.clone())
+                    .with_tree(scan.manifest_id, scan.manifest_len);
+                (Some(ws_ref), Some(scan))
+            }
+        }
+        None => (None, None),
+    };
+
     let output_globs = if !args.outputs.is_empty() {
         if let Err(e) = rusty_grid_core::blob::validate_output_patterns(&args.outputs) {
             eprintln!("--output: {e}");
@@ -2823,11 +2971,12 @@ async fn run_submit_with_secret(
     }
 
     let is_gpu = args.gpu || args.task_type.eq_ignore_ascii_case("gpu") || spec.requires_gpu();
+    let default_timeout_secs = if args.workspace.is_some() { 1800 } else { 60 };
     let timeout_secs = resolve_u64(
         args.timeout_secs,
         &[],
         submit_cfg.as_ref().and_then(|s| s.timeout_secs),
-        60,
+        default_timeout_secs,
     )
     .max(1);
     let requirements = TaskRequirements {
@@ -2839,7 +2988,32 @@ async fn run_submit_with_secret(
     };
 
     // Only the input blobs the master lacks are sent, on a connection of their own.
-    let upload = if inputs.inputs.is_empty() {
+    let upload = if let Some(ref scan) = workspace_scan {
+        let uploaded =
+            match crate::blobs::BlobConnection::connect(&master_addr, secret.as_ref()).await {
+                Ok(connection) => crate::blobs::upload_inputs(&connection, &scan.prepared).await,
+                Err(e) => Err(e.to_string()),
+            };
+        match uploaded {
+            Ok(report) => {
+                eprintln!(
+                    "Workspace '{}': {} files ({}); sent {} of {} blobs ({}), {} already on the master",
+                    args.workspace.as_deref().unwrap_or(""),
+                    scan.prepared.files,
+                    rusty_grid_worker::staging::human_bytes(scan.prepared.bytes),
+                    report.uploaded,
+                    report.blobs,
+                    rusty_grid_worker::staging::human_bytes(report.bytes),
+                    report.blobs - report.uploaded
+                );
+                Some(report)
+            }
+            Err(e) => {
+                eprintln!("Uploading the workspace files failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if inputs.inputs.is_empty() {
         None
     } else {
         let uploaded =
@@ -2867,10 +3041,13 @@ async fn run_submit_with_secret(
         }
     };
 
-    let task = Task::new(spec, requirements)
+    let mut task = Task::new(spec, requirements)
         .with_placement(&placement)
         .with_inputs(inputs.inputs)
         .with_output_globs(output_globs.clone());
+    if let Some(ws) = workspace_ref {
+        task = task.with_workspace(ws);
+    }
     let wait = args.wait || args.output.is_some() || !output_globs.is_empty();
     let submit_msg = ClientMessage::SubmitTask { task, wait };
 
@@ -3684,6 +3861,85 @@ async fn run_workers(
         insecure: args.insecure,
     };
     run_status(status_args, config_file, secret_opts).await
+}
+
+pub async fn run_workspaces(
+    args: WorkspacesArgs,
+    config_file: Option<ConfigFile>,
+    secret_opts: SecretOpts,
+) -> ExitCode {
+    let status_cfg = config_file.as_ref().and_then(|c| c.status.clone());
+    let master_addr = resolve_string(
+        args.master,
+        &["RUSTY_GRID_MASTER_ADDR", "RUSTY_GRID_MASTER"],
+        status_cfg.as_ref().and_then(|s| s.master.clone()),
+        DEFAULT_MASTER_ADDR,
+    );
+    let secret = match client_secret(
+        &secret_opts,
+        config_file.as_ref(),
+        SecretSection::Status,
+        &master_addr,
+        peer_insecure(args.insecure, status_cfg.as_ref().and_then(|s| s.insecure)),
+    ) {
+        Ok(secret) => secret,
+        Err(code) => return code,
+    };
+
+    let mut transport = match connect_master(&master_addr, secret.as_ref()).await {
+        Ok(t) => t,
+        Err(e) => {
+            return report_master_failure(
+                &master_addr,
+                secret.is_some(),
+                "Failed to connect to Master",
+                &e,
+            )
+        }
+    };
+    let had_secret = secret.is_some();
+
+    let response = match exchange(
+        &mut transport,
+        &master_addr,
+        had_secret,
+        &ClientMessage::ListWorkspaces,
+        "Failed to list workspaces",
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(code) => return code,
+    };
+
+    match response {
+        ClientResponse::Workspaces { workspaces } => {
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&workspaces).unwrap());
+            } else {
+                println!("Workspaces ({}):", workspaces.len());
+                for ws in &workspaces {
+                    println!(
+                        "- {} -> worker {} (last_used_utc: {})",
+                        ws.name, ws.worker, ws.last_used_utc
+                    );
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        ClientResponse::Error { message } => {
+            if args.json {
+                println!("{}", serde_json::json!({ "error": message }));
+            } else {
+                eprintln!("Error: {message}");
+            }
+            ExitCode::FAILURE
+        }
+        other => {
+            eprintln!("Unexpected response: {other:?}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 const MAX_MAPREDUCE_SCRIPT_BYTES: usize = 64 * 1024;

@@ -36,7 +36,10 @@ pub use protocol::{
     MessageTransport, MessageWriter, ProtocolError, WireCodec, WorkerMessage, LENGTH_FIELD_BYTES,
     MAX_FRAME_SIZE, WIRE_FORMAT_AUTH, WIRE_FORMAT_BINCODE, WIRE_FORMAT_JSON,
 };
-pub use task::{Task, TaskId, TaskRequirements, TaskResult, TaskSpec, TaskStatus};
+pub use task::{
+    Task, TaskId, TaskRequirements, TaskResult, TaskSpec, TaskStatus, WorkspaceAffinity,
+    WorkspaceRef, WorkspaceSource,
+};
 
 #[cfg(test)]
 mod tests {

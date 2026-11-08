@@ -269,6 +269,7 @@ async fn test_mcp_server_full_lifecycle_and_stdout_hygiene() {
     assert!(tool_names.contains(&"submit"));
     assert!(tool_names.contains(&"task_result"));
     assert!(tool_names.contains(&"doctor"));
+    assert!(tool_names.contains(&"workspaces"));
 
     // 5. Call tool: status
     mcp.send_line(
@@ -1255,4 +1256,317 @@ echo FINAL_SUMMARY_MARKER_MCP2_OK
         actual_hash, expected_hash,
         "downloaded 1 MiB binary must match expected BLAKE3 hash without UTF-8 corruption"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_mcp_server_workspace_submission_and_workspaces_tool() {
+    use rusty_grid_core::capabilities::WorkerCapabilities;
+    use rusty_grid_core::cluster_auth::client_handshake;
+    use rusty_grid_core::protocol::{
+        MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage,
+        PROTOCOL_VERSION_CURRENT,
+    };
+    use rusty_grid_core::task::{TaskSpec, WorkspaceSource};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use uuid::Uuid;
+
+    let cluster = TestCluster::spawn(0x7D).await;
+    let home = tempfile::tempdir().expect("temp home");
+
+    // Populate a small workspace tree inside `home` with `.gitignore` excluding `/target/`.
+    std::fs::create_dir_all(home.path().join("src")).unwrap();
+    std::fs::create_dir_all(home.path().join("target")).unwrap();
+    std::fs::write(
+        home.path().join("Cargo.toml"),
+        b"[package]\nname = \"ws-e2e\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(home.path().join(".gitignore"), b"/target/\n").unwrap();
+    std::fs::write(
+        home.path().join("src/lib.rs"),
+        b"pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
+    std::fs::write(home.path().join("target/ignored.o"), b"ignored-artifact").unwrap();
+
+    // Connect a worker session that advertises `ProtocolCapabilities::WORKSPACES`.
+    let ws_worker_id = Uuid::new_v4();
+    let stream = tokio::net::TcpStream::connect(&cluster.master_addr)
+        .await
+        .expect("connect workspace worker");
+    let mut worker_transport = MessageTransport::new(stream);
+    client_handshake(
+        &mut worker_transport,
+        &cluster.secret,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("workspace worker handshake");
+
+    let mut caps = WorkerCapabilities::new("ws-worker-e2e", 4, 4096, false);
+    caps.tags = vec!["os:macos".to_string(), "arch:aarch64".to_string()];
+    worker_transport
+        .send_msg(&WorkerMessage::Register {
+            worker_id: ws_worker_id,
+            capabilities: caps,
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            supported_features: ProtocolCapabilities::all_supported()
+                | ProtocolCapabilities::WORKSPACES,
+            running_tasks: Vec::new(),
+        })
+        .await
+        .expect("send Register");
+    match worker_transport
+        .recv_msg::<MasterMessage>()
+        .await
+        .expect("recv Registered")
+    {
+        Some(MasterMessage::Registered { .. }) => {}
+        other => panic!("expected MasterMessage::Registered, got {other:?}"),
+    }
+
+    let assigned_tasks: Arc<Mutex<Vec<rusty_grid_core::task::Task>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let assigned_tasks_clone = Arc::clone(&assigned_tasks);
+    let worker_loop = tokio::spawn(async move {
+        while let Ok(Some(msg)) = worker_transport.recv_msg::<MasterMessage>().await {
+            if let MasterMessage::AssignTask { task } = msg {
+                let task_id = task.id;
+                let ws_name = task
+                    .workspace
+                    .as_ref()
+                    .map(|w| w.name.clone())
+                    .unwrap_or_default();
+                let cwd = match &task.spec {
+                    TaskSpec::Command { working_dir, .. } => working_dir.clone(),
+                    _ => None,
+                };
+                assigned_tasks_clone.lock().await.push(*task);
+                let stdout = format!("ws={ws_name} cwd={cwd:?}\n").into_bytes();
+                let _ = worker_transport
+                    .send_msg(&WorkerMessage::TaskResult {
+                        worker_id: ws_worker_id,
+                        task_id,
+                        exit_code: 0,
+                        stdout: stdout.into(),
+                        stderr: Vec::new().into(),
+                        execution_time_ms: 15,
+                        is_gpu_executed: false,
+                        device_name: None,
+                        error: None,
+                        asset_bytes: None,
+                        artifacts: Vec::new(),
+                        outputs: Vec::new(),
+                    })
+                    .await;
+            }
+        }
+    });
+
+    let mut mcp = McpProcess::spawn(home.path(), &cluster.master_addr, Some(&cluster.secret_hex));
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {} },
+                "clientInfo": { "name": "ws-e2e-agent", "version": "1.0.0" }
+            }
+        })
+        .to_string(),
+    );
+    let _ = mcp.read_json_response();
+
+    // 1. `workspaces` is empty before any workspace task completes.
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "workspaces",
+                "arguments": {}
+            }
+        })
+        .to_string(),
+    );
+    let ws_empty_resp = mcp.read_json_response();
+    assert_eq!(ws_empty_resp["result"]["isError"], false);
+    let ws_empty_arr: Vec<Value> = serde_json::from_str(
+        ws_empty_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(ws_empty_arr.is_empty());
+
+    // 2. Passing `workspace` together with `files` is refused with JSON-RPC -32602.
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "submit",
+                "arguments": {
+                    "type": "command",
+                    "command": "cargo",
+                    "files": ["Cargo.toml"],
+                    "workspace": {
+                        "name": "oxideswarm"
+                    }
+                }
+            }
+        })
+        .to_string(),
+    );
+    let conflict_resp = mcp.read_json_response();
+    assert_eq!(conflict_resp["id"], 3);
+    assert_eq!(conflict_resp["error"]["code"], -32602);
+
+    // 3. Submit a workspace task syncing `.` with `cwd: "src"` and no explicit `timeout_secs`.
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "submit",
+                "arguments": {
+                    "type": "command",
+                    "command": "cargo",
+                    "args": ["test", "--lib"],
+                    "workspace": {
+                        "name": "oxideswarm",
+                        "sync_dir": ".",
+                        "cwd": "src"
+                    },
+                    "wait": true
+                }
+            }
+        })
+        .to_string(),
+    );
+    let submit_resp = mcp.read_json_response();
+    assert_eq!(
+        submit_resp["result"]["isError"], false,
+        "workspace submit failed: {submit_resp:?}"
+    );
+    let submit_body: Value = serde_json::from_str(
+        submit_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(submit_body["exit_code"], 0);
+    assert!(submit_body["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("ws=oxideswarm"));
+    assert_eq!(submit_body["workspace"]["name"], "oxideswarm");
+    assert_eq!(submit_body["workspace"]["worker"], ws_worker_id.to_string());
+    assert_eq!(submit_body["workspace"]["files"], 3);
+    assert!(submit_body["workspace"]["uploaded_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(submit_body["workspace"]["skipped"], 0);
+
+    {
+        let tasks = assigned_tasks.lock().await;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].requirements.timeout_secs, 1800);
+        let ws = tasks[0].workspace.as_ref().expect("workspace spec");
+        assert_eq!(ws.name, "oxideswarm");
+        assert!(matches!(ws.source, Some(WorkspaceSource::Tree { .. })));
+        match &tasks[0].spec {
+            TaskSpec::Command { working_dir, .. } => {
+                assert_eq!(*working_dir, Some(PathBuf::from("src")));
+            }
+            other => panic!("expected Command spec, got {other:?}"),
+        }
+    }
+
+    // 4. Submit a workspace task with `sync_dir: null` (no sync).
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "submit",
+                "arguments": {
+                    "type": "command",
+                    "command": "cargo",
+                    "args": ["check"],
+                    "workspace": {
+                        "name": "oxideswarm",
+                        "sync_dir": null
+                    },
+                    "wait": true
+                }
+            }
+        })
+        .to_string(),
+    );
+    let nosync_resp = mcp.read_json_response();
+    assert_eq!(nosync_resp["result"]["isError"], false);
+    let nosync_body: Value = serde_json::from_str(
+        nosync_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(nosync_body["workspace"]["name"], "oxideswarm");
+    assert_eq!(nosync_body["workspace"]["worker"], ws_worker_id.to_string());
+    assert_eq!(nosync_body["workspace"]["files"], 0);
+    assert_eq!(nosync_body["workspace"]["uploaded_bytes"], 0);
+    assert_eq!(nosync_body["workspace"]["skipped"], 0);
+
+    // 5. Query the `workspaces` MCP tool and CLI subcommand: both report the recorded affinity.
+    mcp.send_line(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "workspaces",
+                "arguments": {}
+            }
+        })
+        .to_string(),
+    );
+    let ws_resp = mcp.read_json_response();
+    assert_eq!(ws_resp["result"]["isError"], false);
+    let ws_arr: Vec<Value> =
+        serde_json::from_str(ws_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(ws_arr.len(), 1);
+    assert_eq!(ws_arr[0]["name"], "oxideswarm");
+    assert_eq!(ws_arr[0]["worker"], ws_worker_id.to_string());
+    assert!(ws_arr[0]["last_used_utc"].as_u64().unwrap() > 0);
+
+    let cli_out = mcp_command(home.path())
+        .args([
+            "--secret",
+            &cluster.secret_hex,
+            "workspaces",
+            "--master",
+            &cluster.master_addr,
+            "--json",
+        ])
+        .output()
+        .expect("run oxideswarm workspaces --json");
+    assert!(
+        cli_out.status.success(),
+        "workspaces CLI failed: {}",
+        String::from_utf8_lossy(&cli_out.stderr)
+    );
+    let cli_arr: Vec<Value> = serde_json::from_slice(&cli_out.stdout).unwrap();
+    assert_eq!(cli_arr.len(), 1);
+    assert_eq!(cli_arr[0]["name"], "oxideswarm");
+    assert_eq!(cli_arr[0]["worker"], ws_worker_id.to_string());
+    assert!(cli_arr[0]["last_used_utc"].as_u64().unwrap() > 0);
+
+    worker_loop.abort();
 }

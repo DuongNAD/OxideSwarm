@@ -375,9 +375,14 @@ or `~/.oxideswarm/cluster.secret`.
 
 # Inspect the grid, fetch task results, or cancel a task
 ./target/release/oxideswarm workers --master 127.0.0.1:8088
+./target/release/oxideswarm workspaces --master 127.0.0.1:8088
 ./target/release/oxideswarm status --master 127.0.0.1:8088 --json
 ./target/release/oxideswarm result <TASK_ID> --wait --output-dir out/
 ./target/release/oxideswarm cancel <TASK_ID>
+
+# Persistent agent workspaces: sync a project tree once and reuse its build directory across runs
+./target/release/oxideswarm submit --workspace oxideswarm --wait --command cargo -- test -p rusty_grid_core --lib
+./target/release/oxideswarm submit --workspace oxideswarm --no-sync --cwd crates/core --wait --command cargo -- test --lib
 ./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --mapper word_count --reducer sum
 # `--mapper` / `--reducer` ship local .sh scripts to workers; `--map-cmd` / `--reduce-cmd` run scripts/binaries that are already on every worker
 ./target/release/oxideswarm mapreduce --master 127.0.0.1:8088 --input data.txt --mapper ./map.sh --reducer ./reduce.sh
@@ -493,7 +498,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--cores <N>` | `1` | Minimum CPU cores required on the assigned worker |
 | `--ram-mb <MB>` (alias `--ram`) | `0` | Minimum RAM in megabytes required on the assigned worker |
 | `--gpu` | `false` | Require a worker that advertises a GPU |
-| `--timeout-secs <SECS>` | `60` (`[submit].timeout_secs`) | Task execution timeout in seconds |
+| `--timeout-secs <SECS>` | `60` (`1800` with `--workspace`; `[submit].timeout_secs`) | Task execution timeout in seconds |
 | `--max-retries <N>` | Master default | Maximum execution retries for this task |
 | `--wait` | `false` (implied by `--output` and `-o`) | Wait synchronously for task completion and print output |
 | `--json` | `false` | Emit submission/result output as JSON |
@@ -507,6 +512,12 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--interpreter <PROG>` | `sh` / `cmd.exe` | Shell tasks: run the script with `<PROG>` (e.g. `python3`, `bash`) |
 | `--env <KEY=VALUE>` | Repeatable | Set an environment variable in the task process |
 | `--input <LOCAL[:SANDBOX]>` (alias `--file`) | Repeatable | Stage a local file or directory into the worker's task sandbox (deduplicated via blob store) |
+| `--workspace <NAME>` | — | Run the task inside a persistent named workspace (`[a-z0-9][a-z0-9._-]{0,63}`) on a `--workspaces` worker (mutually exclusive with `--input`) |
+| `--sync <DIR>` | Current directory (`.` when `--workspace` is set) | Local directory to sync into `--workspace` before execution |
+| `--no-sync` | `false` | Run inside `--workspace` as it already exists on the worker without syncing local files |
+| `--cwd <REL>` | Workspace root | Relative working directory inside `--workspace` for `--command` tasks |
+| `--workspace-max-files <N>` | `100000` | Maximum file count scanned when syncing a `--workspace` source tree |
+| `--workspace-max-mb <MB>` | `2048` | Maximum total megabytes scanned when syncing a `--workspace` source tree |
 | `--output <PATTERN>` (alias `--expected-output`) | Repeatable | Glob/path pattern of sandbox files to collect after execution (implies `--wait`) |
 | `--output-dir <DIR>` | Current directory | Local directory where collected `--output` files are written |
 | `--matrix-dim <N>` | `64` | GPU tasks: square matrix dimension $N \times N$ (up to `8192` on physical GPU, `2048` on simulated GPU) |
@@ -529,6 +540,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | :--- | :--- | :--- |
 | `oxideswarm status` | `--master <ADDR\|auto>`, `--task-id <UUID>` (alias `--task`), `--workers`, `--json`, `--insecure` | Query cluster summary metrics, a specific task's status (`--task-id`), or connected workers (`--workers`) |
 | `oxideswarm workers` | `--master <ADDR\|auto>`, `--json`, `--insecure` | List connected workers with OS/arch, cores, RAM, GPU, tags, and running task counts |
+| `oxideswarm workspaces` | `--master <ADDR\|auto>`, `--json`, `--insecure` | List persistent agent workspaces and the worker affinity recorded for each workspace (`name`, `worker`, `last_used_utc`) |
 | `oxideswarm result <ID>` | `<ID>`, `--master <ADDR\|auto>`, `-w` / `--wait`, `--json`, `--output-dir <DIR>`, `--insecure` | Fetch stdout/stderr, exit code, and output blobs for task `<ID>` |
 | `oxideswarm cancel <ID>` | `<ID>`, `--master <ADDR\|auto>`, `--json`, `--insecure` | Cancel a queued or running task `<ID>` and terminate its worker process tree |
 | `oxideswarm mapreduce` | `--master <ADDR\|auto>`, `--input <FILE_OR_TEXT>` (required, repeatable), `--mapper <NAME_OR_SCRIPT>` (default `word_count`), `--map-cmd <CMD>`, `--reducer <NAME_OR_SCRIPT>` (default `sum`), `--reduce-cmd <CMD>`, `--chunks <N>` (default `4`), `--timeout-secs <SECS>` (default `60`, `[submit].timeout_secs`), `--json`, `--insecure` | Partition inputs across workers, run built-in (`word_count`, `line_count`, `identity` / `sum`, `count`, `max`, `min`, `concat`), local script (`--mapper` / `--reducer`), or worker command (`--map-cmd` / `--reduce-cmd`) stages |
@@ -538,7 +550,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `oxideswarm secret join-token` | `--master <HOST:PORT>`, `--p2p-ticket <TICKET>`, `--p2p-ticket-file <PATH>` | Print a join token (`oxs1-join:...`: the master address, an optional P2P ticket and the cluster secret, with an integrity tag) to stdout, with a warning on stderr. The token is as sensitive as the secret. Without `--master`, the `[master] listen` of the config file is used unless it is a wildcard |
 | `oxideswarm join` | `--replace-secret`, `--replace-master`, `--expect-workers <N>` (default `0`), `--no-doctor` | Read a join token from **standard input** (piped, or pasted at a no-echo prompt on a terminal; an argument is refused), save the secret at mode `0600` (Windows: owner-only ACL) and the master address in `~/.oxideswarm/rusty-grid.toml` (edited in place, comments kept, a private `.bak-<time>` backup first, never through a symlink), refuse a different secret configured via `OXIDESWARM_SECRET*`, `--secret*` or the config file, refuse to replace a different secret without `--replace-secret` or a different master or ticket without `--replace-master`, then run the doctor checks and exit with their status. Design: [docs/design/0048-join-token.md](docs/design/0048-join-token.md) |
 | `oxideswarm mode [MODE] [ACTION]` | `[MODE]` (`test`, `dev`, `doc`, `research`), `[ACTION]`, `-a` / `--action-opt <ACTION>`, `--iterations <N>` (default `5`), `--port <PORT>` (`RUSTY_GRID_DASHBOARD_PORT`; without `--port`, `dev status` probes `.dev_cluster.json` then `8080`), `-i` / `--interactive`, `--json` | Run or inspect workflow modes (`test`, `dev`, `doc`, `research`) or open the interactive menu (`--interactive`) |
-| `oxideswarm mcp` | `--master <ADDR\|auto>`, `--insecure` | Run the Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio |
+| `oxideswarm mcp` | `--master <ADDR\|auto>`, `--workspace-max-files <N>` (default `100000`), `--workspace-max-mb <MB>` (default `2048`), `--insecure` | Run the Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio |
 
 #### `agent-mesh` CLI Subcommands (`crates/agent_mesh`)
 | Subcommand | Flags | Description |
