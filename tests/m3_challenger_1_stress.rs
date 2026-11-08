@@ -84,13 +84,17 @@ fn create_test_runner_with_cap(
 // 1. Path Traversal & Isolation Attack Tests
 // =========================================================================
 
-/// Every file and directory below `root`, as sorted relative paths (symlinks are not followed).
+/// Every file and directory below `root`, as sorted relative paths (symlinks are not followed;
+/// the worker's `.locks` infrastructure directory is ignored).
 fn tree_listing(root: &Path) -> Vec<String> {
     fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in entries.flatten() {
+            if entry.file_name() == ".locks" {
+                continue;
+            }
             let path = entry.path();
             out.push(
                 path.strip_prefix(root)
