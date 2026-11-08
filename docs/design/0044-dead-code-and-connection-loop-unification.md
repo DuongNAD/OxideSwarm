@@ -33,15 +33,18 @@ What exists at `master` `01a9786`:
 ## Goals
 
 - **G1** Every symbol and file listed in `FEAT-11` (`docs/BACKLOG.md:1223-1235`) either has a
-  production caller or is removed.
+  production caller, is removed, or (for `compute_intensity` on the wire) is deprecated until the
+  next breaking protocol bump.
 - **G2** TCP and 2-lane QUIC worker sessions share one session state machine (`WorkerSession` in
   `crates/master/src/session.rs`), with one implementation of authentication, registration,
   inbound message dispatch, and disconnect cleanup.
 - **G3** When a worker starts with `keep_sandboxes == false`, `SandboxConfig::ensure_usable` sweeps
   leftover `<base_dir>/<task_id>` directories from crashed runs without deleting a sandbox that
-  another live worker on the same host is using.
+  another live worker on the same host is using, even if the running task deletes everything inside
+  its own sandbox directory.
 - **G4** `gen3d` and `autorig` compile only when the opt-in Cargo feature `3d` is enabled
-  (`docs/ROADMAP.md` decision Q2).
+  (`docs/ROADMAP.md` decision Q2), CI still lints and tests the `3d` feature, and the master does
+  not place 3D tasks onto workers built without `3d`.
 
 ## Non-goals
 
@@ -51,6 +54,8 @@ What exists at `master` `01a9786`:
   session entry point simply makes `W7` a one-line branch in the P2P accept path.
 - Implementing real master failover (`FEAT-6`, Phase E).
 - Changing `TaskSpec::Generative3D` or `TaskSpec::AutoRig` wire definitions in `rusty_grid_core`.
+- Forcing a breaking protocol version bump solely to drop `compute_intensity` from the wire in
+  `FEAT-11`.
 
 ## Design
 
@@ -74,14 +79,22 @@ What exists at `master` `01a9786`:
    - Call `auto_rig_mesh_async` from `TaskRunner::execute_auto_rig_workload`
      (`crates/worker/src/runner.rs:2424-2477`) so production execution and
      `crates/worker/tests/test_challenger_m3_blender_job_object.rs` go through the same function.
-5. **Remove `compute_intensity` from `TaskSpec::GpuCompute`:**
-   - Remove `compute_intensity: u32` from `TaskSpec::GpuCompute` (`crates/core/src/task.rs:1046`)
-     and `BinaryTaskSpec::GpuCompute` (`:1157`), plus its conversions in `task.rs:1211-1421` and
-     call sites in `crates/cli/src/cli_app.rs:2399`, `crates/cli/src/mcp.rs:1735`,
-     `crates/cli/src/doctor.rs:506`, and `crates/agent_mesh/src/bridge.rs:196-215`.
-   - Bump `PROTOCOL_VERSION_CURRENT` and `PROTOCOL_VERSION_MIN_COMPATIBLE` by 1 and regenerate
-     `crates/core/src/wire_layout.txt` with `UPDATE_WIRE_LAYOUT=1` (as enforced by `FEAT-8`,
-     [design 0040](0040-protocol-versioning.md)).
+5. **Deprecate `compute_intensity` on `TaskSpec::GpuCompute` without a wire break:**
+   - After `FEAT-8` ([design 0040](0040-protocol-versioning.md)) and `DEPLOYMENT.md` 3.5, every
+     bincode layout change to `TaskSpec` forces a breaking `PROTOCOL_VERSION_CURRENT` bump that
+     makes old peers refuse each other.
+   - Keep `compute_intensity: u32` on the wire in `TaskSpec::GpuCompute`
+     (`crates/core/src/task.rs:1046`), `HumanTaskSpec::GpuCompute` (`:1100`), and
+     `BinaryTaskSpec::GpuCompute` (`:1157`) so `crates/core/tests/data/wire_layout.txt` is
+     unchanged, and mark `compute_intensity` `#[deprecated]` in `crates/core/src/task.rs` (adding
+     `#[allow(deprecated)]` on the internal mirror conversions in `task.rs:1211-1421` and in
+     `crates/core/src/wire_layout_tests.rs:235-243`).
+   - Stop setting `compute_intensity` from the CLI (`crates/cli/src/cli_app.rs:2399`), MCP
+     (`crates/cli/src/mcp.rs:1735`), `doctor` (`crates/cli/src/doctor.rs:506`), and `agent_mesh`
+     (`crates/agent_mesh/src/bridge.rs:196-215`), passing `0` internally under
+     `#[allow(deprecated)]`.
+   - Remove `compute_intensity` from the wire in the same release as the next required protocol
+     version bump: `W1` of [design 0039](0039-agent-workspaces.md).
 
 ### D2 Prune `crates/core/src/arbitrage.rs`
 
@@ -135,9 +148,9 @@ Create `crates/master/src/session.rs` and replace the duplicated worker bodies o
      `capabilities.cpu_cores > 0`), refuses `WorkerMessage::ClaimMasterRole` via
      `reject_master_role_claim`, and rejects any other initial variant. Refusal frames use
      `send_refusal_and_drain` when `p2p_conn.is_some()` and `send_msg` otherwise.
-   - Calls `registry.register_session`, attaches `rx_clock`, runs `failover_superseded_session` if
-     `registration.superseded_session` is `Some`, registers `P2pConnGuard` if `p2p_conn` is
-     present, sends `MasterMessage::RegisterAck`, and broadcasts
+   - Calls `registry.register_session`, attaches `rx_clock`, spawns `failover_superseded_session`
+     in its own detached task if `registration.superseded_session` is `Some`, registers
+     `P2pConnGuard` if `p2p_conn` is present, sends `MasterMessage::RegisterAck`, and broadcasts
      `DashboardStreamMessage::WorkerRegistered`.
 3. **Active session lanes (`ActiveLanes`):**
    - `ActiveLanes::Single`: splits `transport` into `reader` and `writer`, spawns one outbound
@@ -165,108 +178,224 @@ Create `crates/master/src/session.rs` and replace the duplicated worker bodies o
      single cleanup block (`handle_worker_disconnect_with_broadcast`, `P2pConnGuard::unlist`, and
      dropping the `AbortOnDrop` writer guards).
 
+#### Preserved invariants
+
+Every invariant of the existing TCP and QUIC session handlers is preserved and verified by its
+existing guard test(s):
+
+- **A failover sweep of session `s` also takes every older session (`<= s`) of that worker:**
+  guarded by `queue::tests::test_sweep_of_a_later_session_recovers_tasks_stranded_on_an_older_one`
+  (`crates/master/src/queue.rs:2924`) and
+  `test_a_third_registration_of_a_worker_id_leaves_no_task_on_a_dead_session`
+  (`tests/master_failover_cancel_liveness.rs:409`).
+- **A connection handler that a newer registration aborted never sweeps the new session:**
+  guarded by `registry::tests::test_registry_session_isolation_on_reconnect`
+  (`crates/master/src/registry.rs:1219`),
+  `queue::tests::test_session_scoped_failover_spares_the_newer_session`
+  (`crates/master/src/queue.rs:2891`),
+  `test_reregistering_worker_id_fails_over_the_superseded_session_exactly_once`
+  (`tests/master_failover_cancel_liveness.rs:299`), and
+  `test_a_restarted_worker_keeps_its_identity_at_the_master`
+  (`tests/worker_connection_lifecycle.rs:904`).
+- **The supersede sweep (`failover_superseded_session`) runs in its own spawned task:**
+  guarded by `server::tests::test_superseded_session_sweep_survives_the_abort_of_its_caller`
+  (`crates/master/src/server.rs:5162`).
+- **`BlobService` answers off the inbound loop, on the data stream:**
+  guarded by `test_adversarial_master_multiplexed_heartbeat_under_backpressured_data_lane`
+  (`tests/m2_challenger_2_stress.rs:1015`),
+  `test_adversarial_data_lane_backpressure_and_concurrent_traffic`
+  (`tests/m3_challenger_2_checkpoint_stress.rs:570`), and `tests/blob_transfer_e2e.rs`.
+- **The handshake permit is held until authentication finishes, then dropped:**
+  guarded by `test_workers_over_quic_release_the_pre_auth_slot_once_registered`
+  (`tests/master_quic_limits.rs:123`) and
+  `server::tests::test_connection_limits_keep_two_separate_budgets_and_do_not_leak_permits`
+  (`crates/master/src/server.rs:5231`).
+- **P2P refusals go through `send_refusal_and_drain` (and `drain_refusal_stream` on pre-registration
+  auth failure):**
+  guarded by `server::tests::test_p2p_handshake_refusals_delivered_over_real_iroh`
+  (`crates/master/src/server.rs:6553`).
+
 ### D5 Start-up sweep of leftover task sandboxes (`crates/worker/src/sandbox.rs`)
 
-1. **Per-sandbox advisory lock file (`.sandbox.lock`):**
-   - In `Sandbox::create` (`crates/worker/src/sandbox.rs:625`), after creating `<base_dir>/<task_id>`
-     with mode `0o700`, open `<base_dir>/<task_id>/.sandbox.lock` with `create(true).write(true)`
-     and acquire an exclusive non-blocking lock via `std::fs::File::try_lock()`. Store the locked
-     `std::fs::File` in `Sandbox { ..., lock_file: Option<std::fs::File> }`.
-   - In `Sandbox::destroy` (and `Drop`), drop `lock_file` before removing `<base_dir>/<task_id>`.
-     If the worker process is killed with `SIGKILL` or crashes, the operating system kernel closes
-     the file descriptor and releases the lock automatically.
+1. **External per-sandbox advisory lock file (`<base_dir>/.locks/<task_id>.lock`):**
+   - Lock files live in `<base_dir>/.locks/<task_id>.lock`, outside the task-writable directory
+     `<base_dir>/<task_id>/`, so a running task cannot unlink or replace its own lock file and the
+     lock file never appears in the task's directory listings or output globs.
+   - In `Sandbox::create` (`crates/worker/src/sandbox.rs:625`):
+     1. Ensure `<base_dir>/.locks` exists with mode `0o700` on Unix (verifying via
+        `symlink_metadata` that `<base_dir>/.locks` is a real directory owned by `current_euid()`).
+     2. Open `<base_dir>/.locks/<task_id>.lock` (refusing symlinks) with `create(true).write(true)`
+        and acquire an exclusive non-blocking lock via `std::fs::File::try_lock()` **before**
+        creating `<base_dir>/<task_id>`, so a concurrent sweep can never observe a newly created
+        sandbox directory that is not locked yet.
+     3. Create `<base_dir>/<task_id>` with mode `0o700` and store the locked `std::fs::File` in
+        `Sandbox { ..., lock_file: Option<std::fs::File> }`.
+   - In `Sandbox::destroy` (and `Drop`), remove `<base_dir>/<task_id>` first, then unlink
+     `<base_dir>/.locks/<task_id>.lock` and drop `lock_file`. If the worker process is killed with
+     `SIGKILL` or crashes, the operating system kernel closes the file descriptor and releases the
+     advisory lock automatically.
 2. **Start-up sweep in `SandboxConfig::ensure_usable`:**
    - When `!self.keep_sandboxes`, `SandboxConfig::ensure_usable` (`crates/worker/src/sandbox.rs:277`)
      calls `self.sweep_leftover_sandboxes().await` after `remove_legacy_staging_cache().await`.
-   - `sweep_leftover_sandboxes` iterates direct entries of `self.base_dir`:
-     - Parses the entry's file name with `uuid::Uuid::parse_str`. Non-UUID entries (`cache`,
-       `worker.id`, `.write_probe_*`, or anything else) are ignored.
+   - `sweep_leftover_sandboxes` ensures `<base_dir>/.locks` exists (`0o700`, non-symlink) and
+     iterates direct entries of `self.base_dir`:
+     - Parses the entry's file name with `uuid::Uuid::parse_str`. Non-UUID entries (`.locks`,
+       `cache`, `worker.id`, `.write_probe_*`, or anything else) are ignored.
      - Inspects the entry with `tokio::fs::symlink_metadata` and skips symbolic links,
        non-directories, or (on Unix) directories whose `uid != current_euid()`.
-     - Checks `<entry>/.sandbox.lock` via `symlink_metadata` (refusing if it is a symbolic link),
-       opens or creates it, and calls `try_lock()`.
+     - Opens or creates `<base_dir>/.locks/<task_id>.lock` (checking `symlink_metadata` to refuse
+       symbolic links) and calls `try_lock()`.
      - If `try_lock()` fails (`TryLockError::WouldBlock`), another worker process on the same host
-       is actively running that task, so the directory is left untouched.
-     - If `try_lock()` succeeds, drops the lock handle and removes `<entry>` with
-       `tokio::fs::remove_dir_all`, logging a summary count at `info!` when one or more leftover
-       sandboxes were swept.
+       is actively running (or creating) that task, so `<base_dir>/<task_id>` is left untouched even
+       if the task has deleted everything inside `<base_dir>/<task_id>`.
+     - If `try_lock()` succeeds, removes `<base_dir>/<task_id>` with `tokio::fs::remove_dir_all`,
+       unlinks `<base_dir>/.locks/<task_id>.lock`, and drops the lock handle, logging a summary
+       count at `info!` when one or more leftover sandboxes were swept.
+     - Sweeps any orphan `<task_id>.lock` file in `<base_dir>/.locks` whose `<base_dir>/<task_id>`
+       directory no longer exists and whose `try_lock()` succeeds.
+3. **Interaction with `--keep-sandboxes`:**
+   - Starting a worker with `--keep-sandboxes` (`keep_sandboxes == true`) skips both the start-up
+     sweep and `Sandbox::destroy` cleanup. A later worker start on the same `base_dir` *without*
+     `--keep-sandboxes` sweeps any unlocked `<base_dir>/<task_id>` directories that an earlier
+     `--keep-sandboxes` run kept. Document this explicitly in `README.md` next to
+     `--keep-sandboxes` (`README.md:424` and `README.md:610`).
 
 ### D6 Gate `gen3d` and `autorig` behind Cargo feature `3d`
 
-- In `crates/worker/Cargo.toml`, add `3d = []` under `[features]`. In `crates/cli/Cargo.toml`, add
-  `3d = ["rusty_grid_worker/3d"]`.
-- In `crates/worker/src/lib.rs`, gate `pub mod autorig;` and `pub mod gen3d;` with
-  `#[cfg(feature = "3d")]`.
-- In `crates/worker/src/runner.rs`, compile the full `execute_generative_3d_workload` and
-  `execute_auto_rig_workload` implementations under `#[cfg(feature = "3d")]`, and provide
-  `#[cfg(not(feature = "3d"))]` stubs that return `TaskResult::failure` with a clear message telling
-  the operator to rebuild with `--features 3d` (mirroring `spawn_real_gpu_job` when built without
-  `gpu-wgpu`).
-- Add `required-features = ["3d"]` to the 3D test targets (`test_challenger_m3_blender_job_object`,
-  `m8_challenger_stress`, `m8b_challenger_stress`, `m8_autorig_verification`) so default builds skip
-  compiling `gen3d` and `autorig`, while `--features 3d` (or `--all-features`) runs them.
+1. **Cargo feature and worker compilation:**
+   - In `crates/worker/Cargo.toml`, add `3d = []` under `[features]`. In `crates/cli/Cargo.toml`
+     and `crates/master/Cargo.toml`, add `3d = ["rusty_grid_worker/3d"]`.
+   - In `crates/worker/src/lib.rs`, gate `pub mod autorig;` and `pub mod gen3d;` with
+     `#[cfg(feature = "3d")]`.
+   - In `crates/worker/src/runner.rs`, compile the full `execute_generative_3d_workload` and
+     `execute_auto_rig_workload` implementations under `#[cfg(feature = "3d")]`, and provide
+     `#[cfg(not(feature = "3d"))]` stubs that return `TaskResult::failure` with a clear message
+     telling the operator to rebuild with `--features 3d` (mirroring `spawn_real_gpu_job` when
+     built without `gpu-wgpu`).
+2. **Cluster placement for 3D tasks (`ProtocolCapabilities::THREE_D`):**
+   - Add `ProtocolCapabilities::THREE_D = 1 << 11` in `crates/core/src/protocol.rs` (leaving
+     `1 << 10` for `0039`'s `WORKSPACES`).
+   - Include `THREE_D` in `ProtocolCapabilities::all_supported()` on the master; in
+     `crates/worker/src/client.rs`, advertise `ProtocolCapabilities::THREE_D` in
+     `WorkerMessage::Register.features` only when compiled with `#[cfg(feature = "3d")]`.
+   - In `crates/master/src/queue.rs:436` (`required_features(task)`), insert
+     `ProtocolCapabilities::THREE_D` whenever
+     `matches!(task.spec, TaskSpec::Generative3D(_) | TaskSpec::AutoRig(_))`.
+   - In a mixed cluster, a `Generative3D` or `AutoRig` task never lands on a worker built without
+     `3d`: it waits for a `3d`-capable worker with `UnschedulableReason::ClusterLacksCapability`
+     (or fails immediately with `TaskResult::failure` when `--fail-unfulfillable-tasks` is enabled).
+3. **Test targets and CI coverage:**
+   - Every test file matched by
+     `git grep -ln 'Generative3D\|TaskSpec::AutoRig\|gen3d::\|autorig::' -- 'tests/*.rs' 'crates/*/tests/*.rs'`
+     is handled according to what it tests:
+     - **Pure-3D targets (`required-features = ["3d"]` in `Cargo.toml`):**
+       - `crates/cli/tests/test_cli_3d_submission.rs`
+       - `crates/worker/tests/test_3d1_honest_sdf.rs`
+       - `crates/worker/tests/test_autorig_adversarial_stress.rs`
+       - `crates/worker/tests/test_autorig_pipeline.rs`
+       - `crates/worker/tests/test_challenger_m3_blender_job_object.rs`
+       - `crates/worker/tests/test_gen3d_adversarial_stress.rs`
+       - `crates/worker/tests/test_gen3d_pipeline.rs`
+       - `tests/test_3d_autorig_pipeline.rs`
+       - `tests/test_challenger_m5_3d_pipeline.rs`
+       - `tests/m8_challenger_stress.rs`, `tests/m8b_challenger_stress.rs`, and
+         `tests/m8_autorig_verification.rs`
+     - **Mixed targets (stay in default builds without `3d`; gate individual 3D helpers and test
+       functions with `#[cfg(feature = "3d")]`):**
+       - `crates/worker/tests/common/mod.rs` (gate 3D helper functions with `#[cfg(feature = "3d")]`)
+       - `crates/worker/tests/test_challenger_m2_job_object.rs` (gate the 3D test functions with
+         `#[cfg(feature = "3d")]`)
+       - `crates/worker/tests/test_sec5_hardened_runner.rs` (required CI job `sec5 hardened runner`:
+         gate only the 3D test functions with `#[cfg(feature = "3d")]` so non-3D hardened runner
+         tests continue running in the required job, and run the 3D tests in the `3d` CI step)
+       - `tests/test_challenger_m4_scheduler_runner.rs` (scheduler tests only construct
+         `TaskSpec::Generative3D`/`AutoRig`; gate the `TaskRunner` 3D execution tests with
+         `#[cfg(feature = "3d")]`, and update the scheduler tests to register workers with
+         `ProtocolCapabilities::THREE_D` when testing 3D placement)
+     - **Core/CLI-flag-only targets (use only `rusty_grid_core::TaskSpec`, which stays
+       unconditional; run in default builds unchanged):**
+       - `crates/cli/tests/test_bug2_cli_flags.rs`
+       - `crates/core/tests/m1_3d_adversarial_stress.rs`
+       - `crates/core/tests/m1_challenger_1_3d_serialization.rs`
+   - **CI job/step:** Add a step/job in `.github/workflows/ci.yml` that runs
+     `cargo clippy --workspace --all-targets --features 3d --locked -- -D warnings` and runs the
+     `3d` test suite (`cargo test --workspace --features 3d --locked` or the `3d`-gated test targets
+     including `test_sec5_hardened_runner --features 3d`) so the frozen 3D code never rots.
 
 ## Compatibility
 
-- Removing `compute_intensity` from `TaskSpec::GpuCompute` changes the bincode layout of `Task` and
-  `WorkerMessage::AssignTask` / `ClientMessage::SubmitTask`. Per `FEAT-8`
-  ([design 0040](0040-protocol-versioning.md)), `PROTOCOL_VERSION_CURRENT` and
-  `PROTOCOL_VERSION_MIN_COMPATIBLE` advance by 1 and `crates/core/src/wire_layout.txt` is updated
-  in the same commit.
-- Upgrade order follows `DEPLOYMENT.md` 3.5: upgrade and restart the master first, then workers and
-  CLI/MCP clients.
-- `WorkerMessage::ClaimMasterRole { ticket: MasterLeaseTicket }` is unchanged on the wire.
+- No wire format change is made in `FEAT-11`: `TaskSpec::GpuCompute::compute_intensity` remains on
+  the wire (marked `#[deprecated]`) until `0039` W1 bumps the protocol version, and
+  `WorkerMessage::ClaimMasterRole { ticket: MasterLeaseTicket }` is unchanged.
+- `ProtocolCapabilities::THREE_D` (`1 << 11`) uses the additive `features` bitfield introduced in
+  `0035`; workers built without `3d` simply omit the bit, and the master holds or refuses 3D tasks
+  until a worker advertising `THREE_D` is available.
 - On Android, `OxideWorkerBridge.kt` already lives in `com.oxideswarm.worker.runner`, so removing
   the `com.oxideswarm.worker.service` JNI symbols does not affect the APK bridge.
 
 ## Security
 
-- `sweep_leftover_sandboxes` checks `symlink_metadata` on `<base_dir>`, `<base_dir>/<uuid>`, and
-  `<base_dir>/<uuid>/.sandbox.lock`, never follows symbolic links, checks `uid == current_euid()`
-  on Unix, and touches only valid UUID-named subdirectories that are not locked by a live worker.
-- The unified `WorkerSession` preserves the pre-authentication `handshake_permit` budget,
-  `handshake_timeout` Slowloris defence, cluster-secret handshake before reading `InboundMessage`,
-  and QUIC control/data lane separation.
+- `Sandbox::create` and `sweep_leftover_sandboxes` keep advisory lock files in
+  `<base_dir>/.locks/<task_id>.lock` (`0o700`), outside `<base_dir>/<task_id>/`, acquire the lock
+  before creating `<base_dir>/<task_id>`, check `symlink_metadata` on `<base_dir>`,
+  `<base_dir>/.locks`, `<base_dir>/.locks/<task_id>.lock`, and `<base_dir>/<task_id>`, never follow
+  symbolic links, check `uid == current_euid()` on Unix, and touch only valid UUID-named
+  subdirectories whose `.locks/<task_id>.lock` is not held by a live worker.
+- The unified `WorkerSession` preserves all six session, lane, permit, and P2P refusal invariants
+  listed in D4.
 
 ## Test plan
 
 - **Unit:**
-  - `crates/core/src/wire_layout_tests.rs`: passes with the bumped protocol version and updated
-    `wire_layout.txt` after removing `compute_intensity`.
-  - `crates/master/src/session.rs` and `crates/master/src/server.rs`: existing TCP and 2-lane QUIC
-    registration, refusal, heartbeat, mobile telemetry, oversized-frame, and superseded-session
-    unit tests pass through `WorkerSession`.
+  - `crates/core/src/wire_layout_tests.rs`: passes with `crates/core/tests/data/wire_layout.txt`
+    unchanged while `TaskSpec::GpuCompute::compute_intensity` is marked `#[deprecated]`.
   - `crates/worker/src/sandbox.rs`: unit tests verifying that:
-    1. `ensure_usable` removes unlocked leftover `<base_dir>/<uuid>` directories when
-       `keep_sandboxes == false`;
-    2. `ensure_usable` leaves a live `Sandbox` (holding `.sandbox.lock`) untouched even when called
-       by a second `SandboxConfig` sharing the same `base_dir`;
-    3. `ensure_usable` leaves `<base_dir>/cache/blobs`, `worker.id`, non-UUID directories, and
-       symbolic links untouched;
-    4. `ensure_usable` removes nothing when `keep_sandboxes == true`.
-  - `cargo check --workspace --locked` and `cargo test --workspace --lib --locked` pass both with
-    default features (without `3d`) and with `--features 3d`.
-- **Integration:**
-  - `cargo test -p rusty_grid_master --test master_quic_limits --locked`
-  - `cargo test -p rusty_grid_master --test cluster_auth_e2e --locked`
-  - `cargo test -p rusty_grid_worker --test worker_connection_lifecycle --locked`
-  - `cargo test -p rusty_grid_worker --test test_challenger_m3_blender_job_object --features 3d --locked`
-- **Gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
-  `cargo check -p rusty_grid_master --no-default-features --locked`, `cargo test --workspace --lib --locked`,
-  and `cargo audit`.
+    1. `ensure_usable` removes unlocked leftover `<base_dir>/<uuid>` directories and their
+       `<base_dir>/.locks/<uuid>.lock` files when `keep_sandboxes == false`;
+    2. `ensure_usable` leaves a live `Sandbox` untouched even when a task deletes **everything**
+       inside `<base_dir>/<task_id>` and a second `SandboxConfig` sharing the same `base_dir` runs
+       `ensure_usable`;
+    3. `ensure_usable` leaves `<base_dir>/.locks`, `<base_dir>/cache/blobs`, `worker.id`, non-UUID
+       directories, and symbolic links untouched;
+    4. `ensure_usable` removes nothing when `keep_sandboxes == true`, and a subsequent
+       `ensure_usable` with `keep_sandboxes == false` sweeps those retained unlocked sandboxes.
+  - `crates/master/src/queue.rs`: unit test verifying that `Generative3D` and `AutoRig` tasks are
+    not placed on a worker registered without `ProtocolCapabilities::THREE_D` (returning
+    `UnschedulableReason::ClusterLacksCapability` or failing under `--fail-unfulfillable-tasks`),
+    and are placed once a worker with `ProtocolCapabilities::THREE_D` registers.
+  - `crates/master/src/session.rs` and `crates/master/src/server.rs`: all existing TCP and 2-lane
+    QUIC registration, refusal, heartbeat, mobile telemetry, oversized-frame, and
+    superseded-session unit tests pass through `WorkerSession`.
+- **Integration and Gates:**
+  - Default build (without `3d`): `cargo test --workspace --locked` passes without compiling
+    `gen3d` or `autorig`.
+  - `3d` CI job/step: `cargo clippy --workspace --all-targets --features 3d --locked -- -D warnings`
+    and all `3d`-gated test targets pass with `--features 3d`.
+  - For PR (d) (`F11-d`, D4 session merge): **every `[[test]]` target of `rusty_grid_master` and
+    `rusty_grid_worker`**, plus `bash test_integration.sh` and `bash run_chaos_test.sh`, must pass.
+  - Standard gates on every PR: `cargo fmt --all -- --check`,
+    `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+    `cargo check -p rusty_grid_master --no-default-features --locked`,
+    `cargo test --workspace --lib --locked`, and `cargo audit`.
 
 ## Work items
 
-| ID | Item | Files | Done when | Status |
-|---|---|---|---|---|
-| F11-1 | Delete `dashboard/index.html`, `shaders/hash.wgsl`, `DashboardState`, `Sandbox::prepare_spec`, `probe_physical_adapter`, and `TaskSpec::GpuCompute::compute_intensity`; wire `auto_rig_mesh_async` into `TaskRunner::execute_auto_rig_workload`; bump protocol version and `wire_layout.txt` | `crates/core/src/task.rs`, `crates/core/src/protocol.rs`, `crates/core/src/wire_layout.txt`, `crates/master/src/dashboard/`, `crates/worker/src/shaders/`, `crates/worker/src/sandbox.rs`, `crates/worker/src/wgpu_engine.rs`, `crates/worker/src/autorig/mod.rs`, `crates/worker/src/runner.rs`, `crates/cli/src/`, `crates/agent_mesh/src/bridge.rs` | None of the removed files/symbols exist, `auto_rig_mesh_async` is called by `execute_auto_rig_workload`, and `wire_layout_tests` passes | Planned |
-| F11-2 | Prune `crates/core/src/arbitrage.rs` to `MasterLeaseTicket` and remove unreferenced scoring/election/refusal exports | `crates/core/src/arbitrage.rs`, `crates/core/src/lib.rs`, `tests/mobile_coordination_test.rs`, `tests/m5a_challenger_2_stress.rs` | Every public item in `arbitrage.rs` has a production caller or is required by `WorkerMessage::ClaimMasterRole` | Planned |
-| F11-3 | Remove `com.oxideswarm.worker.service.OxideWorkerBridge` JNI exports and `nativeStartWorkerLegacy` | `crates/android_bridge/src/lib.rs` | Only `Java_com_oxideswarm_worker_runner_OxideWorkerBridge_*` JNI symbols are exported | Planned |
-| F11-4 | Merge TCP `handle_connection` and QUIC `handle_multiplexed_connection` into `WorkerSession` in `crates/master/src/session.rs` | `crates/master/src/session.rs`, `crates/master/src/server.rs`, `crates/master/src/lib.rs` | `server.rs` delegates both TCP and 2-lane QUIC worker sessions to `WorkerSession`, and all master/worker unit and integration tests pass | Planned |
-| F11-5 | Add `.sandbox.lock` and start-up leftover sandbox sweep in `SandboxConfig::ensure_usable` | `crates/worker/src/sandbox.rs` | Unit tests prove crashed UUID sandboxes are swept on start-up while live locked sandboxes and `cache/blobs` are preserved | Planned |
-| F11-6 | Gate `gen3d` and `autorig` behind Cargo feature `3d` (decision Q2) | `crates/worker/Cargo.toml`, `crates/worker/src/lib.rs`, `crates/worker/src/runner.rs`, `crates/cli/Cargo.toml`, `Cargo.toml` | Workspace builds and tests pass both with default features and with `--features 3d` | Planned |
+Implementation is split into four separate pull requests, opened and reviewed in this exact order:
+
+| ID | Pull Request | Scope | Files | Done when | Status |
+|---|---|---|---|---|---|
+| F11-a | PR (a): Dead-code deletions (`D1.1`–`D1.5`, `D2`, `D3`) | Delete `dashboard/index.html`, `shaders/hash.wgsl`, `DashboardState`, `Sandbox::prepare_spec`, `probe_physical_adapter`, dead `arbitrage.rs` items, and duplicate `service` JNI exports; wire `auto_rig_mesh_async` into `TaskRunner::execute_auto_rig_workload`; mark `compute_intensity` `#[deprecated]` in `task.rs` and stop setting it in CLI/MCP (no wire change; wire removal waits for `0039` W1) | `crates/core/src/task.rs`, `crates/core/src/arbitrage.rs`, `crates/core/src/lib.rs`, `crates/master/src/dashboard/`, `crates/worker/src/shaders/`, `crates/worker/src/sandbox.rs`, `crates/worker/src/wgpu_engine.rs`, `crates/worker/src/autorig/mod.rs`, `crates/worker/src/runner.rs`, `crates/cli/src/`, `crates/agent_mesh/src/bridge.rs`, `crates/android_bridge/src/lib.rs`, `tests/mobile_coordination_test.rs`, `tests/m5a_challenger_2_stress.rs` | None of the removed files/symbols exist, `auto_rig_mesh_async` is called by `execute_auto_rig_workload`, `compute_intensity` is deprecated with zero wire changes, and workspace tests pass | Planned |
+| F11-b | PR (b): Start-up sandbox sweep (`D5`) | Add `<base_dir>/.locks/<task_id>.lock` advisory locking (acquired before creating `<base_dir>/<task_id>`) and start-up leftover sandbox sweep in `SandboxConfig::ensure_usable`; document `--keep-sandboxes` interaction in `README.md` | `crates/worker/src/sandbox.rs`, `README.md` | A unit test deletes everything inside a live sandbox, runs a second `ensure_usable`, and the sandbox directory survives; unlocked crashed UUID sandboxes are swept | Planned |
+| F11-c | PR (c): Opt-in `3d` feature (`D6`) | Gate `gen3d` and `autorig` behind Cargo feature `3d`, add `ProtocolCapabilities::THREE_D` placement requirement for `Generative3D`/`AutoRig`, gate 3D test targets/functions, and add the `--features 3d` CI step | `crates/core/src/protocol.rs`, `crates/master/src/queue.rs`, `crates/master/Cargo.toml`, `crates/worker/Cargo.toml`, `crates/worker/src/lib.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/Cargo.toml`, `crates/worker/tests/`, `crates/cli/tests/`, `tests/`, `.github/workflows/ci.yml` | `cargo test --workspace` passes without `3d`, the new CI step passes with `--features 3d`, and unit tests verify 3D task placement when only a non-`3d` worker is connected | Planned |
+| F11-d | PR (d): Worker session loop merge (`D4`) | Merge TCP `handle_connection` and QUIC `handle_multiplexed_connection` into `WorkerSession` in `crates/master/src/session.rs` | `crates/master/src/session.rs`, `crates/master/src/server.rs`, `crates/master/src/lib.rs` | All six preserved invariants hold, and every `[[test]]` target of `rusty_grid_master` and `rusty_grid_worker` plus `test_integration.sh` and `run_chaos_test.sh` pass | Planned |
 
 ## Status log
 
 - 2026-11-08: Draft written from `docs/BACKLOG.md` (`FEAT-11`) and `docs/ROADMAP.md` (decision Q2)
   at `master` `01a9786`.
+- 2026-11-08: Updated per owner review (`118-fix`): moved sandbox locks to
+  `<base_dir>/.locks/<task_id>.lock` acquired before creating the sandbox directory, changed
+  `compute_intensity` from a wire removal to `#[deprecated]` until `0039` W1, added full 3D test
+  target inventory, `--features 3d` CI step, and `ProtocolCapabilities::THREE_D` placement gating,
+  documented the six preserved session invariants and full test gates for D4, noted `--keep-sandboxes`
+  sweep behavior, and split implementation into four ordered PRs (`F11-a` through `F11-d`).
