@@ -111,21 +111,22 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
 ### D2: Append-only journal, group commit, and self-describing snapshot compaction (`crates/master/src/store.rs`)
 
 1. **File header (including `PROTOCOL_VERSION_CURRENT`) and frame envelope:**
-   - Both `journal.bin` and `snapshot.bin` begin with a 16-byte header:
+   - Both `journal.bin` and `snapshot.bin` begin with a 24-byte header:
      ```text
-     [magic: 8B][store_format_version: u32 LE][protocol_version: u32 LE]
+     [magic: 8B][store_format_version: u32 LE][protocol_version: u32 LE][generation: u64 LE]
      ```
      where `magic` is `b"OXSWJRN1"` for `journal.bin` and `b"OXSWSNP1"` for `snapshot.bin`,
      `store_format_version` is `1u32`, and `protocol_version` records
      `rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT` (`crates/core/src/protocol.rs:31`) at the
      time the file was written.
-   - Every journal frame after the 16-byte header has the fixed layout:
+   - Every journal frame after the 24-byte header has the fixed layout:
      ```text
-     [payload_len: u32 LE][blake3_hash: [u8; 32]][payload: [u8; payload_len]]
+     [payload_len: u32 LE][len_check: u32 LE][blake3_hash: [u8; 32]][payload: [u8; payload_len]]
      ```
      `payload_len` is bounded by `rusty_grid_core::protocol::MAX_FRAME_SIZE` (`64 MiB`,
      `crates/core/src/protocol.rs:16`). In `journal.bin`, `payload` is a `bincode`-serialized
-     `JournalRecord`. In `snapshot.bin`, a single frame follows the 16-byte header whose `payload`
+     `JournalRecord`. In `snapshot.bin`, a single frame follows the 24-byte header with a `u64` length
+     (`[payload_len: u64 LE][blake3][payload]`, bounded by 4 GiB) whose `payload`
      is UTF-8 JSON (`serde_json`) of `SnapshotImage` using the `is_human_readable() == true` serde
      representations (`HumanTaskSpec`, etc. in `crates/core/src/task.rs:1442-1460`), so snapshots
      remain self-describing across `PROTOCOL_VERSION_CURRENT` bumps via `#[serde(default)]`.
@@ -222,10 +223,10 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
      `DEFAULT_COMPACT_MAX_RECORDS` (`10,000` records), or on **clean master shutdown** (`shutdown_tx`
      / `SIGINT` / `SIGTERM`), `TaskStore` writes a self-describing JSON `SnapshotImage`
      (`next_sequence: u64` plus all non-evicted `PersistedTaskEntry` records in `tasks` and
-     `terminal_order`) to `<state_dir>/snapshot.bin.tmp` with the 16-byte header (`b"OXSWSNP1"`,
-     `1u32`, `PROTOCOL_VERSION_CURRENT`) and frame envelope (`[payload_len][blake3][json_bytes]`),
+     `terminal_order`) to `<state_dir>/snapshot.bin.tmp` with the 24-byte header (`b"OXSWSNP1"`,
+     `1u32`, `PROTOCOL_VERSION_CURRENT`) and frame envelope (`[payload_len u64][blake3][json_bytes]`),
      calls `sync_all()`, atomically renames `snapshot.bin.tmp` to `snapshot.bin`, and resets
-     `journal.bin` to its 16-byte header with `PROTOCOL_VERSION_CURRENT` and 0 records.
+     `journal.bin` to its 24-byte header (generation `g + 1` in both files) with `PROTOCOL_VERSION_CURRENT` and 0 records.
 
 ### D3: Startup replay, `max_retries == 0` enforcement, and adoption hold window
 
@@ -441,7 +442,7 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
   updates `crates/core/tests/data/wire_layout.txt` (enforced by `crates/core/src/wire_layout_tests.rs`).
 - **On-disk state across protocol version upgrades (path (a) — self-describing JSON snapshot on clean shutdown):**
   - Both `journal.bin` and `snapshot.bin` record `protocol_version: u32` (`PROTOCOL_VERSION_CURRENT`)
-    in bytes `12..16` of their 16-byte file header (D2.1).
+    in bytes `12..16` of their 24-byte file header (D2.1).
   - `snapshot.bin` is stored as UTF-8 JSON using the `Human*` serde representations (`#[serde(default)]`
     for added fields, unknown fields ignored on removal), and a clean master shutdown (`SIGTERM`,
     `SIGINT`, or `MasterHandle::shutdown`) always compacts all live and retained terminal tasks into
@@ -449,7 +450,7 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
   - On startup after a binary upgrade where `PROTOCOL_VERSION_CURRENT` changed:
     1. `TaskStore::open` reads `snapshot.bin` via `serde_json` even when the snapshot header's
        `protocol_version != PROTOCOL_VERSION_CURRENT`.
-    2. If `journal.bin` has 0 records after its 16-byte header (the normal state after a clean stop),
+    2. If `journal.bin` has 0 records after its 24-byte header (the normal state after a clean stop),
        `TaskStore::open` rewrites the `snapshot.bin` and `journal.bin` headers with the new
        `PROTOCOL_VERSION_CURRENT` and startup succeeds with all tasks preserved.
     3. If `journal.bin` contains uncompacted bincode records **and** its header
@@ -570,6 +571,22 @@ lands as a self-contained, reviewable unit.
   plaintext task data on disk and Windows `icacls` owner-only ACLs in Security; defined deferred
   `pending_failover_charge` accounting and hold trade-off in D4.5; and scheduled the wire removal of
   deprecated `compute_intensity` in `F1-b` alongside the protocol version `3 -> 4` bump.
+- **2026-11-08:** `F1-a` module landed: `crates/master/src/store.rs` (`TaskStore` journal, 5 ms group
+  commit, JSON snapshot compaction, torn-tail recovery, `store.lock`) and `GridError::Storage`, not
+  yet wired into `TaskQueue`, `MasterServer` or the CLI. Windows owner-only ACL is still a TODO.
+- **2026-11-08:** Review fixes to the `store.rs` format (v1 is frozen with this change): 24-byte headers
+  carry a `u64` generation (a journal older than the snapshot is discarded after an interrupted
+  compaction); the snapshot frame has a `u64` length (4 GiB bound; `Bytes` keep the core JSON form,
+  base64 needs a core serde change and is deferred); a bad journal frame is a torn tail only if no
+  valid frame follows it, otherwise `open` refuses; a zero-filled tail is truncated; durable appends
+  enqueue synchronously and return a `DurableAck`; the journal byte layout is recorded in
+  `crates/master/tests/data/journal_layout.txt` and a change requires bumping `STORE_FORMAT_VERSION`.
+- **2026-11-08:** Review round 2 (still format v1): journal frames gain `len_check: u32` (a bijective
+  mix of `payload_len`). Header valid and payload past EOF is a torn tail with no scan; an invalid
+  header or a BLAKE3 mismatch probes only offsets whose `len_check` passes, so classification is
+  linear and a torn payload that embeds journal bytes still opens as a torn tail. `compact` takes
+  the `SnapshotImage` by value and encodes it on the writer thread. Moving snapshot `Bytes` to base64
+  later needs a `STORE_FORMAT_VERSION` bump (the reader takes a JSON string as raw UTF-8).
 - **2026-11-08:** Implemented `F1-b wire` (PR #141): bumped `PROTOCOL_VERSION_CURRENT` and
   `PROTOCOL_VERSION_MIN_COMPATIBLE` from `3` to `4`, added `ProtocolCapabilities::SESSION_RESUME`
   (`1 << 12`, kept out of `all_supported()` until adoption and worker resume land), added
