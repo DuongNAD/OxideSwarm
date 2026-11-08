@@ -225,7 +225,10 @@ Because `WireCodec` and the 1-byte frame discriminator (`0x01` JSON, `0x02` Binc
   with `Incompatible protocol version 5` instead of an opaque decode error; the other v5 requests and
   every v5 response keep the v6 layout (`Hello` was appended, nothing moved) and are refused by the
   version check. A v6 client against a v5 master cannot be answered: the v5 master cannot decode
-  `Hello`, closes the connection, and `connect_master` reports `ConnectionClosed` with the "older or
-  newer build" hint. The master journal (`store.rs`) embeds `Task`, so `STORE_FORMAT_VERSION` is 2;
+  `Hello` and drops the connection; `connect_master` reports `ConnectionClosed`, an I/O error, or (for an
+  unreadable reply to the probe only) a `ConnectionFailed` that carries the "older or newer build" hint. The master journal (`store.rs`) embeds `Task`, so `STORE_FORMAT_VERSION` is 2;
   version 1 files still open when they hold no records (`docs/design/0046-master-durability.md`).
   Regenerated `crates/core/tests/data/wire_layout.txt`.
+- 2026-11-09: Review fixes for protocol version 6: `required_features` adds `WORKSPACES` to a task
+  with a workspace, so it waits with `ClusterLacksCapability` until workers advertise the bit (`0039`
+  W2, W3); the upgrade hint of `connect_master` also covers an undecodable reply to the `Hello` probe.

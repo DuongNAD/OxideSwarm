@@ -267,8 +267,9 @@ refuses any peer outside `PROTOCOL_VERSION_MIN_COMPATIBLE..=PROTOCOL_VERSION_CUR
 Client commands (`submit`, `cancel`, `status`, `doctor`, `mcp`, ...) stamp `protocol_version` on every `ClientMessage`
 and `ClientResponse` (unversioned JSON frames default to `LEGACY_UNVERSIONED_PROTOCOL_VERSION = 2` and are refused), and
 `connect_master` runs a side-effect-free `Hello` version check before sending any state-changing request so a
-newer CLI never executes a task on an older master (a master older than version 6 cannot decode `Hello`, closes the
-connection, and the CLI prints the "older or newer build" hint). Always **upgrade and restart the master first**, then the workers
+newer CLI never executes a task on an older master (a master older than version 6 cannot decode `Hello` and drops the
+connection; the CLI then reports a closed connection, an I/O error or an unreadable reply to the version check, and
+in each case prints the "older or newer build, upgrade both Master and CLI" hint). Always **upgrade and restart the master first**, then the workers
 and CLIs: an upgraded v6 master immediately refuses v5 (and older) workers and clients before registration or task
 submission, whereas a newer worker pointed at an un-upgraded v2 master registers before inspecting the v2 `RegisterAck`,
 drops the connection on the version mismatch, and retries with backoff (briefly appearing in the v2 master's `workers`

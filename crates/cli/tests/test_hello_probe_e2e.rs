@@ -196,3 +196,66 @@ async fn a_probe_reply_from_another_version_is_an_incompatible_version_error() {
         "got {err:?}"
     );
 }
+
+/// A master that answers the probe with bytes a v6 client cannot decode (what an older master's
+/// reply to an unknown request, or a half-written frame, looks like) gets the upgrade hint, and
+/// only the probe is reworded: the error is a `ConnectionFailed` that names protocol version 6.
+#[tokio::test]
+async fn an_undecodable_probe_reply_carries_the_upgrade_hint() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                let _ = stream.read(&mut buf).await;
+                // A complete frame (length 9, bincode tag) whose body is no ClientResponse.
+                let mut frame = 9u32.to_be_bytes().to_vec();
+                frame.push(0x02);
+                frame.extend_from_slice(&[0xff; 8]);
+                let _ = stream.write_all(&frame).await;
+                let _ = stream.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            });
+        }
+    });
+    let err = connect_master(&addr.to_string(), None)
+        .await
+        .err()
+        .expect("an undecodable reply must fail the connect");
+    match err {
+        GridError::ConnectionFailed(message) => {
+            assert!(
+                message.contains("older or newer build")
+                    && message.contains(&format!("protocol version {PROTOCOL_VERSION_CURRENT}")),
+                "{message}"
+            );
+        }
+        other => panic!("expected ConnectionFailed with the hint, got {other:?}"),
+    }
+}
+
+/// A master that dies in the middle of the reply frame is an I/O error of the probe, which
+/// `report_master_failure` already answers with the same hint.
+#[tokio::test]
+async fn a_probe_reply_cut_off_mid_frame_is_a_closed_or_io_error() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 64];
+        let _ = stream.read(&mut buf).await;
+        let _ = stream.write_all(&[0, 0, 0, 40, 0x02, 1, 2]).await;
+        let _ = stream.flush().await;
+    });
+    let err = connect_master(&addr.to_string(), None)
+        .await
+        .err()
+        .expect("a truncated reply must fail the connect");
+    assert!(
+        matches!(err, GridError::ConnectionClosed | GridError::Io(_)),
+        "got {err:?}"
+    );
+}

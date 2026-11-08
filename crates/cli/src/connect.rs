@@ -215,8 +215,9 @@ pub async fn connect_master(
 
     // Verify protocol version compatibility with a side-effect-free Hello request before any
     // caller sends a state-changing message (such as SubmitTask or CancelTask). A Master older
-    // than protocol version 6 cannot decode Hello and closes the connection, which the callers
-    // report with the "older or newer build" hint (`report_master_failure`).
+    // than protocol version 6 cannot decode Hello and closes the connection (`ConnectionClosed`,
+    // or a bincode/IO framing error when it dies mid-frame). Those failures of the probe, and only
+    // of the probe, are reported with the "older or newer build" upgrade hint.
     let probe_future = async {
         transport
             .send_msg(&rusty_grid_core::protocol::ClientMessage::Hello)
@@ -231,7 +232,13 @@ pub async fn connect_master(
             operation: "protocol_version_check".into(),
             duration_secs: AUTH_TIMEOUT.as_secs(),
         })?
-        .map_err(GridError::from)?;
+        .map_err(|e| match GridError::from(e) {
+            GridError::Framing(detail) => GridError::ConnectionFailed(format!(
+                "Failed to connect to Master at {addr}: the reply to the protocol version check could not be read ({detail}). If the Master is running an older or newer build, upgrade both Master and CLI to protocol version {}",
+                rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT
+            )),
+            other => other,
+        })?;
     match probe_reply {
         Some(rusty_grid_core::protocol::ClientResponse::Hello { .. }) => Ok(transport),
         Some(rusty_grid_core::protocol::ClientResponse::Error { message }) => {
