@@ -3372,6 +3372,97 @@ mod tests {
         assert!(res.stdout_str().contains("compilation artifacts generated"));
     }
 
+    #[tokio::test]
+    async fn test_rust_compilation_with_cargo_toml_runs_cargo_build_offline() {
+        let runner = test_runner(false);
+
+        // 1. A crate with a local path dependency builds via `cargo build --offline`
+        //    and produces the compiled binary in `result.outputs`.
+        let mut sources = HashMap::new();
+        sources.insert(
+            "Cargo.toml".to_string(),
+            r#"[package]
+name = "w8_app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+w8_dep = { path = "w8_dep" }
+"#
+            .to_string(),
+        );
+        sources.insert(
+            "src/main.rs".to_string(),
+            "fn main() { println!(\"magic={}\", w8_dep::answer()); }\n".to_string(),
+        );
+        sources.insert(
+            "w8_dep/Cargo.toml".to_string(),
+            r#"[package]
+name = "w8_dep"
+version = "0.1.0"
+edition = "2021"
+"#
+            .to_string(),
+        );
+        sources.insert(
+            "w8_dep/src/lib.rs".to_string(),
+            "pub fn answer() -> u32 { 42 }\n".to_string(),
+        );
+
+        let task = Task::new(
+            TaskSpec::RustCompilation {
+                crate_name: "w8_app".to_string(),
+                source_files: sources,
+                compiler_flags: Vec::new(),
+                target_dir: None,
+            },
+            TaskRequirements::generic(1, 60),
+        );
+
+        let res = runner.execute_task(&task, None, None).await;
+        assert!(
+            res.is_success(),
+            "expected cargo build --offline to succeed, got: {res:?}"
+        );
+        assert!(
+            res.outputs.iter().any(|o| o.path.contains("w8_app")),
+            "expected compiled w8_app binary in result.outputs, got: {:?}",
+            res.outputs
+        );
+
+        // 2. An uncached registry dependency fails immediately under `--offline`.
+        let mut bad_sources = HashMap::new();
+        bad_sources.insert(
+            "Cargo.toml".to_string(),
+            r#"[package]
+name = "w8_missing_dep"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nonexistent_oxideswarm_crate_w8 = "99.99.99"
+"#
+            .to_string(),
+        );
+        bad_sources.insert("src/main.rs".to_string(), "fn main() {}\n".to_string());
+
+        let bad_task = Task::new(
+            TaskSpec::RustCompilation {
+                crate_name: "w8_missing_dep".to_string(),
+                source_files: bad_sources,
+                compiler_flags: Vec::new(),
+                target_dir: None,
+            },
+            TaskRequirements::generic(1, 30),
+        );
+
+        let bad_res = runner.execute_task(&bad_task, None, None).await;
+        assert!(
+            !bad_res.is_success(),
+            "expected uncached dependency to fail under --offline, got: {bad_res:?}"
+        );
+    }
+
     #[cfg(not(feature = "3d"))]
     #[tokio::test]
     async fn test_runner_3d_stubs_fail_cleanly_when_built_without_3d_feature() {
@@ -4736,96 +4827,5 @@ mod process_tree_tests {
                 }
             }
         }
-    }
-
-    #[tokio::test]
-    async fn test_rust_compilation_with_cargo_toml_runs_cargo_build_offline() {
-        let (runner, _dir) = runner_with(|c| c);
-
-        // 1. A crate with a local path dependency builds via `cargo build --offline`
-        //    and produces the compiled binary in `result.outputs`.
-        let mut sources = HashMap::new();
-        sources.insert(
-            "Cargo.toml".to_string(),
-            r#"[package]
-name = "w8_app"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-w8_dep = { path = "w8_dep" }
-"#
-            .to_string(),
-        );
-        sources.insert(
-            "src/main.rs".to_string(),
-            "fn main() { println!(\"magic={}\", w8_dep::answer()); }\n".to_string(),
-        );
-        sources.insert(
-            "w8_dep/Cargo.toml".to_string(),
-            r#"[package]
-name = "w8_dep"
-version = "0.1.0"
-edition = "2021"
-"#
-            .to_string(),
-        );
-        sources.insert(
-            "w8_dep/src/lib.rs".to_string(),
-            "pub fn answer() -> u32 { 42 }\n".to_string(),
-        );
-
-        let task = Task::new(
-            TaskSpec::RustCompilation {
-                crate_name: "w8_app".to_string(),
-                source_files: sources,
-                compiler_flags: Vec::new(),
-                target_dir: None,
-            },
-            TaskRequirements::generic(1, 60),
-        );
-
-        let res = runner.execute_task(&task, None, None).await;
-        assert!(
-            res.is_success(),
-            "expected cargo build --offline to succeed, got: {res:?}"
-        );
-        assert!(
-            res.outputs.iter().any(|o| o.path.contains("w8_app")),
-            "expected compiled w8_app binary in result.outputs, got: {:?}",
-            res.outputs
-        );
-
-        // 2. An uncached registry dependency fails immediately under `--offline`.
-        let mut bad_sources = HashMap::new();
-        bad_sources.insert(
-            "Cargo.toml".to_string(),
-            r#"[package]
-name = "w8_missing_dep"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-nonexistent_oxideswarm_crate_w8 = "99.99.99"
-"#
-            .to_string(),
-        );
-        bad_sources.insert("src/main.rs".to_string(), "fn main() {}\n".to_string());
-
-        let bad_task = Task::new(
-            TaskSpec::RustCompilation {
-                crate_name: "w8_missing_dep".to_string(),
-                source_files: bad_sources,
-                compiler_flags: Vec::new(),
-                target_dir: None,
-            },
-            TaskRequirements::generic(1, 30),
-        );
-
-        let bad_res = runner.execute_task(&bad_task, None, None).await;
-        assert!(
-            !bad_res.is_success(),
-            "expected uncached dependency to fail under --offline, got: {bad_res:?}"
-        );
     }
 }
