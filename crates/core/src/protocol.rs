@@ -1460,18 +1460,59 @@ pub mod master_features {
     /// [`parse_session_resume_hold_secs`], preventing `Instant + Duration` overflow on bogus input.
     pub const MAX_SESSION_RESUME_HOLD_SECS: u64 = 3_600;
 
-    /// `MasterMessage::CancelTask { task_id, reason: Some(RESULT_ACK_REASON.into()) }` sentinel
-    /// sent by the Master on the control lane after it has accepted and durably recorded a
+    /// `MasterMessage::CancelTask { task_id, reason: Some(format_result_ack_reason(token)) }`
+    /// prefix sent by the Master on the control lane after it has accepted and durably recorded a
     /// `WorkerMessage::TaskResult` from a `SESSION_RESUME`-capable Worker. The Worker retains
     /// the completed result (and its pinned output files) in `pending_resume_outbox` until it
-    /// receives this acknowledgment (or a regular `CancelTask` for `task_id`), preventing result
-    /// loss if the Master shuts down gracefully or the session drops mid-flush.
+    /// receives this acknowledgment for the matching attempt token (or a regular `CancelTask` for
+    /// `task_id`), preventing result loss if the Master shuts down gracefully or the session drops
+    /// mid-flush without letting an earlier attempt's acknowledgment evict a later retry's result.
     pub const RESULT_ACK_REASON: &str = "oxs:result-ack";
 
     /// Every feature this build of the Master supports unconditionally.
     pub const SUPPORTED: &[&str] = &[MOBILE_TELEMETRY];
 
     const PREFIX: &str = "features=";
+
+    /// Computes a deterministic 64-bit token for a [`crate::task::TaskResult`] so a result
+    /// acknowledgment (`"oxs:result-ack:<token>"`) only ever acknowledges the matching attempt's
+    /// buffered result and never a later retry of the same `task_id`.
+    pub fn result_ack_token(result: &crate::task::TaskResult) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        result.task_id.hash(&mut hasher);
+        result.exit_code.hash(&mut hasher);
+        result.stdout.hash(&mut hasher);
+        result.stderr.hash(&mut hasher);
+        result.execution_time_ms.hash(&mut hasher);
+        result.is_gpu_executed.hash(&mut hasher);
+        result.device_name.hash(&mut hasher);
+        result.error.hash(&mut hasher);
+        for o in &result.outputs {
+            o.path.hash(&mut hasher);
+            o.id.hash(&mut hasher);
+            o.size.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Formats a `MasterMessage::CancelTask` reason string acknowledging `result` (`token`).
+    pub fn format_result_ack_reason(token: u64) -> String {
+        format!("{RESULT_ACK_REASON}:{token:016x}")
+    }
+
+    /// Parses a `MasterMessage::CancelTask` reason string to check whether it is a result
+    /// acknowledgment (`"oxs:result-ack"` or `"oxs:result-ack:<hex-token>"`).
+    ///
+    /// Returns `Some(Some(token))` for a token-keyed acknowledgment, `Some(None)` for a bare
+    /// [`RESULT_ACK_REASON`], or `None` for an ordinary cancellation reason.
+    pub fn parse_result_ack_reason(reason: &str) -> Option<Option<u64>> {
+        if reason == RESULT_ACK_REASON {
+            return Some(None);
+        }
+        let hex = reason.strip_prefix(RESULT_ACK_REASON)?.strip_prefix(':')?;
+        u64::from_str_radix(hex, 16).ok().map(Some)
+    }
 
     /// Formats the `session-resume=<hold_secs>` feature token.
     pub fn session_resume_feature(hold_secs: u64) -> String {

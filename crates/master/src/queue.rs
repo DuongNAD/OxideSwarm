@@ -629,6 +629,16 @@ pub struct AdoptionOutcome {
 /// cannot grow the set without bound.
 const MAX_SESSION_RESUME_WORKERS: usize = 4_096;
 
+#[derive(Default)]
+struct SessionResumeTracker {
+    /// FIFO insertion order of workers in `session_resume_workers`.
+    order: std::collections::VecDeque<Uuid>,
+    /// Workers with a currently connected `WorkerSession`.
+    connected: HashSet<Uuid>,
+    /// Workers that currently have active assignments (`worker_assignments`) or active holds (`held_tasks`).
+    with_work_or_hold: HashSet<Uuid>,
+}
+
 /// True when `entry` is in `TaskState::Queued` and eligible for scheduling now (not held in an
 /// active `adoptable_by` window, not awaiting `fail_if_not_adopted` failure, and if it has a
 /// deferred failover charge, its failover budget is not exhausted).
@@ -680,6 +690,8 @@ struct TaskQueueInner {
     session_resume_hold: Duration,
     /// Workers whose most recent registration negotiated `ProtocolCapabilities::SESSION_RESUME`.
     session_resume_workers: Arc<std::sync::Mutex<HashSet<Uuid>>>,
+    /// Tracks FIFO order and liveness/assignment protection for `session_resume_workers`.
+    session_resume_tracker: Arc<std::sync::Mutex<SessionResumeTracker>>,
 }
 
 /// Bytes one blob reference (id, size, flags) is charged in addition to its path.
@@ -816,9 +828,16 @@ impl TaskQueueInner {
 
     /// Drops a retained terminal task and its byte charge.
     fn remove_retained(&mut self, task_id: &TaskId) {
+        let prev_hold_worker = self
+            .tasks
+            .get(task_id)
+            .and_then(|e| e.adoptable_by.map(|(w, _)| w));
         self.tasks.remove(task_id);
         self.untrack_active_task(task_id);
         self.track_adoption_hold(*task_id, false);
+        if let Some(wid) = prev_hold_worker {
+            self.refresh_worker_resume_protection(wid);
+        }
         if let Some(size) = self.terminal_sizes.remove(task_id) {
             self.terminal_bytes = self.terminal_bytes.saturating_sub(size);
         }
@@ -984,6 +1003,46 @@ impl TaskQueueInner {
             }
         }
     }
+
+    fn refresh_worker_resume_protection(&self, worker_id: Uuid) {
+        let has_active = self
+            .worker_assignments
+            .get(&worker_id)
+            .is_some_and(|tasks| !tasks.is_empty());
+        let has_holds = self.held_tasks.iter().any(|tid| {
+            self.tasks
+                .get(tid)
+                .is_some_and(|e| e.adoptable_by.is_some_and(|(w, _)| w == worker_id))
+        });
+        let mut tracker = self
+            .session_resume_tracker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if has_active || has_holds {
+            tracker.with_work_or_hold.insert(worker_id);
+        } else {
+            tracker.with_work_or_hold.remove(&worker_id);
+        }
+    }
+
+    fn rebuild_all_resume_protection(&self) {
+        let mut protected = HashSet::new();
+        for (wid, tasks) in &self.worker_assignments {
+            if !tasks.is_empty() {
+                protected.insert(*wid);
+            }
+        }
+        for tid in &self.held_tasks {
+            if let Some((wid, _)) = self.tasks.get(tid).and_then(|e| e.adoptable_by) {
+                protected.insert(wid);
+            }
+        }
+        let mut tracker = self
+            .session_resume_tracker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        tracker.with_work_or_hold = protected;
+    }
 }
 
 const UNRESUMED_ZERO_RETRY_ERROR: &str =
@@ -996,6 +1055,7 @@ pub struct TaskQueue {
     adoption_holds: Arc<std::sync::atomic::AtomicUsize>,
     session_resume_hold_secs: Arc<std::sync::atomic::AtomicU64>,
     session_resume_workers: Arc<std::sync::Mutex<HashSet<Uuid>>>,
+    session_resume_tracker: Arc<std::sync::Mutex<SessionResumeTracker>>,
     #[cfg(test)]
     ready_views_calls: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -1051,6 +1111,8 @@ impl TaskQueue {
         let adoption_holds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let session_resume_hold_secs = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let session_resume_workers = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let session_resume_tracker =
+            Arc::new(std::sync::Mutex::new(SessionResumeTracker::default()));
         Self {
             inner: Arc::new(RwLock::new(TaskQueueInner {
                 tasks: HashMap::new(),
@@ -1075,10 +1137,12 @@ impl TaskQueue {
                 adoption_holds: Arc::clone(&adoption_holds),
                 session_resume_hold: Duration::ZERO,
                 session_resume_workers: Arc::clone(&session_resume_workers),
+                session_resume_tracker: Arc::clone(&session_resume_tracker),
             })),
             adoption_holds,
             session_resume_hold_secs,
             session_resume_workers,
+            session_resume_tracker,
             #[cfg(test)]
             ready_views_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
@@ -1115,20 +1179,56 @@ impl TaskQueue {
     }
 
     /// Records whether `worker_id`'s current registration supports `ProtocolCapabilities::SESSION_RESUME`.
+    ///
+    /// When the tracked set reaches [`MAX_SESSION_RESUME_WORKERS`], only the oldest worker that is
+    /// not currently connected and has no active assignments or adoption holds is evicted.
     pub fn set_worker_session_resume(&self, worker_id: Uuid, enabled: bool) {
         let mut set = self
             .session_resume_workers
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let mut tracker = self
+            .session_resume_tracker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if enabled {
-            if !set.contains(&worker_id) && set.len() >= MAX_SESSION_RESUME_WORKERS {
-                if let Some(&evict) = set.iter().next() {
+            if set.contains(&worker_id) {
+                tracker.order.retain(|w| *w != worker_id);
+                tracker.order.push_back(worker_id);
+                return;
+            }
+            while set.len() >= MAX_SESSION_RESUME_WORKERS {
+                let evict_pos = tracker.order.iter().position(|candidate| {
+                    !tracker.connected.contains(candidate)
+                        && !tracker.with_work_or_hold.contains(candidate)
+                });
+                let Some(pos) = evict_pos else {
+                    break;
+                };
+                if let Some(evict) = tracker.order.remove(pos) {
                     set.remove(&evict);
                 }
             }
             set.insert(worker_id);
+            tracker.order.push_back(worker_id);
         } else {
             set.remove(&worker_id);
+            tracker.connected.remove(&worker_id);
+            tracker.order.retain(|w| *w != worker_id);
+        }
+    }
+
+    /// Marks whether a `SESSION_RESUME`-capable worker currently has a live session so the
+    /// [`MAX_SESSION_RESUME_WORKERS`] bound never evicts a connected worker even while idle.
+    pub fn set_worker_session_resume_connected(&self, worker_id: Uuid, connected: bool) {
+        let mut tracker = self
+            .session_resume_tracker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if connected {
+            tracker.connected.insert(worker_id);
+        } else {
+            tracker.connected.remove(&worker_id);
         }
     }
 
@@ -1186,6 +1286,9 @@ impl TaskQueue {
             }
         };
         inner.track_adoption_hold(task_id, false);
+        if let Some(wid) = last_worker_id {
+            inner.refresh_worker_resume_protection(wid);
+        }
         inner.track_terminal_task(task_id);
         Some(record)
     }
@@ -1247,6 +1350,9 @@ impl TaskQueue {
                     }
                 };
                 inner.track_adoption_hold(task_id, false);
+                if let Some(wid) = last_worker_id {
+                    inner.refresh_worker_resume_protection(wid);
+                }
                 inner.update_active_task(task_id);
                 return (Some(record), false, true);
             } else {
@@ -1302,6 +1408,9 @@ impl TaskQueue {
                     }
                 };
                 inner.track_adoption_hold(task_id, false);
+                if let Some(wid) = last_worker_id {
+                    inner.refresh_worker_resume_protection(wid);
+                }
                 inner.track_terminal_task(task_id);
                 return (Some(record), true, false);
             }
@@ -1317,6 +1426,9 @@ impl TaskQueue {
             entry.pending_failover_charge = false;
             entry.pending_failover_reason = None;
             inner.track_adoption_hold(task_id, false);
+            if let Some(wid) = last_worker_id {
+                inner.refresh_worker_resume_protection(wid);
+            }
             (None, false, true)
         } else {
             (None, false, false)
@@ -1676,6 +1788,7 @@ impl TaskQueue {
                 }
             }
             inner.sync_adoption_holds();
+            inner.rebuild_all_resume_protection();
             inner.maybe_trigger_compaction();
         }
 
@@ -1870,6 +1983,7 @@ impl TaskQueue {
             if released_any {
                 inner.ready_epoch = inner.ready_epoch.wrapping_add(1);
             }
+            inner.refresh_worker_resume_protection(worker_id);
             inner.maybe_trigger_compaction();
         }
 
@@ -1964,22 +2078,26 @@ impl TaskQueue {
                 }
             }
             for wid in expired_workers {
-                let has_active = inner
-                    .worker_assignments
-                    .get(&wid)
-                    .is_some_and(|tasks| !tasks.is_empty());
-                let has_holds = inner.held_tasks.iter().any(|tid| {
-                    inner
-                        .tasks
-                        .get(tid)
-                        .is_some_and(|e| e.adoptable_by.is_some_and(|(w, _)| w == wid))
-                });
-                if !has_active && !has_holds {
+                inner.refresh_worker_resume_protection(wid);
+                let is_protected = {
+                    let tracker = inner
+                        .session_resume_tracker
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    tracker.connected.contains(&wid) || tracker.with_work_or_hold.contains(&wid)
+                };
+                if !is_protected {
                     inner
                         .session_resume_workers
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&wid);
+                    inner
+                        .session_resume_tracker
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .order
+                        .retain(|w| *w != wid);
                 }
             }
             if released_any {
@@ -2583,7 +2701,7 @@ impl TaskQueue {
         if !has_charge {
             return;
         }
-        let record = {
+        let (record, last_worker_id) = {
             let entry = inner.tasks.get_mut(&task_id).expect("checked above");
             let last_worker_id = entry.adoptable_by.map(|(w, _)| w);
             let reason = entry
@@ -2604,18 +2722,25 @@ impl TaskQueue {
                 error: Some(format!("Worker evicted ({reason})")),
             };
             entry.retry_history.push(attempt.clone());
-            JournalRecord::TaskRequeued {
-                task_id,
-                state: TaskState::Queued,
-                retry_count: entry.retry_count,
-                failover_count: entry.failover_count,
-                evacuation_count: entry.evacuation_count,
-                rejection_count: entry.rejection_count,
-                avoid_workers: entry.avoid_workers.clone(),
-                retry_attempt: Some(attempt),
-                retry_delay_ms: Some(0),
-            }
+            (
+                JournalRecord::TaskRequeued {
+                    task_id,
+                    state: TaskState::Queued,
+                    retry_count: entry.retry_count,
+                    failover_count: entry.failover_count,
+                    evacuation_count: entry.evacuation_count,
+                    rejection_count: entry.rejection_count,
+                    avoid_workers: entry.avoid_workers.clone(),
+                    retry_attempt: Some(attempt),
+                    retry_delay_ms: Some(0),
+                },
+                last_worker_id,
+            )
         };
+        inner.track_adoption_hold(task_id, false);
+        if let Some(wid) = last_worker_id {
+            inner.refresh_worker_resume_protection(wid);
+        }
         inner.append_non_durable(&record);
     }
 
@@ -2671,6 +2796,7 @@ impl TaskQueue {
                     .entry(worker_id)
                     .or_default()
                     .insert(key.task_id);
+                inner.refresh_worker_resume_protection(worker_id);
 
                 let record = JournalRecord::TaskDispatched {
                     task_id: key.task_id,
@@ -2743,6 +2869,7 @@ impl TaskQueue {
                 .entry(worker_id)
                 .or_default()
                 .insert(*task_id);
+            inner.refresh_worker_resume_protection(worker_id);
 
             let record = JournalRecord::TaskDispatched {
                 task_id: *task_id,
@@ -2855,6 +2982,7 @@ impl TaskQueue {
                         .entry(worker_id)
                         .or_default()
                         .insert(task_id);
+                    inner.refresh_worker_resume_protection(worker_id);
 
                     let record = JournalRecord::TaskDispatched {
                         task_id,
@@ -2911,6 +3039,7 @@ impl TaskQueue {
                 if let Some(tasks) = inner.worker_assignments.get_mut(&wid) {
                     tasks.remove(task_id);
                 }
+                inner.refresh_worker_resume_protection(wid);
             }
 
             let (priority, sequence, record) = {
@@ -3017,6 +3146,7 @@ impl TaskQueue {
         if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
             tasks.remove(task_id);
         }
+        inner.refresh_worker_resume_protection(*worker_id);
         inner.insert_ready(QueueOrderKey {
             priority_rev: Reverse(priority),
             sequence,
@@ -3417,6 +3547,7 @@ impl TaskQueue {
         if let Some(tasks) = inner.worker_assignments.get_mut(&worker_id) {
             tasks.remove(&task_id);
         }
+        inner.refresh_worker_resume_protection(worker_id);
 
         // If task is already terminal (e.g. Cancelled by master directive, Completed, Failed), preserve state
         if state.is_terminal() {
@@ -3645,6 +3776,7 @@ impl TaskQueue {
             if let Some(tasks) = inner.worker_assignments.get_mut(&worker_id) {
                 tasks.remove(&task_id);
             }
+            inner.refresh_worker_resume_protection(worker_id);
 
             if state.is_terminal() {
                 return Ok(ResultDisposition::Late);
@@ -3727,7 +3859,9 @@ impl TaskQueue {
             let now_epoch = Utc::now().timestamp() as u64;
 
             let mut record = None;
+            let mut prev_hold_worker = None;
             if let Some(entry) = inner.tasks.get_mut(task_id) {
+                prev_hold_worker = entry.adoptable_by.map(|(w, _)| w);
                 entry.state = TaskState::Failed;
                 entry.adoptable_by = None;
                 entry.fail_if_not_adopted = false;
@@ -3750,6 +3884,9 @@ impl TaskQueue {
                 });
             }
             inner.track_adoption_hold(*task_id, false);
+            if let Some(wid) = prev_hold_worker {
+                inner.refresh_worker_resume_protection(wid);
+            }
             inner.track_terminal_task(*task_id);
             let ack = record.and_then(|r| inner.append_durable_warn(&r));
             inner.maybe_trigger_compaction();
@@ -3982,6 +4119,15 @@ impl TaskQueue {
             for tid in terminal_to_track {
                 inner.track_terminal_task(tid);
             }
+            if !inner.worker_assignments.contains_key(worker_id) {
+                inner
+                    .session_resume_tracker
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .connected
+                    .remove(worker_id);
+            }
+            inner.refresh_worker_resume_protection(*worker_id);
 
             let mut acks = Vec::with_capacity(records.len());
             for record in &records {
@@ -4241,6 +4387,15 @@ impl TaskQueue {
             for tid in terminal_to_track {
                 inner.track_terminal_task(tid);
             }
+            if !inner.worker_assignments.contains_key(worker_id) {
+                inner
+                    .session_resume_tracker
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .connected
+                    .remove(worker_id);
+            }
+            inner.refresh_worker_resume_protection(*worker_id);
 
             let mut acks = Vec::with_capacity(records.len());
             for record in &records {
@@ -4414,7 +4569,9 @@ impl TaskQueue {
 
             let mut recorded = None;
             let mut record = None;
+            let mut prev_hold_worker = None;
             if let Some(entry) = inner.tasks.get_mut(task_id) {
+                prev_hold_worker = entry.adoptable_by.map(|(w, _)| w);
                 entry.state = TaskState::Cancelled;
                 entry.adoptable_by = None;
                 entry.fail_if_not_adopted = false;
@@ -4440,6 +4597,12 @@ impl TaskQueue {
                 });
             }
             inner.track_adoption_hold(*task_id, false);
+            if let Some(wid) = assigned_worker_id {
+                inner.refresh_worker_resume_protection(wid);
+            }
+            if let Some(wid) = prev_hold_worker {
+                inner.refresh_worker_resume_protection(wid);
+            }
             inner.track_terminal_task(*task_id);
             let ack = if let Some(ref r) = record {
                 inner.append_durable_warn(r)
@@ -7702,6 +7865,31 @@ mod tests {
         assert!(b_outcome.adopted.is_empty());
         assert_eq!(b_outcome.stale_to_cancel, vec![tid]);
 
+        // `worker_b` attempts to send a Checkpoint and a TaskResult for `worker_a`'s held task:
+        // both must be refused (`Ok(false)` and `ResultDisposition::Stale`).
+        let cp = CheckpointData::new(1, b"forged-cp".to_vec());
+        let cp_applied = queue
+            .record_checkpoint_from(worker_b, Some(2), tid, cp)
+            .await
+            .unwrap();
+        assert!(
+            !cp_applied,
+            "worker_b must not be able to checkpoint a task held by worker_a"
+        );
+        assert!(queue.get_checkpoint(&tid).await.is_none());
+
+        let forged_res = TaskResult::success(worker_b, tid, "forged", 10, false);
+        let res_outcome = queue
+            .record_result_from(worker_b, Some(2), forged_res)
+            .await
+            .unwrap();
+        assert_eq!(
+            res_outcome.disposition,
+            ResultDisposition::Stale,
+            "worker_b must not be able to complete a task held by worker_a"
+        );
+        assert!(!res_outcome.adopted_from_hold);
+
         // And `worker_a`'s hold must still be intact so `worker_a` can adopt it.
         let a_outcome = queue.adopt_session_tasks(worker_a, 3, &[tid]).await;
         assert_eq!(a_outcome.adopted, vec![tid]);
@@ -7709,6 +7897,110 @@ mod tests {
         let info = queue.get_task(&tid).await.unwrap();
         assert_eq!(info.state, TaskState::Running);
         assert_eq!(info.assigned_worker_id, Some(worker_a));
+    }
+
+    #[tokio::test]
+    async fn rv158b_probe_bound_evicts_live_worker_resume_flag() {
+        let queue = TaskQueue::new();
+        queue.set_session_resume_hold(Duration::from_secs(60)).await;
+        let live_worker = Uuid::new_v4();
+        queue.set_worker_session_resume(live_worker, true);
+
+        let tid = queue.submit(echo_task("rv158b-p4")).await.unwrap();
+        queue
+            .schedule_tasks_batch_in_sessions(&[(tid, live_worker, 1)])
+            .await;
+        queue
+            .mark_running_from(live_worker, Some(1), &tid)
+            .await
+            .unwrap();
+
+        for _ in 0..MAX_SESSION_RESUME_WORKERS {
+            queue.set_worker_session_resume(Uuid::new_v4(), true);
+        }
+
+        assert!(
+            queue
+                .inner
+                .read()
+                .await
+                .session_resume_workers
+                .lock()
+                .unwrap()
+                .contains(&live_worker),
+            "live worker with an active task must not be evicted by MAX_SESSION_RESUME_WORKERS churn"
+        );
+    }
+
+    #[tokio::test]
+    async fn rv158b_probe_bound_evicts_worker_with_active_hold() {
+        let queue = TaskQueue::new();
+        queue.set_session_resume_hold(Duration::from_secs(60)).await;
+        let worker_a = Uuid::new_v4();
+        queue.set_worker_session_resume(worker_a, true);
+
+        let tid = queue.submit(echo_task("rv158b-p4b")).await.unwrap();
+        queue
+            .schedule_tasks_batch_in_sessions(&[(tid, worker_a, 1)])
+            .await;
+        queue
+            .mark_running_from(worker_a, Some(1), &tid)
+            .await
+            .unwrap();
+        queue
+            .handle_session_disconnected(&worker_a, Some(1), "socket drop", true)
+            .await;
+
+        for _ in 0..MAX_SESSION_RESUME_WORKERS {
+            queue.set_worker_session_resume(Uuid::new_v4(), true);
+        }
+
+        assert!(
+            queue
+                .inner
+                .read()
+                .await
+                .session_resume_workers
+                .lock()
+                .unwrap()
+                .contains(&worker_a),
+            "worker with an active adoption hold must not be evicted by MAX_SESSION_RESUME_WORKERS churn"
+        );
+    }
+
+    #[tokio::test]
+    async fn rv158b_probe_evicted_live_worker_gets_no_hold() {
+        let queue = TaskQueue::new();
+        queue.set_session_resume_hold(Duration::from_secs(60)).await;
+        let live_worker = Uuid::new_v4();
+        queue.set_worker_session_resume(live_worker, true);
+
+        let mut task = echo_task("rv158b-p4c");
+        task.requirements.max_retries = Some(0);
+        let tid = queue.submit(task).await.unwrap();
+        queue
+            .schedule_tasks_batch_in_sessions(&[(tid, live_worker, 1)])
+            .await;
+        queue
+            .mark_running_from(live_worker, Some(1), &tid)
+            .await
+            .unwrap();
+
+        for _ in 0..MAX_SESSION_RESUME_WORKERS {
+            queue.set_worker_session_resume(Uuid::new_v4(), true);
+        }
+
+        queue
+            .handle_session_disconnected(&live_worker, Some(1), "socket drop", true)
+            .await;
+        let info = queue.get_task(&tid).await.unwrap();
+        assert_eq!(
+            info.state,
+            TaskState::Queued,
+            "live worker's zero-retry task must be held for ResumeSession after disconnect despite churn"
+        );
+        let outcome = queue.adopt_session_tasks(live_worker, 2, &[tid]).await;
+        assert_eq!(outcome.adopted, vec![tid]);
     }
 
     #[tokio::test]

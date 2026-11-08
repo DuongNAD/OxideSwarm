@@ -1259,36 +1259,123 @@ async fn sigkill_child_master_entrypoint() {
     std::future::pending::<()>().await;
 }
 
+fn locate_rusty_grid_bin() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_rusty-grid") {
+        let pb = std::path::PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let target_dir = exe.parent()?.parent()?;
+    let bin = target_dir.join(format!("rusty-grid{}", std::env::consts::EXE_SUFFIX));
+    bin.exists().then_some(bin)
+}
+
+async fn submit_task_via_tcp(
+    master_addr: std::net::SocketAddr,
+    task: Task,
+) -> rusty_grid_core::task::TaskId {
+    use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
+    let stream = tokio::net::TcpStream::connect(master_addr)
+        .await
+        .expect("connect to master for submit");
+    let mut transport = MessageTransport::new(stream);
+    transport
+        .send_msg(&ClientMessage::SubmitTask { task, wait: false })
+        .await
+        .expect("send SubmitTask");
+    match transport
+        .recv_msg::<ClientResponse>()
+        .await
+        .expect("recv SubmitTask response")
+    {
+        Some(ClientResponse::TaskSubmitted { task_id }) => task_id,
+        other => panic!("expected TaskSubmitted, got {other:?}"),
+    }
+}
+
+async fn is_task_running_via_tcp(
+    master_addr: std::net::SocketAddr,
+    task_id: rusty_grid_core::task::TaskId,
+) -> bool {
+    use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
+    let Ok(stream) = tokio::net::TcpStream::connect(master_addr).await else {
+        return false;
+    };
+    let mut transport = MessageTransport::new(stream);
+    if transport
+        .send_msg(&ClientMessage::GetTaskStatus { task_id })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    matches!(
+        transport.recv_msg::<ClientResponse>().await,
+        Ok(Some(ClientResponse::TaskStatusInfo { ref state_name, .. })) if state_name == "Running"
+    )
+}
+
 /// `158-fix` M3 (unclean `SIGKILL` master crash with uncompacted journal replay):
-/// Spawns a child master process on `--state-dir`, runs both a normal task and a `max_retries = 0`
-/// task on a 2-slot worker, kills the child master with `Child::kill()` (`SIGKILL`) so
-/// `close_and_compact_store_sync` does not run, starts `master2` on the same `--state-dir`
-/// (replaying `journal.bin` directly), and verifies both tasks are adopted and finish with 1 run
-/// and 0 retries/failovers.
+/// Spawns the `rusty-grid` CLI master process on `--state-dir` (falling back to the test-binary
+/// child entrypoint only when `rusty-grid` has not been built in the target directory yet), runs
+/// both a normal task and a `max_retries = 0` task on a 2-slot worker, kills the child master with
+/// `Child::kill()` (`SIGKILL`) so `close_and_compact_store_sync` does not run, starts `master2` on
+/// the same `--state-dir` (replaying `journal.bin` directly), and verifies both tasks are adopted
+/// and finish with 1 run and 0 retries/failovers.
 #[tokio::test]
 async fn test_master_sigkill_restart_adopts_running_normal_and_zero_retry_tasks_once() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state_dir = dir.path().join("master-state");
+    let home_dir = dir.path().join("home");
+    std::fs::create_dir_all(&home_dir).expect("create home_dir");
     let port_file = dir.path().join("master.addr");
     let ready_file = dir.path().join("master.ready");
     let marker_normal = dir.path().join("sigkill_normal.marker");
     let marker_zero = dir.path().join("sigkill_zero.marker");
     let gate_path = dir.path().join("sigkill.gate");
 
-    let mut child = std::process::Command::new(std::env::current_exe().expect("current_exe"))
-        .arg("--exact")
-        .arg("sigkill_child_master_entrypoint")
-        .arg("--nocapture")
-        .env("OXIDESWARM_TEST_SIGKILL_MASTER_STATE_DIR", &state_dir)
-        .env("OXIDESWARM_TEST_SIGKILL_MASTER_PORT_FILE", &port_file)
-        .env("OXIDESWARM_TEST_SIGKILL_MASTER_READY_FILE", &ready_file)
-        .env("OXIDESWARM_TEST_SIGKILL_MARKER_NORMAL", &marker_normal)
-        .env("OXIDESWARM_TEST_SIGKILL_MARKER_ZERO", &marker_zero)
-        .env("OXIDESWARM_TEST_SIGKILL_GATE", &gate_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn child master process");
+    let cli_bin = locate_rusty_grid_bin();
+    let mut child = if let Some(ref bin) = cli_bin {
+        std::process::Command::new(bin)
+            .args([
+                "master",
+                "--listen",
+                "127.0.0.1:0",
+                "--port-file",
+                port_file.to_str().unwrap(),
+                "--dashboard-port",
+                "0",
+                "--state-dir",
+                state_dir.to_str().unwrap(),
+                "--session-resume-hold-secs",
+                "30",
+            ])
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
+            .env_remove("OXIDESWARM_SECRET")
+            .env_remove("RUSTY_GRID_SECRET")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn rusty-grid master process")
+    } else {
+        std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .arg("--exact")
+            .arg("sigkill_child_master_entrypoint")
+            .arg("--nocapture")
+            .env("OXIDESWARM_TEST_SIGKILL_MASTER_STATE_DIR", &state_dir)
+            .env("OXIDESWARM_TEST_SIGKILL_MASTER_PORT_FILE", &port_file)
+            .env("OXIDESWARM_TEST_SIGKILL_MASTER_READY_FILE", &ready_file)
+            .env("OXIDESWARM_TEST_SIGKILL_MARKER_NORMAL", &marker_normal)
+            .env("OXIDESWARM_TEST_SIGKILL_MARKER_ZERO", &marker_zero)
+            .env("OXIDESWARM_TEST_SIGKILL_GATE", &gate_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child master process")
+    };
 
     assert!(
         wait_for(
@@ -1297,18 +1384,27 @@ async fn test_master_sigkill_restart_adopts_running_normal_and_zero_retry_tasks_
             || async {
                 std::fs::read_to_string(&port_file)
                     .ok()
-                    .and_then(|s| s.trim().parse::<std::net::SocketAddr>().ok())
+                    .and_then(|s| {
+                        let trimmed = s.trim();
+                        trimmed.parse::<std::net::SocketAddr>().ok().or_else(|| {
+                            trimmed
+                                .parse::<u16>()
+                                .ok()
+                                .map(|p| std::net::SocketAddr::from(([127, 0, 0, 1], p)))
+                        })
+                    })
                     .is_some()
             }
         )
         .await,
-        "child master process must write its bound address"
+        "child master process must write its bound address/port"
     );
-    let master_addr: std::net::SocketAddr = std::fs::read_to_string(&port_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let port_str = std::fs::read_to_string(&port_file).unwrap();
+    let trimmed = port_str.trim();
+    let master_addr: std::net::SocketAddr = trimmed.parse().unwrap_or_else(|_| {
+        let port: u16 = trimmed.parse().expect("parse port");
+        std::net::SocketAddr::from(([127, 0, 0, 1], port))
+    });
 
     let (w_shutdown_tx, w_shutdown_rx) = watch::channel(false);
     let mut w1 = WorkerClient::for_testing(
@@ -1328,29 +1424,63 @@ async fn test_master_sigkill_restart_adopts_running_normal_and_zero_retry_tasks_
         let _ = w1.run(w_shutdown_rx).await;
     });
 
-    assert!(
-        wait_for(
-            Duration::from_secs(10),
-            Duration::from_millis(25),
-            || async {
-                ready_file.exists()
-                    && std::fs::read_to_string(&marker_normal)
-                        .map(|s| s.lines().count() == 1)
-                        .unwrap_or(false)
-                    && std::fs::read_to_string(&marker_zero)
-                        .map(|s| s.lines().count() == 1)
-                        .unwrap_or(false)
-            }
+    let (t_normal_id, t_zero_id) = if cli_bin.is_some() {
+        let tn = submit_task_via_tcp(
+            master_addr,
+            gated_marker_task(&marker_normal, &gate_path, None, None, Some(2)),
         )
-        .await,
-        "both normal and max_retries=0 tasks must start running before SIGKILL"
-    );
-    let ready_text = std::fs::read_to_string(&ready_file).expect("read ready_file");
-    let mut lines = ready_text.lines();
-    let t_normal_id: rusty_grid_core::task::TaskId =
-        lines.next().unwrap().parse().expect("parse t_normal_id");
-    let t_zero_id: rusty_grid_core::task::TaskId =
-        lines.next().unwrap().parse().expect("parse t_zero_id");
+        .await;
+        let tz = submit_task_via_tcp(
+            master_addr,
+            gated_marker_task(&marker_zero, &gate_path, None, None, Some(0)),
+        )
+        .await;
+        assert!(
+            wait_for(
+                Duration::from_secs(10),
+                Duration::from_millis(25),
+                || async {
+                    is_task_running_via_tcp(master_addr, tn).await
+                        && is_task_running_via_tcp(master_addr, tz).await
+                        && std::fs::read_to_string(&marker_normal)
+                            .map(|s| s.lines().count() == 1)
+                            .unwrap_or(false)
+                        && std::fs::read_to_string(&marker_zero)
+                            .map(|s| s.lines().count() == 1)
+                            .unwrap_or(false)
+                }
+            )
+            .await,
+            "both normal and max_retries=0 tasks must start running on rusty-grid CLI master before SIGKILL"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        (tn, tz)
+    } else {
+        assert!(
+            wait_for(
+                Duration::from_secs(10),
+                Duration::from_millis(25),
+                || async {
+                    ready_file.exists()
+                        && std::fs::read_to_string(&marker_normal)
+                            .map(|s| s.lines().count() == 1)
+                            .unwrap_or(false)
+                        && std::fs::read_to_string(&marker_zero)
+                            .map(|s| s.lines().count() == 1)
+                            .unwrap_or(false)
+                }
+            )
+            .await,
+            "both normal and max_retries=0 tasks must start running before SIGKILL"
+        );
+        let ready_text = std::fs::read_to_string(&ready_file).expect("read ready_file");
+        let mut lines = ready_text.lines();
+        let tn: rusty_grid_core::task::TaskId =
+            lines.next().unwrap().parse().expect("parse t_normal_id");
+        let tz: rusty_grid_core::task::TaskId =
+            lines.next().unwrap().parse().expect("parse t_zero_id");
+        (tn, tz)
+    };
 
     // Uncleanly kill (`SIGKILL`) the child master process so `close_and_compact_store_sync` never runs.
     let _ = child.kill();

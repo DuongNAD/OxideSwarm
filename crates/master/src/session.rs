@@ -588,7 +588,6 @@ impl<
         let negotiated_features = worker_features & ProtocolCapabilities::all_supported();
         let worker_supports_resume =
             negotiated_features.contains(ProtocolCapabilities::SESSION_RESUME);
-        queue.set_worker_session_resume(worker_id, worker_supports_resume);
 
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<MasterMessage>(128);
         let registration = registry
@@ -601,6 +600,7 @@ impl<
                 abort_handle,
             )
             .await?;
+        queue.set_worker_session_resume(worker_id, worker_supports_resume);
         let session_id = registration.session_id;
         registry
             .set_rx_clock(&worker_id, session_id, rx_clock)
@@ -621,6 +621,7 @@ impl<
             )
             .await;
         }
+        queue.set_worker_session_resume_connected(worker_id, worker_supports_resume);
         if !worker_supports_resume {
             let outcome = queue.adopt_session_tasks(worker_id, session_id, &[]).await;
             if !outcome.newly_failed.is_empty() {
@@ -938,7 +939,6 @@ impl<
 
     async fn run(&mut self) -> GridResult<()> {
         let default_lane = self.lanes.default_lane_kind();
-        let mut shutting_down = false;
         loop {
             tokio::select! {
                 inbound = self.lanes.recv_next() => {
@@ -997,31 +997,27 @@ impl<
                                 grace_period_secs: Some(5),
                             })
                             .await;
-                        shutting_down = true;
                         break;
                     } else if res.is_err() {
-                        shutting_down = true;
                         break;
                     }
                 }
             }
         }
 
-        if !shutting_down {
-            handle_worker_disconnect_with_broadcast(
-                &self.registry,
-                &self.queue,
-                &self.scheduler_notify,
-                Some(&self.waiters),
-                &self.worker_id,
-                Some(self.session_id),
-                default_lane.cleanup_reason(),
-                false,
-                #[cfg(feature = "dashboard")]
-                self.broadcast_tx.as_ref(),
-            )
-            .await;
-        }
+        handle_worker_disconnect_with_broadcast(
+            &self.registry,
+            &self.queue,
+            &self.scheduler_notify,
+            Some(&self.waiters),
+            &self.worker_id,
+            Some(self.session_id),
+            default_lane.cleanup_reason(),
+            false,
+            #[cfg(feature = "dashboard")]
+            self.broadcast_tx.as_ref(),
+        )
+        .await;
 
         #[cfg(feature = "p2p")]
         if let Some(ref guard) = self.p2p_guard {

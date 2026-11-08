@@ -467,9 +467,15 @@ impl ServerConfig {
     /// disconnected or restarted workers (`Duration::ZERO` disables session resume; clamped to
     /// [`rusty_grid_core::protocol::master_features::MAX_SESSION_RESUME_HOLD_SECS`]).
     pub fn with_session_resume_hold(mut self, hold: Duration) -> Self {
-        let max_hold = Duration::from_secs(
-            rusty_grid_core::protocol::master_features::MAX_SESSION_RESUME_HOLD_SECS,
-        );
+        let max_secs = rusty_grid_core::protocol::master_features::MAX_SESSION_RESUME_HOLD_SECS;
+        let max_hold = Duration::from_secs(max_secs);
+        if hold > max_hold {
+            warn!(
+                requested_secs = hold.as_secs(),
+                max_secs = max_secs,
+                "Requested session-resume hold exceeds maximum; clamping to {max_secs}s"
+            );
+        }
         self.session_resume_hold = if hold.is_zero() {
             Duration::ZERO
         } else {
@@ -2288,6 +2294,7 @@ async fn apply_task_result_inner(
         registry.clear_rejections(&worker_id).await;
     }
     let send_ack = queue.session_resume_hold_secs() > 0;
+    let ack_token = rusty_grid_core::protocol::master_features::result_ack_token(&result);
 
     // 3. Notify awaiting clients, but only once the task is really finished: a requeued
     //    task (rejection, execution retry) will still produce its real result and keeps its
@@ -2305,20 +2312,16 @@ async fn apply_task_result_inner(
                 let waiters = Arc::clone(waiters);
                 let ack_registry = registry.clone();
                 tokio::spawn(async move {
-                    let sync_ok = match ack.await {
-                        Ok(()) => true,
-                        Err(err) => {
-                            warn!(
-                                task_id = %task_id.0,
-                                error = %err,
-                                "Failed to sync TaskTerminal journal record for task result"
-                            );
-                            false
-                        }
-                    };
-                    if send_ack && sync_ok {
+                    if let Err(err) = ack.await {
+                        warn!(
+                            task_id = %task_id.0,
+                            error = %err,
+                            "Failed to sync TaskTerminal journal record for task result"
+                        );
+                    }
+                    if send_ack {
                         ack_registry
-                            .send_result_ack(&worker_id, session_id, task_id)
+                            .send_result_ack(&worker_id, session_id, task_id, ack_token)
                             .await;
                     }
                     let mut lock = waiters.write().await;
@@ -2331,7 +2334,7 @@ async fn apply_task_result_inner(
             } else {
                 if send_ack {
                     registry
-                        .send_result_ack(&worker_id, session_id, task_id)
+                        .send_result_ack(&worker_id, session_id, task_id, ack_token)
                         .await;
                 }
                 let mut lock = waiters.write().await;
@@ -2342,24 +2345,18 @@ async fn apply_task_result_inner(
                 }
             }
         } else {
-            let sync_ok = if let Some(ack) = durable_ack {
-                match ack.await {
-                    Ok(()) => true,
-                    Err(err) => {
-                        warn!(
-                            task_id = %task_id.0,
-                            error = %err,
-                            "Failed to sync TaskTerminal journal record for task result"
-                        );
-                        false
-                    }
+            if let Some(ack) = durable_ack {
+                if let Err(err) = ack.await {
+                    warn!(
+                        task_id = %task_id.0,
+                        error = %err,
+                        "Failed to sync TaskTerminal journal record for task result"
+                    );
                 }
-            } else {
-                true
-            };
-            if send_ack && sync_ok {
+            }
+            if send_ack {
                 registry
-                    .send_result_ack(&worker_id, session_id, task_id)
+                    .send_result_ack(&worker_id, session_id, task_id, ack_token)
                     .await;
             }
             let mut lock = waiters.write().await;
@@ -2371,19 +2368,17 @@ async fn apply_task_result_inner(
         }
     } else if send_ack {
         if let Some(ack) = durable_ack {
-            let ack_registry = registry.clone();
-            tokio::spawn(async move {
-                if ack.await.is_ok() {
-                    ack_registry
-                        .send_result_ack(&worker_id, session_id, task_id)
-                        .await;
-                }
-            });
-        } else {
-            registry
-                .send_result_ack(&worker_id, session_id, task_id)
-                .await;
+            if let Err(err) = ack.await {
+                warn!(
+                    task_id = %task_id.0,
+                    error = %err,
+                    "Failed to sync journal record for non-terminal task result"
+                );
+            }
         }
+        registry
+            .send_result_ack(&worker_id, session_id, task_id, ack_token)
+            .await;
     }
 
     // 4. Wake scheduler loop to assign pending tasks

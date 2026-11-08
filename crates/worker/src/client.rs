@@ -169,16 +169,64 @@ pub fn compute_effective_resume_grace(
     }
 }
 
+/// Maximum total bytes of task results buffered in the session-resume outbox (design 0046 D4).
+pub const MAX_RESUME_OUTBOX_BYTES: usize = 32 * 1024 * 1024;
+
+fn buffered_result_bytes(result: &TaskResult) -> usize {
+    256usize
+        .saturating_add(result.stdout.0.len())
+        .saturating_add(result.stderr.0.len())
+        .saturating_add(result.error.as_ref().map_or(0, String::len))
+        .saturating_add(result.device_name.as_ref().map_or(0, String::len))
+        .saturating_add(result.asset_bytes.as_ref().map_or(0, |b| b.0.len()))
+        .saturating_add(
+            result
+                .artifacts
+                .iter()
+                .map(|a| a.path.len().saturating_add(a.data.len()))
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            result
+                .outputs
+                .iter()
+                .map(|o| o.path.len().saturating_add(64))
+                .sum::<usize>(),
+        )
+}
+
 /// Completed task result buffered in the worker's session-resume outbox until acknowledged by the
-/// Master (`MasterMessage::CancelTask { reason: Some(RESULT_ACK_REASON) }`) or until the resume
-/// window expires. Holds `output_pin` (`Arc<CachePin>`) so output blobs stay pinned in
+/// Master (`MasterMessage::CancelTask { reason: Some("oxs:result-ack:<token>") }`) or until the
+/// resume window expires. Holds `output_pin` (`Arc<CachePin>`) so output blobs stay pinned in
 /// `BlobCache` across transient session drops.
 #[derive(Clone)]
 struct BufferedTaskResult {
     task: Task,
     result: TaskResult,
+    ack_token: u64,
+    byte_size: usize,
     _output_pin: Option<Arc<crate::blob_cache::CachePin>>,
     used_blobs: bool,
+}
+
+impl BufferedTaskResult {
+    fn new(
+        task: Task,
+        result: TaskResult,
+        output_pin: Option<Arc<crate::blob_cache::CachePin>>,
+        used_blobs: bool,
+    ) -> Self {
+        let ack_token = master_features::result_ack_token(&result);
+        let byte_size = buffered_result_bytes(&result);
+        Self {
+            task,
+            result,
+            ack_token,
+            byte_size,
+            _output_pin: output_pin,
+            used_blobs,
+        }
+    }
 }
 
 /// Bounded per-worker outbox for checkpoints and task results retained across transient session
@@ -188,6 +236,8 @@ struct PendingResumeOutbox {
     results: Vec<BufferedTaskResult>,
     cancelled: std::collections::HashSet<TaskId>,
     max_results: usize,
+    total_bytes: usize,
+    max_bytes: usize,
 }
 
 impl Default for PendingResumeOutbox {
@@ -203,6 +253,8 @@ impl PendingResumeOutbox {
             results: Vec::new(),
             cancelled: std::collections::HashSet::new(),
             max_results: max_results.max(2),
+            total_bytes: 0,
+            max_bytes: MAX_RESUME_OUTBOX_BYTES,
         }
     }
 
@@ -210,6 +262,7 @@ impl PendingResumeOutbox {
         self.checkpoints.clear();
         self.results.clear();
         self.cancelled.clear();
+        self.total_bytes = 0;
     }
 
     fn push_result(&mut self, item: BufferedTaskResult) -> bool {
@@ -218,47 +271,83 @@ impl PendingResumeOutbox {
             return false;
         }
         let mut evicted_used_blobs = false;
+        let mut removed_bytes = 0usize;
         self.results.retain(|r| {
             if r.result.task_id == task_id {
                 evicted_used_blobs |= r.used_blobs;
+                removed_bytes = removed_bytes.saturating_add(r.byte_size);
                 false
             } else {
                 true
             }
         });
-        while self.results.len() >= self.max_results {
+        self.total_bytes = self.total_bytes.saturating_sub(removed_bytes);
+        while self.results.len() >= self.max_results
+            || (!self.results.is_empty()
+                && self.total_bytes.saturating_add(item.byte_size) > self.max_bytes)
+        {
             let evicted = self.results.remove(0);
+            self.total_bytes = self.total_bytes.saturating_sub(evicted.byte_size);
             evicted_used_blobs |= evicted.used_blobs;
         }
+        self.total_bytes = self.total_bytes.saturating_add(item.byte_size);
         self.results.push(item);
         evicted_used_blobs
     }
 
-    fn ack_result(&mut self, task_id: TaskId) -> bool {
-        self.checkpoints.remove(&task_id);
+    fn update_result(&mut self, task_id: TaskId, prev_token: u64, result: TaskResult) -> u64 {
+        let new_token = master_features::result_ack_token(&result);
+        let new_size = buffered_result_bytes(&result);
+        for item in &mut self.results {
+            if item.result.task_id == task_id && item.ack_token == prev_token {
+                self.total_bytes = self
+                    .total_bytes
+                    .saturating_sub(item.byte_size)
+                    .saturating_add(new_size);
+                item.result = result;
+                item.ack_token = new_token;
+                item.byte_size = new_size;
+                break;
+            }
+        }
+        new_token
+    }
+
+    fn ack_result(&mut self, task_id: TaskId, ack_token: Option<u64>) -> bool {
         let mut used_blobs = false;
+        let mut removed_any = false;
+        let mut removed_bytes = 0usize;
         self.results.retain(|item| {
-            if item.result.task_id == task_id {
+            if item.result.task_id == task_id && ack_token.is_none_or(|t| item.ack_token == t) {
                 used_blobs |= item.used_blobs;
+                removed_any = true;
+                removed_bytes = removed_bytes.saturating_add(item.byte_size);
                 false
             } else {
                 true
             }
         });
+        self.total_bytes = self.total_bytes.saturating_sub(removed_bytes);
+        if ack_token.is_none() || removed_any {
+            self.checkpoints.remove(&task_id);
+        }
         used_blobs
     }
 
     fn cancel_task(&mut self, task_id: TaskId) -> bool {
         self.checkpoints.remove(&task_id);
         let mut used_blobs = false;
+        let mut removed_bytes = 0usize;
         self.results.retain(|item| {
             if item.result.task_id == task_id {
                 used_blobs |= item.used_blobs;
+                removed_bytes = removed_bytes.saturating_add(item.byte_size);
                 false
             } else {
                 true
             }
         });
+        self.total_bytes = self.total_bytes.saturating_sub(removed_bytes);
         self.cancelled.insert(task_id);
         used_blobs
     }
@@ -2178,7 +2267,7 @@ impl WorkerClient {
                 }
             };
 
-            let _guard = ActiveTaskGuard {
+            let mut _guard = ActiveTaskGuard {
                 task_id,
                 attempt,
                 heartbeat_tracker: Arc::clone(&tracker),
@@ -2322,9 +2411,13 @@ impl WorkerClient {
                 .ok()
                 .and_then(|cache| cache.take_task_outputs(task.id))
                 .map(Arc::new);
+            // Ownership of this attempt's output pin now lives in `output_pin`; prevent `_guard`
+            // from releasing a subsequent retry attempt's `task_outputs` entry on drop.
+            _guard.runner = None;
             let resume_enabled = grace_enabled
                 && (current_session_hold_secs.load(Ordering::Acquire) > 0
                     || resume_window_active.load(Ordering::Acquire));
+            let mut buffered_token = master_features::result_ack_token(&result);
 
             if cancelled_reason.is_none() && !suppress.load(Ordering::Acquire) {
                 let (live_tx, evicted_used_blobs) = {
@@ -2333,12 +2426,12 @@ impl WorkerClient {
                         .unwrap_or_else(|e| e.into_inner());
                     let tx = current_tx(&session_data_tx, &outbound_tx);
                     let evicted = if resume_enabled {
-                        outbox.push_result(BufferedTaskResult {
-                            task: task.clone(),
-                            result: result.clone(),
-                            _output_pin: output_pin.clone(),
+                        outbox.push_result(BufferedTaskResult::new(
+                            task.clone(),
+                            result.clone(),
+                            output_pin.clone(),
                             used_blobs,
-                        })
+                        ))
                     } else {
                         false
                     };
@@ -2376,6 +2469,12 @@ impl WorkerClient {
                             result.error = Some(e);
                         }
                     }
+                    if resume_enabled && cancelled_reason.is_none() {
+                        buffered_token = pending_resume_outbox
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .update_result(task.id, buffered_token, result.clone());
+                    }
                 }
 
                 let blob_client_closed = had_outputs
@@ -2398,11 +2497,10 @@ impl WorkerClient {
                 pending_resume_outbox
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .ack_result(task.id);
+                    .ack_result(task.id, Some(buffered_token));
             }
 
             drop(output_pin);
-            runner.release_task_outputs(task.id);
             drop(_inputs);
             if used_blobs {
                 if let Ok(cache) = runner.blob_cache() {
@@ -2445,14 +2543,15 @@ impl WorkerClient {
 
     /// Cancels an active task by signaling the cancellation channel and triggering abort if necessary.
     pub async fn handle_cancel_task(&self, task_id: TaskId, reason: Option<String>) {
-        if reason.as_deref() == Some(rusty_grid_core::protocol::master_features::RESULT_ACK_REASON)
+        if let Some(ack_token) = reason
+            .as_deref()
+            .and_then(rusty_grid_core::protocol::master_features::parse_result_ack_reason)
         {
             let used_blobs = self
                 .pending_resume_outbox
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .ack_result(task_id);
-            self.runner.release_task_outputs(task_id);
+                .ack_result(task_id, ack_token);
             if used_blobs {
                 if let Ok(cache) = self.runner.blob_cache() {
                     let _ = tokio::task::spawn_blocking(move || cache.evict_to_fit()).await;
@@ -2480,9 +2579,7 @@ impl WorkerClient {
         let mut lock = self.active_task_table.write().await;
         if let Some(mut handle) = lock.remove(&task_id) {
             let r = reason.unwrap_or_else(|| "Cancelled by master directive".into());
-            if r.contains("no longer assigned to this worker")
-                || r.contains("Session resume hold expired")
-            {
+            if r.contains("no longer assigned to this worker") {
                 handle.suppress_result.store(true, Ordering::Release);
             }
             info!(task_id = %task_id, reason = %r, "Cancelling active task");
@@ -3143,81 +3240,84 @@ impl WorkerClient {
             }
         }
         let mut farewell: Option<WorkerMessage> = None;
-        let _outbox_flush_guard =
-            (!buffered_checkpoints.is_empty() || !buffered_results.is_empty()).then(|| {
-                let data_tx = session.data_tx.clone();
-                let flush_blob_client = blob_client.clone();
-                let flush_runner = Arc::clone(&self.runner);
-                let flush_outbox = Arc::clone(&self.pending_resume_outbox);
-                AbortOnDrop(tokio::spawn(async move {
-                    for (tid, cp_msg) in buffered_checkpoints {
-                        let cancelled = flush_outbox
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .cancelled
-                            .contains(&tid);
-                        if !cancelled && data_tx.send(cp_msg).await.is_err() {
-                            return;
-                        }
+        let _outbox_flush_guard = (!buffered_checkpoints.is_empty()
+            || !buffered_results.is_empty())
+        .then(|| {
+            let data_tx = session.data_tx.clone();
+            let flush_blob_client = blob_client.clone();
+            let flush_runner = Arc::clone(&self.runner);
+            let flush_outbox = Arc::clone(&self.pending_resume_outbox);
+            AbortOnDrop(tokio::spawn(async move {
+                for (tid, cp_msg) in buffered_checkpoints {
+                    let cancelled = flush_outbox
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .cancelled
+                        .contains(&tid);
+                    if !cancelled && data_tx.send(cp_msg).await.is_err() {
+                        return;
                     }
-                    for item in buffered_results {
-                        let still_pending = {
-                            let outbox = flush_outbox.lock().unwrap_or_else(|e| e.into_inner());
-                            !outbox.cancelled.contains(&item.task.id)
-                                && outbox
-                                    .results
-                                    .iter()
-                                    .any(|r| r.result.task_id == item.task.id)
-                        };
-                        if !still_pending {
-                            continue;
-                        }
+                }
+                for item in buffered_results {
+                    let still_pending = {
+                        let outbox = flush_outbox.lock().unwrap_or_else(|e| e.into_inner());
+                        !outbox.cancelled.contains(&item.task.id)
+                            && outbox.results.iter().any(|r| {
+                                r.result.task_id == item.task.id && r.ack_token == item.ack_token
+                            })
+                    };
+                    if !still_pending {
+                        continue;
+                    }
 
-                        let mut result = item.result.clone();
-                        if !result.outputs.is_empty() {
-                            match flush_runner.blob_cache() {
-                                Ok(cache) => {
-                                    upload_task_outputs(
-                                        &item.task,
-                                        &mut result,
-                                        flush_blob_client.as_deref(),
-                                        &cache,
-                                    )
-                                    .await;
-                                }
-                                Err(e) => {
-                                    result.outputs.clear();
-                                    result.error = Some(e);
-                                }
+                    let mut result = item.result.clone();
+                    if !result.outputs.is_empty() {
+                        match flush_runner.blob_cache() {
+                            Ok(cache) => {
+                                upload_task_outputs(
+                                    &item.task,
+                                    &mut result,
+                                    flush_blob_client.as_deref(),
+                                    &cache,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                result.outputs.clear();
+                                result.error = Some(e);
                             }
                         }
-
-                        if !item.result.outputs.is_empty()
-                            && flush_blob_client
-                                .as_ref()
-                                .is_some_and(|client| client.is_closed())
-                        {
-                            return;
-                        }
-
-                        let still_pending = {
-                            let outbox = flush_outbox.lock().unwrap_or_else(|e| e.into_inner());
-                            !outbox.cancelled.contains(&item.task.id)
-                                && outbox
-                                    .results
-                                    .iter()
-                                    .any(|r| r.result.task_id == item.task.id)
-                        };
-                        if !still_pending {
-                            continue;
-                        }
-
-                        if data_tx.send(WorkerMessage::from(result)).await.is_err() {
-                            return;
-                        }
                     }
-                }))
-            });
+
+                    if !item.result.outputs.is_empty()
+                        && flush_blob_client
+                            .as_ref()
+                            .is_some_and(|client| client.is_closed())
+                    {
+                        return;
+                    }
+
+                    let current_token = {
+                        let mut outbox = flush_outbox.lock().unwrap_or_else(|e| e.into_inner());
+                        outbox.update_result(item.task.id, item.ack_token, result.clone())
+                    };
+                    let still_pending = {
+                        let outbox = flush_outbox.lock().unwrap_or_else(|e| e.into_inner());
+                        !outbox.cancelled.contains(&item.task.id)
+                            && outbox.results.iter().any(|r| {
+                                r.result.task_id == item.task.id && r.ack_token == current_token
+                            })
+                    };
+                    if !still_pending {
+                        continue;
+                    }
+
+                    if data_tx.send(WorkerMessage::from(result)).await.is_err() {
+                        return;
+                    }
+                }
+            }))
+        });
 
         let outcome: GridResult<()> = loop {
             tokio::select! {
@@ -7230,6 +7330,7 @@ mod tests {
             battery_pct: Some(80),
             is_charging: Some(true),
             thermal_throttled: false,
+            network_type: Some("cellular".into()),
             ..Default::default()
         });
         assert_eq!(default_client.effective_resume_grace(), Duration::ZERO);
@@ -7257,14 +7358,10 @@ mod tests {
         );
         let task_id = task.id;
         let res = TaskResult::success(client.worker_id(), task_id, "ok", 5, false);
+        let token = master_features::result_ack_token(&res);
         {
             let mut outbox = client.pending_resume_outbox.lock().unwrap();
-            outbox.push_result(BufferedTaskResult {
-                task,
-                result: res,
-                _output_pin: None,
-                used_blobs: false,
-            });
+            outbox.push_result(BufferedTaskResult::new(task, res, None, false));
         }
         assert_eq!(client.resumable_task_ids().await, vec![task_id]);
 
@@ -7278,7 +7375,7 @@ mod tests {
         client
             .handle_cancel_task(
                 task_id,
-                Some(rusty_grid_core::protocol::master_features::RESULT_ACK_REASON.to_string()),
+                Some(master_features::format_result_ack_reason(token)),
             )
             .await;
         assert!(client.resumable_task_ids().await.is_empty());
@@ -7286,5 +7383,94 @@ mod tests {
             !client.cancelled_unseen.lock().unwrap().contains(&task_id),
             "RESULT_ACK_REASON must not record task_id in cancelled_unseen"
         );
+    }
+
+    #[tokio::test]
+    async fn test_stale_attempt_result_ack_preserves_retry_outbox_and_output_pins() {
+        let client = WorkerClient::for_testing("127.0.0.1:9999", None, Some(1), false);
+        let task = Task::new(
+            rusty_grid_core::task::TaskSpec::builtin_test("sleep", 0),
+            TaskRequirements::generic(1, 32),
+        );
+        let task_id = task.id;
+        let attempt1_res = TaskResult::failure(
+            client.worker_id(),
+            task_id,
+            1,
+            "",
+            "boom",
+            5,
+            Some("boom".into()),
+        );
+        let token1 = master_features::result_ack_token(&attempt1_res);
+        let attempt2_res = TaskResult::success(client.worker_id(), task_id, "ok-2", 7, false);
+        let token2 = master_features::result_ack_token(&attempt2_res);
+        assert_ne!(token1, token2);
+
+        // Attempt 2 has buffered its result in the outbox AND holds an active output pin in the
+        // runner's BlobCache when attempt 1's delayed acknowledgement arrives.
+        {
+            let mut outbox = client.pending_resume_outbox.lock().unwrap();
+            outbox.push_result(BufferedTaskResult::new(
+                task.clone(),
+                attempt2_res,
+                None,
+                true,
+            ));
+        }
+        let cache = client.runner.blob_cache().unwrap();
+        let fake_blob_id = rusty_grid_core::blob::BlobId::of(b"retry-attempt-2-output");
+        cache.keep_task_outputs(task_id, cache.pin([fake_blob_id]));
+
+        // Master's delayed ack for attempt 1 arrives: must NOT evict attempt 2's buffered result
+        // and must NOT release attempt 2's output pin in `BlobCache`.
+        client
+            .handle_cancel_task(
+                task_id,
+                Some(master_features::format_result_ack_reason(token1)),
+            )
+            .await;
+        assert_eq!(client.resumable_task_ids().await, vec![task_id]);
+        assert!(
+            cache.take_task_outputs(task_id).is_some(),
+            "attempt 1 result-ack must not release attempt 2's task_outputs pin"
+        );
+
+        // Now attempt 2's ack arrives and clears the buffered result.
+        client
+            .handle_cancel_task(
+                task_id,
+                Some(master_features::format_result_ack_reason(token2)),
+            )
+            .await;
+        assert!(client.resumable_task_ids().await.is_empty());
+    }
+
+    #[test]
+    fn test_pending_resume_outbox_enforces_byte_budget() {
+        let mut outbox = PendingResumeOutbox::with_capacity(16);
+        outbox.max_bytes = 2_048;
+
+        let worker_id = Uuid::new_v4();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let task = Task::new(
+                rusty_grid_core::task::TaskSpec::builtin_test("sleep", 0),
+                TaskRequirements::generic(1, 32),
+            );
+            ids.push(task.id);
+            let payload = format!("chunk-{i}-{}", "x".repeat(600));
+            let res = TaskResult::success(worker_id, task.id, payload, 1, false);
+            outbox.push_result(BufferedTaskResult::new(task, res, None, false));
+        }
+
+        assert!(
+            outbox.total_bytes <= outbox.max_bytes,
+            "total_bytes {} exceeded max_bytes {}",
+            outbox.total_bytes,
+            outbox.max_bytes
+        );
+        assert!(outbox.results.len() < 5);
+        assert_eq!(outbox.results.last().unwrap().result.task_id, ids[4]);
     }
 }

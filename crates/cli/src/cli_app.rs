@@ -1438,13 +1438,21 @@ async fn run_master(
     if let Some(ref dir) = state_dir {
         server_config = server_config.with_state_dir(dir);
     }
-    let session_resume_hold_secs = resolve_u64(
+    let requested_hold_secs = resolve_u64(
         args.session_resume_hold_secs,
         &["RUSTY_GRID_SESSION_RESUME_HOLD_SECS"],
         master_cfg.as_ref().and_then(|m| m.session_resume_hold_secs),
         rusty_grid_master::DEFAULT_SESSION_RESUME_HOLD_SECS,
-    )
-    .min(rusty_grid_core::protocol::master_features::MAX_SESSION_RESUME_HOLD_SECS);
+    );
+    let max_hold_secs = rusty_grid_core::protocol::master_features::MAX_SESSION_RESUME_HOLD_SECS;
+    if requested_hold_secs > max_hold_secs {
+        tracing::warn!(
+            requested_secs = requested_hold_secs,
+            max_secs = max_hold_secs,
+            "Requested --session-resume-hold-secs exceeds maximum; clamping to {max_hold_secs}s"
+        );
+    }
+    let session_resume_hold_secs = requested_hold_secs.min(max_hold_secs);
     server_config =
         server_config.with_session_resume_hold(Duration::from_secs(session_resume_hold_secs));
 
