@@ -207,7 +207,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | 155 |
 | REL-5 | Contributor and security files | P3 | S | REL-1 |  | Implemented | 75 |
 | JOIN-1 | Join a machine with one token | P2 | M |  |  | Planned |  |
-| LINK-1 | Show whether each link is direct or relayed | P2 | M |  |  | Planned |  |
+| LINK-1 | Show whether each link is direct or relayed | P2 | M |  |  | Partial | 159 (open) |
 | BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Planned |  |
 
 ## Phase 0: integrate open work
@@ -1543,3 +1543,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-08: Added CACHE-1, REAPI-1, JOIN-1, LINK-1 and BENCH-1 as Planned, from the research
   recorded in [ROADMAP.md](ROADMAP.md) (decision Q7). Their evidence was read at `master` `fec164e`.
 - 2026-11-08: REL-4 implemented in pull request 155: `.github/workflows/release.yml` builds archives for Linux, macOS (arm64, x86_64) and Windows, with and without `gpu-wgpu`, and `SHA256SUMS`; a `v*` tag creates the release, a pull request only uploads artifacts. No tag exists yet: the owner cuts the first one. Crates have `publish = false`, `authors` match the licence and `README.md` has an Install section.
+- 2026-11-09: LINK-1 is Partial: steps 1 and 2 are in pull request 159. `doctor` has a `LINK` column, check C7 (warning for a relayed worker) and check C8 (an 8 MiB blob to each worker, MB/s, `--skip-throughput`). Steps 3 (relay URL option) and 4 (guide) are Planned; they touch `server.rs` and the worker client.

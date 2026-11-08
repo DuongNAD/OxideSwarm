@@ -655,6 +655,10 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                     "skip_spread": {
                         "type": "boolean",
                         "description": "Skip workload spread check C6 (default: false)"
+                    },
+                    "skip_throughput": {
+                        "type": "boolean",
+                        "description": "Skip the blob throughput probe C8 (default: false)"
                     }
                 },
                 "required": []
@@ -922,6 +926,7 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             check_opt_u64(obj, "spread_tasks")?;
             check_opt_bool(obj, "skip_gpu")?;
             check_opt_bool(obj, "skip_spread")?;
+            check_opt_bool(obj, "skip_throughput")?;
             Ok(())
         }
         other => Err(format!("Unknown tool: '{other}'")),
@@ -2572,6 +2577,9 @@ async fn tool_doctor(state: &McpState, args: &Value) -> ToolCallResult {
     }
     if let Some(skip_spread) = args.get("skip_spread").and_then(Value::as_bool) {
         options.skip_spread = skip_spread;
+    }
+    if let Some(skip_throughput) = args.get("skip_throughput").and_then(Value::as_bool) {
+        options.skip_throughput = skip_throughput;
     }
 
     let target_addr = state
