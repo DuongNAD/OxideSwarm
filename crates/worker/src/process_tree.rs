@@ -1355,13 +1355,10 @@ mod tests {
 
     #[test]
     fn test_task_env_needle_matches_exact_nul_delimited_entry() {
-        let run_token =
-            uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid uuid");
+        let run_token = uuid::Uuid::new_v4();
         let needle = build_task_env_needle(run_token);
-        assert_eq!(
-            &needle[..],
-            b"RUSTY_GRID_RUN_TOKEN=550e8400-e29b-41d4-a716-446655440000\0"
-        );
+        let expected = format!("RUSTY_GRID_RUN_TOKEN={run_token}\0");
+        assert_eq!(&needle[..], expected.as_bytes());
 
         // Exact match at start of buffer.
         assert!(env_block_contains_needle(&needle, &needle));
@@ -1376,13 +1373,11 @@ mod tests {
         assert!(env_block_contains_needle_chunk(&block, &needle, false));
 
         // Substring suffix of another variable name must not match.
-        let mut fake = Vec::new();
-        fake.extend_from_slice(b"NOT_RUSTY_GRID_RUN_TOKEN=550e8400-e29b-41d4-a716-446655440000\0");
+        let fake = format!("NOT_{expected}").into_bytes();
         assert!(!env_block_contains_needle(&fake, &needle));
 
         // Different run token UUID must not match.
-        let other_token =
-            uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001").expect("valid uuid");
+        let other_token = uuid::Uuid::new_v4();
         let other_needle = build_task_env_needle(other_token);
         assert!(!env_block_contains_needle(&block, &other_needle));
     }

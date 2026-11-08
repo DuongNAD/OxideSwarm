@@ -1409,9 +1409,13 @@ sys.exit(0)
 // FEAT-2 (Design 0031): Containment after a worker crash
 // ============================================================================
 
+#[cfg(unix)]
 const FEAT2_HELPER_ENV: &str = "OXIDESWARM_SEC5_CRASH_CONTAINMENT_HELPER";
+#[cfg(unix)]
 const FEAT2_HELPER_PIDS_ENV: &str = "OXIDESWARM_SEC5_CRASH_CONTAINMENT_PIDS_FILE";
+#[cfg(unix)]
 const FEAT2_HELPER_SANDBOX_ENV: &str = "OXIDESWARM_SEC5_CRASH_CONTAINMENT_SANDBOX_DIR";
+#[cfg(unix)]
 const FEAT2_HELPER_COUNT_ENV: &str = "OXIDESWARM_SEC5_CRASH_CONTAINMENT_TASK_COUNT";
 
 #[tokio::test]
@@ -2065,6 +2069,7 @@ exit(0);
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn feat2_worker_subprocess_helper() {
     if std::env::var(FEAT2_HELPER_ENV).ok().as_deref() != Some("1") {
@@ -2179,6 +2184,7 @@ time.sleep(300)
     }
 }
 
+#[cfg(unix)]
 async fn run_worker_sigkill_containment_test(task_count: usize) {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let pids_file = temp_dir.path().join("crash_descendants.pids");
@@ -2229,12 +2235,14 @@ async fn run_worker_sigkill_containment_test(task_count: usize) {
     assert_all_dead_async(&pids, Duration::from_secs(5)).await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_feat2_worker_sigkill_terminates_child_grandchild_and_setsid_descendants_within_five_seconds(
 ) {
     run_worker_sigkill_containment_test(1).await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_feat2_eight_concurrent_tasks_all_contained_after_worker_sigkill() {
     run_worker_sigkill_containment_test(8).await;
