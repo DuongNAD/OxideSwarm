@@ -204,7 +204,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented | 118 (design), 125, 126, 127, 131 |
 | CACHE-1 | Reuse the result of an identical task | P2 | L | FEAT-1 |  | Planned |  |
 | REAPI-1 | Serve the blob store as a Remote Execution API cache | P3 | L | CACHE-1 | Yes | Planned |  |
-| REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Planned |  |
+| REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | 155 |
 | REL-5 | Contributor and security files | P3 | S | REL-1 |  | Implemented | 75 |
 | JOIN-1 | Join a machine with one token | P2 | M |  |  | Planned |  |
 | LINK-1 | Show whether each link is direct or relayed | P2 | M |  |  | Planned |  |
@@ -1542,3 +1542,4 @@ Add one dated line per finished item, newest last.
   still read `cluster.secret`.
 - 2026-11-08: Added CACHE-1, REAPI-1, JOIN-1, LINK-1 and BENCH-1 as Planned, from the research
   recorded in [ROADMAP.md](ROADMAP.md) (decision Q7). Their evidence was read at `master` `fec164e`.
+- 2026-11-08: REL-4 implemented in pull request 155: `.github/workflows/release.yml` builds archives for Linux, macOS (arm64, x86_64) and Windows, with and without `gpu-wgpu`, and `SHA256SUMS`; a `v*` tag creates the release, a pull request only uploads artifacts. No tag exists yet: the owner cuts the first one. Crates have `publish = false`, `authors` match the licence and `README.md` has an Install section.
