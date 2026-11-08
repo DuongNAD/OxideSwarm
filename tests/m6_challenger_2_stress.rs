@@ -538,9 +538,13 @@ echo "OK: $READBACK"
     }
 
     // Verify sandbox cleanup: no leftover task sandbox directories in base_dir
+    // (ignoring worker infrastructure `.locks`)
     let mut read_dir = tokio::fs::read_dir(temp_dir.path()).await.unwrap();
     let mut leftover_count = 0;
-    while let Ok(Some(_entry)) = read_dir.next_entry().await {
+    while let Ok(Some(entry)) = read_dir.next_entry().await {
+        if entry.file_name() == ".locks" {
+            continue;
+        }
         leftover_count += 1;
     }
     assert_eq!(
