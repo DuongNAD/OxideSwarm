@@ -8,11 +8,11 @@
 //!   itself, and its operator may add user tags ([`validate_user_tag`]). In `ListWorkers` /
 //!   `ClusterStatus` answers the master adds `link:<path>`, `id:<worker uuid>` and
 //!   `state:<state>`, and the worker adds its task isolation level as `iso:<level>`
-//!   ([`IsolationLevel`], design 0033). Those seven prefixes are [`RESERVED_TAG_PREFIXES`]: no user tag may start
-//!   with one.
+//!   ([`IsolationLevel`], design 0033) and probed host tools as `tool:<name>` (design 0039).
+//!   Those eight prefixes are [`RESERVED_TAG_PREFIXES`]: no user tag may start with one.
 //! * **Task constraints.** `require:<key>=<value>` entries of `Task::tags`, parsed into a
 //!   [`Placement`]. Keys: `os`, `arch`, `worker` (UUID or name), `iso` (a minimum
-//!   [`IsolationLevel`]) and `tag` (repeatable). Every
+//!   [`IsolationLevel`]), `tool` (repeatable) and `tag` (repeatable). Every
 //!   constraint must hold; other task tags are ignored.
 
 use std::fmt;
@@ -38,8 +38,10 @@ pub const ID_TAG_PREFIX: &str = "id:";
 pub const STATE_TAG_PREFIX: &str = "state:";
 /// Prefix of the task isolation tag a worker adds itself (`iso:fs+net`).
 pub const ISO_TAG_PREFIX: &str = "iso:";
+/// Prefix of a probed host-tool tag a worker adds itself (`tool:cargo`, `tool:rustc`, `tool:git`).
+pub const TOOL_TAG_PREFIX: &str = "tool:";
 /// Tag prefixes only the worker or the master may set.
-pub const RESERVED_TAG_PREFIXES: [&str; 7] = [
+pub const RESERVED_TAG_PREFIXES: [&str; 8] = [
     OS_TAG_PREFIX,
     ARCH_TAG_PREFIX,
     SLOTS_TAG_PREFIX,
@@ -47,6 +49,7 @@ pub const RESERVED_TAG_PREFIXES: [&str; 7] = [
     ID_TAG_PREFIX,
     STATE_TAG_PREFIX,
     ISO_TAG_PREFIX,
+    TOOL_TAG_PREFIX,
 ];
 /// Longest user tag, in bytes.
 pub const MAX_USER_TAG_LEN: usize = 64;
@@ -203,6 +206,29 @@ pub fn normalize_arch(value: &str) -> String {
     }
 }
 
+/// Checks and normalizes a tool name (`require:tool=<name>`, `--require-tool`, MCP `tools`):
+/// 1 to [`MAX_USER_TAG_LEN`] bytes, no whitespace, `=`, `,`, `:`, `/` or `\`, lowercased.
+pub fn validate_tool_name(name: &str) -> Result<String, String> {
+    if name.is_empty() {
+        return Err("a tool name cannot be empty".to_string());
+    }
+    if name.len() > MAX_USER_TAG_LEN {
+        return Err(format!(
+            "tool name `{name}` is {} bytes long; the limit is {MAX_USER_TAG_LEN}",
+            name.len()
+        ));
+    }
+    if name
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '=' | ',' | ':' | '/' | '\\'))
+    {
+        return Err(format!(
+            "tool name `{name}` contains whitespace, `=`, `,`, `:`, `/` or `\\`"
+        ));
+    }
+    Ok(name.to_ascii_lowercase())
+}
+
 /// The placement constraints of one task. An empty `Placement` lets any worker run the task.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Placement {
@@ -215,6 +241,9 @@ pub struct Placement {
     /// Minimum isolation level ([`IsolationLevel`]); a worker without an `iso:` tag counts as
     /// `off`.
     pub isolation: Option<IsolationLevel>,
+    /// Host tools (`tool:<name>`) the worker must all advertise, lowercase, sorted and without
+    /// duplicates.
+    pub tools: Vec<String>,
     /// User tags the worker must all carry, sorted and without duplicates.
     pub tags: Vec<String>,
 }
@@ -226,13 +255,15 @@ impl Placement {
             && self.arch.is_none()
             && self.worker.is_none()
             && self.isolation.is_none()
+            && self.tools.is_empty()
             && self.tags.is_empty()
     }
 
     /// Parses the `require:` entries of a task's tags; tags without that prefix are ignored.
     ///
     /// Rejects an entry that is not `require:<key>=<value>`, an unknown key, an empty value, a
-    /// second `os`, `arch`, `worker` or `iso`, an unknown isolation level, and a `tag` that is not a valid user tag.
+    /// second `os`, `arch`, `worker` or `iso`, an unknown isolation level, an invalid `tool`, and
+    /// a `tag` that is not a valid user tag.
     pub fn from_task_tags(task_tags: &[String]) -> Result<Self, String> {
         let mut placement = Self::default();
         for tag in task_tags {
@@ -262,6 +293,12 @@ impl Placement {
                 "os" => &mut placement.os,
                 "arch" => &mut placement.arch,
                 "worker" => &mut placement.worker,
+                "tool" => {
+                    let tool = validate_tool_name(value)
+                        .map_err(|e| format!("placement constraint `{tag}`: {e}"))?;
+                    placement.tools.push(tool);
+                    continue;
+                }
                 "tag" => {
                     validate_user_tag(value)
                         .map_err(|e| format!("placement constraint `{tag}`: {e}"))?;
@@ -270,7 +307,7 @@ impl Placement {
                 }
                 other => {
                     return Err(format!(
-                        "unknown placement constraint `{other}` in `{tag}` (known: os, arch, worker, iso, tag)"
+                        "unknown placement constraint `{other}` in `{tag}` (known: os, arch, worker, iso, tool, tag)"
                     ))
                 }
             };
@@ -285,6 +322,8 @@ impl Placement {
                 _ => value.to_string(),
             });
         }
+        placement.tools.sort();
+        placement.tools.dedup();
         placement.tags.sort();
         placement.tags.dedup();
         Ok(placement)
@@ -307,6 +346,9 @@ impl Placement {
         }
         if let Some(level) = self.isolation {
             tags.push(format!("{REQUIRE_PREFIX}iso={level}"));
+        }
+        for tool in &self.tools {
+            tags.push(format!("{REQUIRE_PREFIX}tool={tool}"));
         }
         for tag in &self.tags {
             tags.push(format!("{REQUIRE_PREFIX}tag={tag}"));
@@ -343,6 +385,13 @@ impl Placement {
                 return false;
             }
         }
+        if !self
+            .tools
+            .iter()
+            .all(|wanted| has_value(TOOL_TAG_PREFIX, wanted, str::to_ascii_lowercase))
+        {
+            return false;
+        }
         self.tags.iter().all(|wanted| worker_tags.contains(wanted))
     }
 
@@ -371,6 +420,9 @@ impl fmt::Display for Placement {
         }
         if let Some(level) = self.isolation {
             parts.push(format!("iso>={level}"));
+        }
+        for tool in &self.tools {
+            parts.push(format!("tool={tool}"));
         }
         for tag in &self.tags {
             parts.push(format!("tag={tag}"));
@@ -426,6 +478,9 @@ mod tests {
             "state:busy",
             "iso:fs",
             "iso:off",
+            "tool:cargo",
+            "tool:rustc",
+            "tool:git",
         ] {
             assert!(validate_user_tag(bad).is_err(), "{bad:?} must be refused");
         }
@@ -453,6 +508,9 @@ mod tests {
             "require:os=Darwin",
             "require:arch=ARM64",
             "require:worker=Mac-Air",
+            "require:tool=Rustc",
+            "require:tool=cargo",
+            "require:tool=CARGO",
             "require:tag=laptop",
             "require:tag=fast",
             "require:tag=laptop",
@@ -462,6 +520,11 @@ mod tests {
         assert_eq!(p.arch.as_deref(), Some("aarch64"));
         assert_eq!(p.worker.as_deref(), Some("Mac-Air"));
         assert_eq!(
+            p.tools,
+            tags(&["cargo", "rustc"]),
+            "tools lowercased, sorted, duplicates dropped"
+        );
+        assert_eq!(
             p.tags,
             tags(&["fast", "laptop"]),
             "sorted, duplicates dropped"
@@ -469,7 +532,7 @@ mod tests {
         assert!(!p.is_empty());
         assert_eq!(
             p.to_string(),
-            "os=macos, arch=aarch64, worker=Mac-Air, tag=fast, tag=laptop"
+            "os=macos, arch=aarch64, worker=Mac-Air, tool=cargo, tool=rustc, tag=fast, tag=laptop"
         );
     }
 
@@ -518,7 +581,13 @@ mod tests {
             ),
             ("require:=x", "unknown placement constraint ``"),
             ("require:tag=os:macos", "only the worker or the master"),
+            ("require:tag=tool:cargo", "only the worker or the master"),
             ("require:tag=a b", "whitespace"),
+            ("require:tool=", "empty value"),
+            ("require:tool=two words", "whitespace"),
+            ("require:tool=a,b", "contains whitespace"),
+            ("require:tool=a:b", "contains whitespace"),
+            ("require:tool=a/b", "contains whitespace"),
         ] {
             let err = Placement::from_task_tags(&tags(&[bad])).unwrap_err();
             assert!(err.contains(needle), "{bad}: {err}");
@@ -608,9 +677,37 @@ mod tests {
             arch: Some("x86_64".into()),
             worker: Some("DELL-VOSTRO".into()),
             isolation: Some(IsolationLevel::FsNet),
+            tools: tags(&["cargo", "git", "rustc"]),
             tags: tags(&["cpu", "office"]),
         };
         assert_eq!(Placement::from_task_tags(&p.to_task_tags()).unwrap(), p);
+    }
+
+    #[test]
+    fn test_require_tool_matches_worker_with_tool_and_avoids_worker_without() {
+        let id = Uuid::new_v4();
+        let need_cargo = Placement::from_task_tags(&tags(&["require:tool=cargo"])).unwrap();
+        assert_eq!(need_cargo.tools, tags(&["cargo"]));
+        assert_eq!(need_cargo.to_string(), "tool=cargo");
+        assert!(need_cargo.matches(
+            id,
+            "w1",
+            &tags(&["os:linux", "tool:cargo", "tool:rustc", "tool:git"])
+        ));
+        assert!(need_cargo.matches(id, "w1", &tags(&["tool:CARGO"])));
+        assert!(
+            !need_cargo.matches(id, "w2", &tags(&["os:linux", "tool:git"])),
+            "require:tool=cargo must avoid a worker without tool:cargo"
+        );
+        assert!(
+            !need_cargo.matches(id, "w3", &tags(&["os:linux", "cargo"])),
+            "a bare user tag 'cargo' must not satisfy require:tool=cargo"
+        );
+
+        let need_both =
+            Placement::from_task_tags(&tags(&["require:tool=cargo", "require:tool=git"])).unwrap();
+        assert!(need_both.matches(id, "w1", &tags(&["tool:cargo", "tool:git"])));
+        assert!(!need_both.matches(id, "w2", &tags(&["tool:cargo"])));
     }
 
     #[test]

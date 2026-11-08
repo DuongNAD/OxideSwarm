@@ -1,11 +1,11 @@
 # 0020: Bounded host capability probes at worker start-up
 
 Status: Implemented
-Created: 2026-11-04    Updated: 2026-11-04
+Created: 2026-11-04    Updated: 2026-11-09
 
 ## Summary
 
-Bound every host capability probe subprocess spawned during `WorkerCapabilities::detect` / `WorkerCapabilities::detect_with_overrides` (`blender --version`, `sysctl`, `nvidia-smi`, `pmset`, `dumpsys`, `getprop`, `sw_vers`, and `nvcc`) to `HOST_PROBE_TIMEOUT` (`3 s`), kill the probe's process group (Unix `libc::killpg` with `libc::SIGKILL`) or Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) on both child exit and timeout, reap timed-out children on a detached thread so uninterruptible kernel sleeps never block start-up, and treat a timed-out Blender probe as "no Blender" (`has_blender = false, blender_version = None`) with a warning that names the binary path.
+Bound every host capability probe subprocess spawned during `WorkerCapabilities::detect` / `WorkerCapabilities::detect_with_overrides` (`blender --version`, `cargo --version`, `rustc --version`, `git --version`, `sysctl`, `nvidia-smi`, `pmset`, `dumpsys`, `getprop`, `sw_vers`, and `nvcc`) to `HOST_PROBE_TIMEOUT` (`3 s`), kill the probe's process group (Unix `libc::killpg` with `libc::SIGKILL`) or Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) on both child exit and timeout, reap timed-out children on a detached thread so uninterruptible kernel sleeps never block start-up, and treat a timed-out Blender probe as "no Blender" (`has_blender = false, blender_version = None`) with a warning that names the binary path.
 
 ## Context
 
@@ -39,10 +39,11 @@ Bound every host capability probe subprocess spawned during `WorkerCapabilities:
    - **When the direct child exits (`Ok(Some(status))`):** on Unix, `kill_probe_group(pid)` (`libc::killpg(pgid, libc::SIGKILL)`) is called immediately; on Windows, `job_guard.terminate_and_close()` (`TerminateJobObject` + `CloseHandle`) terminates the `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job Object immediately. Any background grandchild spawned in the probe's process group or Job Object (even if the direct `cmd.exe` or shell wrapper has already exited) is terminated and closes its inherited stdout descriptor. The caller then waits on `rx.recv_timeout(remaining)` for the remaining probe budget; if a grandchild that escaped the Unix process group via `setsid` still holds the pipe open past `deadline`, `rx.recv_timeout(remaining)` times out and `run_command_bounded` returns `ProbeExecOutcome::TimedOut`.
    - **When `deadline` expires (`now >= deadline`):** `job_guard.terminate_and_close()` terminates and closes the Windows Job Object, and `reap_probe_child_detached(child)` kills the Unix process group (`libc::killpg(pgid, libc::SIGKILL)`) and direct child (`child.kill()`), then spawns a detached thread calling `child.wait()`. Reaping on a detached thread guarantees that a process wedged in uninterruptible kernel sleep (`nvidia-smi` on a hung GPU driver) never blocks worker start-up past `HOST_PROBE_TIMEOUT`.
 
-### D2 Blender and host probe semantics (`probe_blender_with_timeout`, `run_host_probe`)
+### D2 Blender, host tool, and system probe semantics (`probe_blender_with_timeout`, `probe_tool_with_timeout`, `run_host_probe`)
 
 - `probe_blender_with_timeout(program, timeout)` builds the command with `crate::cluster_auth::probe_command(program)` (preserving [design 0009](0009-blender-and-3d-process-supervision.md) **G3** secret stripping) and classifies the outcome as `BlenderProbeResult::{Version(String), SucceededWithoutVersion, Failed, TimedOut}`.
 - On `BlenderProbeResult::TimedOut`, `probe_blender_with_timeout` emits a `tracing::warn!` naming the probed path and timeout, and both `detect_blender` and `probe_blender_binary` return `(false, None)` immediately rather than falling back to `"Blender (Env Path)"` / `"Blender (Custom Path)"` or probing additional fallback candidates.
+- `probe_tool_with_timeout(program, timeout)` (`detect_host_tools_uncached` / `detect_host_tools` for `HOST_PROBED_TOOLS = ["cargo", "rustc", "git"]`, [design 0039](0039-agent-workspaces.md) D8) runs `<tool> --version` through `crate::cluster_auth::probe_command` and `run_command_bounded` with `HOST_PROBE_TIMEOUT` (`3 s`), applying `augment_windows_path` and `resolve_windows_executable` on Windows so tool resolution matches `TaskRunner`. Each tool that exits `0` within `HOST_PROBE_TIMEOUT` adds `tool:<name>` (`tool:cargo`, `tool:rustc`, `tool:git`) to `WorkerCapabilities::tags`; a timed-out or failing probe logs a warning and omits the tag.
 - All other host capability probes in `crates/core/src/capabilities.rs` (`sysctl`, `nvidia-smi`, `pmset`, `dumpsys`, `getprop`, `sw_vers`, `nvcc`) execute through `run_host_probe(cmd, label)` with `HOST_PROBE_TIMEOUT` (`3 s`).
 
 ## Compatibility
@@ -60,12 +61,15 @@ Bound every host capability probe subprocess spawned during `WorkerCapabilities:
 - `capabilities::tests::test_probe_blender_with_timeout_handles_version_non_version_failure_and_timeout` in `crates/core/src/capabilities.rs` (covering normal version output, non-version output, non-zero exit, wrapper script leaving a background grandchild holding stdout, detached-session `setsid` grandchild holding stdout past the deadline, and hung script timeout + grandchild termination via PID file on both Unix and Windows).
 - `capabilities::tests::test_hung_blender_probe_via_override_times_out_and_reports_no_blender` in `crates/core/src/capabilities.rs` (calling `detect_blender(Some(path))` directly with a 60s hang script so `RUSTY_GRID_NO_BLENDER` in the environment cannot bypass the probe, using a pure `cmd.exe` wrapper on Windows (`ping -n 60 127.0.0.1 >NUL`) so the `3 s` production `HOST_PROBE_TIMEOUT` test is independent of cold Python start time, and verifying `has_blender == false`, `blender_version == None`, and no surviving grandchild on Unix).
 - `client::tests::test_worker_client_with_hung_blender_path_reports_no_blender_within_timeout` in `crates/worker/src/client.rs`.
+- `capabilities::tests::test_probe_tool_with_timeout_and_host_tool_tags` in `crates/core/src/capabilities.rs` (covering `probe_tool_with_timeout` exit 0, exit non-zero, hung script timeout and grandchild termination, and `detect_host_tools_uncached` for `cargo`, `rustc`, `git`).
 
 ## Work items
 
 - `BUG-15` in `WORK_PLAN.md` / `docs/BACKLOG.md`.
+- `W8` in [design 0039](0039-agent-workspaces.md).
 
 ## Status log
 
 - 2026-11-04: Implemented `HOST_PROBE_TIMEOUT` (`3 s`), `run_command_bounded`, `probe_blender_with_timeout`, and `run_host_probe` in `crates/core/src/capabilities.rs`; shared Windows Job Object helper (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) between `rusty_grid_core::capabilities` and `rusty_grid_worker::process_tree`; bounded stdout reader join with `rx.recv_timeout(remaining)`, killed process group via `libc::killpg(pgid, libc::SIGKILL)` (Unix) or Job Object termination (Windows) on both child exit and timeout, reaped timed-out probes on a detached thread, and verified grandchild cleanup in unit tests.
 - 2026-11-04: Widened Windows test budgets in `capabilities::tests::test_probe_blender_with_timeout_handles_version_non_version_failure_and_timeout` (`15 s` probe timeout with `10 s` elapsed bound on the background-stdout wrapper, `5 s` probe timeout with `15 s` elapsed bound on the hung wrapper, `15 s` on simple `cmd.exe` probes, and `5 s` process-table wait in `assert_pid_file_process_dead`) and made the Windows variant of `capabilities::tests::test_hung_blender_probe_via_override_times_out_and_reports_no_blender` call `detect_blender(Some(path))` directly with a pure `cmd.exe` hang wrapper (`ping -n 60 127.0.0.1 >NUL`) so neither test depends on cold Python startup completing within `3 s` on Windows CI runners (`TEST-12`).
+- 2026-11-09: Extended bounded start-up probing with `probe_tool_with_timeout`, `detect_host_tools_uncached`, and `detect_host_tools` for `cargo --version`, `rustc --version`, and `git --version` under `HOST_PROBE_TIMEOUT` (`3 s`, [design 0039](0039-agent-workspaces.md) W8).
