@@ -317,7 +317,7 @@ pub fn create_web_ui_router_full(
         .route("/api/status", get(api_status))
         .route("/api/workers", get(api_get_workers))
         .route("/api/tasks", get(api_get_tasks).post(api_submit_task))
-        .route("/api/tasks/:task_id", get(api_get_task_standardized))
+        .route("/api/tasks/{task_id}", get(api_get_task_standardized))
         // Discovery & Rendezvous Probe APIs
         .route("/api/discovery/probe", get(api_discovery_probe))
         .route("/api/rendezvous/register", post(api_rendezvous_register))
@@ -951,7 +951,7 @@ async fn handle_ws_client(
     let snapshot = state.build_snapshot().await;
     let initial_msg = DashboardStreamMessage::Snapshot(snapshot);
     if let Ok(json) = serde_json::to_string(&initial_msg) {
-        if !send_ws(&mut sender, Message::Text(json)).await {
+        if !send_ws(&mut sender, Message::Text(json.into())).await {
             return;
         }
     }
@@ -968,7 +968,7 @@ async fn handle_ws_client(
                     Ok(event) => {
                         match serde_json::to_string(&event) {
                             Ok(json) => {
-                                if !send_ws(&mut sender, Message::Text(json)).await {
+                                if !send_ws(&mut sender, Message::Text(json.into())).await {
                                     break;
                                 }
                             }
@@ -983,7 +983,7 @@ async fn handle_ws_client(
                         let fresh_snapshot = state.build_snapshot().await;
                         let msg = DashboardStreamMessage::Snapshot(fresh_snapshot);
                         if let Ok(json) = serde_json::to_string(&msg) {
-                            if !send_ws(&mut sender, Message::Text(json)).await {
+                            if !send_ws(&mut sender, Message::Text(json.into())).await {
                                 break;
                             }
                         }
@@ -1015,7 +1015,7 @@ async fn handle_ws_client(
                             let fresh_snapshot = state.build_snapshot().await;
                             let msg = DashboardStreamMessage::Snapshot(fresh_snapshot);
                             if let Ok(json) = serde_json::to_string(&msg) {
-                                if !send_ws(&mut sender, Message::Text(json)).await {
+                                if !send_ws(&mut sender, Message::Text(json.into())).await {
                                     break;
                                 }
                             }
@@ -1027,7 +1027,7 @@ async fn handle_ws_client(
                 }
             }
             _ = ping_interval.tick() => {
-                if !send_ws(&mut sender, Message::Ping(vec![])).await {
+                if !send_ws(&mut sender, Message::Ping(Vec::new().into())).await {
                     debug!("Keepalive ping failed; client disconnected");
                     break;
                 }

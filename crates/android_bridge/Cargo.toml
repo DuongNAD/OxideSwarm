@@ -11,7 +11,7 @@ name = "oxideworker"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-jni = "0.21"
+jni = "0.22"
 rusty_grid_worker = { path = "../worker" }
 rusty_grid_core = { path = "../core" }
 tokio = { workspace = true }
