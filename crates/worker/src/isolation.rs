@@ -160,7 +160,9 @@ pub(crate) struct Jail<'a> {
     pub host: &'a HostDirs,
     /// Files the task must not read wherever they are.
     pub protected_files: &'a [PathBuf],
-    /// The worker's sandbox base directory (`<base>/<task id>` holds this task's files).
+    /// The worker's sandbox base directory (`<base>/<task id>` holds this task's files). Only
+    /// the Seatbelt profile names it: on Linux everything outside the sandbox is denied anyway.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub sandbox_base: &'a Path,
     /// The task's own sandbox directory.
     pub sandbox_dir: &'a Path,
