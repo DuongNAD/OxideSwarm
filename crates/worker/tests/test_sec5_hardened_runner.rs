@@ -1747,51 +1747,115 @@ async fn test_feat2_short_task_finishes_under_one_second_without_pipe_note() {
     );
 }
 
-#[cfg(unix)]
-fn find_other_processes_with_current_exe() -> Vec<u32> {
-    let current_pid = std::process::id();
-    let current_exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| std::fs::canonicalize(&p).ok().or(Some(p)));
-    let current_name = current_exe
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
+const FEAT2_SUP_HELPER_ENV: &str = "RUSTY_GRID_FEAT2_SUP_HELPER";
+const FEAT2_SUP_SANDBOX_ENV: &str = "RUSTY_GRID_FEAT2_SUP_SANDBOX";
+const FEAT2_SUP_READY_ENV: &str = "RUSTY_GRID_FEAT2_SUP_READY";
+const FEAT2_SUP_RELEASE_ENV: &str = "RUSTY_GRID_FEAT2_SUP_RELEASE";
+const FEAT2_SUP_DONE_ENV: &str = "RUSTY_GRID_FEAT2_SUP_DONE";
 
-    let mut sys = sysinfo::System::new();
-    sys.refresh_processes();
+#[cfg(unix)]
+fn find_supervisor_pids_for_helper(worker_pid: u32) -> Vec<u32> {
+    let output = std::process::Command::new("ps")
+        .args(["-ax", "-o", "pid=,stat=,args="])
+        .output()
+        .expect("run ps -ax -o pid=,stat=,args=");
+    assert!(
+        output.status.success(),
+        "ps failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let current_pid = std::process::id();
     let mut out = Vec::new();
-    for (pid, proc_info) in sys.processes() {
-        let pid_u32 = pid.as_u32();
-        if pid_u32 == current_pid {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.contains("feat2_supervisor_exit_helper") {
             continue;
         }
-        let exe_matches = match (proc_info.exe(), current_exe.as_ref()) {
-            (Some(p), Some(cur)) => {
-                p == cur.as_path()
-                    || std::fs::canonicalize(p)
-                        .ok()
-                        .is_some_and(|canon| &canon == cur)
-            }
-            _ => false,
+        let mut fields = trimmed.split_whitespace();
+        let Some(pid_str) = fields.next() else {
+            continue;
         };
-        let name_matches = !current_name.is_empty() && proc_info.name() == current_name;
-        if exe_matches || name_matches {
-            out.push(pid_u32);
+        let Some(stat) = fields.next() else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == worker_pid || pid == current_pid {
+            continue;
         }
+        if stat.starts_with('Z') {
+            continue;
+        }
+        out.push(pid);
     }
     out
 }
 
 #[tokio::test]
-async fn test_feat2_supervisor_processes_exit_within_one_second_after_normal_end() {
-    let (runner, _sandbox_dir) = create_test_runner();
-    #[cfg(unix)]
-    let baseline = find_other_processes_with_current_exe();
+async fn feat2_supervisor_exit_helper() {
+    if std::env::var(FEAT2_SUP_HELPER_ENV).ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let sandbox_dir = std::path::PathBuf::from(
+        std::env::var(FEAT2_SUP_SANDBOX_ENV).expect("missing FEAT2_SUP_SANDBOX_ENV"),
+    );
+    let ready_file = std::path::PathBuf::from(
+        std::env::var(FEAT2_SUP_READY_ENV).expect("missing FEAT2_SUP_READY_ENV"),
+    );
+    let release_file = std::path::PathBuf::from(
+        std::env::var(FEAT2_SUP_RELEASE_ENV).expect("missing FEAT2_SUP_RELEASE_ENV"),
+    );
+    let done_file = std::path::PathBuf::from(
+        std::env::var(FEAT2_SUP_DONE_ENV).expect("missing FEAT2_SUP_DONE_ENV"),
+    );
+
+    let sandbox_config = SandboxConfig::new(sandbox_dir);
+    let runner_config = RunnerConfig::new(sandbox_config);
+    let mut caps = WorkerCapabilities::new("sup_exit_worker", 4, 8192, false, false, None);
+    caps.has_cuda = false;
+    let runner = TaskRunner::new(uuid::Uuid::new_v4(), caps, runner_config);
 
     let py_exe = get_python_exe().to_string_lossy().to_string();
-    for _ in 0..3 {
+    let task1_code = r#"
+import os, sys, time
+ready_path = sys.argv[1]
+release_path = sys.argv[2]
+with open(ready_path, "w", encoding="utf-8") as f:
+    f.write(f"PID:{os.getpid()}\n")
+    f.flush()
+    os.fsync(f.fileno())
+deadline = time.time() + 15.0
+while time.time() < deadline:
+    if os.path.exists(release_path):
+        break
+    time.sleep(0.02)
+"#;
+
+    let task1 = Task::new(
+        TaskSpec::Command {
+            program: py_exe.clone(),
+            args: vec![
+                "-c".to_string(),
+                task1_code.to_string(),
+                ready_file.to_string_lossy().to_string(),
+                release_file.to_string_lossy().to_string(),
+            ],
+            env: Default::default(),
+            working_dir: None,
+            stdin: None,
+        },
+        TaskRequirements {
+            timeout_secs: 20,
+            ..Default::default()
+        },
+    );
+    let res1 = runner.execute_task(&task1, None, None).await;
+    assert!(res1.is_success(), "Task 1 failed: {:?}", res1.error);
+
+    for _ in 0..2 {
         let task = Task::new(
             TaskSpec::Command {
                 program: py_exe.clone(),
@@ -1812,14 +1876,93 @@ async fn test_feat2_supervisor_processes_exit_within_one_second_after_normal_end
         assert!(res.is_success(), "Task failed: {:?}", res.error);
     }
 
+    let mut f = File::create(&done_file).expect("create done file");
+    f.write_all(b"DONE\n").expect("write done file");
+    f.sync_all().expect("sync done file");
+    drop(f);
+
+    // Stay alive until the parent closes stdin so supervisor dismissal is verified while the
+    // worker process itself is still alive.
+    let _ = tokio::task::spawn_blocking(|| {
+        let mut buf = [0u8; 1];
+        let _ = std::io::Read::read(&mut std::io::stdin(), &mut buf);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_feat2_supervisor_processes_exit_within_one_second_after_normal_end() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let sandbox_dir = temp_dir.path().join("sup_sandbox");
+    std::fs::create_dir_all(&sandbox_dir).expect("create sandbox dir");
+    let ready_file = temp_dir.path().join("task1.ready");
+    let release_file = temp_dir.path().join("task1.release");
+    let done_file = temp_dir.path().join("all_tasks.done");
+
+    let current_exe = std::env::current_exe().expect("current_exe");
+    let mut worker_proc = tokio::process::Command::new(&current_exe)
+        .args(["--exact", "feat2_supervisor_exit_helper", "--nocapture"])
+        .env(FEAT2_SUP_HELPER_ENV, "1")
+        .env(FEAT2_SUP_SANDBOX_ENV, &sandbox_dir)
+        .env(FEAT2_SUP_READY_ENV, &ready_file)
+        .env(FEAT2_SUP_RELEASE_ENV, &release_file)
+        .env(FEAT2_SUP_DONE_ENV, &done_file)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn feat2_supervisor_exit_helper");
+
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    let worker_pid = worker_proc.id().expect("worker pid");
+
+    let ready_deadline = Instant::now() + Duration::from_secs(15);
+    while !ready_file.exists() {
+        if let Ok(Some(status)) = worker_proc.try_wait() {
+            panic!("feat2_supervisor_exit_helper exited early before ready_file with {status}");
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "Timed out waiting for task 1 ready file"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    #[cfg(unix)]
+    {
+        let active_sup = find_supervisor_pids_for_helper(worker_pid);
+        assert!(
+            !active_sup.is_empty(),
+            "Expected live supervisor process for worker_pid={worker_pid} while Task 1 is running"
+        );
+    }
+
+    std::fs::write(&release_file, b"GO\n").expect("write release file");
+
+    let done_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if done_file.exists() {
+            if let Ok(contents) = std::fs::read_to_string(&done_file) {
+                if contents.contains("DONE") {
+                    break;
+                }
+            }
+        }
+        if let Ok(Some(status)) = worker_proc.try_wait() {
+            panic!("feat2_supervisor_exit_helper exited early before done_file with {status}");
+        }
+        assert!(
+            Instant::now() < done_deadline,
+            "Timed out waiting for all_tasks.done"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
     #[cfg(unix)]
     {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            let leftover: Vec<u32> = find_other_processes_with_current_exe()
-                .into_iter()
-                .filter(|pid| !baseline.contains(pid))
-                .collect();
+            let leftover = find_supervisor_pids_for_helper(worker_pid);
             if leftover.is_empty() {
                 break;
             }
@@ -1831,6 +1974,16 @@ async fn test_feat2_supervisor_processes_exit_within_one_second_after_normal_end
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
+
+    drop(worker_proc.stdin.take());
+    let status = worker_proc
+        .wait()
+        .await
+        .expect("wait feat2_supervisor_exit_helper");
+    assert!(
+        status.success(),
+        "feat2_supervisor_exit_helper exited with non-zero status: {status}"
+    );
 }
 
 #[cfg(target_os = "macos")]
