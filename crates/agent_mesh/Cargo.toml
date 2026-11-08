@@ -11,9 +11,15 @@ description = "Cross-Platform Coding Agent Communication Framework PoC"
 name = "agent-mesh"
 path = "src/main.rs"
 
+[features]
+default = []
+# Opt-in 3D generation and auto-rigging worker support for agent_mesh integration tests (FEAT-11 / D6).
+3d = ["dep:rusty_grid_worker", "rusty_grid_worker/3d"]
+
 [dependencies]
 rusty_grid_core = { workspace = true }
 rusty_grid_master = { workspace = true }
+rusty_grid_worker = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["codec"] }
 bytes = { workspace = true }

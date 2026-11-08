@@ -19,18 +19,26 @@
 #![allow(clippy::needless_borrow, clippy::needless_borrows_for_generic_args)]
 
 use agent_mesh::bridge::AgentGridBridge;
-use agent_mesh::{compute_sha256, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub};
+use agent_mesh::{compute_sha256, AgentMeshClient, AgentMeshEnvelope};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+#[cfg(feature = "3d")]
 use futures::{SinkExt, StreamExt};
 use rusty_grid_master::server::{MasterServer, ServerConfig};
+#[cfg(feature = "3d")]
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
+#[cfg(feature = "3d")]
 use std::sync::Arc;
+#[cfg(feature = "3d")]
 use std::time::Duration;
 use tempfile::TempDir;
+#[cfg(feature = "3d")]
 use tokio::sync::watch;
+#[cfg(feature = "3d")]
 use tokio_tungstenite::connect_async;
+#[cfg(feature = "3d")]
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
+#[cfg(feature = "3d")]
 use uuid::Uuid;
 
 fn create_minimal_valid_glb() -> Vec<u8> {
@@ -53,6 +61,7 @@ fn create_minimal_valid_glb() -> Vec<u8> {
     glb
 }
 
+#[cfg(feature = "3d")]
 fn create_humanoid_obj() -> Vec<u8> {
     let mut s = String::new();
     s.push_str("# Humanoid OBJ\n");
@@ -356,8 +365,10 @@ async fn test_adv_bridge_binary_data_parser_fuzzing() {
 // 3. WebSocket DeliveryAck and Correlation Routing Suite
 // =========================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_adv_websocket_delivery_ack_and_correlation_routing() {
+    use agent_mesh::AgentMeshHub;
     // 1. Spawn Master
     let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
         .await
@@ -507,8 +518,10 @@ async fn test_adv_websocket_delivery_ack_and_correlation_routing() {
 // 4. High-Concurrency Agent Mesh Burst Suite (10 Concurrent Clients)
 // =========================================================================
 
+#[cfg(feature = "3d")]
 #[tokio::test]
 async fn test_adv_high_concurrency_mesh_burst() {
+    use agent_mesh::AgentMeshHub;
     // 1. Spawn Master
     let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
         .await
