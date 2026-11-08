@@ -202,7 +202,7 @@ foreach ($restore in $sddlRestores) {
     }
 }
 
-$runningWorkers = @(Get-Process -Name "rusty-grid-worker", "rusty_grid_worker", "ox" -ErrorAction SilentlyContinue)
+$runningWorkers = @(Get-Process -Name "oxideswarm", "rusty-grid" -ErrorAction SilentlyContinue)
 $lockHeld = $false
 if (-not [string]::IsNullOrWhiteSpace($ManifestPath)) {
     $manifestDir = Split-Path -Parent $ManifestPath

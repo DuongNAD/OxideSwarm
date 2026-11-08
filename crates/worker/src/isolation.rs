@@ -139,10 +139,24 @@ impl HostDirs {
         cargo_home: Option<PathBuf>,
     ) -> Self {
         let non_empty = |p: Option<PathBuf>| p.filter(|p| !p.as_os_str().is_empty());
+        #[cfg(windows)]
+        let norm = |p: PathBuf| {
+            if !p.as_os_str().is_empty() && p.exists() && !windows::is_reparse_point(&p) {
+                windows::normalize_win_path(&p)
+            } else {
+                p
+            }
+        };
+        #[cfg(not(windows))]
+        let norm = |p: PathBuf| p;
+
+        let user_home = norm(user_home);
+        let rustup_home = norm(non_empty(rustup_home).unwrap_or_else(|| user_home.join(".rustup")));
+        let cargo_home = norm(non_empty(cargo_home).unwrap_or_else(|| user_home.join(".cargo")));
         Self {
-            rustup_home: non_empty(rustup_home).unwrap_or_else(|| user_home.join(".rustup")),
-            cargo_home: non_empty(cargo_home).unwrap_or_else(|| user_home.join(".cargo")),
             user_home,
+            rustup_home,
+            cargo_home,
         }
     }
 }
@@ -168,7 +182,15 @@ pub fn prepare_environment(
     sandbox: &Path,
 ) -> EnvPlan {
     let mut plan = EnvPlan::default();
-    let path_text = |p: &Path| p.to_string_lossy().into_owned();
+    let path_text = |p: &Path| {
+        #[cfg(windows)]
+        if !p.as_os_str().is_empty() && p.exists() && !windows::is_reparse_point(p) {
+            return windows::normalize_win_path(p)
+                .to_string_lossy()
+                .into_owned();
+        }
+        p.to_string_lossy().into_owned()
+    };
     if !task_env.contains_key("RUSTUP_HOME") {
         plan.set
             .push(("RUSTUP_HOME".into(), path_text(&host.rustup_home)));
@@ -778,10 +800,10 @@ pub mod windows {
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
-        GetSecurityInfo, SetEntriesInAclW, SetNamedSecurityInfoW, SetSecurityInfo, DENY_ACCESS,
-        EXPLICIT_ACCESS_W, GRANT_ACCESS, SDDL_REVISION_1, SET_ACCESS, SE_FILE_OBJECT,
-        SE_WINDOW_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
+        GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW, SetNamedSecurityInfoW,
+        SetSecurityInfo, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, SDDL_REVISION_1, SET_ACCESS,
+        SE_FILE_OBJECT, SE_WINDOW_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -901,8 +923,9 @@ pub mod windows {
 
     /// Canonicalizes `p` (or its longest existing ancestor prefix when `p` does not exist yet) and
     /// lexically resolves `.` and `..` components on any non-existent suffix so `<sandbox>\..\..`
-    /// cannot bypass `path_starts_with_ci`.
-    pub(crate) fn normalize_win_path(p: &Path) -> PathBuf {
+    /// cannot bypass `path_starts_with_ci` and 8.3 short names (`RUNNER~1`) are expanded on the
+    /// host before paths enter an AppContainer.
+    pub fn normalize_win_path(p: &Path) -> PathBuf {
         if let Ok(canon) = std::fs::canonicalize(p) {
             return strip_verbatim_prefix(canon);
         }
@@ -1129,18 +1152,26 @@ pub mod windows {
     }
 
     /// Resolves `program` against `search_path` on Windows. Returns `None` if the executable
-    /// does not exist.
+    /// does not exist. Expands 8.3 short names on non-reparse paths so `CreateProcessW` inside an
+    /// AppContainer never walks denied ancestor directories with `FindFirstFileW`.
     pub(super) fn resolve_program(program: &str, search_path: &str) -> Option<String> {
+        let norm_file = |found: &Path| -> String {
+            if !is_reparse_point(found) {
+                normalize_win_path(found).to_string_lossy().into_owned()
+            } else {
+                found.to_string_lossy().into_owned()
+            }
+        };
         let p = Path::new(program);
         let has_sep = program.contains('/') || program.contains('\\') || program.contains(':');
         if has_sep {
             if p.is_file() {
-                return Some(program.to_string());
+                return Some(norm_file(p));
             }
             for ext in WINDOWS_EXEC_EXTS {
                 let candidate = PathBuf::from(format!("{program}{ext}"));
                 if candidate.is_file() {
-                    return Some(candidate.to_string_lossy().into_owned());
+                    return Some(norm_file(&candidate));
                 }
             }
             if !program.starts_with("/bin/") && !program.starts_with("/usr/bin/") {
@@ -1156,20 +1187,20 @@ pub mod windows {
             };
             let direct = base.join(bare);
             if direct.is_file() {
-                return Some(direct.to_string_lossy().into_owned());
+                return Some(norm_file(&direct));
             }
             for ext in WINDOWS_EXEC_EXTS {
                 let with_ext = base.join(format!("{bare}{ext}"));
                 if with_ext.is_file() {
-                    return Some(with_ext.to_string_lossy().into_owned());
+                    return Some(norm_file(&with_ext));
                 }
             }
         }
         None
     }
 
-    /// RAII wrapper for a SID allocated from a well-known SID, current process token, or
-    /// `DeriveCapabilitySidsFromName`.
+    /// RAII wrapper for a SID allocated from a well-known SID, current process token, SDDL string,
+    /// or `DeriveCapabilitySidsFromName`.
     pub struct OwnedSid(Vec<u8>);
 
     impl OwnedSid {
@@ -1183,6 +1214,20 @@ pub mod windows {
             let len = unsafe { GetLengthSid(raw) } as usize;
             let slice = unsafe { std::slice::from_raw_parts(raw as *const u8, len) };
             Ok(Self(slice.to_vec()))
+        }
+
+        pub fn from_sid_string(sid_str: &str) -> io::Result<Self> {
+            let wide = to_wide(OsStr::new(sid_str));
+            let mut raw_sid: PSID = std::ptr::null_mut();
+            let ok = unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut raw_sid) };
+            if ok == 0 || raw_sid.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let res = Self::from_raw_psid(raw_sid);
+            unsafe {
+                LocalFree(raw_sid as HLOCAL);
+            }
+            res
         }
 
         pub fn from_well_known(sid_type: WELL_KNOWN_SID_TYPE) -> io::Result<Self> {
@@ -1870,12 +1915,30 @@ pub mod windows {
             return Ok(());
         }
         let rx_mask = GENERIC_READ | GENERIC_EXECUTE | SYNCHRONIZE;
-        if dacl_already_grants_sid(path, sid, FILE_READ_ATTRIBUTES) {
+        let user_sid = OwnedSid::current_user()?;
+        let has_sid = dacl_already_grants_sid(path, sid, FILE_READ_ATTRIBUTES);
+        let has_user = dacl_already_grants_sid(
+            path,
+            user_sid.as_psid(),
+            FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+        );
+        if has_sid && has_user {
             return Ok(());
         }
         record_acl_grant(manifest_path, path)?;
-        let entry = explicit_access(sid, rx_mask, GRANT_ACCESS, NO_INHERITANCE);
-        merge_entries_on_path(path, &[entry])
+        let mut entries = Vec::with_capacity(2);
+        if !has_sid {
+            entries.push(explicit_access(sid, rx_mask, GRANT_ACCESS, NO_INHERITANCE));
+        }
+        if !has_user {
+            entries.push(explicit_access(
+                user_sid.as_psid(),
+                rx_mask,
+                GRANT_ACCESS,
+                NO_INHERITANCE,
+            ));
+        }
+        merge_entries_on_path(path, &entries)
     }
 
     /// Sets a single inheritable read+execute ACE (`OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`)
@@ -1886,18 +1949,37 @@ pub mod windows {
             return Ok(());
         }
         let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
-        if dacl_already_grants_sid_with_flags(
+        let user_sid = OwnedSid::current_user()?;
+        let has_sid = dacl_already_grants_sid_with_flags(
             path,
             sid,
             FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
             inherit,
-        ) {
+        );
+        let has_user = dacl_already_grants_sid_with_flags(
+            path,
+            user_sid.as_psid(),
+            FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+            inherit,
+        );
+        if has_sid && has_user {
             return Ok(());
         }
         record_acl_grant(manifest_path, path)?;
         let rx_mask = GENERIC_READ | GENERIC_EXECUTE | SYNCHRONIZE;
-        let entry = explicit_access(sid, rx_mask, GRANT_ACCESS, inherit);
-        merge_entries_on_path(path, &[entry])
+        let mut entries = Vec::with_capacity(2);
+        if !has_sid {
+            entries.push(explicit_access(sid, rx_mask, GRANT_ACCESS, inherit));
+        }
+        if !has_user {
+            entries.push(explicit_access(
+                user_sid.as_psid(),
+                rx_mask,
+                GRANT_ACCESS,
+                inherit,
+            ));
+        }
+        merge_entries_on_path(path, &entries)
     }
 
     /// Grants `oxideswarm.toolchain` read+execute on the existing subdirectories and config files
@@ -2005,6 +2087,10 @@ pub mod windows {
                 OwnedSid::from_well_known(WinBuiltinAnyPackageSid).ok(),
             ),
             (
+                "S-1-15-2-2 (ALL RESTRICTED APPLICATION PACKAGES)",
+                OwnedSid::from_sid_string("S-1-15-2-2").ok(),
+            ),
+            (
                 "S-1-15-3-1 (InternetClient)",
                 OwnedSid::from_well_known(WinCapabilityInternetClientSid).ok(),
             ),
@@ -2101,6 +2187,60 @@ pub mod windows {
                         sandbox_base.display(),
                         sys_dir.display()
                     ));
+                }
+            }
+        }
+        // Refuse to rewrite the DACL of a folder inside the user's home directory (such as
+        // `C:\Users\me\Documents` or `C:\Users\me\Desktop`) unless it is inside OxideSwarm's own
+        // `<user_home>\.oxideswarm\sandboxes` directory.
+        if !host.user_home.as_os_str().is_empty()
+            && path_starts_with_ci(sandbox_base, &host.user_home)
+        {
+            let allowed_ox = host.user_home.join(".oxideswarm").join("sandboxes");
+            if !path_starts_with_ci(sandbox_base, &allowed_ox) {
+                return Err(format!(
+                    "refusing to rewrite the DACL of user folder '{}' as sandbox_base; point --sandbox-base-dir at a dedicated OxideSwarm subdirectory such as '{}'",
+                    sandbox_base.display(),
+                    allowed_ox.display()
+                ));
+            }
+        }
+        if let Some(env_up) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+            if !env_up.as_os_str().is_empty() && path_starts_with_ci(sandbox_base, &env_up) {
+                let allowed_ox = env_up.join(".oxideswarm").join("sandboxes");
+                let in_ox_sandboxes = path_starts_with_ci(sandbox_base, &allowed_ox);
+                let in_temp = path_starts_with_ci(sandbox_base, &temp_root);
+                if !in_ox_sandboxes && !in_temp {
+                    return Err(format!(
+                        "refusing to rewrite the DACL of user folder '{}' as sandbox_base; point --sandbox-base-dir at a dedicated OxideSwarm subdirectory such as '{}'",
+                        sandbox_base.display(),
+                        allowed_ox.display()
+                    ));
+                }
+            }
+        }
+        // If `sandbox_base` already exists on disk, refuse to rewrite its DACL if it contains any
+        // entry not created by OxideSwarm (`cache`, `.locks`, `other_task`, `.isolation-probe-*`,
+        // `.isolation-outside-*`, `.write_probe_*`, or a UUID task sandbox directory).
+        if sandbox_base.exists() {
+            if let Ok(entries) = std::fs::read_dir(sandbox_base) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let s = name.to_string_lossy();
+                    let is_oxideswarm_entry = s == ".locks"
+                        || s == "cache"
+                        || s == "other_task"
+                        || s.starts_with(".isolation-probe-")
+                        || s.starts_with(".isolation-outside-")
+                        || s.starts_with(".write_probe_")
+                        || uuid::Uuid::try_parse(&s).is_ok();
+                    if !is_oxideswarm_entry {
+                        return Err(format!(
+                            "refusing to rewrite the DACL of existing folder '{}' containing non-sandbox entry '{}'; point --sandbox-base-dir at a dedicated OxideSwarm subdirectory",
+                            sandbox_base.display(),
+                            s
+                        ));
+                    }
                 }
             }
         }
@@ -2776,14 +2916,28 @@ pub mod windows {
 
         let mut existing_protected: Vec<PathBuf> = Vec::new();
         for pf in protected_files {
-            if !pf.as_os_str().is_empty() && pf.exists() && !existing_protected.contains(pf) {
-                existing_protected.push(pf.clone());
+            if !pf.as_os_str().is_empty() && pf.exists() {
+                let norm_pf = if !is_reparse_point(pf) {
+                    normalize_win_path(pf)
+                } else {
+                    pf.clone()
+                };
+                if !existing_protected.contains(&norm_pf) {
+                    existing_protected.push(norm_pf);
+                }
             }
         }
         if !host.user_home.as_os_str().is_empty() {
             let default_secret = host.user_home.join(".oxideswarm").join("cluster.secret");
-            if default_secret.exists() && !existing_protected.contains(&default_secret) {
-                existing_protected.push(default_secret);
+            if default_secret.exists() {
+                let norm_def = if !is_reparse_point(&default_secret) {
+                    normalize_win_path(&default_secret)
+                } else {
+                    default_secret
+                };
+                if !existing_protected.contains(&norm_def) {
+                    existing_protected.push(norm_def);
+                }
             }
         }
 
@@ -2794,8 +2948,18 @@ pub mod windows {
                 probe_dir.display()
             )
         })?;
+        let norm_base = if !is_reparse_point(sandbox_base) {
+            normalize_win_path(sandbox_base)
+        } else {
+            sandbox_base.to_path_buf()
+        };
+        let norm_probe_dir = if !is_reparse_point(&probe_dir) {
+            normalize_win_path(&probe_dir)
+        } else {
+            probe_dir.clone()
+        };
         let outside_name = format!(".isolation-outside-{}", std::process::id());
-        let outside_file = sandbox_base.join(&outside_name);
+        let outside_file = norm_base.join(&outside_name);
         let outcome = async {
             let empty_host =
                 HostDirs::from_home(PathBuf::new(), Some(PathBuf::new()), Some(PathBuf::new()));
@@ -2803,23 +2967,24 @@ pub mod windows {
                 level,
                 host: &empty_host,
                 protected_files: &[],
-                sandbox_base,
-                sandbox_dir: &probe_dir,
+                sandbox_base: &norm_base,
+                sandbox_dir: &norm_probe_dir,
             };
             let comspec = std::env::var("COMSPEC")
                 .unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
             let mut cmd_line = format!(
-                "echo ok > inside && (echo no > ..\\{outside_name} 2>nul && exit /b 3 || ver >nul)"
+                "echo ok > inside && (echo no > ..\\{outside_name} 2>nul && exit 3 || ver >nul)"
             );
             for idx in 0..existing_protected.len() {
                 let code = 10 + idx;
                 cmd_line.push_str(&format!(
-                    " && (type \"%OXIDE_PROBE_PROTECTED_{idx}%\" >nul 2>nul && exit /b {code} || ver >nul)"
+                    " && ((ver >nul) < \"%OXIDE_PROBE_PROTECTED_{idx}%\" 2>nul && exit {code} || ver >nul)"
                 ));
             }
+            cmd_line.push_str(" && exit 0");
             let mut cmd = tokio::process::Command::new(&comspec);
             cmd.args(["/C", &cmd_line]);
-            cmd.current_dir(&probe_dir);
+            cmd.current_dir(&norm_probe_dir);
             cmd.env_clear();
             for (name, value) in super::inherited_environment(std::env::vars_os()) {
                 cmd.env(name, value);
@@ -3817,5 +3982,31 @@ mod tests {
             ),
             "purely non-existent <sandbox>\\..\\.. escape must NOT pass"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_validate_sandbox_base_safe_rejects_user_folders_and_non_empty_dirs() {
+        let fake_home = tempfile::tempdir().unwrap();
+        let host = HostDirs::from_home(fake_home.path().to_path_buf(), None, None);
+
+        let docs = fake_home.path().join("Documents");
+        std::fs::create_dir_all(&docs).unwrap();
+        let err_docs = windows::validate_sandbox_base_safe(&docs, &host)
+            .expect_err("must reject <user_home>\\Documents");
+        assert!(err_docs.contains("user folder"), "{err_docs}");
+
+        let ox_sandboxes = fake_home.path().join(".oxideswarm").join("sandboxes");
+        std::fs::create_dir_all(&ox_sandboxes).unwrap();
+        windows::validate_sandbox_base_safe(&ox_sandboxes, &host)
+            .expect("<user_home>\\.oxideswarm\\sandboxes must be accepted");
+
+        let outside = tempfile::tempdir().unwrap();
+        let non_empty = outside.path().join("operator_folder");
+        std::fs::create_dir_all(&non_empty).unwrap();
+        std::fs::write(non_empty.join("important.docx"), "data").unwrap();
+        let err_non_empty = windows::validate_sandbox_base_safe(&non_empty, &host)
+            .expect_err("must reject existing directory containing non-sandbox files");
+        assert!(err_non_empty.contains("important.docx"), "{err_non_empty}");
     }
 }

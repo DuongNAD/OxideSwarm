@@ -259,11 +259,27 @@ fn augment_windows_path(existing_path: &str) -> String {
         std::path::PathBuf::from(r"C:\msys64\usr\bin"),
     ]);
 
+    let normalized_existing: String = existing_path
+        .split(';')
+        .map(|part| {
+            if (part.contains('~') || part.contains('/')) && !part.is_empty() {
+                let p = Path::new(part);
+                if p.exists() && !crate::isolation::windows::is_reparse_point(p) {
+                    return crate::isolation::windows::normalize_win_path(p)
+                        .to_string_lossy()
+                        .into_owned();
+                }
+            }
+            part.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+
     let mut prefix = String::new();
     for p in &paths_to_check {
         if p.exists() {
             let p_str = p.to_string_lossy();
-            if !existing_path.contains(&*p_str) {
+            if !normalized_existing.contains(&*p_str) {
                 if !prefix.is_empty() {
                     prefix.push(';');
                 }
@@ -272,11 +288,11 @@ fn augment_windows_path(existing_path: &str) -> String {
         }
     }
     if prefix.is_empty() {
-        existing_path.to_string()
-    } else if existing_path.is_empty() {
+        normalized_existing
+    } else if normalized_existing.is_empty() {
         prefix
     } else {
-        format!("{prefix};{existing_path}")
+        format!("{prefix};{normalized_existing}")
     }
 }
 
@@ -2632,6 +2648,45 @@ impl TaskRunner {
         #[cfg(not(windows))]
         let resolved_program = program.to_string();
 
+        #[cfg(windows)]
+        let (eff_sandbox_path, eff_cwd, eff_sandbox_base) = if self.config.isolation
+            != IsolationLevel::Off
+        {
+            let sp = if sandbox_path.exists()
+                && !crate::isolation::windows::is_reparse_point(sandbox_path)
+            {
+                crate::isolation::windows::normalize_win_path(sandbox_path)
+            } else {
+                sandbox_path.to_path_buf()
+            };
+            let cw = if cwd.exists() && !crate::isolation::windows::is_reparse_point(cwd) {
+                crate::isolation::windows::normalize_win_path(cwd)
+            } else {
+                cwd.to_path_buf()
+            };
+            let sb = if self.config.sandbox_config.base_dir.exists()
+                && !crate::isolation::windows::is_reparse_point(
+                    &self.config.sandbox_config.base_dir,
+                ) {
+                crate::isolation::windows::normalize_win_path(&self.config.sandbox_config.base_dir)
+            } else {
+                self.config.sandbox_config.base_dir.clone()
+            };
+            (sp, cw, sb)
+        } else {
+            (
+                sandbox_path.to_path_buf(),
+                cwd.to_path_buf(),
+                self.config.sandbox_config.base_dir.clone(),
+            )
+        };
+        #[cfg(not(windows))]
+        let (eff_sandbox_path, eff_cwd, eff_sandbox_base) = (
+            sandbox_path.to_path_buf(),
+            cwd.to_path_buf(),
+            self.config.sandbox_config.base_dir.clone(),
+        );
+
         // Under `--isolation fs|fs+net` the task is confined by the platform's mechanism (macOS:
         // `sandbox-exec` wraps the program; Linux: a `pre_exec` hook registered below). When
         // that is impossible the task fails, it never runs plain.
@@ -2639,8 +2694,8 @@ impl TaskRunner {
             level: self.config.isolation,
             host: &self.config.host_dirs,
             protected_files: &self.config.protected_files,
-            sandbox_base: &self.config.sandbox_config.base_dir,
-            sandbox_dir: sandbox_path,
+            sandbox_base: &eff_sandbox_base,
+            sandbox_dir: &eff_sandbox_path,
         });
         let isolation_failure = |e: &str| {
             TaskResult::failure(
@@ -2672,7 +2727,7 @@ impl TaskRunner {
 
         let mut cmd = tokio::process::Command::new(&spawn_program);
         cmd.args(&spawn_args);
-        cmd.current_dir(cwd);
+        cmd.current_dir(&eff_cwd);
 
         // A confined task gets an allowlisted environment, not a copy of the worker's: tokens and
         // credentials in the worker's environment are none of its business (design 0033 D1.4).
@@ -2694,6 +2749,17 @@ impl TaskRunner {
         // Inject user environment variables (skipping PATH to preserve effective_path)
         for (k, v) in env {
             if k != "PATH" {
+                #[cfg(windows)]
+                if self.config.isolation != IsolationLevel::Off
+                    && (k.eq_ignore_ascii_case("RUSTC") || k.eq_ignore_ascii_case("CARGO"))
+                    && (v.contains('~') || v.contains('/'))
+                {
+                    let p = Path::new(v);
+                    if p.exists() && !crate::isolation::windows::is_reparse_point(p) {
+                        cmd.env(k, crate::isolation::windows::normalize_win_path(p));
+                        continue;
+                    }
+                }
                 cmd.env(k, v);
             }
         }
@@ -2703,12 +2769,15 @@ impl TaskRunner {
         cmd.env("RUSTY_GRID_WORKER_ID", self.worker_id.to_string());
         cmd.env(
             "RUSTY_GRID_SANDBOX_DIR",
-            sandbox_path.to_string_lossy().to_string(),
+            eff_sandbox_path.to_string_lossy().to_string(),
         );
 
         if self.config.isolation != IsolationLevel::Off {
-            let plan =
-                crate::isolation::prepare_environment(&self.config.host_dirs, env, sandbox_path);
+            let plan = crate::isolation::prepare_environment(
+                &self.config.host_dirs,
+                env,
+                &eff_sandbox_path,
+            );
             for (name, value) in &plan.set {
                 cmd.env(name, value);
             }
@@ -2750,8 +2819,8 @@ impl TaskRunner {
             let level = self.config.isolation;
             let host_dirs = self.config.host_dirs.clone();
             let protected_files = self.config.protected_files.clone();
-            let sandbox_base = self.config.sandbox_config.base_dir.clone();
-            let sandbox_dir = sandbox_path.to_path_buf();
+            let sandbox_base = eff_sandbox_base.clone();
+            let sandbox_dir = eff_sandbox_path.clone();
             let run_token = configured.run_token();
             let std_cmd = cmd.as_std();
             let prog_for_setup = std_cmd.get_program().to_string_lossy().to_string();
