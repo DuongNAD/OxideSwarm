@@ -532,6 +532,11 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "items": { "type": "string" },
                         "description": "Required worker user tags"
                     },
+                    "tools": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Required worker host tools (e.g. [\"cargo\", \"rustc\", \"git\"]), matched against worker tool:<name> tags"
+                    },
                     "timeout_secs": {
                         "type": "integer",
                         "description": "Task timeout in seconds (default: 60)"
@@ -860,6 +865,7 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             let arch_opt = check_opt_str(obj, "arch")?;
             let worker_opt = check_opt_str(obj, "worker")?;
             let req_tags = check_opt_str_array(obj, "require_tags")?;
+            let tools_opt = check_opt_str_array(obj, "tools")?;
             let isolation_opt = check_opt_str(obj, "isolation")?;
 
             let mut placement_tags = Vec::new();
@@ -880,6 +886,11 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             if let Some(tags) = req_tags {
                 for t in tags {
                     placement_tags.push(format!("{REQUIRE_PREFIX}tag={t}"));
+                }
+            }
+            if let Some(tools) = tools_opt {
+                for t in tools {
+                    placement_tags.push(format!("{REQUIRE_PREFIX}tool={t}"));
                 }
             }
             Placement::from_task_tags(&placement_tags)
@@ -1867,6 +1878,11 @@ async fn tool_submit(state: &McpState, args: &Value, ctx: &mut ToolCallContext) 
     if let Some(tags_arr) = args.get("require_tags").and_then(Value::as_array) {
         for t in tags_arr.iter().filter_map(Value::as_str) {
             placement_tags.push(format!("{REQUIRE_PREFIX}tag={t}"));
+        }
+    }
+    if let Some(tools_arr) = args.get("tools").and_then(Value::as_array) {
+        for t in tools_arr.iter().filter_map(Value::as_str) {
+            placement_tags.push(format!("{REQUIRE_PREFIX}tool={t}"));
         }
     }
 
@@ -3511,6 +3527,81 @@ mod tests {
         assert_eq!(queued_val["connected_workers"], 0);
         assert_eq!(queued_val["total_tasks"], 1);
         assert_eq!(queued_val["pending_tasks"], 1);
+
+        let _ = master.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_submit_tools_argument_validates_and_adds_require_tool_placement() {
+        assert_eq!(
+            validate_tool_arguments(
+                "submit",
+                &json!({"command": "echo", "tools": ["cargo", "rustc", "GIT"]})
+            ),
+            Ok(())
+        );
+        for bad in [
+            json!({"command": "echo", "tools": [""]}),
+            json!({"command": "echo", "tools": ["bad:tool"]}),
+            json!({"command": "echo", "tools": "cargo"}),
+        ] {
+            assert!(
+                validate_tool_arguments("submit", &bad).is_err(),
+                "expected invalid tools arg {bad} to be rejected"
+            );
+        }
+
+        let submit_schema = available_tools()
+            .into_iter()
+            .find(|t| t.name == "submit")
+            .unwrap()
+            .input_schema;
+        assert_eq!(submit_schema["properties"]["tools"]["type"], "array");
+        assert_eq!(
+            submit_schema["properties"]["tools"]["items"]["type"],
+            "string"
+        );
+
+        use rusty_grid_master::reaper::ReaperConfig;
+        use rusty_grid_master::scheduler::SchedulerConfig;
+        use rusty_grid_master::server::{MasterServer, ServerConfig};
+
+        let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_web_ui(false);
+        let master = MasterServer::spawn_with_config(
+            server_config,
+            SchedulerConfig::default(),
+            ReaperConfig::default(),
+        )
+        .await
+        .expect("master starts");
+
+        let state = McpState::new(master.server_addr().to_string(), None);
+        let submit_res = call_tool(
+            &state,
+            "submit",
+            &json!({
+                "type": "command",
+                "command": "echo",
+                "args": ["needs-cargo"],
+                "tools": ["cargo", "git"],
+                "wait": false
+            }),
+        )
+        .await;
+        assert!(!submit_res.is_error, "{submit_res:?}");
+
+        let tasks = master.queue().list_tasks().await;
+        assert_eq!(tasks.len(), 1);
+        let task = master
+            .queue()
+            .get_task_spec(&tasks[0].task_id)
+            .await
+            .expect("task spec");
+        let placement = task.placement().expect("valid placement");
+        assert_eq!(
+            placement.tools,
+            vec!["cargo".to_string(), "git".to_string()]
+        );
 
         let _ = master.shutdown();
     }

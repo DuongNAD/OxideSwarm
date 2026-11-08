@@ -472,7 +472,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | Flag / Alias | Default / Env / Config | Description |
 | :--- | :--- | :--- |
 | `--master <ADDR\|auto>` | `127.0.0.1:8088` (`RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[submit].master`) | Master grid port address (`HOST:8088`, bare `HOST`, or `auto`) |
-| `--type <TYPE>` (alias `--task-type`) | `generic` | Task type: `command` (`generic`), `shell`, `gpu`, `3d`, or `autorig` |
+| `--type <TYPE>` (alias `--task-type`) | `generic` | Task type: `command` (`generic`), `shell`, `compile`, `gpu`, `3d`, or `autorig` |
 | `--command <CMD>` | — | Executable name or shell snippet to run on the worker |
 | `-- <ARGS>...` | — | Trailing command arguments passed to `--command` |
 | `--cores <N>` | `1` | Minimum CPU cores required on the assigned worker |
@@ -486,7 +486,9 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--arch <ARCH>` | — | Pin to worker CPU architecture: `x86_64` (`amd64`, `x64`), `aarch64` (`arm64`) |
 | `--worker <NAME\|ID>` | — | Pin to a specific worker by name (case-insensitive) or UUID prefix |
 | `--require-tag <TAG>` | Repeatable | Require a worker carrying this user tag (`worker --tag`) |
+| `--require-tool <TOOL>` | Repeatable | Require a worker that advertises this host tool (`tool:<name>`, e.g. `cargo`, `rustc`, `git`) |
 | `--require-isolation <LEVEL>` | — | Require a worker confined at least at `fs` or `fs+net` (`worker --isolation`); the constraint is `require:iso=<level>`, met when the worker's `iso:` tag is at that level or above (`off < fs < fs+net`; a worker without the tag counts as `off`) |
+| `--source <PATH[:SANDBOX]>` (alias `--source-dir`) | Repeatable | Compile tasks: Rust source file or Cargo crate directory to compile (`cargo build --offline` when `Cargo.toml` is present, else `rustc`) |
 | `--stdin-file <PATH>` | — | Command tasks: send a local file (at most 32 MiB) as standard input |
 | `--script-file <PATH>` | — | Shell tasks: send a local script file (at most 32 MiB) to execute |
 | `--interpreter <PROG>` | `sh` / `cmd.exe` | Shell tasks: run the script with `<PROG>` (e.g. `python3`, `bash`) |

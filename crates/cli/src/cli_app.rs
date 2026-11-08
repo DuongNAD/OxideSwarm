@@ -380,7 +380,7 @@ pub struct WorkerArgs {
     #[arg(
         long = "tag",
         value_name = "TAG",
-        help = "User tag advertised to the master, matched by `submit --require-tag` (repeatable; env RUSTY_GRID_WORKER_TAGS, comma-separated). The prefixes os:, arch:, slots:, link:, id:, state: and iso: are reserved"
+        help = "User tag advertised to the master, matched by `submit --require-tag` (repeatable; env RUSTY_GRID_WORKER_TAGS, comma-separated). The prefixes os:, arch:, slots:, link:, id:, state:, iso: and tool: are reserved"
     )]
     pub tags: Vec<String>,
 
@@ -516,7 +516,7 @@ pub struct SubmitArgs {
         long = "type",
         alias = "task-type",
         default_value = "generic",
-        help = "Task type: command (default, also `generic`), shell, gpu, 3d, or autorig. `compile` needs source files, which only the agent-mesh bridge sends"
+        help = "Task type: command (default, also `generic`), shell, compile, gpu, 3d, or autorig"
     )]
     pub task_type: String,
 
@@ -671,6 +671,21 @@ pub struct SubmitArgs {
         help = "Run only on a worker that carries this user tag (`worker --tag`); repeatable, all must match"
     )]
     pub require_tags: Vec<String>,
+
+    #[arg(
+        long = "require-tool",
+        value_name = "TOOL",
+        help = "Run only on a worker that advertises this host tool (`tool:<name>`, e.g. cargo, rustc, git); repeatable, all must match"
+    )]
+    pub require_tools: Vec<String>,
+
+    #[arg(
+        long = "source",
+        visible_alias = "source-dir",
+        value_name = "PATH[:SANDBOX]",
+        help = "Compile tasks: Rust source file or Cargo crate directory to compile (repeatable)"
+    )]
+    pub sources: Vec<String>,
 
     #[arg(
         long,
@@ -2358,10 +2373,14 @@ pub fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
             return only_for("--work-group-size", "gpu");
         }
     }
-    if !args.inputs.is_empty() && !is_command && kind != "shell" {
+    let is_compile = kind == "compile";
+    if !args.sources.is_empty() && !is_compile {
+        return only_for("--source", "compile");
+    }
+    if !args.inputs.is_empty() && !is_command && kind != "shell" && !is_compile {
         return only_for("--input (or --file)", "command and shell");
     }
-    if !args.outputs.is_empty() && !is_command && kind != "shell" {
+    if !args.outputs.is_empty() && !is_command && kind != "shell" && !is_compile {
         if matches!(
             kind.as_str(),
             "3d" | "gen3d" | "3d_generate" | "generative_3d" | "autorig" | "auto_rig" | "rig"
@@ -2377,10 +2396,10 @@ pub fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
         }
         return only_for("--output", "command and shell");
     }
-    if args.output_dir.is_some() && !is_command && kind != "shell" {
+    if args.output_dir.is_some() && !is_command && kind != "shell" && !is_compile {
         return only_for("--output-dir", "command and shell");
     }
-    if args.output_dir.is_some() && args.outputs.is_empty() {
+    if args.output_dir.is_some() && args.outputs.is_empty() && !is_compile {
         return Err("--output-dir requires at least one --output pattern".to_string());
     }
     let env = parse_env_pairs(&args.env)?;
@@ -2492,11 +2511,17 @@ pub fn build_task_spec(args: &SubmitArgs) -> Result<TaskSpec, String> {
                 dim,
             ))
         }
-        "compile" => Err(
-            "compile tasks need the crate's source files, which `submit` cannot send; they are \
-             submitted through the agent-mesh bridge (`grid_compile`)"
-                .to_string(),
-        ),
+        "compile" => {
+            let (crate_name, source_files) = collect_compile_sources(args)?;
+            let spec = TaskSpec::RustCompilation {
+                crate_name,
+                source_files,
+                compiler_flags: args.args.clone(),
+                target_dir: None,
+            };
+            spec.validate()?;
+            Ok(spec)
+        }
         "shell" => {
             let script = match &args.script_file {
                 Some(path) => {
@@ -2566,6 +2591,231 @@ fn read_task_input(path: &Path, flag: &str) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("{flag} {}: {e}", path.display()))
 }
 
+/// Collects Rust source files and crate metadata from `--source` (or `--input` when `--source`
+/// is omitted) for `submit --type compile`.
+fn collect_compile_sources(args: &SubmitArgs) -> Result<(String, HashMap<String, String>), String> {
+    let (raw_specs, flag_name) = if !args.sources.is_empty() {
+        (&args.sources, "--source")
+    } else if !args.inputs.is_empty() {
+        (&args.inputs, "--input")
+    } else {
+        return Err(
+            "compile tasks require --source <PATH> (a Rust source file or Cargo crate directory)"
+                .to_string(),
+        );
+    };
+
+    let mut source_files = HashMap::new();
+    let mut first_local_path: Option<PathBuf> = None;
+
+    for raw in raw_specs {
+        let (local_path, explicit_dest) =
+            crate::blobs::parse_input_spec(raw).map_err(|e| e.replace("--input", flag_name))?;
+        if first_local_path.is_none() {
+            first_local_path = Some(local_path.clone());
+        }
+        let meta = std::fs::metadata(&local_path)
+            .map_err(|e| format!("{flag_name} {}: {e}", local_path.display()))?;
+        if meta.is_dir() {
+            let prefix = match explicit_dest {
+                Some(dest) => {
+                    let parts: Vec<&str> = dest
+                        .split('/')
+                        .filter(|p| !p.is_empty() && *p != ".")
+                        .collect();
+                    if parts.is_empty() {
+                        String::new()
+                    } else {
+                        let joined = parts.join("/");
+                        rusty_grid_core::blob::validate_blob_path(&joined)
+                            .map_err(|e| format!("{flag_name}: sandbox path '{dest}': {e}"))?;
+                        joined
+                    }
+                }
+                None => String::new(),
+            };
+            collect_compile_dir(
+                &local_path,
+                &local_path,
+                &prefix,
+                flag_name,
+                &mut source_files,
+            )?;
+        } else if meta.is_file() {
+            let sandbox_rel = match explicit_dest {
+                Some(dest) => {
+                    let parts: Vec<&str> = dest
+                        .split('/')
+                        .filter(|p| !p.is_empty() && *p != ".")
+                        .collect();
+                    if parts.is_empty() {
+                        return Err(format!(
+                            "{flag_name}: '{dest}' is the sandbox root; a file needs a file name"
+                        ));
+                    }
+                    let joined = parts.join("/");
+                    rusty_grid_core::blob::validate_blob_path(&joined)
+                        .map_err(|e| format!("{flag_name}: sandbox path '{dest}': {e}"))?;
+                    joined
+                }
+                None => default_compile_file_dest(&local_path, flag_name)?,
+            };
+            let bytes = read_task_input(&local_path, flag_name)?;
+            let text = String::from_utf8(bytes).map_err(|_| {
+                format!(
+                    "{flag_name} {}: the file is not UTF-8 text",
+                    local_path.display()
+                )
+            })?;
+            source_files.insert(sandbox_rel, text);
+        } else {
+            return Err(format!(
+                "{flag_name} {}: path is neither a regular file nor a directory",
+                local_path.display()
+            ));
+        }
+    }
+
+    if source_files.is_empty() {
+        return Err(format!("{flag_name}: no source files found"));
+    }
+
+    let crate_name = if let Some(cmd) = &args.command {
+        let trimmed = cmd.trim();
+        if trimmed.is_empty() {
+            "crate".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    } else if let Some(manifest) = source_files.get("Cargo.toml") {
+        parse_cargo_package_name(manifest).unwrap_or_else(|| "crate".to_string())
+    } else if let Some(path) = first_local_path {
+        path.file_stem()
+            .or_else(|| path.file_name())
+            .and_then(|s| s.to_str())
+            .map(|s| s.replace('-', "_"))
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "crate".to_string())
+    } else {
+        "crate".to_string()
+    };
+
+    Ok((crate_name, source_files))
+}
+
+fn collect_compile_dir(
+    root: &Path,
+    current: &Path,
+    prefix: &str,
+    flag_name: &str,
+    out: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(current)
+        .map_err(|e| format!("{flag_name} {}: {e}", current.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("{flag_name} {}: {e}", current.display()))?;
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("{flag_name} {}: {e}", entry.path().display()))?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if name_str == ".git" || name_str == "target" {
+                continue;
+            }
+            collect_compile_dir(root, &entry.path(), prefix, flag_name, out)?;
+        } else if file_type.is_file() {
+            let rel = entry
+                .path()
+                .strip_prefix(root)
+                .map_err(|e| format!("{flag_name} {}: {e}", entry.path().display()))?
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(s) => s.to_str(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            if rel.is_empty() {
+                continue;
+            }
+            let sandbox_rel = if prefix.is_empty() {
+                rel
+            } else {
+                format!("{prefix}/{rel}")
+            };
+            if rusty_grid_core::blob::validate_blob_path(&sandbox_rel).is_err() {
+                continue;
+            }
+            let bytes = read_task_input(&entry.path(), flag_name)?;
+            let text = String::from_utf8(bytes).map_err(|_| {
+                format!(
+                    "{flag_name} {}: the file is not UTF-8 text",
+                    entry.path().display()
+                )
+            })?;
+            out.insert(sandbox_rel, text);
+        }
+    }
+    Ok(())
+}
+
+fn default_compile_file_dest(local: &Path, flag_name: &str) -> Result<String, String> {
+    let mut parts = Vec::new();
+    let mut relative = true;
+    for component in local.components() {
+        match component {
+            std::path::Component::Normal(part) => match part.to_str() {
+                Some(s) => parts.push(s.to_string()),
+                None => relative = false,
+            },
+            std::path::Component::CurDir => {}
+            _ => relative = false,
+        }
+    }
+    if relative && !parts.is_empty() {
+        let joined = parts.join("/");
+        if rusty_grid_core::blob::validate_blob_path(&joined).is_ok() {
+            return Ok(joined);
+        }
+    }
+    if let (Some(file_name), Some(parent)) =
+        (local.file_name().and_then(|n| n.to_str()), local.parent())
+    {
+        if parent.file_name().and_then(|n| n.to_str()) == Some("src") {
+            let candidate = format!("src/{file_name}");
+            if rusty_grid_core::blob::validate_blob_path(&candidate).is_ok() {
+                return Ok(candidate);
+            }
+        }
+        if rusty_grid_core::blob::validate_blob_path(file_name).is_ok() {
+            return Ok(file_name.to_string());
+        }
+    }
+    Err(format!(
+        "{flag_name} '{}': cannot derive a sandbox path; name one with PATH:SANDBOX_PATH",
+        local.display()
+    ))
+}
+
+fn parse_cargo_package_name(manifest: &str) -> Option<String> {
+    let parsed: toml::Value = toml::from_str(manifest).ok()?;
+    parsed
+        .get("package")?
+        .get("name")?
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// `--env KEY=VALUE` pairs as a map; the first `=` ends the key, which must not be empty.
 fn parse_env_pairs(pairs: &[String]) -> Result<HashMap<String, String>, String> {
     let mut env = HashMap::new();
@@ -2595,7 +2845,7 @@ fn resolve_isolation(
     }
 }
 
-/// The placement constraints of `submit --os / --arch / --worker / --require-isolation / --require-tag`, checked and
+/// The placement constraints of `submit --os / --arch / --worker / --require-isolation / --require-tag / --require-tool`, checked and
 /// normalised exactly as the master will read them.
 fn build_placement(args: &SubmitArgs) -> Result<Placement, String> {
     let mut tags = Vec::new();
@@ -2615,6 +2865,9 @@ fn build_placement(args: &SubmitArgs) -> Result<Placement, String> {
     }
     for tag in &args.require_tags {
         tags.push(format!("{REQUIRE_PREFIX}tag={tag}"));
+    }
+    for tool in &args.require_tools {
+        tags.push(format!("{REQUIRE_PREFIX}tool={tool}"));
     }
     Placement::from_task_tags(&tags)
 }
@@ -2734,12 +2987,18 @@ async fn run_submit_with_secret(
     };
 
     // Inputs are hashed (and directories listed) before connecting, so a typo in a path never
-    // reaches the master.
-    let inputs = match crate::blobs::scan_inputs(&args.inputs) {
-        Ok(inputs) => inputs,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
+    // reaches the master. When `--type compile` was given without `--source`, `args.inputs` was
+    // already loaded into `TaskSpec::RustCompilation.source_files`.
+    let is_compile = matches!(spec, TaskSpec::RustCompilation { .. });
+    let inputs = if is_compile && args.sources.is_empty() {
+        crate::blobs::PreparedInputs::default()
+    } else {
+        match crate::blobs::scan_inputs(&args.inputs) {
+            Ok(inputs) => inputs,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
         }
     };
     for skipped in &inputs.skipped {
@@ -2865,7 +3124,7 @@ async fn run_submit_with_secret(
         .with_placement(&placement)
         .with_inputs(inputs.inputs)
         .with_output_globs(output_globs.clone());
-    let wait = args.wait || args.output.is_some() || !output_globs.is_empty();
+    let wait = args.wait || args.output.is_some() || !output_globs.is_empty() || is_compile;
     let submit_msg = ClientMessage::SubmitTask { task, wait };
 
     let response = match exchange(
@@ -2945,7 +3204,27 @@ async fn run_submit_with_secret(
                     Err(e) => Err(e.to_string()),
                 };
                 match downloaded {
-                    Ok(saved) => Some(saved),
+                    Ok(saved) => {
+                        if is_compile && result.asset_bytes.is_none() {
+                            if let (Some(ref out_path), Some(first)) =
+                                (&asset_output_path, saved.first())
+                            {
+                                if let Some(parent) = out_path.parent() {
+                                    if !parent.as_os_str().is_empty() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+                                }
+                                if let Err(e) = std::fs::copy(first, out_path) {
+                                    eprintln!(
+                                        "Failed to write compiled output to '{}': {e}",
+                                        out_path.display()
+                                    );
+                                    download_failed = true;
+                                }
+                            }
+                        }
+                        Some(saved)
+                    }
                     Err(e) => {
                         eprintln!("Downloading the output files failed: {e}");
                         download_failed = true;
@@ -4358,7 +4637,11 @@ mod tests {
             ),
             (
                 &["--type", "compile", "--command", "demo"],
-                "agent-mesh bridge",
+                "compile tasks require --source",
+            ),
+            (
+                &["--source", "main.rs", "--", "true"],
+                "--source applies to compile",
             ),
         ] {
             let err = build_task_spec(&submit_args(args)).unwrap_err();
@@ -6133,5 +6416,232 @@ fail_unfulfillable_tasks = false
             Some(std::path::Path::new("/tmp/cfg-state"))
         );
         assert_eq!(resolved_none, None);
+    }
+
+    #[test]
+    fn test_submit_require_tool_flag_parses_and_builds_placement() {
+        let placement = build_placement(&submit_args(&[
+            "--require-tool",
+            "Cargo",
+            "--require-tool",
+            "rustc",
+            "--",
+            "true",
+        ]))
+        .unwrap();
+        assert_eq!(placement.tools, ["cargo", "rustc"]);
+        assert_eq!(
+            placement.to_task_tags(),
+            ["require:tool=cargo", "require:tool=rustc"]
+        );
+
+        let err = build_placement(&submit_args(&["--require-tool", "bad:tool", "--", "true"]))
+            .unwrap_err();
+        assert!(err.contains("require:tool"), "{err}");
+
+        let tag_err = build_placement(&submit_args(&["--require-tag", "tool:cargo", "--", "true"]))
+            .unwrap_err();
+        assert!(
+            tag_err.contains("only the worker or the master"),
+            "{tag_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo(
+    ) {
+        use rusty_grid_core::capabilities::MobileCapabilities;
+        use rusty_grid_master::reaper::ReaperConfig;
+        use rusty_grid_master::registry::WorkerStatus;
+        use rusty_grid_master::scheduler::SchedulerConfig;
+        use rusty_grid_master::server::{MasterServer, ServerConfig};
+        use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
+        use rusty_grid_worker::MobileTelemetryHandle;
+        use tokio::sync::watch;
+
+        let temp = tempfile::tempdir().unwrap();
+        let secret = rusty_grid_core::cluster_auth::ClusterSecret::generate().unwrap();
+        let secret_opts = SecretOpts {
+            value: Some(SecretText(secret.to_hex())),
+            file: None,
+        };
+
+        let master_blob_dir = temp.path().join("master-blobs");
+        let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_web_ui(false)
+            .with_cluster_secret(secret.clone())
+            .with_blob_store(&master_blob_dir, 256 * 1024 * 1024);
+        let master = MasterServer::spawn_with_config(
+            server_config,
+            SchedulerConfig::default(),
+            ReaperConfig::default(),
+        )
+        .await
+        .expect("master starts");
+        let master_addr = master.server_addr().to_string();
+
+        let plugged_in = || {
+            MobileTelemetryHandle::new(Some(MobileCapabilities {
+                battery_pct: Some(100),
+                is_charging: Some(true),
+                ..MobileCapabilities::default()
+            }))
+        };
+
+        // Worker 1: does NOT advertise `tool:cargo`.
+        let w1_sandbox = temp.path().join("w1-sandbox");
+        let w1_config = WorkerConfig::new(master_addr.clone())
+            .with_cluster_secret(secret.clone())
+            .with_no_battery(true)
+            .with_name("worker-no-cargo")
+            .with_cores(2)
+            .with_ram_mb(2048)
+            .with_sandbox_base_dir(&w1_sandbox)
+            .with_mobile_telemetry(plugged_in())
+            .with_redirection_portal(false);
+        let mut w1_client = rusty_grid_core::capabilities::with_test_tool_probe(
+            vec!["tool:git".to_string()],
+            || WorkerClient::new(w1_config),
+        );
+        let w1_id = w1_client.worker_id();
+        let (w1_stop_tx, w1_stop_rx) = watch::channel(false);
+        let w1_handle = tokio::spawn(async move {
+            let _ = w1_client.run(w1_stop_rx).await;
+        });
+
+        // Worker 2: advertises `tool:cargo` and `tool:rustc`.
+        let w2_sandbox = temp.path().join("w2-sandbox");
+        let w2_config = WorkerConfig::new(master_addr.clone())
+            .with_cluster_secret(secret.clone())
+            .with_no_battery(true)
+            .with_name("worker-with-cargo")
+            .with_cores(2)
+            .with_ram_mb(2048)
+            .with_sandbox_base_dir(&w2_sandbox)
+            .with_mobile_telemetry(plugged_in())
+            .with_redirection_portal(false);
+        let mut w2_client = rusty_grid_core::capabilities::with_test_tool_probe(
+            vec![
+                "tool:cargo".to_string(),
+                "tool:rustc".to_string(),
+                "tool:git".to_string(),
+            ],
+            || WorkerClient::new(w2_config),
+        );
+        let w2_id = w2_client.worker_id();
+        let (w2_stop_tx, w2_stop_rx) = watch::channel(false);
+        let w2_handle = tokio::spawn(async move {
+            let _ = w2_client.run(w2_stop_rx).await;
+        });
+
+        // Wait until both workers are registered on the master.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let workers = master.list_workers().await.unwrap_or_default();
+            let connected = workers
+                .iter()
+                .filter(|w| w.status != WorkerStatus::Disconnected)
+                .count();
+            if connected >= 2 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for both workers to register"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Create a crate with a local path dependency (passed via `--source` + `--input`).
+        let crate_dir = temp.path().join("app_crate");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            r#"[package]
+name = "feat10_cli_bin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+local_math = { path = "local_math" }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            "fn main() { println!(\"sum={}\", local_math::add(19, 23)); }\n",
+        )
+        .unwrap();
+
+        let dep_dir = temp.path().join("local_math");
+        std::fs::create_dir_all(dep_dir.join("src")).unwrap();
+        std::fs::write(
+            dep_dir.join("Cargo.toml"),
+            r#"[package]
+name = "local_math"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dep_dir.join("src/lib.rs"),
+            "pub fn add(a: u32, b: u32) -> u32 { a + b }\n",
+        )
+        .unwrap();
+
+        let client_out_dir = temp.path().join("client-out");
+        let input_spec = format!("{}:local_math", dep_dir.display());
+        let s_args = submit_args(&[
+            "--master",
+            &master_addr,
+            "--type",
+            "compile",
+            "--require-tool",
+            "cargo",
+            "--source",
+            crate_dir.to_str().unwrap(),
+            "--input",
+            &input_spec,
+            "--output-dir",
+            client_out_dir.to_str().unwrap(),
+        ]);
+
+        let exit = run_submit_with_secret(s_args, None, secret_opts).await;
+        assert_eq!(
+            exit,
+            ExitCode::SUCCESS,
+            "submit --type compile must succeed"
+        );
+
+        // Verify the task ran on Worker 2 (`worker-with-cargo`) and avoided Worker 1 (`worker-no-cargo`).
+        let tasks = master.queue().list_tasks().await;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].assigned_worker_id, Some(w2_id));
+        assert_ne!(tasks[0].assigned_worker_id, Some(w1_id));
+
+        // Verify the compiled binary reached the client output directory and runs!
+        let bin_name = if cfg!(windows) {
+            "feat10_cli_bin.exe"
+        } else {
+            "feat10_cli_bin"
+        };
+        let downloaded_bin = client_out_dir.join("target").join(bin_name);
+        assert!(
+            downloaded_bin.is_file(),
+            "expected compiled binary at {}",
+            downloaded_bin.display()
+        );
+        let run_out = std::process::Command::new(&downloaded_bin)
+            .output()
+            .expect("run downloaded binary");
+        assert!(run_out.status.success(), "{run_out:?}");
+        assert_eq!(String::from_utf8_lossy(&run_out.stdout).trim(), "sum=42");
+
+        let _ = w1_stop_tx.send(true);
+        let _ = w2_stop_tx.send(true);
+        let _ = w1_handle.await;
+        let _ = w2_handle.await;
+        let _ = master.shutdown();
     }
 }

@@ -1115,9 +1115,14 @@ impl Drop for WorkerClient {
 
 /// What the worker advertises in `WorkerCapabilities::tags`: its system tags (`os:`, `arch:`, see
 /// `rusty_grid_core::placement`), its effective task concurrency (`slots:<n>`), its isolation
-/// level (`iso:<level>`), then the
+/// level (`iso:<level>`), its probed host tools (`tool:<name>`), then the
 /// configured user tags that are not among them.
-fn advertised_tags(user_tags: &[String], slots: usize, isolation: IsolationLevel) -> Vec<String> {
+fn advertised_tags(
+    user_tags: &[String],
+    slots: usize,
+    isolation: IsolationLevel,
+    tool_tags: &[String],
+) -> Vec<String> {
     let mut tags = rusty_grid_core::placement::system_tags();
     tags.push(format!(
         "{}{}",
@@ -1125,8 +1130,16 @@ fn advertised_tags(user_tags: &[String], slots: usize, isolation: IsolationLevel
         slots.max(1)
     ));
     tags.push(isolation.tag());
+    for tag in tool_tags {
+        if tag.starts_with(rusty_grid_core::placement::TOOL_TAG_PREFIX) && !tags.contains(tag) {
+            tags.push(tag.clone());
+        }
+    }
     for tag in user_tags {
-        if !tags.contains(tag) && !tag.starts_with(rusty_grid_core::placement::SLOTS_TAG_PREFIX) {
+        if !tags.contains(tag)
+            && !tag.starts_with(rusty_grid_core::placement::SLOTS_TAG_PREFIX)
+            && !tag.starts_with(rusty_grid_core::placement::TOOL_TAG_PREFIX)
+        {
             tags.push(tag.clone());
         }
     }
@@ -1173,10 +1186,12 @@ impl WorkerClient {
                 }
             })
             .max(1);
+        let tool_tags = capabilities.tags.clone();
         capabilities = capabilities.with_tags(advertised_tags(
             &config.tags,
             concurrency_permits,
             config.isolation,
+            &tool_tags,
         ));
         // A real GPU is advertised only if this binary can compute on one (see `gpu`).
         let gpu_request = GpuRequest {
@@ -5717,26 +5732,29 @@ mod tests {
                     "laptop".into(),
                     format!("os:{}", std::env::consts::OS),
                     "slots:99".into(),
+                    "tool:spoofed".into(),
                 ])
                 .with_redirection_portal(false)
                 .with_no_battery(true),
         );
+        let mut expected = vec![
+            format!("os:{}", std::env::consts::OS),
+            format!("arch:{}", std::env::consts::ARCH),
+            "slots:3".to_string(),
+            "iso:off".to_string(),
+        ];
+        expected.extend(rusty_grid_core::capabilities::detect_host_tools());
+        expected.push("laptop".to_string());
         assert_eq!(
             client.capabilities().tags,
-            vec![
-                format!("os:{}", std::env::consts::OS),
-                format!("arch:{}", std::env::consts::ARCH),
-                "slots:3".to_string(),
-                "iso:off".to_string(),
-                "laptop".to_string(),
-            ],
-            "system tags, slots:<n> and iso:<level> first, a user tag equal to one of them or starting with slots: is not repeated"
+            expected,
+            "system tags, slots:<n>, iso:<level> and probed tool:<name> first, a user tag equal to one of them or starting with slots:/tool: is not repeated"
         );
     }
 
     #[tokio::test]
     async fn test_run_refuses_a_reserved_or_malformed_user_tag() {
-        for bad in ["os:windows", "link:fake", "two words"] {
+        for bad in ["os:windows", "link:fake", "tool:cargo", "two words"] {
             let mut client = WorkerClient::new(
                 WorkerConfig::new("127.0.0.1:9")
                     .with_tags(vec![bad.into()])

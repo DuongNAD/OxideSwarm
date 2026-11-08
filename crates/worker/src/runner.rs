@@ -1903,29 +1903,6 @@ impl TaskRunner {
             }
         }
 
-        // Determine entry point and default crate type
-        let entry_candidates = [
-            ("src/lib.rs", "lib"),
-            ("src/main.rs", "bin"),
-            ("lib.rs", "lib"),
-            ("main.rs", "bin"),
-        ];
-
-        let (entry_rel, default_crate_type) = entry_candidates
-            .iter()
-            .find(|(path, _)| source_files.contains_key(*path))
-            .map(|(path, ctype)| (*path, *ctype))
-            .unwrap_or_else(|| {
-                // Fallback: look for any .rs file in source_files
-                source_files
-                    .keys()
-                    .find(|k| k.ends_with(".rs"))
-                    .map(|k| (k.as_str(), "lib"))
-                    .unwrap_or(("src/lib.rs", "lib"))
-            });
-
-        let entry_file = sandbox.path().join(entry_rel);
-
         let out_dir = if let Some(td) = target_dir {
             match sanitize_relative_path(sandbox.path(), td) {
                 Ok(p) => p,
@@ -1948,31 +1925,75 @@ impl TaskRunner {
 
         let _ = tokio::fs::create_dir_all(&out_dir).await;
 
-        let mut args = vec![
-            entry_file.to_string_lossy().to_string(),
-            "--crate-name".to_string(),
-            crate_name.to_string(),
-            "--out-dir".to_string(),
-            out_dir.to_string_lossy().to_string(),
-        ];
+        let use_cargo = sandbox.path().join("Cargo.toml").is_file();
+        let (program, args, compile_env) = if use_cargo {
+            let mut cargo_args = vec!["build".to_string()];
+            if !compiler_flags.iter().any(|f| f == "--offline") {
+                cargo_args.push("--offline".to_string());
+            }
+            cargo_args.push("--target-dir".to_string());
+            cargo_args.push(out_dir.to_string_lossy().to_string());
+            for flag in compiler_flags {
+                cargo_args.push(flag.clone());
+            }
+            let mut env = HashMap::new();
+            env.insert(
+                "CARGO_TARGET_DIR".to_string(),
+                out_dir.to_string_lossy().to_string(),
+            );
+            ("cargo", cargo_args, env)
+        } else {
+            // Determine entry point and default crate type
+            let entry_candidates = [
+                ("src/lib.rs", "lib"),
+                ("src/main.rs", "bin"),
+                ("lib.rs", "lib"),
+                ("main.rs", "bin"),
+            ];
 
-        if !compiler_flags.iter().any(|f| f == "--crate-type") {
-            args.push("--crate-type".to_string());
-            args.push(default_crate_type.to_string());
-        }
+            let (entry_rel, default_crate_type) = entry_candidates
+                .iter()
+                .find(|(path, _)| source_files.contains_key(*path))
+                .map(|(path, ctype)| (*path, *ctype))
+                .unwrap_or_else(|| {
+                    // Fallback: look for any .rs file in source_files
+                    source_files
+                        .keys()
+                        .find(|k| k.ends_with(".rs"))
+                        .map(|k| (k.as_str(), "lib"))
+                        .unwrap_or(("src/lib.rs", "lib"))
+                });
 
-        for flag in compiler_flags {
-            args.push(flag.clone());
-        }
+            let entry_file = sandbox.path().join(entry_rel);
+
+            let mut rustc_args = vec![
+                entry_file.to_string_lossy().to_string(),
+                "--crate-name".to_string(),
+                crate_name.to_string(),
+                "--out-dir".to_string(),
+                out_dir.to_string_lossy().to_string(),
+            ];
+
+            if !compiler_flags.iter().any(|f| f == "--crate-type") {
+                rustc_args.push("--crate-type".to_string());
+                rustc_args.push(default_crate_type.to_string());
+            }
+
+            for flag in compiler_flags {
+                rustc_args.push(flag.clone());
+            }
+
+            ("rustc", rustc_args, HashMap::new())
+        };
 
         let mut res = self
             .execute_process_supervised(
                 task.id,
                 sandbox.path(),
-                "rustc",
+                program,
                 &args,
                 sandbox.path(),
-                &HashMap::new(),
+                &compile_env,
                 None,
                 timeout,
                 child_pid,
@@ -1982,9 +2003,33 @@ impl TaskRunner {
             .await;
 
         // On successful compilation, check for generated library / binary artifact; everything
-        // rustc wrote directly into the output directory is returned as an output file.
+        // placed directly into the output directory is returned as an output file.
         let mut artifact_patterns = Vec::new();
         if res.is_success() {
+            if use_cargo {
+                for meta_name in ["CACHEDIR.TAG", ".rustc_info.json", ".cargo-lock"] {
+                    let _ = tokio::fs::remove_file(out_dir.join(meta_name)).await;
+                }
+                for profile in ["release", "debug"] {
+                    let profile_dir = out_dir.join(profile);
+                    if let Ok(mut entries) = tokio::fs::read_dir(&profile_dir).await {
+                        while let Ok(Some(entry)) = entries.next_entry().await {
+                            if !entry.file_type().await.is_ok_and(|ft| ft.is_file()) {
+                                continue;
+                            }
+                            let fname = entry.file_name().to_string_lossy().to_string();
+                            if !fname.starts_with('.')
+                                && !fname.ends_with(".d")
+                                && !fname.ends_with(".pdb")
+                                && !fname.ends_with(".exp")
+                                && !fname.ends_with(".ilk")
+                            {
+                                let _ = tokio::fs::copy(entry.path(), out_dir.join(&fname)).await;
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(rel_out_dir) = out_dir
                 .strip_prefix(sandbox.path())
                 .ok()
@@ -1996,18 +2041,29 @@ impl TaskRunner {
             let mut found_artifacts = Vec::new();
             if let Ok(mut entries) = tokio::fs::read_dir(&out_dir).await {
                 while let Ok(Some(entry)) = entries.next_entry().await {
+                    if !entry.file_type().await.is_ok_and(|ft| ft.is_file()) {
+                        continue;
+                    }
                     let fname = entry.file_name().to_string_lossy().to_string();
                     if fname.ends_with(".rlib")
                         || fname.ends_with(".dylib")
                         || fname.ends_with(".so")
                         || fname.ends_with(".a")
+                        || fname.ends_with(".dll")
                         || fname == crate_name
                         || fname == format!("{crate_name}.exe")
+                        || (use_cargo
+                            && !fname.starts_with('.')
+                            && !fname.ends_with(".d")
+                            && !fname.ends_with(".pdb")
+                            && !fname.ends_with(".exp")
+                            && !fname.ends_with(".ilk"))
                     {
                         found_artifacts.push(fname);
                     }
                 }
             }
+            found_artifacts.sort();
             if !found_artifacts.is_empty() {
                 let notice = format!(
                     "\n[rusty_grid: compilation artifacts generated in target/: {}]\n",
@@ -4680,5 +4736,96 @@ mod process_tree_tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_rust_compilation_with_cargo_toml_runs_cargo_build_offline() {
+        let (runner, _dir) = runner_with(|c| c);
+
+        // 1. A crate with a local path dependency builds via `cargo build --offline`
+        //    and produces the compiled binary in `result.outputs`.
+        let mut sources = HashMap::new();
+        sources.insert(
+            "Cargo.toml".to_string(),
+            r#"[package]
+name = "w8_app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+w8_dep = { path = "w8_dep" }
+"#
+            .to_string(),
+        );
+        sources.insert(
+            "src/main.rs".to_string(),
+            "fn main() { println!(\"magic={}\", w8_dep::answer()); }\n".to_string(),
+        );
+        sources.insert(
+            "w8_dep/Cargo.toml".to_string(),
+            r#"[package]
+name = "w8_dep"
+version = "0.1.0"
+edition = "2021"
+"#
+            .to_string(),
+        );
+        sources.insert(
+            "w8_dep/src/lib.rs".to_string(),
+            "pub fn answer() -> u32 { 42 }\n".to_string(),
+        );
+
+        let task = Task::new(
+            TaskSpec::RustCompilation {
+                crate_name: "w8_app".to_string(),
+                source_files: sources,
+                compiler_flags: Vec::new(),
+                target_dir: None,
+            },
+            TaskRequirements::generic(1, 60),
+        );
+
+        let res = runner.execute_task(&task, None, None).await;
+        assert!(
+            res.is_success(),
+            "expected cargo build --offline to succeed, got: {res:?}"
+        );
+        assert!(
+            res.outputs.iter().any(|o| o.path.contains("w8_app")),
+            "expected compiled w8_app binary in result.outputs, got: {:?}",
+            res.outputs
+        );
+
+        // 2. An uncached registry dependency fails immediately under `--offline`.
+        let mut bad_sources = HashMap::new();
+        bad_sources.insert(
+            "Cargo.toml".to_string(),
+            r#"[package]
+name = "w8_missing_dep"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nonexistent_oxideswarm_crate_w8 = "99.99.99"
+"#
+            .to_string(),
+        );
+        bad_sources.insert("src/main.rs".to_string(), "fn main() {}\n".to_string());
+
+        let bad_task = Task::new(
+            TaskSpec::RustCompilation {
+                crate_name: "w8_missing_dep".to_string(),
+                source_files: bad_sources,
+                compiler_flags: Vec::new(),
+                target_dir: None,
+            },
+            TaskRequirements::generic(1, 30),
+        );
+
+        let bad_res = runner.execute_task(&bad_task, None, None).await;
+        assert!(
+            !bad_res.is_success(),
+            "expected uncached dependency to fail under --offline, got: {bad_res:?}"
+        );
     }
 }

@@ -703,7 +703,7 @@ impl WorkerCapabilities {
             has_gpu,
             is_simulated_gpu,
             gpu_device_name,
-            tags: Vec::new(),
+            tags: detect_host_tools(),
             mobile,
             has_blender,
             blender_version,
@@ -1558,6 +1558,83 @@ fn run_host_probe(cmd: &mut std::process::Command, label: &str) -> Option<std::p
         }
         ProbeExecOutcome::SpawnFailed => None,
     }
+}
+
+/// Host tools probed at worker start-up (`<tool> --version`, bounded by [`HOST_PROBE_TIMEOUT`]).
+pub const HOST_PROBED_TOOLS: [&str; 3] = ["cargo", "rustc", "git"];
+
+std::thread_local! {
+    static TEST_TOOL_PROBE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Overrides the host tool tags returned by [`detect_host_tools`] on the current thread for the
+/// duration of `f`. Used by tests to simulate a worker with or without specific tools (`cargo`,
+/// `rustc`, `git`).
+#[doc(hidden)]
+pub fn with_test_tool_probe<R>(tools: Vec<String>, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<Vec<String>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_TOOL_PROBE.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
+    let normalized: Vec<String> = tools
+        .into_iter()
+        .map(|t| {
+            if t.starts_with(crate::placement::TOOL_TAG_PREFIX) {
+                t
+            } else {
+                format!("{}{t}", crate::placement::TOOL_TAG_PREFIX)
+            }
+        })
+        .collect();
+    let prev = TEST_TOOL_PROBE.with(|c| c.borrow_mut().replace(normalized));
+    let _reset = Reset(prev);
+    f()
+}
+
+/// Runs `<program> --version` bounded by `timeout` (with cluster secrets stripped via
+/// [`crate::cluster_auth::probe_command`]) and returns `true` when the subprocess exits 0.
+pub fn probe_tool_with_timeout<P: AsRef<std::ffi::OsStr>>(
+    program: P,
+    timeout: std::time::Duration,
+) -> bool {
+    let program_ref = program.as_ref();
+    let mut cmd = crate::cluster_auth::probe_command(program_ref);
+    cmd.arg("--version");
+    match run_command_bounded(&mut cmd, timeout) {
+        ProbeExecOutcome::Output(output) => output.status.success(),
+        ProbeExecOutcome::TimedOut => {
+            tracing::warn!(
+                tool = %program_ref.to_string_lossy(),
+                timeout_secs = timeout.as_secs_f32(),
+                "Host tool version probe timed out; treating tool as unavailable"
+            );
+            false
+        }
+        ProbeExecOutcome::SpawnFailed => false,
+    }
+}
+
+/// Probes [`HOST_PROBED_TOOLS`] (`cargo`, `rustc`, `git`) with [`HOST_PROBE_TIMEOUT`] without
+/// consulting the process-wide cache, returning `tool:<name>` tags in [`HOST_PROBED_TOOLS`] order.
+pub fn detect_host_tools_uncached() -> Vec<String> {
+    HOST_PROBED_TOOLS
+        .iter()
+        .filter(|&&tool| probe_tool_with_timeout(tool, HOST_PROBE_TIMEOUT))
+        .map(|tool| format!("{}{tool}", crate::placement::TOOL_TAG_PREFIX))
+        .collect()
+}
+
+/// Probes `cargo --version`, `rustc --version` and `git --version` on `PATH` (each bounded by
+/// [`HOST_PROBE_TIMEOUT`]) and returns `tool:<name>` tags for those that succeed.
+pub fn detect_host_tools() -> Vec<String> {
+    if let Some(override_tags) = TEST_TOOL_PROBE.with(|c| c.borrow().clone()) {
+        return override_tags;
+    }
+    static DETECTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    DETECTED.get_or_init(detect_host_tools_uncached).clone()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3141,5 +3218,65 @@ Now drawing from 'AC Power'
         );
         #[cfg(unix)]
         assert_pid_file_process_dead(&env_pid_file);
+    }
+
+    #[test]
+    fn test_probe_tool_with_timeout_and_host_tool_tags() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let simple_timeout = if cfg!(windows) {
+            std::time::Duration::from_secs(15)
+        } else {
+            std::time::Duration::from_secs(2)
+        };
+
+        let ok_tool = write_test_script(
+            dir.path(),
+            "tool_ok",
+            "echo 'cargo 1.91.0'",
+            "echo cargo 1.91.0",
+        );
+        assert!(probe_tool_with_timeout(&ok_tool, simple_timeout));
+
+        let fail_tool = write_test_script(dir.path(), "tool_fail", "exit 1", "exit /b 1");
+        assert!(!probe_tool_with_timeout(&fail_tool, simple_timeout));
+
+        let hung_pid_file = dir.path().join("hung_tool.pid");
+        let hung_tool = write_test_script(
+            dir.path(),
+            "tool_hung",
+            &format!("sleep 60 &\necho $! > '{}'\nwait", hung_pid_file.display()),
+            &format!(
+                "python -c \"import subprocess; p = subprocess.Popen(['ping', '-n', '60', '127.0.0.1']); open(r'{}', 'w').write(str(p.pid)); p.wait()\"",
+                hung_pid_file.display()
+            ),
+        );
+        let hung_timeout = if cfg!(windows) {
+            HOST_PROBE_TIMEOUT
+        } else {
+            std::time::Duration::from_millis(800)
+        };
+        let start = std::time::Instant::now();
+        assert!(!probe_tool_with_timeout(&hung_tool, hung_timeout));
+        assert!(start.elapsed() < std::time::Duration::from_secs(15));
+        assert_pid_file_process_dead(&hung_pid_file);
+
+        let uncached = detect_host_tools_uncached();
+        for tag in &uncached {
+            assert!(
+                matches!(tag.as_str(), "tool:cargo" | "tool:rustc" | "tool:git"),
+                "unexpected tool tag {tag}"
+            );
+        }
+
+        with_test_tool_probe(vec!["git".into()], || {
+            let caps = WorkerCapabilities::detect_with_overrides(HardwareOverrides {
+                no_gpu: true,
+                no_blender: true,
+                no_cuda: true,
+                no_battery: true,
+                ..Default::default()
+            });
+            assert_eq!(caps.tags, vec!["tool:git".to_string()]);
+        });
     }
 }
