@@ -65,9 +65,34 @@ connect the Windows machine with `connect_remote.cmd` and the ticket from
 `~/.oxideswarm/master_ticket.txt` ([README, section D](../../README.md#d-remote-wan-connection-cross-network--internet--requires-ticket-and-secret));
 then continue with step 6.
 
-### 4. Copy the cluster secret to Windows
+### 4. Join Windows with one token (or copy the cluster secret)
 
-Copy `~/.oxideswarm/cluster.secret` from the Mac to `%USERPROFILE%\.oxideswarm\cluster.secret` on
+Fastest: create a join token on the Mac and pipe it into `oxideswarm join` on Windows. The token
+carries the cluster secret and the Mac's address, so it replaces this step and the address in step 5.
+It is as sensitive as the secret: move it by USB stick or `scp`, never through chat, e-mail or a
+cloud-synced folder, and never as a command line argument (`join` refuses that).
+
+On the Mac:
+
+```bash
+./target/release/oxideswarm secret join-token --master <MAC_IP>:8088 > ~/join.token
+```
+
+On Windows (PowerShell; the token goes in on standard input):
+
+```powershell
+scp <USER>@<MAC_IP>:join.token "$env:TEMP\join.token"
+Get-Content "$env:TEMP\join.token" | .\target\release\oxideswarm.exe join
+Remove-Item "$env:TEMP\join.token"
+```
+
+`join` saves the secret in `%USERPROFILE%\.oxideswarm\cluster.secret` (owner-only), the address in
+`%USERPROFILE%\.oxideswarm\rusty-grid.toml`, and runs the doctor checks against the Mac (no worker
+is expected yet). Delete `~/join.token` on the Mac too. Then go to step 5; the worker needs no
+`--master` (the saved address is used) but the `switch_role` launcher still takes one. If this machine
+already has a different secret, `join` refuses until you add `--replace-secret`; if its `rusty-grid.toml` already names another master, until you add `--replace-master` (the file is edited in place and a private backup is kept). Instead of a file you can run `oxideswarm join` alone and paste the token at the prompt; it is not shown. A terminal cuts a pasted line at about 1024 bytes on macOS, so a long token (one with a P2P ticket) can arrive truncated: `join` then refuses it (nothing is written) and you pipe it instead, `pbpaste | oxideswarm join` or, on Windows, `Get-Clipboard | oxideswarm join`. If `OXIDESWARM_SECRET`, `OXIDESWARM_SECRET_FILE` or a `secret` key of `rusty-grid.toml` sets a different secret, `join` refuses and names it, because it would override the secret the token installs.
+
+By hand instead, copy the secret file. Copy `~/.oxideswarm/cluster.secret` from the Mac to `%USERPROFILE%\.oxideswarm\cluster.secret` on
 Windows, by USB stick or, on Windows (PowerShell):
 
 ```powershell

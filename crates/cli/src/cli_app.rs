@@ -152,8 +152,11 @@ pub enum Commands {
     /// Check a running cluster end to end: connection, workers, pinned probes, GPUs, spreading
     Doctor(DoctorArgs),
 
-    /// Generate or show the shared cluster secret
+    /// Generate or show the shared cluster secret, or create a join token for another machine
     Secret(SecretCliArgs),
+
+    /// Join this machine to a cluster with a join token read from standard input
+    Join(crate::join::JoinArgs),
 
     /// Workflow modes and presets (test, dev, doc, research)
     Mode(mode_cli::ModeCliArgs),
@@ -1005,6 +1008,9 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
         Commands::Mapreduce(args) => run_mapreduce(args, config_file, secret_opts).await,
         Commands::Doctor(args) => run_doctor_command(args, config_file, secret_opts).await,
         Commands::Secret(args) => run_secret(args, &secret_opts, config_file.as_ref()),
+        Commands::Join(args) => {
+            crate::join::run_join(args, &secret_opts, config_file.as_ref()).await
+        }
         Commands::Mode(args) => {
             let code = mode_cli::run_mode_cli(args).await;
             if code == 0 {
