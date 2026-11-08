@@ -6,33 +6,68 @@
 //! # Files under `<state_dir>`
 //!
 //! * `store.lock`: exclusive advisory lock held for the lifetime of the `TaskStore`.
-//! * `journal.bin`: 16-byte header, then frames `[payload_len u32 LE][blake3 32B][payload]`, where
+//! * `journal.bin`: 24-byte header, then frames `[payload_len u32 LE][blake3 32B][payload]`, where
 //!   the payload is the bincode form of a [`JournalRecord`].
-//! * `snapshot.bin`: 16-byte header, then one frame whose payload is the JSON form of a
-//!   [`SnapshotImage`] (human-readable serde representations, so it survives protocol bumps).
+//! * `snapshot.bin`: 24-byte header, then one frame `[payload_len u64 LE][blake3 32B][payload]`
+//!   whose payload is the JSON form of a [`SnapshotImage`] (human-readable serde representations,
+//!   so it survives protocol bumps). The length is `u64` and bounded by [`SNAPSHOT_MAX_BYTES`].
 //!
-//! The 16-byte header is `[magic 8B][store_format_version u32 LE][protocol_version u32 LE]`.
+//! The header is `[magic 8B][store_format_version u32 LE][protocol_version u32 LE][generation u64 LE]`.
 //!
-//! # Durability
+//! **A change to the bincode layout of [`JournalRecord`] or of any type it contains (`Task`,
+//! `TaskState`, `RetryAttempt`, `CheckpointData`, `TaskResult`) is a change of the journal format:
+//! bump [`STORE_FORMAT_VERSION`].** `store_layout_is_frozen` guards this with recorded bytes.
 //!
-//! [`TaskStore::append_durable`] returns only after a `sync_data()` that covers its record.
-//! Durable appends arriving within [`GROUP_COMMIT_WINDOW`] (up to [`MAX_GROUP_BATCH`] records)
-//! share one `sync_data()`. [`TaskStore::append`] writes without syncing.
+//! # Generations
+//!
+//! Compaction writes the snapshot with generation `g + 1`, then resets the journal to a header with
+//! generation `g + 1`. A journal whose generation is older than the snapshot's is what a crash
+//! between those two steps leaves behind; `open` discards its records, because the snapshot
+//! already holds them (replaying them would, for example, duplicate retry history).
+//!
+//! # Durability and ordering
+//!
+//! [`TaskStore::append_durable`] enqueues the record **synchronously** (so the on-disk order is the
+//! order of the calls) and returns a [`DurableAck`] that resolves after a `sync_data()` covering
+//! the record. Durable appends arriving within [`GROUP_COMMIT_WINDOW`] (up to [`MAX_GROUP_BATCH`]
+//! records) share one `sync_data()`. [`TaskStore::append`] enqueues without waiting for a sync.
+//!
+//! The intended pattern for a queue guarded by a lock is: enqueue under the lock, drop the lock,
+//! then await the ack. Awaiting while holding the lock serializes every commit behind its own
+//! `sync_data()` and defeats the group commit.
+//!
+//! Known limits (documented, not bugs): a lone durable append waits up to the 5 ms window for
+//! companions; the command channel to the writer is unbounded; `open` reads whole files into
+//! memory; dropping the store joins the writer thread (it drains and syncs first, normally
+//! milliseconds), so drop it from a shutdown path or `spawn_blocking`, not from a hot async path.
 //!
 //! # Compaction contract
 //!
 //! The store cannot see the queue, so the caller builds the [`SnapshotImage`]. The image must
-//! cover exactly the records appended before the `compact` call: build it and call `compact` under
-//! the same lock that orders appends. A crash between the snapshot rename and the journal reset
-//! leaves a journal whose records the snapshot already holds, so a replaying consumer must treat
-//! a record for a state it already has (same task and sequence) as idempotent.
+//! cover exactly the records appended before the `compact` call: build it, enqueue `compact`, and
+//! enqueue appends under the same lock.
+//!
+//! # Torn tails and corruption
+//!
+//! A bad final frame (short, or checksum mismatch) is a torn write: it is truncated. A bad frame
+//! is only treated as the tail if **no valid frame can be found after it** (a forward scan for any
+//! offset that parses as a frame with a matching BLAKE3). If one exists, the bad frame is in the
+//! middle of acknowledged history (bit rot, for example in a length field) and `open` refuses.
+//! A zero-filled tail (file size extended by the OS, data never written) contains no valid frame
+//! and is truncated the same way.
+//!
+//! The snapshot's `Bytes` fields keep the core JSON representation (a string if UTF-8, otherwise
+//! a number array, up to 4x the raw size), hence the 4 GiB snapshot bound.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::future::Future;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -53,9 +88,13 @@ pub const SNAPSHOT_MAGIC: &[u8; 8] = b"OXSWSNP1";
 /// On-disk layout version understood by this module.
 pub const STORE_FORMAT_VERSION: u32 = 1;
 /// Size of the file header in bytes.
-pub const HEADER_LEN: usize = 16;
-/// Size of a frame header: `payload_len` (4) plus the BLAKE3 hash (32).
+pub const HEADER_LEN: usize = 24;
+/// Size of a journal frame header: `payload_len` (4) plus the BLAKE3 hash (32).
 pub const FRAME_HEADER_LEN: usize = 4 + 32;
+/// Size of the snapshot frame header: `payload_len` (8) plus the BLAKE3 hash (32).
+pub const SNAPSHOT_FRAME_HEADER_LEN: usize = 8 + 32;
+/// Upper bound of the snapshot payload (JSON) in bytes.
+pub const SNAPSHOT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Group commit window: a durable append waits at most this long for companions.
 pub const GROUP_COMMIT_WINDOW: Duration = Duration::from_millis(5);
 /// A group commit never batches more than this many records.
@@ -183,6 +222,8 @@ pub struct Recovered {
     pub records: Vec<JournalRecord>,
     /// True if a torn final journal frame was cut off.
     pub truncated_tail: bool,
+    /// True if a journal older than the snapshot (crash during compaction) was discarded.
+    pub stale_journal_discarded: bool,
 }
 
 /// Tuning knobs; [`StoreOptions::default`] gives the design values.
@@ -205,6 +246,35 @@ impl Default for StoreOptions {
 
 type Ack = oneshot::Sender<GridResult<()>>;
 
+/// Resolves when the record it was returned for is on disk (a `sync_data()` covered it), or with
+/// the error that stopped the writer. Dropping it does not cancel the write.
+#[derive(Debug)]
+pub struct DurableAck(oneshot::Receiver<GridResult<()>>);
+
+impl DurableAck {
+    /// Blocks the calling thread until the record is durable. Must not be called from inside a
+    /// tokio runtime worker; `.await` the ack there.
+    pub fn wait(self) -> GridResult<()> {
+        self.0
+            .blocking_recv()
+            .unwrap_or_else(|_| Err(writer_stopped()))
+    }
+}
+
+impl Future for DurableAck {
+    type Output = GridResult<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0)
+            .poll(cx)
+            .map(|r| r.unwrap_or_else(|_| Err(writer_stopped())))
+    }
+}
+
+fn writer_stopped() -> GridError {
+    GridError::Storage("the store writer stopped".into())
+}
+
 enum Cmd {
     Append { frame: Vec<u8>, ack: Option<Ack> },
     Compact { snapshot_frame: Vec<u8>, ack: Ack },
@@ -217,6 +287,9 @@ struct Shared {
     journal_records: AtomicU64,
     compaction_due: AtomicBool,
     failed: Mutex<Option<String>>,
+    /// Test-only fault injection: 1 = `sync_data` fails, 2 = the writer panics at the sync.
+    #[cfg(test)]
+    inject: std::sync::atomic::AtomicU8,
 }
 
 /// Handle to the on-disk store. Dropping it flushes pending records, stops the writer thread and
@@ -249,7 +322,7 @@ impl TaskStore {
         prepare_dir(&dir)?;
 
         let lock_path = dir.join(LOCK_FILE);
-        let lock = open_rw(&lock_path, false)?;
+        let lock = open_rw(&lock_path)?;
         match lock.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
@@ -267,38 +340,36 @@ impl TaskStore {
         let _ = std::fs::remove_file(dir.join(SNAPSHOT_TMP_FILE));
 
         let snapshot_path = dir.join(SNAPSHOT_FILE);
-        let (snapshot, snapshot_version) = read_snapshot(&snapshot_path)?;
+        let snapshot = read_snapshot(&snapshot_path)?;
+        let snapshot_generation = snapshot.as_ref().map_or(0, |s| s.generation);
 
         let journal_path = dir.join(JOURNAL_FILE);
-        let loaded = read_journal(&journal_path)?;
-        if let Some(image) = &snapshot {
-            if snapshot_version != Some(PROTOCOL_VERSION_CURRENT) {
+        let loaded = read_journal(&journal_path, snapshot_generation)?;
+        if let Some(s) = &snapshot {
+            if s.version != PROTOCOL_VERSION_CURRENT {
                 // Self-describing JSON: carry it over to the current protocol version.
-                write_snapshot_file(&dir, &encode_snapshot(image)?)?;
+                write_snapshot_file(&dir, s.generation, &encode_snapshot(&s.image)?)?;
             }
         }
 
-        let journal = open_rw(&journal_path, true)?;
-        let mut journal_len = loaded.valid_len;
-        if loaded.fresh || loaded.rewrite_header {
+        let mut journal = open_rw(&journal_path)?;
+        let journal_len = if loaded.reset {
+            reset_journal(&mut journal, &dir, snapshot_generation, "journal_header")?;
+            sync_dir(&dir, "journal_dir")?;
+            HEADER_LEN as u64
+        } else {
+            if loaded.truncated_tail {
+                journal
+                    .set_len(loaded.valid_len)
+                    .and_then(|()| journal.sync_all())
+                    .map_err(|e| storage_io(&journal_path, "truncate", e))?;
+                note_fsync(&dir, "journal_tail");
+            }
             journal
-                .set_len(0)
-                .map_err(|e| storage_io(&journal_path, "reset", e))?;
-            (&journal)
-                .write_all(&header_bytes(JOURNAL_MAGIC))
-                .map_err(|e| storage_io(&journal_path, "write header of", e))?;
-            journal_len = HEADER_LEN as u64;
-            journal
-                .sync_all()
-                .map_err(|e| storage_io(&journal_path, "sync", e))?;
-        } else if loaded.truncated_tail {
-            journal
-                .set_len(loaded.valid_len)
-                .map_err(|e| storage_io(&journal_path, "truncate", e))?;
-            journal
-                .sync_all()
-                .map_err(|e| storage_io(&journal_path, "sync", e))?;
-        }
+                .seek(SeekFrom::End(0))
+                .map_err(|e| storage_io(&journal_path, "seek in", e))?;
+            loaded.valid_len
+        };
 
         let shared = Arc::new(Shared::default());
         shared.journal_bytes.store(journal_len, Ordering::Relaxed);
@@ -309,6 +380,7 @@ impl TaskStore {
             dir: dir.clone(),
             journal,
             _lock: lock,
+            generation: snapshot_generation,
             bytes: journal_len,
             records: loaded.records.len() as u64,
             options,
@@ -329,9 +401,10 @@ impl TaskStore {
             shared,
         };
         let recovered = Recovered {
-            snapshot,
+            snapshot: snapshot.map(|s| s.image),
             records: loaded.records,
             truncated_tail: loaded.truncated_tail,
+            stale_journal_discarded: loaded.stale,
         };
         Ok((store, recovered))
     }
@@ -341,40 +414,45 @@ impl TaskStore {
         &self.dir
     }
 
-    /// Queues `record` for writing without waiting for it to reach disk.
+    /// Enqueues `record` without waiting for a sync.
     pub fn append(&self, record: &JournalRecord) -> GridResult<()> {
         let frame = encode_record_frame(record)?;
         self.send(Cmd::Append { frame, ack: None })
     }
 
-    /// Appends `record` and returns once a `sync_data()` covering it has completed.
-    pub async fn append_durable(&self, record: &JournalRecord) -> GridResult<()> {
-        let rx = self.start_durable(record)?;
-        rx.await
-            .map_err(|_| GridError::Storage("the store writer stopped".into()))?
+    /// Enqueues `record` now (fixing its place in the journal) and returns an ack that resolves
+    /// once a `sync_data()` covering it has completed. Call it under the lock that orders your
+    /// mutations, then drop the lock and await the ack.
+    pub fn append_durable(&self, record: &JournalRecord) -> GridResult<DurableAck> {
+        let frame = encode_record_frame(record)?;
+        let (ack, rx) = oneshot::channel();
+        self.send(Cmd::Append {
+            frame,
+            ack: Some(ack),
+        })?;
+        Ok(DurableAck(rx))
     }
 
-    /// Blocking form of [`append_durable`](Self::append_durable) for non-async callers. Must not
-    /// be called from inside a tokio runtime worker.
+    /// `append_durable(record)?.wait()` for non-async callers.
     pub fn append_durable_blocking(&self, record: &JournalRecord) -> GridResult<()> {
-        let rx = self.start_durable(record)?;
-        rx.blocking_recv()
-            .map_err(|_| GridError::Storage("the store writer stopped".into()))?
+        self.append_durable(record)?.wait()
     }
 
-    /// Writes `image` as the new snapshot and resets the journal (see the module docs for the
-    /// contract between `image` and previously appended records).
-    pub async fn compact(&self, image: &SnapshotImage) -> GridResult<()> {
-        let rx = self.start_compact(image)?;
-        rx.await
-            .map_err(|_| GridError::Storage("the store writer stopped".into()))?
+    /// Enqueues a compaction to `image` (see the module docs for the contract) and returns an ack
+    /// that resolves when the snapshot is installed and the journal reset.
+    pub fn compact(&self, image: &SnapshotImage) -> GridResult<DurableAck> {
+        let snapshot_frame = encode_snapshot(image)?;
+        let (ack, rx) = oneshot::channel();
+        self.send(Cmd::Compact {
+            snapshot_frame,
+            ack,
+        })?;
+        Ok(DurableAck(rx))
     }
 
-    /// Blocking form of [`compact`](Self::compact).
+    /// `compact(image)?.wait()` for non-async callers.
     pub fn compact_blocking(&self, image: &SnapshotImage) -> GridResult<()> {
-        let rx = self.start_compact(image)?;
-        rx.blocking_recv()
-            .map_err(|_| GridError::Storage("the store writer stopped".into()))?
+        self.compact(image)?.wait()
     }
 
     /// True once the journal passed the size or record-count threshold.
@@ -397,32 +475,6 @@ impl TaskStore {
         self.shared.journal_bytes.load(Ordering::Relaxed)
     }
 
-    fn start_durable(
-        &self,
-        record: &JournalRecord,
-    ) -> GridResult<oneshot::Receiver<GridResult<()>>> {
-        let frame = encode_record_frame(record)?;
-        let (ack, rx) = oneshot::channel();
-        self.send(Cmd::Append {
-            frame,
-            ack: Some(ack),
-        })?;
-        Ok(rx)
-    }
-
-    fn start_compact(
-        &self,
-        image: &SnapshotImage,
-    ) -> GridResult<oneshot::Receiver<GridResult<()>>> {
-        let snapshot_frame = encode_snapshot(image)?;
-        let (ack, rx) = oneshot::channel();
-        self.send(Cmd::Compact {
-            snapshot_frame,
-            ack,
-        })?;
-        Ok(rx)
-    }
-
     fn send(&self, cmd: Cmd) -> GridResult<()> {
         if let Some(reason) = self.shared.failed.lock().unwrap().clone() {
             return Err(GridError::Storage(reason));
@@ -431,13 +483,14 @@ impl TaskStore {
             .as_ref()
             .ok_or_else(|| GridError::Storage("the store is closed".into()))?
             .send(cmd)
-            .map_err(|_| GridError::Storage("the store writer stopped".into()))
+            .map_err(|_| writer_stopped())
     }
 }
 
 impl Drop for TaskStore {
     fn drop(&mut self) {
         // Closing the channel makes the writer drain, sync, and release the lock when it exits.
+        // The join blocks the caller for that drain (normally milliseconds).
         self.tx.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -447,9 +500,11 @@ impl Drop for TaskStore {
 
 struct Writer {
     dir: PathBuf,
+    /// Positioned at the end of the journal; only this thread writes.
     journal: File,
     /// Held only so the lock lives as long as the writer.
     _lock: File,
+    generation: u64,
     bytes: u64,
     records: u64,
     options: StoreOptions,
@@ -540,20 +595,25 @@ impl Writer {
     }
 
     fn sync(&mut self) -> GridResult<()> {
+        #[cfg(test)]
+        match self.shared.inject.load(Ordering::SeqCst) {
+            1 => return Err(GridError::Storage("injected sync failure".into())),
+            2 => panic!("injected writer panic"),
+            _ => {}
+        }
         self.shared.sync_calls.fetch_add(1, Ordering::Relaxed);
         self.journal
             .sync_data()
-            .map_err(|e| storage_io(&self.dir.join(JOURNAL_FILE), "sync", e))
+            .map_err(|e| storage_io(&self.dir.join(JOURNAL_FILE), "sync", e))?;
+        note_fsync(&self.dir, "journal_data");
+        Ok(())
     }
 
     fn compact(&mut self, snapshot_frame: &[u8]) -> GridResult<()> {
-        write_snapshot_file(&self.dir, snapshot_frame)?;
-        let path = self.dir.join(JOURNAL_FILE);
-        self.journal
-            .set_len(0)
-            .and_then(|()| self.journal.write_all(&header_bytes(JOURNAL_MAGIC)))
-            .and_then(|()| self.journal.sync_all())
-            .map_err(|e| storage_io(&path, "reset", e))?;
+        let next = self.generation + 1;
+        write_snapshot_file(&self.dir, next, snapshot_frame)?;
+        reset_journal(&mut self.journal, &self.dir, next, "journal_reset")?;
+        self.generation = next;
         self.bytes = HEADER_LEN as u64;
         self.records = 0;
         self.publish_counters();
@@ -614,6 +674,31 @@ impl Writer {
 // ---------------------------------------------------------------------------------------------
 // Directory, file and frame helpers
 // ---------------------------------------------------------------------------------------------
+
+/// Test-only record of fsync calls as `(state dir, kind)`, so tests can check that each
+/// durability step happens and in which order.
+#[cfg(test)]
+static FSYNC_LOG: Mutex<Vec<(PathBuf, &'static str)>> = Mutex::new(Vec::new());
+
+fn note_fsync(_dir: &Path, _kind: &'static str) {
+    #[cfg(test)]
+    FSYNC_LOG.lock().unwrap().push((_dir.to_path_buf(), _kind));
+}
+
+/// `fsync` of a directory so a create or rename in it survives a crash. A no-op on Windows,
+/// which has no directory fsync.
+fn sync_dir(dir: &Path, kind: &'static str) -> GridResult<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| storage_io(dir, "sync", e))?;
+        note_fsync(dir, kind);
+    }
+    #[cfg(not(unix))]
+    let _ = (dir, kind);
+    Ok(())
+}
 
 fn storage_io(path: &Path, what: &str, err: std::io::Error) -> GridError {
     GridError::Storage(format!("cannot {what} {}: {err}", path.display()))
@@ -684,15 +769,11 @@ fn prepare_dir(dir: &Path) -> GridResult<()> {
     Ok(())
 }
 
-/// Opens `path` read-write, creating it with mode 0600 on Unix.
-fn open_rw(path: &Path, append: bool) -> GridResult<File> {
+/// Opens `path` read-write (not append: Windows append handles cannot `set_len`), creating it with
+/// mode 0600 on Unix. The position is the start of the file.
+fn open_rw(path: &Path) -> GridResult<File> {
     let mut opts = OpenOptions::new();
-    opts.read(true).create(true);
-    if append {
-        opts.append(true);
-    } else {
-        opts.write(true);
-    }
+    opts.read(true).write(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -701,16 +782,40 @@ fn open_rw(path: &Path, append: bool) -> GridResult<File> {
     opts.open(path).map_err(|e| storage_io(path, "open", e))
 }
 
-fn header_bytes(magic: &[u8; 8]) -> [u8; HEADER_LEN] {
+fn header_bytes(magic: &[u8; 8], generation: u64) -> [u8; HEADER_LEN] {
     let mut h = [0u8; HEADER_LEN];
     h[..8].copy_from_slice(magic);
     h[8..12].copy_from_slice(&STORE_FORMAT_VERSION.to_le_bytes());
     h[12..16].copy_from_slice(&PROTOCOL_VERSION_CURRENT.to_le_bytes());
+    h[16..24].copy_from_slice(&generation.to_le_bytes());
     h
 }
 
-/// Validates the magic and format version; returns the recorded protocol version.
-fn parse_header(path: &Path, magic: &[u8; 8], bytes: &[u8]) -> GridResult<u32> {
+/// Empties the journal and writes a fresh header, leaving the position after it; fsyncs the file.
+fn reset_journal(
+    journal: &mut File,
+    dir: &Path,
+    generation: u64,
+    kind: &'static str,
+) -> GridResult<()> {
+    let path = dir.join(JOURNAL_FILE);
+    journal
+        .set_len(0)
+        .and_then(|()| journal.seek(SeekFrom::Start(0)))
+        .and_then(|_| journal.write_all(&header_bytes(JOURNAL_MAGIC, generation)))
+        .and_then(|()| journal.sync_all())
+        .map_err(|e| storage_io(&path, "reset", e))?;
+    note_fsync(dir, kind);
+    Ok(())
+}
+
+struct Header {
+    protocol: u32,
+    generation: u64,
+}
+
+/// Validates the magic and format version of a complete header.
+fn parse_header(path: &Path, magic: &[u8; 8], bytes: &[u8]) -> GridResult<Header> {
     if bytes.len() < HEADER_LEN || &bytes[..8] != magic {
         return Err(GridError::Storage(format!(
             "{} is not a task store file (bad magic); refusing to open",
@@ -724,7 +829,10 @@ fn parse_header(path: &Path, magic: &[u8; 8], bytes: &[u8]) -> GridResult<u32> {
             path.display()
         )));
     }
-    Ok(u32::from_le_bytes(bytes[12..16].try_into().unwrap()))
+    Ok(Header {
+        protocol: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+        generation: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+    })
 }
 
 fn encode_frame(payload: &[u8]) -> GridResult<Vec<u8>> {
@@ -747,69 +855,87 @@ fn encode_record_frame(record: &JournalRecord) -> GridResult<Vec<u8>> {
     encode_frame(&payload)
 }
 
-/// Returns the full snapshot file body after the header: one frame holding the JSON image.
+/// Returns the snapshot frame `[len u64][blake3][json]` (the part after the header).
 fn encode_snapshot(image: &SnapshotImage) -> GridResult<Vec<u8>> {
     let payload = serde_json::to_vec(image)?;
-    encode_frame(&payload)
+    if payload.len() as u64 > SNAPSHOT_MAX_BYTES {
+        return Err(GridError::Storage(format!(
+            "the snapshot is {} bytes, above the {SNAPSHOT_MAX_BYTES} byte bound",
+            payload.len()
+        )));
+    }
+    let mut frame = Vec::with_capacity(SNAPSHOT_FRAME_HEADER_LEN + payload.len());
+    frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    frame.extend_from_slice(blake3::hash(&payload).as_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
 }
 
-/// Writes `snapshot.bin.tmp`, syncs it, and renames it over `snapshot.bin`.
-fn write_snapshot_file(dir: &Path, snapshot_frame: &[u8]) -> GridResult<()> {
+/// Writes `snapshot.bin.tmp`, syncs it, renames it over `snapshot.bin`, and syncs the directory.
+fn write_snapshot_file(dir: &Path, generation: u64, snapshot_frame: &[u8]) -> GridResult<()> {
     let tmp = dir.join(SNAPSHOT_TMP_FILE);
     let dest = dir.join(SNAPSHOT_FILE);
     let _ = std::fs::remove_file(&tmp);
-    let mut file = OpenOptions::new();
-    file.write(true).create_new(true);
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        file.mode(0o600);
+        opts.mode(0o600);
     }
-    let mut file = file.open(&tmp).map_err(|e| storage_io(&tmp, "create", e))?;
-    file.write_all(&header_bytes(SNAPSHOT_MAGIC))
+    let mut file = opts.open(&tmp).map_err(|e| storage_io(&tmp, "create", e))?;
+    file.write_all(&header_bytes(SNAPSHOT_MAGIC, generation))
         .and_then(|()| file.write_all(snapshot_frame))
         .and_then(|()| file.sync_all())
         .map_err(|e| storage_io(&tmp, "write", e))?;
+    note_fsync(dir, "snapshot_file");
     drop(file);
     std::fs::rename(&tmp, &dest).map_err(|e| storage_io(&dest, "install", e))?;
-    #[cfg(unix)]
-    if let Ok(d) = File::open(dir) {
-        let _ = d.sync_all();
-    }
-    Ok(())
+    sync_dir(dir, "snapshot_dir")
 }
 
-/// Reads and verifies `snapshot.bin`. Returns the image and the header's protocol version.
-fn read_snapshot(path: &Path) -> GridResult<(Option<SnapshotImage>, Option<u32>)> {
+struct LoadedSnapshot {
+    image: SnapshotImage,
+    version: u32,
+    generation: u64,
+}
+
+/// Reads and verifies `snapshot.bin`. It is installed by rename, so it has no torn-tail
+/// tolerance: any damage is an error.
+fn read_snapshot(path: &Path) -> GridResult<Option<LoadedSnapshot>> {
     let mut bytes = Vec::new();
     match File::open(path) {
         Ok(mut f) => {
             f.read_to_end(&mut bytes)
                 .map_err(|e| storage_io(path, "read", e))?;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(storage_io(path, "open", e)),
     }
-    let version = parse_header(path, SNAPSHOT_MAGIC, &bytes)?;
+    let header = parse_header(path, SNAPSHOT_MAGIC, &bytes)?;
     let corrupt = |why: &str| GridError::Storage(format!("{} is corrupt: {why}", path.display()));
     let body = &bytes[HEADER_LEN..];
-    if body.len() < FRAME_HEADER_LEN {
+    if body.len() < SNAPSHOT_FRAME_HEADER_LEN {
         return Err(corrupt("truncated frame header"));
     }
-    let len = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
-    if len > MAX_FRAME_SIZE {
+    let len = u64::from_le_bytes(body[..8].try_into().unwrap());
+    if len > SNAPSHOT_MAX_BYTES {
         return Err(corrupt("frame length exceeds the maximum"));
     }
-    if body.len() != FRAME_HEADER_LEN + len {
+    if body.len() as u64 != SNAPSHOT_FRAME_HEADER_LEN as u64 + len {
         return Err(corrupt("frame length does not match the file size"));
     }
-    let payload = &body[FRAME_HEADER_LEN..];
-    if blake3::hash(payload).as_bytes() != &body[4..FRAME_HEADER_LEN] {
+    let payload = &body[SNAPSHOT_FRAME_HEADER_LEN..];
+    if blake3::hash(payload).as_bytes() != &body[8..SNAPSHOT_FRAME_HEADER_LEN] {
         return Err(corrupt("checksum mismatch"));
     }
     let image = serde_json::from_slice(payload)
         .map_err(|e| corrupt(&format!("cannot decode the snapshot: {e}")))?;
-    Ok((Some(image), Some(version)))
+    Ok(Some(LoadedSnapshot {
+        image,
+        version: header.protocol,
+        generation: header.generation,
+    }))
 }
 
 struct LoadedJournal {
@@ -817,13 +943,35 @@ struct LoadedJournal {
     /// Length of the valid prefix (header plus whole frames).
     valid_len: u64,
     truncated_tail: bool,
-    /// The file is missing or holds only a torn header: create it.
-    fresh: bool,
-    /// Header-only journal written by another protocol version: stamp the current one.
-    rewrite_header: bool,
+    /// The file must be recreated with a fresh header (missing, torn or all-zero header, a
+    /// header-only journal of another protocol version, or a stale generation).
+    reset: bool,
+    /// The records were discarded because the journal predates the snapshot.
+    stale: bool,
 }
 
-fn read_journal(path: &Path) -> GridResult<LoadedJournal> {
+/// Looks for any offset at or after `from` that parses as a complete frame with a valid BLAKE3.
+/// Used to tell a torn tail (nothing valid follows) from damage in the middle of the history.
+fn valid_frame_follows(bytes: &[u8], from: usize) -> Option<usize> {
+    let total = bytes.len();
+    let mut o = from;
+    while o + FRAME_HEADER_LEN <= total {
+        let len = u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize;
+        if len <= MAX_FRAME_SIZE {
+            let end = o + FRAME_HEADER_LEN + len;
+            if end <= total
+                && blake3::hash(&bytes[o + FRAME_HEADER_LEN..end]).as_bytes()
+                    == &bytes[o + 4..o + FRAME_HEADER_LEN]
+            {
+                return Some(o);
+            }
+        }
+        o += 1;
+    }
+    None
+}
+
+fn read_journal(path: &Path, snapshot_generation: u64) -> GridResult<LoadedJournal> {
     let mut bytes = Vec::new();
     match File::open(path) {
         Ok(mut f) => {
@@ -837,32 +985,60 @@ fn read_journal(path: &Path) -> GridResult<LoadedJournal> {
         records: Vec::new(),
         valid_len: HEADER_LEN as u64,
         truncated_tail: false,
-        fresh: false,
-        rewrite_header: false,
+        reset: false,
+        stale: false,
     };
     if bytes.len() < HEADER_LEN {
-        // Empty, or the process died while writing the header: only a prefix of ours is allowed.
+        // Empty, or the process died while writing the header: only a prefix of ours (or zeros,
+        // when the OS extended the file) is allowed.
         let n = bytes.len().min(8);
-        if bytes[..n] != JOURNAL_MAGIC[..n] {
+        let zeros = bytes.iter().all(|b| *b == 0);
+        if !zeros && bytes[..n] != JOURNAL_MAGIC[..n] {
             return Err(GridError::Storage(format!(
                 "{} is not a task store file (bad magic); refusing to open",
                 path.display()
             )));
         }
-        out.fresh = true;
+        out.reset = true;
         return Ok(out);
     }
-    let version = parse_header(path, JOURNAL_MAGIC, &bytes)?;
-    if bytes.len() == HEADER_LEN {
-        out.rewrite_header = version != PROTOCOL_VERSION_CURRENT;
+    if bytes[..HEADER_LEN].iter().all(|b| *b == 0) && bytes.iter().all(|b| *b == 0) {
+        warn!("task store: {} is all zeros; recreating it", path.display());
+        out.reset = true;
         return Ok(out);
     }
-    if version != PROTOCOL_VERSION_CURRENT {
+    let header = parse_header(path, JOURNAL_MAGIC, &bytes)?;
+    if header.generation < snapshot_generation {
+        warn!(
+            "task store: {} (generation {}) predates the snapshot (generation {}); a compaction \
+             was interrupted, so its records are already in the snapshot and are discarded",
+            path.display(),
+            header.generation,
+            snapshot_generation
+        );
+        out.reset = true;
+        out.stale = true;
+        return Ok(out);
+    }
+    if header.generation > snapshot_generation {
         return Err(GridError::Storage(format!(
-            "{} holds uncompacted records written by protocol version {version}, but this binary \
+            "{} has generation {} but the snapshot has generation {snapshot_generation}; the \
+             snapshot is missing or was replaced; refusing to open",
+            path.display(),
+            header.generation
+        )));
+    }
+    if bytes.len() == HEADER_LEN {
+        out.reset = header.protocol != PROTOCOL_VERSION_CURRENT;
+        return Ok(out);
+    }
+    if header.protocol != PROTOCOL_VERSION_CURRENT {
+        return Err(GridError::Storage(format!(
+            "{} holds uncompacted records written by protocol version {}, but this binary \
              is protocol version {PROTOCOL_VERSION_CURRENT}; start the previous binary and stop \
              it cleanly (which compacts the journal) before upgrading",
-            path.display()
+            path.display(),
+            header.protocol
         )));
     }
 
@@ -870,31 +1046,47 @@ fn read_journal(path: &Path) -> GridResult<LoadedJournal> {
     let mut off = HEADER_LEN;
     while off < total {
         let remaining = total - off;
-        if remaining < FRAME_HEADER_LEN {
-            return torn(path, out, off, "short frame header");
+        let bad = if remaining < FRAME_HEADER_LEN {
+            Some("short frame header")
+        } else {
+            let len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+            if len > MAX_FRAME_SIZE {
+                return Err(GridError::Storage(format!(
+                    "{} is corrupt: the frame at offset {off} claims {len} bytes (maximum {MAX_FRAME_SIZE})",
+                    path.display()
+                )));
+            }
+            let end = off + FRAME_HEADER_LEN + len;
+            if end > total {
+                Some("short frame payload")
+            } else if blake3::hash(&bytes[off + FRAME_HEADER_LEN..end]).as_bytes()
+                != &bytes[off + 4..off + FRAME_HEADER_LEN]
+            {
+                Some("checksum mismatch")
+            } else {
+                None
+            }
+        };
+        if let Some(why) = bad {
+            if let Some(later) = valid_frame_follows(&bytes, off + 1) {
+                return Err(GridError::Storage(format!(
+                    "{} is corrupt: the frame at offset {off} is bad ({why}) but a valid frame \
+                     follows at offset {later}; refusing to drop acknowledged history",
+                    path.display()
+                )));
+            }
+            warn!(
+                "task store: {why} at offset {off} of {}; discarding the torn tail ({} records kept)",
+                path.display(),
+                out.records.len()
+            );
+            out.valid_len = off as u64;
+            out.truncated_tail = true;
+            return Ok(out);
         }
         let len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
-        if len > MAX_FRAME_SIZE {
-            return Err(GridError::Storage(format!(
-                "{} is corrupt: the frame at offset {off} claims {len} bytes (maximum {MAX_FRAME_SIZE})",
-                path.display()
-            )));
-        }
         let end = off + FRAME_HEADER_LEN + len;
-        if end > total {
-            return torn(path, out, off, "short frame payload");
-        }
-        let payload = &bytes[off + FRAME_HEADER_LEN..end];
-        if blake3::hash(payload).as_bytes() != &bytes[off + 4..off + FRAME_HEADER_LEN] {
-            if end == total {
-                return torn(path, out, off, "checksum mismatch in the final frame");
-            }
-            return Err(GridError::Storage(format!(
-                "{} is corrupt: checksum mismatch in the frame at offset {off} (not the last frame)",
-                path.display()
-            )));
-        }
-        let record = bincode::deserialize(payload).map_err(|e| {
+        let record = bincode::deserialize(&bytes[off + FRAME_HEADER_LEN..end]).map_err(|e| {
             GridError::Storage(format!(
                 "{} is corrupt: the frame at offset {off} does not decode: {e}",
                 path.display()
@@ -904,17 +1096,6 @@ fn read_journal(path: &Path) -> GridResult<LoadedJournal> {
         off = end;
         out.valid_len = off as u64;
     }
-    Ok(out)
-}
-
-fn torn(path: &Path, mut out: LoadedJournal, off: usize, why: &str) -> GridResult<LoadedJournal> {
-    warn!(
-        "task store: {why} at offset {off} of {}; discarding the torn tail ({} records kept)",
-        path.display(),
-        out.records.len()
-    );
-    out.valid_len = off as u64;
-    out.truncated_tail = true;
     Ok(out)
 }
 
@@ -1259,26 +1440,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn group_commit_shares_syncs_between_concurrent_appends() {
+    async fn group_commit_shares_syncs_between_enqueued_appends() {
         const N: u64 = 1_000;
         let dir = tempfile::tempdir().unwrap();
         let (store, _) = TaskStore::open(dir.path()).unwrap();
-        let store = Arc::new(store);
-
-        let futures = (0..N).map(|i| {
-            let store = Arc::clone(&store);
-            async move { store.append_durable(&marker(i)).await }
-        });
-        for res in join_all(futures).await {
+        let acks: Vec<_> = (0..N)
+            .map(|i| store.append_durable(&marker(i)).unwrap())
+            .collect();
+        for res in join_all(acks).await {
             res.unwrap();
         }
         let syncs = store.sync_count();
         assert_eq!(store.journal_records(), N);
-        // At least ceil(N / MAX_GROUP_BATCH) syncs are needed; one per append would be N.
         assert!(syncs >= 1, "no sync happened");
         assert!(syncs <= N / 10, "{syncs} syncs for {N} appends");
-
-        let store = Arc::try_unwrap(store).unwrap();
         drop(store);
         let (_s, rec) = TaskStore::open(dir.path()).unwrap();
         assert_eq!(rec.records.len() as u64, N);
@@ -1386,5 +1561,470 @@ mod tests {
         symlink(&dir, &link).unwrap();
         let msg = expect_storage_err(TaskStore::open(&link));
         assert!(msg.contains("symbolic link"), "{msg}");
+    }
+
+    // ---- review fixes -------------------------------------------------------------------
+
+    fn rec_kinds(rec: &Recovered) -> Vec<&'static str> {
+        rec.records
+            .iter()
+            .map(|r| match r {
+                JournalRecord::TaskSubmitted { .. } => "TaskSubmitted",
+                JournalRecord::TaskEvicted { .. } => "TaskEvicted",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    fn header_generation(path: &Path) -> u64 {
+        let bytes = std::fs::read(path).unwrap();
+        u64::from_le_bytes(bytes[16..24].try_into().unwrap())
+    }
+
+    fn fsync_kinds(dir: &Path) -> Vec<&'static str> {
+        FSYNC_LOG
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(d, _)| d == dir)
+            .map(|(_, k)| *k)
+            .collect()
+    }
+
+    fn assert_subsequence(log: &[&str], wanted: &[&str]) {
+        let mut it = log.iter();
+        for w in wanted {
+            assert!(
+                it.any(|k| k == w),
+                "fsync kind {w:?} missing or out of order in {log:?}"
+            );
+        }
+    }
+
+    // A flipped bit in the length of a MIDDLE frame must not silently drop later frames.
+    #[test]
+    fn middle_frame_length_bitrot_is_refused_and_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let records: Vec<_> = (0..4).map(|i| submitted("t", i)).collect();
+        write_all(dir.path(), &records);
+        let path = journal_path(dir.path());
+        let mut bytes = std::fs::read(&path).unwrap();
+        let first = encode_record_frame(&records[0]).unwrap().len();
+        bytes[HEADER_LEN + first + 2] ^= 0x10; // length ~1 MiB, below MAX_FRAME_SIZE
+        std::fs::write(&path, &bytes).unwrap();
+        let msg = expect_storage_err(TaskStore::open(dir.path()));
+        assert!(msg.contains("valid frame"), "{msg}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn zero_filled_tail_is_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        write_all(dir.path(), &[marker(1), marker(2)]);
+        let path = journal_path(dir.path());
+        let good = std::fs::metadata(&path).unwrap().len();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&[0u8; 4096]).unwrap();
+        drop(f);
+        let (s, rec) = TaskStore::open(dir.path()).unwrap();
+        assert!(rec.truncated_tail);
+        assert_eq!(rec.records.len(), 2);
+        drop(s);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), good);
+    }
+
+    #[test]
+    fn hash_valid_undecodable_frame_is_refused_last_and_middle() {
+        let bad = encode_frame(&[0xFFu8; 12]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write_all(dir.path(), &[marker(1)]);
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(journal_path(dir.path()))
+            .unwrap();
+        f.write_all(&bad).unwrap();
+        drop(f);
+        expect_storage_err(TaskStore::open(dir.path()));
+
+        let dir = tempfile::tempdir().unwrap();
+        write_all(dir.path(), &[marker(1)]);
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(journal_path(dir.path()))
+            .unwrap();
+        f.write_all(&bad).unwrap();
+        f.write_all(&encode_record_frame(&marker(2)).unwrap())
+            .unwrap();
+        drop(f);
+        expect_storage_err(TaskStore::open(dir.path()));
+    }
+
+    #[test]
+    fn torn_or_zeroed_journal_headers_are_recreated() {
+        for keep in [0usize, 3, 8, 10, 15, 23] {
+            let dir = tempfile::tempdir().unwrap();
+            drop(TaskStore::open(dir.path()).unwrap());
+            let path = journal_path(dir.path());
+            let f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.set_len(keep as u64).unwrap();
+            drop(f);
+            let (s, rec) = TaskStore::open(dir.path()).unwrap_or_else(|e| panic!("{keep}: {e}"));
+            assert!(rec.records.is_empty());
+            s.append_durable_blocking(&marker(1)).unwrap();
+            drop(s);
+            let (_s, rec) = TaskStore::open(dir.path()).unwrap();
+            assert_eq!(rec.records.len(), 1, "keep={keep}");
+        }
+        for zeros in [16usize, HEADER_LEN, 4096] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(journal_path(dir.path()), vec![0u8; zeros]).unwrap();
+            let (s, rec) = TaskStore::open(dir.path()).unwrap_or_else(|e| panic!("{zeros}: {e}"));
+            assert!(rec.records.is_empty());
+            s.append_durable_blocking(&marker(1)).unwrap();
+        }
+    }
+
+    #[test]
+    fn crash_after_tmp_before_rename_keeps_the_old_state() {
+        let dir = tempfile::tempdir().unwrap();
+        write_all(dir.path(), &[marker(1), marker(2)]);
+        std::fs::write(dir.path().join(SNAPSHOT_TMP_FILE), b"half a snapshot").unwrap();
+        let (_s, rec) = TaskStore::open(dir.path()).unwrap();
+        assert!(rec.snapshot.is_none());
+        assert_eq!(rec.records, vec![marker(1), marker(2)]);
+        assert!(!dir.path().join(SNAPSHOT_TMP_FILE).exists());
+    }
+
+    #[test]
+    fn crash_after_rename_before_reset_discards_the_stale_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = SnapshotImage {
+            next_sequence: 3,
+            ..Default::default()
+        };
+        let saved;
+        {
+            let (store, _) = TaskStore::open(dir.path()).unwrap();
+            for i in 0..3 {
+                store.append_durable_blocking(&submitted("x", i)).unwrap();
+            }
+            saved = std::fs::read(journal_path(dir.path())).unwrap();
+            store.compact_blocking(&image).unwrap();
+        }
+        assert_eq!(header_generation(&dir.path().join(SNAPSHOT_FILE)), 1);
+        assert_eq!(header_generation(&journal_path(dir.path())), 1);
+        // Put the pre-compaction journal (generation 0) back: the crash window.
+        std::fs::write(journal_path(dir.path()), &saved).unwrap();
+        let (store, rec) = TaskStore::open(dir.path()).unwrap();
+        assert_eq!(rec.snapshot.as_ref(), Some(&image));
+        assert!(rec.records.is_empty());
+        assert!(rec.stale_journal_discarded);
+        store.append_durable_blocking(&marker(5)).unwrap();
+        drop(store);
+        assert_eq!(header_generation(&journal_path(dir.path())), 1);
+        let (_s, rec) = TaskStore::open(dir.path()).unwrap();
+        assert_eq!(rec.records, vec![marker(5)]);
+        assert!(!rec.stale_journal_discarded);
+    }
+
+    #[test]
+    fn a_journal_newer_than_the_snapshot_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (store, _) = TaskStore::open(dir.path()).unwrap();
+            store.compact_blocking(&image_with(1)).unwrap();
+            store.append_durable_blocking(&marker(1)).unwrap();
+        }
+        std::fs::remove_file(dir.path().join(SNAPSHOT_FILE)).unwrap();
+        let msg = expect_storage_err(TaskStore::open(dir.path()));
+        assert!(msg.contains("generation"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_durable_future_created_first_lands_on_disk_first() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (store, _) = TaskStore::open(dir.path()).unwrap();
+            let ack = store.append_durable(&submitted("first", 1)).unwrap();
+            store.append(&marker(2)).unwrap();
+            ack.await.unwrap();
+        }
+        let (_s, rec) = TaskStore::open(dir.path()).unwrap();
+        assert_eq!(rec_kinds(&rec), ["TaskSubmitted", "TaskEvicted"]);
+    }
+
+    async fn every_waiter_gets_an_error(mode: u8) {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = TaskStore::open(dir.path()).unwrap();
+        let store = Arc::new(store);
+        store.shared.inject.store(mode, Ordering::SeqCst);
+        let mut handles = Vec::new();
+        for i in 0..600u64 {
+            let s = Arc::clone(&store);
+            handles.push(tokio::spawn(
+                async move { s.append_durable(&marker(i))?.await },
+            ));
+        }
+        for h in handles {
+            let r = tokio::time::timeout(Duration::from_secs(10), h)
+                .await
+                .expect("a waiter hung")
+                .unwrap();
+            assert!(r.is_err(), "mode {mode}: a durable append succeeded");
+        }
+        let later = match store.append_durable(&marker(9999)) {
+            Ok(ack) => ack.await,
+            Err(e) => Err(e),
+        };
+        assert!(later.is_err());
+        assert!(store.append(&marker(10000)).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sync_failure_reaches_every_waiter() {
+        every_waiter_gets_an_error(1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_writer_panic_reaches_every_waiter() {
+        every_waiter_gets_an_error(2).await;
+    }
+
+    #[test]
+    fn a_snapshot_with_a_20_mib_binary_result_compacts_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = task("big");
+        let id = t.id;
+        let result = TaskResult::success(Uuid::new_v4(), id, vec![0xFFu8; 20 << 20], 1, false);
+        let image = SnapshotImage {
+            next_sequence: 1,
+            tasks: vec![PersistedTaskEntry {
+                task: t,
+                priority: 0,
+                sequence: 0,
+                state: TaskState::Completed,
+                assigned_worker_id: None,
+                submitted_at_utc: 0,
+                retry_count: 0,
+                failover_count: 0,
+                evacuation_count: 0,
+                rejection_count: 0,
+                avoid_workers: vec![],
+                retry_history: vec![],
+                result: Some(result),
+                error_message: None,
+            }],
+            terminal_order: vec![id],
+        };
+        {
+            let (store, _) = TaskStore::open(dir.path()).unwrap();
+            store.compact_blocking(&image).unwrap();
+        }
+        let (_s, rec) = TaskStore::open(dir.path()).unwrap();
+        assert!(rec.snapshot.as_ref() == Some(&image));
+    }
+
+    // The documented pattern: enqueue under the lock, await after dropping it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn enqueue_under_a_lock_and_await_outside_batches_commits() {
+        const N: u64 = 1_000;
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = TaskStore::open(dir.path()).unwrap();
+        let store = Arc::new(store);
+        let lock = Arc::new(Mutex::new(()));
+        let mut hs = Vec::new();
+        for i in 0..N {
+            let (s, l) = (Arc::clone(&store), Arc::clone(&lock));
+            hs.push(tokio::spawn(async move {
+                let ack = {
+                    let _g = l.lock().unwrap();
+                    s.append_durable(&marker(i)).unwrap()
+                };
+                ack.await.unwrap();
+            }));
+        }
+        for h in hs {
+            h.await.unwrap();
+        }
+        let syncs = store.sync_count();
+        assert!(syncs <= N / 2, "{syncs} syncs for {N} appends");
+        drop(store);
+        let (_s, rec) = TaskStore::open(dir.path()).unwrap();
+        assert_eq!(rec.records.len() as u64, N);
+    }
+
+    #[test]
+    fn fresh_open_syncs_the_journal_header_then_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(TaskStore::open(dir.path()).unwrap());
+        let log = fsync_kinds(dir.path());
+        #[cfg(unix)]
+        assert_subsequence(&log, &["journal_header", "journal_dir"]);
+        #[cfg(not(unix))]
+        assert_subsequence(&log, &["journal_header"]);
+    }
+
+    #[test]
+    fn compaction_syncs_snapshot_then_directory_then_journal_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = TaskStore::open(dir.path()).unwrap();
+        store.append_durable_blocking(&marker(1)).unwrap();
+        store.compact_blocking(&image_with(1)).unwrap();
+        let log = fsync_kinds(dir.path());
+        #[cfg(unix)]
+        assert_subsequence(
+            &log,
+            &[
+                "journal_data",
+                "snapshot_file",
+                "snapshot_dir",
+                "journal_reset",
+            ],
+        );
+        #[cfg(not(unix))]
+        assert_subsequence(&log, &["journal_data", "snapshot_file", "journal_reset"]);
+    }
+
+    // ---- recorded byte layout of the journal --------------------------------------------
+
+    fn layout_task() -> Task {
+        let mut t = Task::new(
+            TaskSpec::command("echo", vec!["hi".into()]),
+            TaskRequirements::generic(1, 10),
+        );
+        t.id = TaskId(Uuid::from_u128(1));
+        t.created_at_utc = 1_700_000_000;
+        t
+    }
+
+    fn layout_records() -> Vec<(&'static str, JournalRecord)> {
+        let id = TaskId(Uuid::from_u128(1));
+        let w = Uuid::from_u128(2);
+        let attempt = RetryAttempt {
+            attempt: 1,
+            timestamp_utc: 42,
+            failed_worker_id: Some(w),
+            reason: "lost".into(),
+            exit_code: Some(137),
+            error: Some("killed".into()),
+        };
+        vec![
+            (
+                "TaskSubmitted",
+                JournalRecord::TaskSubmitted {
+                    task: Box::new(layout_task()),
+                    priority: 9,
+                    sequence: 7,
+                    submitted_at_utc: 11,
+                },
+            ),
+            (
+                "TaskDispatched",
+                JournalRecord::TaskDispatched {
+                    task_id: id,
+                    worker_id: w,
+                    timestamp_utc: 12,
+                },
+            ),
+            (
+                "TaskRunning",
+                JournalRecord::TaskRunning {
+                    task_id: id,
+                    worker_id: w,
+                    timestamp_utc: 13,
+                },
+            ),
+            (
+                "CheckpointRecorded",
+                JournalRecord::CheckpointRecorded {
+                    task_id: id,
+                    checkpoint: CheckpointData {
+                        sequence: 3,
+                        delta_state: vec![1u8, 2, 3].into(),
+                        timestamp: 5,
+                    },
+                },
+            ),
+            (
+                "TaskRequeued",
+                JournalRecord::TaskRequeued {
+                    task_id: id,
+                    state: TaskState::Retrying,
+                    retry_count: 2,
+                    failover_count: 1,
+                    evacuation_count: 3,
+                    rejection_count: 4,
+                    avoid_workers: vec![w],
+                    retry_attempt: Some(attempt.clone()),
+                    retry_delay_ms: Some(250),
+                },
+            ),
+            (
+                "TaskAdopted",
+                JournalRecord::TaskAdopted {
+                    task_id: id,
+                    worker_id: w,
+                    timestamp_utc: 14,
+                },
+            ),
+            (
+                "TaskTerminal",
+                JournalRecord::TaskTerminal {
+                    task_id: id,
+                    state: TaskState::Failed,
+                    assigned_worker_id: Some(w),
+                    retry_count: 2,
+                    failover_count: 1,
+                    evacuation_count: 3,
+                    rejection_count: 4,
+                    retry_attempt: Some(attempt),
+                    result: Some(TaskResult::failure(
+                        w,
+                        id,
+                        1,
+                        "out",
+                        "err",
+                        9,
+                        Some("boom".into()),
+                    )),
+                    error_message: Some("boom".into()),
+                    timestamp_utc: 15,
+                },
+            ),
+            ("TaskEvicted", JournalRecord::TaskEvicted { task_id: id }),
+        ]
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Recorded bincode bytes of every `JournalRecord` variant (plus the file header). If this
+    /// fails you changed the on-disk format: bump `STORE_FORMAT_VERSION`, then regenerate the
+    /// file with `OX_BLESS_JOURNAL_LAYOUT=1 cargo test -p rusty_grid_master --lib store_layout`.
+    #[test]
+    fn store_layout_is_frozen() {
+        let mut lines = vec![format!(
+            "header {}",
+            hex(&header_bytes(JOURNAL_MAGIC, 0)[..16])
+        )];
+        for (name, rec) in layout_records() {
+            lines.push(format!(
+                "{name} {}",
+                hex(&bincode::serialize(&rec).unwrap())
+            ));
+        }
+        let actual = lines.join("\n") + "\n";
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/journal_layout.txt");
+        if std::env::var_os("OX_BLESS_JOURNAL_LAYOUT").is_some() {
+            std::fs::create_dir_all(Path::new(path).parent().unwrap()).unwrap();
+            std::fs::write(path, &actual).unwrap();
+        }
+        let expected = include_str!("../tests/data/journal_layout.txt");
+        assert_eq!(
+            actual.replace("\r\n", "\n"),
+            expected.replace("\r\n", "\n"),
+            "journal byte layout changed: bump STORE_FORMAT_VERSION and re-bless"
+        );
     }
 }
