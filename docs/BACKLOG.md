@@ -126,9 +126,10 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-08, at `master` `4e1aeb3`: 54 items Implemented, 3 Partial and 13 Planned. "Pull
-requests" lists them by number, "(open)" marks one that is not merged yet, and "(design)" marks a
-design record that builds nothing.
+On 2026-11-08, at `master` `4e1aeb3`: 54 items Implemented, 3 Partial and 13 Planned. Five Planned
+items were added later that day from the research recorded in [ROADMAP.md](ROADMAP.md): CACHE-1,
+REAPI-1, JOIN-1, LINK-1 and BENCH-1. "Pull requests" lists them by number, "(open)" marks one
+that is not merged yet, and "(design)" marks a design record that builds nothing.
 
 | ID | Item | Priority | Size | Needs | Owner | Status | Pull requests |
 |---|---|---|---|---|---|---|---|
@@ -201,8 +202,13 @@ design record that builds nothing.
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Planned |  |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Planned |  |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented | 118 (design), 125, 126, 127, 131 |
-| REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | PRNUM |
+| CACHE-1 | Reuse the result of an identical task | P2 | L | FEAT-1 |  | Planned |  |
+| REAPI-1 | Serve the blob store as a Remote Execution API cache | P3 | L | CACHE-1 | Yes | Planned |  |
+| REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | 155 |
 | REL-5 | Contributor and security files | P3 | S | REL-1 |  | Implemented | 75 |
+| JOIN-1 | Join a machine with one token | P2 | M |  |  | Planned |  |
+| LINK-1 | Show whether each link is direct or relayed | P2 | M |  |  | Planned |  |
+| BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Planned |  |
 
 ## Phase 0: integrate open work
 
@@ -1250,6 +1256,58 @@ Each item below needs a design record before code.
   session state machine. Add the sweep.
 - **Done when:** Each listed symbol has a production caller or is gone.
 
+### CACHE-1: Reuse the result of an identical task
+
+- **Evidence:** Read, on 2026-11-08 at `master` `fec164e`. No code in `crates/` maps a task to an
+  earlier result: every submission is placed and run. Input files already have content digests
+  (`BlobId` is an unkeyed BLAKE3 hash, `crates/core/src/blob.rs:55`), so a task's inputs can be
+  named by hash. The Bazel Remote Execution API keys its `ActionCache` by the digest of an `Action`
+  (command, input root and platform) and stores an `ActionResult`
+  ([remote_execution.proto](https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto)).
+- **Problem:** A coding agent that reruns `cargo test` on an unchanged tree waits for a full run.
+  Workspaces (WS-1 of design 0039) make a rebuild after an edit incremental, but an exact repeat
+  still runs from the start.
+- **Do:**
+  1. Write a design record first. It fixes the key: a BLAKE3 hash over a canonical encoding of the
+     command and arguments, the environment, the working directory, the input tree digests, the
+     output patterns, and the placement constraints and worker tags that can change a result
+     (`os:`, `arch:`, `iso:`).
+  2. Make caching opt-in per task (`submit` flag and MCP argument). A task without declared inputs
+     cannot be cached, because the key cannot cover what its command reads. The design record
+     states that a command which reads the network, the clock or files outside its inputs can
+     return a stale result, and that this is why caching is opt-in.
+  3. Store only results with exit code 0 and every declared output present. A hit returns the stored
+     `TaskResult`, marked as cached, and its output blobs, without placing the task. Bound the cache
+     by size with least-recently-used eviction, and pin the output blobs of each entry.
+  4. Follow the wire rule for the cached marker, with a protocol version bump (FEAT-8).
+  5. Record the hit rate on the WS-7 user story before MCP turns caching on by default.
+- **Done when:** A test submits the same cacheable task twice: the worker runs it once, and the
+  second result downloads byte-identical outputs. A change to one input file, one environment
+  variable or the `os` constraint is a miss. A failed run is not stored. An entry survives a master
+  restart.
+
+### REAPI-1: Serve the blob store as a Remote Execution API cache
+
+- **Evidence:** Read, on 2026-11-08. REAPI v2 defines `DigestFunction` `BLAKE3 = 9`, and a server
+  may implement only `Capabilities`, `ContentAddressableStorage`, `ActionCache` and
+  `google.bytestream.ByteStream`, with execution disabled
+  ([remote_execution.proto](https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto)).
+  NativeLink has advertised BLAKE3 since
+  [pull request 403](https://github.com/TraceMachina/nativelink/pull/403) (2023-11-20). A `BlobId`
+  equals a REAPI BLAKE3 `Digest.hash`, and blob sizes already travel next to ids, so no rehashing
+  is needed.
+- **Problem:** Bazel, Buck2 and other REAPI clients cannot use the owner's machines as a remote
+  cache.
+- **Do:**
+  1. Write a design record. It puts the gRPC listener behind the cluster secret, on a port of its
+     own, behind an opt-in Cargo feature, and lists the new dependencies for the owner to approve.
+  2. Implement the cache-only profile: `Capabilities` reports BLAKE3 only, CAS and `ByteStream`
+     read and write the master's `BlobStore`, and `ActionCache` reads and writes the CACHE-1 store.
+  3. Leave the `Execution` service out.
+- **Done when:** A REAPI client set to the BLAKE3 digest function, for example Bazel with
+  `--digest_function=blake3`, builds a sample project twice against the master, and the second
+  build reports remote cache hits. A client without the cluster credential is refused.
+
 ## Phase 6: release
 
 ### REL-4: Release workflow and install path
@@ -1273,6 +1331,78 @@ Each item below needs a design record before code.
   `docs/SECURITY.md:172` offers only a public issue for security reports.
 - **Do:** Add the files, and add a private reporting route.
 - **Done when:** The files exist, and `docs/SECURITY.md` names a private route.
+
+### JOIN-1: Join a machine with one token
+
+- **Evidence:** Read, on 2026-11-08 at `master` `fec164e`. A master tells the owner to copy
+  `cluster.secret` to each machine by hand, at mode 600 (`crates/cli/src/secret_cmd.rs:252`). A
+  worker then also needs the master's address or a P2P ticket (`--p2p-ticket`,
+  `crates/cli/src/cli_app.rs:371`). `docs/guides/two-machine-cluster.md` walks through both steps.
+  Tailscale, which users compare a join against, asks only to install the client and log in on
+  each device ([what is Tailscale](https://tailscale.com/docs/concepts/what-is-tailscale.md)).
+- **Problem:** Joining a machine takes two values carried over two channels, and a wrong file mode
+  or a stale ticket shows up only as a refused handshake.
+- **Do:**
+  1. Write a design record first, because this adds a CLI command.
+  2. Let the master print, on explicit request only, one join token that carries the master's
+     address or P2P ticket and the cluster secret. The token is as sensitive as the secret: it is
+     never logged and never written to a config file.
+  3. Add a join command that reads the token from standard input, so it stays out of shell history
+     and process lists. It writes the secret to `~/.oxideswarm/cluster.secret` at mode 600,
+     refuses to replace a different secret without an explicit flag, saves the address or ticket,
+     and then runs the `doctor` checks.
+  4. Add a QR code form for the Android app after AND-1.
+  5. Update `README.md` and `docs/guides/two-machine-cluster.md`.
+- **Done when:** A test with two temporary `HOME` directories creates a token on the master side,
+  joins the worker side with it on standard input, and `doctor` passes. The written secret file has
+  mode 600 on Unix. A token with one changed byte is refused. Neither stdout nor stderr of either
+  process contains the secret.
+
+### LINK-1: Show whether each link is direct or relayed
+
+- **Evidence:** Read, on 2026-11-08 at `master` `fec164e`. The master tags each P2P worker with
+  `link:Direct P2P (QUIC):<rtt>` or `link:Relay (DERP):<rtt>` (`crates/master/src/server.rs:2869`).
+  `doctor` reads the tag into `WorkerSummary::link` (`crates/cli/src/doctor.rs:121`), but `render`
+  (`doctor.rs:205`) never prints it, and no check warns about a relayed worker. The P2P endpoint
+  uses either n0's public relays (`presets::N0`) or none (`presets::Minimal`,
+  `crates/master/src/server.rs:552`). No option names a relay of the owner's own. The n0 public
+  relays are rate-limited and meant for development, and a self-hosted relay needs a public IP
+  address and a DNS name ([iroh hole punching](https://docs.iroh.computer/concepts/holepunching)).
+- **Problem:** A worker that falls back to a relay moves blobs more slowly, and the owner cannot see
+  it from `doctor`. A cluster that outgrows the public relays has nowhere else to go.
+- **Do:**
+  1. Print each worker's link kind and round-trip time in the `doctor` table, and add a check that
+     warns when a worker is relayed.
+  2. Add a `doctor` probe that moves a fixed-size blob to each worker and reports MB/s.
+  3. Add a relay URL option for master, worker and client that selects a custom iroh relay. Write
+     its design record and its `README.md` reference entry.
+  4. Write a guide in `docs/guides/` for running a self-hosted relay.
+- **Done when:** A `doctor` unit test renders the link column and a warning for a relayed worker. A
+  test resolves the relay option to a custom relay map. A live run through a self-hosted relay is
+  recorded with its date.
+
+### BENCH-1: Publish benchmarks with the scripts that measured them
+
+- **Evidence:** Read, on 2026-11-08 at `master` `fec164e`. `run_cluster_benchmark.sh` measures
+  chunk hashing and matrix products on two nodes. `benchmarks/interconnect/` holds a one-off WAN
+  dataset. `ox-mode research` benchmarks the wire codec. Nothing measures per-task scheduling
+  overhead, the bytes a repeated blob upload saves, or the user story end to end. HyperQueue, the
+  nearest Rust task scheduler, states a per-task overhead below 0.1 ms in its README without a
+  method ([HyperQueue](https://github.com/It4innovations/hyperqueue)).
+- **Problem:** Writing standard rule 6 forbids a performance number without its script, so the
+  project cannot yet state how fast it is.
+- **Do:**
+  1. Add `benchmarks/grid/` with a script that runs on loopback and measures: (a) no-op task
+     throughput and the p50 and p99 time from submit to result, with one to four workers; (b) a
+     first and a repeated upload of the same input tree, in bytes sent and time.
+  2. After WS-7, add (c): the end-to-end offload of `cargo test` for a fixed public crate at a fixed
+     commit, cold and warm, between two machines.
+  3. Write each run to a results file with its date, commit, hardware, operating systems and
+     network.
+  4. Link the results from `README.md`. Compare with HyperQueue only with a run of both on the same
+     machine.
+- **Done when:** The script runs on macOS, Linux and Windows. Dated records of (a) and (b) on one
+  machine, and of (c) on two machines, are committed, and `README.md` links them.
 
 ## Status log
 
@@ -1410,4 +1540,6 @@ Add one dated line per finished item, newest last.
   cache directories, the cluster secret file or the config file in use, and under `fs+net` it has
   no network. `FEAT-3b` (Linux) and `FEAT-3c` (Windows) are Planned, so on those systems a task can
   still read `cluster.secret`.
-- 2026-11-08: REL-4 implemented in pull request PRNUM: `.github/workflows/release.yml` builds archives for Linux, macOS (arm64, x86_64) and Windows, with and without `gpu-wgpu`, and `SHA256SUMS`; a `v*` tag creates the release, a pull request only uploads artifacts. No tag exists yet: the owner cuts the first one. Crates have `publish = false`, `authors` match the licence and `README.md` has an Install section.
+- 2026-11-08: Added CACHE-1, REAPI-1, JOIN-1, LINK-1 and BENCH-1 as Planned, from the research
+  recorded in [ROADMAP.md](ROADMAP.md) (decision Q7). Their evidence was read at `master` `fec164e`.
+- 2026-11-08: REL-4 implemented in pull request 155: `.github/workflows/release.yml` builds archives for Linux, macOS (arm64, x86_64) and Windows, with and without `gpu-wgpu`, and `SHA256SUMS`; a `v*` tag creates the release, a pull request only uploads artifacts. No tag exists yet: the owner cuts the first one. Crates have `publish = false`, `authors` match the licence and `README.md` has an Install section.
