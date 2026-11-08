@@ -2839,6 +2839,18 @@ try {
             )
             .unwrap();
 
+            let staged_host = HostDirs::from_home(
+                user_home.clone(),
+                Some(rustup_home.clone()),
+                Some(cargo_home.clone()),
+            );
+            rusty_grid_worker::isolation::windows::prepare_worker_toolchains(
+                &staged_host,
+                &[],
+                None,
+            )
+            .expect("prepare staged toolchain ACLs");
+
             StagedWinToolchain {
                 _home_dir: home_dir,
                 user_home,

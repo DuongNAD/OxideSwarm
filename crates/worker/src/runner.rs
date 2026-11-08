@@ -259,27 +259,11 @@ fn augment_windows_path(existing_path: &str) -> String {
         std::path::PathBuf::from(r"C:\msys64\usr\bin"),
     ]);
 
-    let normalized_existing: String = existing_path
-        .split(';')
-        .map(|part| {
-            if (part.contains('~') || part.contains('/')) && !part.is_empty() {
-                let p = Path::new(part);
-                if p.exists() && !crate::isolation::windows::is_reparse_point(p) {
-                    return crate::isolation::windows::normalize_win_path(p)
-                        .to_string_lossy()
-                        .into_owned();
-                }
-            }
-            part.to_string()
-        })
-        .collect::<Vec<_>>()
-        .join(";");
-
     let mut prefix = String::new();
     for p in &paths_to_check {
         if p.exists() {
             let p_str = p.to_string_lossy();
-            if !normalized_existing.contains(&*p_str) {
+            if !existing_path.contains(&*p_str) {
                 if !prefix.is_empty() {
                     prefix.push(';');
                 }
@@ -288,11 +272,11 @@ fn augment_windows_path(existing_path: &str) -> String {
         }
     }
     if prefix.is_empty() {
-        normalized_existing
-    } else if normalized_existing.is_empty() {
+        existing_path.to_string()
+    } else if existing_path.is_empty() {
         prefix
     } else {
-        format!("{prefix};{normalized_existing}")
+        format!("{prefix};{existing_path}")
     }
 }
 
@@ -2641,6 +2625,27 @@ impl TaskRunner {
                     base
                 }
             }
+        };
+
+        #[cfg(windows)]
+        let effective_path = if self.config.isolation != IsolationLevel::Off {
+            effective_path
+                .split(';')
+                .map(|part| {
+                    if (part.contains('~') || part.contains('/')) && !part.is_empty() {
+                        let p = Path::new(part);
+                        if p.exists() && !crate::isolation::windows::is_reparse_point(p) {
+                            return crate::isolation::windows::normalize_win_path(p)
+                                .to_string_lossy()
+                                .into_owned();
+                        }
+                    }
+                    part.to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(";")
+        } else {
+            effective_path
         };
 
         #[cfg(windows)]
