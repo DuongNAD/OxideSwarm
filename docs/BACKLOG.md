@@ -126,7 +126,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-08, at `master` `5df82df`: 47 items Implemented, 3 Partial and 20 Planned. "Pull
+On 2026-11-08, at `master` `9ed146e`: 48 items Implemented, 2 Partial and 20 Planned. "Pull
 requests" lists them by number, "(open)" marks one that is not merged yet, and "(design)" marks a
 design record that builds nothing.
 
@@ -153,7 +153,7 @@ design record that builds nothing.
 | TEST-1 | Gate host-bound tests | P1 | M | INT-4 |  | Implemented | 51 |
 | TEST-2 | Isolate tests from the host battery | P1 | M | INT-4 |  | Implemented | 76 |
 | TEST-3 | Repair stale, starved and flaky tests | P1 | M | TEST-1 |  | Implemented | 39 |
-| TEST-4 | Stop tests from reading the real home directory | P1 | S | INT-4 |  | Partial | 29 |
+| TEST-4 | Stop tests from reading the real home directory | P1 | S | INT-4 |  | Implemented | 29, 112 |
 | TEST-5 | Register or delete the orphan Rust test | P1 | S | INT-4 |  | Implemented | 19 |
 | TEST-6 | Extend CI to the full suite | P1 | M | TEST-1, TEST-2, TEST-3, TEST-4 |  | Partial | 67 |
 | TEST-7 | Run or delete the orphan Python tests | P2 | M | INT-4 |  | Implemented | 55, 66 |
@@ -1339,3 +1339,8 @@ Add one dated line per finished item, newest last.
 - 2026-11-08: The roadmap (`ROADMAP.md`) sets the order after this backlog. Its decision Q2 freezes
   3D-2 and 3D-3. Its decision Q3 drops the grid features of MESH-3, and keeps only the removal of
   the hub-local file fallback in `parse_binary_data`. These items stay Planned.
+- 2026-11-08: TEST-4 is Implemented: pull requests 29, 112. At `master` `9ed146e` on macOS,
+  `cargo test --workspace --locked --no-fail-fast` gave the same result with an empty temporary
+  `HOME` and with a dummy `cluster.secret` in it: 1700 passed, 0 failed and 4 ignored in 124 test
+  binaries. Neither run wrote anything else under `HOME/.oxideswarm`. Pull request 112 records the
+  same check at `5b16f55` in `README.md`.
