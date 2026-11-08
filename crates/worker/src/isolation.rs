@@ -227,6 +227,13 @@ pub(crate) fn confine_command(
     }
 }
 
+/// Whether a task can enter a private user and network namespace here (`fs+net`; false when
+/// unprivileged user namespaces are unavailable or `RUSTY_GRID_ISOLATION_NO_USERNS` is set).
+#[cfg(target_os = "linux")]
+pub fn private_netns_available() -> bool {
+    linux::private_netns_available()
+}
+
 /// The Landlock ABI version of the running kernel (`1` is Linux 5.13), or why there is none.
 #[cfg(target_os = "linux")]
 pub fn landlock_abi() -> std::io::Result<u32> {

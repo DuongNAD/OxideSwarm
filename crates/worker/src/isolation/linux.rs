@@ -18,8 +18,9 @@
 //!   sockets are closed by seccomp instead. From ABI 6 it also stops signals to processes outside
 //!   the task's domain and connects to abstract Unix sockets of other domains. It always stops
 //!   `ptrace` (and so `/proc/<pid>/environ`, `mem`, `fd`) of processes outside the task's domain.
-//! * **seccomp** refuses `socket(2)` for `AF_UNIX` (`fs`) or for everything but `AF_NETLINK`
-//!   (`fs+net`), `io_uring_*` (which could create sockets behind the filter's back) and the
+//! * **seccomp** refuses `socket(2)` for `AF_UNIX` (`fs`) or for every domain (`fs+net`; netlink
+//!   included, since without a private network namespace it would list the host's sockets),
+//!   `keyctl`/`add_key`/`request_key`, `io_uring_*` (which could create sockets behind the filter's back) and the
 //!   `TIOCSTI` ioctl; a foreign system-call ABI (32-bit, x32) kills the process, because the
 //!   filter matches native numbers only.
 //! * **`unshare(CLONE_NEWUSER | CLONE_NEWNET)`** (`fs+net`, best effort): an empty network
@@ -252,6 +253,9 @@ struct ArchInfo {
     io_uring_setup: u32,
     io_uring_enter: u32,
     io_uring_register: u32,
+    keyctl: u32,
+    add_key: u32,
+    request_key: u32,
 }
 
 #[allow(dead_code)]
@@ -263,6 +267,9 @@ const X86_64: ArchInfo = ArchInfo {
     io_uring_setup: 425,
     io_uring_enter: 426,
     io_uring_register: 427,
+    keyctl: 250,
+    add_key: 248,
+    request_key: 249,
 };
 
 #[allow(dead_code)]
@@ -274,6 +281,9 @@ const AARCH64: ArchInfo = ArchInfo {
     io_uring_setup: 425,
     io_uring_enter: 426,
     io_uring_register: 427,
+    keyctl: 219,
+    add_key: 217,
+    request_key: 218,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -300,7 +310,6 @@ const fn offset_arg(i: u32) -> u32 {
 }
 
 const AF_UNIX: u32 = 1;
-const AF_NETLINK: u32 = 16;
 /// `ioctl` request that pushes a character into a terminal's input queue.
 const TIOCSTI: u32 = 0x5412;
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
@@ -365,8 +374,10 @@ fn jeq(k: u32, jt: Jump, jf: Jump) -> Op {
 /// 2. `io_uring_setup|enter|register` fail with `ENOSYS`;
 /// 3. `ioctl(_, TIOCSTI, _)` fails with `EPERM`;
 /// 4. `socket(domain, ...)` fails with `EACCES` for `AF_UNIX` (`fs`) or for every domain but
-///    `AF_NETLINK` (`fs+net`; netlink stays for route queries, in an empty namespace);
-/// 5. everything else is allowed. `socketpair` stays allowed: it cannot reach anything outside.
+///    `AF_NETLINK` too (`fs+net`: no socket at all, because without a private network namespace
+///    netlink would list the host's sockets, routes and addresses);
+/// 5. `keyctl`, `add_key` and `request_key` fail with `EPERM` (the worker user's keyring);
+/// 6. everything else is allowed. `socketpair` stays allowed: it cannot reach anything outside.
 fn build_filter(arch: &ArchInfo, level: IsolationLevel) -> Vec<SockFilter> {
     let mut ops = vec![
         load(OFFSET_ARCH),
@@ -388,6 +399,9 @@ fn build_filter(arch: &ArchInfo, level: IsolationLevel) -> Vec<SockFilter> {
     ] {
         ops.push(jeq(nr, Jump::Ret(Verdict::Errno(ENOSYS)), Jump::Fall));
     }
+    for nr in [arch.keyctl, arch.add_key, arch.request_key] {
+        ops.push(jeq(nr, Jump::Ret(Verdict::Errno(EPERM)), Jump::Fall));
+    }
     // ioctl: only TIOCSTI is refused. A match always returns; a miss skips the two checks.
     ops.push(jeq(arch.ioctl, Jump::Fall, Jump::Skip(2)));
     ops.push(load(offset_arg(1)));
@@ -396,21 +410,22 @@ fn build_filter(arch: &ArchInfo, level: IsolationLevel) -> Vec<SockFilter> {
         Jump::Ret(Verdict::Errno(EPERM)),
         Jump::Ret(Verdict::Allow),
     ));
-    // socket: by domain.
-    ops.push(jeq(arch.socket, Jump::Fall, Jump::Skip(2)));
-    ops.push(load(offset_arg(0)));
-    ops.push(match level {
-        IsolationLevel::FsNet => jeq(
-            AF_NETLINK,
-            Jump::Ret(Verdict::Allow),
+    // socket: every domain under fs+net, AF_UNIX under fs.
+    if level == IsolationLevel::FsNet {
+        ops.push(jeq(
+            arch.socket,
             Jump::Ret(Verdict::Errno(EACCES)),
-        ),
-        _ => jeq(
+            Jump::Fall,
+        ));
+    } else {
+        ops.push(jeq(arch.socket, Jump::Fall, Jump::Skip(2)));
+        ops.push(load(offset_arg(0)));
+        ops.push(jeq(
             AF_UNIX,
             Jump::Ret(Verdict::Errno(EACCES)),
             Jump::Ret(Verdict::Allow),
-        ),
-    });
+        ));
+    }
 
     // The verdicts follow the body; falling off the end of the body allows.
     let mut verdicts = vec![Verdict::Allow, Verdict::Kill];
@@ -459,7 +474,7 @@ fn build_filter(arch: &ArchInfo, level: IsolationLevel) -> Vec<SockFilter> {
 #[cfg(target_os = "linux")]
 pub(super) use sys::Confinement;
 #[cfg(target_os = "linux")]
-pub use sys::{landlock_abi, probe};
+pub use sys::{landlock_abi, private_netns_available, probe};
 
 #[cfg(target_os = "linux")]
 mod sys {
@@ -547,6 +562,24 @@ mod sys {
         }
     }
 
+    /// What the leader may read of its own `/proc/<pid>`.
+    const PROC_SELF_ENTRIES: [&std::ffi::CStr; 14] = [
+        c"/proc/self/status",
+        c"/proc/self/stat",
+        c"/proc/self/statm",
+        c"/proc/self/maps",
+        c"/proc/self/smaps",
+        c"/proc/self/cgroup",
+        c"/proc/self/limits",
+        c"/proc/self/fd",
+        c"/proc/self/fdinfo",
+        c"/proc/self/comm",
+        c"/proc/self/cmdline",
+        c"/proc/self/environ",
+        c"/proc/self/auxv",
+        c"/proc/self/mountinfo",
+    ];
+
     struct Rule {
         fd: OwnedFd,
         access: u64,
@@ -561,7 +594,7 @@ mod sys {
         attr_size: usize,
         rules: Vec<Rule>,
         /// Access of the rule on the task leader's own `/proc/<pid>`, opened in the child.
-        proc_self_access: u64,
+        try_namespaces: bool,
         filter: Vec<SockFilter>,
         /// `"<uid> <uid> 1\n"` and `"<gid> <gid> 1\n"`: the identity mapping written after
         /// entering the user namespace, so the task keeps its numeric ids.
@@ -620,7 +653,8 @@ mod sys {
                 scoped: scoped(abi),
                 attr_size: attr_size(abi),
                 rules,
-                proc_self_access: (fs::READ_FILE | fs::READ_DIR) & handled,
+                try_namespaces: level == IsolationLevel::FsNet
+                    && std::env::var_os("RUSTY_GRID_ISOLATION_NO_USERNS").is_none(),
                 filter: build_filter(arch, level),
                 uid_map: format!("{uid} {uid} 1\n").into_bytes(),
                 gid_map: format!("{gid} {gid} 1\n").into_bytes(),
@@ -648,7 +682,7 @@ mod sys {
                 {
                     return Err(io::Error::last_os_error());
                 }
-                if self.level == IsolationLevel::FsNet {
+                if self.try_namespaces {
                     self.enter_namespaces();
                 }
                 self.landlock()?;
@@ -691,14 +725,24 @@ mod sys {
             for rule in &self.rules {
                 add_rule(ruleset, rule.access, rule.fd.as_raw_fd())?;
             }
-            // The task leader's own `/proc/<pid>` (the path is resolved here, in the child, so it
-            // is the task and not the worker). Other processes' directories stay out of reach.
-            let fd = libc::open(
-                c"/proc/self".as_ptr(),
-                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            );
-            if fd >= 0 {
-                let added = add_rule(ruleset, self.proc_self_access, fd);
+            // The task leader's own `/proc/<pid>` entries (the paths are resolved here, in the
+            // child, so they name the task and not the worker). Not `net`, which shows the
+            // sockets of the network namespace, nor `task/*/net`. Other processes' directories
+            // stay out of reach.
+            for path in PROC_SELF_ENTRIES {
+                let fd = libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC);
+                if fd < 0 {
+                    continue;
+                }
+                let mut st: libc::stat = std::mem::zeroed();
+                let access = if libc::fstat(fd, &mut st) == 0
+                    && (st.st_mode & libc::S_IFMT) == libc::S_IFDIR
+                {
+                    (fs::READ_FILE | fs::READ_DIR) & self.handled_fs
+                } else {
+                    fs::READ_FILE & self.handled_fs
+                };
+                let added = add_rule(ruleset, access, fd);
                 libc::close(fd);
                 added?;
             }
@@ -794,6 +838,13 @@ exit 0"#;
             .and_then(|r| r);
         let _ = std::fs::remove_dir_all(&probe_dir);
         outcome?;
+        if level == IsolationLevel::FsNet {
+            if private_netns_available() {
+                tracing::info!("fs+net: tasks run in a private network namespace (and seccomp refuses every socket)");
+            } else {
+                tracing::warn!("fs+net: unprivileged user namespaces are unavailable (or RUSTY_GRID_ISOLATION_NO_USERNS is set), so tasks share the worker's network namespace; seccomp refuses every socket() call, which is the only network barrier (design 0033)");
+            }
+        }
         if abi < 3 {
             tracing::warn!(abi, "Landlock ABI below 3 (Linux < 6.2): a task can truncate files it owns inside the read-only toolchain directories");
         }
@@ -801,6 +852,25 @@ exit 0"#;
             tracing::warn!(abi, "Landlock ABI below 6 (Linux < 6.12): a task can send signals to the worker and to other processes of the same user");
         }
         Ok(())
+    }
+
+    /// Whether a task can enter a private user and network namespace on this host.
+    pub fn private_netns_available() -> bool {
+        use std::os::unix::process::CommandExt;
+        if std::env::var_os("RUSTY_GRID_ISOLATION_NO_USERNS").is_some() {
+            return false;
+        }
+        let mut cmd = std::process::Command::new("/bin/true");
+        // SAFETY: the hook only calls `unshare`.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        cmd.output().is_ok_and(|o| o.status.success())
     }
 
     fn run_probe(level: IsolationLevel, base: &Path, dir: &Path) -> Result<(), String> {
@@ -899,6 +969,10 @@ mod tests {
             call(arch.ioctl, 0, u64::from(TIOCSTI)),
             SECCOMP_RET_ERRNO | u32::from(EPERM)
         );
+        // The kernel keyring is refused at every level.
+        for nr in [arch.keyctl, arch.add_key, arch.request_key] {
+            assert_eq!(call(nr, 0, 0), SECCOMP_RET_ERRNO | u32::from(EPERM));
+        }
         // io_uring is refused at every level.
         for nr in [
             arch.io_uring_setup,
@@ -916,10 +990,9 @@ mod tests {
         );
         match level {
             IsolationLevel::FsNet => {
-                for domain in [2, 10, 17, 40, 3] {
+                for domain in [2, 10, 16, 17, 40, 3] {
                     assert_eq!(socket(domain), DENY, "domain {domain}");
                 }
-                assert_eq!(socket(16), ALLOW, "netlink");
             }
             _ => {
                 for domain in [2, 10, 16, 17] {
@@ -979,6 +1052,9 @@ mod tests {
         assert_eq!(native.io_uring_setup, libc::SYS_io_uring_setup as u32);
         assert_eq!(native.io_uring_enter, libc::SYS_io_uring_enter as u32);
         assert_eq!(native.io_uring_register, libc::SYS_io_uring_register as u32);
+        assert_eq!(native.keyctl, libc::SYS_keyctl as u32);
+        assert_eq!(native.add_key, libc::SYS_add_key as u32);
+        assert_eq!(native.request_key, libc::SYS_request_key as u32);
     }
 
     #[test]

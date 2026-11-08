@@ -1432,6 +1432,7 @@ except OSError as e:
     #[tokio::test]
     async fn test_fs_net_enters_a_private_namespace_when_the_host_allows_it() {
         require_landlock!();
+        let _serial = NETNS_ENV.lock().await;
         if !python3() {
             eprintln!("skipped: no python3");
             return;
@@ -1479,13 +1480,109 @@ except OSError as e:
         }
         let (uid, gid) = (value(&net, "UID"), value(&net, "GID"));
         if uid == worker_ids.0.to_string() && gid == worker_ids.1.to_string() {
-            assert!(has(&net, "NETLINK=OK"), "{:?}", lines(&net));
+            assert!(has(&net, "NETLINK=ERR13"), "{:?}", lines(&net));
         } else {
             // AppArmor (Ubuntu 24.04+) lets `unshare` succeed but strips the capabilities in the
             // new namespace, so the id map cannot be written: the ids show as the overflow id.
             assert!(!require, "ids are not mapped: uid {uid} gid {gid}");
             assert_eq!((uid.as_str(), gid.as_str()), ("65534", "65534"));
             eprintln!("note: private network namespace without an id map (restricted userns)");
+        }
+    }
+
+    /// Serialises the tests that depend on `RUSTY_GRID_ISOLATION_NO_USERNS` (process-wide).
+    static NETNS_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Without a private network namespace (here forced with `RUSTY_GRID_ISOLATION_NO_USERNS`,
+    /// like a host that forbids unprivileged user namespaces) a task shares the worker's network
+    /// namespace: netlink would list the host's sockets, routes and addresses, and
+    /// `/proc/self/net/tcp` its connections. `fs+net` must deny both.
+    #[tokio::test]
+    async fn test_fs_net_without_a_private_namespace_hides_the_hosts_sockets() {
+        require_landlock!();
+        let _serial = NETNS_ENV.lock().await;
+        if !python3() {
+            eprintln!("skipped: no python3");
+            return;
+        }
+        let py = r#"
+import os, socket
+print("NETNS=" + os.readlink("/proc/self/ns/net"))
+for name, proto in (("DIAG", 4), ("ROUTE", 0)):
+    try:
+        socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, proto).close()
+        print(name + "=OK")
+    except OSError as e:
+        print(name + "=ERR%d" % e.errno)
+try:
+    open("/proc/self/net/tcp").read()
+    print("PROCNET=OK")
+except OSError as e:
+    print("PROCNET=ERR%d" % e.errno)
+"#;
+        let script = r#"exec python3 -c "$T_PY""#;
+        let value = |result: &TaskResult, key: &str| {
+            lines(result)
+                .iter()
+                .find_map(|l| l.strip_prefix(&format!("{key}=")).map(str::to_string))
+                .unwrap_or_default()
+        };
+        let control = run_at(IsolationLevel::Off, script, &[("T_PY", py)]).await;
+        if !(has(&control, "DIAG=OK") && has(&control, "ROUTE=OK") && has(&control, "PROCNET=OK")) {
+            eprintln!(
+                "skipped: netlink or /proc/self/net unusable even unconfined: {:?}",
+                lines(&control)
+            );
+            return;
+        }
+        let worker_netns = std::fs::read_link("/proc/self/ns/net").unwrap();
+        // SAFETY: only this and the other NETNS_ENV tests read it, and they hold the lock.
+        unsafe { std::env::set_var("RUSTY_GRID_ISOLATION_NO_USERNS", "1") };
+        let net = run_at(IsolationLevel::FsNet, script, &[("T_PY", py)]).await;
+        unsafe { std::env::remove_var("RUSTY_GRID_ISOLATION_NO_USERNS") };
+        assert_eq!(
+            value(&net, "NETNS"),
+            worker_netns.to_string_lossy(),
+            "the namespace was not entered"
+        );
+        for name in ["DIAG=ERR13", "ROUTE=ERR13", "PROCNET=ERR13"] {
+            assert!(
+                has(&net, name),
+                "{name}: {:?} {}",
+                lines(&net),
+                net.stderr_str()
+            );
+        }
+    }
+
+    /// The worker user's kernel keyring is out of reach (`EPERM`).
+    #[tokio::test]
+    async fn test_the_kernel_keyring_is_refused() {
+        require_landlock!();
+        if !python3() {
+            eprintln!("skipped: no python3");
+            return;
+        }
+        let py = r#"
+import ctypes, platform
+nr = 250 if platform.machine() == "x86_64" else 219
+libc = ctypes.CDLL(None, use_errno=True)
+# KEYCTL_GET_KEYRING_ID(0) of KEY_SPEC_USER_KEYRING (-4)
+r = libc.syscall(nr, 0, -4, 0)
+print("KEYCTL_OK" if r >= 0 else "KEYCTL_ERR%d" % ctypes.get_errno())
+"#;
+        let script = r#"python3 -c "$T_PY""#;
+        let control = run_at(IsolationLevel::Off, script, &[("T_PY", py)]).await;
+        if !has(&control, "KEYCTL_OK") {
+            eprintln!(
+                "skipped: keyctl unusable even unconfined: {:?}",
+                lines(&control)
+            );
+            return;
+        }
+        for level in LEVELS {
+            let result = run_at(level, script, &[("T_PY", py)]).await;
+            assert!(has(&result, "KEYCTL_ERR1"), "{level}: {:?}", lines(&result));
         }
     }
 
