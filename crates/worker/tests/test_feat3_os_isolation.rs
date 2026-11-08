@@ -1467,20 +1467,24 @@ except OSError as e:
         assert_eq!(value(&fs, "NETNS"), worker_netns.to_string_lossy());
         let net = run_at(IsolationLevel::FsNet, script, &[("T_PY", py)]).await;
         let netns = value(&net, "NETNS");
+        let require = std::env::var_os("RUSTY_GRID_REQUIRE_USERNS").is_some();
         if netns == worker_netns.to_string_lossy() {
             assert!(
-                std::env::var_os("RUSTY_GRID_REQUIRE_USERNS").is_none(),
+                !require,
                 "the task did not enter a private network namespace"
             );
-            eprintln!("note: unprivileged user namespaces are unavailable here, seccomp only");
-        } else {
-            assert_eq!(
-                value(&net, "UID"),
-                worker_ids.0.to_string(),
-                "ids are mapped to themselves"
-            );
-            assert_eq!(value(&net, "GID"), worker_ids.1.to_string());
+            eprintln!("note: no private network namespace here, seccomp only");
+            return;
+        }
+        let (uid, gid) = (value(&net, "UID"), value(&net, "GID"));
+        if uid == worker_ids.0.to_string() && gid == worker_ids.1.to_string() {
             assert!(has(&net, "NETLINK=OK"), "{:?}", lines(&net));
+        } else {
+            // AppArmor (Ubuntu 24.04+) lets `unshare` succeed but strips the capabilities in the
+            // new namespace, so the id map cannot be written: the ids show as the overflow id.
+            assert!(!require, "ids are not mapped: uid {uid} gid {gid}");
+            assert_eq!((uid.as_str(), gid.as_str()), ("65534", "65534"));
+            eprintln!("note: private network namespace without an id map (restricted userns)");
         }
     }
 

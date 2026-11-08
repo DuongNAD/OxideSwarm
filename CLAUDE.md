@@ -36,6 +36,7 @@ cargo test -p rusty_grid_android_bridge --test mobile_coordination_test # Dynami
 cargo test -p rusty_grid_core --lib protocol::          # unit tests in one module
 
 cargo test -p rusty_grid_worker --features gpu-wgpu     # real wgpu path (Metal/Vulkan/DX12); a host without a GPU skips those tests, RUSTY_GRID_REQUIRE_GPU=1 makes that a failure
+cargo test -p rusty_grid_worker --test test_feat3_os_isolation   # --isolation fs|fs+net on macOS (sandbox-exec) and Linux (Landlock/seccomp); a Linux kernel without Landlock skips unless RUSTY_GRID_REQUIRE_LANDLOCK=1, RUSTY_GRID_REQUIRE_USERNS=1 demands the private network namespace
 cargo run --release -p rusty_grid_worker --features gpu-wgpu --example gemm_bench -- 1024   # GPU vs CPU timing + the adapter in use
 cargo check -p rusty_grid_master --no-default-features  # must keep compiling without dashboard/p2p
 
