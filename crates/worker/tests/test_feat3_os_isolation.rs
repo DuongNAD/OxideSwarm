@@ -134,6 +134,7 @@ impl Rig {
         )
     }
 
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     async fn run(&self, script: &str) -> TaskResult {
         self.runner
             .execute_task(&self.task(script, &[], 60), None, None)
