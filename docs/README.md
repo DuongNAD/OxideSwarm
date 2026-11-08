@@ -31,6 +31,7 @@ before adding or changing a document.
 | [design/0034-fail-unfulfillable-tasks.md](design/0034-fail-unfulfillable-tasks.md) | Fail unfulfillable tasks (`--fail-unfulfillable-tasks`, `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, `[master].fail_unfulfillable_tasks`) when no registered worker can satisfy capabilities or placement constraints (`SCHED-3`) | Contributors |
 | [design/0038-large-language-model-inference.md](design/0038-large-language-model-inference.md) | Planned: language model inference on the grid, by expert routing to local model servers and by llama.cpp RPC over an authenticated tunnel (`LLM-1` to `LLM-5`) | Contributors |
 | [design/0039-agent-workspaces.md](design/0039-agent-workspaces.md) | Accepted, not built: persistent workspaces for coding agents on workers, synced from a local directory, with affinity and one task per workspace, plus P2P for clients and `cargo` builds (`FEAT-4`, `FEAT-10`) | Contributors |
+| [design/0044-dead-code-and-connection-loop-unification.md](design/0044-dead-code-and-connection-loop-unification.md) | Planned: remove dead code, merge TCP and 2-lane QUIC worker connection loops into `WorkerSession`, sweep leftover sandboxes at start-up, and gate `gen3d`/`autorig` behind Cargo feature `3d` (`FEAT-11`, decision Q2) | Contributors |
 | [BACKLOG.md](BACKLOG.md) | Open work in execution order, each item with files and a check | Coding agents, contributors |
 | [ROADMAP.md](ROADMAP.md) | Direction after the backlog: the purpose, phases A to E, what waits, and the owner's decisions | Owner, contributors |
 
