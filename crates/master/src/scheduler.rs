@@ -15,7 +15,7 @@
 //!    4-core worker that keeps being topped up with 1-core jobs) holds back the worker closest to
 //!    having room for it, so the tasks behind it cannot refill that worker.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify};
@@ -269,6 +269,7 @@ struct Shape {
     cpu_cores: usize,
     ram_mb: u64,
     placement: Placement,
+    workspace: Option<String>,
 }
 
 impl Shape {
@@ -280,6 +281,7 @@ impl Shape {
             cpu_cores: view.requirements.cpu_cores,
             ram_mb: view.requirements.ram_mb,
             placement: placement.clone(),
+            workspace: view.workspace.clone(),
         }
     }
 }
@@ -391,6 +393,11 @@ struct Engine<'a> {
     /// Seats held back for a task ahead in the queue that is waiting for slots to free up on them
     /// (see `hold_back`): nothing placed later in the pass may land there.
     reserved: Vec<bool>,
+    /// Per workspace name, the worker that last finished a task in it (design 0039 D4).
+    workspace_affinity: HashMap<String, Uuid>,
+    /// Workspace names that currently have a `Scheduled` or `Running` task (or one placed earlier
+    /// in this pass); at most one active task per workspace name is allowed at a time.
+    active_workspaces: HashSet<String>,
 }
 
 /// Returns the latest [`MobileLiveStatus`] for `worker`, preferring the live telemetry snapshot
@@ -529,7 +536,19 @@ impl<'a> Engine<'a> {
             gpu_recent: gpu_recent || gpu_waiting,
             dead: HashMap::new(),
             free_slots,
+            workspace_affinity: HashMap::new(),
+            active_workspaces: HashSet::new(),
         }
+    }
+
+    fn with_workspaces(
+        mut self,
+        workspace_affinity: HashMap<String, Uuid>,
+        active_workspaces: HashSet<String>,
+    ) -> Self {
+        self.workspace_affinity = workspace_affinity;
+        self.active_workspaces = active_workspaces;
+        self
     }
 
     fn skip_reason(&self, view: &TaskView, placement: &Placement) -> ScheduleSkipReason {
@@ -622,6 +641,17 @@ impl<'a> Engine<'a> {
             self.dead.insert(shape, verdict.clone());
             return verdict;
         }
+        if view
+            .workspace
+            .as_ref()
+            .is_some_and(|ws| self.active_workspaces.contains(ws))
+        {
+            // Another task in this workspace is already Scheduled or Running (or was placed
+            // earlier in this pass). Leave this task queued without holding back any seat.
+            let verdict = Verdict::Skip(self.skip_reason(view, placement));
+            self.dead.insert(shape, verdict.clone());
+            return verdict;
+        }
 
         let weight = view.requirements.cpu_cores.max(1);
         let mut full = Vec::new();
@@ -639,6 +669,9 @@ impl<'a> Engine<'a> {
         }
 
         let chosen = self.rank(view, &mut candidates);
+        if let Some(ref ws) = view.workspace {
+            self.active_workspaces.insert(ws.clone());
+        }
         let seat = &mut self.seats[chosen];
         let free_before = seat.remaining_slots();
         seat.placed.tasks += 1;
@@ -862,6 +895,19 @@ impl<'a> Engine<'a> {
 
     /// Picks the candidate to use according to the policy.
     fn rank(&mut self, view: &TaskView, candidates: &mut [usize]) -> usize {
+        if let Some(aff_worker) = view
+            .workspace
+            .as_ref()
+            .and_then(|ws| self.workspace_affinity.get(ws))
+        {
+            if let Some(pos) = candidates
+                .iter()
+                .position(|&c| self.seats[c].worker.worker_id == *aff_worker)
+            {
+                candidates.swap(0, pos);
+                return candidates[0];
+            }
+        }
         let config = self.config;
         let seats = &self.seats;
         let prefer_cpu_only = config.preserve_gpu_for_gpu_tasks && !view.requires_gpu;
@@ -1033,6 +1079,26 @@ impl WorkloadScheduler {
         workers: &[WorkerInfo],
         avoid: &HashMap<TaskId, Vec<Uuid>>,
     ) -> ScheduleReport {
+        Self::matchmake_with_workspaces(
+            config,
+            tasks,
+            workers,
+            avoid,
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+    }
+
+    /// Pure matchmaking with per-task `avoid` lists, per-workspace `workspace_affinity` map, and
+    /// `active_workspaces` set (design 0039 D4).
+    pub fn matchmake_with_workspaces(
+        config: &SchedulerConfig,
+        tasks: &[Task],
+        workers: &[WorkerInfo],
+        avoid: &HashMap<TaskId, Vec<Uuid>>,
+        workspace_affinity: &HashMap<String, Uuid>,
+        active_workspaces: &HashSet<String>,
+    ) -> ScheduleReport {
         let mut report = ScheduleReport::default();
         if tasks.is_empty() || workers.is_empty() {
             for task in tasks {
@@ -1055,7 +1121,8 @@ impl WorkloadScheduler {
             .collect();
         // GPU-capable work in the batch itself is "waiting".
         let gpu_waiting = views.iter().any(|v| v.requires_gpu);
-        let mut engine = Engine::new(config, workers, workers, None, gpu_waiting, false);
+        let mut engine = Engine::new(config, workers, workers, None, gpu_waiting, false)
+            .with_workspaces(workspace_affinity.clone(), active_workspaces.clone());
         for (task, view) in tasks.iter().zip(&views) {
             match engine.place(view) {
                 Verdict::Placed(idx) => {
@@ -1182,6 +1249,7 @@ impl WorkloadScheduler {
         workers.sort_by_key(|w| w.worker_id);
 
         let loads = self.queue.assigned_loads().await;
+        let (workspace_affinity, active_workspaces) = self.queue.workspace_scheduling_state().await;
         let (gpu_waiting, gpu_recent) = self.gpu_demand(&workers).await;
         let mut engine = Engine::new(
             &self.config,
@@ -1190,7 +1258,8 @@ impl WorkloadScheduler {
             Some(&loads),
             gpu_waiting,
             gpu_recent,
-        );
+        )
+        .with_workspaces(workspace_affinity, active_workspaces);
         engine.rr_cursor = self.rr_cursor.load(std::sync::atomic::Ordering::Relaxed);
 
         let ready_epoch = self.queue.ready_epoch().await;
@@ -3984,5 +4053,242 @@ mod tests {
             "t_gpu must be reported once in report.unfulfillable when the placement walk already moved past sweep_cursor"
         );
         assert_eq!(r2.unfulfillable[0].0, t_gpu);
+    }
+
+    #[test]
+    fn test_workspace_affinity_first_across_policies_and_fallback_when_ineligible() {
+        use rusty_grid_core::task::WorkspaceRef;
+
+        let mut w_idle = make_worker("idle-8c", 8, 16384, false, false);
+        w_idle.features.insert(ProtocolCapabilities::WORKSPACES);
+
+        let mut w_aff = make_worker("aff-4c-busy", 4, 8192, false, false);
+        w_aff.active_tasks = 2;
+        w_aff.cpu_usage_pct = 70.0;
+        w_aff.features.insert(ProtocolCapabilities::WORKSPACES);
+
+        let workers = vec![w_idle.clone(), w_aff.clone()];
+        let task = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("oxide-repo"));
+
+        let mut affinity = HashMap::new();
+        affinity.insert("oxide-repo".to_string(), w_aff.worker_id);
+
+        for policy in [
+            SchedulingPolicy::WeightedLeastLoaded,
+            SchedulingPolicy::LeastLoaded,
+            SchedulingPolicy::RoundRobin,
+        ] {
+            let cfg = SchedulerConfig {
+                policy,
+                ..SchedulerConfig::default()
+            };
+            let report = WorkloadScheduler::matchmake_with_workspaces(
+                &cfg,
+                std::slice::from_ref(&task),
+                &workers,
+                &HashMap::new(),
+                &affinity,
+                &HashSet::new(),
+            );
+            assert_eq!(report.assignments.len(), 1);
+            assert_eq!(
+                report.assignments[0].worker_id, w_aff.worker_id,
+                "affinity worker must be ranked first under policy {policy:?}"
+            );
+        }
+
+        // If the affinity worker is disconnected or saturated, the normal policy falls back to w_idle.
+        let mut w_aff_disc = w_aff.clone();
+        w_aff_disc.status = WorkerStatus::Disconnected;
+        let report_disc = WorkloadScheduler::matchmake_with_workspaces(
+            &SchedulerConfig::default(),
+            std::slice::from_ref(&task),
+            &[w_idle.clone(), w_aff_disc],
+            &HashMap::new(),
+            &affinity,
+            &HashSet::new(),
+        );
+        assert_eq!(report_disc.assignments.len(), 1);
+        assert_eq!(report_disc.assignments[0].worker_id, w_idle.worker_id);
+    }
+
+    #[test]
+    fn test_workspace_require_worker_constraint_wins_over_affinity() {
+        use rusty_grid_core::task::WorkspaceRef;
+
+        let mut w1 = make_worker("worker-alpha", 4, 8192, false, false);
+        w1.features.insert(ProtocolCapabilities::WORKSPACES);
+        let mut w2 = make_worker("worker-beta", 4, 8192, false, false);
+        w2.features.insert(ProtocolCapabilities::WORKSPACES);
+
+        let mut affinity = HashMap::new();
+        affinity.insert("oxide-repo".to_string(), w1.worker_id);
+
+        let task = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("oxide-repo"))
+        .with_tags(vec![format!("require:worker={}", w2.worker_id)]);
+
+        let report = WorkloadScheduler::matchmake_with_workspaces(
+            &SchedulerConfig::default(),
+            std::slice::from_ref(&task),
+            &[w1, w2.clone()],
+            &HashMap::new(),
+            &affinity,
+            &HashSet::new(),
+        );
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(
+            report.assignments[0].worker_id, w2.worker_id,
+            "explicit require:worker=<id> must win over workspace affinity"
+        );
+    }
+
+    #[test]
+    fn test_no_second_task_of_one_workspace_in_a_pass_and_no_seat_held_back() {
+        use rusty_grid_core::task::WorkspaceRef;
+
+        let mut w1 = make_worker("w1", 4, 8192, false, false);
+        w1.features.insert(ProtocolCapabilities::WORKSPACES);
+        let mut w2 = make_worker("w2", 4, 8192, false, false);
+        w2.features.insert(ProtocolCapabilities::WORKSPACES);
+
+        let ws_a_1 = Task::new(
+            TaskSpec::new_command("cargo", vec!["check".into()]),
+            TaskRequirements::generic(4, 30),
+        )
+        .with_workspace(WorkspaceRef::new("ws-a"));
+        let ws_a_2 = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(4, 30),
+        )
+        .with_workspace(WorkspaceRef::new("ws-a"));
+        let ws_b_1 = Task::new(
+            TaskSpec::new_command("cargo", vec!["clippy".into()]),
+            TaskRequirements::generic(4, 30),
+        )
+        .with_workspace(WorkspaceRef::new("ws-b"));
+
+        let tasks = vec![ws_a_1.clone(), ws_a_2.clone(), ws_b_1.clone()];
+        let report = WorkloadScheduler::matchmake(
+            &SchedulerConfig::default(),
+            &tasks,
+            &[w1.clone(), w2.clone()],
+        );
+
+        // ws_a_1 and ws_b_1 are placed; ws_a_2 is skipped without holding back w2's seat.
+        let placed_ids: Vec<TaskId> = report.assignments.iter().map(|a| a.task_id).collect();
+        assert_eq!(placed_ids, vec![ws_a_1.id, ws_b_1.id]);
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].0, ws_a_2.id);
+    }
+
+    #[tokio::test]
+    async fn test_schedule_batch_enforces_workspace_one_at_a_time_and_records_affinity_on_finish() {
+        use rusty_grid_core::task::WorkspaceRef;
+
+        let (registry, queue, waiters, notify) = scheduler_fixture().await;
+        let mut feat = ProtocolCapabilities::all_supported();
+        feat.insert(ProtocolCapabilities::WORKSPACES);
+
+        let w1_id = Uuid::new_v4();
+        let (w1_tx, _w1_rx) = tokio::sync::mpsc::channel(1024);
+        let w1_sess = registry
+            .register_session(
+                w1_id,
+                WorkerCapabilities::new("w1", 4, 8192, false, false, None),
+                feat,
+                "127.0.0.1:9310".parse().unwrap(),
+                w1_tx,
+                None,
+            )
+            .await
+            .unwrap()
+            .session_id;
+
+        let w2_id = Uuid::new_v4();
+        let (w2_tx, _w2_rx) = tokio::sync::mpsc::channel(1024);
+        let w2_sess = registry
+            .register_session(
+                w2_id,
+                WorkerCapabilities::new("w2", 8, 16384, false, false, None),
+                feat,
+                "127.0.0.1:9311".parse().unwrap(),
+                w2_tx,
+                None,
+            )
+            .await
+            .unwrap()
+            .session_id;
+
+        let sched = WorkloadScheduler::new(
+            SchedulerConfig::default(),
+            registry.clone(),
+            queue.clone(),
+            notify,
+        )
+        .with_waiters(waiters);
+
+        // Submit two tasks in workspace "repo-x" (pinning the first to w1 so w1 becomes the affinity worker).
+        let t1 = Task::new(
+            TaskSpec::new_command("cargo", vec!["build".into()]),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("repo-x"))
+        .with_tags(vec![format!("require:worker={w1_id}")]);
+        let t2 = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(WorkspaceRef::new("repo-x"));
+
+        let t1_id = queue.submit(t1).await.unwrap();
+        let t2_id = queue.submit(t2).await.unwrap();
+
+        // Pass 1: only t1 is scheduled; t2 stays Queued while t1 is Scheduled/Running.
+        let r1 = sched.schedule_once().await.unwrap();
+        assert_eq!(r1.assignments.len(), 1);
+        assert_eq!(r1.assignments[0].task_id, t1_id);
+        assert_eq!(r1.assignments[0].worker_id, w1_id);
+        assert_eq!(
+            queue.get_state(&t2_id).await,
+            Some(crate::queue::TaskState::Queued)
+        );
+
+        // Pass 2 while t1 is still Scheduled: t2 is still skipped.
+        let r2 = sched.schedule_once().await.unwrap();
+        assert!(r2.assignments.is_empty());
+        assert_eq!(
+            queue.get_state(&t2_id).await,
+            Some(crate::queue::TaskState::Queued)
+        );
+
+        // Complete t1 on w1; w1 now holds affinity for "repo-x".
+        queue
+            .record_result_from(
+                w1_id,
+                Some(w1_sess),
+                rusty_grid_core::task::TaskResult::success(w1_id, t1_id, "", 1, false),
+            )
+            .await
+            .unwrap();
+        registry.decrement_active_tasks(&w1_id).await.unwrap();
+        assert_eq!(queue.workspace_affinity("repo-x").await, Some(w1_id));
+
+        // Pass 3: even though w2 has 8 cores vs w1's 4 cores, t2 lands on w1 due to workspace affinity!
+        let r3 = sched.schedule_once().await.unwrap();
+        assert_eq!(r3.assignments.len(), 1);
+        assert_eq!(r3.assignments[0].task_id, t2_id);
+        assert_eq!(r3.assignments[0].worker_id, w1_id);
+
+        // Fail t2 on w1 (non-rejection execution failure, max_retries = 0); affinity stays on w1.
+        let _ = w2_sess;
+        let _ = w2_id;
     }
 }

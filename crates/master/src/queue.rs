@@ -470,6 +470,8 @@ pub struct TaskView {
     /// validates them, so an error only reaches here for a task that bypassed it; such a task is
     /// placed nowhere.
     pub placement: Result<Placement, String>,
+    /// Named persistent workspace (`Task::workspace`), if any (design 0039 D4).
+    pub workspace: Option<String>,
 }
 
 impl TaskView {
@@ -486,6 +488,7 @@ impl TaskView {
             required_features: required_features(task),
             avoid: Vec::new(),
             placement: task.placement(),
+            workspace: task.workspace.as_ref().map(|w| w.name.clone()),
         }
     }
 }
@@ -502,11 +505,26 @@ fn required_features(task: &Task) -> ProtocolCapabilities {
     if matches!(task.spec, TaskSpec::Generative3D(_) | TaskSpec::AutoRig(_)) {
         features.insert(ProtocolCapabilities::THREE_D);
     }
-    if task.workspace.is_some() {
+    if let Some(workspace) = &task.workspace {
         features.insert(ProtocolCapabilities::WORKSPACES);
+        if workspace.source.is_some() {
+            features.insert(ProtocolCapabilities::BLOB_TRANSFER);
+        }
     }
     features
 }
+
+/// Last worker that finished a task in a named workspace, and when (design 0039 D4, D6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceAffinity {
+    pub name: String,
+    pub worker_id: Uuid,
+    pub last_used_utc: u64,
+}
+
+/// Upper bound on in-memory workspace affinity entries so ephemeral workspace names cannot grow
+/// the map without bound.
+const MAX_WORKSPACE_AFFINITIES: usize = 4_096;
 
 /// What the master's own books say a worker is carrying: the tasks assigned to it that have not
 /// reported a result (`Scheduled` or `Running`), whatever its last heartbeat claimed.
@@ -656,6 +674,8 @@ struct TaskQueueInner {
     /// Atomic mirror of `held_tasks.len()` so `release_expired_adoption_holds` is O(1) lock-free
     /// when no hold is active.
     adoption_holds: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-workspace affinity recorded when a worker finishes a task in that workspace (design 0039 D4).
+    workspace_affinity: HashMap<String, WorkspaceAffinity>,
 }
 
 /// Bytes one blob reference (id, size, flags) is charged in addition to its path.
@@ -736,11 +756,20 @@ pub(crate) fn task_active_bytes(task: &Task) -> usize {
         .map(|i| i.path.len() + BLOB_REF_BYTES)
         .chain(task.output_globs.iter().map(String::len))
         .sum();
+    let workspace_bytes = task.workspace.as_ref().map_or(0, |w| {
+        w.name.len()
+            + if w.source.is_some() {
+                BLOB_REF_BYTES
+            } else {
+                0
+            }
+    });
     RETAINED_ENTRY_OVERHEAD_BYTES
         + spec
         + staged_files_bytes
         + expected_outputs_bytes
         + blob_refs_bytes
+        + workspace_bytes
         + checkpoint
         + task.tags.iter().map(String::len).sum::<usize>()
 }
@@ -960,6 +989,40 @@ impl TaskQueueInner {
             }
         }
     }
+
+    fn record_workspace_affinity(&mut self, name: &str, worker_id: Uuid, last_used_utc: u64) {
+        if !self.workspace_affinity.contains_key(name)
+            && self.workspace_affinity.len() >= MAX_WORKSPACE_AFFINITIES
+        {
+            if let Some(oldest_key) = self
+                .workspace_affinity
+                .iter()
+                .min_by_key(|(k, v)| (v.last_used_utc, *k))
+                .map(|(k, _)| k.clone())
+            {
+                self.workspace_affinity.remove(&oldest_key);
+            }
+        }
+        self.workspace_affinity.insert(
+            name.to_string(),
+            WorkspaceAffinity {
+                name: name.to_string(),
+                worker_id,
+                last_used_utc,
+            },
+        );
+    }
+
+    fn is_workspace_active(&self, name: &str) -> bool {
+        self.tasks.values().any(|entry| {
+            entry.state.is_active()
+                && entry
+                    .task
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|ws| ws.name == name)
+        })
+    }
 }
 
 const UNRESUMED_ZERO_RETRY_ERROR: &str =
@@ -1045,6 +1108,7 @@ impl TaskQueue {
                 store_closed: false,
                 held_tasks: HashSet::new(),
                 adoption_holds: Arc::clone(&adoption_holds),
+                workspace_affinity: HashMap::new(),
             })),
             adoption_holds,
             #[cfg(test)]
@@ -1316,6 +1380,7 @@ impl TaskQueue {
             inner.active_sizes.clear();
             inner.active_bytes = 0;
             inner.held_tasks.clear();
+            inner.workspace_affinity.clear();
             inner.sync_adoption_holds();
             inner.store_closed = false;
             inner.next_sequence = max_seq.max(1);
@@ -1323,6 +1388,14 @@ impl TaskQueue {
 
             for p in sorted_entries {
                 let task_id = p.task.id;
+                if matches!(p.state, TaskState::Completed | TaskState::Failed) {
+                    if let (Some(ws), Some(wid)) = (&p.task.workspace, p.assigned_worker_id) {
+                        let rejected = p.result.as_ref().is_some_and(is_worker_rejection);
+                        if !rejected {
+                            inner.record_workspace_affinity(&ws.name, wid, p.submitted_at_utc);
+                        }
+                    }
+                }
                 let zero_retries = p
                     .task
                     .requirements
@@ -1470,8 +1543,26 @@ impl TaskQueue {
                             terminal.push((entry.task.id, ids));
                         }
                     }
-                } else if !entry.task.inputs.is_empty() {
-                    active.push((entry.task.id, entry.task.inputs.clone()));
+                } else {
+                    let mut inputs = entry.task.inputs.clone();
+                    if let Some(ref ws) = entry.task.workspace {
+                        if let Some(rusty_grid_core::task::WorkspaceSource::Tree {
+                            manifest,
+                            manifest_size,
+                        }) = ws.source
+                        {
+                            inputs.push(rusty_grid_core::blob::TaskInput {
+                                path: format!("workspace:{}", ws.name),
+                                source: rusty_grid_core::blob::InputSource::Tree {
+                                    manifest,
+                                    manifest_size,
+                                },
+                            });
+                        }
+                    }
+                    if !inputs.is_empty() {
+                        active.push((entry.task.id, inputs));
+                    }
                 }
             }
             (active, terminal)
@@ -2260,6 +2351,44 @@ impl TaskQueue {
             .collect()
     }
 
+    /// Returns a snapshot of `(workspace_affinity_map, active_workspace_names)` for a scheduling pass:
+    /// - `workspace_affinity_map` maps each known workspace name to the worker UUID that last
+    ///   finished (`Completed` or `Failed`) a task in that workspace.
+    /// - `active_workspace_names` contains every workspace name that currently has a `Scheduled`
+    ///   or `Running` task in the queue.
+    pub async fn workspace_scheduling_state(&self) -> (HashMap<String, Uuid>, HashSet<String>) {
+        let inner = self.inner.read().await;
+        let affinities = inner
+            .workspace_affinity
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.worker_id))
+            .collect();
+        let active = inner
+            .tasks
+            .values()
+            .filter(|e| matches!(e.state, TaskState::Scheduled | TaskState::Running))
+            .filter_map(|e| e.task.workspace.as_ref().map(|ws| ws.name.clone()))
+            .collect();
+        (affinities, active)
+    }
+
+    /// Returns the worker UUID that last finished a task in `workspace_name`, if known.
+    pub async fn workspace_affinity(&self, workspace_name: &str) -> Option<Uuid> {
+        let inner = self.inner.read().await;
+        inner
+            .workspace_affinity
+            .get(workspace_name)
+            .map(|e| e.worker_id)
+    }
+
+    /// Returns all known workspace affinity entries sorted by workspace name.
+    pub async fn list_workspaces(&self) -> Vec<WorkspaceAffinity> {
+        let inner = self.inner.read().await;
+        let mut list: Vec<WorkspaceAffinity> = inner.workspace_affinity.values().cloned().collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        list
+    }
+
     /// Pops the highest-priority queued task matching `predicate`, marks it `Scheduled` to `worker_id`,
     /// and records worker assignment.
     pub async fn pop_and_schedule<F>(&self, worker_id: Uuid, predicate: F) -> Option<Task>
@@ -2276,7 +2405,14 @@ impl TaskQueue {
                 .iter()
                 .find(|k| {
                     if let Some(entry) = inner.tasks.get(&k.task_id) {
-                        is_schedulable_queued(entry, now) && predicate(&entry.task.requirements)
+                        let ws_busy = entry
+                            .task
+                            .workspace
+                            .as_ref()
+                            .is_some_and(|ws| inner.is_workspace_active(&ws.name));
+                        is_schedulable_queued(entry, now)
+                            && !ws_busy
+                            && predicate(&entry.task.requirements)
                     } else {
                         false
                     }
@@ -2342,6 +2478,14 @@ impl TaskQueue {
             let (priority_info, zero_retries) = {
                 let entry = inner.tasks.get(task_id)?;
                 if !is_schedulable_queued(entry, now) {
+                    return None;
+                }
+                if entry
+                    .task
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|ws| inner.is_workspace_active(&ws.name))
+                {
                     return None;
                 }
                 (
@@ -2441,11 +2585,21 @@ impl TaskQueue {
 
             for &(task_id, worker_id, session_id) in assignments {
                 let (priority, sequence, zero_retries) = match inner.tasks.get(&task_id) {
-                    Some(entry) if is_schedulable_queued(entry, now) => (
-                        entry.priority,
-                        entry.sequence,
-                        policy.zero_retries_for(entry),
-                    ),
+                    Some(entry) if is_schedulable_queued(entry, now) => {
+                        if entry
+                            .task
+                            .workspace
+                            .as_ref()
+                            .is_some_and(|ws| inner.is_workspace_active(&ws.name))
+                        {
+                            continue;
+                        }
+                        (
+                            entry.priority,
+                            entry.sequence,
+                            policy.zero_retries_for(entry),
+                        )
+                    }
                     Some(entry) if entry.state == TaskState::Queued => continue,
                     Some(entry) => {
                         // A ready key can only be stale here (the entry left Queued without
@@ -3180,6 +3334,15 @@ impl TaskQueue {
         }
 
         if res_state.is_terminal() {
+            if !rejected && matches!(res_state, TaskState::Completed | TaskState::Failed) {
+                if let Some(ws_name) = inner
+                    .tasks
+                    .get(&task_id)
+                    .and_then(|e| e.task.workspace.as_ref().map(|ws| ws.name.clone()))
+                {
+                    inner.record_workspace_affinity(&ws_name, worker_id, now_epoch);
+                }
+            }
             inner.track_terminal_task(task_id);
         } else {
             inner.update_active_task(task_id);
@@ -7085,5 +7248,18 @@ mod tests {
         let report = WorkloadScheduler::matchmake(&cfg, &tasks, std::slice::from_ref(&w));
         assert!(report.skipped.is_empty());
         assert!(report.assignments.iter().any(|a| a.task_id == ws_task.id));
+
+        // A workspace task with a tree source requires both WORKSPACES and BLOB_TRANSFER.
+        let ws_tree_task = Task::new(
+            TaskSpec::new_command("cargo", vec!["test".into()]),
+            TaskRequirements::generic(1, 30),
+        )
+        .with_workspace(
+            WorkspaceRef::new("agent-1")
+                .with_tree(rusty_grid_core::blob::BlobId::of(b"manifest"), 16),
+        );
+        let tree_features = TaskView::of(&ws_tree_task).required_features;
+        assert!(tree_features.contains(ProtocolCapabilities::WORKSPACES));
+        assert!(tree_features.contains(ProtocolCapabilities::BLOB_TRANSFER));
     }
 }
