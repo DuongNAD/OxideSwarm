@@ -192,6 +192,34 @@ pub enum SecretAction {
     Generate(SecretGenerateArgs),
     /// Print the cluster secret (or the derived dashboard token) this machine would use
     Show(SecretShowArgs),
+    /// Print a join token (master address, optional P2P ticket and the cluster secret) for
+    /// `oxideswarm join` on another machine. The token is as sensitive as the secret.
+    JoinToken(JoinTokenArgs),
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct JoinTokenArgs {
+    #[arg(
+        long,
+        value_name = "HOST:PORT",
+        help = "Address other machines use to reach this master's grid port (default: the [master] listen address of the config file, unless it is a wildcard such as 0.0.0.0)"
+    )]
+    pub master: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "TICKET",
+        conflicts_with = "p2p_ticket_file",
+        help = "Also carry this P2P connection ticket"
+    )]
+    pub p2p_ticket: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Also carry the P2P ticket stored in this file (default: the [master] p2p_ticket_file of the config file, if it exists)"
+    )]
+    pub p2p_ticket_file: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -294,6 +322,26 @@ pub fn run_secret(args: SecretCliArgs, opts: &SecretOpts, config: Option<&Config
                 }
             }
         }
+        SecretAction::JoinToken(args) => match resolve_for_show(opts, config)
+            .and_then(|secret| {
+                secret.ok_or_else(|| {
+                    GridError::Config(
+                        "No cluster secret found to put in a token. Create one with `oxideswarm secret generate`.".into(),
+                    )
+                })
+            })
+            .and_then(|secret| build_join_token(&args, secret, config))
+        {
+            Ok(token) => {
+                eprintln!("This token contains the cluster secret: anyone who has it can join and drive your cluster. Send it over a channel you trust and do not paste it into chat, e-mail, tickets or logs. On the new machine run: oxideswarm join  (token on standard input)");
+                println!("{}", token.encode());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
         SecretAction::Show(show) => match resolve_for_show(opts, config) {
             Ok(Some(secret)) => {
                 println!("{}", render_secret(&secret, show.dashboard_token));
@@ -311,6 +359,56 @@ pub fn run_secret(args: SecretCliArgs, opts: &SecretOpts, config: Option<&Config
             }
         },
     }
+}
+
+/// Builds the join token for `secret`. The address comes from `--master`, else from the config
+/// file's `[master] listen` when other machines could dial it (not a wildcard, not port 0); the
+/// ticket from `--p2p-ticket`, `--p2p-ticket-file` or the config's `[master] p2p_ticket_file`.
+pub fn build_join_token(
+    args: &JoinTokenArgs,
+    secret: ClusterSecret,
+    config: Option<&ConfigFile>,
+) -> GridResult<crate::join::JoinToken> {
+    let master_cfg = config.and_then(|c| c.master.as_ref());
+    let ticket = match (&args.p2p_ticket, &args.p2p_ticket_file) {
+        (Some(t), _) => Some(t.trim().to_string()),
+        (None, Some(file)) => Some(
+            std::fs::read_to_string(file)
+                .map_err(|e| {
+                    GridError::Config(format!(
+                        "cannot read P2P ticket file '{}': {e}",
+                        file.display()
+                    ))
+                })?
+                .trim()
+                .to_string(),
+        ),
+        (None, None) => master_cfg
+            .and_then(|m| m.p2p_ticket_file.as_deref())
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .map(|t| t.trim().to_string()),
+    }
+    .filter(|t| !t.is_empty());
+
+    let master = match &args.master {
+        Some(m) => Some(crate::connect::normalize_master_addr(m)),
+        None => master_cfg
+            .and_then(|m| m.listen.as_deref())
+            .and_then(|l| l.parse::<std::net::SocketAddr>().ok())
+            .filter(|a| !a.ip().is_unspecified() && a.port() != 0)
+            .map(|a| a.to_string()),
+    }
+    .filter(|m| !m.is_empty());
+    if master.is_none() && ticket.is_none() {
+        return Err(GridError::Config(
+            "no address to put in the token: pass --master HOST:PORT (the address other machines use to reach this master, for example 192.168.1.5:8088), or --p2p-ticket-file".into(),
+        ));
+    }
+    Ok(crate::join::JoinToken {
+        master,
+        ticket,
+        secret,
+    })
 }
 
 // ---------------------------------------------------------------------------------------------

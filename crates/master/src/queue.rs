@@ -6862,19 +6862,41 @@ mod tests {
         let id = t.id;
         let q2 = q.clone();
         let h = tokio::spawn(async move { q2.submit(t).await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Abort only once `submit` has really entered its durable-ack wait (the task is in the
+        // map; it only reaches `ready_queue` after the commit window). A fixed
+        // sleep was a race: on a loaded CI host the spawned submit may not have run at all
+        // after 20 ms, and aborting it first leaves no task (state `None`).
+        let entered = poll_test_condition(|| async { q.get_state(&id).await.is_some() }).await;
+        assert!(entered, "submit never reached its durable-ack wait");
         h.abort();
         let _ = h.await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
+        // The detached ack task must still publish the task. Wait for that with a generous
+        // bound instead of guessing how long the commit window plus scheduling takes.
+        let published =
+            poll_test_condition(|| async { q.ready_task_ids(10).await.contains(&id) }).await;
         let st = q.get_state(&id).await;
-        let ready = q.ready_task_ids(10).await.contains(&id);
         assert!(
-            st.is_none() || ready,
+            published,
             "ZOMBIE: task is {st:?} but not in ready_queue (never scheduled)"
         );
         assert_eq!(st, Some(TaskState::Queued));
-        assert!(ready);
+    }
+
+    /// Polls `cond` every 5 ms until it holds or 20 s pass (a bound, not an expected delay).
+    async fn poll_test_condition<F, Fut>(mut cond: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if cond().await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
     }
 
     #[tokio::test]

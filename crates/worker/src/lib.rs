@@ -22,6 +22,7 @@ pub mod sandbox;
 pub mod staging;
 #[cfg(feature = "gpu-wgpu")]
 pub mod wgpu_engine;
+pub mod workspace;
 
 pub use backoff::{BackoffConfig, ExponentialBackoff};
 pub use blob_cache::{BlobCache, CachePin, DEFAULT_BLOB_CACHE_MAX_BYTES};

@@ -159,6 +159,7 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | TEST-5 | Register or delete the orphan Rust test | P1 | S | INT-4 |  | Implemented | 19 |
 | TEST-6 | Extend CI to the full suite | P1 | M | TEST-1, TEST-2, TEST-3, TEST-4 |  | Implemented | 67, 124 |
 | TEST-7 | Run or delete the orphan Python tests | P2 | M | INT-4 |  | Implemented | 55, 66 |
+| TEST-19 | Fix flaky required tests | P1 | S | TEST-3 |  | Implemented | 161 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented | 68 |
@@ -206,9 +207,9 @@ that is not merged yet, and "(design)" marks a design record that builds nothing
 | REAPI-1 | Serve the blob store as a Remote Execution API cache | P3 | L | CACHE-1 | Yes | Planned |  |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Implemented | 155 |
 | REL-5 | Contributor and security files | P3 | S | REL-1 |  | Implemented | 75 |
-| JOIN-1 | Join a machine with one token | P2 | M |  |  | Planned |  |
-| LINK-1 | Show whether each link is direct or relayed | P2 | M |  |  | Planned |  |
-| BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Planned |  |
+| JOIN-1 | Join a machine with one token | P2 | M |  |  | Partial | 163 (open) |
+| LINK-1 | Show whether each link is direct or relayed | P2 | M |  |  | Partial | 159 (open) |
+| BENCH-1 | Publish benchmarks with the scripts that measured them | P2 | M |  |  | Partial | 162 (open) |
 
 ## Phase 0: integrate open work
 
@@ -704,6 +705,25 @@ The full suite must pass on a clean machine before CI can require it.
 - **Do:** Run each file. Add those with value to a runner, and delete the rest. Rename the mesh
   runner to say that it is a simulation.
 - **Done when:** Every file in `tests/` is named by a runner or a `[[test]]` entry.
+
+### TEST-19: Fix flaky required tests
+
+- **Evidence:** CI failures of 2026-11-09 and full-suite runs on macOS; each test passed when rerun.
+- **Problem:**
+  - `queue::tests::rvb_drop_submit_future_mid_ack_loses_task_from_ready_queue` slept 20 ms and
+    then aborted the spawned `submit`, assuming it had reached its durable-ack wait. On a loaded
+    host the task had not run yet, so the abort left no task at all. It then slept a fixed 300 ms
+    for the detached ack task to publish the task.
+  - `store::tests::classifying_a_damaged_tail_is_linear` asserted a wall-clock bound (1 s) on
+    opening an 8 MiB damaged journal, which fails when the machine is busy.
+  - `e2e_cluster::test_tier2_bva_large_output_stream_truncation` waited 5 s for MSYS2 `sh` on a
+    Windows runner; the work is tiny, the process start is slow under load.
+- **Do:** The first test waits for the task to appear before it aborts, and polls (20 s bound) for
+  it to reach the ready queue. The second counts probes and hashed bytes (`ScanWork`) on inputs of
+  N and 4N bytes and asserts the algorithm's own bounds. The third waits up to 60 s, with a 40 s
+  task timeout, and keeps every assertion. No production code changed.
+- **Done when:** Each test passes 50 times in a row under a CPU load, and the Windows jobs pass
+  on three runs.
 
 ## Phase 3: make the documents true
 
@@ -1543,3 +1563,5 @@ Add one dated line per finished item, newest last.
 - 2026-11-08: Added CACHE-1, REAPI-1, JOIN-1, LINK-1 and BENCH-1 as Planned, from the research
   recorded in [ROADMAP.md](ROADMAP.md) (decision Q7). Their evidence was read at `master` `fec164e`.
 - 2026-11-08: REL-4 implemented in pull request 155: `.github/workflows/release.yml` builds archives for Linux, macOS (arm64, x86_64) and Windows, with and without `gpu-wgpu`, and `SHA256SUMS`; a `v*` tag creates the release, a pull request only uploads artifacts. No tag exists yet: the owner cuts the first one. Crates have `publish = false`, `authors` match the licence and `README.md` has an Install section.
+- 2026-11-09: LINK-1 is Partial: steps 1 and 2 are in pull request 159. `doctor` has a `LINK` column, check C7 (warning for a relayed worker) and check C8 (an 8 MiB blob to each worker, MB/s, `--skip-throughput`). Steps 3 (relay URL option) and 4 (guide) are Planned; they touch `server.rs` and the worker client.
+- 2026-11-09: BENCH-1 is Partial: (a) and (b) are in pull request 162 with `benchmarks/grid/bench_grid.py` and a dated record from one Mac (loaded, noted in the record). (c), the two-machine `cargo test` offload, waits for WS-7.

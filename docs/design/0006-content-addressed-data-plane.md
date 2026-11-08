@@ -124,8 +124,9 @@ Behaviour before this change (design record 0003, inline staging):
 - A result whose outputs are not all in the store gets an error naming the first missing one; when
   present, they are pinned in the same store call that checks them.
 - Each worker connection has a `BlobService` task that answers its requests in order, off the
-  inbound loop. On QUIC the replies are routed to the data stream; client requests are answered
-  inline on their own connection.
+  inbound loop. On QUIC the replies are routed to the data stream; a client's requests are
+  handled up to `MAX_IN_FLIGHT_REQUESTS` at a time on their own connection and answered in
+  request order (design 0039 W9).
 
 ### D4 Worker cache, fetch and collection
 

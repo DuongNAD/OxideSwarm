@@ -1169,3 +1169,54 @@ mod cli {
         worker.abort();
     }
 }
+
+/// A client that ignores any limit and writes a long run of requests before reading a single
+/// reply is held back by the master's socket buffers (it reads and answers one request at a
+/// time), and still gets every answer, in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_a_flood_of_pipelined_requests_is_answered_in_order() {
+    use rusty_grid_core::blob::BlobHasher;
+    use rusty_grid_core::blob_transfer::{BlobReply, BlobRequest};
+    let cluster = Cluster::start(true).await;
+    let transport = rusty_grid_cli::connect_master(&cluster.addr, None)
+        .await
+        .unwrap();
+    let ids: Vec<_> = (0..300u32)
+        .map(|i| {
+            let mut h = BlobHasher::new();
+            h.update(&i.to_be_bytes());
+            h.finish()
+        })
+        .collect();
+    let (mut writer, mut reader) = transport.split();
+    let sender = {
+        let ids = ids.clone();
+        tokio::spawn(async move {
+            for id in ids {
+                writer
+                    .send_msg(&ClientMessage::BlobRequest {
+                        request: BlobRequest::Missing { ids: vec![id] },
+                    })
+                    .await
+                    .unwrap();
+            }
+            writer
+        })
+    };
+    // Read nothing for a moment so the requests pile up against the master's read side.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for expected in &ids {
+        match tokio::time::timeout(Duration::from_secs(20), reader.recv_msg::<ClientResponse>())
+            .await
+            .expect("reply in time")
+            .unwrap()
+            .expect("connection open")
+        {
+            ClientResponse::BlobReply {
+                reply: BlobReply::Missing { ids },
+            } => assert_eq!(ids, vec![*expected], "replies came out of order"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let _ = sender.await.unwrap();
+}

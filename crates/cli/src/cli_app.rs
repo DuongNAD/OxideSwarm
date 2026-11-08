@@ -152,8 +152,11 @@ pub enum Commands {
     /// Check a running cluster end to end: connection, workers, pinned probes, GPUs, spreading
     Doctor(DoctorArgs),
 
-    /// Generate or show the shared cluster secret
+    /// Generate or show the shared cluster secret, or create a join token for another machine
     Secret(SecretCliArgs),
+
+    /// Join this machine to a cluster with a join token read from standard input
+    Join(crate::join::JoinArgs),
 
     /// Workflow modes and presets (test, dev, doc, research)
     Mode(mode_cli::ModeCliArgs),
@@ -936,6 +939,12 @@ pub struct DoctorArgs {
     #[arg(long, help = "Leave out the spread check (C6)")]
     pub skip_spread: bool,
 
+    #[arg(
+        long,
+        help = "Leave out the blob throughput probe (C8), which moves an 8 MiB blob to every worker"
+    )]
+    pub skip_throughput: bool,
+
     #[arg(long, help = "Print the report as JSON")]
     pub json: bool,
 
@@ -999,6 +1008,9 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
         Commands::Mapreduce(args) => run_mapreduce(args, config_file, secret_opts).await,
         Commands::Doctor(args) => run_doctor_command(args, config_file, secret_opts).await,
         Commands::Secret(args) => run_secret(args, &secret_opts, config_file.as_ref()),
+        Commands::Join(args) => {
+            crate::join::run_join(args, &secret_opts, config_file.as_ref()).await
+        }
         Commands::Mode(args) => {
             let code = mode_cli::run_mode_cli(args).await;
             if code == 0 {
@@ -2685,6 +2697,7 @@ async fn run_doctor_command(
         spread_tasks: args.spread_tasks,
         skip_gpu: args.skip_gpu,
         skip_spread: args.skip_spread,
+        skip_throughput: args.skip_throughput,
     };
     let report = run_doctor(&master_addr, secret.as_ref(), &options).await;
     if args.json {
@@ -4389,7 +4402,7 @@ mod tests {
                 assert_eq!(a.probe_timeout_secs, 60);
                 assert_eq!(a.gpu_dim, 512);
                 assert_eq!(a.spread_tasks, None);
-                assert!(!a.skip_gpu && !a.skip_spread && !a.json);
+                assert!(!a.skip_gpu && !a.skip_spread && !a.skip_throughput && !a.json);
             }
             other => panic!("expected doctor, got {other:?}"),
         }
@@ -4402,6 +4415,7 @@ mod tests {
             "--spread-tasks",
             "16",
             "--skip-gpu",
+            "--skip-throughput",
             "--json",
         ])
         .command
@@ -4410,7 +4424,7 @@ mod tests {
                 assert_eq!(a.master.as_deref(), Some("10.0.0.7"));
                 assert_eq!(a.expect_workers, 2);
                 assert_eq!(a.spread_tasks, Some(16));
-                assert!(a.skip_gpu && a.json);
+                assert!(a.skip_gpu && a.skip_throughput && a.json);
             }
             other => panic!("expected doctor, got {other:?}"),
         }

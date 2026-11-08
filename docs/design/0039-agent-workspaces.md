@@ -311,14 +311,14 @@ Roadmap Phase C names these steps WS-1 to WS-7. The column "Roadmap" maps them.
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
 | W1 | `Task::workspace`, `WorkspaceRef`, name rules, the `WORKSPACES` bit, a lightweight `ClientMessage::Hello` / `ClientResponse::Hello` version probe variant appended last (replacing `connect_master`'s `ClusterStatus` probe from `FEAT-8b`), the next protocol version, both mirrors and all four `From` impls. Needs FEAT-8. Roadmap WS-1 | `crates/core/src/task.rs`, `crates/core/src/protocol.rs`, `crates/core/src/wire_layout_tests.rs`, `crates/core/tests/data/wire_layout.txt`, `crates/cli/src/connect.rs`, `crates/master/src/server.rs` | Both codecs round-trip, `connect_master` probes with `Hello`, the layout test records the new version, and `Task::validate` refuses bad names | Implemented |
-| W2 | The workspace store, sync, lock, bounds and worker options. Roadmap WS-1, WS-2 | `crates/worker/src/workspace.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `README.md` | The sync unit tests of the test plan pass | Planned |
+| W2 | The workspace store, sync, lock, bounds and worker options. Roadmap WS-1, WS-2 | `crates/worker/src/workspace.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs`, `README.md` | The sync unit tests of the test plan pass | W2a done (store, sync, locks, bounds and tests in `workspace.rs`); W2b pending (wiring into `runner.rs` and `client.rs`, options, advertising `WORKSPACES`) |
 | W3 | Required feature, affinity, one task per workspace. Roadmap WS-1 | `crates/master/src/queue.rs`, `crates/master/src/scheduler.rs`, `crates/master/src/server.rs` | The scheduler unit tests of the test plan pass | Planned |
 | W4 | Source selection with `.gitignore` and limits. Roadmap WS-2 | `crates/cli/src/blobs.rs`, `crates/cli/Cargo.toml` | The scan unit tests pass, and `cargo audit` passes with the `ignore` crate | Done |
 | W5 | `submit --workspace`, `--sync`, `--no-sync`, `--cwd`, the MCP `workspace` field, the `workspaces` tool and command. Roadmap WS-5 | `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs`, `crates/core/src/protocol.rs`, `README.md` | `tests/mcp_server_e2e.rs` covers a workspace submission and the `workspaces` tool | Planned |
 | W6 | End-to-end test | `tests/agent_workspace_e2e.rs`, `crates/cli/Cargo.toml` | The integration test of the test plan passes on Linux, macOS and Windows in CI | Planned |
 | W7 | P2P for clients, the MCP server and blob connections. Roadmap WS-3 | `crates/core/src/transport.rs`, `crates/cli/src/connect.rs`, `crates/cli/src/mcp.rs`, `crates/cli/src/blobs.rs`, `crates/master/src/server.rs` | A test submits a task and downloads its output through a ticket, and a client without a secret is refused | Planned |
 | W8 | Tool probes, `require:tool=`, and `cargo build --offline` in `RustCompilation`. Roadmap WS-4, FEAT-10 | `crates/core/src/capabilities.rs`, `crates/core/src/placement.rs`, `crates/worker/src/runner.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs` | The FEAT-10 "Done when" passes, and a `require:tool=cargo` task avoids a worker without cargo | Planned |
-| W9 | Several blob uploads in flight from one client. Roadmap WS-6 | `crates/cli/src/blobs.rs`, `crates/core/src/blob_transfer.rs` | A test with 10,000 small files sees more than one request in flight, and `blob_transfer_e2e` passes | Planned |
+| W9 | Several blob uploads in flight from one client. Roadmap WS-6 | `crates/cli/src/blobs.rs`, `crates/core/src/blob_transfer.rs` | A test with 10,000 small files sees more than one request in flight, and `blob_transfer_e2e` passes | Done |
 | W10 | Guide and live record. Roadmap WS-7 | `docs/guides/offload-cargo-test.md`, `docs/README.md` | The live run of the test plan is recorded with its date, and the guide follows the guide template | Planned |
 | W11 | Symbolic links and empty directories in manifests (`oxideswarm-tree/2`). Optional | `crates/core/src/blob.rs`, `crates/worker/src/workspace.rs`, `crates/cli/src/blobs.rs` | A link inside the tree arrives as a link, and a link that leaves the tree is refused | Planned |
 
@@ -352,3 +352,41 @@ off by default until FEAT-3 is Implemented.
   inside the root (no parent directories, no global excludes), so the result does not depend on the
   machine. The CLI flags `--workspace-max-files` and `--workspace-max-mb` and the existing `--input
   <dir>` are unchanged; W5 wires them.
+- 2026-11-09: W9 done, no wire change. `BlobConnection` (`crates/cli/src/blobs.rs`) now writes
+  requests back to back and a reader task hands each reply to the oldest waiting call; replies are
+  matched by position, which is sound because the master answers the requests of one connection in
+  arrival order (design 0006 D3). The client keeps at most `MAX_IN_FLIGHT_REQUESTS` (16) requests
+  in flight, and `TRANSFER_CONCURRENCY` (8) blobs move at the same time, so 8 were in flight in the
+  test. On the master, `handle_client_connection` now runs up to `MAX_IN_FLIGHT_REQUESTS` blob
+  requests of one connection at the same time (different blobs overlap their disk work), sends the
+  replies in request order, answers any other message only after the pending blob replies, and
+  stops reading while 16 are pending, so a client that floods requests is held back by the socket
+  buffers. Two chunks of the same blob must still be sent one after the other, which `upload_blob`
+  does. A new client works with an older master (it answers one request at a time) and an older
+  client with this master. Measured on one machine (macOS, release build, loopback, 10,000 files
+  of about 20 bytes): 42.6 s with one request in flight, 29.6 s with up to 8. The master's
+  per-blob `sync_all` bounds the gain on loopback; the larger win is a link with real latency.
+  Compression is left out: design 0006 and the non-goals above keep it out of scope, and this
+  record does not change that. The existence check stays one `Missing` request per 65,536 ids, so
+  10,000 files need one.
+- 2026-11-09: W2a done, not wired. `crates/worker/src/workspace.rs` holds `WorkspaceStore` (root and
+  the design 0021 checks, `acquire`, `list`, `evict_to_fit`), `WorkspaceGuard` (`sync`,
+  `prepare_tmp`, `finish`, `task_env`, `tree_dir`, `tmp_dir`), the `BlobSource` trait the sync reads
+  blobs from, `state.json` and the unit tests of the test plan. Two details differ from D3 without
+  changing its outcome: deletions run before the writes (a path that turns from a file into a
+  directory needs no special case), and temporary files live in `<name>/tmp/` (same file system, so
+  the rename stays atomic, and a crash leaves nothing in the tree). On Windows the sandbox path
+  rules apply in full; elsewhere a file such as `aux.rs` is legal. `File::try_lock` is stable since
+  1.89, below the MSRV 1.91. W2b is pending: the runner and client wiring, `--workspaces`,
+  `--workspace-root`, `--workspace-limit-mb`, `--max-workspaces`, and advertising `WORKSPACES`; it
+  waits for the pull requests that rewrite `runner.rs` and `client.rs`.
+- 2026-11-09: W2a review fixes. `sync` recreates `tmp/` through `prepare_tmp`, so a task that
+  replaced it with a link cannot make the sync write outside the workspace, and stale temporary
+  files are removed; temporary names carry a random suffix. A manifest whose paths differ only by
+  case (Unicode lowercasing) is refused by the store on every host, because such a tree cannot exist
+  on the case-insensitive file systems of macOS and Windows; names that differ only by NFC/NFD
+  normalisation are a residual and are not detected. A kept file with more than one hard link keeps
+  its mode. A workspace with a missing or malformed `state.json` is listed as `Syncing` with its
+  measured size, `finish` writes a record for it, and eviction removes the whole `<name>/`
+  directory except a held lock.
+
