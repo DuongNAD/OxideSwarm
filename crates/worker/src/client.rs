@@ -272,6 +272,9 @@ pub struct WorkerConfig {
     /// How strongly task processes are confined (CLI `--isolation`, default `off`; design 0033).
     /// A level this host cannot enforce makes [`WorkerClient::run`] fail at start-up.
     pub isolation: IsolationLevel,
+    /// Files a confined task must not read even though they are outside the denied home: the
+    /// cluster secret file and the config file in use (CLI, with `--isolation`).
+    pub protected_files: Vec<std::path::PathBuf>,
     /// Fallback heartbeat interval if not specified by Master in `RegisterAck` (default: 3s).
     pub default_heartbeat_interval: Duration,
     /// Maximum duration to await Master response during registration handshake (default: 5s).
@@ -360,6 +363,7 @@ impl WorkerConfig {
             max_concurrency: None,
             process_priority: None,
             isolation: IsolationLevel::Off,
+            protected_files: Vec::new(),
             default_heartbeat_interval: Duration::from_secs(3),
             handshake_timeout: Duration::from_secs(5),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -515,6 +519,11 @@ impl WorkerConfig {
 
     pub fn with_isolation(mut self, level: IsolationLevel) -> Self {
         self.isolation = level;
+        self
+    }
+
+    pub fn with_protected_files(mut self, files: Vec<std::path::PathBuf>) -> Self {
+        self.protected_files = files;
         self
     }
 
@@ -1193,7 +1202,9 @@ impl WorkerClient {
         if let Some(priority) = config.process_priority {
             runner_cfg = runner_cfg.with_process_priority(priority);
         }
-        runner_cfg = runner_cfg.with_isolation(config.isolation);
+        runner_cfg = runner_cfg
+            .with_isolation(config.isolation)
+            .with_protected_files(config.protected_files.clone());
         let runner = Arc::new(TaskRunner::new(worker_id, capabilities.clone(), runner_cfg));
         let active_task_table = Arc::new(RwLock::new(HashMap::new()));
         let concurrency_semaphore = Arc::new(Semaphore::new(concurrency_permits));

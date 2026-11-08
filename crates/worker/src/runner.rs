@@ -137,6 +137,9 @@ pub struct RunnerConfig {
     pub isolation: IsolationLevel,
     /// The host directories the isolation policy names (the owner's home, the Rust toolchain).
     pub host_dirs: HostDirs,
+    /// Files denied to confined tasks wherever they are (the cluster secret file, the config
+    /// file in use).
+    pub protected_files: Vec<PathBuf>,
 }
 
 impl Default for RunnerConfig {
@@ -158,6 +161,7 @@ impl RunnerConfig {
             blender_path: None,
             isolation: IsolationLevel::Off,
             host_dirs: HostDirs::detect(),
+            protected_files: Vec::new(),
         }
     }
 
@@ -166,6 +170,11 @@ impl RunnerConfig {
     /// name them.
     pub fn with_isolation(mut self, level: IsolationLevel) -> Self {
         self.isolation = level;
+        self
+    }
+
+    pub fn with_protected_files(mut self, files: Vec<PathBuf>) -> Self {
+        self.protected_files = files;
         self
     }
 
@@ -2627,6 +2636,7 @@ impl TaskRunner {
             let jail = crate::isolation::Jail {
                 level: self.config.isolation,
                 host: &self.config.host_dirs,
+                protected_files: &self.config.protected_files,
                 sandbox_base: &self.config.sandbox_config.base_dir,
                 sandbox_dir: sandbox_path,
             };
