@@ -60,8 +60,11 @@ pub enum IsolationLevel {
     /// No OS-level confinement (the default): a task runs with the worker's own file access.
     #[default]
     Off,
-    /// Files: a task may write only its own sandbox and read only it, the system and the Rust
-    /// toolchain.
+    /// Files: a task writes only its own sandbox. It cannot read the owner's home, other tasks'
+    /// sandboxes, the blob cache or the shared temp areas (macOS: also the per-user temp
+    /// directory, `/private/tmp`, `/Users/Shared`, `/Volumes`); the system and the Rust
+    /// toolchain stay readable. On macOS it also closes the non-file routes out of the sandbox
+    /// (LaunchServices, preferences, Unix sockets, clipboard, terminal input, signals).
     Fs,
     /// `Fs` plus no network sockets.
     FsNet,

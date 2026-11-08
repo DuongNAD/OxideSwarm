@@ -1866,6 +1866,17 @@ async fn run_worker(
             return ExitCode::FAILURE;
         }
     };
+    // A task can read the environment and argv of this user's other processes on macOS, so a
+    // secret passed that way would defeat the isolation it is meant to enforce.
+    if isolation != IsolationLevel::Off {
+        let exposed = crate::secret_cmd::secret_exposed_to_tasks(&secret_opts, |name| {
+            std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
+        });
+        if let Some(channel) = exposed {
+            eprintln!("{}", crate::secret_cmd::exposed_secret_error(channel));
+            return ExitCode::from(AUTH_EXIT_CODE);
+        }
+    }
 
     let keep_sandboxes = resolve_bool(
         if args.keep_sandboxes {

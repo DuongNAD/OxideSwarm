@@ -512,6 +512,300 @@ cargo build --offline 2>&1
         assert!(wait_dead(tracked).await, "the timed-out task is gone");
     }
 
+    // ---- Security review of PR 133: escapes that are not file accesses -------------------
+
+    /// Runs `script` as a task at `level`; the owner's dummy secret path is in `$T_SECRET`.
+    async fn run_at(level: IsolationLevel, script: &str, extra: &[(&str, &str)]) -> TaskResult {
+        let rig = Rig::new(level, false);
+        rig.runner
+            .execute_task(&rig.task(script, extra, 120), None, None)
+            .await
+    }
+
+    fn has(result: &TaskResult, line: &str) -> bool {
+        lines(result).iter().any(|l| l == line)
+    }
+
+    /// H1: LaunchServices starts a background-only app that launchd runs unconfined. The app
+    /// copies the owner's dummy secret into the sandbox. `(deny lsopen)` stops `open` and
+    /// `NSWorkspace` alike.
+    #[tokio::test]
+    async fn test_launchservices_cannot_start_an_unconfined_helper() {
+        // The helper is built by the task, so the script is the same at every level. The bundle
+        // is created in the task's sandbox and launched either with `open` or with NSWorkspace.
+        let script = |how: &str| {
+            format!(
+                r#"
+APP="$RUSTY_GRID_SANDBOX_DIR/Esc.app"; mkdir -p "$APP/Contents/MacOS"
+cat > "$APP/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>run</string><key>CFBundleIdentifier</key><string>dev.oxideswarm.feat3.esc</string><key>CFBundlePackageType</key><string>APPL</string><key>LSBackgroundOnly</key><true/></dict></plist>
+PLIST
+printf '#!/bin/sh\n/bin/cat "%s" > "%s/stolen.txt" 2>&1\n' "$T_SECRET" "$RUSTY_GRID_SANDBOX_DIR" > "$APP/Contents/MacOS/run"
+chmod +x "$APP/Contents/MacOS/run"
+{how}
+i=0; while [ $i -lt 30 ] && [ ! -s "$RUSTY_GRID_SANDBOX_DIR/stolen.txt" ]; do sleep 0.2; i=$((i+1)); done
+echo "STOLEN=$(cat "$RUSTY_GRID_SANDBOX_DIR/stolen.txt" 2>/dev/null)"
+"#
+            )
+        };
+        let routes = [
+            ("open", script("/usr/bin/open -g -j \"$APP\"")),
+            (
+                "nsworkspace",
+                script(
+                    "/usr/bin/osascript -l JavaScript -e 'ObjC.import(\"AppKit\"); $.NSWorkspace.sharedWorkspace.openURL($.NSURL.fileURLWithPath(\"'\"$APP\"'\"))' >/dev/null 2>&1",
+                ),
+            ),
+        ];
+        for (route, script) in &routes {
+            let control = run_at(IsolationLevel::Off, script, &[]).await;
+            if !control.stdout_str().contains(SECRET) {
+                eprintln!(
+                    "skipped {route}: LaunchServices is not usable here (the control failed)"
+                );
+                continue;
+            }
+            for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+                let result = run_at(level, script, &[]).await;
+                assert!(
+                    !result.stdout_str().contains(SECRET),
+                    "{route} at {level}: a LaunchServices helper read the denied secret: {}",
+                    result.stdout_str()
+                );
+            }
+        }
+    }
+
+    /// H2: cfprefsd reads and writes the owner's preference files on the task's behalf.
+    #[tokio::test]
+    async fn test_preferences_of_the_owner_are_neither_read_nor_written() {
+        let domain = format!("dev.oxideswarm.feat3.read.{}", std::process::id());
+        let wdomain = format!("dev.oxideswarm.feat3.write.{}", std::process::id());
+        let defaults = |args: &[&str]| {
+            std::process::Command::new("/usr/bin/defaults")
+                .args(args)
+                .output()
+        };
+        let cleanup = || {
+            let _ = defaults(&["delete", &domain]);
+            let _ = defaults(&["delete", &wdomain]);
+        };
+        if !defaults(&["write", &domain, "key", "owner-preference-value"])
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skipped: cannot write preferences here");
+            return;
+        }
+        let script = format!(
+            r#"
+echo "READ=$(/usr/bin/defaults read {domain} key 2>/dev/null)"
+/usr/bin/defaults write {wdomain} planted yes 2>/dev/null; echo "WRITE_RC=$?"
+echo "READ_AFTER_WRITE=$(/usr/bin/defaults read {wdomain} planted 2>/dev/null)"
+"#
+        );
+        let control = run_at(IsolationLevel::Off, &script, &[]).await;
+        let control_reads = has(&control, "READ=owner-preference-value");
+        let _ = defaults(&["delete", &wdomain]);
+        if !control_reads {
+            cleanup();
+            eprintln!("skipped: preferences are not readable even unconfined here");
+            return;
+        }
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let result = run_at(level, &script, &[]).await;
+            assert!(
+                !result.stdout_str().contains("owner-preference-value"),
+                "{level}: read the owner's preference: {}",
+                result.stdout_str()
+            );
+            assert!(
+                !has(&result, "READ_AFTER_WRITE=yes"),
+                "{level}: wrote a preference into the owner's home"
+            );
+            let planted =
+                defaults(&["read", &wdomain, "planted"]).is_ok_and(|o| o.status.success());
+            assert!(
+                !planted,
+                "{level}: the owner's preferences now hold the task's write"
+            );
+        }
+        cleanup();
+    }
+
+    /// M1: the worker's environment is not inherited, only an allowlist.
+    #[tokio::test]
+    async fn test_worker_only_environment_variables_do_not_reach_a_confined_task() {
+        // `CARGO_PKG_NAME` is set by `cargo test` in this very process and is not on the list.
+        assert!(std::env::var_os("CARGO_PKG_NAME").is_some());
+        let script = r#"echo "WORKER_VAR=${CARGO_PKG_NAME-unset}"; echo "PATH_SET=${PATH:+yes}"; echo "TASK_VAR=${T_BASE:+yes}"; echo "ID=${RUSTY_GRID_TASK_ID:+yes}""#;
+        let control = run_at(IsolationLevel::Off, script, &[]).await;
+        assert!(
+            has(&control, "WORKER_VAR=rusty_grid_worker"),
+            "{:?}",
+            lines(&control)
+        );
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let result = run_at(level, script, &[]).await;
+            for expected in ["WORKER_VAR=unset", "PATH_SET=yes", "TASK_VAR=yes", "ID=yes"] {
+                assert!(
+                    has(&result, expected),
+                    "{level}: {expected} in {:?}",
+                    lines(&result)
+                );
+            }
+        }
+    }
+
+    /// M2: the desktop session's Unix sockets (ssh-agent, gpg-agent, docker) are unreachable.
+    #[tokio::test]
+    async fn test_unix_sockets_cannot_be_connected_to_under_fs() {
+        // Server and client both run in the task's sandbox, so only the socket rule differs
+        // between the control and the confined runs.
+        let script = r#"
+cd "$RUSTY_GRID_SANDBOX_DIR"
+S=agent.sock   # relative: a Unix socket path is limited to about 100 bytes
+/usr/bin/nc -lU "$S" >/dev/null 2>&1 &
+i=0; while [ $i -lt 25 ] && [ ! -S "$S" ]; do sleep 0.2; i=$((i+1)); done
+[ -S "$S" ] && echo SOCKET_UP
+echo | /usr/bin/nc -U -w 2 "$S" >/dev/null 2>&1 && echo CONNECTED || echo REFUSED
+kill $! 2>/dev/null
+"#;
+        let control = run_at(IsolationLevel::Off, script, &[]).await;
+        if !(has(&control, "SOCKET_UP") && has(&control, "CONNECTED")) {
+            eprintln!(
+                "skipped: no Unix socket connect even unconfined: {:?}",
+                lines(&control)
+            );
+            return;
+        }
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let result = run_at(level, script, &[]).await;
+            assert!(has(&result, "REFUSED"), "{level}: {:?}", lines(&result));
+        }
+    }
+
+    /// M3: the clipboard. Reads nothing of the developer's clipboard; skips when it is empty.
+    #[tokio::test]
+    async fn test_clipboard_is_not_readable() {
+        let clip = std::process::Command::new("/usr/bin/pbpaste").output();
+        let Ok(clip) = clip else { return };
+        if clip.stdout.is_empty() {
+            eprintln!("skipped: the clipboard holds no text, nothing to leak");
+            return;
+        }
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let result = run_at(level, "/usr/bin/pbpaste 2>/dev/null; echo END", &[]).await;
+            assert_eq!(
+                result.stdout_str().trim(),
+                "END",
+                "{level}: the task read the clipboard"
+            );
+        }
+    }
+
+    /// M5: a task cannot signal processes that are not its own, the worker included.
+    #[tokio::test]
+    async fn test_a_task_cannot_signal_foreign_processes() {
+        let mut victim = std::process::Command::new("/bin/sleep")
+            .arg("120")
+            .spawn()
+            .expect("victim");
+        let pid = victim.id().to_string();
+        let script = r#"kill -0 "$VICTIM" 2>/dev/null && echo SIGNALLED || echo DENIED
+sleep 120 & kill -STOP $! && echo OWN_CHILD_OK; kill -9 $! 2>/dev/null; wait $! 2>/dev/null; true"#;
+        let control = run_at(IsolationLevel::Off, script, &[("VICTIM", &pid)]).await;
+        let control_ok = has(&control, "SIGNALLED");
+        for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
+            let result = run_at(level, script, &[("VICTIM", &pid)]).await;
+            assert!(has(&result, "DENIED"), "{level}: {:?}", lines(&result));
+            assert!(
+                has(&result, "OWN_CHILD_OK"),
+                "{level}: a task can still signal its own children"
+            );
+        }
+        let _ = victim.kill();
+        let _ = victim.wait();
+        assert!(control_ok, "the unconfined control must be able to signal");
+    }
+
+    /// M4: TIOCSTI. Runs the task from a process that has a controlling terminal (a pty made by
+    /// python3 around this very test binary, see `tiocsti_inner`).
+    #[tokio::test]
+    async fn test_a_task_cannot_inject_keystrokes_into_the_controlling_terminal() {
+        if std::process::Command::new("/usr/bin/python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipped: no python3 for the pty harness");
+            return;
+        }
+        let harness = r#"
+import os, pty, select, sys, time
+exe, level = sys.argv[1], sys.argv[2]
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["FEAT3_TIOCSTI_LEVEL"] = level
+    os.execv(exe, [exe, "--exact", "macos::tiocsti_inner", "--ignored", "--nocapture", "--test-threads=1"])
+out = b""
+end = time.time() + 90
+done = False
+while time.time() < end:
+    r, _, _ = select.select([fd], [], [], 0.3)
+    if r:
+        try:
+            d = os.read(fd, 65536)
+        except OSError:
+            break
+        if not d:
+            break
+        out += d
+        continue
+    # Nothing to read: stop once the child has exited.
+    if done:
+        break
+    wpid, _ = os.waitpid(pid, os.WNOHANG)
+    if wpid == pid:
+        done = True
+sys.stdout.write(out.decode("utf-8", "replace"))
+"#;
+        let exe = std::env::current_exe().unwrap();
+        let mut seen = HashMap::new();
+        for level in ["off", "fs", "fs+net"] {
+            let out = std::process::Command::new("/usr/bin/python3")
+                .args(["-c", harness, exe.to_str().unwrap(), level])
+                .output()
+                .expect("harness");
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            seen.insert(level, text);
+        }
+        let off = &seen["off"];
+        if !off.contains("TIOCSTI=INJECTED") {
+            eprintln!("skipped: the unconfined control could not inject either: {off}");
+            return;
+        }
+        for level in ["fs", "fs+net"] {
+            let text = &seen[level];
+            assert!(text.contains("TIOCSTI=DENIED"), "{level}: {text}");
+            assert!(!text.contains("TIOCSTI=INJECTED"), "{level}: {text}");
+        }
+    }
+
+    /// The pty-side half of the test above; ignored unless the harness starts it.
+    #[tokio::test]
+    #[ignore]
+    async fn tiocsti_inner() {
+        let level: IsolationLevel = std::env::var("FEAT3_TIOCSTI_LEVEL")
+            .unwrap_or_default()
+            .parse()
+            .unwrap_or_default();
+        // A real attacker ignores the job-control signals a background process group gets.
+        let script = r#"trap '' TTOU TTIN TSTP; /usr/bin/perl -e 'open(TTY, "+<", "/dev/tty") or do { print "TIOCSTI=NOTTY\n"; exit }; my $c = "@"; if (ioctl(TTY, 0x80017472, $c)) { print "TIOCSTI=INJECTED\n" } else { print "TIOCSTI=DENIED\n" }'"#;
+        let result = run_at(level, script, &[]).await;
+        println!("{}", result.stdout_str());
+    }
+
     async fn wait_for_pid(pid: &AtomicU32) -> u32 {
         for _ in 0..200 {
             let v = pid.load(Ordering::Acquire);

@@ -2656,6 +2656,15 @@ impl TaskRunner {
         cmd.args(&spawn_args);
         cmd.current_dir(cwd);
 
+        // A confined task gets an allowlisted environment, not a copy of the worker's: tokens and
+        // credentials in the worker's environment are none of its business (design 0033 D1.4).
+        if self.config.isolation != IsolationLevel::Off {
+            cmd.env_clear();
+            for (name, value) in crate::isolation::inherited_environment(std::env::vars_os()) {
+                cmd.env(name, value);
+            }
+        }
+
         // The worker's own secrets are none of the task's business. Removed before the task's own
         // environment is applied, so a task that is handed one explicitly still gets it.
         for name in SECRET_ENV_VARS {
