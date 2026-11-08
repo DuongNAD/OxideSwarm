@@ -394,9 +394,10 @@ running }` within a master-advertised hold window (`--session-resume-hold-secs`)
      - While session resume is active, any completed `TaskResult` is buffered in
        `pending_resume_outbox: Mutex<PendingResumeOutbox>` together with its `Arc<CachePin>` (taken
        via `BlobCache::take_task_outputs(task_id)` so the attempt owns its output pin directly) and a
-       64-bit content token `ack_token = master_features::result_ack_token(&result)` (BLAKE3 digest
-       of `task_id`, `worker_id`, `exit_code`, `execution_duration_ms`, `stdout`, `stderr`, `error`,
-       and `outputs`).
+       64-bit content token `ack_token = master_features::result_ack_token(&result)` (first 8
+       little-endian bytes of the BLAKE3 digest over a canonical encoding of `task_id`,
+       `worker_id`, `exit_code`, `execution_time_ms`, `is_gpu_executed`, `device_name`, `stdout`,
+       `stderr`, `error`, `asset_bytes`, `artifacts`, and `outputs`).
      - `PendingResumeOutbox` is bounded both in entry count (`max(2, 2 * concurrency_permits)`) and
        in total buffered payload bytes (`MAX_RESUME_OUTBOX_BYTES = 32 MiB`), evicting the oldest
        buffered result and unpinning its blobs if either limit is exceeded.
