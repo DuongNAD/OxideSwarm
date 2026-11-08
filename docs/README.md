@@ -36,6 +36,7 @@ before adding or changing a document.
 | [design/0039-agent-workspaces.md](design/0039-agent-workspaces.md) | Accepted, not built: persistent workspaces for coding agents on workers, synced from a local directory, with affinity and one task per workspace, plus P2P for clients and `cargo` builds (`FEAT-4`, `FEAT-10`) | Contributors |
 | [design/0040-protocol-versioning.md](design/0040-protocol-versioning.md) | Protocol version 3, golden-bytes version-bump enforcement, `RegisterAck` feature-bit gating, and client-path protocol versioning (`FEAT-8`) | Contributors |
 | [design/0044-dead-code-and-connection-loop-unification.md](design/0044-dead-code-and-connection-loop-unification.md) | Planned: remove dead code, merge TCP and 2-lane QUIC worker connection loops into `WorkerSession`, sweep leftover sandboxes at start-up, and gate `gen3d`/`autorig` behind Cargo feature `3d` (`FEAT-11`, decision Q2) | Contributors |
+| [design/0046-master-durability.md](design/0046-master-durability.md) | Draft: append-only task journal and snapshot store (`--state-dir`), startup replay, and worker session resume (`WorkerMessage::ResumeSession`) (`FEAT-1`) | Contributors |
 | [BACKLOG.md](BACKLOG.md) | Open work in execution order, each item with files and a check | Coding agents, contributors |
 | [ROADMAP.md](ROADMAP.md) | Direction after the backlog: the purpose, phases A to E, what waits, and the owner's decisions | Owner, contributors |
 
