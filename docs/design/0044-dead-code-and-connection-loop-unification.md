@@ -94,7 +94,8 @@ What exists at `master` `7b1f912`:
      (`crates/agent_mesh/src/bridge.rs:196-215`), passing `0` internally under
      `#[allow(deprecated)]`.
    - Remove `compute_intensity` from the wire in the same release as the next required protocol
-     version bump: `W1` of [design 0039](0039-agent-workspaces.md).
+     version bump: `F1-b` of [design 0046](0046-master-durability.md) (Phase B `FEAT-1`, which
+     adds `WorkerMessage::ResumeSession` and bumps `PROTOCOL_VERSION_CURRENT` from `3` to `4`).
 
 ### D2 Prune `crates/core/src/arbitrage.rs`
 
@@ -325,7 +326,7 @@ existing guard test(s):
 ## Compatibility
 
 - No wire format change is made in `FEAT-11`: `TaskSpec::GpuCompute::compute_intensity` remains on
-  the wire (marked `#[deprecated]`) until `0039` W1 bumps the protocol version, and
+  the wire (marked `#[deprecated]`) until `0046` `F1-b` bumps the protocol version, and
   `WorkerMessage::ClaimMasterRole { ticket: MasterLeaseTicket }` is unchanged.
 - `ProtocolCapabilities::THREE_D` (`1 << 11`) uses the additive `features` bitfield introduced in
   `0035`; workers built without `3d` simply omit the bit, and the master holds or refuses 3D tasks
@@ -384,7 +385,7 @@ Implementation is split into four separate pull requests, opened and reviewed in
 
 | ID | Pull Request | Scope | Files | Done when | Status |
 |---|---|---|---|---|---|
-| F11-a | PR (a): Dead-code deletions (`D1.1`–`D1.5`, `D2`, `D3`) | Delete `dashboard/index.html`, `shaders/hash.wgsl`, `DashboardState`, `Sandbox::prepare_spec`, `probe_physical_adapter`, dead `arbitrage.rs` items, and duplicate `service` JNI exports; wire `auto_rig_mesh_async` into `TaskRunner::execute_auto_rig_workload`; mark `compute_intensity` `#[deprecated]` in `task.rs` and stop setting it in CLI/MCP (no wire change; wire removal waits for `0039` W1) | `crates/core/src/task.rs`, `crates/core/src/arbitrage.rs`, `crates/core/src/lib.rs`, `crates/master/src/dashboard/`, `crates/worker/src/shaders/`, `crates/worker/src/sandbox.rs`, `crates/worker/src/wgpu_engine.rs`, `crates/worker/src/autorig/mod.rs`, `crates/worker/src/runner.rs`, `crates/cli/src/`, `crates/agent_mesh/src/bridge.rs`, `crates/android_bridge/src/lib.rs`, `tests/mobile_coordination_test.rs`, `tests/m5a_challenger_2_stress.rs` | None of the removed files/symbols exist, `auto_rig_mesh_async` is called by `execute_auto_rig_workload`, `compute_intensity` is deprecated with zero wire changes, and workspace tests pass | Planned |
+| F11-a | PR (a): Dead-code deletions (`D1.1`–`D1.5`, `D2`, `D3`) | Delete `dashboard/index.html`, `shaders/hash.wgsl`, `DashboardState`, `Sandbox::prepare_spec`, `probe_physical_adapter`, dead `arbitrage.rs` items, and duplicate `service` JNI exports; wire `auto_rig_mesh_async` into `TaskRunner::execute_auto_rig_workload`; mark `compute_intensity` `#[deprecated]` in `task.rs` and stop setting it in CLI/MCP (no wire change; wire removal happens in `0046` `F1-b`) | `crates/core/src/task.rs`, `crates/core/src/arbitrage.rs`, `crates/core/src/lib.rs`, `crates/master/src/dashboard/`, `crates/worker/src/shaders/`, `crates/worker/src/sandbox.rs`, `crates/worker/src/wgpu_engine.rs`, `crates/worker/src/autorig/mod.rs`, `crates/worker/src/runner.rs`, `crates/cli/src/`, `crates/agent_mesh/src/bridge.rs`, `crates/android_bridge/src/lib.rs`, `tests/mobile_coordination_test.rs`, `tests/m5a_challenger_2_stress.rs` | None of the removed files/symbols exist, `auto_rig_mesh_async` is called by `execute_auto_rig_workload`, `compute_intensity` is deprecated with zero wire changes, and workspace tests pass | Planned |
 | F11-b | PR (b): Start-up sandbox sweep (`D5`) | Add `<base_dir>/.locks/<task_id>.lock` advisory locking (acquired before creating `<base_dir>/<task_id>`) and start-up leftover sandbox sweep in `SandboxConfig::ensure_usable`; document `--keep-sandboxes` interaction in `README.md` | `crates/worker/src/sandbox.rs`, `README.md` | A unit test deletes everything inside a live sandbox, runs a second `ensure_usable`, and the sandbox directory survives; unlocked crashed UUID sandboxes are swept | Planned |
 | F11-c | PR (c): Opt-in `3d` feature (`D6`) | Gate `gen3d` and `autorig` behind Cargo feature `3d`, add `ProtocolCapabilities::THREE_D` placement requirement for `Generative3D`/`AutoRig`, gate 3D test targets/functions, and add the `--features 3d` CI step | `crates/core/src/protocol.rs`, `crates/master/src/queue.rs`, `crates/master/Cargo.toml`, `crates/worker/Cargo.toml`, `crates/worker/src/lib.rs`, `crates/worker/src/runner.rs`, `crates/worker/src/client.rs`, `crates/cli/Cargo.toml`, `crates/worker/tests/`, `crates/cli/tests/`, `tests/`, `.github/workflows/ci.yml` | `cargo test --workspace` passes without `3d`, the new CI step passes with `--features 3d`, and unit tests verify 3D task placement when only a non-`3d` worker is connected | Planned |
 | F11-d | PR (d): Worker session loop merge (`D4`) | Merge TCP `handle_connection` and QUIC `handle_multiplexed_connection` into `WorkerSession` in `crates/master/src/session.rs` | `crates/master/src/session.rs`, `crates/master/src/server.rs`, `crates/master/src/lib.rs` | All six preserved invariants hold, and every `[[test]]` target of `rusty_grid_master` and `rusty_grid_worker` plus `test_integration.sh` and `run_chaos_test.sh` pass | Planned |
@@ -399,3 +400,6 @@ Implementation is split into four separate pull requests, opened and reviewed in
   target inventory, `--features 3d` CI step, and `ProtocolCapabilities::THREE_D` placement gating,
   documented the six preserved session invariants and full test gates for D4, noted `--keep-sandboxes`
   sweep behavior, and split implementation into four ordered PRs (`F11-a` through `F11-d`).
+- 2026-11-08: Updated D1.5, Compatibility, and `F11-a` per `122-fix` so the wire removal of
+  deprecated `compute_intensity` lands in `F1-b` of `design/0046-master-durability.md` (the next
+  protocol version bump).
