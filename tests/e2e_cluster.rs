@@ -890,36 +890,48 @@ async fn test_tier1_f5_batch_5_tasks_spread_across_3_workers() {
 async fn test_tier1_f5_batch_compilation_speedup_parallel_vs_sequential() {
     let (cluster, _, _, _) = TestCluster::setup_ac_cluster().await;
 
-    let start = Instant::now();
+    // Proves that the three tasks run at the same time, without a wall-clock bound: the bound
+    // failed on a loaded macOS runner (650 ms against 550 ms). Each task drops a marker into a
+    // shared directory and waits until all three markers exist. Run one after another, the first
+    // task never sees the other two and exits 7 after 200 polls (at least 10 s), well inside its
+    // 60 s timeout.
+    let barrier = tempfile::tempdir().unwrap();
+    let barrier_dir = barrier.path().to_string_lossy().replace('\\', "/");
+    let script = "d=\"$1\"; touch \"$d/$2\"; i=0; \
+                  while [ \"$(ls \"$d\" | wc -l | tr -d ' ')\" -lt 3 ]; do \
+                  i=$((i + 1)); [ \"$i\" -ge 200 ] && exit 7; sleep 0.05; done";
+
     let mut task_futs = Vec::new();
-    for _ in 0..3 {
+    for n in 0..3 {
         let task = Task::new(
-            TaskSpec::command("sleep", vec!["0.2".into()]),
-            TaskRequirements::generic(1, 10),
+            TaskSpec::command(
+                "sh",
+                vec![
+                    "-c".into(),
+                    script.into(),
+                    "barrier".into(),
+                    barrier_dir.clone(),
+                    format!("task-{n}"),
+                ],
+            ),
+            TaskRequirements::generic(1, 60),
         );
         let c = &cluster;
         task_futs.push(async move {
             let id = c.master.submit_task(task).await.unwrap();
-            c.master.wait_task(id, Some(Duration::from_secs(5))).await
+            c.master.wait_task(id, Some(Duration::from_secs(90))).await
         });
     }
 
-    let results = join_all(task_futs).await;
-    let elapsed = start.elapsed();
-
-    for res in results {
-        assert_eq!(res.unwrap().exit_code, 0);
+    for res in join_all(task_futs).await {
+        let res = res.unwrap();
+        assert_eq!(
+            res.exit_code, 0,
+            "a task did not see all three markers, so the tasks did not run in parallel \
+             (stderr: {})",
+            &*res.stderr
+        );
     }
-
-    // 3 parallel tasks of 200ms each should finish well before sequential time (with margin for Windows process startup)
-    #[cfg(windows)]
-    let max_duration = Duration::from_millis(1000);
-    #[cfg(not(windows))]
-    let max_duration = Duration::from_millis(550);
-    assert!(
-        elapsed < max_duration,
-        "Parallel execution took {elapsed:?}, expected speedup over 600ms sequential"
-    );
 }
 
 #[tokio::test]
