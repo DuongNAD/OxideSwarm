@@ -1,6 +1,6 @@
 # 0031: Containment after a worker crash
 
-Status: Draft
+Status: Accepted
 Created: 2026-11-08    Updated: 2026-11-08
 
 ## Summary
@@ -121,9 +121,10 @@ In `run_chaos_test.sh`:
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| `FEAT-2` | Add per-task lifeline pipe, double-forked process-group supervisor, pre-`execve` Linux cgroup v2 leaf + `RUSTY_GRID_TASK_ID` `setsid` sweep, and `run_chaos_test.sh` victim completion rejection | `crates/worker/src/process_tree.rs`, `crates/worker/src/runner.rs`, `crates/worker/tests/test_worker_crash_containment.rs`, `run_chaos_test.sh`, `docs/design/0031-containment-after-worker-crash.md`, `docs/README.md` | Direct `waitpid(-1)` in a task returns `ECHILD` at once; normal completion kills a `setsid` child; a test starts the real worker, runs a script with a child and a grandchild, sends `kill -9` to the worker, and asserts all are dead within 5 s on Linux and macOS; `run_chaos_test.sh` fails if the victim writes `done:` after the kill | Planned |
+| `FEAT-2` | Add per-task lifeline pipe, double-forked process-group supervisor, pre-`execve` Linux cgroup v2 leaf + `RUSTY_GRID_TASK_ID` `setsid` sweep, and `run_chaos_test.sh` victim completion rejection | `crates/worker/src/process_tree.rs`, `crates/worker/src/runner.rs`, `crates/worker/tests/test_worker_crash_containment.rs`, `tests/cli_worker_signals_e2e.rs`, `run_chaos_test.sh`, `docs/design/0031-containment-after-worker-crash.md`, `docs/README.md` | Direct `waitpid(-1)` in a task returns `ECHILD` at once; normal completion kills a `setsid` child; a test starts the real worker, runs a script with a child and a grandchild, sends `kill -9` to the worker, and asserts all are dead within 5 s on Linux and macOS; `run_chaos_test.sh` fails if the victim writes `done:` after the kill | Implemented |
 
 ## Status log
 
 - 2026-11-08: Initial draft written for `FEAT-2` (Phase B of `docs/ROADMAP.md`).
 - 2026-11-08: Addressed review `116-fix`: dropped `PR_SET_CHILD_SUBREAPER` and `PR_SET_PDEATHSIG` from the task leader, moved Linux cgroup v2 leaf assignment into `pre_exec` before `execve`, held `SPAWN_LOCK` across `pipe` + `fcntl(FD_CLOEXEC)` and `cmd.spawn()` on macOS, chose `KERN_PROCARGS2` on macOS and stated the `env -i` + `setsid` limitation in G3 and Security, documented Android's 32 phantom-process limit in Compatibility, and added the direct `waitpid(-1)` (`ECHILD`) and normal-exit `setsid` cleanup tests to the Test plan.
+- 2026-11-08: Design accepted (PR #116 merged) and implemented in `crates/worker/src/process_tree.rs`, `crates/worker/src/runner.rs`, `crates/worker/tests/test_worker_crash_containment.rs`, `tests/cli_worker_signals_e2e.rs`, and `run_chaos_test.sh`.

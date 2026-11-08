@@ -341,8 +341,8 @@ done
 FAILOVER_MS=$(( $(now_ms) - T_KILL_MS ))
 log_pass "All ${TASKS_COUNT} tasks reached Completed ${FAILOVER_MS} ms after the kill"
 
-# Content checks on the marker logs (the orphaned shell of a SIGKILLed worker keeps running and may
-# add its own "done:" line from the victim's directory; only the survivor's line counts).
+# Content checks on the marker logs (the task supervisor terminates the SIGKILLed victim's task
+# tree on lifeline EOF, so an orphaned task must never write a `done:${SB_VICTIM}` line).
 FAILOVER_VERIFIED_COUNT=0
 TASK_ROWS=""
 for i in $(seq 1 "$TASKS_COUNT"); do
@@ -356,6 +356,9 @@ for i in $(seq 1 "$TASKS_COUNT"); do
             grep -q "^done:${SB_SURVIVOR}[^:]*:${EXPECTED_HASH}$" "$LOG" && break
             sleep 0.2
         done
+        if grep -q "^done:${SB_VICTIM}" "$LOG"; then
+            log_fail "orphaned task ${i} on the SIGKILLed victim kept running and wrote done:${SB_VICTIM} after the kill (log: $(tr '\n' '|' < "$LOG"))"
+        fi
         grep -q "^done:${SB_SURVIVOR}[^:]*:${EXPECTED_HASH}$" "$LOG" \
             || log_fail "orphaned task ${i} was not re-executed on the survivor with the expected SHA-256 (log: $(tr '\n' '|' < "$LOG"))"
         FAILOVER_VERIFIED_COUNT=$((FAILOVER_VERIFIED_COUNT + 1))

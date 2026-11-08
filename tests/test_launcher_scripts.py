@@ -730,6 +730,12 @@ class StaticRepositoryChecks(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_chaos_script_rejects_victim_done_line_after_sigkill(self):
+        """FEAT-2 (Design 0031): run_chaos_test.sh must fail if an orphaned victim task writes done:${SB_VICTIM}."""
+        chaos = read(os.path.join(ROOT, "run_chaos_test.sh"))
+        self.assertIn('grep -q "^done:${SB_VICTIM}" "$LOG"', chaos)
+        self.assertIn("kept running and wrote done:${SB_VICTIM} after the kill", chaos)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
