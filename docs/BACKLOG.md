@@ -126,7 +126,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 Size is S, M or L. "Owner" means the item needs a person, a device, a decision or an approval to
 merge.
 
-On 2026-11-08, at `master` `553b53e`: 52 items Implemented, 0 Partial and 18 Planned. "Pull
+On 2026-11-08, at `master` `b03172a`: 53 items Implemented, 0 Partial and 17 Planned. "Pull
 requests" lists them by number, "(open)" marks one that is not merged yet, and "(design)" marks a
 design record that builds nothing.
 
@@ -199,7 +199,7 @@ design record that builds nothing.
 | FEAT-8 | Real protocol versioning | P2 | M | INT-4 |  | Implemented | 40, 110, 120 |
 | FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Planned |  |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Planned |  |
-| FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Planned |  |
+| FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented | 118 (design), 125, 126, 127, 131 |
 | REL-4 | Release workflow and install path | P2 | M | TEST-6 | D4 | Planned |  |
 | REL-5 | Contributor and security files | P3 | S | REL-1 |  | Implemented | 75 |
 
@@ -1355,5 +1355,16 @@ Add one dated line per finished item, newest last.
   - TEST-6 (pull requests 67, 124): `ci.yml` has no `continue-on-error`. The 21 required checks on
     `master` are every check of the `553b53e` run, and all passed. The one exception is
     "p2p wan relay (ignored)", which runs only on a schedule or by hand and so cannot be required.
-  - FEAT-11 stays Planned in this index: pull requests 125 and 126 are merged, 127 is open, and the
-    merge of the two connection loops has no pull request yet.
+- 2026-11-08: FEAT-11 is Implemented: design 0044 (pull request 118) and its four parts, pull
+  requests 125, 126, 127 and 131. Checked at `master` `b03172a`:
+  - `dashboard/index.html`, `shaders/hash.wgsl`, `DashboardState`, `prepare_spec`,
+    `probe_physical_adapter` and the `service` JNI exports are gone from `crates/`.
+  - `auto_rig_mesh_async` has a production caller in `crates/worker/src/runner.rs`.
+    `crates/core/src/arbitrage.rs` keeps 181 lines, and `MasterLeaseTicket` is used by
+    `protocol.rs` and by `reject_master_role_claim` in `crates/master/src/server.rs`.
+  - `handle_connection` and `handle_multiplexed_connection` in `server.rs` both call
+    `WorkerSession::run_connection` (`crates/master/src/session.rs`).
+  - Leftover sandboxes are swept at start-up (pull request 126).
+  - One symbol neither has a caller nor is gone: `compute_intensity`. Design 0044 D1.5 keeps it on
+    the wire as `#[deprecated]`, and nothing in the CLI or MCP sets it. It leaves the wire at the
+    next protocol version bump, in FEAT-1 (design 0046, `F1-b`).
