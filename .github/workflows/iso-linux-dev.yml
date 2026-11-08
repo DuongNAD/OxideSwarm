@@ -23,4 +23,5 @@ jobs:
           sysctl kernel.apparmor_restrict_unprivileged_userns kernel.io_uring_disabled || true
           python3 -c "import ctypes; l=ctypes.CDLL(None,use_errno=True); print('landlock abi', l.syscall(444,None,0,1), ctypes.get_errno())"
       - run: cargo test -p rusty_grid_worker --lib isolation --locked
-      - run: cargo test -p rusty_grid_worker --test test_feat3_os_isolation --locked -- --nocapture --test-threads=4
+      - if: always()
+        run: cargo test -p rusty_grid_worker --test test_feat3_os_isolation --locked -- --nocapture --test-threads=4
