@@ -97,6 +97,8 @@ impl ProtocolCapabilities {
     pub const THREE_D: Self = Self(1 << 11);
     /// Worker session resumption across transient master restarts or network drops
     /// (`WorkerMessage::ResumeSession`, `master_features::SESSION_RESUME_PREFIX`).
+    /// Not advertised in [`ProtocolCapabilities::all_supported`] until master task adoption and
+    /// worker session resume are wired (`docs/design/0046-master-durability.md` D4.1).
     pub const SESSION_RESUME: Self = Self(1 << 12);
 
     pub const fn all_supported() -> Self {
@@ -110,8 +112,7 @@ impl ProtocolCapabilities {
                 | Self::FILE_STAGING.0
                 | Self::ADAPTIVE_KEEPALIVE.0
                 | Self::BLOB_TRANSFER.0
-                | Self::THREE_D.0
-                | Self::SESSION_RESUME.0,
+                | Self::THREE_D.0,
         )
     }
 
@@ -1452,6 +1453,10 @@ pub mod master_features {
     /// Announced only when the Master has a non-zero session-resume hold configured.
     pub const SESSION_RESUME_PREFIX: &str = "session-resume=";
 
+    /// Upper bound (`1 hour`) on the session-resume hold seconds accepted by
+    /// [`parse_session_resume_hold_secs`], preventing `Instant + Duration` overflow on bogus input.
+    pub const MAX_SESSION_RESUME_HOLD_SECS: u64 = 3_600;
+
     /// Every feature this build of the Master supports unconditionally.
     pub const SUPPORTED: &[&str] = &[MOBILE_TELEMETRY];
 
@@ -1463,7 +1468,8 @@ pub mod master_features {
     }
 
     /// Extracts the Master's advertised session-resume hold in seconds from a `RegisterAck`'s
-    /// `message`, or `None` if `session-resume=<secs>` is not announced or cannot be parsed.
+    /// `message`, or `None` if `session-resume=<secs>` is not announced, cannot be parsed, or
+    /// exceeds [`MAX_SESSION_RESUME_HOLD_SECS`].
     pub fn parse_session_resume_hold_secs(message: Option<&str>) -> Option<u64> {
         message
             .and_then(|m| m.trim().strip_prefix(PREFIX))
@@ -1472,6 +1478,7 @@ pub mod master_features {
                     .find_map(|f| f.trim().strip_prefix(SESSION_RESUME_PREFIX))
             })
             .and_then(|secs| secs.parse::<u64>().ok())
+            .filter(|&secs| secs <= MAX_SESSION_RESUME_HOLD_SECS)
     }
 
     /// The `RegisterAck` message announcing `features`.
@@ -4720,14 +4727,16 @@ mod tests {
     fn test_session_resume_feature_and_message_round_trip() {
         use super::master_features::{
             announced, announcement, parse_session_resume_hold_secs, session_resume_feature, BLOBS,
-            MOBILE_TELEMETRY, SESSION_RESUME_PREFIX,
+            MAX_SESSION_RESUME_HOLD_SECS, MOBILE_TELEMETRY, SESSION_RESUME_PREFIX,
         };
 
         assert_eq!(ProtocolCapabilities::SESSION_RESUME.bits(), 1 << 12);
         assert!(
-            ProtocolCapabilities::all_supported().contains(ProtocolCapabilities::SESSION_RESUME)
+            !ProtocolCapabilities::all_supported().contains(ProtocolCapabilities::SESSION_RESUME),
+            "SESSION_RESUME must not be advertised in all_supported() until adoption and worker resume are wired"
         );
         assert_eq!(SESSION_RESUME_PREFIX, "session-resume=");
+        assert_eq!(MAX_SESSION_RESUME_HOLD_SECS, 3_600);
 
         let token = session_resume_feature(30);
         assert_eq!(token, "session-resume=30");
@@ -4743,6 +4752,18 @@ mod tests {
         assert_eq!(
             parse_session_resume_hold_secs(Some("features=mobile-telemetry, session-resume=45")),
             Some(45)
+        );
+        assert_eq!(
+            parse_session_resume_hold_secs(Some("features=session-resume=3600")),
+            Some(3_600)
+        );
+        assert_eq!(
+            parse_session_resume_hold_secs(Some("features=session-resume=3601")),
+            None
+        );
+        assert_eq!(
+            parse_session_resume_hold_secs(Some(&format!("features=session-resume={}", u64::MAX))),
+            None
         );
         assert_eq!(parse_session_resume_hold_secs(None), None);
         assert_eq!(parse_session_resume_hold_secs(Some("")), None);
@@ -5268,7 +5289,13 @@ mod tests {
         };
 
         for codec in [WireCodec::Bincode, WireCodec::Json] {
-            for bad_ver in [1u32, 2, PROTOCOL_VERSION_CURRENT + 1, 99] {
+            for bad_ver in [
+                1u32,
+                2,
+                PROTOCOL_VERSION_CURRENT - 1,
+                PROTOCOL_VERSION_CURRENT + 1,
+                99,
+            ] {
                 let raw_req = serialize_client_message_with_version(&req, bad_ver, codec).unwrap();
                 match deserialize_message::<ClientMessage>(&raw_req) {
                     Err(ProtocolError::IncompatibleVersion {

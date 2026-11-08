@@ -1365,6 +1365,7 @@ Add one dated line per finished item, newest last.
   - `handle_connection` and `handle_multiplexed_connection` in `server.rs` both call
     `WorkerSession::run_connection` (`crates/master/src/session.rs`).
   - Leftover sandboxes are swept at start-up (pull request 126).
-  - One symbol neither has a caller nor is gone: `compute_intensity`. Design 0044 D1.5 keeps it on
-    the wire as `#[deprecated]`, and nothing in the CLI or MCP sets it. It leaves the wire at the
-    next protocol version bump, in FEAT-1 (design 0046, `F1-b`).
+  - `compute_intensity` (design 0044 D1.5): marked `#[deprecated]` without a wire break in `F11-a`
+    (pull request 125) and removed from `TaskSpec::GpuCompute`, `HumanTaskSpec::GpuCompute`, and
+    `BinaryTaskSpec::GpuCompute` at the protocol version `3 -> 4` bump in `FEAT-1` (`F1-b` wire,
+    pull request 141, design 0046).

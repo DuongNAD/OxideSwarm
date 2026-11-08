@@ -6374,57 +6374,69 @@ mod tests {
             .expect("spawn master");
         let addr = server.server_addr;
 
-        // 1. Worker with lower (2) or higher (current + 1) protocol_version is refused by Master
-        // with a clear RegisterAck message.
-        for bad_worker_ver in [2u32, PROTOCOL_VERSION_CURRENT + 1] {
-            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-            let mut transport = MessageTransport::new(stream);
-            transport
-                .send_msg(&WorkerMessage::Register {
-                    worker_id: Uuid::new_v4(),
-                    capabilities: WorkerCapabilities::new(
-                        "skew-worker",
-                        4,
-                        4096,
-                        false,
-                        false,
-                        None,
-                    ),
-                    protocol_version: bad_worker_ver,
-                    features: ProtocolCapabilities::all_supported(),
-                })
-                .await
-                .unwrap();
-            let ack = transport
-                .recv_msg::<MasterMessage>()
-                .await
-                .unwrap()
-                .expect("RegisterAck");
-            match ack {
-                MasterMessage::RegisterAck {
-                    accepted,
-                    protocol_version,
-                    message,
-                    ..
-                } => {
-                    assert!(!accepted);
-                    assert_eq!(protocol_version, PROTOCOL_VERSION_CURRENT);
-                    let msg = message.unwrap_or_default();
-                    assert!(
-                        msg.contains(&format!("Incompatible protocol version {bad_worker_ver}"))
-                            && msg.contains(&PROTOCOL_VERSION_CURRENT.to_string()),
-                        "expected version mismatch message, got: {msg}"
-                    );
+        // 1. Worker with lower (2, current - 1) or higher (current + 1) protocol_version in both
+        // Bincode and JSON is refused by Master with a clear RegisterAck message.
+        for codec in [WireCodec::Bincode, WireCodec::Json] {
+            for bad_worker_ver in [
+                2u32,
+                PROTOCOL_VERSION_CURRENT - 1,
+                PROTOCOL_VERSION_CURRENT + 1,
+            ] {
+                let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let mut transport = MessageTransport::with_codec(stream, codec);
+                transport
+                    .send_msg(&WorkerMessage::Register {
+                        worker_id: Uuid::new_v4(),
+                        capabilities: WorkerCapabilities::new(
+                            "skew-worker",
+                            4,
+                            4096,
+                            false,
+                            false,
+                            None,
+                        ),
+                        protocol_version: bad_worker_ver,
+                        features: ProtocolCapabilities::all_supported(),
+                    })
+                    .await
+                    .unwrap();
+                let ack = transport
+                    .recv_msg::<MasterMessage>()
+                    .await
+                    .unwrap()
+                    .expect("RegisterAck");
+                match ack {
+                    MasterMessage::RegisterAck {
+                        accepted,
+                        protocol_version,
+                        message,
+                        ..
+                    } => {
+                        assert!(!accepted);
+                        assert_eq!(protocol_version, PROTOCOL_VERSION_CURRENT);
+                        let msg = message.unwrap_or_default();
+                        assert!(
+                            msg.contains(&format!(
+                                "Incompatible protocol version {bad_worker_ver}"
+                            )) && msg.contains(&PROTOCOL_VERSION_CURRENT.to_string()),
+                            "expected version mismatch message for {codec:?}, got: {msg}"
+                        );
+                    }
+                    other => panic!("expected RegisterAck, got {other:?}"),
                 }
-                other => panic!("expected RegisterAck, got {other:?}"),
             }
         }
 
-        // 2. Client with lower (2) or higher (current + 1) protocol_version in both Bincode and
-        // JSON receives a clear ClientResponse::Error from the Master, and a client reading a
-        // mismatched ClientResponse from a fake Master also refuses with GridError::IncompatibleVersion.
+        // 2. Client with lower (2, current - 1) or higher (current + 1) protocol_version in both
+        // Bincode and JSON receives a clear ClientResponse::Error from the Master, and a client
+        // reading a mismatched ClientResponse from a fake Master also refuses with
+        // GridError::IncompatibleVersion.
         for codec in [WireCodec::Bincode, WireCodec::Json] {
-            for bad_client_ver in [2u32, PROTOCOL_VERSION_CURRENT + 1] {
+            for bad_client_ver in [
+                2u32,
+                PROTOCOL_VERSION_CURRENT - 1,
+                PROTOCOL_VERSION_CURRENT + 1,
+            ] {
                 let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
                 let mut transport = MessageTransport::with_codec(stream, codec);
                 let raw_frame =
@@ -6452,47 +6464,49 @@ mod tests {
             // Client side: receiving a non-Error ClientResponse with an incompatible protocol_version
             // fails with GridError::IncompatibleVersion naming both versions (without a
             // "Registration handshake failed:" prefix).
-            let (client_io, master_io) = tokio::io::duplex(4096);
-            let bad_master_ver = PROTOCOL_VERSION_CURRENT + 2;
-            tokio::spawn(async move {
-                let mut fake_master = MessageTransport::with_codec(master_io, codec);
-                let _ = fake_master
-                    .recv_msg::<InboundMessage>()
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let bad_resp = stamp_frame_version(
-                    &ClientResponse::WorkerList {
-                        workers: Vec::new(),
-                    },
-                    bad_master_ver,
-                    codec,
-                );
-                fake_master.send_raw_frame(bad_resp.into()).await.unwrap();
-            });
-            let mut client_transport = MessageTransport::with_codec(client_io, codec);
-            client_transport
-                .send_msg(&ClientMessage::ListWorkers)
-                .await
-                .unwrap();
-            let err: GridError = client_transport
-                .recv_msg::<ClientResponse>()
-                .await
-                .expect_err("client must refuse incompatible Master ClientResponse")
-                .into();
-            assert!(
-                !err.to_string().contains("Registration handshake failed:"),
-                "client refusal must not carry worker handshake prefix: {err}"
-            );
-            match &err {
-                GridError::IncompatibleVersion(msg) => {
-                    assert!(
-                        msg.contains(&format!("Incompatible protocol version {bad_master_ver}"))
-                            && msg.contains(&PROTOCOL_VERSION_CURRENT.to_string()),
-                        "expected clear client-side version refusal, got: {msg}"
+            for bad_master_ver in [PROTOCOL_VERSION_CURRENT - 1, PROTOCOL_VERSION_CURRENT + 2] {
+                let (client_io, master_io) = tokio::io::duplex(4096);
+                tokio::spawn(async move {
+                    let mut fake_master = MessageTransport::with_codec(master_io, codec);
+                    let _ = fake_master
+                        .recv_msg::<InboundMessage>()
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let bad_resp = stamp_frame_version(
+                        &ClientResponse::WorkerList {
+                            workers: Vec::new(),
+                        },
+                        bad_master_ver,
+                        codec,
                     );
+                    fake_master.send_raw_frame(bad_resp.into()).await.unwrap();
+                });
+                let mut client_transport = MessageTransport::with_codec(client_io, codec);
+                client_transport
+                    .send_msg(&ClientMessage::ListWorkers)
+                    .await
+                    .unwrap();
+                let err: GridError = client_transport
+                    .recv_msg::<ClientResponse>()
+                    .await
+                    .expect_err("client must refuse incompatible Master ClientResponse")
+                    .into();
+                assert!(
+                    !err.to_string().contains("Registration handshake failed:"),
+                    "client refusal must not carry worker handshake prefix: {err}"
+                );
+                match &err {
+                    GridError::IncompatibleVersion(msg) => {
+                        assert!(
+                            msg.contains(&format!(
+                                "Incompatible protocol version {bad_master_ver}"
+                            )) && msg.contains(&PROTOCOL_VERSION_CURRENT.to_string()),
+                            "expected clear client-side version refusal, got: {msg}"
+                        );
+                    }
+                    other => panic!("expected GridError::IncompatibleVersion, got {other:?}"),
                 }
-                other => panic!("expected GridError::IncompatibleVersion, got {other:?}"),
             }
         }
 
