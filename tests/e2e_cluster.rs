@@ -1303,10 +1303,14 @@ async fn test_tier2_bva_large_output_stream_truncation() {
             working_dir: None,
             stdin: None,
         },
-        TaskRequirements::generic(1, 10),
+        TaskRequirements::generic(1, 40),
     );
+    // The work is tiny (~500 KB through a pipe), but MSYS2 `sh` on a loaded Windows CI runner
+    // can need several seconds just to start and fork `yes`/`head`; 5 s timed out once. The
+    // budget only bounds a hang, it is not an expected duration, and the task timeout above is
+    // kept below it so a hung `sh` still fails in the worker first.
     let res = cluster
-        .submit_and_wait(task, Duration::from_secs(5))
+        .submit_and_wait(task, Duration::from_secs(60))
         .await
         .unwrap();
 
