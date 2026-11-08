@@ -232,6 +232,28 @@ fn test_research_mode_profile_and_bench() {
     );
 }
 
+/// True when `needle` occurs in `text` and is not just a run of digits inside a longer number. The
+/// report carries measured timings, so a float such as `0.74090` must not read as a GPU model name.
+fn contains_standalone_number(text: &str, needle: &str) -> bool {
+    let is_number_char = |c: char| c.is_ascii_digit() || c == '.';
+    text.match_indices(needle).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + needle.len()..].chars().next();
+        !before.is_some_and(is_number_char) && !after.is_some_and(is_number_char)
+    })
+}
+
+#[test]
+fn test_standalone_number_check_ignores_digits_inside_measurements() {
+    assert!(!contains_standalone_number(
+        "\"ms\": 0.74090, \"n\": 140903",
+        "4090"
+    ));
+    assert!(!contains_standalone_number("1.4090e-3", "4090"));
+    assert!(contains_standalone_number("gpu: geforce 4090 ti", "4090"));
+    assert!(contains_standalone_number("4090", "4090"));
+}
+
 #[test]
 fn test_research_mode_distributed_and_report() {
     let root = find_workspace_root();
@@ -289,7 +311,9 @@ fn test_research_mode_distributed_and_report() {
         let lower = text.to_ascii_lowercase();
         assert!(!text.contains("OPTIMAL"), "output must not print OPTIMAL");
         assert!(
-            !lower.contains("rtx") && !lower.contains("4090") && !lower.contains("worker-gpu"),
+            !lower.contains("rtx")
+                && !contains_standalone_number(&lower, "4090")
+                && !lower.contains("worker-gpu"),
             "output must not print invented RTX / worker-gpu-rtx4090 hardware or node names"
         );
         assert!(
