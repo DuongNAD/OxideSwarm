@@ -17,16 +17,16 @@ Created: 2026-11-08    Updated: 2026-11-08
 
 ## Context
 
-What exists at `master` `01a9786`:
+What exists at `master` `7b1f912`:
 
 | Area | Today | Code |
 |---|---|---|
 | Unused assets and types | `crates/master/src/dashboard/index.html` and `crates/worker/src/shaders/hash.wgsl` are never included (`web_ui.rs:64` includes `crates/master/src/dashboard.html`; `wgpu_engine.rs:14` includes `crates/worker/src/shaders/gemm.wgsl`). `DashboardState`, `create_dashboard_router`, and `create_dashboard_router_with_auth` (`crates/master/src/dashboard/mod.rs:17-105`), `Sandbox::prepare_spec` (`crates/worker/src/sandbox.rs:714-727`), and `probe_physical_adapter` (`crates/worker/src/wgpu_engine.rs:183-185`) have no callers anywhere in the workspace | `crates/master/src/dashboard/`, `crates/worker/src/shaders/`, `crates/worker/src/sandbox.rs`, `crates/worker/src/wgpu_engine.rs` |
 | Duplicate auto-rig provider routing | `auto_rig_mesh_async` (`crates/worker/src/autorig/mod.rs:113-156`) is called only by `crates/worker/tests/test_challenger_m3_blender_job_object.rs`, while `TaskRunner::execute_auto_rig_workload` (`crates/worker/src/runner.rs:2424-2477`) duplicates the same Blender-vs-builtin routing inline | `crates/worker/src/autorig/mod.rs`, `crates/worker/src/runner.rs` |
 | Unused `compute_intensity` field | `TaskSpec::GpuCompute` (`crates/core/src/task.rs:1046`) and `BinaryTaskSpec::GpuCompute` (`:1157`) carry `compute_intensity: u32`, which `crates/worker/src/runner.rs:36` notes is never read by the worker or `wgpu_engine` | `crates/core/src/task.rs`, `crates/worker/src/runner.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs`, `crates/cli/src/doctor.rs` |
-| Dead role-arbitrage scoring and election code | Per `FEAT-6` ([design 0026](0026-refuse-claim-master-role.md)), the master refuses every `WorkerMessage::ClaimMasterRole` with `reject_master_role_claim` (`crates/master/src/server.rs:3211-3231`). In `crates/core/src/arbitrage.rs` (869 lines), only `MasterLeaseTicket` has a production caller; `MasterRefusalReason`, `MobileEnvironmentTelemetry`, `evaluate_mobile_master_refusal_matrix`, `is_cellular_or_metered`, `check_mobile_master_eligibility`, `evaluate_mobile_master_refusal`, `PlatformType`, `AuthorityEvaluation`, `calculate_authority_score`, `CandidateRanking`, `resolve_election_tie`, `ClaimVerdict`, and `evaluate_master_claim` have only test callers | `crates/core/src/arbitrage.rs`, `crates/core/src/lib.rs`, `tests/mobile_coordination_test.rs`, `tests/m5a_challenger_2_stress.rs` |
+| Dead role-arbitrage scoring and election code | Per `FEAT-6` ([design 0026](0026-refuse-claim-master-role.md)), the master refuses every `WorkerMessage::ClaimMasterRole` with `reject_master_role_claim` (`crates/master/src/server.rs:3244-3260`). In `crates/core/src/arbitrage.rs` (869 lines), only `MasterLeaseTicket` has a production caller; `MasterRefusalReason`, `MobileEnvironmentTelemetry`, `evaluate_mobile_master_refusal_matrix`, `is_cellular_or_metered`, `check_mobile_master_eligibility`, `evaluate_mobile_master_refusal`, `PlatformType`, `AuthorityEvaluation`, `calculate_authority_score`, `CandidateRanking`, `resolve_election_tie`, `ClaimVerdict`, and `evaluate_master_claim` have only test callers | `crates/core/src/arbitrage.rs`, `crates/core/src/lib.rs`, `tests/mobile_coordination_test.rs`, `tests/m5a_challenger_2_stress.rs` |
 | Duplicate Android JNI exports | `crates/android_bridge/src/lib.rs:528-786` exports 11 `Java_com_oxideswarm_worker_service_OxideWorkerBridge_*` functions for a `com.oxideswarm.worker.service.OxideWorkerBridge` class that does not exist, plus `nativeStartWorkerLegacy` (`:578`, `:850`), while the Kotlin singleton in `packaging/android/app/app/src/main/java/com/oxideswarm/worker/runner/OxideWorkerBridge.kt` lives in `com.oxideswarm.worker.runner` | `crates/android_bridge/src/lib.rs`, `packaging/android/app/app/src/main/java/com/oxideswarm/worker/runner/OxideWorkerBridge.kt` |
-| Duplicated TCP and QUIC worker session loops | `crates/master/src/server.rs` contains two worker session handlers: `handle_connection` (`:3284-3761`, 478 lines, single stream) and `handle_multiplexed_connection` (`:3765-4425`, 660 lines, 2-lane QUIC control + data streams). Both repeat authentication, `Register` validation, `WorkerRegistry::register_session`, superseded-session failover, `RegisterAck` delivery, `BlobService` setup, the inbound message dispatch table (`Heartbeat`, `Disconnecting`, `TaskProgress`, `TaskResult`, `Checkpoint`, `BlobRequest`, `MobileTelemetry`, `ClaimMasterRole`), and disconnect cleanup | `crates/master/src/server.rs` |
+| Duplicated TCP and QUIC worker session loops | `crates/master/src/server.rs` contains two worker session handlers: `handle_connection` (`:3317-3791`, 475 lines, single stream) and `handle_multiplexed_connection` (`:3795-4462`, 668 lines, 2-lane QUIC control + data streams). Both repeat authentication, `Register` validation, `WorkerRegistry::register_session`, superseded-session failover, `RegisterAck` delivery, `BlobService` setup, the inbound message dispatch table (`Heartbeat`, `Disconnecting`, `TaskProgress`, `TaskResult`, `Checkpoint`, `BlobRequest`, `MobileTelemetry`, `ClaimMasterRole`), and disconnect cleanup | `crates/master/src/server.rs` |
 | Leftover task sandboxes after a worker crash | `Sandbox::create` (`crates/worker/src/sandbox.rs:625`) creates `<base_dir>/<task_id>` and `Sandbox::destroy` removes it when a task finishes. After `SIGKILL` or power loss, leftover `<base_dir>/<task_id>` directories remain on disk forever; `SandboxConfig::ensure_usable` (`:277-295`) sweeps only legacy `<base_dir>/cache/objects` and `<base_dir>/cache/tmp` | `crates/worker/src/sandbox.rs` |
 | Always-compiled 3D modules | `crates/worker/src/gen3d` and `crates/worker/src/autorig` are compiled unconditionally into every `rusty_grid_worker` build even though `docs/ROADMAP.md` decision Q2 freezes 3D and moves it behind an opt-in Cargo feature | `crates/worker/Cargo.toml`, `crates/worker/src/lib.rs`, `crates/worker/src/runner.rs` |
 
@@ -89,7 +89,7 @@ What exists at `master` `01a9786`:
      unchanged, and mark `compute_intensity` `#[deprecated]` in `crates/core/src/task.rs` (adding
      `#[allow(deprecated)]` on the internal mirror conversions in `task.rs:1211-1421` and in
      `crates/core/src/wire_layout_tests.rs:235-243`).
-   - Stop setting `compute_intensity` from the CLI (`crates/cli/src/cli_app.rs:2399`), MCP
+   - Stop setting `compute_intensity` from the CLI (`crates/cli/src/cli_app.rs:2402`), MCP
      (`crates/cli/src/mcp.rs:1735`), `doctor` (`crates/cli/src/doctor.rs:506`), and `agent_mesh`
      (`crates/agent_mesh/src/bridge.rs:196-215`), passing `0` internally under
      `#[allow(deprecated)]`.
@@ -109,7 +109,7 @@ What exists at `master` `01a9786`:
     `SCORE_MIN`, `SCORE_MAX`, `LEASE_RENEWAL_INTERVAL_MS`.
 - Keep `MasterLeaseTicket`, `LeaseValidationError`, `LEASE_VALIDITY_DURATION_MS`, and
   `LEASE_HMAC_LABEL` in `crates/core/src/arbitrage.rs` for the `WorkerMessage::ClaimMasterRole`
-  wire struct (`crates/core/src/protocol.rs:479`) and its refusal tests.
+  wire struct (`crates/core/src/protocol.rs:511`) and its refusal tests.
 - Remove the dead-code tests of those deleted functions from `crates/core/src/arbitrage.rs`,
   `tests/mobile_coordination_test.rs`, and `tests/m5a_challenger_2_stress.rs`, keeping the tests
   that verify `MasterLeaseTicket` signing/verification and the master's refusal of
@@ -131,8 +131,8 @@ What exists at `master` `01a9786`:
 ### D4 Unify TCP and QUIC worker connection loops (`crates/master/src/session.rs`)
 
 Create `crates/master/src/session.rs` and replace the duplicated worker bodies of
-`handle_connection` (`crates/master/src/server.rs:3284-3761`) and `handle_multiplexed_connection`
-(`crates/master/src/server.rs:3765-4425`) with a single `WorkerSession` state machine:
+`handle_connection` (`crates/master/src/server.rs:3317-3791`) and `handle_multiplexed_connection`
+(`crates/master/src/server.rs:3795-4462`) with a single `WorkerSession` state machine:
 
 1. **Pre-registration transport abstraction (`PreAuthSession`):**
    - `PreAuthSession::Single { transport, remote_addr }` (TCP)
@@ -190,7 +190,7 @@ existing guard test(s):
   (`tests/master_failover_cancel_liveness.rs:409`).
 - **A connection handler that a newer registration aborted never sweeps the new session:**
   guarded by `registry::tests::test_registry_session_isolation_on_reconnect`
-  (`crates/master/src/registry.rs:1219`),
+  (`crates/master/src/registry.rs:1236`),
   `queue::tests::test_session_scoped_failover_spares_the_newer_session`
   (`crates/master/src/queue.rs:2891`),
   `test_reregistering_worker_id_fails_over_the_superseded_session_exactly_once`
@@ -199,7 +199,7 @@ existing guard test(s):
   (`tests/worker_connection_lifecycle.rs:904`).
 - **The supersede sweep (`failover_superseded_session`) runs in its own spawned task:**
   guarded by `server::tests::test_superseded_session_sweep_survives_the_abort_of_its_caller`
-  (`crates/master/src/server.rs:5162`).
+  (`crates/master/src/server.rs:5189`).
 - **`BlobService` answers off the inbound loop, on the data stream:**
   guarded by `test_adversarial_master_multiplexed_heartbeat_under_backpressured_data_lane`
   (`tests/m2_challenger_2_stress.rs:1015`),
@@ -209,11 +209,11 @@ existing guard test(s):
   guarded by `test_workers_over_quic_release_the_pre_auth_slot_once_registered`
   (`tests/master_quic_limits.rs:123`) and
   `server::tests::test_connection_limits_keep_two_separate_budgets_and_do_not_leak_permits`
-  (`crates/master/src/server.rs:5231`).
+  (`crates/master/src/server.rs:5258`).
 - **P2P refusals go through `send_refusal_and_drain` (and `drain_refusal_stream` on pre-registration
   auth failure):**
   guarded by `server::tests::test_p2p_handshake_refusals_delivered_over_real_iroh`
-  (`crates/master/src/server.rs:6553`).
+  (`crates/master/src/server.rs:6580`).
 
 ### D5 Start-up sweep of leftover task sandboxes (`crates/worker/src/sandbox.rs`)
 
@@ -258,7 +258,7 @@ existing guard test(s):
      sweep and `Sandbox::destroy` cleanup. A later worker start on the same `base_dir` *without*
      `--keep-sandboxes` sweeps any unlocked `<base_dir>/<task_id>` directories that an earlier
      `--keep-sandboxes` run kept. Document this explicitly in `README.md` next to
-     `--keep-sandboxes` (`README.md:424` and `README.md:610`).
+     `--keep-sandboxes` (`README.md:427` and `README.md:613`).
 
 ### D6 Gate `gen3d` and `autorig` behind Cargo feature `3d`
 

@@ -1269,6 +1269,11 @@ async fn test_worker_with_1s_negotiated_interval_does_not_reconnect_within_15s_a
 #[tokio::test]
 async fn test_idle_wifi_phone_switching_to_unknown_network_stays_in_session_1_for_25s_with_10s_reaper(
 ) {
+    use rusty_grid_core::capabilities::MobileCapabilities;
+    use rusty_grid_core::protocol::{
+        MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage,
+        PROTOCOL_VERSION_CURRENT,
+    };
     use rusty_grid_master::reaper::ReaperConfig;
     use rusty_grid_master::scheduler::SchedulerConfig;
 
@@ -1324,6 +1329,90 @@ async fn test_idle_wifi_phone_switching_to_unknown_network_stays_in_session_1_fo
         1
     );
 
+    // Also connect a raw-protocol phone (simulating an older APK that never restarts its
+    // heartbeat timer when `network_type` drops to `None` or a task arrives) so this test
+    // guards the master's `update_mobile_telemetry` window retention on its own.
+    let raw_id = Uuid::new_v4();
+    let raw_stream = tokio::net::TcpStream::connect(&master_addr)
+        .await
+        .expect("connect raw phone");
+    let mut raw_transport = MessageTransport::new(raw_stream);
+    raw_transport
+        .send_msg(&WorkerMessage::Register {
+            worker_id: raw_id,
+            capabilities: WorkerCapabilities::new("raw-apk-phone", 2, 4096, false, false, None)
+                .with_mobile(Some(MobileCapabilities {
+                    os_version: "Android 14".into(),
+                    soc_model: "Snapdragon".into(),
+                    battery_pct: Some(85),
+                    is_charging: Some(false),
+                    thermal_throttled: false,
+                })),
+            protocol_version: PROTOCOL_VERSION_CURRENT,
+            features: ProtocolCapabilities::all_supported(),
+        })
+        .await
+        .expect("send raw Register");
+    match raw_transport
+        .recv_msg::<MasterMessage>()
+        .await
+        .expect("recv raw RegisterAck")
+    {
+        Some(MasterMessage::RegisterAck { accepted: true, .. }) => {}
+        other => panic!("expected accepted RegisterAck for raw phone, got {other:?}"),
+    }
+    raw_transport
+        .send_msg(&WorkerMessage::MobileTelemetry {
+            worker_id: raw_id,
+            battery_pct: Some(85),
+            is_charging: Some(false),
+            thermal_throttled: false,
+            battery_temperature: Some(33.0),
+            network_type: Some("wifi".into()),
+            battery_tier: Some(BatteryTier::Normal),
+            thermal_tier: Some(ThermalTier::Normal),
+        })
+        .await
+        .expect("send raw wifi telemetry");
+    raw_transport
+        .send_msg(&WorkerMessage::MobileTelemetry {
+            worker_id: raw_id,
+            battery_pct: Some(85),
+            is_charging: Some(false),
+            thermal_throttled: false,
+            battery_temperature: Some(33.0),
+            network_type: None,
+            battery_tier: Some(BatteryTier::Normal),
+            thermal_tier: Some(ThermalTier::Normal),
+        })
+        .await
+        .expect("send raw None telemetry");
+    let raw_initial_session = wait_for(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        || async {
+            master
+                .registry()
+                .get_worker(raw_id)
+                .await
+                .and_then(|w| w.mobile_status)
+                .and_then(|s| s.network_type)
+                .as_deref()
+                == Some("wifi")
+        },
+    )
+    .await;
+    assert!(
+        raw_initial_session,
+        "Master must retain network_type=wifi for raw-protocol phone after network_type=None telemetry"
+    );
+    let raw_session_id = master
+        .registry()
+        .get_worker(raw_id)
+        .await
+        .unwrap()
+        .session_id;
+
     // After ~1 s on Wi-Fi (while the worker's heartbeat ticker was armed for 60 s), switch
     // network_type to None (simulating Wi-Fi roaming / activeNetwork without capabilities).
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1344,7 +1433,8 @@ async fn test_idle_wifi_phone_switching_to_unknown_network_stays_in_session_1_fo
         "Master must observe network_type=None after telemetry update"
     );
 
-    // Wait 25 s with the 10 s reaper running: the phone must remain Connected in session 1.
+    // Wait 25 s with the 10 s reaper running: both the WorkerClient phone and the raw-protocol
+    // phone (which sent zero Heartbeats) must remain Connected in their original sessions.
     tokio::time::sleep(Duration::from_millis(25_200)).await;
 
     let info = master.registry().get_worker(w_id).await.unwrap();
@@ -1353,6 +1443,18 @@ async fn test_idle_wifi_phone_switching_to_unknown_network_stays_in_session_1_fo
         "Idle Wi-Fi phone switching to network_type=None must stay in session 1 for 25 s with a 10 s reaper"
     );
     assert_eq!(info.status, WorkerStatus::Connected);
+
+    let raw_info = master.registry().get_worker(raw_id).await.unwrap();
+    assert_eq!(
+        raw_info.session_id, raw_session_id,
+        "Raw-protocol phone that never restarts its heartbeat timer must stay in its original session"
+    );
+    assert_eq!(
+        raw_info.status,
+        WorkerStatus::Connected,
+        "Raw-protocol phone that sends no heartbeats for 25 s after network_type=None must not be reaped by the 10 s reaper"
+    );
+    drop(raw_transport);
 
     let _ = w_shutdown_tx.send(true);
     let _ = master.shutdown();

@@ -12,4 +12,5 @@ pub mod secret_cmd;
 pub use cli_app::run_cli;
 pub use connect::{connect_master, DEFAULT_MASTER_ADDR, DEFAULT_MASTER_PORT};
 pub use mcp::{run_mcp, McpArgs};
+pub use mode_cli as mode;
 pub use mode_cli::{run_mode_cli, ModeCliArgs};
