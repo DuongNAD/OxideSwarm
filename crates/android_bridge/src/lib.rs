@@ -589,10 +589,7 @@ pub extern "system" fn Java_com_oxideswarm_worker_runner_OxideWorkerBridge_nativ
         }
         Err(_) => None,
     };
-    let name: String = match jstring_to_string(&mut env, &worker_name) {
-        Ok(s) => s,
-        Err(_) => String::new(),
-    };
+    let name: String = jstring_to_string(&mut env, &worker_name).unwrap_or_default();
     if start_worker_impl(
         master,
         ticket_str,
