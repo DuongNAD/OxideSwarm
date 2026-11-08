@@ -241,6 +241,7 @@ echo "RUSTUP_HOME=$RUSTUP_HOME"; echo "CARGO_HOME=$CARGO_HOME"
 echo "SSH=${SSH_AUTH_SOCK-unset}"; echo "GPG=${GPG_AGENT_INFO-unset}"
 echo "DBUS=${DBUS_SESSION_BUS_ADDRESS-unset}"; echo "DOCKER=${DOCKER_HOST-unset}"
 echo "SECRET=${OXIDESWARM_SECRET-unset}"
+echo "TOKEN=${RUSTY_GRID_RUN_TOKEN-unset}"
 "#,
             &[
                 ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
@@ -269,6 +270,10 @@ echo "SECRET=${OXIDESWARM_SECRET-unset}"
         }
         assert_eq!(got["RUSTUP_HOME"], rig.host.rustup_home.to_string_lossy());
         assert_eq!(got["CARGO_HOME"], rig.host.cargo_home.to_string_lossy());
+        assert_ne!(
+            got["TOKEN"], "unset",
+            "FEAT-2's containment token must survive the environment preparation"
+        );
         for name in ["SSH", "GPG", "DBUS", "DOCKER", "SECRET"] {
             assert_eq!(got[name], "unset", "{name}");
         }
